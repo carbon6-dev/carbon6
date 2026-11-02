@@ -606,6 +606,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     let pane_el = NodeRef::<leptos::html::Div>::new();
     let wide = RwSignal::new(false);
     watch_width(pane_el, wide);
+    provide_context(GlanceBeside(wide));
     let glance_at = RwSignal::new(None::<(f64, f64)>);
     let sheet = RwSignal::new(false);
     Effect::new(move || {
@@ -718,16 +719,27 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         <Show when=own_strip>
             <SessionStrip chrome />
         </Show>
-        <div class="flex min-h-0 flex-1">
         <div class="relative flex min-h-0 min-w-0 flex-1 flex-col">
-        {move || find_open.get().then(|| view! { <FindBar session=id_stored.get_value() initial=find_q.clone() open=find_open force_open root=find_root.clone() /> })}
+        // At the transcript's right edge, not the column's.
+        {move || find_open.get().then(|| view! {
+            <div class=format!("pointer-events-none absolute inset-x-0 top-0 z-30 {READING_ROW}")>
+                <div class=format!("relative {READING} [&>*]:pointer-events-auto")>
+                    <FindBar session=id_stored.get_value() initial=find_q.clone() open=find_open force_open root=find_root.clone() />
+                </div>
+                {glance_room(wide)}
+            </div>
+        })}
         // Only up and down: what's wider (code, a table) scrolls within itself.
         <ScrollBox node_ref=scroller follow=stick class="overflow-x-hidden" on_scroll=Callback::new(move |()| {
             if let Some(el) = scroller.get_untracked() {
                 far.set(el.scroll_height() - el.scroll_top() - el.client_height() > el.client_height());
             }
         })>
-        <div class="mx-auto max-w-4xl px-4 pb-8 pt-4">
+        // The transcript at its reading width and, when the session is wide,
+        // the glance beside it, the two centred together; the glance stays
+        // in sight as the transcript scrolls.
+        <div class=format!("{READING_ROW} items-start")>
+        <div class=format!("{READING} px-4 pb-8 pt-4")>
             <Suspense fallback=|| ()>
                 {move || detail.get().map(|r| match r {
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
@@ -753,12 +765,19 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             </Suspense>
             {move || detail.get().and_then(Result::ok).map(|d| view! { <Transcript session=d.session feed running=Signal::derive(running) /> })}
         </div>
+        <Show when=move || wide.get()>
+            <aside class="sticky top-0 max-h-[calc(100dvh-8rem)] w-72 shrink-0 overflow-y-auto pb-4 pt-4">
+                <crate::details::Glance chrome />
+            </aside>
+        </Show>
+        </div>
         // Scrolled up a screen or more: back to the end in one click, with
         // what came in meanwhile counted. It stays at the box's lower edge.
         {move || far.get().then(|| {
             let fresh = events.with(|evs| evs.len()).saturating_sub(left_at.get());
             view! {
-                <div class="pointer-events-none sticky bottom-3 flex justify-end px-4">
+                <div class=format!("pointer-events-none sticky bottom-3 {READING_ROW}")>
+                    <div class=format!("flex justify-end px-4 {READING}")>
                     <button class="pointer-events-auto rounded-full border border-zinc-300 bg-white/95 px-3 py-1 text-xs font-medium shadow-md hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-900/95 dark:hover:bg-zinc-800"
                         title="To the latest (End)"
                         on:click=move |_| {
@@ -773,6 +792,8 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                         }>
                         {if fresh > 0 { format!("↓ {fresh} new") } else { "↓ Latest".to_owned() }}
                     </button>
+                    </div>
+                    {glance_room(wide)}
                 </div>
             }
         })}
@@ -810,13 +831,6 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                 }
             }}
         </div>
-        // Wide: the glance beside the transcript, always there.
-        <Show when=move || wide.get()>
-            <aside class="w-72 shrink-0 overflow-y-auto border-l border-zinc-200 px-2 py-2 dark:border-zinc-800">
-                <crate::details::Glance chrome />
-            </aside>
-        </Show>
-        </div>
         <Popover at=glance_at class="w-72">
             <crate::details::Glance chrome on_done=move |()| glance_at.set(None) />
         </Popover>
@@ -825,9 +839,28 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     }
 }
 
+/// The transcript's reading column (and what lines up with it: the message
+/// box, the find bar): at most 56rem, centred.
+const READING: &str = "w-full min-w-0 max-w-4xl";
+/// A row centring the reading column and, when the glance is beside it,
+/// the gap and the glance (or the room they take), as one group.
+const READING_ROW: &str = "flex justify-center gap-6";
+
 /// How wide the session's column must be for the glance to be a column
-/// beside the transcript.
-const GLANCE_COLUMN_MIN: i32 = 1100;
+/// beside the transcript: the reading column (896px), the gap (24px), the
+/// glance and a 16px margin on either side.
+const GLANCE_COLUMN_MIN: i32 = 896 + 24 + GLANCE_WIDTH as i32 + 2 * 16;
+
+/// Where the glance is beside the transcript: the room it and the gap
+/// take, so what lines up with the transcript keeps its left edge.
+fn glance_room(beside: RwSignal<bool>) -> impl IntoView {
+    move || beside.get().then(|| view! { <div class="w-72 shrink-0" aria-hidden="true"></div> })
+}
+
+/// The glance is beside the transcript (for the message box, to line up
+/// with it).
+#[derive(Clone, Copy)]
+struct GlanceBeside(RwSignal<bool>);
 
 /// Keeps `wide` saying whether the element is wide enough for the glance
 /// beside it, as it resizes (its tile, a pane beside it, the window).
@@ -968,8 +1001,14 @@ impl SessionChrome {
     /// the glance opened under what was clicked.
     fn show_looks(&self, ev: &web_sys::MouseEvent) {
         if self.wide.get_untracked() {
-            if let Some(el) = document().get_element_by_id(&format!("look-{}", self.id.get_value())) {
-                el.scroll_into_view();
+            // Within the glance only (it stays put beside the transcript):
+            // the transcript keeps its place.
+            if let Some(el) = document()
+                .get_element_by_id(&format!("look-{}", self.id.get_value()))
+                .and_then(|e| wasm_bindgen::JsCast::dyn_into::<web_sys::HtmlElement>(e).ok())
+                && let Some(aside) = el.closest("aside").ok().flatten()
+            {
+                aside.set_scroll_top(el.offset_top());
             }
             return;
         }
@@ -4136,6 +4175,8 @@ fn Composer(
     };
     let stop = move |_| interrupt();
     let esc_armed = use_context::<EscArmed>();
+    // The session's own box keeps in line with its transcript.
+    let beside = if inline { None } else { use_context::<GlanceBeside>() };
     // Send now (stop and send): the message waits in the box until the turn
     // has stopped, then starts the next one (sent anyway if stopping takes
     // long: it queues).
@@ -4189,7 +4230,9 @@ fn Composer(
                 }
             }
         >
-            <div class=if inline { "space-y-2" } else { "mx-auto max-w-4xl space-y-2 px-2 py-1.5 sm:px-3 sm:py-2" }>
+            // In line with the transcript, the glance's room beside it.
+            <div class=if inline { "" } else { READING_ROW }>
+            <div class=if inline { "space-y-2" } else { "w-full min-w-0 max-w-4xl space-y-2 px-2 py-1.5 sm:px-3 sm:py-2" }>
                 {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
                 // One box: what's attached, the text, and a toolbar along its
                 // bottom edge (📎, the chips, Send).
@@ -4519,6 +4562,8 @@ fn Composer(
                         "Wake the agent that started it"
                     </label>
                 })}
+            </div>
+            {beside.map(|GlanceBeside(b)| glance_room(b))}
             </div>
         </div>
     }

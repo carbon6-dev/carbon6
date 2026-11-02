@@ -27,7 +27,7 @@ One line each, read-only: **Runs on** (worker, online dot, model and effort, run
 
 - Icons: Lucide (ISC), inline.
 - A pane opens beside the session when its tile is at least ~1100px wide, else in a tile of its own; on a phone beside (it fills the screen, ‹ goes back).
-- The glance is a column (288px) when the session's column is at least ~1100px wide, else behind the context ring: a popover, a sheet from the bottom on a phone. ⌘I opens and closes it there; Esc closes it.
+- The glance is a column (288px) 24px to the right of the transcript, which keeps its reading width (56rem); the two are centred together in the session's column, the glance stays in sight as the transcript scrolls, and the message box and the find bar line up with the transcript. That needs the session's column to be at least 1240px wide (896 + 24 + 288 and 16px either side); narrower, the glance is behind the context ring: a popover, a sheet from the bottom on a phone. ⌘I opens and closes it there; Esc closes it.
 - The bar's only count is *N running*.
 - The branch has no "based on" yet.
 
