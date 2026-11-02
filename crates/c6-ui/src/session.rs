@@ -4054,7 +4054,7 @@ fn Composer(
                     <div class="relative">
                     <textarea
                         node_ref=area
-                        class=move || format!("block w-full bg-transparent px-3 pt-2 text-sm outline-none {} {}", crate::util::GROWS, match (shown_next().is_some(), touch) { (true, true) => "pr-9 placeholder:italic", (true, false) => "placeholder:italic", _ => "" })
+                        class=move || format!("block w-full bg-transparent px-3 pb-1.5 pt-2 text-sm outline-none {} {}", crate::util::GROWS, match (shown_next().is_some(), touch) { (true, true) => "pr-9 placeholder:italic", (true, false) => "placeholder:italic", _ => "" })
                         rows="1"
                         enterkeyhint=if touch { "enter" } else { "send" }
                         placeholder=move || if let Some(s) = shown_next() { s } else if disabled.get() { "This session failed to start.".to_owned() } else if touch {
