@@ -98,7 +98,7 @@ pub fn ProjectsPage() -> impl IntoView {
         });
     };
     view! {
-        <main class="mx-auto max-w-4xl space-y-4 px-4 py-5">
+        <main class="mx-auto max-w-4xl space-y-4 px-4 py-5" data-hold-reloads="">
             <header class="flex flex-wrap items-baseline gap-x-3 gap-y-1">
                 <h1 class="text-xl font-semibold">"Projects"</h1>
                 <span class="text-sm text-zinc-500">"Long-running efforts: their work, documents and phases"</span>
@@ -259,7 +259,7 @@ pub fn ProjectPage(id: String) -> impl IntoView {
         patch(ProjectPatch { title: Some(title.get_untracked()), purpose: Some(purpose.get_untracked()), ..Default::default() });
     };
     view! {
-        <main class="mx-auto max-w-3xl space-y-4 px-4 py-5">
+        <main class="mx-auto max-w-3xl space-y-4 px-4 py-5" data-hold-reloads="">
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             {move || match shown.get() {
                 None => view! { <p class="text-sm text-zinc-500">"Loading…"</p> }.into_any(),

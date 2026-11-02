@@ -43,12 +43,15 @@ pub fn DecisionLink(class: &'static str) -> impl IntoView {
 const QUIET: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Whether you're typing (a field has the focus): a reload waits.
-/// You're typing in a decision (a reload would drop it). A field elsewhere
-/// (a session's message box in another tile, say) doesn't hold reloads.
+/// You're typing in a page that reloads quietly: a decision, or a page
+/// marked `data-hold-reloads` (a project, a work item, their lists). A reload
+/// would rebuild what you're typing in and take the focus from it. A field
+/// elsewhere (a session's message box in another tile, say) doesn't hold
+/// reloads.
 fn typing() -> bool {
     document().active_element().is_some_and(|el| {
         (matches!(el.tag_name().as_str(), "INPUT" | "TEXTAREA" | "SELECT") || el.has_attribute("contenteditable"))
-            && el.closest("[data-decisions]").ok().flatten().is_some()
+            && el.closest("[data-decisions], [data-hold-reloads]").ok().flatten().is_some()
     })
 }
 
@@ -64,6 +67,12 @@ pub(crate) fn reload_quietly(tick: RwSignal<u32>) {
             later(due, tick);
         }
     });
+}
+
+/// Loads again now (`tick`), or once you stop typing in the page: for a
+/// page's own timer, which must not rebuild what you're typing in either.
+pub(crate) fn tick_quietly(tick: RwSignal<u32>, due: StoredValue<bool>) {
+    if typing() { later(due, tick) } else { tick.update(|t| *t += 1) }
 }
 
 fn later(due: StoredValue<bool>, tick: RwSignal<u32>) {

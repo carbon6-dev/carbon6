@@ -40,7 +40,8 @@ fn mark_seen(id: String, after: impl Fn(Result<WorkItem, String>) + 'static) {
 fn open_work() -> (LocalResource<Result<Vec<WorkItem>, String>>, RwSignal<u32>) {
     let tick = RwSignal::new(0u32);
     crate::decisions::reload_quietly(tick);
-    let handle = set_interval_with_handle(move || tick.update(|t| *t += 1), std::time::Duration::from_secs(30)).ok();
+    let due = StoredValue::new(false);
+    let handle = set_interval_with_handle(move || crate::decisions::tick_quietly(tick, due), std::time::Duration::from_secs(30)).ok();
     on_cleanup(move || {
         if let Some(h) = handle {
             h.clear();
@@ -254,7 +255,7 @@ pub fn WorkPage() -> impl IntoView {
     });
     on_cleanup(move || keys.remove());
     view! {
-        <main class="mx-auto max-w-4xl space-y-4 px-4 py-5">
+        <main class="mx-auto max-w-4xl space-y-4 px-4 py-5" data-hold-reloads="">
             <header class="flex flex-wrap items-baseline gap-x-3 gap-y-1">
                 <h1 class="text-xl font-semibold">"Work"</h1>
                 <span class="text-sm text-zinc-500">{move || {
@@ -651,7 +652,7 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
         });
     };
     view! {
-        <main class="mx-auto max-w-3xl space-y-4 px-4 py-5">
+        <main class="mx-auto max-w-3xl space-y-4 px-4 py-5" data-hold-reloads="">
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             {move || match shown.get() {
                 None => view! { <p class="text-sm text-zinc-500">"Loading…"</p> }.into_any(),
