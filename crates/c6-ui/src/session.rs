@@ -208,13 +208,15 @@ pub(crate) enum Window {
 /// How far the log has come, for streamed text that arrives after the
 /// message it streamed (catching up, the stream sends what the log has
 /// before what was live meanwhile): drawn again, it doubles the reply.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct Logged {
     /// The last turn the log says ended.
     ended: u64,
     /// The last reply, or start or end of a turn: what streamed before it
     /// is in it (or was dropped).
     settled: u64,
+    /// The calls whose results are in: their output is.
+    results: std::collections::HashSet<String>,
 }
 
 impl Logged {
@@ -226,6 +228,9 @@ impl Logged {
                 self.settled = self.settled.max(e.seq);
             }
             EventKind::Assistant { .. } | EventKind::TurnStarted { .. } => self.settled = self.settled.max(e.seq),
+            EventKind::ToolResult { ref call_id, .. } => {
+                self.results.insert(call_id.clone());
+            }
             _ => {}
         }
     }
@@ -254,12 +259,15 @@ impl Logged {
         (turn != 0 && turn <= self.ended) || (seq != 0 && seq <= self.settled)
     }
 
-    /// Streamed text or thinking: added to `s` unless the log has it.
-    /// Whether it was.
+    /// Streamed text, thinking or tool output: added to `s` unless the log
+    /// has it. Whether it was.
     fn stream(&self, s: &mut Streaming, msg: StreamMsg) -> bool {
         match msg {
             StreamMsg::Text { turn, text, seq } if !self.has(turn, seq) => s.text.push_str(&text),
             StreamMsg::Thinking { turn, text, seq } if !self.has(turn, seq) => s.thinking.push_str(&text),
+            StreamMsg::ToolOutput { call_id, text } if !self.results.contains(&call_id) => {
+                s.tool_output.entry(call_id).or_default().push_str(&text)
+            }
             _ => return false,
         }
         true
@@ -329,10 +337,9 @@ impl Feed {
                     });
                 }
                 StreamMsg::Window { from: f } => from.set(f),
-                msg @ (StreamMsg::Text { .. } | StreamMsg::Thinking { .. }) => {
+                msg @ (StreamMsg::Text { .. } | StreamMsg::Thinking { .. } | StreamMsg::ToolOutput { .. }) => {
                     streaming.maybe_update(|s| logged.with_value(|l| l.stream(s, msg)))
                 }
-                StreamMsg::ToolOutput { call_id, text } => streaming.update(|s| s.tool_output.entry(call_id).or_default().push_str(&text)),
                 StreamMsg::Activity { running, status } => {
                     activity.set(Some(running));
                     // A retry starts the response over: drop what the failed call streamed.
@@ -4865,7 +4872,7 @@ mod tests {
     /// next turn's until that one's first message arrives.
     #[test]
     fn late_text_for_an_ended_turn_is_not_shown() {
-        let l = Logged { ended: 3, settled: 0 };
+        let l = Logged { ended: 3, ..Default::default() };
         assert!(l.has(3, 0), "its turn ended");
         assert!(l.has(2, 0), "an earlier turn");
         assert!(!l.has(4, 0), "the turn running now");
@@ -4887,10 +4894,10 @@ mod tests {
         )
     }
 
-    fn result(seq: u64) -> Event {
+    fn result(seq: u64, call_id: &str) -> Event {
         logged(
             seq,
-            serde_json::json!({"type": "tool_result", "call_id": "c", "tool": "Bash", "output": "", "is_error": false, "truncated": false, "duration_ms": 0}),
+            serde_json::json!({"type": "tool_result", "call_id": call_id, "tool": "Bash", "output": "", "is_error": false, "truncated": false, "duration_ms": 0}),
         )
     }
 
@@ -4906,7 +4913,9 @@ mod tests {
     fn text_a_reply_in_the_log_already_has_is_not_shown_again() {
         let (mut l, mut s) = (Logged::default(), Streaming::default());
         // Replayed: the turn's start, a tool's result, then the reply (seq 12).
-        for e in [logged(10, serde_json::json!({"type": "turn_started", "turn": 3})), result(11), reply(12, "Now the catch-up preview.")] {
+        for e in
+            [logged(10, serde_json::json!({"type": "turn_started", "turn": 3})), result(11, "c"), reply(12, "Now the catch-up preview.")]
+        {
             l.note(&e);
         }
         // Then, live, the text that reply streamed (the log was at 12).
@@ -4930,7 +4939,7 @@ mod tests {
         l.stream(&mut s, text(12, " there."));
         assert_eq!(s.text, "", "late text for the reply drawn above");
         // A tool's result or a usage report in between settles nothing.
-        l.event(&mut s, &result(13));
+        l.event(&mut s, &result(13, "c"));
         l.stream(&mut s, text(14, "Then"));
         assert_eq!(s.text, "Then");
         l.stream(&mut s, StreamMsg::Text { turn: 0, text: ".".into(), seq: 0 });
@@ -4941,6 +4950,26 @@ mod tests {
     fn stop_says_how_many_background_agents_it_stops() {
         assert_eq!(stop_question(1), "This also stops 1 background agent. Stop anyway?");
         assert_eq!(stop_question(3), "This also stops 3 background agents. Stop anyway?");
+    }
+
+    fn output(call_id: &str, text: &str) -> StreamMsg {
+        StreamMsg::ToolOutput { call_id: call_id.into(), text: text.into() }
+    }
+
+    /// A call's output streamed live is dropped once its result is in,
+    /// replayed (catching up, the result comes before the output that was
+    /// live meanwhile) or live; another call's still shows.
+    #[test]
+    fn output_of_a_call_whose_result_is_in_is_not_kept() {
+        let (mut l, mut s) = (Logged::default(), Streaming::default());
+        l.note(&result(11, "c"));
+        assert!(!l.stream(&mut s, output("c", "building…")), "its result was replayed");
+        assert!(l.stream(&mut s, output("d", "running")));
+        l.event(&mut s, &result(12, "d"));
+        assert!(!l.stream(&mut s, output("d", " more")), "its result came live");
+        assert!(s.tool_output.is_empty(), "{:?}", s.tool_output);
+        assert!(l.stream(&mut s, output("e", "next")));
+        assert_eq!(s.tool_output.get("e").map(String::as_str), Some("next"));
     }
 
     fn file(name: &str, mb: usize) -> c6_api::AttachmentUpload {

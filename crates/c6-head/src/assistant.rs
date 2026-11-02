@@ -144,7 +144,7 @@ async fn recover(st: &Arc<HeadState>, head_id: WorkerId) -> anyhow::Result<()> {
                 return anyhow::Ok(());
             };
             warn!(session = %session_id, turn, "closing assistant turn interrupted by head restart");
-            let sink = Sink { st: st.clone(), session_id: session_id.clone(), head_id, seq: tokio::sync::Mutex::new(last_seq as u64) };
+            let sink = Sink::new(st.clone(), session_id.clone(), head_id, last_seq as u64);
             let mut seen = std::collections::HashSet::new();
             for event in events.iter().rev() {
                 let settled = match &event.kind {
@@ -247,6 +247,16 @@ struct Sink {
     session_id: String,
     head_id: WorkerId,
     seq: tokio::sync::Mutex<u64>,
+    /// The next event's seq as of the last append, read without waiting on
+    /// one: what streamed text is stamped with.
+    logged: std::sync::atomic::AtomicU64,
+}
+
+impl Sink {
+    /// A sink whose last event is `last_seq`.
+    fn new(st: Arc<HeadState>, session_id: String, head_id: WorkerId, last_seq: u64) -> Self {
+        Sink { st, session_id, head_id, seq: tokio::sync::Mutex::new(last_seq), logged: std::sync::atomic::AtomicU64::new(last_seq + 1) }
+    }
 }
 
 #[async_trait]
@@ -257,10 +267,16 @@ impl EventSink for Sink {
         let ev = SessionEvent { seq: *seq, ts_ms: now_ms(), kind: Some(kind) };
         crate::sessions::ingest(&self.st, self.head_id, SessionEventBatch { session_id: self.session_id.clone(), events: vec![ev] })
             .await?;
+        self.logged.store(*seq + 1, std::sync::atomic::Ordering::SeqCst);
         Ok(*seq)
     }
 
-    fn ephemeral(&self, kind: ephemeral_event::Kind) {
+    fn ephemeral(&self, mut kind: ephemeral_event::Kind) {
+        // Where the log is: its next reply has this text, so a viewer that
+        // got that reply first (catching up) knows to drop it.
+        if let ephemeral_event::Kind::Text(d) | ephemeral_event::Kind::Thinking(d) = &mut kind {
+            d.seq = self.logged.load(std::sync::atomic::Ordering::SeqCst);
+        }
         if let Some(msg) = crate::convert::ephemeral(&kind) {
             self.st.hub.publish(&self.session_id, msg);
         }
@@ -319,7 +335,7 @@ impl Actor {
             }
         }
         let last_seq = events.last().map(|e| e.seq).unwrap_or(0).max(row.last_seq as u64);
-        let sink = Arc::new(Sink { st: st.clone(), session_id: session_id.clone(), head_id, seq: tokio::sync::Mutex::new(last_seq) });
+        let sink = Arc::new(Sink::new(st.clone(), session_id.clone(), head_id, last_seq));
         let env = Arc::new(Env {
             st: st.clone(),
             session_id: session_id.clone(),
@@ -2096,6 +2112,51 @@ mod tests {
         let gated: Vec<&str> = catalog::ops().iter().map(|o| o.name).filter(|n| reach(n).is_some()).collect();
         assert_eq!(gated.len(), asked.len(), "{gated:?}");
         assert!(asked.iter().all(|n| gated.contains(n)), "{gated:?}");
+    }
+
+    /// The assistant's streamed text says where its log was, as a worker's
+    /// does: a viewer catching up gets the reply first and drops that text.
+    #[tokio::test]
+    async fn streamed_text_says_where_the_log_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = crate::start(crate::HeadConfig {
+            data_dir: dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            auth: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let st = head.state.clone();
+        let id = st.assistant.head_id().unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, last_seq) \
+                     VALUES ('ask', ?, 'test', '', '', '', 'idle', 0, 0, 1)",
+        )
+        .bind(id.to_string())
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+        let mut live = st.hub.subscribe("ask");
+        let sink = Sink::new(st.clone(), "ask".into(), id, 1);
+        let text = |t: &str| ephemeral_event::Kind::Text(c6_proto::TextDelta { turn: 1, text: t.into(), ..Default::default() });
+        sink.ephemeral(text("Hello"));
+        let reply = c6_proto::AssistantMessage { turn: 1, ..Default::default() };
+        assert_eq!(sink.append(session_event::Kind::Assistant(reply)).await.unwrap(), 2);
+        sink.ephemeral(text("Next"));
+        let mut got = Vec::new();
+        while let Ok(msg) = live.try_recv() {
+            got.push(match msg {
+                api::StreamMsg::Text { text, seq, .. } => format!("{text}@{seq}"),
+                api::StreamMsg::Event { event } => format!("event {}", event.seq),
+                _ => continue,
+            });
+        }
+        assert_eq!(got, ["Hello@2", "event 2", "Next@3"]);
+        drop(sink);
+        head.shutdown().await.unwrap();
     }
 
     #[tokio::test]
