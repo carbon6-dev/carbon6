@@ -2151,6 +2151,19 @@ fn SessionStats(usage: Memo<UsageStats>) -> impl IntoView {
     }
 }
 
+/// Why `adding` can't join the attachments already `held`, if it can't: the
+/// head takes 10 MB a file and 20 MB a message (c6-head sessions.rs).
+fn too_large(held: &[c6_api::AttachmentUpload], adding: &[c6_api::AttachmentUpload]) -> Option<String> {
+    const MB: usize = 1024 * 1024;
+    let size = |a: &c6_api::AttachmentUpload| a.data.trim().len() / 4 * 3;
+    let mb = |n: usize| format!("{:.1} MB", n as f64 / MB as f64);
+    if let Some(a) = adding.iter().find(|a| size(a) > 10 * MB) {
+        return Some(format!("{} is too large to attach ({}; the limit is 10 MB a file)", a.name, mb(size(a))));
+    }
+    let total: usize = held.iter().chain(adding).map(size).sum();
+    (total > 20 * MB).then(|| format!("Too much to send in one message ({}; the limit is 20 MB in all)", mb(total)))
+}
+
 /// A button on the dark backdrop behind a full-size image.
 const FULL_BUTTON: &str = "rounded-md border border-zinc-500 px-2 py-0.5 hover:bg-white/10";
 
@@ -3529,7 +3542,10 @@ fn Composer(
         spawn_local(async move {
             match js_read_files(&ev).await.ok().and_then(|v| v.as_string()) {
                 Some(json) => match serde_json::from_str::<Vec<c6_api::AttachmentUpload>>(&json) {
-                    Ok(files) => attachments.update(|a| a.extend(files)),
+                    Ok(files) => match too_large(&attachments.get_untracked(), &files) {
+                        Some(e) => error.set(Some(e)),
+                        None => attachments.update(|a| a.extend(files)),
+                    },
                     Err(e) => error.set(Some(e.to_string())),
                 },
                 None => error.set(Some("could not read the file".into())),
@@ -4154,6 +4170,17 @@ mod tests {
         assert!(!stale(4, 3), "the turn running now");
         assert!(!stale(1, 0), "no turn has ended yet");
         assert!(!stale(0, 3), "a stream that names no turn is shown");
+    }
+
+    fn file(name: &str, mb: usize) -> c6_api::AttachmentUpload {
+        c6_api::AttachmentUpload { name: name.into(), mime: "image/png".into(), data: "A".repeat(mb * 1024 * 1024 / 3 * 4) }
+    }
+
+    #[test]
+    fn a_file_over_10_mb_or_a_message_over_20_mb_is_refused_with_its_size() {
+        assert_eq!(too_large(&[], &[file("small.png", 3)]), None);
+        assert!(too_large(&[], &[file("big.png", 11)]).is_some_and(|e| e.contains("big.png") && e.contains("10 MB a file")));
+        assert!(too_large(&[file("a.png", 9), file("b.png", 9)], &[file("c.png", 9)]).is_some_and(|e| e.contains("20 MB in all")));
     }
 
     /// A notice is waiting until a turn takes it.

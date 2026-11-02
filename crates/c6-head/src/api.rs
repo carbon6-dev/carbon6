@@ -48,7 +48,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/ca.pem", get(ui_ca_pem))
         .route("/ca.crt", get(ui_ca_crt))
         .route("/ca.mobileconfig", get(ui_ca_profile))
-        .route("/api/v1/sessions", get(list_sessions).post(create_session))
+        .route("/api/v1/sessions", get(list_sessions).post(create_session).layer(axum::extract::DefaultBodyLimit::max(ATTACHED_BODY)))
         .route("/api/v1/sessions/{id}", get(get_session).patch(update_session))
         .route("/api/v1/sessions/{id}/events", get(session_events))
         .route("/api/v1/sessions/{id}/children", get(session_children))
@@ -82,7 +82,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/settings/commands", get(get_commands_setting).put(put_commands))
         .route("/api/v1/settings/agents", get(get_agents).put(put_agents))
         .route("/api/v1/commands", get(list_commands))
-        .route("/api/v1/sessions/{id}/messages", post(send_message))
+        .route("/api/v1/sessions/{id}/messages", post(send_message).layer(axum::extract::DefaultBodyLimit::max(ATTACHED_BODY)))
         .route("/api/v1/sessions/{id}/seen", post(seen_session))
         .route("/api/v1/sessions/{id}/interrupt", post(interrupt_session))
         .route("/api/v1/sessions/{id}/resume", post(resume_session))
@@ -702,6 +702,10 @@ async fn chatgpt_callback(State(st): State<Arc<HeadState>>, uri: Uri) -> Respons
 }
 
 /// Trunk's outputs: `name-<16 hex>.ext`, and the wasm, `name-<16 hex>_bg.wasm`.
+/// A body that may carry attachments: up to 20 MB of them (sessions.rs),
+/// as base64 (a third more) in JSON. The default 2 MB refused a screenshot.
+const ATTACHED_BODY: usize = 32 * 1024 * 1024;
+
 fn is_fingerprinted(path: &str) -> bool {
     let stem = path.rsplit('/').next().unwrap_or(path).split('.').next().unwrap_or("");
     let stem = stem.strip_suffix("_bg").unwrap_or(stem);
