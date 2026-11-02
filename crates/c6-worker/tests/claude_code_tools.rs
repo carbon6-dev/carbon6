@@ -28,6 +28,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --mcp-config) url=$(printf '%s' "$2" | sed 's/.*"url":"\([^"]*\)".*/\1/');;
     --append-system-prompt) printf '%s' "$2" > system.txt;;
+    --append-system-prompt-file) cat "$2" > system.txt;;
   esac
   shift
 done

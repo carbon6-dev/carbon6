@@ -255,10 +255,18 @@ impl Process {
             cmd.args(["--effort", e]);
         }
         if let Some(s) = &launch.settings {
-            cmd.args(["--settings", s]);
+            cmd.args(["--settings", &*no_nul(s)]);
         }
         if let Some(p) = launch.system_prompt.as_deref().filter(|p| !p.trim().is_empty()) {
-            cmd.args(["--append-system-prompt", p]);
+            // From a file in its private folder: the guidance carries memory
+            // notes and the memex brief, which can be long (past the limit on
+            // arguments) and hold any text (a NUL refuses to start it).
+            let p = no_nul(p);
+            let file = output_root.as_ref().map(|r| r.0.join("carbon6-system-prompt.md"));
+            match file.filter(|f| std::fs::write(f, p.as_bytes()).is_ok()) {
+                Some(f) => cmd.arg("--append-system-prompt-file").arg(f),
+                None => cmd.args(["--append-system-prompt", &*p]),
+            };
         }
         if let Some(m) = &mcp {
             // A subagent may work for hours without a word on the bridge:
@@ -688,6 +696,12 @@ fn user_content(input: &PendingInput, preamble: Option<&str>) -> Value {
 /// before creating its claude-uid/session/tasks/*.output tree. Give each
 /// process a private root instead of trusting paths into the host filesystem.
 struct OutputRoot(PathBuf);
+
+/// Text for an argument or file of Claude Code's: a NUL can't be passed to
+/// a process, so it is left out.
+fn no_nul(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.contains('\0') { s.replace('\0', "").into() } else { s.into() }
+}
 
 impl OutputRoot {
     fn new() -> std::io::Result<Self> {
@@ -1440,7 +1454,8 @@ case "$*" in *"--input-format stream-json"*) ;; *) echo "missing stream-json inp
 read -r prompt
 pwd > cwd.txt
 printf '%s' "$CLAUDE_CODE_TMPDIR" > output-root.txt
-while [ $# -gt 0 ]; do [ "$1" = "--settings" ] && printf '%s' "$2" > settings.txt; [ "$1" = "--append-system-prompt" ] && printf '%s' "$2" > system.txt; [ "$1" = "--mcp-config" ] && printf '%s %s %s' "$2" "$MCP_TOOL_TIMEOUT" "$CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT" > mcp.txt; shift; done
+printf '%s\n' "$@" > args.txt
+while [ $# -gt 0 ]; do [ "$1" = "--settings" ] && printf '%s' "$2" > settings.txt; [ "$1" = "--append-system-prompt" ] && printf '%s' "$2" > system.txt; [ "$1" = "--append-system-prompt-file" ] && cat "$2" > system.txt; [ "$1" = "--mcp-config" ] && printf '%s %s %s' "$2" "$MCP_TOOL_TIMEOUT" "$CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT" > mcp.txt; shift; done
 printf '%s' "$prompt" > prompt.txt
 cat <<'EOF'
 {"type":"system","subtype":"init","session_id":"s","tools":["Bash"],"model":"claude-opus-5-5"}
@@ -1517,7 +1532,9 @@ EOF
             conversation: "0199-session".into(),
             effort: Some("high".into()),
             settings: Some(r#"{"hooks":{}}"#.into()),
-            system_prompt: Some("carbon6's guidance.".into()),
+            // A NUL (as in a mail quoted in the memex brief) can't go on a
+            // command line: it's left out, and the guidance goes by file.
+            system_prompt: Some("carbon6's\0 guidance.".into()),
             ..Default::default()
         };
         let bridge = crate::mcp_bridge::Bridge::start().await.unwrap();
@@ -1547,6 +1564,7 @@ EOF
         assert_eq!(end.reason, Some(TurnEndReason::Completed));
         assert_eq!(std::fs::read_to_string(dir.path().join("settings.txt")).unwrap(), r#"{"hooks":{}}"#, "the head's hooks are passed on");
         assert_eq!(std::fs::read_to_string(dir.path().join("system.txt")).unwrap(), "carbon6's guidance.", "in its system prompt");
+        assert!(std::fs::read_to_string(dir.path().join("args.txt")).unwrap().contains("--append-system-prompt-file"), "from a file");
         assert_eq!(
             std::fs::read_to_string(dir.path().join("mcp.txt")).unwrap(),
             format!("{mcp} 86400000 86400000"),
