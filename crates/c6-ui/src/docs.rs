@@ -2261,6 +2261,133 @@ fn said(c: &c6_api::docs::DocComment, under: Option<AnyView>) -> AnyView {
     .into_any()
 }
 
+/// An icon button on your comment: shown on hover with a mouse (and to the
+/// keyboard), always on a touch screen.
+const COMMENT_TOOL: &str = "rounded p-0.5 text-muted opacity-0 hover:bg-zinc-100 hover:text-zinc-900 focus-visible:opacity-100 group-hover/said:opacity-100 pointer-coarse:opacity-100 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
+
+/// Your comment that no agent has received yet: as `said`, with edit and
+/// delete beside who wrote it. Edit makes it a box like the reply's (Enter
+/// saves, Escape cancels); delete asks first. Its thread goes with its only
+/// comment.
+#[component]
+fn MyComment(c: c6_api::docs::DocComment, thread: String) -> impl IntoView {
+    let ctx = expect_context::<ThreadsCtx>();
+    let (doc, tick) = (ctx.doc, ctx.tick);
+    let ids = StoredValue::new((thread, c.id));
+    let when = since(c.at).trim_end_matches(" ago").to_owned();
+    let shown = RwSignal::new(c.text);
+    let text = RwSignal::new(String::new());
+    let editing = RwSignal::new(false);
+    let deleting = RwSignal::new(false);
+    let busy = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let area = NodeRef::<leptos::html::Textarea>::new();
+    crate::util::autosize(area, move || text.track());
+    // Into the box as it opens, the cursor after the text.
+    Effect::new(move || {
+        if let Some(el) = area.get() {
+            let _ = el.focus();
+            let end = el.value().encode_utf16().count() as u32;
+            let _ = el.set_selection_range(end, end);
+        }
+    });
+    let edit = move |_| {
+        text.set(shown.get_untracked());
+        error.set(None);
+        editing.set(true);
+    };
+    let cancel = move || {
+        editing.set(false);
+        error.set(None);
+    };
+    let save = move || {
+        let said = text.get_untracked();
+        if busy.get_untracked() || said.trim().is_empty() {
+            return;
+        }
+        if said.trim() == shown.with_untracked(|s| s.trim().to_owned()) {
+            editing.set(false);
+            return;
+        }
+        busy.set(true);
+        spawn_local(async move {
+            let (thread, comment) = ids.get_value();
+            let r = api::doc_comment_edit(doc.get_value(), thread, comment, said.clone()).await;
+            let _ = busy.try_set(false);
+            match r {
+                Ok(_) => {
+                    let _ = shown.try_set(said.trim().to_owned());
+                    let _ = editing.try_set(false);
+                    let _ = tick.try_update(|t| *t += 1);
+                }
+                // It stays open with what you wrote (an agent may have got
+                // it meanwhile: the message says).
+                Err(e) => {
+                    let _ = error.try_set(Some(e));
+                }
+            }
+        });
+    };
+    let delete = move |_| {
+        if busy.get_untracked() {
+            return;
+        }
+        busy.set(true);
+        spawn_local(async move {
+            let (thread, comment) = ids.get_value();
+            let r = api::doc_comment_delete(doc.get_value(), thread, comment).await;
+            let _ = busy.try_set(false);
+            let _ = deleting.try_set(false);
+            match r {
+                Ok(()) => {
+                    let _ = tick.try_update(|t| *t += 1);
+                }
+                Err(e) => {
+                    let _ = error.try_set(Some(e));
+                }
+            }
+        });
+    };
+    view! {
+        <div class="group/said flex flex-col items-end">
+            <div class="mb-0.5 flex items-center gap-0.5 text-xs text-muted">
+                {move || (!editing.get() && !deleting.get()).then(|| view! {
+                    <button class=COMMENT_TOOL title="Edit your comment (no agent has it yet)" aria-label="Edit your comment" on:click=edit>{crate::icons::pencil()}</button>
+                    <button class=COMMENT_TOOL title="Delete your comment" aria-label="Delete your comment"
+                        on:click=move |_| { error.set(None); deleting.set(true) }>{crate::icons::trash()}</button>
+                })}
+                <span class="ml-1">{format!("You · {when}")}</span>
+            </div>
+            {move || if editing.get() {
+                view! {
+                    <div class="w-full space-y-1">
+                        <textarea node_ref=area rows="1" class=format!("{INPUT} {COMMENT_GROWS}") prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev))
+                            on:keydown=move |ev| if ev.key() == "Escape" { ev.prevent_default(); cancel() } else if crate::util::sends(&ev) { ev.prevent_default(); save() } />
+                        <div class="flex justify-end gap-2">
+                            <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| cancel()>"Cancel"</button>
+                            <button class=format!("{BUTTON} text-xs") disabled=move || busy.get() || text.with(|t| t.trim().is_empty()) on:click=move |_| save()>"Save"</button>
+                        </div>
+                    </div>
+                }
+                .into_any()
+            } else {
+                view! {
+                    <p class="max-w-[85%] whitespace-pre-wrap break-words rounded-xl bg-sky-50 px-3 py-1.5 text-zinc-900 dark:bg-sky-950/60 dark:text-zinc-100">{move || shown.get()}</p>
+                }
+                .into_any()
+            }}
+            {move || deleting.get().then(|| view! {
+                <div class="mt-1 flex items-center gap-2 text-xs">
+                    <span class="text-soft">"Delete this comment?"</span>
+                    <button class="font-medium text-red-700 hover:underline disabled:opacity-50 dark:text-red-400" disabled=move || busy.get() on:click=delete>"Delete"</button>
+                    <button class="text-muted hover:underline" on:click=move |_| deleting.set(false)>"Cancel"</button>
+                </div>
+            })}
+            {move || error.get().map(|e| view! { <div class="w-full"><ErrorBox message=e /></div> })}
+        </div>
+    }
+}
+
 /// "changed the doc · Show": Show flashes the blocks its edits made (those
 /// last written in one of its versions), else the block it's on.
 fn changed_the_doc(ctx: ThreadsCtx, t: &DocThread) -> AnyView {
@@ -2388,25 +2515,35 @@ fn Thread(id: String, about: bool) -> impl IntoView {
     };
     // That it changed the doc goes under the agent's newest comment (after
     // them all if it hasn't written one): which comment made which edit
-    // isn't kept.
+    // isn't kept. Each comment is drawn again only when it changes, so one
+    // you're editing keeps what you type as others come in.
     let comments = move || {
         t.with(|t| {
-            let mut changed = (!t.edits.is_empty()).then(|| changed_the_doc(ctx, t));
             let last_agent = t.comments.iter().rposition(|c| c.by.starts_with("session:"));
-            let list = t
-                .comments
+            t.comments
                 .iter()
                 .enumerate()
-                .map(|(i, c)| said(c, if Some(i) == last_agent { changed.take() } else { None }))
-                .collect_view();
-            view! { {list}{changed} }
+                .map(|(i, c)| (c.clone(), (Some(i) == last_agent && !t.edits.is_empty()).then(|| t.edits.clone())))
+                .collect::<Vec<_>>()
         })
+    };
+    let changed_after = move || {
+        t.with(|t| (!t.edits.is_empty() && !t.comments.iter().any(|c| c.by.starts_with("session:"))).then(|| changed_the_doc(ctx, t)))
     };
     view! {
         <div class="space-y-2 rounded-lg border border-zinc-200 p-2 text-sm dark:border-zinc-800" data-thread=tid.get_value()>
             {about.then(|| view! { <About t /> })}
             {status}
-            <div node_ref=list class="max-h-96 space-y-2 overflow-y-auto">{comments}</div>
+            <div node_ref=list class="max-h-96 space-y-2 overflow-y-auto">
+                <For each=comments key=|(c, edits)| (c.id.clone(), c.text.clone(), c.editable, edits.clone()) children=move |(c, edits)| {
+                    if c.by == "you" && c.editable {
+                        view! { <MyComment c thread=tid.get_value() /> }.into_any()
+                    } else {
+                        said(&c, edits.map(|_| t.with_untracked(|t| changed_the_doc(ctx, t))))
+                    }
+                } />
+                {changed_after}
+            </div>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             <div class="relative">
                 <textarea node_ref=area rows="1" class=format!("{INPUT} {COMMENT_GROWS} pr-9") placeholder="Reply…" prop:value=move || reply.get() on:input=move |ev| reply.set(event_target_value(&ev))

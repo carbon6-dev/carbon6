@@ -159,7 +159,7 @@ The tool waits for the submitted values, the same way an approval waits. Cancell
   | `memories.create`, `memories.update` | memory notes are what the realm's sessions start with |
   | `work.add`, `work.edit`, `work.attach`, `work.todos.add`, `work.todos.edit` | work items and to-dos (a to-do's prompt is a session's first message) |
   | `projects.add`, `projects.edit`, `projects.work`, `projects.links`, `projects.phases` | a project's title, purpose, phases, links |
-  | `docs.create`, `docs.edit`, `docs.rename`, `docs.comment`, `docs.reply` | documents and comments the realm's agents read and answer |
+  | `docs.create`, `docs.edit`, `docs.rename`, `docs.comment`, `docs.reply`, `docs.comments.edit` | documents and comments the realm's agents read and answer |
   | `collections.create`, `collections.update`, `records.create`, `records.put`, `series.create`, `series.update`, `series.record`, `views.act` | the realm's data (a view's action may also start its template) |
   | `apps.operations.call` | an app's operation writes its data or starts its session, as the app |
   | `memex.notes.create`, `memex.trails.append`, `memex.trails.update`, `memex.relations.write`, `claims.add`, `things.create`, `knowledge.record`, `knowledge.set`, `mail.drafts.set` | knowledge the realm's agents search (from root, home's), and a reply box's draft a session may pick up |

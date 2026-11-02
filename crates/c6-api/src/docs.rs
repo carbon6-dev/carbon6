@@ -604,6 +604,10 @@ pub struct DocComment {
     pub by: String,
     pub text: String,
     pub at: UnixMs,
+    /// A person's comment in an open thread that no agent has received yet:
+    /// its writer can still edit or delete it.
+    #[serde(default)]
+    pub editable: bool,
 }
 
 /// A comment thread on a document.
@@ -680,4 +684,12 @@ pub struct CommentNew {
     /// already answered it, if it can still take input.
     #[serde(default)]
     pub to: String,
+}
+
+/// `PATCH /api/v1/docs/{id}/threads/{thread}/comments/{comment}`: your
+/// comment's new text, while no agent has received it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct CommentEdit {
+    pub text: String,
 }

@@ -8,12 +8,12 @@
 //! made for it (`answering`). A thread an agent answered needs you until
 //! you reply or resolve it; only you resolve a thread you wrote.
 
-use c6_api::docs::{Anchor, CommentNew, DocComment, DocThread, ThreadNew};
+use c6_api::docs::{Anchor, CommentEdit, CommentNew, DocComment, DocThread, ThreadNew};
 use c6_core::now_ms;
 use serde_json::{Value, json};
 use sqlx::Row as _;
 
-use crate::{HeadState, bad_request, forbidden, not_found};
+use crate::{HeadState, bad_request, conflict, forbidden, not_found};
 
 const MAX_TEXT: usize = 20_000;
 
@@ -70,6 +70,18 @@ fn unsent(sent: &std::collections::HashMap<String, String>, thread: &str, to_age
     }
 }
 
+/// Where a thread's comments no agent has received yet begin: after the
+/// one last sent with it. With no record of that (a thread sent before sends
+/// were recorded, or resolved since), after the agent's latest answer, as
+/// `unsent` counts; none, if it was sent and hasn't been answered.
+fn unreceived_from(sent: &std::collections::HashMap<String, String>, thread: &str, to_agent: bool, comments: &[DocComment]) -> usize {
+    match sent.get(thread).and_then(|id| comments.iter().position(|c| c.id == *id)) {
+        Some(i) => i + 1,
+        None if !to_agent => 0,
+        None => comments.iter().rposition(|c| agent(&c.by)).map_or(comments.len(), |i| i + 1),
+    }
+}
+
 /// Notes each thread's latest comment as sent; the record keeps only
 /// threads still open.
 async fn note_sent(st: &HeadState, realm: &str, pool: &sqlx::SqlitePool, threads: &[String]) -> anyhow::Result<()> {
@@ -104,12 +116,12 @@ pub async fn list(st: &HeadState, realm: &str, doc: &str) -> anyhow::Result<Vec<
     for r in rows {
         let id: String = r.get("id");
         let anchor: Anchor = serde_json::from_str(&r.get::<String, _>("anchor")).unwrap_or_default();
-        let comments: Vec<DocComment> = sqlx::query("SELECT * FROM doc_comments WHERE thread_id = ? ORDER BY at, id")
+        let mut comments: Vec<DocComment> = sqlx::query("SELECT * FROM doc_comments WHERE thread_id = ? ORDER BY at, id")
             .bind(&id)
             .fetch_all(&pool)
             .await?
             .iter()
-            .map(|c| DocComment { id: c.get("id"), by: c.get("by"), text: c.get("text"), at: c.get("at") })
+            .map(|c| DocComment { id: c.get("id"), by: c.get("by"), text: c.get("text"), at: c.get("at"), editable: false })
             .collect();
         let edits: Vec<i64> = sqlx::query_scalar("SELECT rev FROM doc_ops WHERE doc_id = ? AND answering = ? ORDER BY rev")
             .bind(doc)
@@ -127,6 +139,14 @@ pub async fn list(st: &HeadState, realm: &str, doc: &str) -> anyhow::Result<Vec<
         let to_agent = r.get::<i64, _>("to_agent") != 0;
         let unsent =
             thread_state == "open" && comments.last().is_some_and(|last| !agent(&last.by) && unsent(&sent, &id, to_agent, &comments));
+        // A person's comment no agent has received, in an open thread, can
+        // still change.
+        if thread_state == "open" {
+            let from = unreceived_from(&sent, &id, to_agent, &comments);
+            for c in comments.iter_mut().skip(from) {
+                c.editable = !agent(&c.by);
+            }
+        }
         out.push(DocThread {
             id,
             doc: doc.to_owned(),
@@ -296,6 +316,65 @@ pub async fn reply(st: &HeadState, realm: &str, doc: &str, thread: &str, c: &Com
     one(st, realm, doc, thread).await
 }
 
+/// A comment its writer may still change: theirs (a person's), in an open
+/// thread, and no agent has received it (`DocComment::editable`).
+async fn changeable(st: &HeadState, realm: &str, doc: &str, thread: &str, comment: &str, by: &str) -> anyhow::Result<DocThread> {
+    let t = one(st, realm, doc, thread).await?;
+    let c = t.comments.iter().find(|c| c.id == comment).ok_or_else(|| not_found(format!("no comment {comment} in this thread")))?;
+    if agent(by) || c.by != by {
+        return Err(forbidden("only who wrote a comment edits or deletes it"));
+    }
+    if t.state != "open" {
+        return Err(conflict("the thread is resolved: reply to reopen it"));
+    }
+    if !c.editable {
+        return Err(conflict("an agent has received this comment: reply in the thread instead"));
+    }
+    Ok(t)
+}
+
+/// Your comment's text, changed in place (its time stays) while no agent
+/// has received it.
+pub async fn edit(
+    st: &HeadState,
+    realm: &str,
+    doc: &str,
+    thread: &str,
+    comment: &str,
+    e: &CommentEdit,
+    by: &str,
+) -> anyhow::Result<DocThread> {
+    let text = check_text(&e.text)?;
+    changeable(st, realm, doc, thread, comment, by).await?;
+    let pool = super::pool(st, realm).await?;
+    sqlx::query("UPDATE doc_comments SET text = ? WHERE id = ? AND thread_id = ?")
+        .bind(&text)
+        .bind(comment)
+        .bind(thread)
+        .execute(&pool)
+        .await?;
+    changed(st, realm, doc, by).await;
+    one(st, realm, doc, thread).await
+}
+
+/// Your comment, gone while no agent has received it; with it the thread,
+/// if it was the only one.
+pub async fn delete(st: &HeadState, realm: &str, doc: &str, thread: &str, comment: &str, by: &str) -> anyhow::Result<()> {
+    changeable(st, realm, doc, thread, comment, by).await?;
+    let pool = super::pool(st, realm).await?;
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM doc_comments WHERE id = ? AND thread_id = ?").bind(comment).bind(thread).execute(&mut *tx).await?;
+    // Only if nothing else is in it (a reply may have just come).
+    sqlx::query("DELETE FROM doc_threads WHERE id = ? AND NOT EXISTS (SELECT 1 FROM doc_comments WHERE thread_id = ?)")
+        .bind(thread)
+        .bind(thread)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    changed(st, realm, doc, by).await;
+    Ok(())
+}
+
 /// Resolves a thread. An agent resolves only threads it began.
 pub async fn resolve(st: &HeadState, realm: &str, doc: &str, thread: &str, by: &str) -> anyhow::Result<DocThread> {
     let pool = super::pool(st, realm).await?;
@@ -341,6 +420,20 @@ async fn commented(st: &HeadState, realm: &str, doc: &str, thread: &str, by: &st
     let title = super::title_of(st, realm, doc).await.map(|t| t.0).unwrap_or_default();
     let event = json!({"type": "doc", "op": "commented", "doc": {"id": doc, "title": title, "realm": realm}, "thread": thread, "by": by, "text": text});
     crate::triggers::dispatch(st, realm, "doc", "commented", event).await;
+    moved(st, realm, doc).await;
+}
+
+/// A comment changed or went (no trigger: nobody else has seen it): on the
+/// live feed, and the work and projects holding the document moved.
+async fn changed(st: &HeadState, realm: &str, doc: &str, by: &str) {
+    let _ = st.docs.live.send(c6_api::docs::DocChange {
+        id: doc.to_owned(),
+        realm: realm.to_owned(),
+        rev: 0,
+        by: by.to_owned(),
+        what: "commented".into(),
+    });
+    st.attention.changed();
     moved(st, realm, doc).await;
 }
 

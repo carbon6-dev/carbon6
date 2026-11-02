@@ -1101,6 +1101,7 @@ fn reach(op: &str) -> Option<Reach> {
         | "docs.rename"
         | "docs.comment"
         | "docs.reply"
+        | "docs.comments.edit"
         | "collections.create"
         | "collections.update"
         | "records.create"
@@ -2086,6 +2087,7 @@ mod tests {
             "docs.rename",
             "docs.comment",
             "docs.reply",
+            "docs.comments.edit",
             "collections.create",
             "collections.update",
             "records.create",

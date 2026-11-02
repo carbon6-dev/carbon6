@@ -1707,6 +1707,18 @@ pub async fn doc_thread_reply(id: String, thread: String, c: &c6_api::docs::Comm
     send_json(Request::post(&format!("/api/v1/docs/{}/threads/{}/comments", enc(&id), enc(&thread))), c).await
 }
 
+/// Your comment's new text (while no agent has received it).
+pub async fn doc_comment_edit(id: String, thread: String, comment: String, text: String) -> Result<c6_api::docs::DocThread, String> {
+    let url = format!("/api/v1/docs/{}/threads/{}/comments/{}", enc(&id), enc(&thread), enc(&comment));
+    send_json(Request::patch(&url), &c6_api::docs::CommentEdit { text }).await
+}
+
+/// Deletes your comment (while no agent has received it); a thread's only
+/// comment takes the thread with it.
+pub async fn doc_comment_delete(id: String, thread: String, comment: String) -> Result<(), String> {
+    empty(Request::delete(&format!("/api/v1/docs/{}/threads/{}/comments/{}", enc(&id), enc(&thread), enc(&comment))).send().await).await
+}
+
 /// Sends comment threads to an agent together (`threads` empty: all your
 /// open ones not sent yet).
 pub async fn doc_threads_send(id: String, threads: Vec<String>) -> Result<Vec<c6_api::docs::DocThread>, String> {
