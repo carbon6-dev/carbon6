@@ -2203,31 +2203,36 @@ fn too_large(held: &[c6_api::AttachmentUpload], adding: &[c6_api::AttachmentUplo
 }
 
 /// A message from another session's agent: not a bubble of yours but a card
-/// on the left in the sender's mark, with the sender named and linked,
-/// folded to a few lines, and what the agent was given behind a disclosure.
+/// on the left in the sender's mark. It says what it is, names the sender
+/// as a link, leads with the message's first line (agents are asked to make
+/// it say what it's about), and folds the rest; what the agent was given
+/// sits behind a disclosure.
 #[component]
 fn SessionMessage(from: String, title: String, text: String, prompt: String) -> impl IntoView {
     let mark = Memo::new({
         let from = from.clone();
         move |_| crate::marks::of_id(&from)
     });
-    let lines = text.lines().count();
-    let long = lines > 3 || text.chars().count() > 320;
+    let (subject, rest) = subject_of(&text);
     let open = RwSignal::new(false);
     let name = if title.is_empty() { "another session".to_owned() } else { title };
     view! {
         <div class="flex flex-col items-start">
-            <div class="max-w-[85%] space-y-1 rounded-r-md border-l-4 bg-zinc-50 px-3 py-2 text-sm dark:bg-zinc-900/60"
+            <div class="max-w-[85%] space-y-1.5 rounded-r-md border-l-4 bg-zinc-50 px-3 py-2 text-sm dark:bg-zinc-900/60"
                 style=move || format!("border-left-color:{}", mark.get().map_or("#a1a1aa", |m| crate::marks::colour_hex(&m)))>
-                <p class="flex flex-wrap items-center gap-x-1.5 text-xs text-zinc-500">
+                <p class="text-[11px] font-medium uppercase tracking-wide text-sky-700 dark:text-sky-400">"↘ Message from another session"</p>
+                <Go to=View::session(from.clone()) stop=true
+                    class="inline-flex max-w-full items-center gap-1.5 rounded-md border border-sky-300 px-2 py-0.5 text-xs text-sky-800 hover:bg-sky-50 dark:border-sky-800 dark:text-sky-300 dark:hover:bg-sky-950"
+                    title="Open the session that sent it">
                     {move || mark.get().map(|m| view! { <span class="h-2.5 w-2.5 shrink-0 rounded-full" style=crate::marks::fill(&m)></span> })}
-                    <Go to=View::session(from.clone()) class="font-medium text-zinc-700 hover:underline dark:text-zinc-300" stop=true>{name}</Go>
-                    <span>"· message from another session"</span>
-                </p>
-                <div class=move || format!("whitespace-pre-wrap text-zinc-800 dark:text-zinc-200 {}", if long && !open.get() { "line-clamp-3" } else { "" })>{text}</div>
-                {long.then(|| view! {
+                    <span class="truncate font-medium">{name}</span>
+                    <span class="shrink-0">"↗"</span>
+                </Go>
+                <p class="font-medium text-zinc-900 dark:text-zinc-100">{subject}</p>
+                {rest.map(|rest| view! {
+                    {move || open.get().then(|| view! { <div class="whitespace-pre-wrap text-zinc-800 dark:text-zinc-200">{rest.clone()}</div> })}
                     <button class="text-xs text-sky-700 hover:underline dark:text-sky-400" on:click=move |_| open.update(|o| *o = !*o)>
-                        {move || if open.get() { "Show less".to_owned() } else { format!("Show all ({lines} lines)") }}
+                        {move || if open.get() { "Show less" } else { "Show the full message" }}
                     </button>
                 })}
                 {(!prompt.is_empty()).then(|| view! {
@@ -2239,6 +2244,24 @@ fn SessionMessage(from: String, title: String, text: String, prompt: String) -> 
             </div>
         </div>
     }
+}
+
+/// A message's lead and the rest: its first line, cut at a sentence's end
+/// (or with …) when that line runs past 160 characters.
+fn subject_of(text: &str) -> (String, Option<String>) {
+    let text = text.trim();
+    let (first, after) = text.split_once('\n').map_or((text, ""), |(a, b)| (a.trim(), b.trim()));
+    let (lead, spill) = if first.chars().count() <= 160 {
+        (first.to_owned(), String::new())
+    } else {
+        let head: String = first.chars().take(160).collect();
+        match head.rfind(". ") {
+            Some(i) if i > 40 => (head[..=i].to_owned(), first[i + 1..].trim().to_owned()),
+            _ => (format!("{}…", head.trim_end()), first.to_owned()),
+        }
+    };
+    let rest = [spill.as_str(), after].into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join("\n\n");
+    (lead, (!rest.is_empty()).then_some(rest))
 }
 
 /// A button on the dark backdrop behind a full-size image.
@@ -4283,6 +4306,16 @@ mod tests {
 
     fn file(name: &str, mb: usize) -> c6_api::AttachmentUpload {
         c6_api::AttachmentUpload { name: name.into(), mime: "image/png".into(), data: "A".repeat(mb * 1024 * 1024 / 3 * 4) }
+    }
+
+    #[test]
+    fn a_session_message_leads_with_its_first_line() {
+        assert_eq!(subject_of("Ready to merge.\nDetails here."), ("Ready to merge.".into(), Some("Details here.".into())));
+        assert_eq!(subject_of("Short."), ("Short.".into(), None));
+        let long = format!("{} Then more words follow here.", "A first sentence that runs on. ".repeat(6));
+        let (lead, rest) = subject_of(&long);
+        assert!(lead.ends_with('.') && lead.chars().count() <= 160, "{lead}");
+        assert!(rest.is_some_and(|r| r.contains("more words")));
     }
 
     #[test]
