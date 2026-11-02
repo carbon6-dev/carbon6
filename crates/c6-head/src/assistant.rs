@@ -855,7 +855,24 @@ impl Tool for Call {
         let labels = self.env.labels_now().await;
         let scope = crate::memex::scope_for(st, &labels).await;
         let mut ask: Option<(String, String)> = None;
-        if op.effect == Effect::Destructive {
+        // What the approval shows (else the operation and its input).
+        let mut asked: Option<String> = None;
+        // From root, a session starts in a realm, as that realm, only once
+        // you approve its realm and first message.
+        let mut elsewhere: Option<String> = None;
+        if op.name == "sessions.create" && self.env.realm == crate::realms::ROOT {
+            if serde_json::to_string(&args).unwrap_or_default() != shown {
+                return ToolOutput::err("a secret you were given cannot go into a session in another realm");
+            }
+            match start_in_realm(st, &mut args).await {
+                Ok(s) => {
+                    ask = Some(("assistant: a session in another realm".into(), s.said));
+                    asked = Some(s.prompt);
+                    elsewhere = Some(s.realm);
+                }
+                Err(e) => return ToolOutput::err(e),
+            }
+        } else if op.effect == Effect::Destructive {
             ask = Some(("assistant: destructive operations".into(), format!("{}: {}", op.name, op.summary)));
         } else if op.replaces.is_some() {
             match crate::memex::SCOPE.scope(scope.clone(), removed_entries(st, op, &args, &self.env.realm)).await {
@@ -878,12 +895,13 @@ impl Tool for Call {
             _ => {}
         }
         if let Some((policy, message)) = ask {
+            let input = asked.unwrap_or_else(|| crate::util_clip(&format!("{name} {shown}"), 4000));
             let approval = |state: &str| {
                 session_event::Kind::Approval(c6_proto::Approval {
                     call_id: ctx.call_id.clone(),
                     state: state.into(),
                     tool: "c6_call".into(),
-                    input: crate::util_clip(&format!("{name} {shown}"), 4000),
+                    input: input.clone(),
                     policy: policy.clone(),
                     message: message.clone(),
                 })
@@ -905,7 +923,11 @@ impl Tool for Call {
                 return ToolOutput::err(format!("the user did not approve {name} ({state}); do not try another way to do it"));
             }
         }
-        let result = crate::memex::SCOPE.scope(scope, execute(st, op, args, "assistant", Some(&self.env.realm))).await;
+        let result = match &elsewhere {
+            // As that realm's API token would, with none of root's.
+            Some(realm) => execute(st, op, args, "assistant", Some(realm)).await,
+            None => crate::memex::SCOPE.scope(scope, execute(st, op, args, "assistant", Some(&self.env.realm))).await,
+        };
         match result {
             Ok(mut v) => {
                 // Secrets go to the user, not the model.
@@ -954,6 +976,88 @@ fn secret_note(op: &Op) -> &'static str {
         "triggers.rotate" => "The old URL no longer works.",
         _ => "Copy it now: it is not shown again.",
     }
+}
+
+/// The label of a session the assistant started from root (the console).
+pub const STARTED_FROM_CONSOLE: &str = "started-by:console";
+/// The longest first message the assistant may start a session in another
+/// realm with: what you approve is shown in full, also in the decision.
+const PROMPT_SHOWN: usize = 4000;
+
+/// A session the assistant in root would start in a realm.
+struct InRealm {
+    realm: String,
+    /// Where and how, in words.
+    said: String,
+    /// Its first message, as it goes.
+    prompt: String,
+}
+
+/// What starting a session from root asks you, or why it cannot: the
+/// realm it runs in, where and how, and its first message, in full. The
+/// first message is the one way root's knowledge reaches the realm, so
+/// nothing else that could carry it is passed (attachments, work, to-dos).
+/// Labels the call `started-by:console`.
+async fn start_in_realm(st: &HeadState, args: &mut Value) -> Result<InRealm, String> {
+    let req: api::CreateSession =
+        serde_json::from_value(args["body"].clone()).map_err(|e| format!("sessions.create needs a body (c6_describe it): {e}"))?;
+    let realm = req.realm.as_deref().map(str::trim).unwrap_or("").to_owned();
+    if realm.is_empty() || realm == crate::realms::ROOT {
+        return Err("sessions do not run in root: name the realm to start it in (body.realm, from realms.list), and the user \
+                    approves it there"
+            .into());
+    }
+    crate::realms::check_for_sessions(st, &realm).await.map_err(|e| format!("{e:#}"))?;
+    let other_work = req.work.as_deref().map(str::trim).is_some_and(|w| !matches!(w, "" | "new" | "none" | "guess"));
+    if !req.attachments.is_empty() || !req.work_refs.is_empty() || req.todo.is_some() || other_work {
+        return Err("from root a session starts with its first message only: no attachments, work item, to-do or references".into());
+    }
+    let prompt = req.prompt.as_deref().map(str::trim).unwrap_or("").to_owned();
+    if prompt.chars().count() > PROMPT_SHOWN {
+        return Err(format!("keep the first message under {PROMPT_SHOWN} characters: the user approves it in full"));
+    }
+    let worker = st.store.worker(WorkerId(req.worker_id)).await.map_err(|e| format!("{e:#}"))?.ok_or("no such worker")?;
+    if !crate::realms::available(&worker.realms, &realm) {
+        return Err(format!("{} is not available to realm {realm}", worker.name));
+    }
+    let name = crate::realms::list(st, &crate::realms::Caller::root())
+        .await
+        .ok()
+        .and_then(|rs| rs.into_iter().find(|r| r.id == realm))
+        .map_or_else(|| realm.clone(), |r| if r.name == realm { realm.clone() } else { format!("{} ({realm})", r.name) });
+    let mut said = format!("Start a session in {name} on {}", worker.name);
+    if let Some(ssh) = req.ssh.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        said.push_str(&format!(" over SSH to {ssh}"));
+    }
+    if !req.cwd.trim().is_empty() {
+        said.push_str(&format!(", in {}{}", req.cwd.trim(), if req.worktree { " (a new git worktree)" } else { "" }));
+    }
+    if !req.model.trim().is_empty() || !req.connection_id.trim().is_empty() {
+        let connection = match st.store.connection(req.connection_id.trim()).await {
+            Ok(Some(c)) => c.name,
+            _ => req.connection_id.trim().to_owned(),
+        };
+        let on = if connection.is_empty() { String::new() } else { format!(" on {connection}") };
+        said.push_str(&format!(", with {}{on}", Some(req.model.trim()).filter(|m| !m.is_empty()).unwrap_or("its default model")));
+    }
+    if let Some(e) = req.effort.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+        said.push_str(&format!(", effort {e}"));
+    }
+    if let Some(t) = req.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        said.push_str(&format!(", titled “{t}”"));
+    }
+    if !req.labels.is_empty() {
+        said.push_str(&format!(", labelled {}", req.labels.join(", ")));
+    }
+    said.push_str(&format!(
+        ". It runs under {name}'s own rules, labelled {STARTED_FROM_CONSOLE}. {}",
+        if prompt.is_empty() { "It has no first message." } else { "Its first message:" }
+    ));
+    let mut labels = req.labels.clone();
+    labels.push(STARTED_FROM_CONSOLE.to_owned());
+    args["body"]["labels"] = json!(labels);
+    args["body"]["realm"] = json!(realm);
+    Ok(InRealm { realm, said, prompt: if prompt.is_empty() { "(no first message)".into() } else { prompt } })
 }
 
 /// The first of your policies (ask or deny) that applies to this call.
@@ -1549,8 +1653,12 @@ knowledge, and administration is refused: for that, the user opens the assistant
 when this realm needs another's data, suggest a grant.
 - You cannot run commands yourself. For work on a machine (running tests, builds, commands, reading a repository in depth), \
 use c6_delegate: it runs one of the templates the user lets agents start and waits for its report, which you then answer from. \
-With no template for the place, tell the user to add one (Settings → Templates, \"Agents may start it\"). For a quick look at a \
-file or the git state on a worker, the workers' file and git operations do. For something recurring, create a trigger or workflow.
+With no template for the place, tell the user to add one (Settings → Templates, \"Agents may start it\"), or start a session on a \
+worker (sessions.create) and tell the user. Sessions never run in root: from root, start it in the realm the work belongs to \
+(body.realm; ask if that is unclear), never send the user to another realm for it. The user approves each such start, seeing the \
+realm and the first message, so write in it only what that realm should know. Then follow the session (sessions.get, \
+sessions.events) and report. For a quick look at a file or the git state on a worker, the workers' file and git operations do. \
+For something recurring, create a trigger or workflow.
 - The user may just want to talk: answer from what you know, and use operations only when the question is about their setup or \
 asks for something done.
 - What the user @-mentions comes after their message in <mentioned> blocks, read for this conversation only: use it, and say \

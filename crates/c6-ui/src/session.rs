@@ -3340,6 +3340,15 @@ fn summarize(name: &str, input: &serde_json::Value) -> String {
     }
 }
 
+/// The operation of Ask's approval ("<op> <input JSON>") as a c6_call's
+/// input; anything else (a session's first message): null.
+fn c6_approval_op(input: &str) -> serde_json::Value {
+    input
+        .split_once(' ')
+        .filter(|(op, rest)| op.contains('.') && serde_json::from_str::<serde_json::Value>(rest).is_ok())
+        .map_or(serde_json::Value::Null, |(op, _)| serde_json::json!({ "op": op }))
+}
+
 /// (text, status) for update_plan / TodoWrite inputs.
 fn plan_items(input: &serde_json::Value) -> Vec<(String, String)> {
     let list = input.get("plan").or_else(|| input.get("todos")).and_then(|v| v.as_array()).cloned().unwrap_or_default();
@@ -4593,13 +4602,17 @@ fn ApprovalCard(
     // list, so its log alone says (the head refuses a stale answer).
     let waiting =
         move || open.get() && live.sessions.with(|ss| ss.iter().find(|s| s.id == sid.get_value()).is_none_or(|s| s.awaiting_approval));
+    // Ask's carbon6 call is "<op> <input>", or what its message says it
+    // gives (a session's first message), shown as it is.
+    let c6 = tool_kind(&tool) == "c6_call";
+    let parsed =
+        if c6 { c6_approval_op(&input) } else { serde_json::from_str::<serde_json::Value>(&input).unwrap_or(serde_json::Value::Null) };
     // A shell command reads best as itself.
-    let parsed = serde_json::from_str::<serde_json::Value>(&input).unwrap_or(serde_json::Value::Null);
-    let shown = parsed["command"].as_str().map(str::to_owned).unwrap_or_else(|| input.clone());
+    let shown = parsed["command"].as_str().filter(|_| !c6).map(str::to_owned).unwrap_or_else(|| input.clone());
     // What it would do, in words, where the tool is one we can say it for.
     let (label, server) = tool_label(&tool);
     let raw = parsed.to_string();
-    let what = Some(summarize(&tool, &parsed)).filter(|w| !w.is_empty() && *w != raw && *w != shown);
+    let what = Some(summarize(&tool, &parsed)).filter(|w| !w.is_empty() && *w != raw && *w != shown && !(c6 && parsed.is_null()));
     let answer = move |allow: bool| {
         spawn_local(async move {
             sent.set(Some(api::decide(sid.get_value(), call.get_value(), allow).await.map(|_| allow)));
@@ -4917,6 +4930,10 @@ mod tests {
         assert_eq!(call("settings.routes.put"), "Settings routes put");
         assert_eq!(call("workers.enrollments.create"), "Workers enrollments create");
         assert_eq!(summarize("c6_call", &serde_json::Value::Null), "Run a carbon6 operation");
+        // Its approvals: the operation, else (a session's first message) nothing to say.
+        assert_eq!(summarize("c6_call", &c6_approval_op(r#"connections.delete {"id":"c1"}"#)), "Connections delete");
+        assert!(c6_approval_op("Check the disk.usage on thalassa").is_null());
+        assert!(c6_approval_op("README.md is out of date: fix it").is_null());
         let discover = |v: serde_json::Value| summarize("c6_discover", &v);
         assert_eq!(
             discover(serde_json::json!({"query": " enrollment token for a new worker "})),

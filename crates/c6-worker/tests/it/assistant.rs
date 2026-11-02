@@ -501,3 +501,169 @@ async fn assistant_in_a_realm_stays_there() {
     assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST);
     head.shutdown().await.unwrap();
 }
+
+/// The assistant in root starts a session in a realm only once you approve
+/// it, seeing the realm and the first message (docs/assistant.md §Realms):
+/// the session runs as that realm's, says it came from the console, and the
+/// assistant gets its id. Denied, nothing starts; root and commons are no
+/// place for one; a realm's assistant still starts them only in its own.
+#[tokio::test]
+async fn assistant_in_root_starts_sessions_in_a_realm_you_approve() {
+    let mock = MockLlm::start().await;
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    http.post(format!("{api}/connections")).json(&json!({"name": "m", "base_url": mock.base_url()})).send().await.unwrap();
+    http.put(format!("{api}/settings/assistant")).json(&json!({"model": {"connection": "m", "model": "mock-1"}})).send().await.unwrap();
+    http.post(format!("{api}/realms")).json(&json!({"id": "lab", "name": "Lab"})).send().await.unwrap();
+    // A worker the head knows (no process: its sessions just wait for it).
+    let worker = c6_core::WorkerId(uuid::Uuid::now_v7());
+    let w = c6_head::store::NewWorker {
+        id: worker,
+        name: "thalassa",
+        hostname: "thalassa",
+        os: "linux",
+        arch: "x86_64",
+        version: "0",
+        cert_serial: "thalassa",
+    };
+    head.state.store.insert_worker(&w, "", 0).await.unwrap();
+    head.state.store.set_worker_role(worker, "worker").await.unwrap();
+    let create = |realm: &str, prompt: &str| {
+        let body = json!({"worker_id": worker.0, "cwd": "/srv/app", "realm": realm, "prompt": prompt, "labels": ["ops"]});
+        ("c6_call".to_owned(), json!({"op": "sessions.create", "input": {"body": body}}).to_string())
+    };
+    let events = |id: String| {
+        let (http, api) = (http.clone(), api.clone());
+        async move { http.get(format!("{api}/sessions/{id}/events?after=0")).send().await.unwrap().json::<Vec<Event>>().await.unwrap() }
+    };
+    let on_thalassa = async || {
+        let all: Vec<Session> = http.get(format!("{api}/sessions")).send().await.unwrap().json().await.unwrap();
+        all.into_iter().filter(|s| s.worker_id == worker.0).collect::<Vec<_>>()
+    };
+    // The tool results once `turns` turns have ended.
+    let results = |id: String, turns: usize| async move {
+        eventually("the turn's end", async || {
+            let es = events(id.clone()).await;
+            let ended = es.iter().filter(|e| matches!(e.kind, EventKind::TurnEnded { .. })).count();
+            (ended == turns).then(|| {
+                es.into_iter()
+                    .filter_map(|e| match e.kind {
+                        EventKind::ToolResult { output, is_error, .. } => Some((output, is_error)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .await
+    };
+    let approvals = |es: &[Event]| -> Vec<(String, String, String)> {
+        es.iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::Approval { call_id, state, input, message, .. } if state == "requested" => {
+                    Some((call_id.clone(), input.clone(), message.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+
+    // Asked for work on a machine, it starts nothing until you approve.
+    mock.push(Reply::ToolCalls(vec![create("lab", "Check the disk on thalassa")]));
+    mock.push(Reply::Text("Started it in Lab.".into()));
+    let s: Session = http
+        .post(format!("{api}/assistant"))
+        .json(&json!({"prompt": "check the disk on thalassa"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(s.realm, "root");
+    let (call_id, input, message) = eventually("an approval request", async || approvals(&events(s.id.clone()).await).pop()).await;
+    assert_eq!(input, "Check the disk on thalassa", "the first message, as it goes");
+    assert!(
+        message.contains("Start a session in Lab (lab) on thalassa, in /srv/app")
+            && message.contains("labelled ops")
+            && message.contains("started-by:console"),
+        "{message}"
+    );
+    assert!(on_thalassa().await.is_empty(), "nothing starts before you approve");
+    let d = eventually("the approval's decision", async || {
+        let ds: Vec<c6_api::Decision> = http.get(format!("{api}/decisions")).send().await.ok()?.json().await.ok()?;
+        ds.into_iter().find(|d| d.context["call_id"] == call_id)
+    })
+    .await;
+    assert!(d.document.contains("Lab (lab)") && d.document.contains("Check the disk on thalassa"), "{}", d.document);
+    // Approved: it runs in lab, says where it came from, and the assistant has its id.
+    let r = http.post(format!("{api}/sessions/{}/approvals/{call_id}", s.id)).json(&json!({"allow": true})).send().await.unwrap();
+    assert!(r.status().is_success());
+    let out = results(s.id.clone(), 1).await;
+    assert!(!out[0].1, "{out:?}");
+    let made: Value = serde_json::from_str(&out[0].0).unwrap();
+    let started = on_thalassa().await;
+    assert_eq!(started.len(), 1);
+    assert_eq!(made["id"], started[0].id.as_str(), "the assistant gets the session's id");
+    assert_eq!(started[0].realm, "lab");
+    assert!(started[0].labels.contains(&"started-by:console".to_owned()) && started[0].labels.contains(&"ops".to_owned()));
+
+    // Denied: nothing starts, and the assistant is told.
+    mock.push(Reply::ToolCalls(vec![create("lab", "Delete the old logs")]));
+    mock.push(Reply::Text("Not started.".into()));
+    http.post(format!("{api}/sessions/{}/messages", s.id)).json(&json!({"text": "and clean the logs"})).send().await.unwrap();
+    let call_id =
+        eventually("a second approval request", async || approvals(&events(s.id.clone()).await).into_iter().nth(1).map(|a| a.0)).await;
+    let r = http.post(format!("{api}/sessions/{}/approvals/{call_id}", s.id)).json(&json!({"allow": false})).send().await.unwrap();
+    assert!(r.status().is_success());
+    let out = results(s.id.clone(), 2).await;
+    assert!(out[1].1 && out[1].0.contains("did not approve"), "{out:?}");
+    assert_eq!(on_thalassa().await.len(), 1);
+
+    // Root and commons are no place for a session, nor is no realm: refused
+    // without asking.
+    mock.push(Reply::ToolCalls(vec![create("root", "x"), create("commons", "x"), create("", "x")]));
+    mock.push(Reply::Text("Cannot.".into()));
+    http.post(format!("{api}/sessions/{}/messages", s.id)).json(&json!({"text": "run it here"})).send().await.unwrap();
+    let out = results(s.id.clone(), 3).await;
+    assert_eq!(out.len(), 5, "{out:?}");
+    assert!(out[2].1 && out[2].0.contains("sessions do not run in root"), "{out:?}");
+    assert!(out[3].1 && out[3].0.contains("sessions do not run in commons"), "{out:?}");
+    assert!(out[4].1 && out[4].0.contains("name the realm"), "{out:?}");
+    assert_eq!(approvals(&events(s.id.clone()).await).len(), 2, "no approval asked for those");
+    assert_eq!(on_thalassa().await.len(), 1);
+
+    // A realm's assistant starts sessions in its own realm only, as before.
+    mock.push(Reply::ToolCalls(vec![create("home", "x"), create("lab", "Tidy up")]));
+    mock.push(Reply::Text("Done.".into()));
+    let s: Session = http
+        .post(format!("{api}/assistant"))
+        .json(&json!({"prompt": "tidy up", "realm": "lab"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let out = results(s.id.clone(), 1).await;
+    assert!(out[0].1 && out[0].0.contains("limited to realm lab"), "{out:?}");
+    assert!(!out[1].1, "{out:?}");
+    assert!(approvals(&events(s.id.clone()).await).is_empty());
+    let started = on_thalassa().await;
+    assert_eq!(started.len(), 2);
+    assert!(started.iter().all(|x| x.realm == "lab"));
+    let made: Value = serde_json::from_str(&out[1].0).unwrap();
+    let own = started.iter().find(|x| made["id"] == x.id.as_str()).unwrap();
+    assert!(!own.labels.contains(&"started-by:console".to_owned()), "{:?}", own.labels);
+    head.shutdown().await.unwrap();
+}
