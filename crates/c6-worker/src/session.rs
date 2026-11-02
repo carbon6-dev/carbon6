@@ -1047,6 +1047,8 @@ impl SessionManager {
             claude: None,
             claude_stdin: Arc::default(),
             handoff_announced: false,
+            stopping: false,
+            stopped_until: None,
         };
         let handle =
             Handle { tx, tools: actor.session_tools.clone(), running: actor.running_flag.clone(), claude_code, inbox: actor.inbox.clone() };
@@ -1476,6 +1478,12 @@ struct Actor {
     claude_stdin: crate::claude_code::Stdin,
     /// The log says a switch away from Claude Code waits for its tasks.
     handoff_announced: bool,
+    /// You stopped the running Claude Code turn, and until when after it
+    /// ended its tasks lost with it are the stop's doing: their notices
+    /// wait for your next message instead of waking the agent
+    /// (docs/background.md §4, Stopping).
+    stopping: bool,
+    stopped_until: Option<std::time::Instant>,
 }
 
 /// A subagent's parent's tools, and whether the parent runs Claude Code.
@@ -1635,7 +1643,10 @@ impl Actor {
                         }
                     }
                     Some(ActorMsg::Interrupt) => {
-                        if let Some((_, cancel)) = &running { cancel.cancel(); }
+                        if let Some((_, cancel)) = &running {
+                            cancel.cancel();
+                            self.stopping |= self.runs_claude_code();
+                        }
                     }
                     Some(ActorMsg::SendNow(command_id)) => {
                         if running.is_some() && self.runs_claude_code() {
@@ -1728,7 +1739,11 @@ impl Actor {
                         let lost_native = ev.kind == c6_tools::TaskKind::ClaudeCode && ev.state == c6_tools::TaskState::Lost;
                         let notice = ((ev.notify || lost_native) && !matches!(ev.state, c6_tools::TaskState::Started | c6_tools::TaskState::Stopped))
                             .then(|| task_notice(&record, &ev.output));
-                        if let Err(e) = self.task_event(record, notice, running.is_some()).await {
+                        // Lost because you stopped the turn (Claude Code didn't
+                        // stop, so its process was): the agent hears it with
+                        // your next message, and isn't woken for it.
+                        let held = lost_native && self.after_stop(running.is_some());
+                        if let Err(e) = self.task_event(record, notice, running.is_some() && !held, !held).await {
                             error!(session = %self.writer.session_id, "recording a background task: {e:#}");
                             return;
                         }
@@ -1752,7 +1767,7 @@ impl Actor {
                         let tell = notify || kind == "claude_code";
                         let record = BackgroundTask { task_id, kind, description, state: "lost".into(), notify, ..Default::default() };
                         let notice = tell.then(|| task_notice(&record, &report));
-                        if let Err(e) = self.task_event(record, notice, running.is_some()).await {
+                        if let Err(e) = self.task_event(record, notice, running.is_some(), true).await {
                             error!(session = %self.writer.session_id, "recording a lost background task: {e:#}");
                             return;
                         }
@@ -1877,6 +1892,14 @@ impl Actor {
                         Ok(Some((conv, claude))) => {
                             self.conv = Some(conv);
                             self.claude = claude;
+                            if std::mem::take(&mut self.stopping) {
+                                self.stopped_until = Some(std::time::Instant::now() + crate::claude_code::STOP_QUIET);
+                            }
+                            // A turn Claude Code started right after your stop,
+                            // stopped before it showed anything: not a turn.
+                            if self.claude.as_mut().is_some_and(|p| p.take_unshown()) {
+                                self.turns -= 1;
+                            }
                             if let Err(e) = self.settle_delegations().await {
                                 error!(session = %self.writer.session_id, "reading a delegation's outcome: {e:#}");
                             }
@@ -2095,12 +2118,18 @@ impl Actor {
     /// Logs a background task's start or end and, for an end the agent
     /// should hear about, queues the notice (`notice`). Its id names the
     /// task and how it ended, so the same end is never told twice.
-    async fn task_event(&mut self, record: BackgroundTask, notice: Option<String>, busy: bool) -> anyhow::Result<()> {
+    async fn task_event(&mut self, record: BackgroundTask, notice: Option<String>, busy: bool, wake: bool) -> anyhow::Result<()> {
         let command_id = format!("task:{}:{}", record.task_id, record.state);
         self.writer.append(session_event::Kind::BackgroundTask(record)).await?;
         let Some(text) = notice else { return Ok(()) };
         let input = PendingInput { command_id, text, command: "task-notification".into(), ..Default::default() };
-        self.notice(input, busy, true).await
+        self.notice(input, busy, wake).await
+    }
+
+    /// You stopped its Claude Code turn just now, or are stopping the one
+    /// `running`: what Claude Code loses meanwhile is the stop's doing.
+    fn after_stop(&self, running: bool) -> bool {
+        (running && self.stopping) || self.stopped_until.is_some_and(|t| std::time::Instant::now() < t)
     }
 
     /// Rewinds the conversation to before event `to_seq`, restoring files

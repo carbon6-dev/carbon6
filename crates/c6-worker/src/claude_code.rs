@@ -75,6 +75,10 @@ pub struct ClaudeConversation {
 pub const IDLE: Duration = Duration::from_secs(15 * 60);
 /// How long an interrupted turn has to end before its process is killed.
 const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
+/// After you stop a turn, how long what ends or starts is taken as the
+/// stop's doing rather than news for the agent (docs/background.md §4,
+/// Stopping): a turn Claude Code starts by itself then is stopped too.
+pub const STOP_QUIET: Duration = Duration::from_secs(5);
 /// How long a closing process has to exit before it is killed.
 const CLOSE_GRACE: Duration = Duration::from_secs(10);
 
@@ -186,6 +190,15 @@ pub(crate) struct Process {
     /// hasn't started a turn for them by itself.
     unwoken: Vec<String>,
     wake_due: Option<tokio::time::Instant>,
+    /// You stopped its last turn: until when a turn it starts by itself is
+    /// taken as the stop's doing (`None` once one of its tasks ends on its
+    /// own: a turn then is for that).
+    after_stop: Option<tokio::time::Instant>,
+    /// The turn about to run is one it started by itself right after your
+    /// stop: it is stopped as it begins.
+    quiet: bool,
+    /// The last turn was such a one and logged nothing.
+    unshown: bool,
     /// When its last turn ended (or it started).
     idle_since: tokio::time::Instant,
     /// A Send now it hasn't answered yet.
@@ -371,6 +384,9 @@ impl Process {
             subagent_tasks: HashSet::new(),
             unwoken: Vec::new(),
             wake_due: None,
+            after_stop: None,
+            quiet: false,
+            unshown: false,
             idle_since: tokio::time::Instant::now(),
             send_now: None,
             old_send_now: false,
@@ -428,6 +444,12 @@ impl Process {
     /// this returns true.
     pub async fn idle_line(&mut self, v: Value, sink: &Arc<dyn EventSink>) -> anyhow::Result<bool> {
         if self.begins_turn(&v) {
+            // Right after you stopped a turn, with nothing of yours waiting
+            // and none of its tasks ended since, Claude Code starts a turn
+            // for the notifications it queued during the one you stopped
+            // (seen with 2.1.311): that is the stop's doing, so it is stopped
+            // too, and they reach the agent with your next message.
+            self.quiet = self.unconfirmed.is_empty() && self.after_stop.is_some_and(|t| tokio::time::Instant::now() < t);
             self.pending = Some(v);
             // It woke by itself: that turn hears about what ended.
             self.unwoken.clear();
@@ -435,17 +457,21 @@ impl Process {
             return Ok(true);
         }
         self.side_line(&v, sink).await?;
-        // One of its own tasks ended while it waits. Claude Code usually
-        // starts a turn for it; when it doesn't (seen with a long build), the
-        // agent would wait for good, so the session tells it.
         if v["type"] == "system"
             && v["subtype"] == "task_notification"
             && v["parent_tool_use_id"].is_null()
             && let Some(status) = v["status"].as_str().filter(|s| matches!(*s, "completed" | "failed"))
-            && !v["task_id"].as_str().is_some_and(|t| self.subagent_tasks.contains(t))
         {
-            self.unwoken.push(unwoken_notice(&v, status));
-            self.wake_due.get_or_insert_with(|| tokio::time::Instant::now() + WAKE_GRACE);
+            // A task that ended on its own (a stop's are stopped or killed):
+            // a turn Claude Code starts now is for it, and goes ahead.
+            self.after_stop = None;
+            // One of its own tasks ended while it waits. Claude Code usually
+            // starts a turn for it; when it doesn't (seen with a long build),
+            // the agent would wait for good, so the session tells it.
+            if !v["task_id"].as_str().is_some_and(|t| self.subagent_tasks.contains(t)) {
+                self.unwoken.push(unwoken_notice(&v, status));
+                self.wake_due.get_or_insert_with(|| tokio::time::Instant::now() + WAKE_GRACE);
+            }
         }
         Ok(false)
     }
@@ -461,6 +487,13 @@ impl Process {
         self.wake_due = None;
         let notices = std::mem::take(&mut self.unwoken);
         (!notices.is_empty()).then(|| notices.join("\n"))
+    }
+
+    /// Whether its last turn was one it started by itself right after your
+    /// stop, which was stopped before it showed anything and logged nothing
+    /// (so its number is free again). Asking clears it.
+    pub fn take_unshown(&mut self) -> bool {
+        std::mem::take(&mut self.unshown)
     }
 
     fn begins_turn(&self, v: &Value) -> bool {
@@ -646,6 +679,8 @@ impl Process {
         self.wake_due = None;
         self.mapper.result = None;
         self.mapper.interrupted = false;
+        // One it started by itself right after your stop (`idle_line`).
+        let quiet = std::mem::take(&mut self.quiet) && inputs.is_empty() && !opened;
         let mut started = opened;
         if !inputs.is_empty() && !opened {
             for input in &inputs {
@@ -668,6 +703,13 @@ impl Process {
         for (i, input) in inputs.into_iter().enumerate() {
             alive &= self.send(input, if i == 0 { preamble } else { None }, true).await.is_ok();
         }
+        // You had just stopped the agent: this turn stops as it begins. It
+        // shows only if the model got to say something first.
+        if quiet {
+            info!(session = %self.launch.conversation, "Claude Code started a turn by itself right after you stopped one: stopping it too");
+            self.mapper.interrupted = true;
+            alive &= write_line(&self.stdin, &interrupt_request()).await.is_ok();
+        }
         let mut interrupted_at: Option<tokio::time::Instant> = None;
         while alive {
             let v = match self.pending.take() {
@@ -676,8 +718,7 @@ impl Process {
                     _ = cancel.cancelled(), if interrupted_at.is_none() => {
                         self.mapper.interrupted = true;
                         interrupted_at = Some(tokio::time::Instant::now());
-                        let request = serde_json::json!({"type": "control_request", "request_id": uuid::Uuid::now_v7().to_string(), "request": {"subtype": "interrupt"}});
-                        alive = write_line(&self.stdin, &request).await.is_ok();
+                        alive = write_line(&self.stdin, &interrupt_request()).await.is_ok();
                         continue;
                     }
                     _ = tokio::time::sleep_until(interrupted_at.map_or_else(tokio::time::Instant::now, |t| t + INTERRUPT_GRACE)), if interrupted_at.is_some() => {
@@ -686,7 +727,9 @@ impl Process {
                         alive = false;
                         continue;
                     }
-                    _ = more.notified() => {
+                    // A turn stopped as it began takes no input: what comes
+                    // meanwhile starts the next.
+                    _ = more.notified(), if !quiet => {
                         let Joining { inputs, now } = feed();
                         for input in inputs {
                             let (command_id, send_now) = (input.command_id.clone(), input.send_now);
@@ -736,14 +779,23 @@ impl Process {
                     for uuid in v["user_message_uuids"].as_array().into_iter().flatten().filter_map(Value::as_str) {
                         self.confirm(uuid, &mut started, sink).await?;
                     }
-                    self.woke(&mut started, sink).await?;
-                    self.mapper.handle(&v, sink).await?;
+                    // You stopped it (or it is the turn stopped right after):
+                    // for a moment, what follows is the stop's doing.
+                    self.after_stop = (interrupted_at.is_some() || quiet).then(|| tokio::time::Instant::now() + STOP_QUIET);
+                    // Stopped before the model said anything: nothing to show.
+                    self.unshown = quiet && !started;
+                    if !self.unshown {
+                        self.woke(&mut started, sink).await?;
+                        self.mapper.handle(&v, sink).await?;
+                    }
                     let reason = if self.mapper.interrupted {
                         TurnEndReason::Interrupted
                     } else {
                         self.mapper.result.unwrap_or(TurnEndReason::Completed)
                     };
-                    sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: reason as i32 })).await?;
+                    if !self.unshown {
+                        sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: reason as i32 })).await?;
+                    }
                     self.notified.clear();
                     self.idle_since = tokio::time::Instant::now();
                     return Ok(TurnEnd { reason: Some(reason), alive: true, no_conversation: false });
@@ -869,6 +921,12 @@ fn is_yours(input: &PendingInput) -> bool {
 /// before creating its claude-uid/session/tasks/*.output tree. Give each
 /// process a private root instead of trusting paths into the host filesystem.
 struct OutputRoot(PathBuf);
+
+/// Asks Claude Code to stop its turn (Esc). Its background agents stop with
+/// it; its background commands don't.
+fn interrupt_request() -> Value {
+    serde_json::json!({"type": "control_request", "request_id": uuid::Uuid::now_v7().to_string(), "request": {"subtype": "interrupt"}})
+}
 
 /// How long Claude Code has to start a turn by itself for a task that ended
 /// while it waited, before the session tells the agent.
@@ -2226,6 +2284,107 @@ done
         assert!(idle_until_or_turn(&mut p, &sink, |_| false).await, "it starts a turn for the build");
         assert!(p.wake_due().is_none() && p.take_unwoken().is_none(), "nothing for the session to send");
         assert_eq!(run(&mut p, 2, &[], &sink).await.reason, Some(TurnEndReason::Completed));
+        p.close().await;
+    }
+
+    /// A stand-in `claude` that, as 2.1.311 does, starts a turn by itself
+    /// right after a turn you stopped, for its agent's notification queued
+    /// during it. It records what it reads (`stdin.txt`). Stopped too, it
+    /// waits; then its build ends on its own and it wakes for that.
+    fn stopping_claude(dir: &Path) -> PathBuf {
+        script(
+            dir,
+            "claude-stopping",
+            r#"#!/bin/sh
+uuid_of() { printf '%s' "$1" | sed -n 's/.*"uuid":"\([^"]*\)".*/\1/p'; }
+echo_of() { printf '{"type":"user","isReplay":true,"uuid":"%s","message":{"role":"user","content":"echo"},"parent_tool_use_id":null}\n' "$(uuid_of "$1")"; }
+say() { printf '{"type":"assistant","message":{"content":[{"type":"text","text":"%s"}],"stop_reason":"end_turn"},"parent_tool_use_id":null}\n' "$1"; }
+init() { printf '%s\n' '{"type":"system","subtype":"init"}'; }
+done_ok() { printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"usage":{}}'; }
+stopped() { printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"usage":{}}'; }
+stops=0
+while read -r line; do
+  printf '%s\n' "$line" >> stdin.txt
+  case "$line" in
+    *'"interrupt"'*)
+      stops=$((stops+1))
+      if [ "$stops" = 1 ]; then
+        printf '%s\n' '{"type":"system","subtype":"task_notification","task_id":"fg1","status":"stopped","summary":"Wait"}'
+        stopped
+        init
+      else
+        stopped
+        sleep 0.3
+        printf '%s\n' '{"type":"system","subtype":"task_notification","task_id":"bg1","status":"completed","summary":"Build finished"}'
+        init
+        say "The build passed."
+        done_ok
+      fi
+      continue;;
+    *'"control_request"'*) continue;;
+  esac
+  init
+  echo_of "$line"
+  case "$line" in
+    *hold*)
+      printf '%s\n' '{"type":"system","subtype":"task_started","task_id":"bg1","description":"Build","task_type":"local_bash","is_backgrounded":true}'
+      printf '%s\n' '{"type":"system","subtype":"task_started","task_id":"ag1","description":"Review","task_type":"local_agent","is_backgrounded":true}'
+      printf '%s\n' '{"type":"system","subtype":"task_notification","task_id":"ag1","status":"completed","summary":"Reviewed"}'
+      printf '%s\n' '{"type":"system","subtype":"task_started","task_id":"fg1","description":"Wait","task_type":"local_bash","is_backgrounded":false}'
+      say "Waiting.";;
+    *)
+      say "Next."
+      done_ok;;
+  esac
+done
+"#,
+        )
+    }
+
+    /// The turn Claude Code starts by itself right after you stop one is
+    /// stopped as it begins and shows nothing; a task that then ends on its
+    /// own still wakes the agent.
+    #[tokio::test]
+    async fn a_turn_claude_code_starts_right_after_your_stop_is_stopped_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stopping_claude(dir.path());
+        let tools = Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()));
+        let vec_sink = Arc::new(VecSink::default());
+        let sink: Arc<dyn EventSink> = vec_sink.clone();
+        let mut p = spawn(&bin, dir.path(), "s", false, Some(observer(dir.path(), tools).await));
+        let cancel = CancellationToken::new();
+        let more = tokio::sync::Notify::new();
+        let turn = p.turn(1, vec![input("c1", "hold on")], false, None, "opus", &sink, &Joining::default, &more, &cancel);
+        let stop = async {
+            replied(&vec_sink).await;
+            cancel.cancel();
+        };
+        let (end, ()) = tokio::join!(turn, stop);
+        assert_eq!(end.unwrap().reason, Some(TurnEndReason::Interrupted));
+        let shown = kinds(&vec_sink);
+        // It starts one by itself at once: stopped as it begins, logged nowhere.
+        assert!(idle_until_or_turn(&mut p, &sink, |_| false).await);
+        assert_eq!(run(&mut p, 2, &[], &sink).await.reason, Some(TurnEndReason::Interrupted));
+        assert!(p.take_unshown() && !p.take_unshown(), "said once");
+        let interrupts = std::fs::read_to_string(dir.path().join("stdin.txt"))
+            .unwrap()
+            .lines()
+            .filter(|l| l.contains(r#""subtype":"interrupt""#))
+            .count();
+        assert_eq!(interrupts, 2, "yours, then the one for its own turn");
+        // Then its build ends on its own: it wakes for that, as before.
+        assert!(idle_until_or_turn(&mut p, &sink, |_| false).await);
+        assert_eq!(run(&mut p, 2, &[], &sink).await.reason, Some(TurnEndReason::Completed));
+        assert!(!p.take_unshown());
+        let events = vec_sink.0.lock().unwrap().clone();
+        let after: Vec<&str> =
+            events.iter().map(kind).filter(|k| *k != "other").skip(shown.iter().filter(|k| **k != "other").count()).collect();
+        assert_eq!(after, ["user", "turn_started", "assistant", "usage", "turn_ended"], "only the turn for the build shows");
+        let woke = events.iter().rev().find_map(|e| match &e.kind {
+            Some(session_event::Kind::User(u)) => Some(u.text.clone()),
+            _ => None,
+        });
+        assert_eq!(woke.as_deref(), Some("Build finished"));
         p.close().await;
     }
 
