@@ -1247,8 +1247,7 @@ fn Comments(id: String, tick: RwSignal<u32>, commenting: RwSignal<Option<String>
     let show_resolved = RwSignal::new(false);
     // Your open comments not sent to an agent yet: sent together, in one
     // message to one session (each can also go on its own, as you write it).
-    let unsent =
-        Memo::new(move |_| shown.with(|ts| ts.iter().filter(|t| t.state == "open" && !t.to_agent && t.created_by == "you").count()));
+    let unsent = Memo::new(move |_| shown.with(|ts| ts.iter().filter(|t| t.state == "open" && t.unsent).count()));
     let sending = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
     let send_all = move |_| {
@@ -1409,16 +1408,21 @@ fn WithAgent(session: String, waiting: bool) -> impl IntoView {
 fn Thread(t: c6_api::docs::DocThread, doc: String, tick: RwSignal<u32>) -> impl IntoView {
     let (doc, tid) = (StoredValue::new(doc), StoredValue::new(t.id.clone()));
     // A draft: the thread redraws as comments come in.
-    let reply = crate::util::draft(&format!("reply.{}.{}", doc.get_value(), tid.get_value()));
+    let key = StoredValue::new(format!("reply.{}.{}", doc.get_value(), tid.get_value()));
+    let reply = crate::util::draft(&key.get_value());
     let to_agent = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
     let done = move |r: Result<c6_api::docs::DocThread, String>| match r {
         Ok(_) => {
-            reply.set(String::new());
-            tick.update(|t| *t += 1);
+            let _ = error.try_set(None);
+            let _ = tick.try_update(|t| *t += 1);
         }
-        Err(e) => error.set(Some(e)),
+        Err(e) => {
+            let _ = error.try_set(Some(e));
+        }
     };
+    // The draft goes as it's sent (the thread is drawn again before the
+    // answer comes, and would find it), and comes back if sending fails.
     let send = move || {
         let c = c6_api::docs::CommentNew {
             text: reply.get_untracked(),
@@ -1427,8 +1431,31 @@ fn Thread(t: c6_api::docs::DocThread, doc: String, tick: RwSignal<u32>) -> impl 
         if c.text.trim().is_empty() {
             return;
         }
-        spawn_local(async move { done(api::doc_thread_reply(doc.get_value(), tid.get_value(), &c).await) });
+        crate::util::forget_draft(&key.get_value());
+        reply.set(String::new());
+        spawn_local(async move {
+            let r = api::doc_thread_reply(doc.get_value(), tid.get_value(), &c).await;
+            if r.is_err() {
+                crate::util::storage_set(&format!("c6.draft.{}", key.get_value()), &c.text);
+                let _ = reply.try_set(c.text.clone());
+            }
+            done(r)
+        });
     };
+    // Its last word, yours, hasn't gone to an agent: send it now.
+    let send_unsent = move |_| {
+        spawn_local(async move {
+            match api::doc_threads_send(doc.get_value(), vec![tid.get_value()]).await {
+                Ok(_) => {
+                    let _ = tick.try_update(|t| *t += 1);
+                }
+                Err(e) => {
+                    let _ = error.try_set(Some(e));
+                }
+            }
+        });
+    };
+    let unsent = t.unsent;
     let open = t.state == "open";
     view! {
         <div class=format!("space-y-1 rounded-md border p-2 text-sm {}", if t.needs_you { "border-amber-300 bg-amber-50/50 dark:border-amber-800 dark:bg-amber-950/20" } else { "border-zinc-200 dark:border-zinc-800" })
@@ -1442,6 +1469,10 @@ fn Thread(t: c6_api::docs::DocThread, doc: String, tick: RwSignal<u32>) -> impl 
                     view! { <WithAgent session=t.agent.clone() waiting /> }
                 })}
                 {t.needs_you.then(|| view! { <span class="font-medium text-amber-700 dark:text-amber-300">"answered: your move"</span> })}
+                {unsent.then(|| view! {
+                    <button class="rounded border border-violet-300 px-1.5 text-violet-700 hover:bg-violet-50 dark:border-violet-800 dark:text-violet-300 dark:hover:bg-violet-950"
+                        title="Your last comment here hasn't gone to an agent: send the thread now" on:click=send_unsent>"Send to agent"</button>
+                })}
                 {(!open).then(|| view! { <span>{format!("resolved by {}", author(&t.resolved_by))}</span> })}
             </div>
             {t.comments.iter().map(|c| view! {
@@ -1452,6 +1483,13 @@ fn Thread(t: c6_api::docs::DocThread, doc: String, tick: RwSignal<u32>) -> impl 
             <div class="flex items-center gap-2">
                 <input class=format!("{INPUT} min-w-0 flex-1") placeholder="Reply…" prop:value=move || reply.get() on:input=move |ev| reply.set(event_target_value(&ev))
                     on:keydown=move |ev| if ev.key() == "Enter" { send() } />
+                // Send, as the message box's: a soft square, sky once there's text.
+                <button class=move || format!("flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-md {}", if reply.with(|r| r.trim().is_empty()) { "bg-zinc-600 text-zinc-200" } else { "bg-sky-600 text-white" })
+                    title="Send the reply (Enter)" aria-label="Send the reply" on:click=move |_| send()>
+                    <svg viewBox="0 0 16 16" class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M8 13V3M3.5 7.5 8 3l4.5 4.5" />
+                    </svg>
+                </button>
                 <label class="flex items-center gap-1 text-xs text-zinc-500" title="Send the thread to an agent">
                     <input type="checkbox" prop:checked=move || to_agent.get() on:change=move |ev| to_agent.set(event_target_checked(&ev)) />"agent"
                 </label>

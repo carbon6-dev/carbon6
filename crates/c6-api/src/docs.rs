@@ -634,6 +634,10 @@ pub struct DocThread {
     /// An agent answered and you haven't replied or resolved it yet.
     #[serde(default)]
     pub needs_you: bool,
+    /// Its last comment is a person's and hasn't gone to an agent (it was
+    /// left without "agent", or never sent): it can be sent now.
+    #[serde(default)]
+    pub unsent: bool,
     pub created_by: String,
     pub created_at: UnixMs,
     #[serde(default, skip_serializing_if = "Option::is_none")]

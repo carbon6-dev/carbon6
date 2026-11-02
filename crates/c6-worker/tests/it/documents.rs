@@ -887,6 +887,23 @@ async fn comments_go_to_an_agent_together() {
     // Nothing left to send.
     let r = http.post(format!("{api}/docs/{id}/threads/send")).json(&json!({})).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    let unsent = |threads: &Value, t: &str| threads.as_array().unwrap().iter().find(|x| x["id"] == t).unwrap()["unsent"].as_bool();
+    let all = send(M::GET, format!("docs/{id}/threads"), Value::Null).await;
+    assert_eq!((unsent(&all, &t1), unsent(&all, &t2)), (Some(false), Some(false)), "both went: {all}");
+    // A reply left without "agent" can go later, alone.
+    send(M::POST, format!("docs/{id}/threads/{t1}/comments"), json!({"text": "Also say the currency."})).await;
+    let all = send(M::GET, format!("docs/{id}/threads"), Value::Null).await;
+    assert_eq!((unsent(&all, &t1), unsent(&all, &t2)), (Some(true), Some(false)), "{all}");
+    mock.push(Reply::Text("On it again.".into()));
+    let sent = send(M::POST, format!("docs/{id}/threads/send"), json!({})).await;
+    assert_eq!(sent.as_array().unwrap().len(), 1, "only the thread with an unsent reply: {sent}");
+    turns(sid.clone(), 3).await;
+    assert!(
+        mock.requests().iter().any(|r| r["messages"].to_string().contains("Also say the currency.")),
+        "the late reply reached the agent"
+    );
+    let all = send(M::GET, format!("docs/{id}/threads"), Value::Null).await;
+    assert_eq!(unsent(&all, &t1), Some(false), "{all}");
     stop.cancel();
 }
 

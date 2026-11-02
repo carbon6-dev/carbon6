@@ -47,9 +47,50 @@ async fn thread_row(pool: &sqlx::SqlitePool, doc: &str, thread: &str) -> anyhow:
         .ok_or_else(|| not_found(format!("no thread {thread} on this document")))
 }
 
+/// Which comment of each thread last went to an agent (thread id to comment
+/// id), kept per realm as a setting: `comments_sent@<realm>`.
+fn sent_key(realm: &str) -> String {
+    format!("comments_sent@{realm}")
+}
+
+async fn sent_in(st: &HeadState, realm: &str) -> std::collections::HashMap<String, String> {
+    st.store.setting(&sent_key(realm)).await.ok().flatten().and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default()
+}
+
+/// Whether a thread's last comment (a person's) hasn't gone to an agent:
+/// it isn't the one last sent. A thread sent before sends were recorded
+/// counts as unsent if it never went to an agent, or if a person spoke after
+/// the agent's answer.
+fn unsent(sent: &std::collections::HashMap<String, String>, thread: &str, to_agent: bool, comments: &[DocComment]) -> bool {
+    let Some(last) = comments.last() else { return false };
+    match sent.get(thread) {
+        Some(id) => *id != last.id,
+        None => !to_agent || comments.iter().any(|c| agent(&c.by)),
+    }
+}
+
+/// Notes each thread's latest comment as sent; the record keeps only
+/// threads still open.
+async fn note_sent(st: &HeadState, realm: &str, pool: &sqlx::SqlitePool, threads: &[String]) -> anyhow::Result<()> {
+    let mut sent = sent_in(st, realm).await;
+    for t in threads {
+        let last: Option<String> = sqlx::query_scalar("SELECT id FROM doc_comments WHERE thread_id = ? ORDER BY at DESC, id DESC LIMIT 1")
+            .bind(t)
+            .fetch_optional(pool)
+            .await?;
+        if let Some(id) = last {
+            sent.insert(t.clone(), id);
+        }
+    }
+    let open: Vec<String> = sqlx::query_scalar("SELECT id FROM doc_threads WHERE state = 'open'").fetch_all(pool).await?;
+    sent.retain(|t, _| open.contains(t));
+    st.store.set_setting(&sent_key(realm), &serde_json::to_string(&sent)?).await
+}
+
 /// A document's threads as they are now (open first), with whether each is
 /// detached and needs you.
 pub async fn list(st: &HeadState, realm: &str, doc: &str) -> anyhow::Result<Vec<DocThread>> {
+    let sent = sent_in(st, realm).await;
     let pool = super::pool(st, realm).await?;
     let mut conn = pool.acquire().await?;
     let (state, _) = super::load_head(&mut conn, doc).await?;
@@ -82,6 +123,9 @@ pub async fn list(st: &HeadState, realm: &str, doc: &str) -> anyhow::Result<Vec<
         };
         let thread_state: String = r.get("state");
         let needs_you = thread_state == "open" && comments.last().is_some_and(|c| agent(&c.by));
+        let to_agent = r.get::<i64, _>("to_agent") != 0;
+        let unsent =
+            thread_state == "open" && comments.last().is_some_and(|last| !agent(&last.by) && unsent(&sent, &id, to_agent, &comments));
         out.push(DocThread {
             id,
             doc: doc.to_owned(),
@@ -89,11 +133,12 @@ pub async fn list(st: &HeadState, realm: &str, doc: &str) -> anyhow::Result<Vec<
             state: thread_state,
             detached,
             about: r.get("about"),
-            to_agent: r.get::<i64, _>("to_agent") != 0,
+            to_agent,
             agent: r.get("agent"),
             comments,
             edits,
             needs_you,
+            unsent,
             created_by: r.get("created_by"),
             created_at: r.get("created_at"),
             resolved_at: r.get("resolved_at"),
@@ -364,11 +409,8 @@ async fn send(st: &HeadState, realm: &str, doc: &str, thread: &str, _by: &str) -
 /// thread `by` began that hasn't been sent to an agent.
 pub async fn send_many(st: &HeadState, realm: &str, doc: &str, ids: &[String], by: &str) -> anyhow::Result<Vec<DocThread>> {
     let all = list(st, realm, doc).await?;
-    let chosen: Vec<DocThread> = all
-        .into_iter()
-        .filter(|t| t.state == "open")
-        .filter(|t| if ids.is_empty() { !t.to_agent && t.created_by == by } else { ids.contains(&t.id) })
-        .collect();
+    let chosen: Vec<DocThread> =
+        all.into_iter().filter(|t| t.state == "open").filter(|t| if ids.is_empty() { t.unsent } else { ids.contains(&t.id) }).collect();
     if chosen.is_empty() {
         return Err(bad_request("no open comment threads to send"));
     }
@@ -443,7 +485,7 @@ async fn deliver(
     for thread in threads {
         sqlx::query("UPDATE doc_threads SET to_agent = 1, agent = ? WHERE id = ?").bind(&sent_to).bind(thread).execute(&pool).await?;
     }
-    Ok(())
+    note_sent(st, realm, &pool, threads).await
 }
 
 /// The `doc` tool's `comment` action: create (block, quote, text), reply
