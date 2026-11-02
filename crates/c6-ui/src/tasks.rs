@@ -29,6 +29,15 @@ impl Task {
         self.running()
     }
 
+    /// It ended badly: failed, lost, or a command that exited non-zero.
+    fn failed(&self) -> bool {
+        match self.state.as_str() {
+            "failed" | "lost" => true,
+            "finished" => self.kind != "claude_code" && self.exit_code != 0,
+            _ => false,
+        }
+    }
+
     fn status(&self) -> String {
         match self.state.as_str() {
             "started" => "running".into(),
@@ -109,7 +118,6 @@ pub fn elapsed(ms: i64) -> String {
     }
 }
 
-/// Session task history, with a prominent running count and an inspector.
 /// What's running now: the tasks that keep the session showing as running
 /// (those that tell the agent when they end, and Claude Code's own), and
 /// the servers and watchers that don't.
@@ -130,96 +138,64 @@ pub fn running_line(tasks: usize, servers: usize) -> String {
     }
 }
 
-/// How many tasks the session has run or runs now.
-pub fn count(events: &[Event]) -> usize {
-    lifecycle(events).len()
+/// The tasks that need a look, for a session's glance: those running and
+/// those that ended badly, as (id, what it is, failed, when it started).
+pub fn needs_look(events: &[Event]) -> Vec<(String, String, bool, i64)> {
+    lifecycle(events)
+        .into_iter()
+        .filter(|t| t.running() || t.failed())
+        .map(|t| {
+            let failed = t.failed();
+            (t.id, t.description, failed, t.since)
+        })
+        .collect()
 }
 
-/// `line`: a quiet line for the bottom of the transcript, shown only while
-/// something runs (docs/background.md §4), instead of the bar's button.
-/// `on_open`: the button opens that (the session's details) instead of its
-/// list.
+/// A quiet line for the bottom of the transcript, shown only while
+/// something runs (docs/background.md §4): it opens the session's tasks.
 #[component]
-pub fn RunningTasks(
-    session: String,
-    events: RwSignal<Vec<Event>>,
-    #[prop(optional)] compact: bool,
-    #[prop(optional)] line: bool,
-    #[prop(optional, into)] on_open: Option<Callback<()>>,
-) -> impl IntoView {
+pub fn RunningTasks(session: String, events: RwSignal<Vec<Event>>) -> impl IntoView {
     let session = StoredValue::new(session);
     let list = Memo::new(move |_| events.with(|e| lifecycle(e)));
     let counts = Memo::new(move |_| events.with(|e| running_counts(e)));
     let at = RwSignal::new(None::<(f64, f64)>);
     let selected = RwSignal::new(None::<String>);
     let error = RwSignal::new(None::<String>);
-    let shown = move || if line { counts.with(|(t, s)| t + s > 0) } else { !list.with(Vec::is_empty) };
     view! {
-        <Show when=shown>
-                <div>
-                    {if line {
-                        view! {
-                            <button class="text-xs text-sky-700 hover:underline dark:text-sky-400" title="Open the background tasks"
-                                on:click=move |ev| {
-                                    ev.stop_propagation();
-                                    at.set(if at.get_untracked().is_some() { None } else { Some(below(&ev, 384.0)) });
-                                }>
-                                {move || counts.with(|(t, s)| format!("{} ›", running_line(*t, *s)))}
-                            </button>
-                        }
-                        .into_any()
-                    } else {
-                        view! {
-                            // Bright only while something runs.
-                            <button class=move || if list.with(|tasks| tasks.iter().any(|t| t.running())) {
-                                    "rounded-md border border-sky-300 bg-sky-50 px-2 py-1 text-xs text-sky-800 hover:bg-sky-100 dark:border-sky-900 dark:bg-sky-950 dark:text-sky-300"
-                                } else {
-                                    "rounded-md px-2 py-1 text-xs text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
-                                }
-                                title=move || list.with(|tasks| format!("Background tasks: {} running · {} total", tasks.iter().filter(|t| t.running()).count(), tasks.len()))
-                                on:click=move |ev| {
-                                    ev.stop_propagation();
-                                    match on_open {
-                                        Some(f) => f.run(()),
-                                        None => at.set(if at.get_untracked().is_some() { None } else { Some(below(&ev, 384.0)) }),
-                                    }
-                                }>
-                                <strong>{move || list.with(|tasks| {
-                                    let n = tasks.iter().filter(|t| t.running()).count();
-                                    if compact { format!("⚙ {n}") } else { format!("⚙ {n} running") }
-                                })}</strong>
-                                {(!compact).then_some(move || list.with(|tasks| format!(" · {} tasks", tasks.len())))}
-                            </button>
-                        }
-                        .into_any()
-                    }}
-                    <Popover at class="w-96 max-w-[calc(100vw-1rem)] space-y-2 text-xs">
-                            <p class="text-muted">"Task history remains available when the worker is offline. Inspect streams with Refresh."</p>
-                            {task_rows(session, list, error, Callback::new(move |id| {
-                                selected.set(Some(id));
-                                at.set(None);
-                            }))}
-                    </Popover>
-                    {inspector(session, list, selected)}
-                </div>
+        <Show when=move || counts.with(|(t, s)| t + s > 0)>
+            <div>
+                <button class="text-xs text-sky-700 hover:underline dark:text-sky-400" title="Open the background tasks"
+                    on:click=move |ev| {
+                        ev.stop_propagation();
+                        at.set(if at.get_untracked().is_some() { None } else { Some(below(&ev, 384.0)) });
+                    }>
+                    {move || counts.with(|(t, s)| format!("{} ›", running_line(*t, *s)))}
+                </button>
+                <Popover at class="w-96 max-w-[calc(100vw-1rem)] space-y-2 text-xs">
+                    <p class="text-muted">"Task history remains available when the worker is offline. Inspect streams with Refresh."</p>
+                    {task_rows(session, list, error, Callback::new(move |id| {
+                        selected.set(Some(id));
+                        at.set(None);
+                    }))}
+                </Popover>
+                {inspector(session, list, selected)}
+            </div>
         </Show>
     }
 }
 
-/// A session's background tasks listed in place (in its details), running
-/// first; nothing when it has none.
+/// One task as the list shows it (Inspect, and Stop while it runs), from
+/// a session's glance.
 #[component]
-pub fn TaskHistory(session: String, events: RwSignal<Vec<Event>>) -> impl IntoView {
+pub fn TaskCard(session: String, events: RwSignal<Vec<Event>>, id: String) -> impl IntoView {
     let session = StoredValue::new(session);
-    let list = Memo::new(move |_| events.with(|e| lifecycle(e)));
+    let list = Memo::new(move |_| events.with(|e| lifecycle(e).into_iter().filter(|t| t.id == id).collect::<Vec<_>>()));
     let selected = RwSignal::new(None::<String>);
     let error = RwSignal::new(None::<String>);
     view! {
-        <Show when=move || !list.with(Vec::is_empty)>
-            <div class="space-y-2 text-xs">
-                {task_rows(session, list, error, Callback::new(move |id| selected.set(Some(id))))}
-            </div>
-        </Show>
+        <div class="space-y-2 text-xs">
+            {task_rows(session, list, error, Callback::new(move |id| selected.set(Some(id))))}
+        </div>
         {inspector(session, list, selected)}
     }
 }
@@ -515,6 +491,31 @@ mod tests {
             assert!(!tasks[0].can_stop());
         }
         assert_eq!(lifecycle(&[event(1, "shell", "finished")])[0].status(), "finished · exit 7");
+    }
+
+    #[test]
+    fn a_task_needs_a_look_while_it_runs_or_once_it_ended_badly() {
+        let with = |task: &str, state: &str, kind: &str, exit: i32| {
+            let mut e = event(1, task, state);
+            if let EventKind::BackgroundTask { kind: k, exit_code, .. } = &mut e.kind {
+                *k = kind.into();
+                *exit_code = exit;
+            }
+            e
+        };
+        let evs = [
+            with("build", "started", "shell", 0),
+            with("ok", "finished", "shell", 0),
+            with("tests", "finished", "shell", 101),
+            with("agent", "finished", "agent", 1),
+            with("native", "finished", "claude_code", 1),
+            with("gone", "lost", "shell", 0),
+            with("broke", "failed", "shell", 0),
+            with("mine", "stopped_by_user", "shell", 0),
+        ];
+        let looks = needs_look(&evs);
+        let ids: Vec<(&str, bool)> = looks.iter().map(|(id, _, failed, _)| (id.as_str(), *failed)).collect();
+        assert_eq!(ids, [("build", false), ("tests", true), ("agent", true), ("gone", true), ("broke", true)]);
     }
 
     #[test]

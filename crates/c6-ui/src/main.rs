@@ -20,6 +20,7 @@ mod docs;
 mod explorer;
 mod files;
 mod fleet;
+mod icons;
 mod itemviews;
 mod labels;
 mod mail;
@@ -33,6 +34,7 @@ mod monitor;
 mod needs;
 mod notify;
 mod outputs;
+mod panes;
 mod people;
 mod photos;
 mod place;
@@ -95,7 +97,6 @@ fn Main() -> impl IntoView {
     provide_context(labels::LabelFilter::restored());
     provide_context(sessions::Grouping::load());
     provide_context(aspects::Facets::load());
-    provide_context(aspects::Spotlight(RwSignal::new(None)));
     // Plan limits per connection, beside every connection picker.
     quota::provide();
     // A signed-in browser opening a login link (to sign in again).

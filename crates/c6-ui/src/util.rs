@@ -86,6 +86,12 @@ pub fn touch_first() -> bool {
     window().match_media("(pointer: coarse)").ok().flatten().is_some_and(|m| m.matches())
 }
 
+/// The phone's layout: one tile and one pane at a time. The desktop one
+/// needs 48rem of width and 32rem of height (`md` in the style).
+pub fn phone() -> bool {
+    !window().match_media("(min-width: 48rem) and (min-height: 32rem)").ok().flatten().is_some_and(|m| m.matches())
+}
+
 /// The key that sends a message box: Enter (Shift+Enter for a new line);
 /// on a touch screen only ⌘/Ctrl+Enter, Return being a new line. ⌘/Ctrl+Enter
 /// sends everywhere.

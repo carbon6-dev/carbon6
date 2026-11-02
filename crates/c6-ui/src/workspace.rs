@@ -45,6 +45,24 @@ pub enum View {
         #[serde(default)]
         target: Option<Target>,
     },
+    /// A session's changes (its folder's git status and diff), beside it.
+    SessionChanges {
+        id: String,
+    },
+    /// A session's terminals, opened in its folder.
+    SessionTerminal {
+        id: String,
+    },
+    /// A session's folder.
+    SessionFiles {
+        id: String,
+    },
+    /// What a session published; `output`: the one shown (empty: the newest).
+    SessionOutputs {
+        id: String,
+        #[serde(default)]
+        output: String,
+    },
     Search {
         q: String,
         #[serde(default)]
@@ -173,6 +191,11 @@ impl View {
                 }
                 p
             }
+            View::SessionChanges { id } => format!("/sessions/{id}/changes"),
+            View::SessionTerminal { id } => format!("/sessions/{id}/terminal"),
+            View::SessionFiles { id } => format!("/sessions/{id}/files"),
+            View::SessionOutputs { id, output } if output.is_empty() => format!("/sessions/{id}/outputs"),
+            View::SessionOutputs { id, output } => format!("/sessions/{id}/outputs?output={}", enc(output)),
             View::Search { q, kind, worker } => {
                 let mut p = format!("/search?q={}", enc(q));
                 if !kind.is_empty() {
@@ -230,7 +253,7 @@ impl View {
             .ok()
             .map(|p| {
                 let mut m = HashMap::new();
-                for key in ["q", "kind", "worker", "open", "signed_in", "signed_in_with_link"] {
+                for key in ["q", "kind", "worker", "open", "output", "signed_in", "signed_in_with_link"] {
                     if let Some(v) = p.get(key) {
                         m.insert(key.to_owned(), v);
                     }
@@ -268,6 +291,10 @@ impl View {
                 });
                 View::Session { id: (*id).to_owned(), target }
             }
+            ["sessions", id, "changes"] => View::SessionChanges { id: (*id).to_owned() },
+            ["sessions", id, "terminal"] => View::SessionTerminal { id: (*id).to_owned() },
+            ["sessions", id, "files"] => View::SessionFiles { id: (*id).to_owned() },
+            ["sessions", id, "outputs"] => View::SessionOutputs { id: (*id).to_owned(), output: get("output") },
             ["search"] => View::Search { q: get("q"), kind: get("kind"), worker: get("worker") },
             ["workers"] => View::Workers,
             ["workers", id] => View::Worker { id: (*id).to_owned() },
@@ -335,6 +362,14 @@ impl View {
             View::Session { id, .. } => {
                 live.sessions.with(|ss| ss.iter().find(|s| &s.id == id).map(|s| s.title.clone())).unwrap_or_else(|| "Session".into())
             }
+            // Its name, and the session's.
+            View::SessionChanges { id } | View::SessionTerminal { id } | View::SessionFiles { id } | View::SessionOutputs { id, .. } => {
+                let name = self.session_pane().map_or("", |(p, _)| p.name());
+                match live.sessions.with(|ss| ss.iter().find(|s| &s.id == id).map(|s| s.title.clone())) {
+                    Some(t) => format!("{name} · {t}"),
+                    None => name.to_owned(),
+                }
+            }
             View::Search { q, .. } => format!("Search: {q}"),
             View::Workers => "Workers".into(),
             View::Worker { id } => live
@@ -380,11 +415,25 @@ impl View {
     /// stacking columns.
     fn is_section(&self) -> bool {
         !matches!(self, View::Session { .. } | View::Worker { .. })
+            && self.session_pane().is_none()
             && !matches!(self, View::Collections { name } if !name.is_empty())
             && !matches!(self, View::Work { id } if !id.is_empty())
             && !matches!(self, View::Docs { id } if !id.is_empty())
             && !matches!(self, View::Projects { id } if !id.is_empty())
             && !matches!(self, View::App { record, .. } if !record.is_empty())
+    }
+
+    /// A session's pane (Changes, Terminal, Files, Outputs): which, and
+    /// whose.
+    pub fn session_pane(&self) -> Option<(crate::panes::Pane, &str)> {
+        use crate::panes::Pane;
+        match self {
+            View::SessionChanges { id } => Some((Pane::Changes, id)),
+            View::SessionTerminal { id } => Some((Pane::Terminal, id)),
+            View::SessionFiles { id } => Some((Pane::Files, id)),
+            View::SessionOutputs { id, .. } => Some((Pane::Outputs, id)),
+            _ => None,
+        }
     }
 }
 
@@ -725,6 +774,40 @@ impl Layout {
         let t = self.tiles.get(self.focus)?;
         t.columns.iter().find(|c| c.key == t.active).or_else(|| t.columns.get(t.cursor)).map(|c| &c.view)
     }
+
+    /// The pane a tile's bar speaks for: its last, or the session that a
+    /// pane of its (Changes, Terminal…) is open beside.
+    pub fn bar_column(&self, tile: u64) -> Option<u64> {
+        let t = self.tile(tile)?;
+        let last = t.columns.last()?;
+        let session = last
+            .view
+            .session_pane()
+            .and_then(|(_, id)| t.columns.iter().find(|c| matches!(&c.view, View::Session { id: x, .. } if x == id)).map(|c| c.key));
+        Some(session.unwrap_or(last.key))
+    }
+
+    /// Where a session's pane is open, if it is: (tile key, pane key).
+    pub fn find_pane(&self, pane: crate::panes::Pane, id: &str) -> Option<(u64, u64)> {
+        self.tiles.iter().find_map(|t| t.columns.iter().find(|c| c.view.session_pane() == Some((pane, id))).map(|c| (t.key, c.key)))
+    }
+
+    /// Opens `view` beside pane `col` of tile `tile`, keeping that pane:
+    /// the tile shows the two (a list that was beside it goes back in the
+    /// tile's history).
+    fn open_after(&mut self, tile: u64, col: u64, view: View) {
+        let Some(ti) = self.tiles.iter().position(|t| t.key == tile) else { return };
+        let Some(me) = self.tiles[ti].columns.iter().find(|c| c.key == col).cloned() else { return };
+        let key = self.key();
+        let t = &mut self.tiles[ti];
+        let next = vec![me, Column { key, view }];
+        if t.columns.iter().map(|c| &c.view).ne(next.iter().map(|c| &c.view)) {
+            t.go(next);
+        }
+        t.settle();
+        self.focus = ti;
+        self.touch(ti);
+    }
 }
 
 /// How a link opens.
@@ -898,6 +981,12 @@ impl Workspace {
             l.focus = origin;
             l.touch(origin);
         });
+    }
+
+    /// Opens `view` beside pane `col` of tile `tile`, keeping that pane (a
+    /// session's Changes beside its transcript).
+    pub fn open_after(&self, tile: u64, col: u64, view: View) {
+        self.layout.update(|l| l.open_after(tile, col, view));
     }
 
     /// Moves the item a tile shows (its right pane) into a tile of its own.
@@ -1258,11 +1347,12 @@ impl ColumnCtx {
         self.ws.close_column(self.tile, self.col);
     }
 
-    /// Whether it's its tile's last column, the one the tile's bar speaks
-    /// for (tracked: a column opened or closed beside it changes it).
-    pub fn is_last(&self) -> bool {
+    /// Whether its tile's bar speaks for it: it's the tile's last column,
+    /// or one of its own panes is beside it (tracked: a column opened or
+    /// closed beside it changes it).
+    pub fn in_bar(&self) -> bool {
         let (tile, col) = (self.tile, self.col);
-        self.ws.layout.with(|l| l.tile(tile).and_then(|t| t.columns.last()).map(|c| c.key) == Some(col))
+        self.ws.layout.with(|l| l.bar_column(tile) == Some(col))
     }
 }
 
@@ -1530,16 +1620,16 @@ pub fn Tiles() -> impl IntoView {
     }
 }
 
-/// A session's state, as its tile's bar shows it.
-fn status_pill(s: &Session) -> (&'static str, &'static str) {
+/// A session's state, as its tile's bar shows it: (its dot, its word).
+fn status_dot(s: &Session) -> (&'static str, &'static str) {
     if s.awaiting_approval {
-        return ("bg-amber-500 text-white", "needs approval");
+        return ("bg-amber-500", "needs you");
     }
     match s.display_status() {
-        SessionStatus::Running => ("bg-blue-600 text-white", "running"),
-        SessionStatus::Idle => ("bg-white/70 text-zinc-600 dark:bg-black/30 dark:text-zinc-300", "idle"),
-        SessionStatus::Starting => ("bg-white/70 text-amber-700 dark:bg-black/30 dark:text-amber-300", "starting"),
-        SessionStatus::Failed => ("bg-red-600 text-white", "failed"),
+        SessionStatus::Running => ("animate-pulse bg-blue-500", "running"),
+        SessionStatus::Idle => ("bg-zinc-400 dark:bg-zinc-500", "idle"),
+        SessionStatus::Starting => ("bg-amber-400", "starting"),
+        SessionStatus::Failed => ("bg-red-500", "failed"),
     }
 }
 
@@ -1607,20 +1697,20 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
         },
         _ => None,
     };
-    // The session it shows (alone, or as the item beside a list): its pane,
-    // and how it is now. The bar wears its colour and says its state.
+    // The session it shows (alone, as the item beside a list, or with one
+    // of its panes beside it): its pane, and how it is now. The bar wears
+    // its colour and says its state.
     let shown = Memo::new(move |_| {
-        tile.get().and_then(|t| match t.columns.last().map(|c| (c.key, &c.view)) {
-            Some((col, View::Session { id, .. })) => Some((col, id.clone())),
-            _ => None,
+        ws.layout.with(|l| {
+            let col = l.bar_column(key)?;
+            l.tile(key)?.columns.iter().find(|c| c.key == col).and_then(|c| match &c.view {
+                View::Session { id, .. } => Some((col, id.clone())),
+                _ => None,
+            })
         })
     });
     let session = Memo::new(move |_| shown.get().and_then(|(_, id)| live.sessions.with(|ss| ss.iter().find(|s| s.id == id).cloned())));
     let colour = Memo::new(move |_| session.get().map(|s| crate::marks::of(&s)));
-    // Pointing at a value in some tile's bar dims the tiles without it.
-    let spot = crate::aspects::use_spotlight();
-    let dim =
-        Memo::new(move |_| spot.0.get().is_some_and(|k| !session.get().is_some_and(|s| crate::aspects::of(&s).iter().any(|a| a.key == k))));
     let palette_at = RwSignal::new(None::<(f64, f64)>);
     let menu_at = RwSignal::new(None::<(f64, f64)>);
     let rename_at = RwSignal::new(None::<(f64, f64)>);
@@ -1658,10 +1748,9 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
     view! {
         <div
             class=move || format!(
-                "min-h-0 min-w-0 flex-1 md:absolute md:left-(--l) md:top-(--t) md:h-(--h) md:w-(--w) md:p-1 md:transition-[left,top,width,height,opacity] md:duration-150 {} {} {}",
+                "min-h-0 min-w-0 flex-1 md:absolute md:left-(--l) md:top-(--t) md:h-(--h) md:w-(--w) md:p-1 md:transition-[left,top,width,height,opacity] md:duration-150 {} {}",
                 if focused.get() && !minimized.get() { "flex" } else { "hidden" },
                 if minimized.get() || (full.get() && !focused.get()) { "md:hidden" } else { "md:flex" },
-                if dim.get() { "opacity-35" } else { "" },
             )
             style=move || { let r = rect.get(); format!("--l:{:.4}%;--t:{:.4}%;--w:{:.4}%;--h:{:.4}%", r.left * 100.0, r.top * 100.0, r.width * 100.0, r.height * 100.0) }
         >
@@ -1695,7 +1784,8 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                 <div class=format!("pointer-events-none absolute z-20 rounded-md border-2 border-blue-500 bg-blue-500/15 {at}")></div>
             })}
             // The tile's own bar: its history, its name (and a session's
-            // colour and state), and what you can do to the whole tile.
+            // colour, state, what runs in it, its panes and its actions),
+            // and what you can do to the whole tile.
             // Dragged by its bar to another place or column. Always the
             // panel's own colours, so it reads whatever the mark; the mark
             // is a stripe along its top.
@@ -1727,18 +1817,20 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                 <span node_ref=title_el class="min-w-0 flex-1 truncate px-1 font-medium text-zinc-800 dark:text-zinc-100"
                     title=move || if renamable() { format!("{} · Double-click to rename", title.get()) } else { title.get() }
                     on:dblclick=move |ev| if renamable() { ev.stop_propagation(); rename_under_title() }>{title}</span>
-                <crate::aspects::AspectStrip session=session />
                 {move || session.get().map(|s| {
-                    let (cls, label) = status_pill(&s);
+                    let (dot, label) = status_dot(&s);
                     view! {
-                        <span class=format!("flex shrink-0 items-center gap-1 rounded-full px-1.5 py-px text-[10px] font-medium {cls}")>
-                            {(s.display_status() == SessionStatus::Running).then(|| view! { <span class="h-1.5 w-1.5 animate-pulse rounded-full bg-white"></span> })}
+                        <span class="flex shrink-0 items-center gap-1 pr-1 text-[11px] text-soft">
+                            <span class=format!("size-1.5 rounded-full {dot}")></span>
                             {label}
                         </span>
                     }
                 })}
-                {move || chrome().is_some().then(|| view! {
-                    <button class=btn title="Actions: rename, find, new like this, save as template, archive"
+                // What runs in it, its panes, then its actions.
+                {move || chrome().map(|c| view! {
+                    <crate::session::SessionControls chrome=c />
+                    <span class="mx-1 h-4 w-px shrink-0 bg-zinc-200 dark:bg-zinc-700"></span>
+                    <button class=btn title="Actions: rename, find, files, outputs, details, new like this, save as template, archive"
                         on:click=move |ev| menu_at.set(if menu_at.get_untracked().is_some() { None } else { Some(below(&ev, 240.0)) })>"⋯"</button>
                 })}
                 {move || pinnable().map(|id| {
@@ -1813,13 +1905,13 @@ mod tests {
             "side_chats_running": 1
         }))
         .unwrap();
-        assert_eq!(status_pill(&session).1, "running");
+        assert_eq!(status_dot(&session).1, "running");
         assert_eq!(session.status, SessionStatus::Idle, "the main composer must remain available");
         session.awaiting_approval = true;
-        assert_eq!(status_pill(&session).1, "needs approval");
+        assert_eq!(status_dot(&session).1, "needs you");
         session.awaiting_approval = false;
         session.side_chats_running = 0;
-        assert_eq!(status_pill(&session).1, "idle");
+        assert_eq!(status_dot(&session).1, "idle");
     }
 
     #[test]
@@ -1847,6 +1939,62 @@ mod tests {
             assert_eq!(layout.tiles[0].columns[1].key, key);
             assert_eq!(layout.tiles[0].columns[1].view, View::Brief);
         }
+    }
+
+    #[test]
+    fn a_sessions_panes_have_their_own_addresses() {
+        use crate::panes::Pane;
+        for (view, path, pane) in [
+            (View::SessionChanges { id: "s1".into() }, "/sessions/s1/changes", Pane::Changes),
+            (View::SessionTerminal { id: "s1".into() }, "/sessions/s1/terminal", Pane::Terminal),
+            (View::SessionFiles { id: "s1".into() }, "/sessions/s1/files", Pane::Files),
+            (View::SessionOutputs { id: "s1".into(), output: String::new() }, "/sessions/s1/outputs", Pane::Outputs),
+        ] {
+            assert_eq!(view.path(), path);
+            assert_eq!(view.session_pane(), Some((pane, "s1")));
+            assert!(!view.is_section(), "an item: it opens beside, not in place of a list");
+            let back: View = serde_json::from_str(&serde_json::to_string(&view).unwrap()).unwrap();
+            assert_eq!(back, view, "kept with the layout");
+        }
+        // Saved before an output was picked.
+        let v: View = serde_json::from_str(r#"{"view":"session_outputs","id":"s1"}"#).unwrap();
+        assert_eq!(v, View::SessionOutputs { id: "s1".into(), output: String::new() });
+        assert_eq!(View::session("s1").session_pane(), None);
+    }
+
+    #[test]
+    fn a_pane_opens_beside_its_session_and_the_bar_still_speaks_for_it() {
+        use crate::panes::Pane;
+        // A session opened from the list: the tile shows both.
+        let mut l = Layout::new(View::Sessions);
+        let tile = l.tiles[0].key;
+        let key = l.key();
+        l.tiles[0].columns.push(Column { key, view: View::session("s1") });
+        l.tiles[0].settle();
+        assert_eq!(l.bar_column(tile), Some(key));
+        // Its Changes: beside the session, which stays; the list goes back
+        // in the tile's history.
+        l.open_after(tile, key, View::SessionChanges { id: "s1".into() });
+        let t = l.tile(tile).unwrap();
+        assert_eq!(t.columns.len(), 2);
+        assert_eq!(t.columns[0].key, key, "the session's pane is kept, not drawn again");
+        assert_eq!(t.columns[1].view, View::SessionChanges { id: "s1".into() });
+        assert_eq!(t.back.last().unwrap()[0].view, View::Sessions);
+        assert_eq!(l.bar_column(tile), Some(key), "the bar speaks for the session, not its pane");
+        let changes = t.columns[1].key;
+        assert_eq!(l.find_pane(Pane::Changes, "s1"), Some((tile, changes)));
+        assert_eq!(l.find_pane(Pane::Terminal, "s1"), None);
+        assert_eq!(l.find_pane(Pane::Changes, "s2"), None);
+        // Another of its panes takes that one's place.
+        l.open_after(tile, key, View::SessionTerminal { id: "s1".into() });
+        assert_eq!(l.tile(tile).unwrap().columns[0].key, key);
+        assert_eq!(l.find_pane(Pane::Changes, "s1"), None);
+        // Something else beside it (a doc): the bar speaks for that.
+        l.open_after(tile, key, View::Docs { id: "d1".into() });
+        assert_ne!(l.bar_column(tile), Some(key));
+        // Another session's pane beside it is not its own.
+        l.open_after(tile, key, View::SessionFiles { id: "s2".into() });
+        assert_ne!(l.bar_column(tile), Some(key));
     }
 
     fn r(left: f64, top: f64, width: f64, height: f64) -> Rect {
@@ -2083,6 +2231,9 @@ struct Pos {
     len: usize,
     /// The active pane of the focused tile.
     active: bool,
+    /// A session with one of its own panes beside it: they share the tile
+    /// evenly (the transcript isn't a list).
+    even: bool,
 }
 
 #[component]
@@ -2094,7 +2245,8 @@ fn ColumnView(tile: u64, col: u64) -> impl IntoView {
             let ti = l.tiles.iter().position(|t| t.key == tile)?;
             let t = &l.tiles[ti];
             let index = t.columns.iter().position(|c| c.key == col)?;
-            Some(Pos { index, cursor: t.cursor, len: t.columns.len(), active: t.active == col && l.focus == ti })
+            let even = l.bar_column(tile) == Some(t.columns[0].key) && t.columns.len() == 2;
+            Some(Pos { index, cursor: t.cursor, len: t.columns.len(), active: t.active == col && l.focus == ti, even })
         })
     });
     let view =
@@ -2115,7 +2267,8 @@ fn ColumnView(tile: u64, col: u64) -> impl IntoView {
             id=ctx.root_id()
             class=move || match pos.get() {
                 Some(p) if p.len == 2 && p.index == 0 => format!(
-                    "min-w-0 flex-col border-r border-zinc-200 dark:border-zinc-800 md:flex md:basis-[40%] md:shrink-0 {}",
+                    "min-w-0 flex-col border-r border-zinc-200 dark:border-zinc-800 md:flex md:shrink-0 {} {}",
+                    if p.even { "md:basis-1/2" } else { "md:basis-[40%]" },
                     if p.cursor == 0 { "flex flex-1" } else { "hidden" },
                 ),
                 Some(p) => format!("min-w-0 flex-1 flex-col md:flex {}", if p.cursor == p.index { "flex" } else { "hidden" }),
@@ -2171,6 +2324,10 @@ fn ColumnHeader(label: Signal<String>, pos: Signal<Option<Pos>>, view: Signal<Op
 fn render_view(view: View) -> AnyView {
     match view {
         View::Session { id, target } => view! { <crate::session::SessionView id target /> }.into_any(),
+        View::SessionOutputs { id, output } => view! { <crate::panes::SessionPane id pane=crate::panes::Pane::Outputs output /> }.into_any(),
+        View::SessionChanges { id } => view! { <crate::panes::SessionPane id pane=crate::panes::Pane::Changes /> }.into_any(),
+        View::SessionTerminal { id } => view! { <crate::panes::SessionPane id pane=crate::panes::Pane::Terminal /> }.into_any(),
+        View::SessionFiles { id } => view! { <crate::panes::SessionPane id pane=crate::panes::Pane::Files /> }.into_any(),
         other => view! {
             <ScrollBox>
                 {match other {
@@ -2206,7 +2363,11 @@ fn render_view(view: View) -> AnyView {
                     View::App { name, record } => view! { <crate::views::ViewPage name=name.clone() record=record.clone() /> }.into_any(),
                     View::Realms => view! { <crate::explorer::RealmsMap /> }.into_any(),
                     View::Explore { realm, section, kind, id } => view! { <crate::explorer::ExplorePage realm=realm.clone() section=section.clone() kind=kind.clone() id=id.clone() /> }.into_any(),
-                    View::Session { .. } => ().into_any(),
+                    View::Session { .. }
+                    | View::SessionChanges { .. }
+                    | View::SessionTerminal { .. }
+                    | View::SessionFiles { .. }
+                    | View::SessionOutputs { .. } => ().into_any(),
                 }}
             </ScrollBox>
         }

@@ -6,7 +6,9 @@ use c6_api::{ContentBlock, Event, EventKind, QueuedInput, Session, SessionStatus
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
+use crate::details::GLANCE_WIDTH;
 use crate::models::ModelInput;
+use crate::panes::Pane;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT, storage_get, storage_set};
 use crate::workspace::{ColumnCtx, Go, Popover, ScrollBox, Target, View, below, use_column};
 use crate::{api, markdown, sessions};
@@ -541,63 +543,30 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         model_label(&m, &e)
     });
     let id_stored = StoredValue::new(id.clone());
-    let tab = RwSignal::new("transcript");
-    let details = crate::details::remembered();
-    // Esc closes the details drawer, or else stops a running turn (unless
-    // typing in a field, e.g. a side chat); ⌘I opens and closes the drawer,
-    // ⌘F finds in the session.
-    let esc_id = id.clone();
-    let _keys = window_event_listener(leptos::ev::keydown, move |ev| {
-        if !active() {
-            return;
-        }
-        let in_field = ev
-            .target()
-            .and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok())
-            .is_some_and(|el| matches!(el.tag_name().as_str(), "TEXTAREA" | "INPUT"));
-        // Taken already (⌘I is italic in a chat's composer).
-        let command = (ev.meta_key() || ev.ctrl_key()) && !ev.alt_key() && !ev.shift_key() && !ev.default_prevented();
-        match ev.key().as_str() {
-            "Escape" if !in_field && details.get_untracked() => details.set(false),
-            "Escape" if !in_field && running() => {
-                let id = esc_id.clone();
-                spawn_local(async move {
-                    let _ = api::interrupt(id).await;
-                });
-            }
-            "i" | "I" if command => {
-                ev.prevent_default();
-                details.update(|d| *d = !*d);
-            }
-            "f" | "F" if command => {
-                ev.prevent_default();
-                tab.set("transcript");
-                find_open.set(true);
-            }
-            _ => {}
-        }
-    });
     // Where the session really runs (its worktree, if it has one).
     let started = Memo::new(move |_| {
         events.with(|evs| match evs.first().map(|e| &e.kind) {
-            Some(EventKind::Started { cwd, worktree_branch, .. }) => Some((cwd.clone(), worktree_branch.clone())),
+            Some(EventKind::Started { cwd, worktree_branch, repo_root, .. }) => {
+                Some(Started { cwd: cwd.clone(), branch: worktree_branch.clone(), repo: repo_root.clone() })
+            }
             _ => None,
         })
     });
-    // Whether it works over SSH, once that's known.
-    let ssh = Memo::new(move |_| detail.get().and_then(Result::ok).map(|d| d.session.ssh.is_some()));
     // Its folder's git state, for the Changes count and the branch: not
     // over SSH, and while its worker is online.
     let git_at = Memo::new(move |_| {
         let s = detail.get().and_then(Result::ok)?.session;
-        let cwd = started.get()?.0;
+        let cwd = started.get()?.cwd;
         (s.ssh.is_none() && live.workers.with(|ws| !worker_offline(&s, ws))).then(|| (s.worker_id.to_string(), cwd))
     });
     let git = crate::details::git_state(git_at, events);
     let meta_root = StoredValue::new(root.clone());
-    let subagents = SubagentTree::new(id_stored, detail, events, force_open, meta_root, tab);
-    // The output the Outputs tab shows (the details can pick one).
-    let output = RwSignal::new(None::<String>);
+    let subagents = SubagentTree::new(id_stored, detail, events, force_open, meta_root);
+    // What runs in it now: background tasks (servers too) and subagents.
+    let busy = Memo::new(move |_| {
+        let (tasks, servers) = events.with(|e| crate::tasks::running_counts(e));
+        tasks + servers + subagents.running()
+    });
 
     let find_root = root.clone();
     // "New like this": a popup with the new-session form, filled in from
@@ -612,7 +581,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         if !c.is_empty() {
             (seed.connection_id, seed.model, seed.effort) = (c, m, e);
         }
-        seed.worktree = started.get_untracked().is_some_and(|(_, b)| !b.is_empty());
+        seed.worktree = started.get_untracked().is_some_and(|s| !s.branch.is_empty());
         like_this.set(Some(seed));
     };
     // "Save as template": its place and model, for agents or you to start
@@ -628,21 +597,84 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             (seed.connection_id, seed.model, seed.effort) = (c, m, e);
         }
         // The session's folder is the repository a worktree was made of.
-        seed.worktree = started.get_untracked().is_some_and(|(_, b)| !b.is_empty());
+        seed.worktree = started.get_untracked().is_some_and(|s| !s.branch.is_empty());
         as_template.set(Some(seed));
     };
+    // The glance: a column beside the transcript while the session's
+    // column is wide, else a popover from the context ring (a sheet from
+    // the bottom on a phone).
+    let pane_el = NodeRef::<leptos::html::Div>::new();
+    let wide = RwSignal::new(false);
+    watch_width(pane_el, wide);
+    let glance_at = RwSignal::new(None::<(f64, f64)>);
+    let sheet = RwSignal::new(false);
+    Effect::new(move || {
+        if wide.get() {
+            glance_at.set(None);
+            sheet.set(false);
+        }
+    });
+    let details = RwSignal::new(false);
     let chrome = SessionChrome {
         token: SessionChrome::next_token(),
         id: id_stored,
         detail,
-        tab,
         find_open,
         like_this: Callback::new(move |()| open_like_this()),
         as_template: Callback::new(move |()| open_as_template()),
         col,
+        events,
+        usage,
+        started,
+        model_label,
+        connection: Signal::derive(move || choice.current.with(|(c, _, _)| c.clone())),
+        git,
+        subagents,
+        running: Signal::derive(running),
+        busy,
+        wide,
+        glance_at,
+        sheet,
+        details,
     };
-    // The tile's bar offers this session's actions (⋯), wherever you are
-    // in the transcript.
+    // Esc closes the session's details or its glance, or else stops a
+    // running turn (unless typing in a field, e.g. a side chat); ⌘I opens
+    // and closes the glance where it isn't a column, ⌘F finds in the
+    // session.
+    let esc_id = id.clone();
+    let _keys = window_event_listener(leptos::ev::keydown, move |ev| {
+        if !active() {
+            return;
+        }
+        let in_field = ev
+            .target()
+            .and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok())
+            .is_some_and(|el| matches!(el.tag_name().as_str(), "TEXTAREA" | "INPUT"));
+        // Taken already (⌘I is italic in a chat's composer).
+        let command = (ev.meta_key() || ev.ctrl_key()) && !ev.alt_key() && !ev.shift_key() && !ev.default_prevented();
+        match ev.key().as_str() {
+            "Escape" if details.get_untracked() => details.set(false),
+            "Escape" if !in_field && (glance_at.get_untracked().is_some() || sheet.get_untracked()) => chrome.close_glance(),
+            "Escape" if !in_field && running() => {
+                let id = esc_id.clone();
+                spawn_local(async move {
+                    let _ = api::interrupt(id).await;
+                });
+            }
+            // Not in a field, where it may be italic.
+            "i" | "I" if command && !in_field => {
+                ev.prevent_default();
+                chrome.toggle_glance(None);
+            }
+            "f" | "F" if command => {
+                ev.prevent_default();
+                find_open.set(true);
+            }
+            _ => {}
+        }
+    });
+    // The tile's bar offers this session's panes and actions, wherever you
+    // are in the transcript.
     if let Some(c) = col {
         let ws = c.ws;
         ws.chrome.update(|m| {
@@ -656,27 +688,20 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             }
         });
     }
-    let connection = Signal::derive(move || choice.current.with(|(c, _, _)| c.clone()));
-    // Its actions (⋯) are in the tile's bar while that bar is this
-    // session's; with another column beside it (a doc), in its own bar.
-    let own_menu = Signal::derive(move || col.is_none_or(|c| !c.is_last()));
+    // Its panes and actions are in the tile's bar while that bar is this
+    // session's; with another view beside it (a doc), in a strip of its own.
+    let own_strip = move || col.is_none_or(|c| !c.in_bar());
     view! {
-        // A container: the bar and the drawer fit the pane, not the window.
-        <div class="@container relative flex min-h-0 flex-1 flex-col">
+        // Measured: the glance is a column only when the session is wide.
+        <div node_ref=pane_el class="@container relative flex min-h-0 flex-1 flex-col">
         {move || like_this.get().map(|seed| view! { <sessions::NewSessionDialog seed on_close=move |()| like_this.set(None) /> })}
         {move || as_template.get().map(|seed| view! { <sessions::SaveTemplateDialog seed on_close=move |()| as_template.set(None) /> })}
-        // Its views and how it stands, then its details: they stay put
-        // while the transcript scrolls.
-        <SessionBar session=id_stored tab ssh events usage git subagents details chrome own_menu />
-        {move || details.get().then(|| detail.get().and_then(Result::ok)).flatten().map(|d| {
-            let on = d.session.clone();
-            let online = Signal::derive(move || live.workers.with(|ws| !worker_offline(&on, ws)));
-            view! {
-                <crate::details::DetailsDrawer session=d.session worker_name=d.worker_name online events usage started model_label connection git
-                    running=Signal::derive(running) subagents tab output open=details />
-            }
-        })}
-        <div class="relative flex min-h-0 flex-1 flex-col">
+        {move || details.get().then(|| view! { <crate::details::SessionDetails session=id_stored.get_value() usage on_close=move |()| details.set(false) /> })}
+        <Show when=own_strip>
+            <SessionStrip chrome />
+        </Show>
+        <div class="flex min-h-0 flex-1">
+        <div class="relative flex min-h-0 min-w-0 flex-1 flex-col">
         {move || find_open.get().then(|| view! { <FindBar session=id_stored.get_value() initial=find_q.clone() open=find_open force_open root=find_root.clone() /> })}
         // Only up and down: what's wider (code, a table) scrolls within itself.
         <ScrollBox node_ref=scroller follow=stick class="overflow-x-hidden" on_scroll=Callback::new(move |()| {
@@ -708,31 +733,11 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                     }
                 })}
             </Suspense>
-
-            {move || {
-                let wid = detail.get().and_then(|d| d.ok()).map(|d| d.session.worker_id.to_string());
-                let cwd = started.get().map(|(c, _)| c);
-                match (tab.get(), wid, cwd) {
-                    ("changes", Some(w), Some(c)) => view! { <crate::files::Changes worker_id=w path=c /> }.into_any(),
-                    ("files", Some(w), Some(c)) => view! { <crate::files::FileBrowser worker_id=w root=c /> }.into_any(),
-                    ("terminal", Some(w), Some(c)) => {
-                        let ssh = detail.get().and_then(|d| d.ok()).and_then(|d| d.session.ssh);
-                        view! { <crate::term::Terminals worker_id=w default_cwd=c ssh /> }.into_any()
-                    }
-                    ("transcript", _, _) => ().into_any(),
-                    ("config", _, _) => view! { <crate::labels::SessionConfig session=id_stored.get_value() /> }.into_any(),
-                    ("outputs", _, _) => view! { <crate::outputs::Outputs session=id_stored.get_value() events chosen=output /> }.into_any(),
-                    _ => view! { <p class="py-6 text-center text-sm text-muted">"Available once the session has started."</p> }.into_any(),
-                }
-            }}
-            <div class:hidden=move || tab.get() != "transcript">
-                {move || detail.get().and_then(Result::ok).map(|d| view! { <Transcript session=d.session feed running=Signal::derive(running) /> })}
-            </div>
-
+            {move || detail.get().and_then(Result::ok).map(|d| view! { <Transcript session=d.session feed running=Signal::derive(running) /> })}
         </div>
         // Scrolled up a screen or more: back to the end in one click, with
         // what came in meanwhile counted. It stays at the box's lower edge.
-        {move || (far.get() && tab.get() == "transcript").then(|| {
+        {move || far.get().then(|| {
             let fresh = events.with(|evs| evs.len()).saturating_sub(left_at.get());
             view! {
                 <div class="pointer-events-none sticky bottom-3 flex justify-end px-4">
@@ -754,7 +759,6 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             }
         })}
         </ScrollBox>
-            <Show when=move || tab.get() == "transcript">
             {move || {
                 // Claude Code's own subagents take no messages.
                 if detail.get().and_then(|d| d.ok()).is_some_and(|d| d.session.observed) {
@@ -766,7 +770,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                 let files = Signal::derive(move || {
                     // @-completion lists the worker's files: not for SSH sessions.
                     let s = detail.get().and_then(|d| d.ok())?.session;
-                    let cwd = started.get()?.0;
+                    let cwd = started.get()?.cwd;
                     s.ssh.is_none().then_some((s.worker_id.to_string(), cwd))
                 });
                 match wake {
@@ -787,31 +791,172 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                     }
                 }
             }}
-            </Show>
         </div>
+        // Wide: the glance beside the transcript, always there.
+        <Show when=move || wide.get()>
+            <aside class="w-72 shrink-0 overflow-y-auto border-l border-zinc-200 px-2 py-2 dark:border-zinc-800">
+                <crate::details::Glance chrome />
+            </aside>
+        </Show>
+        </div>
+        <Popover at=glance_at class="w-72">
+            <crate::details::Glance chrome on_done=move |()| glance_at.set(None) />
+        </Popover>
+        {move || sheet.get().then(|| view! { <GlanceSheet chrome /> })}
         </div>
     }
 }
 
-/// What a session pane offers its tile's bar: what you can do with the
-/// session (the bar's ⋯).
+/// How wide the session's column must be for the glance to be a column
+/// beside the transcript.
+const GLANCE_COLUMN_MIN: i32 = 1100;
+
+/// Keeps `wide` saying whether the element is wide enough for the glance
+/// beside it, as it resizes (its tile, a pane beside it, the window).
+fn watch_width(el: NodeRef<leptos::html::Div>, wide: RwSignal<bool>) {
+    let observer = StoredValue::new_local(None::<web_sys::ResizeObserver>);
+    Effect::new(move || {
+        let Some(node) = el.get() else { return };
+        let measure = wasm_bindgen::closure::Closure::<dyn Fn(js_sys::Array)>::new(move |_: js_sys::Array| {
+            // A last resize may come after the pane has gone; hidden (a
+            // phone's other pane), it keeps what it was.
+            if let Some(n) = el.try_get_untracked().flatten()
+                && n.client_width() > 0
+            {
+                let w = n.client_width() >= GLANCE_COLUMN_MIN;
+                if wide.try_get_untracked() != Some(w) {
+                    wide.set(w);
+                }
+            }
+        });
+        if let Ok(obs) = web_sys::ResizeObserver::new(wasm_bindgen::JsCast::unchecked_ref(measure.as_ref())) {
+            obs.observe(&node);
+            observer.set_value(Some(obs));
+        }
+        measure.forget();
+    });
+    on_cleanup(move || {
+        if let Some(o) = observer.try_get_value().flatten() {
+            o.disconnect();
+        }
+    });
+}
+
+/// Where a session works, from its first event: its folder (its worktree,
+/// if it has one), the worktree's branch, and the repository it's of.
+#[derive(Clone, PartialEq)]
+pub(crate) struct Started {
+    pub(crate) cwd: String,
+    pub(crate) branch: String,
+    pub(crate) repo: String,
+}
+
+/// What a session pane offers its tile's bar (its panes, what runs in it,
+/// its context ring and its ⋯), and its glance.
 #[derive(Clone, Copy)]
 pub struct SessionChrome {
     /// Which pane registered it (a pane's view can be replaced in place).
     token: u64,
-    id: StoredValue<String>,
-    detail: LocalResource<Result<c6_api::SessionDetail, String>>,
-    tab: RwSignal<&'static str>,
+    pub(crate) id: StoredValue<String>,
+    pub(crate) detail: LocalResource<Result<c6_api::SessionDetail, String>>,
     find_open: RwSignal<bool>,
     like_this: Callback<()>,
     as_template: Callback<()>,
-    col: Option<ColumnCtx>,
+    pub(crate) col: Option<ColumnCtx>,
+    pub(crate) events: RwSignal<Vec<Event>>,
+    pub(crate) usage: Memo<UsageStats>,
+    pub(crate) started: Memo<Option<Started>>,
+    pub(crate) model_label: Memo<String>,
+    /// The connection it uses now.
+    pub(crate) connection: Signal<String>,
+    pub(crate) git: LocalResource<Option<(usize, String)>>,
+    pub(crate) subagents: SubagentTree,
+    /// A turn is running.
+    pub(crate) running: Signal<bool>,
+    /// How many background tasks and subagents run now.
+    busy: Memo<usize>,
+    /// The glance is a column beside the transcript.
+    wide: RwSignal<bool>,
+    /// The glance as a popover, while open.
+    glance_at: RwSignal<Option<(f64, f64)>>,
+    /// The glance as a phone's bottom sheet, while open.
+    sheet: RwSignal<bool>,
+    /// The session's details dialog is open.
+    details: RwSignal<bool>,
 }
 
 impl SessionChrome {
     fn next_token() -> u64 {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// It works over SSH: no Changes or Files (the worker can't look at
+    /// that machine's files).
+    fn ssh(&self) -> bool {
+        self.detail.get().and_then(Result::ok).is_some_and(|d| d.session.ssh.is_some())
+    }
+
+    /// Whether its pane is open, anywhere.
+    fn pane_open(&self, pane: Pane) -> bool {
+        let id = self.id.get_value();
+        self.col.is_some_and(|c| c.ws.layout.with(|l| l.find_pane(pane, &id).is_some()))
+    }
+
+    /// Its pane opened, or closed if it's open; ⌘/Ctrl-click: in a new tile.
+    fn toggle_pane(&self, pane: Pane, ev: &web_sys::MouseEvent) {
+        if let Some(c) = self.col {
+            crate::panes::toggle(c, pane, &self.id.get_value(), ev.meta_key() || ev.ctrl_key());
+        }
+    }
+
+    /// Its pane opened, unless it is already.
+    fn show_pane(&self, pane: Pane, ev: &web_sys::MouseEvent) {
+        if let Some(c) = self.col {
+            crate::panes::show(c, pane, &self.id.get_value(), ev.meta_key() || ev.ctrl_key());
+        }
+    }
+
+    fn ring_id(&self) -> String {
+        format!("ring-{}", self.token)
+    }
+
+    /// Opens or closes the glance where it isn't a column: under `anchor`
+    /// (by default the context ring), its right edge with the anchor's, or
+    /// on a phone as a sheet from the bottom.
+    fn toggle_glance(&self, anchor: Option<web_sys::Element>) {
+        if self.wide.get_untracked() {
+            return;
+        }
+        if self.glance_at.get_untracked().is_some() || self.sheet.get_untracked() {
+            return self.close_glance();
+        }
+        if crate::util::phone() {
+            return self.sheet.set(true);
+        }
+        let rect = anchor.or_else(|| document().get_element_by_id(&self.ring_id())).map(|el| el.get_bounding_client_rect());
+        self.glance_at.set(Some(match rect {
+            Some(r) => ((r.right() - GLANCE_WIDTH).max(8.0), r.bottom() + 4.0),
+            None => (8.0, 48.0),
+        }));
+    }
+
+    fn close_glance(&self) {
+        self.glance_at.set(None);
+        self.sheet.set(false);
+    }
+
+    /// What needs a look in the glance: scrolled to in its column, else
+    /// the glance opened under what was clicked.
+    fn show_looks(&self, ev: &web_sys::MouseEvent) {
+        if self.wide.get_untracked() {
+            if let Some(el) = document().get_element_by_id(&format!("look-{}", self.id.get_value())) {
+                el.scroll_into_view();
+            }
+            return;
+        }
+        let el = ev.current_target().and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok());
+        self.toggle_glance(el);
     }
 }
 
@@ -857,7 +1002,7 @@ pub fn RenameForm(session: String, title: String, #[prop(into)] on_done: Callbac
 /// choice.
 #[component]
 pub fn SessionMenu(chrome: SessionChrome, #[prop(into)] on_rename: Callback<()>, #[prop(into)] on_done: Callback<()>) -> impl IntoView {
-    let SessionChrome { id, detail, tab, find_open, like_this, as_template, col, .. } = chrome;
+    let SessionChrome { id, detail, find_open, like_this, as_template, details, col, .. } = chrome;
     let session = move || detail.get().and_then(Result::ok).map(|d| d.session);
     // Your own sessions are renamed; subagents and observed ones aren't.
     let renamable = move || session().is_some_and(|s| s.parent_id.is_none() && !s.observed);
@@ -870,10 +1015,23 @@ pub fn SessionMenu(chrome: SessionChrome, #[prop(into)] on_rename: Callback<()>,
                 </button>
             </Show>
             <button class=MENU_ITEM on:click=move |_| {
-                tab.set("transcript");
                 find_open.set(true);
                 on_done.run(());
             }>"Find in session"<span class=MENU_HINT>"⌘F"</span></button>
+            <div class=MENU_RULE></div>
+            <Show when=move || !chrome.ssh()>
+                <button class=MENU_ITEM title="Its folder, beside the transcript (⌘-click: a new tile)"
+                    on:click=move |ev| { chrome.show_pane(Pane::Files, &ev); on_done.run(()) }>
+                    {crate::icons::folder()}"Files"
+                </button>
+            </Show>
+            <button class=MENU_ITEM title="What it published, beside the transcript (⌘-click: a new tile)"
+                on:click=move |ev| { chrome.show_pane(Pane::Outputs, &ev); on_done.run(()) }>
+                {crate::icons::package()}"Outputs"
+            </button>
+            <button class=MENU_ITEM on:click=move |_| { details.set(true); on_done.run(()) }>
+                "Session details…"<span class=MENU_HINT>"usage, config"</span>
+            </button>
             <Show when=seeds>
                 <div class=MENU_RULE></div>
                 <button class=MENU_ITEM
@@ -894,100 +1052,121 @@ pub fn SessionMenu(chrome: SessionChrome, #[prop(into)] on_rename: Callback<()>,
     }
 }
 
-/// A session's own bar, under its tile's, staying put as the transcript
-/// scrolls: its views (with counts) on the left; on the right how it
-/// stands (tasks, subagents, context), each opening its details, and the
-/// details drawer's button. `own_menu`: the tile's bar speaks for another
-/// view, so its actions (⋯) are here too.
+/// An icon button of a session's: 24px square, filled while what it opens
+/// is open.
+fn icon_class(open: bool) -> &'static str {
+    if open {
+        "flex h-6 min-w-6 shrink-0 items-center justify-center gap-0.5 rounded px-1 bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100"
+    } else {
+        "flex h-6 min-w-6 shrink-0 items-center justify-center gap-0.5 rounded px-1 text-muted hover:bg-zinc-200/70 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+    }
+}
+
+/// How full the context is, as a 16px ring (amber from 80%).
+fn context_ring(pct: Option<u64>) -> impl IntoView {
+    // The circle's length: 2π × 6.
+    const ROUND: f64 = 37.7;
+    let p = pct.unwrap_or(0).min(100) as f64;
+    let tone = if p >= 80.0 { "stroke-amber-500" } else { "stroke-blue-500" };
+    view! {
+        <svg viewBox="0 0 16 16" class="size-4 shrink-0" fill="none" stroke-width="2" aria-hidden="true">
+            <circle cx="8" cy="8" r="6" class="stroke-zinc-300 dark:stroke-zinc-600" />
+            <circle cx="8" cy="8" r="6" class=tone
+                stroke-dasharray=format!("{:.2} {ROUND}", ROUND * p / 100.0) transform="rotate(-90 8 8)" />
+        </svg>
+    }
+}
+
+/// What runs in a session and its panes, for its tile's bar (or its own
+/// strip): "N running" while a background task or subagent runs, then
+/// Changes (with how many files changed), Terminal, and the context ring
+/// while the glance isn't a column.
 #[component]
-fn SessionBar(
-    session: StoredValue<String>,
-    tab: RwSignal<&'static str>,
-    ssh: Memo<Option<bool>>,
-    events: RwSignal<Vec<Event>>,
-    usage: Memo<UsageStats>,
-    git: LocalResource<Option<(usize, String)>>,
-    subagents: SubagentTree,
-    details: RwSignal<bool>,
-    chrome: SessionChrome,
-    own_menu: Signal<bool>,
-) -> impl IntoView {
+pub fn SessionControls(chrome: SessionChrome) -> impl IntoView {
+    let changed = move || chrome.git.get().flatten().map(|g| g.0).filter(|n| *n > 0);
+    let glance_open = move || chrome.glance_at.get().is_some() || chrome.sheet.get();
+    let pct = move || chrome.usage.with(|u| u.context.and_then(|used| (used * 100).checked_div(u.context_window)));
+    let ring_title = move || {
+        chrome.usage.with(|u| match u.context {
+            Some(used) => match (used * 100).checked_div(u.context_window) {
+                Some(p) => format!("Context: {p}% used ({} of {} tokens) · the glance (⌘I)", tokens(used), tokens(u.context_window)),
+                None => format!("Context: {} tokens · the glance (⌘I)", tokens(used)),
+            },
+            None => "Context: known after the first model call · the glance (⌘I)".to_owned(),
+        })
+    };
+    view! {
+        {move || {
+            let n = chrome.busy.get();
+            (n > 0).then(|| view! {
+                <button class="flex shrink-0 items-center gap-1 rounded px-1 py-0.5 text-[11px] text-blue-600 hover:bg-zinc-200/70 dark:text-blue-400 dark:hover:bg-zinc-800"
+                    title="Background tasks and subagents running: what needs a look"
+                    on:click=move |ev| chrome.show_looks(&ev)>
+                    <svg viewBox="0 0 16 16" class="size-3 shrink-0 animate-spin" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                        <circle cx="8" cy="8" r="6" stroke-opacity="0.3" />
+                        <path d="M14 8a6 6 0 0 0-6-6" />
+                    </svg>
+                    <span class="tabular-nums">{format!("{n} running")}</span>
+                </button>
+            })
+        }}
+        <div class="flex shrink-0 items-center gap-0.5">
+            <Show when=move || !chrome.ssh()>
+                <button class=move || icon_class(chrome.pane_open(Pane::Changes)) aria-label="Changes"
+                    title=move || match changed() {
+                        Some(1) => "Changes: 1 file (⌘-click: a new tile)".to_owned(),
+                        Some(n) => format!("Changes: {n} files (⌘-click: a new tile)"),
+                        None => "Changes (⌘-click: a new tile)".to_owned(),
+                    }
+                    on:click=move |ev| chrome.toggle_pane(Pane::Changes, &ev)>
+                    {crate::icons::file_diff()}
+                    {move || changed().map(|n| view! { <span class="text-[10px] leading-none tabular-nums">{n}</span> })}
+                </button>
+            </Show>
+            <button class=move || icon_class(chrome.pane_open(Pane::Terminal)) aria-label="Terminal" title="Terminal (⌘-click: a new tile)"
+                on:click=move |ev| chrome.toggle_pane(Pane::Terminal, &ev)>
+                {crate::icons::square_terminal()}
+            </button>
+            <Show when=move || !chrome.wide.get()>
+                <button id=chrome.ring_id() class=move || icon_class(glance_open()) aria-label="Glance" title=ring_title
+                    on:click=move |ev| {
+                        let el = ev.current_target().and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok());
+                        chrome.toggle_glance(el);
+                    }>
+                    {move || context_ring(pct())}
+                </button>
+            </Show>
+        </div>
+    }
+}
+
+/// A session's own strip, when its tile's bar speaks for another view
+/// beside it (a doc): its panes and its actions (⋯), at the right.
+#[component]
+fn SessionStrip(chrome: SessionChrome) -> impl IntoView {
     let live = api::live();
     let menu_at = RwSignal::new(None::<(f64, f64)>);
     let rename_at = RwSignal::new(None::<(f64, f64)>);
     // Renaming from here opens under this ⋯ (the tile's title is another
     // view's).
     let rename_from = StoredValue::new((8.0, 48.0));
-    let outputs = Memo::new(move |_| events.with(|e| crate::outputs::count(e)));
-    let changed = move || git.get().flatten().map(|g| g.0).filter(|n| *n > 0);
-    let context = move || {
-        usage.with(|u| {
-            let used = u.context?;
-            let pct = (used * 100).checked_div(u.context_window);
-            let full = pct.is_some_and(|p| p >= 80);
-            let title = match pct {
-                Some(p) => format!("Context: {} of {} tokens ({p}%), what the next model request starts from. Compacts at 85%.", tokens(used), tokens(u.context_window)),
-                None => format!("Context: {} tokens, what the next model request starts from.", tokens(used)),
-            };
-            Some(view! {
-                <button class=format!("{BAR_ITEM} {}", if full { "text-amber-700 dark:text-amber-400" } else { "text-zinc-600 dark:text-zinc-400" })
-                    title=title on:click=move |_| details.set(true)>
-                    <span class="hidden @md:inline">"Context"</span>
-                    {pct.map(|p| view! {
-                        <span class="h-1.5 w-10 overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-700">
-                            <span class=format!("block h-full {}", if full { "bg-amber-500" } else { "bg-blue-500" }) style=format!("width:{}%", p.min(100))></span>
-                        </span>
-                    })}
-                    <span class="tabular-nums">{match pct { Some(p) => format!("{p}%"), None => tokens(used) }}</span>
-                </button>
-            })
-        })
-    };
     view! {
-        <div class="flex h-8 shrink-0 items-center gap-2 border-b border-zinc-200 bg-zinc-50 px-2 text-xs dark:border-zinc-800 dark:bg-zinc-900/60">
-            <div class="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto [scrollbar-width:none]">
-                {bar_tab(tab, "Transcript", "transcript", ())}
-                // Not over SSH: the worker can't look at that machine's files.
-                {move || (ssh.get() == Some(false)).then(|| view! {
-                    {bar_tab(tab, "Changes", "changes", move || changed().map(|n| view! {
-                        <span class="tabular-nums text-emerald-600 dark:text-emerald-400">{format!("±{n}")}</span>
-                    }))}
-                    {bar_tab(tab, "Files", "files", ())}
-                })}
-                {bar_tab(tab, "Terminal", "terminal", ())}
-                {bar_tab(tab, "Outputs", "outputs", move || (outputs.get() > 0).then(|| view! {
-                    <span class="tabular-nums text-muted">{outputs.get()}</span>
-                }))}
-                {bar_tab(tab, "Config", "config", ())}
-            </div>
-            <div class="flex shrink-0 items-center gap-1">
-                <crate::tasks::RunningTasks session=session.get_value() events compact=true on_open=move |()| details.set(true) />
-                <SubagentsPill tree=subagents />
-                {context}
-                <button class=move || format!("{BAR_ITEM} {}", if details.get() { "bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100" } else { "text-muted" })
-                    title="Details (⌘I)" aria-label="Details" aria-pressed=move || details.get().to_string()
-                    on:click=move |_| details.update(|d| *d = !*d)>
-                    // A box with its drawer pulled out.
-                    <svg viewBox="0 0 16 16" class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round">
-                        <rect x="2" y="2.5" width="12" height="11" rx="1.5" />
-                        <path d="M2 7h12" />
-                    </svg>
-                </button>
-                <Show when=move || own_menu.get()>
-                    <button class=format!("{BAR_ITEM} text-muted") title="Actions: rename, find, new like this, save as template, archive"
-                        on:click=move |ev| {
-                            rename_from.set_value(below(&ev, 320.0));
-                            menu_at.set(if menu_at.get_untracked().is_some() { None } else { Some(below(&ev, 240.0)) });
-                        }>"⋯"</button>
-                </Show>
-            </div>
+        <div class="flex h-8 shrink-0 items-center justify-end gap-1 border-b border-zinc-200 bg-zinc-50 px-2 text-xs dark:border-zinc-800 dark:bg-zinc-900/60">
+            <SessionControls chrome />
+            <span class="mx-1 h-4 w-px shrink-0 bg-zinc-200 dark:bg-zinc-700"></span>
+            <button class="rounded px-1.5 py-0.5 text-zinc-600 hover:bg-zinc-200/70 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                title="Actions: rename, find, files, outputs, details, new like this, save as template, archive"
+                on:click=move |ev| {
+                    rename_from.set_value(below(&ev, 320.0));
+                    menu_at.set(if menu_at.get_untracked().is_some() { None } else { Some(below(&ev, 240.0)) });
+                }>"⋯"</button>
             <Popover at=menu_at class="w-60">
                 <SessionMenu chrome on_rename=move |()| rename_at.set(Some(rename_from.get_value())) on_done=move |()| menu_at.set(None) />
             </Popover>
             <Popover at=rename_at class="w-[min(22rem,calc(100vw-1rem))] p-3">
                 // The name read untracked: a rebuilt form loses what was typed.
                 {move || {
-                    let id = session.get_value();
+                    let id = chrome.id.get_value();
                     let title = live
                         .sessions
                         .with_untracked(|ss| ss.iter().find(|s| s.id == id).map(|s| s.title.clone()))
@@ -1000,18 +1179,32 @@ fn SessionBar(
     }
 }
 
-/// A view's tab in the session's bar, with its count after the name.
-fn bar_tab(tab: RwSignal<&'static str>, label: &'static str, value: &'static str, count: impl IntoView + 'static) -> impl IntoView {
+/// The glance on a phone: a sheet from the bottom, about half the screen,
+/// closed by a tap outside it, its ✕, or pulling its handle down.
+#[component]
+fn GlanceSheet(chrome: SessionChrome) -> impl IntoView {
+    let close = move || chrome.sheet.set(false);
+    let pulled_from = StoredValue::new(None::<i32>);
     view! {
-        <button class=move || format!("flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full px-2.5 py-0.5 {}", if tab.get() == value {
-                "bg-zinc-200 font-medium text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100"
-            } else {
-                "text-zinc-600 hover:bg-zinc-200/60 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
-            })
-            on:click=move |_| tab.set(value)>
-            {label}
-            {count}
-        </button>
+        <div class="fixed inset-0 z-40 bg-black/30" on:click=move |ev| { ev.stop_propagation(); close() }></div>
+        <div class="fixed inset-x-0 bottom-0 z-50 flex max-h-[50dvh] flex-col rounded-t-xl border-t border-zinc-200 bg-white text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
+            on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); close() }>
+            <div class="relative flex h-7 shrink-0 touch-none items-center justify-center"
+                on:pointerdown=move |ev: web_sys::PointerEvent| pulled_from.set_value(Some(ev.client_y()))
+                on:pointerup=move |ev: web_sys::PointerEvent| {
+                    if pulled_from.get_value().is_some_and(|y| ev.client_y() - y > 40) {
+                        close();
+                    }
+                    pulled_from.set_value(None);
+                }>
+                <span class="h-1 w-10 rounded-full bg-zinc-300 dark:bg-zinc-600"></span>
+                <button class="absolute right-2 top-1 rounded px-1.5 text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                    title="Close" on:click=move |_| close()>"✕"</button>
+            </div>
+            <div class="min-h-0 flex-1 overflow-y-auto px-2 pb-4">
+                <crate::details::Glance chrome on_done=move |()| close() />
+            </div>
+        </div>
     }
 }
 
@@ -1066,7 +1259,6 @@ pub(crate) struct SubagentTree {
     /// The pane's root, where their threads are found.
     root: StoredValue<String>,
     force_open: ForceOpen,
-    tab: RwSignal<&'static str>,
 }
 
 impl SubagentTree {
@@ -1076,7 +1268,6 @@ impl SubagentTree {
         events: RwSignal<Vec<Event>>,
         force_open: ForceOpen,
         root: StoredValue<String>,
-        tab: RwSignal<&'static str>,
     ) -> Self {
         let live = api::live();
         // How many work now in its whole tree (from the live session list).
@@ -1119,16 +1310,21 @@ impl SubagentTree {
                 })
                 .collect::<Vec<_>>()
         });
-        Self { list, session, root, force_open, tab }
+        Self { list, session, root, force_open }
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.list.with(Vec::is_empty)
+    /// Its subagents, each with its depth below the session.
+    pub(crate) fn rows(&self) -> Vec<(Session, usize)> {
+        self.list.get()
+    }
+
+    /// How many of them work now.
+    pub(crate) fn running(&self) -> usize {
+        self.list.with(|l| l.iter().filter(|(s, _)| s.status == SessionStatus::Running).count())
     }
 
     /// Goes to a subagent's thread in the transcript.
-    fn go(&self, id: String) {
-        self.tab.set("transcript");
+    pub(crate) fn go(&self, id: String) {
         // Open the threads on the way down, then the one itself.
         let mut chain = vec![id.clone()];
         let rows = self.list.get_untracked();
@@ -1139,78 +1335,6 @@ impl SubagentTree {
         }
         self.force_open.0.update(|ids| ids.extend(chain));
         reveal_when_rendered(self.root.get_value(), format!("sub-{id}"), "[]".into(), 0);
-    }
-}
-
-/// The session's subagents in its bar: counts by state, and a list that
-/// goes to each one's thread.
-#[component]
-fn SubagentsPill(tree: SubagentTree) -> impl IntoView {
-    let at = RwSignal::new(None::<(f64, f64)>);
-    let pill = move || {
-        let rows = tree.list.get();
-        (!rows.is_empty()).then(|| {
-            let count = |want: &str| {
-                rows.iter()
-                    .filter(|(s, _)| subagent_state(s.status == SessionStatus::Running, s.end_reason).0.ends_with(want))
-                    .count()
-            };
-            let mut parts = Vec::new();
-            for (word, n) in [("running", count("running")), ("done", count("done")), ("interrupted", count("interrupted")), ("failed", count("failed")), ("lost", count("lost"))] {
-                if n > 0 {
-                    parts.push(format!("{n} {word}"));
-                }
-            }
-            // Narrow: how many run, else how many there are.
-            let short = match count("running") {
-                0 => rows.len().to_string(),
-                n => format!("{n} running"),
-            };
-            let all = parts.join(" · ");
-            view! {
-                <button class="shrink-0 whitespace-nowrap rounded-md border border-violet-300 bg-violet-50 px-2 py-0.5 text-xs text-violet-800 hover:bg-violet-100 dark:border-violet-900 dark:bg-violet-950 dark:text-violet-300"
-                    title=format!("Subagents: {all}")
-                    on:click=move |ev| at.set(if at.get_untracked().is_some() { None } else { Some(below(&ev, 448.0)) })>
-                    <span class="@2xl:hidden">{format!("◆ {short}")}</span>
-                    <span class="hidden @2xl:inline">{format!("◆ {all}")}</span>
-                </button>
-            }
-        })
-    };
-    view! {
-        {pill}
-        <Popover at class="w-[28rem] max-w-[calc(100vw-1rem)] space-y-0.5 text-xs">
-            <SubagentList tree on_go=move |()| at.set(None) />
-        </Popover>
-    }
-}
-
-/// A session's subagents, each with its state, going to its thread.
-#[component]
-pub(crate) fn SubagentList(tree: SubagentTree, #[prop(optional, into)] on_go: Option<Callback<()>>) -> impl IntoView {
-    move || {
-        tree.list
-            .get()
-            .into_iter()
-            .map(|(s, depth)| {
-                let (pill, tone) = subagent_state(s.status == SessionStatus::Running, s.end_reason);
-                let id = s.id.clone();
-                view! {
-                    <button class="flex w-full items-center gap-2 rounded px-1 py-0.5 text-left text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800"
-                        style=format!("padding-left: {}rem", 0.25 + depth as f32 * 1.0)
-                        on:click=move |_| {
-                            tree.go(id.clone());
-                            if let Some(f) = on_go {
-                                f.run(());
-                            }
-                        }>
-                        <span class=format!("w-24 shrink-0 {tone}")>{pill}</span>
-                        <span class="min-w-0 flex-1 truncate">{s.title.clone()}</span>
-                        <span class="max-w-[40%] shrink-0 truncate font-mono text-muted">{s.model.clone()}</span>
-                    </button>
-                }
-            })
-            .collect_view()
     }
 }
 
@@ -1518,7 +1642,7 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
             {move || queued.get().into_iter().map(|q| view! { <Queued q session_id=id.get_value() worker_id=worker_id pull=pull /> }).collect_view()}
             {move || (!running.get()).then(|| view! { <WaitingNotices events session_id=id.get_value() /> })}
             // What still runs in the background, while or after it works.
-            <crate::tasks::RunningTasks session=id.get_value() events line=true />
+            <crate::tasks::RunningTasks session=id.get_value() events />
         </div>
     }
 }
@@ -2023,9 +2147,6 @@ fn stop_icon() -> impl IntoView {
 const MENU_ITEM: &str = "flex w-full items-center gap-3 rounded px-2 py-1 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800";
 const MENU_HINT: &str = "ml-auto text-[11px] text-muted";
 const MENU_RULE: &str = "my-1 border-t border-zinc-200 dark:border-zinc-700";
-
-/// A quiet button in the session's bar (how it stands, its details).
-const BAR_ITEM: &str = "flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-1.5 py-0.5 hover:bg-zinc-200/60 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
 
 /// The message box's model chip: quiet, grey text with a background only on
 /// hover, so the toolbar doesn't compete with what you're typing.
@@ -2721,6 +2842,12 @@ impl Subagents {
 fn tree_working(root: String) -> Memo<u32> {
     let live = api::live();
     Memo::new(move |_| live.sessions.with(|ss| ss.iter().find(|s| s.id == root).map_or(0, |s| s.subagents_running)))
+}
+
+/// A subagent that ended badly: failed, or lost with its worker (not
+/// done, and not stopped).
+pub(crate) fn subagent_failed(s: &Session) -> bool {
+    s.status != SessionStatus::Running && s.end_reason.is_some_and(|r| !matches!(r, TurnEndReason::Completed | TurnEndReason::Interrupted))
 }
 
 /// How a subagent stands: (pill, its colors).

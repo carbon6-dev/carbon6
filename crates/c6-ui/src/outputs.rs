@@ -29,10 +29,6 @@ fn outputs(events: &[Event]) -> Vec<(String, Vec<Version>)> {
     out
 }
 
-pub fn count(events: &[Event]) -> usize {
-    outputs(events).len()
-}
-
 fn url(session: &str, seq: u64) -> String {
     crate::api::url(&format!("/api/v1/sessions/{session}/outputs/{seq}"))
 }
@@ -54,8 +50,8 @@ fn kind(name: &str, mime: &str) -> String {
     }
 }
 
-/// The Outputs tab. `chosen`: the output shown (by name; the newest when
-/// `None`), which the session's details can set before opening the tab.
+/// A session's Outputs pane. `chosen`: the output shown (by name; the
+/// newest when `None`), as its glance picked it.
 #[component]
 pub fn Outputs(session: String, events: RwSignal<Vec<Event>>, chosen: RwSignal<Option<String>>) -> impl IntoView {
     let session = StoredValue::new(session);
@@ -116,8 +112,9 @@ pub fn Outputs(session: String, events: RwSignal<Vec<Event>>, chosen: RwSignal<O
     }
 }
 
-/// The newest outputs, for the session's details: `on_pick` with an
-/// output's name, or `None` for all of them (the Outputs tab).
+/// The newest three outputs, a line each, for the session's glance:
+/// `on_pick` with an output's name, or `None` for all of them (the Outputs
+/// pane). Nothing when it has published nothing.
 #[component]
 pub fn Recent(events: RwSignal<Vec<Event>>, #[prop(into)] on_pick: Callback<Option<String>>) -> impl IntoView {
     let list = Memo::new(move |_| {
@@ -128,25 +125,23 @@ pub fn Recent(events: RwSignal<Vec<Event>>, #[prop(into)] on_pick: Callback<Opti
     });
     move || {
         let l = list.get();
-        if l.is_empty() {
-            return view! { <p class="py-1 text-xs text-muted">"Nothing yet"</p> }.into_any();
-        }
         let n = l.len();
         view! {
-            {l.into_iter().take(5).map(|(name, vs)| {
+            {l.into_iter().take(3).map(|(name, vs)| {
                 let latest = vs.last().cloned().expect("a version");
                 let pick = name.clone();
                 view! {
-                    <button class="block w-full rounded px-1 py-0.5 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800" title=name.clone()
+                    <button class="flex w-full min-w-0 items-baseline gap-2 rounded px-1.5 py-1 text-left text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800" title=name.clone()
                         on:click=move |_| on_pick.run(Some(pick.clone()))>
-                        <div class="truncate text-sm">{latest.title.clone()}</div>
-                        <div class="truncate text-[11px] text-muted">{format!("{} · {}", kind(&name, &latest.mime), size(latest.size))}</div>
+                        <span class="min-w-0 flex-1 truncate">{latest.title.clone()}</span>
+                        <span class="shrink-0 text-[11px] text-muted">{format!("{} · {}", kind(&name, &latest.mime), size(latest.size))}</span>
                     </button>
                 }
             }).collect_view()}
-            <button class="px-1 pt-1 text-xs text-sky-700 hover:underline dark:text-sky-400" on:click=move |_| on_pick.run(None)>{format!("Show all {n}")}</button>
+            {(n > 3).then(|| view! {
+                <button class="px-1.5 text-[11px] text-muted hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" on:click=move |_| on_pick.run(None)>{format!("All {n}")}</button>
+            })}
         }
-        .into_any()
     }
 }
 
@@ -192,7 +187,7 @@ pub fn published_line(session: &str, seq: u64, name: &str, title: &str, mime: &s
                 <span class="font-medium text-zinc-700 dark:text-zinc-300">{title.to_owned()}</span>
                 <span class="font-mono">{format!("{name} · {}", size(size_bytes))}</span>
                 <a class="underline" href=u.clone() target="_blank" rel="noopener">"open"</a>
-                <span>"· see Outputs"</span>
+                <span>"· see Outputs (⋯)"</span>
             </p>
             {image.then(|| view! {
                 <a href=u.clone() target="_blank" rel="noopener" title="Open full size">
