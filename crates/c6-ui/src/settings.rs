@@ -463,6 +463,8 @@ fn AppearanceSetting() -> impl IntoView {
                 {option("system", "System", "Follows your device's setting")}
                 {option("light", "Light", "Always light")}
                 {option("dark", "Dark", "Always dark")}
+                {option("dim", "Dim", "Dark, with softer greys behind")}
+                {option("soft", "Soft", "Dark, softer still")}
             </div>
             <p class="text-xs text-muted">"Kept in this browser, so each device can have its own."</p>
         </section>

@@ -30,6 +30,20 @@
 @custom-variant lg (@media (width >= 64rem) and (height >= 32rem));
 @custom-variant xl (@media (width >= 80rem) and (height >= 32rem));
 
+/* The softer darks (Settings → Appearance): dark mode with the three
+   background greys repointed, page, panels and chips; text and accents
+   are unchanged. Unlayered, so they win over the theme's own values. */
+html.dim {
+  --color-zinc-950: #141417;
+  --color-zinc-900: #1c1c20;
+  --color-zinc-800: #2a2a2f;
+}
+html.soft {
+  --color-zinc-950: #1c1d21;
+  --color-zinc-900: #25262b;
+  --color-zinc-800: #33343a;
+}
+
 /* Phones: iOS zooms into fields with text under 16px when they get
    focus, which throws the layout off; give them 16px there. */
 @media (max-width: 639px) {
