@@ -1154,7 +1154,8 @@ fn BlockView(
             // them here; without, 💬 shows on hover to start one.
             {move || match open_threads.with(Vec::len) {
                 0 => view! {
-                    <button class="invisible absolute right-1 top-0.5 px-1 text-xs text-zinc-400 hover:text-violet-600 group-hover:visible" title="Comment on this"
+                    // No hover on a touch screen: there it always shows.
+                    <button class="invisible absolute right-1 top-0.5 px-1 text-xs text-zinc-400 hover:text-violet-600 group-hover:visible pointer-coarse:visible" title="Comment on this"
                         on:click=move |_| { threads.focus.set(Some(bid.get_value())); commenting.set(Some(bid.get_value())) }>"💬"</button>
                 }.into_any(),
                 n => view! {
