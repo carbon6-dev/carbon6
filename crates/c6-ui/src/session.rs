@@ -5019,13 +5019,17 @@ fn Composer(
                             // Send (the agent reads it at its next step), and ▾
                             // beside it for Send now (at once).
                             view! {
-                                <div class="relative flex items-center gap-0.5">
-                                    <button class="flex h-5.5 items-center rounded-md px-1 text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                                // One split button: Send, then its ▾ (Send now) past a
+                                // full-height light line, so the two read as one.
+                                <div class="relative flex items-stretch overflow-hidden rounded-md">
+                                    <button class=format!("{SEND} rounded-none {SEND_READY}") title=format!("{send_label}: the agent reads it at its next step") aria-label=send_label
+                                        prop:disabled=move || disabled.get() on:click=move |_| send()>{send_icon()}</button>
+                                    <button class="flex w-4 shrink-0 items-center justify-center border-l border-sky-300 bg-sky-600 text-white hover:bg-sky-700"
                                         title="More ways to send" aria-label="More ways to send"
                                         aria-haspopup="menu" prop:aria-expanded=move || send_menu.get().to_string() data-pop=send_pop.get_value()
-                                        on:click=move |ev| { ev.stop_propagation(); send_menu.update(|o| *o = !*o); }>"▾"</button>
-                                    <button class=format!("{SEND} {SEND_SHAPE} {SEND_READY}") title=format!("{send_label}: the agent reads it at its next step") aria-label=send_label
-                                        prop:disabled=move || disabled.get() on:click=move |_| send()>{send_icon()}</button>
+                                        on:click=move |ev| { ev.stop_propagation(); send_menu.update(|o| *o = !*o); }>
+                                        <svg viewBox="0 0 10 10" class="h-2.5 w-2.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 4 5 6.5 7.5 4" /></svg>
+                                    </button>
                                     {move || send_menu.get().then(|| view! {
                                         <div role="menu" data-pop=send_pop.get_value() class="absolute bottom-full right-0 z-40 mb-1 w-max rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
                                             <button role="menuitem" class="flex w-full items-center gap-4 px-3 py-1.5 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
