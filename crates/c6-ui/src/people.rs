@@ -23,11 +23,12 @@ pub fn Person(
     // Where it opens: under the name, else above it when there's no room;
     // fixed to the window, so a scrolling list doesn't cut it off.
     let open = RwSignal::new(None::<String>);
-    let _esc = window_event_listener(leptos::ev::keydown, move |ev| {
-        if open.get_untracked().is_some() && ev.key() == "Escape" {
-            open.set(None);
-        }
-    });
+    let pop = StoredValue::new(crate::util::dismissable(
+        move || open.with(Option::is_some),
+        move || {
+            open.try_set(None);
+        },
+    ));
     let button = NodeRef::<leptos::html::Button>::new();
     let place = move || {
         let r = button.get_untracked()?.get_bounding_client_rect();
@@ -44,10 +45,9 @@ pub fn Person(
     view! {
         <span class="inline">
             <button node_ref=button type="button" class=format!("cursor-pointer hover:underline {class}") title="Who they are to you"
-                on:click=move |ev| { ev.stop_propagation(); open.set(if open.get_untracked().is_some() { None } else { place() }); }>{label}</button>
+                aria-expanded=move || open.with(Option::is_some).to_string() data-pop=pop.get_value() on:click=move |ev| { ev.stop_propagation(); open.set(if open.get_untracked().is_some() { None } else { place() }); }>{label}</button>
             {move || open.get().map(|style| view! {
-                <span class="fixed inset-0 z-40" on:click=move |ev| { ev.stop_propagation(); open.set(None); }></span>
-                <span style=style class="fixed z-50 block w-80 max-w-[90vw] space-y-2 overflow-y-auto rounded-lg border border-zinc-200 bg-white p-3 text-left text-sm font-normal text-zinc-900 shadow-lg dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+                <span style=style data-pop=pop.get_value() class="fixed z-50 block w-80 max-w-[90vw] space-y-2 overflow-y-auto rounded-lg border border-zinc-200 bg-white p-3 text-left text-sm font-normal text-zinc-900 shadow-lg dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
                     on:click=|ev| ev.stop_propagation()>
                     <Card name=name.get_value() address=address.get_value() about=about.get_value() />
                 </span>

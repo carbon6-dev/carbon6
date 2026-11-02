@@ -281,6 +281,12 @@ pub(crate) fn Message(
     let my_reactions: Vec<String> =
         meta["my_reactions"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(str::to_owned)).collect();
     let picker = RwSignal::new(false);
+    let pop = StoredValue::new(crate::util::dismissable(
+        move || picker.get(),
+        move || {
+            picker.try_set(false);
+        },
+    ));
     let editing = {
         let id = id.clone();
         Memo::new(move |_| chat.editing.get().as_deref() == Some(id.as_str()))
@@ -334,7 +340,7 @@ pub(crate) fn Message(
             view! {
                 <div class="absolute -top-3 right-3 z-20 hidden items-center gap-0.5 rounded-md border border-zinc-200 bg-white px-1 py-0.5 text-xs shadow-sm group-hover:flex dark:border-zinc-700 dark:bg-zinc-900">
                     {QUICK.iter().map(|n| { let react = react.clone(); view! { <button class=btn title=format!(":{n}:") on:click=move |_| react(n.to_string(), false)>{text::face(n)}</button> } }).collect_view()}
-                    <button class=btn title="Add a reaction" on:click=move |_| picker.update(|p| *p = !*p)>"☺+"</button>
+                    <button class=btn title="Add a reaction" data-pop=pop.get_value() on:click=move |_| picker.update(|p| *p = !*p)>"☺+"</button>
                     {(!in_thread).then(|| view! { <button class=btn title="Reply in a thread" on:click=move |_| open_thread()>"💬"</button> })}
                     <button class=btn title="Save for later" on:click=move |_| chat.act("memex.chat.save", json!({"id": id1}))>"🔖"</button>
                     <button class=btn title="Copy link" on:click=move |_| { let _ = window().navigator().clipboard().write_text(&url1); }>"🔗"</button>
@@ -416,7 +422,7 @@ pub(crate) fn Message(
                                 }
                             }).collect_view()}
                             <button class="rounded-full border border-zinc-200 px-1.5 text-xs text-muted hover:border-zinc-400 dark:border-zinc-700" title="Add a reaction"
-                                on:click=move |_| picker.update(|p| *p = !*p)>"☺+"</button>
+                                data-pop=pop.get_value() on:click=move |_| picker.update(|p| *p = !*p)>"☺+"</button>
                         </div>
                     }
                 })}
@@ -433,7 +439,7 @@ pub(crate) fn Message(
             {actions}
             {move || picker.get().then(|| {
                 let react = react.clone();
-                view! { <EmojiPicker pick=Callback::new(move |n: String| { react(n, false); picker.set(false); }) close=picker /> }
+                view! { <div class="contents" data-pop=pop.get_value()><EmojiPicker pick=Callback::new(move |n: String| { react(n, false); picker.set(false); }) close=picker /></div> }
             })}
         </div>
     }

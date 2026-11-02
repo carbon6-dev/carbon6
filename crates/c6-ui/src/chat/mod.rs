@@ -604,6 +604,12 @@ fn ConvRow(c: Value) -> impl IntoView {
     let mentions = c["mentions"].as_i64().unwrap_or(0);
     let muted = c["muted"] == true;
     let menu = RwSignal::new(false);
+    let pop = StoredValue::new(crate::util::dismissable(
+        move || menu.get(),
+        move || {
+            menu.try_set(false);
+        },
+    ));
     let status = c["user_status"].as_str().filter(|s| !s.is_empty()).map(str::to_owned);
     let name = label(&c);
     let icon = c.clone();
@@ -620,8 +626,9 @@ fn ConvRow(c: Value) -> impl IntoView {
                 {(mentions > 0).then(|| view! { <span class="rounded-full bg-red-600 px-1.5 text-[10px] font-semibold text-white">{mentions.to_string()}</span> })}
             </button>
             <button class="absolute right-1 top-0.5 hidden rounded px-1 text-xs text-muted hover:bg-zinc-300 group-hover:block dark:hover:bg-zinc-700"
-                title="Options" on:click=move |_| menu.update(|m| *m = !*m)>"⋯"</button>
-            {move || menu.get().then(|| view! { <ConvMenu c=c.clone() close=menu /> })}
+                title="Options" aria-haspopup="menu" aria-expanded=move || menu.get().to_string() data-pop=pop.get_value()
+                on:click=move |_| menu.update(|m| *m = !*m)>"⋯"</button>
+            {move || menu.get().then(|| view! { <div class="contents" data-pop=pop.get_value()><ConvMenu c=c.clone() close=menu /></div> })}
         </div>
     }
 }

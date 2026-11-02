@@ -219,6 +219,7 @@ fn feeds() -> LocalResource<Result<serde_json::Value, String>> {
 fn AppsMenu() -> impl IntoView {
     let feeds = feeds();
     let menu = NodeRef::<leptos::html::Details>::new();
+    let (pop, toggled) = util::details_pop(menu);
     let close = move |_| {
         if let Some(d) = menu.get_untracked() {
             d.set_open(false);
@@ -226,7 +227,7 @@ fn AppsMenu() -> impl IntoView {
     };
     let item = "rounded-md px-2 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800";
     view! {
-        <details node_ref=menu class="relative shrink-0">
+        <details node_ref=menu data-pop=pop on:toggle=toggled class="relative shrink-0">
             <summary class=format!("{NAV} cursor-pointer list-none whitespace-nowrap")>"Apps ▾"</summary>
             <div class="absolute left-0 top-8 z-40 flex w-48 flex-col rounded-lg border border-zinc-200 bg-white p-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900" on:click=close>
                 {move || feeds.get().and_then(Result::ok).map(|f| view! {
@@ -247,15 +248,20 @@ fn AppsMenu() -> impl IntoView {
 #[component]
 fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
     let menu = NodeRef::<leptos::html::Details>::new();
+    let (pop, toggled) = util::details_pop(menu);
     let feeds = feeds();
-    // Close after choosing something.
-    let close = move |_| {
+    // Close after choosing something (not on opening the Views drop-down in it).
+    let close = move |ev: web_sys::MouseEvent| {
+        let target = ev.target().and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok());
+        if target.is_some_and(|t| t.closest("summary").ok().flatten().is_some()) {
+            return;
+        }
         if let Some(d) = menu.get_untracked() {
             d.set_open(false);
         }
     };
     view! {
-        <details node_ref=menu class="relative xl:hidden">
+        <details node_ref=menu data-pop=pop on:toggle=toggled class="relative xl:hidden">
             <summary class="cursor-pointer list-none rounded-md px-2 py-1 text-sm text-zinc-600 dark:text-zinc-400">
                 "☰"
                 {move || (attention.get() > 0).then(|| view! { <span class="ml-1 rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white">{attention.get()}</span> })}
@@ -350,6 +356,7 @@ fn PlaceMenu() -> impl IntoView {
         api::elsewhere()
     });
     let menu = NodeRef::<leptos::html::Details>::new();
+    let (pop, toggled) = util::details_pop(menu);
     let here = place::realm();
     let elsewhere = {
         let here = here.clone();
@@ -375,7 +382,7 @@ fn PlaceMenu() -> impl IntoView {
         }
     };
     view! {
-        <details node_ref=menu class="relative">
+        <details node_ref=menu data-pop=pop on:toggle=toggled class="relative">
             <summary class="flex cursor-pointer list-none items-center gap-1.5 rounded-md border border-zinc-300 px-2 py-0.5 text-sm dark:border-zinc-700"
                 title="Where you are: a realm, or the console">
                 {match here.clone() {

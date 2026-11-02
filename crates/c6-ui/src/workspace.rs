@@ -1655,19 +1655,25 @@ pub fn below_element(el: Option<&web_sys::Element>, width: f64) -> (f64, f64) {
 }
 
 /// A popover at a place on screen (from [`below`]); a click outside it
-/// closes it, and so does Esc.
+/// closes it, and so does Esc wherever focus is (focus going back to what
+/// opened it).
 #[component]
 pub fn Popover(at: RwSignal<Option<(f64, f64)>>, #[prop(into)] class: String, children: ChildrenFn) -> impl IntoView {
     let class = StoredValue::new(class);
     let children = StoredValue::new(children);
+    let pop = StoredValue::new(crate::util::escapable(
+        move || at.with(Option::is_some),
+        move || {
+            at.try_set(None);
+        },
+    ));
     move || {
         at.get().map(|(x, y)| {
             view! {
                 <div class="fixed inset-0 z-40" on:click=move |ev| { ev.stop_propagation(); at.set(None) }></div>
-                <div
+                <div data-pop=pop.get_value()
                     class=format!("fixed z-50 max-h-[75vh] overflow-y-auto rounded-lg border border-zinc-200 bg-white p-2 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900 {}", class.get_value())
                     style=format!("left:{x}px;top:{y}px")
-                    on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); at.set(None) }
                 >
                     {children.with_value(|c| c())}
                 </div>

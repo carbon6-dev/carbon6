@@ -4010,6 +4010,12 @@ fn Composer(
     // Whether the model chip's menu (the model and its subagents') is open.
     let picking = RwSignal::new(false);
     let toggle = move || picking.update(|p| *p = !*p);
+    let picking_pop = StoredValue::new(crate::util::dismissable(
+        move || picking.get(),
+        move || {
+            picking.try_set(false);
+        },
+    ));
     let id = StoredValue::new(id);
     let area = NodeRef::<leptos::html::Textarea>::new();
     crate::util::autosize(area, move || text.track());
@@ -4108,6 +4114,15 @@ fn Composer(
             command.set(c);
         }
     };
+    // The suggestions go on a press outside them and the box, or Escape.
+    let suggesting = Memo::new(move |_| !suggestions().is_empty());
+    let suggest_pop = StoredValue::new(crate::util::dismissable(
+        move || suggesting.get(),
+        move || {
+            mention.try_set(None);
+            command.try_set(None);
+        },
+    ));
     let complete_command = move |name: String| {
         let t = text.get_untracked();
         let rest = t.split_once(char::is_whitespace).map(|(_, r)| r.trim_start().to_owned()).unwrap_or_default();
@@ -4284,6 +4299,12 @@ fn Composer(
     let beside = if inline { None } else { use_context::<GlanceBeside>() };
     // The ▾ beside Send while the agent works.
     let send_menu = RwSignal::new(false);
+    let send_pop = StoredValue::new(crate::util::dismissable(
+        move || send_menu.get(),
+        move || {
+            send_menu.try_set(false);
+        },
+    ));
     // Send now: the agent gets it at once. Claude Code moves what holds its
     // turn to the background (or stops only that turn), sparing its
     // background agents; carbon6's own loop stops the step and this starts
@@ -4362,7 +4383,7 @@ fn Composer(
                     {move || {
                         let list = suggestions();
                         (!list.is_empty()).then(|| view! {
-                            <div class="absolute bottom-full left-0 z-30 mb-1 max-h-64 w-full max-w-lg overflow-y-auto rounded-md border border-zinc-200 bg-white py-1 text-xs shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
+                            <div data-pop=suggest_pop.get_value() class="absolute bottom-full left-0 z-30 mb-1 max-h-64 w-full max-w-lg overflow-y-auto rounded-md border border-zinc-200 bg-white py-1 text-xs shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
                                 {list.into_iter().enumerate().map(|(i, s)| {
                                     let row = move || format!("block w-full truncate px-3 py-1 text-left {}", if picked.get() == i { "bg-zinc-100 dark:bg-zinc-800" } else { "" });
                                     match s {
@@ -4418,6 +4439,7 @@ fn Composer(
                         class=move || format!("block w-full bg-transparent px-3 pb-1.5 pt-2 text-sm outline-none {} {}", crate::util::GROWS, match (shown_next().is_some(), touch) { (true, true) => "pr-9 placeholder:italic", (true, false) => "placeholder:italic", _ => "" })
                         rows="1"
                         enterkeyhint=if touch { "enter" } else { "send" }
+                        data-pop=suggest_pop.get_value()
                         placeholder=move || if let Some(s) = shown_next() { s } else if disabled.get() { "This session failed to start.".to_owned() } else if touch {
                             // A phone's box is narrow: a hint that fits.
                             if running.get() { "Message: read at its next step…" } else if wake.is_some() { "Message the subagent" } else if inline { "Reply in this side chat" } else { "Message the agent" }.to_owned()
@@ -4527,7 +4549,8 @@ fn Composer(
                                     label.push_str(&format!(" · subagents {}", model_label(&sm, &se)));
                                 }
                                 view! {
-                                    <button class=CHIP title="The model this session and its subagents run on: change them" aria-label=format!("Model: {label}, change it") on:click=move |_| toggle()>
+                                    <button class=CHIP title="The model this session and its subagents run on: change them" aria-label=format!("Model: {label}, change it")
+                                        aria-expanded=move || picking.get().to_string() data-pop=picking_pop.get_value() on:click=move |_| toggle()>
                                         <span class="min-w-0 truncate">{label.clone()}</span>
                                         // What's left of its plan, when it has one.
                                         <crate::quota::QuotaNote connection=Signal::derive(move || m.current.get().0) />
@@ -4536,23 +4559,22 @@ fn Composer(
                                 }
                             }}
                             {move || switch_note(m, kinds.get().and_then(Result::ok).unwrap_or_default()).map(|(text, title)| view! {
-                                <button class="rounded-full bg-amber-100 px-2 py-0.5 text-amber-800 dark:bg-amber-950 dark:text-amber-300" title=title on:click=move |_| toggle()>{text}</button>
+                                <button class="rounded-full bg-amber-100 px-2 py-0.5 text-amber-800 dark:bg-amber-950 dark:text-amber-300" title=title data-pop=picking_pop.get_value() on:click=move |_| toggle()>{text}</button>
                             })}
                         })}
                         // No model chip to hold them (no caller does this today):
                         // subagents keep a chip of their own.
                         {subagents.filter(|_| model.is_none()).map(|s| view! {
                             {move || { let (_, mm, e) = s.current.get(); let label = (!mm.is_empty()).then(|| model_label(&mm, &e)); view! {
-                                <button class=CHIP title=SUBAGENTS_HELP aria-label=format!("Subagents' model: {}, change it", label.as_deref().unwrap_or("the session's")) on:click=move |_| toggle()>
+                                <button class=CHIP title=SUBAGENTS_HELP aria-label=format!("Subagents' model: {}, change it", label.as_deref().unwrap_or("the session's"))
+                                    aria-expanded=move || picking.get().to_string() data-pop=picking_pop.get_value() on:click=move |_| toggle()>
                                     <span class="min-w-0 truncate">{match &label { Some(l) => format!("subagents: {l}"), None => "subagents".to_owned() }}</span>
                                     <span class="text-muted">"▾"</span>
                                 </button>
                             } }}
                         })}
                         {move || picking.get().then(|| view! {
-                            <div class="fixed inset-0 z-30" on:click=move |_| picking.set(false)></div>
-                            <div class="absolute bottom-full left-0 z-40 mb-1 w-max max-w-[90vw] sm:max-w-xl space-y-2 rounded-lg border border-zinc-200 bg-white p-3 text-zinc-700 shadow-lg dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
-                                on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); picking.set(false) }>
+                            <div data-pop=picking_pop.get_value() class="absolute bottom-full left-0 z-40 mb-1 w-max max-w-[90vw] sm:max-w-xl space-y-2 rounded-lg border border-zinc-200 bg-white p-3 text-zinc-700 shadow-lg dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200">
                                 {model.map(|m| view! {
                                     <div class="font-medium">"Model"</div>
                                     <div class="flex flex-wrap items-center gap-2"><ModelPicker connection=m.connection model=m.model effort=m.effort no_claude_code claude_off=claude_off /></div>
@@ -4614,13 +4636,12 @@ fn Composer(
                                 <div class="relative flex items-center gap-0.5">
                                     <button class="flex h-5.5 items-center rounded-md px-1 text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
                                         title="More ways to send" aria-label="More ways to send"
-                                        aria-haspopup="menu" prop:aria-expanded=move || send_menu.get().to_string()
+                                        aria-haspopup="menu" prop:aria-expanded=move || send_menu.get().to_string() data-pop=send_pop.get_value()
                                         on:click=move |ev| { ev.stop_propagation(); send_menu.update(|o| *o = !*o); }>"▾"</button>
                                     <button class=format!("{SEND} {SEND_SHAPE} {SEND_READY}") title=format!("{send_label}: the agent reads it at its next step") aria-label=send_label
                                         prop:disabled=move || disabled.get() on:click=move |_| send()>{send_icon()}</button>
                                     {move || send_menu.get().then(|| view! {
-                                        <div class="fixed inset-0 z-30" on:click=move |_| send_menu.set(false)></div>
-                                        <div role="menu" class="absolute bottom-full right-0 z-40 mb-1 w-max rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
+                                        <div role="menu" data-pop=send_pop.get_value() class="absolute bottom-full right-0 z-40 mb-1 w-max rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
                                             <button role="menuitem" class="flex w-full items-center gap-4 px-3 py-1.5 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
                                                 title="The agent gets it now, not at its next step (Claude Code moves what it waits on to the background; its background agents go on)" on:click=move |_| send_now()>
                                                 <span>"Send now"</span>

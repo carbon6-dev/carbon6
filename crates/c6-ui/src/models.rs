@@ -26,6 +26,14 @@ pub fn ModelInput(
     #[prop(optional)] list: Option<Listed>,
 ) -> impl IntoView {
     let shown = RwSignal::new(false);
+    // Opened by ▾ (the box keeping no focus), a press outside or Escape
+    // closes it too.
+    let pop = StoredValue::new(crate::util::dismissable(
+        move || shown.get() && !disabled.get(),
+        move || {
+            shown.try_set(false);
+        },
+    ));
     let connections = LocalResource::new(api::connections);
     // Asked for when the list is first shown, and again for another connection.
     let offered = LocalResource::new(move || {
@@ -67,7 +75,7 @@ pub fn ModelInput(
         }
     });
     view! {
-        <div class="relative" node_ref=wrap>
+        <div class="relative" node_ref=wrap data-pop=pop.get_value()>
             <div class="flex">
                 <input class=format!("{class} rounded-r-none font-mono") autocomplete="off" placeholder=move || placeholder.get()
                     prop:disabled=move || disabled.get()

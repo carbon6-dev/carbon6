@@ -224,10 +224,69 @@ pub fn NoticeHost() -> impl IntoView {
 type PutAway = std::rc::Rc<dyn Fn()>;
 type Hook = wasm_bindgen::closure::Closure<dyn FnMut(web_sys::Event)>;
 
+/// Something popped up: which one, the component that popped it up (one
+/// that a component within that one pops up is within it), and how it goes
+/// away.
+struct Up {
+    id: u64,
+    owner: Option<Owner>,
+    put_away: PutAway,
+}
+
 thread_local! {
     static POPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    /// What pops up now, and how it goes away: one at a time.
-    static SHOWN: std::cell::RefCell<Option<(u64, PutAway)>> = const { std::cell::RefCell::new(None) };
+    /// What pops up now, outermost first: one at a time, or one within
+    /// another (a drop-down in a menu).
+    static SHOWN: std::cell::RefCell<Vec<Up>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Of what's up (outermost first) when another pops up: what stays (what
+/// it pops up within, `holds`) and what goes.
+fn opening<T>(shown: Vec<T>, holds: impl Fn(&T) -> bool) -> (Vec<T>, Vec<T>) {
+    shown.into_iter().partition(holds)
+}
+
+/// Whether an Escape is this one's: only the innermost goes.
+fn innermost(shown: &[u64], id: u64) -> bool {
+    shown.last() == Some(&id)
+}
+
+/// What opens a pop-up: what carries its `data-pop` and takes focus, or a
+/// `<details>`' summary.
+fn opener_selector(key: &str) -> String {
+    format!(":is(button, summary, input, [role=button])[data-pop=\"{key}\"], [data-pop=\"{key}\"] > summary")
+}
+
+/// Whether `owner` is a component within `of` (not `of` itself: two that
+/// one component pops up are side by side).
+fn within(owner: &Owner, of: &Owner) -> bool {
+    let mut at = owner.parent();
+    while let Some(o) = at {
+        if &o == of {
+            return true;
+        }
+        at = o.parent();
+    }
+    false
+}
+
+/// Where Escape puts focus back: what opened it (focused as it opened, else
+/// the first of its openers on screen); for a pop-up whose opener isn't
+/// marked, what had focus outside it.
+fn opener_of(mine: &str, key: &str) -> Option<web_sys::HtmlElement> {
+    use wasm_bindgen::JsCast;
+    let doc = document();
+    let openers = opener_selector(key);
+    let body: Option<web_sys::Element> = doc.body().map(Into::into);
+    let active = doc.active_element().filter(|a| body.as_ref() != Some(a));
+    if let Some(a) = active.as_ref().filter(|a| a.matches(&openers).unwrap_or(false)) {
+        return a.clone().dyn_into().ok();
+    }
+    let all = doc.query_selector_all(&openers).ok()?;
+    let on_screen = (0..all.length())
+        .filter_map(|i| all.item(i)?.dyn_into::<web_sys::HtmlElement>().ok())
+        .find(|e| e.offset_width() > 0 || e.offset_height() > 0);
+    on_screen.or_else(|| active.filter(|a| a.closest(mine).ok().flatten().is_none()).and_then(|a| a.dyn_into().ok()))
 }
 
 /// The document's listeners while something pops up; dropped, they go.
@@ -241,12 +300,7 @@ impl Drop for Dismiss {
         for (kind, f) in &self.hooks {
             let _ = document().remove_event_listener_with_callback_and_bool(kind, wasm_bindgen::JsCast::unchecked_ref(f.as_ref()), true);
         }
-        SHOWN.with(|s| {
-            let mut s = s.borrow_mut();
-            if s.as_ref().is_some_and(|(i, _)| *i == self.id) {
-                *s = None;
-            }
-        });
+        SHOWN.with(|s| s.borrow_mut().retain(|x| x.id != self.id));
     }
 }
 
@@ -254,11 +308,26 @@ impl Drop for Dismiss {
 /// expect: a press anywhere else (`pointerdown`, a tap and a click alike;
 /// a touch scroll starts with one), a wheel scrolling anywhere else, focus
 /// moving elsewhere, Escape (which goes no further, so it doesn't also stop
-/// a running turn), and another one opening. Scrolling the page by itself
-/// (a transcript following its turn) leaves it open. Nothing covers the
-/// page, so scrolling stays the page's. What belongs to it (its button and
-/// what it shows) carries `data-pop`, the value returned.
+/// a running turn, and puts focus back on what opened it), and another one
+/// opening (but not one opening within it, which goes first on Escape).
+/// Scrolling the page by itself (a transcript following its turn) leaves
+/// it open. Nothing covers the page, so scrolling stays the page's. What
+/// belongs to it (its button and what it shows) carries `data-pop`, the
+/// value returned: a press on its button is no press outside, so the button
+/// alone toggles it. `close` may run once its component is gone: `try_set`.
 pub fn dismissable(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static) -> String {
+    pop_up(shown, close, true)
+}
+
+/// As `dismissable`, for what covers the page to catch a press outside it
+/// (`Popover`): Escape, one at a time and focus going back, but presses,
+/// wheels and focus left to what covers the page. What it shows carries
+/// `data-pop` (and its button, if one opens it, for focus to go back to).
+pub fn escapable(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static) -> String {
+    pop_up(shown, close, false)
+}
+
+fn pop_up(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static, outside_closes: bool) -> String {
     use wasm_bindgen::JsCast;
     let id = POPS.with(|n| {
         n.set(n.get() + 1);
@@ -266,6 +335,8 @@ pub fn dismissable(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone 
     });
     let key = format!("pop{id}");
     let mine = format!("[data-pop=\"{key}\"]");
+    let marked = key.clone();
+    let owner = Owner::current();
     let hooks = StoredValue::new_local(None::<Dismiss>);
     Effect::new(move || {
         if !shown() {
@@ -275,12 +346,18 @@ pub fn dismissable(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone 
         if hooks.with_value(Option::is_some) {
             return;
         }
-        let put_away: PutAway = std::rc::Rc::new(close.clone());
-        let before = SHOWN.with(|s| s.borrow_mut().replace((id, put_away)));
-        if let Some((other, put_away)) = before
-            && other != id
-        {
-            put_away();
+        // What it doesn't pop up within goes (put away once the list is
+        // let go of).
+        let gone = SHOWN.with(|s| {
+            let mut s = s.borrow_mut();
+            let holds = |x: &Up| owner.as_ref().zip(x.owner.as_ref()).is_some_and(|(o, of)| within(o, of));
+            let (stay, gone) = opening(std::mem::take(&mut *s), holds);
+            *s = stay;
+            s.push(Up { id, owner: owner.clone(), put_away: std::rc::Rc::new(close.clone()) });
+            gone
+        });
+        for x in gone {
+            (x.put_away)();
         }
         let outside = {
             let mine = mine.clone();
@@ -291,24 +368,32 @@ pub fn dismissable(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone 
             }
         };
         let mut d = Dismiss { id, hooks: Vec::new() };
-        for kind in ["pointerdown", "wheel", "focusin"] {
-            let (outside, close) = (outside.clone(), close.clone());
-            d.hooks.push((
-                kind,
-                wasm_bindgen::closure::Closure::new(move |ev: web_sys::Event| {
-                    if outside(&ev) {
-                        close();
-                    }
-                }),
-            ));
+        if outside_closes {
+            for kind in ["pointerdown", "wheel", "focusin"] {
+                let (outside, close) = (outside.clone(), close.clone());
+                d.hooks.push((
+                    kind,
+                    wasm_bindgen::closure::Closure::new(move |ev: web_sys::Event| {
+                        if outside(&ev) {
+                            close();
+                        }
+                    }),
+                ));
+            }
         }
+        let opener = opener_of(&mine, &marked);
         let close = close.clone();
         d.hooks.push((
             "keydown",
             wasm_bindgen::closure::Closure::new(move |ev: web_sys::Event| {
-                if ev.dyn_ref::<web_sys::KeyboardEvent>().is_some_and(|k| k.key() == "Escape") {
-                    ev.stop_propagation();
-                    close();
+                let escape = ev.dyn_ref::<web_sys::KeyboardEvent>().is_some_and(|k| k.key() == "Escape" && !k.is_composing());
+                if !escape || !SHOWN.with(|s| innermost(&s.borrow().iter().map(|x| x.id).collect::<Vec<_>>(), id)) {
+                    return;
+                }
+                ev.stop_propagation();
+                close();
+                if let Some(el) = &opener {
+                    let _ = el.focus();
                 }
             }),
         ));
@@ -321,6 +406,26 @@ pub fn dismissable(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone 
         hooks.set_value(Some(d));
     });
     key
+}
+
+/// A `<details>` drop-down that goes away as `dismissable` says: give the
+/// `<details>` the `data-pop` returned and the handler for its `toggle`.
+pub fn details_pop(menu: NodeRef<leptos::html::Details>) -> (String, impl Fn(web_sys::Event) + Copy + 'static) {
+    let open = RwSignal::new(false);
+    let pop = dismissable(
+        move || open.get(),
+        move || {
+            if let Some(d) = menu.try_get_untracked().flatten() {
+                d.set_open(false);
+            }
+            // Its `toggle` says so too, but not if it was drawn again.
+            open.try_set(false);
+        },
+    );
+    let toggled = move |_: web_sys::Event| {
+        open.try_set(menu.try_get_untracked().flatten().is_some_and(|d| d.open()));
+    };
+    (pop, toggled)
 }
 
 /// A "⋯" button and its menu. With `row`, it's a row's: on touch screens
@@ -431,4 +536,47 @@ pub fn Choices(choices: Vec<(String, String)>, value: RwSignal<String>, #[prop(o
         </div>
     }
     .into_any()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn what_pops_up_within_another_keeps_it_open() {
+        // A menu (1) holding a drop-down (2), and another opening within
+        // the drop-down: both stay.
+        assert_eq!(opening(vec![1, 2], |_| true), (vec![1, 2], vec![]));
+        // One opening elsewhere puts both away.
+        assert_eq!(opening(vec![1, 2], |_| false), (vec![], vec![1, 2]));
+        // One opening in the menu but not in its drop-down: the drop-down goes.
+        assert_eq!(opening(vec![1, 2], |x| *x == 1), (vec![1], vec![2]));
+    }
+
+    #[test]
+    fn escape_puts_away_the_innermost_only() {
+        assert!(innermost(&[1, 2], 2));
+        assert!(!innermost(&[1, 2], 1));
+        assert!(!innermost(&[], 1));
+    }
+
+    #[test]
+    fn its_opener_carries_its_mark_or_is_its_summary() {
+        assert_eq!(opener_selector("pop3"), ":is(button, summary, input, [role=button])[data-pop=\"pop3\"], [data-pop=\"pop3\"] > summary");
+    }
+
+    #[test]
+    fn a_component_is_within_its_parents() {
+        let root = Owner::new();
+        let (child, grandchild) = root.with(|| {
+            let child = Owner::new();
+            let grandchild = child.with(Owner::new);
+            (child, grandchild)
+        });
+        assert!(within(&grandchild, &root));
+        assert!(within(&grandchild, &child));
+        assert!(!within(&child, &child));
+        assert!(!within(&root, &child));
+        assert!(!within(&grandchild, &Owner::new()));
+    }
 }

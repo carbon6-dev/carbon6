@@ -21,6 +21,8 @@ pub fn ViewsMenu(class: &'static str) -> impl IntoView {
         api::views()
     });
     let menu = NodeRef::<leptos::html::Details>::new();
+    let (pop, toggled) = crate::util::details_pop(menu);
+    let pop = StoredValue::new(pop);
     let close = move |_| {
         if let Some(d) = menu.get_untracked() {
             d.set_open(false);
@@ -30,7 +32,7 @@ pub fn ViewsMenu(class: &'static str) -> impl IntoView {
         let vs: Vec<ViewDef> = views.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|v| v.menu).collect();
         (!vs.is_empty()).then(|| {
             view! {
-                <details node_ref=menu class="relative shrink-0">
+                <details node_ref=menu data-pop=pop.get_value() on:toggle=toggled class="relative shrink-0">
                     <summary class=format!("{class} cursor-pointer list-none whitespace-nowrap")>"Views ▾"</summary>
                     <div class="absolute left-0 top-8 z-40 flex w-56 flex-col rounded-lg border border-zinc-200 bg-white p-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900" on:click=close>
                         {vs.into_iter().map(|v| {
