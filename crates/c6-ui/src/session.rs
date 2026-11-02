@@ -2912,20 +2912,26 @@ fn SubagentPeek(events: RwSignal<Vec<Event>>, streaming: RwSignal<Streaming>) ->
 /// Normalizes tool names across profiles (Claude, Codex, generic).
 /// A tool's name as people read it: an MCP server's tool
 /// (`mcp__carbon6__SendMessage`) as its words ("Send message") and its
-/// server ("carbon6"); any other tool as it's named.
+/// server ("carbon6"); Ask's tools for carbon6's operations as "carbon6"
+/// (what they do, in words, is their summary); any other tool as it's
+/// named.
 fn tool_label(name: &str) -> (String, Option<String>) {
+    if matches!(tool_kind(name), "c6_call" | "c6_discover" | "c6_describe") {
+        return ("carbon6".to_owned(), None);
+    }
     let Some(rest) = name.strip_prefix("mcp__") else { return (name.to_owned(), None) };
     let Some((server, tool)) = rest.split_once("__") else { return (name.to_owned(), None) };
     let server = server.strip_prefix("claude_ai_").unwrap_or(server).replace('_', " ");
     (words(tool), Some(server))
 }
 
-/// `SendMessage` or `send_message` as "Send message".
+/// `SendMessage`, `send_message` or `settings.routes.put` as "Send
+/// message", "Settings routes put".
 fn words(s: &str) -> String {
     let mut out = String::new();
     let mut prev_lower = false;
     for c in s.chars() {
-        if c == '_' || c == '-' {
+        if c == '_' || c == '-' || c == '.' {
             out.push(' ');
             prev_lower = false;
             continue;
@@ -2959,6 +2965,8 @@ fn tool_kind(name: &str) -> &str {
         "doc" | "Doc" | "mcp__carbon6__doc" => "doc",
         "c6_ask" | "mcp__carbon6__ask" => "ask",
         "app_call" | "AppCall" | "mcp__carbon6__app_call" | "mcp__carbon6__AppCall" => "app_call",
+        // Ask's (docs/assistant.md): an operation run, looked up, read.
+        "c6_call" | "c6_discover" | "c6_describe" => name,
         other => other,
     }
 }
@@ -3033,6 +3041,19 @@ fn summarize(name: &str, input: &serde_json::Value) -> String {
             let target = if instance.is_empty() { op } else { format!("{instance}.{op}") };
             if args.is_empty() { format!("run {target}") } else { format!("run {target} ({})", args.join(", ")) }
         }
+        // What Ask does, in words rather than its JSON.
+        "c6_call" => match s("op").as_str() {
+            "" => "Run a carbon6 operation".into(),
+            "sessions.create" => "Start a session".into(),
+            "docs.create" => "Make a document".into(),
+            op => words(op),
+        },
+        "c6_discover" => match (s("query"), s("area")) {
+            (q, _) if !q.trim().is_empty() => format!("Look up {}", q.trim()),
+            (_, a) if !a.is_empty() => format!("Look up what {a} can do"),
+            _ => "Look up what carbon6 can do".into(),
+        },
+        "c6_describe" => format!("Read how {} works", s("op")),
         // Its title, else its first question.
         "ask" => {
             let first = input.pointer("/fields/0/label").and_then(|v| v.as_str()).unwrap_or("").to_owned();
@@ -3056,6 +3077,82 @@ fn plan_items(input: &serde_json::Value) -> Vec<(String, String)> {
             (text, i.get("status").and_then(|v| v.as_str()).unwrap_or("pending").to_owned())
         })
         .collect()
+}
+
+/// The session a `sessions.create` call made, from its result (the
+/// session, as JSON; its start if the output was cut short): its id and
+/// title.
+fn made_session(output: &str) -> Option<(String, String)> {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(output) {
+        let id = v["id"].as_str().filter(|i| !i.is_empty())?.to_owned();
+        return Some((id, v["title"].as_str().unwrap_or("").to_owned()));
+    }
+    let field = |k: &str| {
+        let at = output.find(&format!("\"{k}\":"))? + k.len() + 3;
+        let rest = output[at..].trim_start().strip_prefix('"')?;
+        Some(rest[..rest.find('"')?].to_owned())
+    };
+    Some((field("id").filter(|i| !i.is_empty())?, field("title").unwrap_or_default()))
+}
+
+/// A session Ask started: its colour as a stripe, its title, how it
+/// stands and where it runs, live; it opens the session (⌘/Ctrl-click: in
+/// a new tile). One line with an Open button on a desktop, two short lines
+/// to tap on a phone.
+#[component]
+fn MadeSession(id: String, title: String) -> impl IntoView {
+    let live = api::live();
+    let (col, ws) = (use_column(), crate::workspace::use_workspace());
+    let row = {
+        let id = id.clone();
+        Memo::new(move |_| live.sessions.with(|ss| ss.iter().find(|s| s.id == id).cloned()))
+    };
+    let target = StoredValue::new(id.clone());
+    let open = move |ev: web_sys::MouseEvent| {
+        // Not the tool card's details opening and closing.
+        ev.prevent_default();
+        ev.stop_propagation();
+        let (to, how) = (View::session(target.get_value()), crate::workspace::How::from_mouse(&ev));
+        match col {
+            Some(c) => c.open(to, how),
+            None => ws.open(None, to, how),
+        }
+    };
+    let hashed = c6_api::marks::hashed(&id).to_owned();
+    view! {
+        <div class="mt-1.5 flex basis-full cursor-pointer items-stretch overflow-hidden rounded-md border border-zinc-200 bg-white hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900 dark:hover:bg-zinc-800"
+            title="Open the session (⌘-click: in a new tile)" on:click=open>
+            <span class="w-1 shrink-0" style=move || crate::marks::fill(&row.with(|r| r.as_ref().map(crate::marks::of)).unwrap_or_else(|| hashed.clone()))></span>
+            {move || {
+                let s = row.get();
+                let title = s.as_ref().map(|s| s.title.clone()).filter(|t| !t.trim().is_empty())
+                    .or_else(|| Some(title.clone()).filter(|t| !t.trim().is_empty()))
+                    .unwrap_or_else(|| "New session".into());
+                let (cls, word) = match &s {
+                    Some(s) if s.awaiting_approval => ("text-amber-700 dark:text-amber-400", "needs you"),
+                    Some(s) => match s.display_status() {
+                        SessionStatus::Running => ("text-blue-600 dark:text-blue-400", "● running"),
+                        SessionStatus::Idle => ("text-zinc-500", "idle"),
+                        SessionStatus::Starting => ("text-amber-700 dark:text-amber-400", "starting"),
+                        SessionStatus::Failed => ("text-red-600 dark:text-red-400", "failed"),
+                    },
+                    None => ("text-zinc-500", "starting"),
+                };
+                let place = s.as_ref().map(|s| live.session_worker(s));
+                view! {
+                    <div class="flex min-w-0 flex-1 flex-col px-2 py-1 md:flex-row md:items-center md:gap-2">
+                        <span class="truncate text-sm font-medium">{title}</span>
+                        <span class="flex min-w-0 shrink-0 items-center gap-1.5 text-xs">
+                            <span class=cls>{word}</span>
+                            {place.map(|p| view! { <span class="truncate text-zinc-500">{format!("· {p}")}</span> })}
+                        </span>
+                    </div>
+                }
+            }}
+            <button class="mr-1.5 hidden shrink-0 self-center rounded-md border border-zinc-200 px-2 py-0.5 text-xs hover:bg-zinc-100 md:block dark:border-zinc-700 dark:hover:bg-zinc-700"
+                on:click=open>"Open"</button>
+        </div>
+    }
 }
 
 #[component]
@@ -3103,9 +3200,15 @@ fn ToolCard(
         let to = input.get("to").and_then(|v| v.as_str()).unwrap_or_default().to_owned();
         Memo::new(move |_| s.resolve(&to))
     });
+    // Ask's operation, if it is one: a session or a document it made shows
+    // as a card.
+    let op = if kind == "c6_call" { input.get("op").and_then(|v| v.as_str()).unwrap_or("").to_owned() } else { String::new() };
+    let worded = matches!(kind.as_str(), "c6_call" | "c6_discover" | "c6_describe");
+    let made_session = (op == "sessions.create")
+        .then(|| Memo::new(move |_| result.with(|r| r.as_ref().filter(|r| !r.is_error).and_then(|r| made_session(&r.output)))));
     // A document it wrote: a card that opens it (docs/docs.md §12).
-    let doc_card = (kind == "doc").then(|| {
-        let action = input.get("action").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+    let doc_card = (kind == "doc" || op == "docs.create").then(|| {
+        let action = if op == "docs.create" { "created" } else { input.get("action").and_then(|v| v.as_str()).unwrap_or("") }.to_owned();
         Signal::derive(move || {
             let r = result.get().filter(|r| !r.is_error)?;
             let v: serde_json::Value = serde_json::from_str(&r.output).ok()?;
@@ -3152,7 +3255,12 @@ fn ToolCard(
     view! {
         <div id=dom_id class=format!("rounded-md border border-zinc-200 text-sm dark:border-zinc-800 {}", Arrived::class())>
         <details class="group" open=started_open>
-            <summary class="flex cursor-pointer select-none items-center gap-2 px-3 py-1.5">
+            // A session it made shows on a line of its own below.
+            <summary class=if made_session.is_some() {
+                "flex cursor-pointer select-none flex-wrap items-center gap-x-2 px-3 py-1.5"
+            } else {
+                "flex cursor-pointer select-none items-center gap-2 px-3 py-1.5"
+            }>
                 {move || {
                     let (icon, cls) = match result.get() {
                         None => ("●", "animate-pulse text-blue-500"),
@@ -3170,7 +3278,7 @@ fn ToolCard(
                         {server.map(|s| view! { <span class="shrink-0 whitespace-nowrap rounded bg-zinc-100 px-1 text-[10px] text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400" title=name.clone()>{s}</span> })}
                     }
                 }
-                <span class="min-w-0 flex-1 truncate font-mono text-xs text-zinc-500">{summary}</span>
+                <span class=if worded { "min-w-0 flex-1 truncate text-xs text-zinc-600 dark:text-zinc-300" } else { "min-w-0 flex-1 truncate font-mono text-xs text-zinc-500" }>{summary}</span>
                 {sent_to.map(|(to, title)| view! {
                     <Go to=View::session(to.clone()) class="min-w-0 max-w-[50%] truncate text-[11px] text-sky-700 hover:underline dark:text-sky-400" stop=true>
                         {move || format!("→ sent to {} ↗", title.get().unwrap_or_else(|| "a session".into()))}
@@ -3184,6 +3292,7 @@ fn ToolCard(
                     }
                 })}
                 {move || result.get().map(|r| view! { <span class="shrink-0 whitespace-nowrap text-[11px] text-zinc-400">{format!("{:.1}s", r.duration_ms as f64 / 1000.0)}</span> })}
+                {move || made_session.and_then(|m| m.get()).map(|(id, title)| view! { <MadeSession id title /> })}
             </summary>
             <div class="space-y-2 border-t border-zinc-200 px-3 py-2 dark:border-zinc-800">
                 {plan.map(|items| view! {
@@ -4489,6 +4598,37 @@ mod tests {
         assert_eq!(tool_label("mcp__carbon6__doc"), ("Doc".to_owned(), Some("carbon6".to_owned())));
         assert_eq!(tool_label("Bash"), ("Bash".to_owned(), None), "other tools as named");
         assert_eq!(tool_label("web_fetch"), ("web_fetch".to_owned(), None));
+        assert_eq!(tool_label("c6_call"), ("carbon6".to_owned(), None), "Ask's: what it does is the summary");
+    }
+
+    #[test]
+    fn asks_operations_read_as_words() {
+        let call = |op: &str| summarize("c6_call", &serde_json::json!({"op": op, "input": {"body": {"prompt": "x"}}}));
+        assert_eq!(call("sessions.create"), "Start a session");
+        assert_eq!(call("docs.create"), "Make a document");
+        assert_eq!(call("settings.routes.put"), "Settings routes put");
+        assert_eq!(call("workers.enrollments.create"), "Workers enrollments create");
+        assert_eq!(summarize("c6_call", &serde_json::Value::Null), "Run a carbon6 operation");
+        let discover = |v: serde_json::Value| summarize("c6_discover", &v);
+        assert_eq!(
+            discover(serde_json::json!({"query": " enrollment token for a new worker "})),
+            "Look up enrollment token for a new worker"
+        );
+        assert_eq!(discover(serde_json::json!({"area": "sessions"})), "Look up what sessions can do");
+        assert_eq!(discover(serde_json::json!({})), "Look up what carbon6 can do");
+        assert_eq!(summarize("c6_describe", &serde_json::json!({"op": "sessions.create"})), "Read how sessions.create works");
+    }
+
+    #[test]
+    fn the_session_a_call_made() {
+        let made =
+            serde_json::json!({"id": "01a18f50-9f48-7567-8070-43e1f17ba642", "title": "Fix the login", "work": {"id": "w1", "title": "t"}});
+        let whole = serde_json::to_string_pretty(&made).unwrap();
+        let want = Some(("01a18f50-9f48-7567-8070-43e1f17ba642".to_owned(), "Fix the login".to_owned()));
+        assert_eq!(made_session(&whole), want);
+        assert_eq!(made_session(&whole[..whole.len() - 30]), want, "cut short");
+        assert_eq!(made_session("no operation \"sessions.create\""), None);
+        assert_eq!(made_session("{\"error\": \"x\"}"), None);
     }
 
     fn log(users: &[u64], n: u64) -> Vec<Event> {
