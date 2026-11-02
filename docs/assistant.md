@@ -173,12 +173,13 @@ The tool waits for the submitted values, the same way an approval waits. Cancell
   | Reads of every kind | root may read every realm |
   | `sessions.update`, `sessions.labels.set`, `sessions.colour.set`, `sessions.subagent_model.set`, `sessions.seen`, `sessions.viewed`, `sessions.suggestion.seen`, `marks.set`, `attention.seen`, `work.seen`, `decisions.edit` | housekeeping (a title, labels, a mark, seen, snooze or dismiss) that carries nothing to an agent |
   | `sessions.interrupt`, `sessions.resume`, `sessions.notices.deliver`, `sessions.queue.dismiss`, `sessions.queue.pull`, `work.refresh`, `projects.refresh` | steers a session or note with what is already in the realm (a resume uses the realm's own prompt) |
-  | `sessions.approvals.decide`, `workflows.steps.decide` | an allow or deny with no text; the same as in any realm |
   | `work.detach`, `work.merge`, `projects.detach`, `projects.merge`, `projects.docs`, `projects.plan`, `projects.proposed`, `projects.propose`, `projects.sessions.*`, `docs.restore`, `docs.export`, `docs.resolve`, `docs.comments.send`, `decks.bring_in` | rearranges or sends on what is already in the realm |
   | `memex.summarize`, `memex.review.decide`, `memex.commitment.set`, `memex.scan`, `google.sync`, `mail.requests.*`, `mail.triage.*`, `mail.drafts.link`, `mail.drafts.clear` | made from the realm's own knowledge, or a status |
   | `mail.draft`, `mail.modify`, `calendar.*`, `contacts.*`, `chat.*` | your own Google and Slack accounts, outside carbon6; sending mail and deleting ask already (destructive) |
   | `workers.fs.mkdir`, `workers.terminals.open`, `notifications.test` | a machine's folder, a terminal you use yourself, a test notification |
   | Destructive operations (deletes, `sessions.rewind`, `mail.send`…) | ask already, as everywhere |
+
+- **Approvals are yours, in every realm.** The assistant never allows or denies a tool call, a workflow step or an approve decision (`sessions.approvals.decide`, `workflows.steps.decide`, `decisions.answer` on an approve decision); it says what waits and that you answer it in its card. So a policy that holds a call for you can't be passed by an agent (`assistant::yours_to_approve`).
 
 ## 9. Open questions
 

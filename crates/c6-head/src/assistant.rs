@@ -863,6 +863,9 @@ impl Tool for Call {
         // trigger…) goes as that realm's, only once you approve the realm
         // and exactly what goes there.
         let mut elsewhere: Option<IntoRealm> = None;
+        if let Some(why) = yours_to_approve(st, &name, &args).await {
+            return ToolOutput::err(why);
+        }
         if self.env.realm == crate::realms::ROOT {
             let unsealed = serde_json::to_string(&args).unwrap_or_default() != shown;
             match into_realm(st, op, &mut args, unsealed).await {
@@ -1102,6 +1105,24 @@ fn reach(op: &str) -> Option<Reach> {
 /// itself). What it carries is shown in full, so nothing that could hide
 /// more goes: no files or attachments, no secret you gave it, nothing over
 /// PROMPT_SHOWN characters. `unsealed`: a secret was put in its input.
+/// Allowing or denying what waits on your approval (a tool call, a
+/// workflow step, an approve decision) is yours: Ask never answers it, in
+/// any realm, so a policy that holds a call for you can't be passed by an
+/// agent. It points you to the card instead.
+async fn yours_to_approve(st: &HeadState, name: &str, args: &Value) -> Option<String> {
+    let approval = match name {
+        "sessions.approvals.decide" | "workflows.steps.decide" => true,
+        "decisions.answer" => match args["id"].as_i64().or_else(|| args["id"].as_str().and_then(|i| i.parse().ok())) {
+            Some(id) => crate::decisions::get(st, id).await.ok().flatten().is_some_and(|d| d.kind == "approve"),
+            None => false,
+        },
+        _ => false,
+    };
+    approval.then(|| {
+        "approvals are the user's to answer, not yours: don't allow or deny it. Tell them it's waiting, and that they answer it in its approval card (or in Decisions)".to_owned()
+    })
+}
+
 async fn into_realm(st: &HeadState, op: &Op, args: &mut Value, unsealed: bool) -> Result<Option<IntoRealm>, String> {
     if op.name == "sessions.create" {
         if unsealed {

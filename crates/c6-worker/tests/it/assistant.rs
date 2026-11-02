@@ -890,3 +890,68 @@ async fn assistant_in_root_puts_things_in_a_realm_only_as_you_approve() {
     assert!(theirs[0].realm == "lab" && !theirs[0].labels.contains(&"started-by:console".to_owned()), "{:?}", theirs[0]);
     head.shutdown().await.unwrap();
 }
+
+/// Approvals are yours: the assistant never allows or denies a tool call, a
+/// workflow step or an approve decision, in any realm, and says to answer it
+/// in its card (docs/assistant.md §Realms).
+#[tokio::test]
+async fn assistant_never_answers_an_approval_for_you() {
+    let mock = MockLlm::start().await;
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    http.post(format!("{api}/connections")).json(&json!({"name": "m", "base_url": mock.base_url()})).send().await.unwrap();
+    http.put(format!("{api}/settings/assistant")).json(&json!({"model": {"connection": "m", "model": "mock-1"}})).send().await.unwrap();
+    // An approve decision waiting on you.
+    let d: Value = http
+        .post(format!("{api}/decisions"))
+        .json(&json!({"kind": "approve", "title": "Allow Bash?", "options": [{"label": "Allow"}, {"label": "Deny"}]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = d["id"].as_i64().expect("a decision id");
+
+    mock.push(Reply::ToolCalls(vec![(
+        "c6_call".into(),
+        json!({"op": "sessions.approvals.decide", "input": {"id": "some-session", "call_id": "c1", "body": {"allow": true}}}).to_string(),
+    )]));
+    mock.push(Reply::ToolCalls(vec![(
+        "c6_call".into(),
+        json!({"op": "decisions.answer", "input": {"id": id, "body": {"option": "Allow"}}}).to_string(),
+    )]));
+    mock.push(Reply::Text("Done.".into()));
+    let s: Session =
+        http.post(format!("{api}/assistant")).json(&json!({"prompt": "approve it"})).send().await.unwrap().json().await.unwrap();
+    let results = eventually("its two calls", async || {
+        let es: Vec<Event> = http.get(format!("{api}/sessions/{}/events?after=0", s.id)).send().await.ok()?.json().await.ok()?;
+        let outs: Vec<(String, bool)> = es
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                EventKind::ToolResult { output, is_error, .. } => Some((output, is_error)),
+                _ => None,
+            })
+            .collect();
+        (outs.len() == 2).then_some(outs)
+    })
+    .await;
+    for (out, err) in &results {
+        assert!(*err && out.contains("approvals are the user's to answer"), "{results:?}");
+    }
+    // The decision still waits on you.
+    let after: Value = http.get(format!("{api}/decisions/{id}")).send().await.unwrap().json().await.unwrap();
+    assert_ne!(after["state"], "answered", "{after}");
+    head.shutdown().await.unwrap();
+}
