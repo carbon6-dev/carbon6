@@ -44,6 +44,120 @@ fn cfg() -> TurnConfig {
     }
 }
 
+/// A successful tool call followed by a provider which never continues.
+struct StalledContinuation {
+    requests: Arc<std::sync::atomic::AtomicUsize>,
+    opening: bool,
+}
+
+#[async_trait]
+impl ModelClient for StalledContinuation {
+    async fn stream(&self, _req: &ModelRequest) -> Result<c6_llm::EventStream, c6_llm::LlmError> {
+        use std::sync::atomic::Ordering;
+        if self.requests.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Ok(futures::stream::iter([
+                Ok(ModelEvent::Block {
+                    index: 0,
+                    block: Block::ToolUse { id: "once".into(), name: "side_effect".into(), input_json: "{}".into() },
+                }),
+                Ok(ModelEvent::Done { stop_reason: "tool_use".into() }),
+            ])
+            .boxed());
+        }
+        if self.opening { futures::future::pending().await } else { Ok(futures::stream::pending().boxed()) }
+    }
+}
+
+struct SideEffect(Arc<std::sync::atomic::AtomicUsize>);
+
+#[async_trait]
+impl Tool for SideEffect {
+    fn spec(&self) -> c6_llm::ToolSpec {
+        c6_llm::ToolSpec { name: "side_effect".into(), description: "count once".into(), parameters: serde_json::json!({"type": "object"}) }
+    }
+    fn concurrency(&self) -> c6_tools::Concurrency {
+        c6_tools::Concurrency::Exclusive
+    }
+    async fn call(&self, _ctx: &c6_tools::ToolCtx, _input: serde_json::Value) -> c6_tools::ToolOutput {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        c6_tools::ToolOutput::ok("done")
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stalled_continuation_can_be_cancelled_in_either_model_wait_phase() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for (opening, bounded) in [(true, false), (false, false), (true, true), (false, true)] {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let effects = Arc::new(AtomicUsize::new(0));
+        let mut client: Box<dyn ModelClient> = Box::new(StalledContinuation { requests: requests.clone(), opening });
+        if bounded {
+            client =
+                c6_llm::limit::bounded(client, c6_llm::limit::Limits { total: Duration::from_secs(600), idle: Duration::from_secs(300) });
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let session = Arc::new(SessionTools::new(dir.path().to_owned()));
+        let vec_sink = Arc::new(VecSink::default());
+        let sink: Arc<dyn EventSink> = vec_sink.clone();
+        let mut conv = Conversation { history: vec![Message::user_text("do it once")], context_tokens: 0 };
+        let cancel = CancellationToken::new();
+        let (cfg, tools) = (cfg(), vec![Arc::new(SideEffect(effects.clone())) as Arc<dyn Tool>]);
+        let mut pending = Vec::new;
+        let turn = run_turn(1, &cfg, client.as_ref(), &tools, &session, &sink, &mut conv, &mut pending, &cancel);
+        tokio::pin!(turn);
+        let wait = if bounded { 1 } else { 14 * 60 };
+        assert!(tokio::time::timeout(Duration::from_secs(wait), &mut turn).await.is_err());
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(effects.load(Ordering::SeqCst), 1);
+        assert!(matches!(vec_sink.events.lock().unwrap().last().unwrap().kind, Some(session_event::Kind::ToolResult(_))));
+        // Cancellation already works in both model-wait phases.
+        cancel.cancel();
+        assert_eq!(turn.await.unwrap(), TurnEndReason::Interrupted);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_deadline_after_a_successful_tool_ends_the_turn_without_replaying_it() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for opening in [true, false] {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let effects = Arc::new(AtomicUsize::new(0));
+        let client = c6_llm::limit::bounded(
+            Box::new(StalledContinuation { requests: requests.clone(), opening }),
+            c6_llm::limit::Limits { total: Duration::from_secs(600), idle: Duration::from_secs(300) },
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let session = Arc::new(SessionTools::new(dir.path().to_owned()));
+        let vec_sink = Arc::new(VecSink::default());
+        let sink: Arc<dyn EventSink> = vec_sink.clone();
+        let mut conv = Conversation { history: vec![Message::user_text("do it once")], context_tokens: 0 };
+        let start = tokio::time::Instant::now();
+        let reason = run_turn(
+            1,
+            &cfg(),
+            client.as_ref(),
+            &[Arc::new(SideEffect(effects.clone()))],
+            &session,
+            &sink,
+            &mut conv,
+            &mut Vec::new,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reason, TurnEndReason::Error);
+        assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(600));
+        assert_eq!(requests.load(Ordering::SeqCst), 2, "no automatic continuation retry");
+        assert_eq!(effects.load(Ordering::SeqCst), 1, "no repeated side effect");
+        let events = vec_sink.events.lock().unwrap();
+        assert_eq!(events.iter().filter(|e| matches!(&e.kind, Some(session_event::Kind::ToolResult(r)) if !r.is_error)).count(), 1);
+        assert!(
+            events.iter().any(|e| matches!(&e.kind, Some(session_event::Kind::Error(e)) if e.message.contains("model call timed out")))
+        );
+        assert!(matches!(events.last().unwrap().kind, Some(session_event::Kind::TurnEnded(_))));
+    }
+}
+
 /// A server report independent of the prompt's estimated size.
 struct ReportedUsage {
     inner: OpenAiChat,

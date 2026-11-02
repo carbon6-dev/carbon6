@@ -170,6 +170,10 @@ pub enum LlmError {
     Http { status: u16, body: String, retry_after: Option<Duration> },
     #[error("network error: {0}")]
     Network(String),
+    /// A caller's time budget was exhausted. Do not silently start the
+    /// same call again: that would defeat the budget.
+    #[error("model call timed out: {0}")]
+    Deadline(String),
     #[error("bad response from provider: {0}")]
     Protocol(String),
     #[error("{0}")]

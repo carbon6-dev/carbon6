@@ -37,6 +37,9 @@ pub const LABEL: &str = "assistant";
 const NAME: &str = "head";
 /// How long a question or an approval waits for you.
 const WAIT: Duration = Duration::from_secs(3600);
+/// Per model request, not per turn: tools and approvals have their own
+/// lifetimes. Includes transport retries and ignores SSE keepalive bytes.
+const MODEL_LIMITS: c6_llm::limit::Limits = c6_llm::limit::Limits { total: Duration::from_secs(600), idle: Duration::from_secs(300) };
 
 /// Marks a request the head makes to itself (the assistant's calls): it is
 /// you, already signed in, limited to the realm the conversation works in
@@ -547,6 +550,7 @@ impl Actor {
                         return anyhow::Ok(());
                     }
                 };
+                let client = c6_llm::limit::bounded(client, MODEL_LIMITS);
                 // Where it may delegate: the templates agents may start.
                 let templates = crate::templates::for_subagents(&st, &env.realm, "").await;
                 let tools = env.tools(templates);
