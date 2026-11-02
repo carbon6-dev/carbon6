@@ -23,6 +23,15 @@ async fn work_of(st: &HeadState, session: &str) -> Vec<String> {
     crate::work::holding(st, &format!("session:{session}")).await.unwrap_or_default()
 }
 
+/// The project a session (through its root) is a quick session of.
+async fn quick_project(st: &HeadState, session: &str) -> Option<String> {
+    let root = match st.store.session(session).await.ok().flatten() {
+        Some(s) => s.root_id.clone().or(s.parent_id.clone()).unwrap_or(s.id),
+        None => session.to_owned(),
+    };
+    crate::projects::of_session(st, &root).await
+}
+
 /// Whether `session` may write document `id` in `realm`, and if not why.
 pub async fn may_write(st: &HeadState, realm: &str, id: &str, session: &str) -> anyhow::Result<Result<(), String>> {
     let by = format!("session:{session}");
@@ -47,6 +56,12 @@ pub async fn may_write(st: &HeadState, realm: &str, id: &str, session: &str) -> 
             {
                 return Ok(Ok(()));
             }
+        }
+        // A quick session's project's documents (docs/projects.md §3.1).
+        if let Some(p) = quick_project(st, session).await
+            && crate::projects::holds_doc(st, &p, id).await
+        {
+            return Ok(Ok(()));
         }
         let granted: i64 = sqlx::query_scalar("SELECT count(*) FROM doc_writers WHERE doc_id = ? AND writer = ?")
             .bind(id)
@@ -198,6 +213,15 @@ pub async fn for_session(st: &HeadState, session: &str, p: &Value) -> anyhow::Re
                     if let Err(e) = crate::projects::add_doc_in(st, &row, &d, &by).await {
                         tracing::warn!(project = %p, "attaching a document: {e:#}");
                     }
+                }
+            }
+            // A quick session's documents belong to its project.
+            if let Some(p) = quick_project(st, session).await
+                && let Ok(Some(row)) = crate::projects::load(st, &p).await
+            {
+                let d = c6_api::projects::ProjectDocIn { doc: doc.summary.id.clone(), role: String::new() };
+                if let Err(e) = crate::projects::add_doc_in(st, &row, &d, &by).await {
+                    tracing::warn!(project = %p, "attaching a document: {e:#}");
                 }
             }
             Ok(json!({"did": "created", "doc": about(&doc.summary), "keys": applied.keys, "blocks": shown(&doc, &applied.hashes),

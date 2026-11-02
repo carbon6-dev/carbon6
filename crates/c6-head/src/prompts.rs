@@ -97,7 +97,7 @@ pub const DEFAULTS: &[Prompt] = &[
     },
     Prompt {
         name: "work.attach",
-        description: "Which piece of work a session you start belongs to: one already open, a new one, or none (docs/work.md §4). Placeholders: {{session}}, {{open}}.",
+        description: "Which piece of work a session you start belongs to: one already open, a new one, a project as a quick session, or none (docs/work.md §4, docs/projects.md §3.1). Placeholders: {{session}}, {{open}}, {{projects}}.",
         default: text::WORK_ATTACH,
     },
     Prompt {

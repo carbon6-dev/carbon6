@@ -203,7 +203,17 @@ pub async fn refs(st: &HeadState, id: &str) -> Vec<String> {
 pub async fn attach_by(st: &HeadState, id: &str, r: &WorkRef, by: &str) -> anyhow::Result<()> {
     modify(st, id, by, None, |f| attach_to(f, r, by)).await?;
     refresh(st, id);
+    joined(st, std::slice::from_ref(r)).await;
     Ok(())
+}
+
+/// Sessions now serving work are no project's quick sessions.
+async fn joined(st: &HeadState, refs: &[WorkRef]) {
+    for r in refs {
+        if let Some(s) = r.reference.strip_prefix("session:") {
+            crate::projects::session_joined_work(st, s).await;
+        }
+    }
 }
 
 /// The open items something is attached to.
@@ -228,19 +238,30 @@ pub async fn session_tags(st: &HeadState, realm: Option<&str>) -> anyhow::Result
     .bind(realm)
     .fetch_all(&st.store.pool)
     .await?;
-    // Later rows (moved last) win.
-    Ok(rows
+    // Quick sessions (docs/projects.md §3.1): a project and no work.
+    let quick = sqlx::query(
+        "SELECT json_extract(q.value, '$.session') AS session, r.id AS project, coalesce(json_extract(r.fields, '$.title'), '') AS title \
+         FROM records r, json_each(r.fields, '$.sessions') q WHERE r.collection = ? AND (? IS NULL OR r.realm = ?) ORDER BY r.updated_at",
+    )
+    .bind(crate::projects::PROJECTS)
+    .bind(realm)
+    .bind(realm)
+    .fetch_all(&st.store.pool)
+    .await?;
+    let mut tags: HashMap<String, api::work::WorkTag> = quick
         .iter()
         .map(|r| {
-            let tag = api::work::WorkTag {
-                id: r.get("id"),
-                title: r.get("title"),
-                project: r.get("project"),
-                project_title: r.get("project_title"),
-            };
+            let tag = api::work::WorkTag { project: r.get("project"), project_title: r.get("title"), ..Default::default() };
             (r.get("session"), tag)
         })
-        .collect())
+        .collect();
+    // Later rows (moved last) win; work wins over a quick session.
+    tags.extend(rows.iter().map(|r| {
+        let tag =
+            api::work::WorkTag { id: r.get("id"), title: r.get("title"), project: r.get("project"), project_title: r.get("project_title") };
+        (r.get("session"), tag)
+    }));
+    Ok(tags)
 }
 
 async fn holding_in(st: &HeadState, reference: &str, realm: Option<&str>) -> anyhow::Result<Vec<String>> {
@@ -545,6 +566,7 @@ pub async fn attach(st: &HeadState, id: &str, r: &WorkRef, caller: &Caller, by: 
     }
     modify(st, id, by, None, |f| attach_to(f, r, by)).await?;
     refresh(st, id);
+    joined(st, std::slice::from_ref(r)).await;
     get(st, id, caller).await
 }
 
@@ -827,6 +849,13 @@ pub async fn describe(st: &HeadState, realm: &str, reference: &str) -> anyhow::R
     live_of(st, realm, &a, &requests).await
 }
 
+/// A session as work sees it (running, needs_you, failed, idle, archived
+/// or gone).
+pub async fn session_live(st: &HeadState, realm: &str, session: &str) -> anyhow::Result<LiveAttached> {
+    let a = Attached { reference: format!("session:{session}"), ..Default::default() };
+    live_of(st, realm, &a, &HashMap::new()).await
+}
+
 async fn live_of(st: &HeadState, realm: &str, a: &Attached, requests: &HashMap<(String, i64), Value>) -> anyhow::Result<LiveAttached> {
     let mut l = LiveAttached { reference: a.reference.clone(), title: a.title.clone(), state: a.status.clone(), ..Default::default() };
     if let Some(id) = a.reference.strip_prefix("session:") {
@@ -1006,6 +1035,7 @@ pub async fn on_session(st: &HeadState, session_id: &str) {
         _ => return,
     };
     moved_ref(st, &format!("session:{target}")).await;
+    crate::projects::quick_session_moved(st, &target).await;
 }
 
 pub async fn on_decision(st: &HeadState, d: &api::Decision) {
@@ -1047,6 +1077,8 @@ pub async fn on_new_session(st: &HeadState, s: &api::Session, work: Option<&str>
     let asked = work.map(str::trim).unwrap_or("");
     let result = match asked {
         "none" => Ok(()),
+        // A quick session in a project (docs/projects.md §3.1).
+        p if p.starts_with("project:") => crate::projects::add_session(st, &p["project:".len()..], &s.id, "you").await,
         "new" => {
             let title = first_line(if s.title.trim().is_empty() { prompt } else { &s.title });
             new_with(st, &s.realm, &title, "", &all, "you").await.map(|_| ())
@@ -1162,6 +1194,7 @@ async fn new_with(st: &HeadState, realm: &str, title: &str, done_when: &str, ref
     }
     let id = insert(st, realm, &f, &[], by).await?;
     refresh(st, &id);
+    joined(st, refs).await;
     guess_project(st, &id);
     Ok(id)
 }
@@ -1176,6 +1209,7 @@ async fn add_all(st: &HeadState, id: &str, refs: &[WorkRef], by: &str) -> anyhow
     })
     .await?;
     refresh(st, id);
+    joined(st, refs).await;
     Ok(())
 }
 
@@ -1311,8 +1345,19 @@ async fn guess(st: &HeadState, s: &api::Session, refs: &[WorkRef], prompt: &str)
     about.push_str(&format!("First message: {}", prompt.chars().take(4000).collect::<String>()));
     let template = crate::prompts::get(st, "work.attach", &s.realm).await;
     let open_text = if lines.is_empty() { "(none yet)".to_owned() } else { lines.join("\n") };
-    let ask_text = api::prompts::fill(&template, &[("session", &about), ("open", &open_text)]);
+    let projects = crate::projects::rows(st, Some(&s.realm), false).await?;
+    let projects: Vec<_> = projects.into_iter().filter(|p| p.fields.status == "active").collect();
+    let project_lines: Vec<String> =
+        projects.iter().take(40).map(|p| format!("{}: {} — {}", p.id, p.fields.title, p.fields.purpose)).collect();
+    let projects_text = if project_lines.is_empty() { "(none)".to_owned() } else { project_lines.join("\n") };
+    let ask_text = api::prompts::fill(&template, &[("session", &about), ("open", &open_text), ("projects", &projects_text)]);
     let v = ask(st, &s.realm, model, "work: which work", &s.title, ask_text).await?;
+    // A quick task in a project: the project, no work item.
+    if let Some(p) = v["project"].as_str()
+        && projects.iter().any(|r| r.id == p)
+    {
+        return crate::projects::add_session(st, p, &s.id, "guess").await;
+    }
     if let Some(id) = v["work"].as_str()
         && open.iter().any(|r| r.id == id)
     {

@@ -246,6 +246,14 @@ pub fn ProjectPage(id: String) -> impl IntoView {
     };
     // Made once, so a reply that lands after the page redrew still has them.
     let (apply_cb, plan_cb, phase_cb) = (Callback::new(apply), Callback::new(start_plan), Callback::new(phase_change));
+    // A quick session, started like the project's latest session (its
+    // worker, folder and model).
+    let quick_cb = Callback::new(move |()| {
+        let seed = live.sessions.with_untracked(|ss| {
+            ss.iter().filter(|s| s.work.as_ref().is_some_and(|w| w.project == id.get_value())).max_by_key(|s| s.updated_at).cloned()
+        });
+        starting.set(Some((String::new(), seed, format!("project:{}", id.get_value()), "Quick session".to_owned())));
+    });
     let save = move || {
         editing.set(false);
         patch(ProjectPatch { title: Some(title.get_untracked()), purpose: Some(purpose.get_untracked()), ..Default::default() });
@@ -368,6 +376,7 @@ pub fn ProjectPage(id: String) -> impl IntoView {
                             }
                         })}
                         <Proposed p=p.clone() apply=apply_cb />
+                        <QuickSessions p=p.clone() apply=apply_cb start=quick_cb />
                         <section class="space-y-1">
                             <div class="flex flex-wrap items-center gap-2">
                                 <h2 class="flex-1 text-xs font-medium uppercase tracking-wide text-zinc-500">{format!("Work ({} open)", open.len())}</h2>
@@ -430,6 +439,8 @@ pub fn ProjectPage(id: String) -> impl IntoView {
                 let close = move |()| { starting.try_set(None); tick.try_update(|t| *t += 1); };
                 let note = if title.starts_with("Plan") {
                     "It joins the planning work in this project. Its session proposes the phase's work for you to accept here, and brings the plan up to date."
+                } else if title.starts_with("Quick") {
+                    "A quick task in this project, with no work item: it gets the project's context and its documents. When it ends, archive it or keep it as work."
                 } else {
                     "It joins work in this project that brings the plan up to date with what the phase delivered."
                 };
@@ -440,6 +451,72 @@ pub fn ProjectPage(id: String) -> impl IntoView {
             })}
         </main>
     }
+}
+
+/// Quick sessions (docs/projects.md §3.1): in the project with no work
+/// item. Running ones first; an ended one waits for you to archive it or
+/// keep it as work.
+#[component]
+fn QuickSessions(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>, start: Callback<()>) -> impl IntoView {
+    let active = p.fields.status == "active";
+    if p.live_sessions.is_empty() && !active {
+        return ().into_any();
+    }
+    let project = StoredValue::new(p.id.clone());
+    let pill = |state: &str| match state {
+        "running" => ("running", "bg-sky-100 text-sky-800 dark:bg-sky-900/40 dark:text-sky-300"),
+        "needs_you" => ("needs you", "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300"),
+        "failed" => ("failed", "bg-rose-100 text-rose-800 dark:bg-rose-900/40 dark:text-rose-300"),
+        _ => ("ended", "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300"),
+    };
+    let n = p.live_sessions.len();
+    let rows = p
+        .live_sessions
+        .into_iter()
+        .map(|q| {
+            let (label, class) = pill(&q.state);
+            let sid = StoredValue::new(q.id.clone());
+            let ended = q.state != "running";
+            view! {
+                <div class="flex items-center gap-2 rounded px-2 py-1 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900">
+                    <span class=format!("rounded px-1.5 py-0.5 text-[11px] font-medium {class}")>{label}</span>
+                    <Go to=View::session(q.id.clone()) class="min-w-0 flex-1 truncate hover:underline">{q.title}</Go>
+                    <span class="text-xs text-zinc-400">{since(q.at)}</span>
+                    {ended.then(|| view! {
+                        <button class=format!("{BUTTON_QUIET} text-xs") title="A work item in this project, with this session attached: for something you mean to finish"
+                            on:click=move |_| spawn_local(async move {
+                                let r = api::project_session_promote(project.get_value(), sid.get_value()).await;
+                                match r {
+                                    Ok(_) => apply.run(api::project_get(project.get_value()).await),
+                                    Err(e) => apply.run(Err(e)),
+                                }
+                            })>"Keep as work"</button>
+                        <button class=format!("{BUTTON_QUIET} text-xs") title="Done with it: the session is archived and leaves the project"
+                            on:click=move |_| spawn_local(async move {
+                                apply.run(api::project_session_archive(project.get_value(), sid.get_value()).await)
+                            })>"Archive"</button>
+                    })}
+                </div>
+            }
+        })
+        .collect_view();
+    view! {
+        <section class="space-y-1">
+            <div class="flex items-center gap-2">
+                <h2 class="flex-1 text-xs font-medium uppercase tracking-wide text-zinc-500">{format!("Sessions ({n})")}</h2>
+                {active.then(|| view! {
+                    <button class=format!("{BUTTON_QUIET} text-xs") title="A quick task in this project with no work item, such as drafting a doc"
+                        on:click=move |_| start.run(())>"+ Session"</button>
+                })}
+            </div>
+            {if n == 0 {
+                view! { <p class="px-2 text-xs text-zinc-500">"No quick sessions. Start one for a task that won't outlive it."</p> }.into_any()
+            } else {
+                rows.into_any()
+            }}
+        </section>
+    }
+    .into_any()
 }
 
 /// The phases in order: done ✓, the current one marked (with its target,

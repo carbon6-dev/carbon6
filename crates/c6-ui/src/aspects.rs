@@ -58,7 +58,10 @@ pub fn of(s: &Session) -> Vec<Aspect> {
     let worker = s.worker_id.to_string();
     out.push(Aspect { aspect: "worker", label: live.worker_name(&worker), key: format!("worker:{worker}") });
     if let Some(w) = &s.work {
-        out.push(Aspect { aspect: "work", key: format!("work:{}", w.id), label: w.title.clone() });
+        // A quick session (docs/projects.md §3.1) has a project and no work.
+        if !w.id.is_empty() {
+            out.push(Aspect { aspect: "work", key: format!("work:{}", w.id), label: w.title.clone() });
+        }
         if !w.project.is_empty() {
             out.push(Aspect { aspect: "project", key: format!("project:{}", w.project), label: w.project_title.clone() });
         }

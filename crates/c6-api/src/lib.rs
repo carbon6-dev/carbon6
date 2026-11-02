@@ -1695,8 +1695,10 @@ pub struct CreateSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub realm: Option<String>,
     /// The work it belongs to (docs/work.md §4): a work item's id, "new",
-    /// "none", or "guess" (an agent picks, unless the work that holds
-    /// `work_refs` does). Empty: the work that holds `work_refs`, if any.
+    /// "none", "guess" (an agent picks, unless the work that holds
+    /// `work_refs` does), or "project:<id>" (a quick session in that
+    /// project, with no work item: docs/projects.md §3.1). Empty: the work
+    /// that holds `work_refs`, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work: Option<String>,
     /// What it was started from (a request, a conversation), attached to

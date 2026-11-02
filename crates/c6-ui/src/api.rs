@@ -1503,6 +1503,22 @@ pub async fn project_proposed(id: String, proposal: String, accept: bool) -> Res
     send_json(Request::post(&format!("/api/v1/projects/{}/proposed", enc(&id))), &c6_api::projects::ProposedIn { proposal, accept }).await
 }
 
+/// The project a session is a quick session of (docs/projects.md §3.1).
+pub async fn project_of_session(session: String) -> Result<Option<ProjectItem>, String> {
+    let list: Vec<ProjectItem> = json(Request::get(&format!("/api/v1/projects/of-session/{}", enc(&session))).send().await).await?;
+    Ok(list.into_iter().next())
+}
+
+/// Archives a project's quick session.
+pub async fn project_session_archive(id: String, session: String) -> Result<ProjectItem, String> {
+    json(Request::post(&format!("/api/v1/projects/{}/sessions/{}/archive", enc(&id), enc(&session))).send().await).await
+}
+
+/// Keeps a project's quick session as work: the new work item.
+pub async fn project_session_promote(id: String, session: String) -> Result<WorkItem, String> {
+    json(Request::post(&format!("/api/v1/projects/{}/sessions/{}/promote", enc(&id), enc(&session))).send().await).await
+}
+
 /// The realm's deck themes (docs/docs.md §5).
 pub async fn deck_themes() -> Result<Vec<c6_api::slides::DeckTheme>, String> {
     json(Request::get("/api/v1/decks/themes").send().await).await

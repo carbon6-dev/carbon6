@@ -1,6 +1,7 @@
 //! Projects (docs/projects.md): long-running efforts made of work items
 //! that each finish quickly, plus what outlives them: documents, links,
-//! phases. Sessions belong to a project only through its work.
+//! phases. Sessions belong to a project through its work, or directly as
+//! quick sessions: tasks that don't outlive their session (§3.1).
 
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +49,37 @@ pub struct ProjectFields {
     /// Work sessions proposed, waiting for you.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proposed: Vec<ProposedWork>,
+    /// Quick sessions: in the project with no work item, until you archive
+    /// them or keep them as work.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<QuickSession>,
+}
+
+/// A session in the project with no work item of its own.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct QuickSession {
+    pub session: String,
+    /// you, guess, or an API token.
+    #[serde(default)]
+    pub by: String,
+    #[serde(default)]
+    pub at: UnixMs,
+}
+
+/// A quick session as it is now.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct LiveSession {
+    pub id: String,
+    pub title: String,
+    /// running (or starting), needs_you (an approval or a question),
+    /// ended (its turn is over: archive it or keep it as work), failed.
+    pub state: String,
+    /// When it last moved.
+    #[serde(default)]
+    pub at: UnixMs,
 }
 
 fn active() -> String {
@@ -198,6 +230,9 @@ pub struct ProjectItem {
     /// Its documents as they are now, the plan first.
     #[serde(default)]
     pub docs: Vec<LiveDoc>,
+    /// Its quick sessions as they are now, running first.
+    #[serde(default)]
+    pub live_sessions: Vec<LiveSession>,
     pub labels: Vec<String>,
     pub created_at: UnixMs,
     pub updated_at: UnixMs,
@@ -281,6 +316,14 @@ pub struct ProjectWorkIn {
     pub phase: String,
     #[serde(default)]
     pub title: String,
+}
+
+/// `POST /api/v1/projects/{id}/sessions`: a session joins the project as a
+/// quick session (one serving a work item can't).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProjectSessionIn {
+    pub session: String,
 }
 
 /// `POST /api/v1/projects/{id}/detach`: what leaves it (one of them).

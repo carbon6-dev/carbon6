@@ -3,7 +3,7 @@
 Status: proposed (2026-10-30). Decided with you:
 - a **project** is a long-running effort (an epic) made of work items that each finish quickly, plus what outlives them: docs, decks, a plan, phases;
 - **phases are optional**: a project can be just its work and its docs;
-- **sessions belong to a project only through work.** Planning is a work item too ("Plan phase 2");
+- **sessions belong to a project through work**, planning included ("Plan phase 2"), **or directly as quick sessions** (§3.1, decided 2026-11-01): a task that won't outlive its session, such as drafting a doc, needs no work item. An ended quick session needs you until you archive it or keep it as work;
 - **the agent guesses a new work item's project**, as it guesses a session's work, and "Find work in what's open" proposes projects as well;
 - projects **refer to docs and decks** (docs/docs.md), which people and agents write and keep changing, and which export to Google Docs and Slides or standard files.
 
@@ -17,7 +17,7 @@ Work (docs/work.md) is deliberately short-lived: you finish it and close it. Som
 |---|---|---|---|---|
 | **Session** | minutes to hours | a conversation | turns | its turn ending |
 | **Work** | days | sessions, requests, threads, PRs, docs | to-dos, each a session | you, after "looks done" |
-| **Project** | weeks to months | work, docs and decks, links | phases (optional), each made of work | you, after "looks done" |
+| **Project** | weeks to months | work, quick sessions, docs and decks, links | phases (optional), each made of work | you, after "looks done" |
 
 Each level does the one above it the same way: a to-do starts a session for its work, and a phase's next steps become work for its project.
 
@@ -38,6 +38,16 @@ Each level does the one above it the same way: a to-do starts a session for its 
 
 **Projects are flat.** A project doesn't contain projects, and work items don't depend on each other.
 
+### 3.1 Quick sessions
+
+Some tasks don't outlive their session: draft a short doc for the project, summarize its open questions, answer a question about it. Making a work item for each is busywork, and leaving the session unfiled loses the project's context. A **quick session** is in the project directly, with no work item.
+
+- **Starting one:** "+ Session" on the project, or "Just this project: ‹project›" in the new-session form's Work field. When an agent picks the work (`work.attach`), it may choose a project for a small task by itself. It gets the project's context, edits the project's documents without asking, and the documents it makes go on the project.
+- **While it runs** it makes the project **moving** (an approval or a question: **needs you**).
+- **Once it ends** (its turn is over, or it failed) it stays on the project and makes it **needs you** until you decide: **Archive** (done with it: the session is archived and leaves the project) or **Keep as work** (a work item in the project named after it, with the session attached, for something you mean to finish). Looking at it doesn't settle it, unlike a work item's session. Sending it a message makes it run again; when it ends again it still waits for you.
+- **Only in projects:** a session outside any project is unfiled or serves work, as before.
+- Attaching it to a work item (from its header) makes it that work's session instead.
+
 **Documents belong to the project, not to its work.** A doc or deck made while doing a piece of work (the design doc of phase 1, the deck for its review) is attached to the project, so it stays when the work closes. Work can refer to the same document too. A project's **plan** is a doc like any other: made with the project from the editable template `project.plan` (purpose, phases, open questions), and changed by you and by sessions.
 
 ## 4. Its state
@@ -46,8 +56,8 @@ Worked out on every read from its work, its phases and its docs, the first that 
 
 | State | When |
 |---|---|
-| **needs you** | any of its work needs you; a phase offers "looks done"; the project offers "looks done"; an agent answered a doc comment you haven't seen |
-| **moving** | some of its work is moving or waiting on others |
+| **needs you** | any of its work needs you; a phase offers "looks done"; the project offers "looks done"; an agent answered a doc comment you haven't seen; a quick session asks for something, or ended and waits for you to archive it or keep it as work |
+| **moving** | some of its work is moving or waiting on others, or a quick session runs |
 | **stalled** | it's active, and **no work in it is open**. Everything may be done, but nothing is advancing the project. The project's version of "gone quiet" |
 | **gone quiet** | its open work has all gone quiet |
 | **on track** | otherwise |
@@ -162,3 +172,16 @@ Projects need documents (docs/docs.md §14) up to step 2 for the plan and doc re
 - **Projects found in your work** (`project.propose`, `POST /api/v1/projects/propose`, `projects.propose`): "Find work in what's open" on the Work panel also asks for projects: groups of three or more open or recently closed (30 days) work items in no project with one purpose, labels on several items counted as a hint, the projects you have listed so none is proposed twice; at most five, each with a title, a purpose and its work (only real work in no project, two or more). They show as **Projects found in your work**, each with **Make the project** (made with its work and a plan doc, opened beside) and **Skip**.
 - **Seen with a real model** (local qwen3.6 27b routed for `task:projects`): "Pair each new hire with a mentor for their first week" was guessed into Team onboarding; "Renew the TLS certificate on the build server" stayed in no project. `project.propose` was tested with a stand-in model only.
 - **Not built:** splitting a project; a guess for work moved out of a project; proposals that include labels as projects without their work.
+
+### Quick sessions (2026-11-01)
+
+- **Records.** `ProjectFields.sessions` lists a project's quick sessions (session, by, at); `ProjectItem.live_sessions` gives each as it is now (running, needs_you, ended or failed; running first). Archived or deleted sessions are left out of it, so archiving one elsewhere also settles it. No migration: the list lives in the project's record.
+- **Starting.** `POST /api/v1/sessions` with `work: "project:<id>"` makes a quick session of an active project in the session's realm. Its first message gets `project.context` with "a quick session in the project, with no work item of its own" as its work. `POST /api/v1/projects/{id}/sessions` (`projects.sessions.add`) makes an existing session one, unless it serves a work item. A session is a quick session of one project at most, and attaching it to a work item takes it off.
+- **The guess.** `work.attach` gains `{{projects}}` (active projects: id, title, purpose) and the answer `{"project": "<id>"}` for a quick task in one of them. A customized `work.attach` without the placeholder never offers it.
+- **State** (`projects::state_of`): a quick session that asks for something comes after work that needs you; an ended or failed one makes the project need you ("‹title› ended: archive it or keep it as work"), ahead of moving work; a running one makes it moving, so a project with no work but a running quick session isn't stalled or gone quiet. Marking it seen changes none of this. A quick session's turn end or question marks its project moved (`projects::quick_session_moved`, from the sessions hook), without rewriting "where we are".
+- **Archive** (`POST …/sessions/{session}/archive`, `projects.sessions.archive`): archives the session with its side chats and subagents and takes it off. **Keep as work** (`POST …/sessions/{session}/promote`, `projects.sessions.promote`): a work item in the project named after the session (in no phase), with the session attached and its note written as for any work; returns the work item. `GET /api/v1/projects/of-session/{session}` (`projects.sessions.of`) gives the project a session is a quick session of.
+- **Documents.** The `doc` tool lets a quick session (through its root, so its side chats and subagents too) write its project's documents without asking, and puts the documents it creates on the project.
+- **Live list.** `Session.work` for a quick session has its project and an empty work id, so the project's mark shows in its tile bar and no work mark does.
+- **UI.** The project page has **Sessions**: each quick session with its state, how long ago it moved, and for an ended one **Keep as work** and **Archive**; "+ Session" opens the new-session form preset to the project, like the project's latest session (worker, folder, model). The new-session form's Work field lists "Just this project: ‹project›" for each active project. A quick session's header reads `Project: ‹project›` with **Keep as work** and **Archive**, beside the Work menu.
+- **Fixed on the way:** starting a session from a dialog (+ Session, Plan the next phase, a to-do's ▶ Start) closed the dialog in the same task that then updated the form, so the page panicked on a disposed signal and the UI stopped. The form now finishes its own updates first and the dialog closes on the next tick.
+- **Seen with a real model** (local qwen3.6 27b, scratch head, in the browser): "+ Session" on Team onboarding opened the form preset to "Just this project: Team onboarding"; the session got the project context, wrote "Welcome note" with the `doc` tool, and the doc joined the project's documents. Once its turn ended the project read "Needs you: … ended: archive it or keep it as work". **Keep as work** from the session's header made a work item in the project with the session; **Archive** on the project page archived later quick sessions and the project went back to on track, in both tiles showing it.

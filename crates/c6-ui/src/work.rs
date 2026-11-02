@@ -896,8 +896,29 @@ pub fn SessionWork(session_id: String, title: Signal<String>) -> impl IntoView {
         tick.track();
         api::work_list(false)
     });
+    // A quick session's project (docs/projects.md §3.1).
+    let sid = StoredValue::new(session_id.clone());
+    let quick = LocalResource::new(move || {
+        tick.track();
+        api::project_of_session(sid.get_value())
+    });
     let error = RwSignal::new(None::<String>);
     let current = move || mine.get().and_then(Result::ok).and_then(|w| w.into_iter().next());
+    let quick_project = move || if current().is_some() { None } else { quick.get().and_then(Result::ok).flatten() };
+    let dispose = move |keep: bool| {
+        let Some(p) = quick_project() else { return };
+        spawn_local(async move {
+            let r = if keep {
+                api::project_session_promote(p.id, sid.get_value()).await.map(|_| ())
+            } else {
+                api::project_session_archive(p.id, sid.get_value()).await.map(|_| ())
+            };
+            if let Err(e) = r {
+                error.set(Some(e));
+            }
+            tick.update(|t| *t += 1);
+        });
+    };
     let change = move |to: String| {
         let from = current().map(|w| w.id);
         spawn_local(async move {
@@ -931,6 +952,19 @@ pub fn SessionWork(session_id: String, title: Signal<String>) -> impl IntoView {
     };
     view! {
         <span class="inline-flex min-w-0 items-center gap-1 text-xs text-zinc-600 dark:text-zinc-400">
+            {move || quick_project().map(|p| view! {
+                <span>"Project:"</span>
+                <crate::marks::ValueGlyph key=format!("project:{}", p.id) />
+                <Go to=View::Projects { id: p.id.clone() } class="max-w-48 truncate text-violet-700 hover:underline dark:text-violet-400"
+                    title="A quick session in this project, with no work item">
+                    {p.fields.title.clone()}
+                </Go>
+                <button class="rounded px-1 text-violet-700 hover:bg-zinc-200/60 dark:text-violet-400 dark:hover:bg-zinc-800"
+                    title="A work item in the project, with this session attached" on:click=move |_| dispose(true)>"Keep as work"</button>
+                <button class="rounded px-1 hover:bg-zinc-200/60 dark:hover:bg-zinc-800"
+                    title="Done with it: archive the session and take it off the project" on:click=move |_| dispose(false)>"Archive"</button>
+                <span class="text-zinc-400">"·"</span>
+            })}
             <span>"Work:"</span>
             {move || current().map(|w| view! {
                 {(!w.fields.project.is_empty()).then(|| view! {

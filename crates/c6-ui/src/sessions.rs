@@ -902,6 +902,8 @@ fn SessionForm(
     // The work it belongs to: yours to pick (a seed's session's, if any),
     // else an agent picks.
     let work_items = LocalResource::new(|| api::work_list(false));
+    // Active projects, for a quick session in one (docs/projects.md §3.1).
+    let quick_projects = LocalResource::new(|| api::projects_list(false));
     let work_pick = RwSignal::new(work);
     if !seed.from.is_empty() && work_pick.get_untracked().is_empty() {
         let from = seed.from.clone();
@@ -1045,7 +1047,9 @@ fn SessionForm(
         }
         pending.set(true);
         spawn_local(async move {
-            match api::create_session(req).await {
+            let created = api::create_session(req).await;
+            pending.try_set(false);
+            match created {
                 // The new session takes the form's tile (Back returns to
                 // the form); from a popup, a tile of its own.
                 Ok(s) => {
@@ -1057,13 +1061,16 @@ fn SessionForm(
                         Some(c) => c.open(View::session(s.id), how),
                         None => ws.open(None, View::session(s.id), how),
                     }
+                    // Closing a dialog disposes this form: on the next tick,
+                    // once what it set has been drawn.
                     if let Some(f) = on_started {
-                        f.run(());
+                        set_timeout(move || f.run(()), std::time::Duration::ZERO);
                     }
                 }
-                Err(e) => error.set(Some(e)),
+                Err(e) => {
+                    error.try_set(Some(e));
+                }
             }
-            pending.set(false);
         });
     };
     let submit_click = submit;
@@ -1167,7 +1174,7 @@ fn SessionForm(
                 <label class="block text-xs text-zinc-500" title="What you mean to finish that this session serves (docs/work.md)">
                     "Work"
                     <select class=format!("mt-1 {INPUT}")
-                        prop:value=move || { work_items.track(); work_pick.get() }
+                        prop:value=move || { work_items.track(); quick_projects.track(); work_pick.get() }
                         on:change=move |ev| work_pick.set(event_target_value(&ev))>
                         <option value="">"An agent picks (or starts one)"</option>
                         <option value="new">"New work"</option>
@@ -1175,6 +1182,16 @@ fn SessionForm(
                         {move || work_items.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|w| {
                             view! { <option value=w.id.clone()>{w.fields.title.clone()}</option> }
                         }).collect_view()}
+                        {move || {
+                            let projects: Vec<_> = quick_projects.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|p| p.fields.status == "active").collect();
+                            (!projects.is_empty()).then(|| view! {
+                                <optgroup label="A quick task, no work item">
+                                    {projects.into_iter().map(|p| view! {
+                                        <option value=format!("project:{}", p.id)>{format!("Just this project: {}", p.fields.title)}</option>
+                                    }).collect_view()}
+                                </optgroup>
+                            })
+                        }}
                     </select>
                 </label>
             </div>

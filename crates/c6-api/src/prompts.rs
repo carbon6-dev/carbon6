@@ -183,13 +183,17 @@ one-line resolution when we are done.";
 
 /// Which piece of work a new session belongs to (docs/work.md §4).
 /// `{{session}}` (its title, folder and first message), `{{open}}` (the
-/// open work items, one per line with its id).
+/// open work items, one per line with its id), `{{projects}}` (the active
+/// projects, one per line with its id and purpose).
 pub const WORK_ATTACH: &str = "The user keeps a list of work they mean to finish. They just started an agent session; decide which piece \
 of work it belongs to.\n\nThe session:\n{{session}}\n\nTheir open work, one per line (id: title, then the next step):\n{{open}}\n\n\
+Their active projects, one per line (id: title — purpose):\n{{projects}}\n\n\
 Answer with JSON only:\n\
 - {\"work\": \"<id>\"} when it clearly continues one of those;\n\
 - {\"new\": \"<a few words: what they mean to get done>\", \"done_when\": \"<one line: what finished looks like>\"} when it starts \
 something they will want to finish;\n\
+- {\"project\": \"<project id>\"} for a quick task in one of those projects that will be done within this session (draft a short doc, \
+summarize, answer a question about it): it joins the project with no work item;\n\
 - {\"none\": true} for a quick question or a throwaway that is not work to finish.\n\
 Prefer an existing item over a new one only when it is the same goal, not merely the same project.";
 

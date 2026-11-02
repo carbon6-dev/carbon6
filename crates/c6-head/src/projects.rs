@@ -3,7 +3,9 @@
 //! records of the system collection `projects` in their realm, each change
 //! a version in the record's history; a work item names its project in
 //! its own fields (`project`, `phase`), so a piece of work is in one
-//! project at most. Sessions belong to a project only through work.
+//! project at most. Sessions belong to a project through work, or
+//! directly as quick sessions (docs/projects.md §3.1) until you archive
+//! them or keep them as work.
 
 use std::sync::Arc;
 
@@ -12,7 +14,8 @@ use axum::routing::post;
 use axum::{Extension, Json, Router};
 use c6_api as api;
 use c6_api::projects::{
-    LiveDoc, ProjectDetach, ProjectFields, ProjectItem, ProjectMerge, ProjectNew, ProjectPatch, ProjectWork, ProjectWorkIn,
+    LiveDoc, LiveSession, ProjectDetach, ProjectFields, ProjectItem, ProjectMerge, ProjectNew, ProjectPatch, ProjectWork, ProjectWorkIn,
+    QuickSession,
 };
 use c6_core::now_ms;
 use serde_json::Value;
@@ -396,7 +399,8 @@ pub(crate) async fn view(st: &HeadState, rows: Vec<Stored>) -> anyhow::Result<Ve
             docs.push(LiveDoc { doc: d.doc.clone(), role: d.role.clone(), title, kind, updated_at: at, answered });
         }
         docs.sort_by_key(|d| d.role != "plan");
-        let (state, why) = state_of(&r.fields, &work, &docs);
+        let live_sessions = live_sessions(st, &r.realm, &r.fields.sessions).await;
+        let (state, why) = state_of(&r.fields, &work, &docs, &live_sessions);
         let late = late(&r.fields, &today());
         out.push(ProjectItem {
             id: r.id,
@@ -408,6 +412,7 @@ pub(crate) async fn view(st: &HeadState, rows: Vec<Stored>) -> anyhow::Result<Ve
             late,
             work,
             docs,
+            live_sessions,
             labels: r.labels,
             created_at: r.created_at,
             updated_at: r.updated_at,
@@ -416,12 +421,36 @@ pub(crate) async fn view(st: &HeadState, rows: Vec<Stored>) -> anyhow::Result<Ve
     Ok(out)
 }
 
+/// Its quick sessions as they are now, running first; archived and gone
+/// ones are left out (archived elsewhere: dispositioned).
+async fn live_sessions(st: &HeadState, realm: &str, sessions: &[QuickSession]) -> Vec<LiveSession> {
+    let mut out = Vec::new();
+    for q in sessions {
+        let Ok(l) = crate::work::session_live(st, realm, &q.session).await else { continue };
+        let state = match l.state.as_str() {
+            "archived" | "gone" => continue,
+            "idle" => "ended",
+            s => s,
+        };
+        out.push(LiveSession { id: q.session.clone(), title: l.title, state: state.to_owned(), at: l.at });
+    }
+    let rank = |s: &str| match s {
+        "running" => 0,
+        "needs_you" => 1,
+        _ => 2,
+    };
+    out.sort_by(|a, b| rank(&a.state).cmp(&rank(&b.state)).then(b.at.cmp(&a.at)));
+    out
+}
+
 /// Its state and why (docs/projects.md §4), the first that holds: what
-/// you set (paused, done, dropped); needs you (a "looks done", or work
-/// that needs you); moving (work moving or waiting on others); stalled (no
-/// work open: nothing advances it); gone quiet (its open work has all gone
-/// quiet); on track.
-pub(crate) fn state_of(f: &ProjectFields, work: &[ProjectWork], docs: &[LiveDoc]) -> (String, String) {
+/// you set (paused, done, dropped); needs you (a "looks done", work or a
+/// quick session that needs you, or a quick session that ended and waits
+/// for you to archive it or keep it as work); moving (work moving or
+/// waiting on others, or a quick session running); stalled (no work open:
+/// nothing advances it); gone quiet (its open work has all gone quiet); on
+/// track.
+pub(crate) fn state_of(f: &ProjectFields, work: &[ProjectWork], docs: &[LiveDoc], quick: &[LiveSession]) -> (String, String) {
     let r = |state: &str, why: String| (state.to_owned(), why);
     if f.status != "active" {
         return r(&f.status, String::new());
@@ -439,8 +468,19 @@ pub(crate) fn state_of(f: &ProjectFields, work: &[ProjectWork], docs: &[LiveDoc]
     if let Some(w) = open.iter().find(|w| w.state == "needs_you") {
         return r("needs_you", format!("{}: {}", w.title, w.why));
     }
+    if let Some(q) = quick.iter().find(|q| q.state == "needs_you") {
+        return r("needs_you", format!("{} waits for your answer", q.title));
+    }
+    // Ended: yours to archive or keep as work, however long ago you saw it.
+    if let Some(q) = quick.iter().find(|q| matches!(q.state.as_str(), "ended" | "failed")) {
+        let what = if q.state == "failed" { "failed" } else { "ended" };
+        return r("needs_you", format!("{} {what}: archive it or keep it as work", q.title));
+    }
     if let Some(w) = open.iter().find(|w| matches!(w.state.as_str(), "moving" | "waiting")) {
         return r("moving", if w.why.is_empty() { format!("{} is moving", w.title) } else { format!("{}: {}", w.title, w.why) });
+    }
+    if let Some(q) = quick.iter().find(|q| q.state == "running") {
+        return r("moving", format!("{} is running", q.title));
     }
     if open.is_empty() {
         let why = if work.is_empty() { "No work in it yet" } else { "All its work is closed, and nothing new is open" };
@@ -869,12 +909,19 @@ pub async fn proposed(st: &HeadState, id: &str, q: &api::projects::ProposedIn, c
 /// What a session started in a work item in a project is told after its
 /// first message (`project.context`), unless the realm turned it off.
 pub async fn context_for(st: &HeadState, work: &str) -> Option<String> {
-    let pid = crate::work::project_of(st, work).await?;
+    let quick = work.strip_prefix("project:");
+    let pid = match quick {
+        Some(p) => p.to_owned(),
+        None => crate::work::project_of(st, work).await?,
+    };
     let r = load(st, &pid).await.ok()??;
     if r.fields.status != "active" || !crate::work::settings(st, &r.realm).await.project_context {
         return None;
     }
-    let work_title = crate::work::title_of(st, work).await.unwrap_or_default();
+    let work_title = match quick {
+        Some(_) => "a quick session in the project, with no work item of its own".to_owned(),
+        None => crate::work::title_of(st, work).await.unwrap_or_default(),
+    };
     let item = view(st, vec![r]).await.ok()?.remove(0);
     let f = &item.fields;
     let phase = f
@@ -906,6 +953,111 @@ pub async fn with_context(st: &HeadState, work: Option<&str>, prompt: &str) -> O
     }
     let c = context_for(st, w).await?;
     Some(format!("{prompt}\n\n---\n{c}"))
+}
+
+// --- Quick sessions (docs/projects.md §3.1) ---------------------------------
+
+/// The project a session is in as a quick session.
+pub async fn of_session(st: &HeadState, session: &str) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT r.id FROM records r, json_each(r.fields, '$.sessions') q \
+         WHERE r.collection = ? AND json_extract(q.value, '$.session') = ? ORDER BY r.updated_at DESC LIMIT 1",
+    )
+    .bind(PROJECTS)
+    .bind(session)
+    .fetch_optional(&st.store.pool)
+    .await
+    .ok()
+    .flatten()
+}
+
+/// A session joins an active project of its realm as a quick session (it
+/// leaves any other project's quick sessions).
+pub async fn add_session(st: &HeadState, id: &str, session: &str, by: &str) -> anyhow::Result<()> {
+    let s = st.store.session(session).await?.ok_or_else(|| not_found(format!("no session {session}")))?;
+    let p = load(st, id).await?.ok_or_else(|| not_found(format!("no project {id}")))?;
+    if p.realm != s.realm {
+        return Err(bad_request(format!("that session is in realm {}, the project in {}", s.realm, p.realm)));
+    }
+    if p.fields.status != "active" {
+        return Err(bad_request(format!("{} is {}: quick sessions join active projects", p.fields.title, p.fields.status)));
+    }
+    if let Some(other) = of_session(st, session).await.filter(|o| o != id) {
+        drop_session_from(st, &other, session, by).await?;
+    }
+    modify(st, id, by, None, |f| {
+        if f.sessions.iter().any(|q| q.session == session) {
+            return Ok(false);
+        }
+        f.sessions.push(QuickSession { session: session.to_owned(), by: by.to_owned(), at: now_ms() });
+        f.moved_at = now_ms();
+        Ok(true)
+    })
+    .await
+}
+
+async fn drop_session_from(st: &HeadState, id: &str, session: &str, by: &str) -> anyhow::Result<()> {
+    modify(st, id, by, None, |f| {
+        let before = f.sessions.len();
+        f.sessions.retain(|q| q.session != session);
+        if f.sessions.len() != before {
+            f.moved_at = now_ms();
+        }
+        Ok(f.sessions.len() != before)
+    })
+    .await
+}
+
+/// A session now serves a work item: it is no project's quick session.
+pub async fn session_joined_work(st: &HeadState, session: &str) {
+    if let Some(p) = of_session(st, session).await
+        && let Err(e) = drop_session_from(st, &p, session, "you").await
+    {
+        tracing::warn!(project = %p, %session, "leaving the quick sessions: {e:#}");
+    }
+}
+
+async fn quick(st: &HeadState, id: &str, session: &str, caller: &Caller) -> anyhow::Result<Stored> {
+    let p = visible(st, id, caller).await?;
+    if !p.fields.sessions.iter().any(|q| q.session == session) {
+        return Err(bad_request(format!("session {session} is not a quick session of this project")));
+    }
+    Ok(p)
+}
+
+/// Archive: the session is archived (with its side chats and subagents)
+/// and leaves the project.
+pub async fn archive_session(st: &HeadState, id: &str, session: &str, caller: &Caller, by: &str) -> anyhow::Result<ProjectItem> {
+    quick(st, id, session, caller).await?;
+    st.store.set_archived(session, true).await?;
+    drop_session_from(st, id, session, by).await?;
+    st.registry.bump();
+    get(st, id, caller).await
+}
+
+/// Keep as work: a new work item in the project, named after the session,
+/// with the session attached (its note is written as for any work); the
+/// session leaves the quick sessions.
+pub async fn promote_session(st: &HeadState, id: &str, session: &str, caller: &Caller, by: &str) -> anyhow::Result<api::work::WorkItem> {
+    quick(st, id, session, caller).await?;
+    let s = st.store.session(session).await?.ok_or_else(|| not_found(format!("no session {session}")))?;
+    let title = if s.title.trim().is_empty() { "Work from a quick session".to_owned() } else { s.title.chars().take(MAX_TITLE).collect() };
+    let n = api::work::WorkNew { title, ..Default::default() };
+    let w = crate::work::create_in_project(st, caller, &n, id, "", by).await?;
+    let r = api::work::WorkRef { reference: format!("session:{session}"), title: s.title.clone() };
+    crate::work::attach_by(st, &w.id, &r, by).await?;
+    drop_session_from(st, id, session, by).await?;
+    crate::work::get(st, &w.id, caller).await
+}
+
+/// A quick session's turn ended or it asks for something: the project moved.
+pub async fn quick_session_moved(st: &HeadState, session: &str) {
+    if let Some(p) = of_session(st, session).await {
+        if let Err(e) = touch(st, &p, now_ms()).await {
+            tracing::warn!(project = %p, "noting that it moved: {e:#}");
+        }
+        st.registry.bump();
+    }
 }
 
 // --- Documents and links -----------------------------------------------------
@@ -1211,6 +1363,54 @@ pub fn routes() -> Router<Arc<HeadState>> {
         .route("/api/v1/projects/{id}/plan", post(plan_project))
         .route("/api/v1/projects/{id}/proposed", post(proposed_project))
         .route("/api/v1/projects/propose", post(propose_projects))
+        .route("/api/v1/projects/of-session/{session}", axum::routing::get(project_of_session))
+        .route("/api/v1/projects/{id}/sessions", post(session_project))
+        .route("/api/v1/projects/{id}/sessions/{session}/archive", post(archive_project_session))
+        .route("/api/v1/projects/{id}/sessions/{session}/promote", post(promote_project_session))
+}
+
+/// `GET /api/v1/projects/of-session/{session}`: the project it's a quick
+/// session of (an empty list when none).
+async fn project_of_session(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(session): Path<String>,
+) -> ApiResult<Json<Vec<ProjectItem>>> {
+    let Some(id) = of_session(&st, &session).await else { return Ok(Json(Vec::new())) };
+    match get(&st, &id, &caller).await {
+        Ok(p) => Ok(Json(vec![p])),
+        Err(_) => Ok(Json(Vec::new())),
+    }
+}
+
+async fn session_project(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(q): Json<api::projects::ProjectSessionIn>,
+) -> ApiResult<Json<ProjectItem>> {
+    visible(&st, &id, &caller).await?;
+    if crate::work::holding(&st, &format!("session:{}", q.session)).await?.into_iter().next().is_some() {
+        return Err(bad_request("that session serves a work item: take it out of the work first").into());
+    }
+    add_session(&st, &id, &q.session, &crate::docs::by_of(&caller)).await?;
+    Ok(Json(get(&st, &id, &caller).await?))
+}
+
+async fn archive_project_session(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path((id, session)): Path<(String, String)>,
+) -> ApiResult<Json<ProjectItem>> {
+    Ok(Json(archive_session(&st, &id, &session, &caller, &crate::docs::by_of(&caller)).await?))
+}
+
+async fn promote_project_session(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path((id, session)): Path<(String, String)>,
+) -> ApiResult<Json<api::work::WorkItem>> {
+    Ok(Json(promote_session(&st, &id, &session, &caller, &crate::docs::by_of(&caller)).await?))
 }
 
 async fn propose_projects(
@@ -1354,19 +1554,19 @@ mod tests {
     #[test]
     fn its_state_comes_from_its_work() {
         let f = ProjectFields { title: "p".into(), status: "active".into(), ..Default::default() };
-        let st = |work: &[ProjectWork]| state_of(&f, work, &[]).0;
+        let st = |work: &[ProjectWork]| state_of(&f, work, &[], &[]).0;
         assert_eq!(st(&[]), "stalled");
-        assert_eq!(state_of(&f, &[w("a", "done")], &[]), ("stalled".into(), "All its work is closed, and nothing new is open".into()));
+        assert_eq!(state_of(&f, &[w("a", "done")], &[], &[]), ("stalled".into(), "All its work is closed, and nothing new is open".into()));
         assert_eq!(st(&[w("a", "open")]), "on_track");
         assert_eq!(st(&[w("a", "quiet"), w("b", "quiet"), w("c", "done")]), "quiet");
         assert_eq!(st(&[w("a", "quiet"), w("b", "waiting")]), "moving");
-        assert_eq!(state_of(&f, &[w("a", "moving"), w("b", "needs_you")], &[]), ("needs_you".into(), "b: b why".into()));
+        assert_eq!(state_of(&f, &[w("a", "moving"), w("b", "needs_you")], &[], &[]), ("needs_you".into(), "b: b why".into()));
         let offered = ProjectFields { offer: Some(api::work::WorkOffer { evidence: "shipped".into(), at: 1 }), ..f.clone() };
-        assert_eq!(state_of(&offered, &[], &[]).0, "needs_you");
+        assert_eq!(state_of(&offered, &[], &[], &[]).0, "needs_you");
         let answered = LiveDoc { doc: "d".into(), title: "Plan".into(), kind: "doc".into(), answered: 1, ..Default::default() };
-        assert_eq!(state_of(&f, &[w("a", "open")], &[answered]), ("needs_you".into(), "An agent answered a comment on Plan".into()));
+        assert_eq!(state_of(&f, &[w("a", "open")], &[answered], &[]), ("needs_you".into(), "An agent answered a comment on Plan".into()));
         let paused = ProjectFields { status: "paused".into(), ..f.clone() };
-        assert_eq!(state_of(&paused, &[], &[]).0, "paused");
+        assert_eq!(state_of(&paused, &[], &[], &[]).0, "paused");
         // Late: the current phase's target has passed.
         let phases = vec![
             api::projects::Phase {
@@ -1384,7 +1584,26 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let phased = ProjectFields { phases, ..f };
+        let phased = ProjectFields { phases, ..f.clone() };
         assert!(late(&phased, "2026-10-02") && !late(&phased, "2026-10-01"));
+    }
+
+    #[test]
+    fn quick_sessions_need_you_once_they_end() {
+        let f = ProjectFields { title: "p".into(), status: "active".into(), ..Default::default() };
+        let q = |state: &str| LiveSession { id: state.into(), title: format!("Draft {state}"), state: state.into(), at: 1 };
+        // Running: the project moves, even with no work at all (not stalled).
+        assert_eq!(state_of(&f, &[], &[], &[q("running")]), ("moving".into(), "Draft running is running".into()));
+        // Ended: needs you until archived or kept as work, ahead of moving work.
+        assert_eq!(
+            state_of(&f, &[w("a", "moving")], &[], &[q("running"), q("ended")]),
+            ("needs_you".into(), "Draft ended ended: archive it or keep it as work".into())
+        );
+        assert_eq!(state_of(&f, &[], &[], &[q("failed")]).1, "Draft failed failed: archive it or keep it as work");
+        assert_eq!(state_of(&f, &[], &[], &[q("needs_you")]), ("needs_you".into(), "Draft needs_you waits for your answer".into()));
+        // Quiet work and a running quick session: moving, not gone quiet.
+        assert_eq!(state_of(&f, &[w("a", "quiet")], &[], &[q("running")]).0, "moving");
+        // A work item that needs you comes first.
+        assert_eq!(state_of(&f, &[w("b", "needs_you")], &[], &[q("ended")]).1, "b: b why");
     }
 }

@@ -534,3 +534,163 @@ async fn new_work_finds_its_project_and_projects_are_found_in_work() {
         ok(send(M::POST, "projects".into(), json!({"title": found[0]["title"], "purpose": found[0]["purpose"], "work": names})).await);
     assert_eq!(made["work"].as_array().unwrap().len(), 3);
 }
+
+/// Quick sessions (docs/projects.md §3.1): in a project with no work item,
+/// told the project's context; once its turn ends one needs you until you
+/// archive it or keep it as work, whether or not you've looked at it.
+#[tokio::test]
+async fn quick_sessions_need_you_until_archived_or_kept_as_work() {
+    use c6_testkit::{MockLlm, Reply, eventually};
+    use c6_worker::{ConnState, Identity, Worker, conn, enroll};
+    let mock = MockLlm::start().await;
+    let (head_dir, state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
+    enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
+    let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
+    let (tx, mut rx) = tokio::sync::watch::channel(ConnState::Connecting);
+    let stop = tokio_util::sync::CancellationToken::new();
+    tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
+    let send = |method: M, path: String, body: Value| {
+        let (http, url) = (http.clone(), format!("{api}/{path}"));
+        async move {
+            let r = http.request(method, &url).json(&body).send().await.unwrap();
+            let s = r.status();
+            (s, r.json::<Value>().await.unwrap_or(Value::Null))
+        }
+    };
+    let ok = |(s, v): (StatusCode, Value)| {
+        assert!(s.is_success(), "{s}: {v}");
+        v
+    };
+    let get = |path: String| {
+        let (http, url) = (http.clone(), format!("{api}/{path}"));
+        async move { http.get(&url).send().await.unwrap().json::<Value>().await.unwrap() }
+    };
+    let conn = ok(send(M::POST, "connections".into(), json!({"name": "m", "base_url": mock.base_url()})).await);
+    let settings =
+        |guess: bool| json!({"guess": guess, "notes": false, "quiet_days": 3, "nudge": true, "needs_hours": 4, "project_context": true});
+    ok(send(M::PUT, "settings/work".into(), settings(false)).await);
+    ok(send(
+        M::PUT,
+        "settings/routes".into(),
+        json!([{"name": "work", "applies_to": ["task:work", "task:projects"], "connection": conn["id"], "model": "small", "enabled": true}]),
+    )
+    .await);
+    let start = |prompt: &str, work: &str| {
+        mock.push_about_all(&["You are carbon6", prompt], Reply::Text("ok".into()));
+        json!({"worker_id": worker.identity.meta.worker_id.0, "cwd": "", "connection_id": conn["id"], "model": "m", "prompt": prompt, "work": work})
+    };
+    let p = ok(send(M::POST, "projects".into(), json!({"title": "Realms for the team", "purpose": "The team uses realms daily"})).await);
+    let pid = p["id"].as_str().unwrap().to_owned();
+    assert_eq!(p["state"], "stalled", "no work, no sessions");
+    let quick_state = async |id: &str| -> Option<String> {
+        let p = get(format!("projects/{pid}")).await;
+        p["live_sessions"].as_array().unwrap().iter().find(|q| q["id"] == id).map(|q| q["state"].as_str().unwrap().to_owned())
+    };
+
+    // 1. A quick session: in the project with no work, told its context.
+    let s1 = ok(send(M::POST, "sessions".into(), start("Draft a short welcome note", &format!("project:{pid}"))).await)["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let first = eventually("the quick session's first turn", async || {
+        mock.requests().into_iter().map(|r| r["messages"].to_string()).find(|m| m.contains("Draft a short welcome note"))
+    })
+    .await;
+    assert!(first.contains("a quick session in the project") && first.contains("Realms for the team"), "{first}");
+    assert!(get(format!("work/of?ref=session:{s1}")).await.as_array().unwrap().is_empty(), "no work item");
+    let tagged = get("sessions".into()).await;
+    let tag = tagged.as_array().unwrap().iter().find(|s| s["id"] == s1.as_str()).unwrap()["work"].clone();
+    assert_eq!((tag["id"].as_str(), tag["project"].as_str()), (Some(""), Some(pid.as_str())), "{tag}");
+    assert_eq!(get(format!("projects/of-session/{s1}")).await[0]["id"], pid.as_str());
+
+    // 2. Ended: the project needs you, and still does once you've seen it.
+    eventually("the quick session to end", async || (quick_state(&s1).await.as_deref() == Some("ended")).then_some(())).await;
+    let p = get(format!("projects/{pid}")).await;
+    assert_eq!(
+        (p["state"].as_str(), p["why"].as_str()),
+        (Some("needs_you"), Some("Draft a short welcome note ended: archive it or keep it as work"))
+    );
+    c6_head::work::seen_session(&head.state, &s1, c6_core::now_ms() + 1).await.unwrap();
+    assert_eq!(get(format!("projects/{pid}")).await["state"], "needs_you", "seeing it doesn't settle it");
+
+    // 3. Keep as work: a work item in the project with the session.
+    let w = ok(send(M::POST, format!("projects/{pid}/sessions/{s1}/promote"), Value::Null).await);
+    assert_eq!((w["title"].as_str(), w["project"].as_str()), (Some("Draft a short welcome note"), Some(pid.as_str())));
+    assert!(w["attached"].to_string().contains(&format!("session:{s1}")), "{w}");
+    let p = get(format!("projects/{pid}")).await;
+    assert!(p["live_sessions"].as_array().unwrap().is_empty());
+    assert!(get(format!("projects/of-session/{s1}")).await.as_array().unwrap().is_empty());
+    assert_eq!(get(format!("work/of?ref=session:{s1}")).await[0]["id"], w["id"]);
+    // Not a quick session any more.
+    assert_eq!(send(M::POST, format!("projects/{pid}/sessions/{s1}/archive"), Value::Null).await.0, StatusCode::BAD_REQUEST);
+    // A session serving work can't be made a quick session.
+    assert_eq!(send(M::POST, format!("projects/{pid}/sessions"), json!({"session": s1})).await.0, StatusCode::BAD_REQUEST);
+
+    // 4. Archive: the session is archived and leaves the project.
+    let s2 = ok(send(M::POST, "sessions".into(), start("Summarize the open questions", &format!("project:{pid}"))).await)["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    eventually("the second quick session to end", async || (quick_state(&s2).await.as_deref() == Some("ended")).then_some(())).await;
+    let p = ok(send(M::POST, format!("projects/{pid}/sessions/{s2}/archive"), Value::Null).await);
+    assert!(p["live_sessions"].as_array().unwrap().is_empty());
+    let listed = get("sessions".into()).await;
+    assert!(!listed.as_array().unwrap().iter().any(|s| s["id"] == s2.as_str()), "archived: out of the list");
+
+    // 5. Attached to work from its header: no longer a quick session.
+    let s3 = ok(send(M::POST, "sessions".into(), start("Check the realm names", &format!("project:{pid}"))).await)["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(quick_state(&s3).await.is_some());
+    ok(send(M::POST, format!("work/{}/attach", w["id"].as_str().unwrap()), json!({"ref": format!("session:{s3}")})).await);
+    assert!(quick_state(&s3).await.is_none());
+
+    // A document a quick session makes is put on the project.
+    let create = json!({"action": "create", "title": "Welcome note", "markdown": "# Welcome note\n\nHello, team."});
+    mock.push_about_all(&["You are carbon6", "Write the welcome doc"], Reply::ToolCalls(vec![("doc".into(), create.to_string())]));
+    mock.push_about_all(&["You are carbon6", "Write the welcome doc"], Reply::Text("Written.".into()));
+    let s5 = ok(send(
+        M::POST,
+        "sessions".into(),
+        json!({"worker_id": worker.identity.meta.worker_id.0, "cwd": "", "connection_id": conn["id"], "model": "m",
+               "prompt": "Write the welcome doc", "work": format!("project:{pid}")}),
+    )
+    .await)["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    eventually("its document to join the project", async || {
+        let p = get(format!("projects/{pid}")).await;
+        p["docs"].as_array().unwrap().iter().any(|d| d["title"] == "Welcome note").then_some(())
+    })
+    .await;
+    eventually("the doc session to end", async || (quick_state(&s5).await.as_deref() == Some("ended")).then_some(())).await;
+
+    // 6. An agent's guess may pick "just this project".
+    ok(send(M::PUT, "settings/work".into(), settings(true)).await);
+    mock.push_about("decide which piece", Reply::Text(json!({"project": pid}).to_string()));
+    let s4 = ok(send(M::POST, "sessions".into(), start("Fix a typo in the plan", "guess")).await)["id"].as_str().unwrap().to_owned();
+    eventually("the guess to file it in the project", async || quick_state(&s4).await.map(|_| ())).await;
+    let guessed = mock.requests().into_iter().map(|r| r["messages"].to_string()).find(|m| m.contains("decide which piece")).unwrap();
+    assert!(guessed.contains(&pid) && guessed.contains("The team uses realms daily"), "the guess sees the projects: {guessed}");
+    // Closed projects take no quick sessions.
+    ok(send(M::PATCH, format!("projects/{pid}"), json!({"status": "done"})).await);
+    assert_eq!(send(M::POST, format!("projects/{pid}/sessions"), json!({"session": s2})).await.0, StatusCode::BAD_REQUEST);
+    stop.cancel();
+    head.shutdown().await.unwrap();
+}
