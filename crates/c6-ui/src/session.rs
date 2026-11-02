@@ -9,7 +9,7 @@ use leptos::task::spawn_local;
 use crate::details::GLANCE_WIDTH;
 use crate::models::ModelInput;
 use crate::panes::Pane;
-use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT, storage_get, storage_set};
+use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT, now_ms, storage_get, storage_set};
 use crate::workspace::{ColumnCtx, Go, Popover, ScrollBox, Target, View, below, use_column};
 use crate::{api, markdown, sessions};
 
@@ -637,11 +637,14 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         sheet,
         details,
     };
-    // Esc closes the session's details or its glance, or else stops a
-    // running turn (unless typing in a field, e.g. a side chat); ⌘I opens
-    // and closes the glance where it isn't a column, ⌘F finds in the
-    // session.
+    // Esc closes the session's details or its glance; pressed twice within
+    // 1.5s it stops a running turn, from the message box too (once only
+    // arms it, and Stop reads "Esc", so a stray Esc doesn't stop the
+    // agent); ⌘I opens and closes
+    // the glance where it isn't a column, ⌘F finds in the session.
     let esc_id = id.clone();
+    let esc_armed = RwSignal::new(None::<i64>);
+    provide_context(EscArmed(esc_armed));
     let _keys = window_event_listener(leptos::ev::keydown, move |ev| {
         if !active() {
             return;
@@ -655,11 +658,26 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         match ev.key().as_str() {
             "Escape" if details.get_untracked() => details.set(false),
             "Escape" if !in_field && (glance_at.get_untracked().is_some() || sheet.get_untracked()) => chrome.close_glance(),
-            "Escape" if !in_field && running() => {
-                let id = esc_id.clone();
-                spawn_local(async move {
-                    let _ = api::interrupt(id).await;
-                });
+            // Taken already: a menu, a mention list or a suggestion put away.
+            "Escape" if running() && !ev.default_prevented() => {
+                let now = now_ms();
+                if esc_armed.get_untracked().is_some_and(|at| now - at < 1500) {
+                    esc_armed.set(None);
+                    let id = esc_id.clone();
+                    spawn_local(async move {
+                        let _ = api::interrupt(id).await;
+                    });
+                } else {
+                    esc_armed.set(Some(now));
+                    set_timeout(
+                        move || {
+                            if esc_armed.get_untracked() == Some(now) {
+                                esc_armed.set(None)
+                            }
+                        },
+                        std::time::Duration::from_millis(1500),
+                    );
+                }
             }
             // Not in a field, where it may be italic.
             "i" | "I" if command && !in_field => {
@@ -2119,6 +2137,11 @@ const SEND_SHAPE: &str = "rounded-md";
 const SEND: &str = "flex size-5.5 shrink-0 items-center justify-center disabled:opacity-50";
 const SEND_EMPTY: &str = "bg-zinc-600 text-zinc-200";
 const SEND_READY: &str = "bg-sky-600 text-white hover:bg-sky-700";
+
+/// One Esc pressed while the agent runs (when, in ms): a second within
+/// 1.5s stops it, and until then Stop reads "Esc".
+#[derive(Clone, Copy)]
+struct EscArmed(RwSignal<Option<i64>>);
 
 /// Stop: a thin ring, a small square in it.
 const STOP: &str = "flex size-5 shrink-0 items-center justify-center rounded-full border-[1.2px] border-zinc-400 text-muted hover:border-zinc-500 hover:text-zinc-500 disabled:opacity-50";
@@ -4112,6 +4135,7 @@ fn Composer(
         });
     };
     let stop = move |_| interrupt();
+    let esc_armed = use_context::<EscArmed>();
     // Send now (stop and send): the message waits in the box until the turn
     // has stopped, then starts the next one (sent anyway if stopping takes
     // long: it queues).
@@ -4449,6 +4473,9 @@ fn Composer(
                         <div class="ml-auto flex shrink-0 items-center gap-0.5">
                         {move || if stopping.get() {
                             view! { <button class=format!("{STOP} animate-pulse") disabled=true title="Stopping…" aria-label="Stopping…">{stop_icon()}</button> }.into_any()
+                        } else if running.get() && esc_armed.is_some_and(|EscArmed(a)| a.get().is_some()) {
+                            // One Esc pressed: Stop says what the next one does.
+                            view! { <button class=format!("{STOP} w-auto px-1.5 text-[10px] font-semibold") title="Press Esc again to stop" aria-label="Press Esc again to stop" on:click=stop>"Esc"</button> }.into_any()
                         } else if running.get() && has_text.get() {
                             // Both runtimes take it into the running turn (Claude Code's
                             // process stays up: docs/background.md §4).
