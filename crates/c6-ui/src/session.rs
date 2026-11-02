@@ -3111,18 +3111,20 @@ fn ToolCard(
                         Some(r) if r.is_error => ("✕", "text-red-500"),
                         Some(_) => ("✓", "text-emerald-600"),
                     };
-                    view! { <span class=format!("text-xs {cls}")>{icon}</span> }
+                    view! { <span class=format!("shrink-0 text-xs {cls}")>{icon}</span> }
                 }}
                 {
+                    // The name never gives way: the summary and the
+                    // recipient do (a long one squeezed it to a letter a line).
                     let (label, server) = tool_label(&name);
                     view! {
-                        <span class="text-xs font-semibold" title=name.clone()>{label}</span>
-                        {server.map(|s| view! { <span class="rounded bg-zinc-100 px-1 text-[10px] text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400" title=name.clone()>{s}</span> })}
+                        <span class="shrink-0 whitespace-nowrap text-xs font-semibold" title=name.clone()>{label}</span>
+                        {server.map(|s| view! { <span class="shrink-0 whitespace-nowrap rounded bg-zinc-100 px-1 text-[10px] text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400" title=name.clone()>{s}</span> })}
                     }
                 }
                 <span class="min-w-0 flex-1 truncate font-mono text-xs text-zinc-500">{summary}</span>
                 {sent_to.map(|(to, title)| view! {
-                    <Go to=View::session(to.clone()) class="shrink-0 text-[11px] text-sky-700 hover:underline dark:text-sky-400" stop=true>
+                    <Go to=View::session(to.clone()) class="min-w-0 max-w-[50%] truncate text-[11px] text-sky-700 hover:underline dark:text-sky-400" stop=true>
                         {move || format!("→ sent to {} ↗", title.get().unwrap_or_else(|| "a session".into()))}
                     </Go>
                 })}
@@ -3133,7 +3135,7 @@ fn ToolCard(
                             on:click=move |ev| { ev.prevent_default(); ev.stop_propagation(); scroll_to(&target); }>"↻ its thread"</button>
                     }
                 })}
-                {move || result.get().map(|r| view! { <span class="text-[11px] text-zinc-400">{format!("{:.1}s", r.duration_ms as f64 / 1000.0)}</span> })}
+                {move || result.get().map(|r| view! { <span class="shrink-0 whitespace-nowrap text-[11px] text-zinc-400">{format!("{:.1}s", r.duration_ms as f64 / 1000.0)}</span> })}
             </summary>
             <div class="space-y-2 border-t border-zinc-200 px-3 py-2 dark:border-zinc-800">
                 {plan.map(|items| view! {
