@@ -359,6 +359,8 @@ pub async fn require(State(st): State<Arc<HeadState>>, mut req: Request, next: N
                 return (status, Json(api::ApiError { error })).into_response();
             }
             req.extensions_mut().insert(caller);
+            // Its settings are the realm's own, as a realm's page's are.
+            return crate::store::SETTINGS_REALM.scope(realm, next.run(req)).await;
         }
         return next.run(req).await;
     }
@@ -385,8 +387,14 @@ pub async fn require(State(st): State<Arc<HeadState>>, mut req: Request, next: N
                 if let Err((status, error)) = crate::realms::admit(&st, &caller, req.method(), &path).await {
                     return (status, Json(api::ApiError { error })).into_response();
                 }
+                // A realm's token: its settings are the realm's own, as a
+                // realm's page's are (not root's, which every realm inherits).
+                let realm = caller.realm.clone();
                 req.extensions_mut().insert(caller);
-                return next.run(req).await;
+                return match realm {
+                    Some(realm) => crate::store::SETTINGS_REALM.scope(realm, next.run(req)).await,
+                    None => next.run(req).await,
+                };
             }
             None if st.auth.required => {
                 return (StatusCode::UNAUTHORIZED, Json(api::ApiError { error: "invalid API token".into() })).into_response();
