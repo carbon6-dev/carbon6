@@ -160,6 +160,13 @@ pub(crate) struct Process {
     pending: Option<Value>,
     /// Background-task notifications since the last turn ended.
     notified: Vec<String>,
+    /// Tasks Claude Code's subagents own: their ends are theirs to hear.
+    subagent_tasks: HashSet<String>,
+    /// Its own tasks that ended while no turn ran, as notices for the agent
+    /// ([`Process::take_unwoken`]), and when to deliver them if Claude Code
+    /// hasn't started a turn for them by itself.
+    unwoken: Vec<String>,
+    wake_due: Option<tokio::time::Instant>,
     /// When its last turn ended (or it started).
     idle_since: tokio::time::Instant,
     registration: Option<crate::mcp_bridge::Registration>,
@@ -335,6 +342,9 @@ impl Process {
             unconfirmed: Default::default(),
             pending: None,
             notified: Vec::new(),
+            subagent_tasks: HashSet::new(),
+            unwoken: Vec::new(),
+            wake_due: None,
             idle_since: tokio::time::Instant::now(),
             registration: mcp,
             pidfile: None,
@@ -391,10 +401,38 @@ impl Process {
     pub async fn idle_line(&mut self, v: Value, sink: &Arc<dyn EventSink>) -> anyhow::Result<bool> {
         if self.begins_turn(&v) {
             self.pending = Some(v);
+            // It woke by itself: that turn hears about what ended.
+            self.unwoken.clear();
+            self.wake_due = None;
             return Ok(true);
         }
         self.side_line(&v, sink).await?;
+        // One of its own tasks ended while it waits. Claude Code usually
+        // starts a turn for it; when it doesn't (seen with a long build), the
+        // agent would wait for good, so the session tells it.
+        if v["type"] == "system"
+            && v["subtype"] == "task_notification"
+            && v["parent_tool_use_id"].is_null()
+            && let Some(status) = v["status"].as_str().filter(|s| matches!(*s, "completed" | "failed"))
+            && !v["task_id"].as_str().is_some_and(|t| self.subagent_tasks.contains(t))
+        {
+            self.unwoken.push(unwoken_notice(&v, status));
+            self.wake_due.get_or_insert_with(|| tokio::time::Instant::now() + WAKE_GRACE);
+        }
         Ok(false)
+    }
+
+    /// When the session should tell the agent about tasks that ended while
+    /// no turn ran, if Claude Code hasn't started one for them by then.
+    pub fn wake_due(&self) -> Option<tokio::time::Instant> {
+        self.wake_due
+    }
+
+    /// The notice for those tasks (`None`: nothing is waiting).
+    pub fn take_unwoken(&mut self) -> Option<String> {
+        self.wake_due = None;
+        let notices = std::mem::take(&mut self.unwoken);
+        (!notices.is_empty()).then(|| notices.join("\n"))
     }
 
     fn begins_turn(&self, v: &Value) -> bool {
@@ -411,6 +449,13 @@ impl Process {
 
     /// A line that is not part of a turn's transcript.
     async fn side_line(&mut self, v: &Value, sink: &Arc<dyn EventSink>) -> anyhow::Result<()> {
+        if v["type"] == "system"
+            && v["subtype"] == "task_started"
+            && v["owned_by_subagent"].as_bool() == Some(true)
+            && let Some(t) = v["task_id"].as_str()
+        {
+            self.subagent_tasks.insert(t.to_owned());
+        }
         if v["type"] == "system" && v["subtype"] == "task_notification" && v["parent_tool_use_id"].is_null() {
             let summary = v["summary"].as_str().or(v["description"].as_str()).unwrap_or("A background task ended.");
             self.notified.push(summary.to_owned());
@@ -498,6 +543,9 @@ impl Process {
         cancel: &CancellationToken,
     ) -> anyhow::Result<TurnEnd> {
         self.mapper.turn = turn;
+        // This turn hears about whatever ended before it.
+        self.unwoken.clear();
+        self.wake_due = None;
         self.mapper.result = None;
         self.mapper.interrupted = false;
         let mut started = opened;
@@ -696,6 +744,22 @@ fn user_content(input: &PendingInput, preamble: Option<&str>) -> Value {
 /// before creating its claude-uid/session/tasks/*.output tree. Give each
 /// process a private root instead of trusting paths into the host filesystem.
 struct OutputRoot(PathBuf);
+
+/// How long Claude Code has to start a turn by itself for a task that ended
+/// while it waited, before the session tells the agent.
+pub const WAKE_GRACE: Duration = Duration::from_secs(10);
+
+/// What the agent is told about one of its tasks that ended while it waited
+/// (Claude Code's own notification, as it would have given it).
+fn unwoken_notice(v: &Value, status: &str) -> String {
+    let what = v["summary"].as_str().or(v["description"].as_str()).unwrap_or("A background task");
+    let mut s = format!("<background-task kind=\"claude-code\" status=\"{status}\">\nTask: {what}\n");
+    if let Some(out) = v["output_file"].as_str().filter(|o| !o.is_empty()) {
+        s.push_str(&format!("Output: {out}\n"));
+    }
+    s.push_str("</background-task>");
+    s
+}
 
 /// Text for an argument or file of Claude Code's: a NUL can't be passed to
 /// a process, so it is left out.
@@ -1887,6 +1951,122 @@ done
         assert_eq!(events[5..].iter().map(kind).collect::<Vec<_>>(), ["user", "turn_started", "assistant", "usage", "turn_ended"]);
         let Some(session_event::Kind::User(u)) = &events[5].kind else { panic!() };
         assert_eq!((u.command.as_str(), u.text.as_str()), ("task-notification", "Build finished"));
+        p.close().await;
+    }
+
+    /// A stand-in `claude` whose first turn leaves a build and a subagent's
+    /// command running and ends; both end while it waits. With `wake` it
+    /// starts a turn for the build by itself, as Claude Code usually does;
+    /// without, it stays quiet (as seen with a 20-minute build). It answers
+    /// whatever it is sent next.
+    fn waiting_claude(dir: &Path, wake: bool) -> PathBuf {
+        let woke = if wake {
+            r#"printf '%s\n' '{"type":"system","subtype":"init"}'
+say "The build passed."
+done_ok"#
+        } else {
+            ""
+        };
+        script(
+            dir,
+            if wake { "claude-wakes" } else { "claude-quiet" },
+            &format!(
+                r#"#!/bin/sh
+uuid_of() {{ printf '%s' "$1" | sed -n 's/.*"uuid":"\([^"]*\)".*/\1/p'; }}
+echo_of() {{ printf '{{"type":"user","isReplay":true,"uuid":"%s","message":{{"role":"user","content":"echo"}},"parent_tool_use_id":null}}\n' "$(uuid_of "$1")"; }}
+say() {{ printf '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"%s"}}],"stop_reason":"end_turn"}},"parent_tool_use_id":null}}\n' "$1"; }}
+done_ok() {{ printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"usage":{{}}}}'; }}
+read -r line
+printf '%s\n' '{{"type":"system","subtype":"init"}}'
+echo_of "$line"
+printf '%s\n' '{{"type":"system","subtype":"task_started","task_id":"build","tool_use_id":"toolu_b","description":"cargo build","task_type":"local_bash","is_backgrounded":true}}'
+printf '%s\n' '{{"type":"system","subtype":"task_started","task_id":"sub","description":"the subagent tests","task_type":"local_bash","owned_by_subagent":true}}'
+say "The build runs in the background, waiting for it."
+done_ok
+sleep 0.2
+printf '%s\n' '{{"type":"system","subtype":"task_notification","task_id":"sub","status":"completed","summary":"The subagent tests passed"}}'
+printf '%s\n' '{{"type":"system","subtype":"task_notification","task_id":"build","tool_use_id":"toolu_b","status":"completed","summary":"Build finished","output_file":"/tmp/build.out"}}'
+{woke}
+while read -r line; do
+  printf '%s\n' '{{"type":"system","subtype":"init"}}'
+  echo_of "$line"
+  say "Continuing."
+  done_ok
+done
+"#
+            ),
+        )
+    }
+
+    /// Reads it while no turn runs until `until` holds or a turn begins
+    /// (true).
+    async fn idle_until_or_turn(p: &mut Process, sink: &Arc<dyn EventSink>, until: impl Fn(&Process) -> bool) -> bool {
+        while !until(p) {
+            let v = p.next_line().await.expect("still up");
+            if p.idle_line(v, sink).await.unwrap() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// A task of its own that ended while it waited, with no turn from
+    /// Claude Code for it: the session can tell the agent (once), and the
+    /// agent goes on. A subagent's task ending doesn't count.
+    #[tokio::test]
+    async fn a_finished_task_wakes_the_agent_when_claude_code_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = waiting_claude(dir.path(), false);
+        let tools = Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()));
+        let vec_sink = Arc::new(VecSink::default());
+        let sink: Arc<dyn EventSink> = vec_sink.clone();
+        let mut p = spawn(&bin, dir.path(), "s", false, Some(observer(dir.path(), tools).await));
+        assert_eq!(run(&mut p, 1, &[input("c1", "build it")], &sink).await.reason, Some(TurnEndReason::Completed));
+        assert!(p.wake_due().is_none(), "nothing has ended yet");
+        let began = idle_until_or_turn(&mut p, &sink, |p| p.wake_due().is_some()).await;
+        assert!(!began, "this Claude Code starts no turn for it");
+        let notice = p.take_unwoken().expect("the build's end is waiting");
+        assert!(
+            notice.contains(r#"status="completed""#)
+                && notice.contains("Task: Build finished")
+                && notice.contains("Output: /tmp/build.out"),
+            "{notice}"
+        );
+        assert!(!notice.contains("subagent"), "its subagent's task is its subagent's to hear about: {notice}");
+        assert!(p.wake_due().is_none() && p.take_unwoken().is_none(), "told once");
+        // The session sends it as a notice; the agent goes on.
+        let wake = PendingInput {
+            command_id: "task:claude-wake:1".into(),
+            text: notice,
+            command: "task-notification".into(),
+            ..Default::default()
+        };
+        assert_eq!(run(&mut p, 2, &[wake], &sink).await.reason, Some(TurnEndReason::Completed));
+        assert!(
+            vec_sink
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| matches!(&e.kind, Some(session_event::Kind::Assistant(a)) if format!("{:?}", a.blocks).contains("Continuing.")))
+        );
+        p.close().await;
+    }
+
+    /// When Claude Code starts a turn for the task by itself, the session has
+    /// nothing to add.
+    #[tokio::test]
+    async fn no_wake_is_needed_when_claude_code_wakes_by_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = waiting_claude(dir.path(), true);
+        let tools = Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()));
+        let vec_sink = Arc::new(VecSink::default());
+        let sink: Arc<dyn EventSink> = vec_sink.clone();
+        let mut p = spawn(&bin, dir.path(), "s", false, Some(observer(dir.path(), tools).await));
+        assert_eq!(run(&mut p, 1, &[input("c1", "build it")], &sink).await.reason, Some(TurnEndReason::Completed));
+        assert!(idle_until_or_turn(&mut p, &sink, |_| false).await, "it starts a turn for the build");
+        assert!(p.wake_due().is_none() && p.take_unwoken().is_none(), "nothing for the session to send");
+        assert_eq!(run(&mut p, 2, &[], &sink).await.reason, Some(TurnEndReason::Completed));
         p.close().await;
     }
 

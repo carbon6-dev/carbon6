@@ -1511,6 +1511,9 @@ impl Actor {
                 self.running_flag.store(true, std::sync::atomic::Ordering::SeqCst);
             }
             let idle_until = self.claude.as_ref().filter(|_| running.is_none()).and_then(|p| p.idle_until(self.claude_idle()));
+            // Claude Code's tasks that ended while it waited, if it doesn't
+            // start a turn for them by itself.
+            let wake_at = self.claude.as_ref().filter(|_| running.is_none()).and_then(|p| p.wake_due());
             // Notices the hourly limit held: once the hour allows.
             let retry_at = (running.is_none() && self.deferred.iter().any(|(_, wake)| *wake))
                 .then(|| self.auto_turns.front().map_or_else(std::time::Instant::now, |t| *t + HOUR));
@@ -1807,6 +1810,21 @@ impl Actor {
                                     return;
                                 }
                             }
+                        }
+                    }
+                }
+                _ = tokio::time::sleep_until(wake_at.unwrap_or_else(tokio::time::Instant::now)), if running.is_none() && wake_at.is_some() => {
+                    if let Some(text) = self.claude.as_mut().and_then(|p| p.take_unwoken()) {
+                        info!(session = %self.writer.session_id, "Claude Code didn't wake for its finished tasks: telling the agent");
+                        let input = PendingInput {
+                            command_id: format!("task:claude-wake:{}", uuid::Uuid::now_v7()),
+                            text,
+                            command: "task-notification".into(),
+                            ..Default::default()
+                        };
+                        if let Err(e) = self.notice(input, false, true).await {
+                            error!(session = %self.writer.session_id, "telling the agent about its tasks: {e:#}");
+                            return;
                         }
                     }
                 }
