@@ -120,6 +120,33 @@ pub fn minimize() -> impl IntoView {
     })
 }
 
+/// Lucide `search`: a search field's magnifier.
+pub fn search() -> impl IntoView {
+    icon(view! {
+        <circle cx="11" cy="11" r="8" />
+        <path d="m21 21-4.3-4.3" />
+    })
+}
+
+/// Lucide `sliders-horizontal`: filter, sort and group.
+pub fn sliders() -> impl IntoView {
+    icon(view! {
+        <path d="M21 4h-7M10 4H3M21 12h-9M8 12H3M21 20h-5M12 20H3" />
+        <path d="M14 2v4M8 10v4M16 18v4" />
+    })
+}
+
+/// Lucide `square-check` when `on`, else `square`: a toggle chip's box.
+pub fn check_box(on: bool) -> impl IntoView {
+    view! {
+        <svg viewBox="0 0 24 24" class="size-3.5 shrink-0" fill="none" stroke="currentColor" stroke-width="2.25"
+            stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect width="18" height="18" x="3" y="3" rx="2" />
+            {on.then(|| view! { <path d="m9 12 2 2 4-4" /> })}
+        </svg>
+    }
+}
+
 /// An icon button in a bar (a tile's, a pane's, a session's strip): 28px
 /// round a 16px glyph, 40px on a touch screen. Hover only with a mouse (a
 /// tapped button on a phone keeps no look); a ring for the keyboard's focus.

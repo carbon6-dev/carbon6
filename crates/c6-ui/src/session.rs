@@ -2475,7 +2475,9 @@ fn picker_model(kind: &str, default: Option<String>) -> String {
 
 /// Connection select plus a model field that lists the connections' models
 /// and also takes free text. `no_claude_code`: leave Claude Code out (it
-/// cannot run there, e.g. over SSH or for subagents).
+/// cannot run there, e.g. over SSH or for subagents). `auto`: offer Auto
+/// (connection "": your routing rules choose) while it says so, or while
+/// Auto is chosen; on Auto there's no model to type.
 #[component]
 pub(crate) fn ModelPicker(
     connection: RwSignal<String>,
@@ -2486,6 +2488,7 @@ pub(crate) fn ModelPicker(
     /// its connections are shown, not chosen.
     #[prop(optional)]
     claude_off: Option<Signal<Option<String>>>,
+    #[prop(optional, into)] auto: Option<Signal<bool>>,
 ) -> impl IntoView {
     let connections = LocalResource::new(api::connections);
     // Effort only where the connection passes it on to the model.
@@ -2502,6 +2505,9 @@ pub(crate) fn ModelPicker(
             connection.set(c);
             model.set(default);
         }>
+            {move || auto.filter(|a| a.get() || connection.with(String::is_empty)).map(|_| view! {
+                <option value="" selected=move || connection.with(String::is_empty)>"Auto (your routing rules)"</option>
+            })}
             {move || connections.get().and_then(Result::ok).unwrap_or_default().into_iter()
                 .filter(|c| !(no_claude_code && c.kind == "claude_code") || connection.get_untracked() == c.id)
                 .map(|c| {
@@ -2515,7 +2521,7 @@ pub(crate) fn ModelPicker(
             }).collect_view()}
         </select>
         <crate::quota::QuotaNote connection />
-        <div class="w-56"><ModelInput connection=connection value=model on_set=move |v| model.set(v) class=SMALL_INPUT.to_owned() placeholder="model id" /></div>
+        <div class="w-56 max-w-full" class:hidden=move || auto.is_some() && connection.with(String::is_empty)><ModelInput connection=connection value=model on_set=move |v| model.set(v) class=SMALL_INPUT.to_owned() placeholder="model id" /></div>
         <select class=SMALL_INPUT class:hidden=move || !supports_effort(&connection.get()) title="Reasoning effort" on:change=move |ev| effort.set(event_target_value(&ev))>
             {EFFORTS.iter().map(|&(value, label)| view! {
                 <option value=value selected=move || effort.get() == value>{label}</option>
@@ -2604,10 +2610,10 @@ fn NewSideChat(parent: String, anchor_seq: u64, defaults: (String, String, Strin
 
 /// The message box's Send: a small soft square (`rounded-full` makes it a
 /// circle), quiet while there's nothing to send, sky once there is.
-const SEND_SHAPE: &str = "rounded-md";
-const SEND: &str = "flex size-5.5 shrink-0 items-center justify-center disabled:opacity-50";
-const SEND_EMPTY: &str = "bg-zinc-600 text-zinc-200";
-const SEND_READY: &str = "bg-sky-600 text-white hover:bg-sky-700";
+pub(crate) const SEND_SHAPE: &str = "rounded-md";
+pub(crate) const SEND: &str = "flex size-5.5 shrink-0 items-center justify-center disabled:opacity-50";
+pub(crate) const SEND_EMPTY: &str = "bg-zinc-600 text-zinc-200";
+pub(crate) const SEND_READY: &str = "bg-sky-600 text-white hover:bg-sky-700";
 
 /// One Esc pressed while the agent runs (when, in ms): a second within
 /// 1.5s stops it, and until then Stop reads "Esc".
@@ -2637,7 +2643,7 @@ const STOP: &str = "flex size-5 shrink-0 items-center justify-center rounded-ful
 /// Send's icon, an arrow up: its one path, to change it.
 const SEND_ICON: &str = "M8 13V3M3.5 7.5 8 3l4.5 4.5";
 
-fn send_icon() -> impl IntoView {
+pub(crate) fn send_icon() -> impl IntoView {
     view! {
         <svg viewBox="0 0 16 16" class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d=SEND_ICON />

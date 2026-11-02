@@ -67,7 +67,7 @@ pub fn attention_title(shown: usize, hidden: usize) -> String {
 
 /// The labels of your sessions, for suggestions: yours first, then the
 /// automatic ones (folders in their ~/ form).
-fn known_labels(sessions: &[c6_api::Session]) -> Vec<String> {
+pub(crate) fn known_labels(sessions: &[c6_api::Session]) -> Vec<String> {
     let mut mine: Vec<String> = Vec::new();
     let mut auto: Vec<String> = Vec::new();
     for s in sessions {
