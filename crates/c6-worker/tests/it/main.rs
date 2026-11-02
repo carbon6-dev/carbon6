@@ -14,6 +14,7 @@ mod attention;
 mod automations;
 mod background;
 mod cards;
+mod catchup;
 mod chaos;
 mod collections;
 mod commands;

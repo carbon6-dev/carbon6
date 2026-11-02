@@ -861,6 +861,8 @@ pub struct Workspace {
     /// The tile being dragged by its bar, and where it would drop.
     pub dragging: RwSignal<Option<u64>>,
     pub drop_at: RwSignal<Option<Drop>>,
+    /// The catch-ups of sessions you came back to, by session.
+    pub catchups: RwSignal<HashMap<String, crate::catchup::Card>>,
     /// Counts the views the head has taken (recently viewed loads again).
     pub viewed: RwSignal<u32>,
 }
@@ -898,6 +900,7 @@ impl Workspace {
             dragging: RwSignal::new(None),
             drop_at: RwSignal::new(None),
             viewed: RwSignal::new(0),
+            catchups: RwSignal::new(HashMap::new()),
         };
         // A link or redirect to a particular view opens it (the home page
         // just restores the workspace).
@@ -1235,21 +1238,40 @@ impl Workspace {
         // It lives as long as the page does.
         let _ = window_event_listener_untyped("visibilitychange", move |_| page.set(!document().hidden()));
         let told = StoredValue::new(HashMap::<String, i64>::new());
+        // The sessions in view (with the page): one that comes into view
+        // again is one you came back to, and is asked first what it did
+        // since you looked (its catch-up), then told seen.
+        let in_view = StoredValue::new(HashSet::<String>::new());
         Effect::new(move || {
             let sessions = live.sessions.get();
             let visible = ws.layout.with(Layout::visible_sessions);
             if !page.get() {
+                in_view.set_value(HashSet::new());
                 return;
+            }
+            let now: HashSet<String> = sessions.iter().filter(|s| visible.contains(&s.id)).map(|s| s.id.clone()).collect();
+            let back: HashSet<String> = in_view.with_value(|was| now.difference(was).cloned().collect());
+            in_view.set_value(now);
+            for s in sessions.iter().filter(|s| back.contains(&s.id) && !matches!(s.status, SessionStatus::Idle | SessionStatus::Failed)) {
+                leptos::task::spawn_local(crate::catchup::look(ws.catchups, s.id.clone()));
             }
             for s in sessions.iter().filter(|s| visible.contains(&s.id) && matches!(s.status, SessionStatus::Idle | SessionStatus::Failed))
             {
-                if told.with_value(|t| t.get(&s.id) == Some(&s.updated_at)) {
+                if told.with_value(|t| t.get(&s.id) == Some(&s.updated_at)) && !back.contains(&s.id) {
                     continue;
                 }
                 told.update_value(|t| {
                     t.insert(s.id.clone(), s.updated_at);
                 });
-                leptos::task::spawn_local(api::session_seen(s.id.clone()));
+                let id = s.id.clone();
+                if back.contains(&id) {
+                    leptos::task::spawn_local(async move {
+                        crate::catchup::look(ws.catchups, id.clone()).await;
+                        api::session_seen(id).await;
+                    });
+                } else {
+                    leptos::task::spawn_local(api::session_seen(id));
+                }
             }
         });
         // The focused session, with the page in view: you viewed it (the
@@ -1848,7 +1870,7 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                 {move || chrome().map(|c| view! {
                     <crate::session::SessionControls chrome=c />
                     <span class="mx-1 h-4 w-px shrink-0 bg-zinc-200 dark:bg-zinc-700"></span>
-                    <button class=btn title="Actions: rename, find, files, outputs, details, new like this, save as template, archive" aria-label="Actions"
+                    <button class=btn title="Actions: rename, find, files, outputs, details, new like this, save as template, catch-up, timeline, archive" aria-label="Actions"
                         on:click=move |ev| menu_at.set(if menu_at.get_untracked().is_some() { None } else { Some(below(&ev, 240.0)) })>{crate::icons::ellipsis()}</button>
                 })}
                 {move || pinnable().map(|id| {

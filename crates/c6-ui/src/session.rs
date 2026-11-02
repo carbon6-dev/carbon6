@@ -528,7 +528,8 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     });
     let force_open = ForceOpen(RwSignal::new(target.open.clone()));
     provide_context(force_open);
-    provide_context(Reach(RwSignal::new(HashMap::new())));
+    let reach = RwSignal::new(HashMap::new());
+    provide_context(Reach(reach));
     provide_context(Follow(stick));
     // Drawn only part way (after a jump back): its last event isn't the
     // end, so it isn't followed.
@@ -664,6 +665,41 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         }
     });
     let details = RwSignal::new(false);
+    // How it shows itself (a catch-up card, its timeline), the same on
+    // every device; and whether its transcript is folded into hours now.
+    let view_settings = RwSignal::new(None::<c6_api::SessionViewSettings>);
+    {
+        let id = id.clone();
+        spawn_local(async move {
+            if let Ok(v) = api::session_view(id).await {
+                let _ = view_settings.try_set(Some(v));
+            }
+        });
+    }
+    let folded = RwSignal::new(true);
+    // To a place in the transcript (all of it, loaded back to there).
+    let jump = Callback::new(move |(seq, el): (u64, String)| {
+        folded.set(false);
+        stick.set(false);
+        if seq > 0 {
+            reach.update(|r| {
+                r.insert(id_stored.get_value(), seq);
+            });
+        }
+        reveal_when_rendered(meta_root.get_value(), el, "[]".into(), 0);
+    });
+    // Its catch-up, where it isn't the glance column's first section: a
+    // popover from the pill over the transcript, or a phone's sheet.
+    let cards = crate::catchup::cards();
+    let card_open = Memo::new(move |_| cards.and_then(|c| c.with(|m| m.get(&id_stored.get_value()).filter(|c| c.open).map(|c| c.c.steps))));
+    let catch_at = RwSignal::new(None::<(f64, f64)>);
+    let catch_sheet = RwSignal::new(false);
+    Effect::new(move || {
+        if wide.get() || card_open.get().is_none() {
+            catch_at.set(None);
+            catch_sheet.set(false);
+        }
+    });
     let chrome = SessionChrome {
         token: SessionChrome::next_token(),
         id: id_stored,
@@ -685,6 +721,8 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         glance_at,
         sheet,
         details,
+        view_settings,
+        folded,
     };
     // Esc closes the session's details or its glance; pressed twice within
     // 1.5s it stops a running turn, from the message box too (once only
@@ -802,6 +840,17 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         // in sight as the transcript scrolls.
         <div class=format!("{READING_ROW} items-start")>
         <div class=format!("{READING} px-4 pb-8 pt-4")>
+            // Its catch-up, where the glance isn't a column: a pill that
+            // stays at the top as the transcript scrolls.
+            {move || card_open.get().filter(|_| !wide.get()).map(|steps| view! {
+                <div class="pointer-events-none sticky top-2 z-20 mb-3 flex justify-center">
+                    <button class="pointer-events-auto rounded-full border border-sky-300 bg-sky-50/95 px-3 py-1 text-xs font-medium text-sky-800 shadow-md hover:bg-sky-100 dark:border-sky-800 dark:bg-sky-950/95 dark:text-sky-200 dark:hover:bg-sky-900"
+                        title="What it did since you looked"
+                        on:click=move |ev| if crate::util::phone() { catch_sheet.set(true) } else { catch_at.set(Some(below(&ev, 384.0))) }>
+                        {format!("Catch up · {steps} new")}
+                    </button>
+                </div>
+            })}
             <Suspense fallback=|| ()>
                 {move || detail.get().map(|r| match r {
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
@@ -825,10 +874,14 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                     }
                 })}
             </Suspense>
-            {move || detail.get().and_then(Result::ok).map(|d| view! { <Transcript session=d.session feed running=Signal::derive(running) /> })}
+            {move || detail.get().and_then(Result::ok).map(|d| view! {
+                <Transcript session=d.session feed running=Signal::derive(running) view_settings folded />
+            })}
         </div>
         <Show when=move || wide.get()>
             <aside class=format!("sticky top-0 max-h-[calc(100dvh-8rem)] overflow-y-auto pb-4 pt-4 {GLANCE_COLUMN}")>
+                <crate::catchup::CatchupBody session=id_stored.get_value() jump caps=true
+                    class="mb-2 border-b border-zinc-200 px-1.5 pb-3 dark:border-zinc-800" />
                 <crate::details::Glance chrome />
             </aside>
         </Show>
@@ -897,6 +950,10 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             <crate::details::Glance chrome on_done=move |()| glance_at.set(None) />
         </Popover>
         {move || sheet.get().then(|| view! { <GlanceSheet chrome /> })}
+        <Popover at=catch_at class="w-[min(24rem,calc(100vw-1rem))] p-3">
+            <crate::catchup::CatchupBody session=id_stored.get_value() jump on_done=move |()| catch_at.set(None) />
+        </Popover>
+        {move || catch_sheet.get().then(|| view! { <crate::catchup::CatchupSheet session=id_stored.get_value() jump open=catch_sheet /> })}
         </div>
     }
 }
@@ -1005,6 +1062,10 @@ pub struct SessionChrome {
     sheet: RwSignal<bool>,
     /// The session's details dialog is open.
     details: RwSignal<bool>,
+    /// Whether it shows a catch-up card and its timeline (None until read).
+    view_settings: RwSignal<Option<c6_api::SessionViewSettings>>,
+    /// Its transcript is folded into hours (while its timeline is on).
+    folded: RwSignal<bool>,
 }
 
 impl SessionChrome {
@@ -1130,8 +1191,29 @@ pub fn RenameForm(session: String, title: String, #[prop(into)] on_done: Callbac
 /// choice.
 #[component]
 pub fn SessionMenu(chrome: SessionChrome, #[prop(into)] on_rename: Callback<()>, #[prop(into)] on_done: Callback<()>) -> impl IntoView {
-    let SessionChrome { id, detail, find_open, like_this, as_template, details, col, .. } = chrome;
+    let SessionChrome { id, detail, find_open, like_this, as_template, details, col, view_settings, folded, .. } = chrome;
     let session = move || detail.get().and_then(Result::ok).map(|d| d.session);
+    // Its catch-up card and timeline, on or off (kept on the head).
+    let cards = crate::catchup::cards();
+    let set_view = move |change: fn(&mut c6_api::SessionViewSettings, bool), on: bool| {
+        let Some(mut v) = view_settings.get_untracked() else { return };
+        change(&mut v, on);
+        view_settings.set(Some(v.clone()));
+        if !v.catchup
+            && let Some(c) = cards
+        {
+            c.update(|m| {
+                m.remove(&id.get_value());
+            });
+        }
+        if v.timeline {
+            folded.set(true);
+        }
+        spawn_local(async move {
+            let _ = api::set_session_view(id.get_value(), v).await;
+        });
+    };
+    let flag = move |f: fn(&c6_api::SessionViewSettings) -> bool| Signal::derive(move || view_settings.with(|v| v.as_ref().is_some_and(f)));
     // Your own sessions are renamed; subagents and observed ones aren't.
     let renamable = move || session().is_some_and(|s| s.parent_id.is_none() && !s.observed);
     let seeds = move || session().is_some_and(|s| !s.observed && s.instance.is_empty());
@@ -1169,6 +1251,13 @@ pub fn SessionMenu(chrome: SessionChrome, #[prop(into)] on_rename: Callback<()>,
                     title="Save this session's worker, folder, model and labels as a template, which agents can start as a remote subagent"
                     on:click=move |_| { as_template.run(()); on_done.run(()) }>"Save as template…"</button>
             </Show>
+            <Show when=move || view_settings.with(Option::is_some)>
+                <div class=MENU_RULE></div>
+                <MenuSwitch on=flag(|v| v.catchup) label="Catch-up" hint="a card when you come back"
+                    on_change=move |on| set_view(|v, on| v.catchup = on, on) />
+                <MenuSwitch on=flag(|v| v.timeline) label="Timeline" hint="turns folded, by hour"
+                    on_change=move |on| set_view(|v, on| v.timeline = on, on) />
+            </Show>
             <div class=MENU_RULE></div>
             <button class=format!("{MENU_ITEM} text-red-600 dark:text-red-400") title="Archive the session and close this column" on:click=move |_| {
                 spawn_local(async move {
@@ -1177,6 +1266,26 @@ pub fn SessionMenu(chrome: SessionChrome, #[prop(into)] on_rename: Callback<()>,
                 on_done.run(());
             }>"Archive"</button>
         </div>
+    }
+}
+
+/// An on/off item of the ⋯ menu: the switch, what it is and a hint. The
+/// menu stays open, so you see it change.
+#[component]
+fn MenuSwitch(
+    #[prop(into)] on: Signal<bool>,
+    on_change: impl Fn(bool) + 'static,
+    label: &'static str,
+    hint: &'static str,
+) -> impl IntoView {
+    view! {
+        <button type="button" role="switch" class=MENU_ITEM aria-checked=move || on.get().to_string() on:click=move |_| on_change(!on.get_untracked())>
+            <span class=move || format!("relative h-3.5 w-[26px] shrink-0 rounded-full transition-colors {}", if on.get() { "bg-sky-600" } else { "bg-zinc-300 dark:bg-zinc-600" })>
+                <span class=move || format!("absolute left-0.5 top-0.5 h-2.5 w-2.5 rounded-full bg-white shadow-sm transition-transform {}", if on.get() { "translate-x-3" } else { "" })></span>
+            </span>
+            {label}
+            <span class=MENU_HINT>{hint}</span>
+        </button>
     }
 }
 
@@ -1287,7 +1396,7 @@ fn SessionStrip(chrome: SessionChrome) -> impl IntoView {
             <SessionControls chrome />
             <span class="mx-1 h-4 w-px shrink-0 bg-zinc-200 dark:bg-zinc-700"></span>
             <button class=crate::icons::BAR_BUTTON aria-label="Actions"
-                title="Actions: rename, find, files, outputs, details, new like this, save as template, archive"
+                title="Actions: rename, find, files, outputs, details, new like this, save as template, catch-up, timeline, archive"
                 on:click=move |ev| {
                     rename_from.set_value(below(&ev, 320.0));
                     menu_at.set(if menu_at.get_untracked().is_some() { None } else { Some(below(&ev, 240.0)) });
@@ -1469,10 +1578,67 @@ impl SubagentTree {
     }
 }
 
-/// A session's transcript, with the side chats branching from its messages
-/// shown under them (recursively).
+/// Approvals answered (allowed, denied or expired), by call.
+fn decided_calls(evs: &[Event]) -> std::collections::HashSet<String> {
+    evs.iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::Approval { call_id, state, .. } if state != "requested" => Some(call_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Tool calls' results, by call.
+fn tool_results(session: &str, evs: &[Event]) -> HashMap<String, ToolResultView> {
+    evs.iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::ToolResult { call_id, output, is_error, truncated, duration_ms, images, .. } => Some((
+                call_id.clone(),
+                ToolResultView {
+                    output: output.clone(),
+                    is_error: *is_error,
+                    truncated: *truncated,
+                    duration_ms: *duration_ms,
+                    images: (0..*images)
+                        .map(|i| crate::api::url(&format!("/api/v1/sessions/{session}/attachments/{}/{i}", e.seq)))
+                        .collect(),
+                },
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A turn's events in full (a turn opened in the timeline), with their
+/// tool calls' results.
 #[component]
-fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoView {
+pub(crate) fn TurnEvents(
+    session: String,
+    events: Signal<Vec<Event>>,
+    streaming: RwSignal<Streaming>,
+    usage: Memo<UsageStats>,
+) -> impl IntoView {
+    let id = StoredValue::new(session);
+    let decided = Memo::new(move |_| events.with(|evs| decided_calls(evs)));
+    let results = Memo::new(move |_| events.with(|evs| tool_results(&id.get_value(), evs)));
+    view! {
+        <For each=move || events.get() key=|e| e.seq let:e>
+            <div>{render_event(&id.get_value(), &e, results, decided, streaming, usage)}</div>
+        </For>
+    }
+}
+
+/// A session's transcript, with the side chats branching from its messages
+/// shown under them (recursively). `view_settings` and `folded` (a
+/// session's own transcript): its timeline, and whether it's folded now.
+#[component]
+fn Transcript(
+    session: Session,
+    feed: Feed,
+    running: Signal<bool>,
+    #[prop(optional)] view_settings: Option<RwSignal<Option<c6_api::SessionViewSettings>>>,
+    #[prop(optional)] folded: Option<RwSignal<bool>>,
+) -> impl IntoView {
     let Feed { events, streaming, queued, edit_open, edit_rows, secrets, from, to, .. } = feed;
     let id = StoredValue::new(session.id.clone());
     let worker_id = session.worker_id;
@@ -1531,39 +1697,17 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
         }
     });
     on_sight(bottom, move || feed.later());
-    // Approvals answered (allowed, denied or expired), by call.
-    let decided = Memo::new(move |_| {
-        events.with(|evs| {
-            evs.iter()
-                .filter_map(|e| match &e.kind {
-                    EventKind::Approval { call_id, state, .. } if state != "requested" => Some(call_id.clone()),
-                    _ => None,
-                })
-                .collect::<std::collections::HashSet<_>>()
-        })
-    });
-    let results = Memo::new(move |_| {
-        events.with(|evs| {
-            evs.iter()
-                .filter_map(|e| match &e.kind {
-                    EventKind::ToolResult { call_id, output, is_error, truncated, duration_ms, images, .. } => Some((
-                        call_id.clone(),
-                        ToolResultView {
-                            output: output.clone(),
-                            is_error: *is_error,
-                            truncated: *truncated,
-                            duration_ms: *duration_ms,
-                            images: (0..*images)
-                                .map(|i| crate::api::url(&format!("/api/v1/sessions/{}/attachments/{}/{i}", id.get_value(), e.seq)))
-                                .collect(),
-                        },
-                    )),
-                    _ => None,
-                })
-                .collect::<HashMap<_, _>>()
-        })
-    });
+    let decided = Memo::new(move |_| events.with(|evs| decided_calls(evs)));
+    let results = Memo::new(move |_| events.with(|evs| tool_results(&id.get_value(), evs)));
     let usage = Memo::new(move |_| events.with(|evs| UsageStats::from_events(evs)));
+    // Folded into hours (the session's timeline is on, and you haven't
+    // asked for all of it); where you left off, while you catch up.
+    let timeline_on = Memo::new(move |_| view_settings.is_some_and(|v| v.with(|v| v.as_ref().is_some_and(|v| v.timeline))));
+    let is_folded = Memo::new(move |_| timeline_on.get() && folded.is_some_and(|f| f.get()));
+    let cards = crate::catchup::cards();
+    let here = Memo::new(move |_| {
+        cards.and_then(|c| c.with(|m| m.get(&id.get_value()).map(|c| (c.c.since_seq, c.c.since_at)))).filter(|(s, _)| *s > 0)
+    });
     // Ticks while a turn runs, for its elapsed time.
     let now = RwSignal::new(js_sys::Date::now() as i64);
     let ticker = set_interval_with_handle(move || now.set(js_sys::Date::now() as i64), std::time::Duration::from_secs(1)).ok();
@@ -1655,6 +1799,30 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
     view! {
         // A long unbroken string (a path, a URL) wraps instead of widening it.
         <div class="space-y-4 [overflow-wrap:anywhere]">
+            // Its timeline or all of it, while its timeline is on.
+            {move || timeline_on.get().then(|| {
+                let seg = move |on: bool| {
+                    if on { "rounded px-2 py-0.5 bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100" } else { "rounded px-2 py-0.5 text-muted hover:text-zinc-900 dark:hover:text-zinc-100" }
+                };
+                let set = move |on: bool| {
+                    if let Some(f) = folded {
+                        f.set(on);
+                    }
+                };
+                view! {
+                    <div class="flex justify-end">
+                        <div class="inline-flex items-center gap-0.5 rounded-md border border-zinc-200 p-0.5 text-xs dark:border-zinc-700" role="group" aria-label="Show the transcript">
+                            <button class=move || seg(is_folded.get()) aria-pressed=move || is_folded.get().to_string() title="Its turns folded into hours"
+                                on:click=move |_| set(true)>"Timeline"</button>
+                            <button class=move || seg(!is_folded.get()) aria-pressed=move || (!is_folded.get()).to_string() title="Every message and step"
+                                on:click=move |_| set(false)>"All"</button>
+                        </div>
+                    </div>
+                }
+            })}
+            <Show when=move || !is_folded.get() fallback=move || view! {
+                <crate::timeline::Timeline session=id.get_value() events from streaming usage />
+            }>
             // Events are append-only: keyed by seq, each renders once, so
             // expanded cards stay open while the turn continues.
             {move || feed.more().then(|| view! {
@@ -1723,6 +1891,10 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
                                 </div>
                             })}
                         </div>
+                        // Where you left off, while you catch up.
+                        {move || here.get().filter(|(s, _)| *s == seq).map(|(_, at)| view! {
+                            <crate::catchup::YouWereHere session=id.get_value() at />
+                        })}
                         {move || rewinding.get().filter(|(s, _)| *s == seq).map(|(_, edit)| view! {
                             <RewindPanel session=id.get_value() seq text=user_text.clone().unwrap_or_default() edit on_done=Callback::new(move |()| rewinding.set(None)) />
                         })}
@@ -1748,6 +1920,7 @@ fn Transcript(session: Session, feed: Feed, running: Signal<bool>) -> impl IntoV
                     }>"Latest ↓"</button>
                 </div>
             })}
+            </Show>
             <crate::decisions::SessionDecisions session=id.get_value() />
             {move || secrets.get().into_iter().map(|c| view! { <SecretCardView card=c on_dismiss=Callback::new(move |id: String| secrets.update(|s| s.retain(|x| x.call_id != id))) /> }).collect_view()}
             // What streams in: the same elements, their text growing (not

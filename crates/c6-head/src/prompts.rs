@@ -81,6 +81,16 @@ pub const DEFAULTS: &[Prompt] = &[
         default: text::SUGGEST,
     },
     Prompt {
+        name: "session.catchup",
+        description: "The paragraph of a session's catch-up card: what it did while you were away. Placeholders: {{title}}, {{since}} (how long ago you looked), {{counts}} (what it did, counted), {{events}} (what happened since: messages, final replies, a line per tool call).",
+        default: text::CATCHUP,
+    },
+    Prompt {
+        name: "session.timeline",
+        description: "The one-line summary of each turn in an hour of a session's timeline. Placeholders: {{title}}, {{turns}} (each turn: its number, who started it, its tool calls and final reply). Answer lines as <turn number>: <line>.",
+        default: text::TIMELINE,
+    },
+    Prompt {
         name: "session.claude_code",
         description: "Told to Claude Code sessions about carbon6, at the start of what carbon6 adds to Claude Code's system prompt (its guidance for memory, task cards and the memex follows).",
         default: c6_agent::CLAUDE_CODE_NOTE,

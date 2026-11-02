@@ -169,6 +169,9 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/decisions", get(session_decisions))
         .route("/api/v1/sessions/{id}/suggestion", get(session_suggestion))
         .route("/api/v1/sessions/{id}/suggestion/seen", post(suggestion_seen))
+        .route("/api/v1/sessions/{id}/catchup", get(session_catchup))
+        .route("/api/v1/sessions/{id}/timeline", get(session_timeline))
+        .route("/api/v1/sessions/{id}/view", get(get_session_view).put(put_session_view))
         .route("/api/v1/settings/suggestions", get(get_suggestion_settings).put(put_suggestion_settings))
         .route("/api/v1/settings/session_grouping", get(get_session_grouping).put(put_session_grouping))
         .route("/api/v1/settings/session_facets", get(get_session_facets).put(put_session_facets))
@@ -952,6 +955,50 @@ async fn suggestion_seen(
     Json(s): Json<api::SuggestionSeen>,
 ) -> ApiResult<StatusCode> {
     crate::suggestions::seen(&st, &id, s.for_seq, s.accepted).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// What a session did since you last looked: 204 while its catch-up is off.
+async fn session_catchup(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Query(q): Query<api::CatchupQuery>,
+) -> ApiResult<Response> {
+    Ok(match crate::catchup::get(&st, &id, &q, &caller).await? {
+        Some(c) => Json(c).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    })
+}
+
+/// A session's turns, for its timeline: 204 while its timeline is off.
+async fn session_timeline(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Query(q): Query<api::TimelineQuery>,
+) -> ApiResult<Response> {
+    Ok(match crate::timeline::get(&st, &id, &q, &caller).await? {
+        Some(t) => Json(t).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    })
+}
+
+async fn get_session_view(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<api::SessionViewSettings>> {
+    Ok(Json(crate::catchup::view(&st, &id, &caller).await?))
+}
+
+async fn put_session_view(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(v): Json<api::SessionViewSettings>,
+) -> ApiResult<StatusCode> {
+    crate::catchup::set_view(&st, &id, &v, &caller).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -1725,10 +1725,17 @@ pub async fn check_routes(st: &HeadState, routes: &[api::Route]) -> anyhow::Resu
                 .iter()
                 .find(|c| c.id == want || c.name == want)
                 .ok_or_else(|| bad_request(format!("routing rule {:?}: no connection {want:?}", r.name)))?;
-            // A pool only for what runs in the head (the assistant, suggestions).
-            let head_side = r.applies_to.iter().any(|l| l == crate::assistant::LABEL || l == crate::suggestions::ROUTE_LABEL);
+            // A pool only for what runs in the head (the assistant,
+            // suggestions, catch-ups and timelines).
+            let head_side = r.applies_to.iter().any(|l| {
+                [crate::assistant::LABEL, crate::suggestions::ROUTE_LABEL, crate::catchup::ROUTE_LABEL, crate::timeline::ROUTE_LABEL]
+                    .contains(&l.as_str())
+            });
             if !head_side {
-                crate::pools::not_for_sessions(c, &format!("routing rule {:?} (unless it applies to assistant or task:suggest)", r.name))?;
+                crate::pools::not_for_sessions(
+                    c,
+                    &format!("routing rule {:?} (unless it applies to assistant, task:suggest, task:catchup or task:timeline)", r.name),
+                )?;
             }
         }
         check_effort(Some(r.effort.clone())).map_err(|e| bad_request(format!("routing rule {:?}: {e}", r.name)))?;

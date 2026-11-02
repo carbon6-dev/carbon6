@@ -96,18 +96,19 @@ pub async fn seen(st: &HeadState, session_id: &str, for_seq: i64, accepted: bool
     Ok(())
 }
 
-/// The connection and model: a routing rule for `task:suggest` that
-/// applies to the session (its realm's rules first, then root's), else the
-/// session's own. A rule whose connection the session's realm may not use
-/// is passed over.
-async fn model_for(st: &HeadState, row: &crate::store::SessionRow) -> anyhow::Result<(String, String)> {
+/// The connection and model for a session's small task (`label`:
+/// `task:suggest`, `task:catchup`, `task:timeline`): a routing rule for it
+/// that applies to the session (its realm's rules first, then root's),
+/// else the session's own. A rule whose connection the session's realm may
+/// not use is passed over.
+pub(crate) async fn model_for(st: &HeadState, row: &crate::store::SessionRow, label: &str) -> anyhow::Result<(String, String)> {
     let mut labels = row.all_labels();
-    labels.push(ROUTE_LABEL.into());
+    labels.push(label.into());
     let connections = st.store.connections().await?;
     // The realm's rules, then root's (setting_for merges them).
     let routes: Vec<api::Route> =
         serde_json::from_str(&st.store.setting_for(crate::sessions::ROUTES, &row.realm).await?.unwrap_or_default()).unwrap_or_default();
-    for r in routes.iter().filter(|r| r.enabled && r.applies_to.iter().any(|l| l == ROUTE_LABEL)) {
+    for r in routes.iter().filter(|r| r.enabled && r.applies_to.iter().any(|l| l == label)) {
         if !api::labels::applies(&r.applies_to, &labels) {
             continue;
         }
@@ -202,7 +203,7 @@ async fn make(st: &HeadState, row: &crate::store::SessionRow, for_seq: i64) -> a
         &template,
         &[("title", &row.title), ("labels", &labels), ("exchanges", &exchanges(st, &row.id, for_seq as u64).await?)],
     );
-    let (connection, model) = model_for(st, row).await?;
+    let (connection, model) = model_for(st, row, ROUTE_LABEL).await?;
     let origin = c6_llm::activity::Origin {
         what: "suggestion".into(),
         about: row.title.clone(),

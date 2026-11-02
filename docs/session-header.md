@@ -11,7 +11,7 @@ Left to right: back and forward, the session's mark, its title (double-click to 
 
 - **◌ N** (a spinner and the count, blue) is the only count in the bar: nothing when nothing runs, no done or failed counts, no ⚙ or ◆. Its hover says "N running in the background:" and names each ("Subagent: …", "Task: …"), a line each; its accessible name says the same. It opens the glance (scrolled to *Needs a look* when the glance is a column).
 - **Buttons:** every button in the bar, the session's strip and a pane's bar is a 16px Lucide icon (‹ › ⋯ ☆ ⧉ − focus ✕ too) in a 28px target (24px in a pane's 28px bar), 40px on a touch screen, where those bars grow to 44px. The session's icons are filled while their pane is open. **Changes** (with how many files changed), **Terminal**, and the **context ring** (filling with the context used, amber from 80%, the figure in its title) while the glance isn't a column. Not over SSH: no Changes.
-- **⋯:** Rename… · Find in session (⌘F) · Files · Outputs · Session details… (usage, and what applies: labels, slash commands, agents, skills, hooks) · New like this… · Save as template… · Archive.
+- **⋯:** Rename… · Find in session (⌘F) · Files · Outputs · Session details… (usage, and what applies: labels, slash commands, agents, skills, hooks) · New like this… · Save as template… · the **Catch-up** and **Timeline** switches (docs/catchup.md) · Archive.
 - With another view beside the session in its tile (a doc), the bar speaks for that view; the session's icons and ⋯ are in a slim strip at the top of the session. A pane of its own beside it leaves the bar the session's.
 - **Gone:** the second bar and its tabs, the drawer, ⚙, the ◆ pill, the aspect marks (and the dimming of other tiles when pointing at one).
 

@@ -8,6 +8,7 @@ pub mod assistant;
 pub mod attention;
 pub mod auth;
 pub mod catalog;
+pub mod catchup;
 pub mod claims;
 pub mod collections;
 pub mod commons;
@@ -61,6 +62,7 @@ pub mod suggestions;
 pub mod telemetry;
 pub mod templates;
 pub mod terminals;
+pub mod timeline;
 pub mod tls;
 pub mod triggers;
 pub mod ui_ca;
@@ -187,6 +189,9 @@ pub struct HeadState {
     /// When each session sent other sessions messages in the last hour
     /// (docs/background.md §6).
     pub(crate) messages_sent: std::sync::Mutex<std::collections::HashMap<String, std::collections::VecDeque<i64>>>,
+    /// Catch-ups' paragraphs and timelines' turns and lines, made when
+    /// looked at.
+    pub(crate) catchup: catchup::Cache,
     /// Itself, for what must outlive a borrow (set once it is made).
     me: std::sync::OnceLock<std::sync::Weak<HeadState>>,
 }
@@ -308,6 +313,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         docs: Default::default(),
         attention: Default::default(),
         messages_sent: Default::default(),
+        catchup: Default::default(),
         me: Default::default(),
     });
     let _ = state.me.set(Arc::downgrade(&state));

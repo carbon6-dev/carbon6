@@ -1255,6 +1255,42 @@ pub async fn set_suggestion_settings(s: c6_api::SuggestionSettings) -> Result<()
     empty(Request::put(&format!("/api/v1/settings/suggestions{}", in_realm('?'))).json(&s).map_err(|e| e.to_string())?.send().await).await
 }
 
+/// Whether a session shows a catch-up card and its timeline.
+pub async fn session_view(id: String) -> Result<c6_api::SessionViewSettings, String> {
+    json(Request::get(&format!("/api/v1/sessions/{id}/view")).send().await).await
+}
+
+pub async fn set_session_view(id: String, v: c6_api::SessionViewSettings) -> Result<(), String> {
+    empty(Request::put(&format!("/api/v1/sessions/{id}/view")).json(&v).map_err(|e| e.to_string())?.send().await).await
+}
+
+/// What a session did since you last looked (or since event `since`),
+/// with the paragraph if `summary`; None while its catch-up is off.
+pub async fn catchup(id: String, since: Option<u64>, summary: bool) -> Result<Option<c6_api::Catchup>, String> {
+    let since = since.map(|s| format!("&since={s}")).unwrap_or_default();
+    let resp = check(Request::get(&format!("/api/v1/sessions/{id}/catchup?summary={summary}{since}")).send().await).await?;
+    if resp.status() == 204 {
+        return Ok(None);
+    }
+    resp.json().await.map(Some).map_err(|e| e.to_string())
+}
+
+/// A session's turns (`hour`: those of the hour from then, with their
+/// lines); None while its timeline is off.
+pub async fn timeline(id: String, hour: Option<i64>) -> Result<Option<Vec<c6_api::TimelineTurn>>, String> {
+    let hour = hour.map(|h| format!("?hour={h}")).unwrap_or_default();
+    let resp = check(Request::get(&format!("/api/v1/sessions/{id}/timeline{hour}")).send().await).await?;
+    if resp.status() == 204 {
+        return Ok(None);
+    }
+    resp.json().await.map(Some).map_err(|e| e.to_string())
+}
+
+/// About a thousand of a session's events after event `after`.
+pub async fn session_events_after(id: String, after: u64) -> Result<Vec<c6_api::Event>, String> {
+    json(Request::get(&format!("/api/v1/sessions/{id}/events?after={after}")).send().await).await
+}
+
 /// A suggestion was shown, or (`accepted`) taken.
 pub async fn suggestion_seen(id: String, for_seq: i64, accepted: bool) {
     let body = c6_api::SuggestionSeen { for_seq, accepted };

@@ -7,9 +7,9 @@ A **pool** is a connection made of other connections. What runs in the head and 
 Pools are for what runs in the head, which calls models itself:
 - the memex: understanding (sorting, cards, reading, pages), drafting, vision, embeddings and transcription (**Settings → Memex**);
 - the assistant (**Settings → Assistant**, or a routing rule for `assistant`);
-- session suggestions (a routing rule for `task:suggest`).
+- session suggestions, catch-up cards and timelines (a routing rule for `task:suggest`, `task:catchup` or `task:timeline`).
 
-Sessions don't use pools. A session's worker dials its connection itself, so a session can't start on a pool, and a routing rule names a pool only if it applies to `assistant` or `task:suggest`.
+Sessions don't use pools. A session's worker dials its connection itself, so a session can't start on a pool, and a routing rule names a pool only if it applies to `assistant`, `task:suggest`, `task:catchup` or `task:timeline`.
 
 ## How a pool picks a member
 

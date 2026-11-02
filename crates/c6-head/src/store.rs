@@ -229,6 +229,15 @@ fn own_key(key: &str, realm: &str) -> String {
     format!("{key}@{realm}")
 }
 
+/// The per-realm setting that says what new sessions start with (its
+/// `catchup` and `timeline`, beside suggestions' `enabled`).
+const SESSION_VIEW_DEFAULTS: &str = "session_suggestions";
+
+/// Where a session keeps how it shows itself to you (no table of its own).
+fn session_view_key(id: &str) -> String {
+    format!("session_view:{id}")
+}
+
 /// The realm a Settings request is for (none: root's).
 fn request_realm() -> Option<String> {
     SETTINGS_REALM.try_with(Clone::clone).ok().filter(|r| r != crate::realms::ROOT)
@@ -621,8 +630,42 @@ impl Store {
         for c in commands {
             insert_command(&mut tx, c, held).await?;
         }
+        // Your new session starts as its realm shows new sessions (Settings
+        // → Suggestions: the catch-up card, the timeline).
+        if s.parent_id.is_none() {
+            let mut defaults = None;
+            for key in [own_key(SESSION_VIEW_DEFAULTS, &s.realm), SESSION_VIEW_DEFAULTS.to_owned()] {
+                defaults =
+                    sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = ?").bind(key).fetch_optional(&mut *tx).await?;
+                if defaults.is_some() {
+                    break;
+                }
+            }
+            let view: c6_api::SessionViewSettings = defaults.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+            if view != c6_api::SessionViewSettings::default() {
+                sqlx::query("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
+                    .bind(session_view_key(&s.id))
+                    .bind(serde_json::to_string(&view)?)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
         tx.commit().await?;
         Ok(colour)
+    }
+
+    /// How a session shows itself to you (the catch-up card, the timeline).
+    pub async fn session_view(&self, id: &str) -> anyhow::Result<c6_api::SessionViewSettings> {
+        Ok(self.raw_setting(&session_view_key(id)).await?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default())
+    }
+
+    pub async fn set_session_view(&self, id: &str, view: &c6_api::SessionViewSettings) -> anyhow::Result<()> {
+        sqlx::query("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+            .bind(session_view_key(id))
+            .bind(serde_json::to_string(view)?)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// How many subagents of a tree are working now.
@@ -1251,6 +1294,16 @@ impl Store {
     pub async fn last_seq(&self, session_id: &str) -> anyhow::Result<u64> {
         let n: Option<i64> =
             sqlx::query_scalar("SELECT MAX(seq) FROM events WHERE session_id = ?").bind(session_id).fetch_one(&self.pool).await?;
+        Ok(n.unwrap_or(0) as u64)
+    }
+
+    /// The session's last event at or before `ts` (0: none).
+    pub async fn seq_at(&self, session_id: &str, ts: i64) -> anyhow::Result<u64> {
+        let n: Option<i64> = sqlx::query_scalar("SELECT MAX(seq) FROM events WHERE session_id = ? AND ts <= ?")
+            .bind(session_id)
+            .bind(ts)
+            .fetch_one(&self.pool)
+            .await?;
         Ok(n.unwrap_or(0) as u64)
     }
 
