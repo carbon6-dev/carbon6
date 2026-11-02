@@ -297,6 +297,7 @@ impl Process {
             calls: HashMap::new(),
             mcp_calls: HashSet::new(),
             children: HashMap::new(),
+            backgrounded: HashSet::new(),
             call_usage: HashMap::new(),
             per_call: false,
         };
@@ -727,6 +728,10 @@ struct Mapper {
     mcp_calls: HashSet<String>,
     /// Mirrored subagents, by the call that started each.
     children: HashMap<String, Child>,
+    /// Calls that started a subagent in the background: their tool result
+    /// comes at once ("launched"), so the subagent ends with its task's
+    /// notification instead.
+    backgrounded: HashSet<String>,
     /// Each conversation's model call so far, by whose it is (`None`: the
     /// session's; else the call that started a subagent): its message id,
     /// model and usage. Claude Code sends a message per content block, each
@@ -926,14 +931,47 @@ impl Mapper {
         Ok(Some((id, log)))
     }
 
-    /// The call that started a subagent got its result: its turn is over.
+    /// The call that started a subagent got its result: its turn is over,
+    /// unless it runs in the background (that result only says it started).
     async fn ended(&mut self, call: &str, is_error: bool) -> anyhow::Result<()> {
+        if self.backgrounded.contains(call) {
+            return Ok(());
+        }
+        let reason = if is_error { TurnEndReason::Error } else { TurnEndReason::Completed };
+        self.end_child(call, reason).await
+    }
+
+    async fn end_child(&mut self, call: &str, reason: TurnEndReason) -> anyhow::Result<()> {
         if let Some(c) = self.children.get_mut(call).filter(|c| c.open) {
             c.open = false;
-            let reason = if is_error { TurnEndReason::Error } else { TurnEndReason::Completed };
             c.log.append(session_event::Kind::TurnEnded(TurnEnded { turn: 1, reason: reason as i32 })).await?;
         }
         Ok(())
+    }
+
+    /// A task Claude Code started for a call (`tool_use_id`): a subagent in
+    /// the background is noted as such when it starts, and its mirror ends
+    /// with the task's last status.
+    async fn task_of_call(&mut self, v: &Value) -> anyhow::Result<()> {
+        let Some(call) = v["tool_use_id"].as_str().filter(|c| !c.is_empty()) else { return Ok(()) };
+        let reason = match v["subtype"].as_str().unwrap_or("") {
+            "task_started" => {
+                if v["is_backgrounded"].as_bool() == Some(true) {
+                    self.backgrounded.insert(call.to_owned());
+                }
+                return Ok(());
+            }
+            "task_notification" => v["status"].as_str(),
+            "task_updated" => v["patch"]["status"].as_str(),
+            _ => None,
+        };
+        let reason = match reason {
+            Some("completed") => TurnEndReason::Completed,
+            Some("failed") => TurnEndReason::Error,
+            Some("stopped" | "killed") => TurnEndReason::Interrupted,
+            _ => return Ok(()),
+        };
+        self.end_child(call, reason).await
     }
 
     async fn close_children(&mut self, reason: TurnEndReason) -> anyhow::Result<()> {
@@ -988,7 +1026,7 @@ impl Mapper {
     async fn handle(&mut self, v: &Value, sink: &Arc<dyn EventSink>) -> anyhow::Result<()> {
         if self.native_task(v) {
             self.saw_output = true;
-            return Ok(());
+            return self.task_of_call(v).await;
         }
         // A subagent's traffic goes to its mirror (its report also comes as
         // the call's tool result).
@@ -1191,6 +1229,7 @@ mod tests {
             calls: HashMap::new(),
             mcp_calls: HashSet::new(),
             children: HashMap::new(),
+            backgrounded: HashSet::new(),
             call_usage: HashMap::new(),
             per_call: false,
         };
@@ -1597,6 +1636,87 @@ JSON
         assert_eq!(grand.iter().map(kind).collect::<Vec<_>>(), ["started", "turn_started", "user", "assistant", "turn_ended"]);
     }
 
+    /// A stand-in `claude` that starts two subagents in the background: their
+    /// calls return at once, they keep working, and their tasks' notifications
+    /// say how each ended (one completed, one failed).
+    fn fake_claude_with_background_subagents(dir: &Path) -> PathBuf {
+        script(
+            dir,
+            "claude-bg",
+            r#"#!/bin/sh
+read -r line
+cat <<'JSON'
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_bg","name":"Task","input":{"description":"long build","prompt":"Build it.","run_in_background":true}},{"type":"tool_use","id":"toolu_bad","name":"Task","input":{"description":"doomed","prompt":"Try.","run_in_background":true}}],"stop_reason":"tool_use"},"parent_tool_use_id":null}
+{"type":"system","subtype":"task_started","task_id":"a1","tool_use_id":"toolu_bg","description":"long build","task_type":"local_agent","is_backgrounded":true}
+{"type":"system","subtype":"task_started","task_id":"a2","tool_use_id":"toolu_bad","description":"doomed","task_type":"local_agent","is_backgrounded":true}
+{"type":"user","message":{"role":"user","content":"Build it."},"parent_tool_use_id":"toolu_bg"}
+{"type":"user","message":{"role":"user","content":"Try."},"parent_tool_use_id":"toolu_bad"}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_bg","content":"Async agent launched"},{"type":"tool_result","tool_use_id":"toolu_bad","content":"Async agent launched"}]},"parent_tool_use_id":null}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Building."}],"stop_reason":"end_turn"},"parent_tool_use_id":"toolu_bg"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Built."}],"stop_reason":"end_turn"},"parent_tool_use_id":"toolu_bg"}
+{"type":"system","subtype":"task_notification","task_id":"a1","tool_use_id":"toolu_bg","status":"completed","summary":"Built."}
+{"type":"system","subtype":"task_notification","task_id":"a2","tool_use_id":"toolu_bad","status":"failed","summary":"It broke."}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Both are done."}],"stop_reason":"end_turn"},"parent_tool_use_id":null}
+{"type":"result","subtype":"success","is_error":false,"result":"Both are done.","usage":{"input_tokens":5,"output_tokens":20}}
+JSON
+"#,
+        )
+    }
+
+    /// A subagent in the background keeps running after its call returns,
+    /// and ends with its task: completed or failed, not when the call said
+    /// it launched, and not left running for the parent to look busy.
+    #[tokio::test]
+    async fn background_subagents_end_with_their_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_claude_with_background_subagents(dir.path());
+        let observer = observer(dir.path(), Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()))).await;
+        let journal = observer.journal.clone();
+        let vec_sink = Arc::new(VecSink::default());
+        let sink: Arc<dyn EventSink> = vec_sink.clone();
+        let mut p = spawn(&bin, dir.path(), "0199-main", false, Some(observer));
+        let end = run(&mut p, 1, &[input("c1", "go")], &sink).await;
+        assert_eq!(end.reason, Some(TurnEndReason::Completed));
+        // Before the process goes: nothing closes them on the way out.
+        let main = vec_sink.0.lock().unwrap().clone();
+        let spawned: Vec<SubagentSpawned> = main
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Some(session_event::Kind::SubagentSpawned(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(spawned.len(), 2);
+        for (sp, want, last_text) in [(&spawned[0], TurnEndReason::Completed, "Built."), (&spawned[1], TurnEndReason::Error, "")] {
+            let (_, child) = journal.load_session(&sp.child_session_id).await.unwrap().unwrap();
+            let ends: Vec<i32> = child
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    Some(session_event::Kind::TurnEnded(t)) => Some(t.reason),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(ends, [want as i32], "{}: one end, with its task's status", sp.description);
+            // It ended after its own work, not when its call returned.
+            assert_eq!(kind(child.last().unwrap()), "turn_ended");
+            if !last_text.is_empty() {
+                let texts: Vec<String> = child
+                    .iter()
+                    .filter_map(|e| match &e.kind {
+                        Some(session_event::Kind::Assistant(a)) => Some(format!("{:?}", a.blocks)),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(texts.last().unwrap().contains(last_text), "{texts:?}");
+            }
+        }
+        p.exited().await;
+        for sp in &spawned {
+            let (_, child) = journal.load_session(&sp.child_session_id).await.unwrap().unwrap();
+            assert_eq!(child.iter().filter(|e| kind(e) == "turn_ended").count(), 1, "exiting doesn't end it twice");
+        }
+    }
+
     /// A stand-in `claude` that stays up and answers each message: it echoes
     /// it, then replies, with "join" it waits for a second message first,
     /// and with "slow" it starts a background task and waits to be
@@ -1786,6 +1906,7 @@ done
             calls: HashMap::new(),
             mcp_calls: HashSet::new(),
             children: HashMap::new(),
+            backgrounded: HashSet::new(),
             call_usage: HashMap::new(),
             per_call: false,
         };
