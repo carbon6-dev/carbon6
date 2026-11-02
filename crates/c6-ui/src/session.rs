@@ -203,6 +203,12 @@ pub(crate) enum Window {
     All,
 }
 
+/// Streamed text for `turn` arriving once the log says that turn (or a later
+/// one) ended: its message is already drawn. Turn 0: not said, so shown.
+fn stale(turn: u64, ended: u64) -> bool {
+    turn != 0 && turn <= ended
+}
+
 /// Events in a window, and loaded at a time before it.
 const TAIL: u64 = 300;
 
@@ -235,6 +241,9 @@ impl Feed {
         // The replay arrives all at once (not an event at a time, each
         // drawn and scrolled to).
         let replay = StoredValue::new(Vec::<Event>::new());
+        // The last turn the log says ended: text streamed for it (or an
+        // earlier one) that arrives late is already in its messages.
+        let ended = StoredValue::new(0u64);
         let handle = api::stream_session(
             id,
             move |msg| match msg {
@@ -248,6 +257,9 @@ impl Feed {
                     }
                 }
                 StreamMsg::Event { event } => {
+                    if let EventKind::TurnEnded { turn, .. } = event.kind {
+                        ended.update_value(|e| *e = (*e).max(turn));
+                    }
                     streaming.update(|s| match &event.kind {
                         EventKind::Assistant { .. } => {
                             s.text.clear();
@@ -256,7 +268,8 @@ impl Feed {
                         EventKind::ToolResult { call_id, .. } => {
                             s.tool_output.remove(call_id);
                         }
-                        EventKind::TurnEnded { .. } => *s = Streaming::default(),
+                        // A new turn shows only what it streams.
+                        EventKind::TurnEnded { .. } | EventKind::TurnStarted { .. } => *s = Streaming::default(),
                         _ => {}
                     });
                     if let EventKind::TurnEnded { .. } = event.kind {
@@ -272,8 +285,9 @@ impl Feed {
                     });
                 }
                 StreamMsg::Window { from: f } => from.set(f),
-                StreamMsg::Text { text, .. } => streaming.update(|s| s.text.push_str(&text)),
-                StreamMsg::Thinking { text, .. } => streaming.update(|s| s.thinking.push_str(&text)),
+                StreamMsg::Text { turn, text } if !stale(turn, ended.get_value()) => streaming.update(|s| s.text.push_str(&text)),
+                StreamMsg::Thinking { turn, text } if !stale(turn, ended.get_value()) => streaming.update(|s| s.thinking.push_str(&text)),
+                StreamMsg::Text { .. } | StreamMsg::Thinking { .. } => {}
                 StreamMsg::ToolOutput { call_id, text } => streaming.update(|s| s.tool_output.entry(call_id).or_default().push_str(&text)),
                 StreamMsg::Activity { running, status } => {
                     activity.set(Some(running));
@@ -287,6 +301,11 @@ impl Feed {
                 StreamMsg::Queue { queued: q } => queued.set(q),
                 StreamMsg::Synced => {
                     let r = replay.try_update_value(std::mem::take).unwrap_or_default();
+                    let last =
+                        r.iter().filter_map(|e| if let EventKind::TurnEnded { turn, .. } = e.kind { Some(turn) } else { None }).max();
+                    if let Some(t) = last {
+                        ended.update_value(|e| *e = (*e).max(t));
+                    }
                     // Opened at a place: drawn from there, not to the end.
                     if let Window::At(at) = window {
                         to.set(bound(&r, at));
@@ -4008,6 +4027,18 @@ fn SecretCardView(card: SecretCard, on_dismiss: Callback<String>) -> impl IntoVi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Text streamed for a turn the log says ended is already in its
+    /// messages: shown again, it doubles the reply, then stands in for the
+    /// next turn's until that one's first message arrives.
+    #[test]
+    fn late_text_for_an_ended_turn_is_not_shown() {
+        assert!(stale(3, 3), "its turn ended");
+        assert!(stale(2, 3), "an earlier turn");
+        assert!(!stale(4, 3), "the turn running now");
+        assert!(!stale(1, 0), "no turn has ended yet");
+        assert!(!stale(0, 3), "a stream that names no turn is shown");
+    }
 
     /// A notice is waiting until a turn takes it.
     #[test]

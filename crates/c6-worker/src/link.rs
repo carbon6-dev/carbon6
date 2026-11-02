@@ -126,6 +126,17 @@ impl HeadLink {
         }
     }
 
+    /// Sends what is waiting to be coalesced now. Called before an event is
+    /// logged, so a reply's last streamed text never reaches the head after
+    /// the message it streamed (the UI would show that text again).
+    pub fn flush_ephemeral(&self) {
+        let Some(events) = self.ephemeral_buf.lock().unwrap().take() else { return };
+        let Some(tx) = self.outbound.lock().unwrap().clone() else { return };
+        for ev in events {
+            let _ = tx.try_send(WorkerMsg { msg: Some(worker_msg::Msg::Ephemeral(ev)) });
+        }
+    }
+
     /// Credentials for the head's own knowledge store (in this process). A
     /// worker's sessions ask with `session_credential`.
     pub async fn credential(&self, connection_id: &str) -> anyhow::Result<CredentialGrant> {
@@ -332,6 +343,25 @@ mod tests {
         push_merged(&mut v, text("b", 1, "y"));
         assert_eq!(v.len(), 4);
         assert_eq!(v[0], text("a", 1, "Hello"));
+    }
+
+    /// Text waiting to be coalesced goes out before a logged event, on the
+    /// same channel, so the head never gets a reply's last text after the
+    /// reply.
+    #[tokio::test]
+    async fn waiting_text_is_sent_before_what_comes_next() {
+        let link = HeadLink::default();
+        let (tx, mut rx) = mpsc::channel(8);
+        link.connected(tx);
+        link.ephemeral(text("a", 1, "Hel"));
+        link.ephemeral(text("a", 1, "lo"));
+        assert!(rx.try_recv().is_err(), "coalescing: nothing yet");
+        link.flush_ephemeral();
+        let Some(worker_msg::Msg::Ephemeral(ev)) = rx.try_recv().unwrap().msg else { panic!("not the text") };
+        assert_eq!(ev, text("a", 1, "Hello"));
+        // The coalescing timer finds nothing left to send.
+        link.flush_ephemeral();
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

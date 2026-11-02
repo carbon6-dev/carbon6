@@ -3113,6 +3113,8 @@ pub(crate) struct Writer {
 impl EventSink for Writer {
     async fn append(&self, kind: session_event::Kind) -> anyhow::Result<u64> {
         let mut next = self.next_seq.lock().await;
+        // Streamed text first: it must not arrive after what it streamed.
+        self.link.flush_ephemeral();
         let ev = SessionEvent { seq: *next, ts_ms: c6_core::now_ms(), kind: Some(kind) };
         self.journal.append(&self.session_id, &ev).await?;
         *next += 1;
