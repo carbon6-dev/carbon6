@@ -2027,8 +2027,28 @@ const MENU_RULE: &str = "my-1 border-t border-zinc-200 dark:border-zinc-700";
 /// A quiet button in the session's bar (how it stands, its details).
 const BAR_ITEM: &str = "flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-1.5 py-0.5 hover:bg-zinc-200/60 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
 
-/// The message box's model and subagents chips: small filled pills.
-const CHIP: &str = "inline-flex h-6 max-w-full items-center gap-1 rounded-full bg-zinc-100 px-2 text-zinc-700 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-200 dark:hover:bg-zinc-700";
+/// The message box's model chip: quiet, grey text with a background only on
+/// hover, so the toolbar doesn't compete with what you're typing.
+const CHIP: &str = "inline-flex h-6 max-w-full items-center gap-1 rounded-md px-1.5 text-zinc-500 hover:bg-zinc-100 hover:text-zinc-800 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
+
+/// A small on/off switch (the look of the document comments' "Send to agent").
+#[component]
+fn Switch(
+    #[prop(into)] on: Signal<bool>,
+    on_change: impl Fn(bool) + 'static,
+    label: &'static str,
+    #[prop(optional, into)] title: String,
+) -> impl IntoView {
+    view! {
+        <button type="button" role="switch" aria-checked=move || on.get().to_string() title=title
+            class="inline-flex items-center gap-1.5 rounded text-zinc-600 dark:text-zinc-400" on:click=move |_| on_change(!on.get_untracked())>
+            <span class=move || format!("relative h-3.5 w-[26px] shrink-0 rounded-full transition-colors {}", if on.get() { "bg-sky-600" } else { "bg-zinc-300 dark:bg-zinc-600" })>
+                <span class=move || format!("absolute left-0.5 top-0.5 h-2.5 w-2.5 rounded-full bg-white shadow-sm transition-transform {}", if on.get() { "translate-x-3" } else { "" })></span>
+            </span>
+            {label}
+        </button>
+    }
+}
 
 const SUBAGENTS_HELP: &str = "The agent starts a subagent with its Task tool when it decides a piece of work suits one (or you ask). This is the connection and model they run on, unless a call or a named agent asks for another. carbon6 runs them itself, whatever this session runs on.";
 
@@ -3708,9 +3728,9 @@ fn Composer(
     });
     let shown_next = move || next.get().filter(|_| text.with(String::is_empty) && !running.get()).map(|s| s.text);
     // The model row, on phones (always shown on wider screens).
-    // Which chip's pickers are open: "model" or "subagents".
-    let picking = RwSignal::new(None::<&'static str>);
-    let toggle = move |which: &'static str| picking.update(|p| *p = if *p == Some(which) { None } else { Some(which) });
+    // Whether the model chip's menu (the model and its subagents') is open.
+    let picking = RwSignal::new(false);
+    let toggle = move || picking.update(|p| *p = !*p);
     let id = StoredValue::new(id);
     let area = NodeRef::<leptos::html::Textarea>::new();
     crate::util::autosize(area, move || text.track());
@@ -4201,74 +4221,100 @@ fn Composer(
                         </button>
                     })}
                     </div>
-                    // The toolbar: 📎, the model and its subagents' (each chip
-                    // opening its pickers above it, a change waiting for Send
+                    // The toolbar: +, the model (its chip opening one menu above it
+                    // for the model and its subagents', a change waiting for Send
                     // beside), and Send.
                     <div class="flex items-center gap-1 px-1 pb-1">
+                        // Drawn, not an emoji, so it matches the other icons.
                         <button class="flex size-6.5 shrink-0 items-center justify-center rounded-md text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
-                            title="Attach images or files (or paste / drop them)" aria-label="Attach images or files" on:click=move |_| { if let Some(i) = picker.get_untracked() { i.click(); } }>"📎"</button>
+                            title="Attach images or files (or paste / drop them)" aria-label="Attach images or files" on:click=move |_| { if let Some(i) = picker.get_untracked() { i.click(); } }>
+                            <svg viewBox="0 0 16 16" class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+                                <path d="M8 2.5v11M2.5 8h11" />
+                            </svg>
+                        </button>
                         <input node_ref=picker type="file" multiple class="hidden" on:change=add_files />
                 {(model.is_some() || subagents.is_some()).then(|| view! {
                     <div class="relative flex min-w-0 flex-1 flex-wrap items-center gap-1 text-xs">
                         {model.map(|m| view! {
-                            {move || { let (_, mm, e) = m.current.get(); let label = model_label(&mm, &e); view! {
-                                <button class=CHIP title="The model this session runs on: change it" aria-label=format!("Model: {label}, change it") on:click=move |_| toggle("model")>
-                                    <span class="min-w-0 truncate">{label.clone()}</span>
-                                    // What's left of its plan, when it has one.
-                                    <crate::quota::QuotaNote connection=Signal::derive(move || m.current.get().0) />
-                                    <span class="text-zinc-400">"▾"</span>
-                                </button>
-                            } }}
+                            {move || {
+                                let (_, mm, e) = m.current.get();
+                                let mut label = model_label(&mm, &e);
+                                // Subagents on another model say so; on the
+                                // session's, nothing.
+                                if let Some((_, sm, se)) = subagents.map(|s| s.current.get()).filter(|(_, sm, _)| !sm.is_empty()) {
+                                    label.push_str(&format!(" · subagents {}", model_label(&sm, &se)));
+                                }
+                                view! {
+                                    <button class=CHIP title="The model this session and its subagents run on: change them" aria-label=format!("Model: {label}, change it") on:click=move |_| toggle()>
+                                        <span class="min-w-0 truncate">{label.clone()}</span>
+                                        // What's left of its plan, when it has one.
+                                        <crate::quota::QuotaNote connection=Signal::derive(move || m.current.get().0) />
+                                        <span class="text-zinc-400">"▾"</span>
+                                    </button>
+                                }
+                            }}
                             {move || switch_note(m, kinds.get().and_then(Result::ok).unwrap_or_default()).map(|(text, title)| view! {
-                                <button class="rounded-full bg-amber-100 px-2 py-0.5 text-amber-800 dark:bg-amber-950 dark:text-amber-300" title=title on:click=move |_| toggle("model")>{text}</button>
+                                <button class="rounded-full bg-amber-100 px-2 py-0.5 text-amber-800 dark:bg-amber-950 dark:text-amber-300" title=title on:click=move |_| toggle()>{text}</button>
                             })}
                         })}
-                        {subagents.map(|s| view! {
-                            // "subagents" alone: they run on the session's model.
+                        // No model chip to hold them (no caller does this today):
+                        // subagents keep a chip of their own.
+                        {subagents.filter(|_| model.is_none()).map(|s| view! {
                             {move || { let (_, mm, e) = s.current.get(); let label = (!mm.is_empty()).then(|| model_label(&mm, &e)); view! {
-                                <button class=CHIP title=SUBAGENTS_HELP aria-label=format!("Subagents' model: {}, change it", label.as_deref().unwrap_or("the session's")) on:click=move |_| toggle("subagents")>
+                                <button class=CHIP title=SUBAGENTS_HELP aria-label=format!("Subagents' model: {}, change it", label.as_deref().unwrap_or("the session's")) on:click=move |_| toggle()>
                                     <span class="min-w-0 truncate">{match &label { Some(l) => format!("subagents: {l}"), None => "subagents".to_owned() }}</span>
                                     <span class="text-zinc-400">"▾"</span>
                                 </button>
                             } }}
                         })}
-                        {move || picking.get().map(|which| view! {
-                            <div class="fixed inset-0 z-30" on:click=move |_| picking.set(None)></div>
+                        {move || picking.get().then(|| view! {
+                            <div class="fixed inset-0 z-30" on:click=move |_| picking.set(false)></div>
                             <div class="absolute bottom-full left-0 z-40 mb-1 w-max max-w-[90vw] sm:max-w-xl space-y-2 rounded-lg border border-zinc-200 bg-white p-3 text-zinc-700 shadow-lg dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
-                                on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); picking.set(None) }>
-                                {match which {
-                                    "model" => model.map(|m| view! {
-                                        <div class="font-medium">"Model"</div>
-                                        <div class="flex flex-wrap items-center gap-2"><ModelPicker connection=m.connection model=m.model effort=m.effort no_claude_code claude_off=claude_off /></div>
-                                        {move || switch_note(m, kinds.get().and_then(Result::ok).unwrap_or_default()).map(|(text, title)| view! {
-                                            <p class="text-amber-700 dark:text-amber-400">{text}{(!title.is_empty()).then(|| view! { <span class="block text-zinc-500 dark:text-zinc-400">{title}</span> })}</p>
-                                        })}
-                                        <p class="text-zinc-500 dark:text-zinc-400">"It switches when you send your next message."</p>
-                                    }.into_any()),
-                                    _ => subagents.map(|s| {
-                                        let set = move |req: c6_api::SetSubagentModel| {
-                                            spawn_local(async move {
-                                                if let Err(e) = api::set_subagent_model(subagent_id.get_value(), req).await {
-                                                    error.set(Some(e));
-                                                }
-                                            });
-                                        };
-                                        view! {
+                                on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); picking.set(false) }>
+                                {model.map(|m| view! {
+                                    <div class="font-medium">"Model"</div>
+                                    <div class="flex flex-wrap items-center gap-2"><ModelPicker connection=m.connection model=m.model effort=m.effort no_claude_code claude_off=claude_off /></div>
+                                    {move || switch_note(m, kinds.get().and_then(Result::ok).unwrap_or_default()).map(|(text, title)| view! {
+                                        <p class="text-amber-700 dark:text-amber-400">{text}{(!title.is_empty()).then(|| view! { <span class="block text-zinc-500 dark:text-zinc-400">{title}</span> })}</p>
+                                    })}
+                                    <p class="text-zinc-500 dark:text-zinc-400">"It switches when you send your next message."</p>
+                                })}
+                                {subagents.map(|s| {
+                                    let set = move |req: c6_api::SetSubagentModel| {
+                                        spawn_local(async move {
+                                            if let Err(e) = api::set_subagent_model(subagent_id.get_value(), req).await {
+                                                error.set(Some(e));
+                                            }
+                                        });
+                                    };
+                                    // Turned off here but nothing Set yet: the
+                                    // picker shows until they Set (or close this).
+                                    let choosing = RwSignal::new(false);
+                                    let same = Signal::derive(move || s.current.get().1.is_empty() && !choosing.get());
+                                    // Once a change lands, the switch follows it.
+                                    Effect::new(move || { s.current.track(); choosing.set(false); });
+                                    let flip = move |on: bool| {
+                                        choosing.set(!on);
+                                        if on && !s.current.get_untracked().1.is_empty() {
+                                            set(c6_api::SetSubagentModel::default());
+                                        }
+                                    };
+                                    view! {
+                                        <div class=if model.is_some() { "space-y-2 border-t border-zinc-200 pt-2 dark:border-zinc-700" } else { "space-y-2" }>
                                             <div class="font-medium">"Subagents"</div>
                                             <p class="max-w-md text-zinc-500 dark:text-zinc-400">{SUBAGENTS_HELP}</p>
-                                            <div class="flex flex-wrap items-center gap-2">
-                                                <ModelPicker connection=s.connection model=s.model effort=s.effort no_claude_code=true />
-                                                {move || s.change().map(|req| view! {
-                                                    <button class="rounded-md bg-violet-600 px-2 py-1 text-white hover:bg-violet-700" on:click=move |_| set(req.clone())>"Set"</button>
-                                                })}
-                                                {move || (!s.current.get().1.is_empty()).then(|| view! {
-                                                    <button class="hover:underline" title="Run them on the session's own model"
-                                                        on:click=move |_| set(c6_api::SetSubagentModel::default())>"Use the session's"</button>
-                                                })}
-                                            </div>
-                                        }.into_any()
-                                    }),
-                                }}
+                                            <Switch on=same on_change=flip label="Same as the session" title="Run them on the session's own model, or turn off to choose theirs" />
+                                            {move || (!same.get()).then(|| view! {
+                                                <div class="flex flex-wrap items-center gap-2">
+                                                    <ModelPicker connection=s.connection model=s.model effort=s.effort no_claude_code=true />
+                                                    {move || s.change().map(|req| view! {
+                                                        <button class="rounded-md bg-violet-600 px-2 py-1 text-white hover:bg-violet-700" on:click=move |_| set(req.clone())>"Set"</button>
+                                                    })}
+                                                </div>
+                                            })}
+                                        </div>
+                                    }
+                                })}
                             </div>
                         })}
                     </div>
