@@ -548,14 +548,17 @@ fn moved_off(from: (f64, f64), to: (f64, f64)) -> bool {
     (to.0 - from.0).hypot(to.1 - from.1) > PRESS_SLOP
 }
 
-/// Which way a dragged tab trades places: past the middle of the tab
-/// before it (-1) or after it (1), else none (0).
-fn drag_step(x: f64, before: Option<f64>, after: Option<f64>) -> isize {
-    match (before, after) {
-        (Some(m), _) if x < m => -1,
-        (_, Some(m)) if x > m => 1,
-        _ => 0,
-    }
+/// The gap a dragged tab would land in, with the pointer at `x` (`mids`:
+/// the tabs' middles, in order): before the first tab whose middle is past
+/// it (0: before them all), else after the last.
+fn drop_slot(x: f64, mids: &[f64]) -> usize {
+    mids.iter().position(|&m| x < m).unwrap_or(mids.len())
+}
+
+/// How many places the tab at `i` moves to land in gap `slot`: none for
+/// the gaps either side of it.
+fn slot_step(i: usize, slot: usize) -> isize {
+    if slot > i { (slot - i - 1) as isize } else { slot as isize - i as isize }
 }
 
 /// How far to scroll the strip (`left` to `right`) with a lifted tab at
@@ -587,8 +590,9 @@ struct Press {
 
 /// Phones: switch tiles, add one, and every tile in a sheet (▸, with the
 /// sessions you viewed lately). The current tab's × closes
-/// its tile. A long press lifts a tab: drag it to reorder the tabs, or let
-/// go where it is for its menu.
+/// its tile. A long press lifts a tab: drag it and a line marks where it
+/// will land (it stays put until let go), or let go where it is for its
+/// menu.
 #[component]
 pub fn MobileBar() -> impl IntoView {
     let ws = use_workspace();
@@ -644,6 +648,8 @@ pub fn MobileBar() -> impl IntoView {
     // a tab (the click that ends it is no tap).
     let press = StoredValue::new(None::<Press>);
     let lifted = RwSignal::new(None::<u64>);
+    // The gap a lifted tab would land in, when that would move it.
+    let line = RwSignal::new(None::<usize>);
     let pressed = StoredValue::new(false);
     // While a tab is lifted: what keeps the strip scrolling near its ends.
     let scrolling = StoredValue::new(None::<IntervalHandle>);
@@ -668,11 +674,12 @@ pub fn MobileBar() -> impl IntoView {
                 let _ = el.release_pointer_capture(p.pointer);
             }
             let _ = lifted.try_set(None);
+            let _ = line.try_set(None);
         }
         Some(p)
     };
-    // A lifted tab follows the pointer: past a neighbour's middle, they
-    // trade places; near an end of the strip, the strip scrolls.
+    // A lifted tab stays put while the line follows the pointer, to the gap
+    // nearest it; near an end of the strip, the strip scrolls.
     let follow = move || {
         let (Some(p), Some(el)) = (press.try_get_value().flatten(), strip.try_get_untracked().flatten()) else { return };
         if !p.lifted {
@@ -684,15 +691,18 @@ pub fn MobileBar() -> impl IntoView {
             el.set_scroll_left(el.scroll_left() + by);
         }
         let Some(i) = tiles.try_with_untracked(|t| t.iter().position(|(k, ..)| *k == p.key)).flatten() else { return };
-        let mid = |j: Option<usize>| {
-            j.and_then(|j| el.children().item(j as u32)).map(|t| {
+        let tabs = el.children();
+        let mids: Vec<f64> = (0..tabs.length())
+            .filter_map(|j| tabs.item(j))
+            .map(|t| {
                 let r = t.get_bounding_client_rect();
                 r.left() + r.width() / 2.0
             })
-        };
-        let step = drag_step(p.at.0, mid(i.checked_sub(1)), mid(Some(i + 1)));
-        if step != 0 {
-            ws.step_tile(p.key, step);
+            .collect();
+        let slot = drop_slot(p.at.0, &mids);
+        let at = (p.dragged && slot_step(i, slot) != 0).then_some(slot);
+        if line.get_untracked() != at {
+            let _ = line.try_set(at);
         }
     };
     let down = move |ev: web_sys::PointerEvent| {
@@ -758,16 +768,22 @@ pub fn MobileBar() -> impl IntoView {
         follow();
     };
     // Let go: a tab lifted and not dragged shows its menu; a dragged one
-    // stays where it was dropped.
+    // moves to the line, if there is one.
     let up = move |ev: web_sys::PointerEvent| {
         if press.with_value(|p| p.is_none_or(|p| p.pointer != ev.pointer_id())) {
             return;
         }
-        if let Some(p) = end()
-            && p.lifted
-            && !p.dragged
-            && let Some(tab) = tab_of(p.key)
-        {
+        let slot = line.get_untracked();
+        let Some(p) = end() else { return };
+        if !p.lifted {
+            return;
+        }
+        if p.dragged {
+            let i = tiles.with_untracked(|t| t.iter().position(|(k, ..)| *k == p.key));
+            if let (Some(i), Some(slot)) = (i, slot) {
+                ws.step_tile(p.key, slot_step(i, slot));
+            }
+        } else if let Some(tab) = tab_of(p.key) {
             let r = tab.get_bounding_client_rect();
             menu.set(Some((p.key, r.left(), r.top())));
         }
@@ -786,7 +802,7 @@ pub fn MobileBar() -> impl IntoView {
         end();
     });
     view! {
-        <nav class="flex shrink-0 items-center gap-1 border-t border-zinc-200 bg-zinc-50 px-2 py-1 md:hidden dark:border-zinc-800 dark:bg-zinc-950">
+        <nav class="relative flex shrink-0 items-center gap-1 border-t border-zinc-200 bg-zinc-50 px-2 py-1 md:hidden dark:border-zinc-800 dark:bg-zinc-950">
             // Padded so the current tab's × (taller than the tabs, for a
             // finger) fits without the strip scrolling up and down. While a
             // tab is lifted, the finger drags it rather than the strip.
@@ -800,14 +816,28 @@ pub fn MobileBar() -> impl IntoView {
                 on:pointerleave=move |_| if press.with_value(|p| p.is_some_and(|p| !p.lifted)) { end(); }
                 on:touchmove=move |ev| if lifted.get_untracked().is_some() { ev.prevent_default() }
                 on:contextmenu=move |ev| ev.prevent_default()>
-                {move || tiles.get().into_iter().map(|(key, label, focused)| view! {
+                {move || {
+                    let tabs = tiles.get();
+                    let n = tabs.len();
+                    tabs.into_iter().enumerate().map(|(j, (key, label, focused))| view! {
                     <div data-tile=key.to_string()
-                        class=if focused { "flex max-w-44 shrink-0 select-none items-center rounded-md bg-zinc-200 transition-transform [-webkit-touch-callout:none] dark:bg-zinc-800" } else { "flex max-w-36 shrink-0 select-none items-center rounded-md transition-transform [-webkit-touch-callout:none]" }
-                        class=("scale-105", move || lifted.get() == Some(key))
-                        class=("shadow-md", move || lifted.get() == Some(key))
-                        class=("bg-white", move || lifted.get() == Some(key) && !focused)
-                        class=("dark:bg-zinc-800", move || lifted.get() == Some(key) && !focused)
+                        class=if focused { "relative flex max-w-44 shrink-0 select-none items-center rounded-md bg-zinc-200 [-webkit-touch-callout:none] dark:bg-zinc-800" } else { "relative flex max-w-36 shrink-0 select-none items-center rounded-md [-webkit-touch-callout:none]" }
+                        class=("opacity-50", move || lifted.get() == Some(key))
+                        class=("outline-dashed", move || lifted.get() == Some(key))
+                        class=("outline-1", move || lifted.get() == Some(key))
+                        class=("outline-sky-400", move || lifted.get() == Some(key))
                     >
+                        // Where the lifted tab will land: the gap before this
+                        // tab, or after it if it is the last.
+                        {move || {
+                            let side = match line.get() {
+                                Some(s) if s == j && j == 0 => "left-0",
+                                Some(s) if s == j => "-left-[3px]",
+                                Some(s) if s == n && j + 1 == n => "right-0",
+                                _ => return None,
+                            };
+                            Some(view! { <span class=format!("pointer-events-none absolute inset-y-1 w-0.5 rounded-full bg-sky-400 {side}")></span> })
+                        }}
                         <button
                             class=if focused { "min-w-0 truncate py-1.5 pl-2.5 text-xs font-medium" } else { "min-w-0 truncate px-2.5 py-1.5 text-xs text-zinc-600 dark:text-zinc-400" }
                             on:click=move |_| if !pressed.try_update_value(std::mem::take).unwrap_or(false) { ws.show_tile(key) }
@@ -819,8 +849,14 @@ pub fn MobileBar() -> impl IntoView {
                                 on:click=move |_| ws.close_tile(key)>"×"</button>
                         })}
                     </div>
-                }).collect_view()}
+                }).collect_view()
+                }}
             </div>
+            {move || lifted.get().is_some().then(|| view! {
+                <div class="pointer-events-none absolute inset-x-0 bottom-full flex justify-center pb-1">
+                    <span class="rounded-full bg-zinc-50/90 px-2 py-0.5 text-[11px] text-muted dark:bg-zinc-950/90">"Drag to move · let go to drop"</span>
+                </div>
+            })}
             <button class="shrink-0 rounded-md px-2.5 py-1.5 text-xs text-muted" title="New tile" on:click=move |_| ws.new_tile()>"+"</button>
             <button class="shrink-0 rounded-md px-2.5 py-1.5 text-xs tabular-nums text-zinc-600 dark:text-zinc-400"
                 title="Your tiles, and the sessions you viewed lately" aria-haspopup="dialog" aria-expanded=move || sheet.get().to_string()
@@ -1036,12 +1072,17 @@ mod tests {
     }
 
     #[test]
-    fn a_dragged_tab_trades_places_past_a_neighbours_middle() {
-        assert_eq!(drag_step(50.0, Some(40.0), Some(90.0)), 0);
-        assert_eq!(drag_step(39.0, Some(40.0), Some(90.0)), -1);
-        assert_eq!(drag_step(91.0, Some(40.0), Some(90.0)), 1);
-        assert_eq!(drag_step(0.0, None, Some(90.0)), 0, "the first stays first");
-        assert_eq!(drag_step(200.0, Some(40.0), None), 0, "the last stays last");
+    fn a_dragged_tab_lands_in_the_gap_nearest_the_finger() {
+        let mids = [40.0, 90.0, 140.0];
+        assert_eq!(drop_slot(10.0, &mids), 0, "before them all");
+        assert_eq!(drop_slot(60.0, &mids), 1);
+        assert_eq!(drop_slot(200.0, &mids), 3, "after them all");
+        assert_eq!(slot_step(1, 1), 0, "the gap before it: where it is");
+        assert_eq!(slot_step(1, 2), 0, "the gap after it: where it is");
+        assert_eq!(slot_step(1, 0), -1);
+        assert_eq!(slot_step(1, 3), 1);
+        assert_eq!(slot_step(0, 3), 2);
+        assert_eq!(slot_step(2, 0), -2);
     }
 
     #[test]

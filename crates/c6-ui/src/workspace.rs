@@ -1111,11 +1111,14 @@ impl Workspace {
         self.layout.update(|l| l.move_tile(key, to));
     }
 
-    /// Moves a tile one place left (`by` < 0) or right among the tiles
-    /// shown, in reading order (a phone's tab dragged; from a timer too,
-    /// so it may come after the page let go).
+    /// Moves a tile `by` places left (< 0) or right among the tiles shown,
+    /// in reading order (a phone's tab dropped).
     pub fn step_tile(&self, key: u64, by: isize) {
-        let _ = self.layout.try_update(|l| l.step_tile(key, by));
+        let _ = self.layout.try_update(|l| {
+            for _ in 0..by.unsigned_abs() {
+                l.step_tile(key, by.signum());
+            }
+        });
     }
 
     pub fn new_tile(&self) {
