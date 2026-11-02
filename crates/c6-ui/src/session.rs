@@ -2351,12 +2351,14 @@ const FULL_BUTTON: &str = "rounded-md border border-zinc-500 px-2 py-0.5 hover:b
 
 /// An image full size over the page, focused so Esc closes it, as Close or
 /// a click outside it does. `info` (its size, say) shows by its name, and
-/// `children` (more buttons) before Close.
+/// `children` (more buttons) before Close. `fill`: as big as the screen
+/// allows, even past its own size (a drawing, sharp at any size).
 #[component]
-fn FullImage(
+pub(crate) fn FullImage(
     src: String,
     name: String,
     #[prop(optional, into)] info: String,
+    #[prop(optional)] fill: bool,
     #[prop(into)] close: Callback<()>,
     #[prop(optional)] children: Option<Children>,
 ) -> impl IntoView {
@@ -2370,7 +2372,7 @@ fn FullImage(
         <div node_ref=el tabindex="-1" class="fixed inset-0 z-50 flex flex-col items-center justify-center gap-3 bg-black/75 p-4 outline-none"
             on:click=move |_| close.run(())
             on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); close.run(()) }>
-            <img class="max-h-[80dvh] max-w-[92vw] rounded-md object-contain shadow-2xl" src=src alt=name.clone() on:click=|ev| ev.stop_propagation() />
+            <img class=if fill { "h-[80dvh] w-[92vw] rounded-md bg-white object-contain shadow-2xl" } else { "max-h-[80dvh] max-w-[92vw] rounded-md object-contain shadow-2xl" } src=src alt=name.clone() on:click=|ev| ev.stop_propagation() />
             <div class="flex items-center gap-3 text-sm text-zinc-100" on:click=|ev| ev.stop_propagation()>
                 <span class="max-w-[60vw] truncate">{name}</span>
                 {(!info.is_empty()).then(|| view! { <span class="text-zinc-400">{info}</span> })}

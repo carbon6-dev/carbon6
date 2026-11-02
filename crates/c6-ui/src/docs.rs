@@ -347,6 +347,33 @@ fn ChipEditor(block: String, key: String, value: Value, ctx: ChipCtx) -> impl In
     }
 }
 
+/// A picture in a document: a click or tap shows it as big as the screen
+/// allows (`fill`: past its own size too, for a drawing), and ⌘-, Ctrl-,
+/// Shift- or middle-click opens `new_tab` (a file's address) as a link would.
+#[component]
+fn Expandable(src: String, name: String, fill: bool, new_tab: Option<String>, children: Children) -> impl IntoView {
+    let open = RwSignal::new(false);
+    let href = new_tab.clone();
+    view! {
+        <a href=href target="_blank" title="Show it bigger" class="inline-block max-w-full cursor-zoom-in"
+            on:click=move |ev: web_sys::MouseEvent| {
+                ev.stop_propagation();
+                if new_tab.is_none() || (ev.button() == 0 && !(ev.meta_key() || ev.ctrl_key() || ev.shift_key() || ev.alt_key())) {
+                    ev.prevent_default();
+                    open.set(true);
+                }
+            }>
+            {children()}
+        </a>
+        // Its clicks stay here: the block around it would start editing.
+        {move || open.get().then(|| view! {
+            <div on:click=|ev| ev.stop_propagation()>
+                <crate::session::FullImage src=src.clone() name=name.clone() fill=fill close=move |_| open.set(false) />
+            </div>
+        })}
+    }
+}
+
 /// An embed (docs/docs.md §3): a picture, a file, a diagram, a chart drawn
 /// from its rows, or a live view of the realm.
 #[component]
@@ -356,12 +383,17 @@ fn Embed(v: Value) -> impl IntoView {
     let s = |k: &str| v[k].as_str().unwrap_or("").to_owned();
     let file_url = |blob: &str| api::url(&format!("/api/v1/docs/{}/files/{}", api::enc(&doc), api::enc(blob)));
     match v["type"].as_str().unwrap_or("") {
-        "image" => view! {
-            <figure class="my-2">
-                <img src=file_url(&s("blob")) alt=if s("alt").is_empty() { s("name") } else { s("alt") } class="max-h-[32rem] max-w-full rounded border border-zinc-200 dark:border-zinc-800" />
-                {(!s("caption").is_empty()).then(|| view! { <figcaption class="mt-1 text-xs text-zinc-500">{s("caption")}</figcaption> })}
-            </figure>
-        }.into_any(),
+        "image" => {
+            let (src, alt) = (file_url(&s("blob")), if s("alt").is_empty() { s("name") } else { s("alt") });
+            view! {
+                <figure class="my-2">
+                    <Expandable src=src.clone() name=alt.clone() fill=false new_tab=Some(src.clone())>
+                        <img src=src alt=alt class="max-h-[32rem] max-w-full rounded border border-zinc-200 dark:border-zinc-800" />
+                    </Expandable>
+                    {(!s("caption").is_empty()).then(|| view! { <figcaption class="mt-1 text-xs text-zinc-500">{s("caption")}</figcaption> })}
+                </figure>
+            }.into_any()
+        }
         "file" => view! {
             <a href=file_url(&s("blob")) class="my-1 inline-flex items-center gap-2 rounded border border-zinc-200 px-2 py-1 text-sm text-sky-700 hover:bg-zinc-50 dark:border-zinc-800 dark:text-sky-400 dark:hover:bg-zinc-900"
                 on:click=|ev| ev.stop_propagation()>
@@ -373,9 +405,12 @@ fn Embed(v: Value) -> impl IntoView {
         "diagram" => {
             let svg = s("svg");
             let src = format!("data:image/svg+xml;base64,{}", base64_of(svg.as_bytes()));
+            let title = s("title");
             view! {
                 <figure class="my-2">
-                    <img src=src alt=s("title") class="max-w-full" />
+                    <Expandable src=src.clone() name=title.clone() fill=true new_tab=None>
+                        <img src=src alt=title class="max-w-full" />
+                    </Expandable>
                     {(!s("title").is_empty()).then(|| view! { <figcaption class="mt-1 text-xs text-zinc-500">{s("title")}</figcaption> })}
                 </figure>
             }.into_any()
