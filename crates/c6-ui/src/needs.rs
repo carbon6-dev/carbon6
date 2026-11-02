@@ -1,0 +1,345 @@
+//! What needs you: a pill in the header with how many things wait on you
+//! (amber), else how many are worth a look (grey), that opens the list of
+//! them (`GET /api/v1/attention`): a drop-down on wide screens, a sheet
+//! from the bottom on a phone. It loads again when the live feed says it
+//! may have changed, never on a timer.
+
+use c6_api::{Attention, AttentionElsewhere, AttentionItem};
+use leptos::prelude::*;
+use leptos::task::spawn_local;
+
+use crate::api;
+use crate::place::{self, Place};
+use crate::util::now_ms;
+use crate::workspace::{How, View, use_workspace};
+
+/// What the pill's number starts with (none for now; "@", say).
+const PREFIX: &str = "";
+
+/// How long a ping from the live feed waits for more before it loads.
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// The pill's text: its prefix and the number, if there is one.
+fn pill(n: usize) -> String {
+    if n == 0 { PREFIX.to_owned() } else { format!("{PREFIX}{n}") }
+}
+
+/// The pill's accessible name and hover.
+fn label(waiting: usize, worth: usize) -> String {
+    match (waiting, worth) {
+        (0, 0) => "What needs you: nothing".into(),
+        (w, 0) => format!("What needs you: {w} waiting"),
+        (0, l) => format!("What needs you: {l} worth a look"),
+        (w, l) => format!("What needs you: {w} waiting, {l} worth a look"),
+    }
+}
+
+/// How long ago, as short as it gets: "now", "2m", "3h", "4d".
+fn short_ago(ms: i64) -> String {
+    let s = (ms / 1000).max(0);
+    match s {
+        0..=59 => "now".into(),
+        60..=3599 => format!("{}m", s / 60),
+        3600..=86_399 => format!("{}h", s / 3600),
+        _ => format!("{}d", s / 86_400),
+    }
+}
+
+/// The small tag before a waiting item.
+fn tag(kind: &str) -> &'static str {
+    match kind {
+        "approval" => "Approval",
+        "question" => "Question",
+        _ => "Decision",
+    }
+}
+
+/// What a row says.
+fn text(i: &AttentionItem) -> String {
+    match i.kind.as_str() {
+        "turn_ended" => format!("“{}” ended its turn", i.detail),
+        "failed" => format!("“{}” failed", i.detail),
+        "comment_answer" => format!("An answer on “{}”", i.detail),
+        "brief" => match i.count.unwrap_or(0) {
+            1 => "1 person waiting on you in the Brief".into(),
+            n => format!("{n} people waiting on you in the Brief"),
+        },
+        _ => i.title.clone(),
+    }
+}
+
+/// The colour of a worth-a-look row's dot.
+fn dot(kind: &str) -> &'static str {
+    match kind {
+        "turn_ended" => "bg-emerald-500",
+        "failed" => "bg-red-500",
+        "comment_answer" => "bg-sky-500",
+        _ => "bg-zinc-400",
+    }
+}
+
+/// Where a row goes: an approval's or a question's session, Decisions for
+/// another decision, a turn's session, the document of a comment answer,
+/// the Brief.
+fn target(i: &AttentionItem) -> View {
+    match (i.kind.as_str(), &i.session_id, &i.doc_id) {
+        ("approval" | "question" | "turn_ended" | "failed", Some(s), _) => View::session(s.clone()),
+        ("comment_answer", _, Some(d)) => View::Docs { id: d.clone() },
+        ("brief", ..) => View::Brief,
+        _ => View::Decisions,
+    }
+}
+
+/// Whether opening a row means you've seen it (a turn's end).
+fn seen_by_opening(kind: &str) -> bool {
+    matches!(kind, "turn_ended" | "failed")
+}
+
+/// The line under a waiting row: where it is, its realm if not this page's,
+/// and how long ago.
+fn under(i: &AttentionItem, here: &str, now: i64) -> String {
+    let realm = i.realm.as_deref().filter(|r| *r != here);
+    let when = short_ago(now - i.at);
+    [Some(i.detail.as_str()).filter(|d| !d.is_empty()), realm, Some(when.as_str())].into_iter().flatten().collect::<Vec<_>>().join(" · ")
+}
+
+/// Another realm's row.
+fn elsewhere_text(e: &AttentionElsewhere) -> String {
+    let name = if e.id == "root" { "the console" } else { e.name.as_str() };
+    format!("{} waiting in {name} →", e.waiting)
+}
+
+#[component]
+pub fn NeedsYou() -> impl IntoView {
+    let live = api::live();
+    let tick = RwSignal::new(0u32);
+    let list = LocalResource::new(move || {
+        tick.track();
+        api::realm().track();
+        api::attention()
+    });
+    // The last list loaded, kept while the next one comes.
+    let shown = RwSignal::new(Attention::default());
+    Effect::new(move || {
+        if let Some(Ok(a)) = list.get() {
+            shown.set(a);
+        }
+    });
+    // A ping (and the feed coming back, having missed some) loads it again,
+    // once a burst has settled.
+    let due = StoredValue::new(false);
+    Effect::new(move |seen: Option<()>| {
+        live.attention.track();
+        let up = live.connected.get();
+        if seen.is_none() || !up || due.try_get_value() != Some(false) {
+            return;
+        }
+        due.set_value(true);
+        set_timeout(
+            move || {
+                if due.try_update_value(|d| *d = false).is_some() {
+                    let _ = tick.try_update(|t| *t += 1);
+                }
+            },
+            SETTLE,
+        );
+    });
+    let open = RwSignal::new(false);
+    let keys = window_event_listener(leptos::ev::keydown, move |ev| {
+        if ev.key() == "Escape" && open.get_untracked() {
+            open.set(false);
+        }
+    });
+    on_cleanup(move || keys.remove());
+    let counts = move || shown.with(|a| (a.waiting.len(), a.worth.len()));
+    let pill_class = move || {
+        let base = "inline-flex h-5 min-w-6 items-center justify-center rounded-full px-1.5 text-[11px] font-semibold";
+        match counts() {
+            (w, _) if w > 0 => format!("{base} bg-amber-500 text-white"),
+            (_, l) if l > 0 => format!("{base} border border-zinc-400 text-zinc-600 dark:border-zinc-500 dark:text-zinc-300"),
+            _ => format!("{base} border border-zinc-300 text-zinc-400 dark:border-zinc-700 dark:text-zinc-600"),
+        }
+    };
+    let number = move || {
+        let (w, l) = counts();
+        pill(if w > 0 { w } else { l })
+    };
+    let mark_all = move |_| {
+        spawn_local(async move {
+            let _ = api::attention_seen(Vec::new()).await;
+            let _ = tick.try_update(|t| *t += 1);
+        });
+    };
+    let close = Callback::new(move |()| open.set(false));
+    view! {
+        <div class="relative shrink-0">
+            <button class="flex items-center rounded-md px-1 py-1 hover:bg-zinc-200/60 dark:hover:bg-zinc-800"
+                aria-haspopup="dialog" aria-expanded=move || open.get().to_string()
+                aria-label=move || { let (w, l) = counts(); label(w, l) } title=move || { let (w, l) = counts(); label(w, l) }
+                on:click=move |_| open.update(|o| *o = !*o)>
+                <span class=pill_class>{number}</span>
+            </button>
+            <Show when=move || open.get()>
+                // A click outside closes it (on a phone the page dims).
+                <div class="fixed inset-0 z-40 bg-black/30 md:bg-transparent" on:click=move |_| open.set(false)></div>
+                <div role="dialog" aria-label="What needs you"
+                    class="fixed inset-x-0 bottom-0 z-50 flex max-h-[80dvh] flex-col rounded-t-xl border border-zinc-200 bg-white text-sm shadow-lg md:absolute md:inset-x-auto md:bottom-auto md:right-0 md:top-9 md:max-h-[70vh] md:w-[420px] md:rounded-lg dark:border-zinc-700 dark:bg-zinc-900">
+                    <div class="flex items-center gap-2 border-b border-zinc-200 px-3 py-2 dark:border-zinc-800">
+                        <span class="flex-1 font-semibold">"Needs you"</span>
+                        {move || (counts().1 > 0).then(|| view! {
+                            <button class="rounded px-1.5 py-0.5 text-xs text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                                title="The turns that ended stop being worth a look" on:click=mark_all>"Mark all seen"</button>
+                        })}
+                    </div>
+                    <div class="min-h-0 overflow-y-auto p-1 pb-4 md:pb-1">
+                        {move || {
+                            let a = shown.get();
+                            let now = now_ms();
+                            if a.waiting.is_empty() && a.worth.is_empty() && a.elsewhere.is_empty() {
+                                return view! { <p class="px-2 py-6 text-center text-zinc-500">"Nothing needs you."</p> }.into_any();
+                            }
+                            let here = place::realm().unwrap_or_else(|| "root".into());
+                            view! {
+                                {(!a.waiting.is_empty()).then(|| view! {
+                                    <Heading text=format!("Waiting on you · {}", a.waiting.len()) />
+                                    {a.waiting.iter().map(|i| {
+                                        let (kind, title, line) = (tag(&i.kind), i.title.clone(), under(i, &here, now));
+                                        view! {
+                                            <Row item=i.clone() close>
+                                                <span class="mt-0.5 shrink-0 rounded bg-amber-100 px-1 text-[10px] font-semibold uppercase tracking-wide text-amber-800 dark:bg-amber-950 dark:text-amber-300">{kind}</span>
+                                                <span class="min-w-0 flex-1">
+                                                    <span class="block truncate">{title}</span>
+                                                    <span class="block truncate text-xs text-zinc-500">{line}</span>
+                                                </span>
+                                            </Row>
+                                        }
+                                    }).collect_view()}
+                                })}
+                                {(!a.worth.is_empty()).then(|| view! {
+                                    <Heading text=format!("Worth a look · {}", a.worth.len()) />
+                                    {a.worth.iter().map(|i| {
+                                        let (colour, says, when) = (format!("mt-1.5 h-2 w-2 shrink-0 rounded-full {}", dot(&i.kind)), text(i), short_ago(now - i.at));
+                                        view! {
+                                            <Row item=i.clone() close>
+                                                <span class=colour></span>
+                                                <span class="min-w-0 flex-1 truncate">{says}</span>
+                                                <span class="shrink-0 text-xs text-zinc-500">{when}</span>
+                                            </Row>
+                                        }
+                                    }).collect_view()}
+                                })}
+                                {(!a.elsewhere.is_empty()).then(|| view! {
+                                    <div class="my-1 border-t border-zinc-200 dark:border-zinc-800"></div>
+                                    {a.elsewhere.iter().map(|e| {
+                                        let to = if e.id == "root" { Place::Console } else { Place::Realm(e.id.clone()) };
+                                        view! {
+                                            <a rel="external" href=place::url_of(&to) class="block rounded-md px-2 py-1.5 text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800">
+                                                {elsewhere_text(e)}
+                                            </a>
+                                        }
+                                    }).collect_view()}
+                                })}
+                            }.into_any()
+                        }}
+                    </div>
+                </div>
+            </Show>
+        </div>
+    }
+}
+
+#[component]
+fn Heading(text: String) -> impl IntoView {
+    view! { <div class="px-2 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">{text}</div> }
+}
+
+/// A row: goes to the item in the focused tile (⌘/Ctrl-click: a new one)
+/// and closes the list; a turn's end is seen once you open it.
+#[component]
+fn Row(item: AttentionItem, close: Callback<()>, children: Children) -> impl IntoView {
+    let ws = use_workspace();
+    let to = target(&item);
+    let href = to.href();
+    let to = StoredValue::new(to);
+    let (key, seen) = (item.key.clone(), seen_by_opening(&item.kind));
+    view! {
+        <a href=href class="flex items-start gap-2 rounded-md px-2 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800" on:click=move |ev: web_sys::MouseEvent| {
+            if ev.button() != 0 || ev.shift_key() || ev.alt_key() {
+                return;
+            }
+            ev.prevent_default();
+            ws.open(None, to.get_value(), How::from_mouse(&ev));
+            if seen {
+                let key = key.clone();
+                spawn_local(async move {
+                    let _ = api::attention_seen(vec![key]).await;
+                });
+            }
+            close.run(());
+        }>{children()}</a>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(kind: &str) -> AttentionItem {
+        AttentionItem { kind: kind.into(), title: "Allow shell?".into(), detail: "Fix the build".into(), ..Default::default() }
+    }
+
+    #[test]
+    fn rows_say_what_needs_you() {
+        assert_eq!(text(&item("turn_ended")), "“Fix the build” ended its turn");
+        assert_eq!(text(&item("failed")), "“Fix the build” failed");
+        assert_eq!(text(&AttentionItem { detail: "Plan".into(), ..item("comment_answer") }), "An answer on “Plan”");
+        assert_eq!(text(&AttentionItem { count: Some(3), ..item("brief") }), "3 people waiting on you in the Brief");
+        assert_eq!(text(&AttentionItem { count: Some(1), ..item("brief") }), "1 person waiting on you in the Brief");
+        assert_eq!(text(&item("approval")), "Allow shell?");
+        assert_eq!((tag("approval"), tag("question"), tag("decision")), ("Approval", "Question", "Decision"));
+    }
+
+    #[test]
+    fn the_pill_names_both_counts() {
+        assert_eq!(label(3, 2), "What needs you: 3 waiting, 2 worth a look");
+        assert_eq!(label(3, 0), "What needs you: 3 waiting");
+        assert_eq!(label(0, 2), "What needs you: 2 worth a look");
+        assert_eq!(label(0, 0), "What needs you: nothing");
+        assert_eq!(pill(0), PREFIX);
+        assert_eq!(pill(4), format!("{PREFIX}4"));
+    }
+
+    #[test]
+    fn times_are_short() {
+        assert_eq!(
+            (short_ago(5_000), short_ago(120_000), short_ago(3 * 3_600_000), short_ago(2 * 86_400_000)),
+            ("now".into(), "2m".into(), "3h".into(), "2d".into())
+        );
+    }
+
+    #[test]
+    fn under_a_row_its_realm_only_if_another() {
+        let i = AttentionItem { realm: Some("home".into()), at: 0, ..item("approval") };
+        assert_eq!(under(&i, "home", 120_000), "Fix the build · 2m");
+        assert_eq!(under(&i, "lab", 120_000), "Fix the build · home · 2m");
+        assert_eq!(under(&AttentionItem { detail: String::new(), ..i }, "home", 0), "now");
+    }
+
+    #[test]
+    fn other_realms_say_only_how_many() {
+        let e = AttentionElsewhere { id: "lab".into(), name: "Lab".into(), waiting: 2 };
+        assert_eq!(elsewhere_text(&e), "2 waiting in Lab →");
+        assert_eq!(elsewhere_text(&AttentionElsewhere { id: "root".into(), ..e }), "2 waiting in the console →");
+    }
+
+    #[test]
+    fn rows_go_where_the_thing_is() {
+        let s = Some("s1".to_owned());
+        assert_eq!(target(&AttentionItem { session_id: s.clone(), ..item("approval") }), View::session("s1"));
+        assert_eq!(target(&AttentionItem { session_id: s.clone(), ..item("failed") }), View::session("s1"));
+        assert_eq!(target(&AttentionItem { session_id: s, ..item("decision") }), View::Decisions);
+        assert_eq!(target(&AttentionItem { doc_id: Some("d1".into()), ..item("comment_answer") }), View::Docs { id: "d1".into() });
+        assert_eq!(target(&item("brief")), View::Brief);
+        assert!(seen_by_opening("turn_ended") && !seen_by_opening("comment_answer"));
+    }
+}

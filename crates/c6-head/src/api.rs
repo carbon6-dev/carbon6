@@ -190,6 +190,8 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/decisions/{id}", get(get_decision).patch(edit_decision))
         .route("/api/v1/decisions/{id}/answer", post(answer_decision))
         .route("/api/v1/decisions/{id}/session", post(decision_session))
+        .route("/api/v1/attention", get(get_attention))
+        .route("/api/v1/attention/seen", post(attention_seen))
         .route("/api/v1/assistant", post(ask_assistant))
         .route("/api/v1/assistant/mentionables", get(ask_mentionables))
         .route("/api/v1/assistant/claude", get(ask_claude))
@@ -392,6 +394,7 @@ async fn live(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Cal
 async fn live_socket(st: Arc<HeadState>, caller: Caller, mut socket: WebSocket) {
     let mut changes = st.registry.subscribe();
     let mut docs = st.docs.live.subscribe();
+    let mut attention = st.attention.subscribe();
     loop {
         changes.borrow_and_update();
         let Ok(workers) = workers_for(&st, &caller).await else { return };
@@ -403,10 +406,19 @@ async fn live_socket(st: Arc<HeadState>, caller: Caller, mut socket: WebSocket) 
                 return;
             }
         }
-        // Documents' changes go out as they happen, between snapshots.
+        // Documents' changes go out as they happen, between snapshots, and
+        // so does word that what needs you may have changed (already
+        // coalesced: `attention::Pings`).
         loop {
             tokio::select! {
                 _ = st.shutdown.cancelled() => return,
+                r = attention.changed() => {
+                    if r.is_err() { return }
+                    let Ok(text) = serde_json::to_string(&api::LiveEvent::Attention) else { return };
+                    if socket.send(Message::Text(text.into())).await.is_err() {
+                        return;
+                    }
+                }
                 r = changes.changed() => {
                     if r.is_err() { return }
                     // Coalesce bursts (e.g. many heartbeats) into one snapshot.
@@ -1132,6 +1144,10 @@ async fn update_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>
         return Err(ApiErr(StatusCode::NOT_FOUND, "no such session".into()));
     }
     st.registry.bump();
+    // An archived session's turn isn't worth a look any more.
+    if req.archived.is_some() {
+        st.attention.changed();
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2156,22 +2172,23 @@ async fn put_session_imports(State(st): State<Arc<HeadState>>, Json(s): Json<api
 /// What waits on you in each realm (docs/realms-ux.md §6): counts only,
 /// for the realm switcher. A realm's token learns only about its own.
 async fn get_elsewhere(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<Vec<api::RealmWaiting>>> {
-    let mut out = Vec::new();
-    for r in crate::realms::list(&st, &Caller::root()).await? {
-        // Root's is the console's (your browser's only): installs, grants.
-        let console = r.id == crate::realms::ROOT;
-        if (console && !caller.browser) || !(caller.sees_others() || caller.sees(&r.id)) {
-            continue;
-        }
-        let decisions = crate::decisions::open_count(&st, &Caller::in_realm(&r.id)).await?;
-        let approvals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE realm = ? AND awaiting > 0 AND archived = 0")
-            .bind(&r.id)
-            .fetch_one(&st.store.pool)
-            .await
-            .map_err(anyhow::Error::from)?;
-        out.push(api::RealmWaiting { id: r.id, name: r.name, waiting: (decisions + approvals).max(0) as u64 });
-    }
-    Ok(Json(out))
+    Ok(Json(crate::attention::places(&st, &caller).await?))
+}
+
+/// What needs you here, and how many wait in each other realm.
+async fn get_attention(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<api::Attention>> {
+    Ok(Json(crate::attention::get(&st, &caller).await?))
+}
+
+/// You've seen these worth-a-look items (none named: all of them).
+async fn attention_seen(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    body: Option<Json<api::AttentionSeen>>,
+) -> ApiResult<StatusCode> {
+    let keys = body.map(|Json(b)| b.keys).unwrap_or_default();
+    crate::attention::seen(&st, &caller, &keys).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// The realm a session is in, for links from before realms had their own

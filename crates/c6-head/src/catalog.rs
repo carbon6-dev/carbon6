@@ -94,6 +94,7 @@ pub fn scope(name: &str) -> Option<Scope> {
     const REALM_AREAS: &[&str] = &[
         "sessions.",
         "decisions.",
+        "attention.",
         "work.",
         "projects.",
         "marks.",
@@ -611,6 +612,8 @@ fn build() -> Vec<Op> {
         op!("decisions.answer", "decisions", "POST" "/api/v1/decisions/{id}/answer", Write, Input::Body(schema::<api::DecisionAnswer>), "Answers a decision (an option, the form's fields, a note); what waits on it gets the answer.", choices = &[("id", "decisions.list")]),
         op!("decisions.edit", "decisions", "PATCH" "/api/v1/decisions/{id}", Write, Input::Body(schema::<api::DecisionEdit>), "Snoozes, dismisses or reopens a decision.", choices = &[("id", "decisions.list")]),
         op!("decisions.session", "decisions", "POST" "/api/v1/decisions/{id}/session", Write, Input::None, "Starts a session that helps the user settle a decision, with its context.", choices = &[("id", "decisions.list")]),
+        op!("attention.list", "decisions", "GET" "/api/v1/attention", Read, Input::None, "What needs the user in this realm: waiting (open decisions, among them tool calls to approve and agents' questions; not task cards), worth a look (sessions whose turn ended or failed since the user saw them, agents' answers to the user's comments, people waiting on the user in the Brief), and for other realms only how many wait there."),
+        op!("attention.seen", "decisions", "POST" "/api/v1/attention/seen", Write, Input::Body(schema::<api::AttentionSeen>), "Marks worth-a-look items seen, by key (none: all of them): a session's ended turn or failure stops being worth a look until its next. Waiting items leave only when answered, snoozed or dismissed; a comment answer when its thread is replied to or resolved; the Brief's row when its people are answered there."),
 
         // Hosts.
         op!("hosts.list", "hosts", "GET" "/api/v1/hosts", Read, Input::None, "Hosts in the inventory with their last check."),

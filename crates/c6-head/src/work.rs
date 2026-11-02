@@ -587,6 +587,7 @@ pub async fn detach(st: &HeadState, id: &str, r: &WorkRef, caller: &Caller) -> a
 pub async fn seen_session(st: &HeadState, session_id: &str, at: i64) -> anyhow::Result<()> {
     if st.store.mark_seen(session_id, at).await? {
         st.registry.bump();
+        st.attention.changed();
     }
     Ok(())
 }
@@ -605,6 +606,7 @@ pub async fn seen(st: &HeadState, id: &str, caller: &Caller) -> anyhow::Result<W
     }
     if any {
         st.registry.bump();
+        st.attention.changed();
     }
     get(st, id, caller).await
 }
@@ -1048,6 +1050,8 @@ pub async fn on_decision(st: &HeadState, d: &api::Decision) {
 /// The memex's events: a request opened, changed or got a new message.
 pub async fn on_memex_event(st: &HeadState, realm: &str, kind: &str, data: &Value) {
     if kind.starts_with("request.") {
+        // The Brief's count of people waiting on you may have changed.
+        st.attention.changed();
         let mut ids: Vec<i64> = data["request_ids"].as_array().into_iter().flatten().filter_map(Value::as_i64).collect();
         ids.extend(data["request_id"].as_i64());
         ids.sort_unstable();

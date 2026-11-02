@@ -112,6 +112,38 @@ pub async fn answered(st: &HeadState, realm: &str, doc: &str) -> usize {
     }
 }
 
+/// A thread an agent answered, waiting for your reply or for you to
+/// resolve it.
+pub struct Answered {
+    pub doc: String,
+    /// The document's title.
+    pub title: String,
+    pub thread: String,
+    /// What the thread is about (quoted words, a block, a tab).
+    pub about: String,
+    /// When the agent answered.
+    pub at: i64,
+}
+
+/// Every thread in a realm that an agent answered last and that's still
+/// open (what `list` calls needs you), newest first, in one query.
+pub async fn answered_in(st: &HeadState, realm: &str, limit: i64) -> anyhow::Result<Vec<Answered>> {
+    let pool = super::pool(st, realm).await?;
+    let rows = sqlx::query(
+        "SELECT t.id, t.doc_id, t.about, d.title, c.at FROM doc_threads t \
+         JOIN docs d ON d.id = t.doc_id AND d.deleted_at IS NULL \
+         JOIN doc_comments c ON c.id = (SELECT id FROM doc_comments WHERE thread_id = t.id ORDER BY at DESC, id DESC LIMIT 1) \
+         WHERE t.state = 'open' AND c.by LIKE 'session:%' ORDER BY c.at DESC LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(&pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| Answered { doc: r.get("doc_id"), title: r.get("title"), thread: r.get("id"), about: r.get("about"), at: r.get("at") })
+        .collect())
+}
+
 /// A new thread with its first comment; sent to an agent when asked.
 pub async fn create(st: &HeadState, realm: &str, doc: &str, n: &ThreadNew, by: &str) -> anyhow::Result<DocThread> {
     let text = check_text(&n.text)?;
@@ -228,6 +260,7 @@ pub async fn resolve(st: &HeadState, realm: &str, doc: &str, thread: &str, by: &
         by: by.to_owned(),
         what: "commented".into(),
     });
+    st.attention.changed();
     let title = super::title_of(st, realm, doc).await.map(|t| t.0).unwrap_or_default();
     let event =
         json!({"type": "doc", "op": "thread_resolved", "doc": {"id": doc, "title": title, "realm": realm}, "thread": thread, "by": by});
@@ -246,6 +279,8 @@ async fn commented(st: &HeadState, realm: &str, doc: &str, thread: &str, by: &st
         by: by.to_owned(),
         what: "commented".into(),
     });
+    // An agent's answer is worth a look; your reply settles it.
+    st.attention.changed();
     let title = super::title_of(st, realm, doc).await.map(|t| t.0).unwrap_or_default();
     let event = json!({"type": "doc", "op": "commented", "doc": {"id": doc, "title": title, "realm": realm}, "thread": thread, "by": by, "text": text});
     crate::triggers::dispatch(st, realm, "doc", "commented", event).await;
@@ -350,6 +385,7 @@ pub async fn send_many(st: &HeadState, realm: &str, doc: &str, ids: &[String], b
         by: by.to_owned(),
         what: "commented".into(),
     });
+    st.attention.changed();
     let now = list(st, realm, doc).await?;
     Ok(now.into_iter().filter(|t| threads.contains(&t.id)).collect())
 }

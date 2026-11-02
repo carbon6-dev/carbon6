@@ -674,6 +674,7 @@ async fn hand_over(st: &HeadState, worker_id: WorkerId, mut create: SessionComma
             match st.store.fail_held(&session_id, &format!("could not hand it to its worker: {e:#}")).await {
                 Ok(()) => {
                     publish_queue(st, &session_id).await;
+                    st.attention.changed();
                     crate::triggers::session_ended(st, &session_id, "failed").await;
                 }
                 // Left held: the next start hands it over.
@@ -1816,6 +1817,14 @@ pub async fn ingest(st: &HeadState, worker_id: WorkerId, batch: SessionEventBatc
     if !ing.events.is_empty() {
         st.registry.bump();
     }
+    // A turn that ended is worth a look; one that started isn't any more.
+    if ing
+        .events
+        .iter()
+        .any(|e| matches!(e.kind, Some(c6_proto::session_event::Kind::TurnEnded(_) | c6_proto::session_event::Kind::TurnStarted(_))))
+    {
+        st.attention.changed();
+    }
     notify_events(st, &batch.session_id, &ing.events).await;
     crate::memex::on_events(st, &batch.session_id, &ing.events).await;
     crate::decisions::on_events(st, &batch.session_id, &ing.events).await;
@@ -2008,6 +2017,7 @@ pub async fn on_rejected(st: &HeadState, worker_id: WorkerId, r: CommandRejected
         publish_queue(st, &session_id).await;
         st.registry.bump();
         if st.store.session(&session_id).await?.is_some_and(|s| s.status == "failed") {
+            st.attention.changed();
             crate::triggers::session_ended(st, &session_id, "failed").await;
         }
     }

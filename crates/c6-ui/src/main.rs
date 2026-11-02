@@ -29,6 +29,7 @@ mod marks;
 mod memex;
 mod models;
 mod monitor;
+mod needs;
 mod notify;
 mod outputs;
 mod people;
@@ -144,6 +145,7 @@ fn Main() -> impl IntoView {
                         </nav>
                         <span class="flex-1"></span>
                         <monitor::ActivityBadge />
+                        <needs::NeedsYou />
                         <assistant::AskButton />
                     }.into_any()
                 } else {
@@ -170,6 +172,7 @@ fn Main() -> impl IntoView {
                         <span class="flex-1"></span>
                         <span class="hidden xl:contents"><views::ViewsMenu class=NAV /></span>
                         <monitor::ActivityBadge />
+                        <needs::NeedsYou />
                         <assistant::AskButton />
                         <span class="hidden md:contents"><search::SearchBox /></span>
                     }.into_any()

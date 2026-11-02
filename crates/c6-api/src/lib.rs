@@ -105,6 +105,9 @@ pub enum LiveEvent {
     Doc { change: docs::DocChange },
     /// Every mark given (docs/marks.md); same cadence as the snapshots.
     Marks { marks: marks::Marks },
+    /// What needs you may have changed (`GET /api/v1/attention`): read it
+    /// again. At most one every half second.
+    Attention,
 }
 
 // --- LLM connections --------------------------------------------------------
@@ -4683,8 +4686,75 @@ pub struct SlackClientIn {
 pub struct RealmWaiting {
     pub id: String,
     pub name: String,
-    /// Open decisions and approvals.
+    /// Open decisions, approvals and questions (not task cards).
     pub waiting: u64,
+}
+
+/// What needs you (`GET /api/v1/attention`), in the caller's realm: what
+/// waits on you (it counts), what's worth a look (it doesn't), and for
+/// other realms only how many wait there.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Attention {
+    /// Open decisions (approvals of tool calls and agents' questions among
+    /// them), newest first; not task cards.
+    pub waiting: Vec<AttentionItem>,
+    /// Turns that ended or failed since you last saw them, agents' answers
+    /// to your comments, people waiting on you in the Brief; newest first.
+    pub worth: Vec<AttentionItem>,
+    /// Other realms with something waiting: a count each, nothing more.
+    pub elsewhere: Vec<AttentionElsewhere>,
+}
+
+/// One thing that needs you.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AttentionItem {
+    /// Stable: `decision:<id>`, `session:<id>`, `thread:<doc>:<thread>` or
+    /// `brief`.
+    pub key: String,
+    /// Waiting: `approval`, `question` or `decision`. Worth a look:
+    /// `turn_ended`, `failed`, `comment_answer` or `brief`.
+    pub kind: String,
+    pub title: String,
+    /// Where it is: the session's title for an approval or a turn, the
+    /// document's for a comment answer.
+    #[serde(default)]
+    pub detail: String,
+    pub at: UnixMs,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realm: Option<String>,
+    /// How many (the Brief's row: people waiting on you).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
+}
+
+/// Another realm, and how many things wait on you there.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AttentionElsewhere {
+    pub id: String,
+    pub name: String,
+    pub waiting: u64,
+}
+
+/// `POST /api/v1/attention/seen`: the worth-a-look items you've seen (by
+/// key); none, every one you see.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AttentionSeen {
+    #[serde(default)]
+    pub keys: Vec<String>,
 }
 
 /// How the session list is grouped (`/api/v1/settings/session_grouping`):

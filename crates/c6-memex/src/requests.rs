@@ -363,6 +363,18 @@ pub async fn some(m: &Memex, ids: &[i64]) -> anyhow::Result<Value> {
     Ok(json!(out))
 }
 
+/// How many people wait on you in the Brief (its "Needs you": open
+/// requests, and snoozed ones whose time has come), and when the latest of
+/// them changed. One query, for the head's "what needs you".
+pub async fn waiting_people(m: &Memex) -> anyhow::Result<(i64, i64)> {
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(DISTINCT person), COALESCE(MAX(updated_at), 0) FROM requests WHERE category = 'needs_you' AND {OPEN}"
+    )))
+    .bind(c6_core::now_ms())
+    .fetch_one(&m.store.pool)
+    .await?)
+}
+
 /// Requests, the latest first: open ones (and snoozed ones whose time has
 /// come), or of a status.
 pub async fn list(m: &Memex, status: &str, limit: u32) -> anyhow::Result<Vec<api::Request>> {

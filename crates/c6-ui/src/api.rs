@@ -27,6 +27,8 @@ pub struct LiveFeed {
     pub doc: ReadSignal<Option<c6_api::docs::DocChange>>,
     /// Every mark given to an aspect's value (docs/marks.md).
     pub marks: ReadSignal<c6_api::marks::Marks>,
+    /// Bumped when what needs you may have changed (read it again).
+    pub attention: ReadSignal<u32>,
 }
 
 impl LiveFeed {
@@ -36,6 +38,7 @@ impl LiveFeed {
         let (connected, set_connected) = signal(false);
         let (doc, set_doc) = signal(None);
         let (marks, set_marks) = signal(c6_api::marks::Marks::new());
+        let (attention, set_attention) = signal(0u32);
         spawn_local(async move {
             let mut backoff = 500;
             loop {
@@ -51,6 +54,7 @@ impl LiveFeed {
                                     LiveEvent::Workers { workers } => set_workers.set(workers),
                                     LiveEvent::Sessions { sessions } => set_sessions.set(sessions),
                                     LiveEvent::Doc { change } => set_doc.set(Some(change)),
+                                    LiveEvent::Attention => set_attention.update(|n| *n = n.wrapping_add(1)),
                                     // Sent with every snapshot: only a change wakes what wears them.
                                     LiveEvent::Marks { marks: given } => {
                                         if marks.with_untracked(|m| *m != given) {
@@ -68,7 +72,7 @@ impl LiveFeed {
                 backoff = (backoff * 2).min(10_000);
             }
         });
-        Self { workers, sessions, connected, doc, marks }
+        Self { workers, sessions, connected, doc, marks, attention }
     }
 
     pub fn worker_name(&self, id: &str) -> String {
@@ -175,6 +179,17 @@ pub async fn locate_session(id: &str) -> Result<String, String> {
 /// What waits on you in each realm (for the switcher).
 pub async fn elsewhere() -> Result<Vec<c6_api::RealmWaiting>, String> {
     json(Request::get("/api/v1/elsewhere").send().await).await
+}
+
+/// What needs you here, and how many wait in each other realm.
+pub async fn attention() -> Result<c6_api::Attention, String> {
+    json(Request::get("/api/v1/attention").send().await).await
+}
+
+/// You've seen these worth-a-look items (none: all of them).
+pub async fn attention_seen(keys: Vec<String>) -> Result<(), String> {
+    let body = c6_api::AttentionSeen { keys };
+    empty(Request::post("/api/v1/attention/seen").json(&body).map_err(|e| e.to_string())?.send().await).await
 }
 
 thread_local! {

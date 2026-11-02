@@ -5,6 +5,7 @@ pub mod analytics;
 pub mod api;
 pub mod apps;
 pub mod assistant;
+pub mod attention;
 pub mod auth;
 pub mod catalog;
 pub mod claims;
@@ -180,6 +181,8 @@ pub struct HeadState {
     pub quotas: quotas::Quotas,
     /// Documents' changes, for the live feed and their settled events.
     pub docs: docs::Docs,
+    /// Pings the live feed when what needs you may have changed.
+    pub attention: attention::Pings,
     /// When each session sent other sessions messages in the last hour
     /// (docs/background.md §6).
     pub(crate) messages_sent: std::sync::Mutex<std::collections::HashMap<String, std::collections::VecDeque<i64>>>,
@@ -302,6 +305,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         pools: Default::default(),
         quotas: Default::default(),
         docs: Default::default(),
+        attention: Default::default(),
         messages_sent: Default::default(),
         me: Default::default(),
     });
@@ -348,6 +352,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     workflows::spawn(state.clone());
     memex::spawn(state.clone());
     decisions::spawn_sweeper(state.clone());
+    attention::spawn(state.clone());
     // Nudges about work left open (docs/work.md §7).
     work::spawn_sweeper(state.clone());
     // ChatGPT plans' usage windows (Claude Code's come with its turns).
