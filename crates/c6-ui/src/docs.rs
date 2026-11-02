@@ -1,10 +1,12 @@
 //! Documents (docs/docs.md §12): the Docs list, and a document's panel.
-//! Click a block to edit its Markdown in place; typing sends the change
-//! when you pause or leave the block, guarded by the version you read, so
+//! A document reads first: ✎ by a block (or a double-click, or Edit for
+//! the whole doc) opens its Markdown in place; typing sends the change
+//! when you pause or are done, guarded by the version you read, so
 //! someone else's edit since is never overwritten. A document updates live
-//! as others (and agents) write it.
+//! as others (and agents) write it, each block drawn again only when it
+//! changes, so what you're typing (a block, a comment) keeps the cursor.
 
-use c6_api::docs::{Doc, DocBatch, DocBlock, DocNew, DocOp, DocPatch, DocQuery, DocRestore, DocSummary, DocVersion};
+use c6_api::docs::{Doc, DocBatch, DocBlock, DocNew, DocOp, DocPatch, DocQuery, DocRestore, DocSummary, DocTab, DocThread, DocVersion};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use serde_json::{Map, Value};
@@ -128,18 +130,6 @@ struct ChipCtx {
     refs: RwSignal<std::collections::HashMap<String, c6_api::work::LiveAttached>>,
     editing: RwSignal<Option<(String, String, Value)>>,
     send: StoredValue<Box<dyn Fn(Vec<DocOp>) + Send + Sync>>,
-}
-
-/// A document's comment threads as last loaded, shared by its blocks (each
-/// marks its own) and its Comments section (which loads them).
-#[derive(Clone, Copy)]
-struct ThreadsCtx {
-    shown: RwSignal<Vec<c6_api::docs::DocThread>>,
-    tick: RwSignal<u32>,
-    /// The new-comment box to put the cursor in, once, as you open it
-    /// (its block, "" for the whole tab); never on a redraw, which would
-    /// take the cursor from wherever you're typing.
-    focus: RwSignal<Option<String>>,
 }
 
 fn esc(s: &str) -> String {
@@ -392,7 +382,7 @@ fn Embed(v: Value) -> impl IntoView {
                     <Expandable src=src.clone() name=alt.clone() fill=false new_tab=Some(src.clone())>
                         <img src=src alt=alt class="max-h-[32rem] max-w-full rounded border border-zinc-200 dark:border-zinc-800" />
                     </Expandable>
-                    {(!s("caption").is_empty()).then(|| view! { <figcaption class="mt-1 text-xs text-zinc-500">{s("caption")}</figcaption> })}
+                    {(!s("caption").is_empty()).then(|| view! { <figcaption class="mt-1 text-xs text-muted">{s("caption")}</figcaption> })}
                 </figure>
             }.into_any()
         }
@@ -400,7 +390,7 @@ fn Embed(v: Value) -> impl IntoView {
             <a href=file_url(&s("blob")) class="my-1 inline-flex items-center gap-2 rounded border border-zinc-200 px-2 py-1 text-sm text-sky-700 hover:bg-zinc-50 dark:border-zinc-800 dark:text-sky-400 dark:hover:bg-zinc-900"
                 on:click=|ev| ev.stop_propagation()>
                 "📎 " {s("name")}
-                <span class="text-xs text-zinc-500">{v["size"].as_u64().map(|n| format!("{} KB", n.div_ceil(1024))).unwrap_or_default()}</span>
+                <span class="text-xs text-muted">{v["size"].as_u64().map(|n| format!("{} KB", n.div_ceil(1024))).unwrap_or_default()}</span>
             </a>
         }.into_any(),
         // An agent's SVG, drawn as a picture: it can't run or restyle the page.
@@ -413,14 +403,14 @@ fn Embed(v: Value) -> impl IntoView {
                     <Expandable src=src.clone() name=title.clone() fill=true new_tab=None>
                         <img src=src alt=title class="max-w-full" />
                     </Expandable>
-                    {(!s("title").is_empty()).then(|| view! { <figcaption class="mt-1 text-xs text-zinc-500">{s("title")}</figcaption> })}
+                    {(!s("title").is_empty()).then(|| view! { <figcaption class="mt-1 text-xs text-muted">{s("title")}</figcaption> })}
                 </figure>
             }.into_any()
         }
         "chart" => view! { <Chart v=v.clone() /> }.into_any(),
         "view" => view! { <EmbedView name=s("view") /> }.into_any(),
         other => view! {
-            <div class="rounded border border-zinc-200 px-3 py-2 text-sm text-zinc-500 dark:border-zinc-800">{format!("{other} (not shown here)")}</div>
+            <div class="rounded border border-zinc-200 px-3 py-2 text-sm text-muted dark:border-zinc-800">{format!("{other} (not shown here)")}</div>
         }.into_any(),
     }
 }
@@ -521,9 +511,9 @@ fn Chart(v: Value) -> impl IntoView {
             <div class="flex items-center gap-2 text-sm">
                 <span class="flex-1 font-medium">{title}</span>
                 {legend.iter().enumerate().map(|(k, l)| view! {
-                    <span class="flex items-center gap-1 text-xs text-zinc-500"><span class="inline-block size-2 rounded-sm" style=format!("background:{}", SERIES[k % SERIES.len()])></span>{l.clone()}</span>
+                    <span class="flex items-center gap-1 text-xs text-muted"><span class="inline-block size-2 rounded-sm" style=format!("background:{}", SERIES[k % SERIES.len()])></span>{l.clone()}</span>
                 }).collect_view()}
-                <button class="text-xs text-zinc-500 hover:underline" on:click=move |_| data.update(|d| *d = !*d)>"Data"</button>
+                <button class="text-xs text-muted hover:underline" on:click=move |_| data.update(|d| *d = !*d)>"Data"</button>
             </div>
             <div class="text-zinc-700 dark:text-zinc-300" inner_html=svg></div>
             {move || data.get().then(|| view! {
@@ -547,9 +537,9 @@ fn EmbedView(name: String) -> impl IntoView {
             {move || views.get().map(|r| match r {
                 Err(e) => view! { <ErrorBox message=e /> }.into_any(),
                 Ok(all) => match all.iter().find(|v| v.name == name).cloned() {
-                    None => view! { <p class="text-sm text-zinc-500">{format!("No view {name} in this realm.")}</p> }.into_any(),
+                    None => view! { <p class="text-sm text-muted">{format!("No view {name} in this realm.")}</p> }.into_any(),
                     Some(v) => view! {
-                        <div class="mb-1 text-xs font-medium uppercase tracking-wide text-zinc-500">{if v.title.is_empty() { v.name.clone() } else { v.title.clone() }}</div>
+                        <div class="mb-1 text-xs font-medium uppercase tracking-wide text-muted">{if v.title.is_empty() { v.name.clone() } else { v.title.clone() }}</div>
                         <crate::views::ViewBody view=v all=all />
                     }.into_any(),
                 },
@@ -646,7 +636,7 @@ pub fn DocsPage() -> impl IntoView {
         <main class="mx-auto max-w-4xl space-y-4 px-4 py-5">
             <header class="flex flex-wrap items-baseline gap-x-3 gap-y-1">
                 <h1 class="text-xl font-semibold">"Docs"</h1>
-                <span class="text-sm text-zinc-500">"Docs and decks you and agents write together"</span>
+                <span class="text-sm text-muted">"Docs and decks you and agents write together"</span>
             </header>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             <div class="flex flex-wrap items-center gap-2">
@@ -680,10 +670,10 @@ pub fn DocsPage() -> impl IntoView {
                 </select>
             </div>
             {move || match shown.get() {
-                None => view! { <p class="text-sm text-zinc-500">"Loading…"</p> }.into_any(),
+                None => view! { <p class="text-sm text-muted">"Loading…"</p> }.into_any(),
                 Some(Err(e)) => view! { <ErrorBox message=e /> }.into_any(),
                 Some(Ok(l)) if l.is_empty() => view! {
-                    <p class="text-sm text-zinc-500">"No documents yet. Make one above, or ask a session to write one (it gets the doc tool)."</p>
+                    <p class="text-sm text-muted">"No documents yet. Make one above, or ask a session to write one (it gets the doc tool)."</p>
                 }.into_any(),
                 Some(Ok(l)) => view! {
                     {remember_titles(&l)}
@@ -697,7 +687,7 @@ pub fn DocsPage() -> impl IntoView {
                                         ev.prevent_default();
                                         open_doc.with_value(|f| f(id.clone(), How::from_mouse(&ev)));
                                     }>
-                                    <span class="shrink-0 text-zinc-400" title=d.kind.clone()>{kind_mark(&d.kind)}</span>
+                                    <span class="shrink-0 text-muted" title=d.kind.clone()>{kind_mark(&d.kind)}</span>
                                     <span class="min-w-0 flex-1 truncate font-medium">{d.title.clone()}</span>
                                     {(d.pending > 0).then(|| view! {
                                         <span class="shrink-0 rounded bg-violet-100 px-1.5 text-[11px] text-violet-800 dark:bg-violet-900/40 dark:text-violet-300"
@@ -705,9 +695,9 @@ pub fn DocsPage() -> impl IntoView {
                                             {format!("✎ {} to write", d.pending)}
                                         </span>
                                     })}
-                                    {d.labels.iter().map(|l| view! { <span class="shrink-0 text-[11px] text-zinc-500">{format!("#{l}")}</span> }).collect_view()}
+                                    {d.labels.iter().map(|l| view! { <span class="shrink-0 text-[11px] text-muted">{format!("#{l}")}</span> }).collect_view()}
                                     // The session it came from, else who changed it last.
-                                    <span class="max-w-[40%] shrink truncate text-xs text-zinc-400">
+                                    <span class="max-w-[40%] shrink truncate text-xs text-muted">
                                         {format!("{} · {}", if d.created_by.starts_with("session:") { format!("from {}", author_named(&d.created_by)) } else { author_named(&d.updated_by) }, since(d.updated_at))}
                                     </span>
                                 </a>
@@ -722,8 +712,153 @@ pub fn DocsPage() -> impl IntoView {
 
 // --- A document -------------------------------------------------------------
 
-/// A document, open: its tabs, blocks to click and edit, history, and what
-/// refers to it.
+/// How the comments panel sits: beside the doc in a wide tile, over the
+/// doc's right side in a narrower one, or as a sheet from the bottom on a
+/// phone.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fit {
+    Docked,
+    Floating,
+    Sheet,
+}
+
+/// A tile at least this wide (64rem) has the comments panel beside the doc.
+const DOCKED_FROM: f64 = 1024.0;
+
+/// A button in the doc's bar.
+const BAR: &str = "shrink-0 rounded-md px-2 py-1 text-sm text-soft hover:bg-zinc-100 dark:hover:bg-zinc-800";
+
+/// A doc's comments, shared by its bar, its blocks (each marks its own),
+/// the popover by a block and the panel: the threads as last loaded, and
+/// what is open.
+#[derive(Clone, Copy)]
+struct ThreadsCtx {
+    doc: StoredValue<String>,
+    shown: RwSignal<Vec<DocThread>>,
+    tick: RwSignal<u32>,
+    /// The new-comment box to put the cursor in, once, as you open it
+    /// (its block, "" for the whole tab); never on a redraw, which would
+    /// take the cursor from wherever you're typing.
+    focus: RwSignal<Option<String>>,
+    /// The block (or slide) a new comment is being written on ("": the tab).
+    commenting: RwSignal<Option<String>>,
+    /// The comments panel is open.
+    panel: RwSignal<bool>,
+    /// The block whose comments show in a popover by its 💬, and where it
+    /// hangs in the page (top and right, in pixels).
+    pop: RwSignal<Option<String>>,
+    pop_at: RwSignal<(f64, f64)>,
+    tabs: Memo<Vec<DocTab>>,
+    deck: Memo<bool>,
+    /// The page: what the popover hangs in, and blocks are found in.
+    root: NodeRef<leptos::html::Div>,
+    /// Scrolls to blocks and flashes them (on their tab).
+    reveal: Callback<Vec<String>>,
+    /// Your open comments not sent to an agent yet, and sending them.
+    unsent: Memo<usize>,
+    sending: RwSignal<bool>,
+    send_all: Callback<()>,
+}
+
+impl ThreadsCtx {
+    /// A block's 💬 (`marker`) pressed: its popover opens under it (with a
+    /// new comment box, `new`), or closes if it was open.
+    fn toggle_pop(self, block: String, marker: &web_sys::Element, new: bool) {
+        if !new && self.pop.get_untracked().as_deref() == Some(block.as_str()) {
+            self.close_pop();
+            return;
+        }
+        self.place_pop(marker);
+        self.pop.set(Some(block.clone()));
+        if new {
+            self.focus.set(Some(block.clone()));
+            self.commenting.set(Some(block));
+        }
+    }
+
+    /// The popover hangs under `marker`, its right edge on the marker's.
+    fn place_pop(self, marker: &web_sys::Element) {
+        let Some(root) = self.root.try_get_untracked().flatten() else { return };
+        let (r, m) = (root.get_bounding_client_rect(), marker.get_bounding_client_rect());
+        let _ = self.pop_at.try_set((m.bottom() - r.top() + 4.0, (r.right() - m.right()).max(8.0)));
+    }
+
+    /// The popover goes, and the new comment in it (its draft stays).
+    fn close_pop(self) {
+        if let Some(b) = self.pop.try_get_untracked().flatten() {
+            if self.commenting.try_get_untracked().flatten().as_ref() == Some(&b) {
+                let _ = self.commenting.try_set(None);
+            }
+            let _ = self.pop.try_set(None);
+        }
+    }
+}
+
+/// Where a block is drawn in the page.
+fn block_sel(id: &str) -> String {
+    format!("[data-block=\"{}\"]", id.replace(['"', '\\'], ""))
+}
+
+/// Scrolls the page to the first of these blocks (drawn under `root`) and
+/// flashes each.
+fn flash_blocks(root: NodeRef<leptos::html::Div>, ids: &[String]) {
+    use wasm_bindgen::JsCast;
+    let Some(root) = root.try_get_untracked().flatten() else { return };
+    let mut first = true;
+    for id in ids {
+        let Some(el) = root.query_selector(&block_sel(id)).ok().flatten() else { continue };
+        if first {
+            first = false;
+            // The tile's scrolling area, the block about a third down it
+            // (clear of the bar).
+            match root.parent_element() {
+                Some(area) => {
+                    let (a, r) = (area.get_bounding_client_rect(), el.get_bounding_client_rect());
+                    let opts = web_sys::ScrollToOptions::new();
+                    opts.set_top((f64::from(area.scroll_top()) + r.top() - a.top() - (a.height() / 3.0).max(56.0)).max(0.0));
+                    opts.set_behavior(web_sys::ScrollBehavior::Smooth);
+                    area.scroll_to_with_scroll_to_options(&opts);
+                }
+                None => el.scroll_into_view(),
+            }
+        }
+        let classes = el.class_list();
+        let _ = classes.remove_1("c6-flash");
+        // Read a size, so the animation starts again.
+        let _ = el.dyn_ref::<web_sys::HtmlElement>().map(web_sys::HtmlElement::offset_width);
+        let _ = classes.add_1("c6-flash");
+    }
+}
+
+/// Closes a popover (`close`) on a press outside it (`node`), but not on
+/// what matches `keep` (what opens it), and on an Escape that a box in it
+/// didn't take.
+fn dismiss(node: NodeRef<leptos::html::Div>, keep: &'static str, close: impl Fn() + Clone + 'static) {
+    use wasm_bindgen::JsCast;
+    let shut = close.clone();
+    let press = window_event_listener(leptos::ev::pointerdown, move |ev| {
+        let Some(t) = ev.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) else { return };
+        let inside = node.try_get_untracked().flatten().is_some_and(|el| el.contains(Some(t.as_ref())));
+        if !inside && t.closest(keep).ok().flatten().is_none() {
+            shut();
+        }
+    });
+    let keys = window_event_listener(leptos::ev::keydown, move |ev| {
+        if ev.key() == "Escape" && !ev.default_prevented() {
+            close();
+        }
+    });
+    on_cleanup(move || {
+        press.remove();
+        keys.remove();
+    });
+}
+
+/// A document, open: a bar that stays at the top (its title, its comments,
+/// Edit, what uses it, export and history), then its tabs and blocks to
+/// read. ✎ by a block, or a double-click, opens it in Markdown; Edit opens
+/// any you click. Its comments are in a panel (💬 in the bar) and in a
+/// popover by each block's 💬.
 #[component]
 pub fn DocPage(id: String) -> impl IntoView {
     let id = StoredValue::new(id);
@@ -734,26 +869,56 @@ pub fn DocPage(id: String) -> impl IntoView {
         api::doc_get(id.get_value())
     });
     let doc = RwSignal::new(None::<Result<Doc, String>>);
+    let error = RwSignal::new(None::<String>);
     Effect::new(move || {
-        if let Some(r) = loaded.get() {
-            if let Ok(d) = &r {
+        let Some(r) = loaded.get() else { return };
+        match r {
+            Ok(d) => {
                 remember_titles([&d.summary]);
+                if doc.with_untracked(|x| !matches!(x, Some(Ok(o)) if *o == d)) {
+                    doc.set(Some(Ok(d)));
+                }
             }
-            doc.set(Some(r));
+            // Once shown, a doc stays, with what went wrong above it.
+            Err(e) if doc.with_untracked(|x| matches!(x, Some(Ok(_)))) => error.set(Some(e)),
+            Err(e) => doc.set(Some(Err(e))),
         }
     });
+    // Each part is drawn again only when what it shows changes: a change
+    // anywhere in the doc mustn't draw again a box you're typing in.
+    let state = Memo::new(move |_| {
+        doc.with(|d| match d {
+            None => 0u8,
+            Some(Err(_)) => 1,
+            Some(Ok(_)) => 2,
+        })
+    });
+    let shown_doc = Memo::new(move |_| doc.with(|d| d.as_ref().and_then(|r| r.as_ref().ok()).cloned()));
+    let summary = Memo::new(move |_| shown_doc.with(|d| d.as_ref().map(|d| d.summary.clone()).unwrap_or_default()));
+    let tabs = Memo::new(move |_| shown_doc.with(|d| d.as_ref().map(|d| d.tabs.clone()).unwrap_or_default()));
+    let tab_names = Memo::new(move |_| tabs.with(|ts| ts.iter().map(|t| (t.id.clone(), t.title.clone())).collect::<Vec<_>>()));
     let tab = RwSignal::new(String::new());
-    let error = RwSignal::new(None::<String>);
+    let current = Memo::new(move |_| {
+        let chosen = tab.get();
+        tabs.with(|ts| if ts.iter().any(|t| t.id == chosen) { chosen } else { ts.first().map(|t| t.id.clone()).unwrap_or_default() })
+    });
+    let blocks = Memo::new(move |_| {
+        let c = current.get();
+        tabs.with(|ts| ts.iter().find(|t| t.id == c).map(|t| t.blocks.clone()).unwrap_or_default())
+    });
+    let is_deck = Memo::new(move |_| summary.with(|s| s.kind == "deck"));
+    let doc_rev = Memo::new(move |_| summary.with(|s| s.rev));
     let renaming = RwSignal::new(false);
     let title = RwSignal::new(String::new());
     let history = RwSignal::new(false);
     let exporting = RwSignal::new(false);
     let edit = RwSignal::new(None::<Editing>);
     let deck_pick = RwSignal::new(None::<String>);
-    // The block (or slide) a new comment is about ("": the tab).
-    let commenting = RwSignal::new(None::<String>);
     let draft = Draft { text: RwSignal::new(String::new()), typed: RwSignal::new(0) };
     let adding = RwSignal::new(String::new());
+    let adding_open = RwSignal::new(false);
+    // Edit mode: a click on a block opens it in Markdown.
+    let edit_all = RwSignal::new(false);
     let reload = move || tick.update(|t| *t += 1);
     let reload_cb = Callback::new(move |()| reload());
     let send = move |ops: Vec<DocOp>| {
@@ -777,9 +942,8 @@ pub fn DocPage(id: String) -> impl IntoView {
         send: StoredValue::new(Box::new(move |ops: Vec<DocOp>| send.with_value(|f| f(ops)))),
     };
     provide_context(chip_ctx);
-    provide_context(ThreadsCtx { shown: RwSignal::new(Vec::new()), tick, focus: RwSignal::new(None) });
     Effect::new(move || {
-        let Some(Ok(d)) = doc.get() else { return };
+        let Some(d) = shown_doc.get() else { return };
         let refs = ref_chips(&d);
         if refs.is_empty() {
             return;
@@ -790,6 +954,155 @@ pub fn DocPage(id: String) -> impl IntoView {
             }
         });
     });
+
+    // Comments: the panel, the popover by a block, and where they go.
+    let root = NodeRef::<leptos::html::Div>::new();
+    let fit = RwSignal::new(Fit::Floating);
+    let (tile_w, tile_h) = (RwSignal::new(0.0_f64), RwSignal::new(600.0_f64));
+    let panel = RwSignal::new(false);
+    let pop = RwSignal::new(None::<String>);
+    let shown_threads = RwSignal::new(Vec::<DocThread>::new());
+    let reveal = Callback::new(move |ids: Vec<String>| {
+        // Each as the block drawn for it (a slide, for a block on one), on
+        // the tab of the first.
+        let mut on = None::<String>;
+        let mut els = Vec::new();
+        tabs.with_untracked(|ts| {
+            for t in ts {
+                for b in &t.blocks {
+                    if ids.iter().any(|i| *i == b.id || b.children.iter().any(|c| c.id == *i))
+                        && *on.get_or_insert_with(|| t.id.clone()) == t.id
+                    {
+                        els.push(b.id.clone());
+                    }
+                }
+            }
+        });
+        let Some(on) = on else { return };
+        if on != current.get_untracked() {
+            tab.set(on);
+        }
+        // A sheet covers the doc.
+        if fit.get_untracked() == Fit::Sheet {
+            panel.set(false);
+            pop.set(None);
+        }
+        request_animation_frame(move || flash_blocks(root, &els));
+    });
+    let unsent = Memo::new(move |_| shown_threads.with(|ts| ts.iter().filter(|t| t.state == "open" && t.unsent).count()));
+    let open_n = Memo::new(move |_| shown_threads.with(|ts| ts.iter().filter(|t| t.state == "open").count()));
+    let sending = RwSignal::new(false);
+    let send_all = Callback::new(move |()| {
+        sending.set(true);
+        spawn_local(async move {
+            match api::doc_threads_send(id.get_value(), Vec::new()).await {
+                Ok(_) => tick.update(|t| *t += 1),
+                Err(e) => error.set(Some(e)),
+            }
+            sending.set(false);
+        });
+    });
+    let threads = ThreadsCtx {
+        doc: id,
+        shown: shown_threads,
+        tick,
+        focus: RwSignal::new(None),
+        commenting: RwSignal::new(None),
+        panel,
+        pop,
+        pop_at: RwSignal::new((0.0, 0.0)),
+        tabs,
+        deck: is_deck,
+        root,
+        reveal,
+        unsent,
+        sending,
+        send_all,
+    };
+    provide_context(threads);
+    let loaded_threads = LocalResource::new(move || {
+        tick.track();
+        api::doc_threads(id.get_value())
+    });
+    Effect::new(move || {
+        if let Some(Ok(t)) = loaded_threads.get()
+            && shown_threads.with_untracked(|s| *s != t)
+        {
+            shown_threads.set(t);
+        }
+    });
+    // A new comment on what has no popover (the tab, a slide) is written
+    // in the panel.
+    Effect::new(move || {
+        if let Some(b) = threads.commenting.get()
+            && pop.get_untracked().as_ref() != Some(&b)
+        {
+            panel.set(true);
+        }
+    });
+    // The popover follows its block as the doc changes or the tile is
+    // resized, and goes with it (another tab, the block deleted).
+    Effect::new(move || {
+        tile_w.track();
+        // The panel docked or not moves the doc.
+        panel.track();
+        fit.track();
+        let here = blocks.with(|bs| pop.get().filter(|p| bs.iter().any(|b| b.id == *p)));
+        match here {
+            None if pop.get_untracked().is_some() => threads.close_pop(),
+            None => {}
+            Some(b) => request_animation_frame(move || {
+                let marker = root
+                    .try_get_untracked()
+                    .flatten()
+                    .and_then(|r| r.query_selector(&format!("{} > [data-marks]", block_sel(&b))).ok().flatten());
+                if let Some(m) = marker {
+                    threads.place_pop(&m);
+                }
+            }),
+        }
+    });
+    // The tile's size: the panel beside the doc, over it, or a sheet.
+    Effect::new(move || {
+        use wasm_bindgen::JsCast;
+        use wasm_bindgen::closure::Closure;
+        let Some(el) = root.get() else { return };
+        // The tile's scrolling area, which the page fills.
+        let Some(area) = el.parent_element() else { return };
+        let on = Closure::<dyn Fn(js_sys::Array)>::new(move |entries: js_sys::Array| {
+            let Some(e) = entries.get(0).dyn_ref::<web_sys::ResizeObserverEntry>().map(|e| e.content_rect()) else { return };
+            // Hidden: nothing to go by.
+            if e.width() <= 0.0 {
+                return;
+            }
+            let phone = crate::util::touch_first()
+                || !window().match_media("(min-width: 48rem) and (min-height: 32rem)").ok().flatten().is_some_and(|m| m.matches());
+            let f = if e.width() >= DOCKED_FROM {
+                Fit::Docked
+            } else if phone {
+                Fit::Sheet
+            } else {
+                Fit::Floating
+            };
+            if fit.try_get_untracked().is_some_and(|x| x != f) {
+                let _ = fit.try_set(f);
+            }
+            let _ = tile_w.try_set(e.width());
+            let _ = tile_h.try_set(e.height());
+        });
+        if let Ok(ro) = web_sys::ResizeObserver::new(on.as_ref().unchecked_ref()) {
+            ro.observe(&area);
+            on.forget();
+            let ro = send_wrapper::SendWrapper::new(ro);
+            on_cleanup(move || ro.disconnect());
+        }
+    });
+    // Set only when they change: each draws the panel or popover anew.
+    let docked = Memo::new(move |_| panel.get() && fit.get() == Fit::Docked);
+    let floating = Memo::new(move |_| panel.get() && fit.get() == Fit::Floating);
+    let sheet = Memo::new(move |_| panel.get() && fit.get() == Fit::Sheet);
+    let popped = Memo::new(move |_| pop.get().map(|b| (b, fit.get() == Fit::Sheet)));
+
     let attaching = RwSignal::new(false);
     let attach_file = move |ev: leptos::ev::Event| {
         use wasm_bindgen::JsCast;
@@ -842,6 +1155,29 @@ pub fn DocPage(id: String) -> impl IntoView {
                 .collect::<Vec<_>>()
         }
     });
+    // What refers to it: its projects, then its work.
+    let used = Signal::derive(move || {
+        let mut out: Vec<(View, String)> = in_projects
+            .get()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(pid, title, role)| {
+                (
+                    View::Projects { id: pid },
+                    format!("Project · {title}{}", if role.is_empty() { String::new() } else { format!(" ({role})") }),
+                )
+            })
+            .collect();
+        out.extend(
+            used_in
+                .get()
+                .and_then(Result::ok)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|w| (View::Work { id: w.id.clone() }, format!("Work · {}", w.fields.title))),
+        );
+        out
+    });
     let rename = move || {
         let t = title.get_untracked();
         renaming.set(false);
@@ -874,119 +1210,380 @@ pub fn DocPage(id: String) -> impl IntoView {
         };
         send.with_value(|f| f(vec![op]));
     };
-    view! {
-        <main class="mx-auto max-w-3xl space-y-4 px-4 py-5">
-            {move || error.get().map(|e| view! {
-                <div class="flex items-start gap-2">
-                    <div class="flex-1"><ErrorBox message=e /></div>
-                    <button class="text-xs text-zinc-500" on:click=move |_| error.set(None)>"✕"</button>
+    // The boxes to add a block and rename it: the cursor in them as they open.
+    let add_ref = NodeRef::<leptos::html::Textarea>::new();
+    let rename_ref = NodeRef::<leptos::html::Input>::new();
+    Effect::new(move || {
+        if let Some(el) = add_ref.get() {
+            let _ = el.focus();
+        }
+    });
+    Effect::new(move || {
+        if let Some(el) = rename_ref.get() {
+            let _ = el.focus();
+        }
+    });
+    let toggle_edit = move |_| {
+        if edit_all.get_untracked() {
+            edit_all.set(false);
+            adding_open.set(false);
+            save(id.get_value(), edit, draft, false, error, reload);
+        } else {
+            edit_all.set(true);
+        }
+    };
+    // The blocks drawn, each kept while it's unchanged; the one open in
+    // Markdown as it was when opened, so a change to it from elsewhere
+    // waits until you're done rather than taking what you're typing.
+    let drawn = Memo::new(move |_| {
+        let open = edit.with(|e| e.as_ref().map(|e| e.block.clone()));
+        let mut bs = blocks.get();
+        if let Some(o) = open
+            && let Some(b) = bs.iter_mut().find(|b| b.id == o.id)
+        {
+            *b = o;
+        }
+        bs
+    });
+    let empty = Memo::new(move |_| blocks.with(Vec::is_empty));
+    let show_add = Memo::new(move |_| !is_deck.get() && (edit_all.get() || empty.get()));
+
+    let bar = move || {
+        view! {
+            <div class="sticky top-0 z-20 border-b border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950">
+                <div class="mx-auto flex max-w-3xl flex-wrap items-center gap-1 px-4 py-1">
+                    <span class="shrink-0 text-muted" title=move || summary.with(|s| s.kind.clone())>{move || summary.with(|s| kind_mark(&s.kind))}</span>
+                    {move || if renaming.get() {
+                        view! {
+                            <input node_ref=rename_ref class=format!("{INPUT} min-w-0 flex-1 basis-40 font-semibold") prop:value=move || title.get()
+                                on:input=move |ev| title.set(event_target_value(&ev))
+                                on:keydown=move |ev| if ev.key() == "Enter" { rename() } else if ev.key() == "Escape" { renaming.set(false) }
+                                on:blur=move |_| rename() />
+                        }.into_any()
+                    } else {
+                        view! {
+                            <h1 class="min-w-0 flex-1 basis-40 cursor-text truncate text-lg font-semibold" title="Click to rename"
+                                on:click=move |_| { title.set(summary.with_untracked(|s| s.title.clone())); renaming.set(true); }>
+                                {move || summary.with(|s| s.title.clone())}
+                            </h1>
+                        }.into_any()
+                    }}
+                    <button data-opens="comments" class=move || format!("{BAR} {}", if panel.get() { "bg-zinc-100 dark:bg-zinc-800" } else { "" })
+                        title=move || if panel.get() { "Hide the comments" } else { "Show the comments" }
+                        on:click=move |_| panel.update(|p| *p = !*p)>
+                        {move || match open_n.get() { 0 => "💬".to_owned(), n => format!("💬 {n} open") }}
+                    </button>
+                    {move || (unsent.get() > 0).then(|| send_all_button(threads, true))}
+                    {move || (!is_deck.get()).then(|| view! {
+                        <button class=move || format!("{BAR} {}", if edit_all.get() { "bg-zinc-100 font-medium dark:bg-zinc-800" } else { "" })
+                            title=move || if edit_all.get() { "Back to reading" } else { "Edit the doc: a click on a block opens it in Markdown" }
+                            on:click=toggle_edit>
+                            {move || if edit_all.get() { "Done" } else { "✎ Edit" }}
+                        </button>
+                    })}
+                    <UsedIn items=used />
+                    <crate::util::Menu label="Export and history" items=vec![
+                        ("Export…", Callback::new(move |()| exporting.update(|x| *x = !*x))),
+                        ("History", Callback::new(move |()| history.update(|x| *x = !*x))),
+                    ] />
                 </div>
+                {move || floating.get().then(|| view! { <FloatingPanel tile_h /> })}
+            </div>
+        }
+    };
+    let content = move || {
+        view! {
+            <header class="space-y-1">
+                <p class="flex flex-wrap items-center gap-x-1 text-xs text-muted">
+                    {move || summary.with(|s| view! {
+                        {s.created_by.strip_prefix("session:").map(|id| view! { <FromSession id=id.to_owned() />" · " })}
+                        {format!("Version {} · changed {} by {}", s.rev, since(s.updated_at), author_named(&s.updated_by))}
+                        {(!s.labels.is_empty()).then(|| format!(" · {}", s.labels.iter().map(|l| format!("#{l}")).collect::<Vec<_>>().join(" ")))}
+                    })}
+                </p>
+                {move || summary.with(|s| (s.pending > 0).then(|| view! {
+                    <p class="text-sm text-violet-700 dark:text-violet-300">
+                        {format!("✎ Being written by {}: {} {} to go", s.writers.iter().map(|w| author_named(w)).collect::<Vec<_>>().join(", "), s.pending, if s.pending == 1 { "part" } else { "parts" })}
+                    </p>
+                }))}
+            </header>
+            {move || tab_names.with(|ts| ts.len() > 1).then(|| {
+                let on_tab = current.get();
+                view! {
+                    <nav class="flex flex-wrap gap-1 border-b border-zinc-200 dark:border-zinc-800">
+                        {tab_names.get().into_iter().map(|(tid, name)| {
+                            let on = tid == on_tab;
+                            view! {
+                                <button class=format!("-mb-px border-b-2 px-2 py-1 text-sm {}", if on { "border-zinc-900 font-medium dark:border-zinc-100" } else { "border-transparent text-muted" })
+                                    on:click=move |_| tab.set(tid.clone())>{name}</button>
+                            }
+                        }).collect_view()}
+                    </nav>
+                }
             })}
-            {move || match doc.get() {
-                None => view! { <p class="text-sm text-zinc-500">"Loading…"</p> }.into_any(),
-                Some(Err(e)) => view! { <ErrorBox message=e /> }.into_any(),
-                Some(Ok(d)) => {
-                    let s = d.summary.clone();
-                    // Tracked: choosing a tab draws it (not only the next reload).
-                    let chosen = tab.get();
-                    let current = if d.tabs.iter().any(|t| t.id == chosen) { chosen } else { d.tabs.first().map(|t| t.id.clone()).unwrap_or_default() };
-                    let blocks = d.tabs.iter().find(|t| t.id == current).map(|t| t.blocks.clone()).unwrap_or_default();
-                    let rev = s.rev;
-                    let kind = s.kind.clone();
-                    let tabs = d.tabs.clone();
-                    let t2 = s.title.clone();
-                    view! {
-                        <header class="space-y-1">
-                            <div class="flex items-baseline gap-2">
-                                <span class="text-zinc-400" title=s.kind.clone()>{kind_mark(&s.kind)}</span>
-                                {move || if renaming.get() {
-                                    view! {
-                                        <input class=format!("{INPUT} text-lg font-semibold") prop:value=move || title.get()
-                                            on:input=move |ev| title.set(event_target_value(&ev))
-                                            on:keydown=move |ev| if ev.key() == "Enter" { rename() } else if ev.key() == "Escape" { renaming.set(false) }
-                                            on:blur=move |_| rename() />
-                                    }.into_any()
-                                } else {
-                                    let t = t2.clone();
-                                    view! {
-                                        <h1 class="min-w-0 flex-1 cursor-text text-xl font-semibold" title="Click to rename"
-                                            on:click=move |_| { title.set(t.clone()); renaming.set(true); }>{t2.clone()}</h1>
-                                    }.into_any()
-                                }}
-                                <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| exporting.update(|h| *h = !*h)>"Export"</button>
-                                <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| history.update(|h| *h = !*h)>
-                                    {move || if history.get() { "Hide history" } else { "History" }}
-                                </button>
+            {move || exporting.get().then(|| view! { <Exports id=id.get_value() kind=summary.with_untracked(|s| s.kind.clone()) /> })}
+            {move || history.get().then(|| view! { <History id=id.get_value() reload=reload_cb /> })}
+            {move || is_deck.get().then(|| shown_doc.get().map(|d| view! {
+                <crate::deck::DeckView doc=d send=Callback::new(move |ops: Vec<DocOp>| send.with_value(|f| f(ops))) error picked=deck_pick commenting=threads.commenting />
+            }))}
+            {move || (!is_deck.get()).then(|| view! {
+                <article class="space-y-1">
+                    <For each=move || drawn.get() key=|b: &DocBlock| (b.id.clone(), b.hash.clone(), b.rev) children=move |b: DocBlock| view! {
+                        <BlockView doc_id=id b kind=summary.with_untracked(|s| s.kind.clone()) doc_rev edit draft error reload=reload_cb edit_all />
+                    } />
+                    {move || empty.get().then(|| view! { <p class="text-sm text-muted">"Empty: add a block below to start it."</p> })}
+                </article>
+            })}
+            // The end, in edit mode (or an empty doc): a line that opens
+            // into a Markdown box.
+            {move || show_add.get().then(|| view! {
+                <div>
+                    {move || if adding_open.get() {
+                        view! {
+                            <div class="space-y-1">
+                                <textarea node_ref=add_ref class=format!("{INPUT} min-h-[4rem] font-mono text-sm") placeholder="Add to the end in Markdown…"
+                                    prop:value=move || adding.get() on:input=move |ev| adding.set(event_target_value(&ev))
+                                    on:keydown=move |ev| if ev.key() == "Enter" && (ev.meta_key() || ev.ctrl_key()) { add_block() } else if ev.key() == "Escape" { ev.prevent_default(); adding_open.set(false) } />
+                                <div class="flex items-center justify-end gap-2">
+                                    <label class=format!("{BUTTON_QUIET} cursor-pointer text-xs") title="A picture shows in the doc; any other file is a link to download">
+                                        {move || if attaching.get() { "Adding…" } else { "+ Picture or file" }}
+                                        <input type="file" class="hidden" on:change=attach_file />
+                                    </label>
+                                    <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| adding_open.set(false)>"Cancel"</button>
+                                    <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| add_block()>"Add (⌘↵)"</button>
+                                </div>
                             </div>
-                            <p class="flex flex-wrap items-center gap-x-1 text-xs text-zinc-500">
-                                {s.created_by.strip_prefix("session:").map(|id| view! { <FromSession id=id.to_owned() />" · " })}
-                                {format!("Version {} · changed {} by {}", s.rev, since(s.updated_at), author_named(&s.updated_by))}
-                                {(!s.labels.is_empty()).then(|| format!(" · {}", s.labels.iter().map(|l| format!("#{l}")).collect::<Vec<_>>().join(" ")))}
-                            </p>
-                            {(s.pending > 0).then(|| view! {
-                                <p class="text-sm text-violet-700 dark:text-violet-300">
-                                    {format!("✎ Being written by {}: {} {} to go", s.writers.iter().map(|w| author_named(w)).collect::<Vec<_>>().join(", "), s.pending, if s.pending == 1 { "part" } else { "parts" })}
-                                </p>
-                            })}
-                        </header>
-                        {(tabs.len() > 1).then(|| view! {
-                            <nav class="flex flex-wrap gap-1 border-b border-zinc-200 dark:border-zinc-800">
-                                {tabs.iter().map(|t| {
-                                    let tid = t.id.clone();
-                                    let on = t.id == current;
-                                    view! {
-                                        <button class=format!("-mb-px border-b-2 px-2 py-1 text-sm {}", if on { "border-zinc-900 font-medium dark:border-zinc-100" } else { "border-transparent text-zinc-500" })
-                                            on:click=move |_| tab.set(tid.clone())>{t.title.clone()}</button>
-                                    }
-                                }).collect_view()}
-                            </nav>
-                        })}
-                        {let k = kind.clone(); move || exporting.get().then(|| view! { <Exports id=id.get_value() kind=k.clone() /> })}
-                        {move || history.get().then(|| view! { <History id=id.get_value() reload=reload_cb /> })}
-                        {(kind == "deck").then(|| view! {
-                            <crate::deck::DeckView doc=d.clone() send=Callback::new(move |ops: Vec<DocOp>| send.with_value(|f| f(ops))) error picked=deck_pick commenting />
-                        })}
-                        <article class="space-y-1" class:hidden=kind == "deck">
-                            {blocks.iter().map(|b| view! {
-                                <BlockView doc_id=id b=b.clone() rev=rev kind=kind.clone() edit draft error reload=reload_cb commenting />
-                            }).collect_view()}
-                            {blocks.is_empty().then(|| view! { <p class="text-sm text-zinc-500">"Empty. Write below to start it."</p> })}
-                        </article>
-                        <div class="space-y-1" class:hidden=s.kind == "deck">
-                            <textarea class=format!("{INPUT} min-h-[4rem] font-mono text-sm")
-                                placeholder=if s.kind == "deck" { "Add slides in Markdown (--- between slides)…" } else { "Add to the end in Markdown…" }
-                                prop:value=move || adding.get() on:input=move |ev| adding.set(event_target_value(&ev))
-                                on:keydown=move |ev| if ev.key() == "Enter" && (ev.meta_key() || ev.ctrl_key()) { add_block() } />
-                            <div class="flex items-center justify-end gap-2">
-                                <label class=format!("{BUTTON_QUIET} cursor-pointer text-xs") title="A picture shows in the doc; any other file is a link to download">
+                        }.into_any()
+                    } else {
+                        view! {
+                            <div class="flex flex-wrap items-center gap-x-2 rounded-md border border-dashed border-zinc-300 px-3 py-2 text-sm text-muted dark:border-zinc-700">
+                                <button class="hover:text-zinc-900 dark:hover:text-zinc-100" on:click=move |_| adding_open.set(true)>"+ Add a block at the end"</button>
+                                <span aria-hidden="true">"·"</span>
+                                <label class="cursor-pointer hover:text-zinc-900 dark:hover:text-zinc-100" title="A picture shows in the doc; any other file is a link to download">
                                     {move || if attaching.get() { "Adding…" } else { "+ Picture or file" }}
                                     <input type="file" class="hidden" on:change=attach_file />
                                 </label>
-                                <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| add_block()>"Add (⌘↵)"</button>
                             </div>
-                        </div>
-                        <Comments id=id.get_value() tick commenting />
-                        {move || {
-                            let w = used_in.get().and_then(Result::ok).unwrap_or_default();
-                            let p = in_projects.get().unwrap_or_default();
-                            (!w.is_empty() || !p.is_empty()).then_some((w, p))
-                        }.map(|(w, p)| view! {
-                            <section class="space-y-1 border-t border-zinc-200 pt-3 dark:border-zinc-800">
-                                <h2 class="text-xs font-medium uppercase tracking-wide text-zinc-500">"Refers to it"</h2>
-                                {p.into_iter().map(|(pid, title, role)| view! {
-                                    <Go to=View::Projects { id: pid } class="block text-sm text-sky-700 hover:underline dark:text-sky-400">
-                                        {format!("Project · {title}{}", if role.is_empty() { String::new() } else { format!(" ({role})") })}
-                                    </Go>
-                                }).collect_view()}
-                                {w.into_iter().map(|w| view! {
-                                    <Go to=View::Work { id: w.id.clone() } class="block text-sm text-sky-700 hover:underline dark:text-sky-400">{format!("Work · {}", w.fields.title)}</Go>
-                                }).collect_view()}
-                            </section>
+                        }.into_any()
+                    }}
+                </div>
+            })}
+        }
+    };
+    view! {
+        <div node_ref=root class="relative">
+            <div class="flex items-start">
+                <div class="min-w-0 flex-1">
+                    {move || (state.get() == 2).then(bar)}
+                    <main class="mx-auto max-w-3xl space-y-4 px-4 pb-8 pt-3">
+                        {move || error.get().map(|e| view! {
+                            <div class="flex items-start gap-2">
+                                <div class="flex-1"><ErrorBox message=e /></div>
+                                <button class="text-xs text-muted" on:click=move |_| error.set(None)>"✕"</button>
+                            </div>
                         })}
-                    }.into_any()
-                }
-            }}
-        </main>
+                        {move || match state.get() {
+                            0 => view! { <p class="text-sm text-muted">"Loading…"</p> }.into_any(),
+                            1 => view! { <ErrorBox message=doc.with_untracked(|d| d.as_ref().and_then(|r| r.as_ref().err()).cloned().unwrap_or_default()) /> }.into_any(),
+                            _ => content().into_any(),
+                        }}
+                    </main>
+                </div>
+                // Beside the doc, scrolling on its own.
+                {move || docked.get().then(|| view! {
+                    <aside class="sticky top-0 flex w-80 shrink-0 flex-col border-l border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950"
+                        style=move || format!("height: {}px", tile_h.get())>
+                        <CommentsPanel />
+                    </aside>
+                })}
+            </div>
+            {move || sheet.get().then(|| view! {
+                <Sheet close=Callback::new(move |()| panel.set(false))><CommentsPanel /></Sheet>
+            })}
+            {move || popped.get().map(|(b, on_sheet)| if on_sheet {
+                view! {
+                    <Sheet close=Callback::new(move |()| threads.close_pop())>
+                        <div class="min-h-0 flex-1 space-y-2 overflow-y-auto overscroll-contain p-3 text-sm"><PopBody block=b /></div>
+                    </Sheet>
+                }.into_any()
+            } else {
+                view! { <BlockPop block=b /> }.into_any()
+            })}
+        </div>
+    }
+}
+
+/// "Send N to agent": your open comments not sent yet go, each thread to
+/// its session.
+fn send_all_button(ctx: ThreadsCtx, arrow: bool) -> impl IntoView {
+    view! {
+        <button class="shrink-0 rounded-md bg-sky-600 px-2 py-1 text-xs font-medium text-white hover:bg-sky-700 disabled:opacity-50"
+            title="Your open comments that haven't gone to an agent: each thread goes to its session, which answers in it"
+            disabled=move || ctx.sending.get() on:click=move |_| ctx.send_all.run(())>
+            {move || format!("Send {} to agent{}", ctx.unsent.get(), if arrow { " ↑" } else { "" })}
+        </button>
+    }
+}
+
+/// "Used in N ▾": the projects and work that refer to a doc, as a menu
+/// (shown only when there are some).
+#[component]
+fn UsedIn(items: Signal<Vec<(View, String)>>) -> impl IntoView {
+    let open = RwSignal::new(false);
+    let pop = StoredValue::new(crate::util::dismissable(
+        move || open.get(),
+        move || {
+            open.try_set(false);
+        },
+    ));
+    let n = Memo::new(move |_| items.with(Vec::len));
+    move || {
+        (n.get() > 0).then(|| {
+            view! {
+                <div class="relative shrink-0">
+                    <button class=BAR data-pop=pop.get_value() aria-haspopup="menu" aria-expanded=move || open.get().to_string()
+                        title="What refers to this doc" on:click=move |_| open.update(|o| *o = !*o)>
+                        {move || format!("Used in {} ▾", n.get())}
+                    </button>
+                    {move || open.get().then(|| view! {
+                        <div role="menu" data-pop=pop.get_value() on:click=move |_| open.set(false)
+                            class="absolute right-0 top-full z-30 mt-1 w-64 max-w-[80vw] rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
+                            {items.get().into_iter().map(|(to, label)| view! {
+                                <Go to class="block truncate px-3 py-1.5 text-sky-700 hover:bg-zinc-100 dark:text-sky-400 dark:hover:bg-zinc-800">{label}</Go>
+                            }).collect_view()}
+                        </div>
+                    })}
+                </div>
+            }
+        })
+    }
+}
+
+/// The comments panel over the doc's right side, hanging from the bar; a
+/// press outside it (or Escape) closes it.
+#[component]
+fn FloatingPanel(tile_h: RwSignal<f64>) -> impl IntoView {
+    let ctx = expect_context::<ThreadsCtx>();
+    let node = NodeRef::<leptos::html::Div>::new();
+    dismiss(node, "[data-opens=comments]", move || {
+        let _ = ctx.panel.try_set(false);
+    });
+    view! {
+        <div node_ref=node class="absolute right-2 top-full z-10 mt-1 flex w-80 max-w-[calc(100%-1rem)] flex-col overflow-hidden rounded-lg border border-zinc-200 bg-white shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
+            style=move || format!("max-height: {}px", (tile_h.get() - 72.0).max(240.0))>
+            <CommentsPanel />
+        </div>
+    }
+}
+
+/// A sheet from the bottom of the screen (a phone's), over a dimmed page;
+/// a tap above it or Escape closes it.
+#[component]
+fn Sheet(close: Callback<()>, children: Children) -> impl IntoView {
+    let keys = window_event_listener(leptos::ev::keydown, move |ev| {
+        if ev.key() == "Escape" && !ev.default_prevented() {
+            close.run(());
+        }
+    });
+    on_cleanup(move || keys.remove());
+    view! {
+        <div class="fixed inset-0 z-40 bg-black/30" on:click=move |_| close.run(())></div>
+        <div class="fixed inset-x-0 bottom-0 z-50 flex max-h-[85dvh] flex-col overflow-hidden rounded-t-xl border-t border-zinc-200 bg-white shadow-2xl dark:border-zinc-700 dark:bg-zinc-900">
+            {children()}
+        </div>
+    }
+}
+
+/// Comments (docs/docs.md §8): open or resolved threads, each with what
+/// it's about; a new one on the whole tab; and your comments not sent to an
+/// agent yet, to send.
+#[component]
+fn CommentsPanel() -> impl IntoView {
+    let ctx = expect_context::<ThreadsCtx>();
+    let resolved = RwSignal::new(false);
+    let ids = Memo::new(move |_| {
+        let resolved = resolved.get();
+        ctx.shown.with(|ts| ts.iter().filter(|t| (t.state != "open") == resolved).map(|t| t.id.clone()).collect::<Vec<_>>())
+    });
+    // A new comment on the tab, or on what has no popover (a slide).
+    let new_on = Memo::new(move |_| ctx.commenting.get().filter(|b| ctx.pop.with(|p| p.as_ref() != Some(b))));
+    let seg = move |on: bool| {
+        format!(
+            "rounded px-2 py-0.5 {}",
+            if on { "bg-white font-medium shadow-sm dark:bg-zinc-700" } else { "text-muted hover:text-zinc-900 dark:hover:text-zinc-100" }
+        )
+    };
+    view! {
+        <div class="flex shrink-0 items-center gap-2 border-b border-zinc-200 px-3 py-2 dark:border-zinc-800">
+            <h2 class="flex-1 text-sm font-semibold">"Comments"</h2>
+            <div class="flex rounded-md bg-zinc-100 p-0.5 text-xs dark:bg-zinc-800" role="group">
+                <button class=move || seg(!resolved.get()) aria-pressed=move || (!resolved.get()).to_string() on:click=move |_| resolved.set(false)>"Open"</button>
+                <button class=move || seg(resolved.get()) aria-pressed=move || resolved.get().to_string() on:click=move |_| resolved.set(true)>"Resolved"</button>
+            </div>
+            <button class="rounded px-1.5 text-lg leading-none text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                title="Close" aria-label="Close the comments" on:click=move |_| ctx.panel.set(false)>"×"</button>
+        </div>
+        <div class="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain p-3 text-sm">
+            <button class="text-xs text-muted hover:text-zinc-900 hover:underline dark:hover:text-zinc-100"
+                on:click=move |_| { ctx.focus.set(Some(String::new())); ctx.commenting.set(Some(String::new())) }>"+ On the whole tab"</button>
+            {move || new_on.get().map(|b| view! { <NewComment block=b done=Callback::new(move |()| ctx.commenting.set(None)) /> })}
+            <For each=move || ids.get() key=|id| id.clone() children=move |id| view! { <Thread id about=true /> } />
+            {move || ids.with(Vec::is_empty).then(|| view! {
+                <p class="text-muted">{if resolved.get() { "No resolved comments." } else { "No open comments. Press 💬 by a block to start one." }}</p>
+            })}
+        </div>
+        {move || (ctx.unsent.get() > 0).then(|| view! {
+            <div class="flex shrink-0 items-center gap-2 border-t border-zinc-200 px-3 py-2 dark:border-zinc-800">
+                <span class="flex-1 text-xs text-muted">{move || format!("{} not sent yet", ctx.unsent.get())}</span>
+                {send_all_button(ctx, false)}
+            </div>
+        })}
+    }
+}
+
+/// A block's comments, in a popover under its 💬 over the doc: a press
+/// outside it or Escape closes it.
+#[component]
+fn BlockPop(block: String) -> impl IntoView {
+    let ctx = expect_context::<ThreadsCtx>();
+    let node = NodeRef::<leptos::html::Div>::new();
+    dismiss(node, "[data-marks]", move || ctx.close_pop());
+    view! {
+        <div node_ref=node class="absolute z-30 max-h-[70vh] w-80 max-w-[calc(100%-1rem)] space-y-2 overflow-y-auto overscroll-contain rounded-lg border border-zinc-200 bg-white p-2 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
+            style=move || ctx.pop_at.with(|(top, right)| format!("top: {top}px; right: {right}px"))>
+            <PopBody block />
+        </div>
+    }
+}
+
+/// What a block's popover holds: its open threads, and a new one.
+#[component]
+fn PopBody(block: String) -> impl IntoView {
+    let ctx = expect_context::<ThreadsCtx>();
+    let bid = StoredValue::new(block);
+    let ids = Memo::new(move |_| {
+        ctx.shown.with(|ts| {
+            ts.iter().filter(|t| t.state == "open" && t.anchor.block == bid.get_value()).map(|t| t.id.clone()).collect::<Vec<_>>()
+        })
+    });
+    let writing = Memo::new(move |_| ctx.commenting.with(|c| c.as_deref() == Some(bid.get_value().as_str())));
+    let close = Callback::new(move |()| ctx.close_pop());
+    view! {
+        <div class="flex items-center justify-end gap-2 text-xs">
+            <button class="text-muted hover:text-zinc-900 hover:underline dark:hover:text-zinc-100"
+                on:click=move |_| { ctx.close_pop(); ctx.panel.set(true); }>"All comments ›"</button>
+            <button class="rounded px-1 text-base leading-none text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                title="Close" aria-label="Close" on:click=move |_| close.run(())>"×"</button>
+        </div>
+        <For each=move || ids.get() key=|id| id.clone() children=move |id| view! { <Thread id about=false /> } />
+        {move || if writing.get() {
+            view! { <NewComment block=bid.get_value() done=close /> }.into_any()
+        } else {
+            view! {
+                <button class="text-xs text-muted hover:text-zinc-900 hover:underline dark:hover:text-zinc-100"
+                    on:click=move |_| { ctx.focus.set(Some(bid.get_value())); ctx.commenting.set(Some(bid.get_value())) }>"+ New thread on this block"</button>
+            }.into_any()
+        }}
     }
 }
 
@@ -1010,6 +1607,9 @@ struct Editing {
     /// What it said when you started (or last saved).
     original: String,
     chips: Map<String, Value>,
+    /// The block as it was drawn when you opened it: drawn so until you're
+    /// done, whatever changes it meanwhile.
+    block: DocBlock,
 }
 
 /// The draft of the block being edited, and a count of keystrokes (to
@@ -1087,45 +1687,48 @@ fn save(
     });
 }
 
-/// One block: shown, or (clicked) edited as Markdown.
+/// One block: read (its links and chips work, and text can be selected),
+/// or open in Markdown: by ✎ in its margin, a double-click, or a click in
+/// edit mode. Done or Escape saves it and goes back to reading.
 #[component]
 fn BlockView(
     doc_id: StoredValue<String>,
     b: DocBlock,
-    rev: i64,
     kind: String,
+    doc_rev: Memo<i64>,
     edit: RwSignal<Option<Editing>>,
     draft: Draft,
     error: RwSignal<Option<String>>,
     reload: Callback<()>,
-    commenting: RwSignal<Option<String>>,
+    edit_all: RwSignal<bool>,
 ) -> impl IntoView {
     let bid = StoredValue::new(b.id.clone());
     let block = StoredValue::new(b.clone());
-    // Its open comment threads, and whether they're shown under it.
+    let pending = b.kind == "pending";
+    // Its open comment threads: a marker with their count.
     let threads = expect_context::<ThreadsCtx>();
-    let open_threads = Memo::new(move |_| {
-        threads.shown.with(|ts| ts.iter().filter(|t| t.state == "open" && t.anchor.block == bid.get_value()).cloned().collect::<Vec<_>>())
-    });
-    let showing = RwSignal::new(false);
+    let open_n =
+        Memo::new(move |_| threads.shown.with(|ts| ts.iter().filter(|t| t.state == "open" && t.anchor.block == bid.get_value()).count()));
+    let popped = Memo::new(move |_| threads.pop.with(|p| p.as_deref() == Some(bid.get_value().as_str())));
     let hover = format!("{} · last written by {} (version {})", b.kind, author_named(&b.by), b.rev);
     let chip_ctx = use_context::<ChipCtx>();
     let (col, ws) = (use_column(), use_workspace());
-    let is_editing = move || edit.with(|e| e.as_ref().is_some_and(|e| e.id == bid.get_value()));
+    let is_open = Memo::new(move |_| edit.with(|e| e.as_ref().is_some_and(|e| e.id == bid.get_value())));
     let begin = move |text: String| {
         let b = block.get_value();
         edit.set(Some(Editing {
             id: b.id.clone(),
-            rev,
+            rev: doc_rev.get_untracked(),
             hash: b.hash.clone(),
             original: text.clone(),
             chips: b.attrs.get("chips").and_then(Value::as_object).cloned().unwrap_or_default(),
+            block: b,
         }));
         draft.text.set(text);
     };
     let start = move || {
         let b = block.get_value();
-        if b.kind == "pending" {
+        if b.kind == "pending" || is_open.get_untracked() {
             return;
         }
         // Another block being edited is saved first.
@@ -1144,7 +1747,7 @@ fn BlockView(
         begin(b.text.clone());
     };
     let finish = move |keep: bool| {
-        if is_editing() {
+        if is_open.get_untracked() {
             save(doc_id.get_value(), edit, draft, keep, error, move || reload.run(()));
         }
     };
@@ -1165,58 +1768,82 @@ fn BlockView(
             std::time::Duration::from_millis(1500),
         );
     };
+    let marker = move |ev: web_sys::MouseEvent, new: bool| {
+        use wasm_bindgen::JsCast;
+        if let Some(el) = ev.current_target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
+            threads.toggle_pop(bid.get_value(), &el, new);
+        }
+    };
     view! {
-        <div class="group relative rounded py-0.5 pl-2 pr-8 hover:bg-zinc-50 dark:hover:bg-zinc-900/60" title=hover data-block=b.id.clone()>
-            {move || match edit.get().filter(|e| e.id == bid.get_value()) {
-                Some(_) => {
-                    view! {
-                        <textarea class=format!("{INPUT} min-h-[3rem] font-mono text-sm") autofocus
+        <div class="group relative rounded py-0.5 pl-2 pr-14 hover:bg-zinc-50 dark:hover:bg-zinc-900/60" title=hover data-block=b.id.clone()>
+            {move || if is_open.get() {
+                let area = NodeRef::<leptos::html::Textarea>::new();
+                crate::util::autosize(area, move || draft.text.track());
+                Effect::new(move || {
+                    if let Some(el) = area.get() {
+                        let _ = el.focus();
+                        let end = el.value().encode_utf16().count() as u32;
+                        let _ = el.set_selection_range(end, end);
+                    }
+                });
+                view! {
+                    <div class="space-y-1 py-1">
+                        <textarea node_ref=area class=format!("{INPUT} block min-h-[3rem] resize-none font-mono text-sm")
                             prop:value=move || draft.text.get() on:input=move |ev| { draft.text.set(event_target_value(&ev)); typed(); }
                             on:blur=move |_| finish(false)
-                            on:keydown=move |ev| if ev.key() == "Escape" { edit.set(None) } else if ev.key() == "Enter" && (ev.meta_key() || ev.ctrl_key()) { finish(false) } />
-                    }.into_any()
-                }
-                None => {
-                    let b = block.get_value();
-                    view! {
-                        <div class="cursor-text" on:click=move |ev| {
+                            on:keydown=move |ev| if ev.key() == "Escape" { ev.prevent_default(); finish(false) } else if ev.key() == "Enter" && (ev.meta_key() || ev.ctrl_key()) { finish(false) } />
+                        <div class="flex justify-end">
+                            // Pressed, the box keeps the focus (no blur) until Done saves.
+                            <button class="rounded-md bg-zinc-900 px-2.5 py-1 text-xs font-medium text-white hover:bg-zinc-700 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
+                                title="Save it and go back to reading (Esc, ⌘↵)" on:mousedown=|ev| ev.prevent_default() on:click=move |_| finish(false)>"Done"</button>
+                        </div>
+                    </div>
+                }.into_any()
+            } else {
+                let b = block.get_value();
+                view! {
+                    <div class=move || if edit_all.get() { "cursor-text" } else { "" }
+                        on:click=move |ev| {
                             if let Some(c) = chip_ctx && chip_clicked(&ev, &block.get_value(), c, col, ws) { return; }
                             if crate::mentions::follow_link(&ev, col, ws) { return; }
-                            start()
-                        }><Shown b=b kind=kind.clone() /></div>
-                    }.into_any()
-                }
+                            if edit_all.get_untracked() { start() }
+                        }
+                        on:dblclick=move |ev: web_sys::MouseEvent| {
+                            use wasm_bindgen::JsCast;
+                            // Not on what a click does something with.
+                            let on_control = ev.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                                .is_some_and(|el| el.closest("a,button,input,select,textarea,figure,[data-chip],[data-ref]").ok().flatten().is_some());
+                            if !on_control { start() }
+                        }>
+                        <Shown b=b kind=kind.clone() />
+                    </div>
+                }.into_any()
             }}
             {move || chip_ctx.and_then(|c| c.editing.get().filter(|(b, _, _)| *b == bid.get_value() || block.get_value().children.iter().any(|x| x.id == *b)).map(|(b, k, v)| view! {
                 <ChipEditor block=b key=k value=v ctx=c />
             }))}
-            // Inside the block, in its right padding: outside it, the
-            // pointer left the block on its way and the button hid, and at
-            // the panel's edge it sat over the scrollbar.
-            // With open comments, a lasting marker with their count opens
-            // them here; without, 💬 shows on hover to start one.
-            {move || match open_threads.with(Vec::len) {
-                0 => view! {
-                    // No hover on a touch screen: there it always shows.
-                    <button class="invisible absolute right-1 top-0.5 px-1 text-xs text-zinc-400 hover:text-violet-600 group-hover:visible pointer-coarse:visible" title="Comment on this"
-                        on:click=move |_| { threads.focus.set(Some(bid.get_value())); commenting.set(Some(bid.get_value())) }>"💬"</button>
-                }.into_any(),
-                n => view! {
-                    <button class="absolute right-0.5 top-0.5 rounded px-1 text-xs font-medium text-violet-700 hover:bg-violet-100 dark:text-violet-300 dark:hover:bg-violet-950"
-                        title=move || if showing.get() { "Hide its comments" } else { "Show its comments here" }
-                        on:click=move |_| showing.update(|s| *s = !*s)>{format!("💬 {n}")}</button>
-                }.into_any(),
-            }}
-        </div>
-        {move || (showing.get() && !open_threads.with(Vec::is_empty)).then(|| view! {
-            <div class="my-1 space-y-2 border-l-2 border-violet-300 pl-3 dark:border-violet-800">
-                {open_threads.get().into_iter().map(|t| view! { <Thread t doc=doc_id.get_value() tick=threads.tick /> }).collect_view()}
-                <button class="text-xs text-violet-700 hover:underline dark:text-violet-300" on:click=move |_| { threads.focus.set(Some(bid.get_value())); commenting.set(Some(bid.get_value())) }>"+ Another comment"</button>
+            // In its right margin, inside the block: outside it, the pointer
+            // left the block on its way and the buttons hid, and at the
+            // panel's edge they sat over the scrollbar. ✎ and 💬 show on
+            // hover (always on a touch screen, which has none); with open
+            // comments, a lasting marker with their count opens them.
+            <div data-marks="" class="absolute right-0.5 top-0.5 flex items-center">
+                {move || (!pending && !is_open.get()).then(|| view! {
+                    <button class="invisible rounded px-1 text-xs text-muted hover:bg-zinc-100 hover:text-zinc-900 group-hover:visible pointer-coarse:visible dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                        title="Edit this block in Markdown (or double-click it)" aria-label="Edit this block" on:click=move |_| start()>"✎"</button>
+                })}
+                {move || match open_n.get() {
+                    0 => view! {
+                        <button class="invisible rounded px-1 text-xs text-muted hover:bg-zinc-100 group-hover:visible pointer-coarse:visible dark:hover:bg-zinc-800"
+                            title="Comment on this" aria-label="Comment on this block" on:click=move |ev| marker(ev, true)>"💬"</button>
+                    }.into_any(),
+                    n => view! {
+                        <button class=move || format!("rounded px-1 text-xs font-medium text-soft hover:bg-zinc-100 dark:hover:bg-zinc-800 {}", if popped.get() { "bg-zinc-100 dark:bg-zinc-800" } else { "" })
+                            title="Its comments" on:click=move |ev| marker(ev, false)>{format!("💬 {n}")}</button>
+                    }.into_any(),
+                }}
             </div>
-        })}
-        {move || (commenting.get() == Some(bid.get_value())).then(|| view! {
-            <NewComment doc=doc_id block=bid.get_value() commenting posted=reload />
-        })}
+        </div>
     }
 }
 
@@ -1240,7 +1867,7 @@ fn Shown(b: DocBlock, kind: String) -> impl IntoView {
             let hidden = b.attrs["hidden"] == true;
             view! {
                 <div class=format!("my-2 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800 {}", if hidden { "opacity-50" } else { "" })>
-                    <div class="mb-1 text-[11px] uppercase tracking-wide text-zinc-400">{format!("slide · {layout}{}", if hidden { " · hidden" } else { "" })}</div>
+                    <div class="mb-1 text-[11px] uppercase tracking-wide text-muted">{format!("slide · {layout}{}", if hidden { " · hidden" } else { "" })}</div>
                     {b.children.iter().map(|c| {
                         let refs = use_context::<ChipCtx>().map(|c| c.refs);
                         let c = c.clone();
@@ -1250,7 +1877,7 @@ fn Shown(b: DocBlock, kind: String) -> impl IntoView {
                             view! { <div class="md" inner_html=move || chips_html(&c.text, &c.attrs, &refs.map(|r| r.get()).unwrap_or_default())></div> }.into_any()
                         }
                     }).collect_view()}
-                    {(!notes.is_empty()).then(|| view! { <p class="mt-2 border-t border-zinc-100 pt-1 text-xs text-zinc-500 dark:border-zinc-900">{format!("Notes: {notes}")}</p> })}
+                    {(!notes.is_empty()).then(|| view! { <p class="mt-2 border-t border-zinc-100 pt-1 text-xs text-muted dark:border-zinc-900">{format!("Notes: {notes}")}</p> })}
                 </div>
             }
             .into_any()
@@ -1265,88 +1892,197 @@ fn Shown(b: DocBlock, kind: String) -> impl IntoView {
     }
 }
 
-/// Comments (docs/docs.md §8): its threads, open first, each with what
-/// it's about, its comments, a reply box, "send to an agent" and Resolve; a
-/// new thread on the block or slide you picked (💬), or on the whole tab.
-#[component]
-fn Comments(id: String, tick: RwSignal<u32>, commenting: RwSignal<Option<String>>) -> impl IntoView {
-    let id = StoredValue::new(id);
-    let threads = LocalResource::new(move || {
-        tick.track();
-        api::doc_threads(id.get_value())
-    });
-    let shown = expect_context::<ThreadsCtx>().shown;
-    Effect::new(move || {
-        if let Some(Ok(t)) = threads.get() {
-            shown.set(t);
-        }
-    });
-    let show_resolved = RwSignal::new(false);
-    // Your open comments not sent to an agent yet: sent together, in one
-    // message to one session (each can also go on its own, as you write it).
-    let unsent = Memo::new(move |_| shown.with(|ts| ts.iter().filter(|t| t.state == "open" && t.unsent).count()));
-    let sending = RwSignal::new(false);
-    let error = RwSignal::new(None::<String>);
-    let send_all = move |_| {
-        sending.set(true);
-        spawn_local(async move {
-            match api::doc_threads_send(id.get_value(), Vec::new()).await {
-                Ok(_) => {
-                    error.set(None);
-                    tick.update(|t| *t += 1);
-                }
-                Err(e) => error.set(Some(e)),
-            }
-            sending.set(false);
-        });
+/// What a thread is about, as its card's quote box shows it: a picture's
+/// or diagram's thumbnail, and words.
+#[derive(Clone, PartialEq)]
+struct Subject {
+    thumb: Option<String>,
+    text: String,
+    /// It's in the doc, to go to.
+    here: bool,
+}
+
+/// What a thread on `block` is about: the block's first line, a picture
+/// or diagram with its caption, "Whole tab"; once gone, what it said
+/// (`about`).
+fn subject(tabs: &[DocTab], block: &str, about: &str, doc: &str) -> Subject {
+    let words = |text: String| Subject { thumb: None, text, here: true };
+    if block.is_empty() {
+        return Subject { thumb: None, text: "Whole tab".into(), here: false };
+    }
+    let found =
+        tabs.iter().flat_map(|t| &t.blocks).find_map(|b| if b.id == block { Some(b) } else { b.children.iter().find(|c| c.id == block) });
+    let Some(b) = found else {
+        return Subject { thumb: None, text: first_line(about, &Value::Null), here: false };
     };
-    view! {
-        <section class="space-y-2 border-t border-zinc-200 pt-3 dark:border-zinc-800">
-            <div class="flex items-center gap-2">
-                <h2 class="flex-1 text-xs font-medium uppercase tracking-wide text-zinc-500">"Comments"</h2>
-                <button class="text-xs text-zinc-500 hover:underline" on:click=move |_| { expect_context::<ThreadsCtx>().focus.set(Some(String::new())); commenting.set(Some(String::new())) }>"+ On the whole tab"</button>
-                <label class="flex items-center gap-1 text-xs text-zinc-500">
-                    <input type="checkbox" prop:checked=move || show_resolved.get() on:change=move |ev| show_resolved.set(event_target_checked(&ev)) />
-                    "Resolved"
-                </label>
-            </div>
-            // On a row of its own: as it goes, nothing slides under the
-            // pointer (in the header, "+ On the whole tab" did).
-            {move || (unsent.get() > 0).then(|| view! {
-                <div class="flex justify-end">
-                    <button class="rounded-md border border-violet-300 px-2 py-0.5 text-xs text-violet-700 hover:bg-violet-50 disabled:opacity-50 dark:border-violet-800 dark:text-violet-300 dark:hover:bg-violet-950"
-                        title="Your open comments that haven't gone to an agent, in one message to one session, which answers each in its thread"
-                        disabled=move || sending.get() on:click=send_all>
-                        {move || match unsent.get() { 1 => "Send 1 comment to an agent".to_owned(), n => format!("Send {n} comments to an agent") }}
-                    </button>
-                </div>
-            })}
-            {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
-            // A comment on the whole tab is written here; one on a block,
-            // under that block (BlockView).
-            {move || (commenting.get().as_deref() == Some("")).then(|| view! {
-                <NewComment doc=id block=String::new() commenting posted=Callback::new(move |()| tick.update(|t| *t += 1)) />
-            })}
-            {move || shown.get().into_iter().filter(|t| show_resolved.get() || t.state == "open").map(|t| view! { <Thread t doc=id.get_value() tick /> }).collect_view()}
-            {move || shown.get().iter().all(|t| t.state != "open").then(|| view! { <p class="text-sm text-zinc-500">"No open comments. Hover a block and press 💬 to start one."</p> })}
-        </section>
+    let v = &b.attrs;
+    let s = |k: &str| v[k].as_str().unwrap_or("").to_owned();
+    let either = |a: String, b: &str| if a.trim().is_empty() { b.to_owned() } else { a };
+    match (b.kind.as_str(), v["type"].as_str().unwrap_or("")) {
+        ("embed", "image") => Subject {
+            thumb: Some(api::url(&format!("/api/v1/docs/{}/files/{}", api::enc(doc), api::enc(&s("blob"))))),
+            text: either(
+                if s("caption").is_empty() { if s("alt").is_empty() { s("name") } else { s("alt") } } else { s("caption") },
+                "A picture",
+            ),
+            here: true,
+        },
+        ("embed", "diagram") => Subject {
+            thumb: Some(format!("data:image/svg+xml;base64,{}", base64_of(s("svg").as_bytes()))),
+            text: either(s("title"), "A diagram"),
+            here: true,
+        },
+        ("embed", "chart") => words(either(s("title"), "A chart")),
+        ("embed", "file") => words(format!("📎 {}", s("name"))),
+        ("embed", "view") => words(format!("View · {}", s("view"))),
+        ("slide", _) => {
+            words(either(b.children.iter().map(|c| first_line(&c.text, &c.attrs)).find(|l| !l.is_empty()).unwrap_or_default(), "A slide"))
+        }
+        _ => words(either(first_line(&b.text, &b.attrs), &first_line(about, &Value::Null))),
     }
 }
 
-/// Writing a new comment: on a block (`block`, shown just under it, so the
-/// page stays where you were) or on the whole tab (`block` empty).
+/// A block's Markdown as a line of plain words: its first line with text,
+/// without the marks that make it a heading, an item or a quote, or bold,
+/// code or a link; its chips as they read.
+fn first_line(md: &str, attrs: &Value) -> String {
+    let chips = attrs.get("chips").and_then(Value::as_object);
+    let mut text = String::with_capacity(md.len());
+    let mut rest = md;
+    while let Some(i) = rest.find("<?c6 block ") {
+        let after = &rest[i + 11..];
+        let Some(j) = after.find("?>") else { break };
+        let key = after[..j].trim();
+        text.push_str(&rest[..i]);
+        let v = chips.and_then(|c| c.get(key)).cloned().unwrap_or(Value::Null);
+        let s = |k: &str| v[k].as_str().unwrap_or("").to_owned();
+        text.push_str(&match v["type"].as_str().unwrap_or("") {
+            "mention" => format!("@{}", if s("name").is_empty() { s("user") } else { s("name") }),
+            "ref" => {
+                if s("title").is_empty() {
+                    s("ref")
+                } else {
+                    s("title")
+                }
+            }
+            _ => s("value"),
+        });
+        rest = &after[j + 2..];
+    }
+    text.push_str(rest);
+    let is_rule = |l: &str| l.len() >= 3 && l.chars().all(|c| matches!(c, '-' | '*' | '_' | ' ')) && !l.contains(char::is_alphanumeric);
+    let is_table_rule = |l: &str| l.starts_with('|') && l.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '));
+    let Some(line) = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with("```") && !l.starts_with("~~~") && !is_rule(l) && !is_table_rule(l))
+    else {
+        return String::new();
+    };
+    // What starts it: #, >, a bullet, a number, a task's box.
+    let mut l = line;
+    loop {
+        let before = l;
+        l = l.trim_start_matches('#').trim_start_matches('>').trim_start();
+        for lead in ["- [ ] ", "- [x] ", "- [X] ", "* [ ] ", "* [x] ", "- ", "* ", "+ "] {
+            if let Some(r) = l.strip_prefix(lead) {
+                l = r;
+            }
+        }
+        let digits = l.chars().take_while(char::is_ascii_digit).count();
+        if digits > 0 && (l[digits..].starts_with(". ") || l[digits..].starts_with(") ")) {
+            l = &l[digits + 2..];
+        }
+        l = l.trim_start();
+        if l == before {
+            break;
+        }
+    }
+    // Links and pictures as their words; emphasis and code marks go.
+    let mut out = String::with_capacity(l.len());
+    let mut chars = l.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '!' if l[i + 1..].starts_with('[') => {}
+            '[' => {
+                if let Some(close) = l[i..].find("](")
+                    && let Some(end) = l[i + close..].find(')')
+                {
+                    out.push_str(&l[i + 1..i + close]);
+                    let skip_to = i + close + end;
+                    while chars.peek().is_some_and(|(j, _)| *j <= skip_to) {
+                        chars.next();
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            '*' | '`' => {}
+            '~' if l[i + 1..].starts_with('~') || l[..i].ends_with('~') => {}
+            '_' if l[i + 1..].starts_with('_') || l[..i].ends_with('_') => {}
+            '|' => {
+                if !out.trim().is_empty() && !l[i + 1..].trim().is_empty() {
+                    out.push_str(" · ");
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ").replace("· ·", "·")
+}
+
+/// A thread's quote box: what it's about, and ↗ to go to it in the doc.
 #[component]
-fn NewComment(doc: StoredValue<String>, block: String, commenting: RwSignal<Option<String>>, posted: Callback<()>) -> impl IntoView {
+fn About(t: Memo<DocThread>) -> impl IntoView {
+    let ctx = expect_context::<ThreadsCtx>();
+    let what = Memo::new(move |_| {
+        let (block, about) = t.with(|t| (t.anchor.block.clone(), t.about.clone()));
+        ctx.tabs.with(|ts| subject(ts, &block, &about, &ctx.doc.get_value()))
+    });
+    view! {
+        <div class="flex items-start gap-2 border-l-2 border-zinc-300 pl-2 dark:border-zinc-600">
+            {move || what.with(|w| w.thumb.clone()).map(|src| view! {
+                <img src=src alt="" class="h-8 w-8 shrink-0 rounded border border-zinc-200 bg-white object-contain dark:border-zinc-700" />
+            })}
+            <div class="min-w-0 flex-1">
+                <p class="line-clamp-2 break-words">{move || what.with(|w| w.text.clone())}</p>
+                {move || t.with(|t| t.anchor.quote.clone()).chars().next().is_some().then(|| view! {
+                    <p class="truncate text-xs text-muted">{move || format!("“{}”", t.with(|t| t.anchor.quote.clone()))}</p>
+                })}
+            </div>
+            {move || (what.with(|w| w.here) && !ctx.deck.get()).then(|| view! {
+                <button class="shrink-0 rounded px-1 text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                    title="Show it in the doc" aria-label="Show it in the doc"
+                    on:click=move |_| ctx.reveal.run(vec![t.with_untracked(|t| t.anchor.block.clone())])>"↗"</button>
+            })}
+        </div>
+    }
+}
+
+/// Writing a new comment: on a block (`block`, in its popover) or on the
+/// whole tab or a slide (in the panel). `done`: Cancel or Escape (the
+/// draft stays).
+#[component]
+fn NewComment(block: String, done: Callback<()>) -> impl IntoView {
+    let ctx = expect_context::<ThreadsCtx>();
+    let doc = ctx.doc;
     let error = RwSignal::new(None::<String>);
-    // Kept as drafts: the document redraws its blocks, and this box with
-    // them, whenever it changes (an agent writing, another comment).
+    // Kept as drafts: the box goes when its popover does, and may be
+    // drawn again.
     let keys = StoredValue::new((format!("comment.{}.{block}", doc.get_value()), format!("comment-quote.{}.{block}", doc.get_value())));
     let (text, quote) = keys.with_value(|(t, q)| (crate::util::draft(t), crate::util::draft(q)));
     let to_agent = RwSignal::new(false);
     let on_block = !block.is_empty();
+    let what = if !on_block {
+        "Comment on the whole tab"
+    } else if ctx.tabs.with_untracked(|ts| ts.iter().flat_map(|t| &t.blocks).any(|b| b.id == block && b.kind == "slide")) {
+        "Comment on this slide"
+    } else {
+        "Comment on this block"
+    };
     let block = StoredValue::new(block);
     let writing = NodeRef::<leptos::html::Textarea>::new();
-    let focus = expect_context::<ThreadsCtx>().focus;
+    let focus = ctx.focus;
     Effect::new(move || {
         if let Some(el) = writing.get()
             && focus.get_untracked().is_some_and(|b| block.with_value(|x| *x == b))
@@ -1363,9 +2099,8 @@ fn NewComment(doc: StoredValue<String>, block: String, commenting: RwSignal<Opti
             text: said.clone(),
             to: if to_agent.get_untracked() { "agent".into() } else { String::new() },
         };
-        // The draft goes as it's sent, not when the answer comes: posting
-        // reloads the document, and a box drawn again in between would
-        // otherwise find the draft and keep it.
+        // The draft goes as it's sent, not when the answer comes: a box
+        // drawn again in between would otherwise find the draft and keep it.
         keys.with_value(|(t, q)| {
             crate::util::forget_draft(t);
             crate::util::forget_draft(q);
@@ -1373,8 +2108,9 @@ fn NewComment(doc: StoredValue<String>, block: String, commenting: RwSignal<Opti
         spawn_local(async move {
             match api::doc_thread_new(doc.get_value(), &t).await {
                 Ok(_) => {
-                    commenting.set(None);
-                    posted.run(());
+                    // The popover stays, showing the new thread.
+                    let _ = ctx.commenting.try_set(None);
+                    let _ = ctx.tick.try_update(|t| *t += 1);
                 }
                 // Not posted: what you wrote comes back.
                 Err(e) => {
@@ -1390,19 +2126,19 @@ fn NewComment(doc: StoredValue<String>, block: String, commenting: RwSignal<Opti
         });
     };
     view! {
-        <div class="my-1 space-y-1 rounded-md border border-violet-300 p-2 dark:border-violet-800">
-            <div class="text-xs text-zinc-500">{if on_block { "Comment on this block" } else { "Comment on the whole tab" }}</div>
+        <div class="space-y-1 rounded-lg border border-zinc-200 p-2 dark:border-zinc-800">
+            <div class="text-xs text-muted">{what}</div>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             {on_block.then(|| view! {
                 <input class=INPUT placeholder="A few of its words to point at (optional)" prop:value=move || quote.get() on:input=move |ev| quote.set(event_target_value(&ev)) />
             })}
             <textarea node_ref=writing rows="1" class=format!("{INPUT} {COMMENT_GROWS}") placeholder="Your comment" prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev))
-                on:keydown=move |ev| if ev.key() == "Escape" { commenting.set(None) } else if crate::util::sends(&ev) { ev.prevent_default(); post() } />
+                on:keydown=move |ev| if ev.key() == "Escape" { ev.prevent_default(); done.run(()) } else if crate::util::sends(&ev) { ev.prevent_default(); post() } />
             <div class="flex items-center gap-2">
                 <div class="flex-1">
                     <AgentSwitch on=to_agent title="The session that last wrote it gets the thread (queued if busy), else the newest one of the document's work or project" />
                 </div>
-                <button class=BUTTON_QUIET on:click=move |_| commenting.set(None)>"Cancel"</button>
+                <button class=BUTTON_QUIET on:click=move |_| done.run(())>"Cancel"</button>
                 <button class=BUTTON on:click=move |_| post()>"Comment"</button>
             </div>
         </div>
@@ -1418,7 +2154,7 @@ const COMMENT_GROWS: &str = "block max-h-44 resize-none overflow-y-auto";
 fn AgentSwitch(on: RwSignal<bool>, #[prop(optional, into)] title: String) -> impl IntoView {
     view! {
         <button type="button" role="switch" aria-checked=move || on.get().to_string() title=title
-            class="inline-flex items-center gap-1.5 rounded text-xs text-zinc-600 dark:text-zinc-400" on:click=move |_| on.update(|v| *v = !*v)>
+            class="inline-flex items-center gap-1.5 rounded text-xs text-soft" on:click=move |_| on.update(|v| *v = !*v)>
             <span class=move || format!("relative h-3.5 w-[26px] shrink-0 rounded-full transition-colors {}", if on.get() { "bg-sky-600" } else { "bg-zinc-300 dark:bg-zinc-600" })>
                 <span class=move || format!("absolute left-0.5 top-0.5 h-2.5 w-2.5 rounded-full bg-white shadow-sm transition-transform {}", if on.get() { "translate-x-3" } else { "" })></span>
             </span>
@@ -1437,8 +2173,8 @@ fn AgentOnIt(session: String) -> impl IntoView {
     move || {
         if running() {
             view! {
-                <span class="inline-flex items-center gap-1 text-sky-700 dark:text-sky-300">
-                    <span class="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-sky-500"></span>"agent is on it…"
+                <span class="inline-flex items-center gap-1">
+                    <span class="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-zinc-400"></span>"working…"
                 </span>
             }
             .into_any()
@@ -1471,55 +2207,83 @@ fn AgentName(id: String) -> impl IntoView {
     }
 }
 
-/// One comment: yours on the right, in sky; an agent's on the left, grey,
-/// edged in its session's colour and named by it; anyone else's on the
-/// left, plain. `under`: what goes beneath it (the edits it made).
+/// One comment: yours on the right, a quiet grey-blue; anyone else's on
+/// the left, grey, an agent's named by its session (its colour on the dot
+/// by the name). `under`: what goes beneath it (that it changed the doc).
 fn said(c: &c6_api::docs::DocComment, under: Option<AnyView>) -> AnyView {
     let when = since(c.at).trim_end_matches(" ago").to_owned();
     let text = c.text.clone();
     if c.by == "you" {
         return view! {
             <div class="flex flex-col items-end">
-                <div class="mb-0.5 text-xs text-zinc-500">{format!("You · {when}")}</div>
-                <p class="max-w-[85%] whitespace-pre-wrap break-words rounded-xl bg-sky-100 px-3 py-1.5 text-sky-950 dark:bg-sky-900/50 dark:text-sky-50">{text}</p>
+                <div class="mb-0.5 text-xs text-muted">{format!("You · {when}")}</div>
+                <p class="max-w-[85%] whitespace-pre-wrap break-words rounded-xl bg-sky-50 px-3 py-1.5 text-zinc-900 dark:bg-sky-950/60 dark:text-zinc-100">{text}</p>
                 {under}
             </div>
         }
         .into_any();
     }
-    let session = c.by.strip_prefix("session:").map(str::to_owned);
-    let who = match session.clone() {
-        Some(id) => view! { <AgentName id /> }.into_any(),
+    let who = match c.by.strip_prefix("session:") {
+        Some(id) => view! { <AgentName id=id.to_owned() /> }.into_any(),
         None => view! { <span class="truncate">{author(&c.by)}</span> }.into_any(),
     };
-    let edge = session.is_some();
     view! {
         <div class="flex flex-col items-start">
-            <div class="mb-0.5 flex max-w-full items-center gap-1 text-xs text-zinc-500">
+            <div class="mb-0.5 flex max-w-full items-center gap-1 text-xs text-muted">
                 {who}<span class="shrink-0">{format!("· {when}")}</span>
             </div>
-            <p class=format!("max-w-[85%] whitespace-pre-wrap break-words rounded-xl bg-zinc-100 px-3 py-1.5 dark:bg-zinc-800 {}", if edge { "border-l-[3px]" } else { "" })
-                style=move || session.as_deref().map(|id| format!("border-left-color:{}", crate::marks::colour_hex(&session_mark(id)))).unwrap_or_default()>
-                {text}
-            </p>
+            <p class="max-w-[85%] whitespace-pre-wrap break-words rounded-xl bg-zinc-100 px-3 py-1.5 dark:bg-zinc-800">{text}</p>
             {under}
         </div>
     }
     .into_any()
 }
 
+/// "changed the doc · Show": Show flashes the blocks its edits made (those
+/// last written in one of its versions), else the block it's on.
+fn changed_the_doc(ctx: ThreadsCtx, t: &DocThread) -> AnyView {
+    let (edits, anchor) = (t.edits.clone(), t.anchor.block.clone());
+    let show = move |_| {
+        let mut ids = ctx.tabs.with_untracked(|ts| {
+            ts.iter()
+                .flat_map(|t| &t.blocks)
+                .flat_map(|b| std::iter::once(b).chain(&b.children))
+                .filter(|b| edits.contains(&b.rev))
+                .map(|b| b.id.clone())
+                .collect::<Vec<_>>()
+        });
+        if ids.is_empty() && !anchor.is_empty() {
+            ids.push(anchor.clone());
+        }
+        ctx.reveal.run(ids);
+    };
+    view! {
+        <div class="mt-1 text-xs text-muted">
+            "changed the doc · "
+            <button class="underline hover:text-zinc-900 dark:hover:text-zinc-100" title="Flash what it changed" on:click=show>"Show"</button>
+        </div>
+    }
+    .into_any()
+}
+
 /// One thread: a conversation (yours on the right, an agent's on the
-/// left), the newest last, just above the box to reply.
+/// left), the newest last, just above the box to reply; in the panel,
+/// what it's about first (`about`). Drawn once: as comments come in, only
+/// they are drawn again, so the reply box keeps what you type, and the
+/// cursor.
 #[component]
-fn Thread(t: c6_api::docs::DocThread, doc: String, tick: RwSignal<u32>) -> impl IntoView {
-    let (doc, tid) = (StoredValue::new(doc), StoredValue::new(t.id.clone()));
-    // A draft: the thread redraws as comments come in.
+fn Thread(id: String, about: bool) -> impl IntoView {
+    let ctx = expect_context::<ThreadsCtx>();
+    let (doc, tick) = (ctx.doc, ctx.tick);
+    let tid = StoredValue::new(id);
+    let t = Memo::new(move |_| ctx.shown.with(|ts| ts.iter().find(|t| t.id == tid.get_value()).cloned().unwrap_or_default()));
+    // A draft: the thread may be drawn again (in the panel and a popover).
     let key = StoredValue::new(format!("reply.{}.{}", doc.get_value(), tid.get_value()));
     let reply = crate::util::draft(&key.get_value());
     // With an agent already, a reply goes on to it unless you say not.
-    let to_agent = RwSignal::new(t.to_agent && !t.agent.is_empty());
+    let to_agent = RwSignal::new(t.with_untracked(|t| t.to_agent && !t.agent.is_empty()));
     let error = RwSignal::new(None::<String>);
-    let done = move |r: Result<c6_api::docs::DocThread, String>| match r {
+    let done = move |r: Result<DocThread, String>| match r {
         Ok(_) => {
             let _ = error.try_set(None);
             let _ = tick.try_update(|t| *t += 1);
@@ -1528,8 +2292,7 @@ fn Thread(t: c6_api::docs::DocThread, doc: String, tick: RwSignal<u32>) -> impl 
             let _ = error.try_set(Some(e));
         }
     };
-    // The draft goes as it's sent (the thread is drawn again before the
-    // answer comes, and would find it), and comes back if sending fails.
+    // The draft goes as it's sent, and comes back if sending fails.
     let send = move || {
         let c = c6_api::docs::CommentNew {
             text: reply.get_untracked(),
@@ -1564,9 +2327,10 @@ fn Thread(t: c6_api::docs::DocThread, doc: String, tick: RwSignal<u32>) -> impl 
     };
     let area = NodeRef::<leptos::html::Textarea>::new();
     crate::util::autosize(area, move || reply.track());
-    // Drawn again whenever comments come in: scrolled to the newest.
+    // As comments come in: scrolled to the newest.
     let list = NodeRef::<leptos::html::Div>::new();
     Effect::new(move || {
+        t.with(|t| t.comments.len());
         if list.get().is_some() {
             request_animation_frame(move || {
                 if let Some(el) = list.try_get_untracked().flatten() {
@@ -1575,63 +2339,52 @@ fn Thread(t: c6_api::docs::DocThread, doc: String, tick: RwSignal<u32>) -> impl 
             });
         }
     });
-    // The version an edit chip shows, and bringing it (or a block of it) back.
-    let showing = RwSignal::new(None::<i64>);
-    let restore = Callback::new(move |(rev, block): (i64, Option<String>)| {
-        spawn_local(async move {
-            match api::doc_restore(doc.get_value(), &DocRestore { rev, block }).await {
-                Ok(_) => {
-                    let _ = showing.try_set(None);
-                    let _ = tick.try_update(|t| *t += 1);
+    let open = Memo::new(move |_| t.with(|t| t.state == "open"));
+    // Where it stands: what it was about is gone, the agent working, not
+    // sent yet, resolved, your move.
+    let status = move || {
+        t.with(|t| {
+            let waiting = t.to_agent && !t.needs_you && t.comments.last().is_some_and(|c| c.by != format!("session:{}", t.agent));
+            let resolved = t.state != "open";
+            (t.detached || waiting || t.unsent || resolved || t.needs_you).then(|| {
+                view! {
+                    <div class="flex flex-wrap items-center gap-2 text-xs text-muted">
+                        {t.detached.then(|| view! { <span class="rounded bg-zinc-100 px-1 dark:bg-zinc-800" title="What it was about is gone or changed">"detached"</span> })}
+                        {waiting.then(|| view! { <AgentOnIt session=t.agent.clone() /> })}
+                        {t.unsent.then(|| view! {
+                            <span>"not sent yet"</span>
+                            <button class="text-sky-700 hover:underline dark:text-sky-400" title="Your last comment here hasn't gone to an agent: send the thread now"
+                                on:click=send_unsent>"Send now"</button>
+                        })}
+                        {resolved.then(|| view! { <span>{format!("resolved by {}", author(&t.resolved_by))}</span> })}
+                        <span class="flex-1"></span>
+                        {t.needs_you.then(|| view! { <span class="rounded-full bg-amber-100 px-2 py-0.5 font-medium text-amber-800 dark:bg-amber-900/50 dark:text-amber-300">"Your move"</span> })}
+                    </div>
                 }
-                Err(e) => {
-                    let _ = error.try_set(Some(e));
-                }
-            }
-        });
-    });
-    // Which comment made which edit isn't kept: they go under the agent's
-    // newest comment (after them all if it hasn't written one).
-    let mut chips = (!t.edits.is_empty()).then(|| {
-        view! {
-            <div class="mt-1 flex flex-wrap items-center gap-1 text-xs text-zinc-500">
-                "edited"
-                {t.edits.iter().map(|&rev| view! {
-                    <button class=move || format!("rounded-full px-1.5 {}", if showing.get() == Some(rev) { "bg-sky-100 text-sky-800 dark:bg-sky-900/50 dark:text-sky-200" } else { "bg-zinc-100 text-zinc-600 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700" })
-                        title=format!("The document as it was at version {rev}") on:click=move |_| showing.update(|s| *s = if *s == Some(rev) { None } else { Some(rev) })>
-                        {format!("v{rev}")}
-                    </button>
-                }).collect_view()}
-            </div>
-        }
-        .into_any()
-    });
-    let last_agent = t.comments.iter().rposition(|c| c.by.starts_with("session:"));
-    let comments =
-        t.comments.iter().enumerate().map(|(i, c)| said(c, if Some(i) == last_agent { chips.take() } else { None })).collect_view();
-    // Waiting on the agent: the last word isn't its.
-    let waiting = t.to_agent && !t.needs_you && t.comments.last().is_some_and(|c| c.by != format!("session:{}", t.agent));
-    let unsent = t.unsent;
-    let open = t.state == "open";
+            })
+        })
+    };
+    // That it changed the doc goes under the agent's newest comment (after
+    // them all if it hasn't written one): which comment made which edit
+    // isn't kept.
+    let comments = move || {
+        t.with(|t| {
+            let mut changed = (!t.edits.is_empty()).then(|| changed_the_doc(ctx, t));
+            let last_agent = t.comments.iter().rposition(|c| c.by.starts_with("session:"));
+            let list = t
+                .comments
+                .iter()
+                .enumerate()
+                .map(|(i, c)| said(c, if Some(i) == last_agent { changed.take() } else { None }))
+                .collect_view();
+            view! { {list}{changed} }
+        })
+    };
     view! {
-        <div class=format!("space-y-2 rounded-md border border-zinc-200 p-2 text-sm dark:border-zinc-800 {}", if t.needs_you { "border-l-2 border-l-amber-500 dark:border-l-amber-500" } else { "" })
-            data-thread=t.id.clone()>
-            <div class="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
-                <span class="min-w-[40%] flex-1 truncate">{format!("On {}", t.about)}</span>
-                {t.detached.then(|| view! { <span class="rounded bg-zinc-100 px-1 dark:bg-zinc-800" title="What it was about is gone or changed">"detached"</span> })}
-                {waiting.then(|| view! { <AgentOnIt session=t.agent.clone() /> })}
-                {unsent.then(|| view! {
-                    <button class="rounded border border-violet-300 px-1.5 text-violet-700 hover:bg-violet-50 dark:border-violet-800 dark:text-violet-300 dark:hover:bg-violet-950"
-                        title="Your last comment here hasn't gone to an agent: send the thread now" on:click=send_unsent>"Send now"</button>
-                })}
-                {(!open).then(|| view! { <span>{format!("resolved by {}", author(&t.resolved_by))}</span> })}
-                {t.needs_you.then(|| view! { <span class="rounded-full bg-amber-100 px-2 py-0.5 font-medium text-amber-800 dark:bg-amber-900/50 dark:text-amber-300">"Your move"</span> })}
-            </div>
-            <div node_ref=list class="max-h-96 space-y-2 overflow-y-auto">
-                {comments}
-                {chips}
-            </div>
-            {move || showing.get().map(|rev| view! { <Version id=doc.get_value() rev restore /> })}
+        <div class="space-y-2 rounded-lg border border-zinc-200 p-2 text-sm dark:border-zinc-800" data-thread=tid.get_value()>
+            {about.then(|| view! { <About t /> })}
+            {status}
+            <div node_ref=list class="max-h-96 space-y-2 overflow-y-auto">{comments}</div>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             <div class="relative">
                 <textarea node_ref=area rows="1" class=format!("{INPUT} {COMMENT_GROWS} pr-9") placeholder="Reply…" prop:value=move || reply.get() on:input=move |ev| reply.set(event_target_value(&ev))
@@ -1646,8 +2399,8 @@ fn Thread(t: c6_api::docs::DocThread, doc: String, tick: RwSignal<u32>) -> impl 
             </div>
             <div class="flex items-center gap-2">
                 <div class="flex-1"><AgentSwitch on=to_agent title="Send the thread to an agent" /></div>
-                {open.then(|| view! {
-                    <button class="text-xs text-zinc-500 hover:underline" on:click=move |_| spawn_local(async move { done(api::doc_thread_resolve(doc.get_value(), tid.get_value()).await) })>"Resolve"</button>
+                {move || open.get().then(|| view! {
+                    <button class="text-xs text-muted hover:underline" on:click=move |_| spawn_local(async move { done(api::doc_thread_resolve(doc.get_value(), tid.get_value()).await) })>"Resolve"</button>
                 })}
             </div>
         </div>
@@ -1687,7 +2440,7 @@ fn Exports(id: String, kind: String) -> impl IntoView {
     };
     view! {
         <section class="space-y-2 rounded-lg border border-zinc-200 p-3 text-sm dark:border-zinc-800">
-            <h2 class="text-xs font-medium uppercase tracking-wide text-zinc-500">"Export"</h2>
+            <h2 class="text-xs font-medium uppercase tracking-wide text-muted">"Export"</h2>
             <div class="flex flex-wrap gap-2">
                 {formats.iter().map(|(f, label)| {
                     let f = *f;
@@ -1703,11 +2456,11 @@ fn Exports(id: String, kind: String) -> impl IntoView {
             <ToGoogle id=id.get_value() />
             {move || past.get().and_then(Result::ok).filter(|p| !p.is_empty()).map(|p| view! {
                 <div class="space-y-0.5">
-                    <div class="text-xs text-zinc-500">"Made before"</div>
+                    <div class="text-xs text-muted">"Made before"</div>
                     {p.into_iter().map(|e| view! {
                         <div class="flex items-center gap-2">
                             <a href=api::url(&e.url) class="min-w-0 flex-1 truncate text-sky-700 hover:underline dark:text-sky-400">{e.name.clone()}</a>
-                            <span class="shrink-0 text-xs text-zinc-400">{format!("v{} · {} KB · {}", e.rev, e.size.div_ceil(1024), since(e.at))}</span>
+                            <span class="shrink-0 text-xs text-muted">{format!("v{} · {} KB · {}", e.rev, e.size.div_ceil(1024), since(e.at))}</span>
                         </div>
                     }).collect_view()}
                 </div>
@@ -1759,12 +2512,12 @@ fn ToGoogle(id: String) -> impl IntoView {
             let app = g.app.clone();
             view! {
                 <div class="space-y-1 border-t border-zinc-200 pt-2 dark:border-zinc-800">
-                    <div class="text-xs text-zinc-500">{app.clone()}</div>
+                    <div class="text-xs text-muted">{app.clone()}</div>
                     {if g.accounts.is_empty() {
                         view! {
                             <div class="flex items-center gap-2">
                                 <button class=BUTTON_QUIET on:click=connect>"Connect Google"</button>
-                                <span class="text-xs text-zinc-500">"Only the files carbon6 makes in your Drive (drive.file)."</span>
+                                <span class="text-xs text-muted">"Only the files carbon6 makes in your Drive (drive.file)."</span>
                             </div>
                         }.into_any()
                     } else if let Some(f) = g.file.clone() {
@@ -1774,7 +2527,7 @@ fn ToGoogle(id: String) -> impl IntoView {
                                     <a href=f.url.clone() target="_blank" rel="noopener" class="min-w-0 flex-1 truncate text-sky-700 hover:underline dark:text-sky-400">
                                         {format!("Open in {app}")}
                                     </a>
-                                    <span class="shrink-0 text-xs text-zinc-400">{format!("v{} · {} · {}", f.rev, f.account, since(f.at))}</span>
+                                    <span class="shrink-0 text-xs text-muted">{format!("v{} · {} · {}", f.rev, f.account, since(f.at))}</span>
                                 </div>
                                 <div class="flex flex-wrap gap-2">
                                     <button class=BUTTON_QUIET disabled=move || busy.get() on:click=move |_| go(false, false)>
@@ -1823,7 +2576,7 @@ fn History(id: String, reload: Callback<()>) -> impl IntoView {
     };
     view! {
         <section class="space-y-2 rounded-lg border border-zinc-200 p-3 text-sm dark:border-zinc-800">
-            <h2 class="text-xs font-medium uppercase tracking-wide text-zinc-500">"History"</h2>
+            <h2 class="text-xs font-medium uppercase tracking-wide text-muted">"History"</h2>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             {move || versions.get().map(|r| match r {
                 Err(e) => view! { <ErrorBox message=e /> }.into_any(),
@@ -1833,13 +2586,13 @@ fn History(id: String, reload: Callback<()>) -> impl IntoView {
                     let by = run[0].by.clone();
                     view! {
                         <div>
-                            <div class="text-xs text-zinc-500">{format!("{}, {} {}, {}{}", author_named(&by), run.len(), if run.len() == 1 { "edit" } else { "edits" },
+                            <div class="text-xs text-muted">{format!("{}, {} {}, {}{}", author_named(&by), run.len(), if run.len() == 1 { "edit" } else { "edits" },
                                 when_hm(first), if last != first { format!("–{}", when_hm(last)) } else { String::new() })}</div>
                             {run.iter().map(|v| {
                                 let rev = v.rev;
                                 view! {
                                     <div class="flex items-center gap-2 pl-2">
-                                        <span class="w-10 shrink-0 text-xs text-zinc-400">{format!("v{rev}")}</span>
+                                        <span class="w-10 shrink-0 text-xs text-muted">{format!("v{rev}")}</span>
                                         <span class="min-w-0 flex-1 truncate">{v.summary.clone()}</span>
                                         <button class="text-xs text-sky-700 hover:underline dark:text-sky-400" on:click=move |_| open.set(if open.get_untracked() == Some(rev) { None } else { Some(rev) })>"Open"</button>
                                         <button class="text-xs text-sky-700 hover:underline dark:text-sky-400" title="Bring this version back as a new change"
@@ -1923,5 +2676,20 @@ mod tests {
         assert_eq!(super::base64_of(b"Ma"), "TWE=");
         assert_eq!(super::base64_of(b"M"), "TQ==");
         assert_eq!(super::base64_of(b""), "");
+    }
+
+    #[test]
+    fn a_blocks_first_line_reads_as_plain_words() {
+        use serde_json::{Value, json};
+        let plain = |md: &str| super::first_line(md, &Value::Null);
+        assert_eq!(plain("## The **plan**, in `short`"), "The plan, in short");
+        assert_eq!(plain("\n\n- [ ] Ask [the team](https://x.y/z) first\n- then"), "Ask the team first");
+        assert_eq!(plain("> 1. Quoted _and_ numbered"), "Quoted _and_ numbered");
+        assert_eq!(plain("```rust\nfn main() {}\n```"), "fn main() {}");
+        assert_eq!(plain("| Name | Owner |\n|---|---|\n| a | b |"), "Name · Owner");
+        assert_eq!(plain("![A chart](x.png) and ~~old~~ words"), "A chart and old words");
+        assert_eq!(plain("---"), "");
+        let chips = json!({"chips": {"d": {"type": "date", "value": "2026-11-02"}, "m": {"type": "mention", "user": "u1", "name": "Ann"}}});
+        assert_eq!(super::first_line("Due <?c6 block d?>, ask <?c6 block m?>", &chips), "Due 2026-11-02, ask @Ann");
     }
 }
