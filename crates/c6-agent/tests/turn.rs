@@ -106,6 +106,7 @@ async fn a_stalled_continuation_can_be_cancelled_in_either_model_wait_phase() {
         let turn = run_turn(1, &cfg, client.as_ref(), &tools, &session, &sink, &mut conv, &mut pending, &cancel);
         tokio::pin!(turn);
         let wait = if bounded { 1 } else { 14 * 60 };
+        // test-lint: allow (time is paused: this proves the turn still waits, it can't fail on a slow machine)
         assert!(tokio::time::timeout(Duration::from_secs(wait), &mut turn).await.is_err());
         assert_eq!(requests.load(Ordering::SeqCst), 2);
         assert_eq!(effects.load(Ordering::SeqCst), 1);
