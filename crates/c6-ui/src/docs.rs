@@ -1245,15 +1245,34 @@ fn Thread(t: c6_api::docs::DocThread, doc: String, tick: RwSignal<u32>) -> impl 
     }
 }
 
+thread_local! {
+    /// Each document's past exports and Google file as last loaded (see
+    /// [`Exports`]).
+    static EXPORTS: std::cell::RefCell<std::collections::HashMap<String, Vec<c6_api::docs::DocExport>>> = Default::default();
+    static GOOGLE: std::cell::RefCell<std::collections::HashMap<String, c6_api::docs::DocGoogle>> = Default::default();
+}
+
 /// Export: the formats a document goes to, and the files made before
 /// (each with the version it was made from), to download again.
 #[component]
 fn Exports(id: String, kind: String) -> impl IntoView {
     let id = StoredValue::new(id);
     let tick = RwSignal::new(0u32);
-    let past = LocalResource::new(move || {
+    // The page draws this box again whenever the document changes (an agent
+    // editing a deck): with what it loaded last, so it doesn't empty and
+    // refill each time (a flicker), while the list loads again.
+    let past = RwSignal::new(EXPORTS.with(|c| c.borrow().get(&id.get_value()).cloned()));
+    Effect::new(move || {
         tick.track();
-        api::doc_exports(id.get_value())
+        let doc = id.get_value();
+        spawn_local(async move {
+            if let Ok(list) = api::doc_exports(doc.clone()).await {
+                EXPORTS.with(|c| c.borrow_mut().insert(doc, list.clone()));
+                if past.try_get_untracked().is_some_and(|cur| cur.as_ref() != Some(&list)) {
+                    let _ = past.try_set(Some(list));
+                }
+            }
+        });
     });
     let busy = RwSignal::new(None::<&'static str>);
     let error = RwSignal::new(None::<String>);
@@ -1292,7 +1311,7 @@ fn Exports(id: String, kind: String) -> impl IntoView {
             </div>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             <ToGoogle id=id.get_value() />
-            {move || past.get().and_then(Result::ok).filter(|p| !p.is_empty()).map(|p| view! {
+            {move || past.get().filter(|p| !p.is_empty()).map(|p| view! {
                 <div class="space-y-0.5">
                     <div class="text-xs text-zinc-500">"Made before"</div>
                     {p.into_iter().map(|e| view! {
@@ -1314,9 +1333,19 @@ fn Exports(id: String, kind: String) -> impl IntoView {
 fn ToGoogle(id: String) -> impl IntoView {
     let id = StoredValue::new(id);
     let tick = RwSignal::new(0u32);
-    let google = LocalResource::new(move || {
+    // As in the box around it: what it loaded last, then fresh.
+    let google = RwSignal::new(GOOGLE.with(|c| c.borrow().get(&id.get_value()).cloned()));
+    Effect::new(move || {
         tick.track();
-        api::doc_google(id.get_value())
+        let doc = id.get_value();
+        spawn_local(async move {
+            if let Ok(g) = api::doc_google(doc.clone()).await {
+                GOOGLE.with(|c| c.borrow_mut().insert(doc, g.clone()));
+                if google.try_get_untracked().is_some_and(|cur| cur.as_ref() != Some(&g)) {
+                    let _ = google.try_set(Some(g));
+                }
+            }
+        });
     });
     let busy = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
@@ -1346,7 +1375,7 @@ fn ToGoogle(id: String) -> impl IntoView {
         });
     };
     view! {
-        {move || google.get().and_then(Result::ok).map(|g| {
+        {move || google.get().map(|g| {
             let app = g.app.clone();
             view! {
                 <div class="space-y-1 border-t border-zinc-200 pt-2 dark:border-zinc-800">
