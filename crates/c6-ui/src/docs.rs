@@ -2259,9 +2259,10 @@ fn said(c: &c6_api::docs::DocComment, under: Option<AnyView>) -> AnyView {
 
 /// An icon button on your comment: shown on hover with a mouse (and to the
 /// keyboard), always on a touch screen.
-/// A row of a comment's ⋯ menu: tall enough to tap on a phone.
-const MENU_ROW: &str = "block w-full px-3 py-1.5 text-left hover:bg-zinc-100 pointer-coarse:py-3 dark:hover:bg-zinc-800";
-const COMMENT_TOOL: &str = "rounded px-1.5 leading-none text-muted opacity-0 pointer-coarse:px-2.5 pointer-coarse:py-1.5 hover:bg-zinc-100 hover:text-zinc-900 focus-visible:opacity-100 group-hover/said:opacity-100 pointer-coarse:opacity-100 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
+/// Edit, Delete and Cancel under your comment: real buttons, roomy on a
+/// phone.
+const SMALL_BUTTON: &str = "rounded-md border border-zinc-300 px-3 py-1.5 text-sm hover:bg-zinc-100 pointer-coarse:px-4 pointer-coarse:py-2 dark:border-zinc-600 dark:hover:bg-zinc-800";
+const COMMENT_TOOL: &str = "rounded px-1.5 leading-none text-muted opacity-60 pointer-coarse:px-2.5 pointer-coarse:py-1.5 hover:bg-zinc-100 hover:text-zinc-900 focus-visible:opacity-100 group-hover/said:opacity-100 pointer-coarse:opacity-100 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
 
 /// Your comment that no agent has received yet: as `said`, with edit and
 /// delete beside who wrote it. Edit makes it a box like the reply's (Enter
@@ -2352,18 +2353,9 @@ fn MyComment(c: c6_api::docs::DocComment, thread: String) -> impl IntoView {
         <div class="group/said flex flex-col items-end">
             <div class="mb-0.5 flex items-center gap-0.5 text-xs text-muted">
                 {move || (!editing.get() && !deleting.get()).then(|| view! {
-                    <div class="relative">
-                        <button class=COMMENT_TOOL title="Edit or delete your comment (no agent has it yet)" aria-label="Edit or delete your comment"
-                            aria-haspopup="menu" prop:aria-expanded=move || menu.get().to_string() data-pop=pop.get_value()
-                            on:click=move |ev| { ev.stop_propagation(); menu.update(|o| *o = !*o) }>"⋯"</button>
-                        {move || menu.get().then(|| view! {
-                            <div role="menu" data-pop=pop.get_value() class="absolute right-0 top-full z-30 mt-1 w-32 rounded-md border border-zinc-200 bg-white py-1 text-sm text-zinc-900 shadow-lg dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100">
-                                <button role="menuitem" class=MENU_ROW on:click=move |ev| { menu.set(false); edit(ev) }>"Edit"</button>
-                                <button role="menuitem" class=format!("{MENU_ROW} text-red-700 dark:text-red-400")
-                                    on:click=move |_| { menu.set(false); error.set(None); deleting.set(true) }>"Delete"</button>
-                            </div>
-                        })}
-                    </div>
+                    <button class=COMMENT_TOOL title="Edit or delete your comment (no agent has it yet)" aria-label="Edit or delete your comment"
+                        aria-expanded=move || menu.get().to_string() data-pop=pop.get_value()
+                        on:click=move |ev| { ev.stop_propagation(); menu.update(|o| *o = !*o) }>"⋯"</button>
                 })}
                 <span class="ml-1">{format!("You · {when}")}</span>
             </div>
@@ -2385,12 +2377,20 @@ fn MyComment(c: c6_api::docs::DocComment, thread: String) -> impl IntoView {
                 }
                 .into_any()
             }}
+            // Edit and Delete under the comment, in the thread's own flow: a
+            // menu floating over it was cut off by the list's scrolling.
+            {move || (menu.get() && !editing.get() && !deleting.get()).then(|| view! {
+                <div data-pop=pop.get_value() class="mt-1.5 flex gap-3">
+                    <button class=SMALL_BUTTON on:click=move |ev| { menu.set(false); edit(ev) }>"Edit"</button>
+                    <button class=format!("{SMALL_BUTTON} text-red-700 dark:text-red-400")
+                        on:click=move |_| { menu.set(false); error.set(None); deleting.set(true) }>"Delete"</button>
+                </div>
+            })}
             {move || deleting.get().then(|| view! {
                 <div class="mt-1.5 flex flex-col items-end gap-2">
                     <span class="text-xs text-soft">"Delete this comment?"</span>
                     <div class="flex gap-3">
-                        <button class="rounded-md border border-zinc-300 px-3 py-1.5 text-sm hover:bg-zinc-100 pointer-coarse:px-4 pointer-coarse:py-2 dark:border-zinc-600 dark:hover:bg-zinc-800"
-                            on:click=move |_| deleting.set(false)>"Cancel"</button>
+                        <button class=SMALL_BUTTON on:click=move |_| deleting.set(false)>"Cancel"</button>
                         <button class="rounded-md bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50 pointer-coarse:px-4 pointer-coarse:py-2"
                             disabled=move || busy.get() on:click=delete>"Delete"</button>
                     </div>
