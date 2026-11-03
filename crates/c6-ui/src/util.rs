@@ -292,6 +292,18 @@ fn within(owner: &Owner, of: &Owner) -> bool {
     false
 }
 
+/// Whether what carries `data-pop` `key` sits inside the pop-up `outer`'s
+/// element on the page.
+fn inside(key: &str, outer: u64) -> bool {
+    document()
+        .query_selector(&format!("[data-pop=\"{key}\"]"))
+        .ok()
+        .flatten()
+        .and_then(|el| el.parent_element())
+        .and_then(|p| p.closest(&format!("[data-pop=\"pop{outer}\"]")).ok().flatten())
+        .is_some()
+}
+
 /// Where Escape puts focus back: what opened it (focused as it opened, else
 /// the first of its openers on screen); for a pop-up whose opener isn't
 /// marked, what had focus outside it.
@@ -372,7 +384,9 @@ fn pop_up(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static
         // let go of).
         let gone = SHOWN.with(|s| {
             let mut s = s.borrow_mut();
-            let holds = |x: &Up| owner.as_ref().zip(x.owner.as_ref()).is_some_and(|(o, of)| within(o, of));
+            // Within it as components go, or on the page (a drop-down in a
+            // panel the same component pops up).
+            let holds = |x: &Up| owner.as_ref().zip(x.owner.as_ref()).is_some_and(|(o, of)| within(o, of)) || inside(&marked, x.id);
             let (stay, gone) = opening(std::mem::take(&mut *s), holds);
             *s = stay;
             s.push(Up { id, owner: owner.clone(), put_away: std::rc::Rc::new(close.clone()) });
