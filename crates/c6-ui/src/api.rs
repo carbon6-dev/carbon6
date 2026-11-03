@@ -586,6 +586,11 @@ pub async fn rename(id: String, title: String) -> Result<(), String> {
     empty(Request::patch(&format!("/api/v1/sessions/{id}")).json(&Body { title }).map_err(|e| e.to_string())?.send().await).await
 }
 
+/// A name for a session from how it started, to start from (docs/suggestions.md §7).
+pub async fn suggest_name(id: String) -> Result<String, String> {
+    json::<c6_api::SuggestedName>(Request::get(&format!("/api/v1/sessions/{id}/name/suggestion")).send().await).await.map(|n| n.title)
+}
+
 pub async fn dismiss_rejected(id: String) -> Result<(), String> {
     empty(Request::delete(&format!("/api/v1/sessions/{id}/queue/rejected")).send().await).await
 }

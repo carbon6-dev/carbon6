@@ -165,6 +165,12 @@ tests again\", \"commit this\", \"yes, use eu-west\"). If the agent's last messa
 (\"Want me to deploy?\", \"Should I build it?\"), reply with the short answer they would most likely give (\"yes, deploy\", \"go ahead\"). \
 Reply with a single - only when there is no question, offer or obvious follow-up.";
 
+/// A session's name, from its first exchange (docs/suggestions.md §7).
+/// `{{exchanges}}`.
+pub const NAME: &str = "Name this conversation between a user and an agent, as a title in a list of sessions. Here is how it \
+started:\n\n{{exchanges}}\n\nReply with only the name: two to five words in sentence case that say what it is about (\"Realm \
+switching speed\", \"Fix the pager's off-by-one\", \"Postgres upgrade plan\"), with no quotes and no full stop.";
+
 /// What a session did while you were away, in a paragraph (the catch-up
 /// card). `{{title}}`, `{{since}}` (how long ago you looked), `{{counts}}`
 /// (what it did, counted) and `{{events}}` (what happened since, oldest

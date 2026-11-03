@@ -36,6 +36,7 @@ pub mod lists;
 pub mod marks;
 pub mod memex;
 pub mod memory;
+pub mod naming;
 pub mod notify;
 pub mod oauth;
 pub mod operations;

@@ -176,6 +176,7 @@ pub async fn create_linked(st: &HeadState, req: api::CreateSession, instance: &s
     if prompt.is_none() && !files.is_empty() {
         return Err(bad_request("attachments need a prompt"));
     }
+    let named_by_first_line = req.title.as_deref().is_none_or(|t| t.trim().is_empty());
     let title = req.title.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| default_title(prompt));
     let row = SessionRow {
         id: Uuid::now_v7().to_string(),
@@ -243,6 +244,11 @@ pub async fn create_linked(st: &HeadState, req: api::CreateSession, instance: &s
         st.store.add_remote_delegation(&input_id, &row.id, &l.parent_id, &l.parent_call_id).await?;
     }
     let brief = Brief { labels: brief_labels, text: prompt.unwrap_or("").to_owned() };
+    // Your session with its first line for a title is named after its
+    // first turn (waiting for it before that can end).
+    if link.is_none() && named_by_first_line {
+        crate::naming::expect(st, &row.id).await?;
+    }
     insert(st, row, spec, prompt.map(|p| (p, files)), input_id, Some(brief)).await
 }
 
@@ -345,6 +351,7 @@ pub async fn create_assistant(st: &HeadState, req: api::AskAssistant) -> anyhow:
         labels,
         ..Default::default()
     };
+    crate::naming::expect(st, &row.id).await?;
     let session = insert(st, row, spec, Some((prompt, Vec::new())), Uuid::now_v7().to_string(), None).await?;
     crate::assistant::started(&session.id);
     Ok(session)
@@ -1726,15 +1733,24 @@ pub async fn check_routes(st: &HeadState, routes: &[api::Route]) -> anyhow::Resu
                 .find(|c| c.id == want || c.name == want)
                 .ok_or_else(|| bad_request(format!("routing rule {:?}: no connection {want:?}", r.name)))?;
             // A pool only for what runs in the head (the assistant,
-            // suggestions, catch-ups and timelines).
+            // suggestions, catch-ups, timelines and names).
             let head_side = r.applies_to.iter().any(|l| {
-                [crate::assistant::LABEL, crate::suggestions::ROUTE_LABEL, crate::catchup::ROUTE_LABEL, crate::timeline::ROUTE_LABEL]
-                    .contains(&l.as_str())
+                [
+                    crate::assistant::LABEL,
+                    crate::suggestions::ROUTE_LABEL,
+                    crate::catchup::ROUTE_LABEL,
+                    crate::timeline::ROUTE_LABEL,
+                    crate::naming::ROUTE_LABEL,
+                ]
+                .contains(&l.as_str())
             });
             if !head_side {
                 crate::pools::not_for_sessions(
                     c,
-                    &format!("routing rule {:?} (unless it applies to assistant, task:suggest, task:catchup or task:timeline)", r.name),
+                    &format!(
+                        "routing rule {:?} (unless it applies to assistant, task:suggest, task:catchup, task:timeline or task:name)",
+                        r.name
+                    ),
                 )?;
             }
         }
@@ -1895,6 +1911,7 @@ pub async fn ingest(st: &HeadState, worker_id: WorkerId, batch: SessionEventBatc
     notify_events(st, &batch.session_id, &ing.events).await;
     crate::memex::on_events(st, &batch.session_id, &ing.events).await;
     crate::decisions::on_events(st, &batch.session_id, &ing.events).await;
+    crate::naming::on_events(st, &batch.session_id, &ing.events).await;
     // How a run's session went: its first turn's end.
     for ev in &ing.events {
         if let Some(c6_proto::session_event::Kind::TurnEnded(t)) = &ev.kind {

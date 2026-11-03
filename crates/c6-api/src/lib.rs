@@ -2720,6 +2720,12 @@ pub enum StreamMsg {
     Window {
         from: u64,
     },
+    /// The session named itself after its first turn (docs/suggestions.md
+    /// §7): `title`, in place of `from` (what Undo puts back).
+    Named {
+        title: String,
+        from: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -4632,6 +4638,13 @@ pub struct Suggestion {
     pub for_seq: i64,
 }
 
+/// A name for a session, to start from (`/api/v1/sessions/{id}/name/suggestion`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SuggestedName {
+    pub title: String,
+}
+
 /// You saw a suggestion (and took it, or not).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -4641,9 +4654,10 @@ pub struct SuggestionSeen {
     pub accepted: bool,
 }
 
-/// Whether sessions suggest your next message (`/api/v1/settings/suggestions`, per realm),
-/// and what new sessions start with: the catch-up card and finished turns
-/// folded (each session then has its own, `/api/v1/sessions/{id}/view`).
+/// Whether sessions suggest your next message (`/api/v1/settings/suggestions`, per realm)
+/// and name themselves after their first turn, and what new sessions start
+/// with: the catch-up card and finished turns folded (each session then has
+/// its own, `/api/v1/sessions/{id}/view`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SuggestionSettings {
@@ -4656,6 +4670,9 @@ pub struct SuggestionSettings {
     /// old name, reads as this).
     #[serde(default, alias = "timeline")]
     pub fold: bool,
+    /// Sessions get a short name once their first turn ends.
+    #[serde(default = "yes")]
+    pub names: bool,
 }
 
 fn yes() -> bool {
@@ -4664,7 +4681,7 @@ fn yes() -> bool {
 
 impl Default for SuggestionSettings {
     fn default() -> Self {
-        Self { enabled: true, catchup: false, fold: false }
+        Self { enabled: true, catchup: false, fold: false, names: true }
     }
 }
 

@@ -36,6 +36,7 @@ mod labels;
 mod m4;
 mod memory;
 mod messages;
+mod naming;
 mod notices;
 mod notify;
 mod operations;

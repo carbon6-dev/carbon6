@@ -213,7 +213,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                         name="routes"
                         title="Model routing"
                         noun="rule"
-                        help="Which connection and model a new session gets when it is started without one (from the Sessions page, c6 run, templates or automations), by its labels: yours, worker:, folder:, host:, template:. The first enabled rule that matches wins. Without a match: the connection's default model, else the model of your latest session on it. A subagent connection and model, if set, run the Task tool's subagents, on any API connection whatever the session runs on (a named agent's model, or one a Task call asks for, still wins; you can also change it in the session). Tools lists only the tools to send to the model, in any profile's naming; empty means all. Sessions keep their starting list; side chats and carbon6 subagents inherit it. The assistant and Claude Code's own tools are unaffected. MCP tools use their full mcp__<server>__<tool> names. A rule for task:suggest picks the model for suggested next messages, task:catchup for a session's catch-up card and task:timeline for its timeline's lines (on a connection the session's realm may use). Rules for a realm are its own: its sessions use them before root's."
+                        help="Which connection and model a new session gets when it is started without one (from the Sessions page, c6 run, templates or automations), by its labels: yours, worker:, folder:, host:, template:. The first enabled rule that matches wins. Without a match: the connection's default model, else the model of your latest session on it. A subagent connection and model, if set, run the Task tool's subagents, on any API connection whatever the session runs on (a named agent's model, or one a Task call asks for, still wins; you can also change it in the session). Tools lists only the tools to send to the model, in any profile's naming; empty means all. Sessions keep their starting list; side chats and carbon6 subagents inherit it. The assistant and Claude Code's own tools are unaffected. MCP tools use their full mcp__<server>__<tool> names. A rule for task:suggest picks the model for suggested next messages, task:name for a session's name, task:catchup for its catch-up card and task:timeline for its timeline's lines (on a connection the session's realm may use). Rules for a realm are its own: its sessions use them before root's."
                         fields=ROUTE_FIELDS
                         examples=route_examples
                         realm=routes_realm
@@ -1256,8 +1256,9 @@ fn SessionImportsSetting() -> impl IntoView {
     }
 }
 
-/// Suggested next messages (docs/suggestions.md), and what new sessions
-/// start with (the catch-up card, finished turns folded), per realm.
+/// Suggested next messages and session names (docs/suggestions.md), and
+/// what new sessions start with (the catch-up card, finished turns folded),
+/// per realm.
 #[component]
 fn SuggestionsSetting() -> impl IntoView {
     let shown = RwSignal::new(c6_api::SuggestionSettings::default());
@@ -1281,11 +1282,16 @@ fn SuggestionsSetting() -> impl IntoView {
     view! {
         <section class="space-y-2 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <h2 class="font-medium">"Suggested next messages"</h2>
-            <p class="text-sm text-muted">"When a turn finishes, the message box offers what you'd likely type next; Tab takes it. A small model call per finished turn, only while you're looking at the session: a routing rule with the label task:suggest picks the model (else the session's own), and the prompt is session.suggest."</p>
+            <p class="text-sm text-muted">"When a turn finishes, the message box offers what you'd likely type next; Tab takes it. A small model call per finished turn, only while you're looking at the session: a routing rule with the label task:suggest picks the model (else the session's own), and the prompt is session.suggest. Names: once a session's first turn finishes, one call gives it a short name in place of its first line; a name you give it stays (task:name, session.name)."</p>
             <label class="flex items-center gap-2 text-sm">
                 <input type="checkbox" prop:checked=move || shown.with(|s| s.enabled)
                     on:change=move |ev| set(|s, on| s.enabled = on, event_target_checked(&ev)) />
                 "Suggest next messages"
+            </label>
+            <label class="flex items-center gap-2 text-sm">
+                <input type="checkbox" prop:checked=move || shown.with(|s| s.names)
+                    on:change=move |ev| set(|s, on| s.names = on, event_target_checked(&ev)) />
+                "Name sessions"<span class="text-muted">"a short name after the first turn"</span>
             </label>
             <h3 class="pt-2 text-sm font-medium">"New sessions start with"</h3>
             <p class="text-sm text-muted">"Each session has its own switches in its ⋯ menu; these are what a new one starts with. Catch-up: when you come back to a session that did 5 steps or more (or waits on you), a card says what happened since you looked, counted, and in a paragraph from a small model (a routing rule with the label task:catchup picks it, else the session's own; the prompt is session.catchup). Fold finished turns: the transcript shows each finished turn as one row (who started it, what it did, its steps), opened in place by a click; what it did is written when you open its hour in the glance's timeline (task:timeline, session.timeline)."</p>
@@ -2964,6 +2970,7 @@ fn route_examples() -> Vec<(&'static str, serde_json::Value)> {
         ("Research at high effort", r("Research", &["research"], "claude-opus-5-5", "high", "claude-sonnet-5-5")),
         ("A template on a local model", r("Triage locally", &["template:triage"], "qwen3.6:27b", "", "")),
         ("Suggested next messages on a small model", r("Suggestions", &["task:suggest"], "claude-haiku-4-5", "", "")),
+        ("Session names on a small model", r("Names", &["task:name"], "claude-haiku-4-5", "", "")),
         ("Catch-up cards on a small model", r("Catch-up", &["task:catchup"], "claude-haiku-4-5", "", "")),
         ("Timeline lines on a small model", r("Timeline", &["task:timeline"], "claude-haiku-4-5", "", "")),
     ]

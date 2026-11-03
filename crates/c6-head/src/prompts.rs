@@ -81,6 +81,11 @@ pub const DEFAULTS: &[Prompt] = &[
         default: text::SUGGEST,
     },
     Prompt {
+        name: "session.name",
+        description: "A session's name after its first turn, and the Rename box's Suggest (docs/suggestions.md §7). Placeholder: {{exchanges}} (how it started).",
+        default: text::NAME,
+    },
+    Prompt {
         name: "session.catchup",
         description: "The paragraph of a session's catch-up card: what it did while you were away. Placeholders: {{title}}, {{since}} (how long ago you looked), {{counts}} (what it did, counted), {{events}} (what happened since: messages, final replies, a line per tool call).",
         default: text::CATCHUP,

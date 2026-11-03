@@ -169,6 +169,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/decisions", get(session_decisions))
         .route("/api/v1/sessions/{id}/suggestion", get(session_suggestion))
         .route("/api/v1/sessions/{id}/suggestion/seen", post(suggestion_seen))
+        .route("/api/v1/sessions/{id}/name/suggestion", get(session_name_suggestion))
         .route("/api/v1/sessions/{id}/catchup", get(session_catchup))
         .route("/api/v1/sessions/{id}/timeline", get(session_timeline))
         .route("/api/v1/sessions/{id}/view", get(get_session_view).put(put_session_view))
@@ -949,6 +950,24 @@ async fn session_suggestion(
     })
 }
 
+/// A name for the session to start from (the Rename box's Suggest).
+async fn session_name_suggestion(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<api::SuggestedName>> {
+    let row = st
+        .store
+        .session(&id)
+        .await?
+        .filter(|r| caller.sees(&r.realm))
+        .ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "no such session".into()))?;
+    match crate::naming::suggest(&st, &row).await {
+        Ok(title) => Ok(Json(api::SuggestedName { title })),
+        Err(e) => Err(ApiErr(StatusCode::BAD_GATEWAY, format!("no name to suggest: {e:#}"))),
+    }
+}
+
 async fn suggestion_seen(
     State(st): State<Arc<HeadState>>,
     Path(id): Path<String>,
@@ -1184,6 +1203,8 @@ async fn update_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>
             return Err(ApiErr(StatusCode::BAD_REQUEST, format!("a session's name can be at most {MAX_TITLE} characters")));
         }
         found &= st.store.set_title(&id, t).await?;
+        // Your name wins: never named by itself (an Undo of its name too).
+        crate::naming::forget(&st, &id).await?;
     }
     if let Some(a) = req.archived {
         found &= st.store.set_archived(&id, a).await?;
