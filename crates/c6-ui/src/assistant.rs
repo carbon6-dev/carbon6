@@ -14,12 +14,13 @@ use crate::workspace::{How, View, use_workspace};
 #[component]
 pub fn AskButton() -> impl IntoView {
     let open = RwSignal::new(false);
-    let _hotkey = window_event_listener(leptos::ev::keydown, move |ev| {
+    let hotkey = window_event_listener(leptos::ev::keydown, move |ev| {
         if ev.key().eq_ignore_ascii_case("j") && (ev.meta_key() || ev.ctrl_key()) {
             ev.prevent_default();
             open.set(true);
         }
     });
+    on_cleanup(move || hotkey.remove());
     view! {
         <button class="rounded-md border border-zinc-300 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-200/60 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
             title="Ask carbon6 to do or explain anything (⌘J)" on:click=move |_| open.set(true)>"✦ Ask"</button>
@@ -33,7 +34,7 @@ pub fn AskButton() -> impl IntoView {
 fn AskBox(on_close: Callback<()>) -> impl IntoView {
     let ws = use_workspace();
     let live = api::live();
-    let text = RwSignal::new(String::new());
+    let text = crate::util::draft("ask");
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
     let area = NodeRef::<leptos::html::Textarea>::new();
@@ -56,6 +57,7 @@ fn AskBox(on_close: Callback<()>) -> impl IntoView {
         spawn_local(async move {
             match api::ask_assistant(prompt, ctx).await {
                 Ok(s) => {
+                    crate::util::forget_draft("ask");
                     on_close.run(());
                     ws.open(None, View::session(s.id), How::Beside);
                 }
@@ -70,7 +72,7 @@ fn AskBox(on_close: Callback<()>) -> impl IntoView {
                 on:click=|ev| ev.stop_propagation()>
                 <div class="flex items-center gap-2">
                     <h2 class="font-medium">"Ask carbon6"</h2>
-                    <span class="flex-1 text-xs text-zinc-500">"anything you can do in the UI, or about your setup"</span>
+                    <span class="flex-1 text-xs text-muted">"anything you can do in the UI, or about your setup"</span>
                     <button class=format!("{BUTTON_QUIET} text-xs") title="Your Ask conversations: come back to one, or start one with a model of your choice"
                         on:click=move |_| { on_close.run(()); ws.open(None, View::Chats, How::OwnTile); }>"Your conversations →"</button>
                 </div>
@@ -83,7 +85,7 @@ fn AskBox(on_close: Callback<()>) -> impl IntoView {
                     }></textarea>
                 {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
                 <div class="flex items-center justify-end gap-2">
-                    <span class="flex-1 text-xs text-zinc-500">"Enter to ask · Shift+Enter for a new line · it asks before anything destructive"</span>
+                    <span class="flex-1 text-xs text-muted">"Enter to ask · Shift+Enter for a new line · it asks before anything destructive"</span>
                     <button class=BUTTON_QUIET on:click=move |_| on_close.run(())>"Cancel"</button>
                     <button class=BUTTON disabled=move || busy.get() on:click=move |_| send()>{move || if busy.get() { "Asking…" } else { "Ask" }}</button>
                 </div>
@@ -118,11 +120,11 @@ pub fn AssistantSettings() -> impl IntoView {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <div>
                 <h2 class="font-medium">"Assistant"</h2>
-                <p class="text-sm text-zinc-500">"Ask carbon6 (✦ Ask, ⌘J) to do anything you can do here, or to explain your setup. It runs in the head, needs no worker, asks you for missing details with a form, shows tokens only to you, and asks before anything destructive. Its conversations have the label assistant, so routes, policies and budgets for that label apply."</p>
+                <p class="text-sm text-muted">"Ask carbon6 (✦ Ask, ⌘J) to do anything you can do here, or to explain your setup. It runs in the head, needs no worker, asks you for missing details with a form, shows tokens only to you, and asks before anything destructive. Its conversations have the label assistant, so routes, policies and budgets for that label apply."</p>
             </div>
             <div class="grid gap-2 sm:grid-cols-3">
                 <label class="space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Connection"</span>
+                    <span class="text-xs text-muted">"Connection"</span>
                     <select class=format!("{INPUT} py-1 text-sm") prop:value=move || conn.get() on:change=move |ev| conn.set(event_target_value(&ev))>
                         <option value="">"Default (routes for assistant)"</option>
                         {move || connections.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|c| c.kind != "claude_code")
@@ -130,7 +132,7 @@ pub fn AssistantSettings() -> impl IntoView {
                     </select>
                 </label>
                 <label class="space-y-0.5 sm:col-span-2">
-                    <span class="text-xs text-zinc-500">"Model"</span>
+                    <span class="text-xs text-muted">"Model"</span>
                     <ModelInput connection=conn value=model on_set=move |v| model.set(v) class=format!("{INPUT} py-1 text-xs") placeholder="e.g. claude-sonnet-5-5, gpt-5, qwen3.6:27b" />
                 </label>
             </div>

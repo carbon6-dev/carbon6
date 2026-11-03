@@ -18,6 +18,10 @@ struct Task {
     exit_code: i32,
     elapsed_ms: u64,
     notify: bool,
+    /// Claude Code's kind for its own task (`local_agent`, ...), and whether
+    /// it holds the turn.
+    native_type: String,
+    foreground: bool,
 }
 
 impl Task {
@@ -27,6 +31,20 @@ impl Task {
 
     fn can_stop(&self) -> bool {
         self.running()
+    }
+
+    /// Stopped: by you, the agent or Claude Code.
+    fn stopped(&self) -> bool {
+        self.state.starts_with("stopped")
+    }
+
+    /// It ended badly: failed, lost, or a command that exited non-zero.
+    fn failed(&self) -> bool {
+        match self.state.as_str() {
+            "failed" | "lost" => true,
+            "finished" => self.kind != "claude_code" && self.exit_code != 0,
+            _ => false,
+        }
     }
 
     fn status(&self) -> String {
@@ -79,18 +97,26 @@ fn kind_name(kind: &str) -> &'static str {
 fn lifecycle(events: &[Event]) -> Vec<Task> {
     let mut out: Vec<Task> = Vec::new();
     for e in events {
-        if let EventKind::BackgroundTask { task_id, kind, description, state, exit_code, elapsed_ms, notify } = &e.kind {
-            let since = out.iter().find(|t| &t.id == task_id).map(|t| t.since).unwrap_or(e.ts);
+        if let EventKind::BackgroundTask { task_id, kind, description, state, exit_code, elapsed_ms, notify, native_type, foreground } =
+            &e.kind
+        {
+            let before = out.iter().find(|t| &t.id == task_id);
+            let since = before.map(|t| t.since).unwrap_or(e.ts);
+            // Started again: a new run, unless it was running (Claude Code
+            // moved it to the background).
+            let since = if state == "started" && !before.is_some_and(Task::running) { e.ts } else { since };
             out.retain(|r| &r.id != task_id);
             out.push(Task {
                 id: task_id.clone(),
                 kind: kind.clone(),
                 description: description.clone(),
-                since: if state == "started" { e.ts } else { since },
+                since,
                 state: state.clone(),
                 exit_code: *exit_code,
                 elapsed_ms: *elapsed_ms,
                 notify: *notify,
+                native_type: native_type.clone(),
+                foreground: *foreground,
             });
         }
     }
@@ -109,7 +135,6 @@ pub fn elapsed(ms: i64) -> String {
     }
 }
 
-/// Session task history, with a prominent running count and an inspector.
 /// What's running now: the tasks that keep the session showing as running
 /// (those that tell the agent when they end, and Claude Code's own), and
 /// the servers and watchers that don't.
@@ -130,106 +155,148 @@ pub fn running_line(tasks: usize, servers: usize) -> String {
     }
 }
 
-/// `line`: a quiet line for the bottom of the transcript, shown only while
-/// something runs (docs/background.md §4), instead of the bar's button.
+/// Claude Code's own agents running in the background (`local_agent`, not
+/// holding the turn): a Stop stops them too (docs/background.md §4).
+pub fn background_agents(events: &[Event]) -> usize {
+    lifecycle(events).iter().filter(|t| t.running() && t.kind == "claude_code" && t.native_type == "local_agent" && !t.foreground).count()
+}
+
+/// What the tasks running now are, servers and watchers too.
+pub fn running(events: &[Event]) -> Vec<String> {
+    lifecycle(events).into_iter().filter(Task::running).map(|t| t.description).collect()
+}
+
+/// The last few tasks that failed or were stopped, beside those running.
+const RECENT: usize = 3;
+
+/// The tasks a session's ◌ N lists: those running, then the last few that
+/// failed or were stopped, newest first; `all`: every one.
+fn short_list(tasks: Vec<Task>, all: bool) -> Vec<Task> {
+    if all {
+        return tasks;
+    }
+    let (running, ended): (Vec<Task>, Vec<Task>) = tasks.into_iter().partition(Task::running);
+    let recent = ended.into_iter().rev().filter(|t| t.failed() || t.stopped()).take(RECENT);
+    running.into_iter().chain(recent).collect()
+}
+
+/// How many tasks the short list leaves out.
+pub fn left_out(events: &[Event]) -> usize {
+    let tasks = lifecycle(events);
+    let total = tasks.len();
+    total - short_list(tasks, false).len()
+}
+
+/// A session's tasks for its bar's ◌ N (see [`short_list`]), each with its
+/// state and time, Inspect, and Stop while it runs. Nothing when there are
+/// none to show.
 #[component]
-pub fn RunningTasks(
-    session: String,
-    events: RwSignal<Vec<Event>>,
-    #[prop(optional)] compact: bool,
-    #[prop(optional)] line: bool,
-) -> impl IntoView {
+pub fn BackgroundTasks(session: String, events: RwSignal<Vec<Event>>, #[prop(into)] all: Signal<bool>) -> impl IntoView {
+    let session = StoredValue::new(session);
+    let list = Memo::new(move |_| short_list(events.with(|e| lifecycle(e)), all.get()));
+    let selected = RwSignal::new(None::<String>);
+    let error = RwSignal::new(None::<String>);
+    view! {
+        <Show when=move || !list.with(Vec::is_empty)>
+            <div class="space-y-2">
+                <p class="text-[10px] font-medium uppercase tracking-wide text-muted">"Tasks"</p>
+                {task_rows(session, list, error, Callback::new(move |id| selected.set(Some(id))))}
+            </div>
+        </Show>
+        {inspector(session, list, selected)}
+    }
+}
+
+/// A quiet line for the bottom of the transcript, shown only while
+/// something runs (docs/background.md §4): it opens the session's tasks.
+#[component]
+pub fn RunningTasks(session: String, events: RwSignal<Vec<Event>>) -> impl IntoView {
     let session = StoredValue::new(session);
     let list = Memo::new(move |_| events.with(|e| lifecycle(e)));
     let counts = Memo::new(move |_| events.with(|e| running_counts(e)));
     let at = RwSignal::new(None::<(f64, f64)>);
     let selected = RwSignal::new(None::<String>);
-    let now = clock();
     let error = RwSignal::new(None::<String>);
-    let shown = move || if line { counts.with(|(t, s)| t + s > 0) } else { !list.with(Vec::is_empty) };
     view! {
-        <Show when=shown>
-                <div>
-                    {if line {
-                        view! {
-                            <button class="text-xs text-sky-700 hover:underline dark:text-sky-400" title="Open the background tasks"
-                                on:click=move |ev| {
-                                    ev.stop_propagation();
-                                    at.set(if at.get_untracked().is_some() { None } else { Some(below(&ev, 384.0)) });
-                                }>
-                                {move || counts.with(|(t, s)| format!("{} ›", running_line(*t, *s)))}
-                            </button>
-                        }
-                        .into_any()
-                    } else {
-                        view! {
-                            // Bright only while something runs.
-                            <button class=move || if list.with(|tasks| tasks.iter().any(|t| t.running())) {
-                                    "rounded-md border border-sky-300 bg-sky-50 px-2 py-1 text-xs text-sky-800 hover:bg-sky-100 dark:border-sky-900 dark:bg-sky-950 dark:text-sky-300"
-                                } else {
-                                    "rounded-md px-2 py-1 text-xs text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
-                                }
-                                title=move || list.with(|tasks| format!("Background tasks: {} running · {} total", tasks.iter().filter(|t| t.running()).count(), tasks.len()))
-                                on:click=move |ev| {
-                                    ev.stop_propagation();
-                                    at.set(if at.get_untracked().is_some() { None } else { Some(below(&ev, 384.0)) });
-                                }>
-                                <strong>{move || list.with(|tasks| {
-                                    let n = tasks.iter().filter(|t| t.running()).count();
-                                    if compact { format!("⚙ {n}") } else { format!("⚙ {n} running") }
-                                })}</strong>
-                                {(!compact).then_some(move || list.with(|tasks| format!(" · {} tasks", tasks.len())))}
-                            </button>
-                        }
-                        .into_any()
-                    }}
-                    <Popover at class="w-96 max-w-[calc(100vw-1rem)] space-y-2 text-xs">
-                            <p class="text-zinc-500">"Task history remains available when the worker is offline. Inspect streams with Refresh."</p>
-                            {move || list.get().into_iter().map(|t| {
-                                let id = t.id.clone();
-                                let inspect_id = t.id.clone();
-                                let running = t.running();
-                                let can_stop = t.can_stop();
-                                let status = t.status();
-                                let notification = t.notification();
-                                // What it is first, in words; its id and how its
-                                // end is reported on hover.
-                                let about = format!("{} · {notification}", t.id);
-                                view! {
-                                    <div class="space-y-1 border-t border-zinc-100 pt-2 dark:border-zinc-800">
-                                        <div class="flex items-start gap-2" title=about>
-                                            <span class=format!("mt-1 h-2 w-2 shrink-0 rounded-full {}", state_dot(&t.state, running))></span>
-                                            <span class="line-clamp-2 min-w-0 flex-1 text-[13px] text-zinc-800 dark:text-zinc-100">{t.description.clone()}</span>
-                                        </div>
-                                        <div class="flex flex-wrap items-center gap-2 pl-4 text-zinc-600 dark:text-zinc-400">
-                                            <span class="rounded bg-zinc-100 px-1 text-[10px] dark:bg-zinc-800">{kind_name(&t.kind)}</span>
-                                            <span>{status}</span>
-                                            <span>{move || if running { elapsed(now.get() - t.since) } else if t.state == "lost" { "elapsed unknown".into() } else { elapsed(t.elapsed_ms as i64) }}</span>
-                                            <span class="flex-1"></span>
-                                            <button class="rounded-md border border-zinc-200 px-2 py-0.5 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800" on:click=move |_| {
-                                                selected.set(Some(inspect_id.clone()));
-                                                at.set(None);
-                                            }>"Inspect"</button>
-                                            {can_stop.then(|| view! { <button class="rounded-md border border-red-200 px-2 py-0.5 text-red-700 hover:bg-red-50 dark:border-red-900 dark:text-red-400 dark:hover:bg-red-950" on:click=move |_| {
-                                            let id = id.clone();
-                                            spawn_local(async move {
-                                                if let Err(e) = api::stop_task(session.get_value(), id).await {
-                                                    error.set(Some(e));
-                                                }
-                                            });
-                                        }>"Stop"</button> })}
-                                        </div>
-                                    </div>
-                                }
-                            }).collect_view()}
-                            {move || error.get().map(|e| view! { <p class="text-red-600">{e}</p> })}
-                    </Popover>
-                    {move || selected.get().map(|id| {
-                        let task = Memo::new(move |_| list.with(|tasks| tasks.iter().find(|t| t.id == id).cloned()));
-                        view! { <TaskInspector session=session.get_value() task on_close=Callback::new(move |_| selected.set(None)) /> }
-                    })}
-                </div>
+        <Show when=move || counts.with(|(t, s)| t + s > 0)>
+            <div>
+                <button class="text-xs text-sky-700 hover:underline dark:text-sky-400" title="Open the background tasks"
+                    on:click=move |ev| {
+                        ev.stop_propagation();
+                        at.set(if at.get_untracked().is_some() { None } else { Some(below(&ev, 384.0)) });
+                    }>
+                    {move || counts.with(|(t, s)| format!("{} ›", running_line(*t, *s)))}
+                </button>
+                <Popover at class="w-96 max-w-[calc(100vw-1rem)] space-y-2 text-xs">
+                    <p class="text-muted">"Task history remains available when the worker is offline. Inspect streams with Refresh."</p>
+                    {task_rows(session, list, error, Callback::new(move |id| {
+                        selected.set(Some(id));
+                        at.set(None);
+                    }))}
+                </Popover>
+                {inspector(session, list, selected)}
+            </div>
         </Show>
+    }
+}
+
+/// The tasks, each with what it is, how it stands, Inspect and (while it
+/// runs) Stop.
+fn task_rows(
+    session: StoredValue<String>,
+    list: Memo<Vec<Task>>,
+    error: RwSignal<Option<String>>,
+    inspect: Callback<String>,
+) -> impl IntoView {
+    let now = clock();
+    view! {
+        {move || list.get().into_iter().map(|t| {
+            let id = t.id.clone();
+            let inspect_id = t.id.clone();
+            let running = t.running();
+            let can_stop = t.can_stop();
+            let status = t.status();
+            let notification = t.notification();
+            // What it is first, in words; its id and how its
+            // end is reported on hover.
+            let about = format!("{} · {notification}", t.id);
+            view! {
+                <div class="space-y-1 border-t border-zinc-100 pt-2 dark:border-zinc-800">
+                    <div class="flex items-start gap-2" title=about>
+                        <span class=format!("mt-1 h-2 w-2 shrink-0 rounded-full {}", state_dot(&t.state, running))></span>
+                        <span class="line-clamp-2 min-w-0 flex-1 text-[13px] text-zinc-800 dark:text-zinc-100">{t.description.clone()}</span>
+                    </div>
+                    <div class="flex flex-wrap items-center gap-2 pl-4 text-zinc-600 dark:text-zinc-400">
+                        <span class="rounded bg-zinc-100 px-1 text-[10px] dark:bg-zinc-800">{kind_name(&t.kind)}</span>
+                        <span>{status}</span>
+                        <span>{move || if running { elapsed(now.get() - t.since) } else if t.state == "lost" { "elapsed unknown".into() } else { elapsed(t.elapsed_ms as i64) }}</span>
+                        <span class="flex-1"></span>
+                        <button class="rounded-md border border-zinc-200 px-2 py-0.5 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800" on:click=move |_| {
+                            inspect.run(inspect_id.clone());
+                        }>"Inspect"</button>
+                        {can_stop.then(|| view! { <button class="rounded-md border border-red-200 px-2 py-0.5 text-red-700 hover:bg-red-50 dark:border-red-900 dark:text-red-400 dark:hover:bg-red-950" on:click=move |_| {
+                        let id = id.clone();
+                        spawn_local(async move {
+                            if let Err(e) = api::stop_task(session.get_value(), id).await {
+                                error.set(Some(e));
+                            }
+                        });
+                    }>"Stop"</button> })}
+                    </div>
+                </div>
+            }
+        }).collect_view()}
+        {move || error.get().map(|e| view! { <p class="text-red-600">{e}</p> })}
+    }
+}
+
+/// The inspector of the task chosen, while one is.
+fn inspector(session: StoredValue<String>, list: Memo<Vec<Task>>, selected: RwSignal<Option<String>>) -> impl IntoView {
+    move || {
+        selected.get().map(|id| {
+            let task = Memo::new(move |_| list.with(|tasks| tasks.iter().find(|t| t.id == id).cloned()));
+            view! { <TaskInspector session=session.get_value() task on_close=Callback::new(move |_| selected.set(None)) /> }
+        })
     }
 }
 
@@ -266,9 +333,9 @@ fn TaskInspector(session: String, task: Memo<Option<Task>>, on_close: Callback<(
                     <button class=BUTTON_QUIET on:click=move |_| snapshot.refetch()>"Refresh"</button>
                     <button class=BUTTON_QUIET on:click=move |_| on_close.run(())>"Close"</button>
                 </div>
-                <p class="text-xs text-zinc-500">"Read-only live snapshot. Use Refresh to see new output; there is no automatic polling. Inspecting does not wake the model, consume output or change its read cursor."</p>
+                <p class="text-xs text-muted">"Read-only live snapshot. Use Refresh to see new output; there is no automatic polling. Inspecting does not wake the model, consume output or change its read cursor."</p>
                 {move || task.get().map(|t| view! {
-                    <p class="text-xs text-zinc-500">{format!("Session history: {} · {}", t.status(), t.notification())}</p>
+                    <p class="text-xs text-muted">{format!("Session history: {} · {}", t.status(), t.notification())}</p>
                     <pre class="whitespace-pre-wrap break-all font-mono text-xs">{t.description}</pre>
                 })}
                 <Suspense fallback=|| view! { <p role="status">"Loading task snapshot…"</p> }>
@@ -314,17 +381,17 @@ pub fn ended_line(task_id: &str, kind: &str, description: &str, state: &str, exi
     let native = kind == "claude_code";
     let (icon, what, tone) = match state {
         "started" => return None,
-        "finished" if native => ("✓", "finished".to_owned(), "text-zinc-500"),
-        "finished" if agent && exit_code == 0 => ("✓", "finished".to_owned(), "text-zinc-500"),
+        "finished" if native => ("✓", "finished".to_owned(), "text-muted"),
+        "finished" if agent && exit_code == 0 => ("✓", "finished".to_owned(), "text-muted"),
         "finished" if agent => ("✗", "failed".to_owned(), "text-red-600 dark:text-red-400"),
-        "finished" if exit_code == 0 => ("✓", "exited 0".to_owned(), "text-zinc-500"),
+        "finished" if exit_code == 0 => ("✓", "exited 0".to_owned(), "text-muted"),
         "finished" => ("✗", format!("exited {exit_code}"), "text-red-600 dark:text-red-400"),
         "failed" => ("✗", "failed".to_owned(), "text-red-600 dark:text-red-400"),
-        "stopped" if native => ("■", "stopped by Claude Code".to_owned(), "text-zinc-500"),
-        "stopped" => ("■", "stopped by the agent".to_owned(), "text-zinc-500"),
-        "stopped_by_user" => ("■", "stopped by you".to_owned(), "text-zinc-500"),
+        "stopped" if native => ("■", "stopped by Claude Code".to_owned(), "text-muted"),
+        "stopped" => ("■", "stopped by the agent".to_owned(), "text-muted"),
+        "stopped_by_user" => ("■", "stopped by you".to_owned(), "text-muted"),
         "lost" => ("!", "lost (worker restarted or CLI exited)".to_owned(), "text-amber-700 dark:text-amber-400"),
-        other => ("·", other.to_owned(), "text-zinc-500"),
+        other => ("·", other.to_owned(), "text-muted"),
     };
     let label = if agent { format!("agent: {description}") } else { description.to_owned() };
     let time = if state == "lost" { String::new() } else { format!(" · {}", elapsed(elapsed_ms as i64)) };
@@ -357,8 +424,41 @@ mod tests {
                 exit_code: if state == "finished" { 7 } else { 0 },
                 elapsed_ms: 2500,
                 notify: false,
+                native_type: String::new(),
+                foreground: false,
             },
         }
+    }
+
+    /// One of Claude Code's own tasks: its kind, and whether it holds the turn.
+    fn native(seq: u64, task: &str, state: &str, native: &str, fg: bool) -> Event {
+        let mut e = event(seq, task, state);
+        if let EventKind::BackgroundTask { kind, native_type, foreground, .. } = &mut e.kind {
+            *kind = "claude_code".into();
+            *native_type = native.into();
+            *foreground = fg;
+        }
+        e
+    }
+
+    #[test]
+    fn background_agents_are_claude_codes_running_agents_not_in_the_turn() {
+        let evs = [
+            native(1, "bg-agent", "started", "local_agent", false),
+            native(2, "fg-agent", "started", "local_agent", true),
+            native(3, "command", "started", "local_bash", false),
+            native(4, "done-agent", "started", "local_agent", false),
+            native(5, "done-agent", "finished", "local_agent", false),
+            event(6, "shell", "started"),
+        ];
+        assert_eq!(background_agents(&evs), 1);
+        // The CLI moved the foreground one to the background: it counts, and
+        // it has run since it started.
+        let mut moved = evs.to_vec();
+        moved.push(native(7, "fg-agent", "started", "local_agent", false));
+        assert_eq!(background_agents(&moved), 2);
+        let task = lifecycle(&moved).into_iter().find(|t| t.id == "fg-agent").unwrap();
+        assert_eq!(task.since, 2000);
     }
 
     #[test]
@@ -464,6 +564,47 @@ mod tests {
             assert!(!tasks[0].can_stop());
         }
         assert_eq!(lifecycle(&[event(1, "shell", "finished")])[0].status(), "finished · exit 7");
+    }
+
+    #[test]
+    fn a_task_ended_badly_when_it_failed_was_lost_or_exited_non_zero() {
+        let with = |task: &str, state: &str, kind: &str, exit: i32| {
+            let mut e = event(1, task, state);
+            if let EventKind::BackgroundTask { kind: k, exit_code, .. } = &mut e.kind {
+                *k = kind.into();
+                *exit_code = exit;
+            }
+            e
+        };
+        let evs = [
+            with("build", "started", "shell", 0),
+            with("ok", "finished", "shell", 0),
+            with("tests", "finished", "shell", 101),
+            with("agent", "finished", "agent", 1),
+            with("native", "finished", "claude_code", 1),
+            with("gone", "lost", "shell", 0),
+            with("broke", "failed", "shell", 0),
+            with("mine", "stopped_by_user", "shell", 0),
+        ];
+        let failed: Vec<String> = lifecycle(&evs).into_iter().filter(Task::failed).map(|t| t.id).collect();
+        assert_eq!(failed, ["tests", "agent", "gone", "broke"]);
+    }
+
+    #[test]
+    fn the_short_list_has_the_running_and_the_last_few_stopped_or_failed() {
+        let evs = [
+            event(1, "old fail", "failed"),
+            event(2, "ok", "finished"),
+            event(3, "stopped", "stopped_by_user"),
+            event(4, "f2", "failed"),
+            event(5, "f3", "lost"),
+            event(6, "f4", "failed"),
+            event(7, "run", "started"),
+        ];
+        let ids = |all| short_list(lifecycle(&evs), all).into_iter().map(|t| t.id).collect::<Vec<_>>();
+        assert_eq!(ids(false), ["run", "f4", "f3", "f2"], "the newest three ended badly, after what runs");
+        assert_eq!(ids(true).len(), 7);
+        assert_eq!(left_out(&evs), 3);
     }
 
     #[test]

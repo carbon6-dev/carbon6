@@ -15,7 +15,7 @@ The head keeps its last 200 model calls in memory (`c6_llm::activity`). Calls st
 **Which calls are tracked.** A client wrapped with `activity::track` reports every call it makes, which covers every model call the head makes:
 - the memex: the brief's sorting, "same request?" checks, drafts, understanding, summaries, system pages and vision (`c6_memex::llm::ask`, whose `what` and `about` name the purpose and the conversation or item);
 - the assistant;
-- session suggestions.
+- session suggestions and names.
 
 Agent sessions run their model calls on workers, so they appear under **Sessions running** with a link to the session instead. Embeddings aren't shown.
 

@@ -161,8 +161,34 @@ knowledge_record and re-checks with knowledge_verify; never stop to ask the user
 pub const SUGGEST: &str = "You suggest the user's next message to a coding agent, so they can accept it with one key instead of typing it. \
 Here is the end of their conversation (session \"{{title}}\"; labels: {{labels}}):\n\n{{exchanges}}\n\n\
 Reply with only the message the user is most likely to send next: one short line, in their voice, as they would type it (\"run the \
-tests again\", \"commit this\", \"yes, use eu-west\"). If the agent asked them something, answer it the way they most likely would. \
-If there is no clear next step, reply with a single -";
+tests again\", \"commit this\", \"yes, use eu-west\"). If the agent's last message asks them something or offers to do something \
+(\"Want me to deploy?\", \"Should I build it?\"), reply with the short answer they would most likely give (\"yes, deploy\", \"go ahead\"). \
+Reply with a single - only when there is no question, offer or obvious follow-up.";
+
+/// A session's name, from its first exchange (docs/suggestions.md §7).
+/// `{{exchanges}}`.
+pub const NAME: &str = "Name this conversation between a user and an agent, as a title in a list of sessions. Here is how it \
+started:\n\n{{exchanges}}\n\nReply with only the name: two to five words in sentence case that say what it is about (\"Realm \
+switching speed\", \"Fix the pager's off-by-one\", \"Postgres upgrade plan\"), with no quotes and no full stop.";
+
+/// What a session did while you were away, in a paragraph (the catch-up
+/// card). `{{title}}`, `{{since}}` (how long ago you looked), `{{counts}}`
+/// (what it did, counted) and `{{events}}` (what happened since, oldest
+/// first: messages, final replies, a line per tool call).
+pub const CATCHUP: &str = "The user is coming back to an agent session (\"{{title}}\") they last looked at {{since}}. Tell them what \
+happened since, so they can pick up where they left off.\n\nWhat it did, counted:\n{{counts}}\n\nWhat happened since, oldest first \
+(messages, each turn's final reply, and one line per tool call, without its output):\n\n{{events}}\n\n\
+Reply with one short paragraph of plain text (two to four sentences, no heading or list): what the agent did and where it stands now, \
+what failed or is left open, and what waits on the user, if anything. Name a file, command or result only when it matters. Don't \
+repeat the counts.";
+
+/// One line per turn of an hour, for a session's timeline. `{{title}}`
+/// and `{{turns}}` (each turn: its number, who started it, its tool calls
+/// and its final reply).
+pub const TIMELINE: &str = "Here are turns of an agent session (\"{{title}}\"), each with who started it, the tools it used and its \
+final reply:\n\n{{turns}}\n\nFor each turn, say in one short line (at most twelve words, no full stop) what the agent did in it, \
+as a log entry: \"Fixed the pager's off-by-one and ran the tests\", \"Answered how the cache expires\". Reply with one line per turn, \
+as <turn number>: <line>, and nothing else.";
 
 /// When an agent proposes a task card (docs/task-cards.md).
 pub const TASK_CARDS: &str = "While you work you may notice things worth doing that do not belong in the task you were given. Propose \

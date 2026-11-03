@@ -792,6 +792,287 @@ async fn the_decks_apps_decks_come_in_once() {
     stop.cancel();
 }
 
+/// Comments sent together: two threads left unsent go to the document's
+/// writer (idle) in one message, both noted as with it; then nothing is
+/// left to send.
+#[tokio::test]
+async fn comments_go_to_an_agent_together() {
+    use c6_testkit::{MockLlm, Reply};
+    use c6_worker::{ConnState, Identity, Worker, conn, enroll};
+    let mock = MockLlm::start().await;
+    let (head_dir, state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
+    enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
+    let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
+    let (tx, mut rx) = tokio::sync::watch::channel(ConnState::Connecting);
+    let stop = tokio_util::sync::CancellationToken::new();
+    tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
+    let send = |method: M, path: String, body: Value| {
+        let (http, url) = (http.clone(), format!("{api}/{path}"));
+        async move {
+            let r = http.request(method, &url).json(&body).send().await.unwrap();
+            let s = r.status();
+            let v: Value = r.json().await.unwrap_or(Value::Null);
+            assert!(s.is_success(), "{s}: {v}");
+            v
+        }
+    };
+    send(M::PUT, "settings/work".into(), json!({"guess": false, "notes": false, "quiet_days": 3, "nudge": false, "needs_hours": 4})).await;
+    let conn = send(M::POST, "connections".into(), json!({"name": "m", "base_url": mock.base_url()})).await;
+    let turns = |id: String, n: usize| {
+        let (http, api) = (http.clone(), api.clone());
+        async move {
+            eventually("the turn to end", async || {
+                let d: Value = http.get(format!("{api}/sessions/{id}")).send().await.ok()?.json().await.ok()?;
+                let ev: Vec<Value> = http.get(format!("{api}/sessions/{id}/events")).send().await.ok()?.json().await.ok()?;
+                let ended = ev.iter().filter(|e| e["type"] == "turn_ended").count();
+                (d["session"]["status"] == "idle" && ended >= n).then_some(ev)
+            })
+            .await
+        }
+    };
+    let create = json!({"action": "create", "title": "Pricing", "markdown": "# Pricing\n\nWe charge per seat.\n\nAnnual plans get two months free."});
+    mock.push(Reply::ToolCalls(vec![("doc".into(), create.to_string())]));
+    mock.push(Reply::Text("Wrote it.".into()));
+    let s = send(
+        M::POST,
+        "sessions".into(),
+        json!({"worker_id": worker.identity.meta.worker_id.0, "cwd": "", "connection_id": conn["id"], "model": "m",
+               "prompt": "write the pricing doc", "work": "new"}),
+    )
+    .await;
+    let sid = s["id"].as_str().unwrap().to_owned();
+    turns(sid.clone(), 1).await;
+    let id = send(M::GET, "docs?q=Pricing".into(), Value::Null).await[0]["id"].as_str().unwrap().to_owned();
+    let full = send(M::GET, format!("docs/{id}"), Value::Null).await;
+    let (b1, b2) = (full["tabs"][0]["blocks"][1]["id"].as_str().unwrap(), full["tabs"][0]["blocks"][2]["id"].as_str().unwrap());
+    // Two comments, left unsent while you read on.
+    let t1 = send(M::POST, format!("docs/{id}/threads"), json!({"anchor": {"block": b1}, "text": "Say the price."})).await;
+    let t2 = send(M::POST, format!("docs/{id}/threads"), json!({"anchor": {"block": b2}, "text": "Is it two months or one?"})).await;
+    let (t1, t2) = (t1["id"].as_str().unwrap().to_owned(), t2["id"].as_str().unwrap().to_owned());
+    assert_ne!(t1, t2);
+    // Sent together: one message to the writer, both threads with it.
+    mock.push(Reply::Text("On it.".into()));
+    let sent = send(M::POST, format!("docs/{id}/threads/send"), json!({})).await;
+    let sent = sent.as_array().unwrap();
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    for t in sent {
+        assert_eq!((t["to_agent"].as_bool(), t["agent"].as_str()), (Some(true), Some(sid.as_str())), "{t}");
+    }
+    turns(sid.clone(), 2).await;
+    let asked: Vec<Value> = mock
+        .requests()
+        .into_iter()
+        .filter(|r| {
+            let m = r["messages"].to_string();
+            m.contains(&format!("Thread {t1}")) || m.contains(&format!("Thread {t2}"))
+        })
+        .collect();
+    let first = asked.first().expect("the comments reached the agent")["messages"].to_string();
+    assert!(first.contains(&format!("Thread {t1}")) && first.contains(&format!("Thread {t2}")), "both in one message: {first}");
+    assert!(first.contains("come to you together"), "{first}");
+    // Nothing left to send.
+    let r = http.post(format!("{api}/docs/{id}/threads/send")).json(&json!({})).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    let unsent = |threads: &Value, t: &str| threads.as_array().unwrap().iter().find(|x| x["id"] == t).unwrap()["unsent"].as_bool();
+    let all = send(M::GET, format!("docs/{id}/threads"), Value::Null).await;
+    assert_eq!((unsent(&all, &t1), unsent(&all, &t2)), (Some(false), Some(false)), "both went: {all}");
+    // A reply left without "agent" can go later, alone.
+    send(M::POST, format!("docs/{id}/threads/{t1}/comments"), json!({"text": "Also say the currency."})).await;
+    let all = send(M::GET, format!("docs/{id}/threads"), Value::Null).await;
+    assert_eq!((unsent(&all, &t1), unsent(&all, &t2)), (Some(true), Some(false)), "{all}");
+    mock.push(Reply::Text("On it again.".into()));
+    let sent = send(M::POST, format!("docs/{id}/threads/send"), json!({})).await;
+    assert_eq!(sent.as_array().unwrap().len(), 1, "only the thread with an unsent reply: {sent}");
+    turns(sid.clone(), 3).await;
+    assert!(
+        mock.requests().iter().any(|r| r["messages"].to_string().contains("Also say the currency.")),
+        "the late reply reached the agent"
+    );
+    let all = send(M::GET, format!("docs/{id}/threads"), Value::Null).await;
+    assert_eq!(unsent(&all, &t1), Some(false), "{all}");
+    stop.cancel();
+}
+
+/// Your comments change until an agent has them: edited in place (its
+/// time kept) and deleted, a thread's only comment taking the thread; each
+/// says whether it can still. Refused once an agent has it, for someone
+/// else's, and on a resolved thread; a reply after the thread was sent can
+/// change until it goes too.
+#[tokio::test]
+async fn comments_change_until_an_agent_has_them() {
+    use c6_testkit::{MockLlm, Reply};
+    use c6_worker::{ConnState, Identity, Worker, conn, enroll};
+    let mock = MockLlm::start().await;
+    let (head_dir, state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
+    enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
+    let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
+    let (tx, mut rx) = tokio::sync::watch::channel(ConnState::Connecting);
+    let stop = tokio_util::sync::CancellationToken::new();
+    tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
+    // As you, or with a token (another writer): the status and the answer.
+    let call = |method: M, path: String, body: Value, token: Option<String>| {
+        let (http, url) = (http.clone(), format!("{api}/{path}"));
+        async move {
+            let mut r = http.request(method, &url).json(&body);
+            if let Some(t) = token {
+                r = r.bearer_auth(t);
+            }
+            let r = r.send().await.unwrap();
+            let s = r.status();
+            (s, r.json::<Value>().await.unwrap_or(Value::Null))
+        }
+    };
+    let send = |method: M, path: String, body: Value| {
+        let asked = call(method, path, body, None);
+        async move {
+            let (s, v) = asked.await;
+            assert!(s.is_success(), "{s}: {v}");
+            v
+        }
+    };
+    send(M::PUT, "settings/work".into(), json!({"guess": false, "notes": false, "quiet_days": 3, "nudge": false, "needs_hours": 4})).await;
+    let conn = send(M::POST, "connections".into(), json!({"name": "m", "base_url": mock.base_url()})).await;
+    let turns = |id: String, n: usize| {
+        let (http, api) = (http.clone(), api.clone());
+        async move {
+            eventually("the turn to end", async || {
+                let d: Value = http.get(format!("{api}/sessions/{id}")).send().await.ok()?.json().await.ok()?;
+                let ev: Vec<Value> = http.get(format!("{api}/sessions/{id}/events")).send().await.ok()?.json().await.ok()?;
+                let ended = ev.iter().filter(|e| e["type"] == "turn_ended").count();
+                (d["session"]["status"] == "idle" && ended >= n).then_some(ev)
+            })
+            .await
+        }
+    };
+    let create = json!({"action": "create", "title": "Pricing", "markdown": "# Pricing\n\nWe charge per seat.\n\nAnnual plans get two months free."});
+    mock.push(Reply::ToolCalls(vec![("doc".into(), create.to_string())]));
+    mock.push(Reply::Text("Wrote it.".into()));
+    let s = send(
+        M::POST,
+        "sessions".into(),
+        json!({"worker_id": worker.identity.meta.worker_id.0, "cwd": "", "connection_id": conn["id"], "model": "m",
+               "prompt": "write the pricing doc", "work": "new"}),
+    )
+    .await;
+    let sid = s["id"].as_str().unwrap().to_owned();
+    turns(sid.clone(), 1).await;
+    let id = send(M::GET, "docs?q=Pricing".into(), Value::Null).await[0]["id"].as_str().unwrap().to_owned();
+    let full = send(M::GET, format!("docs/{id}"), Value::Null).await;
+    let (b1, b2) = (full["tabs"][0]["blocks"][1]["id"].as_str().unwrap(), full["tabs"][0]["blocks"][2]["id"].as_str().unwrap());
+    let thread = |t: String| {
+        let all = send(M::GET, format!("docs/{id}/threads"), Value::Null);
+        async move { all.await.as_array().unwrap().iter().find(|x| x["id"] == t).cloned() }
+    };
+    let editable = |t: &Value| t["comments"].as_array().unwrap().iter().map(|c| c["editable"].as_bool().unwrap()).collect::<Vec<_>>();
+
+    // Not sent yet: yours to edit, in place.
+    let t1 = send(M::POST, format!("docs/{id}/threads"), json!({"anchor": {"block": b1}, "text": "Say the price."})).await;
+    let tid = t1["id"].as_str().unwrap().to_owned();
+    let (c1, at) = (t1["comments"][0]["id"].as_str().unwrap().to_owned(), t1["comments"][0]["at"].clone());
+    assert_eq!(editable(&t1), [true], "{t1}");
+    let one = format!("docs/{id}/threads/{tid}/comments/{c1}");
+    let t = send(M::PATCH, one.clone(), json!({"text": " Say the price, in euros. "})).await;
+    assert_eq!((t["comments"][0]["text"].as_str(), &t["comments"][0]["at"]), (Some("Say the price, in euros."), &at), "{t}");
+    assert_eq!(editable(&t), [true]);
+    assert_eq!(call(M::PATCH, one.clone(), json!({"text": "  "}), None).await.0, StatusCode::BAD_REQUEST);
+
+    // Someone else's comment (a realm's token) is theirs to change.
+    let token = send(M::POST, "auth/tokens".into(), json!({"name": "t", "realm": "home"})).await["token"].as_str().unwrap().to_owned();
+    let (s, t) =
+        call(M::POST, format!("docs/{id}/threads/{tid}/comments"), json!({"text": "And the currency?"}), Some(token.clone())).await;
+    assert!(s.is_success(), "{s}: {t}");
+    assert_eq!(t["comments"][1]["by"], "token:home");
+    let theirs = format!("docs/{id}/threads/{tid}/comments/{}", t["comments"][1]["id"].as_str().unwrap());
+    let (s, v) = call(M::PATCH, theirs.clone(), json!({"text": "x"}), None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
+    assert_eq!(call(M::DELETE, theirs.clone(), Value::Null, None).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(call(M::PATCH, one.clone(), json!({"text": "x"}), Some(token.clone())).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(call(M::DELETE, theirs, Value::Null, Some(token)).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(thread(tid.clone()).await.unwrap()["comments"].as_array().unwrap().len(), 1);
+
+    // Deleting a reply leaves the thread; its only comment takes it.
+    let t2 = send(M::POST, format!("docs/{id}/threads"), json!({"anchor": {"block": b2}, "text": "Two months?"})).await;
+    let t2id = t2["id"].as_str().unwrap().to_owned();
+    let t2 = send(M::POST, format!("docs/{id}/threads/{t2id}/comments"), json!({"text": "Or one?"})).await;
+    assert_eq!(editable(&t2), [true, true]);
+    let ids: Vec<String> = t2["comments"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap().to_owned()).collect();
+    send(M::DELETE, format!("docs/{id}/threads/{t2id}/comments/{}", ids[1]), Value::Null).await;
+    let t2 = thread(t2id.clone()).await.expect("the thread stays");
+    assert_eq!(t2["comments"].as_array().unwrap().len(), 1, "{t2}");
+    assert_eq!(t2["comments"][0]["text"], "Two months?");
+    send(M::DELETE, format!("docs/{id}/threads/{t2id}/comments/{}", ids[0]), Value::Null).await;
+    assert!(thread(t2id.clone()).await.is_none(), "its only comment took the thread");
+    let gone = format!("docs/{id}/threads/{t2id}/comments/{}", ids[0]);
+    assert_eq!(call(M::PATCH, gone, json!({"text": "x"}), None).await.0, StatusCode::NOT_FOUND);
+
+    // Sent to the agent, which answers: neither can change now.
+    let answer = json!({"action": "comment", "id": id, "op": "reply", "thread": tid, "text": "€12 a seat?"});
+    mock.push(Reply::ToolCalls(vec![("doc".into(), answer.to_string())]));
+    mock.push(Reply::Text("Answered.".into()));
+    send(M::POST, format!("docs/{id}/threads/send"), json!({"threads": [tid]})).await;
+    turns(sid.clone(), 2).await;
+    let t = thread(tid.clone()).await.unwrap();
+    assert_eq!(t["comments"][1]["by"], format!("session:{sid}"), "{t}");
+    assert_eq!(editable(&t), [false, false], "{t}");
+    let (s, v) = call(M::PATCH, one.clone(), json!({"text": "x"}), None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("an agent has received"), "{v}");
+    assert_eq!(call(M::DELETE, one.clone(), Value::Null, None).await.0, StatusCode::CONFLICT);
+    let agents = format!("docs/{id}/threads/{tid}/comments/{}", t["comments"][1]["id"].as_str().unwrap());
+    assert_eq!(call(M::PATCH, agents, json!({"text": "x"}), None).await.0, StatusCode::FORBIDDEN);
+
+    // A reply after it went is yours to change until it goes too.
+    let t = send(M::POST, format!("docs/{id}/threads/{tid}/comments"), json!({"text": "Yes, round it."})).await;
+    assert_eq!(editable(&t), [false, false, true], "{t}");
+    let reply = format!("docs/{id}/threads/{tid}/comments/{}", t["comments"][2]["id"].as_str().unwrap());
+    let t = send(M::PATCH, reply.clone(), json!({"text": "Yes, and round it."})).await;
+    assert_eq!(t["comments"][2]["text"], "Yes, and round it.");
+    mock.push(Reply::Text("Rounded.".into()));
+    send(M::POST, format!("docs/{id}/threads/send"), json!({})).await;
+    turns(sid.clone(), 3).await;
+    assert!(mock.requests().iter().any(|r| r["messages"].to_string().contains("Yes, and round it.")), "the agent got the edited text");
+    assert_eq!(editable(&thread(tid.clone()).await.unwrap()), [false, false, false]);
+    assert_eq!(call(M::DELETE, reply, Value::Null, None).await.0, StatusCode::CONFLICT);
+
+    // A resolved thread's comments stay as they are.
+    let t = send(M::POST, format!("docs/{id}/threads/{tid}/comments"), json!({"text": "Thanks."})).await;
+    assert_eq!(editable(&t), [false, false, false, true]);
+    let thanks = format!("docs/{id}/threads/{tid}/comments/{}", t["comments"][3]["id"].as_str().unwrap());
+    let t = send(M::POST, format!("docs/{id}/threads/{tid}/resolve"), Value::Null).await;
+    assert_eq!(editable(&t), [false, false, false, false]);
+    let (s, v) = call(M::PATCH, thanks, json!({"text": "x"}), None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    stop.cancel();
+}
+
 /// Comments (docs/docs.md §8): a thread on a block, sent to the session
 /// that wrote it (idle, so it gets the thread as a message by
 /// `docs.comment`); it edits answering the thread and replies; the thread,
@@ -921,6 +1202,128 @@ async fn comments_go_to_the_agent_that_wrote_the_part() {
     let all = send(M::GET, format!("docs/{id}/threads"), Value::Null).await;
     let t2 = all.as_array().unwrap().iter().find(|t| t["id"] == t2["id"]).unwrap().clone();
     assert_eq!((t2["detached"].as_bool(), t2["about"].as_str()), (Some(true), Some("“We charge $12 per seat a month.”")));
+    stop.cancel();
+}
+
+/// Comments never start a session: while the agent that answered a thread
+/// is busy, a reply in that thread goes to it (queued), and so does a new
+/// thread on a part it wrote; it takes both once its step ends.
+#[tokio::test]
+async fn comments_wait_for_their_busy_agent_rather_than_start_a_session() {
+    use c6_testkit::{MockLlm, Reply};
+    use c6_worker::{ConnState, Identity, Worker, conn, enroll};
+    let mock = MockLlm::start().await;
+    let (head_dir, state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
+    enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
+    let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
+    let (tx, mut rx) = tokio::sync::watch::channel(ConnState::Connecting);
+    let stop = tokio_util::sync::CancellationToken::new();
+    tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
+    let send = |method: M, path: String, body: Value| {
+        let (http, url) = (http.clone(), format!("{api}/{path}"));
+        async move {
+            let r = http.request(method, &url).json(&body).send().await.unwrap();
+            let s = r.status();
+            let v: Value = r.json().await.unwrap_or(Value::Null);
+            assert!(s.is_success(), "{s}: {v}");
+            v
+        }
+    };
+    send(M::PUT, "settings/work".into(), json!({"guess": false, "notes": false, "quiet_days": 3, "nudge": false, "needs_hours": 4})).await;
+    let conn = send(M::POST, "connections".into(), json!({"name": "m", "base_url": mock.base_url()})).await;
+    let turns = |id: String, n: usize| {
+        let (http, api) = (http.clone(), api.clone());
+        async move {
+            eventually("the turn to end", async || {
+                let d: Value = http.get(format!("{api}/sessions/{id}")).send().await.ok()?.json().await.ok()?;
+                let ev: Vec<Value> = http.get(format!("{api}/sessions/{id}/events")).send().await.ok()?.json().await.ok()?;
+                let ended = ev.iter().filter(|e| e["type"] == "turn_ended").count();
+                (d["session"]["status"] == "idle" && ended >= n).then_some(ev)
+            })
+            .await
+        }
+    };
+    // The session writes a doc, in its work.
+    let create = json!({"action": "create", "title": "Pricing", "markdown": "# Pricing\n\nWe charge per seat.\n\nAnnual plans get two months free."});
+    mock.push(Reply::ToolCalls(vec![("doc".into(), create.to_string())]));
+    mock.push(Reply::Text("Wrote it.".into()));
+    let s = send(
+        M::POST,
+        "sessions".into(),
+        json!({"worker_id": worker.identity.meta.worker_id.0, "cwd": "", "connection_id": conn["id"], "model": "m",
+               "prompt": "write the pricing doc", "work": "new"}),
+    )
+    .await;
+    let sid = s["id"].as_str().unwrap().to_owned();
+    turns(sid.clone(), 1).await;
+    let id = send(M::GET, "docs?q=Pricing".into(), Value::Null).await[0]["id"].as_str().unwrap().to_owned();
+    let full = send(M::GET, format!("docs/{id}"), Value::Null).await;
+    let (b1, b2) = (full["tabs"][0]["blocks"][1]["id"].as_str().unwrap(), full["tabs"][0]["blocks"][2]["id"].as_str().unwrap());
+    // A thread it took while idle: it's the thread's agent.
+    mock.push(Reply::Text("Noted.".into()));
+    let t1 = send(M::POST, format!("docs/{id}/threads"), json!({"anchor": {"block": b1}, "text": "Say the price.", "to": "agent"})).await;
+    let t1 = t1["id"].as_str().unwrap().to_owned();
+    turns(sid.clone(), 2).await;
+
+    // Now it's busy: a turn that holds after its first words.
+    let gate = mock.push_gated(Reply::Text("Working on it.".into()));
+    let asked = mock.requests().len();
+    send(M::POST, format!("sessions/{sid}/messages"), json!({"text": "Check the numbers."})).await;
+    eventually("the turn to be running", async || {
+        let d: Value = http.get(format!("{api}/sessions/{sid}")).send().await.ok()?.json().await.ok()?;
+        (d["session"]["status"] == "running" && mock.requests().len() > asked).then_some(())
+    })
+    .await;
+    let sessions = send(M::GET, "sessions".into(), Value::Null).await.as_array().unwrap().len();
+    // A reply in its thread goes to it, queued.
+    let t = send(M::POST, format!("docs/{id}/threads/{t1}/comments"), json!({"text": "In euros, please.", "to": "agent"})).await;
+    assert_eq!((t["to_agent"].as_bool(), t["agent"].as_str()), (Some(true), Some(sid.as_str())), "{t}");
+    // A new thread on a part it wrote goes to it too.
+    let t2 =
+        send(M::POST, format!("docs/{id}/threads"), json!({"anchor": {"block": b2}, "text": "One month, not two.", "to": "agent"})).await;
+    assert_eq!((t2["to_agent"].as_bool(), t2["agent"].as_str()), (Some(true), Some(sid.as_str())), "{t2}");
+    let t2 = t2["id"].as_str().unwrap().to_owned();
+    let queued = eventually("both to be queued for it", async || {
+        let d: Value = http.get(format!("{api}/sessions/{sid}")).send().await.ok()?.json().await.ok()?;
+        let q = d["queued"].as_array()?.clone();
+        (q.len() == 2).then_some(q)
+    })
+    .await;
+    let has = |t: &str| queued.iter().any(|q| q["text"].as_str().unwrap_or("").contains(&format!("Thread {t}")));
+    assert!(has(&t1) && has(&t2), "{queued:?}");
+    // Sent together, too: one message to it, no session started.
+    send(M::POST, format!("docs/{id}/threads/{t1}/comments"), json!({"text": "And round it."})).await;
+    send(M::POST, format!("docs/{id}/threads/{t2}/comments"), json!({"text": "Say it plainly."})).await;
+    let sent = send(M::POST, format!("docs/{id}/threads/send"), json!({})).await;
+    for t in sent.as_array().unwrap() {
+        assert_eq!(t["agent"].as_str(), Some(sid.as_str()), "{t}");
+    }
+    assert_eq!(send(M::GET, "sessions".into(), Value::Null).await.as_array().unwrap().len(), sessions, "no session started");
+
+    // Its step ends: it takes them.
+    mock.push(Reply::Text("Done.".into()));
+    mock.push(Reply::Text("Done.".into()));
+    mock.push(Reply::Text("Done.".into()));
+    gate.notify_one();
+    eventually("the comments to reach it", async || {
+        let m: Vec<String> = mock.requests().iter().map(|r| r["messages"].to_string()).collect();
+        (m.iter().any(|m| m.contains("In euros, please.")) && m.iter().any(|m| m.contains("come to you together"))).then_some(())
+    })
+    .await;
     stop.cancel();
 }
 

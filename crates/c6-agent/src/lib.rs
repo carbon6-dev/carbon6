@@ -90,6 +90,9 @@ pub struct PendingInput {
     pub from_session_id: String,
     pub from_title: String,
     pub hops: u32,
+    /// Send now: a running turn gets it at once, not at its next step
+    /// (docs/background.md §4). Not logged.
+    pub send_now: bool,
 }
 
 impl PendingInput {

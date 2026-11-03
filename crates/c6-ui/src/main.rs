@@ -8,6 +8,7 @@ mod assistant;
 mod auth;
 mod brief;
 mod calendar;
+mod catchup;
 mod chat;
 mod chats;
 mod collections;
@@ -20,6 +21,7 @@ mod docs;
 mod explorer;
 mod files;
 mod fleet;
+mod icons;
 mod itemviews;
 mod labels;
 mod mail;
@@ -27,10 +29,13 @@ mod mail_html;
 mod markdown;
 mod marks;
 mod memex;
+mod mentions;
 mod models;
 mod monitor;
+mod needs;
 mod notify;
 mod outputs;
+mod panes;
 mod people;
 mod photos;
 mod place;
@@ -43,6 +48,7 @@ mod sessions;
 mod settings;
 mod tasks;
 mod term;
+mod timeline;
 mod understanding;
 mod usage;
 mod util;
@@ -56,8 +62,21 @@ use leptos_router::components::{Route, Router, Routes};
 use leptos_router::path;
 use workspace::{Go, View};
 
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    /// js/crash.js: the banner that offers a reload.
+    #[wasm_bindgen(catch, js_name = c6Crashed)]
+    fn js_crashed() -> Result<(), wasm_bindgen::JsValue>;
+}
+
 fn main() {
-    console_error_panic_hook::set_once();
+    // A panic leaves the app broken (WebAssembly doesn't unwind: what it
+    // held stays held, and its stack is never given back), so beyond the
+    // console's "panicked at …" the page says so and offers a reload.
+    std::panic::set_hook(Box::new(|info| {
+        console_error_panic_hook::hook(info);
+        let _ = js_crashed();
+    }));
     // Each page is one realm's app or the console (docs/realms-ux.md).
     if place::resolve() {
         leptos::mount::mount_to_body(App);
@@ -93,7 +112,6 @@ fn Main() -> impl IntoView {
     provide_context(labels::LabelFilter::restored());
     provide_context(sessions::Grouping::load());
     provide_context(aspects::Facets::load());
-    provide_context(aspects::Spotlight(RwSignal::new(None)));
     // Plan limits per connection, beside every connection picker.
     quota::provide();
     // A signed-in browser opening a login link (to sign in again).
@@ -123,8 +141,11 @@ fn Main() -> impl IntoView {
     let tiles = move || ws.layout.with(|l| l.tiles.len());
     let console = place::is_console();
     view! {
-        <div class="flex h-dvh flex-col">
+        // The page itself never scrolls: its parts do (a phone panned the
+        // whole page, header gone and the right edge cut off).
+        <div class="flex h-dvh flex-col overflow-hidden">
             <util::NoticeHost />
+            <mentions::Peek />
             <header class="flex h-11 shrink-0 items-center gap-2 border-b border-zinc-200 bg-zinc-50 px-3 dark:border-zinc-800 dark:bg-zinc-950">
                 <Brand />
                 <MobileMenu attention=Signal::derive(attention) />
@@ -142,6 +163,7 @@ fn Main() -> impl IntoView {
                         </nav>
                         <span class="flex-1"></span>
                         <monitor::ActivityBadge />
+                        <needs::NeedsYou />
                         <assistant::AskButton />
                     }.into_any()
                 } else {
@@ -168,11 +190,12 @@ fn Main() -> impl IntoView {
                         <span class="flex-1"></span>
                         <span class="hidden xl:contents"><views::ViewsMenu class=NAV /></span>
                         <monitor::ActivityBadge />
+                        <needs::NeedsYou />
                         <assistant::AskButton />
                         <span class="hidden md:contents"><search::SearchBox /></span>
                     }.into_any()
                 }}
-                <button class="hidden rounded-md px-2 py-1 text-xs text-zinc-500 hover:bg-zinc-200/60 hover:text-zinc-900 xl:inline dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                <button class="hidden rounded-md px-2 py-1 text-xs text-muted hover:bg-zinc-200/60 hover:text-zinc-900 xl:inline dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
                     title=move || format!("New tile (or ⌘-click any link): {} open · ⌘1–9 switch tiles · ⌘[ ⌘] back and forward", tiles())
                     on:click=move |_| ws.new_tile()>"+ Tile"</button>
                 {(!console).then(|| view! { <notify::NotifyToggle /> })}
@@ -211,6 +234,7 @@ fn feeds() -> LocalResource<Result<serde_json::Value, String>> {
 fn AppsMenu() -> impl IntoView {
     let feeds = feeds();
     let menu = NodeRef::<leptos::html::Details>::new();
+    let (pop, toggled) = util::details_pop(menu);
     let close = move |_| {
         if let Some(d) = menu.get_untracked() {
             d.set_open(false);
@@ -218,7 +242,7 @@ fn AppsMenu() -> impl IntoView {
     };
     let item = "rounded-md px-2 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800";
     view! {
-        <details node_ref=menu class="relative shrink-0">
+        <details node_ref=menu data-pop=pop on:toggle=toggled class="relative shrink-0">
             <summary class=format!("{NAV} cursor-pointer list-none whitespace-nowrap")>"Apps ▾"</summary>
             <div class="absolute left-0 top-8 z-40 flex w-48 flex-col rounded-lg border border-zinc-200 bg-white p-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900" on:click=close>
                 {move || feeds.get().and_then(Result::ok).map(|f| view! {
@@ -239,15 +263,20 @@ fn AppsMenu() -> impl IntoView {
 #[component]
 fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
     let menu = NodeRef::<leptos::html::Details>::new();
+    let (pop, toggled) = util::details_pop(menu);
     let feeds = feeds();
-    // Close after choosing something.
-    let close = move |_| {
+    // Close after choosing something (not on opening the Views drop-down in it).
+    let close = move |ev: web_sys::MouseEvent| {
+        let target = ev.target().and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok());
+        if target.is_some_and(|t| t.closest("summary").ok().flatten().is_some()) {
+            return;
+        }
         if let Some(d) = menu.get_untracked() {
             d.set_open(false);
         }
     };
     view! {
-        <details node_ref=menu class="relative xl:hidden">
+        <details node_ref=menu data-pop=pop on:toggle=toggled class="relative xl:hidden">
             <summary class="cursor-pointer list-none rounded-md px-2 py-1 text-sm text-zinc-600 dark:text-zinc-400">
                 "☰"
                 {move || (attention.get() > 0).then(|| view! { <span class="ml-1 rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white">{attention.get()}</span> })}
@@ -309,7 +338,7 @@ fn NavLink(to: View, label: &'static str) -> impl IntoView {
 #[component]
 fn ConnBadge(connected: ReadSignal<bool>) -> impl IntoView {
     view! {
-        <span class="flex items-center gap-1.5 text-xs text-zinc-500">
+        <span class="flex items-center gap-1.5 text-xs text-muted">
             <span class=move || {
                 if connected.get() { "h-2 w-2 rounded-full bg-emerald-500" } else { "h-2 w-2 animate-pulse rounded-full bg-amber-500" }
             }></span>
@@ -332,11 +361,17 @@ fn RealmGlyph(#[prop(into)] id: String) -> impl IntoView {
 /// page loads, so the router must not handle them in the page.
 #[component]
 fn PlaceMenu() -> impl IntoView {
+    // Loaded again as things change, like the Decisions count: an update
+    // offer, say, waits in the console while you're in a realm.
+    let (live, tick) = (api::live(), decisions::ticking());
     let places = LocalResource::new(move || {
         api::realms_changed().track();
+        tick.track();
+        live.sessions.track();
         api::elsewhere()
     });
     let menu = NodeRef::<leptos::html::Details>::new();
+    let (pop, toggled) = util::details_pop(menu);
     let here = place::realm();
     let elsewhere = {
         let here = here.clone();
@@ -362,7 +397,7 @@ fn PlaceMenu() -> impl IntoView {
         }
     };
     view! {
-        <details node_ref=menu class="relative">
+        <details node_ref=menu data-pop=pop on:toggle=toggled class="relative">
             <summary class="flex cursor-pointer list-none items-center gap-1.5 rounded-md border border-zinc-300 px-2 py-0.5 text-sm dark:border-zinc-700"
                 title="Where you are: a realm, or the console">
                 {match here.clone() {
@@ -373,12 +408,12 @@ fn PlaceMenu() -> impl IntoView {
                 {move || (elsewhere() > 0).then(|| view! {
                     <span class="rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white" title="Waiting on you in other realms">{elsewhere()}</span>
                 })}
-                <span class="text-zinc-400">"▾"</span>
+                <span class="text-muted">"▾"</span>
             </summary>
             // On a phone, the width of the screen (anchored at the chip, it
             // would run off its edge).
             <div class="fixed inset-x-2 top-12 z-40 rounded-lg border border-zinc-200 bg-white p-1 text-sm shadow-lg sm:absolute sm:inset-x-auto sm:left-0 sm:top-9 sm:w-64 dark:border-zinc-700 dark:bg-zinc-900">
-                <div class="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">"Realms"</div>
+                <div class="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-muted">"Realms"</div>
                 {move || places.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|p| p.id != "root").map(|p| {
                     let current = here.as_deref() == Some(p.id.as_str());
                     view! {
@@ -387,7 +422,7 @@ fn PlaceMenu() -> impl IntoView {
                             <RealmGlyph id=p.id.clone() />
                             <span class="min-w-0 flex-1 truncate">{p.name.clone()}</span>
                             {(p.waiting > 0).then(|| view! { <span class="rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white" title="Waiting on you">{p.waiting}</span> })}
-                            {current.then(|| view! { <span class="text-zinc-400">"✓"</span> })}
+                            {current.then(|| view! { <span class="text-muted">"✓"</span> })}
                         </a>
                     }
                 }).collect_view()}
@@ -396,7 +431,7 @@ fn PlaceMenu() -> impl IntoView {
                     <span class="h-2.5 w-2.5 shrink-0 rounded-full bg-zinc-900 dark:bg-zinc-100"></span>
                     <span class="flex-1">"Console"</span>
                     {move || console_waiting(&places).map(|n| view! { <span class="rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white" title="Waiting on you: installs, grants">{n}</span> })}
-                    <span class="text-xs text-zinc-500">"realms, workers, system"</span>
+                    <span class="text-xs text-muted">"realms, workers, system"</span>
                 </a>
             </div>
         </details>
@@ -415,7 +450,7 @@ fn PlaceLinks() -> impl IntoView {
     let here = place::realm();
     view! {
         <div class="border-t border-zinc-200 pt-1 text-sm dark:border-zinc-800">
-            <div class="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">"Realms"</div>
+            <div class="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-muted">"Realms"</div>
             {move || places.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|p| p.id != "root").map(|p| {
                 let current = here.as_deref() == Some(p.id.as_str());
                 view! {
@@ -423,7 +458,7 @@ fn PlaceLinks() -> impl IntoView {
                         <RealmGlyph id=p.id.clone() />
                         <span class="min-w-0 flex-1 truncate">{p.name.clone()}</span>
                         {(p.waiting > 0).then(|| view! { <span class="rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white">{p.waiting}</span> })}
-                        {current.then(|| view! { <span class="text-zinc-400">"✓"</span> })}
+                        {current.then(|| view! { <span class="text-muted">"✓"</span> })}
                     </a>
                 }
             }).collect_view()}
@@ -446,7 +481,7 @@ fn MissingRealm() -> impl IntoView {
             <div class="fixed inset-0 z-50 flex items-center justify-center bg-zinc-50/95 p-6 dark:bg-zinc-950/95">
                 <div class="max-w-md space-y-3 rounded-xl border border-zinc-200 bg-white p-6 dark:border-zinc-800 dark:bg-zinc-900">
                     <h1 class="text-lg font-semibold">{format!("There is no realm {here:?}")}</h1>
-                    <p class="text-sm text-zinc-500">"It may have been deleted, or the address is mistyped. Go to one of yours:"</p>
+                    <p class="text-sm text-muted">"It may have been deleted, or the address is mistyped. Go to one of yours:"</p>
                     <div class="flex flex-wrap gap-2">
                         {ps.into_iter().filter(|p| p.id != "root").map(|p| view! {
                             <a class="rounded-md border border-zinc-300 px-3 py-1 text-sm hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"

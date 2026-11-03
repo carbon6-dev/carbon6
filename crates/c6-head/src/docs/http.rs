@@ -36,7 +36,9 @@ pub fn routes() -> Router<Arc<HeadState>> {
         .route("/api/v1/docs/google/accounts/{account}", axum::routing::delete(google_remove))
         .route("/api/v1/docs/{id}/threads", get(threads).post(new_thread))
         .route("/api/v1/docs/{id}/threads/{thread}/comments", post(reply))
+        .route("/api/v1/docs/{id}/threads/{thread}/comments/{comment}", axum::routing::patch(edit_comment).delete(delete_comment))
         .route("/api/v1/docs/{id}/threads/{thread}/resolve", post(resolve))
+        .route("/api/v1/docs/{id}/threads/send", post(send_threads))
 }
 
 /// The realm's (`?realm=`, through the settings middleware).
@@ -346,6 +348,39 @@ async fn reply(
 ) -> ApiResult<Json<api::docs::DocThread>> {
     let realm = realm(&st, &caller, &r).await?;
     Ok(Json(super::comments::reply(&st, &realm, &id, &thread, &c, &super::by_of(&caller)).await?))
+}
+
+async fn edit_comment(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path((id, thread, comment)): Path<(String, String, String)>,
+    Query(r): Query<api::InRealm>,
+    Json(e): Json<api::docs::CommentEdit>,
+) -> ApiResult<Json<api::docs::DocThread>> {
+    let realm = realm(&st, &caller, &r).await?;
+    Ok(Json(super::comments::edit(&st, &realm, &id, &thread, &comment, &e, &super::by_of(&caller)).await?))
+}
+
+async fn delete_comment(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path((id, thread, comment)): Path<(String, String, String)>,
+    Query(r): Query<api::InRealm>,
+) -> ApiResult<axum::http::StatusCode> {
+    let realm = realm(&st, &caller, &r).await?;
+    super::comments::delete(&st, &realm, &id, &thread, &comment, &super::by_of(&caller)).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+async fn send_threads(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Query(r): Query<api::InRealm>,
+    Json(s): Json<api::docs::ThreadsSend>,
+) -> ApiResult<Json<Vec<api::docs::DocThread>>> {
+    let realm = realm(&st, &caller, &r).await?;
+    Ok(Json(super::comments::send_many(&st, &realm, &id, &s.threads, &super::by_of(&caller)).await?))
 }
 
 async fn resolve(

@@ -108,7 +108,7 @@ pub fn WorkInSession(
         <span class="inline-flex flex-wrap items-center gap-2 text-xs">
             {move || match title() {
                 Some((id, t)) => view! {
-                    <span class="text-zinc-500">"Session: "</span>
+                    <span class="text-muted">"Session: "</span>
                     <Go to=View::session(id) class="max-w-56 truncate text-sky-700 hover:underline dark:text-sky-400">{t}</Go>
                     <button type="button" class=format!("{BUTTON_QUIET} text-xs") disabled=move || busy.get() on:click=start title="Another session on it">"New session"</button>
                 }.into_any(),

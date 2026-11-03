@@ -29,10 +29,6 @@ fn outputs(events: &[Event]) -> Vec<(String, Vec<Version>)> {
     out
 }
 
-pub fn count(events: &[Event]) -> usize {
-    outputs(events).len()
-}
-
 fn url(session: &str, seq: u64) -> String {
     crate::api::url(&format!("/api/v1/sessions/{session}/outputs/{seq}"))
 }
@@ -45,13 +41,22 @@ fn size(n: u64) -> String {
     }
 }
 
-/// The Outputs tab.
+/// What kind of file an output is, in a word: its extension (else its
+/// type's).
+fn kind(name: &str, mime: &str) -> String {
+    match name.rsplit_once('.') {
+        Some((_, ext)) if !ext.is_empty() && ext.len() <= 5 => ext.to_uppercase(),
+        _ => mime.rsplit('/').next().unwrap_or(mime).to_owned(),
+    }
+}
+
+/// A session's Outputs pane. `chosen`: the output shown (by name; the
+/// newest when `None`), as its glance picked it.
 #[component]
-pub fn Outputs(session: String, events: RwSignal<Vec<Event>>) -> impl IntoView {
+pub fn Outputs(session: String, events: RwSignal<Vec<Event>>, chosen: RwSignal<Option<String>>) -> impl IntoView {
     let session = StoredValue::new(session);
     let list = Memo::new(move |_| events.with(|e| outputs(e)));
     // The chosen output (by name) and version (by seq); default the newest.
-    let chosen = RwSignal::new(None::<String>);
     let version = RwSignal::new(None::<u64>);
     let current = Memo::new(move |_| {
         let l = list.get();
@@ -66,7 +71,7 @@ pub fn Outputs(session: String, events: RwSignal<Vec<Event>>) -> impl IntoView {
                 {move || {
                     let l = list.get();
                     if l.is_empty() {
-                        return view! { <p class="text-sm text-zinc-500">"Nothing published yet. Deliverables the agent publishes (reports, decks, charts, documents) appear here."</p> }.into_any();
+                        return view! { <p class="text-sm text-muted">"Nothing published yet. Deliverables the agent publishes (reports, decks, charts, documents) appear here."</p> }.into_any();
                     }
                     l.into_iter().rev().map(|(name, vs)| {
                         let latest = vs.last().cloned().expect("a version");
@@ -77,7 +82,7 @@ pub fn Outputs(session: String, events: RwSignal<Vec<Event>>) -> impl IntoView {
                             <button class=move || format!("block w-full rounded-md px-2 py-1.5 text-left text-sm {}", if active() { "bg-zinc-200 dark:bg-zinc-800" } else { "hover:bg-zinc-100 dark:hover:bg-zinc-900" })
                                 on:click=move |_| { chosen.set(Some(pick.clone())); version.set(None); }>
                                 <div class="truncate font-medium">{latest.title.clone()}</div>
-                                <div class="truncate font-mono text-[11px] text-zinc-500">{format!("{name} · v{} · {}", vs.len(), size(latest.size))}</div>
+                                <div class="truncate font-mono text-[11px] text-muted">{format!("{name} · v{} · {}", vs.len(), size(latest.size))}</div>
                             </button>
                         }
                     }).collect_view().into_any()
@@ -89,7 +94,7 @@ pub fn Outputs(session: String, events: RwSignal<Vec<Event>>) -> impl IntoView {
                 view! {
                     <div class="min-w-0 space-y-2">
                         <div class="flex flex-wrap items-center gap-2">
-                            <h3 class="min-w-0 flex-1 truncate font-medium">{v.title.clone()}<span class="ml-2 font-mono text-xs text-zinc-500">{name.clone()}</span></h3>
+                            <h3 class="min-w-0 flex-1 truncate font-medium">{v.title.clone()}<span class="ml-2 font-mono text-xs text-muted">{name.clone()}</span></h3>
                             {(n > 1).then(|| view! {
                                 <select class="rounded-md border border-zinc-300 bg-white px-1 py-0.5 text-xs dark:border-zinc-700 dark:bg-zinc-900"
                                     prop:value=v.seq.to_string() on:change=move |ev| version.set(event_target_value(&ev).parse().ok())>
@@ -104,6 +109,39 @@ pub fn Outputs(session: String, events: RwSignal<Vec<Event>>) -> impl IntoView {
                 }
             })}
         </div>
+    }
+}
+
+/// The newest three outputs, a line each, for the session's glance:
+/// `on_pick` with an output's name, or `None` for all of them (the Outputs
+/// pane). Nothing when it has published nothing.
+#[component]
+pub fn Recent(events: RwSignal<Vec<Event>>, #[prop(into)] on_pick: Callback<Option<String>>) -> impl IntoView {
+    let list = Memo::new(move |_| {
+        let mut l = events.with(|e| outputs(e));
+        // Newest published (or republished) first.
+        l.sort_by_key(|(_, vs)| std::cmp::Reverse(vs.last().map_or(0, |v| v.seq)));
+        l
+    });
+    move || {
+        let l = list.get();
+        let n = l.len();
+        view! {
+            {l.into_iter().take(3).map(|(name, vs)| {
+                let latest = vs.last().cloned().expect("a version");
+                let pick = name.clone();
+                view! {
+                    <button class="flex w-full min-w-0 items-baseline gap-2 rounded px-1.5 py-1.5 text-left text-xs leading-snug hover:bg-zinc-100 dark:hover:bg-zinc-800" title=name.clone()
+                        on:click=move |_| on_pick.run(Some(pick.clone()))>
+                        <span class="line-clamp-2 min-w-0 flex-1 [overflow-wrap:anywhere]">{latest.title.clone()}</span>
+                        <span class="shrink-0 text-[11px] text-muted">{format!("{} · {}", kind(&name, &latest.mime), size(latest.size))}</span>
+                    </button>
+                }
+            }).collect_view()}
+            {(n > 3).then(|| view! {
+                <button class="px-1.5 text-[11px] text-muted hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" on:click=move |_| on_pick.run(None)>{format!("All {n}")}</button>
+            })}
+        }
     }
 }
 
@@ -126,14 +164,14 @@ fn Preview(url: String, mime: String) -> impl IntoView {
         let markdown = mime == "text/markdown";
         view! {
             {move || text.get().map(|r| match r {
-                Ok(t) if markdown => view! { <div class="md max-h-[70vh] overflow-auto rounded-md border border-zinc-200 p-4 dark:border-zinc-800" inner_html=crate::markdown::to_html(&t)></div> }.into_any(),
+                Ok(t) if markdown => view! { <div class="md max-h-[70vh] overflow-auto rounded-md border border-zinc-200 p-4 dark:border-zinc-800" on:click=crate::mentions::link_clicks() inner_html=crate::markdown::to_html(&t)></div> }.into_any(),
                 Ok(t) => view! { <pre class="max-h-[70vh] overflow-auto rounded-md border border-zinc-200 p-3 font-mono text-xs dark:border-zinc-800">{t}</pre> }.into_any(),
                 Err(e) => view! { <p class="text-sm text-red-600">{e}</p> }.into_any(),
             })}
         }
         .into_any()
     } else {
-        view! { <p class="rounded-md border border-dashed border-zinc-300 p-6 text-center text-sm text-zinc-500 dark:border-zinc-700">"No preview for this kind of file: download it."</p> }.into_any()
+        view! { <p class="rounded-md border border-dashed border-zinc-300 p-6 text-center text-sm text-muted dark:border-zinc-700">"No preview for this kind of file: download it."</p> }.into_any()
     }
 }
 
@@ -143,13 +181,13 @@ pub fn published_line(session: &str, seq: u64, name: &str, title: &str, mime: &s
     let image = mime.starts_with("image/");
     view! {
         <div class="space-y-1">
-            <p class="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
+            <p class="flex flex-wrap items-center gap-2 text-xs text-muted">
                 <span>"📦"</span>
                 <span>"Published"</span>
                 <span class="font-medium text-zinc-700 dark:text-zinc-300">{title.to_owned()}</span>
                 <span class="font-mono">{format!("{name} · {}", size(size_bytes))}</span>
                 <a class="underline" href=u.clone() target="_blank" rel="noopener">"open"</a>
-                <span>"· see Outputs"</span>
+                <span>"· see Outputs (⋯)"</span>
             </p>
             {image.then(|| view! {
                 <a href=u.clone() target="_blank" rel="noopener" title="Open full size">

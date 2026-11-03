@@ -5,6 +5,23 @@
    your choice in Settings → Appearance). */
 @custom-variant dark (&:where(.dark, .dark *));
 
+/* Grey text that reads on either theme: text-muted for secondary text
+   (zinc-500 on white, zinc-400 on the dark greys), text-soft a step
+   stronger (zinc-600 / zinc-300). Bare zinc-500 on zinc-900 is about
+   3.7:1, below AA's 4.5:1. */
+:root {
+  --c6-muted: var(--color-zinc-500);
+  --c6-soft: var(--color-zinc-600);
+}
+.dark {
+  --c6-muted: var(--color-zinc-400);
+  --c6-soft: var(--color-zinc-300);
+}
+@theme inline {
+  --color-muted: var(--c6-muted);
+  --color-soft: var(--c6-soft);
+}
+
 /* The desktop layout (tiles side by side, the header's nav, the sidebar)
    needs height as well as width: a phone on its side is wide but short,
    so it keeps the phone's layout (one tile, the bottom bar, the ☰ menu).
@@ -12,6 +29,16 @@
 @custom-variant md (@media (width >= 48rem) and (height >= 32rem));
 @custom-variant lg (@media (width >= 64rem) and (height >= 32rem));
 @custom-variant xl (@media (width >= 80rem) and (height >= 32rem));
+
+/* Dark mode's three background greys, page, panels and chips, a step
+   softer than Tailwind's zinc-950/900/800 (the near-black read as too
+   dark); text and accents are unchanged and keep 4.5:1 or more on them.
+   Unlayered, so they win over the theme's own values. */
+html.dark {
+  --color-zinc-950: #141417;
+  --color-zinc-900: #1c1c20;
+  --color-zinc-800: #2a2a2f;
+}
 
 /* Phones: iOS zooms into fields with text under 16px when they get
    focus, which throws the layout off; give them 16px there. */
@@ -35,9 +62,34 @@
   .md pre { @apply overflow-x-auto rounded-md bg-zinc-100 p-3 dark:bg-zinc-900; }
   .md pre code { @apply bg-transparent p-0; }
   .md blockquote { @apply border-l-2 border-zinc-300 pl-3 text-zinc-600 dark:border-zinc-700 dark:text-zinc-400; }
-  /* A wide table scrolls within itself, not the whole transcript. */
-  .md table { @apply block max-w-full overflow-x-auto border-collapse text-xs; }
+  /* A wide table scrolls within itself, not the whole transcript. Its
+     words don't break: wrapping anywhere would let a narrow screen squeeze
+     a column to a letter or two rather than widen the table. */
+  .md table { @apply block max-w-full overflow-x-auto border-collapse text-xs; overflow-wrap: normal; }
   .md th, .md td { @apply border border-zinc-300 px-2 py-1 dark:border-zinc-700; }
+  .md th { @apply whitespace-nowrap; }
+}
+
+/* A carbon6 thing named in Markdown (markdown.rs, mentions.rs): its mark
+   and title on a faint tint of its colour (--m), the text a shade of it
+   that reads on the page. No underline (web links keep theirs). */
+.c6-mention {
+  padding: 0 0.3em;
+  border-radius: 0.3em;
+  background: color-mix(in srgb, var(--m) 16%, transparent);
+  color: color-mix(in srgb, var(--m) 62%, black);
+  text-decoration: none;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+  -webkit-touch-callout: none;
+}
+.dark .c6-mention { color: color-mix(in srgb, var(--m) 45%, white); }
+.c6-mention:hover { background: color-mix(in srgb, var(--m) 26%, transparent); }
+.c6-mention-dot { display: inline-block; margin-right: 0.3em; vertical-align: 0.02em; }
+.c6-mention-doc { margin-right: 0.25em; font-size: 0.9em; opacity: 0.8; }
+/* A long press shows its card, not a text selection. */
+@media (hover: none) {
+  .c6-mention { -webkit-user-select: none; user-select: none; }
 }
 
 /* Search: every match on the page, the current one stronger, and a flash
@@ -58,6 +110,11 @@
   border-radius: 0.5rem;
   animation: c6-flash 2.5s ease-out;
 }
+
+/* A folded turn's row in a transcript (timeline.rs): folded turns one
+   after another sit close, a list of rows rather than the transcript's
+   gaps between messages. */
+.c6-fold:has(+ .c6-fold) { margin-block-end: 0.25rem; }
 
 /* What arrives in a running session's transcript: a short fade up, so
    new tool calls and messages settle in rather than pop. */

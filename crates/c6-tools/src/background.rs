@@ -79,6 +79,12 @@ pub struct TaskEvent {
     pub output: String,
     /// A shell task's process group.
     pub pgid: Option<i32>,
+    /// A Claude Code task's kind as the CLI names it (`local_bash`,
+    /// `local_agent`, ...); empty for carbon6's own.
+    pub native_type: String,
+    /// That Claude Code task holds its turn (a foreground command or
+    /// subagent, until the CLI moves it to the background).
+    pub foreground: bool,
 }
 
 pub type TaskSink = tokio::sync::mpsc::UnboundedSender<TaskEvent>;
@@ -225,6 +231,9 @@ struct NativeTask {
     task_id: String,
     /// You asked the CLI to stop it.
     stop_asked: bool,
+    /// The CLI's `task_type`, and whether it holds the turn.
+    native_type: String,
+    foreground: bool,
     description: String,
     started: Instant,
     elapsed: Option<Duration>,
@@ -256,6 +265,8 @@ fn emit(sink: &Mutex<Option<TaskSink>>, secrets: &crate::Secrets, id: &str, p: &
         elapsed: p.started.elapsed(),
         output,
         pgid: p.pgid.map(|g| g.as_raw()),
+        native_type: String::new(),
+        foreground: false,
     });
 }
 
@@ -290,6 +301,53 @@ impl Background {
         elapsed: Option<Duration>,
         state: TaskState,
     ) -> String {
+        self.observe(scope, task_id, run_id, description, summary, elapsed, state, None)
+    }
+
+    /// A running native task the CLI moved to the background (it held the
+    /// turn until now): reported again as started, no longer in the
+    /// foreground. False: no such running task in the foreground.
+    pub fn background_native(&self, scope: &str, task_id: &str, run_id: Option<&str>) -> bool {
+        let mut native = self.native.lock().unwrap();
+        let id = match run_id {
+            Some(run) => format!("claude:{}", json!([scope, task_id, "run", run])),
+            None => match native.latest.get(&(scope.to_owned(), task_id.to_owned())) {
+                Some(id) => id.clone(),
+                None => return false,
+            },
+        };
+        let Some(task) = native.tasks.get_mut(&id).filter(|t| t.state == TaskState::Started && t.foreground) else { return false };
+        task.foreground = false;
+        if let Some(tx) = self.sink.lock().unwrap().clone() {
+            let _ = tx.send(TaskEvent {
+                id,
+                kind: TaskKind::ClaudeCode,
+                description: self.secrets.redact(&task.description),
+                state: TaskState::Started,
+                notify: false,
+                exit_code: None,
+                elapsed: task.started.elapsed(),
+                output: String::new(),
+                pgid: None,
+                native_type: task.native_type.clone(),
+                foreground: false,
+            });
+        }
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn observe(
+        &self,
+        scope: &str,
+        task_id: &str,
+        run_id: Option<&str>,
+        description: Option<&str>,
+        summary: Option<&str>,
+        elapsed: Option<Duration>,
+        state: TaskState,
+        kind: Option<(&str, bool)>,
+    ) -> String {
         let mut native = self.native.lock().unwrap();
         let key = (scope.to_owned(), task_id.to_owned());
         // JSON array encoding is injective even if upstream ids contain our
@@ -310,6 +368,8 @@ impl Background {
             scope: scope.to_owned(),
             task_id: task_id.to_owned(),
             stop_asked: false,
+            native_type: String::new(),
+            foreground: false,
             description: String::new(),
             started: Instant::now(),
             elapsed: None,
@@ -319,6 +379,10 @@ impl Background {
         });
         if let Some(description) = description {
             task.description = description.to_owned();
+        }
+        if let Some((native_type, foreground)) = kind {
+            task.native_type = native_type.to_owned();
+            task.foreground = foreground;
         }
         if let Some(summary) = summary {
             // Each upstream summary replaces the previous one, rather than
@@ -353,6 +417,8 @@ impl Background {
                     crate::util::truncate_middle(&self.secrets.redact(&String::from_utf8_lossy(&task.summary.data)), TAIL_BYTES).0
                 },
                 pgid: None,
+                native_type: task.native_type.clone(),
+                foreground: task.foreground,
             };
             if is_new {
                 let _ = tx.send(event(TaskState::Started));
@@ -394,6 +460,8 @@ impl Background {
                     elapsed,
                     output: "Claude Code exited without a task completion notification; numeric exit status unavailable.".into(),
                     pgid: None,
+                    native_type: task.native_type.clone(),
+                    foreground: task.foreground,
                 });
             }
         }
@@ -485,7 +553,17 @@ impl Background {
     /// A new legacy start after completion is a new run, even when old CLIs
     /// do not supply run_id. Progress/notifications without run_id still map
     /// to the last observed run, including across carbon6 turns.
-    pub fn start_native(&self, scope: &str, task_id: &str, run_id: Option<&str>, description: &str) -> String {
+    /// `native_type` is the CLI's `task_type`; `foreground`: it holds the
+    /// turn (`is_backgrounded: false`).
+    pub fn start_native(
+        &self,
+        scope: &str,
+        task_id: &str,
+        run_id: Option<&str>,
+        description: &str,
+        native_type: &str,
+        foreground: bool,
+    ) -> String {
         if run_id.is_none() {
             let mut native = self.native.lock().unwrap();
             let key = (scope.to_owned(), task_id.to_owned());
@@ -493,7 +571,7 @@ impl Background {
                 native.latest.remove(&key);
             }
         }
-        let id = self.observe_native(scope, task_id, run_id, Some(description), None, None, TaskState::Started);
+        let id = self.observe(scope, task_id, run_id, Some(description), None, None, TaskState::Started, Some((native_type, foreground)));
         self.native.lock().unwrap().latest.insert((scope.to_owned(), task_id.to_owned()), id.clone());
         id
     }
@@ -647,6 +725,8 @@ impl Background {
             elapsed: p.started.elapsed(),
             output: crate::util::truncate_middle(&self.secrets.redact(&text), crate::MAX_OUTPUT_CHARS).0,
             pgid: None,
+            native_type: String::new(),
+            foreground: false,
         });
     }
 
@@ -905,7 +985,7 @@ mod tests {
         let bg = Background::with_secrets(secrets, None);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         bg.set_sink(Some(tx));
-        let id = bg.start_native("conversation", "bg1", Some("001"), "check private-value");
+        let id = bg.start_native("conversation", "bg1", Some("001"), "check private-value", "local_bash", false);
         let started = rx.try_recv().unwrap();
         assert_eq!(
             (started.kind, started.state, started.notify, started.exit_code),
@@ -948,9 +1028,9 @@ mod tests {
     #[test]
     fn native_ids_survive_turns_and_distinguish_runs_scopes_and_legacy_restarts() {
         let bg = Background::default();
-        let old = bg.start_native("session", "task", Some("zzz"), "first");
+        let old = bg.start_native("session", "task", Some("zzz"), "first", "local_bash", false);
         bg.observe_native("session", "task", Some("zzz"), None, None, None, TaskState::Finished);
-        let current = bg.start_native("session", "task", Some("aaa"), "resumed");
+        let current = bg.start_native("session", "task", Some("aaa"), "resumed", "local_bash", false);
         assert_ne!(old, current);
         // A delayed progress event from the old run does not revive it or
         // change the target of a run-id-less notification in a later turn.
@@ -958,16 +1038,19 @@ mod tests {
         assert!(!bg.snapshot(&old).unwrap().running);
         assert_eq!(bg.observe_native("session", "task", None, None, None, None, TaskState::Stopped), current);
         assert!(!bg.snapshot(&current).unwrap().running);
-        assert_ne!(bg.start_native("other", "task", Some("002"), "other session"), current);
-        let legacy = bg.start_native("session", "legacy", None, "legacy");
-        assert_eq!(bg.start_native("session", "legacy", None, "replayed"), legacy);
+        assert_ne!(bg.start_native("other", "task", Some("002"), "other session", "local_bash", false), current);
+        let legacy = bg.start_native("session", "legacy", None, "legacy", "local_bash", false);
+        assert_eq!(bg.start_native("session", "legacy", None, "replayed", "local_bash", false), legacy);
         bg.close_native("session", TaskState::Lost);
         let lost = bg.snapshot(&legacy).unwrap();
         assert!(!lost.running);
         assert_eq!(lost.exit_code, None);
         assert!(lost.stderr.note.contains("Lost"));
-        assert_ne!(bg.start_native("session", "legacy", None, "new legacy run"), legacy);
-        assert_ne!(bg.start_native("a:b", "c", Some("d"), ""), bg.start_native("a", "b:c", Some("d"), ""));
+        assert_ne!(bg.start_native("session", "legacy", None, "new legacy run", "local_bash", false), legacy);
+        assert_ne!(
+            bg.start_native("a:b", "c", Some("d"), "", "local_bash", false),
+            bg.start_native("a", "b:c", Some("d"), "", "local_bash", false)
+        );
     }
 
     #[test]
@@ -979,7 +1062,7 @@ mod tests {
         let bg = Background::with_secrets(secrets, None);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         bg.set_sink(Some(tx));
-        let id = bg.start_native("s", "t", None, "native");
+        let id = bg.start_native("s", "t", None, "native", "local_bash", false);
         let text = format!("private-value{}", "x".repeat(KEEP_BYTES - 5));
         bg.observe_native("s", "t", None, None, Some(&text), None, TaskState::Started);
         let snap = bg.snapshot(&id).unwrap();
@@ -1008,7 +1091,7 @@ mod tests {
         let secrets = crate::Secrets::default();
         secrets.0.lock().unwrap().push(("TOKEN".into(), "private-value".into()));
         let bg = Background::with_secrets(secrets, None);
-        let id = bg.start_native("s", "task", None, "command");
+        let id = bg.start_native("s", "task", None, "command", "local_bash", false);
         let output = tasks.join("task.output");
         std::fs::write(&output, format!("{}private-value\nreal combined output", "x".repeat(KEEP_BYTES + 100))).unwrap();
         bg.capture_native_output(&id, &root, &output, "task");
@@ -1204,7 +1287,7 @@ mod tests {
         let bg = Background::default();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         bg.set_sink(Some(tx));
-        let id = bg.start_native("s", "t1", Some("r1"), "Build");
+        let id = bg.start_native("s", "t1", Some("r1"), "Build", "local_bash", false);
         assert_eq!(rx.try_recv().unwrap().state, TaskState::Started);
         assert_eq!(bg.native_stop(&id).as_deref(), Some("t1"), "the CLI's own id, to ask it");
         bg.observe_native("s", "t1", Some("r1"), None, Some("Stopped"), None, TaskState::Stopped);

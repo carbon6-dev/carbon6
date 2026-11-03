@@ -114,6 +114,7 @@ async fn a_background_carbon6_subagent_reports_to_claude_code() {
     let notices = std::fs::read_to_string(project.path().join("notices.txt")).unwrap();
     let notice: Value = serde_json::from_str(notices.lines().next().unwrap()).unwrap();
     let text = notice["message"]["content"].as_str().unwrap();
+    assert!(notice.get("origin").is_none(), "a notice is not a person's message: {notice}");
     assert!(text.contains("<background-task") && text.contains("api says hi"), "{text}");
     assert_eq!(std::fs::read_to_string(project.path().join("spawns.txt")).unwrap().lines().count(), 1, "one process");
     let woke = events.iter().find_map(|e| match &e.kind {

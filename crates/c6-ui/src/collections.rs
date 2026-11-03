@@ -31,7 +31,7 @@ fn CollectionList() -> impl IntoView {
         <main class="mx-auto max-w-3xl space-y-4 px-4 py-6">
             <div class="flex flex-wrap items-center gap-2">
                 <h1 class="text-lg font-semibold">"Collections"</h1>
-                <span class="flex-1 text-sm text-zinc-500">"Typed tables of records that apps and agents keep in your realm. Every record matches its collection's schema, and every change is kept."</span>
+                <span class="flex-1 text-sm text-muted">"Typed tables of records that apps and agents keep in your realm. Every record matches its collection's schema, and every change is kept."</span>
                 <button class=BUTTON on:click=move |_| creating.update(|c| *c = !*c)>"New collection"</button>
             </div>
             {move || creating.get().then(|| view! { <NewCollection done=Callback::new(move |()| { creating.set(false); tick.update(|t| *t += 1); }) /> })}
@@ -40,12 +40,12 @@ fn CollectionList() -> impl IntoView {
                 Ok(cs) => {
                     let (system, mine): (Vec<Collection>, Vec<Collection>) = cs.into_iter().partition(|c| c.system);
                     view! {
-                        {mine.is_empty().then(|| view! { <p class="text-sm text-zinc-500">"No collections yet. Agents create them with the records tools, apps bring their own, or make one here."</p> })}
+                        {mine.is_empty().then(|| view! { <p class="text-sm text-muted">"No collections yet. Agents create them with the records tools, apps bring their own, or make one here."</p> })}
                         {mine.into_iter().map(card).collect_view()}
                         <SeriesList />
                         {(!system.is_empty()).then(|| view! {
                             <details class="pt-2">
-                                <summary class="cursor-pointer select-none text-sm text-zinc-500">{format!("carbon6's own configuration ({})", system.len())}</summary>
+                                <summary class="cursor-pointer select-none text-sm text-muted">{format!("carbon6's own configuration ({})", system.len())}</summary>
                                 <div class="mt-2 space-y-2">{system.into_iter().map(card).collect_view()}</div>
                             </details>
                         })}
@@ -91,7 +91,7 @@ fn SeriesList() -> impl IntoView {
     view! {
         <section class="space-y-2 pt-4">
             <h2 class="font-medium">"Series"</h2>
-            <p class="text-sm text-zinc-500">"Numbers over time: points recorded by triggers, agents (series_record) or the API, with dimensions such as service. Triggers watch them for thresholds. Model usage is here too, computed from the usage ledger."</p>
+            <p class="text-sm text-muted">"Numbers over time: points recorded by triggers, agents (series_record) or the API, with dimensions such as service. Triggers watch them for thresholds. Model usage is here too, computed from the usage ledger."</p>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             {move || list.get().map(|r| match r {
                 Err(e) => view! { <ErrorBox message=e /> }.into_any(),
@@ -113,9 +113,9 @@ fn SeriesList() -> impl IntoView {
                     view! {
                         <div class="flex flex-wrap items-center gap-2 rounded-md border border-zinc-200 px-3 py-2 text-sm dark:border-zinc-800">
                             <span class="font-mono font-medium">{s.name.clone()}</span>
-                            <span class="text-xs text-zinc-500">{s.unit.clone()}</span>
-                            {(!s.dimensions.is_empty()).then(|| view! { <span class="text-xs text-zinc-500">{format!("by {}", s.dimensions.join(", "))}</span> })}
-                            <span class="min-w-0 flex-1 truncate text-xs text-zinc-500">{s.description.clone()}</span>
+                            <span class="text-xs text-muted">{s.unit.clone()}</span>
+                            {(!s.dimensions.is_empty()).then(|| view! { <span class="text-xs text-muted">{format!("by {}", s.dimensions.join(", "))}</span> })}
+                            <span class="min-w-0 flex-1 truncate text-xs text-muted">{s.description.clone()}</span>
                             <span class="text-xs">{move || totals.get().map(|(d, w)| format!("sum 24h {} · 7d {} {unit}", fmt(d), fmt(w)))}</span>
                             {(!s.system).then(|| view! {
                                 <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| {
@@ -149,10 +149,10 @@ fn card(c: Collection) -> impl IntoView {
                     <Go to=View::Collections { name: c.name.clone() } class="block rounded-md border border-zinc-200 px-4 py-3 hover:bg-zinc-50 dark:border-zinc-800 dark:hover:bg-zinc-900">
                         <div class="flex items-baseline gap-2">
                             <span class="font-medium">{c.name.clone()}</span>
-                            <span class="text-xs text-zinc-500">{format!("{} record{}", c.records, if c.records == 1 { "" } else { "s" })}</span>
+                            <span class="text-xs text-muted">{format!("{} record{}", c.records, if c.records == 1 { "" } else { "s" })}</span>
                             {c.system.then(|| view! { <span class="rounded bg-zinc-100 px-1 text-xs text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400">"carbon6's own"</span> })}
                         </div>
-                        <div class="text-sm text-zinc-500">{c.description.clone()}</div>
+                        <div class="text-sm text-muted">{c.description.clone()}</div>
                     </Go>
     }
 }
@@ -193,7 +193,7 @@ fn NewCollection(done: Callback<()>) -> impl IntoView {
         <section class="space-y-2 rounded-md border border-zinc-200 p-4 dark:border-zinc-800">
             <input class=INPUT placeholder="Name: letters, digits, - and _" prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev)) />
             <input class=INPUT placeholder="What it holds" prop:value=move || description.get() on:input=move |ev| description.set(event_target_value(&ev)) />
-            <label class="block text-xs text-zinc-500">"Schema (JSON Schema for one record; fields it does not name are rejected)"</label>
+            <label class="block text-xs text-muted">"Schema (JSON Schema for one record; fields it does not name are rejected)"</label>
             <textarea class=format!("{INPUT} h-48 font-mono text-xs") prop:value=move || schema.get() on:input=move |ev| schema.set(event_target_value(&ev))></textarea>
             <input class=INPUT placeholder="Unique fields, comma-separated (optional)" prop:value=move || keys.get() on:input=move |ev| keys.set(event_target_value(&ev)) />
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
@@ -261,12 +261,12 @@ fn CollectionView(name: String) -> impl IntoView {
                         <div class="flex flex-wrap items-center gap-2">
                             <Go to=View::Collections { name: String::new() } class=format!("{BUTTON_QUIET} text-sm")>"← Collections"</Go>
                             <h1 class="text-lg font-semibold">{c.with_value(|c| c.name.clone())}</h1>
-                            <span class="flex-1 text-sm text-zinc-500">{c.with_value(|c| c.description.clone())}</span>
+                            <span class="flex-1 text-sm text-muted">{c.with_value(|c| c.description.clone())}</span>
                             <input class=format!("{INPUT} w-48 py-1 text-sm") placeholder="Search" prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev)) />
                             {c.with_value(|c| !c.system && c.owner.is_empty()).then(|| view! { <button class=BUTTON on:click=move |_| editing.set(Some(None))>"Add a record"</button> })}
-                            {c.with_value(|c| c.system).then(|| view! { <span class="text-xs text-zinc-500">"carbon6's own: change it under Settings"</span> })}
+                            {c.with_value(|c| c.system).then(|| view! { <span class="text-xs text-muted">"carbon6's own: change it under Settings"</span> })}
                             {c.with_value(|c| (!c.owner.is_empty()).then(|| c.owner.clone())).map(|o| view! {
-                                <span class="text-xs text-zinc-500" title="docs/apps.md §6: an app's data is read by anything in the realm and written only by the app">
+                                <span class="text-xs text-muted" title="docs/apps.md §6: an app's data is read by anything in the realm and written only by the app">
                                     {format!("The app {o}'s: written through its operations")}
                                 </span>
                             })}
@@ -294,11 +294,11 @@ fn CollectionView(name: String) -> impl IntoView {
                         {c.with_value(|c| !c.owner.is_empty()).then(|| view! { <Operations collection=c.get_value() picked calling refresh /> })}
                         {move || page.get().map(|p| match p {
                             Err(e) => view! { <ErrorBox message=e /> }.into_any(),
-                            Ok(p) if p.records.is_empty() => view! { <p class="text-sm text-zinc-500">"No records."</p> }.into_any(),
+                            Ok(p) if p.records.is_empty() => view! { <p class="text-sm text-muted">"No records."</p> }.into_any(),
                             Ok(p) => view! {
                                 <div class="overflow-x-auto rounded-md border border-zinc-200 dark:border-zinc-800">
                                     <table class="w-full text-left text-sm">
-                                        <thead class="bg-zinc-50 text-xs text-zinc-500 dark:bg-zinc-900">
+                                        <thead class="bg-zinc-50 text-xs text-muted dark:bg-zinc-900">
                                             <tr>
                                                 {columns.get_value().into_iter().map(|col| view! { <th class="px-3 py-2 font-medium">{col}</th> }).collect_view()}
                                                 <th class="px-3 py-2 font-medium">"Changed"</th>
@@ -317,14 +317,14 @@ fn CollectionView(name: String) -> impl IntoView {
                                                             }
                                                         }>
                                                         {columns.get_value().into_iter().map(|col| view! { <td class="max-w-xs truncate px-3 py-1.5">{cell_view(r.fields.get(&col))}</td> }).collect_view()}
-                                                        <td class="whitespace-nowrap px-3 py-1.5 text-xs text-zinc-500">{format!("{} · {}", ago(now_ms() - r.updated_at), r.updated_by)}</td>
+                                                        <td class="whitespace-nowrap px-3 py-1.5 text-xs text-muted">{format!("{} · {}", ago(now_ms() - r.updated_at), r.updated_by)}</td>
                                                     </tr>
                                                 }
                                             }).collect_view()}
                                         </tbody>
                                     </table>
                                 </div>
-                                <p class="text-xs text-zinc-500">{format!("{} record{}", p.total, if p.total == 1 { "" } else { "s" })}</p>
+                                <p class="text-xs text-muted">{format!("{} record{}", p.total, if p.total == 1 { "" } else { "s" })}</p>
                             }.into_any(),
                         })}
                     }.into_any()
@@ -433,7 +433,7 @@ fn Operations(
     });
     view! {
         <div class="flex flex-wrap items-center gap-2 text-sm">
-            <span class="text-xs text-zinc-500">{move || match picked.get() {
+            <span class="text-xs text-muted">{move || match picked.get() {
                 Some(r) => format!("Record {} · ", &r.id[r.id.len().saturating_sub(6)..]),
                 None => "Pick a record, or ".to_owned(),
             }}</span>
@@ -500,7 +500,7 @@ fn OperationForm(collection: Collection, op: c6_api::Operation, record: Option<R
     view! {
         <section class="space-y-3 rounded-md border border-zinc-200 p-4 dark:border-zinc-800">
             <div class="text-sm font-medium">{format!("{}.{}", collection.owner, op.name)}</div>
-            {(!op.description.is_empty()).then(|| view! { <p class="text-xs text-zinc-500">{op.description.clone()}</p> })}
+            {(!op.description.is_empty()).then(|| view! { <p class="text-xs text-muted">{op.description.clone()}</p> })}
             {fields.get_value().into_iter().map(|(k, e, help, v)| {
                 let label = format!("{k}{}", if required.contains(&k) { " *" } else { "" });
                 let input = match e {
@@ -520,7 +520,7 @@ fn OperationForm(collection: Collection, op: c6_api::Operation, record: Option<R
                 };
                 view! {
                     <label class="block space-y-1">
-                        <span class="text-xs text-zinc-500">{label}{(!help.is_empty()).then(|| format!(" · {help}"))}</span>
+                        <span class="text-xs text-muted">{label}{(!help.is_empty()).then(|| format!(" · {help}"))}</span>
                         {input}
                     </label>
                 }
@@ -706,7 +706,7 @@ fn RecordForm(collection: Collection, record: Option<Record>, done: Callback<()>
                 };
                 view! {
                     <label class="block space-y-1">
-                        <span class="text-xs text-zinc-500">{label}{(!help.is_empty()).then(|| format!(" · {help}"))}</span>
+                        <span class="text-xs text-muted">{label}{(!help.is_empty()).then(|| format!(" · {help}"))}</span>
                         {input}
                     </label>
                 }
@@ -725,7 +725,7 @@ fn RecordForm(collection: Collection, record: Option<Record>, done: Callback<()>
                 <ol class="space-y-1 text-xs">
                     {h.into_iter().rev().map(|c| view! {
                         <li class="rounded bg-zinc-50 p-2 dark:bg-zinc-900">
-                            <div class="text-zinc-500">{format!("v{} · {} · {} · {}", c.version, c.op, c.changed_by, ago(now_ms() - c.changed_at))}</div>
+                            <div class="text-muted">{format!("v{} · {} · {} · {}", c.version, c.op, c.changed_by, ago(now_ms() - c.changed_at))}</div>
                             <pre class="whitespace-pre-wrap font-mono">{serde_json::to_string(&c.fields).unwrap_or_default()}</pre>
                         </li>
                     }).collect_view()}

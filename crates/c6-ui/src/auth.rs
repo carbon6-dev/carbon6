@@ -78,19 +78,19 @@ pub fn SignIn(status: c6_api::AuthStatus) -> impl IntoView {
                 view! {
                     <button class=format!("{BUTTON} w-full py-2") prop:disabled=move || busy.get() on:click=go>"Sign in with a passkey"</button>
                     {(!status.has_passkeys).then(|| view! {
-                        <p class="text-sm text-zinc-500">"No passkey is registered for this address yet: sign in with a login link first, then add one under Settings."</p>
+                        <p class="text-sm text-muted">"No passkey is registered for this address yet: sign in with a login link first, then add one under Settings."</p>
                     })}
                 }.into_any()
             } else {
                 view! {
-                    <p class="text-sm text-zinc-500">
+                    <p class="text-sm text-muted">
                         "Passkeys need a secure address: the head's HTTPS name (set "<code class="font-mono">"ui_tls_head_ca"</code>
                         " in c6h.toml), or http://localhost on the head's machine."
                     </p>
                 }.into_any()
             }}
             <CodeSignIn />
-            <p class="text-sm text-zinc-500">
+            <p class="text-sm text-muted">
                 "Or run "<code class="rounded bg-zinc-100 px-1 font-mono dark:bg-zinc-800">"c6h login-link"</code>
                 " on the head and open the link it prints."
             </p>
@@ -122,7 +122,7 @@ fn CodeSignIn() -> impl IntoView {
     };
     view! {
         <div class="space-y-2 border-t border-zinc-200 pt-4 dark:border-zinc-800">
-            <label class="block text-sm text-zinc-500" for="c6-code">"Have a one-time code? Make one on a signed-in device under Settings → Sign-in."</label>
+            <label class="block text-sm text-muted" for="c6-code">"Have a one-time code? Make one on a signed-in device under Settings → Sign-in."</label>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             <div class="flex gap-2">
                 <input id="c6-code" class=format!("{INPUT} font-mono uppercase tracking-widest") placeholder="XXXX-XXXX"
@@ -158,7 +158,7 @@ pub fn LinkSignIn() -> impl IntoView {
     view! {
         <div class=CARD>
             <h1 class="text-lg font-semibold">"Sign in this browser"</h1>
-            <p class="text-sm text-zinc-500">"This one-time link signs in the browser you open it in. It stops working once used, or after 15 minutes."</p>
+            <p class="text-sm text-muted">"This one-time link signs in the browser you open it in. It stops working once used, or after 15 minutes."</p>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             <button class=format!("{BUTTON} w-full py-2") prop:disabled=move || busy.get() on:click=go>"Sign in"</button>
         </div>
@@ -205,9 +205,9 @@ pub fn SignInSettings(after_link: bool) -> impl IntoView {
             <div class="flex items-start justify-between gap-3">
                 <div>
                     <h2 class="text-lg font-semibold">"Sign-in"</h2>
-                    <p class="text-sm text-zinc-500">"Passkeys sign this head in with Touch ID, Face ID or a security key. Lost them all? "<code class="font-mono">"c6h login-link"</code>" on the head gets you back in."</p>
+                    <p class="text-sm text-muted">"Passkeys sign this head in with Touch ID, Face ID or a security key. Lost them all? "<code class="font-mono">"c6h login-link"</code>" on the head gets you back in."</p>
                 </div>
-                <button class=format!("{BUTTON_QUIET} shrink-0 text-xs text-zinc-500") on:click=sign_out>"Sign out"</button>
+                <button class=format!("{BUTTON_QUIET} shrink-0 text-xs text-muted") on:click=sign_out>"Sign out"</button>
             </div>
             {move || (after_link() && passkeys.get().and_then(Result::ok).is_some_and(|p| p.is_empty())).then(|| view! {
                 <div class="rounded-md border border-sky-300 bg-sky-50 px-3 py-2 text-sm text-sky-800 dark:border-sky-900 dark:bg-sky-950 dark:text-sky-200">
@@ -215,12 +215,12 @@ pub fn SignInSettings(after_link: bool) -> impl IntoView {
                 </div>
             })}
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
-            <p class="text-xs text-zinc-500">
+            <p class="text-xs text-muted">
                 "Each passkey is listed once, named after the device it was made on. Password managers (Google Password Manager, iCloud Keychain) sync it to your other devices, which then sign in with that same passkey."
             </p>
             <div class="divide-y divide-zinc-200 rounded-lg border border-zinc-200 text-sm dark:divide-zinc-800 dark:border-zinc-800">
                 {move || passkeys.get().map(|r| match r {
-                    Ok(ps) if ps.is_empty() => view! { <p class="px-4 py-3 text-zinc-500">"No passkeys yet."</p> }.into_any(),
+                    Ok(ps) if ps.is_empty() => view! { <p class="px-4 py-3 text-muted">"No passkeys yet."</p> }.into_any(),
                     Ok(ps) => ps.into_iter().map(|p| {
                         let (id, rename_id) = (p.id.clone(), p.id.clone());
                         // Some(draft) while renaming.
@@ -258,7 +258,7 @@ pub fn SignInSettings(after_link: bool) -> impl IntoView {
                                         }
                                         None => view! { <div class="font-medium">{name.clone()}</div> }.into_any(),
                                     }}
-                                    <div class="truncate text-xs text-zinc-500">
+                                    <div class="truncate text-xs text-muted">
                                         {format!("{} · added {}", p.rp_id, ago(now_ms() - p.created_at))}
                                         {p.last_used_at.map(|t| format!(" · used {}", ago(now_ms() - t)))}
                                     </div>
@@ -267,12 +267,12 @@ pub fn SignInSettings(after_link: bool) -> impl IntoView {
                                     let save = save2.clone();
                                     view! {
                                         <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| save()>"Save"</button>
-                                        <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") on:click=move |_| editing.set(None)>"Cancel"</button>
+                                        <button class=format!("{BUTTON_QUIET} text-xs text-muted") on:click=move |_| editing.set(None)>"Cancel"</button>
                                     }.into_any()
                                 } else {
                                     let (id, name) = (id.clone(), p.name.clone());
                                     view! {
-                                        <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") on:click=move |_| editing.set(Some(name.clone()))>"Rename"</button>
+                                        <button class=format!("{BUTTON_QUIET} text-xs text-muted") on:click=move |_| editing.set(Some(name.clone()))>"Rename"</button>
                                         <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| {
                                             let id = id.clone();
                                             spawn_local(async move {
@@ -299,13 +299,13 @@ pub fn SignInSettings(after_link: bool) -> impl IntoView {
                 }.into_any()
             } else {
                 view! {
-                    <p class="text-xs text-zinc-500">"To add a passkey, open the head at its HTTPS name (or http://localhost on its machine)."</p>
+                    <p class="text-xs text-muted">"To add a passkey, open the head at its HTTPS name (or http://localhost on its machine)."</p>
                 }.into_any()
             }}
             {move || status.get().and_then(Result::ok).is_some_and(|s| s.head_ca).then(|| view! {
                 <div class="rounded-md border border-zinc-200 px-4 py-3 text-sm dark:border-zinc-800">
                     <div class="font-medium">"Other devices"</div>
-                    <p class="mt-1 text-zinc-500">
+                    <p class="mt-1 text-muted">
                         "This head signs its own HTTPS certificate, so its name never appears in public certificate logs. Each device trusts it once (browsers use the system's trusted certificates): "
                         "on a Mac, open "<a class="underline" href="/ca.pem" rel="external" download="carbon6-ca.pem">"ca.pem"</a>" in Keychain Access and set Trust → Always Trust, then restart the browser; "
                         "on an iPhone or iPad, install the "<a class="underline" href="/ca.mobileconfig" rel="external" download="carbon6-ca.mobileconfig">"configuration profile"</a>
@@ -328,7 +328,7 @@ pub fn SignInSettings(after_link: bool) -> impl IntoView {
                             <div class="flex items-center justify-between gap-3 px-4 py-2">
                                 <div class="min-w-0">
                                     <div class="truncate">{browser_name(s.user_agent.as_deref())}{s.current.then_some(" (this browser)")}</div>
-                                    <div class="text-xs text-zinc-500">{format!("{} · signed in {} · active {}", match s.method.as_str() { "passkey" => "passkey", "code" => "one-time code", _ => "login link" }, ago(now_ms() - s.created_at), ago(now_ms() - s.last_seen_at))}</div>
+                                    <div class="text-xs text-muted">{format!("{} · signed in {} · active {}", match s.method.as_str() { "passkey" => "passkey", "code" => "one-time code", _ => "login link" }, ago(now_ms() - s.created_at), ago(now_ms() - s.last_seen_at))}</div>
                                 </div>
                                 {(!s.current).then(|| view! {
                                     <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| {
@@ -386,7 +386,7 @@ fn ApiTokens() -> impl IntoView {
     view! {
         <div class="rounded-md border border-zinc-200 px-4 py-3 text-sm dark:border-zinc-800">
             <div class="font-medium">"API tokens"</div>
-            <p class="text-zinc-500">
+            <p class="text-muted">
                 "For scripts and the "<code>"c6"</code>" command line. A token can do anything but manage sign-in, unless you limit it to one realm: then it reaches only that realm's sessions, action items, notes, automations and knowledge, and none of carbon6's administration. It is shown once."
             </p>
             <form class="mt-2 flex gap-2" on:submit=move |ev| { ev.prevent_default(); create(); }>
@@ -407,7 +407,7 @@ fn ApiTokens() -> impl IntoView {
                 view! {
                     <div class="mt-2 space-y-1 rounded-md bg-zinc-100 p-3 dark:bg-zinc-900">
                         <div class="select-all break-all font-mono text-xs">{t.clone()}</div>
-                        <p class="text-xs text-zinc-500">"Copy it now; it is not shown again. To set up the CLI:"</p>
+                        <p class="text-xs text-muted">"Copy it now; it is not shown again. To set up the CLI:"</p>
                         <div class="select-all break-all font-mono text-xs">{login}</div>
                     </div>
                 }
@@ -420,7 +420,7 @@ fn ApiTokens() -> impl IntoView {
                             <div class="flex items-center justify-between gap-3 py-1.5">
                                 <div class="min-w-0">
                                     <div class="truncate">{t.name.clone()}{t.realm.clone().map(|r| view! { <span class="ml-2 rounded bg-zinc-100 px-1 text-xs text-zinc-600 dark:bg-zinc-900 dark:text-zinc-400">{format!("realm {r}")}</span> })}</div>
-                                    <div class="text-xs text-zinc-500">{format!("created {} · {}", ago(now_ms() - t.created_at), t.last_used_at.map_or("never used".to_owned(), |u| format!("used {}", ago(now_ms() - u))))}</div>
+                                    <div class="text-xs text-muted">{format!("created {} · {}", ago(now_ms() - t.created_at), t.last_used_at.map_or("never used".to_owned(), |u| format!("used {}", ago(now_ms() - u))))}</div>
                                 </div>
                                 <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| {
                                     let id = id.clone();
@@ -472,7 +472,7 @@ fn OtherDevice() -> impl IntoView {
             <div class="flex items-center justify-between gap-3">
                 <div>
                     <div class="font-medium">"Sign in another device"</div>
-                    <p class="text-zinc-500">{format!("On the other device, open {origin} and enter a one-time code.")}</p>
+                    <p class="text-muted">{format!("On the other device, open {origin} and enter a one-time code.")}</p>
                 </div>
                 <button class=format!("{BUTTON} shrink-0") on:click=create>"Create a code"</button>
             </div>
@@ -480,12 +480,12 @@ fn OtherDevice() -> impl IntoView {
             {move || code.get().map(|c| {
                 let left = (c.expires_at - now.get()) / 1000;
                 if left <= 0 {
-                    view! { <p class="mt-2 text-zinc-500">"The code expired. Create a new one."</p> }.into_any()
+                    view! { <p class="mt-2 text-muted">"The code expired. Create a new one."</p> }.into_any()
                 } else {
                     view! {
                         <div class="mt-3 flex items-baseline gap-3">
                             <span class="select-all font-mono text-2xl font-semibold tracking-widest">{c.code.clone()}</span>
-                            <span class="text-xs text-zinc-500">{format!("works once · expires in {}:{:02}", left / 60, left % 60)}</span>
+                            <span class="text-xs text-muted">{format!("works once · expires in {}:{:02}", left / 60, left % 60)}</span>
                         </div>
                     }.into_any()
                 }

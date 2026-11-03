@@ -19,7 +19,7 @@ use nix::unistd::Pid;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Tool profile recorded for Claude Code sessions.
 pub const PROFILE: &str = "claude_code";
@@ -75,6 +75,10 @@ pub struct ClaudeConversation {
 pub const IDLE: Duration = Duration::from_secs(15 * 60);
 /// How long an interrupted turn has to end before its process is killed.
 const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
+/// After you stop a turn, how long what ends or starts is taken as the
+/// stop's doing rather than news for the agent (docs/background.md §4,
+/// Stopping): a turn Claude Code starts by itself then is stopped too.
+pub const STOP_QUIET: Duration = Duration::from_secs(5);
 /// How long a closing process has to exit before it is killed.
 const CLOSE_GRACE: Duration = Duration::from_secs(10);
 
@@ -121,6 +125,21 @@ async fn write_line(stdin: &Stdin, v: &Value) -> std::io::Result<()> {
 /// Asks the process to stop one of its background tasks (the CLI's id).
 pub async fn stop_task(stdin: &Stdin, task_id: &str) -> std::io::Result<()> {
     write_line(stdin, &serde_json::json!({"type": "control_request", "request_id": uuid::Uuid::now_v7().to_string(), "request": {"subtype": "stop_task", "task_id": task_id}})).await
+}
+
+/// What joins a running turn: inputs to write, and inputs written already
+/// to deliver now (Send now on a message with the agent), by command id.
+#[derive(Default)]
+pub struct Joining {
+    pub inputs: Vec<PendingInput>,
+    pub now: Vec<String>,
+}
+
+/// A Send now the process was asked for: its request, and the turn it
+/// was asked in.
+struct SendNow {
+    request_id: String,
+    turn: u64,
 }
 
 /// An input written to the process, until Claude Code takes it.
@@ -171,8 +190,36 @@ pub(crate) struct Process {
     /// hasn't started a turn for them by itself.
     unwoken: Vec<String>,
     wake_due: Option<tokio::time::Instant>,
+    /// You stopped its last turn: until when a turn it starts by itself is
+    /// taken as the stop's doing (`None` once one of its tasks ends on its
+    /// own: a turn then is for that).
+    after_stop: Option<tokio::time::Instant>,
+    /// The turn about to run is one it started by itself right after your
+    /// stop: it is stopped as it begins.
+    quiet: bool,
+    /// The last turn was such a one, stopped before the model said
+    /// anything: it logged the notices it was for, but no turn.
+    unshown: bool,
+    /// Where it runs and where Claude Code keeps its transcripts
+    /// ([`transcripts_root`]): the only place the text of a notice it starts
+    /// a turn for is written (its stream doesn't carry it).
+    cwd: PathBuf,
+    transcripts: Option<PathBuf>,
+    /// The last message of the main conversation it showed (a `user` or
+    /// `assistant` line's uuid, as in its transcript), and the tasks it
+    /// reported ended during the running turn.
+    last_uuid: Option<String>,
+    turn_tasks: Vec<(String, String)>,
+    /// Of the turn you stopped: its last message, when it ended, and the
+    /// tasks it reported ended (to find, or else name, what it queued).
+    stop_mark: Option<StopMark>,
     /// When its last turn ended (or it started).
     idle_since: tokio::time::Instant,
+    /// A Send now it hasn't answered yet.
+    send_now: Option<SendNow>,
+    /// It answered a Send now without saying how it took it (an older
+    /// Claude Code, which may have stopped the whole turn): said once.
+    old_send_now: bool,
     registration: Option<crate::mcp_bridge::Registration>,
     /// Where its process group is recorded while it runs, so a worker that
     /// starts after a crash can stop it ([`sweep_orphans`]).
@@ -331,6 +378,7 @@ impl Process {
             mcp_calls: HashSet::new(),
             children: HashMap::new(),
             backgrounded: HashSet::new(),
+            task_calls: HashMap::new(),
             call_usage: HashMap::new(),
             per_call: false,
         };
@@ -350,7 +398,17 @@ impl Process {
             subagent_tasks: HashSet::new(),
             unwoken: Vec::new(),
             wake_due: None,
+            after_stop: None,
+            quiet: false,
+            unshown: false,
+            cwd: cwd.to_owned(),
+            transcripts: transcripts_root(),
+            last_uuid: None,
+            turn_tasks: Vec::new(),
+            stop_mark: None,
             idle_since: tokio::time::Instant::now(),
+            send_now: None,
+            old_send_now: false,
             registration: mcp,
             pidfile: None,
             _output_root: output_root,
@@ -405,6 +463,12 @@ impl Process {
     /// this returns true.
     pub async fn idle_line(&mut self, v: Value, sink: &Arc<dyn EventSink>) -> anyhow::Result<bool> {
         if self.begins_turn(&v) {
+            // Right after you stopped a turn, with nothing of yours waiting
+            // and none of its tasks ended since, Claude Code starts a turn
+            // for the notifications it queued during the one you stopped
+            // (seen with 2.1.311): that is the stop's doing, so it is stopped
+            // too, and they reach the agent with your next message.
+            self.quiet = self.unconfirmed.is_empty() && self.after_stop.is_some_and(|t| tokio::time::Instant::now() < t);
             self.pending = Some(v);
             // It woke by itself: that turn hears about what ended.
             self.unwoken.clear();
@@ -412,17 +476,21 @@ impl Process {
             return Ok(true);
         }
         self.side_line(&v, sink).await?;
-        // One of its own tasks ended while it waits. Claude Code usually
-        // starts a turn for it; when it doesn't (seen with a long build), the
-        // agent would wait for good, so the session tells it.
         if v["type"] == "system"
             && v["subtype"] == "task_notification"
             && v["parent_tool_use_id"].is_null()
             && let Some(status) = v["status"].as_str().filter(|s| matches!(*s, "completed" | "failed"))
-            && !v["task_id"].as_str().is_some_and(|t| self.subagent_tasks.contains(t))
         {
-            self.unwoken.push(unwoken_notice(&v, status));
-            self.wake_due.get_or_insert_with(|| tokio::time::Instant::now() + WAKE_GRACE);
+            // A task that ended on its own (a stop's are stopped or killed):
+            // a turn Claude Code starts now is for it, and goes ahead.
+            self.after_stop = None;
+            // One of its own tasks ended while it waits. Claude Code usually
+            // starts a turn for it; when it doesn't (seen with a long build),
+            // the agent would wait for good, so the session tells it.
+            if !v["task_id"].as_str().is_some_and(|t| self.subagent_tasks.contains(t)) {
+                self.unwoken.push(unwoken_notice(&v, status));
+                self.wake_due.get_or_insert_with(|| tokio::time::Instant::now() + WAKE_GRACE);
+            }
         }
         Ok(false)
     }
@@ -438,6 +506,49 @@ impl Process {
         self.wake_due = None;
         let notices = std::mem::take(&mut self.unwoken);
         (!notices.is_empty()).then(|| notices.join("\n"))
+    }
+
+    /// Whether its last turn was one it started by itself right after your
+    /// stop, which was stopped before the model said anything and logged no
+    /// turn (so its number is free again). Asking clears it.
+    pub fn take_unshown(&mut self) -> bool {
+        std::mem::take(&mut self.unshown)
+    }
+
+    /// The notices Claude Code started a turn for right after your stop, as
+    /// they reached the model. Its stream doesn't carry them (2.1.311: only
+    /// the turn's `system/init`, then the model's answer), so they are read
+    /// from its transcript, where it writes them before asking the model.
+    /// Never made up: if they can't be read, a note says so and names what
+    /// is known.
+    async fn queued_notices(&mut self) -> Vec<String> {
+        let mark = self.stop_mark.take();
+        let after = mark.as_ref().and_then(|m| m.uuid.clone());
+        let since = mark.as_ref().map_or_else(std::time::SystemTime::now, |m| m.at);
+        let file = self.transcripts.as_deref().and_then(|root| transcript_of(root, &self.cwd, &self.launch.conversation));
+        if let Some(file) = &file {
+            let until = tokio::time::Instant::now() + TRANSCRIPT_WAIT;
+            loop {
+                let text = tokio::fs::read_to_string(file).await.unwrap_or_default();
+                if let Some(texts) = queued_in(&text, after.as_deref(), since) {
+                    return texts;
+                }
+                if tokio::time::Instant::now() >= until {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        let session = &self.launch.conversation;
+        warn!(%session, transcript = ?file, "the notice Claude Code started a turn for is not in its transcript");
+        let mut note = "Claude Code queued a notice we couldn't read".to_owned();
+        let tasks = mark.map(|m| m.tasks).unwrap_or_default();
+        if !tasks.is_empty() {
+            let named: Vec<String> = tasks.iter().map(|(id, status)| format!("{id} ({status})")).collect();
+            note.push_str(&format!(". In the turn you stopped it reported these tasks ended: {}", named.join(", ")));
+        }
+        note.push('.');
+        vec![note]
     }
 
     fn begins_turn(&self, v: &Value) -> bool {
@@ -461,9 +572,14 @@ impl Process {
         {
             self.subagent_tasks.insert(t.to_owned());
         }
+        if v["type"] == "control_response" {
+            return self.control_response(v, false, sink).await;
+        }
         if v["type"] == "system" && v["subtype"] == "task_notification" && v["parent_tool_use_id"].is_null() {
             let summary = v["summary"].as_str().or(v["description"].as_str()).unwrap_or("A background task ended.");
             self.notified.push(summary.to_owned());
+            let field = |k: &str| v[k].as_str().unwrap_or("").to_owned();
+            self.turn_tasks.push((field("task_id"), field("status")));
         }
         // An echo nobody waits for (such as a model switch's) is not a turn.
         if v["type"] == "user" && v["isReplay"].as_bool() == Some(true) {
@@ -472,19 +588,86 @@ impl Process {
         self.mapper.handle(v, sink).await
     }
 
-    /// Writes an input. The first input of a new conversation gets
-    /// `preamble` in front.
-    async fn send(&mut self, input: PendingInput, preamble: Option<&str>, recorded: bool) -> std::io::Result<()> {
+    /// Writes an input; its uuid. The first input of a new conversation
+    /// gets `preamble` in front.
+    async fn send(&mut self, input: PendingInput, preamble: Option<&str>, recorded: bool) -> std::io::Result<String> {
         let uuid = uuid::Uuid::now_v7().to_string();
-        let line = serde_json::json!({
+        let mut line = serde_json::json!({
             "type": "user",
             "uuid": uuid,
             "session_id": "",
             "parent_tool_use_id": null,
             "message": {"role": "user", "content": user_content(&input, preamble)},
         });
-        self.unconfirmed.push_back(Written { uuid, input, recorded });
-        write_line(&self.stdin, &line).await
+        // Your messages are a person's: Claude Code delivers one sent now
+        // into the running turn only then (not carbon6's notices).
+        if is_yours(&input) {
+            line["origin"] = serde_json::json!({"kind": "human"});
+        }
+        self.unconfirmed.push_back(Written { uuid: uuid.clone(), input, recorded });
+        write_line(&self.stdin, &line).await?;
+        Ok(uuid)
+    }
+
+    /// Asks it to deliver a message written already (`uuid`) now, rather than
+    /// at the agent's next step. Claude Code moves what holds the turn
+    /// (a command, a subagent, an MCP call) to the background and delivers it
+    /// into the turn, or stops only the turn and starts the next with it;
+    /// either way its background agents run on, which a plain interrupt
+    /// would stop (docs/background.md §1).
+    async fn deliver_now(&mut self, uuid: &str) -> std::io::Result<()> {
+        let request_id = uuid::Uuid::now_v7().to_string();
+        let request = serde_json::json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": {"subtype": "interrupt", "send_now": true, "message_uuid": uuid},
+        });
+        self.send_now = Some(SendNow { request_id, turn: self.mapper.turn });
+        write_line(&self.stdin, &request).await
+    }
+
+    /// Its answer to a control request; only a Send now's matters. `running`:
+    /// a turn is under way (the one the Send now was asked in, if its turn).
+    async fn control_response(&mut self, v: &Value, running: bool, sink: &Arc<dyn EventSink>) -> anyhow::Result<()> {
+        let r = &v["response"];
+        let Some(asked) = self.send_now.take_if(|s| r["request_id"].as_str() == Some(s.request_id.as_str())) else { return Ok(()) };
+        let this_turn = running && asked.turn == self.mapper.turn;
+        let session = &self.launch.conversation;
+        if r["subtype"] != "success" {
+            warn!(%session, error = %r["error"], "Claude Code refused Send now: the message reaches the agent at its next step");
+            return Ok(());
+        }
+        match r["response"]["send_now"].as_str() {
+            // Delivered into the running turn: it goes on.
+            Some("delivering") => info!(%session, "Send now: Claude Code delivers the message into the running turn"),
+            // Only the turn stopped; the message starts the next.
+            Some("stopped") => {
+                info!(%session, "Send now: Claude Code stopped the turn; the message starts the next");
+                if this_turn {
+                    self.mapper.interrupted = true;
+                }
+            }
+            Some("nothing_waiting") => info!(%session, "Send now: Claude Code had taken the message already"),
+            Some(other) => warn!(%session, outcome = other, "Send now: an outcome carbon6 doesn't know"),
+            // An older Claude Code: it took it as a plain interrupt, which
+            // stops its background agents too.
+            None => {
+                warn!(%session, "Send now: this Claude Code doesn't say how it took it (an older one): it may have stopped the turn and its background agents");
+                if this_turn {
+                    self.mapper.interrupted = true;
+                }
+                if !std::mem::replace(&mut self.old_send_now, true) {
+                    sink.append(session_event::Kind::Notice(c6_proto::Notice {
+                        title: "Send now stopped the turn".into(),
+                        message: "This Claude Code doesn't know Send now, so it may have taken it as Stop: the turn ended, and Claude Code's own background agents may have stopped with it. Your message starts the next turn. Update Claude Code (claude update) so Send now spares them.".into(),
+                        priority: "low".into(),
+                        quiet: true,
+                    }))
+                    .await?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Inputs written that Claude Code never took and that are not in the
@@ -508,19 +691,20 @@ impl Process {
     }
 
     /// Starts a turn no input of ours began: Claude Code woke on its
-    /// background tasks' notifications.
-    async fn woke(&mut self, started: &mut bool, sink: &Arc<dyn EventSink>) -> anyhow::Result<()> {
+    /// background tasks' notifications. One it started right after your stop
+    /// (`quiet`) shows the notices it was for as they reached the model.
+    async fn woke(&mut self, started: &mut bool, quiet: bool, sink: &Arc<dyn EventSink>) -> anyhow::Result<()> {
         if *started {
             return Ok(());
         }
-        let text = if self.notified.is_empty() { "A background task ended.".to_owned() } else { self.notified.join("\n") };
-        let message = UserMessage {
-            command_id: format!("task:{}", uuid::Uuid::now_v7()),
-            text,
-            command: "task-notification".into(),
-            ..Default::default()
+        let texts = if quiet {
+            self.queued_notices().await
+        } else if self.notified.is_empty() {
+            vec!["A background task ended.".to_owned()]
+        } else {
+            vec![self.notified.join("\n")]
         };
-        sink.append(session_event::Kind::User(message)).await?;
+        told(sink, texts).await?;
         sink.append(session_event::Kind::TurnStarted(TurnStarted { turn: self.mapper.turn, ..Default::default() })).await?;
         *started = true;
         Ok(())
@@ -543,7 +727,7 @@ impl Process {
         preamble: Option<&str>,
         model: &str,
         sink: &Arc<dyn EventSink>,
-        feed: &(dyn Fn() -> Vec<PendingInput> + Send + Sync),
+        feed: &(dyn Fn() -> Joining + Send + Sync),
         more: &tokio::sync::Notify,
         cancel: &CancellationToken,
     ) -> anyhow::Result<TurnEnd> {
@@ -553,6 +737,9 @@ impl Process {
         self.wake_due = None;
         self.mapper.result = None;
         self.mapper.interrupted = false;
+        // One it started by itself right after your stop (`idle_line`).
+        let quiet = std::mem::take(&mut self.quiet) && inputs.is_empty() && !opened;
+        self.turn_tasks.clear();
         let mut started = opened;
         if !inputs.is_empty() && !opened {
             for input in &inputs {
@@ -575,6 +762,13 @@ impl Process {
         for (i, input) in inputs.into_iter().enumerate() {
             alive &= self.send(input, if i == 0 { preamble } else { None }, true).await.is_ok();
         }
+        // You had just stopped the agent: this turn stops as it begins. It
+        // shows only if the model got to say something first.
+        if quiet {
+            info!(session = %self.launch.conversation, "Claude Code started a turn by itself right after you stopped one: stopping it too");
+            self.mapper.interrupted = true;
+            alive &= write_line(&self.stdin, &interrupt_request()).await.is_ok();
+        }
         let mut interrupted_at: Option<tokio::time::Instant> = None;
         while alive {
             let v = match self.pending.take() {
@@ -583,8 +777,7 @@ impl Process {
                     _ = cancel.cancelled(), if interrupted_at.is_none() => {
                         self.mapper.interrupted = true;
                         interrupted_at = Some(tokio::time::Instant::now());
-                        let request = serde_json::json!({"type": "control_request", "request_id": uuid::Uuid::now_v7().to_string(), "request": {"subtype": "interrupt"}});
-                        alive = write_line(&self.stdin, &request).await.is_ok();
+                        alive = write_line(&self.stdin, &interrupt_request()).await.is_ok();
                         continue;
                     }
                     _ = tokio::time::sleep_until(interrupted_at.map_or_else(tokio::time::Instant::now, |t| t + INTERRUPT_GRACE)), if interrupted_at.is_some() => {
@@ -593,14 +786,29 @@ impl Process {
                         alive = false;
                         continue;
                     }
-                    _ = more.notified() => {
-                        for input in feed() {
-                            let command_id = input.command_id.clone();
-                            let sent = self.send(input, None, false).await.is_ok();
-                            alive &= sent;
+                    // A turn stopped as it began takes no input: what comes
+                    // meanwhile starts the next.
+                    _ = more.notified(), if !quiet => {
+                        let Joining { inputs, now } = feed();
+                        for input in inputs {
+                            let (command_id, send_now) = (input.command_id.clone(), input.send_now);
+                            let sent = self.send(input, None, false).await;
+                            alive &= sent.is_ok();
                             // It is with the agent now: it reads it at its next step.
-                            if sent && !command_id.is_empty() {
+                            if sent.is_ok() && !command_id.is_empty() {
                                 sink.append(session_event::Kind::InputDelivered(c6_proto::InputDelivered { command_id })).await?;
+                            }
+                            // Send now: at once.
+                            if let Ok(uuid) = &sent
+                                && send_now
+                            {
+                                alive &= self.deliver_now(uuid).await.is_ok();
+                            }
+                        }
+                        for command_id in now {
+                            match self.unconfirmed.iter().find(|w| w.input.command_id == command_id).map(|w| w.uuid.clone()) {
+                                Some(uuid) => alive &= self.deliver_now(&uuid).await.is_ok(),
+                                None => info!(session = %self.launch.conversation, command = %command_id, "Send now: the agent has taken that message already"),
                             }
                         }
                         continue;
@@ -612,6 +820,12 @@ impl Process {
                 },
             };
             let main = v["parent_tool_use_id"].is_null();
+            if main
+                && matches!(v["type"].as_str(), Some("user" | "assistant"))
+                && let Some(uuid) = v["uuid"].as_str()
+            {
+                self.last_uuid = Some(uuid.to_owned());
+            }
             match v["type"].as_str().unwrap_or("") {
                 "user" if v["isReplay"].as_bool() == Some(true) => {
                     if let Some(uuid) = v["uuid"].as_str() {
@@ -619,25 +833,64 @@ impl Process {
                     }
                 }
                 "system" if v["subtype"] == "init" => {}
+                "control_response" => self.control_response(&v, true, sink).await?,
                 "result" if main => {
+                    // A Send now not answered yet whose turn ends stopped: the
+                    // turn was stopped for it, not failed.
+                    if self.send_now.as_ref().is_some_and(|s| s.turn == turn) && v["subtype"] == "error_during_execution" {
+                        self.mapper.interrupted = true;
+                    }
                     // Inputs it took without echoing them.
                     for uuid in v["user_message_uuids"].as_array().into_iter().flatten().filter_map(Value::as_str) {
                         self.confirm(uuid, &mut started, sink).await?;
                     }
-                    self.woke(&mut started, sink).await?;
-                    self.mapper.handle(&v, sink).await?;
+                    // You stopped it (or it is the turn stopped right after):
+                    // for a moment, what follows is the stop's doing.
+                    self.after_stop = (interrupted_at.is_some() || quiet).then(|| tokio::time::Instant::now() + STOP_QUIET);
+                    // Where what it queues next is found (after the notices of
+                    // this turn, if it is a stopped one, are read).
+                    let mark = (interrupted_at.is_some() || quiet).then(|| StopMark {
+                        uuid: self.last_uuid.clone(),
+                        at: std::time::SystemTime::now(),
+                        tasks: std::mem::take(&mut self.turn_tasks),
+                    });
+                    // Stopped before the model said anything: no turn, only
+                    // the notices it put into the conversation, which the
+                    // agent reads with your next message.
+                    self.unshown = quiet && !started;
+                    if self.unshown {
+                        let texts = self.queued_notices().await;
+                        told(sink, texts).await?;
+                        sink.append(session_event::Kind::Notice(c6_proto::Notice {
+                            title: "Stopped before replying".into(),
+                            message: "Right after you stopped the agent, Claude Code started a turn by itself for this notice; carbon6 stopped it before the agent replied. The agent reads it with your next message.".into(),
+                            priority: "low".into(),
+                            quiet: true,
+                        }))
+                        .await?;
+                    } else {
+                        self.woke(&mut started, quiet, sink).await?;
+                        self.mapper.handle(&v, sink).await?;
+                    }
                     let reason = if self.mapper.interrupted {
                         TurnEndReason::Interrupted
                     } else {
                         self.mapper.result.unwrap_or(TurnEndReason::Completed)
                     };
-                    sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: reason as i32 })).await?;
+                    if !self.unshown {
+                        sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: reason as i32 })).await?;
+                    }
+                    self.stop_mark = mark;
                     self.notified.clear();
                     self.idle_since = tokio::time::Instant::now();
                     return Ok(TurnEnd { reason: Some(reason), alive: true, no_conversation: false });
                 }
+                // In a turn stopped as it began, Claude Code's "[Request
+                // interrupted by user]" and the stream's first frames are not
+                // the model's word: only its message makes the turn show.
+                "stream_event" | "user" if main && quiet && !started => {}
                 "assistant" | "stream_event" | "user" if main => {
-                    self.woke(&mut started, sink).await?;
+                    self.woke(&mut started, quiet, sink).await?;
                     self.mapper.handle(&v, sink).await?;
                 }
                 _ => self.side_line(&v, sink).await?,
@@ -745,10 +998,116 @@ fn user_content(input: &PendingInput, preamble: Option<&str>) -> Value {
     Value::Array(blocks)
 }
 
+/// The input is your message, not one of carbon6's notices (a background
+/// task's end, a subagent's report, another session's message).
+fn is_yours(input: &PendingInput) -> bool {
+    input.from_session_id.is_empty()
+        && input.delegated_by.is_empty()
+        && !matches!(input.command.as_str(), "task-notification" | "session-message")
+}
+
 /// CLI 2.1.314's official installed source resolves CLAUDE_CODE_TMPDIR
 /// before creating its claude-uid/session/tasks/*.output tree. Give each
 /// process a private root instead of trusting paths into the host filesystem.
 struct OutputRoot(PathBuf);
+
+/// Of a turn you stopped: its last message Claude Code showed (`uuid`), when
+/// it ended, and the tasks it reported ended in it (id, status).
+struct StopMark {
+    uuid: Option<String>,
+    at: std::time::SystemTime,
+    tasks: Vec<(String, String)>,
+}
+
+/// How long Claude Code has to write a notice it starts a turn for into its
+/// transcript (it does so before asking the model) before carbon6 gives up
+/// reading it.
+const TRANSCRIPT_WAIT: Duration = Duration::from_secs(2);
+
+/// Where Claude Code keeps its transcripts: `$CLAUDE_CONFIG_DIR/projects`,
+/// else `~/.claude/projects` (the CLI runs with the worker's environment).
+fn transcripts_root() -> Option<PathBuf> {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".claude")))
+        .map(|d| d.join("projects"))
+}
+
+/// A conversation's transcript: `<root>/<cwd, each character but a letter or
+/// digit as ->/<conversation>.jsonl`, or wherever under the root a file of
+/// that name is (conversation ids are unique).
+fn transcript_of(root: &Path, cwd: &Path, conversation: &str) -> Option<PathBuf> {
+    let name = format!("{conversation}.jsonl");
+    let folder: String = cwd.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    let direct = root.join(folder).join(&name);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    std::fs::read_dir(root).into_iter().flatten().flatten().map(|e| e.path().join(&name)).find(|p| p.is_file())
+}
+
+/// The notices Claude Code put into its conversation to start a turn after
+/// the turn you stopped, verbatim from its transcript: the main
+/// conversation's task-notification messages after that turn's last message
+/// (`after`), or, when that message isn't there, written since it ended
+/// (`since`). `None`: none there (yet).
+fn queued_in(transcript: &str, after: Option<&str>, since: std::time::SystemTime) -> Option<Vec<String>> {
+    let entries = transcript.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok());
+    let entries: Vec<Value> = entries.filter(|v| v["isSidechain"].as_bool() != Some(true)).collect();
+    let start = match after.and_then(|u| entries.iter().position(|v| v["uuid"].as_str() == Some(u))) {
+        Some(i) => i + 1,
+        None => {
+            // Its clock and ours: allow a second.
+            let since = chrono::DateTime::<chrono::Utc>::from(since) - chrono::TimeDelta::seconds(1);
+            let after_stop =
+                |v: &Value| v["timestamp"].as_str().and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).is_some_and(|t| t >= since);
+            entries.iter().position(|v| is_task_notice(v) && after_stop(v))?
+        }
+    };
+    let mut texts = Vec::new();
+    for v in &entries[start..] {
+        match v["type"].as_str() {
+            // The model's answer: the notices came before it.
+            Some("assistant") => break,
+            Some("user") if is_task_notice(v) => match &v["message"]["content"] {
+                Value::String(s) => texts.push(s.clone()),
+                Value::Array(blocks) => texts.extend(blocks.iter().filter_map(|b| b["text"].as_str()).map(str::to_owned)),
+                _ => {}
+            },
+            // Something else after them (such as "[Request interrupted by user]").
+            Some("user") if !texts.is_empty() => break,
+            _ => {}
+        }
+    }
+    (!texts.is_empty()).then_some(texts)
+}
+
+/// A message Claude Code wrote into the conversation for a task's
+/// notification.
+fn is_task_notice(v: &Value) -> bool {
+    v["type"] == "user" && (v["origin"]["kind"] == "task-notification" || v["turnOrigin"] == "task_notification")
+}
+
+/// Logs what the agent was told, each as a task notification.
+async fn told(sink: &Arc<dyn EventSink>, texts: Vec<String>) -> anyhow::Result<()> {
+    for text in texts {
+        let message = UserMessage {
+            command_id: format!("task:{}", uuid::Uuid::now_v7()),
+            text,
+            command: "task-notification".into(),
+            ..Default::default()
+        };
+        sink.append(session_event::Kind::User(message)).await?;
+    }
+    Ok(())
+}
+
+/// Asks Claude Code to stop its turn (Esc). Its background agents stop with
+/// it; its background commands don't.
+fn interrupt_request() -> Value {
+    serde_json::json!({"type": "control_request", "request_id": uuid::Uuid::now_v7().to_string(), "request": {"subtype": "interrupt"}})
+}
 
 /// How long Claude Code has to start a turn by itself for a task that ended
 /// while it waited, before the session tells the agent.
@@ -828,6 +1187,9 @@ struct Mapper {
     /// comes at once ("launched"), so the subagent ends with its task's
     /// notification instead.
     backgrounded: HashSet<String>,
+    /// The call that started each task, by the CLI's task id: a task the
+    /// CLI moves to the background later says only its id.
+    task_calls: HashMap<String, String>,
     /// Each conversation's model call so far, by whose it is (`None`: the
     /// session's; else the call that started a subagent): its message id,
     /// model and usage. Claude Code sends a message per content block, each
@@ -904,9 +1266,23 @@ impl Mapper {
         let bg = &obs.tools.background;
         if subtype == "task_started" {
             // Description, not the originating tool's command: the protocol
-            // does not promise a shell command for every kind of task.
-            bg.start_native(&self.scope, task_id, run, v["description"].as_str().unwrap_or(""));
+            // does not promise a shell command for every kind of task. A
+            // foreground one holds the turn until it ends or the CLI moves it.
+            let foreground = v["is_backgrounded"].as_bool() == Some(false);
+            bg.start_native(
+                &self.scope,
+                task_id,
+                run,
+                v["description"].as_str().unwrap_or(""),
+                v["task_type"].as_str().unwrap_or(""),
+                foreground,
+            );
             return true;
+        }
+        // The CLI moved a foreground command or subagent to the background
+        // (Send now, docs/background.md §4): a background task from now on.
+        if subtype == "task_updated" && v["patch"]["is_backgrounded"].as_bool() == Some(true) {
+            bg.background_native(&self.scope, task_id, run);
         }
         let state = match subtype {
             "task_notification" => match v["status"].as_str() {
@@ -1016,12 +1392,7 @@ impl Mapper {
         };
         let ev = SessionEvent { seq: 1, ts_ms: c6_core::now_ms(), kind: Some(session_event::Kind::Started(started)) };
         obs.journal.create_session(&id, &spec, &ev).await?;
-        let log: Arc<dyn EventSink> = Arc::new(crate::session::Writer {
-            session_id: id.clone(),
-            journal: obs.journal.clone(),
-            link: obs.link.clone(),
-            next_seq: tokio::sync::Mutex::new(2),
-        });
+        let log: Arc<dyn EventSink> = Arc::new(crate::session::Writer::new(id.clone(), obs.journal.clone(), obs.link.clone(), 2));
         log.append(session_event::Kind::TurnStarted(TurnStarted { turn: 1, ..Default::default() })).await?;
         self.children.insert(call.to_owned(), Child { id: id.clone(), log: log.clone(), depth: parent_depth + 1, open: true });
         Ok(Some((id, log)))
@@ -1049,11 +1420,22 @@ impl Mapper {
     /// the background is noted as such when it starts, and its mirror ends
     /// with the task's last status.
     async fn task_of_call(&mut self, v: &Value) -> anyhow::Result<()> {
+        // A subagent the CLI moved to the background: its call's result comes
+        // now, and the subagent goes on.
+        if v["subtype"] == "task_updated"
+            && v["patch"]["is_backgrounded"].as_bool() == Some(true)
+            && let Some(call) = v["task_id"].as_str().and_then(|t| self.task_calls.get(t))
+        {
+            self.backgrounded.insert(call.clone());
+        }
         let Some(call) = v["tool_use_id"].as_str().filter(|c| !c.is_empty()) else { return Ok(()) };
         let reason = match v["subtype"].as_str().unwrap_or("") {
             "task_started" => {
                 if v["is_backgrounded"].as_bool() == Some(true) {
                     self.backgrounded.insert(call.to_owned());
+                }
+                if let Some(task) = v["task_id"].as_str() {
+                    self.task_calls.insert(task.to_owned(), call.to_owned());
                 }
                 return Ok(());
             }
@@ -1148,10 +1530,12 @@ impl Mapper {
                         Some("text_delta") => sink.ephemeral(ephemeral_event::Kind::Text(TextDelta {
                             turn: self.turn,
                             text: d["text"].as_str().unwrap_or("").into(),
+                            ..Default::default()
                         })),
                         Some("thinking_delta") => sink.ephemeral(ephemeral_event::Kind::Thinking(TextDelta {
                             turn: self.turn,
                             text: d["thinking"].as_str().unwrap_or("").into(),
+                            ..Default::default()
                         })),
                         _ => {}
                     }
@@ -1331,6 +1715,7 @@ mod tests {
             mcp_calls: HashSet::new(),
             children: HashMap::new(),
             backgrounded: HashSet::new(),
+            task_calls: HashMap::new(),
             call_usage: HashMap::new(),
             per_call: false,
         };
@@ -1507,7 +1892,7 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"usage":{}}
     /// A turn with nothing joining it.
     async fn run(p: &mut Process, turn: u64, inputs: &[PendingInput], sink: &Arc<dyn EventSink>) -> TurnEnd {
         let more = tokio::sync::Notify::new();
-        p.turn(turn, inputs.to_vec(), false, None, "opus", sink, &Vec::new, &more, &CancellationToken::new()).await.unwrap()
+        p.turn(turn, inputs.to_vec(), false, None, "opus", sink, &Joining::default, &more, &CancellationToken::new()).await.unwrap()
     }
 
     /// Waits for the turn's first reply.
@@ -1569,8 +1954,10 @@ EOF
         let launch = Launch { conversation: "0199-usage".into(), ..Default::default() };
         let mut p = Process::spawn(&bin, launch, false, dir.path(), "opus", Arc::default(), None, None).unwrap();
         let more = tokio::sync::Notify::new();
-        let end =
-            p.turn(1, vec![input("c1", "list")], false, None, "opus", &sink, &Vec::new, &more, &CancellationToken::new()).await.unwrap();
+        let end = p
+            .turn(1, vec![input("c1", "list")], false, None, "opus", &sink, &Joining::default, &more, &CancellationToken::new())
+            .await
+            .unwrap();
         assert_eq!(end.reason, Some(TurnEndReason::Completed));
         let events = vec_sink.0.lock().unwrap().clone();
         assert_eq!(
@@ -1627,14 +2014,15 @@ EOF
         // A later turn tries --resume first; the fake has no conversation...
         let mut p =
             Process::spawn(&bin, launch.clone(), true, dir.path(), "opus", Arc::default(), Some(bridge.register(entry())), None).unwrap();
-        let end = p.turn(2, inputs.clone(), false, None, "opus", &sink, &Vec::new, &more, &CancellationToken::new()).await.unwrap();
+        let end = p.turn(2, inputs.clone(), false, None, "opus", &sink, &Joining::default, &more, &CancellationToken::new()).await.unwrap();
         assert_eq!(end, TurnEnd { reason: None, alive: false, no_conversation: true });
         assert_eq!(kinds(&vec_sink), ["user", "turn_started"], "the turn is logged once, before either attempt");
         // ... so a new one starts, which gets the preamble.
         let registration = bridge.register(entry());
         let mcp = registration.mcp_config();
         let mut p = Process::spawn(&bin, launch, false, dir.path(), "opus", Arc::default(), Some(registration), None).unwrap();
-        let end = p.turn(2, inputs, true, Some("CONTEXT"), "opus", &sink, &Vec::new, &more, &CancellationToken::new()).await.unwrap();
+        let end =
+            p.turn(2, inputs, true, Some("CONTEXT"), "opus", &sink, &Joining::default, &more, &CancellationToken::new()).await.unwrap();
         assert_eq!(end.reason, Some(TurnEndReason::Completed));
         assert_eq!(std::fs::read_to_string(dir.path().join("settings.txt")).unwrap(), r#"{"hooks":{}}"#, "the head's hooks are passed on");
         assert_eq!(std::fs::read_to_string(dir.path().join("system.txt")).unwrap(), "carbon6's guidance.", "in its system prompt");
@@ -1906,7 +2294,7 @@ done
         let mut p = spawn(&bin, dir.path(), "s", false, None);
         let queue = Mutex::new(Vec::new());
         let more = tokio::sync::Notify::new();
-        let feed = || std::mem::take(&mut *queue.lock().unwrap());
+        let feed = || Joining { inputs: std::mem::take(&mut *queue.lock().unwrap()), now: Vec::new() };
         let cancel = CancellationToken::new();
         let turn = p.turn(1, vec![input("c1", "join me")], false, None, "opus", &sink, &feed, &more, &cancel);
         // Once the turn is under way.
@@ -1938,7 +2326,7 @@ done
         let mut p = spawn(&bin, dir.path(), "s", false, Some(observer(dir.path(), tools.clone()).await));
         let cancel = CancellationToken::new();
         let more = tokio::sync::Notify::new();
-        let turn = p.turn(1, vec![input("c1", "slow build")], false, None, "opus", &sink, &Vec::new, &more, &cancel);
+        let turn = p.turn(1, vec![input("c1", "slow build")], false, None, "opus", &sink, &Joining::default, &more, &cancel);
         let stop = async {
             replied(&vec_sink).await;
             cancel.cancel();
@@ -2080,6 +2468,213 @@ done
         p.close().await;
     }
 
+    /// A stand-in `claude` that, as 2.1.311 does, starts a turn by itself
+    /// right after a turn you stopped, for its agent's notification queued
+    /// during it, whose text it writes only to its transcript
+    /// (`projects/<cwd>/s.jsonl` in its folder; not with `no-transcript`
+    /// there). It records what it reads (`stdin.txt`). Stopped too, it says
+    /// "[Request interrupted by user]" and waits; then its build ends on its
+    /// own and it wakes for that.
+    fn stopping_claude(dir: &Path) -> PathBuf {
+        script(
+            dir,
+            "claude-stopping",
+            r#"#!/bin/sh
+uuid_of() { printf '%s' "$1" | sed -n 's/.*"uuid":"\([^"]*\)".*/\1/p'; }
+echo_of() { printf '{"type":"user","isReplay":true,"uuid":"%s","message":{"role":"user","content":"echo"},"parent_tool_use_id":null}\n' "$(uuid_of "$1")"; }
+say() { printf '{"type":"assistant","message":{"content":[{"type":"text","text":"%s"}],"stop_reason":"end_turn"},"parent_tool_use_id":null}\n' "$1"; }
+init() { printf '%s\n' '{"type":"system","subtype":"init"}'; }
+done_ok() { printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"usage":{}}'; }
+stopped() { printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"usage":{}}'; }
+said() { printf '{"type":"user","uuid":"%s","message":{"role":"user","content":[{"type":"text","text":"%s"}]},"parent_tool_use_id":null}\n' "$1" "$2"; }
+transcript() { [ -e no-transcript ] && return; t="projects/$(pwd | sed 's/[^A-Za-z0-9]/-/g')"; mkdir -p "$t"; printf '%s\n' "$1" >> "$t/s.jsonl"; }
+stops=0
+while read -r line; do
+  printf '%s\n' "$line" >> stdin.txt
+  case "$line" in
+    *'"interrupt"'*)
+      stops=$((stops+1))
+      if [ "$stops" = 1 ]; then
+        printf '%s\n' '{"type":"system","subtype":"task_notification","task_id":"fg1","status":"stopped","summary":"Wait"}'
+        said u-stop "[Request interrupted by user for tool use]"
+        stopped
+        transcript '{"type":"user","uuid":"u-stop","isSidechain":false,"message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}}'
+        transcript '{"type":"queue-operation","operation":"dequeue"}'
+        transcript '{"type":"user","uuid":"n-ag1","isSidechain":false,"origin":{"kind":"task-notification","producer":"session-task"},"turnOrigin":"task_notification","message":{"role":"user","content":"<task-notification>\n<task-id>ag1</task-id>\n<status>completed</status>\n<summary>Agent \"Review\" is waiting — on its own work</summary>\n</task-notification>"}}'
+        transcript '{"type":"attachment","uuid":"a-1","isSidechain":false,"attachment":{"type":"deferred_tools_delta"}}'
+        init
+      else
+        said u-stop2 "[Request interrupted by user]"
+        transcript '{"type":"user","uuid":"u-stop2","isSidechain":false,"message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}'
+        stopped
+        sleep 0.3
+        printf '%s\n' '{"type":"system","subtype":"task_notification","task_id":"bg1","status":"completed","summary":"Build finished"}'
+        init
+        say "The build passed."
+        done_ok
+      fi
+      continue;;
+    *'"control_request"'*) continue;;
+  esac
+  init
+  echo_of "$line"
+  case "$line" in
+    *hold*)
+      printf '%s\n' '{"type":"system","subtype":"task_started","task_id":"bg1","description":"Build","task_type":"local_bash","is_backgrounded":true}'
+      printf '%s\n' '{"type":"system","subtype":"task_started","task_id":"ag1","description":"Review","task_type":"local_agent","is_backgrounded":true}'
+      printf '%s\n' '{"type":"system","subtype":"task_notification","task_id":"ag1","status":"completed","summary":"Reviewed"}'
+      printf '%s\n' '{"type":"system","subtype":"task_started","task_id":"fg1","description":"Wait","task_type":"local_bash","is_backgrounded":false}'
+      say "Waiting.";;
+    *)
+      say "Next."
+      done_ok;;
+  esac
+done
+"#,
+        )
+    }
+
+    /// What `stopping_claude` put into its conversation for its agent.
+    const QUEUED: &str = "<task-notification>\n<task-id>ag1</task-id>\n<status>completed</status>\n<summary>Agent \"Review\" is waiting — on its own work</summary>\n</task-notification>";
+
+    /// Stops `stopping_claude`'s first turn, then runs the turn it starts by
+    /// itself at once; the events logged from there.
+    async fn stop_then_flush(dir: &Path) -> (Process, Arc<VecSink>, Vec<SessionEvent>) {
+        let bin = stopping_claude(dir);
+        let tools = Arc::new(c6_tools::SessionTools::new(dir.to_owned()));
+        let vec_sink = Arc::new(VecSink::default());
+        let sink: Arc<dyn EventSink> = vec_sink.clone();
+        let mut p = spawn(&bin, dir, "s", false, Some(observer(dir, tools).await));
+        p.transcripts = Some(dir.join("projects"));
+        let cancel = CancellationToken::new();
+        let more = tokio::sync::Notify::new();
+        let turn = p.turn(1, vec![input("c1", "hold on")], false, None, "opus", &sink, &Joining::default, &more, &cancel);
+        let stop = async {
+            replied(&vec_sink).await;
+            cancel.cancel();
+        };
+        let (end, ()) = tokio::join!(turn, stop);
+        assert_eq!(end.unwrap().reason, Some(TurnEndReason::Interrupted));
+        let before = vec_sink.0.lock().unwrap().len();
+        assert!(idle_until_or_turn(&mut p, &sink, |_| false).await);
+        assert_eq!(run(&mut p, 2, &[], &sink).await.reason, Some(TurnEndReason::Interrupted));
+        assert!(p.take_unshown() && !p.take_unshown(), "said once");
+        let flushed = vec_sink.0.lock().unwrap()[before..].to_vec();
+        (p, vec_sink, flushed)
+    }
+
+    /// The notices a stopped turn logged, and its quiet line.
+    fn told_then_stopped(events: &[SessionEvent]) -> Vec<String> {
+        let told: Vec<String> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Some(session_event::Kind::User(u)) => {
+                    assert_eq!(u.command, "task-notification");
+                    Some(u.text.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let notices: Vec<&c6_proto::Notice> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Some(session_event::Kind::Notice(n)) => Some(n),
+                _ => None,
+            })
+            .collect();
+        assert!(notices.len() == 1 && notices[0].quiet && notices[0].title == "Stopped before replying", "{notices:?}");
+        assert!(matches!(events.last().and_then(|e| e.kind.as_ref()), Some(session_event::Kind::Notice(_))), "the line comes last");
+        assert!(
+            !events.iter().any(|e| matches!(&e.kind, Some(session_event::Kind::TurnStarted(_) | session_event::Kind::TurnEnded(_)))),
+            "no turn"
+        );
+        told
+    }
+
+    /// The turn Claude Code starts by itself right after you stop one is
+    /// stopped as it begins: no turn shows, only the notice it put into the
+    /// conversation, word for word as its transcript has it, and a quiet line
+    /// saying the agent reads it with your next message. A task that then
+    /// ends on its own still wakes the agent.
+    #[tokio::test]
+    async fn a_turn_claude_code_starts_right_after_your_stop_is_stopped_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut p, vec_sink, flushed) = stop_then_flush(dir.path()).await;
+        assert_eq!(told_then_stopped(&flushed), [QUEUED], "the notice as it reached the model");
+        let interrupts = std::fs::read_to_string(dir.path().join("stdin.txt"))
+            .unwrap()
+            .lines()
+            .filter(|l| l.contains(r#""subtype":"interrupt""#))
+            .count();
+        assert_eq!(interrupts, 2, "yours, then the one for its own turn");
+        // Then its build ends on its own: it wakes for that, as before.
+        let sink: Arc<dyn EventSink> = vec_sink.clone();
+        let before = vec_sink.0.lock().unwrap().len();
+        assert!(idle_until_or_turn(&mut p, &sink, |_| false).await);
+        assert_eq!(run(&mut p, 2, &[], &sink).await.reason, Some(TurnEndReason::Completed));
+        assert!(!p.take_unshown());
+        let events = vec_sink.0.lock().unwrap()[before..].to_vec();
+        let shown: Vec<&str> = events.iter().map(kind).filter(|k| *k != "other").collect();
+        assert_eq!(shown, ["user", "turn_started", "assistant", "usage", "turn_ended"]);
+        let Some(session_event::Kind::User(u)) = &events.iter().find(|e| kind(e) == "user").unwrap().kind else { panic!() };
+        assert_eq!(u.text, "Build finished");
+        p.close().await;
+    }
+
+    /// When its transcript doesn't have the notice, nothing is made up: the
+    /// log says a notice couldn't be read, and names the tasks it reported.
+    #[tokio::test]
+    async fn a_notice_that_cannot_be_read_is_said_so() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("no-transcript"), "").unwrap();
+        let (p, _, flushed) = stop_then_flush(dir.path()).await;
+        assert_eq!(
+            told_then_stopped(&flushed),
+            [
+                "Claude Code queued a notice we couldn't read. In the turn you stopped it reported these tasks ended: ag1 (completed), fg1 (stopped)."
+            ]
+        );
+        p.close().await;
+    }
+
+    /// The notices come from the transcript after the stopped turn's last
+    /// message, up to what follows them; failing that, by when they were
+    /// written. Subagents' messages are not the conversation's.
+    #[test]
+    fn queued_notices_are_read_after_the_stopped_turn() {
+        let notice = |uuid: &str, text: &str, at: &str| {
+            serde_json::json!({"type": "user", "uuid": uuid, "timestamp": at, "isSidechain": false,
+                "origin": {"kind": "task-notification"}, "message": {"role": "user", "content": text}})
+            .to_string()
+        };
+        let transcript = [
+            notice("old", "an older notice", "2026-11-02T22:00:00.000Z"),
+            serde_json::json!({"type": "user", "uuid": "stop", "message": {"content": [{"type": "text", "text": "[Request interrupted by user for tool use]"}]}}).to_string(),
+            serde_json::json!({"type": "queue-operation", "operation": "dequeue"}).to_string(),
+            notice("n1", "first", "2026-11-02T22:52:16.815Z"),
+            serde_json::json!({"type": "user", "uuid": "side", "isSidechain": true, "origin": {"kind": "task-notification"}, "message": {"content": "a subagent's"}}).to_string(),
+            notice("n2", "second", "2026-11-02T22:52:16.816Z"),
+            serde_json::json!({"type": "user", "uuid": "stop2", "message": {"content": [{"type": "text", "text": "[Request interrupted by user]"}]}}).to_string(),
+            notice("later", "a later one", "2026-11-02T22:53:00.000Z"),
+        ]
+        .join("\n");
+        let at = |t: &str| std::time::SystemTime::from(chrono::DateTime::parse_from_rfc3339(t).unwrap());
+        let long_ago = at("2026-11-01T00:00:00Z");
+        assert_eq!(queued_in(&transcript, Some("stop"), long_ago).unwrap(), ["first", "second"]);
+        assert_eq!(queued_in(&transcript, Some("gone"), at("2026-11-02T22:52:16.900Z")).unwrap(), ["first", "second"], "by time");
+        assert_eq!(queued_in(&transcript, Some("stop2"), long_ago).unwrap(), ["a later one"]);
+        assert!(queued_in(&transcript, Some("later"), long_ago).is_none(), "nothing after it");
+        assert!(queued_in("", None, long_ago).is_none());
+        let folder = Path::new("/home/me/my project");
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("-home-me-my-project").join("c1.jsonl");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(transcript_of(root.path(), folder, "c1"), Some(file.clone()));
+        assert_eq!(transcript_of(root.path(), Path::new("/elsewhere"), "c1"), Some(file), "found by its name");
+        assert_eq!(transcript_of(root.path(), folder, "c2"), None);
+    }
+
     /// A worker that starts after a crash stops the Claude Code processes the
     /// last one recorded, but not a process that merely has the same id now.
     #[tokio::test]
@@ -2136,6 +2731,7 @@ done
             mcp_calls: HashSet::new(),
             children: HashMap::new(),
             backgrounded: HashSet::new(),
+            task_calls: HashMap::new(),
             call_usage: HashMap::new(),
             per_call: false,
         };
@@ -2148,5 +2744,288 @@ done
         }
         assert!(mapper.children.is_empty(), "no mirror for carbon6's own subagent");
         assert_eq!(kinds(&vec_sink), ["assistant", "tool_result"]);
+    }
+
+    /// A stand-in `claude` for Send now. It records every line it reads
+    /// (`stdin.txt`). Its first message starts a turn that waits on a
+    /// foreground command; a message written then waits for a Send now,
+    /// which it answers as the first message asks: `delivering` (the command
+    /// goes to the background and the message joins the turn), `stopped`
+    /// (only the turn stops; the message starts the next), or as an older
+    /// Claude Code does (no `send_now` in its answer). `quick` just answers.
+    fn send_now_claude(dir: &Path) -> PathBuf {
+        script(
+            dir,
+            "claude-send-now",
+            r#"#!/bin/sh
+uuid_of() { printf '%s' "$1" | sed -n 's/.*"uuid":"\([^"]*\)".*/\1/p'; }
+req_of() { printf '%s' "$1" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p'; }
+echo_of() { printf '{"type":"user","isReplay":true,"uuid":"%s","message":{"role":"user","content":"echo"},"parent_tool_use_id":null}\n' "$1"; }
+say() { printf '{"type":"assistant","message":{"content":[{"type":"text","text":"%s"}],"stop_reason":"end_turn"},"parent_tool_use_id":null}\n' "$1"; }
+answer() { printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":%s}}\n' "$1" "$2"; }
+init() { printf '%s\n' '{"type":"system","subtype":"init"}'; }
+done_ok() { printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"usage":{}}'; }
+stopped() { printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"usage":{}}'; }
+mode=""
+waiting=""
+while read -r line; do
+  printf '%s\n' "$line" >> stdin.txt
+  case "$line" in
+    *'"interrupt"'*)
+      req=$(req_of "$line")
+      case "$mode" in
+        delivering)
+          answer "$req" '{"still_queued":[],"send_now":"delivering"}'
+          printf '%s\n' '{"type":"system","subtype":"task_updated","task_id":"fg1","patch":{"is_backgrounded":true}}'
+          printf '%s\n' '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_fg","content":"Moved to the background."}]},"parent_tool_use_id":null}'
+          echo_of "$waiting"
+          say "Got it."
+          done_ok;;
+        stopped)
+          answer "$req" '{"still_queued":["'"$waiting"'"],"send_now":"stopped"}'
+          printf '%s\n' '{"type":"system","subtype":"task_notification","task_id":"fg1","status":"stopped"}'
+          stopped
+          init
+          echo_of "$waiting"
+          say "PING"
+          done_ok;;
+        *)
+          answer "$req" '{"still_queued":["'"$waiting"'"]}'
+          stopped
+          init
+          echo_of "$waiting"
+          say "PING"
+          done_ok;;
+      esac
+      continue;;
+    *'"control_request"'*) continue;;
+  esac
+  if [ -n "$mode" ] && [ "$mode" != quick ]; then
+    waiting=$(uuid_of "$line")
+    continue
+  fi
+  case "$line" in *delivering*) mode=delivering;; *stopped*) mode=stopped;; *quick*) mode=quick;; *) mode=old;; esac
+  init
+  echo_of "$(uuid_of "$line")"
+  if [ "$mode" = quick ]; then
+    say "Done."
+    done_ok
+    continue
+  fi
+  printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_fg","name":"Bash","input":{"command":"make"}}],"stop_reason":"tool_use"},"parent_tool_use_id":null}'
+  printf '%s\n' '{"type":"system","subtype":"task_started","task_id":"fg1","tool_use_id":"toolu_fg","description":"Long build","task_type":"local_bash","is_backgrounded":false}'
+done
+"#,
+        )
+    }
+
+    /// The lines the stand-in read, as JSON.
+    fn read_lines(dir: &Path) -> Vec<Value> {
+        std::fs::read_to_string(dir.join("stdin.txt")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+    }
+
+    /// Runs a turn that waits on a foreground command; once it does, your
+    /// message is sent with Send now.
+    async fn send_now_turn(p: &mut Process, first: &str, sink: &Arc<dyn EventSink>, vec_sink: &VecSink) -> TurnEnd {
+        let queue = Mutex::new(Vec::new());
+        let more = tokio::sync::Notify::new();
+        let feed = || Joining { inputs: std::mem::take(&mut *queue.lock().unwrap()), now: Vec::new() };
+        let cancel = CancellationToken::new();
+        let turn = p.turn(1, vec![input("c1", first)], false, None, "opus", sink, &feed, &more, &cancel);
+        let send = async {
+            replied(vec_sink).await;
+            queue.lock().unwrap().push(PendingInput { send_now: true, ..input("c2", "PING now") });
+            more.notify_one();
+        };
+        let (end, ()) = tokio::join!(turn, send);
+        end.unwrap()
+    }
+
+    /// Send now writes your message (as a person's), then asks Claude Code
+    /// to deliver that message now; "delivering": the foreground command
+    /// goes to the background, the turn goes on with the message, and it
+    /// isn't stopped.
+    #[tokio::test]
+    async fn send_now_delivers_into_the_running_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = send_now_claude(dir.path());
+        let tools = Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tools.background.set_sink(Some(tx));
+        let vec_sink = Arc::new(VecSink::default());
+        let sink: Arc<dyn EventSink> = vec_sink.clone();
+        let mut p = spawn(&bin, dir.path(), "s", false, Some(observer(dir.path(), tools.clone()).await));
+        let end = send_now_turn(&mut p, "delivering", &sink, &vec_sink).await;
+        assert_eq!(end, TurnEnd { reason: Some(TurnEndReason::Completed), alive: true, no_conversation: false });
+        assert_eq!(
+            kinds(&vec_sink),
+            ["user", "turn_started", "assistant", "input_delivered", "tool_result", "user", "assistant", "usage", "turn_ended"],
+            "the message joins the turn, which isn't stopped"
+        );
+        assert!(!vec_sink.0.lock().unwrap().iter().any(|e| matches!(e.kind, Some(session_event::Kind::Error(_)))));
+        let lines = read_lines(dir.path());
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines[0]["origin"], serde_json::json!({"kind": "human"}), "your messages are a person's");
+        assert_eq!((lines[1]["type"].as_str(), &lines[1]["origin"]), (Some("user"), &serde_json::json!({"kind": "human"})));
+        let request = &lines[2]["request"];
+        assert_eq!(lines[2]["type"], "control_request");
+        assert_eq!((request["subtype"].as_str(), request["send_now"].as_bool()), (Some("interrupt"), Some(true)));
+        assert_eq!(request["message_uuid"], lines[1]["uuid"], "it names the message just written");
+        assert!(request.get("cancel_queued").is_none());
+        // The command it moved is a background task now.
+        let started = rx.try_recv().unwrap();
+        assert_eq!((started.native_type.as_str(), started.foreground), ("local_bash", true));
+        let moved = rx.try_recv().unwrap();
+        assert_eq!((moved.id.as_str(), moved.state, moved.foreground), (started.id.as_str(), c6_tools::TaskState::Started, false));
+        assert!(p.tasks_running(), "it runs on in the background");
+        p.close().await;
+    }
+
+    /// "stopped": Claude Code stopped only the turn, which ends interrupted
+    /// (not failed); the message starts the next turn.
+    #[tokio::test]
+    async fn send_now_that_stops_the_turn_ends_it_interrupted() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = send_now_claude(dir.path());
+        let vec_sink = Arc::new(VecSink::default());
+        let sink: Arc<dyn EventSink> = vec_sink.clone();
+        let mut p = spawn(&bin, dir.path(), "s", false, None);
+        let end = send_now_turn(&mut p, "stopped", &sink, &vec_sink).await;
+        assert_eq!(end, TurnEnd { reason: Some(TurnEndReason::Interrupted), alive: true, no_conversation: false });
+        assert_eq!(kinds(&vec_sink), ["user", "turn_started", "assistant", "input_delivered", "usage", "turn_ended"], "not an error");
+        // The next turn is the message's.
+        assert!(idle_until_or_turn(&mut p, &sink, |_| false).await);
+        assert_eq!(run(&mut p, 2, &[], &sink).await.reason, Some(TurnEndReason::Completed));
+        let events = vec_sink.0.lock().unwrap().clone();
+        let Some(session_event::Kind::User(u)) = &events[6].kind else { panic!("{:?}", events[6]) };
+        assert_eq!((u.command_id.as_str(), u.text.as_str()), ("c2", "PING now"));
+        p.close().await;
+    }
+
+    /// An older Claude Code answers without saying how it took Send now (it
+    /// may have stopped the turn and its background agents): the turn ends
+    /// interrupted, and the session says so, once.
+    #[tokio::test]
+    async fn an_older_claude_code_taking_send_now_as_stop_is_noted() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = send_now_claude(dir.path());
+        let vec_sink = Arc::new(VecSink::default());
+        let sink: Arc<dyn EventSink> = vec_sink.clone();
+        let mut p = spawn(&bin, dir.path(), "s", false, None);
+        let end = send_now_turn(&mut p, "older", &sink, &vec_sink).await;
+        assert_eq!(end.reason, Some(TurnEndReason::Interrupted));
+        let notices: Vec<c6_proto::Notice> = vec_sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Some(session_event::Kind::Notice(n)) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].message.contains("background agents") && notices[0].quiet, "{:?}", notices[0]);
+        assert!(!vec_sink.0.lock().unwrap().iter().any(|e| matches!(e.kind, Some(session_event::Kind::Error(_)))));
+        p.close().await;
+    }
+
+    /// carbon6's notices aren't a person's messages: they carry no origin.
+    #[tokio::test]
+    async fn notices_are_not_marked_as_yours() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = send_now_claude(dir.path());
+        let vec_sink = Arc::new(VecSink::default());
+        let sink: Arc<dyn EventSink> = vec_sink.clone();
+        let mut p = spawn(&bin, dir.path(), "s", false, None);
+        let notices = [
+            PendingInput { command: "task-notification".into(), ..input("task:bg1:finished", "quick: the build ended") },
+            PendingInput {
+                command: "session-message".into(),
+                from_session_id: "0199-other".into(),
+                ..input("m1", "quick: from another session")
+            },
+        ];
+        for (turn, notice) in notices.into_iter().enumerate() {
+            assert_eq!(run(&mut p, turn as u64 + 1, &[notice], &sink).await.reason, Some(TurnEndReason::Completed));
+        }
+        assert_eq!(run(&mut p, 3, &[input("c3", "quick: yours")], &sink).await.reason, Some(TurnEndReason::Completed));
+        let lines = read_lines(dir.path());
+        assert_eq!(lines.iter().map(|l| l.get("origin").is_some()).collect::<Vec<_>>(), [false, false, true]);
+        assert!(lines.iter().all(|l| l["uuid"].is_string()), "each with its uuid");
+        p.close().await;
+    }
+
+    /// A foreground subagent or command Claude Code moves to the background
+    /// (`task_updated` with `is_backgrounded`) is a background task from
+    /// then on: the subagent's call returning doesn't end it, its task does.
+    #[tokio::test]
+    async fn a_task_moved_to_the_background_is_a_background_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tools.background.set_sink(Some(tx));
+        let observer = observer(dir.path(), tools.clone()).await;
+        let journal = observer.journal.clone();
+        let vec_sink = Arc::new(VecSink::default());
+        let sink: Arc<dyn EventSink> = vec_sink.clone();
+        let mut mapper = Mapper {
+            turn: 1,
+            scope: "s".into(),
+            output_root: None,
+            saw_output: false,
+            result: None,
+            interrupted: false,
+            observer: Some(observer),
+            calls: HashMap::new(),
+            mcp_calls: HashSet::new(),
+            children: HashMap::new(),
+            backgrounded: HashSet::new(),
+            task_calls: HashMap::new(),
+            call_usage: HashMap::new(),
+            per_call: false,
+        };
+        for line in [
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_a","name":"Agent","input":{"description":"review","prompt":"Review it."}},{"type":"tool_use","id":"toolu_b","name":"Bash","input":{"command":"make"}}]},"parent_tool_use_id":null}"#,
+            r#"{"type":"system","subtype":"task_started","task_id":"a1","tool_use_id":"toolu_a","description":"review","task_type":"local_agent","is_backgrounded":false}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Reviewing."}]},"parent_tool_use_id":"toolu_a"}"#,
+            r#"{"type":"system","subtype":"task_started","task_id":"b1","tool_use_id":"toolu_b","description":"make","task_type":"local_bash","is_backgrounded":false}"#,
+            r#"{"type":"system","subtype":"task_updated","task_id":"a1","patch":{"is_backgrounded":true}}"#,
+            r#"{"type":"system","subtype":"task_updated","task_id":"b1","patch":{"is_backgrounded":true}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_a","content":"Moved to the background."},{"type":"tool_result","tool_use_id":"toolu_b","content":"Moved to the background."}]},"parent_tool_use_id":null}"#,
+        ] {
+            mapper.handle(&serde_json::from_str(line).unwrap(), &sink).await.unwrap();
+        }
+        let events: Vec<c6_tools::TaskEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(
+            events.iter().map(|e| (e.native_type.as_str(), e.foreground, e.state)).collect::<Vec<_>>(),
+            [
+                ("local_agent", true, c6_tools::TaskState::Started),
+                ("local_bash", true, c6_tools::TaskState::Started),
+                ("local_agent", false, c6_tools::TaskState::Started),
+                ("local_bash", false, c6_tools::TaskState::Started),
+            ],
+            "each is reported again once it is in the background"
+        );
+        assert_eq!((&events[2].id, &events[3].id), (&events[0].id, &events[1].id), "the same tasks");
+        let child = mapper.children.get("toolu_a").expect("mirrored");
+        assert!(child.open, "the subagent goes on after its call returns");
+        let child_id = child.id.clone();
+        mapper
+            .handle(
+                &serde_json::json!({"type":"system","subtype":"task_notification","task_id":"a1","tool_use_id":"toolu_a","status":"completed","summary":"Reviewed."}),
+                &sink,
+            )
+            .await
+            .unwrap();
+        let (_, log) = journal.load_session(&child_id).await.unwrap().unwrap();
+        let ends: Vec<i32> = log
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Some(session_event::Kind::TurnEnded(t)) => Some(t.reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends, [TurnEndReason::Completed as i32], "it ends with its task");
     }
 }

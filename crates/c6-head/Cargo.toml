@@ -63,4 +63,5 @@ async-trait = "0.1.92"
 tower = { version = "0.5.3", features = ["util"] }
 
 [dev-dependencies]
+c6-testkit.workspace = true
 tempfile = "3.27.0"

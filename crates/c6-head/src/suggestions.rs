@@ -96,32 +96,49 @@ pub async fn seen(st: &HeadState, session_id: &str, for_seq: i64, accepted: bool
     Ok(())
 }
 
-/// The connection and model: a routing rule for `task:suggest` that
-/// applies to the session (its realm's rules, then root's), else the
-/// session's own.
-async fn model_for(st: &HeadState, row: &crate::store::SessionRow) -> anyhow::Result<(String, String)> {
+/// The connection and model for a session's small task (`label`:
+/// `task:suggest`, `task:catchup`, `task:timeline`): a routing rule for it
+/// that applies to the session (its realm's rules first, then root's),
+/// else the session's own. A rule whose connection the session's realm may
+/// not use is passed over.
+pub(crate) async fn model_for(st: &HeadState, row: &crate::store::SessionRow, label: &str) -> anyhow::Result<(String, String)> {
+    Ok(rule_for(st, row, label).await?.unwrap_or_else(|| (row.connection_id.clone(), row.model.clone())))
+}
+
+/// The connection and model a routing rule for `label` gives this session,
+/// if one does.
+pub(crate) async fn rule_for(st: &HeadState, row: &crate::store::SessionRow, label: &str) -> anyhow::Result<Option<(String, String)>> {
     let mut labels = row.all_labels();
-    labels.push(ROUTE_LABEL.into());
+    labels.push(label.into());
     let connections = st.store.connections().await?;
-    for realm in [row.realm.as_str(), crate::realms::ROOT] {
-        let routes: Vec<api::Route> =
-            serde_json::from_str(&st.store.setting_for(crate::sessions::ROUTES, realm).await?.unwrap_or_default()).unwrap_or_default();
-        for r in routes.iter().filter(|r| r.enabled && r.applies_to.iter().any(|l| l == ROUTE_LABEL)) {
-            if !api::labels::applies(&r.applies_to, &labels) {
-                continue;
-            }
-            let want = r.connection.trim();
-            let connection = if want.is_empty() {
-                Some(row.connection_id.clone())
-            } else {
-                connections.iter().find(|c| c.id == want || c.name == want).map(|c| c.id.clone())
-            };
-            if let Some(c) = connection {
-                return Ok((c, r.model.trim().to_owned()));
-            }
+    // The realm's rules, then root's (setting_for merges them).
+    let routes: Vec<api::Route> =
+        serde_json::from_str(&st.store.setting_for(crate::sessions::ROUTES, &row.realm).await?.unwrap_or_default()).unwrap_or_default();
+    for r in routes.iter().filter(|r| r.enabled && r.applies_to.iter().any(|l| l.trim() == label)) {
+        // Its task: labels are the tasks it serves, any of them (a rule for
+        // task:suggest and task:name serves both); the rest must all match
+        // the session.
+        let rest: Vec<String> = r.applies_to.iter().filter(|l| !l.trim().starts_with("task:")).cloned().collect();
+        if !api::labels::applies(&rest, &labels) {
+            continue;
+        }
+        let want = r.connection.trim();
+        let connection = if want.is_empty() {
+            Some(row.connection_id.clone())
+        } else {
+            connections
+                .iter()
+                .find(|c| (c.id == want || c.name == want) && crate::realms::available(&c.realms, &row.realm))
+                .map(|c| c.id.clone())
+        };
+        // Claude Code runs only as a session on a worker, so it can't
+        // answer a one-off call: the next rule, or the fallback, does.
+        let one_off = |id: &str| connections.iter().find(|c| c.id == id).is_none_or(|c| c.kind != "claude_code");
+        if let Some(c) = connection.filter(|c| one_off(c)) {
+            return Ok(Some((c, r.model.trim().to_owned())));
         }
     }
-    Ok((row.connection_id.clone(), row.model.clone()))
+    Ok(None)
 }
 
 /// The last exchanges, as the model reads them: your messages, the agent's
@@ -199,7 +216,12 @@ async fn make(st: &HeadState, row: &crate::store::SessionRow, for_seq: i64) -> a
         &template,
         &[("title", &row.title), ("labels", &labels), ("exchanges", &exchanges(st, &row.id, for_seq as u64).await?)],
     );
-    let (connection, model) = model_for(st, row).await?;
+    let (connection, model) = model_for(st, row, ROUTE_LABEL).await?;
+    let kind = st.store.connections().await?.into_iter().find(|c| c.id == connection).map(|c| c.kind);
+    anyhow::ensure!(
+        kind.as_deref() != Some("claude_code"),
+        "a Claude Code session needs a {ROUTE_LABEL} rule with an API connection (Settings → Model routing)"
+    );
     let origin = c6_llm::activity::Origin {
         what: "suggestion".into(),
         about: row.title.clone(),

@@ -6,9 +6,176 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 use crate::api;
-use crate::models::ModelInput;
-use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT, StatusPill, ago, clock, storage_get, storage_set};
-use crate::workspace::{Go, How, View, use_column, use_workspace};
+use crate::icons;
+use crate::session::{ModelPicker, SEND, SEND_EMPTY, SEND_READY, SEND_SHAPE, send_icon};
+use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, GROWS, INPUT, StatusPill, ago, clock, escapable, storage_get, storage_set};
+use crate::workspace::{Go, How, Popover, View, below, use_column, use_workspace};
+
+/// Placeholders in the text's own font, in readable grey (a field's value
+/// may be monospace).
+const PLACEHOLDER: &str = "placeholder:font-sans placeholder:text-muted";
+
+/// A choice among a few, as a chip to tap: filled when chosen.
+fn chip(on: bool) -> &'static str {
+    if on {
+        "rounded-full border border-sky-600 bg-sky-600 px-3 py-1 text-xs text-white pointer-coarse:py-1.5 pointer-coarse:text-sm dark:border-sky-500"
+    } else {
+        "rounded-full border border-zinc-300 px-3 py-1 text-xs text-soft hover:bg-zinc-100 pointer-coarse:py-1.5 pointer-coarse:text-sm dark:border-zinc-700 dark:hover:bg-zinc-800"
+    }
+}
+
+/// How the list is ordered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Sort {
+    /// The sessions you viewed, newest first, then the rest by last activity.
+    #[default]
+    Viewed,
+    Activity,
+    Title,
+}
+
+impl Sort {
+    const ALL: [Sort; 3] = [Sort::Viewed, Sort::Activity, Sort::Title];
+
+    fn label(self) -> &'static str {
+        match self {
+            Sort::Viewed => "Recently viewed",
+            Sort::Activity => "Last activity",
+            Sort::Title => "Title",
+        }
+    }
+}
+
+/// Show's choices (value, label); "" is All.
+const SHOWS: [(&str, &str); 4] = [("", "All"), ("running", "Running"), ("needs", "Needs you"), ("idle", "Idle")];
+
+/// Whether Show's choice takes a session: by the state its row says.
+fn shows(s: &Session, show: &str) -> bool {
+    match show {
+        "" => true,
+        "needs" => s.awaiting_approval,
+        word => recent_state(s).1 == word,
+    }
+}
+
+/// The sessions in the order `sort` says: for Recently viewed, those you
+/// viewed (`viewed`: id and when) newest first, then the rest by last
+/// activity.
+fn sorted(mut list: Vec<Session>, sort: Sort, viewed: &[(String, i64)]) -> Vec<Session> {
+    use std::cmp::Reverse;
+    match sort {
+        Sort::Viewed => {
+            let at = |s: &Session| viewed.iter().find(|(id, _)| *id == s.id).map(|(_, at)| *at);
+            list.sort_by_key(|s| match at(s) {
+                Some(t) => (false, Reverse(t)),
+                None => (true, Reverse(s.updated_at)),
+            });
+        }
+        Sort::Activity => list.sort_by_key(|s| Reverse(s.updated_at)),
+        Sort::Title => list.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()).then(b.updated_at.cmp(&a.updated_at))),
+    }
+    list
+}
+
+/// Labels the head puts among a session's own: a template run's.
+const HEAD_SET: [&str; 3] = ["template:", "run:", "started-by:"];
+
+/// The labels you gave a session: not the automatic ones (`repo:`,
+/// `host:`, `worker:`, `folder:`, `model:`), nor a template run's.
+fn own_labels(s: &Session) -> Vec<String> {
+    s.labels.iter().filter(|l| c6_api::labels::check_user_label(l).is_ok() && !HEAD_SET.iter().any(|k| l.starts_with(k))).cloned().collect()
+}
+
+/// Whether any of the list's choices isn't the default (All, no labels,
+/// Recently viewed, no groups): the phone's sliders button shows a dot.
+fn non_default(show: &str, labels: &[String], sort: Sort, levels: &[String]) -> bool {
+    !show.is_empty() || !labels.is_empty() || sort != Sort::default() || !levels.is_empty()
+}
+
+/// A folder's last part ("carbon6" for ~/projects/carbon6).
+fn last_part(path: &str) -> String {
+    let p = path.trim_end_matches('/');
+    p.rsplit('/').next().filter(|x| !x.is_empty()).unwrap_or(path).to_owned()
+}
+
+/// A folder in its `~/` form when it is under a home folder.
+fn home_form(path: &str) -> String {
+    for root in ["/home/", "/Users/"] {
+        if let Some(rest) = path.strip_prefix(root) {
+            return match rest.split_once('/') {
+                Some((_, after)) if !after.is_empty() => format!("~/{after}"),
+                _ => "~".to_owned(),
+            };
+        }
+    }
+    match path.strip_prefix("/root") {
+        Some("") => "~".to_owned(),
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => path.to_owned(),
+    }
+}
+
+/// Where and how a new session runs, in one line: "on thalassa ·
+/// ~/projects/carbon6 · opus · high"; `short` (a phone's chip):
+/// "thalassa · carbon6 · opus".
+fn summary(worker: &str, ssh: Option<&str>, folder: &str, model: &str, effort: &str, short: bool) -> String {
+    let place = match ssh {
+        Some(t) if folder.is_empty() => format!("⇄ {t}"),
+        Some(t) if short => format!("⇄ {t}:{}", last_part(folder)),
+        Some(t) => format!("⇄ {t}:{folder}"),
+        None if folder.is_empty() => "scratch folder".to_owned(),
+        None if short => last_part(folder),
+        None => home_form(folder),
+    };
+    let mut parts = vec![worker.to_owned(), place];
+    parts.extend([model, if short { "" } else { effort }].into_iter().filter(|x| !x.is_empty()).map(str::to_owned));
+    let line = parts.join(" · ");
+    if short { line } else { format!("on {line}") }
+}
+
+/// The list's choices: Show (and its labels: the shared label filter), Sort
+/// and Group (kept in the head, shared with the rail).
+#[derive(Clone, Copy)]
+struct ListChoices {
+    show: RwSignal<String>,
+    labels: RwSignal<Vec<String>>,
+    sort: RwSignal<Sort>,
+    grouping: Grouping,
+}
+
+impl ListChoices {
+    fn changed(&self) -> bool {
+        non_default(&self.show.get(), &self.labels.get(), self.sort.get(), &self.grouping.levels.get())
+    }
+
+    /// Back to All, Recently viewed, no groups.
+    fn reset(&self) {
+        self.show.set(String::new());
+        self.labels.set(Vec::new());
+        self.sort.set(Sort::default());
+        if !self.grouping.levels.with_untracked(Vec::is_empty) {
+            self.grouping.choose(Vec::new());
+        }
+    }
+
+    /// Show ▾'s button: what it shows, if not everything.
+    fn show_label(&self) -> String {
+        let show = self.show.get();
+        let state = SHOWS.iter().find(|(v, _)| *v == show).map(|(_, l)| *l).filter(|_| !show.is_empty());
+        let labels = self.labels.get();
+        let labels = match labels.as_slice() {
+            [] => None,
+            [one] => Some(one.clone()),
+            many => Some(format!("{} labels", many.len())),
+        };
+        match (state, labels) {
+            (None, None) => "Show: All".to_owned(),
+            (Some(s), None) => format!("Show: {s}"),
+            (None, Some(l)) => format!("Show: {l}"),
+            (Some(s), Some(l)) => format!("Show: {s} · {l}"),
+        }
+    }
+}
 
 #[component]
 pub fn SessionsPage() -> impl IntoView {
@@ -16,70 +183,380 @@ pub fn SessionsPage() -> impl IntoView {
     let now = clock();
     let connections = LocalResource::new(api::connections);
     let query = RwSignal::new(String::new());
-    let status_filter = RwSignal::new(String::new());
-    let label_filter = crate::labels::use_filter().0;
-    let grouping = use_grouping();
+    let choices = ListChoices {
+        show: RwSignal::new(String::new()),
+        labels: crate::labels::use_filter().0,
+        sort: RwSignal::new(Sort::default()),
+        grouping: use_grouping(),
+    };
     let folded = Folded::load(Folded::PAGE);
+    // The sessions you viewed, for Recently viewed.
+    let recent = use_recent(usize::MAX, |_| false);
+    let sheet = RwSignal::new(false);
+    let search = move |ev: web_sys::Event| query.set(event_target_value(&ev));
 
     view! {
-        <main class="mx-auto max-w-6xl space-y-6 px-4 py-6">
+        <main class="mx-auto max-w-6xl space-y-4 px-3 py-4 md:space-y-5 md:px-4 md:py-6">
+            <div class="hidden flex-wrap items-center gap-2 md:flex">
+                <h1 class="mr-2 text-lg font-semibold">"Sessions"</h1>
+                <input type="search" class=format!("{INPUT} {PLACEHOLDER} min-w-48 max-w-sm flex-1") placeholder="Search titles, labels, workers, folders"
+                    prop:value=move || query.get() on:input=search />
+                <span class="flex-1"></span>
+                <ListMenus choices />
+            </div>
+            <div class="flex items-center gap-2 md:hidden">
+                <label class="relative min-w-0 flex-1">
+                    <span class="pointer-events-none absolute left-2.5 top-1/2 flex -translate-y-1/2 text-muted">{icons::search()}</span>
+                    <input type="search" class=format!("{INPUT} {PLACEHOLDER} pl-8") placeholder="Search" aria-label="Search sessions"
+                        prop:value=move || query.get() on:input=search />
+                </label>
+                <button class=format!("{} relative", icons::BAR_BUTTON) title="Filter, sort and group" aria-label="Filter, sort and group"
+                    aria-haspopup="dialog" aria-expanded=move || sheet.get().to_string() on:click=move |_| sheet.set(true)>
+                    {icons::sliders()}
+                    {move || choices.changed().then(|| view! {
+                        <span class="absolute right-1 top-1 size-2 rounded-full bg-sky-600 dark:bg-sky-400" title="Not the default"></span>
+                    })}
+                </button>
+            </div>
             <Suspense fallback=|| ()>
                 {move || connections.get().map(|r| match r {
                     Ok(conns) if conns.is_empty() => view! {
-                        <div class="rounded-lg border border-dashed border-zinc-300 p-6 text-center text-sm text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">
+                        <div class="rounded-lg border border-dashed border-zinc-300 p-6 text-center text-sm text-soft dark:border-zinc-700">
                             "Add an LLM connection in " <Go to=View::Settings { note: None, section: "models".into() } class="underline">"Settings"</Go> " to start a session."
                         </div>
                     }.into_any(),
-                    Ok(conns) => view! { <NewSession connections=conns /> <RunTemplate /> }.into_any(),
+                    Ok(conns) => view! { <SessionForm connections=conns /> }.into_any(),
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
                 })}
             </Suspense>
 
-            <section class="space-y-2">
-                <div class="flex flex-wrap items-center gap-2">
-                    <h2 class="flex-1 text-sm font-medium text-zinc-500">"Sessions"</h2>
-                    <input class=format!("{INPUT} w-56") placeholder="Search titles, labels, workers, paths" prop:value=move || query.get()
-                        on:input=move |ev| query.set(event_target_value(&ev)) />
-                    <select class=format!("{INPUT} w-32") prop:value=move || status_filter.get() on:change=move |ev| status_filter.set(event_target_value(&ev))>
-                        <option value="">"All"</option>
-                        <option value="running">"Running"</option>
-                        <option value="idle">"Idle"</option>
-                        <option value="failed">"Failed"</option>
-                    </select>
-                </div>
-                <crate::labels::LabelFilterBar />
-                <GroupBar grouping />
-                <div class="divide-y divide-zinc-200 overflow-hidden rounded-lg border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
-                    {move || {
-                        let q = query.get().to_lowercase();
-                        let st = status_filter.get();
-                        let wanted = label_filter.get();
-                        let realm = crate::api::realm().get();
-                        let sessions: Vec<Session> = live
-                            .sessions
-                            .get()
-                            .into_iter()
-                            .filter(|s| st.is_empty() || serde_json::to_value(s.display_status()).ok().and_then(|v| v.as_str().map(str::to_owned)).as_deref() == Some(st.as_str()))
-                            .filter(|s| crate::labels::matches(s, &wanted))
-                            .filter(|s| realm.is_empty() || s.realm == realm)
-                            .filter(|s| {
-                                q.is_empty()
-                                    || s.labels.iter().chain(s.auto_labels.iter()).any(|l| l.to_lowercase().contains(&q))
-                                    || s.title.to_lowercase().contains(&q)
-                                    || s.cwd.to_lowercase().contains(&q)
-                                    || live.worker_name(&s.worker_id.to_string()).to_lowercase().contains(&q)
-                            })
-                            .collect();
-                        if sessions.is_empty() {
-                            let msg = if wanted.is_empty() && q.is_empty() { "No sessions yet." } else { "No sessions match." };
-                            view! { <p class="px-4 py-8 text-center text-sm text-zinc-500">{msg}</p> }.into_any()
-                        } else {
-                            grouped(sessions, &grouping.levels.get(), String::new(), folded, &|s| view! { <SessionRow s now /> }.into_any(), false)
-                        }
-                    }}
-                </div>
-            </section>
+            <div class="divide-y divide-zinc-200 overflow-hidden rounded-lg border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
+                {move || {
+                    let q = query.get().to_lowercase();
+                    let show = choices.show.get();
+                    let wanted = choices.labels.get();
+                    let realm = api::realm().get();
+                    let viewed: Vec<(String, i64)> = recent.with(|r| r.iter().map(|(s, at)| (s.id.clone(), *at)).collect());
+                    let sessions: Vec<Session> = live
+                        .sessions
+                        .get()
+                        .into_iter()
+                        .filter(|s| shows(s, &show))
+                        .filter(|s| crate::labels::matches(s, &wanted))
+                        .filter(|s| realm.is_empty() || s.realm == realm)
+                        .filter(|s| {
+                            q.is_empty()
+                                || s.labels.iter().chain(s.auto_labels.iter()).any(|l| l.to_lowercase().contains(&q))
+                                || s.title.to_lowercase().contains(&q)
+                                || s.cwd.to_lowercase().contains(&q)
+                                || live.session_worker(s).to_lowercase().contains(&q)
+                        })
+                        .collect();
+                    if sessions.is_empty() {
+                        let msg = if wanted.is_empty() && q.is_empty() && show.is_empty() { "No sessions yet." } else { "No sessions match." };
+                        view! { <p class="px-4 py-8 text-center text-sm text-muted">{msg}</p> }.into_any()
+                    } else {
+                        let sessions = sorted(sessions, choices.sort.get(), &viewed);
+                        grouped(sessions, &choices.grouping.levels.get(), String::new(), folded, &|s| view! { <SessionRow s now /> }.into_any(), false)
+                    }
+                }}
+            </div>
         </main>
+        <Show when=move || sheet.get()>
+            <Sheet open=sheet title="Filter, sort and group" reset=Callback::new(move |()| choices.reset())>
+                <div class="space-y-5">
+                    <section class="space-y-2"><ShowChips choices /></section>
+                    <section class="space-y-2"><LabelChips choices /></section>
+                    <section class="space-y-2"><SortChips choices /></section>
+                    <section class="space-y-2"><GroupChips choices /></section>
+                </div>
+            </Sheet>
+        </Show>
+    }
+}
+
+/// The desktop's Show ▾, Sort ▾ and Group ▾, each opening its choices.
+#[component]
+fn ListMenus(choices: ListChoices) -> impl IntoView {
+    let (show_at, sort_at, group_at) = (RwSignal::new(None), RwSignal::new(None), RwSignal::new(None));
+    let button = "inline-flex shrink-0 items-center gap-1 rounded-md border border-zinc-200 px-2.5 py-1.5 text-xs text-soft hover:bg-zinc-100 dark:border-zinc-800 dark:hover:bg-zinc-800";
+    view! {
+        <button class=button aria-haspopup="dialog" on:click=move |ev| show_at.set(Some(below(&ev, 320.0)))>
+            {move || choices.show_label()} <span class="text-muted">"▾"</span>
+        </button>
+        <button class=button aria-haspopup="dialog" on:click=move |ev| sort_at.set(Some(below(&ev, 224.0)))>
+            {move || format!("Sort: {}", choices.sort.get().label())} <span class="text-muted">"▾"</span>
+        </button>
+        <button class=button aria-haspopup="dialog" on:click=move |ev| group_at.set(Some(below(&ev, 320.0)))>
+            {move || match choices.grouping.levels.get().as_slice() {
+                [] => "Group: none".to_owned(),
+                levels => format!("Group: {}", levels.join(" › ")),
+            }}
+            <span class="text-muted">"▾"</span>
+        </button>
+        <Popover at=show_at class="w-80 space-y-3">
+            <div class="space-y-2"><ShowChips choices /></div>
+            <div class="space-y-2"><LabelChips choices /></div>
+        </Popover>
+        <Popover at=sort_at class="w-56 space-y-2">
+            <SortChips choices done=Callback::new(move |()| sort_at.set(None)) />
+        </Popover>
+        <Popover at=group_at class="w-80 space-y-2">
+            <GroupChips choices />
+        </Popover>
+    }
+}
+
+#[component]
+fn ChipHeading(text: &'static str) -> impl IntoView {
+    view! { <h3 class="text-[11px] font-semibold uppercase tracking-wide text-muted">{text}</h3> }
+}
+
+/// Show: All, Running, Needs you, Idle.
+#[component]
+fn ShowChips(choices: ListChoices) -> impl IntoView {
+    view! {
+        <ChipHeading text="Show" />
+        <div class="flex flex-wrap gap-1.5" role="radiogroup" aria-label="Show">
+            {SHOWS.iter().map(|&(v, l)| {
+                let on = move || choices.show.with(|s| s == v);
+                view! {
+                    <button role="radio" aria-checked=move || on().to_string() class=move || chip(on()) on:click=move |_| choices.show.set(v.to_owned())>{l}</button>
+                }
+            }).collect_view()}
+        </div>
+    }
+}
+
+/// The realm's labels (yours) to show only sessions with, and a field for
+/// any other (the automatic ones too).
+#[component]
+fn LabelChips(choices: ListChoices) -> impl IntoView {
+    let live = api::live();
+    let filter = choices.labels;
+    let mine = Memo::new(move |_| {
+        let realm = api::realm().get();
+        let mut all: Vec<String> =
+            live.sessions.with(|ss| ss.iter().filter(|s| realm.is_empty() || s.realm == realm).flat_map(own_labels).collect());
+        all.extend(filter.get());
+        all.sort();
+        all.dedup();
+        all
+    });
+    let draft = RwSignal::new(String::new());
+    let list_id = format!("c6-show-labels-{}", js_sys::Math::random().to_bits());
+    let add = move || {
+        let new = c6_api::labels::parse_labels(&draft.get_untracked());
+        filter.update(|f| {
+            for l in new {
+                if !f.contains(&l) {
+                    f.push(l);
+                }
+            }
+        });
+        draft.set(String::new());
+    };
+    view! {
+        <ChipHeading text="Labels" />
+        <div class="flex flex-wrap items-center gap-1.5">
+            {move || mine.get().into_iter().map(|l| {
+                let on = { let l = l.clone(); Signal::derive(move || filter.with(|f| f.contains(&l))) };
+                let flip = l.clone();
+                view! {
+                    <button aria-pressed=move || on.get().to_string() class=move || chip(on.get())
+                        on:click=move |_| filter.update(|f| match f.iter().position(|x| *x == flip) {
+                            Some(i) => { f.remove(i); }
+                            None => f.push(flip.clone()),
+                        })>{l}</button>
+                }
+            }).collect_view()}
+            <input class=format!("{INPUT} {PLACEHOLDER} w-36! py-1 font-mono text-xs") list=list_id.clone() placeholder="Another label…" aria-label="Show only sessions with this label"
+                prop:value=move || draft.get() on:input=move |ev| draft.set(event_target_value(&ev))
+                on:change=move |_| add()
+                on:keydown=move |ev| if ev.key() == "Enter" { ev.prevent_default(); add(); } />
+            <datalist id=list_id>
+                {move || live.sessions.with(|ss| crate::labels::known_labels(ss)).into_iter().map(|l| view! { <option value=l></option> }).collect_view()}
+            </datalist>
+        </div>
+    }
+}
+
+/// Sort: Recently viewed, Last activity, Title; `done` after a choice.
+#[component]
+fn SortChips(choices: ListChoices, #[prop(optional)] done: Option<Callback<()>>) -> impl IntoView {
+    view! {
+        <ChipHeading text="Sort" />
+        <div class="flex flex-wrap gap-1.5" role="radiogroup" aria-label="Sort">
+            {Sort::ALL.into_iter().map(|v| {
+                let on = move || choices.sort.get() == v;
+                view! {
+                    <button role="radio" aria-checked=move || on().to_string() class=move || chip(on())
+                        on:click=move |_| { choices.sort.set(v); if let Some(d) = done { d.run(()) } }>{v.label()}</button>
+                }
+            }).collect_view()}
+        </div>
+    }
+}
+
+/// The label keys to group by: repo, host and model, then those of your
+/// labels.
+fn label_keys(sessions: &[Session]) -> Vec<String> {
+    let mut keys: Vec<String> = ["repo", "host", "model"].map(str::to_owned).to_vec();
+    for s in sessions {
+        for l in own_labels(s) {
+            if let Some((k, _)) = l.split_once(':')
+                && !keys.iter().any(|x| x == k)
+            {
+                keys.push(k.to_owned());
+            }
+        }
+    }
+    keys
+}
+
+/// `levels` grouped first by `key` (the rest as they were).
+fn outermost(levels: &[String], key: &str) -> Vec<String> {
+    std::iter::once(key.to_owned()).chain(levels.iter().skip(1).filter(|k| *k != key).cloned()).collect()
+}
+
+/// Group: None, Worker, Folder, Label (and by which label key); once
+/// grouped, the levels to nest further.
+#[component]
+fn GroupChips(choices: ListChoices) -> impl IntoView {
+    let live = api::live();
+    let g = choices.grouping;
+    let first = Memo::new(move |_| g.levels.with(|l| l.first().cloned()));
+    let by_label = Memo::new(move |_| first.get().is_some_and(|k| k != "worker" && k != "folder"));
+    let keys = Memo::new(move |_| live.sessions.with(|ss| label_keys(ss)));
+    let by = move |key: &str| g.choose(outermost(&g.levels.get_untracked(), key));
+    let plain = [("Worker", "worker"), ("Folder", "folder")];
+    view! {
+        <ChipHeading text="Group" />
+        <div class="flex flex-wrap gap-1.5" role="radiogroup" aria-label="Group">
+            <button role="radio" aria-checked=move || first.with(Option::is_none).to_string() class=move || chip(first.with(Option::is_none))
+                on:click=move |_| g.choose(Vec::new())>"None"</button>
+            {plain.into_iter().map(|(l, k)| {
+                let on = move || first.with(|f| f.as_deref() == Some(k));
+                view! { <button role="radio" aria-checked=move || on().to_string() class=move || chip(on()) on:click=move |_| by(k)>{l}</button> }
+            }).collect_view()}
+            <button role="radio" aria-checked=move || by_label.get().to_string() class=move || chip(by_label.get())
+                on:click=move |_| if !by_label.get_untracked() {
+                    // Your first label key, else the repository.
+                    let keys = keys.get_untracked();
+                    by(keys.get(3).or(keys.first()).map(String::as_str).unwrap_or("repo"));
+                }>"Label"</button>
+        </div>
+        {move || by_label.get().then(|| view! {
+            <div class="flex flex-wrap items-center gap-1.5 pl-2" role="radiogroup" aria-label="Group by which label">
+                <span class="text-xs text-muted">"by"</span>
+                {keys.get().into_iter().map(|k| {
+                    let on = { let k = k.clone(); Signal::derive(move || first.with(|f| f.as_deref() == Some(k.as_str()))) };
+                    let pick = k.clone();
+                    view! { <button role="radio" aria-checked=move || on.get().to_string() class=move || format!("{} font-mono", chip(on.get())) on:click=move |_| by(&pick)>{k}</button> }
+                }).collect_view()}
+            </div>
+        })}
+        {move || first.with(Option::is_some).then(|| view! {
+            <div class="border-t border-zinc-200 pt-2 dark:border-zinc-800"><GroupBar grouping=g /></div>
+        })}
+    }
+}
+
+/// A phone's sheet from the bottom of the screen, over a dimmed page: a
+/// tap above it, Done or Esc closes it; `reset` puts Reset at its top
+/// right.
+#[component]
+fn Sheet(
+    open: RwSignal<bool>,
+    #[prop(into)] title: String,
+    #[prop(optional)] reset: Option<Callback<()>>,
+    children: Children,
+) -> impl IntoView {
+    let close = move || {
+        open.try_set(false);
+    };
+    let pop = escapable(move || open.get(), close);
+    let label = title.clone();
+    view! {
+        <div class="fixed inset-0 z-40 bg-black/30" on:click=move |_| close()></div>
+        <div data-pop=pop role="dialog" aria-label=label
+            class="fixed inset-x-0 bottom-0 z-50 flex max-h-[85dvh] flex-col rounded-t-xl border-t border-zinc-200 bg-white text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900">
+            <div class="flex shrink-0 items-center gap-2 border-b border-zinc-200 py-1 pl-4 pr-2 dark:border-zinc-800">
+                <h2 class="flex-1 py-2 font-medium">{title}</h2>
+                {reset.map(|r| view! { <button class="rounded-md px-3 py-2 text-sky-700 dark:text-sky-400" on:click=move |_| r.run(())>"Reset"</button> })}
+            </div>
+            <div class="min-h-0 flex-1 overflow-y-auto px-4 py-4">{children()}</div>
+            <div class="notice-safe shrink-0 border-t border-zinc-200 px-4 pt-3 dark:border-zinc-800">
+                <button class=format!("{BUTTON} w-full py-2") on:click=move |_| close()>"Done"</button>
+            </div>
+        </div>
+    }
+}
+
+/// The sessions you viewed lately (kept by the head, the same on every
+/// device), newest first, as the live feed has them, with when you viewed
+/// each: up to `limit`, leaving out those `skip` says.
+pub(crate) fn use_recent(limit: usize, skip: impl Fn(&str) -> bool + Send + Sync + 'static) -> Memo<Vec<(Session, i64)>> {
+    let (ws, live) = (use_workspace(), api::live());
+    let views = LocalResource::new(move || {
+        api::realm().track();
+        ws.viewed.track();
+        api::recent_sessions()
+    });
+    Memo::new(move |_| {
+        let views = views.get().and_then(Result::ok).unwrap_or_default();
+        live.sessions.with(|all| {
+            views
+                .iter()
+                .filter(|v| !skip(&v.session_id))
+                .filter_map(|v| all.iter().find(|s| s.id == v.session_id).map(|s| (s.clone(), v.at)))
+                .take(limit)
+                .collect()
+        })
+    })
+}
+
+/// A recently viewed session's state, as the Sessions list colours it:
+/// needs you (an approval waits), else running, idle, starting or failed.
+pub(crate) fn recent_state(s: &Session) -> (&'static str, &'static str) {
+    if s.awaiting_approval {
+        ("bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300", "needs you")
+    } else {
+        crate::util::status_look(s.display_status())
+    }
+}
+
+/// A recently viewed session: its mark, title, state and when you viewed
+/// it. It opens in the focused tile (⌘/Ctrl-click: a new one), then
+/// `close` runs (the phone's sheet closes).
+#[component]
+pub(crate) fn RecentRow(s: Session, at: i64, now: RwSignal<i64>, #[prop(optional)] close: Option<Callback<()>>) -> impl IntoView {
+    let (ws, col) = (use_workspace(), use_column());
+    let to = View::session(s.id.clone());
+    let href = to.href();
+    let to = StoredValue::new(to);
+    let (pill, word) = recent_state(&s);
+    view! {
+        <a href=href class="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800" title="Open (⌘-click: new tile)"
+            on:click=move |ev: web_sys::MouseEvent| {
+                if ev.button() != 0 || ev.shift_key() || ev.alt_key() {
+                    return;
+                }
+                ev.prevent_default();
+                let how = How::from_mouse(&ev);
+                match col {
+                    Some(c) => c.open(to.get_value(), how),
+                    None => ws.open(None, to.get_value(), how),
+                }
+                if let Some(c) = close {
+                    c.run(());
+                }
+            }>
+            <span class="h-2.5 w-2.5 shrink-0 rounded-full" style=crate::marks::fill(&crate::marks::of(&s)) title="Its mark"></span>
+            <span class="min-w-0 flex-1 truncate">{s.title.clone()}</span>
+            <span class=format!("inline-flex shrink-0 items-center rounded-full px-2 py-0.5 text-xs font-medium {pill}")>{word}</span>
+            <span class="w-14 shrink-0 text-right text-xs text-muted">{move || ago(now.get() - at)}</span>
+        </a>
     }
 }
 
@@ -107,6 +584,17 @@ impl Grouping {
     fn save(&self, levels: Vec<String>) -> impl std::future::Future<Output = Result<(), String>> + use<> {
         self.levels.set(levels.clone());
         api::put_setting("session_grouping", serde_json::json!({ "levels": levels }))
+    }
+
+    /// Groups by `levels` now, saying so if the head couldn't keep it.
+    fn choose(&self, levels: Vec<String>) {
+        let notice = crate::util::Notice::get();
+        let done = self.save(levels);
+        spawn_local(async move {
+            if let Err(e) = done.await {
+                notice.show(format!("Couldn't keep the grouping: {e}"), None);
+            }
+        });
     }
 }
 
@@ -194,7 +682,7 @@ fn grouped(
             let rows = grouped(list, &rest, here.clone(), folded, row, compact);
             let (button, body) = if compact {
                 (
-                    "flex w-full items-center gap-1 rounded px-1 py-0.5 text-left text-[11px] text-zinc-500 hover:bg-zinc-200/60 dark:hover:bg-zinc-800/60",
+                    "flex w-full items-center gap-1 rounded px-1 py-0.5 text-left text-[11px] text-muted hover:bg-zinc-200/60 dark:hover:bg-zinc-800/60",
                     "ml-1.5 border-l border-zinc-200 pl-1 dark:border-zinc-800",
                 )
             } else {
@@ -206,8 +694,8 @@ fn grouped(
             view! {
                 <div>
                     <button class=button on:click=toggle title=format!("{key}: {}", value.clone().unwrap_or_else(|| format!("no {key}")))>
-                        <span class="w-3 shrink-0 text-sm text-zinc-500">{move || if is_folded.get() { "▸" } else { "▾" }}</span>
-                        {(!compact).then(|| view! { <span class="shrink-0 text-zinc-400">{format!("{key}:")}</span> })}
+                        <span class="w-3 shrink-0 text-sm text-muted">{move || if is_folded.get() { "▸" } else { "▾" }}</span>
+                        {(!compact).then(|| view! { <span class="shrink-0 text-muted">{format!("{key}:")}</span> })}
                         <span class="min-w-0 truncate">{name}</span>
                         <span class="ml-auto shrink-0 tabular-nums">{count}</span>
                         {(running > 0).then(|| view! {
@@ -250,14 +738,14 @@ pub fn GroupBar(grouping: Grouping) -> impl IntoView {
         keys
     });
     view! {
-        <div class="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
+        <div class="flex flex-wrap items-center gap-2 text-xs text-muted">
             <span>"Group by"</span>
             {move || {
                 let levels = grouping.levels.get();
                 levels.iter().enumerate().map(|(i, k)| {
                     let (outer, gone) = (levels.clone(), levels.clone());
                     view! {
-                        {(i > 0).then(|| view! { <span class="text-zinc-400">"›"</span> })}
+                        {(i > 0).then(|| view! { <span class="text-muted">"›"</span> })}
                         <span class="inline-flex items-center gap-1 rounded bg-violet-100 px-1.5 py-0.5 font-mono text-[11px] text-violet-800 dark:bg-violet-950 dark:text-violet-300">
                             {(i > 0).then(|| view! {
                                 <button title="Group by this one level further out" on:click=move |_| {
@@ -331,36 +819,66 @@ pub(crate) fn SessionMenu(id: String, #[prop(optional)] dismiss: Option<Callback
     view! { <crate::util::Menu items row=true label="Session actions" /> }
 }
 
+/// A row's state word in its colour: idle quiet, the rest in colour.
+fn state_colour(word: &str) -> &'static str {
+    match word {
+        "running" => "font-medium text-blue-600 dark:text-blue-400",
+        "needs you" | "starting" => "font-medium text-amber-600 dark:text-amber-400",
+        "failed" => "font-medium text-red-600 dark:text-red-400",
+        _ => "text-muted",
+    }
+}
+
+/// A row's line of where it runs: its worker, its folder's last part and
+/// its model.
+fn where_line(worker: &str, s: &Session) -> String {
+    let place = match (&s.ssh, s.cwd.is_empty()) {
+        (Some(t), true) => format!("⇄ {t}"),
+        (Some(t), false) => format!("⇄ {t}:{}", last_part(&s.cwd)),
+        (None, true) => "scratch folder".to_owned(),
+        (None, false) => last_part(&s.cwd),
+    };
+    [worker, place.as_str(), s.model.as_str()].into_iter().filter(|x| !x.is_empty()).collect::<Vec<_>>().join(" · ")
+}
+
+/// A session in the list: its mark, title, state and when it was last
+/// active; under the title where it runs (all of it on hover) and, if you
+/// gave it any, its labels (with the aspects Settings → Appearance shows).
 #[component]
 fn SessionRow(s: Session, now: RwSignal<i64>) -> impl IntoView {
     let live = api::live();
-    let worker = live.worker_name(&s.worker_id.to_string());
+    let worker = live.session_worker(&s);
     let updated = s.updated_at;
-    let status = s.display_status();
-    let (mark, chips) = (crate::marks::fill(&crate::marks::of(&s)), s.clone());
+    let word = recent_state(&s).1;
+    let mark = crate::marks::fill(&crate::marks::of(&s));
+    let place = match (&s.ssh, s.cwd.is_empty()) {
+        (Some(t), _) => format!("{worker} ⇄ {t}:{}", s.cwd),
+        (None, true) => format!("{worker}: a scratch folder"),
+        (None, false) => format!("{worker}:{}", s.cwd),
+    };
+    let place = if s.on_head { format!("{place}\n{}", api::HEAD_TITLE) } else { place };
+    let labels = own_labels(&s).join(", ");
+    let aspects = !crate::aspects::shown(&s).is_empty();
+    let line = where_line(&worker, &s);
+    let chips = s.clone();
     view! {
-        <div class="group flex items-center gap-1 pr-2 hover:bg-zinc-100 dark:hover:bg-zinc-900">
-        <Go to=View::session(s.id.clone()) class="flex min-w-0 flex-1 items-center gap-3 py-3 pl-4" title="Open beside this list (⌘-click: new tile)">
-            <span class="h-8 w-1 shrink-0 rounded-sm" style=mark title="Its mark"></span>
+        <div class="group flex items-center gap-1 pr-1 hover:bg-zinc-100 md:pr-2 dark:hover:bg-zinc-900">
+        <Go to=View::session(s.id.clone()) class="flex min-w-0 flex-1 items-center gap-3 py-2.5 pl-3 md:pl-4" title="Open beside this list (⌘-click: new tile)">
+            <span class="mt-1.5 h-2.5 w-2.5 shrink-0 self-start rounded-full" style=mark title="Its mark"></span>
             <div class="min-w-0 flex-1">
                 <div class="truncate font-medium">{s.title.clone()}</div>
-                <div class="mt-0.5 flex items-center gap-2"><crate::aspects::AspectChips s=chips /></div>
-                <div class="truncate text-xs text-zinc-500">
-                    {worker} " · " <span class="font-mono">{match (&s.ssh, s.cwd.is_empty()) {
-                        (Some(t), _) => format!("⇄ {t}:{}", s.cwd),
-                        (None, true) => "scratch workspace".to_owned(),
-                        (None, false) => s.cwd.clone(),
-                    }}</span> " · " {s.model.clone()}
-                </div>
-                {(!s.labels.is_empty() || !crate::labels::shown_auto(&s.auto_labels).is_empty()).then(|| view! {
-                    <div class="mt-1 flex flex-wrap gap-1">
-                        {crate::labels::shown_auto(&s.auto_labels).into_iter().map(|l| view! { <crate::labels::LabelChip label=l auto=true stay=true /> }).collect_view()}
-                        {s.labels.iter().cloned().map(|l| view! { <crate::labels::LabelChip label=l stay=true /> }).collect_view()}
+                <div class="truncate text-xs text-muted" title=place>{line}</div>
+                {(!labels.is_empty() || aspects).then(|| view! {
+                    <div class="flex min-w-0 items-center gap-2 text-xs text-muted">
+                        {(!labels.is_empty()).then(|| view! { <span class="min-w-0 truncate" title=labels.clone()>{labels.clone()}</span> })}
+                        <crate::aspects::AspectChips s=chips.clone() />
                     </div>
                 })}
             </div>
-            <StatusPill status />
-            <span class="w-16 shrink-0 text-right text-xs text-zinc-500">{move || ago(now.get() - updated)}</span>
+            <div class="flex shrink-0 flex-col items-end gap-0.5 text-xs md:flex-row md:items-center md:gap-0">
+                <span class=state_colour(word)>{word}</span>
+                <span class="text-muted md:w-20 md:text-right">{move || ago(now.get() - updated)}</span>
+            </div>
         </Go>
         <SessionMenu id=s.id.clone() />
         </div>
@@ -396,7 +914,7 @@ pub fn SessionsRail(open: RwSignal<bool>) -> impl IntoView {
     });
     let small = "rounded px-1 font-normal normal-case tracking-normal hover:bg-zinc-200/60 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
     view! {
-        <div class="flex items-center gap-1 pb-1 pl-1.5 pr-3 pt-2 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
+        <div class="flex items-center gap-1 pb-1 pl-1.5 pr-3 pt-2 text-[11px] font-semibold uppercase tracking-wide text-muted">
             <button class=crate::activity::FOLD title=move || if open.get() { "Fold" } else { "Unfold" } on:click=move |_| open.update(|o| *o = !*o)>
                 {move || if open.get() { "▾" } else { "▸" }}
             </button>
@@ -424,7 +942,7 @@ pub fn SessionsRail(open: RwSignal<bool>) -> impl IntoView {
             {move || {
                 let list = sessions.get();
                 if list.is_empty() {
-                    return view! { <p class="px-2 py-2 text-xs text-zinc-500">"No sessions match."</p> }.into_any();
+                    return view! { <p class="px-2 py-2 text-xs text-muted">"No sessions match."</p> }.into_any();
                 }
                 grouped(list, &grouping.levels.get(), String::new(), folded, &move |s| view! { <RailRow s hover /> }.into_any(), true)
             }}
@@ -532,7 +1050,7 @@ fn RailCard(s: Session, x: f64, y: f64, hover: Hover, like_this: RwSignal<Option
     let ws = use_workspace();
     let live = api::live();
     let now = clock();
-    let worker = live.worker_name(&s.worker_id.to_string());
+    let worker = live.session_worker(&s);
     let updated = s.updated_at;
     let (open_id, tile_id) = (s.id.clone(), s.id.clone());
     let seed = SessionSeed::from_session(&s);
@@ -555,8 +1073,8 @@ fn RailCard(s: Session, x: f64, y: f64, hover: Hover, like_this: RwSignal<Option
                 <StatusPill status=s.display_status() />
             </div>
             {s.awaiting_approval.then(|| view! { <p class="text-xs font-medium text-amber-600">"A tool call waits for your approval"</p> })}
-            <div class="space-y-0.5 text-xs text-zinc-500">
-                <div class="truncate">{worker} " · " {s.model.clone()}</div>
+            <div class="space-y-0.5 text-xs text-muted">
+                <div class="truncate"><span title=s.on_head.then_some(api::HEAD_TITLE)>{worker}</span> " · " {s.model.clone()}</div>
                 <div class="break-all font-mono">{place}</div>
                 <div>{move || format!("active {}", ago(now.get() - updated))}</div>
             </div>
@@ -617,11 +1135,6 @@ impl SessionSeed {
     }
 }
 
-#[component]
-fn NewSession(connections: Vec<Connection>) -> impl IntoView {
-    view! { <SessionForm connections /> }
-}
-
 /// A popup with the new-session form, filled in from `seed`: change what
 /// you like and start it. The new session opens in a tile of its own.
 #[component]
@@ -640,12 +1153,12 @@ pub fn NewSessionDialog(seed: SessionSeed, #[prop(into)] on_close: Callback<()>)
             <div class="w-full max-w-3xl space-y-3 rounded-lg bg-white p-4 shadow-xl outline-none dark:bg-zinc-900" tabindex="-1" on:click=|ev| ev.stop_propagation()>
                 <div class="flex items-center gap-2">
                     <h2 class="flex-1 font-medium">"New session like this one"</h2>
-                    <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") title="Close (Esc)" on:click=move |_| on_close.run(())>"✕"</button>
+                    <button class=format!("{BUTTON_QUIET} text-xs text-muted") title="Close (Esc)" on:click=move |_| on_close.run(())>"✕"</button>
                 </div>
-                <p class="text-xs text-zinc-500">"A new, empty session with this one's worker, folder, model and labels (so the same agents, skills and hooks). Change anything before starting it."</p>
-                <Suspense fallback=|| view! { <p class="text-sm text-zinc-500">"Loading…"</p> }>
+                <p class="text-xs text-muted">"A new, empty session with this one's worker, folder, model and labels (so the same agents, skills and hooks). Change anything before starting it."</p>
+                <Suspense fallback=|| view! { <p class="text-sm text-muted">"Loading…"</p> }>
                     {move || connections.get().map(|r| match r {
-                        Ok(conns) if conns.is_empty() => view! { <p class="text-sm text-zinc-500">"Add an LLM connection in Settings to start a session."</p> }.into_any(),
+                        Ok(conns) if conns.is_empty() => view! { <p class="text-sm text-muted">"Add an LLM connection in Settings to start a session."</p> }.into_any(),
                         Ok(conns) => view! { <SessionForm connections=conns seed=seed.get_value() on_started=on_close on_cancel=on_close /> }.into_any(),
                         Err(e) => view! { <ErrorBox message=e /> }.into_any(),
                     })}
@@ -726,32 +1239,32 @@ pub fn SaveTemplateDialog(seed: SessionSeed, #[prop(into)] on_close: Callback<()
             <div class="w-full max-w-xl space-y-3 rounded-lg bg-white p-4 text-sm shadow-xl outline-none dark:bg-zinc-900" tabindex="-1" on:click=|ev| ev.stop_propagation()>
                 <div class="flex items-center gap-2">
                     <h2 class="flex-1 font-medium">"Save as template"</h2>
-                    <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") title="Close (Esc)" on:click=move |_| on_close.run(())>"✕"</button>
+                    <button class=format!("{BUTTON_QUIET} text-xs text-muted") title="Close (Esc)" on:click=move |_| on_close.run(())>"✕"</button>
                 </div>
-                <p class="text-xs text-zinc-500">"Sessions from it run where this one does, on its model and with its labels."</p>
-                <div class="space-y-0.5 text-xs text-zinc-500">
+                <p class="text-xs text-muted">"Sessions from it run where this one does, on its model and with its labels."</p>
+                <div class="space-y-0.5 text-xs text-muted">
                     <div class="break-all font-mono">{place}</div>
                     <div>{model}</div>
                 </div>
                 <label class="block space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Name"</span>
+                    <span class="text-xs text-muted">"Name"</span>
                     <input class=format!("{INPUT} py-1 font-mono text-xs") prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev)) />
                 </label>
                 <label class="block space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Description (agents read it to choose the template)"</span>
+                    <span class="text-xs text-muted">"Description (agents read it to choose the template)"</span>
                     <input class=format!("{INPUT} py-1") prop:value=move || description.get() on:input=move |ev| description.set(event_target_value(&ev)) />
                 </label>
                 <label class="block space-y-0.5">
-                    <span class="text-xs text-zinc-500">"Prompt (optional: standing instructions; a subagent's task fills {{input}}, or follows)"</span>
+                    <span class="text-xs text-muted">"Prompt (optional: standing instructions; a subagent's task fills {{input}}, or follows)"</span>
                     <textarea class=format!("{INPUT} min-h-20 font-mono text-xs") prop:value=move || prompt.get() on:input=move |ev| prompt.set(event_target_value(&ev))></textarea>
                 </label>
                 <label class="flex items-start gap-2">
                     <input type="checkbox" class="mt-1" prop:checked=move || agents.get() on:change=move |ev| agents.set(event_target_checked(&ev)) />
-                    <span>"Agents may start it"<span class="block text-xs text-zinc-500">"Any session's agent can start it as a remote subagent, here, whatever worker it runs on"</span></span>
+                    <span>"Agents may start it"<span class="block text-xs text-muted">"Any session's agent can start it as a remote subagent, here, whatever worker it runs on"</span></span>
                 </label>
                 <label class="flex items-start gap-2">
                     <input type="checkbox" class="mt-1" prop:checked=move || worktree.get() on:change=move |ev| worktree.set(event_target_checked(&ev)) />
-                    <span>"New git worktree"<span class="block text-xs text-zinc-500">"Each session works in a new worktree of the folder, on a new c6/… branch"</span></span>
+                    <span>"New git worktree"<span class="block text-xs text-muted">"Each session works in a new worktree of the folder, on a new c6/… branch"</span></span>
                 </label>
                 <div class="flex items-center justify-end gap-3">
                     {move || status.get().map(|r| match r {
@@ -795,12 +1308,12 @@ pub fn SessionDialog(
             <div class="w-full max-w-3xl space-y-3 rounded-lg bg-white p-4 text-left shadow-xl outline-none dark:bg-zinc-900" tabindex="-1" on:click=|ev| ev.stop_propagation()>
                 <div class="flex items-center gap-2">
                     <h2 class="flex-1 font-medium">{title}</h2>
-                    <button class=format!("{BUTTON_QUIET} text-xs text-zinc-500") title="Close (Esc)" on:click=move |_| on_close.run(())>"✕"</button>
+                    <button class=format!("{BUTTON_QUIET} text-xs text-muted") title="Close (Esc)" on:click=move |_| on_close.run(())>"✕"</button>
                 </div>
-                <p class="text-xs text-zinc-500">{note}</p>
-                <Suspense fallback=|| view! { <p class="text-sm text-zinc-500">"Loading…"</p> }>
+                <p class="text-xs text-muted">{note}</p>
+                <Suspense fallback=|| view! { <p class="text-sm text-muted">"Loading…"</p> }>
                     {move || connections.get().map(|r| match r {
-                        Ok(conns) if conns.is_empty() => view! { <p class="text-sm text-zinc-500">"Add an LLM connection in Settings to start a session."</p> }.into_any(),
+                        Ok(conns) if conns.is_empty() => view! { <p class="text-sm text-muted">"Add an LLM connection in Settings to start a session."</p> }.into_any(),
                         Ok(conns) => match seed.get_value() {
                             Some(seed) => view! {
                                 <SessionForm connections=conns seed first_message=first.get_value() on_session=on_session.unwrap_or(Callback::new(|_| ()))
@@ -819,8 +1332,12 @@ pub fn SessionDialog(
     }
 }
 
-/// The new-session form. With a `seed` it starts from those values instead
-/// of the ones remembered in this browser, and remembers none of its own.
+/// The new-session form: the prompt first, then one line of where and how
+/// it runs (worker, folder, model, effort), a Worktree chip, Change for the
+/// fields (in place on a desktop, a sheet on a phone), Template ▾ on the
+/// Sessions page, and Send. With a `seed` it starts from those values
+/// instead of the ones remembered in this browser, and remembers none of
+/// its own.
 #[component]
 fn SessionForm(
     connections: Vec<Connection>,
@@ -895,7 +1412,12 @@ fn SessionForm(
     let effort = RwSignal::new(if seeded { seed.effort.clone() } else { storage_get("c6.effort").unwrap_or_default() });
     let worktree =
         RwSignal::new(if seeded { seed.worktree && seed.ssh.is_none() } else { storage_get("c6.worktree").as_deref() == Some("1") });
-    let prompt = RwSignal::new(first_message.unwrap_or_default());
+    // A fresh form keeps what you typed until the session starts.
+    let prompt = match first_message {
+        Some(m) => RwSignal::new(m),
+        None if !seeded => crate::util::draft("new"),
+        None => RwSignal::new(String::new()),
+    };
     // Your labels for the session (remembered per folder).
     let labels = RwSignal::new(seed.labels.join(", "));
     let seed_realm = StoredValue::new(seed.realm.clone());
@@ -986,8 +1508,61 @@ fn SessionForm(
         model.set(storage_get(&format!("c6.model.{c}")).or(default).unwrap_or_default());
     });
 
+    // The Sessions page's box (not a popup's) can run a template instead:
+    // every realm's (an app's are in its realm). The box's text is its
+    // {{input}}, or its prompt is shown when it takes none.
+    let page = on_cancel.is_none();
+    let templates = LocalResource::new(move || async move { if page { api::all_templates().await } else { Ok(Vec::new()) } });
+    let templates = Signal::derive(move || {
+        templates.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|t| t.template.enabled).collect::<Vec<_>>()
+    });
+    let template = RwSignal::new(None::<c6_api::RealmTemplate>);
+    let takes_input = move || template.with(|t| t.as_ref().is_some_and(|t| t.template.prompt.contains("{{input}}")));
+    let note = RwSignal::new(None::<String>);
+    let filter = crate::labels::use_filter().0;
+    // One session opens beside; a fleet run, mission control filtered to it.
+    let run_template = move |t: c6_api::RealmTemplate| {
+        let input = if takes_input() { prompt.get_untracked() } else { String::new() };
+        let used = !input.is_empty();
+        pending.set(true);
+        error.set(None);
+        note.set(None);
+        spawn_local(async move {
+            let ran = api::run_template(t.template.name.clone(), input, Some(t.realm.clone())).await;
+            pending.try_set(false);
+            match ran {
+                Ok(r) => {
+                    let mut started = format!("Started {} session{}", r.sessions.len(), if r.sessions.len() == 1 { "" } else { "s" });
+                    if !r.errors.is_empty() {
+                        started.push_str(&format!(" ({} could not start: {})", r.errors.len(), r.errors.join("; ")));
+                    }
+                    note.try_set(Some(started));
+                    if used {
+                        prompt.try_set(String::new());
+                    }
+                    if let [one] = r.sessions.as_slice() {
+                        match col {
+                            Some(c) => c.open(View::session(one.id.clone()), How::Beside),
+                            None => ws.open(None, View::session(one.id.clone()), How::Beside),
+                        }
+                    } else {
+                        filter.set(vec![format!("run:{}", r.run_id)]);
+                        ws.open(None, View::Mission, How::Beside);
+                    }
+                }
+                Err(e) => {
+                    error.try_set(Some(e));
+                }
+            }
+        });
+    };
+
     let submit = move || {
         if pending.get_untracked() {
+            return;
+        }
+        if let Some(t) = template.get_untracked() {
+            run_template(t);
             return;
         }
         let on_ssh = remote.get_untracked();
@@ -1053,6 +1628,9 @@ fn SessionForm(
                 // The new session takes the form's tile (Back returns to
                 // the form); from a popup, a tile of its own.
                 Ok(s) => {
+                    if !seeded {
+                        crate::util::forget_draft("new");
+                    }
                     if let Some(f) = on_session {
                         f.run(s.clone());
                     }
@@ -1064,7 +1642,12 @@ fn SessionForm(
                     // Closing a dialog disposes this form: on the next tick,
                     // once what it set has been drawn.
                     if let Some(f) = on_started {
-                        set_timeout(move || f.run(()), std::time::Duration::ZERO);
+                        set_timeout(
+                            move || {
+                                f.try_run(());
+                            },
+                            std::time::Duration::ZERO,
+                        );
                     }
                 }
                 Err(e) => {
@@ -1073,8 +1656,12 @@ fn SessionForm(
             }
         });
     };
-    let submit_click = submit;
     let prompt_box = NodeRef::<leptos::html::Textarea>::new();
+    // It grows with the text (a template's prompt, shown, too).
+    crate::util::autosize(prompt_box, move || {
+        prompt.track();
+        template.track();
+    });
     // In a popup, start typing the first message right away.
     if on_cancel.is_some() {
         Effect::new(move || {
@@ -1083,6 +1670,67 @@ fn SessionForm(
             }
         });
     }
+
+    // Where and how it runs, changed only when needed: in place on a
+    // desktop, a sheet on a phone. Esc puts it away.
+    let changing = RwSignal::new(false);
+    let fields_pop = escapable(
+        move || changing.get(),
+        move || {
+            changing.try_set(false);
+        },
+    );
+    let template_at = RwSignal::new(None::<(f64, f64)>);
+    // A template that takes no input: its prompt, shown in the box.
+    let fixed =
+        move || template.with(|t| t.as_ref().filter(|t| !t.template.prompt.contains("{{input}}")).map(|t| t.template.prompt.clone()));
+    let ready = move || template.with(Option::is_some) || prompt.with(|p| !p.trim().is_empty());
+    let touch = crate::util::touch_first();
+    let worker_label = move || {
+        let w = worker.get();
+        live.workers.with(|ws| ws.iter().find(|x| x.id.to_string() == w).map(|x| x.name.clone())).unwrap_or_else(|| "no worker".to_owned())
+    };
+    let model_label = move || {
+        if auto() {
+            return "auto".to_owned();
+        }
+        let m = model.get();
+        if m.trim().is_empty() {
+            conns.with_value(|cs| cs.iter().find(|c| c.id == connection.get()).map(|c| c.name.clone())).unwrap_or_default()
+        } else {
+            m
+        }
+    };
+    let line = move |short: bool| {
+        let on_ssh = remote.get();
+        let target = ssh.get().trim().to_owned();
+        let folder = if on_ssh { remote_dir.get().trim().to_owned() } else { cwd.get() };
+        let effort = if effort_supported() { effort.get() } else { String::new() };
+        let target = if target.is_empty() { "an SSH host".to_owned() } else { target };
+        summary(&worker_label(), on_ssh.then_some(target.as_str()), &folder, &model_label(), &effort, short)
+    };
+    let template_label = |t: &c6_api::RealmTemplate| {
+        if t.realm == "home" { t.template.name.clone() } else { format!("{} ({})", t.template.name, t.realm) }
+    };
+    let template_key = |t: &c6_api::RealmTemplate| format!("{}/{}", t.realm, t.template.name);
+    let pick_template = move |t: Option<c6_api::RealmTemplate>| {
+        template.set(t);
+        changing.set(false);
+        template_at.set(None);
+        note.set(None);
+    };
+    let tool = "inline-flex h-6 shrink-0 items-center gap-1 rounded-md px-1.5 text-xs text-soft hover:bg-zinc-100 hover:text-zinc-900 pointer-coarse:h-8 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
+    let send_title = move || {
+        if template.with(Option::is_some) {
+            "Run the template"
+        } else if !ready() {
+            "Start an empty session"
+        } else if touch {
+            "Start session"
+        } else {
+            "Start session (Enter)"
+        }
+    };
 
     view! {
         {move || picking.get().then(|| view! {
@@ -1093,138 +1741,227 @@ fn SessionForm(
                 on_cancel=Callback::new(move |_| picking.set(false))
             />
         })}
-        <section class=if seeded { "space-y-3" } else { "space-y-3 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900/50" }>
-            <div class="grid gap-3 sm:grid-cols-[1fr_2fr_auto]">
-                <label class="block text-xs text-zinc-500">
-                    "Worker"
-                    <select class=format!("mt-1 {INPUT}") on:change=move |ev| { chosen_by_hand.set(true); worker.set(event_target_value(&ev)) } prop:value=move || worker.get()>
-                        {move || live.workers.get().into_iter().filter(|w| w.status != WorkerStatus::Revoked && w.role != "memex").map(|w| {
-                            let label = if w.status == WorkerStatus::Online { w.name.clone() } else { format!("{} (offline)", w.name) };
-                            view! { <option value=w.id.to_string()>{label}</option> }
-                        }).collect_view()}
-                    </select>
-                </label>
-                <div class="block text-xs text-zinc-500 sm:col-span-2">
-                    <div class="flex items-center gap-3">
-                        <label class="flex items-center gap-1"><input type="radio" name=where_name.clone() prop:checked=move || !remote.get() on:change=move |_| remote.set(false) />"Folder on the worker"</label>
-                        <label class="flex items-center gap-1" title="Work on another machine over SSH, using the worker's keys and ~/.ssh/config">
-                            <input type="radio" name=where_name prop:checked=move || remote.get() on:change=move |_| remote.set(true) />"SSH host, through the worker"
-                        </label>
-                    </div>
-                    <div class="mt-1 flex gap-2" class:hidden=move || !remote.get()>
-                        <input class=format!("{INPUT} min-w-0 flex-1 font-mono") list=recent_id.clone() placeholder="user@host or an ssh_config alias"
-                            prop:value=move || ssh.get() on:input=move |ev| ssh.set(event_target_value(&ev)) />
-                        <datalist id=recent_id>
-                            {move || inventory.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|h| h.host.enabled).map(|h| {
-                                let label = format!("{} · {}", h.host.target, h.host.labels.join(", "));
-                                view! { <option value=h.host.name.clone() label=label></option> }
-                            }).collect_view()}
-                            {move || recent_ssh().into_iter().map(|t| view! { <option value=t></option> }).collect_view()}
-                        </datalist>
-                        <input class=format!("{INPUT} w-40! font-mono") placeholder="folder there (~)"
-                            prop:value=move || remote_dir.get() on:input=move |ev| remote_dir.set(event_target_value(&ev)) />
-                    </div>
-                    <div class="mt-1 flex gap-2" class:hidden=move || remote.get()>
-                        <button class=format!("{INPUT} min-w-0 flex-1 truncate text-left font-mono disabled:opacity-60")
-                            disabled=move || !worker_online()
-                            title=move || if worker_online() { "Choose a folder on the worker" } else { "The worker is offline" }
-                            on:click=move |_| picking.set(true)>
-                            {move || if cwd.get().is_empty() { "No folder: a scratch workspace (choose one…)".to_owned() } else { cwd.get() }}
-                        </button>
-                        {move || (!cwd.get().is_empty()).then(|| view! {
-                            <button class="shrink-0 rounded-md px-2 text-xs text-zinc-500 hover:bg-zinc-200/60 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
-                                title="Work in a scratch workspace instead of a folder" on:click=move |_| cwd.set(String::new())>"✕"</button>
-                        })}
-                    </div>
-                </div>
-                <label class="block text-xs text-zinc-500">
-                    "Connection"
-                    <select class=format!("mt-1 {INPUT}") on:change=move |ev| connection.set(event_target_value(&ev)) prop:value=move || connection.get()>
-                        {move || (has_routes.get() || auto()).then(|| view! { <option value="">"Auto (your routing rules)"</option> })}
-                        {move || conns.get_value().into_iter().map(|c| view! { <option value=c.id.clone()>{crate::quota::option_label(&c.id, &c.name)}</option> }).collect_view()}
-                    </select>
-                    <div class="mt-1"><crate::quota::QuotaNote connection /></div>
-                </label>
-                {move || auto().then(|| view! {
-                    <p class="text-xs text-zinc-500">
-                        "The connection, model and effort come from the first rule in Settings → Model routing that matches this session's labels."
-                    </p>
-                })}
-                <label class="block text-xs text-zinc-500" class:hidden=auto>
-                    "Model"
-                    <div class="mt-1"><ModelInput connection=connection value=model on_set=move |v| model.set(v) class=INPUT.to_owned() placeholder="model id (empty: routing rules, else the default)" /></div>
-                </label>
-                <label class="block text-xs text-zinc-500" class:hidden=move || !effort_supported()>
-                    "Effort"
-                    <select class=format!("mt-1 {INPUT}") prop:value=move || effort.get() on:change=move |ev| effort.set(event_target_value(&ev))>
-                        <option value="">"default"</option>
-                        <option value="low">"low"</option>
-                        <option value="medium">"medium"</option>
-                        <option value="high">"high"</option>
-                        <option value="xhigh">"xhigh"</option>
-                        <option value="max">"max"</option>
-                    </select>
-                </label>
-            </div>
-            <div class="grid gap-3 sm:grid-cols-[2fr_1fr]">
-                <label class="block text-xs text-zinc-500">
-                    "Labels"
-                    <input class=format!("mt-1 font-mono {INPUT}") placeholder="optional, e.g. client:acme, spike (repo, folder, worker and model are added automatically)"
-                        prop:value=move || labels.get() on:input=move |ev| labels.set(event_target_value(&ev)) />
-                </label>
-                <label class="block text-xs text-zinc-500" title="What you mean to finish that this session serves (docs/work.md)">
-                    "Work"
-                    <select class=format!("mt-1 {INPUT}")
-                        prop:value=move || { work_items.track(); quick_projects.track(); work_pick.get() }
-                        on:change=move |ev| work_pick.set(event_target_value(&ev))>
-                        <option value="">"An agent picks (or starts one)"</option>
-                        <option value="new">"New work"</option>
-                        <option value="none">"Not part of any work"</option>
-                        {move || work_items.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|w| {
-                            view! { <option value=w.id.clone()>{w.fields.title.clone()}</option> }
-                        }).collect_view()}
-                        {move || {
-                            let projects: Vec<_> = quick_projects.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|p| p.fields.status == "active").collect();
-                            (!projects.is_empty()).then(|| view! {
-                                <optgroup label="A quick task, no work item">
-                                    {projects.into_iter().map(|p| view! {
-                                        <option value=format!("project:{}", p.id)>{format!("Just this project: {}", p.fields.title)}</option>
-                                    }).collect_view()}
-                                </optgroup>
-                            })
-                        }}
-                    </select>
-                </label>
-            </div>
-            <textarea node_ref=prompt_box class=format!("{INPUT} min-h-24 resize-y")
-                placeholder=if seeded { "First message (optional: leave it empty to start an empty session; ⌘/Ctrl+Enter to start)" } else { "What should the agent do? (⌘/Ctrl+Enter to start)" }
-                prop:value=move || prompt.get()
+        <div class="space-y-2">
+        <section class="rounded-xl border border-zinc-200 bg-white focus-within:border-zinc-400 dark:border-zinc-800 dark:bg-zinc-900 dark:focus-within:border-zinc-600">
+            <textarea node_ref=prompt_box rows="2"
+                class=format!("block w-full bg-transparent px-3 pb-1 pt-2.5 text-sm outline-none disabled:text-muted {PLACEHOLDER} {GROWS}")
+                placeholder=move || match template.get() {
+                    Some(t) if t.template.prompt.contains("{{input}}") => format!("Input for {} (its {{{{input}}}})", t.template.name),
+                    Some(t) => format!("{} takes no input: Send runs it", t.template.name),
+                    None if seeded => "First message (optional: leave it empty to start an empty session)".to_owned(),
+                    None => "What should the agent do?".to_owned(),
+                }
+                prop:value=move || fixed().unwrap_or_else(|| prompt.get())
+                prop:disabled=move || fixed().is_some()
                 on:input=move |ev| prompt.set(event_target_value(&ev))
                 on:keydown=move |ev| {
-                    if ev.key() == "Enter" && (ev.meta_key() || ev.ctrl_key()) { ev.prevent_default(); submit(); }
+                    if crate::util::sends(&ev) { ev.prevent_default(); submit(); }
                 }
             ></textarea>
-            {move || {
-                let is_cc = conns.with_value(|cs| cs.iter().any(|c| c.id == connection.get() && c.kind == "claude_code"));
-                let w = worker.get();
-                let missing = live.workers.with(|ws| ws.iter().any(|x| x.id.to_string() == w && x.status == WorkerStatus::Online && !x.capabilities.iter().any(|c| c == "claude_code")));
-                (is_cc && missing).then(|| view! {
-                    <p class="text-sm text-amber-700 dark:text-amber-400">"This worker doesn't have the claude CLI installed (or it isn't on the worker's PATH; set C6_CLAUDE_BIN)."</p>
-                })
-            }}
-            {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
-            <div class="flex items-center justify-end gap-4">
-                <label class="flex items-center gap-1.5 text-sm text-zinc-600 dark:text-zinc-400" class:hidden=move || remote.get() title="Create a c6/… branch and a separate checkout for this session">
-                    <input type="checkbox" prop:checked=move || worktree.get() on:change=move |ev| worktree.set(event_target_checked(&ev)) />
-                    "New git worktree"
-                </label>
-                {on_cancel.map(|c| view! { <button class=BUTTON_QUIET on:click=move |_| c.run(())>"Cancel"</button> })}
-                <button class=format!("{BUTTON} inline-flex items-center gap-2") disabled=move || pending.get() on:click=move |_| submit_click()>
-                    {move || pending.get().then(|| view! { <span class="h-3 w-3 animate-spin rounded-full border-2 border-current border-t-transparent"></span> })}
-                    {move || if pending.get() { "Starting…" } else { "Start session" }}
+            <div class="flex min-w-0 items-center gap-1.5 px-2 pb-2">
+                // A desktop's summary line, then its buttons.
+                {move || match template.get() {
+                    Some(t) => view! {
+                        <span class="hidden min-w-0 truncate text-xs text-muted md:inline" title=t.template.description.clone()>
+                            "Template: " <span class="text-soft">{template_label(&t)}</span>
+                            {(!t.template.description.is_empty()).then(|| format!(" · {}", t.template.description))}
+                        </span>
+                        <button class=format!("{tool} hidden md:inline-flex") title="Don't use the template" aria-label="Don't use the template"
+                            on:click=move |_| pick_template(None)>{icons::x()}</button>
+                    }.into_any(),
+                    None => view! {
+                        <span class="hidden min-w-0 truncate text-xs text-muted md:inline" title=move || line(false)>{move || line(false)}</span>
+                    }.into_any(),
+                }}
+                // A phone's one chip, opening every field in a sheet.
+                <button data-pop=fields_pop.clone() aria-haspopup="dialog" aria-expanded=move || changing.get().to_string()
+                    class="inline-flex h-8 min-w-0 items-center gap-1 rounded-md border border-zinc-200 px-2 text-xs text-soft md:hidden dark:border-zinc-700"
+                    title="Where and how it runs" on:click=move |_| changing.update(|c| *c = !*c)>
+                    <span class="min-w-0 truncate">{move || template.with(|t| t.as_ref().map(template_label)).unwrap_or_else(|| line(true))}</span>
+                    <span class="text-muted">"▾"</span>
+                </button>
+                <button type="button" role="switch" aria-checked=move || worktree.get().to_string()
+                    title="A new git worktree: a c6/… branch and a separate checkout for this session"
+                    class=move || if remote.get() || template.with(Option::is_some) { "hidden".to_owned() } else {
+                        format!("inline-flex h-6 shrink-0 items-center gap-1 rounded-md border px-1.5 text-xs pointer-coarse:h-8 {}",
+                            if worktree.get() { "border-sky-300 bg-sky-50 text-sky-800 dark:border-sky-800 dark:bg-sky-950 dark:text-sky-300" } else { "border-zinc-300 text-soft hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800" })
+                    }
+                    on:click=move |_| worktree.update(|w| *w = !*w)>
+                    {move || icons::check_box(worktree.get())}
+                    "Worktree"
+                </button>
+                <button data-pop=fields_pop.clone() aria-expanded=move || changing.get().to_string()
+                    class=move || if template.with(Option::is_some) { "hidden".to_owned() } else { format!("{tool} hidden md:inline-flex") }
+                    title="Change where and how it runs" on:click=move |_| changing.update(|c| *c = !*c)>
+                    {move || if changing.get() { "Done" } else { "Change" }}
+                </button>
+                {move || (page && !templates.with(Vec::is_empty)).then(|| view! {
+                    <button class=format!("{tool} hidden md:inline-flex") aria-haspopup="menu" title="Run a template: it sets where and how its sessions run"
+                        on:click=move |ev| template_at.set(Some(below(&ev, 320.0)))>
+                        "Template" <span class="text-muted">"▾"</span>
+                    </button>
+                })}
+                <span class="flex-1"></span>
+                {on_cancel.map(|c| view! { <button class=tool on:click=move |_| c.run(())>"Cancel"</button> })}
+                <button class=move || format!("{SEND} {SEND_SHAPE} {}", if ready() { SEND_READY } else { SEND_EMPTY })
+                    title=send_title aria-label=send_title prop:disabled=move || pending.get() on:click=move |_| submit()>
+                    {move || if pending.get() {
+                        view! { <span class="h-2.5 w-2.5 animate-spin rounded-full border-2 border-current border-t-transparent"></span> }.into_any()
+                    } else {
+                        send_icon().into_any()
+                    }}
                 </button>
             </div>
+            <Popover at=template_at class="w-80">
+                {move || template.with(Option::is_some).then(|| view! {
+                    <button class="block w-full rounded-md px-2 py-1.5 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800" on:click=move |_| pick_template(None)>
+                        "None: a session as set here"
+                    </button>
+                })}
+                {move || templates.get().into_iter().map(|t| {
+                    let on = template.with(|x| x.as_ref().map(template_key)) == Some(template_key(&t));
+                    let (label, description) = (template_label(&t), t.template.description.clone());
+                    view! {
+                        <button class=format!("block w-full rounded-md px-2 py-1.5 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800 {}", if on { "bg-zinc-100 dark:bg-zinc-800" } else { "" })
+                            on:click=move |_| pick_template(Some(t.clone()))>
+                            <span class="block font-medium">{label}</span>
+                            {(!description.is_empty()).then(|| view! { <span class="block text-xs text-muted">{description}</span> })}
+                        </button>
+                    }
+                }).collect_view()}
+            </Popover>
+            <div class:hidden=move || !changing.get()>
+                <div class="fixed inset-0 z-40 bg-black/30 md:hidden" on:click=move |_| changing.set(false)></div>
+                <div data-pop=fields_pop
+                    class="fixed inset-x-0 bottom-0 z-50 flex max-h-[85dvh] flex-col rounded-t-xl border-t border-zinc-200 bg-white text-sm shadow-xl md:static md:z-auto md:max-h-none md:rounded-t-none md:rounded-b-xl md:shadow-none dark:border-zinc-800 dark:bg-zinc-900">
+                    <h2 class="shrink-0 border-b border-zinc-200 px-4 py-3 font-medium md:hidden dark:border-zinc-800">"New session: where and how it runs"</h2>
+                    <div class="min-h-0 flex-1 space-y-3 overflow-y-auto px-4 py-4 md:overflow-visible md:px-3 md:py-3">
+                        {move || template.with(Option::is_some).then(|| view! {
+                            <p class="text-xs text-muted">"The template sets where and how its sessions run."</p>
+                        })}
+                        <div class="space-y-3" class:hidden=move || template.with(Option::is_some)>
+                            <div class="grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]">
+                                <label class="block min-w-0 text-xs text-muted">
+                                    "Worker"
+                                    <select class=format!("mt-1 {INPUT}") on:change=move |ev| { chosen_by_hand.set(true); worker.set(event_target_value(&ev)) } prop:value=move || worker.get()>
+                                        {move || live.workers.get().into_iter().filter(|w| w.status != WorkerStatus::Revoked && w.role != "memex").map(|w| {
+                                            let label = if w.status == WorkerStatus::Online { w.name.clone() } else { format!("{} (offline)", w.name) };
+                                            view! { <option value=w.id.to_string()>{label}</option> }
+                                        }).collect_view()}
+                                    </select>
+                                </label>
+                                <div class="min-w-0 text-xs text-muted">
+                                    <div class="flex flex-wrap items-center gap-x-3 gap-y-1">
+                                        <label class="flex items-center gap-1"><input type="radio" name=where_name.clone() prop:checked=move || !remote.get() on:change=move |_| remote.set(false) />"Folder on the worker"</label>
+                                        <label class="flex items-center gap-1" title="Work on another machine over SSH, using the worker's keys and ~/.ssh/config">
+                                            <input type="radio" name=where_name prop:checked=move || remote.get() on:change=move |_| remote.set(true) />"SSH host, through the worker"
+                                        </label>
+                                    </div>
+                                    <div class="mt-1 flex flex-wrap gap-2" class:hidden=move || !remote.get()>
+                                        <input class=format!("{INPUT} {PLACEHOLDER} w-auto! min-w-0 flex-1 basis-40 font-mono") list=recent_id.clone() placeholder="user@host or an ssh_config alias"
+                                            prop:value=move || ssh.get() on:input=move |ev| ssh.set(event_target_value(&ev)) />
+                                        <datalist id=recent_id>
+                                            {move || inventory.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|h| h.host.enabled).map(|h| {
+                                                let label = format!("{} · {}", h.host.target, h.host.labels.join(", "));
+                                                view! { <option value=h.host.name.clone() label=label></option> }
+                                            }).collect_view()}
+                                            {move || recent_ssh().into_iter().map(|t| view! { <option value=t></option> }).collect_view()}
+                                        </datalist>
+                                        <input class=format!("{INPUT} {PLACEHOLDER} w-auto! min-w-0 flex-1 basis-28 font-mono") placeholder="folder there (~)"
+                                            prop:value=move || remote_dir.get() on:input=move |ev| remote_dir.set(event_target_value(&ev)) />
+                                    </div>
+                                    <div class="mt-1 flex gap-2" class:hidden=move || remote.get()>
+                                        <button class=format!("{INPUT} min-w-0 flex-1 truncate text-left font-mono disabled:opacity-60")
+                                            disabled=move || !worker_online()
+                                            title=move || if worker_online() { "Choose a folder on the worker" } else { "The worker is offline" }
+                                            on:click=move |_| picking.set(true)>
+                                            {move || if cwd.get().is_empty() { "No folder: a scratch workspace (choose one…)".to_owned() } else { cwd.get() }}
+                                        </button>
+                                        {move || (!cwd.get().is_empty()).then(|| view! {
+                                            <button class="shrink-0 rounded-md px-2 text-xs text-muted hover:bg-zinc-200/60 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                                                title="Work in a scratch workspace instead of a folder" aria-label="No folder" on:click=move |_| cwd.set(String::new())>{icons::x()}</button>
+                                        })}
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="min-w-0 text-xs text-muted">
+                                "Connection and model"
+                                <div class="mt-1 flex flex-wrap items-center gap-2">
+                                    <ModelPicker connection model effort auto=has_routes />
+                                </div>
+                                {move || auto().then(|| view! {
+                                    <p class="mt-1">"The connection, model and effort come from the first rule in Settings → Model routing that matches this session's labels."</p>
+                                })}
+                            </div>
+                            <div class="grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
+                                <label class="block min-w-0 text-xs text-muted">
+                                    "Labels"
+                                    <input class=format!("mt-1 font-mono {INPUT} {PLACEHOLDER}") placeholder="optional, e.g. client:acme, spike"
+                                        prop:value=move || labels.get() on:input=move |ev| labels.set(event_target_value(&ev)) />
+                                    <span class="mt-0.5 block">"Repo, folder, worker and model are added automatically."</span>
+                                </label>
+                                <label class="block min-w-0 text-xs text-muted" title="What you mean to finish that this session serves (docs/work.md)">
+                                    "Work"
+                                    <select class=format!("mt-1 {INPUT}")
+                                        prop:value=move || { work_items.track(); quick_projects.track(); work_pick.get() }
+                                        on:change=move |ev| work_pick.set(event_target_value(&ev))>
+                                        <option value="">"An agent picks (or starts one)"</option>
+                                        <option value="new">"New work"</option>
+                                        <option value="none">"Not part of any work"</option>
+                                        {move || work_items.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|w| {
+                                            view! { <option value=w.id.clone()>{w.fields.title.clone()}</option> }
+                                        }).collect_view()}
+                                        {move || {
+                                            let projects: Vec<_> = quick_projects.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|p| p.fields.status == "active").collect();
+                                            (!projects.is_empty()).then(|| view! {
+                                                <optgroup label="A quick task, no work item">
+                                                    {projects.into_iter().map(|p| view! {
+                                                        <option value=format!("project:{}", p.id)>{format!("Just this project: {}", p.fields.title)}</option>
+                                                    }).collect_view()}
+                                                </optgroup>
+                                            })
+                                        }}
+                                    </select>
+                                </label>
+                            </div>
+                        </div>
+                        // A phone has no Template ▾: it's here.
+                        {move || (page && !templates.with(Vec::is_empty)).then(|| view! {
+                            <label class="block min-w-0 text-xs text-muted md:hidden">
+                                "Template"
+                                <select class=format!("mt-1 {INPUT}")
+                                    prop:value=move || template.with(|t| t.as_ref().map(template_key).unwrap_or_default())
+                                    on:change=move |ev| {
+                                        let k = event_target_value(&ev);
+                                        template.set(templates.get_untracked().into_iter().find(|t| template_key(t) == k));
+                                        note.set(None);
+                                    }>
+                                    <option value="">"None: a session as set above"</option>
+                                    {templates.get().into_iter().map(|t| view! { <option value=template_key(&t)>{template_label(&t)}</option> }).collect_view()}
+                                </select>
+                                {move || template.get().filter(|t| !t.template.description.is_empty()).map(|t| view! {
+                                    <span class="mt-0.5 block">{t.template.description}</span>
+                                })}
+                            </label>
+                        })}
+                    </div>
+                    <div class="notice-safe shrink-0 border-t border-zinc-200 px-4 pt-3 md:hidden dark:border-zinc-800">
+                        <button class=format!("{BUTTON} w-full py-2") on:click=move |_| changing.set(false)>"Done"</button>
+                    </div>
+                </div>
+            </div>
         </section>
+        {move || {
+            let is_cc = conns.with_value(|cs| cs.iter().any(|c| c.id == connection.get() && c.kind == "claude_code"));
+            let w = worker.get();
+            let missing = live.workers.with(|ws| ws.iter().any(|x| x.id.to_string() == w && x.status == WorkerStatus::Online && !x.capabilities.iter().any(|c| c == "claude_code")));
+            (is_cc && missing && template.with(Option::is_none)).then(|| view! {
+                <p class="text-sm text-amber-700 dark:text-amber-400">"This worker doesn't have the claude CLI installed (or it isn't on the worker's PATH; set C6_CLAUDE_BIN)."</p>
+            })
+        }}
+        {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+        {move || note.get().map(|m| view! { <p class="text-sm text-emerald-600 dark:text-emerald-400">{m}</p> })}
+        </div>
     }
 }
 
@@ -1232,89 +1969,6 @@ fn SessionForm(
 /// From the session list feed.
 pub fn live_status(id: &str) -> Option<SessionStatus> {
     api::live().sessions.with(|ss| ss.iter().find(|s| s.id == id).map(|s| s.status))
-}
-
-/// Runs a template: one session, or a fleet run (then mission control,
-/// filtered to the run).
-#[component]
-fn RunTemplate() -> impl IntoView {
-    let (ws, col) = (use_workspace(), use_column());
-    let filter = crate::labels::use_filter().0;
-    // Every realm's templates (an app's are in its realm).
-    let templates = LocalResource::new(api::all_templates);
-    // "realm/name".
-    let chosen = RwSignal::new(String::new());
-    let input = RwSignal::new(String::new());
-    let pending = RwSignal::new(false);
-    let result = RwSignal::new(None::<Result<String, String>>);
-    let run = move || {
-        let key = chosen.get_untracked();
-        let Some((realm, name)) = key.split_once('/').map(|(r, n)| (r.to_owned(), n.to_owned())) else { return };
-        if pending.get_untracked() {
-            return;
-        }
-        pending.set(true);
-        spawn_local(async move {
-            match api::run_template(name, input.get_untracked(), Some(realm)).await {
-                Ok(r) => {
-                    let mut note = format!("Started {} session{}", r.sessions.len(), if r.sessions.len() == 1 { "" } else { "s" });
-                    if !r.errors.is_empty() {
-                        note.push_str(&format!(" ({} could not start: {})", r.errors.len(), r.errors.join("; ")));
-                    }
-                    result.set(Some(Ok(note)));
-                    input.set(String::new());
-                    if let [one] = r.sessions.as_slice() {
-                        match col {
-                            Some(c) => c.open(View::session(one.id.clone()), How::Beside),
-                            None => ws.open(None, View::session(one.id.clone()), How::Beside),
-                        }
-                    } else {
-                        filter.set(vec![format!("run:{}", r.run_id)]);
-                        ws.open(None, View::Mission, How::Beside);
-                    }
-                }
-                Err(e) => result.set(Some(Err(e))),
-            }
-            pending.set(false);
-        });
-    };
-    move || {
-        let list: Vec<c6_api::RealmTemplate> =
-            templates.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|t| t.template.enabled).collect();
-        (!list.is_empty()).then(|| {
-            // (key, label, description): another realm's templates say whose.
-            let descriptions: Vec<(String, String, String)> = list
-                .iter()
-                .map(|t| {
-                    let label = if t.realm == "home" { t.template.name.clone() } else { format!("{} ({})", t.template.name, t.realm) };
-                    (format!("{}/{}", t.realm, t.template.name), label, t.template.description.clone())
-                })
-                .collect();
-            let takes_input: Vec<String> =
-                list.iter().filter(|t| t.template.prompt.contains("{{input}}")).map(|t| format!("{}/{}", t.realm, t.template.name)).collect();
-            let takes_input = StoredValue::new(takes_input);
-            let wants_input = move || takes_input.with_value(|v| v.contains(&chosen.get()));
-            view! {
-                <section class="space-y-2 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900/50">
-                    <div class="flex flex-wrap items-center gap-2">
-                        <span class="text-sm font-medium">"Run a template"</span>
-                        <select class=format!("{INPUT} w-auto!") prop:value=move || chosen.get() on:change=move |ev| chosen.set(event_target_value(&ev))>
-                            <option value="">"Choose…"</option>
-                            {descriptions.iter().map(|(k, l, d)| view! { <option value=k.clone() title=d.clone()>{l.clone()}</option> }).collect_view()}
-                        </select>
-                        <input class=format!("{INPUT} min-w-48 flex-1") placeholder=move || if wants_input() { "input for {{input}}" } else { "(this template takes no input)" }
-                            prop:disabled=move || !wants_input() prop:value=move || input.get() on:input=move |ev| input.set(event_target_value(&ev))
-                            on:keydown=move |ev| if ev.key() == "Enter" { run() } />
-                        <button class=BUTTON prop:disabled=move || chosen.get().is_empty() || pending.get() on:click=move |_| run()>"Run"</button>
-                    </div>
-                    {move || result.get().map(|r| match r {
-                        Ok(m) => view! { <p class="text-sm text-emerald-600">{m}</p> }.into_any(),
-                        Err(e) => view! { <ErrorBox message=e /> }.into_any(),
-                    })}
-                </section>
-            }
-        })
-    }
 }
 
 #[cfg(test)]
@@ -1338,5 +1992,104 @@ mod tests {
         assert_eq!(seed.labels, vec!["client:acme".to_owned()]);
         assert_eq!(seed.realm, "work");
         assert!(!seed.worktree);
+    }
+
+    #[test]
+    fn a_recent_row_says_running_idle_or_needs_you() {
+        let mut s: Session = serde_json::from_value(serde_json::json!({
+            "id": "s1", "worker_id": "00000000-0000-0000-0000-000000000001", "title": "t", "cwd": "",
+            "connection_id": "", "model": "", "status": "running", "created_at": 0, "updated_at": 0, "last_seq": 0
+        }))
+        .unwrap();
+        assert_eq!(recent_state(&s).1, "running");
+        assert_eq!(recent_state(&s).0, crate::util::status_look(SessionStatus::Running).0, "the Sessions list's colours");
+        s.status = SessionStatus::Idle;
+        assert_eq!(recent_state(&s).1, "idle");
+        s.awaiting_approval = true;
+        assert_eq!(recent_state(&s), ("bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300", "needs you"));
+    }
+
+    fn session(id: &str, title: &str, updated_at: i64) -> Session {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "worker_id": "00000000-0000-0000-0000-000000000001", "title": title, "cwd": "",
+            "connection_id": "", "model": "", "status": "idle", "created_at": 0, "updated_at": updated_at, "last_seq": 0
+        }))
+        .unwrap()
+    }
+
+    fn ids(list: &[Session]) -> Vec<&str> {
+        list.iter().map(|s| s.id.as_str()).collect()
+    }
+
+    #[test]
+    fn recently_viewed_comes_first_then_the_rest_by_last_activity() {
+        let list = vec![session("a", "alpha", 10), session("b", "Zeta", 50), session("c", "Mid", 30), session("d", "beta", 40)];
+        // Viewed c, then a (a the newest view); b and d not viewed.
+        let viewed = vec![("a".to_owned(), 900), ("c".to_owned(), 800), ("gone".to_owned(), 999)];
+        assert_eq!(ids(&sorted(list.clone(), Sort::Viewed, &viewed)), ["a", "c", "b", "d"]);
+        assert_eq!(Sort::default(), Sort::Viewed);
+        // Nothing viewed: by last activity alone.
+        assert_eq!(ids(&sorted(list.clone(), Sort::Viewed, &[])), ["b", "d", "c", "a"]);
+        assert_eq!(ids(&sorted(list.clone(), Sort::Activity, &viewed)), ["b", "d", "c", "a"]);
+        // Titles whatever their case.
+        assert_eq!(ids(&sorted(list, Sort::Title, &viewed)), ["a", "d", "c", "b"]);
+    }
+
+    #[test]
+    fn your_labels_are_not_the_automatic_ones() {
+        let mut s = session("a", "t", 0);
+        s.labels = ["client:acme", "spike", "repo:github.com/acme/app", "host:web1", "worker:thalassa", "folder:~/x", "model:opus"]
+            .map(str::to_owned)
+            .to_vec();
+        s.auto_labels = vec!["repo:github.com/acme/app".to_owned(), "worker:thalassa".to_owned()];
+        assert_eq!(own_labels(&s), ["client:acme", "spike"]);
+        // A template run's labels are the head's, not yours.
+        s.labels = ["ops", "template:disk-check", "run:r1", "started-by:s0"].map(str::to_owned).to_vec();
+        assert_eq!(own_labels(&s), ["ops"]);
+        s.labels.clear();
+        assert!(own_labels(&s).is_empty(), "automatic labels alone: no labels line");
+    }
+
+    #[test]
+    fn the_sliders_dot_shows_while_a_choice_is_not_the_default() {
+        assert!(!non_default("", &[], Sort::Viewed, &[]));
+        assert!(non_default("running", &[], Sort::Viewed, &[]));
+        assert!(non_default("", &["client:acme".to_owned()], Sort::Viewed, &[]));
+        assert!(non_default("", &[], Sort::Title, &[]));
+        assert!(non_default("", &[], Sort::Activity, &[]));
+        assert!(non_default("", &[], Sort::Viewed, &["worker".to_owned()]));
+    }
+
+    #[test]
+    fn show_takes_sessions_by_their_state_word() {
+        let mut s = session("a", "t", 0);
+        assert!(shows(&s, "") && shows(&s, "idle") && !shows(&s, "running") && !shows(&s, "needs"));
+        s.status = SessionStatus::Running;
+        assert!(shows(&s, "running") && !shows(&s, "idle"));
+        s.awaiting_approval = true;
+        assert!(shows(&s, "needs") && !shows(&s, "running"), "needs you, not running");
+    }
+
+    #[test]
+    fn the_summary_says_where_and_how_in_one_line() {
+        assert_eq!(
+            summary("thalassa", None, "/home/z/projects/carbon6", "opus", "high", false),
+            "on thalassa · ~/projects/carbon6 · opus · high"
+        );
+        assert_eq!(summary("thalassa", None, "/home/z/projects/carbon6", "opus", "high", true), "thalassa · carbon6 · opus");
+        assert_eq!(summary("thalassa", None, "", "auto", "", false), "on thalassa · scratch folder · auto");
+        assert_eq!(summary("w", Some("admin@web1"), "/srv/app", "m", "", true), "w · ⇄ admin@web1:app · m");
+        assert_eq!(home_form("/Users/v/code"), "~/code");
+        assert_eq!(home_form("/root"), "~");
+        assert_eq!(home_form("/srv/app"), "/srv/app");
+        assert_eq!(last_part("/srv/app/"), "app");
+    }
+
+    #[test]
+    fn grouping_by_a_key_puts_it_outermost() {
+        let levels = ["repo".to_owned(), "worker".to_owned()];
+        assert_eq!(outermost(&levels, "folder"), ["folder", "worker"]);
+        assert_eq!(outermost(&levels, "worker"), ["worker"]);
+        assert_eq!(outermost(&[], "worker"), ["worker"]);
     }
 }

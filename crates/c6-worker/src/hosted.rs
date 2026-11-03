@@ -133,7 +133,7 @@ impl HostedClaude {
         };
         p.set_turn_cancel(t.cancel);
         let more = tokio::sync::Notify::new();
-        let feed = Vec::new;
+        let feed = crate::claude_code::Joining::default;
         let mut end = p.turn(t.turn, t.inputs.clone(), false, None, t.model, t.sink, &feed, &more, t.cancel).await?;
         // Asked to resume a conversation Claude Code doesn't have: a new one.
         if end.no_conversation

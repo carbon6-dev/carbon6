@@ -587,6 +587,7 @@ pub async fn detach(st: &HeadState, id: &str, r: &WorkRef, caller: &Caller) -> a
 pub async fn seen_session(st: &HeadState, session_id: &str, at: i64) -> anyhow::Result<()> {
     if st.store.mark_seen(session_id, at).await? {
         st.registry.bump();
+        st.attention.changed();
     }
     Ok(())
 }
@@ -605,6 +606,7 @@ pub async fn seen(st: &HeadState, id: &str, caller: &Caller) -> anyhow::Result<W
     }
     if any {
         st.registry.bump();
+        st.attention.changed();
     }
     get(st, id, caller).await
 }
@@ -1048,6 +1050,8 @@ pub async fn on_decision(st: &HeadState, d: &api::Decision) {
 /// The memex's events: a request opened, changed or got a new message.
 pub async fn on_memex_event(st: &HeadState, realm: &str, kind: &str, data: &Value) {
     if kind.starts_with("request.") {
+        // The Brief's count of people waiting on you may have changed.
+        st.attention.changed();
         let mut ids: Vec<i64> = data["request_ids"].as_array().into_iter().flatten().filter_map(Value::as_i64).collect();
         ids.extend(data["request_id"].as_i64());
         ids.sort_unstable();
@@ -1232,24 +1236,25 @@ pub(crate) async fn model_for_route(
     let route_label = label;
     let connections = st.store.connections().await?;
     let labels = vec![route_label.to_owned()];
-    for r in [realm, crate::realms::ROOT] {
-        let routes: Vec<api::Route> =
-            serde_json::from_str(&st.store.setting_for(crate::sessions::ROUTES, r).await?.unwrap_or_default()).unwrap_or_default();
-        for route in routes.iter().filter(|x| x.enabled && x.applies_to.iter().any(|l| l == route_label)) {
-            if !api::labels::applies(&route.applies_to, &labels) {
-                continue;
-            }
-            let want = route.connection.trim();
-            let connection = if want.is_empty() {
-                fallback.as_ref().map(|f| f.0.clone())
-            } else {
-                connections.iter().find(|c| c.id == want || c.name == want).map(|c| c.id.clone())
-            };
-            if let Some(c) = connection {
-                let model = route.model.trim();
-                let model = if model.is_empty() { fallback.as_ref().map(|f| f.1.clone()).unwrap_or_default() } else { model.to_owned() };
-                return Ok(Some((c, model)));
-            }
+    // The realm's rules, then root's (setting_for merges them). A rule
+    // whose connection the realm may not use is passed over.
+    let routes: Vec<api::Route> =
+        serde_json::from_str(&st.store.setting_for(crate::sessions::ROUTES, realm).await?.unwrap_or_default()).unwrap_or_default();
+    let usable = |c: &crate::store::ConnectionRow| realm == crate::realms::ROOT || crate::realms::available(&c.realms, realm);
+    for route in routes.iter().filter(|x| x.enabled && x.applies_to.iter().any(|l| l == route_label)) {
+        if !api::labels::applies(&route.applies_to, &labels) {
+            continue;
+        }
+        let want = route.connection.trim();
+        let connection = if want.is_empty() {
+            fallback.as_ref().map(|f| f.0.clone())
+        } else {
+            connections.iter().find(|c| (c.id == want || c.name == want) && usable(c)).map(|c| c.id.clone())
+        };
+        if let Some(c) = connection {
+            let model = route.model.trim();
+            let model = if model.is_empty() { fallback.as_ref().map(|f| f.1.clone()).unwrap_or_default() } else { model.to_owned() };
+            return Ok(Some((c, model)));
         }
     }
     Ok(fallback.filter(|(c, _)| !c.is_empty()))

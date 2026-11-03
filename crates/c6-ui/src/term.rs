@@ -119,20 +119,13 @@ pub fn Terminals(
     let wid = StoredValue::new(worker_id);
     let list = LocalResource::new(move || crate::api::terminals(wid.get_value()));
     let active = RwSignal::new(None::<String>);
-    let cwd = RwSignal::new(default_cwd.unwrap_or_default());
+    let home = StoredValue::new(default_cwd.unwrap_or_default());
+    let cwd = RwSignal::new(home.get_value());
+    // Another folder than the session's: asked for only behind "…".
+    let picking = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
 
-    // Show the newest open terminal by default.
-    Effect::new(move || {
-        if active.get_untracked().is_none()
-            && let Some(Ok(ts)) = list.get()
-            && let Some(t) = ts.iter().rev().find(|t| t.exited.is_none())
-        {
-            active.set(Some(t.id.clone()));
-        }
-    });
-
-    let open = move |_| {
+    let open = move || {
         spawn_local(async move {
             match crate::api::open_terminal(wid.get_value(), cwd.get_untracked(), ssh.get_value()).await {
                 Ok(t) => {
@@ -144,6 +137,25 @@ pub fn Terminals(
             }
         });
     };
+    // A session's pane shows a terminal at once: one open in its folder,
+    // or a new one there.
+    let started = StoredValue::new(false);
+    Effect::new(move || {
+        if started.get_value() || active.get_untracked().is_some() {
+            return;
+        }
+        let Some(Ok(ts)) = list.get() else { return };
+        started.set_value(true);
+        let live = || ts.iter().rev().filter(|t| t.exited.is_none());
+        let here = home.with_value(|h| live().find(|t| !h.is_empty() && t.cwd.trim_end_matches('/') == h.trim_end_matches('/')).cloned());
+        // A worker's page (no folder of its own) only shows the newest.
+        let newest = home.with_value(String::is_empty).then(|| live().next().cloned()).flatten();
+        match here.or(newest) {
+            Some(t) => active.set(Some(t.id)),
+            None if !home.with_value(String::is_empty) => open(),
+            None => {}
+        }
+    });
     let close = move |id: String| {
         spawn_local(async move {
             let _ = crate::api::close_terminal(wid.get_value(), id.clone()).await;
@@ -165,19 +177,32 @@ pub fn Terminals(
                             <button class="px-2 py-1 font-mono text-xs" title=t.cwd.clone() on:click=move |_| active.set(Some(id2.clone()))>
                                 {label}{t.exited.map(|c| format!(" (exited {c})"))}
                             </button>
-                            <button class="px-1.5 text-zinc-400 hover:text-red-600" title="Close" on:click={let id = t.id.clone(); move |_| close(id.clone())}>"×"</button>
+                            <button class="px-1.5 text-muted hover:text-red-600" title="Close" on:click={let id = t.id.clone(); move |_| close(id.clone())}>"×"</button>
                         </span>
                     }
                 }).collect_view()}
-                <span class="flex-1"></span>
-                <input class=format!("{} w-64 font-mono text-xs", crate::util::INPUT) placeholder="directory (default: home)"
-                    prop:value=move || cwd.get() on:input=move |ev| cwd.set(event_target_value(&ev)) />
-                <button class=crate::util::BUTTON on:click=open>"New terminal"</button>
+                // Another terminal: + in the session's folder, … for another.
+                <button class="flex size-6 items-center justify-center rounded-md text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100 pointer-coarse:size-9"
+                    title="New terminal in the session's folder" aria-label="New terminal"
+                    on:click=move |_| { cwd.set(home.get_value()); picking.set(false); open(); }>
+                    <svg viewBox="0 0 16 16" class="size-3.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
+                </button>
+                <button class="flex h-6 items-center rounded-md px-1 text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100 pointer-coarse:h-9"
+                    title="New terminal in another folder" aria-label="New terminal in another folder" on:click=move |_| picking.update(|p| *p = !*p)>"…"</button>
+                {move || picking.get().then(|| view! {
+                    <form class="flex items-center gap-1" on:submit=move |ev| { ev.prevent_default(); picking.set(false); open(); }>
+                        <input class=format!("{} w-64 font-mono text-xs", crate::util::INPUT) placeholder="folder (empty: home)" autofocus=true
+                            prop:value=move || cwd.get() on:input=move |ev| cwd.set(event_target_value(&ev))
+                            on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); picking.set(false) } />
+                        <button type="submit" class=crate::util::BUTTON_QUIET>"Open"</button>
+                    </form>
+                })}
             </div>
             {move || error.get().map(|e| view! { <crate::util::ErrorBox message=e /> })}
             {move || match active.get() {
                 Some(tid) => view! { <TerminalView worker_id=wid.get_value() terminal_id=tid /> }.into_any(),
-                None => view! { <p class="py-10 text-center text-sm text-zinc-500">"No terminal open."</p> }.into_any(),
+                None if !started.get_value() || error.get().is_none() && list.get().is_none() => view! { <p class="py-10 text-center text-sm text-muted">"Opening a terminal…"</p> }.into_any(),
+                None => view! { <p class="py-10 text-center text-sm text-muted">"No terminal open: + opens one."</p> }.into_any(),
             }}
         </div>
     }

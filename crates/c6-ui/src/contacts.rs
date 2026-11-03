@@ -110,7 +110,7 @@ pub fn ContactsPage() -> impl IntoView {
                                 <input type="checkbox" prop:checked=move || ticked.with(|t| t.contains(&e1))
                                     on:change=move |ev| { let on = event_target_checked(&ev); ticked.update(|t| { if on { t.insert(e2.clone()); } else { t.remove(&e2); } }); } />
                                 <span>{if c.name.is_empty() { c.email.clone() } else { format!("{} <{}>", c.name, c.email) }}</span>
-                                <span class="text-xs text-zinc-500">{format!("you wrote {} · they wrote {}", c.sent, c.received)}</span>
+                                <span class="text-xs text-muted">{format!("you wrote {} · they wrote {}", c.sent, c.received)}</span>
                                 <span class="flex-1"></span>
                                 <button class=BUTTON_QUIET disabled=move || adding.with(|a| a.contains(&e3))
                                     on:click=move |ev| { ev.prevent_default(); click(name.clone(), email.clone()); }>
@@ -127,15 +127,15 @@ pub fn ContactsPage() -> impl IntoView {
             <Suspense fallback=|| ()>
                 {move || list.get().map(|r| match r {
                     Err(e) => view! { <ErrorBox message=format!("{e} (Connect a Google account in Settings → Mail & calendar.)") /> }.into_any(),
-                    Ok(v) if v.is_empty() => view! { <p class="text-sm text-zinc-500">"No contacts."</p> }.into_any(),
+                    Ok(v) if v.is_empty() => view! { <p class="text-sm text-muted">"No contacts."</p> }.into_any(),
                     Ok(v) => view! {
                         <div class="divide-y divide-zinc-200 rounded-lg border border-zinc-200 text-sm dark:divide-zinc-800 dark:border-zinc-800">
                             {v.into_iter().map(|c| view! {
                                 <div class="flex flex-wrap items-baseline gap-x-3 px-3 py-2">
                                     <span class="font-medium">{c.name.clone()}</span>
-                                    <span class="text-xs text-zinc-500">{c.emails.join(", ")}</span>
-                                    <span class="text-xs text-zinc-500">{c.orgs.join(", ")}</span>
-                                    <span class="text-xs text-zinc-500">{c.phones.join(", ")}</span>
+                                    <span class="text-xs text-muted">{c.emails.join(", ")}</span>
+                                    <span class="text-xs text-muted">{c.orgs.join(", ")}</span>
+                                    <span class="text-xs text-muted">{c.phones.join(", ")}</span>
                                     <span class="flex-1"></span>
                                     {c.emails.first().map(|e| view! { <Go to=View::Memex class="text-xs text-sky-700 hover:underline dark:text-sky-400">{format!("in the memex: person:{e}")}</Go> })}
                                 </div>

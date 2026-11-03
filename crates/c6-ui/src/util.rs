@@ -16,26 +16,53 @@ pub fn today() -> String {
     format!("{:04}-{:02}-{:02}", d.get_full_year(), d.get_month() + 1, d.get_date())
 }
 
-/// A signal that ticks every few seconds, for relative times.
+/// A signal that ticks every few seconds, for relative times, while its
+/// view lives (each hover card has one: never cleared, they piled up).
 pub fn clock() -> RwSignal<i64> {
     let now = RwSignal::new(now_ms());
-    set_interval(move || now.set(now_ms()), std::time::Duration::from_secs(5));
+    let tick = set_interval_with_handle(move || now.set(now_ms()), std::time::Duration::from_secs(5)).ok();
+    on_cleanup(move || {
+        if let Some(t) = tick {
+            t.clear();
+        }
+    });
     now
 }
 
-#[component]
-pub fn StatusPill(status: SessionStatus) -> impl IntoView {
-    let (cls, label) = match status {
+/// A session state's pill colours and word.
+pub fn status_look(status: SessionStatus) -> (&'static str, &'static str) {
+    match status {
         SessionStatus::Running => ("bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-300", "running"),
         SessionStatus::Idle => ("bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300", "idle"),
         SessionStatus::Starting => ("bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300", "starting"),
         SessionStatus::Failed => ("bg-red-100 text-red-800 dark:bg-red-950 dark:text-red-300", "failed"),
-    };
+    }
+}
+
+#[component]
+pub fn StatusPill(status: SessionStatus) -> impl IntoView {
+    let (cls, label) = status_look(status);
     view! { <span class=format!("inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium {cls}")>{label}</span> }
 }
 
 /// Sizes a message box to what is in it; its CSS `max-height` caps it, and
 /// past that it scrolls.
+/// As `fit`, but an empty box with a long `hint` (a suggested message in
+/// its placeholder) is sized to show all of it: measured as if typed, then
+/// emptied again. Without one, as `fit`.
+pub fn fit_hint(el: &web_sys::HtmlTextAreaElement, hint: Option<&str>) {
+    match hint.filter(|h| !h.is_empty()) {
+        Some(h) if el.value().is_empty() => {
+            el.set_value(h);
+            fit(el);
+            let style = el.get_attribute("style").unwrap_or_default();
+            el.set_value("");
+            let _ = el.set_attribute("style", &style);
+        }
+        _ => fit(el),
+    }
+}
+
 pub fn fit(el: &web_sys::HtmlTextAreaElement) {
     // Empty, it keeps its own rows: a long hint doesn't size it.
     if el.value().is_empty() {
@@ -81,6 +108,12 @@ pub fn touch_first() -> bool {
     window().match_media("(pointer: coarse)").ok().flatten().is_some_and(|m| m.matches())
 }
 
+/// The phone's layout: one tile and one pane at a time. The desktop one
+/// needs 48rem of width and 32rem of height (`md` in the style).
+pub fn phone() -> bool {
+    !window().match_media("(min-width: 48rem) and (min-height: 32rem)").ok().flatten().is_some_and(|m| m.matches())
+}
+
 /// The key that sends a message box: Enter (Shift+Enter for a new line);
 /// on a touch screen only ⌘/Ctrl+Enter, Return being a new line. ⌘/Ctrl+Enter
 /// sends everywhere.
@@ -88,8 +121,8 @@ pub fn sends(ev: &web_sys::KeyboardEvent) -> bool {
     ev.key() == "Enter" && !ev.is_composing() && (ev.meta_key() || ev.ctrl_key() || (!ev.shift_key() && !touch_first()))
 }
 
-/// The key for Send now while the agent works (stop its current step, then
-/// send): ⌘/Ctrl+Shift+Enter, on every device (on a touch screen ⌘/Ctrl+Enter
+/// The key for Send now while the agent works (the agent gets it at once,
+/// not at its next step): ⌘/Ctrl+Shift+Enter, on every device (on a touch screen ⌘/Ctrl+Enter
 /// is the only plain Send).
 pub fn sends_now(ev: &web_sys::KeyboardEvent) -> bool {
     ev.key() == "Enter" && !ev.is_composing() && (ev.meta_key() || ev.ctrl_key()) && ev.shift_key()
@@ -105,6 +138,27 @@ pub fn storage_get(key: &str) -> Option<String> {
 
 pub fn storage_set(key: &str, value: &str) {
     storage_set_global(&placed_key(key), value);
+}
+
+pub fn storage_remove(key: &str) {
+    if let Ok(Some(s)) = window().local_storage() {
+        let _ = s.remove_item(&placed_key(key));
+    }
+}
+
+/// A message box's text, kept in this browser until it's sent
+/// (`c6.draft.<key>`): a panel that shows something else for a moment, or a
+/// popup closed by mistake, gives it back as it was.
+pub fn draft(key: &str) -> RwSignal<String> {
+    let key = format!("c6.draft.{key}");
+    let text = RwSignal::new(storage_get(&key).unwrap_or_default());
+    Effect::new(move || text.with(|t| if t.is_empty() { storage_remove(&key) } else { storage_set(&key, t) }));
+    text
+}
+
+/// Drops a draft that was sent, from code that may outlive its box.
+pub fn forget_draft(key: &str) {
+    storage_remove(&format!("c6.draft.{key}"));
 }
 
 fn placed_key(key: &str) -> String {
@@ -192,10 +246,81 @@ pub fn NoticeHost() -> impl IntoView {
 type PutAway = std::rc::Rc<dyn Fn()>;
 type Hook = wasm_bindgen::closure::Closure<dyn FnMut(web_sys::Event)>;
 
+/// Something popped up: which one, the component that popped it up (one
+/// that a component within that one pops up is within it), and how it goes
+/// away.
+struct Up {
+    id: u64,
+    owner: Option<Owner>,
+    put_away: PutAway,
+}
+
 thread_local! {
     static POPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    /// What pops up now, and how it goes away: one at a time.
-    static SHOWN: std::cell::RefCell<Option<(u64, PutAway)>> = const { std::cell::RefCell::new(None) };
+    /// What pops up now, outermost first: one at a time, or one within
+    /// another (a drop-down in a menu).
+    static SHOWN: std::cell::RefCell<Vec<Up>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Of what's up (outermost first) when another pops up: what stays (what
+/// it pops up within, `holds`) and what goes.
+fn opening<T>(shown: Vec<T>, holds: impl Fn(&T) -> bool) -> (Vec<T>, Vec<T>) {
+    shown.into_iter().partition(holds)
+}
+
+/// Whether an Escape is this one's: only the innermost goes.
+fn innermost(shown: &[u64], id: u64) -> bool {
+    shown.last() == Some(&id)
+}
+
+/// What opens a pop-up: what carries its `data-pop` and takes focus, or a
+/// `<details>`' summary.
+fn opener_selector(key: &str) -> String {
+    format!(":is(button, summary, input, [role=button])[data-pop=\"{key}\"], [data-pop=\"{key}\"] > summary")
+}
+
+/// Whether `owner` is a component within `of` (not `of` itself: two that
+/// one component pops up are side by side).
+fn within(owner: &Owner, of: &Owner) -> bool {
+    let mut at = owner.parent();
+    while let Some(o) = at {
+        if &o == of {
+            return true;
+        }
+        at = o.parent();
+    }
+    false
+}
+
+/// Whether what carries `data-pop` `key` sits inside the pop-up `outer`'s
+/// element on the page.
+fn inside(key: &str, outer: u64) -> bool {
+    document()
+        .query_selector(&format!("[data-pop=\"{key}\"]"))
+        .ok()
+        .flatten()
+        .and_then(|el| el.parent_element())
+        .and_then(|p| p.closest(&format!("[data-pop=\"pop{outer}\"]")).ok().flatten())
+        .is_some()
+}
+
+/// Where Escape puts focus back: what opened it (focused as it opened, else
+/// the first of its openers on screen); for a pop-up whose opener isn't
+/// marked, what had focus outside it.
+fn opener_of(mine: &str, key: &str) -> Option<web_sys::HtmlElement> {
+    use wasm_bindgen::JsCast;
+    let doc = document();
+    let openers = opener_selector(key);
+    let body: Option<web_sys::Element> = doc.body().map(Into::into);
+    let active = doc.active_element().filter(|a| body.as_ref() != Some(a));
+    if let Some(a) = active.as_ref().filter(|a| a.matches(&openers).unwrap_or(false)) {
+        return a.clone().dyn_into().ok();
+    }
+    let all = doc.query_selector_all(&openers).ok()?;
+    let on_screen = (0..all.length())
+        .filter_map(|i| all.item(i)?.dyn_into::<web_sys::HtmlElement>().ok())
+        .find(|e| e.offset_width() > 0 || e.offset_height() > 0);
+    on_screen.or_else(|| active.filter(|a| a.closest(mine).ok().flatten().is_none()).and_then(|a| a.dyn_into().ok()))
 }
 
 /// The document's listeners while something pops up; dropped, they go.
@@ -209,12 +334,7 @@ impl Drop for Dismiss {
         for (kind, f) in &self.hooks {
             let _ = document().remove_event_listener_with_callback_and_bool(kind, wasm_bindgen::JsCast::unchecked_ref(f.as_ref()), true);
         }
-        SHOWN.with(|s| {
-            let mut s = s.borrow_mut();
-            if s.as_ref().is_some_and(|(i, _)| *i == self.id) {
-                *s = None;
-            }
-        });
+        SHOWN.with(|s| s.borrow_mut().retain(|x| x.id != self.id));
     }
 }
 
@@ -222,11 +342,26 @@ impl Drop for Dismiss {
 /// expect: a press anywhere else (`pointerdown`, a tap and a click alike;
 /// a touch scroll starts with one), a wheel scrolling anywhere else, focus
 /// moving elsewhere, Escape (which goes no further, so it doesn't also stop
-/// a running turn), and another one opening. Scrolling the page by itself
-/// (a transcript following its turn) leaves it open. Nothing covers the
-/// page, so scrolling stays the page's. What belongs to it (its button and
-/// what it shows) carries `data-pop`, the value returned.
+/// a running turn, and puts focus back on what opened it), and another one
+/// opening (but not one opening within it, which goes first on Escape).
+/// Scrolling the page by itself (a transcript following its turn) leaves
+/// it open. Nothing covers the page, so scrolling stays the page's. What
+/// belongs to it (its button and what it shows) carries `data-pop`, the
+/// value returned: a press on its button is no press outside, so the button
+/// alone toggles it. `close` may run once its component is gone: `try_set`.
 pub fn dismissable(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static) -> String {
+    pop_up(shown, close, true)
+}
+
+/// As `dismissable`, for what covers the page to catch a press outside it
+/// (`Popover`): Escape, one at a time and focus going back, but presses,
+/// wheels and focus left to what covers the page. What it shows carries
+/// `data-pop` (and its button, if one opens it, for focus to go back to).
+pub fn escapable(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static) -> String {
+    pop_up(shown, close, false)
+}
+
+fn pop_up(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static, outside_closes: bool) -> String {
     use wasm_bindgen::JsCast;
     let id = POPS.with(|n| {
         n.set(n.get() + 1);
@@ -234,6 +369,8 @@ pub fn dismissable(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone 
     });
     let key = format!("pop{id}");
     let mine = format!("[data-pop=\"{key}\"]");
+    let marked = key.clone();
+    let owner = Owner::current();
     let hooks = StoredValue::new_local(None::<Dismiss>);
     Effect::new(move || {
         if !shown() {
@@ -243,12 +380,20 @@ pub fn dismissable(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone 
         if hooks.with_value(Option::is_some) {
             return;
         }
-        let put_away: PutAway = std::rc::Rc::new(close.clone());
-        let before = SHOWN.with(|s| s.borrow_mut().replace((id, put_away)));
-        if let Some((other, put_away)) = before
-            && other != id
-        {
-            put_away();
+        // What it doesn't pop up within goes (put away once the list is
+        // let go of).
+        let gone = SHOWN.with(|s| {
+            let mut s = s.borrow_mut();
+            // Within it as components go, or on the page (a drop-down in a
+            // panel the same component pops up).
+            let holds = |x: &Up| owner.as_ref().zip(x.owner.as_ref()).is_some_and(|(o, of)| within(o, of)) || inside(&marked, x.id);
+            let (stay, gone) = opening(std::mem::take(&mut *s), holds);
+            *s = stay;
+            s.push(Up { id, owner: owner.clone(), put_away: std::rc::Rc::new(close.clone()) });
+            gone
+        });
+        for x in gone {
+            (x.put_away)();
         }
         let outside = {
             let mine = mine.clone();
@@ -259,24 +404,32 @@ pub fn dismissable(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone 
             }
         };
         let mut d = Dismiss { id, hooks: Vec::new() };
-        for kind in ["pointerdown", "wheel", "focusin"] {
-            let (outside, close) = (outside.clone(), close.clone());
-            d.hooks.push((
-                kind,
-                wasm_bindgen::closure::Closure::new(move |ev: web_sys::Event| {
-                    if outside(&ev) {
-                        close();
-                    }
-                }),
-            ));
+        if outside_closes {
+            for kind in ["pointerdown", "wheel", "focusin"] {
+                let (outside, close) = (outside.clone(), close.clone());
+                d.hooks.push((
+                    kind,
+                    wasm_bindgen::closure::Closure::new(move |ev: web_sys::Event| {
+                        if outside(&ev) {
+                            close();
+                        }
+                    }),
+                ));
+            }
         }
+        let opener = opener_of(&mine, &marked);
         let close = close.clone();
         d.hooks.push((
             "keydown",
             wasm_bindgen::closure::Closure::new(move |ev: web_sys::Event| {
-                if ev.dyn_ref::<web_sys::KeyboardEvent>().is_some_and(|k| k.key() == "Escape") {
-                    ev.stop_propagation();
-                    close();
+                let escape = ev.dyn_ref::<web_sys::KeyboardEvent>().is_some_and(|k| k.key() == "Escape" && !k.is_composing());
+                if !escape || !SHOWN.with(|s| innermost(&s.borrow().iter().map(|x| x.id).collect::<Vec<_>>(), id)) {
+                    return;
+                }
+                ev.stop_propagation();
+                close();
+                if let Some(el) = &opener {
+                    let _ = el.focus();
                 }
             }),
         ));
@@ -289,6 +442,26 @@ pub fn dismissable(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone 
         hooks.set_value(Some(d));
     });
     key
+}
+
+/// A `<details>` drop-down that goes away as `dismissable` says: give the
+/// `<details>` the `data-pop` returned and the handler for its `toggle`.
+pub fn details_pop(menu: NodeRef<leptos::html::Details>) -> (String, impl Fn(web_sys::Event) + Copy + 'static) {
+    let open = RwSignal::new(false);
+    let pop = dismissable(
+        move || open.get(),
+        move || {
+            if let Some(d) = menu.try_get_untracked().flatten() {
+                d.set_open(false);
+            }
+            // Its `toggle` says so too, but not if it was drawn again.
+            open.try_set(false);
+        },
+    );
+    let toggled = move |_: web_sys::Event| {
+        open.try_set(menu.try_get_untracked().flatten().is_some_and(|d| d.open()));
+    };
+    (pop, toggled)
 }
 
 /// A "⋯" button and its menu. With `row`, it's a row's: on touch screens
@@ -306,9 +479,9 @@ pub fn Menu(items: Vec<(&'static str, Callback<()>)>, #[prop(optional)] row: boo
     );
     let items = StoredValue::new(items);
     let trigger = if row {
-        "row-action flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-zinc-500 hover:bg-zinc-200 dark:hover:bg-zinc-800"
+        "row-action flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-muted hover:bg-zinc-200 dark:hover:bg-zinc-800"
     } else {
-        "flex h-11 w-11 shrink-0 items-center justify-center rounded-md text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+        "flex h-11 w-11 shrink-0 items-center justify-center rounded-md text-muted hover:bg-zinc-100 dark:hover:bg-zinc-800"
     };
     let label = if label.is_empty() { "More".to_owned() } else { label };
     view! {
@@ -359,5 +532,87 @@ pub fn ErrorBox(message: String) -> impl IntoView {
         <div class="rounded-md border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200">
             {message}
         </div>
+    }
+}
+
+/// One of a few answers, each shown whole as a row to tap: a drop-down
+/// shows only the chosen one and cuts long ones off. More than 8 fall back
+/// to a drop-down. `optional`: tapping the chosen row again clears it.
+/// Rows aren't buttons, so a `<label>` around them doesn't pick the first.
+#[component]
+pub fn Choices(choices: Vec<(String, String)>, value: RwSignal<String>, #[prop(optional)] optional: bool) -> impl IntoView {
+    if choices.len() > 8 {
+        return view! {
+            <select class=format!("{INPUT} py-1 text-sm") prop:value=move || value.get() on:change=move |ev| value.set(event_target_value(&ev))>
+                {optional.then(|| view! { <option value="">"—"</option> })}
+                {choices.into_iter().map(|(v, l)| view! { <option value=v>{l}</option> }).collect_view()}
+            </select>
+        }
+        .into_any();
+    }
+    view! {
+        <div role="radiogroup" class="space-y-1">
+            {choices.into_iter().map(|(v, l)| {
+                let v = StoredValue::new(v);
+                let on = Memo::new(move |_| value.with(|x| v.with_value(|v| x == v)));
+                let pick = move || value.update(|x| *x = if optional && v.with_value(|v| x == v) { String::new() } else { v.get_value() });
+                view! {
+                    <div role="radio" tabindex="0" aria-checked=move || on.get().to_string()
+                        class=move || format!(
+                            "flex w-full cursor-pointer items-start gap-2 rounded-md border px-2.5 py-1.5 text-sm outline-none focus-visible:ring-2 focus-visible:ring-sky-500 {}",
+                            if on.get() { "border-sky-500 bg-sky-100 dark:bg-sky-900/40" } else { "border-zinc-300 bg-white hover:border-zinc-400 dark:border-zinc-700 dark:bg-zinc-900 dark:hover:border-zinc-500" },
+                        )
+                        on:click=move |ev| { ev.prevent_default(); pick() }
+                        on:keydown=move |ev| if ev.key() == "Enter" || ev.key() == " " { ev.prevent_default(); pick() }>
+                        <span class=move || format!("mt-1 h-3 w-3 shrink-0 rounded-full border {}", if on.get() { "border-sky-600 bg-sky-600" } else { "border-zinc-400 dark:border-zinc-500" })></span>
+                        <span class="min-w-0 flex-1">{l}</span>
+                    </div>
+                }
+            }).collect_view()}
+        </div>
+    }
+    .into_any()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn what_pops_up_within_another_keeps_it_open() {
+        // A menu (1) holding a drop-down (2), and another opening within
+        // the drop-down: both stay.
+        assert_eq!(opening(vec![1, 2], |_| true), (vec![1, 2], vec![]));
+        // One opening elsewhere puts both away.
+        assert_eq!(opening(vec![1, 2], |_| false), (vec![], vec![1, 2]));
+        // One opening in the menu but not in its drop-down: the drop-down goes.
+        assert_eq!(opening(vec![1, 2], |x| *x == 1), (vec![1], vec![2]));
+    }
+
+    #[test]
+    fn escape_puts_away_the_innermost_only() {
+        assert!(innermost(&[1, 2], 2));
+        assert!(!innermost(&[1, 2], 1));
+        assert!(!innermost(&[], 1));
+    }
+
+    #[test]
+    fn its_opener_carries_its_mark_or_is_its_summary() {
+        assert_eq!(opener_selector("pop3"), ":is(button, summary, input, [role=button])[data-pop=\"pop3\"], [data-pop=\"pop3\"] > summary");
+    }
+
+    #[test]
+    fn a_component_is_within_its_parents() {
+        let root = Owner::new();
+        let (child, grandchild) = root.with(|| {
+            let child = Owner::new();
+            let grandchild = child.with(Owner::new);
+            (child, grandchild)
+        });
+        assert!(within(&grandchild, &root));
+        assert!(within(&grandchild, &child));
+        assert!(!within(&child, &child));
+        assert!(!within(&root, &child));
+        assert!(!within(&grandchild, &Owner::new()));
     }
 }

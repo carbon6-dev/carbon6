@@ -145,6 +145,13 @@ pub(crate) fn Composer(place: Place, thread_ts: Option<String>) -> impl IntoView
         };
         (!list.is_empty()).then_some(list)
     });
+    // The suggestions go on a press outside them and the box, or Escape.
+    let suggest_pop = StoredValue::new(crate::util::dismissable(
+        move || options.with(Option::is_some),
+        move || {
+            caret.try_set(0);
+        },
+    ));
     let complete = move |insert: String| {
         let t = text.get_untracked();
         let c = caret.get_untracked();
@@ -158,7 +165,7 @@ pub(crate) fn Composer(place: Place, thread_ts: Option<String>) -> impl IntoView
             let _ = el.focus();
             set_timeout(
                 move || {
-                    if let Some(el) = area.get_untracked() {
+                    if let Some(el) = area.try_get_untracked().flatten() {
                         let _ = el.set_selection_range(at as u32, at as u32);
                     }
                 },
@@ -180,7 +187,7 @@ pub(crate) fn Composer(place: Place, thread_ts: Option<String>) -> impl IntoView
         let (s, e) = ((a + left.len()) as u32, (b + left.len()) as u32);
         set_timeout(
             move || {
-                if let Some(el) = area.get_untracked() {
+                if let Some(el) = area.try_get_untracked().flatten() {
                     let _ = el.set_selection_range(s, e);
                 }
             },
@@ -261,7 +268,7 @@ pub(crate) fn Composer(place: Place, thread_ts: Option<String>) -> impl IntoView
     let channel_name = place.name.clone();
     let place_name = StoredValue::new(place.name.clone());
     let tool =
-        "rounded px-1.5 py-0.5 text-xs text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
+        "rounded px-1.5 py-0.5 text-xs text-muted hover:bg-zinc-200 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
     let s2 = send.clone();
     view! {
         <div class="relative px-4 pb-3 pt-1">
@@ -273,7 +280,7 @@ pub(crate) fn Composer(place: Place, thread_ts: Option<String>) -> impl IntoView
                 </div>
             })}
             {move || options.get().map(|list| view! {
-                <div class="absolute bottom-full left-4 right-4 z-30 mb-1 overflow-hidden rounded-md border border-zinc-200 bg-white text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
+                <div data-pop=suggest_pop.get_value() class="absolute bottom-full left-4 right-4 z-30 mb-1 overflow-hidden rounded-md border border-zinc-200 bg-white text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
                     {list.into_iter().enumerate().map(|(i, (insert, label, note))| view! {
                         <button class=move || format!("flex w-full items-center gap-2 px-3 py-1 text-left {}", if picked.get() == i { "bg-sky-700 text-white" } else { "hover:bg-zinc-100 dark:hover:bg-zinc-800" })
                             on:mousedown=move |ev| { ev.prevent_default(); complete(insert.clone()); }>
@@ -294,7 +301,7 @@ pub(crate) fn Composer(place: Place, thread_ts: Option<String>) -> impl IntoView
                     <button class=tool title="Quote" on:click=move |_| line("> ")>"❝"</button>
                     <button class=format!("{tool} font-mono") title="Code block" on:click=move |_| wrap("```\n", "\n```")>"{ }"</button>
                 </div>
-                <textarea node_ref=area class="block max-h-60 min-h-[2.5rem] w-full resize-none bg-transparent px-3 py-2 text-sm outline-none" rows="2"
+                <textarea node_ref=area data-pop=suggest_pop.get_value() class="block max-h-60 min-h-[2.5rem] w-full resize-none bg-transparent px-3 py-2 text-sm outline-none" rows="2"
                     placeholder=placeholder prop:value=move || text.get()
                     on:input=move |ev| {
                         text.set(event_target_value(&ev));
@@ -334,7 +341,7 @@ pub(crate) fn Composer(place: Place, thread_ts: Option<String>) -> impl IntoView
                             caret.set(el.selection_start().ok().flatten().unwrap_or(0) as usize);
                         }
                     }></textarea>
-                <div class="flex items-center gap-2 px-2 pb-1 text-[11px] text-zinc-500">
+                <div class="flex items-center gap-2 px-2 pb-1 text-[11px] text-muted">
                     {in_thread.then(|| view! {
                         <label class="flex items-center gap-1">
                             <input type="checkbox" prop:checked=move || broadcast.get() on:change=move |ev| broadcast.set(event_target_checked(&ev)) />

@@ -1,6 +1,6 @@
 # Suggested next messages — Design
 
-Status: built (2026-10-20). Decided: a cheap model chosen by routing (`task:suggest`), else the session's own; made only while someone is looking.
+Status: built (2026-10-20). Decided: a cheap model chosen by routing (`task:suggest`), else the session's own; made only while someone is looking. Session names (§7) built 2026-11-02.
 
 ## 1. What it does
 
@@ -20,7 +20,7 @@ Tap **Use suggestion** below the box, or press **Tab**, to accept it. It becomes
   - A session nobody opens costs nothing.
   - Each turn gets one suggestion at most, cached by the session's position (`last_seq`). Reopening the page or a second tab gets the cached one.
 - **Not while something else is asked.** No suggestion while the session shows a card you answer in place: an approval, a question, or a decision under **Waiting for you**. A task card doesn't count, since it asks nothing of you. The answer goes there, not in the box.
-- **Off per realm,** in Settings → Agents and tools → **Suggest next messages** (on by default).
+- **Off per realm,** in Settings → Suggestions → **Suggest next messages** (on by default).
 
 ## 3. How it's made
 
@@ -35,9 +35,9 @@ Tap **Use suggestion** below the box, or press **Tab**, to accept it. It becomes
   - `{{title}}`, `{{labels}}`;
   - `{{exchanges}}`.
 
-  The default asks for one short line in the user's voice, or `-` when there's no clear next step. Then nothing is shown.
+  The default asks for one short line in the user's voice; when the agent's last message asks something or offers to do something, the likely short answer ("yes, deploy"); and `-` only when there's no question, offer or obvious follow-up. Then nothing is shown.
 - **Model.**
-  1. The model-routing rule that applies to the session's labels plus `task:suggest`, in the session's realm (then root's). Add one to send suggestions to a small, fast model.
+  1. The model-routing rule that applies to the session's labels plus `task:suggest`, in the session's realm (then root's), whose connection that realm may use (a rule naming another realm's connection is passed over). Add one to send suggestions to a small, fast model; for one realm only, add it in the console under Settings → Model routing → Rules for <realm>.
   2. Without such a rule, the session's own connection and model.
 
   It runs in the head, one call with no tools, low effort, and at most 1,024 output tokens, so a thinking model has room to reason. The answer is cut to one line. A reply with no text at all counts as a failed call, not as "no next step".
@@ -66,3 +66,18 @@ Tap **Use suggestion** below the box, or press **Tab**, to accept it. It becomes
    - an errored turn, a pending question, and the setting off get none;
    - the cache serves the second request without a model call;
    - a routing rule with `task:suggest` picks its model.
+
+## 7. Session names
+
+A session's title starts as the first line of its first message, cut at 60 characters. Once its first turn finishes, it gets a short name instead ("Realm switching speed").
+
+- **When.** The first turn that finishes (an errored or interrupted one doesn't count) names it, from your first message and the agent's final reply. A first message of three words or fewer ("hi", "continue") says too little: the next finished turn names it instead, from both turns, once. The name is made once and never revised by itself.
+- **Silently.** The title changes in place: the sidebar, tabs and the session's header follow it live (the head's live list). There's no note and no Undo (a note with Undo was tried and dropped: unnecessary); Rename changes it, and its **Suggest** offers another.
+- **Your names win.** A session you renamed is never named by itself, before or after its first turn. A session started with a title (a template's, a trigger's, `title` in the API) keeps it.
+- **Which sessions.** Your top-level sessions and conversations with the assistant. Subagents and side chats keep their titles.
+- **Off per realm,** in Settings → Suggestions → **Name sessions** (on by default; `names` in `/api/v1/settings/suggestions`). Off when a session's first turn finishes means it isn't named later either.
+- **Model.** A routing rule that applies to the session's labels plus `task:name` (the realm's rules first, then root's, on a connection the realm may use), else the `task:suggest` rule's, else the session's own connection and model (a Claude Code session needs one of those rules). One call with no tools, low effort, at most 1,024 output tokens, counted in the session's usage; a blocking budget means no name. A call that fails leaves the first line.
+- **Prompt.** `session.name` (Settings → Prompts), with `{{exchanges}}`: your messages and the agent's final replies of the turns it's named from (each cut at 2,000 characters; never tool output). The answer is cleaned to one line: quotes, a "Title:" label and closing punctuation are dropped, it starts with a capital, and it's cut to 60 characters at a word.
+- **Rename's Suggest.** For older sessions (or another try): **Suggest** in the Rename box fills it with a name made the same way, to start from; nothing changes until you save. `GET /api/v1/sessions/{id}/name/suggestion` returns `{title}` (operation `sessions.name.suggest`; 502 when the call fails).
+
+**State without a table.** A new session that may be named has a settings key `session_naming:{id}`: `first` (its first finished turn names it), `next` (its first message had few words) or `naming` (the call is out). Naming it, renaming it (`PATCH /api/v1/sessions/{id}` with a title), a failed call, or the setting being off removes the key; without it, a session is never named by itself. Sessions from before this have none. The new title is written only if the key is still there and the title is still the one it replaces, so a rename while the call is out wins.

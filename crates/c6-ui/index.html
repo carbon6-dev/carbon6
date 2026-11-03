@@ -2,8 +2,10 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="theme-color" content="#09090b" />
+    <!-- The keyboard shrinks the page (rather than panning it), so the
+         message box stays above it and the header in view. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content" />
+    <meta name="theme-color" content="#141417" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <meta name="apple-mobile-web-app-title" content="carbon6" />
@@ -18,6 +20,7 @@
     <link data-trunk rel="copy-dir" href="vendor" />
     <link data-trunk rel="copy-dir" href="js" />
     <link rel="stylesheet" href="/vendor/xterm.css" />
+    <script src="/js/crash.js"></script>
     <script src="/js/theme.js"></script>
     <script src="/vendor/xterm.js"></script>
     <script src="/vendor/addon-fit.js"></script>

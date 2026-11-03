@@ -5,8 +5,10 @@ pub mod analytics;
 pub mod api;
 pub mod apps;
 pub mod assistant;
+pub mod attention;
 pub mod auth;
 pub mod catalog;
+pub mod catchup;
 pub mod claims;
 pub mod collections;
 pub mod commons;
@@ -34,6 +36,7 @@ pub mod lists;
 pub mod marks;
 pub mod memex;
 pub mod memory;
+pub mod naming;
 pub mod notify;
 pub mod oauth;
 pub mod operations;
@@ -46,6 +49,7 @@ pub mod providers;
 pub mod push;
 pub mod quotas;
 pub mod realms;
+pub mod recent;
 pub mod registry;
 pub mod remote;
 pub mod schema;
@@ -59,6 +63,7 @@ pub mod suggestions;
 pub mod telemetry;
 pub mod templates;
 pub mod terminals;
+pub mod timeline;
 pub mod tls;
 pub mod triggers;
 pub mod ui_ca;
@@ -180,9 +185,14 @@ pub struct HeadState {
     pub quotas: quotas::Quotas,
     /// Documents' changes, for the live feed and their settled events.
     pub docs: docs::Docs,
+    /// Pings the live feed when what needs you may have changed.
+    pub attention: attention::Pings,
     /// When each session sent other sessions messages in the last hour
     /// (docs/background.md §6).
     pub(crate) messages_sent: std::sync::Mutex<std::collections::HashMap<String, std::collections::VecDeque<i64>>>,
+    /// Catch-ups' paragraphs and timelines' turns and lines, made when
+    /// looked at.
+    pub(crate) catchup: catchup::Cache,
     /// Itself, for what must outlive a borrow (set once it is made).
     me: std::sync::OnceLock<std::sync::Weak<HeadState>>,
 }
@@ -302,7 +312,9 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         pools: Default::default(),
         quotas: Default::default(),
         docs: Default::default(),
+        attention: Default::default(),
         messages_sent: Default::default(),
+        catchup: Default::default(),
         me: Default::default(),
     });
     let _ = state.me.set(Arc::downgrade(&state));
@@ -348,10 +360,14 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     workflows::spawn(state.clone());
     memex::spawn(state.clone());
     decisions::spawn_sweeper(state.clone());
+    attention::spawn(state.clone());
     // Nudges about work left open (docs/work.md §7).
     work::spawn_sweeper(state.clone());
     // ChatGPT plans' usage windows (Claude Code's come with its turns).
     quotas::spawn(state.clone());
+    // Close abandoned assistant waits before rebuilding their decisions,
+    // otherwise reconciliation could reopen a card recovery just settled.
+    assistant::start(state.clone(), api::router(state.clone())).await?;
     {
         let st = state.clone();
         tokio::spawn(async move {
@@ -360,7 +376,6 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
             }
         });
     }
-    assistant::start(state.clone(), api::router(state.clone())).await?;
 
     // Build the search index in the background (first start, or new format).
     let st = state.clone();

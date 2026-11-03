@@ -62,7 +62,7 @@ pub fn PhotosPage() -> impl IntoView {
             <div class="flex flex-wrap items-center gap-2">
                 <h1 class="text-lg font-semibold">"Photos"</h1>
                 {move || status.get().and_then(Result::ok).map(|s| view! {
-                    <span class="text-xs text-zinc-500">{format!("{} photos and videos · {} described", s.media, s.media_seen)}</span>
+                    <span class="text-xs text-muted">{format!("{} photos and videos · {} described", s.media, s.media_seen)}</span>
                 })}
                 <span class="flex-1"></span>
                 <input class=format!("{INPUT} w-full sm:w-80") placeholder="Describe it: “whiteboard at the offsite”, “beach”, a place…"
@@ -83,7 +83,7 @@ pub fn PhotosPage() -> impl IntoView {
                 let list = items.get();
                 if list.is_empty() {
                     return view! {
-                        <p class="text-sm text-zinc-500">
+                        <p class="text-sm text-muted">
                             "No photos or videos yet. Add a folder of them under "
                             <Go to=View::Settings { note: None, section: "memex".into() } class="underline">"Settings → Memex folders"</Go>
                             "; they are read in place (nothing is copied but thumbnails)."
@@ -102,7 +102,7 @@ pub fn PhotosPage() -> impl IntoView {
                 }
                 groups.into_iter().map(|(title, g)| view! {
                     <section class="space-y-1">
-                        <h2 class="text-sm font-medium text-zinc-500">{title}</h2>
+                        <h2 class="text-sm font-medium text-muted">{title}</h2>
                         <div class="grid grid-cols-3 gap-1 sm:grid-cols-5 lg:grid-cols-8">
                             {g.into_iter().map(|it| tile(it, open)).collect_view()}
                         </div>
@@ -135,7 +135,7 @@ fn tile(it: Value, open: RwSignal<Option<String>>) -> impl IntoView {
             {if has_thumb {
                 view! { <img src=src loading="lazy" alt=title class="h-full w-full object-cover transition group-hover:opacity-90" /> }.into_any()
             } else {
-                view! { <span class="flex h-full w-full items-center justify-center p-1 text-[10px] text-zinc-500">{title}</span> }.into_any()
+                view! { <span class="flex h-full w-full items-center justify-center p-1 text-[10px] text-muted">{title}</span> }.into_any()
             }}
             {video.then(|| view! {
                 <span class="absolute bottom-1 right-1 rounded bg-black/60 px-1 text-[10px] text-white">{format!("▶ {}", duration.clone().unwrap_or_default())}</span>
@@ -149,7 +149,7 @@ fn Facets(f: Value, about: RwSignal<Option<(String, String)>>) -> impl IntoView 
     let row = |title: &'static str, list: Vec<Value>, faces: bool| {
         (!list.is_empty()).then(|| view! {
             <div class="flex flex-wrap items-center gap-1 text-xs">
-                <span class="w-14 text-zinc-500">{title}</span>
+                <span class="w-14 text-muted">{title}</span>
                 {list.into_iter().take(16).map(|t| {
                     let id = t["id"].as_str().unwrap_or_default().to_owned();
                     let name = t["name"].as_str().unwrap_or_default().to_owned();
@@ -159,7 +159,7 @@ fn Facets(f: Value, about: RwSignal<Option<(String, String)>>) -> impl IntoView 
                             on:click=move |_| about.set(Some(pick.clone()))>
                             {faces.then(|| view! { <img src=crate::api::url(&format!("/api/v1/memex/face/{id}")) class="h-5 w-5 rounded-full object-cover" alt="" /> })}
                             <span class:pl-1=!faces>{name}</span>
-                            <span class="text-zinc-400">{t["n"].as_i64().unwrap_or(0)}</span>
+                            <span class="text-muted">{t["n"].as_i64().unwrap_or(0)}</span>
                         </button>
                     }
                 }).collect_view()}
@@ -231,7 +231,7 @@ fn detail(v: Value, about: RwSignal<Option<(String, String)>>) -> impl IntoView 
             </div>
             <div class="space-y-2 text-sm">
                 <h2 class="font-medium">{item["title"].as_str().unwrap_or_default().to_owned()}</h2>
-                <p class="text-xs text-zinc-500">
+                <p class="text-xs text-muted">
                     {when}
                     {(!v["camera"].as_str().unwrap_or_default().is_empty()).then(|| format!(" · {}", v["camera"].as_str().unwrap_or_default()))}
                     {map.map(|u| view! { " · " <a href=u target="_blank" rel="noopener noreferrer" class="text-sky-700 hover:underline dark:text-sky-400">"map ↗"</a> })}
@@ -247,7 +247,7 @@ fn detail(v: Value, about: RwSignal<Option<(String, String)>>) -> impl IntoView 
                 </div>
                 <pre class="max-h-80 overflow-auto whitespace-pre-wrap rounded bg-zinc-50 p-2 text-xs dark:bg-zinc-900">{item["text"].as_str().unwrap_or_default().to_owned()}</pre>
                 {v["error"].as_str().map(|e| view! { <p class="text-xs text-amber-700">{e.to_owned()}</p> })}
-                <p class="text-xs text-zinc-500">"Unnamed faces are named under Memex → Review."</p>
+                <p class="text-xs text-muted">"Unnamed faces are named under Memex → Review."</p>
             </div>
         </div>
     }

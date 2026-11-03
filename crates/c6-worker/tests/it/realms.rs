@@ -113,6 +113,21 @@ async fn realms_keep_data_apart() {
     assert!(as_(&home, M::PUT, "settings/skills", Some(skill)).await.unwrap().status().is_success());
     let lab_skills: Value = as_(&root, M::GET, "settings/skills?realm=lab", None).await.unwrap().json().await.unwrap();
     assert!(!lab_skills.to_string().contains("home-only"), "{lab_skills}");
+    // A lab token's settings are lab's own: its lists land in lab (not
+    // home, where skills live by default), and its per-realm settings
+    // leave root's, which every realm inherits, alone.
+    let lab = token(Some("lab")).await;
+    let skill = json!([{"name": "lab-only", "description": "d", "body": "b"}]);
+    assert!(as_(&lab, M::PUT, "settings/skills", Some(skill)).await.unwrap().status().is_success());
+    let lab_skills: Value = as_(&root, M::GET, "settings/skills?realm=lab", None).await.unwrap().json().await.unwrap();
+    assert!(lab_skills.to_string().contains("lab-only"), "{lab_skills}");
+    let home_skills: Value = as_(&root, M::GET, "settings/skills?realm=home", None).await.unwrap().json().await.unwrap();
+    assert!(!home_skills.to_string().contains("lab-only"), "{home_skills}");
+    assert!(as_(&lab, M::PUT, "settings/suggestions", Some(json!({"enabled": false}))).await.unwrap().status().is_success());
+    let mine: Value = as_(&lab, M::GET, "settings/suggestions", None).await.unwrap().json().await.unwrap();
+    assert_eq!(mine["enabled"], false, "lab's own: {mine}");
+    let roots: Value = as_(&root, M::GET, "settings/suggestions", None).await.unwrap().json().await.unwrap();
+    assert_eq!(roots["enabled"], true, "root's untouched: {roots}");
 
     // Sessions: never in root, only in realms that exist; a scoped token's
     // land in its realm and cannot go elsewhere.

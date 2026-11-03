@@ -21,6 +21,8 @@ pub fn ViewsMenu(class: &'static str) -> impl IntoView {
         api::views()
     });
     let menu = NodeRef::<leptos::html::Details>::new();
+    let (pop, toggled) = crate::util::details_pop(menu);
+    let pop = StoredValue::new(pop);
     let close = move |_| {
         if let Some(d) = menu.get_untracked() {
             d.set_open(false);
@@ -30,7 +32,7 @@ pub fn ViewsMenu(class: &'static str) -> impl IntoView {
         let vs: Vec<ViewDef> = views.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|v| v.menu).collect();
         (!vs.is_empty()).then(|| {
             view! {
-                <details node_ref=menu class="relative shrink-0">
+                <details node_ref=menu data-pop=pop.get_value() on:toggle=toggled class="relative shrink-0">
                     <summary class=format!("{class} cursor-pointer list-none whitespace-nowrap")>"Views ▾"</summary>
                     <div class="absolute left-0 top-8 z-40 flex w-56 flex-col rounded-lg border border-zinc-200 bg-white p-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900" on:click=close>
                         {vs.into_iter().map(|v| {
@@ -56,7 +58,7 @@ pub fn ViewPage(name: String, record: String) -> impl IntoView {
             {move || views.get().map(|r| match r {
                 Err(e) => view! { <ErrorBox message=e /> }.into_any(),
                 Ok(all) => match all.iter().find(|v| v.name == name).cloned() {
-                    None => view! { <p class="text-sm text-zinc-500">{format!("No view {name} in this realm (Settings → Views).")}</p> }.into_any(),
+                    None => view! { <p class="text-sm text-muted">{format!("No view {name} in this realm (Settings → Views).")}</p> }.into_any(),
                     Some(v) => {
                         let title = if v.title.is_empty() { v.name.clone() } else { v.title.clone() };
                         view! {
@@ -183,7 +185,7 @@ fn TableView(view: ViewDef) -> impl IntoView {
                 view! {
                     <div class="overflow-x-auto rounded-md border border-zinc-200 dark:border-zinc-800">
                         <table class="w-full text-sm">
-                            <thead class="bg-zinc-50 text-left text-xs text-zinc-500 dark:bg-zinc-900">
+                            <thead class="bg-zinc-50 text-left text-xs text-muted dark:bg-zinc-900">
                                 <tr>{fields.iter().map(|f| view! { <th class="px-2 py-1.5 font-medium">{f.clone()}</th> }).collect_view()}<th></th></tr>
                             </thead>
                             <tbody>
@@ -256,7 +258,7 @@ fn BoardView(view: ViewDef) -> impl IntoView {
                             let (prev, next) = (i.checked_sub(1).map(|p| columns[p].clone()), (i + 1 < ncols).then(|| columns[i + 1].clone()));
                             view! {
                                 <div class="w-64 shrink-0 space-y-2 rounded-lg bg-zinc-100 p-2 dark:bg-zinc-900">
-                                    <div class="flex items-center justify-between px-1 text-xs font-medium text-zinc-500">
+                                    <div class="flex items-center justify-between px-1 text-xs font-medium text-muted">
                                         <span>{if c.is_empty() { "(none)".to_owned() } else { c.clone() }}</span><span>{in_col.len()}</span>
                                     </div>
                                     {in_col.into_iter().map(|rec| {
@@ -272,7 +274,7 @@ fn BoardView(view: ViewDef) -> impl IntoView {
                                         view! {
                                             <div class="space-y-1 rounded-md border border-zinc-200 bg-white p-2 text-sm shadow-sm dark:border-zinc-700 dark:bg-zinc-950">
                                                 <Go to=View::App { name: view.name.clone(), record: rec.id.clone() } class="font-medium hover:underline">{if title.is_empty() { "(open)".to_owned() } else { title }}</Go>
-                                                {details.into_iter().map(|d| view! { <p class="truncate text-xs text-zinc-500">{d}</p> }).collect_view()}
+                                                {details.into_iter().map(|d| view! { <p class="truncate text-xs text-muted">{d}</p> }).collect_view()}
                                                 <div class="flex flex-wrap items-center gap-1">
                                                     {p.map(|to| { let t = to.clone(); view! { <button class=format!("{BUTTON_QUIET} text-xs") title=format!("Move to {t}") on:click=move |_| set(c1.clone(), r1.clone(), f1.clone(), to.clone())>"←"</button> } })}
                                                     {n.map(|to| { let t = to.clone(); view! { <button class=format!("{BUTTON_QUIET} text-xs") title=format!("Move to {t}") on:click=move |_| set(c2.clone(), r2.clone(), f2.clone(), to.clone())>"→"</button> } })}
@@ -322,15 +324,15 @@ fn RecordBody(view: ViewDef, id: String) -> impl IntoView {
                 let fields: Vec<(String, String)> = rec.fields.as_object().map(|o| o.iter().map(|(k, v)| (k.clone(), text_of(Some(v)))).collect()).unwrap_or_default();
                 view! {
                     <div class="flex flex-wrap items-center gap-2">
-                        <Go to=View::App { name: view.name.clone(), record: String::new() } class="text-sm text-zinc-500 hover:underline">{format!("← {}", if view.title.is_empty() { view.name.clone() } else { view.title.clone() })}</Go>
+                        <Go to=View::App { name: view.name.clone(), record: String::new() } class="text-sm text-muted hover:underline">{format!("← {}", if view.title.is_empty() { view.name.clone() } else { view.title.clone() })}</Go>
                         <span class="flex-1"></span>
                         <Actions view=view.clone() record=rec.id.clone() tick error />
                     </div>
                     <dl class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 rounded-md border border-zinc-200 p-3 text-sm dark:border-zinc-800">
-                        {fields.into_iter().map(|(k, v)| view! { <dt class="text-zinc-500">{k}</dt><dd class="whitespace-pre-wrap break-words">{v}</dd> }).collect_view()}
+                        {fields.into_iter().map(|(k, v)| view! { <dt class="text-muted">{k}</dt><dd class="whitespace-pre-wrap break-words">{v}</dd> }).collect_view()}
                     </dl>
                     {(!rec.links.is_empty() || !rec.labels.is_empty()).then(|| view! {
-                        <p class="text-xs text-zinc-500">{format!("links: {} · labels: {}", rec.links.join(", "), rec.labels.join(", "))}</p>
+                        <p class="text-xs text-muted">{format!("links: {} · labels: {}", rec.links.join(", "), rec.labels.join(", "))}</p>
                     })}
                     <h2 class="text-sm font-medium">"Sessions"</h2>
                     {
@@ -338,20 +340,20 @@ fn RecordBody(view: ViewDef, id: String) -> impl IntoView {
                         move || {
                             let ss: Vec<c6_api::Session> = live.sessions.get().into_iter().filter(|s| s.labels.contains(&label) || s.auto_labels.contains(&label)).collect();
                             if ss.is_empty() {
-                                view! { <p class="text-xs text-zinc-500">"None yet: the view's actions start sessions about this record."</p> }.into_any()
+                                view! { <p class="text-xs text-muted">"None yet: the view's actions start sessions about this record."</p> }.into_any()
                             } else {
                                 ss.into_iter().map(|s| {
                                     let status = s.display_status();
                                     view! {
                                         <div class="text-sm"><Go to=View::Session { id: s.id.clone(), target: None } class="hover:underline">{s.title.clone()}</Go>
-                                        <span class="ml-2 text-xs text-zinc-500">{format!("{:?} · {}", status, ago(now_ms() - s.updated_at))}</span></div>
+                                        <span class="ml-2 text-xs text-muted">{format!("{:?} · {}", status, ago(now_ms() - s.updated_at))}</span></div>
                                     }
                                 }).collect_view().into_any()
                             }
                         }
                     }
                     <h2 class="text-sm font-medium">"History"</h2>
-                    <div class="space-y-0.5 text-xs text-zinc-500">
+                    <div class="space-y-0.5 text-xs text-muted">
                         {history.into_iter().rev().map(|h| view! { <p>{format!("v{} {} by {} · {}", h.version, h.op, h.changed_by, ago(now_ms() - h.changed_at))}</p> }).collect_view()}
                     </div>
                 }.into_any()
@@ -394,7 +396,7 @@ fn ChartView(view: ViewDef) -> impl IntoView {
                 let w = 600.0 / n as f64;
                 let fmt = |v: f64| if v.fract() == 0.0 { format!("{v}") } else { format!("{v:.2}") };
                 view! {
-                    <p class="text-sm text-zinc-500">{format!("{} of {} · {}", res.agg, res.series, res.value.map(fmt).unwrap_or_else(|| "no points".into()))}</p>
+                    <p class="text-sm text-muted">{format!("{} of {} · {}", res.agg, res.series, res.value.map(fmt).unwrap_or_else(|| "no points".into()))}</p>
                     <svg viewBox="0 0 600 160" class="h-40 w-full rounded-md border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950">
                         {res.buckets.iter().enumerate().map(|(i, (t, v))| {
                             let h = v / max * 140.0;
@@ -431,9 +433,9 @@ fn FeedView(view: ViewDef) -> impl IntoView {
                         let status = s.display_status();
                         view! {
                             <div class="flex items-center gap-2 border-b border-zinc-100 py-1 text-sm dark:border-zinc-800">
-                                <span class="w-24 shrink-0 text-xs text-zinc-500">{ago(now_ms() - s.updated_at)}</span>
+                                <span class="w-24 shrink-0 text-xs text-muted">{ago(now_ms() - s.updated_at)}</span>
                                 <Go to=View::Session { id: s.id.clone(), target: None } class="min-w-0 flex-1 truncate hover:underline">{s.title.clone()}</Go>
-                                <span class="text-xs text-zinc-500">{format!("{:?}", status)}</span>
+                                <span class="text-xs text-muted">{format!("{:?}", status)}</span>
                             </div>
                         }
                     }).collect_view()
@@ -458,14 +460,14 @@ fn FeedView(view: ViewDef) -> impl IntoView {
                 let realm = api::realm().get_untracked();
                 let ds: Vec<c6_api::Decision> = ds.into_iter().filter(|d| realm.is_empty() || d.realm == realm).collect();
                 if ds.is_empty() {
-                    return view! { <p class="text-sm text-zinc-500">"Nothing waiting."</p> }.into_any();
+                    return view! { <p class="text-sm text-muted">"Nothing waiting."</p> }.into_any();
                 }
                 ds.into_iter().map(|d| {
                     let id = d.id;
                     view! {
                         <div class="space-y-1 border-b border-zinc-100 py-2 text-sm dark:border-zinc-800">
                             <div class="flex items-center gap-2">
-                                <span class="w-24 shrink-0 text-xs text-zinc-500">{ago(now_ms() - d.created_at)}</span>
+                                <span class="w-24 shrink-0 text-xs text-muted">{ago(now_ms() - d.created_at)}</span>
                                 <span class="min-w-0 flex-1 font-medium">{d.title.clone()}</span>
                                 {(d.priority == "high").then(|| view! { <span class="text-xs text-red-600">"high"</span> })}
                             </div>
@@ -483,7 +485,7 @@ fn FeedView(view: ViewDef) -> impl IntoView {
                                         });
                                     }>{shown}</button> }
                                 }).collect_view()}
-                                <Go to=View::Decisions class="text-xs text-zinc-500 underline">"open in Decisions"</Go>
+                                <Go to=View::Decisions class="text-xs text-muted underline">"open in Decisions"</Go>
                             </div>
                         </div>
                     }
@@ -503,7 +505,7 @@ fn PageView(view: ViewDef, all: Vec<ViewDef>) -> impl IntoView {
         let Some(j) = rest[i..].find("}}") else { break };
         let before = &rest[..i];
         if !before.trim().is_empty() {
-            parts.push(view! { <div class="md text-sm" inner_html=crate::markdown::to_html(before)></div> }.into_any());
+            parts.push(view! { <div class="md text-sm" on:click=crate::mentions::link_clicks() inner_html=crate::markdown::to_html(before)></div> }.into_any());
         }
         let name = rest[i + 7..i + j].trim();
         // A page embeds other views, not pages (no loops).
@@ -525,7 +527,10 @@ fn PageView(view: ViewDef, all: Vec<ViewDef>) -> impl IntoView {
         rest = &rest[i + j + 2..];
     }
     if !rest.trim().is_empty() {
-        parts.push(view! { <div class="md text-sm" inner_html=crate::markdown::to_html(rest)></div> }.into_any());
+        parts.push(
+            view! { <div class="md text-sm" on:click=crate::mentions::link_clicks() inner_html=crate::markdown::to_html(rest)></div> }
+                .into_any(),
+        );
     }
     view! { <div class="space-y-4">{parts}</div> }
 }

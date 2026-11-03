@@ -38,6 +38,12 @@ use axum::{Json, Router};
 use serde_json::{Value, json};
 use tokio::sync::Notify;
 
+/// How the head's call that names a session starts (c6_api::prompts::NAME).
+/// It comes whenever a session's first turn ends, in no order a test
+/// sets: it takes only a step pushed about it (`push_about(NAMING, …)`),
+/// else it fails at once (400) and isn't in `requests()`.
+pub const NAMING: &str = "Name this conversation";
+
 #[derive(Clone, Debug)]
 pub enum Reply {
     Text(String),
@@ -182,14 +188,18 @@ async fn completions(State(inner): State<Arc<Inner>>, Json(body): Json<Value>) -
         let last = body["messages"].as_array().and_then(|m| m.last()).map(|m| m["content"].to_string()).unwrap_or_default();
         format!("{} {}", body["model"].as_str().unwrap_or("?"), last.chars().take(160).collect::<String>())
     };
-    inner.requests.lock().unwrap().push(body);
+    let naming = messages.contains(NAMING);
     let step = {
         let mut script = inner.script.lock().unwrap();
-        let at = script.iter().position(|s| s.about.iter().all(|a| messages.contains(a.as_str())));
+        let at = script.iter().position(|s| (!naming || !s.about.is_empty()) && s.about.iter().all(|a| messages.contains(a.as_str())));
         at.and_then(|i| script.remove(i))
     };
+    if !naming || step.is_some() {
+        inner.requests.lock().unwrap().push(body);
+    }
     let answered = match &step {
         Some(s) => format!("{:?}", s.reply).chars().take(120).collect(),
+        None if naming => "a session's name, not scripted (400)".to_owned(),
         None => "script exhausted (500)".to_owned(),
     };
     {
@@ -198,6 +208,9 @@ async fn completions(State(inner): State<Arc<Inner>>, Json(body): Json<Value>) -
         log.push(format!("{n}. {asked}\n   -> {answered}"));
     }
     let Some(step) = step else {
+        if naming {
+            return (axum::http::StatusCode::BAD_REQUEST, "no name scripted").into_response();
+        }
         return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "mock script exhausted").into_response();
     };
     let chunks = match step.reply {

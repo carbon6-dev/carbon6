@@ -45,6 +45,24 @@ pub enum View {
         #[serde(default)]
         target: Option<Target>,
     },
+    /// A session's changes (its folder's git status and diff), beside it.
+    SessionChanges {
+        id: String,
+    },
+    /// A session's terminals, opened in its folder.
+    SessionTerminal {
+        id: String,
+    },
+    /// A session's folder.
+    SessionFiles {
+        id: String,
+    },
+    /// What a session published; `output`: the one shown (empty: the newest).
+    SessionOutputs {
+        id: String,
+        #[serde(default)]
+        output: String,
+    },
     Search {
         q: String,
         #[serde(default)]
@@ -173,6 +191,11 @@ impl View {
                 }
                 p
             }
+            View::SessionChanges { id } => format!("/sessions/{id}/changes"),
+            View::SessionTerminal { id } => format!("/sessions/{id}/terminal"),
+            View::SessionFiles { id } => format!("/sessions/{id}/files"),
+            View::SessionOutputs { id, output } if output.is_empty() => format!("/sessions/{id}/outputs"),
+            View::SessionOutputs { id, output } => format!("/sessions/{id}/outputs?output={}", enc(output)),
             View::Search { q, kind, worker } => {
                 let mut p = format!("/search?q={}", enc(q));
                 if !kind.is_empty() {
@@ -230,7 +253,7 @@ impl View {
             .ok()
             .map(|p| {
                 let mut m = HashMap::new();
-                for key in ["q", "kind", "worker", "open", "signed_in", "signed_in_with_link"] {
+                for key in ["q", "kind", "worker", "open", "output", "signed_in", "signed_in_with_link"] {
                     if let Some(v) = p.get(key) {
                         m.insert(key.to_owned(), v);
                     }
@@ -268,6 +291,10 @@ impl View {
                 });
                 View::Session { id: (*id).to_owned(), target }
             }
+            ["sessions", id, "changes"] => View::SessionChanges { id: (*id).to_owned() },
+            ["sessions", id, "terminal"] => View::SessionTerminal { id: (*id).to_owned() },
+            ["sessions", id, "files"] => View::SessionFiles { id: (*id).to_owned() },
+            ["sessions", id, "outputs"] => View::SessionOutputs { id: (*id).to_owned(), output: get("output") },
             ["search"] => View::Search { q: get("q"), kind: get("kind"), worker: get("worker") },
             ["workers"] => View::Workers,
             ["workers", id] => View::Worker { id: (*id).to_owned() },
@@ -335,6 +362,14 @@ impl View {
             View::Session { id, .. } => {
                 live.sessions.with(|ss| ss.iter().find(|s| &s.id == id).map(|s| s.title.clone())).unwrap_or_else(|| "Session".into())
             }
+            // Its name, and the session's.
+            View::SessionChanges { id } | View::SessionTerminal { id } | View::SessionFiles { id } | View::SessionOutputs { id, .. } => {
+                let name = self.session_pane().map_or("", |(p, _)| p.name());
+                match live.sessions.with(|ss| ss.iter().find(|s| &s.id == id).map(|s| s.title.clone())) {
+                    Some(t) => format!("{name} · {t}"),
+                    None => name.to_owned(),
+                }
+            }
             View::Search { q, .. } => format!("Search: {q}"),
             View::Workers => "Workers".into(),
             View::Worker { id } => live
@@ -365,7 +400,7 @@ impl View {
             View::Projects { id } if id.is_empty() => "Projects".into(),
             View::Projects { .. } => "Project".into(),
             View::Docs { id } if id.is_empty() => "Docs".into(),
-            View::Docs { .. } => "Document".into(),
+            View::Docs { id } => crate::docs::title_of(id).unwrap_or_else(|| "Document".into()),
             View::Collections { name } if name.is_empty() => "Collections".into(),
             View::Collections { name } => format!("Collection · {name}"),
             View::Realms => "Realms".into(),
@@ -380,11 +415,25 @@ impl View {
     /// stacking columns.
     fn is_section(&self) -> bool {
         !matches!(self, View::Session { .. } | View::Worker { .. })
+            && self.session_pane().is_none()
             && !matches!(self, View::Collections { name } if !name.is_empty())
             && !matches!(self, View::Work { id } if !id.is_empty())
             && !matches!(self, View::Docs { id } if !id.is_empty())
             && !matches!(self, View::Projects { id } if !id.is_empty())
             && !matches!(self, View::App { record, .. } if !record.is_empty())
+    }
+
+    /// A session's pane (Changes, Terminal, Files, Outputs): which, and
+    /// whose.
+    pub fn session_pane(&self) -> Option<(crate::panes::Pane, &str)> {
+        use crate::panes::Pane;
+        match self {
+            View::SessionChanges { id } => Some((Pane::Changes, id)),
+            View::SessionTerminal { id } => Some((Pane::Terminal, id)),
+            View::SessionFiles { id } => Some((Pane::Files, id)),
+            View::SessionOutputs { id, .. } => Some((Pane::Outputs, id)),
+            _ => None,
+        }
     }
 }
 
@@ -560,6 +609,23 @@ impl Layout {
         }
     }
 
+    /// Moves tile `key` one place earlier (`by` < 0) or later in reading
+    /// order among the tiles shown, trading places with that neighbour (its
+    /// column and its place in it); the focus stays on its tile.
+    fn step_tile(&mut self, key: u64, by: isize) {
+        let order: Vec<usize> = self.reading_order().into_iter().filter(|&i| !self.tiles[i].minimized).collect();
+        let Some(at) = order.iter().position(|&i| self.tiles[i].key == key) else { return };
+        let Some(&j) = at.checked_add_signed(by.signum()).and_then(|n| order.get(n)) else { return };
+        let (i, focused) = (order[at], self.tiles.get(self.focus).map(|t| t.key));
+        self.tiles.swap(i, j);
+        let stack = self.tiles[i].stack;
+        self.tiles[i].stack = self.tiles[j].stack;
+        self.tiles[j].stack = stack;
+        if let Some(f) = focused.and_then(|k| self.tiles.iter().position(|t| t.key == k)) {
+            self.focus = f;
+        }
+    }
+
     fn touch(&mut self, ti: usize) {
         let k = self.key();
         if let Some(t) = self.tiles.get_mut(ti) {
@@ -708,6 +774,60 @@ impl Layout {
         let t = self.tiles.get(self.focus)?;
         t.columns.iter().find(|c| c.key == t.active).or_else(|| t.columns.get(t.cursor)).map(|c| &c.view)
     }
+
+    /// The pane a tile's bar speaks for: its last, or the session that a
+    /// pane of its (Changes, Terminal…) is open beside.
+    pub fn bar_column(&self, tile: u64) -> Option<u64> {
+        let t = self.tile(tile)?;
+        let last = t.columns.last()?;
+        let session = last
+            .view
+            .session_pane()
+            .and_then(|(_, id)| t.columns.iter().find(|c| matches!(&c.view, View::Session { id: x, .. } if x == id)).map(|c| c.key));
+        Some(session.unwrap_or(last.key))
+    }
+
+    /// Where a session's pane is open, if it is: (tile key, pane key).
+    pub fn find_pane(&self, pane: crate::panes::Pane, id: &str) -> Option<(u64, u64)> {
+        self.tiles.iter().find_map(|t| t.columns.iter().find(|c| c.view.session_pane() == Some((pane, id))).map(|c| (t.key, c.key)))
+    }
+
+    /// Whether pane `col` of tile `tile` is on screen: its tile shown (not
+    /// minimized, nor behind another in focus mode) and, where a tile shows
+    /// one pane at a time (`one_pane`: a phone), the pane it shows.
+    pub fn pane_shown(&self, tile: u64, col: u64, one_pane: bool) -> bool {
+        let Some(ti) = self.tiles.iter().position(|t| t.key == tile) else { return false };
+        let t = &self.tiles[ti];
+        let Some(ci) = t.columns.iter().position(|c| c.key == col) else { return false };
+        !t.minimized && (!self.full || self.focus == ti) && (!one_pane || t.cursor == ci)
+    }
+
+    /// Brings pane `col` of tile `tile` forward: its tile shown and focused,
+    /// and the pane the one a phone shows.
+    fn reveal(&mut self, tile: u64, col: u64) {
+        let Some(ti) = self.tiles.iter().position(|t| t.key == tile) else { return };
+        let Some(ci) = self.tiles[ti].columns.iter().position(|c| c.key == col) else { return };
+        self.tiles[ti].cursor = ci;
+        self.tiles[ti].active = col;
+        self.show(ti);
+    }
+
+    /// Opens `view` beside pane `col` of tile `tile`, keeping that pane:
+    /// the tile shows the two (a list that was beside it goes back in the
+    /// tile's history).
+    fn open_after(&mut self, tile: u64, col: u64, view: View) {
+        let Some(ti) = self.tiles.iter().position(|t| t.key == tile) else { return };
+        let Some(me) = self.tiles[ti].columns.iter().find(|c| c.key == col).cloned() else { return };
+        let key = self.key();
+        let t = &mut self.tiles[ti];
+        let next = vec![me, Column { key, view }];
+        if t.columns.iter().map(|c| &c.view).ne(next.iter().map(|c| &c.view)) {
+            t.go(next);
+        }
+        t.settle();
+        self.focus = ti;
+        self.touch(ti);
+    }
 }
 
 /// How a link opens.
@@ -752,8 +872,8 @@ pub struct Workspace {
     pub layout: RwSignal<Layout>,
     /// A request to open, consumed by the active Brief. Never part of its view.
     pub brief_request: RwSignal<Option<i64>>,
-    /// What each session pane offers its tile's bar (its details), by pane
-    /// key, while it is shown.
+    /// What each session pane offers its tile's bar (its actions, ⋯), by
+    /// pane key, while it is shown.
     pub chrome: RwSignal<HashMap<u64, crate::session::SessionChrome>>,
     /// Sessions that finished or failed while not shown, newest first.
     pub attention: RwSignal<Vec<String>>,
@@ -761,6 +881,12 @@ pub struct Workspace {
     /// The tile being dragged by its bar, and where it would drop.
     pub dragging: RwSignal<Option<u64>>,
     pub drop_at: RwSignal<Option<Drop>>,
+    /// The catch-ups of sessions you came back to, by session.
+    pub catchups: RwSignal<HashMap<String, crate::catchup::Card>>,
+    /// When this page last had each session on screen.
+    pub looked: StoredValue<crate::catchup::Looked>,
+    /// Counts the views the head has taken (recently viewed loads again).
+    pub viewed: RwSignal<u32>,
 }
 
 fn load<T: for<'de> Deserialize<'de>>(key: &str) -> Option<T> {
@@ -795,6 +921,9 @@ impl Workspace {
             pinned: RwSignal::new(load(PINNED_KEY).unwrap_or_default()),
             dragging: RwSignal::new(None),
             drop_at: RwSignal::new(None),
+            viewed: RwSignal::new(0),
+            catchups: RwSignal::new(HashMap::new()),
+            looked: StoredValue::new(crate::catchup::Looked::restore()),
         };
         // A link or redirect to a particular view opens it (the home page
         // just restores the workspace).
@@ -878,6 +1007,18 @@ impl Workspace {
             l.focus = origin;
             l.touch(origin);
         });
+    }
+
+    /// Opens `view` beside pane `col` of tile `tile`, keeping that pane (a
+    /// session's Changes beside its transcript).
+    pub fn open_after(&self, tile: u64, col: u64, view: View) {
+        self.layout.update(|l| l.open_after(tile, col, view));
+    }
+
+    /// Brings a pane forward (its tile shown and focused; on a phone, the
+    /// pane shown).
+    pub fn reveal(&self, tile: u64, col: u64) {
+        self.layout.update(|l| l.reveal(tile, col));
     }
 
     /// Moves the item a tile shows (its right pane) into a tile of its own.
@@ -1002,6 +1143,16 @@ impl Workspace {
         self.layout.update(|l| l.move_tile(key, to));
     }
 
+    /// Moves a tile `by` places left (< 0) or right among the tiles shown,
+    /// in reading order (a phone's tab dropped).
+    pub fn step_tile(&self, key: u64, by: isize) {
+        let _ = self.layout.try_update(|l| {
+            for _ in 0..by.unsigned_abs() {
+                l.step_tile(key, by.signum());
+            }
+        });
+    }
+
     pub fn new_tile(&self) {
         self.open(None, View::home(), How::NewTile);
     }
@@ -1069,6 +1220,18 @@ impl Workspace {
         });
     }
 
+    /// When this page last had a session on screen.
+    pub fn looked_at(&self, id: &str) -> Option<i64> {
+        self.looked.with_value(|l| l.get(id))
+    }
+
+    /// These sessions are on screen now, or were until now (`save`: kept
+    /// in the browser at once).
+    pub fn mark_looked<'a>(&self, ids: impl IntoIterator<Item = &'a String>, save: bool) {
+        let now = crate::util::now_ms();
+        self.looked.update_value(|l| l.note(ids, now, save));
+    }
+
     pub fn dismiss(&self, id: &str) {
         self.attention.update(|a| a.retain(|x| x != id));
     }
@@ -1116,21 +1279,68 @@ impl Workspace {
         // It lives as long as the page does.
         let _ = window_event_listener_untyped("visibilitychange", move |_| page.set(!document().hidden()));
         let told = StoredValue::new(HashMap::<String, i64>::new());
+        // The sessions in view (with the page): one that comes into view
+        // again is one you came back to, and is asked first what it did
+        // since it was last on screen here (its catch-up), then told seen.
+        let in_view = StoredValue::new(HashSet::<String>::new());
         Effect::new(move || {
             let sessions = live.sessions.get();
             let visible = ws.layout.with(Layout::visible_sessions);
             if !page.get() {
+                // Out of sight: on screen until now.
+                in_view.with_value(|was| ws.mark_looked(was, true));
+                in_view.set_value(HashSet::new());
                 return;
+            }
+            let now: HashSet<String> = sessions.iter().filter(|s| visible.contains(&s.id)).map(|s| s.id.clone()).collect();
+            let (back, gone): (HashSet<String>, Vec<String>) =
+                in_view.with_value(|was| (now.difference(was).cloned().collect(), was.difference(&now).cloned().collect()));
+            // When each one back was last on screen, read before it's on
+            // screen again; those still in view, and those gone from it,
+            // were on screen until now.
+            let looked: HashMap<String, i64> = back.iter().filter_map(|id| Some((id.clone(), ws.looked_at(id)?))).collect();
+            let looked_at = move |id: &str| looked.get(id).copied();
+            ws.mark_looked(now.difference(&back), false);
+            ws.mark_looked(&gone, true);
+            in_view.set_value(now);
+            for s in sessions.iter().filter(|s| back.contains(&s.id) && !matches!(s.status, SessionStatus::Idle | SessionStatus::Failed)) {
+                leptos::task::spawn_local(crate::catchup::look(ws.catchups, s.id.clone(), looked_at(&s.id)));
             }
             for s in sessions.iter().filter(|s| visible.contains(&s.id) && matches!(s.status, SessionStatus::Idle | SessionStatus::Failed))
             {
-                if told.with_value(|t| t.get(&s.id) == Some(&s.updated_at)) {
+                if told.with_value(|t| t.get(&s.id) == Some(&s.updated_at)) && !back.contains(&s.id) {
                     continue;
                 }
                 told.update_value(|t| {
                     t.insert(s.id.clone(), s.updated_at);
                 });
-                leptos::task::spawn_local(api::session_seen(s.id.clone()));
+                let id = s.id.clone();
+                if back.contains(&id) {
+                    let at = looked_at(&id);
+                    leptos::task::spawn_local(async move {
+                        crate::catchup::look(ws.catchups, id.clone(), at).await;
+                        api::session_seen(id).await;
+                    });
+                } else {
+                    leptos::task::spawn_local(api::session_seen(id));
+                }
+            }
+        });
+        // The focused session, with the page in view: you viewed it (the
+        // head keeps the list, for every device).
+        let focused = Memo::new(move |_| {
+            ws.layout.with(|l| match l.focused_view() {
+                Some(View::Session { id, .. }) => Some(id.clone()),
+                _ => None,
+            })
+        });
+        Effect::new(move || {
+            if let (Some(id), true) = (focused.get(), page.get()) {
+                leptos::task::spawn_local(async move {
+                    if api::session_viewed(id).await {
+                        let _ = ws.viewed.try_update(|n| *n += 1);
+                    }
+                });
             }
         });
     }
@@ -1212,6 +1422,14 @@ impl ColumnCtx {
 
     pub fn close(&self) {
         self.ws.close_column(self.tile, self.col);
+    }
+
+    /// Whether its tile's bar speaks for it: it's the tile's last column,
+    /// or one of its own panes is beside it (tracked: a column opened or
+    /// closed beside it changes it).
+    pub fn in_bar(&self) -> bool {
+        let (tile, col) = (self.tile, self.col);
+        self.ws.layout.with(|l| l.bar_column(tile) == Some(col))
     }
 }
 
@@ -1301,6 +1519,10 @@ pub fn ScrollBox(
         let observer = StoredValue::new_local(None::<web_sys::ResizeObserver>);
         Effect::new(move || {
             let Some(el) = node.get() else { return };
+            // One at a time: a box drawn anew isn't watched twice.
+            if let Some(o) = observer.try_get_value().flatten() {
+                o.disconnect();
+            }
             let to_end = wasm_bindgen::closure::Closure::<dyn Fn(js_sys::Array)>::new(move |_: js_sys::Array| {
                 // A last resize may come after the box has gone.
                 if let Some(el) = node.try_get_untracked().flatten()
@@ -1441,7 +1663,7 @@ pub fn arrange(tiles: &[(usize, u64)]) -> Vec<Rect> {
 #[component]
 pub fn Tiles() -> impl IntoView {
     let ws = use_workspace();
-    let _keys = window_event_listener(leptos::ev::keydown, move |ev| {
+    let keys = window_event_listener(leptos::ev::keydown, move |ev| {
         if !(ev.meta_key() || ev.ctrl_key()) || ev.alt_key() {
             return;
         }
@@ -1461,6 +1683,7 @@ pub fn Tiles() -> impl IntoView {
             _ => {}
         }
     });
+    on_cleanup(move || keys.remove());
     let keys = Memo::new(move |_| ws.layout.with(|l| l.tiles.iter().map(|t| t.key).collect::<Vec<_>>()));
     // In focus mode the focused tile takes the whole workspace (the others
     // keep their places, hidden).
@@ -1479,25 +1702,30 @@ pub fn Tiles() -> impl IntoView {
     }
 }
 
-/// A session's state, as its tile's bar shows it.
-fn status_pill(s: &Session) -> (&'static str, &'static str) {
+/// A session's own turn, as its tile's bar shows it: (its dot, its word).
+/// What runs in its background (subagents, side chats, tasks) doesn't
+/// count: the bar says that apart.
+fn status_dot(s: &Session) -> (&'static str, &'static str) {
     if s.awaiting_approval {
-        return ("bg-amber-500 text-white", "needs approval");
+        return ("bg-amber-500", "needs you");
     }
-    match s.display_status() {
-        SessionStatus::Running => ("bg-blue-600 text-white", "running"),
-        SessionStatus::Idle => ("bg-white/70 text-zinc-600 dark:bg-black/30 dark:text-zinc-300", "idle"),
-        SessionStatus::Starting => ("bg-white/70 text-amber-700 dark:bg-black/30 dark:text-amber-300", "starting"),
-        SessionStatus::Failed => ("bg-red-600 text-white", "failed"),
+    match s.status {
+        SessionStatus::Running => ("animate-pulse bg-blue-500", "running"),
+        SessionStatus::Idle => ("bg-zinc-400 dark:bg-zinc-500", "idle"),
+        SessionStatus::Starting => ("bg-amber-400", "starting"),
+        SessionStatus::Failed => ("bg-red-500", "failed"),
     }
 }
 
 /// Where a popover opens: below the element clicked, kept on screen.
 pub fn below(ev: &web_sys::MouseEvent, width: f64) -> (f64, f64) {
-    let rect = ev
-        .current_target()
-        .and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok())
-        .map(|el| el.get_bounding_client_rect());
+    let el = ev.current_target().and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok());
+    below_element(el.as_ref(), width)
+}
+
+/// Where a popover opens: below an element, kept on screen.
+pub fn below_element(el: Option<&web_sys::Element>, width: f64) -> (f64, f64) {
+    let rect = el.map(|el| el.get_bounding_client_rect());
     let vw = window().inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(1200.0);
     match rect {
         Some(r) => ((r.left()).min(vw - width - 8.0).max(8.0), r.bottom() + 4.0),
@@ -1506,19 +1734,25 @@ pub fn below(ev: &web_sys::MouseEvent, width: f64) -> (f64, f64) {
 }
 
 /// A popover at a place on screen (from [`below`]); a click outside it
-/// closes it, and so does Esc.
+/// closes it, and so does Esc wherever focus is (focus going back to what
+/// opened it).
 #[component]
 pub fn Popover(at: RwSignal<Option<(f64, f64)>>, #[prop(into)] class: String, children: ChildrenFn) -> impl IntoView {
     let class = StoredValue::new(class);
     let children = StoredValue::new(children);
+    let pop = StoredValue::new(crate::util::escapable(
+        move || at.with(Option::is_some),
+        move || {
+            at.try_set(None);
+        },
+    ));
     move || {
         at.get().map(|(x, y)| {
             view! {
                 <div class="fixed inset-0 z-40" on:click=move |ev| { ev.stop_propagation(); at.set(None) }></div>
-                <div
+                <div data-pop=pop.get_value()
                     class=format!("fixed z-50 max-h-[75vh] overflow-y-auto rounded-lg border border-zinc-200 bg-white p-2 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900 {}", class.get_value())
                     style=format!("left:{x}px;top:{y}px")
-                    on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); at.set(None) }
                 >
                     {children.with_value(|c| c())}
                 </div>
@@ -1553,28 +1787,32 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
         },
         _ => None,
     };
-    // The session it shows (alone, or as the item beside a list): its pane,
-    // and how it is now. The bar wears its colour and says its state.
+    // The session it shows (alone, as the item beside a list, or with one
+    // of its panes beside it): its pane, and how it is now. The bar wears
+    // its colour and says its state.
     let shown = Memo::new(move |_| {
-        tile.get().and_then(|t| match t.columns.last().map(|c| (c.key, &c.view)) {
-            Some((col, View::Session { id, .. })) => Some((col, id.clone())),
-            _ => None,
+        ws.layout.with(|l| {
+            let col = l.bar_column(key)?;
+            l.tile(key)?.columns.iter().find(|c| c.key == col).and_then(|c| match &c.view {
+                View::Session { id, .. } => Some((col, id.clone())),
+                _ => None,
+            })
         })
     });
     let session = Memo::new(move |_| shown.get().and_then(|(_, id)| live.sessions.with(|ss| ss.iter().find(|s| s.id == id).cloned())));
     let colour = Memo::new(move |_| session.get().map(|s| crate::marks::of(&s)));
-    // Its work's mark, as a stripe down the tile's left edge.
-    let work_mark = Memo::new(move |_| session.get().and_then(|s| s.work).map(|w| crate::marks::live_mark(&format!("work:{}", w.id))));
-    // Pointing at a value in some tile's bar dims the tiles without it.
-    let spot = crate::aspects::use_spotlight();
-    let dim =
-        Memo::new(move |_| spot.0.get().is_some_and(|k| !session.get().is_some_and(|s| crate::aspects::of(&s).iter().any(|a| a.key == k))));
     let palette_at = RwSignal::new(None::<(f64, f64)>);
-    let details_at = RwSignal::new(None::<(f64, f64)>);
+    let menu_at = RwSignal::new(None::<(f64, f64)>);
     let rename_at = RwSignal::new(None::<(f64, f64)>);
     let renamable = move || session.get().is_some_and(|s| s.parent_id.is_none() && !s.observed);
     let chrome = move || shown.get().and_then(|(col, _)| ws.chrome.with(|m| m.get(&col).copied()));
-    let btn = "rounded px-1.5 py-0.5 text-zinc-600 hover:bg-black/10 hover:text-zinc-900 disabled:opacity-30 disabled:hover:bg-transparent dark:text-zinc-400 dark:hover:bg-white/10 dark:hover:text-zinc-100";
+    // The rename box opens under the name (from ⋯ as from a double-click).
+    let title_el = NodeRef::<leptos::html::Span>::new();
+    let rename_under_title = move || {
+        let el: Option<web_sys::Element> = title_el.get_untracked().map(Into::into);
+        rename_at.set(Some(below_element(el.as_ref(), 320.0)));
+    };
+    let btn = crate::icons::BAR_BUTTON;
     // Another tile dragged over this one: where it would go, by where the
     // pointer is (the outer fifths make a new column beside this one's).
     let section = NodeRef::<leptos::html::Section>::new();
@@ -1600,10 +1838,9 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
     view! {
         <div
             class=move || format!(
-                "min-h-0 min-w-0 flex-1 md:absolute md:left-(--l) md:top-(--t) md:h-(--h) md:w-(--w) md:p-1 md:transition-[left,top,width,height,opacity] md:duration-150 {} {} {}",
+                "min-h-0 min-w-0 flex-1 md:absolute md:left-(--l) md:top-(--t) md:h-(--h) md:w-(--w) md:p-1 md:transition-[left,top,width,height,opacity] md:duration-150 {} {}",
                 if focused.get() && !minimized.get() { "flex" } else { "hidden" },
                 if minimized.get() || (full.get() && !focused.get()) { "md:hidden" } else { "md:flex" },
-                if dim.get() { "opacity-35" } else { "" },
             )
             style=move || { let r = rect.get(); format!("--l:{:.4}%;--t:{:.4}%;--w:{:.4}%;--h:{:.4}%", r.left * 100.0, r.top * 100.0, r.width * 100.0, r.height * 100.0) }
         >
@@ -1633,18 +1870,17 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                 ws.drop_at.set(None);
             }
         >
-            {move || work_mark.get().map(|m| view! {
-                <div class="pointer-events-none absolute inset-y-0 left-0 z-10 w-[3px]" style=crate::marks::fill(&m)></div>
-            })}
             {move || hint().map(|at| view! {
                 <div class=format!("pointer-events-none absolute z-20 rounded-md border-2 border-blue-500 bg-blue-500/15 {at}")></div>
             })}
             // The tile's own bar: its history, its name (and a session's
-            // colour and state), and what you can do to the whole tile.
+            // colour, state, what runs in it, its panes and its actions),
+            // and what you can do to the whole tile.
             // Dragged by its bar to another place or column. Always the
             // panel's own colours, so it reads whatever the mark; the mark
-            // is a stripe along its top.
-            <div class="@container relative flex h-9 shrink-0 cursor-grab items-center gap-1 border-b border-zinc-200 bg-zinc-50 px-2 text-xs active:cursor-grabbing dark:border-zinc-800 dark:bg-zinc-900"
+            // is a stripe along its top. Taller on a touch screen, for its
+            // buttons' 40px.
+            <div class="@container relative flex h-9 shrink-0 cursor-grab items-center gap-0.5 pointer-coarse:h-11 pointer-coarse:gap-0 border-b border-zinc-200 bg-zinc-50 px-2 text-xs active:cursor-grabbing dark:border-zinc-800 dark:bg-zinc-900"
                 draggable=move || if many.get() { "true" } else { "false" }
                 title="Drag to move this tile: onto another tile's top or bottom half, or its left or right edge for a new column"
                 on:dragstart=move |ev: web_sys::DragEvent| {
@@ -1660,65 +1896,69 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                 }
             >
                 {move || colour.get().map(|c| view! { <div class="pointer-events-none absolute inset-x-0 top-0 h-1" style=crate::marks::fill(&c)></div> })}
-                <button class=btn title="Back (⌘[)" prop:disabled=move || !can_back() on:click=move |_| { ws.focus_tile_key(key); ws.step(-1) }>"‹"</button>
-                <button class=btn title="Forward (⌘])" prop:disabled=move || !can_forward() on:click=move |_| { ws.focus_tile_key(key); ws.step(1) }>"›"</button>
+                <button class=btn title="Back (⌘[)" aria-label="Back" prop:disabled=move || !can_back() on:click=move |_| { ws.focus_tile_key(key); ws.step(-1) }>{crate::icons::chevron_left()}</button>
+                <button class=btn title="Forward (⌘])" aria-label="Forward" prop:disabled=move || !can_forward() on:click=move |_| { ws.focus_tile_key(key); ws.step(1) }>{crate::icons::chevron_right()}</button>
                 {move || colour.get().map(|c| view! {
-                    <button class="ml-0.5 flex shrink-0 hover:scale-125" title="This session's mark: change it" on:click=move |ev| palette_at.set(Some(below(&ev, 380.0)))>
+                    <button class=format!("{btn} hover:[&>*]:scale-125") title="This session's mark: change it" aria-label="Its mark" on:click=move |ev| palette_at.set(Some(below(&ev, 380.0)))>
                         <crate::marks::Glyph mark=Signal::stored(c) shape=crate::marks::Shape::Circle size=12 />
                     </button>
                 })}
                 // A session of your own is renamed by double-clicking its name
                 // (or from ⋯).
-                <span class="min-w-0 flex-1 truncate px-1 font-medium text-zinc-800 dark:text-zinc-100"
+                <span node_ref=title_el class="min-w-0 flex-1 truncate px-1 font-medium text-zinc-800 dark:text-zinc-100"
                     title=move || if renamable() { format!("{} · Double-click to rename", title.get()) } else { title.get() }
-                    on:dblclick=move |ev| if renamable() { ev.stop_propagation(); rename_at.set(Some(below(&ev, 320.0))) }>{title}</span>
-                <crate::aspects::AspectStrip session=session />
+                    on:dblclick=move |ev| if renamable() { ev.stop_propagation(); rename_under_title() }>{title}</span>
                 {move || session.get().map(|s| {
-                    let (cls, label) = status_pill(&s);
+                    let (dot, label) = status_dot(&s);
+                    // A click goes to what waits on you, else what runs in
+                    // the background, else the glance. On a phone, the dot
+                    // alone (the word for screen readers).
                     view! {
-                        <span class=format!("flex shrink-0 items-center gap-1 rounded-full px-1.5 py-px text-[10px] font-medium {cls}")>
-                            {(s.display_status() == SessionStatus::Running).then(|| view! { <span class="h-1.5 w-1.5 animate-pulse rounded-full bg-white"></span> })}
-                            {label}
-                        </span>
+                        <button class="flex h-7 shrink-0 items-center gap-1 rounded px-1 text-[11px] text-soft outline-none focus-visible:ring-2 focus-visible:ring-sky-500/60 pointer-coarse:h-10 pointer-coarse:min-w-10 pointer-coarse:justify-center pointer-fine:hover:bg-black/10 dark:pointer-fine:hover:bg-white/10"
+                            title=move || match chrome() {
+                                Some(c) => format!("{label} · {}", c.status_title()),
+                                None => label.to_owned(),
+                            }
+                            on:click=move |ev| if let Some(c) = chrome() { c.status_click(&ev) }>
+                            <span class=format!("size-1.5 rounded-full {dot}")></span>
+                            <span class="max-sm:sr-only">{label}</span>
+                        </button>
                     }
                 })}
-                {move || chrome().map(|c| view! { <crate::session::SessionTasks chrome=c /> })}
-                {move || chrome().is_some().then(|| view! {
-                    <button class=btn title="Details: where it runs, labels, transcript, changes, files, terminal…" on:click=move |ev| details_at.set(Some(below(&ev, 560.0)))>"⋯"</button>
+                // What runs in it, its panes, then its actions.
+                {move || chrome().map(|c| view! {
+                    <crate::session::SessionControls chrome=c />
+                    <span class="mx-1 h-4 w-px shrink-0 bg-zinc-200 dark:bg-zinc-700"></span>
+                    <button class=btn title="Actions: rename, find, files, outputs, details, new like this, save as template, catch-up, fold finished turns, archive" aria-label="Actions"
+                        on:click=move |ev| menu_at.set(if menu_at.get_untracked().is_some() { None } else { Some(below(&ev, 240.0)) })>{crate::icons::ellipsis()}</button>
                 })}
                 {move || pinnable().map(|id| {
                     let (a, b) = (StoredValue::new(id.clone()), id.clone());
                     let on = move || ws.pinned.with(|p| p.contains(&a.get_value()));
                     view! {
-                        <button class=btn title=move || if on() { "Unpin" } else { "Pin to the dock" } on:click=move |_| ws.toggle_pin(&b)>
-                            {move || if on() { "★" } else { "☆" }}
+                        <button class=btn title=move || if on() { "Unpin" } else { "Pin to the dock" } aria-label=move || if on() { "Unpin" } else { "Pin" }
+                            on:click=move |_| ws.toggle_pin(&b)>
+                            {move || crate::icons::star(on())}
                         </button>
                     }
                 })}
                 {move || two().then(|| view! {
-                    <button class=format!("{btn} hidden md:inline") title="Move the open item to a tile of its own (or ⌘-click a link)" on:click=move |_| ws.detach(key)>"⧉"</button>
+                    <button class=format!("{btn} hidden md:flex") title="Move the open item to a tile of its own (or ⌘-click a link)" aria-label="Into a tile of its own"
+                        on:click=move |_| ws.detach(key)>{crate::icons::square_arrow_out()}</button>
                 })}
                 {move || many.get().then(|| view! {
-                    <button class=format!("{btn} hidden md:inline") title="Minimize: hide this tile; bring it back from the sidebar (or ⌘ and its number)"
+                    <button class=format!("{btn} hidden md:flex") title="Minimize: hide this tile; bring it back from the sidebar (or ⌘ and its number)"
                         aria-label="Minimize" on:click=move |ev| { ev.stop_propagation(); ws.minimize(key) }>
-                        <svg viewBox="0 0 16 16" class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
-                            <path d="M3 12h10" />
-                        </svg>
+                        {crate::icons::minus()}
                     </button>
                 })}
-                <button class=format!("{btn} hidden md:inline") title=move || if full.get() { "Defocus: back to the tiles" } else { "Focus: this tile fills the screen" }
+                <button class=format!("{btn} hidden md:flex") title=move || if full.get() { "Defocus: back to the tiles" } else { "Focus: this tile fills the screen" }
                     aria-label=move || if full.get() { "Defocus" } else { "Focus" }
                     on:click=move |ev| { ev.stop_propagation(); ws.set_full(if full.get_untracked() { None } else { Some(key) }) }>
                     // Corners pointing out (focus) or in (back to the tiles).
-                    <svg viewBox="0 0 16 16" class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                        <path d=move || if full.get() {
-                            "M6 2v4H2M10 2v4h4M6 14v-4H2M10 14v-4h4"
-                        } else {
-                            "M2 6V2h4M14 6V2h-4M2 10v4h4M14 10v4h-4"
-                        } />
-                    </svg>
+                    {move || if full.get() { crate::icons::minimize().into_any() } else { crate::icons::maximize().into_any() }}
                 </button>
-                <button class=btn title="Close this tile" on:click=move |_| ws.close_tile(key)>"✕"</button>
+                <button class=btn title="Close this tile" aria-label="Close this tile" on:click=move |_| ws.close_tile(key)>{crate::icons::x()}</button>
             </div>
             <Popover at=palette_at class="w-auto">
                 {move || shown.get().map(|(_, id)| view! { <crate::marks::SessionPalette session=id on_pick=move |()| palette_at.set(None) /> })}
@@ -1730,8 +1970,10 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                     view! { <crate::session::RenameForm session=id title on_done=move |()| rename_at.set(None) /> }
                 })}
             </Popover>
-            <Popover at=details_at class="w-[min(35rem,calc(100vw-1rem))] p-3">
-                {move || chrome().map(|c| view! { <crate::session::SessionMeta chrome=c on_act=move |()| details_at.set(None) /> })}
+            <Popover at=menu_at class="w-60">
+                {move || chrome().map(|c| view! {
+                    <crate::session::SessionMenu chrome=c on_rename=move |()| rename_under_title() on_done=move |()| menu_at.set(None) />
+                })}
             </Popover>
             <div class="flex min-h-0 flex-1">
                 <For each=move || cols.get() key=|k| *k let:col>
@@ -1748,7 +1990,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tile_status_includes_side_chat_activity_without_changing_the_main_turn() {
+    fn tile_status_is_the_sessions_own_turn_not_what_runs_beside_it() {
         let mut session: Session = serde_json::from_value(serde_json::json!({
             "id": "main", "worker_id": "00000000-0000-0000-0000-000000000000",
             "title": "Main", "cwd": "", "connection_id": "", "model": "",
@@ -1756,13 +1998,18 @@ mod tests {
             "side_chats_running": 1
         }))
         .unwrap();
-        assert_eq!(status_pill(&session).1, "running");
-        assert_eq!(session.status, SessionStatus::Idle, "the main composer must remain available");
+        assert_eq!(status_dot(&session).1, "idle", "a side chat runs, not its turn");
+        session.subagents_running = 2;
+        session.tasks_running = 1;
+        assert_eq!(status_dot(&session).1, "idle", "subagents and tasks are its background");
+        session.status = SessionStatus::Running;
+        assert_eq!(status_dot(&session).1, "running");
+        session.status = SessionStatus::Idle;
         session.awaiting_approval = true;
-        assert_eq!(status_pill(&session).1, "needs approval");
+        assert_eq!(status_dot(&session).1, "needs you");
         session.awaiting_approval = false;
         session.side_chats_running = 0;
-        assert_eq!(status_pill(&session).1, "idle");
+        assert_eq!(status_dot(&session).1, "idle");
     }
 
     #[test]
@@ -1790,6 +2037,69 @@ mod tests {
             assert_eq!(layout.tiles[0].columns[1].key, key);
             assert_eq!(layout.tiles[0].columns[1].view, View::Brief);
         }
+    }
+
+    #[test]
+    fn a_sessions_panes_have_their_own_addresses() {
+        use crate::panes::Pane;
+        for (view, path, pane) in [
+            (View::SessionChanges { id: "s1".into() }, "/sessions/s1/changes", Pane::Changes),
+            (View::SessionTerminal { id: "s1".into() }, "/sessions/s1/terminal", Pane::Terminal),
+            (View::SessionFiles { id: "s1".into() }, "/sessions/s1/files", Pane::Files),
+            (View::SessionOutputs { id: "s1".into(), output: String::new() }, "/sessions/s1/outputs", Pane::Outputs),
+        ] {
+            assert_eq!(view.path(), path);
+            assert_eq!(view.session_pane(), Some((pane, "s1")));
+            assert!(!view.is_section(), "an item: it opens beside, not in place of a list");
+            let back: View = serde_json::from_str(&serde_json::to_string(&view).unwrap()).unwrap();
+            assert_eq!(back, view, "kept with the layout");
+        }
+        // Saved before an output was picked.
+        let v: View = serde_json::from_str(r#"{"view":"session_outputs","id":"s1"}"#).unwrap();
+        assert_eq!(v, View::SessionOutputs { id: "s1".into(), output: String::new() });
+        assert_eq!(View::session("s1").session_pane(), None);
+    }
+
+    #[test]
+    fn a_pane_opens_beside_its_session_and_the_bar_still_speaks_for_it() {
+        use crate::panes::Pane;
+        // A session opened from the list: the tile shows both.
+        let mut l = Layout::new(View::Sessions);
+        let tile = l.tiles[0].key;
+        let key = l.key();
+        l.tiles[0].columns.push(Column { key, view: View::session("s1") });
+        l.tiles[0].settle();
+        assert_eq!(l.bar_column(tile), Some(key));
+        // Its Changes: beside the session, which stays; the list goes back
+        // in the tile's history.
+        l.open_after(tile, key, View::SessionChanges { id: "s1".into() });
+        let t = l.tile(tile).unwrap();
+        assert_eq!(t.columns.len(), 2);
+        assert_eq!(t.columns[0].key, key, "the session's pane is kept, not drawn again");
+        assert_eq!(t.columns[1].view, View::SessionChanges { id: "s1".into() });
+        assert_eq!(t.back.last().unwrap()[0].view, View::Sessions);
+        assert_eq!(l.bar_column(tile), Some(key), "the bar speaks for the session, not its pane");
+        let changes = t.columns[1].key;
+        assert_eq!(l.find_pane(Pane::Changes, "s1"), Some((tile, changes)));
+        assert_eq!(l.find_pane(Pane::Terminal, "s1"), None);
+        assert_eq!(l.find_pane(Pane::Changes, "s2"), None);
+        // Back to the session on a phone: the pane is there but not shown,
+        // and comes forward again.
+        l.tiles[0].cursor = 0;
+        assert!(l.pane_shown(tile, changes, false), "side by side, both show");
+        assert!(!l.pane_shown(tile, changes, true), "a phone shows the session");
+        l.reveal(tile, changes);
+        assert!(l.pane_shown(tile, changes, true));
+        // Another of its panes takes that one's place.
+        l.open_after(tile, key, View::SessionTerminal { id: "s1".into() });
+        assert_eq!(l.tile(tile).unwrap().columns[0].key, key);
+        assert_eq!(l.find_pane(Pane::Changes, "s1"), None);
+        // Something else beside it (a doc): the bar speaks for that.
+        l.open_after(tile, key, View::Docs { id: "d1".into() });
+        assert_ne!(l.bar_column(tile), Some(key));
+        // Another session's pane beside it is not its own.
+        l.open_after(tile, key, View::SessionFiles { id: "s2".into() });
+        assert_ne!(l.bar_column(tile), Some(key));
     }
 
     fn r(left: f64, top: f64, width: f64, height: f64) -> Rect {
@@ -1914,6 +2224,28 @@ mod tests {
     }
 
     #[test]
+    fn a_tile_steps_left_and_right_among_those_shown() {
+        let mut l = opened(5); // the fifth stacks under the first
+        let keys: Vec<u64> = l.tiles.iter().map(|t| t.key).collect();
+        let order = |l: &Layout| l.reading_order().into_iter().map(|i| l.tiles[i].key).collect::<Vec<_>>();
+        assert_eq!(order(&l), [keys[0], keys[4], keys[1], keys[2], keys[3]]);
+        l.focus = 2;
+        l.step_tile(keys[1], -1);
+        assert_eq!(order(&l), [keys[0], keys[1], keys[4], keys[2], keys[3]], "it trades places with the one before");
+        assert_eq!(l.tile(keys[1]).unwrap().stack, Some(0), "into that one's column");
+        assert_eq!(l.tile(keys[4]).unwrap().stack, Some(1));
+        assert_eq!(l.tiles[l.focus].key, keys[2], "the focus stays on its tile");
+        l.step_tile(keys[0], -1);
+        l.step_tile(keys[3], 1);
+        assert_eq!(order(&l), [keys[0], keys[1], keys[4], keys[2], keys[3]], "the ends stay");
+        // A minimized tile is stepped over.
+        let i = l.tiles.iter().position(|t| t.key == keys[4]).unwrap();
+        l.minimize(i);
+        l.step_tile(keys[2], -1);
+        assert_eq!(order(&l), [keys[0], keys[2], keys[4], keys[1], keys[3]]);
+    }
+
+    #[test]
     fn a_layout_saved_before_minimizing_loads_with_every_tile_shown() {
         let l = opened(2);
         let mut v = serde_json::to_value(&l).unwrap();
@@ -2004,6 +2336,9 @@ struct Pos {
     len: usize,
     /// The active pane of the focused tile.
     active: bool,
+    /// A session with one of its own panes beside it: they share the tile
+    /// evenly (the transcript isn't a list).
+    even: bool,
 }
 
 #[component]
@@ -2015,7 +2350,8 @@ fn ColumnView(tile: u64, col: u64) -> impl IntoView {
             let ti = l.tiles.iter().position(|t| t.key == tile)?;
             let t = &l.tiles[ti];
             let index = t.columns.iter().position(|c| c.key == col)?;
-            Some(Pos { index, cursor: t.cursor, len: t.columns.len(), active: t.active == col && l.focus == ti })
+            let even = l.bar_column(tile) == Some(t.columns[0].key) && t.columns.len() == 2;
+            Some(Pos { index, cursor: t.cursor, len: t.columns.len(), active: t.active == col && l.focus == ti, even })
         })
     });
     let view =
@@ -2036,7 +2372,8 @@ fn ColumnView(tile: u64, col: u64) -> impl IntoView {
             id=ctx.root_id()
             class=move || match pos.get() {
                 Some(p) if p.len == 2 && p.index == 0 => format!(
-                    "min-w-0 flex-col border-r border-zinc-200 dark:border-zinc-800 md:flex md:basis-[40%] md:shrink-0 {}",
+                    "min-w-0 flex-col border-r border-zinc-200 dark:border-zinc-800 md:flex md:shrink-0 {} {}",
+                    if p.even { "md:basis-1/2" } else { "md:basis-[40%]" },
                     if p.cursor == 0 { "flex flex-1" } else { "hidden" },
                 ),
                 Some(p) => format!("min-w-0 flex-1 flex-col md:flex {}", if p.cursor == p.index { "flex" } else { "hidden" }),
@@ -2067,23 +2404,25 @@ fn ColumnHeader(label: Signal<String>, pos: Signal<Option<Pos>>, view: Signal<Op
         _ => None,
     };
     let pinned = move || session().is_some_and(|id| ws.pinned.with(|p| p.contains(&id)));
-    let btn = "rounded px-1 text-zinc-400 hover:bg-zinc-200 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
+    // 24px round a 16px glyph (the bar is 28px), 40px on a touch screen.
+    let btn = "flex size-6 shrink-0 items-center justify-center rounded text-muted outline-none focus-visible:ring-2 focus-visible:ring-sky-500/60 pointer-fine:hover:bg-zinc-200 pointer-fine:hover:text-zinc-900 pointer-coarse:size-10 dark:pointer-fine:hover:bg-zinc-800 dark:pointer-fine:hover:text-zinc-100";
     view! {
         <div class=move || format!(
-            "flex h-7 shrink-0 items-center gap-1 border-b border-zinc-100 px-2 text-[11px] dark:border-zinc-900 {}",
-            if ctx.active.get() { "text-zinc-700 dark:text-zinc-300" } else { "text-zinc-500" },
+            "flex h-7 shrink-0 items-center gap-1 border-b border-zinc-100 px-2 text-[11px] pointer-coarse:h-11 pointer-coarse:gap-0 dark:border-zinc-900 {}",
+            if ctx.active.get() { "text-zinc-700 dark:text-zinc-300" } else { "text-muted" },
         )>
             {move || pos.get().filter(|p| p.index == 1).map(|_| view! {
-                <button class=format!("{btn} md:hidden") title="Back to the list" on:click=move |_| ws.show_list(ctx.tile)>"‹"</button>
+                <button class=format!("{btn} md:hidden") title="Back to the list" aria-label="Back to the list" on:click=move |_| ws.show_list(ctx.tile)>{crate::icons::chevron_left()}</button>
             })}
             <span class="min-w-0 flex-1 truncate">{label}</span>
             {move || session().map(|id| view! {
-                <button class=btn title=move || if pinned() { "Unpin" } else { "Pin to the dock" } on:click=move |_| ws.toggle_pin(&id)>
-                    {move || if pinned() { "★" } else { "☆" }}
+                <button class=btn title=move || if pinned() { "Unpin" } else { "Pin to the dock" } aria-label=move || if pinned() { "Unpin" } else { "Pin" }
+                    on:click=move |_| ws.toggle_pin(&id)>
+                    {move || crate::icons::star(pinned())}
                 </button>
             })}
             {move || pos.get().filter(|p| p.len == 2).map(|_| view! {
-                <button class=btn title="Close this pane" on:click=move |_| ctx.close()>"×"</button>
+                <button class=btn title="Close this pane" aria-label="Close this pane" on:click=move |_| ctx.close()>{crate::icons::x()}</button>
             })}
         </div>
     }
@@ -2092,6 +2431,10 @@ fn ColumnHeader(label: Signal<String>, pos: Signal<Option<Pos>>, view: Signal<Op
 fn render_view(view: View) -> AnyView {
     match view {
         View::Session { id, target } => view! { <crate::session::SessionView id target /> }.into_any(),
+        View::SessionOutputs { id, output } => view! { <crate::panes::SessionPane id pane=crate::panes::Pane::Outputs output /> }.into_any(),
+        View::SessionChanges { id } => view! { <crate::panes::SessionPane id pane=crate::panes::Pane::Changes /> }.into_any(),
+        View::SessionTerminal { id } => view! { <crate::panes::SessionPane id pane=crate::panes::Pane::Terminal /> }.into_any(),
+        View::SessionFiles { id } => view! { <crate::panes::SessionPane id pane=crate::panes::Pane::Files /> }.into_any(),
         other => view! {
             <ScrollBox>
                 {match other {
@@ -2127,7 +2470,11 @@ fn render_view(view: View) -> AnyView {
                     View::App { name, record } => view! { <crate::views::ViewPage name=name.clone() record=record.clone() /> }.into_any(),
                     View::Realms => view! { <crate::explorer::RealmsMap /> }.into_any(),
                     View::Explore { realm, section, kind, id } => view! { <crate::explorer::ExplorePage realm=realm.clone() section=section.clone() kind=kind.clone() id=id.clone() /> }.into_any(),
-                    View::Session { .. } => ().into_any(),
+                    View::Session { .. }
+                    | View::SessionChanges { .. }
+                    | View::SessionTerminal { .. }
+                    | View::SessionFiles { .. }
+                    | View::SessionOutputs { .. } => ().into_any(),
                 }}
             </ScrollBox>
         }

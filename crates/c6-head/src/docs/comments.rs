@@ -1,18 +1,19 @@
 //! Comments (docs/docs.md §8): threads anchored to quoted words, a block or
 //! slide, or a whole tab; one can be sent to an agent instead of just left.
-//! It goes to the session that last wrote that part if that session is
-//! idle, else to a new session started from the document's work or project
-//! (its latest session), told what to do by the editable prompt
+//! It goes, as a message (queued if the session is busy), to the session
+//! that already answered the thread, else the one that last wrote that
+//! part, else the latest session of the document's work or project; never
+//! to a new session. It's told what to do by the editable prompt
 //! `docs.comment`. The agent answers in the thread, and links the edits it
 //! made for it (`answering`). A thread an agent answered needs you until
 //! you reply or resolve it; only you resolve a thread you wrote.
 
-use c6_api::docs::{Anchor, CommentNew, DocComment, DocThread, ThreadNew};
+use c6_api::docs::{Anchor, CommentEdit, CommentNew, DocComment, DocThread, ThreadNew};
 use c6_core::now_ms;
 use serde_json::{Value, json};
 use sqlx::Row as _;
 
-use crate::{HeadState, bad_request, forbidden, not_found};
+use crate::{HeadState, bad_request, conflict, forbidden, not_found};
 
 const MAX_TEXT: usize = 20_000;
 
@@ -47,9 +48,62 @@ async fn thread_row(pool: &sqlx::SqlitePool, doc: &str, thread: &str) -> anyhow:
         .ok_or_else(|| not_found(format!("no thread {thread} on this document")))
 }
 
+/// Which comment of each thread last went to an agent (thread id to comment
+/// id), kept per realm as a setting: `comments_sent@<realm>`.
+fn sent_key(realm: &str) -> String {
+    format!("comments_sent@{realm}")
+}
+
+async fn sent_in(st: &HeadState, realm: &str) -> std::collections::HashMap<String, String> {
+    st.store.setting(&sent_key(realm)).await.ok().flatten().and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default()
+}
+
+/// Whether a thread's last comment (a person's) hasn't gone to an agent:
+/// it isn't the one last sent. A thread sent before sends were recorded
+/// counts as unsent if it never went to an agent, or if a person spoke after
+/// the agent's answer.
+fn unsent(sent: &std::collections::HashMap<String, String>, thread: &str, to_agent: bool, comments: &[DocComment]) -> bool {
+    let Some(last) = comments.last() else { return false };
+    match sent.get(thread) {
+        Some(id) => *id != last.id,
+        None => !to_agent || comments.iter().any(|c| agent(&c.by)),
+    }
+}
+
+/// Where a thread's comments no agent has received yet begin: after the
+/// one last sent with it. With no record of that (a thread sent before sends
+/// were recorded, or resolved since), after the agent's latest answer, as
+/// `unsent` counts; none, if it was sent and hasn't been answered.
+fn unreceived_from(sent: &std::collections::HashMap<String, String>, thread: &str, to_agent: bool, comments: &[DocComment]) -> usize {
+    match sent.get(thread).and_then(|id| comments.iter().position(|c| c.id == *id)) {
+        Some(i) => i + 1,
+        None if !to_agent => 0,
+        None => comments.iter().rposition(|c| agent(&c.by)).map_or(comments.len(), |i| i + 1),
+    }
+}
+
+/// Notes each thread's latest comment as sent; the record keeps only
+/// threads still open.
+async fn note_sent(st: &HeadState, realm: &str, pool: &sqlx::SqlitePool, threads: &[String]) -> anyhow::Result<()> {
+    let mut sent = sent_in(st, realm).await;
+    for t in threads {
+        let last: Option<String> = sqlx::query_scalar("SELECT id FROM doc_comments WHERE thread_id = ? ORDER BY at DESC, id DESC LIMIT 1")
+            .bind(t)
+            .fetch_optional(pool)
+            .await?;
+        if let Some(id) = last {
+            sent.insert(t.clone(), id);
+        }
+    }
+    let open: Vec<String> = sqlx::query_scalar("SELECT id FROM doc_threads WHERE state = 'open'").fetch_all(pool).await?;
+    sent.retain(|t, _| open.contains(t));
+    st.store.set_setting(&sent_key(realm), &serde_json::to_string(&sent)?).await
+}
+
 /// A document's threads as they are now (open first), with whether each is
 /// detached and needs you.
 pub async fn list(st: &HeadState, realm: &str, doc: &str) -> anyhow::Result<Vec<DocThread>> {
+    let sent = sent_in(st, realm).await;
     let pool = super::pool(st, realm).await?;
     let mut conn = pool.acquire().await?;
     let (state, _) = super::load_head(&mut conn, doc).await?;
@@ -62,12 +116,12 @@ pub async fn list(st: &HeadState, realm: &str, doc: &str) -> anyhow::Result<Vec<
     for r in rows {
         let id: String = r.get("id");
         let anchor: Anchor = serde_json::from_str(&r.get::<String, _>("anchor")).unwrap_or_default();
-        let comments: Vec<DocComment> = sqlx::query("SELECT * FROM doc_comments WHERE thread_id = ? ORDER BY at, id")
+        let mut comments: Vec<DocComment> = sqlx::query("SELECT * FROM doc_comments WHERE thread_id = ? ORDER BY at, id")
             .bind(&id)
             .fetch_all(&pool)
             .await?
             .iter()
-            .map(|c| DocComment { id: c.get("id"), by: c.get("by"), text: c.get("text"), at: c.get("at") })
+            .map(|c| DocComment { id: c.get("id"), by: c.get("by"), text: c.get("text"), at: c.get("at"), editable: false })
             .collect();
         let edits: Vec<i64> = sqlx::query_scalar("SELECT rev FROM doc_ops WHERE doc_id = ? AND answering = ? ORDER BY rev")
             .bind(doc)
@@ -82,6 +136,17 @@ pub async fn list(st: &HeadState, realm: &str, doc: &str) -> anyhow::Result<Vec<
         };
         let thread_state: String = r.get("state");
         let needs_you = thread_state == "open" && comments.last().is_some_and(|c| agent(&c.by));
+        let to_agent = r.get::<i64, _>("to_agent") != 0;
+        let unsent =
+            thread_state == "open" && comments.last().is_some_and(|last| !agent(&last.by) && unsent(&sent, &id, to_agent, &comments));
+        // A person's comment no agent has received, in an open thread, can
+        // still change.
+        if thread_state == "open" {
+            let from = unreceived_from(&sent, &id, to_agent, &comments);
+            for c in comments.iter_mut().skip(from) {
+                c.editable = !agent(&c.by);
+            }
+        }
         out.push(DocThread {
             id,
             doc: doc.to_owned(),
@@ -89,11 +154,12 @@ pub async fn list(st: &HeadState, realm: &str, doc: &str) -> anyhow::Result<Vec<
             state: thread_state,
             detached,
             about: r.get("about"),
-            to_agent: r.get::<i64, _>("to_agent") != 0,
+            to_agent,
             agent: r.get("agent"),
             comments,
             edits,
             needs_you,
+            unsent,
             created_by: r.get("created_by"),
             created_at: r.get("created_at"),
             resolved_at: r.get("resolved_at"),
@@ -110,6 +176,49 @@ pub async fn answered(st: &HeadState, realm: &str, doc: &str) -> usize {
         Ok(t) => t.iter().filter(|t| t.needs_you).count(),
         Err(_) => 0,
     }
+}
+
+/// A thread an agent answered, waiting for your reply or for you to
+/// resolve it.
+#[derive(Clone, Debug)]
+pub struct Answered {
+    pub doc: String,
+    /// The document's title.
+    pub title: String,
+    pub thread: String,
+    /// What the thread is about (quoted words, a block, a tab).
+    pub about: String,
+    /// The agent's answer (the thread's latest comment): another means it
+    /// answered again.
+    pub comment: String,
+    /// When the agent answered.
+    pub at: i64,
+}
+
+/// Every thread in a realm that an agent answered last and that's still
+/// open (what `list` calls needs you), newest first, in one query.
+pub async fn answered_in(st: &HeadState, realm: &str, limit: i64) -> anyhow::Result<Vec<Answered>> {
+    let pool = super::pool(st, realm).await?;
+    let rows = sqlx::query(
+        "SELECT t.id, t.doc_id, t.about, d.title, c.id AS comment, c.at FROM doc_threads t \
+         JOIN docs d ON d.id = t.doc_id AND d.deleted_at IS NULL \
+         JOIN doc_comments c ON c.id = (SELECT id FROM doc_comments WHERE thread_id = t.id ORDER BY at DESC, id DESC LIMIT 1) \
+         WHERE t.state = 'open' AND c.by LIKE 'session:%' ORDER BY c.at DESC LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(&pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| Answered {
+            doc: r.get("doc_id"),
+            title: r.get("title"),
+            thread: r.get("id"),
+            about: r.get("about"),
+            comment: r.get("comment"),
+            at: r.get("at"),
+        })
+        .collect())
 }
 
 /// A new thread with its first comment; sent to an agent when asked.
@@ -167,7 +276,7 @@ pub async fn create(st: &HeadState, realm: &str, doc: &str, n: &ThreadNew, by: &
     add_comment(&pool, &id, doc, by, &text).await?;
     commented(st, realm, doc, &id, by, &text).await;
     if n.to == "agent" {
-        send(st, realm, doc, &id, by).await?;
+        send(st, realm, doc, &id).await?;
     }
     one(st, realm, doc, &id).await
 }
@@ -202,9 +311,68 @@ pub async fn reply(st: &HeadState, realm: &str, doc: &str, thread: &str, c: &Com
         .await?;
     commented(st, realm, doc, thread, by, &text).await;
     if c.to == "agent" {
-        send(st, realm, doc, thread, by).await?;
+        send(st, realm, doc, thread).await?;
     }
     one(st, realm, doc, thread).await
+}
+
+/// A comment its writer may still change: theirs (a person's), in an open
+/// thread, and no agent has received it (`DocComment::editable`).
+async fn changeable(st: &HeadState, realm: &str, doc: &str, thread: &str, comment: &str, by: &str) -> anyhow::Result<DocThread> {
+    let t = one(st, realm, doc, thread).await?;
+    let c = t.comments.iter().find(|c| c.id == comment).ok_or_else(|| not_found(format!("no comment {comment} in this thread")))?;
+    if agent(by) || c.by != by {
+        return Err(forbidden("only who wrote a comment edits or deletes it"));
+    }
+    if t.state != "open" {
+        return Err(conflict("the thread is resolved: reply to reopen it"));
+    }
+    if !c.editable {
+        return Err(conflict("an agent has received this comment: reply in the thread instead"));
+    }
+    Ok(t)
+}
+
+/// Your comment's text, changed in place (its time stays) while no agent
+/// has received it.
+pub async fn edit(
+    st: &HeadState,
+    realm: &str,
+    doc: &str,
+    thread: &str,
+    comment: &str,
+    e: &CommentEdit,
+    by: &str,
+) -> anyhow::Result<DocThread> {
+    let text = check_text(&e.text)?;
+    changeable(st, realm, doc, thread, comment, by).await?;
+    let pool = super::pool(st, realm).await?;
+    sqlx::query("UPDATE doc_comments SET text = ? WHERE id = ? AND thread_id = ?")
+        .bind(&text)
+        .bind(comment)
+        .bind(thread)
+        .execute(&pool)
+        .await?;
+    changed(st, realm, doc, by).await;
+    one(st, realm, doc, thread).await
+}
+
+/// Your comment, gone while no agent has received it; with it the thread,
+/// if it was the only one.
+pub async fn delete(st: &HeadState, realm: &str, doc: &str, thread: &str, comment: &str, by: &str) -> anyhow::Result<()> {
+    changeable(st, realm, doc, thread, comment, by).await?;
+    let pool = super::pool(st, realm).await?;
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM doc_comments WHERE id = ? AND thread_id = ?").bind(comment).bind(thread).execute(&mut *tx).await?;
+    // Only if nothing else is in it (a reply may have just come).
+    sqlx::query("DELETE FROM doc_threads WHERE id = ? AND NOT EXISTS (SELECT 1 FROM doc_comments WHERE thread_id = ?)")
+        .bind(thread)
+        .bind(thread)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    changed(st, realm, doc, by).await;
+    Ok(())
 }
 
 /// Resolves a thread. An agent resolves only threads it began.
@@ -228,6 +396,7 @@ pub async fn resolve(st: &HeadState, realm: &str, doc: &str, thread: &str, by: &
         by: by.to_owned(),
         what: "commented".into(),
     });
+    st.attention.changed();
     let title = super::title_of(st, realm, doc).await.map(|t| t.0).unwrap_or_default();
     let event =
         json!({"type": "doc", "op": "thread_resolved", "doc": {"id": doc, "title": title, "realm": realm}, "thread": thread, "by": by});
@@ -246,9 +415,25 @@ async fn commented(st: &HeadState, realm: &str, doc: &str, thread: &str, by: &st
         by: by.to_owned(),
         what: "commented".into(),
     });
+    // An agent's answer is worth a look; your reply settles it.
+    st.attention.changed();
     let title = super::title_of(st, realm, doc).await.map(|t| t.0).unwrap_or_default();
     let event = json!({"type": "doc", "op": "commented", "doc": {"id": doc, "title": title, "realm": realm}, "thread": thread, "by": by, "text": text});
     crate::triggers::dispatch(st, realm, "doc", "commented", event).await;
+    moved(st, realm, doc).await;
+}
+
+/// A comment changed or went (no trigger: nobody else has seen it): on the
+/// live feed, and the work and projects holding the document moved.
+async fn changed(st: &HeadState, realm: &str, doc: &str, by: &str) {
+    let _ = st.docs.live.send(c6_api::docs::DocChange {
+        id: doc.to_owned(),
+        realm: realm.to_owned(),
+        rev: 0,
+        by: by.to_owned(),
+        what: "commented".into(),
+    });
+    st.attention.changed();
     moved(st, realm, doc).await;
 }
 
@@ -259,24 +444,42 @@ async fn moved(st: &HeadState, realm: &str, doc: &str) {
     }
 }
 
-/// A session to ask, and whether to start it: the one that last wrote the
-/// thread's part if it's idle, else the latest session of the document's
-/// work or project (a new session like it, in that work).
-async fn pick(st: &HeadState, realm: &str, doc: &str, anchor: &Anchor) -> anyhow::Result<(String, bool, Option<String>)> {
+/// Whether a session can be sent a comment: not archived, not Claude
+/// Code's own subagent (Claude Code runs it) and didn't fail to start.
+/// Busy, waiting on approval or offline is fine: its input queues.
+fn takes_comments(s: &crate::store::SessionRow) -> bool {
+    s.archived == 0 && !s.observed && s.status != "failed"
+}
+
+/// The session `id` if it's still there and can be sent a comment.
+async fn taking(st: &HeadState, id: &str) -> anyhow::Result<Option<String>> {
+    Ok(st.store.session(id).await?.filter(takes_comments).map(|s| s.id))
+}
+
+/// The session a thread goes to, whatever it's doing (a busy one gets it
+/// queued); never a new one. The session that already answered the thread,
+/// else the one that last wrote its part (the block's or slide's writer,
+/// else the document's latest), else the most recently updated session of
+/// the document's work or project. Sessions that can't take it are passed
+/// over; with none left it's refused.
+async fn pick(st: &HeadState, realm: &str, doc: &str, t: &DocThread) -> anyhow::Result<String> {
+    if !t.agent.is_empty()
+        && let Some(s) = taking(st, &t.agent).await?
+    {
+        return Ok(s);
+    }
     let pool = super::pool(st, realm).await?;
     let mut conn = pool.acquire().await?;
     let (state, _) = super::load_head(&mut conn, doc).await?;
     drop(conn);
-    // Who wrote that part last (the slide's or block's, else the document's).
-    let wrote =
-        state.rows.get(&anchor.block).map(|r| r.by.clone()).or_else(|| state.rows.values().max_by_key(|r| r.rev).map(|r| r.by.clone()));
-    if let Some(s) = wrote.as_deref().and_then(|b| b.strip_prefix("session:"))
-        && let Some(row) = st.store.session(s).await?
-        && row.archived == 0
-        && matches!(row.status.as_str(), "idle")
-        && row.awaiting == 0
-    {
-        return Ok((row.id, false, None));
+    // Who wrote that part last (the slide's or block's), then the document.
+    let wrote = [state.rows.get(&t.anchor.block), state.rows.values().max_by_key(|r| r.rev)];
+    for by in wrote.into_iter().flatten().map(|r| r.by.as_str()) {
+        if let Some(sid) = by.strip_prefix("session:")
+            && let Some(s) = taking(st, sid).await?
+        {
+            return Ok(s);
+        }
     }
     // The document's work (and its project's work): their latest session.
     let reference = format!("doc:{doc}");
@@ -284,56 +487,110 @@ async fn pick(st: &HeadState, realm: &str, doc: &str, anchor: &Anchor) -> anyhow
     for p in crate::projects::holding_doc(st, realm, doc).await {
         work.extend(crate::work::in_project(st, &p).await?);
     }
-    let mut best: Option<(crate::store::SessionRow, String)> = None;
+    let mut best: Option<crate::store::SessionRow> = None;
     for w in &work {
         for r in crate::work::refs(st, w).await {
             if let Some(sid) = r.strip_prefix("session:")
                 && let Some(s) = st.store.session(sid).await?
-                && best.as_ref().is_none_or(|(b, _)| b.updated_at < s.updated_at)
+                && takes_comments(&s)
+                && best.as_ref().is_none_or(|b| b.updated_at < s.updated_at)
             {
-                best = Some((s, w.clone()));
+                best = Some(s);
             }
         }
     }
     match best {
-        Some((s, w)) => Ok((s.id, true, Some(w))),
+        Some(s) => Ok(s.id),
         None => Err(bad_request(
             "no session to send it to: the document's work and project have none yet. Start a session on it (or put it in work), then send the thread",
         )),
     }
 }
 
-/// Sends a thread to an agent, by `docs.comment`.
-async fn send(st: &HeadState, realm: &str, doc: &str, thread: &str, _by: &str) -> anyhow::Result<()> {
+/// Sends a thread to an agent, by `docs.comment` (see `pick`).
+async fn send(st: &HeadState, realm: &str, doc: &str, thread: &str) -> anyhow::Result<()> {
     let t = one(st, realm, doc, thread).await?;
-    let (session, start, work) = pick(st, realm, doc, &t.anchor).await?;
+    to_agents(st, realm, doc, &[t]).await
+}
+
+/// Comment threads sent to an agent together: each goes where `pick` says
+/// (never to a new session), and the threads going to one session go in
+/// one message, which answers each in its thread. `ids` empty: every open
+/// thread `by` began that hasn't been sent to an agent.
+pub async fn send_many(st: &HeadState, realm: &str, doc: &str, ids: &[String], by: &str) -> anyhow::Result<Vec<DocThread>> {
+    let all = list(st, realm, doc).await?;
+    let chosen: Vec<DocThread> =
+        all.into_iter().filter(|t| t.state == "open").filter(|t| if ids.is_empty() { t.unsent } else { ids.contains(&t.id) }).collect();
+    if chosen.is_empty() {
+        return Err(bad_request("no open comment threads to send"));
+    }
+    to_agents(st, realm, doc, &chosen).await?;
+    let _ = st.docs.live.send(c6_api::docs::DocChange {
+        id: doc.to_owned(),
+        realm: realm.to_owned(),
+        rev: 0,
+        by: by.to_owned(),
+        what: "commented".into(),
+    });
+    st.attention.changed();
+    let threads: Vec<String> = chosen.iter().map(|t| t.id.clone()).collect();
+    let now = list(st, realm, doc).await?;
+    Ok(now.into_iter().filter(|t| threads.contains(&t.id)).collect())
+}
+
+/// Picks each thread's session (all before any is sent, so one with nowhere
+/// to go sends none), then delivers one message per session.
+async fn to_agents(st: &HeadState, realm: &str, doc: &str, threads: &[DocThread]) -> anyhow::Result<()> {
+    let mut groups: Vec<(String, Vec<&DocThread>)> = Vec::new();
+    for t in threads {
+        let session = pick(st, realm, doc, t).await?;
+        match groups.iter_mut().find(|(s, _)| *s == session) {
+            Some((_, g)) => g.push(t),
+            None => groups.push((session, vec![t])),
+        }
+    }
     let title = super::title_of(st, realm, doc).await.map(|t| t.0).unwrap_or_default();
+    for (session, group) in groups {
+        let mut parts = Vec::new();
+        for t in &group {
+            parts.push(told(st, realm, doc, &title, t).await);
+        }
+        let text = if parts.len() == 1 {
+            parts.remove(0)
+        } else {
+            format!(
+                "{} comments on the document \"{title}\" (doc:{doc}) come to you together. Take each in turn and answer it in its own thread, as it says.\n\n{}",
+                parts.len(),
+                parts.join("\n\n---\n\n")
+            )
+        };
+        let ids: Vec<String> = group.iter().map(|t| t.id.clone()).collect();
+        deliver(st, realm, &ids, &session, &text).await?;
+    }
+    Ok(())
+}
+
+/// What an agent is told about one thread (the prompt `docs.comment`).
+async fn told(st: &HeadState, realm: &str, doc: &str, title: &str, t: &DocThread) -> String {
     let comments: String = t.comments.iter().map(|c| format!("- {}: {}\n", who(&c.by), c.text)).collect();
     let template = crate::prompts::get(st, "docs.comment", realm).await;
     let anchor = if t.anchor.block.is_empty() { t.about.clone() } else { format!("{} (block {})", t.about, t.anchor.block) };
-    let text = c6_api::prompts::fill(
+    c6_api::prompts::fill(
         &template,
-        &[("title", &title), ("doc", doc), ("thread", thread), ("anchor", &anchor), ("comments", comments.trim_end())],
-    );
-    let sent_to = if start {
-        let seed = st.store.session(&session).await?.ok_or_else(|| not_found("its session is gone"))?;
-        let labels: Vec<String> = serde_json::from_str(&seed.labels).unwrap_or_default();
-        let first = crate::projects::with_context(st, work.as_deref(), &text).await.unwrap_or_else(|| text.clone());
-        let req: c6_api::CreateSession = serde_json::from_value(json!({
-            "worker_id": seed.worker_id, "cwd": seed.cwd, "connection_id": seed.connection_id, "model": seed.model,
-            "title": format!("Comment on {title}"), "prompt": first, "labels": labels, "realm": realm,
-        }))?;
-        let s = crate::sessions::create(st, req).await?;
-        crate::work::on_new_session(st, &s, work.as_deref(), &[], &text, None).await;
-        s.id
-    } else {
-        let m: c6_api::SendMessage = serde_json::from_value(json!({"text": text}))?;
-        crate::sessions::send_input(st, &session, &m).await?;
-        session
-    };
+        &[("title", title), ("doc", doc), ("thread", &t.id), ("anchor", &anchor), ("comments", comments.trim_end())],
+    )
+}
+
+/// Sends `text` to the session (queued if it's busy) and notes the threads
+/// as with it.
+async fn deliver(st: &HeadState, realm: &str, threads: &[String], session: &str, text: &str) -> anyhow::Result<()> {
+    let m: c6_api::SendMessage = serde_json::from_value(json!({"text": text}))?;
+    crate::sessions::send_input(st, session, &m).await?;
     let pool = super::pool(st, realm).await?;
-    sqlx::query("UPDATE doc_threads SET to_agent = 1, agent = ? WHERE id = ?").bind(&sent_to).bind(thread).execute(&pool).await?;
-    Ok(())
+    for thread in threads {
+        sqlx::query("UPDATE doc_threads SET to_agent = 1, agent = ? WHERE id = ?").bind(session).bind(thread).execute(&pool).await?;
+    }
+    note_sent(st, realm, &pool, threads).await
 }
 
 /// The `doc` tool's `comment` action: create (block, quote, text), reply

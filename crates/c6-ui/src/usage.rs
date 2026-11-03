@@ -51,7 +51,7 @@ pub fn UsagePage() -> impl IntoView {
     view! {
         <main class="mx-auto max-w-4xl space-y-4 px-4 py-4">
             <div class="flex flex-wrap items-center justify-between gap-2">
-                <p class="text-xs text-zinc-500">"Tokens and cost of model calls in sessions with the filter's labels. Prices and budgets are in Settings."</p>
+                <p class="text-xs text-muted">"Tokens and cost of model calls in sessions with the filter's labels. Prices and budgets are in Settings."</p>
                 <select class=format!("{INPUT} w-auto py-1 text-sm") prop:value=move || days.get().to_string()
                     on:change=move |ev| days.set(event_target_value(&ev).parse().unwrap_or(30))>
                     <option value="1">"Today"</option>
@@ -61,7 +61,7 @@ pub fn UsagePage() -> impl IntoView {
                 </select>
             </div>
             <crate::labels::LabelFilterBar />
-            <Suspense fallback=|| view! { <p class="text-sm text-zinc-500">"Loading…"</p> }>
+            <Suspense fallback=|| view! { <p class="text-sm text-muted">"Loading…"</p> }>
                 {move || report.get().map(|r| match r {
                     Ok(r) => view! { <Report r /> }.into_any(),
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
@@ -137,7 +137,7 @@ fn Report(r: UsageReport) -> impl IntoView {
                         view! { <div class="min-w-[3px] flex-1 rounded-t bg-sky-500/80" style=format!("height:{}%", (frac * 100.0).max(2.0)) title=tip></div> }
                     }).collect_view()}
                 </div>
-                <div class="flex justify-between text-[10px] text-zinc-500">
+                <div class="flex justify-between text-[10px] text-muted">
                     <span>{r.by_day.first().map(|d| d.key.clone())}</span>
                     <span>{r.by_day.last().map(|d| d.key.clone())}</span>
                 </div>
@@ -156,7 +156,7 @@ fn Report(r: UsageReport) -> impl IntoView {
 fn Stat(label: &'static str, value: String) -> impl IntoView {
     view! {
         <div class="rounded-lg border border-zinc-200 px-3 py-2 dark:border-zinc-800">
-            <p class="text-xs text-zinc-500">{label}</p>
+            <p class="text-xs text-muted">{label}</p>
             <p class="text-lg font-semibold tabular-nums">{value}</p>
         </div>
     }
@@ -180,7 +180,7 @@ fn BudgetBar(b: BudgetStatus) -> impl IntoView {
     view! {
         <div class="space-y-1 text-sm">
             <div class="flex items-baseline justify-between gap-2">
-                <span>{b.name.clone()} <span class="text-xs text-zinc-500">{format!(" · per {} · {action}", b.period)}</span></span>
+                <span>{b.name.clone()} <span class="text-xs text-muted">{format!(" · per {} · {action}", b.period)}</span></span>
                 <span class="tabular-nums">{format!("{} of {}", usd(b.spent), usd(b.limit))}
                     {b.blocking.then(|| view! { <span class="ml-2 rounded bg-red-600 px-1.5 text-[10px] font-semibold text-white">"BLOCKING"</span> })}
                 </span>
@@ -198,11 +198,11 @@ fn Table(title: &'static str, rows: Vec<UsageRow>, link: bool) -> impl IntoView 
         <section class="rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
             <h2 class="mb-2 text-sm font-medium">{title}</h2>
             {if rows.is_empty() {
-                view! { <p class="text-xs text-zinc-500">"Nothing yet."</p> }.into_any()
+                view! { <p class="text-xs text-muted">"Nothing yet."</p> }.into_any()
             } else {
                 view! {
                     <div class="overflow-x-auto"><table class="w-full text-xs">
-                        <thead class="text-zinc-500"><tr>
+                        <thead class="text-muted"><tr>
                             <th class="pb-1 text-left font-normal"></th>
                             <th class="pb-1 text-right font-normal">"Calls"</th>
                             <th class="pb-1 text-right font-normal">"In"</th>

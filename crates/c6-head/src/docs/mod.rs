@@ -59,9 +59,11 @@ struct Settling {
 }
 
 /// Who a caller writes as: you (in the browser, or with the console's
-/// token), else the realm's token.
+/// token), the console's assistant (with your approval), else the realm's
+/// token.
 pub fn by_of(caller: &Caller) -> String {
     match (&caller.realm, caller.browser) {
+        _ if caller.console => crate::assistant::BY_CONSOLE.into(),
         (Some(r), false) => format!("token:{r}"),
         _ => "you".into(),
     }

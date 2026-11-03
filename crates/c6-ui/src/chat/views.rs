@@ -29,7 +29,7 @@ fn where_of(m: &Value) -> Place {
 }
 
 fn empty(what: &'static str) -> AnyView {
-    view! { <p class="p-6 text-center text-zinc-500">{what}</p> }.into_any()
+    view! { <p class="p-6 text-center text-muted">{what}</p> }.into_any()
 }
 
 /// Every unread conversation's new messages.
@@ -49,7 +49,7 @@ pub(crate) fn Unreads() -> impl IntoView {
     view! {
         {header("Unreads", view! {
             <span class="flex-1"></span>
-            <button class="text-xs text-zinc-500 hover:underline" on:click=move |_| {
+            <button class="text-xs text-muted hover:underline" on:click=move |_| {
                 if let Some(Ok(v)) = list.get_untracked() { for c in v.as_array().cloned().unwrap_or_default() { read(c); } }
             }>"Mark all as read"</button>
         })}
@@ -67,9 +67,9 @@ pub(crate) fn Unreads() -> impl IntoView {
                             <div class="flex items-center gap-2 border-b border-zinc-200 bg-zinc-50 px-3 py-1.5 dark:border-zinc-800 dark:bg-zinc-900/60">
                                 <ConvIcon c=icon />
                                 <button class="font-semibold hover:underline" on:click=move |_| chat.open(go.clone(), None)>{p.name.clone()}</button>
-                                <span class="text-xs text-zinc-500">{format!("{n} new")}</span>
+                                <span class="text-xs text-muted">{format!("{n} new")}</span>
                                 <span class="flex-1"></span>
-                                <button class="text-xs text-zinc-500 hover:underline" on:click=move |_| read(mark.clone())>"Mark as read"</button>
+                                <button class="text-xs text-muted hover:underline" on:click=move |_| read(mark.clone())>"Mark as read"</button>
                             </div>
                             {c["messages"].as_array().cloned().unwrap_or_default().into_iter().map(|m| view! { <Message m place=p.clone() /> }).collect_view()}
                         </section>
@@ -89,7 +89,7 @@ pub(crate) fn Threads() -> impl IntoView {
         api::rpc("memex.chat.threads", json!({"limit": 50}))
     });
     view! {
-        {header("Threads", view! { <span class="text-xs text-zinc-500">"Threads you've written in or been mentioned in, the latest first"</span> })}
+        {header("Threads", view! { <span class="text-xs text-muted">"Threads you've written in or been mentioned in, the latest first"</span> })}
         <div class="min-h-0 flex-1 space-y-3 overflow-y-auto py-3">
             {move || list.get().map(|r| match r {
                 Err(e) => view! { <ErrorBox message=e /> }.into_any(),
@@ -109,13 +109,13 @@ pub(crate) fn Threads() -> impl IntoView {
                         <section class=format!("mx-4 overflow-hidden rounded-lg border {}", if new > 0 { "border-sky-400 dark:border-sky-700" } else { "border-zinc-200 dark:border-zinc-800" })>
                             <div class="flex items-center gap-2 border-b border-zinc-200 bg-zinc-50 px-3 py-1.5 text-xs dark:border-zinc-800 dark:bg-zinc-900/60">
                                 <button class="font-semibold hover:underline" on:click=move |_| chat.open(go.clone(), Some(ts.clone()))>{p.name.clone()}</button>
-                                <span class="text-zinc-500">{format!("{replies} repl{}", if replies == 1 { "y" } else { "ies" })}</span>
+                                <span class="text-muted">{format!("{replies} repl{}", if replies == 1 { "y" } else { "ies" })}</span>
                                 {(new > 0).then(|| view! { <span class="rounded-full bg-sky-600 px-1.5 font-semibold text-white">{format!("{new} new")}</span> })}
                                 <span class="flex-1"></span>
                                 <button class="text-sky-700 hover:underline dark:text-sky-400" on:click=move |_| { chat.details.set(false); chat.thread.set(Some((open.clone(), ts2.clone()))); }>"Open the thread"</button>
                             </div>
                             {t["first"].is_object().then(|| view! { <Message m=t["first"].clone() place=p.clone() in_thread=true /> })}
-                            {(replies > 1).then(|| view! { <p class="px-14 text-[11px] text-zinc-500">"…"</p> })}
+                            {(replies > 1).then(|| view! { <p class="px-14 text-[11px] text-muted">"…"</p> })}
                             <Message m=t["latest"].clone() place=p.clone() in_thread=true />
                         </section>
                     }
@@ -156,7 +156,7 @@ pub(crate) fn Activity() -> impl IntoView {
                         let why = if a["why"] == "mention" { "Mentioned you" } else { "Reactions to your message" };
                         view! {
                             <div class="border-b border-zinc-100 py-1 dark:border-zinc-900">
-                                <p class="px-4 pt-1 text-[11px] font-medium text-zinc-500">{why}</p>
+                                <p class="px-4 pt-1 text-[11px] font-medium text-muted">{why}</p>
                                 <Message m=m.clone() place=where_of(&m) with_place=true />
                             </div>
                         }
@@ -198,7 +198,7 @@ pub(crate) fn Saved() -> impl IntoView {
                                 <button class="text-sky-700 hover:underline dark:text-sky-400" on:click=move |_| chat.act("memex.chat.save", json!({"id": id1, "done": !finished}))>
                                     {if finished { "Move back to in progress" } else { "Mark complete" }}
                                 </button>
-                                <button class="text-zinc-500 hover:underline" on:click=move |_| chat.act("memex.chat.save", json!({"id": id2, "remove": true}))>"Remove"</button>
+                                <button class="text-muted hover:underline" on:click=move |_| chat.act("memex.chat.save", json!({"id": id2, "remove": true}))>"Remove"</button>
                             </div>
                         </div>
                     }
@@ -252,7 +252,7 @@ pub(crate) fn SearchResults(q: String) -> impl IntoView {
         api::rpc("memex.chat.search", p)
     });
     view! {
-        {header("Search", view! { <span class="truncate text-xs text-zinc-500">{format!("“{q}”")}</span> })}
+        {header("Search", view! { <span class="truncate text-xs text-muted">{format!("“{q}”")}</span> })}
         <div class="min-h-0 flex-1 overflow-y-auto py-2">
             {move || list.get().map(|r| match r {
                 Err(e) => view! { <div class="p-3"><ErrorBox message=e /></div> }.into_any(),
@@ -260,7 +260,7 @@ pub(crate) fn SearchResults(q: String) -> impl IntoView {
                 Ok(v) => {
                     let n = v.as_array().map_or(0, Vec::len);
                     view! {
-                        <p class="px-4 pb-1 text-xs text-zinc-500">{format!("{n}{} messages, the newest first", if n >= 100 { "+" } else { "" })}</p>
+                        <p class="px-4 pb-1 text-xs text-muted">{format!("{n}{} messages, the newest first", if n >= 100 { "+" } else { "" })}</p>
                         {v.as_array().cloned().unwrap_or_default().into_iter().map(|m| view! {
                             <div class="border-b border-zinc-100 py-1 dark:border-zinc-900"><Message m=m.clone() place=where_of(&m) with_place=true /></div>
                         }).collect_view()}
@@ -291,7 +291,7 @@ pub(crate) fn Details(place: Place) -> impl IntoView {
     let tab = RwSignal::new("about");
     let t = move |key: &'static str, label: &'static str| {
         view! {
-            <button class=move || format!("border-b-2 px-2 py-1 text-xs {}", if tab.get() == key { "border-sky-600 font-semibold" } else { "border-transparent text-zinc-500" })
+            <button class=move || format!("border-b-2 px-2 py-1 text-xs {}", if tab.get() == key { "border-sky-600 font-semibold" } else { "border-transparent text-muted" })
                 on:click=move |_| tab.set(key)>{label}</button>
         }
     };
@@ -299,7 +299,7 @@ pub(crate) fn Details(place: Place) -> impl IntoView {
     view! {
         <header class="flex items-center gap-2 border-b border-zinc-200 px-4 py-2 dark:border-zinc-800">
             <span class="flex-1 truncate font-semibold">{place.name.clone()}</span>
-            <button class="text-xs text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100" on:click=move |_| chat.details.set(false)>"✕"</button>
+            <button class="text-xs text-muted hover:text-zinc-900 dark:hover:text-zinc-100" on:click=move |_| chat.details.set(false)>"✕"</button>
         </header>
         <div class="flex gap-1 border-b border-zinc-200 px-2 dark:border-zinc-800">{t("about", "About")}{t("people", "People")}{t("files", "Files")}{t("links", "Links")}</div>
         <div class="space-y-3 p-4 text-sm">
@@ -309,7 +309,7 @@ pub(crate) fn Details(place: Place) -> impl IntoView {
                     let (w2, ch2) = (w1.clone(), c1.clone());
                     let (starred, muted) = (c["starred"] == true, c["muted"] == true);
                     let row = |k: &'static str, v: String| (!v.is_empty()).then(|| view! {
-                        <div><div class="text-[11px] font-semibold uppercase text-zinc-500">{k}</div><div class="whitespace-pre-wrap">{v}</div></div>
+                        <div><div class="text-[11px] font-semibold uppercase text-muted">{k}</div><div class="whitespace-pre-wrap">{v}</div></div>
                     });
                     view! {
                         {row("Topic", c["topic"].as_str().unwrap_or("").to_owned())}
@@ -336,7 +336,7 @@ pub(crate) fn Details(place: Place) -> impl IntoView {
                     seen.sort_by_key(|x| std::cmp::Reverse(x.2));
                     let ws = place.workspace.clone();
                     view! {
-                        <p class="text-xs text-zinc-500">"Who has written here lately"</p>
+                        <p class="text-xs text-muted">"Who has written here lately"</p>
                         {seen.into_iter().map(|(u, n, k)| {
                             let person = chat.person(&ws, &u);
                             let avatar = person.as_ref().and_then(|p| p["avatar"].as_str().map(str::to_owned));
@@ -344,8 +344,8 @@ pub(crate) fn Details(place: Place) -> impl IntoView {
                             view! {
                                 <div class="flex items-center gap-2">
                                     <Avatar url=avatar name=n.clone() size="h-7 w-7" />
-                                    <div class="min-w-0 flex-1"><div class="truncate">{n}</div><div class="truncate text-[11px] text-zinc-500">{title}</div></div>
-                                    <span class="text-[11px] text-zinc-500">{k.to_string()}</span>
+                                    <div class="min-w-0 flex-1"><div class="truncate">{n}</div><div class="truncate text-[11px] text-muted">{title}</div></div>
+                                    <span class="text-[11px] text-muted">{k.to_string()}</span>
                                 </div>
                             }
                         }).collect_view()}
@@ -382,7 +382,7 @@ fn shared(r: Result<Value, String>, files: bool) -> AnyView {
         }
     }
     if rows.is_empty() {
-        return view! { <p class="text-xs text-zinc-500">{if files { "No files shared yet." } else { "No links shared yet." }}</p> }
+        return view! { <p class="text-xs text-muted">{if files { "No files shared yet." } else { "No links shared yet." }}</p> }
             .into_any();
     }
     rows.into_iter()
@@ -390,7 +390,7 @@ fn shared(r: Result<Value, String>, files: bool) -> AnyView {
             view! {
                 <a href=href target="_blank" rel="noopener" class="block rounded-md px-2 py-1 hover:bg-zinc-100 dark:hover:bg-zinc-800">
                     <div class="truncate text-xs font-medium">{format!("{} {name}", if files { "📄" } else { "🔗" })}</div>
-                    <div class="text-[11px] text-zinc-500">{who}</div>
+                    <div class="text-[11px] text-muted">{who}</div>
                 </a>
             }
         })

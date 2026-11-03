@@ -29,12 +29,12 @@ pub fn Review(open: RwSignal<Option<String>>) -> impl IntoView {
     };
     view! {
         <section class="space-y-3">
-            <p class="text-sm text-zinc-500">"The memex never merges people or names faces on its own. Same names (an author on a paper and someone you write to, say) and new faces wait here for you."</p>
+            <p class="text-sm text-muted">"The memex never merges people or names faces on its own. Same names (an author on a paper and someone you write to, say) and new faces wait here for you."</p>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             <Suspense fallback=|| ()>
                 {move || list.get().map(|r| match r {
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
-                    Ok(v) if v.is_empty() => view! { <p class="text-sm text-zinc-500">"Nothing to review."</p> }.into_any(),
+                    Ok(v) if v.is_empty() => view! { <p class="text-sm text-muted">"Nothing to review."</p> }.into_any(),
                     Ok(v) => view! {
                         <ul class="divide-y divide-zinc-200 rounded-lg border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
                             {v.into_iter().map(|r| view! { <ReviewRow r open decide /> }).collect_view()}
@@ -57,7 +57,7 @@ fn ReviewRow(
         let key = t.id.clone();
         view! {
             <button class="font-medium hover:underline" on:click=move |_| open.set(Some(key.clone()))>{t.name.clone()}</button>
-            <span class="ml-1 font-mono text-[11px] text-zinc-500">{t.label.clone()}</span>
+            <span class="ml-1 font-mono text-[11px] text-muted">{t.label.clone()}</span>
         }
     };
     let name = RwSignal::new(String::new());
@@ -68,7 +68,7 @@ fn ReviewRow(
             <li class="flex flex-wrap items-center gap-3 px-3 py-2 text-sm">
                 {picture.map(|src| view! { <img src=src class="h-16 w-16 rounded-md object-cover" alt="a face" /> })}
                 <div class="min-w-0 flex-1 space-y-1">
-                    <p class="text-zinc-500">{r.reason.clone()}</p>
+                    <p class="text-muted">{r.reason.clone()}</p>
                     {guess.as_ref().map(|g| view! { <p>"Maybe: " {thing(g)}</p> })}
                     <input class=format!("{INPUT} py-1 text-sm") placeholder="Who is this? (a name)" prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev)) />
                 </div>
@@ -83,9 +83,9 @@ fn ReviewRow(
     view! {
         <li class="flex flex-wrap items-center gap-2 px-3 py-2 text-sm">
             <span>{thing(&r.a)}</span>
-            <span class="text-zinc-400">"and"</span>
+            <span class="text-muted">"and"</span>
             {b.as_ref().map(|b| view! { <span>{thing(b)}</span> })}
-            <span class="text-xs text-zinc-500">{format!("({})", r.reason)}</span>
+            <span class="text-xs text-muted">{format!("({})", r.reason)}</span>
             <span class="flex-1"></span>
             <button class=BUTTON on:click=move |_| decide(id, true, None)>"Same — merge"</button>
             <button class=BUTTON_QUIET on:click=move |_| decide(id, false, None)>"Different"</button>
@@ -114,7 +114,7 @@ pub fn Commitments(open: RwSignal<Option<String>>) -> impl IntoView {
     view! {
         <section class="space-y-3">
             <div class="flex items-center gap-2 text-sm">
-                <p class="flex-1 text-zinc-500">"Promises and requests in your mail and sessions, as the understanding model read them."</p>
+                <p class="flex-1 text-muted">"Promises and requests in your mail and sessions, as the understanding model read them."</p>
                 <select class=format!("{INPUT} w-auto py-1 text-sm") prop:value=move || status.get() on:change=move |ev| status.set(event_target_value(&ev))>
                     <option value="open">"Open"</option>
                     <option value="done">"Done"</option>
@@ -126,7 +126,7 @@ pub fn Commitments(open: RwSignal<Option<String>>) -> impl IntoView {
             <Suspense fallback=|| ()>
                 {move || list.get().map(|r| match r {
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
-                    Ok(v) if v.is_empty() => view! { <p class="text-sm text-zinc-500">"None. (Choose an understanding model in Settings → Memex to have mail and sessions read.)"</p> }.into_any(),
+                    Ok(v) if v.is_empty() => view! { <p class="text-sm text-muted">"None. (Choose an understanding model in Settings → Memex to have mail and sessions read.)"</p> }.into_any(),
                     Ok(v) => {
                         let now = crate::util::now_ms();
                         view! {
@@ -140,7 +140,7 @@ pub fn Commitments(open: RwSignal<Option<String>>) -> impl IntoView {
                                         <li class="flex flex-wrap items-center gap-2 px-3 py-2 text-sm">
                                             <span class=if c.who == "me" { "rounded bg-amber-100 px-1.5 text-[11px] text-amber-900 dark:bg-amber-950 dark:text-amber-200" } else { "rounded bg-zinc-100 px-1.5 text-[11px] dark:bg-zinc-800" }>{who}</span>
                                             <span class="min-w-0 flex-1">{c.what.clone()}</span>
-                                            {c.due.map(|d| view! { <span class=if late { "text-xs text-red-600" } else { "text-xs text-zinc-500" }>{format!("by {}", date(d))}</span> })}
+                                            {c.due.map(|d| view! { <span class=if late { "text-xs text-red-600" } else { "text-xs text-muted" }>{format!("by {}", date(d))}</span> })}
                                             <button class="max-w-48 truncate text-xs text-sky-700 hover:underline dark:text-sky-400" on:click=move |_| open.set(Some(item.clone()))>{c.item_title.clone()}</button>
                                             {(c.status == "open").then(|| view! {
                                                 <button class=BUTTON_QUIET on:click=move |_| set(id, "done")>"Done"</button>
@@ -216,7 +216,7 @@ pub fn ThingMore(key: String, open: RwSignal<Option<String>>) -> impl IntoView {
     view! {
         <div class="flex items-center gap-2">
             <button class=BUTTON_QUIET disabled=move || busy.get() on:click=summarize>{move || if busy.get() { "Summarizing…" } else { "Summarize what I know" }}</button>
-            <span class="text-xs text-zinc-500">"(saved as a note, marked as the model's)"</span>
+            <span class="text-xs text-muted">"(saved as a note, marked as the model's)"</span>
         </div>
         {move || summary.get().map(|r| match r {
             Ok(s) => view! { <div class="whitespace-pre-wrap rounded-md bg-amber-50 p-3 text-sm dark:bg-amber-950/40">{s}</div> }.into_any(),
@@ -264,7 +264,7 @@ fn timeline(v: Value) -> impl IntoView {
     let w = (all.len() as f64 * 6.0).max(120.0);
     view! {
         <div class="space-y-1">
-            <h3 class="text-xs font-medium uppercase text-zinc-500">{format!("Timeline · {} – {}", all[0].0, all[all.len() - 1].0)}</h3>
+            <h3 class="text-xs font-medium uppercase text-muted">{format!("Timeline · {} – {}", all[0].0, all[all.len() - 1].0)}</h3>
             <svg viewBox=format!("0 0 {w} 40") class="h-12 w-full" preserveAspectRatio="none">
                 {all.iter().enumerate().map(|(i, (m, n))| {
                     let h = (*n as f64 / max) * 38.0;
@@ -303,7 +303,7 @@ fn radial(g: MemexGraph, open: RwSignal<Option<String>>) -> impl IntoView {
     let center = g.center.name.clone();
     view! {
         <div class="space-y-1">
-            <h3 class="text-xs font-medium uppercase text-zinc-500">"Graph"</h3>
+            <h3 class="text-xs font-medium uppercase text-muted">"Graph"</h3>
             <svg viewBox="0 0 600 440" class="w-full rounded-md border border-zinc-200 dark:border-zinc-800">
                 {edges}
                 {g.nodes.iter().zip(&pos).map(|(node, (_, x, y))| view! {
@@ -326,7 +326,7 @@ fn radial(g: MemexGraph, open: RwSignal<Option<String>>) -> impl IntoView {
                 <circle cx=cx.to_string() cy=cy.to_string() r="12" class="fill-zinc-900 dark:fill-zinc-100" />
                 <text x=cx.to_string() y=(cy + 26.0).to_string() text-anchor="middle" class="fill-zinc-900 text-xs font-semibold dark:fill-zinc-100">{center}</text>
             </svg>
-            <p class="text-[11px] text-zinc-500">"Closer and larger: more items in common. Colour: person, org, topic, paper, place, event. Click to go there."</p>
+            <p class="text-[11px] text-muted">"Closer and larger: more items in common. Colour: person, org, topic, paper, place, event. Click to go there."</p>
         </div>
     }
 }

@@ -24,15 +24,18 @@ pub struct Caller {
     /// Your browser (a realm's page or the console), not a token: it may
     /// learn what waits in other realms (docs/realms-ux.md §6).
     pub browser: bool,
+    /// The console's assistant, acting in this realm with your approval
+    /// (docs/assistant.md §Realms): what it writes is the console's.
+    pub console: bool,
 }
 
 impl Caller {
     pub fn root() -> Self {
-        Self { realm: None, browser: false }
+        Self { realm: None, browser: false, console: false }
     }
 
     pub fn in_realm(realm: &str) -> Self {
-        Self { realm: Some(realm.to_owned()), browser: false }
+        Self { realm: Some(realm.to_owned()), browser: false, console: false }
     }
 
     /// Whose decisions and the like a caller lists: its realm's; the
@@ -148,6 +151,8 @@ pub async fn admit(st: &HeadState, caller: &Caller, method: &Method, path: &str)
         }
     };
     match segments.as_slice() {
+        // What you viewed lately is narrowed to the caller's realm itself.
+        ["sessions", "recent"] => Ok(()),
         ["sessions", id, ..] => owned("sessions", "session", (*id).to_owned()).await,
         ["decisions", id, ..] if *id != "count" => owned("decisions", "decision", (*id).to_owned()).await,
         ["memories", id, ..] => owned("memories", "note", (*id).to_owned()).await,

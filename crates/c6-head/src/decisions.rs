@@ -102,6 +102,7 @@ pub async fn open(st: &HeadState, d: &api::DecisionIn, realm: &str, reference: &
         .execute(&st.store.pool)
         .await?;
         st.registry.bump();
+        st.attention.changed();
         return get(st, id).await?.ok_or_else(|| anyhow::anyhow!("decision gone"));
     }
     let id: i64 = sqlx::query_scalar(
@@ -126,6 +127,7 @@ pub async fn open(st: &HeadState, d: &api::DecisionIn, realm: &str, reference: &
     .fetch_one(&st.store.pool)
     .await?;
     st.registry.bump();
+    st.attention.changed();
     let decision = get(st, id).await?.ok_or_else(|| anyhow::anyhow!("decision gone"))?;
     announce(st, &decision, reference).await;
     crate::triggers::on_decision(st, &decision, "opened").await;
@@ -243,6 +245,7 @@ pub async fn edit(st: &HeadState, id: i64, e: &api::DecisionEdit) -> anyhow::Res
         .execute(&st.store.pool)
         .await?;
     st.registry.bump();
+    st.attention.changed();
     Ok(d)
 }
 
@@ -300,6 +303,7 @@ async fn record(st: &HeadState, id: i64, state: &str, answer: &Value, note: &str
     .execute(&st.store.pool)
     .await?;
     st.registry.bump();
+    st.attention.changed();
     if let Ok(Some(d)) = get(st, id).await {
         crate::triggers::on_decision(st, &d, state).await;
     }
@@ -615,6 +619,17 @@ pub async fn sweep(st: &HeadState) {
             warn!(decision = id, "taking the default answer: {e:#}");
         }
         let _ = record(st, id, "expired", &json!({"option": option}), "", "its deadline").await;
+    }
+    // A snoozed one whose time came since the last sweep waits on you again
+    // (a little overlap: a ping too many is harmless, one missed isn't).
+    let woke: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM decisions WHERE state = 'snoozed' AND snooze_until > ? AND snooze_until <= ?")
+        .bind(now_ms() - 35_000)
+        .bind(now_ms())
+        .fetch_one(&st.store.pool)
+        .await
+        .unwrap_or(0);
+    if woke > 0 {
+        st.attention.changed();
     }
 }
 

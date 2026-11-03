@@ -95,7 +95,7 @@ pub fn MessagesView(view: ViewDef) -> impl IntoView {
                 view! {
                     <div class="grid gap-3 md:grid-cols-[minmax(0,2fr)_minmax(0,3fr)]">
                         <div class="divide-y divide-zinc-100 rounded-md border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
-                            {threads.is_empty().then(|| view! { <p class="p-3 text-sm text-zinc-500">"No messages."</p> })}
+                            {threads.is_empty().then(|| view! { <p class="p-3 text-sm text-muted">"No messages."</p> })}
                             {threads.iter().map(|(t, list)| {
                                 let newest = &list[0];
                                 let (t2, n) = (t.clone(), list.len());
@@ -105,7 +105,7 @@ pub fn MessagesView(view: ViewDef) -> impl IntoView {
                                         on:click=move |_| chosen.set(Some(t2.clone()))>
                                         <div class="flex justify-between gap-2">
                                             <span class="truncate font-medium">{newest.meta["from"].as_str().unwrap_or("").to_owned()}</span>
-                                            <span class="shrink-0 text-xs text-zinc-500">{when::compact(newest.created_at)}</span>
+                                            <span class="shrink-0 text-xs text-muted">{when::compact(newest.created_at)}</span>
                                         </div>
                                         <div class="truncate">{newest.title.clone()}{(n > 1).then(|| format!(" ({n})"))}</div>
                                     </button>
@@ -117,7 +117,7 @@ pub fn MessagesView(view: ViewDef) -> impl IntoView {
                         </div>
                         <div class="space-y-3">
                             {match open {
-                                None => view! { <p class="text-sm text-zinc-500">"Choose a thread."</p> }.into_any(),
+                                None => view! { <p class="text-sm text-muted">"Choose a thread."</p> }.into_any(),
                                 Some((_, mut list)) => {
                                     list.reverse();
                                     let last = list.last().map(|i| i.id.clone()).unwrap_or_default();
@@ -125,7 +125,7 @@ pub fn MessagesView(view: ViewDef) -> impl IntoView {
                                         <div class="flex flex-wrap gap-1"><ItemActions view=v item=last tick error /></div>
                                         {list.into_iter().map(|m| view! {
                                             <article class="rounded-md border border-zinc-200 p-3 text-sm dark:border-zinc-800">
-                                                <div class="flex justify-between gap-2 text-xs text-zinc-500">
+                                                <div class="flex justify-between gap-2 text-xs text-muted">
                                                     <span>{m.meta["from"].as_str().unwrap_or("").to_owned()}</span>
                                                     <span>{when::full(m.created_at)}</span>
                                                 </div>
@@ -169,7 +169,7 @@ pub fn CalendarView(view: ViewDef) -> impl IntoView {
             <button class=BUTTON_QUIET on:click=move |_| start.update(|s| *s -= 7.0 * DAY)>"←"</button>
             <button class=BUTTON_QUIET on:click=move |_| start.set(monday(js_sys::Date::now()))>"This week"</button>
             <button class=BUTTON_QUIET on:click=move |_| start.update(|s| *s += 7.0 * DAY)>"→"</button>
-            <span class="text-sm text-zinc-500">{move || format!("{} – {}", day_label(start.get()), day_label(start.get() + 6.0 * DAY))}</span>
+            <span class="text-sm text-muted">{move || format!("{} – {}", day_label(start.get()), day_label(start.get() + 6.0 * DAY))}</span>
         </div>
         {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
         {move || items.get().map(|r| match r {
@@ -183,7 +183,7 @@ pub fn CalendarView(view: ViewDef) -> impl IntoView {
                             let day: Vec<ViewItem> = all.iter().filter(|e| (e.created_at as f64) >= from && (e.created_at as f64) < to).cloned().collect();
                             view! {
                                 <div class="flex gap-3 px-3 py-2 text-sm">
-                                    <div class="w-28 shrink-0 text-zinc-500">{day_label(from)}</div>
+                                    <div class="w-28 shrink-0 text-muted">{day_label(from)}</div>
                                     <div class="min-w-0 flex-1 space-y-1">
                                         {day.into_iter().map(|e| {
                                             let time = if e.meta["all_day"].as_bool() == Some(true) {
@@ -196,9 +196,9 @@ pub fn CalendarView(view: ViewDef) -> impl IntoView {
                                             };
                                             view! {
                                                 <div class="flex flex-wrap items-center gap-2">
-                                                    <span class="w-24 shrink-0 text-xs text-zinc-500">{time}</span>
+                                                    <span class="w-24 shrink-0 text-xs text-muted">{time}</span>
                                                     <span class="font-medium">{e.title.clone()}</span>
-                                                    {e.meta["location"].as_str().map(|l| view! { <span class="text-xs text-zinc-500">{l.to_owned()}</span> })}
+                                                    {e.meta["location"].as_str().map(|l| view! { <span class="text-xs text-muted">{l.to_owned()}</span> })}
                                                     <ItemActions view=v item=e.id.clone() tick error />
                                                 </div>
                                             }
@@ -244,7 +244,7 @@ pub fn GalleryView(view: ViewDef) -> impl IntoView {
                     <img src=src class="max-h-[60vh] rounded" alt=i.title.clone() />
                     <figcaption class="text-sm">
                         <span class="font-medium">{i.title.clone()}</span>
-                        <span class="ml-2 text-xs text-zinc-500">{when::full(i.created_at)}</span>
+                        <span class="ml-2 text-xs text-muted">{when::full(i.created_at)}</span>
                         <p class="whitespace-pre-wrap text-zinc-600 dark:text-zinc-400">{i.text.clone()}</p>
                     </figcaption>
                     <div class="flex flex-wrap gap-1">
@@ -260,7 +260,7 @@ pub fn GalleryView(view: ViewDef) -> impl IntoView {
                 let oldest = all.last().map(|i| i.created_at);
                 let more = all.len() >= 100 * (pages.get().len() + 1);
                 view! {
-                    {all.is_empty().then(|| view! { <p class="text-sm text-zinc-500">"Nothing here yet."</p> })}
+                    {all.is_empty().then(|| view! { <p class="text-sm text-muted">"Nothing here yet."</p> })}
                     <div class="grid grid-cols-3 gap-2 sm:grid-cols-4 lg:grid-cols-6">
                         {all.into_iter().map(|i| {
                             let src = api::view_thumb(&name2, &i.id);

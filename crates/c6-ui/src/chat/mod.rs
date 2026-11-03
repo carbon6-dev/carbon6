@@ -221,8 +221,8 @@ pub(crate) fn ConvIcon(c: Value) -> impl IntoView {
             let n = c["channel_name"].as_str().unwrap_or("").split(", ").count();
             view! { <span class="flex h-4 w-4 shrink-0 items-center justify-center rounded bg-zinc-200 text-[9px] font-semibold dark:bg-zinc-800">{n.to_string()}</span> }.into_any()
         }
-        "private" => view! { <span class="w-4 shrink-0 text-center text-xs text-zinc-500">"🔒"</span> }.into_any(),
-        _ => view! { <span class="w-4 shrink-0 text-center text-zinc-500">"#"</span> }.into_any(),
+        "private" => view! { <span class="w-4 shrink-0 text-center text-xs text-muted">"🔒"</span> }.into_any(),
+        _ => view! { <span class="w-4 shrink-0 text-center text-muted">"#"</span> }.into_any(),
     }
 }
 
@@ -364,7 +364,7 @@ pub fn ChatPage() -> impl IntoView {
 fn Welcome() -> impl IntoView {
     let chat = Chat::get();
     view! {
-        <div class="m-auto max-w-md space-y-2 p-6 text-center text-zinc-500">
+        <div class="m-auto max-w-md space-y-2 p-6 text-center text-muted">
             {move || if chat.channels.with(Vec::is_empty) {
                 view! { <p>"Nothing yet. Connect a workspace in Settings → Slack; its conversations arrive as they're imported."</p> }.into_any()
             } else {
@@ -502,7 +502,7 @@ fn Sidebar() -> impl IntoView {
                 <span class="w-4 text-center">{icon}</span>
                 <span class=move || format!("flex-1 {}", if count.get() > 0 { "font-semibold" } else { "" })>{label}</span>
                 {move || (count.get() > 0).then(|| view! {
-                    <span class=if strong { "rounded-full bg-red-600 px-1.5 text-[10px] font-semibold text-white" } else { "text-[11px] text-zinc-500" }>{count.get().to_string()}</span>
+                    <span class=if strong { "rounded-full bg-red-600 px-1.5 text-[10px] font-semibold text-white" } else { "text-[11px] text-muted" }>{count.get().to_string()}</span>
                 })}
             </button>
         }
@@ -516,7 +516,7 @@ fn Sidebar() -> impl IntoView {
                         chat.workspaces().into_iter().find(|w| Some(&w.0) == ws.as_ref()).map(|w| w.1).unwrap_or_else(|| "Chat".into())
                     }}</span>
                     <button title="Show only unread conversations"
-                        class=move || format!("rounded px-1.5 text-[11px] {}", if unreads_only.get() { "bg-sky-700 text-white" } else { "text-zinc-500 hover:bg-zinc-200 dark:hover:bg-zinc-800" })
+                        class=move || format!("rounded px-1.5 text-[11px] {}", if unreads_only.get() { "bg-sky-700 text-white" } else { "text-muted hover:bg-zinc-200 dark:hover:bg-zinc-800" })
                         on:click=move |_| { let v = !unreads_only.get_untracked(); unreads_only.set(v); storage_set("c6.chat.unreads_only", if v { "1" } else { "0" }); }>
                         "Unreads only"
                     </button>
@@ -536,7 +536,7 @@ fn Sidebar() -> impl IntoView {
                 <input class="w-full rounded-md border border-zinc-200 bg-white px-2 py-1 text-xs dark:border-zinc-800 dark:bg-zinc-900" type="search"
                     placeholder="Filter conversations" prop:value=move || filter.get() on:input=move |ev| filter.set(event_target_value(&ev)) />
                 {move || grouped.get().into_iter().map(|(name, list)| view! { <Section name list prefs_tick /> }).collect_view()}
-                <button class="px-2 text-xs text-zinc-500 hover:underline" on:click=move |_| {
+                <button class="px-2 text-xs text-muted hover:underline" on:click=move |_| {
                     if let Some(w) = chat.shown_workspace()
                         && let Ok(Some(n)) = window().prompt_with_message("A new section's name")
                         && !n.trim().is_empty()
@@ -563,7 +563,7 @@ fn Section(name: String, list: Vec<Value>, prefs_tick: RwSignal<u32>) -> impl In
     let shown = if folded { unread_folded } else { list };
     view! {
         <div>
-            <div class="group flex items-center gap-1 px-1 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
+            <div class="group flex items-center gap-1 px-1 text-[11px] font-semibold uppercase tracking-wide text-muted">
                 <button class="flex flex-1 items-center gap-1 text-left hover:text-zinc-900 dark:hover:text-zinc-100" on:click=move |_| {
                     storage_set(&format!("c6.chat.fold.{n1}"), if folded { "0" } else { "1" });
                     prefs_tick.update(|t| *t += 1);
@@ -604,6 +604,12 @@ fn ConvRow(c: Value) -> impl IntoView {
     let mentions = c["mentions"].as_i64().unwrap_or(0);
     let muted = c["muted"] == true;
     let menu = RwSignal::new(false);
+    let pop = StoredValue::new(crate::util::dismissable(
+        move || menu.get(),
+        move || {
+            menu.try_set(false);
+        },
+    ));
     let status = c["user_status"].as_str().filter(|s| !s.is_empty()).map(str::to_owned);
     let name = label(&c);
     let icon = c.clone();
@@ -619,9 +625,10 @@ fn ConvRow(c: Value) -> impl IntoView {
                 {status.map(|s| view! { <span class="max-w-16 truncate text-[10px] opacity-70" title=s.clone()>{s.split(' ').next().map(text::face_of).unwrap_or_default()}</span> })}
                 {(mentions > 0).then(|| view! { <span class="rounded-full bg-red-600 px-1.5 text-[10px] font-semibold text-white">{mentions.to_string()}</span> })}
             </button>
-            <button class="absolute right-1 top-0.5 hidden rounded px-1 text-xs text-zinc-500 hover:bg-zinc-300 group-hover:block dark:hover:bg-zinc-700"
-                title="Options" on:click=move |_| menu.update(|m| *m = !*m)>"⋯"</button>
-            {move || menu.get().then(|| view! { <ConvMenu c=c.clone() close=menu /> })}
+            <button class="absolute right-1 top-0.5 hidden rounded px-1 text-xs text-muted hover:bg-zinc-300 group-hover:block dark:hover:bg-zinc-700"
+                title="Options" aria-haspopup="menu" aria-expanded=move || menu.get().to_string() data-pop=pop.get_value()
+                on:click=move |_| menu.update(|m| *m = !*m)>"⋯"</button>
+            {move || menu.get().then(|| view! { <div class="contents" data-pop=pop.get_value()><ConvMenu c=c.clone() close=menu /></div> })}
         </div>
     }
 }
@@ -657,7 +664,7 @@ fn ConvMenu(c: Value, close: RwSignal<bool>) -> impl IntoView {
                 view! { <button class=item on:click=move |_| { views::mark_all_read(chat, p.clone()); close.set(false); }>"Mark as read"</button> }
             })}
             <div class="my-1 border-t border-zinc-200 dark:border-zinc-700"></div>
-            <div class="px-3 py-0.5 text-[10px] uppercase text-zinc-500">"Move to"</div>
+            <div class="px-3 py-0.5 text-[10px] uppercase text-muted">"Move to"</div>
             {names.into_iter().filter(|n| *n != section).map(|n| {
                 let set = set.clone();
                 let label = n.clone();
@@ -760,18 +767,18 @@ fn ConversationPane(place: Place, at: Option<String>) -> impl IntoView {
                 let starred = c["starred"] == true;
                 let (w, ch) = (star.workspace.clone(), star.channel.clone());
                 view! {
-                    <button class="text-sm text-zinc-400 hover:text-amber-500" title=if starred { "Unstar" } else { "Star" }
+                    <button class="text-sm text-muted hover:text-amber-500" title=if starred { "Unstar" } else { "Star" }
                         on:click=move |_| chat.act("memex.chat.prefs", json!({"workspace": w, "channel": ch, "starred": !starred}))>
                         {if starred { "★" } else { "☆" }}
                     </button>
                     {(c["muted"] == true).then(|| view! { <span class="rounded bg-zinc-200 px-1 text-[10px] text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400">"muted"</span> })}
-                    <span class="min-w-0 flex-1 truncate text-xs text-zinc-500" title=c["topic"].as_str().unwrap_or("").to_owned()>{c["topic"].as_str().unwrap_or("").to_owned()}</span>
-                    {c["members"].as_i64().map(|n| view! { <span class="text-xs text-zinc-500" title="Members">{format!("👤 {n}")}</span> })}
-                    {c["user_status"].as_str().filter(|s| !s.is_empty()).map(|s| view! { <span class="text-xs text-zinc-500">{text::status(s)}</span> })}
+                    <span class="min-w-0 flex-1 truncate text-xs text-muted" title=c["topic"].as_str().unwrap_or("").to_owned()>{c["topic"].as_str().unwrap_or("").to_owned()}</span>
+                    {c["members"].as_i64().map(|n| view! { <span class="text-xs text-muted" title="Members">{format!("👤 {n}")}</span> })}
+                    {c["user_status"].as_str().filter(|s| !s.is_empty()).map(|s| view! { <span class="text-xs text-muted">{text::status(s)}</span> })}
                 }
             })}
             <span class="flex-1"></span>
-            <button class=move || format!("rounded px-2 py-0.5 text-xs {}", if chat.details.get() { "bg-zinc-200 dark:bg-zinc-800" } else { "text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800" })
+            <button class=move || format!("rounded px-2 py-0.5 text-xs {}", if chat.details.get() { "bg-zinc-200 dark:bg-zinc-800" } else { "text-muted hover:bg-zinc-100 dark:hover:bg-zinc-800" })
                 title="Details" on:click=move |_| { chat.thread.set(None); chat.details.update(|d| *d = !*d); }>"ⓘ Details"</button>
         </header>
         <MessageList place=place.clone() at />
@@ -809,8 +816,8 @@ fn ThreadPane(place: Place, thread_ts: String) -> impl IntoView {
     view! {
         <header class="flex items-center gap-2 border-b border-zinc-200 px-4 py-2 dark:border-zinc-800">
             <span class="font-semibold">"Thread"</span>
-            <span class="flex-1 truncate text-xs text-zinc-500">{name}</span>
-            <button class="text-xs text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100" title="Close (Esc)" on:click=move |_| chat.thread.set(None)>"✕"</button>
+            <span class="flex-1 truncate text-xs text-muted">{name}</span>
+            <button class="text-xs text-muted hover:text-zinc-900 dark:hover:text-zinc-100" title="Close (Esc)" on:click=move |_| chat.thread.set(None)>"✕"</button>
         </header>
         <div class="min-h-0 flex-1 overflow-y-auto py-2">
             {move || messages.get().map(|r| match r {
@@ -826,7 +833,7 @@ fn ThreadPane(place: Place, thread_ts: String) -> impl IntoView {
                         view! {
                             <message::Message m place=place.clone() compact in_thread=true />
                             {(i == 0 && n > 0).then(|| view! {
-                                <div class="mx-4 my-1 flex items-center gap-2 text-[11px] text-zinc-500">
+                                <div class="mx-4 my-1 flex items-center gap-2 text-[11px] text-muted">
                                     <span>{format!("{n} repl{}", if n == 1 { "y" } else { "ies" })}</span>
                                     <span class="h-px flex-1 bg-zinc-200 dark:bg-zinc-800"></span>
                                 </div>

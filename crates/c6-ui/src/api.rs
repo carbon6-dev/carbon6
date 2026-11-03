@@ -27,6 +27,8 @@ pub struct LiveFeed {
     pub doc: ReadSignal<Option<c6_api::docs::DocChange>>,
     /// Every mark given to an aspect's value (docs/marks.md).
     pub marks: ReadSignal<c6_api::marks::Marks>,
+    /// Bumped when what needs you may have changed (read it again).
+    pub attention: ReadSignal<u32>,
 }
 
 impl LiveFeed {
@@ -36,6 +38,7 @@ impl LiveFeed {
         let (connected, set_connected) = signal(false);
         let (doc, set_doc) = signal(None);
         let (marks, set_marks) = signal(c6_api::marks::Marks::new());
+        let (attention, set_attention) = signal(0u32);
         spawn_local(async move {
             let mut backoff = 500;
             loop {
@@ -51,6 +54,7 @@ impl LiveFeed {
                                     LiveEvent::Workers { workers } => set_workers.set(workers),
                                     LiveEvent::Sessions { sessions } => set_sessions.set(sessions),
                                     LiveEvent::Doc { change } => set_doc.set(Some(change)),
+                                    LiveEvent::Attention => set_attention.update(|n| *n = n.wrapping_add(1)),
                                     // Sent with every snapshot: only a change wakes what wears them.
                                     LiveEvent::Marks { marks: given } => {
                                         if marks.with_untracked(|m| *m != given) {
@@ -68,13 +72,24 @@ impl LiveFeed {
                 backoff = (backoff * 2).min(10_000);
             }
         });
-        Self { workers, sessions, connected, doc, marks }
+        Self { workers, sessions, connected, doc, marks, attention }
     }
 
     pub fn worker_name(&self, id: &str) -> String {
         self.workers.with(|ws| ws.iter().find(|w| w.id.to_string() == id).map(|w| w.name.clone()).unwrap_or_else(|| "unknown".into()))
     }
+
+    /// Where a session runs: its worker's name, or "head" for the sessions
+    /// the head runs itself (the assistant, Ask), which have no worker.
+    pub fn session_worker(&self, s: &c6_api::Session) -> String {
+        if s.on_head { HEAD.into() } else { self.worker_name(&s.worker_id.to_string()) }
+    }
 }
+
+/// Where a session the head runs itself is, in place of a worker's name.
+pub const HEAD: &str = "head";
+/// Its hover: what running in the head means.
+pub const HEAD_TITLE: &str = "Runs in carbon6's head, not on a worker: carbon6's own tools only, no shell or files";
 
 pub fn live() -> LiveFeed {
     expect_context::<LiveFeed>()
@@ -164,6 +179,17 @@ pub async fn locate_session(id: &str) -> Result<String, String> {
 /// What waits on you in each realm (for the switcher).
 pub async fn elsewhere() -> Result<Vec<c6_api::RealmWaiting>, String> {
     json(Request::get("/api/v1/elsewhere").send().await).await
+}
+
+/// What needs you here, and how many wait in each other realm.
+pub async fn attention() -> Result<c6_api::Attention, String> {
+    json(Request::get("/api/v1/attention").send().await).await
+}
+
+/// You've seen these worth-a-look items (none: all of them).
+pub async fn attention_seen(keys: Vec<String>) -> Result<(), String> {
+    let body = c6_api::AttentionSeen { keys };
+    empty(Request::post("/api/v1/attention/seen").json(&body).map_err(|e| e.to_string())?.send().await).await
 }
 
 thread_local! {
@@ -500,17 +526,19 @@ pub async fn send_message(
     switch: Option<(String, String, String)>,
     attachments: Vec<c6_api::AttachmentUpload>,
 ) -> Result<QueuedInput, String> {
-    send_message_waking(id, text, switch, attachments, false).await
+    send_message_waking(id, text, switch, attachments, false, false).await
 }
 
 /// `wake`: to a subagent, start a turn in its idle parent when its report
-/// comes.
+/// comes. `send_now`: while the agent works, it gets it at once rather than
+/// at its next step (docs/background.md §4).
 pub async fn send_message_waking(
     id: String,
     text: String,
     switch: Option<(String, String, String)>,
     attachments: Vec<c6_api::AttachmentUpload>,
     wake: bool,
+    send_now: bool,
 ) -> Result<QueuedInput, String> {
     let (connection_id, model, effort) = match switch {
         Some((c, m, e)) => (Some(c), Some(m), Some(e).filter(|e| !e.is_empty())),
@@ -518,7 +546,7 @@ pub async fn send_message_waking(
     };
     send_json(
         Request::post(&format!("/api/v1/sessions/{id}/messages")),
-        &SendMessage { text, attachments, connection_id, model, effort, wake },
+        &SendMessage { text, attachments, connection_id, model, effort, wake, send_now },
     )
     .await
 }
@@ -530,6 +558,11 @@ pub async fn resume(id: String, wake: bool) -> Result<QueuedInput, String> {
 
 pub async fn interrupt(id: String) -> Result<(), String> {
     empty(Request::post(&format!("/api/v1/sessions/{id}/interrupt")).send().await).await
+}
+
+/// Send now for a message already with the agent: it gets it at once.
+pub async fn send_queued_now(id: String, command_id: String) -> Result<(), String> {
+    empty(Request::post(&format!("/api/v1/sessions/{id}/queue/{command_id}/now")).send().await).await
 }
 
 pub async fn archive(id: String) -> Result<(), String> {
@@ -551,6 +584,11 @@ pub async fn rename(id: String, title: String) -> Result<(), String> {
         title: String,
     }
     empty(Request::patch(&format!("/api/v1/sessions/{id}")).json(&Body { title }).map_err(|e| e.to_string())?.send().await).await
+}
+
+/// A name for a session from how it started, to start from (docs/suggestions.md §7).
+pub async fn suggest_name(id: String) -> Result<String, String> {
+    json::<c6_api::SuggestedName>(Request::get(&format!("/api/v1/sessions/{id}/name/suggestion")).send().await).await.map(|n| n.title)
 }
 
 pub async fn dismiss_rejected(id: String) -> Result<(), String> {
@@ -631,6 +669,12 @@ pub async fn descendants(id: String) -> Result<Vec<Session>, String> {
 
 pub async fn get_setting(name: &'static str) -> Result<serde_json::Value, String> {
     json(Request::get(&format!("/api/v1/settings/{name}{}", in_realm('?'))).send().await).await
+}
+
+/// A settings list's own entries in `realm` (the console, choosing which
+/// realm's rules it edits; "root": the defaults every realm inherits).
+pub async fn get_setting_in(name: &'static str, realm: String) -> Result<serde_json::Value, String> {
+    json(Request::get(&format!("/api/v1/settings/{name}?realm={}", enc(&realm))).send().await).await
 }
 
 pub async fn analytics(days: u32, labels: Vec<String>, by: String) -> Result<c6_api::AnalyticsReport, String> {
@@ -908,6 +952,12 @@ pub async fn test_channel(name: String) -> Result<(), String> {
 
 pub async fn put_setting(name: &'static str, value: serde_json::Value) -> Result<(), String> {
     empty(Request::put(&format!("/api/v1/settings/{name}{}", in_realm('?'))).json(&value).map_err(|e| e.to_string())?.send().await).await
+}
+
+/// Replaces a settings list's own entries in `realm` (see `get_setting_in`).
+pub async fn put_setting_in(name: &'static str, realm: String, value: serde_json::Value) -> Result<(), String> {
+    let url = format!("/api/v1/settings/{name}?realm={}", enc(&realm));
+    empty(Request::put(&url).json(&value).map_err(|e| e.to_string())?.send().await).await
 }
 
 pub async fn fs_mkdir(worker: String, path: String) -> Result<serde_json::Value, String> {
@@ -1210,6 +1260,35 @@ pub async fn set_suggestion_settings(s: c6_api::SuggestionSettings) -> Result<()
     empty(Request::put(&format!("/api/v1/settings/suggestions{}", in_realm('?'))).json(&s).map_err(|e| e.to_string())?.send().await).await
 }
 
+/// Whether a session shows a catch-up card, and folds its finished turns.
+pub async fn session_view(id: String) -> Result<c6_api::SessionViewSettings, String> {
+    json(Request::get(&format!("/api/v1/sessions/{id}/view")).send().await).await
+}
+
+pub async fn set_session_view(id: String, v: c6_api::SessionViewSettings) -> Result<(), String> {
+    empty(Request::put(&format!("/api/v1/sessions/{id}/view")).json(&v).map_err(|e| e.to_string())?.send().await).await
+}
+
+/// What a session did since you last looked (or since event `since`;
+/// `looked_at`: when this page last had it on screen), with the paragraph
+/// if `summary`; None while its catch-up is off.
+pub async fn catchup(id: String, since: Option<u64>, looked_at: Option<i64>, summary: bool) -> Result<Option<c6_api::Catchup>, String> {
+    let since = since.map(|s| format!("&since={s}")).unwrap_or_default();
+    let looked = looked_at.map(|t| format!("&looked_at={t}")).unwrap_or_default();
+    let resp = check(Request::get(&format!("/api/v1/sessions/{id}/catchup?summary={summary}{since}{looked}")).send().await).await?;
+    if resp.status() == 204 {
+        return Ok(None);
+    }
+    resp.json().await.map(Some).map_err(|e| e.to_string())
+}
+
+/// A session's turns (`hour`: those of the hour from then, with their
+/// lines).
+pub async fn timeline(id: String, hour: Option<i64>) -> Result<Vec<c6_api::TimelineTurn>, String> {
+    let hour = hour.map(|h| format!("?hour={h}")).unwrap_or_default();
+    json(Request::get(&format!("/api/v1/sessions/{id}/timeline{hour}")).send().await).await
+}
+
 /// A suggestion was shown, or (`accepted`) taken.
 pub async fn suggestion_seen(id: String, for_seq: i64, accepted: bool) {
     let body = c6_api::SuggestionSeen { for_seq, accepted };
@@ -1222,6 +1301,16 @@ pub async fn suggestion_seen(id: String, for_seq: i64, accepted: bool) {
 /// making its work need you.
 pub async fn session_seen(id: String) {
     let _ = empty(Request::post(&format!("/api/v1/sessions/{id}/seen")).send().await).await;
+}
+
+/// You viewed a session: it goes first in recently viewed, on every device.
+pub async fn session_viewed(id: String) -> bool {
+    empty(Request::post(&format!("/api/v1/sessions/{id}/viewed")).send().await).await.is_ok()
+}
+
+/// The sessions you viewed lately in this realm, newest first.
+pub async fn recent_sessions() -> Result<Vec<c6_api::RecentView>, String> {
+    json(Request::get("/api/v1/sessions/recent").send().await).await
 }
 
 /// A session's open decisions (not its approvals and questions: those are in its log).
@@ -1614,6 +1703,24 @@ pub async fn doc_thread_new(id: String, t: &c6_api::docs::ThreadNew) -> Result<c
 
 pub async fn doc_thread_reply(id: String, thread: String, c: &c6_api::docs::CommentNew) -> Result<c6_api::docs::DocThread, String> {
     send_json(Request::post(&format!("/api/v1/docs/{}/threads/{}/comments", enc(&id), enc(&thread))), c).await
+}
+
+/// Your comment's new text (while no agent has received it).
+pub async fn doc_comment_edit(id: String, thread: String, comment: String, text: String) -> Result<c6_api::docs::DocThread, String> {
+    let url = format!("/api/v1/docs/{}/threads/{}/comments/{}", enc(&id), enc(&thread), enc(&comment));
+    send_json(Request::patch(&url), &c6_api::docs::CommentEdit { text }).await
+}
+
+/// Deletes your comment (while no agent has received it); a thread's only
+/// comment takes the thread with it.
+pub async fn doc_comment_delete(id: String, thread: String, comment: String) -> Result<(), String> {
+    empty(Request::delete(&format!("/api/v1/docs/{}/threads/{}/comments/{}", enc(&id), enc(&thread), enc(&comment))).send().await).await
+}
+
+/// Sends comment threads to an agent together (`threads` empty: all your
+/// open ones not sent yet).
+pub async fn doc_threads_send(id: String, threads: Vec<String>) -> Result<Vec<c6_api::docs::DocThread>, String> {
+    send_json(Request::post(&format!("/api/v1/docs/{}/threads/send", enc(&id))), &c6_api::docs::ThreadsSend { threads }).await
 }
 
 pub async fn doc_thread_resolve(id: String, thread: String) -> Result<c6_api::docs::DocThread, String> {

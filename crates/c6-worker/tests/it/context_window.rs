@@ -203,7 +203,7 @@ async fn detected_ollama_window_is_recorded_and_triggers_compaction() {
         })
         .collect();
     assert_eq!(windows, [16_384, 16_384]);
-    let requests = requests.lock().unwrap().clone();
+    let requests = own(&requests);
     assert_eq!(requests.len(), 3);
     assert!(requests[1]["messages"].to_string().contains("context window is nearly full"));
     assert!(requests[2]["messages"].to_string().contains("SUMMARY"));
@@ -285,6 +285,12 @@ async fn settings_reach_assistant_turns_subagents_and_model_switches() {
     assert!(events.iter().any(|e| matches!(e.kind, EventKind::TurnStarted { turn: 2, context_window: 16_384 })));
     stop.cancel();
     head.shutdown().await.unwrap();
+}
+
+/// The session's own calls, without the head's that names it once its
+/// "hi" has had a second turn (docs/suggestions.md §7).
+fn own(requests: &Mutex<Vec<Value>>) -> Vec<Value> {
+    requests.lock().unwrap().iter().filter(|r| !r["messages"].to_string().contains(c6_testkit::NAMING)).cloned().collect()
 }
 
 /// A server reporting `first` prompt tokens on its first call and few after,
@@ -373,7 +379,7 @@ async fn connection_session_defaults_validate_and_reach_sessions() {
     );
     let events = ended(&http, &api, &s.id, 2).await;
     assert!(events.iter().any(|e| matches!(&e.kind, EventKind::Compaction { summary, .. } if summary == "SUMMARY")));
-    assert_eq!(requests.lock().unwrap().len(), 3);
+    assert_eq!(own(&requests).len(), 3);
     // Cleared: the session's own model, and the default point.
     let c: Connection = http.patch(&path).json(&json!({"compact_at": 0, "subagent_model": ""})).send().await.unwrap().json().await.unwrap();
     assert_eq!((c.subagent_model.as_deref(), c.compact_at), (None, None));

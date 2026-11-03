@@ -170,6 +170,8 @@ pub(crate) enum ActorMsg {
     /// what is needed to pick the variant of a custom command it invokes.
     Input(Box<PendingInput>, Option<ModelSpec>, Box<CommandChoice>),
     Interrupt,
+    /// Send now for an input already with the agent (its command id).
+    SendNow(String),
     /// A background task started or ended.
     Task(c6_tools::TaskEvent),
     /// A background task that was running when the worker restarted.
@@ -464,6 +466,7 @@ impl SessionManager {
                     from_session_id: input.from_session_id,
                     from_title: input.from_title,
                     hops: input.hops,
+                    send_now: input.send_now,
                     ..Default::default()
                 };
                 let choice =
@@ -498,9 +501,9 @@ impl SessionManager {
                 let _ = actor.send(ActorMsg::Rewind { command_id: cmd.command_id, to_seq: r.to_seq, restore_files: r.restore_files });
                 Ok(())
             }
-            Some(session_command::Kind::Interrupt(_)) => {
+            Some(session_command::Kind::Interrupt(i)) => {
                 if let Some(a) = self.live(&cmd.session_id) {
-                    let _ = a.send(ActorMsg::Interrupt);
+                    let _ = a.send(if i.send_now.is_empty() { ActorMsg::Interrupt } else { ActorMsg::SendNow(i.send_now) });
                 }
                 Ok(())
             }
@@ -884,12 +887,7 @@ impl SessionManager {
         // A subagent's secrets and head calls go by its tree's top-level
         // session (its row always exists on the head).
         let on_behalf_of = delegation.as_ref().map_or(session_id, |d| d.root_session_id.as_str()).to_owned();
-        let writer = Arc::new(Writer {
-            session_id: session_id.to_owned(),
-            journal: self.journal.clone(),
-            link: self.link.clone(),
-            next_seq: tokio::sync::Mutex::new(next_seq),
-        });
+        let writer = Arc::new(Writer::new(session_id.to_owned(), self.journal.clone(), self.link.clone(), next_seq));
         // On an SSH target, what runs on the worker (hooks, MCP servers)
         // runs in a local folder of the session's.
         let remote = !started.ssh_target.is_empty();
@@ -1049,6 +1047,8 @@ impl SessionManager {
             claude: None,
             claude_stdin: Arc::default(),
             handoff_announced: false,
+            stopping: false,
+            stopped_until: None,
         };
         let handle =
             Handle { tx, tools: actor.session_tools.clone(), running: actor.running_flag.clone(), claude_code, inbox: actor.inbox.clone() };
@@ -1352,6 +1352,9 @@ struct Inbox {
     /// Told when an input is queued (a running Claude Code turn writes it
     /// to its process).
     more: Arc<tokio::sync::Notify>,
+    /// Inputs already with the agent to deliver now (Send now), by command
+    /// id: for a running Claude Code turn.
+    now: Vec<String>,
 }
 
 impl Inbox {
@@ -1360,6 +1363,18 @@ impl Inbox {
             self.queue.push_back((input, model));
             self.more.notify_one();
         }
+    }
+
+    /// Send now for an input already with the agent.
+    fn send_now(&mut self, command_id: String) {
+        self.now.push(command_id);
+        self.more.notify_one();
+    }
+
+    /// What joins a running Claude Code turn: the inputs that may (`join`),
+    /// and those with it already to deliver now.
+    fn joining(&mut self) -> crate::claude_code::Joining {
+        crate::claude_code::Joining { inputs: self.join(), now: std::mem::take(&mut self.now) }
     }
 
     /// Inputs a process never took, first again.
@@ -1463,6 +1478,12 @@ struct Actor {
     claude_stdin: crate::claude_code::Stdin,
     /// The log says a switch away from Claude Code waits for its tasks.
     handoff_announced: bool,
+    /// You stopped the running Claude Code turn, and until when after it
+    /// ended its tasks lost with it are the stop's doing: their notices
+    /// wait for your next message instead of waking the agent
+    /// (docs/background.md §4, Stopping).
+    stopping: bool,
+    stopped_until: Option<std::time::Instant>,
 }
 
 /// A subagent's parent's tools, and whether the parent runs Claude Code.
@@ -1595,6 +1616,14 @@ impl Actor {
                         }
                         let held = std::mem::take(&mut self.deferred);
                         let command_id = input.command_id.clone();
+                        // Send now in carbon6's own loop: the turn stops (it takes
+                        // no input once stopping), and this starts the next. A
+                        // Claude Code turn delivers it at once when it writes it
+                        // (`Process::turn`).
+                        let stops = input.send_now && !self.runs_claude_code();
+                        if stops && let Some((_, cancel)) = &running {
+                            cancel.cancel();
+                        }
                         {
                             let mut inbox = self.inbox.lock().unwrap();
                             for (n, _) in held {
@@ -1605,7 +1634,7 @@ impl Actor {
                         // A running turn of carbon6's own loop takes it at its next
                         // step: it is with the agent. (A Claude Code turn says so
                         // when it writes it to its process.)
-                        if running.is_some() && !self.runs_claude_code() {
+                        if running.is_some() && !self.runs_claude_code() && !stops {
                             let delivered = c6_proto::InputDelivered { command_id };
                             if let Err(e) = self.writer.append(session_event::Kind::InputDelivered(delivered)).await {
                                 error!(session = %self.writer.session_id, "recording a delivered input: {e:#}");
@@ -1614,7 +1643,20 @@ impl Actor {
                         }
                     }
                     Some(ActorMsg::Interrupt) => {
-                        if let Some((_, cancel)) = &running { cancel.cancel(); }
+                        if let Some((_, cancel)) = &running {
+                            cancel.cancel();
+                            self.stopping |= self.runs_claude_code();
+                        }
+                    }
+                    Some(ActorMsg::SendNow(command_id)) => {
+                        if running.is_some() && self.runs_claude_code() {
+                            // The running turn asks its process to deliver it now.
+                            self.inbox.lock().unwrap().send_now(command_id);
+                        } else if let Some((_, cancel)) = &running {
+                            // carbon6's own loop: the turn stops, and the agent
+                            // takes it as its next turn.
+                            cancel.cancel();
+                        }
                     }
                     Some(ActorMsg::Delegate(input, done)) => {
                         match done {
@@ -1688,6 +1730,8 @@ impl Actor {
                             elapsed_ms: ev.elapsed.as_millis() as u64,
                             notify: ev.notify,
                             pgid: ev.pgid.unwrap_or(0),
+                            native_type: ev.native_type.clone(),
+                            foreground: ev.foreground,
                         };
                         // The agent stopped it itself: nothing to tell it. Claude
                         // Code tells its agent about its own tasks, except one
@@ -1695,7 +1739,11 @@ impl Actor {
                         let lost_native = ev.kind == c6_tools::TaskKind::ClaudeCode && ev.state == c6_tools::TaskState::Lost;
                         let notice = ((ev.notify || lost_native) && !matches!(ev.state, c6_tools::TaskState::Started | c6_tools::TaskState::Stopped))
                             .then(|| task_notice(&record, &ev.output));
-                        if let Err(e) = self.task_event(record, notice, running.is_some()).await {
+                        // Lost because you stopped the turn (Claude Code didn't
+                        // stop, so its process was): the agent hears it with
+                        // your next message, and isn't woken for it.
+                        let held = lost_native && self.after_stop(running.is_some());
+                        if let Err(e) = self.task_event(record, notice, running.is_some() && !held, !held).await {
                             error!(session = %self.writer.session_id, "recording a background task: {e:#}");
                             return;
                         }
@@ -1719,7 +1767,7 @@ impl Actor {
                         let tell = notify || kind == "claude_code";
                         let record = BackgroundTask { task_id, kind, description, state: "lost".into(), notify, ..Default::default() };
                         let notice = tell.then(|| task_notice(&record, &report));
-                        if let Err(e) = self.task_event(record, notice, running.is_some()).await {
+                        if let Err(e) = self.task_event(record, notice, running.is_some(), true).await {
                             error!(session = %self.writer.session_id, "recording a lost background task: {e:#}");
                             return;
                         }
@@ -1844,6 +1892,14 @@ impl Actor {
                         Ok(Some((conv, claude))) => {
                             self.conv = Some(conv);
                             self.claude = claude;
+                            if std::mem::take(&mut self.stopping) {
+                                self.stopped_until = Some(std::time::Instant::now() + crate::claude_code::STOP_QUIET);
+                            }
+                            // A turn Claude Code started right after your stop,
+                            // stopped before it showed anything: not a turn.
+                            if self.claude.as_mut().is_some_and(|p| p.take_unshown()) {
+                                self.turns -= 1;
+                            }
                             if let Err(e) = self.settle_delegations().await {
                                 error!(session = %self.writer.session_id, "reading a delegation's outcome: {e:#}");
                             }
@@ -2062,12 +2118,18 @@ impl Actor {
     /// Logs a background task's start or end and, for an end the agent
     /// should hear about, queues the notice (`notice`). Its id names the
     /// task and how it ended, so the same end is never told twice.
-    async fn task_event(&mut self, record: BackgroundTask, notice: Option<String>, busy: bool) -> anyhow::Result<()> {
+    async fn task_event(&mut self, record: BackgroundTask, notice: Option<String>, busy: bool, wake: bool) -> anyhow::Result<()> {
         let command_id = format!("task:{}:{}", record.task_id, record.state);
         self.writer.append(session_event::Kind::BackgroundTask(record)).await?;
         let Some(text) = notice else { return Ok(()) };
         let input = PendingInput { command_id, text, command: "task-notification".into(), ..Default::default() };
-        self.notice(input, busy, true).await
+        self.notice(input, busy, wake).await
+    }
+
+    /// You stopped its Claude Code turn just now, or are stopping the one
+    /// `running`: what Claude Code loses meanwhile is the stop's doing.
+    fn after_stop(&self, running: bool) -> bool {
+        (running && self.stopping) || self.stopped_until.is_some_and(|t| std::time::Instant::now() < t)
     }
 
     /// Rewinds the conversation to before event `to_seq`, restoring files
@@ -2518,7 +2580,7 @@ async fn claude_turn(
         return Ok(None);
     }
     let more = inbox.lock().unwrap().more.clone();
-    let feed = || inbox.lock().unwrap().join();
+    let feed = || inbox.lock().unwrap().joining();
     let failed = async |message: String| -> anyhow::Result<Option<Process>> {
         for input in &inputs {
             sink.append(input.event()).await?;
@@ -3190,6 +3252,22 @@ pub(crate) struct Writer {
     pub journal: Arc<Journal>,
     pub link: Arc<HeadLink>,
     pub next_seq: tokio::sync::Mutex<u64>,
+    /// `next_seq` as of the last append, read without waiting on one: what
+    /// streamed text is stamped with.
+    logged: std::sync::atomic::AtomicU64,
+}
+
+impl Writer {
+    /// A writer whose next event is `next_seq`.
+    pub fn new(session_id: String, journal: Arc<Journal>, link: Arc<HeadLink>, next_seq: u64) -> Self {
+        Writer {
+            session_id,
+            journal,
+            link,
+            next_seq: tokio::sync::Mutex::new(next_seq),
+            logged: std::sync::atomic::AtomicU64::new(next_seq),
+        }
+    }
 }
 
 #[async_trait]
@@ -3201,10 +3279,16 @@ impl EventSink for Writer {
         let ev = SessionEvent { seq: *next, ts_ms: c6_core::now_ms(), kind: Some(kind) };
         self.journal.append(&self.session_id, &ev).await?;
         *next += 1;
+        self.logged.store(*next, std::sync::atomic::Ordering::SeqCst);
         Ok(ev.seq)
     }
 
-    fn ephemeral(&self, kind: ephemeral_event::Kind) {
+    fn ephemeral(&self, mut kind: ephemeral_event::Kind) {
+        // Where the log is: its next reply has this text, so a viewer that
+        // got that reply first (catching up) knows to drop it.
+        if let ephemeral_event::Kind::Text(d) | ephemeral_event::Kind::Thinking(d) = &mut kind {
+            d.seq = self.logged.load(std::sync::atomic::Ordering::SeqCst);
+        }
         self.link.ephemeral(EphemeralEvent { session_id: self.session_id.clone(), kind: Some(kind) });
     }
 }
@@ -4179,6 +4263,41 @@ mod handoff_tests {
         assert!(!t.iter().any(|b| b.starts_with("thinking:")), "{t:?}");
         assert_eq!(conv.context_tokens, 90_000);
         assert_eq!(runtime_of(SessionStarted { tool_profile: "generic".into(), ..Default::default() }, &events).tool_profile, "generic");
+    }
+}
+
+#[cfg(test)]
+mod writer_tests {
+    use c6_proto::{AssistantMessage, TextDelta, WorkerMsg, worker_msg};
+
+    use super::*;
+
+    /// Streamed text says where the log was: a viewer that catches up gets
+    /// the reply from the log before the text it streamed, and drops that
+    /// text by this instead of drawing the reply twice.
+    #[tokio::test]
+    async fn streamed_text_says_where_the_log_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(&dir.path().join("journal.db")).await.unwrap());
+        let started = SessionEvent { seq: 1, ts_ms: 0, kind: Some(session_event::Kind::Started(SessionStarted::default())) };
+        journal.create_session("s", &CreateSession::default(), &started).await.unwrap();
+        let link = Arc::new(HeadLink::default());
+        let (tx, mut rx) = mpsc::channel(8);
+        link.connected(tx);
+        let writer = Writer::new("s".into(), journal, link.clone(), 2);
+        let text = |t: &str| ephemeral_event::Kind::Text(TextDelta { turn: 1, text: t.into(), ..Default::default() });
+        writer.ephemeral(text("Hel"));
+        writer.ephemeral(text("lo"));
+        let reply = AssistantMessage { turn: 1, ..Default::default() };
+        assert_eq!(writer.append(session_event::Kind::Assistant(reply)).await.unwrap(), 2);
+        writer.ephemeral(text("Next"));
+        link.flush_ephemeral();
+        let mut sent = Vec::new();
+        while let Ok(WorkerMsg { msg: Some(worker_msg::Msg::Ephemeral(ev)) }) = rx.try_recv() {
+            let Some(ephemeral_event::Kind::Text(d)) = ev.kind else { panic!("not text") };
+            sent.push((d.text, d.seq));
+        }
+        assert_eq!(sent, [("Hello".to_owned(), 2), ("Next".to_owned(), 3)]);
     }
 }
 

@@ -262,12 +262,16 @@ impl Turn<'_> {
                 Some(Ok(ev)) => {
                     if live {
                         match &ev {
-                            ModelEvent::TextDelta(t) => {
-                                self.sink.ephemeral(ephemeral_event::Kind::Text(TextDelta { turn: self.turn, text: t.clone() }))
-                            }
-                            ModelEvent::ThinkingDelta(t) => {
-                                self.sink.ephemeral(ephemeral_event::Kind::Thinking(TextDelta { turn: self.turn, text: t.clone() }))
-                            }
+                            ModelEvent::TextDelta(t) => self.sink.ephemeral(ephemeral_event::Kind::Text(TextDelta {
+                                turn: self.turn,
+                                text: t.clone(),
+                                ..Default::default()
+                            })),
+                            ModelEvent::ThinkingDelta(t) => self.sink.ephemeral(ephemeral_event::Kind::Thinking(TextDelta {
+                                turn: self.turn,
+                                text: t.clone(),
+                                ..Default::default()
+                            })),
                             _ => {}
                         }
                     }

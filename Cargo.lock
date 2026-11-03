@@ -593,6 +593,7 @@ dependencies = [
  "c6-mcp",
  "c6-memex",
  "c6-proto",
+ "c6-testkit",
  "c6-tools",
  "c6-worker",
  "chacha20poly1305",

@@ -604,6 +604,10 @@ pub struct DocComment {
     pub by: String,
     pub text: String,
     pub at: UnixMs,
+    /// A person's comment in an open thread that no agent has received yet:
+    /// its writer can still edit or delete it.
+    #[serde(default)]
+    pub editable: bool,
 }
 
 /// A comment thread on a document.
@@ -634,6 +638,10 @@ pub struct DocThread {
     /// An agent answered and you haven't replied or resolved it yet.
     #[serde(default)]
     pub needs_you: bool,
+    /// Its last comment is a person's and hasn't gone to an agent (it was
+    /// left without "agent", or never sent): it can be sent now.
+    #[serde(default)]
+    pub unsent: bool,
     pub created_by: String,
     pub created_at: UnixMs,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -650,9 +658,21 @@ pub struct ThreadNew {
     pub anchor: Anchor,
     pub text: String,
     /// `agent`: send it to an agent (the session that last wrote that part,
-    /// if it's idle, else a new one in the document's work or project).
+    /// else the latest session of the document's work or project; queued
+    /// if it's busy, never a new session).
     #[serde(default)]
     pub to: String,
+}
+
+/// `POST /api/v1/docs/{id}/threads/send`: comment threads sent to agents
+/// together, in one message per session they go to.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ThreadsSend {
+    /// The threads; empty: every open thread you began that hasn't been
+    /// sent to an agent.
+    #[serde(default)]
+    pub threads: Vec<String>,
 }
 
 /// `POST /api/v1/docs/{id}/threads/{thread}/comments`: a reply.
@@ -660,7 +680,16 @@ pub struct ThreadNew {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CommentNew {
     pub text: String,
-    /// `agent`: send the thread (again) to an agent.
+    /// `agent`: send the thread (again) to an agent: the session that
+    /// already answered it, if it can still take input.
     #[serde(default)]
     pub to: String,
+}
+
+/// `PATCH /api/v1/docs/{id}/threads/{thread}/comments/{comment}`: your
+/// comment's new text, while no agent has received it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct CommentEdit {
+    pub text: String,
 }

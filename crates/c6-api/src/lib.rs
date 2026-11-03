@@ -105,6 +105,9 @@ pub enum LiveEvent {
     Doc { change: docs::DocChange },
     /// Every mark given (docs/marks.md); same cadence as the snapshots.
     Marks { marks: marks::Marks },
+    /// What needs you may have changed (`GET /api/v1/attention`): read it
+    /// again. At most one every half second.
+    Attention,
 }
 
 // --- LLM connections --------------------------------------------------------
@@ -1801,6 +1804,13 @@ pub struct SendMessage {
     /// turn there (else the parent hears with its next input).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub wake: bool,
+    /// Send now: while the agent works, it gets this at once rather than at
+    /// its next step (docs/background.md §4). Claude Code moves what holds
+    /// the turn to the background, or stops only that turn, sparing its
+    /// background agents; carbon6's own loop stops the turn and this starts
+    /// the next. While the agent is idle it is an ordinary message.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub send_now: bool,
 }
 
 /// `GET`/`PUT /api/v1/settings/subagent-limits`: how far subagents may go
@@ -2132,6 +2142,14 @@ pub enum EventKind {
         elapsed_ms: u64,
         #[serde(default)]
         notify: bool,
+        /// An observed Claude Code task's kind as the CLI names it
+        /// ("local_bash", "local_agent", ...); empty otherwise.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        native_type: String,
+        /// That task holds Claude Code's turn (a foreground command or
+        /// subagent, until the CLI moves it to the background).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        foreground: bool,
     },
     /// A tool call started a subagent (the child session).
     SubagentSpawned {
@@ -2239,6 +2257,17 @@ pub enum EventKind {
 }
 
 impl EventKind {
+    /// How many of the agent's steps this is: each tool call of a reply,
+    /// or the reply itself when it called none.
+    pub fn steps(&self) -> u64 {
+        let EventKind::Assistant { blocks, .. } = self else { return 0 };
+        let calls = blocks.iter().filter(|b| matches!(b, ContentBlock::ToolUse { .. })).count() as u64;
+        if calls > 0 {
+            return calls;
+        }
+        blocks.iter().any(|b| matches!(b, ContentBlock::Text { text } if !text.trim().is_empty())) as u64
+    }
+
     /// What a window's summary needs from before it (usage, the model,
     /// turns, outputs, tasks, subagents): small, and no transcript.
     pub fn summary(&self) -> bool {
@@ -2644,14 +2673,20 @@ pub enum StreamMsg {
     Event {
         event: Event,
     },
-    /// Live-only deltas, superseded by the next durable event.
+    /// Live-only deltas, superseded by the next durable event. `seq`: the
+    /// log's next event when it streamed; the first reply from there has
+    /// this text (0: not said).
     Text {
         turn: u64,
         text: String,
+        #[serde(default)]
+        seq: u64,
     },
     Thinking {
         turn: u64,
         text: String,
+        #[serde(default)]
+        seq: u64,
     },
     ToolOutput {
         call_id: String,
@@ -4597,6 +4632,13 @@ pub struct Suggestion {
     pub for_seq: i64,
 }
 
+/// A name for a session, to start from (`/api/v1/sessions/{id}/name/suggestion`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SuggestedName {
+    pub title: String,
+}
+
 /// You saw a suggestion (and took it, or not).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -4606,12 +4648,25 @@ pub struct SuggestionSeen {
     pub accepted: bool,
 }
 
-/// Whether sessions suggest your next message (`/api/v1/settings/suggestions`, per realm).
+/// Whether sessions suggest your next message (`/api/v1/settings/suggestions`, per realm)
+/// and name themselves after their first turn, and what new sessions start
+/// with: the catch-up card and finished turns folded (each session then has
+/// its own, `/api/v1/sessions/{id}/view`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SuggestionSettings {
     #[serde(default = "yes")]
     pub enabled: bool,
+    /// New sessions show what happened while you were away.
+    #[serde(default)]
+    pub catchup: bool,
+    /// New sessions show each finished turn as one row (`timeline`, its
+    /// old name, reads as this).
+    #[serde(default, alias = "timeline")]
+    pub fold: bool,
+    /// Sessions get a short name once their first turn ends.
+    #[serde(default = "yes")]
+    pub names: bool,
 }
 
 fn yes() -> bool {
@@ -4620,8 +4675,140 @@ fn yes() -> bool {
 
 impl Default for SuggestionSettings {
     fn default() -> Self {
-        Self { enabled: true }
+        Self { enabled: true, catchup: false, fold: false, names: true }
     }
+}
+
+/// How a session shows itself to you (`/api/v1/sessions/{id}/view`), the
+/// same on every device: a catch-up card when you come back, and its
+/// finished turns folded, one row each. Off unless the realm's defaults for
+/// new sessions turned them on when it started.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SessionViewSettings {
+    #[serde(default)]
+    pub catchup: bool,
+    /// Its transcript shows each finished turn as one row, opened by a
+    /// click. Read from `timeline` too (the switch that showed its turns
+    /// by hour in place of the transcript).
+    #[serde(default, alias = "timeline")]
+    pub fold: bool,
+}
+
+/// `GET /api/v1/sessions/{id}/catchup`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct CatchupQuery {
+    /// From after this event (as an earlier answer said); none: since you
+    /// last looked, or your last message, whichever is later.
+    #[serde(default)]
+    pub since: Option<u64>,
+    /// With the paragraph (made by a small model now, unless it's made
+    /// already).
+    #[serde(default)]
+    pub summary: bool,
+    /// When you last had the session on screen (the page remembers it), in
+    /// ms: without `since`, what you last looked at is the later of this
+    /// and the last finished turn you saw (a turn still running moves only
+    /// this one).
+    #[serde(default)]
+    pub looked_at: Option<UnixMs>,
+}
+
+/// What a session did since you last looked (`GET /api/v1/sessions/{id}/catchup`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Catchup {
+    /// The events after this one are new to you: the last you saw, or your
+    /// last message to it, whichever is later.
+    pub since_seq: u64,
+    /// When you looked, or sent that message (0: never).
+    pub since_at: UnixMs,
+    /// Its last event now.
+    pub last_seq: u64,
+    /// Its steps since: each tool call, and each reply that called none.
+    pub steps: u64,
+    /// Worth a card: 5 steps or more, or something waits on you.
+    pub offer: bool,
+    /// What it did, counted (never written by the model): waiting on you
+    /// first; only what isn't zero.
+    #[serde(default)]
+    pub rows: Vec<CatchupRow>,
+    /// The paragraph a small model wrote of it (`summary=true`); empty
+    /// until made.
+    #[serde(default)]
+    pub summary: String,
+}
+
+/// A counted row of a catch-up: its kind (`waiting`, `finished`,
+/// `changes`, `commands` or `messages`), what it says ("3 finished · 1
+/// failed"), and what it counts.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct CatchupRow {
+    pub kind: String,
+    pub text: String,
+    #[serde(default)]
+    pub items: Vec<CatchupItem>,
+}
+
+/// One thing a catch-up row counts, and where it is in the transcript.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct CatchupItem {
+    pub text: String,
+    /// Its event (0: none, e.g. a decision).
+    #[serde(default)]
+    pub seq: u64,
+    /// The tool call it is, if one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub call: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub failed: bool,
+}
+
+/// `GET /api/v1/sessions/{id}/timeline`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TimelineQuery {
+    /// Only the turns that started in the hour from this time (ms), each
+    /// with its line from a small model (made now, unless made already).
+    #[serde(default)]
+    pub hour: Option<UnixMs>,
+}
+
+/// A turn of a session, for its timeline (`GET /api/v1/sessions/{id}/timeline`):
+/// the glance's outline, and the rows of its folded turns.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TimelineTurn {
+    pub turn: u64,
+    /// Its first event (the message that started it, if one) and its end
+    /// (0 while it runs).
+    pub start_seq: u64,
+    pub end_seq: u64,
+    /// When it started.
+    pub at: UnixMs,
+    /// Its steps: each tool call, and each reply that called none.
+    pub steps: u64,
+    /// Who started it: `you`, `session` (another session's message),
+    /// `task` (a background task or subagent ended), `doc` (comments on a
+    /// document), `agent` (the agent that started this subagent), or empty
+    /// (nothing said).
+    #[serde(default)]
+    pub by: String,
+    /// The session's or document's title, for `session` and `doc`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub from: String,
+    /// The first words of the message that started it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub words: String,
+    /// The first sentence of its last reply.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reply: String,
+    /// What it did, in a line, from a small model; empty until made.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary: String,
 }
 
 /// A realm's Slack setup (`GET /api/v1/slack`, docs/slack.md §3, §7).
@@ -4683,8 +4870,89 @@ pub struct SlackClientIn {
 pub struct RealmWaiting {
     pub id: String,
     pub name: String,
-    /// Open decisions and approvals.
+    /// Open decisions, approvals and questions (not task cards).
     pub waiting: u64,
+}
+
+/// What needs you (`GET /api/v1/attention`), in the caller's realm: what
+/// waits on you (it counts), what's worth a look (it doesn't), and for
+/// other realms only how many wait there.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Attention {
+    /// Open decisions (approvals of tool calls and agents' questions among
+    /// them), newest first; not task cards.
+    pub waiting: Vec<AttentionItem>,
+    /// Turns that ended or failed since you last saw them, agents' answers
+    /// to your comments you haven't seen (one per document), people waiting
+    /// on you in the Brief since you last saw it; newest first.
+    pub worth: Vec<AttentionItem>,
+    /// Other realms with something waiting: a count each, nothing more.
+    pub elsewhere: Vec<AttentionElsewhere>,
+}
+
+/// One thing that needs you.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AttentionItem {
+    /// Stable: `decision:<id>`, `session:<id>`, `doc:<doc>` (a document's
+    /// answers) or `brief`.
+    pub key: String,
+    /// Waiting: `approval`, `question` or `decision`. Worth a look:
+    /// `turn_ended`, `failed`, `comment_answer` or `brief`.
+    pub kind: String,
+    pub title: String,
+    /// Where it is: the session's title for an approval or a turn. For a
+    /// document's answers (`title`: the document's), how many ("3 answers"),
+    /// or the one thread's subject.
+    #[serde(default)]
+    pub detail: String,
+    pub at: UnixMs,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_id: Option<String>,
+    /// A document's answers: the thread, when there's just one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realm: Option<String>,
+    /// How many (the Brief's row: people waiting on you; a document's:
+    /// threads with an answer you haven't seen).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
+}
+
+/// Another realm, and how many things wait on you there.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AttentionElsewhere {
+    pub id: String,
+    pub name: String,
+    pub waiting: u64,
+}
+
+/// `POST /api/v1/attention/seen`: the worth-a-look items you've seen (by
+/// key, or `thread:<doc>:<thread>` for one thread's answer); none, every
+/// one you see.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AttentionSeen {
+    #[serde(default)]
+    pub keys: Vec<String>,
+}
+
+/// A session you viewed lately (`GET /api/v1/sessions/recent`, newest
+/// first): the live feed has the rest of it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RecentView {
+    pub session_id: String,
+    pub at: UnixMs,
 }
 
 /// How the session list is grouped (`/api/v1/settings/session_grouping`):

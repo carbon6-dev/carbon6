@@ -38,12 +38,12 @@ pub fn FileBrowser(worker_id: String, #[prop(optional)] root: Option<String>) ->
                         on:input=move |ev| path_input.set(event_target_value(&ev))
                         on:keydown=move |ev| if ev.key() == "Enter" { dir.set(path_input.get_untracked()) } />
                 </div>
-                <label class="flex items-center gap-1.5 text-xs text-zinc-500">
+                <label class="flex items-center gap-1.5 text-xs text-muted">
                     <input type="checkbox" prop:checked=move || hidden.get() on:change=move |ev| hidden.set(event_target_checked(&ev)) />
                     "Show hidden files"
                 </label>
                 <div class="max-h-[70vh] overflow-auto rounded-md border border-zinc-200 dark:border-zinc-800">
-                    <Suspense fallback=|| view! { <p class="p-3 text-sm text-zinc-500">"Loading…"</p> }>
+                    <Suspense fallback=|| view! { <p class="p-3 text-sm text-muted">"Loading…"</p> }>
                         {move || listing.get().map(|r| match r {
                             Err(e) => view! { <div class="p-2"><ErrorBox message=e /></div> }.into_any(),
                             Ok(l) => {
@@ -62,9 +62,9 @@ pub fn FileBrowser(worker_id: String, #[prop(optional)] root: Option<String>) ->
                                                 <li class=move || if open_file.get().as_deref() == Some(full2.as_str()) { "bg-zinc-200 dark:bg-zinc-800" } else { "" }>
                                                     <button class="flex w-full items-center gap-2 px-2 py-1 text-left hover:bg-zinc-100 dark:hover:bg-zinc-900"
                                                         on:click=move |_| if is_dir { dir.set(full.clone()) } else { open_file.set(Some(full.clone())) }>
-                                                        <span class="w-4 text-zinc-400">{if is_dir { "▸" } else { "" }}</span>
+                                                        <span class="w-4 text-muted">{if is_dir { "▸" } else { "" }}</span>
                                                         <span class=if is_dir { "flex-1 truncate font-medium" } else { "flex-1 truncate" }>{name}</span>
-                                                        <span class="shrink-0 text-[11px] text-zinc-400">{mtime.map(|t| ago(now - t)).unwrap_or_default()}</span>
+                                                        <span class="shrink-0 text-[11px] text-muted">{mtime.map(|t| ago(now - t)).unwrap_or_default()}</span>
                                                     </button>
                                                 </li>
                                             }
@@ -79,7 +79,7 @@ pub fn FileBrowser(worker_id: String, #[prop(optional)] root: Option<String>) ->
             <div class="min-w-0">
                 {move || match open_file.get() {
                     Some(p) => view! { <FileViewer worker_id=wid.get_value() path=p /> }.into_any(),
-                    None => view! { <p class="py-10 text-center text-sm text-zinc-500">"Select a file to view it."</p> }.into_any(),
+                    None => view! { <p class="py-10 text-center text-sm text-muted">"Select a file to view it."</p> }.into_any(),
                 }}
             </div>
         </div>
@@ -97,24 +97,24 @@ fn FileViewer(worker_id: String, path: String) -> impl IntoView {
     view! {
         <div class="space-y-2">
             <div class="flex items-center gap-2">
-                <span class="min-w-0 flex-1 truncate font-mono text-xs text-zinc-500">{path.clone()}</span>
+                <span class="min-w-0 flex-1 truncate font-mono text-xs text-muted">{path.clone()}</span>
                 {is_md.then(|| view! {
                     <button class="rounded px-2 py-0.5 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800" on:click=move |_| rendered.update(|r| *r = !*r)>
                         {move || if rendered.get() { "Source" } else { "Rendered" }}
                     </button>
                 })}
             </div>
-            <Suspense fallback=|| view! { <p class="text-sm text-zinc-500">"Loading…"</p> }>
+            <Suspense fallback=|| view! { <p class="text-sm text-muted">"Loading…"</p> }>
                 {move || file.get().map(|r| match r {
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
-                    Ok(f) if f["binary"] == true => view! { <p class="text-sm text-zinc-500">{format!("Binary file ({} bytes)", f["size"])}</p> }.into_any(),
+                    Ok(f) if f["binary"] == true => view! { <p class="text-sm text-muted">{format!("Binary file ({} bytes)", f["size"])}</p> }.into_any(),
                     Ok(f) => {
                         let text = f["content"].as_str().unwrap_or("").to_owned();
                         let truncated = f["truncated"] == true;
                         view! {
                             {truncated.then(|| view! { <p class="text-xs text-amber-600">"Showing the first 2 MB."</p> })}
                             {move || if rendered.get() {
-                                view! { <div class="md max-h-[70vh] overflow-auto rounded-md border border-zinc-200 p-4 dark:border-zinc-800" inner_html=crate::markdown::to_html(&text)></div> }.into_any()
+                                view! { <div class="md max-h-[70vh] overflow-auto rounded-md border border-zinc-200 p-4 dark:border-zinc-800" on:click=crate::mentions::link_clicks() inner_html=crate::markdown::to_html(&text)></div> }.into_any()
                             } else {
                                 view! { <CodeView text=text.clone() /> }.into_any()
                             }}
@@ -134,7 +134,7 @@ fn CodeView(text: String) -> impl IntoView {
     view! {
         <pre class="max-h-[70vh] overflow-auto rounded-md border border-zinc-200 bg-white p-2 font-mono text-xs leading-5 dark:border-zinc-800 dark:bg-zinc-950">
             {lines.into_iter().enumerate().map(|(i, l)| view! {
-                <div class="flex"><span class="mr-3 select-none text-right text-zinc-400" style=format!("min-width:{width}ch")>{i + 1}</span><span class="whitespace-pre">{l}</span></div>
+                <div class="flex"><span class="mr-3 select-none text-right text-muted" style=format!("min-width:{width}ch")>{i + 1}</span><span class="whitespace-pre">{l}</span></div>
             }).collect_view()}
         </pre>
     }
@@ -154,7 +154,7 @@ pub fn Changes(worker_id: String, path: String) -> impl IntoView {
     view! {
         <div class="space-y-3">
             <Show when=not_repo>
-                <p class="rounded-md border border-zinc-200 px-4 py-6 text-center text-sm text-zinc-500 dark:border-zinc-800">
+                <p class="rounded-md border border-zinc-200 px-4 py-6 text-center text-sm text-muted dark:border-zinc-800">
                     "This folder isn't in a git repository, so there are no changes to show. Initialize one (for example "
                     <code class="font-mono">"git init"</code> " in a terminal) to track what the agent changes."
                 </p>
@@ -167,9 +167,9 @@ pub fn Changes(worker_id: String, path: String) -> impl IntoView {
                 })}
             </Suspense>
             <div class="flex justify-end">
-                <button class="rounded-md px-2 py-1 text-xs text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800" on:click=refresh>"Refresh"</button>
+                <button class="rounded-md px-2 py-1 text-xs text-muted hover:bg-zinc-100 dark:hover:bg-zinc-800" on:click=refresh>"Refresh"</button>
             </div>
-            <Suspense fallback=|| view! { <p class="text-sm text-zinc-500">"Loading diff…"</p> }>
+            <Suspense fallback=|| view! { <p class="text-sm text-muted">"Loading diff…"</p> }>
                 {move || diff.get().map(|r| match r {
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
                     Ok(d) => view! { <DiffView diff=d["diff"].as_str().unwrap_or("").to_owned() truncated=d["truncated"] == true /> }.into_any(),
@@ -190,8 +190,8 @@ fn StatusSummary(s: Value) -> impl IntoView {
         <div class="text-sm">
             <div class="flex flex-wrap items-center gap-2">
                 <span class="rounded bg-zinc-100 px-1.5 py-0.5 font-mono text-xs dark:bg-zinc-800">{branch}</span>
-                {s["upstream"].as_str().map(|u| view! { <span class="text-xs text-zinc-500">{format!("→ {u} · {ahead} ahead, {behind} behind")}</span> })}
-                <span class="text-xs text-zinc-500">{format!("{} changed file{}", files.len(), if files.len() == 1 { "" } else { "s" })}</span>
+                {s["upstream"].as_str().map(|u| view! { <span class="text-xs text-muted">{format!("→ {u} · {ahead} ahead, {behind} behind")}</span> })}
+                <span class="text-xs text-muted">{format!("{} changed file{}", files.len(), if files.len() == 1 { "" } else { "s" })}</span>
             </div>
             <ul class="mt-2 grid gap-x-4 font-mono text-xs sm:grid-cols-2">
                 {files.into_iter().map(|f| {
@@ -208,7 +208,7 @@ fn StatusSummary(s: Value) -> impl IntoView {
 #[component]
 pub fn DiffView(diff: String, truncated: bool) -> impl IntoView {
     if diff.trim().is_empty() {
-        return view! { <p class="py-6 text-center text-sm text-zinc-500">"No changes."</p> }.into_any();
+        return view! { <p class="py-6 text-center text-sm text-muted">"No changes."</p> }.into_any();
     }
     let mut files: Vec<(String, Vec<String>)> = Vec::new();
     for line in diff.lines() {
@@ -323,7 +323,7 @@ pub fn FolderPicker(
                     }}
                 </div>
                 <div class="min-h-48 flex-1 overflow-auto rounded-md border border-zinc-200 dark:border-zinc-800">
-                    <Suspense fallback=|| view! { <p class="p-3 text-sm text-zinc-500">"Loading…"</p> }>
+                    <Suspense fallback=|| view! { <p class="p-3 text-sm text-muted">"Loading…"</p> }>
                         {move || listing.get().map(|r| match r {
                             Err(e) => view! { <div class="p-2"><ErrorBox message=e /></div> }.into_any(),
                             Ok(l) => {
@@ -333,7 +333,7 @@ pub fn FolderPicker(
                                     .filter_map(|e| e["name"].as_str().map(str::to_owned))
                                     .collect();
                                 if dirs.is_empty() {
-                                    return view! { <p class="p-3 text-sm text-zinc-500">"No folders here."</p> }.into_any();
+                                    return view! { <p class="p-3 text-sm text-muted">"No folders here."</p> }.into_any();
                                 }
                                 view! {
                                     <ul class="divide-y divide-zinc-100 text-sm dark:divide-zinc-900">
@@ -342,7 +342,7 @@ pub fn FolderPicker(
                                             view! {
                                                 <li><button class="flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
                                                     on:click=move |_| dir.set(full.clone())>
-                                                    <span class="text-zinc-400">"▸"</span><span class="truncate">{name}</span>
+                                                    <span class="text-muted">"▸"</span><span class="truncate">{name}</span>
                                                 </button></li>
                                             }
                                         }).collect_view()}
@@ -368,7 +368,7 @@ pub fn FolderPicker(
                 {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
                 <div class="flex flex-wrap items-center gap-2">
                     <button class=crate::util::BUTTON_QUIET on:click=move |_| { error.set(None); new_name.set(Some(String::new())) }>"New folder"</button>
-                    <label class="flex items-center gap-1.5 text-xs text-zinc-500">
+                    <label class="flex items-center gap-1.5 text-xs text-muted">
                         <input type="checkbox" prop:checked=move || hidden.get() on:change=move |ev| hidden.set(event_target_checked(&ev)) />
                         "Show hidden"
                     </label>
@@ -513,7 +513,7 @@ pub fn FilePicker(
                 </div>
                 {move || if source.get() == Source::Device {
                     view! {
-                        <div class="flex min-h-48 flex-col items-center justify-center gap-2 rounded-md border border-dashed border-zinc-300 p-6 text-sm text-zinc-500 dark:border-zinc-700">
+                        <div class="flex min-h-48 flex-col items-center justify-center gap-2 rounded-md border border-dashed border-zinc-300 p-6 text-sm text-muted dark:border-zinc-700">
                             <p>"A file on the device you are using now."</p>
                             <button class=crate::util::BUTTON on:click=move |_| if let Some(i) = device_input.get_untracked() { i.click(); }>"Choose a file…"</button>
                             <input node_ref=device_input type="file" accept=accept.clone() class="hidden" on:change=from_device />
@@ -536,10 +536,10 @@ pub fn FilePicker(
                                     <button class="rounded px-1 py-0.5 hover:bg-zinc-100 dark:hover:bg-zinc-800" on:click=move |_| dir.set(target.clone())>{label}</button>
                                 }).collect_view()
                             }}
-                            <button class="ml-1 rounded px-1 py-0.5 text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800" title="Home folder" on:click=move |_| dir.set("~".into())>"~"</button>
+                            <button class="ml-1 rounded px-1 py-0.5 text-muted hover:bg-zinc-100 dark:hover:bg-zinc-800" title="Home folder" on:click=move |_| dir.set("~".into())>"~"</button>
                         </div>
                         <div class="min-h-48 flex-1 overflow-auto rounded-md border border-zinc-200 dark:border-zinc-800">
-                            <Suspense fallback=|| view! { <p class="p-3 text-sm text-zinc-500">"Loading…"</p> }>
+                            <Suspense fallback=|| view! { <p class="p-3 text-sm text-muted">"Loading…"</p> }>
                                 {move || listing.get().map(|r| match r {
                                     Err(e) => view! { <div class="p-2"><ErrorBox message=e /></div> }.into_any(),
                                     Ok(l) => {
@@ -550,7 +550,7 @@ pub fn FilePicker(
                                             .filter(|(n, d)| *d || show_all || extensions.iter().any(|x| n.to_lowercase().ends_with(x)))
                                             .collect();
                                         if rows.is_empty() {
-                                            return view! { <p class="p-3 text-sm text-zinc-500">"Nothing to pick here."</p> }.into_any();
+                                            return view! { <p class="p-3 text-sm text-muted">"Nothing to pick here."</p> }.into_any();
                                         }
                                         view! {
                                             <ul class="divide-y divide-zinc-100 text-sm dark:divide-zinc-900">
@@ -560,7 +560,7 @@ pub fn FilePicker(
                                                     view! {
                                                         <li><button class="flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
                                                             on:click=move |_| if is_dir { dir.set(full.clone()) } else { read(full.clone(), name.clone()) }>
-                                                            <span class="w-3 text-zinc-400">{if is_dir { "▸" } else { "" }}</span>
+                                                            <span class="w-3 text-muted">{if is_dir { "▸" } else { "" }}</span>
                                                             <span class=if is_dir { "truncate" } else { "truncate font-mono text-xs" }>{shown}</span>
                                                         </button></li>
                                                     }
@@ -576,17 +576,17 @@ pub fn FilePicker(
                 {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
                 <div class="flex flex-wrap items-center gap-3">
                     {move || (source.get() != Source::Device).then(|| view! {
-                        <label class="flex items-center gap-1.5 text-xs text-zinc-500">
+                        <label class="flex items-center gap-1.5 text-xs text-muted">
                             <input type="checkbox" prop:checked=move || all.get() on:change=move |ev| all.set(event_target_checked(&ev)) />
                             {format!("All files (not only {})", extensions.join(", "))}
                         </label>
-                        <label class="flex items-center gap-1.5 text-xs text-zinc-500">
+                        <label class="flex items-center gap-1.5 text-xs text-muted">
                             <input type="checkbox" prop:checked=move || hidden.get() on:change=move |ev| hidden.set(event_target_checked(&ev)) />
                             "Show hidden"
                         </label>
                     })}
                     <span class="flex-1"></span>
-                    {move || busy.get().then(|| view! { <span class="text-xs text-zinc-500">"Reading…"</span> })}
+                    {move || busy.get().then(|| view! { <span class="text-xs text-muted">"Reading…"</span> })}
                     <button class=crate::util::BUTTON_QUIET on:click=move |_| on_cancel.run(())>"Cancel"</button>
                 </div>
             </div>

@@ -44,12 +44,12 @@ fn Hosts() -> impl IntoView {
         <section class="space-y-2">
             <div>
                 <h2 class="text-base font-semibold">"Hosts"</h2>
-                <p class="text-sm text-zinc-500">"Machines your workers reach over SSH. Sessions on them get their labels; templates can run on every host with given labels. Add and edit them in Settings → Hosts."</p>
+                <p class="text-sm text-muted">"Machines your workers reach over SSH. Sessions on them get their labels; templates can run on every host with given labels. Add and edit them in Settings → Hosts."</p>
             </div>
             {move || error.get().map(|e| view! { <crate::util::ErrorBox message=e /> })}
             <Suspense fallback=|| ()>
                 {move || hosts.get().map(|r| match r {
-                    Ok(hs) if hs.is_empty() => view! { <p class="text-sm text-zinc-500">"No hosts yet."</p> }.into_any(),
+                    Ok(hs) if hs.is_empty() => view! { <p class="text-sm text-muted">"No hosts yet."</p> }.into_any(),
                     Ok(hs) => view! {
                         <div class="divide-y divide-zinc-200 rounded-lg border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
                             {hs.into_iter().map(|s| {
@@ -65,12 +65,12 @@ fn Hosts() -> impl IntoView {
                                     <div class="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-2 text-sm">
                                         <span class=format!("h-2 w-2 shrink-0 rounded-full {dot}")></span>
                                         <span class="font-medium">{name.clone()}</span>
-                                        <span class="font-mono text-xs text-zinc-500">{s.host.target.clone()}</span>
-                                        {(!s.host.worker.is_empty()).then(|| view! { <span class="text-xs text-zinc-500">{format!("via {}", s.host.worker)}</span> })}
+                                        <span class="font-mono text-xs text-muted">{s.host.target.clone()}</span>
+                                        {(!s.host.worker.is_empty()).then(|| view! { <span class="text-xs text-muted">{format!("via {}", s.host.worker)}</span> })}
                                         <span class="flex flex-wrap gap-1">{s.host.labels.iter().map(|l| view! { <span class="rounded bg-zinc-100 px-1.5 text-[11px] dark:bg-zinc-800">{l.clone()}</span> }).collect_view()}</span>
-                                        {(!s.host.enabled).then(|| view! { <span class="text-xs text-zinc-500">"(off)"</span> })}
+                                        {(!s.host.enabled).then(|| view! { <span class="text-xs text-muted">"(off)"</span> })}
                                         <span class="flex-1"></span>
-                                        <span class="max-w-md truncate text-xs text-zinc-500" title=when.clone()>{state}</span>
+                                        <span class="max-w-md truncate text-xs text-muted" title=when.clone()>{state}</span>
                                         <button class="rounded-md px-2 py-0.5 text-xs text-zinc-600 hover:bg-zinc-200/60 disabled:opacity-50 dark:text-zinc-400 dark:hover:bg-zinc-800"
                                             disabled=move || checking.with(|c| c.contains(&n2)) on:click=move |_| check(name.clone())>
                                             {let n3 = s.host.name.clone(); move || if checking.with(|c| c.contains(&n3)) { "Checking…" } else { "Check" }}
@@ -103,7 +103,7 @@ pub fn WorkerPage(id: String) -> impl IntoView {
                 <h1 class="text-lg font-semibold">{move || worker().map(|w| w.name).unwrap_or_default()}</h1>
                 {move || worker().map(|w| {
                     let online = w.status == WorkerStatus::Online;
-                    view! { <span class=if online { "text-xs text-emerald-600" } else { "text-xs text-zinc-500" }>{if online { "online" } else { "offline" }}</span> }
+                    view! { <span class=if online { "text-xs text-emerald-600" } else { "text-xs text-muted" }>{if online { "online" } else { "offline" }}</span> }
                 })}
                 <span class="flex-1"></span>
                 <TabButton tab label="Files" value="files" />
@@ -139,7 +139,12 @@ pub fn TabButton(tab: RwSignal<&'static str>, label: &'static str, value: &'stat
 pub fn Fleet(workers: ReadSignal<Vec<Worker>>) -> impl IntoView {
     // Ticks so "last seen" stays fresh between snapshots.
     let now = RwSignal::new(now_ms());
-    set_interval(move || now.set(now_ms()), Duration::from_secs(5));
+    let tick = set_interval_with_handle(move || now.set(now_ms()), Duration::from_secs(5)).ok();
+    on_cleanup(move || {
+        if let Some(t) = tick {
+            t.clear();
+        }
+    });
     let error = RwSignal::new(None::<String>);
 
     let online = move || workers.with(|ws| ws.iter().filter(|w| w.status == WorkerStatus::Online).count());
@@ -150,7 +155,7 @@ pub fn Fleet(workers: ReadSignal<Vec<Worker>>) -> impl IntoView {
             <div class="flex items-end justify-between gap-4">
                 <div>
                     <h1 class="text-lg font-semibold">"Workers"</h1>
-                    <p class="text-sm text-zinc-500">{move || format!("{} online · {} enrolled", online(), active())}</p>
+                    <p class="text-sm text-muted">{move || format!("{} online · {} enrolled", online(), active())}</p>
                 </div>
                 <AddWorker />
             </div>
@@ -161,7 +166,7 @@ pub fn Fleet(workers: ReadSignal<Vec<Worker>>) -> impl IntoView {
 
             <div class="overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
                 <table class="w-full text-sm">
-                    <thead class="bg-zinc-100 text-left text-xs uppercase tracking-wide text-zinc-500 dark:bg-zinc-900">
+                    <thead class="bg-zinc-100 text-left text-xs uppercase tracking-wide text-muted dark:bg-zinc-900">
                         <tr>
                             <th class="px-3 py-2 font-medium">"Name"</th>
                             <th class="px-3 py-2 font-medium">"Host"</th>
@@ -177,7 +182,7 @@ pub fn Fleet(workers: ReadSignal<Vec<Worker>>) -> impl IntoView {
                             let ws = workers.get();
                             if ws.is_empty() {
                                 view! {
-                                    <tr><td colspan="7" class="px-3 py-10 text-center text-zinc-500">
+                                    <tr><td colspan="7" class="px-3 py-10 text-center text-muted">
                                         "No workers yet. Add one to get started."
                                     </td></tr>
                                 }.into_any()
@@ -246,7 +251,7 @@ fn WorkerRow(w: Worker, now: RwSignal<i64>, error: RwSignal<Option<String>>) -> 
             </td>
             <td class="px-3 py-2 text-right">
                 <button
-                    class="rounded px-2 py-1 text-xs text-zinc-500 hover:bg-zinc-100 hover:text-red-600 dark:hover:bg-zinc-800"
+                    class="rounded px-2 py-1 text-xs text-muted hover:bg-zinc-100 hover:text-red-600 dark:hover:bg-zinc-800"
                     on:click=act(id)
                 >
                     {if revoked { "Remove" } else { "Revoke" }}
@@ -373,7 +378,7 @@ fn TokenView(enrollment: Enrollment, on_done: impl Fn(leptos::ev::MouseEvent) + 
                     {move || if copied.get() { "Copied" } else { "Copy" }}
                 </button>
             </div>
-            <p class="text-zinc-500">"Then start it with " <code class="font-mono">"c6w run"</code> ". It will appear here once attached."</p>
+            <p class="text-muted">"Then start it with " <code class="font-mono">"c6w run"</code> ". It will appear here once attached."</p>
             <div class="flex justify-end">
                 <button class="rounded-md px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800" on:click=on_done>"Done"</button>
             </div>

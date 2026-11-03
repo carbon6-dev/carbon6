@@ -51,7 +51,7 @@ pub fn watch_sessions(live: LiveFeed, ws: crate::workspace::Workspace, filter: c
                         } else {
                             "Finished"
                         },
-                        live.worker_name(&s.worker_id.to_string())
+                        live.session_worker(s)
                     ));
                     opts.set_tag(&s.id);
                     if let Ok(n) = Notification::new_with_options(&s.title, &opts) {
@@ -96,7 +96,7 @@ pub fn NotifyToggle() -> impl IntoView {
         }
     };
     view! {
-        <button class="hidden text-xs text-zinc-500 hover:text-zinc-900 md:inline dark:hover:text-zinc-100" title=title on:click=click>
+        <button class="hidden text-xs text-muted hover:text-zinc-900 md:inline dark:hover:text-zinc-100" title=title on:click=click>
             {move || match (state.get(), filter.with(Vec::is_empty)) {
                 (true, true) => "🔔 on",
                 (true, false) => "🔔 filtered",

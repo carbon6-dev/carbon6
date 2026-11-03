@@ -146,6 +146,8 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
             exit_code: t.exit_code,
             elapsed_ms: t.elapsed_ms,
             notify: t.notify,
+            native_type: t.native_type.clone(),
+            foreground: t.foreground,
         },
         Kind::Rewound(r) => {
             api::EventKind::Rewound { to_seq: r.to_seq, restored_files: r.restored_files, restore_error: r.restore_error.clone() }
@@ -185,8 +187,8 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
 /// (a plan's limits).
 pub fn ephemeral(kind: &ephemeral_event::Kind) -> Option<api::StreamMsg> {
     Some(match kind {
-        ephemeral_event::Kind::Text(d) => api::StreamMsg::Text { turn: d.turn, text: d.text.clone() },
-        ephemeral_event::Kind::Thinking(d) => api::StreamMsg::Thinking { turn: d.turn, text: d.text.clone() },
+        ephemeral_event::Kind::Text(d) => api::StreamMsg::Text { turn: d.turn, text: d.text.clone(), seq: d.seq },
+        ephemeral_event::Kind::Thinking(d) => api::StreamMsg::Thinking { turn: d.turn, text: d.text.clone(), seq: d.seq },
         ephemeral_event::Kind::ToolOutput(d) => api::StreamMsg::ToolOutput { call_id: d.call_id.clone(), text: d.text.clone() },
         ephemeral_event::Kind::Activity(a) => api::StreamMsg::Activity { running: a.running, status: a.status.clone() },
         ephemeral_event::Kind::Secret(c) => {

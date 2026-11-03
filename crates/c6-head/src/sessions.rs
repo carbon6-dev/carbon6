@@ -176,6 +176,7 @@ pub async fn create_linked(st: &HeadState, req: api::CreateSession, instance: &s
     if prompt.is_none() && !files.is_empty() {
         return Err(bad_request("attachments need a prompt"));
     }
+    let named_by_first_line = req.title.as_deref().is_none_or(|t| t.trim().is_empty());
     let title = req.title.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| default_title(prompt));
     let row = SessionRow {
         id: Uuid::now_v7().to_string(),
@@ -243,6 +244,11 @@ pub async fn create_linked(st: &HeadState, req: api::CreateSession, instance: &s
         st.store.add_remote_delegation(&input_id, &row.id, &l.parent_id, &l.parent_call_id).await?;
     }
     let brief = Brief { labels: brief_labels, text: prompt.unwrap_or("").to_owned() };
+    // Your session with its first line for a title is named after its
+    // first turn (waiting for it before that can end).
+    if link.is_none() && named_by_first_line {
+        crate::naming::expect(st, &row.id).await?;
+    }
     insert(st, row, spec, prompt.map(|p| (p, files)), input_id, Some(brief)).await
 }
 
@@ -345,6 +351,7 @@ pub async fn create_assistant(st: &HeadState, req: api::AskAssistant) -> anyhow:
         labels,
         ..Default::default()
     };
+    crate::naming::expect(st, &row.id).await?;
     let session = insert(st, row, spec, Some((prompt, Vec::new())), Uuid::now_v7().to_string(), None).await?;
     crate::assistant::started(&session.id);
     Ok(session)
@@ -674,6 +681,7 @@ async fn hand_over(st: &HeadState, worker_id: WorkerId, mut create: SessionComma
             match st.store.fail_held(&session_id, &format!("could not hand it to its worker: {e:#}")).await {
                 Ok(()) => {
                     publish_queue(st, &session_id).await;
+                    st.attention.changed();
                     crate::triggers::session_ended(st, &session_id, "failed").await;
                 }
                 // Left held: the next start hands it over.
@@ -1004,9 +1012,22 @@ pub async fn send_input_as(
         st,
         &session.realm,
         session.head_labels(),
-        UserInput { text: text.to_owned(), model, attachments: files, wake, delegated_by: delegated_by.to_owned(), ..Default::default() },
+        UserInput {
+            text: text.to_owned(),
+            model,
+            attachments: files,
+            wake,
+            delegated_by: delegated_by.to_owned(),
+            send_now: req.send_now,
+            ..Default::default()
+        },
     )
     .await?;
+    // Send now to a connected worker that doesn't know it (an older one):
+    // as before, the turn stops and this starts the next.
+    if req.send_now && !sends_now(st, worker_id) {
+        interrupt_on(st, worker_id, session_id, String::new());
+    }
     let data = input_command(&id, session_id, input);
     st.store.enqueue_command(&NewCommand { id: &id, session_id, worker_id, data, text: Some(&shown) }).await?;
     publish_queue(st, session_id).await;
@@ -1244,15 +1265,7 @@ pub async fn message_from(st: &HeadState, from: &SessionRow, params: &Value) -> 
     if to.realm != from.realm {
         return Err(bad_request("that session is in another realm: messages go only to sessions in this one"));
     }
-    if to.archived != 0 {
-        return Err(bad_request("that session is archived"));
-    }
-    if to.observed || to.parent_call_id.is_some() {
-        return Err(bad_request("that is a subagent: only the agent that started it talks to it"));
-    }
-    if to.status == "failed" {
-        return Err(bad_request("that session failed to start"));
-    }
+    takes_messages(&to)?;
     let limits = subagent_limits(st, Some(&from.realm)).await?;
     if hops > limits.max_message_hops {
         return Err(bad_request(format!(
@@ -1275,22 +1288,58 @@ pub async fn message_from(st: &HeadState, from: &SessionRow, params: &Value) -> 
         }
         times.push_back(now);
     }
+    enqueue_message(st, &to, text, &from.id, &from.title, hops).await
+}
+
+/// The console's assistant messages a session in a realm, once you approve
+/// it (docs/assistant.md §Realms): as a message from that conversation, so
+/// its agent knows it is not yours, under the session's realm's budgets.
+pub async fn message_from_console(st: &HeadState, to_id: &str, text: &str, from_id: &str) -> anyhow::Result<Value> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(bad_request("the message is empty"));
+    }
+    let to = st.store.session(to_id).await?.ok_or_else(|| not_found("no such session"))?;
+    takes_messages(&to)?;
+    if let Some(why) = crate::usage::blocked(st, &to.all_labels(), &to.realm).await? {
+        return Err(bad_request(format!("not sent: {why}")));
+    }
+    enqueue_message(st, &to, text, from_id, crate::assistant::FROM_CONSOLE, 1).await
+}
+
+/// A session another session's agent (or the console's) may message.
+pub fn takes_messages(to: &SessionRow) -> anyhow::Result<()> {
+    if to.archived != 0 {
+        return Err(bad_request("that session is archived"));
+    }
+    if to.observed || to.parent_call_id.is_some() {
+        return Err(bad_request("that is a subagent: only the agent that started it talks to it"));
+    }
+    if to.status == "failed" {
+        return Err(bad_request("that session failed to start"));
+    }
+    Ok(())
+}
+
+/// Queues a message from another session for `to`'s agent, through the
+/// command queue to its worker, which delivers it as a notice.
+async fn enqueue_message(st: &HeadState, to: &SessionRow, text: &str, from_id: &str, from_title: &str, hops: u32) -> anyhow::Result<Value> {
     let worker_id: WorkerId = to.worker_id.parse()?;
     let id = Uuid::now_v7().to_string();
     let input = UserInput {
         text: text.to_owned(),
         labels: to.head_labels(),
-        from_session_id: from.id.clone(),
-        from_title: from.title.clone(),
+        from_session_id: from_id.to_owned(),
+        from_title: from_title.to_owned(),
         hops,
         ..Default::default()
     };
-    let shown = format!("from \"{}\": {text}", from.title);
+    let shown = format!("from \"{from_title}\": {text}");
     let data = input_command(&id, &to.id, input);
     st.store.enqueue_command(&NewCommand { id: &id, session_id: &to.id, worker_id, data, text: Some(&shown) }).await?;
     publish_queue(st, &to.id).await;
     st.registry.deliver(worker_id);
-    info!(from = %from.id, to = %to.id, hops, "session message");
+    info!(from = %from_id, to = %to.id, hops, "session message");
     Ok(json!({"to": to.id, "title": to.title, "queued": st.registry.get(worker_id).is_none()}))
 }
 
@@ -1507,12 +1556,31 @@ async fn model_switch(
 /// connected and running the turn.
 pub async fn interrupt(st: &HeadState, session_id: &str) -> anyhow::Result<bool> {
     let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    Ok(interrupt_on(st, session.worker_id.parse()?, session_id, String::new()))
+}
+
+/// Send now for a message already with the agent (`command_id`): it gets it
+/// at once (docs/background.md §4). Not queued, like an interrupt; an older
+/// worker takes it as one.
+pub async fn send_queued_now(st: &HeadState, session_id: &str, command_id: &str) -> anyhow::Result<bool> {
+    let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    Ok(interrupt_on(st, session.worker_id.parse()?, session_id, command_id.to_owned()))
+}
+
+fn interrupt_on(st: &HeadState, worker_id: WorkerId, session_id: &str, send_now: String) -> bool {
     let cmd = SessionCommand {
         command_id: Uuid::now_v7().to_string(),
         session_id: session_id.to_owned(),
-        kind: Some(session_command::Kind::Interrupt(Default::default())),
+        kind: Some(session_command::Kind::Interrupt(c6_proto::Interrupt { send_now })),
     };
-    Ok(st.registry.send_command(session.worker_id.parse()?, cmd))
+    st.registry.send_command(worker_id, cmd)
+}
+
+/// The worker takes Send now itself (`UserInput.send_now`), or isn't
+/// connected to say. The head's own (assistant conversations) does.
+fn sends_now(st: &HeadState, worker_id: WorkerId) -> bool {
+    st.assistant.head_id() == Some(worker_id)
+        || st.registry.get(worker_id).is_none_or(|live| live.capabilities.iter().any(|c| c == "send_now"))
 }
 
 /// Your answer to a tool call waiting for approval. `false`: its worker is
@@ -1664,10 +1732,26 @@ pub async fn check_routes(st: &HeadState, routes: &[api::Route]) -> anyhow::Resu
                 .iter()
                 .find(|c| c.id == want || c.name == want)
                 .ok_or_else(|| bad_request(format!("routing rule {:?}: no connection {want:?}", r.name)))?;
-            // A pool only for what runs in the head (the assistant, suggestions).
-            let head_side = r.applies_to.iter().any(|l| l == crate::assistant::LABEL || l == crate::suggestions::ROUTE_LABEL);
+            // A pool only for what runs in the head (the assistant,
+            // suggestions, catch-ups, timelines and names).
+            let head_side = r.applies_to.iter().any(|l| {
+                [
+                    crate::assistant::LABEL,
+                    crate::suggestions::ROUTE_LABEL,
+                    crate::catchup::ROUTE_LABEL,
+                    crate::timeline::ROUTE_LABEL,
+                    crate::naming::ROUTE_LABEL,
+                ]
+                .contains(&l.as_str())
+            });
             if !head_side {
-                crate::pools::not_for_sessions(c, &format!("routing rule {:?} (unless it applies to assistant or task:suggest)", r.name))?;
+                crate::pools::not_for_sessions(
+                    c,
+                    &format!(
+                        "routing rule {:?} (unless it applies to assistant, task:suggest, task:catchup, task:timeline or task:name)",
+                        r.name
+                    ),
+                )?;
             }
         }
         check_effort(Some(r.effort.clone())).map_err(|e| bad_request(format!("routing rule {:?}: {e}", r.name)))?;
@@ -1816,9 +1900,18 @@ pub async fn ingest(st: &HeadState, worker_id: WorkerId, batch: SessionEventBatc
     if !ing.events.is_empty() {
         st.registry.bump();
     }
+    // A turn that ended is worth a look; one that started isn't any more.
+    if ing
+        .events
+        .iter()
+        .any(|e| matches!(e.kind, Some(c6_proto::session_event::Kind::TurnEnded(_) | c6_proto::session_event::Kind::TurnStarted(_))))
+    {
+        st.attention.changed();
+    }
     notify_events(st, &batch.session_id, &ing.events).await;
     crate::memex::on_events(st, &batch.session_id, &ing.events).await;
     crate::decisions::on_events(st, &batch.session_id, &ing.events).await;
+    crate::naming::on_events(st, &batch.session_id, &ing.events).await;
     // How a run's session went: its first turn's end.
     for ev in &ing.events {
         if let Some(c6_proto::session_event::Kind::TurnEnded(t)) = &ev.kind {
@@ -2008,6 +2101,7 @@ pub async fn on_rejected(st: &HeadState, worker_id: WorkerId, r: CommandRejected
         publish_queue(st, &session_id).await;
         st.registry.bump();
         if st.store.session(&session_id).await?.is_some_and(|s| s.status == "failed") {
+            st.attention.changed();
             crate::triggers::session_ended(st, &session_id, "failed").await;
         }
     }

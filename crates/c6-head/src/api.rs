@@ -48,7 +48,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/ca.pem", get(ui_ca_pem))
         .route("/ca.crt", get(ui_ca_crt))
         .route("/ca.mobileconfig", get(ui_ca_profile))
-        .route("/api/v1/sessions", get(list_sessions).post(create_session))
+        .route("/api/v1/sessions", get(list_sessions).post(create_session).layer(axum::extract::DefaultBodyLimit::max(ATTACHED_BODY)))
         .route("/api/v1/sessions/{id}", get(get_session).patch(update_session))
         .route("/api/v1/sessions/{id}/events", get(session_events))
         .route("/api/v1/sessions/{id}/children", get(session_children))
@@ -82,8 +82,10 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/settings/commands", get(get_commands_setting).put(put_commands))
         .route("/api/v1/settings/agents", get(get_agents).put(put_agents))
         .route("/api/v1/commands", get(list_commands))
-        .route("/api/v1/sessions/{id}/messages", post(send_message))
+        .route("/api/v1/sessions/{id}/messages", post(send_message).layer(axum::extract::DefaultBodyLimit::max(ATTACHED_BODY)))
         .route("/api/v1/sessions/{id}/seen", post(seen_session))
+        .route("/api/v1/sessions/{id}/viewed", post(viewed_session))
+        .route("/api/v1/sessions/recent", get(recent_sessions))
         .route("/api/v1/sessions/{id}/interrupt", post(interrupt_session))
         .route("/api/v1/sessions/{id}/resume", post(resume_session))
         .route("/api/v1/sessions/{id}/rewind", post(rewind_session))
@@ -147,6 +149,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/queue/rejected", delete(dismiss_rejected))
         .route("/api/v1/sessions/{id}/queue/{command_id}", put(edit_queued).delete(cancel_queued))
         .route("/api/v1/sessions/{id}/queue/{command_id}/pull", post(pull_queued))
+        .route("/api/v1/sessions/{id}/queue/{command_id}/now", post(send_queued_now))
         .route("/api/v1/sessions/{id}/stream", get(session_stream))
         .route("/api/v1/head/fs/list", get(head_fs_list))
         .route("/api/v1/head/fs/read", get(head_fs_read))
@@ -166,6 +169,10 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/decisions", get(session_decisions))
         .route("/api/v1/sessions/{id}/suggestion", get(session_suggestion))
         .route("/api/v1/sessions/{id}/suggestion/seen", post(suggestion_seen))
+        .route("/api/v1/sessions/{id}/name/suggestion", get(session_name_suggestion))
+        .route("/api/v1/sessions/{id}/catchup", get(session_catchup))
+        .route("/api/v1/sessions/{id}/timeline", get(session_timeline))
+        .route("/api/v1/sessions/{id}/view", get(get_session_view).put(put_session_view))
         .route("/api/v1/settings/suggestions", get(get_suggestion_settings).put(put_suggestion_settings))
         .route("/api/v1/settings/session_grouping", get(get_session_grouping).put(put_session_grouping))
         .route("/api/v1/settings/session_facets", get(get_session_facets).put(put_session_facets))
@@ -190,6 +197,8 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/decisions/{id}", get(get_decision).patch(edit_decision))
         .route("/api/v1/decisions/{id}/answer", post(answer_decision))
         .route("/api/v1/decisions/{id}/session", post(decision_session))
+        .route("/api/v1/attention", get(get_attention))
+        .route("/api/v1/attention/seen", post(attention_seen))
         .route("/api/v1/assistant", post(ask_assistant))
         .route("/api/v1/assistant/mentionables", get(ask_mentionables))
         .route("/api/v1/assistant/claude", get(ask_claude))
@@ -392,6 +401,7 @@ async fn live(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Cal
 async fn live_socket(st: Arc<HeadState>, caller: Caller, mut socket: WebSocket) {
     let mut changes = st.registry.subscribe();
     let mut docs = st.docs.live.subscribe();
+    let mut attention = st.attention.subscribe();
     loop {
         changes.borrow_and_update();
         let Ok(workers) = workers_for(&st, &caller).await else { return };
@@ -403,10 +413,19 @@ async fn live_socket(st: Arc<HeadState>, caller: Caller, mut socket: WebSocket) 
                 return;
             }
         }
-        // Documents' changes go out as they happen, between snapshots.
+        // Documents' changes go out as they happen, between snapshots, and
+        // so does word that what needs you may have changed (already
+        // coalesced: `attention::Pings`).
         loop {
             tokio::select! {
                 _ = st.shutdown.cancelled() => return,
+                r = attention.changed() => {
+                    if r.is_err() { return }
+                    let Ok(text) = serde_json::to_string(&api::LiveEvent::Attention) else { return };
+                    if socket.send(Message::Text(text.into())).await.is_err() {
+                        return;
+                    }
+                }
                 r = changes.changed() => {
                     if r.is_err() { return }
                     // Coalesce bursts (e.g. many heartbeats) into one snapshot.
@@ -701,8 +720,14 @@ async fn chatgpt_callback(State(st): State<Arc<HeadState>>, uri: Uri) -> Respons
     }
 }
 
+/// Trunk's outputs: `name-<16 hex>.ext`, and the wasm, `name-<16 hex>_bg.wasm`.
+/// A body that may carry attachments: up to 20 MB of them (sessions.rs),
+/// as base64 (a third more) in JSON. The default 2 MB refused a screenshot.
+const ATTACHED_BODY: usize = 32 * 1024 * 1024;
+
 fn is_fingerprinted(path: &str) -> bool {
     let stem = path.rsplit('/').next().unwrap_or(path).split('.').next().unwrap_or("");
+    let stem = stem.strip_suffix("_bg").unwrap_or(stem);
     stem.rsplit_once('-').is_some_and(|(_, h)| h.len() == 16 && h.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
@@ -925,12 +950,72 @@ async fn session_suggestion(
     })
 }
 
+/// A name for the session to start from (the Rename box's Suggest).
+async fn session_name_suggestion(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<api::SuggestedName>> {
+    let row = st
+        .store
+        .session(&id)
+        .await?
+        .filter(|r| caller.sees(&r.realm))
+        .ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "no such session".into()))?;
+    match crate::naming::suggest(&st, &row).await {
+        Ok(title) => Ok(Json(api::SuggestedName { title })),
+        Err(e) => Err(ApiErr(StatusCode::BAD_GATEWAY, format!("no name to suggest: {e:#}"))),
+    }
+}
+
 async fn suggestion_seen(
     State(st): State<Arc<HeadState>>,
     Path(id): Path<String>,
     Json(s): Json<api::SuggestionSeen>,
 ) -> ApiResult<StatusCode> {
     crate::suggestions::seen(&st, &id, s.for_seq, s.accepted).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// What a session did since you last looked: 204 while its catch-up is off.
+async fn session_catchup(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Query(q): Query<api::CatchupQuery>,
+) -> ApiResult<Response> {
+    Ok(match crate::catchup::get(&st, &id, &q, &caller).await? {
+        Some(c) => Json(c).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    })
+}
+
+/// A session's turns, for its timeline (the glance's outline, the rows of
+/// folded turns).
+async fn session_timeline(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Query(q): Query<api::TimelineQuery>,
+) -> ApiResult<Json<Vec<api::TimelineTurn>>> {
+    Ok(Json(crate::timeline::get(&st, &id, &q, &caller).await?))
+}
+
+async fn get_session_view(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<api::SessionViewSettings>> {
+    Ok(Json(crate::catchup::view(&st, &id, &caller).await?))
+}
+
+async fn put_session_view(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(v): Json<api::SessionViewSettings>,
+) -> ApiResult<StatusCode> {
+    crate::catchup::set_view(&st, &id, &v, &caller).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1118,6 +1203,8 @@ async fn update_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>
             return Err(ApiErr(StatusCode::BAD_REQUEST, format!("a session's name can be at most {MAX_TITLE} characters")));
         }
         found &= st.store.set_title(&id, t).await?;
+        // Your name wins: never named by itself (an Undo of its name too).
+        crate::naming::forget(&st, &id).await?;
     }
     if let Some(a) = req.archived {
         found &= st.store.set_archived(&id, a).await?;
@@ -1126,6 +1213,10 @@ async fn update_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>
         return Err(ApiErr(StatusCode::NOT_FOUND, "no such session".into()));
     }
     st.registry.bump();
+    // An archived session's turn isn't worth a look any more.
+    if req.archived.is_some() {
+        st.attention.changed();
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1557,7 +1648,9 @@ async fn run_template(
         None if caller.realm.is_none() => crate::templates::realm_of(&st, &name).await?,
         None => caller.realm_for_new(None)?,
     };
-    Ok(Json(crate::templates::run(&st, &name, &body.input, &[], &realm).await?))
+    // The console's assistant's: its sessions say so.
+    let labels = if caller.console { vec![crate::assistant::STARTED_FROM_CONSOLE.to_owned()] } else { Vec::new() };
+    Ok(Json(crate::templates::run(&st, &name, &body.input, &labels, &realm).await?))
 }
 
 async fn all_templates(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<Vec<api::RealmTemplate>>> {
@@ -1659,6 +1752,22 @@ async fn seen_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>) 
     }
     crate::work::seen_session(&st, &id, now_ms()).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// You viewed a session: it goes first in its realm's recently viewed.
+async fn viewed_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    crate::recent::view(&st, &id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The sessions you viewed lately in the caller's realm, newest first.
+async fn recent_sessions(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(q): Query<api::InRealm>,
+) -> ApiResult<Json<Vec<api::RecentView>>> {
+    let realm = realm_for(&st, &caller, &q).await?;
+    Ok(Json(crate::recent::list(&st, &realm).await?))
 }
 
 /// An attachment of a user message, as sent.
@@ -2150,22 +2259,23 @@ async fn put_session_imports(State(st): State<Arc<HeadState>>, Json(s): Json<api
 /// What waits on you in each realm (docs/realms-ux.md §6): counts only,
 /// for the realm switcher. A realm's token learns only about its own.
 async fn get_elsewhere(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<Vec<api::RealmWaiting>>> {
-    let mut out = Vec::new();
-    for r in crate::realms::list(&st, &Caller::root()).await? {
-        // Root's is the console's (your browser's only): installs, grants.
-        let console = r.id == crate::realms::ROOT;
-        if (console && !caller.browser) || !(caller.sees_others() || caller.sees(&r.id)) {
-            continue;
-        }
-        let decisions = crate::decisions::open_count(&st, &Caller::in_realm(&r.id)).await?;
-        let approvals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE realm = ? AND awaiting > 0 AND archived = 0")
-            .bind(&r.id)
-            .fetch_one(&st.store.pool)
-            .await
-            .map_err(anyhow::Error::from)?;
-        out.push(api::RealmWaiting { id: r.id, name: r.name, waiting: (decisions + approvals).max(0) as u64 });
-    }
-    Ok(Json(out))
+    Ok(Json(crate::attention::places(&st, &caller).await?))
+}
+
+/// What needs you here, and how many wait in each other realm.
+async fn get_attention(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<api::Attention>> {
+    Ok(Json(crate::attention::get(&st, &caller).await?))
+}
+
+/// You've seen these worth-a-look items (none named: all of them).
+async fn attention_seen(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    body: Option<Json<api::AttentionSeen>>,
+) -> ApiResult<StatusCode> {
+    let keys = body.map(|Json(b)| b.keys).unwrap_or_default();
+    crate::attention::seen(&st, &caller, &keys).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// The realm a session is in, for links from before realms had their own
@@ -2570,7 +2680,8 @@ async fn run_workflow(
     Json(r): Json<api::RunWorkflow>,
 ) -> ApiResult<Json<api::WorkflowRun>> {
     let realm = caller.realm_for_new(None)?;
-    Ok(Json(crate::workflows::start(&st, &name, &r.input, "manual", &realm).await?))
+    let trigger = if caller.console { crate::assistant::BY_CONSOLE } else { "manual" };
+    Ok(Json(crate::workflows::start(&st, &name, &r.input, trigger, &realm).await?))
 }
 
 #[derive(schemars::JsonSchema, serde::Deserialize)]
@@ -2777,6 +2888,14 @@ async fn resume_session(
 
 async fn interrupt_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
     if crate::sessions::interrupt(&st, &id).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiErr(StatusCode::CONFLICT, "worker is not connected".into()))
+    }
+}
+
+async fn send_queued_now(State(st): State<Arc<HeadState>>, Path((id, command_id)): Path<(String, String)>) -> ApiResult<StatusCode> {
+    if crate::sessions::send_queued_now(&st, &id, &command_id).await? {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiErr(StatusCode::CONFLICT, "worker is not connected".into()))
@@ -3186,6 +3305,7 @@ async fn reach(st: &HeadState, caller: &Caller, asked: &api::InRealm, name: &str
 /// Who a write is by, for history.
 fn writer(caller: &Caller) -> String {
     match &caller.realm {
+        _ if caller.console => crate::assistant::BY_CONSOLE.into(),
         Some(r) => format!("token:{r}"),
         None => "you".into(),
     }
@@ -4203,4 +4323,21 @@ async fn answer_decision(
 /// Starts a session that helps you settle the decision.
 async fn decision_session(State(st): State<Arc<HeadState>>, Path(id): Path<i64>) -> ApiResult<Json<api::Session>> {
     Ok(Json(crate::decisions::start_session(&st, id).await?))
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::is_fingerprinted;
+
+    #[test]
+    fn trunk_outputs_are_fingerprinted_and_the_rest_not() {
+        // The wasm too: without it, 15 MB went again on every page load.
+        assert!(is_fingerprinted("c6-ui-789d462898aabf89_bg.wasm"));
+        assert!(is_fingerprinted("c6-ui-1de8bb420f162f4a.js"));
+        assert!(is_fingerprinted("input-d3c90d3631cf98b5.css"));
+        assert!(!is_fingerprinted("index.html"));
+        assert!(!is_fingerprinted("vendor/xterm.js"));
+        assert!(!is_fingerprinted("js/terminal.js"));
+        assert!(!is_fingerprinted("c6-ui-notahexhashxxxxx_bg.wasm"));
+    }
 }

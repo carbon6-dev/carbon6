@@ -40,6 +40,11 @@ pub fn hex(colour: &str) -> &'static str {
     }
 }
 
+/// A mark's colour alone (for a border or a stripe).
+pub fn colour_hex(mark: &str) -> &'static str {
+    hex(m::parse(mark).map(|(c, _)| c).unwrap_or(""))
+}
+
 /// A mark as CSS for a swatch's background: the colour, or its pattern on
 /// a pale tint of it.
 pub fn fill(mark: &str) -> String {
@@ -116,7 +121,7 @@ impl Shape {
     }
 
     /// Its size and outline as CSS, for a glyph `px` high.
-    fn css(self, px: u32) -> String {
+    pub fn css(self, px: u32) -> String {
         let (w, clip, radius) = match self {
             Shape::Circle => (px, "", "9999px"),
             Shape::Square => (px, "", "2px"),
@@ -198,7 +203,7 @@ pub fn Palette(
         <div class="space-y-[3px]">
             {rows.collect_view()}
             {clear.map(|f| view! {
-                <button class="mt-1 text-[11px] text-zinc-500 hover:underline" on:click=move |ev| { ev.stop_propagation(); f.run(()) }>
+                <button class="mt-1 text-[11px] text-muted hover:underline" on:click=move |ev| { ev.stop_propagation(); f.run(()) }>
                     "Back to its own colour"
                 </button>
             })}

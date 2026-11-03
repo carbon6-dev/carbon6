@@ -41,7 +41,7 @@ pub fn SlackSettings() -> impl IntoView {
     view! {
         <section class="space-y-4 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <h2 class="font-medium">"Slack"</h2>
-            <p class="text-sm text-zinc-500">"Every conversation you're in (channels, private channels, DMs and groups), with its threads and shared documents, kept in this realm's memex and searchable; the Chat page to read and post. It uses your own Slack app, which keeps Slack's normal limits (apps from outside its directory are slowed to a crawl)."</p>
+            <p class="text-sm text-muted">"Every conversation you're in (channels, private channels, DMs and groups), with its threads and shared documents, kept in this realm's memex and searchable; the Chat page to read and post. It uses your own Slack app, which keeps Slack's normal limits (apps from outside its directory are slowed to a crawl)."</p>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             {move || note.get().map(|n| view! { <p class="rounded-md bg-emerald-50 px-3 py-2 text-sm text-emerald-900 dark:bg-emerald-950 dark:text-emerald-200">{n}</p> })}
             {move || setup.get().map(|r| match r {
@@ -54,9 +54,9 @@ pub fn SlackSettings() -> impl IntoView {
                         <div class="space-y-2">
                             <h3 class="text-sm font-medium">"1. The slack app"</h3>
                             {match (s.installed, s.waiting) {
-                                (true, _) => view! { <p class="text-sm text-zinc-500">"Installed in this realm."</p> }.into_any(),
+                                (true, _) => view! { <p class="text-sm text-muted">"Installed in this realm."</p> }.into_any(),
                                 (false, true) => view! {
-                                    <p class="text-sm text-zinc-500">"Waiting for your approval in the console's "
+                                    <p class="text-sm text-muted">"Waiting for your approval in the console's "
                                         <a rel="external" class="underline" href="/admin/decisions">"Decisions"</a> "."</p>
                                 }.into_any(),
                                 (false, false) => view! {
@@ -98,7 +98,7 @@ pub fn SlackSettings() -> impl IntoView {
                         // 3. Workspaces.
                         <div class="space-y-2">
                             <h3 class="text-sm font-medium">"3. Workspaces"</h3>
-                            {s.workspaces.is_empty().then(|| view! { <p class="text-sm text-zinc-500">"None connected yet."</p> })}
+                            {s.workspaces.is_empty().then(|| view! { <p class="text-sm text-muted">"None connected yet."</p> })}
                             {s.workspaces.into_iter().map(|w| {
                                 let id = w.id.clone();
                                 let progress = if w.conversations > 0 && w.imported == w.conversations {
@@ -109,10 +109,10 @@ pub fn SlackSettings() -> impl IntoView {
                                 view! {
                                     <div class="flex flex-wrap items-center gap-2 rounded-md border border-zinc-200 px-3 py-2 text-sm dark:border-zinc-800">
                                         <span class="font-medium">{w.name.clone()}</span>
-                                        <span class="text-zinc-500">{format!("{progress} · {} people", w.people)}</span>
-                                        {(w.files_waiting > 0).then(|| view! { <span class="text-zinc-500">{format!("· {} files waiting", w.files_waiting)}</span> })}
+                                        <span class="text-muted">{format!("{progress} · {} people", w.people)}</span>
+                                        {(w.files_waiting > 0).then(|| view! { <span class="text-muted">{format!("· {} files waiting", w.files_waiting)}</span> })}
                                         {w.retry_after.filter(|t| *t > now_ms()).map(|_| view! { <span class="text-amber-600">"· Slack asked to slow down"</span> })}
-                                        {w.synced_at.map(|t| view! { <span class="text-xs text-zinc-400">{format!("synced {}", ago(now_ms() - t))}</span> })}
+                                        {w.synced_at.map(|t| view! { <span class="text-xs text-muted">{format!("synced {}", ago(now_ms() - t))}</span> })}
                                         <span class="flex-1"></span>
                                         <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| {
                                             let id = id.clone();
@@ -135,7 +135,7 @@ pub fn SlackSettings() -> impl IntoView {
                                 }>"Connect a workspace"</button>
                                 <button class=BUTTON_QUIET disabled=!s.installed on:click=move |_| run(Box::pin(async { api::slack_sync().await.map(|_| Some("Syncing.".into())) }))>"Sync now"</button>
                             </div>
-                            <p class="text-xs text-zinc-500">"Agents see chat only in sessions whose labels a Memex scopes rule gives the kind chat (Settings → Memex scopes); their posts wait for your approval."</p>
+                            <p class="text-xs text-muted">"Agents see chat only in sessions whose labels a Memex scopes rule gives the kind chat (Settings → Memex scopes); their posts wait for your approval."</p>
                         </div>
                     }.into_any()
                 }

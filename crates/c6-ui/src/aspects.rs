@@ -1,9 +1,7 @@
 //! A session's aspects (docs/marks.md): its worker, its work, its project,
 //! its realm, its repo and its model, each value in its mark and its aspect's shape.
-//! A tile's bar shows the ones its realm chose (Settings → Appearance), as
-//! shapes, with names when the tile is wide; pointing at one dims the tiles
-//! that don't share it, and clicking it shows the value, the other sessions
-//! with it, and its palette.
+//! A session's row and its dock line show the ones its realm chose
+//! (Settings → Appearance).
 
 use c6_api::Session;
 use c6_api::marks::{ASPECTS, SessionFacets};
@@ -11,8 +9,7 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 use crate::api;
-use crate::marks::{Glyph, Shape, ValuePalette, live_mark};
-use crate::workspace::{Go, Popover, View, below};
+use crate::marks::{Glyph, Shape, live_mark};
 
 /// One value of one of a session's aspects.
 #[derive(Clone, Debug, PartialEq)]
@@ -27,16 +24,6 @@ pub struct Aspect {
 impl Aspect {
     pub fn shape(&self) -> Shape {
         Shape::of(self.aspect)
-    }
-
-    fn view(&self) -> Option<View> {
-        let (_, value) = self.key.split_once(':')?;
-        match self.aspect {
-            "worker" => Some(View::Worker { id: value.to_owned() }),
-            "work" => Some(View::Work { id: value.to_owned() }),
-            "project" => Some(View::Projects { id: value.to_owned() }),
-            _ => None,
-        }
     }
 
     fn what(&self) -> &'static str {
@@ -55,8 +42,11 @@ impl Aspect {
 pub fn of(s: &Session) -> Vec<Aspect> {
     let live = api::live();
     let mut out = Vec::new();
-    let worker = s.worker_id.to_string();
-    out.push(Aspect { aspect: "worker", label: live.worker_name(&worker), key: format!("worker:{worker}") });
+    // A session the head runs has no worker, so no worker chip.
+    if !s.on_head {
+        let worker = s.worker_id.to_string();
+        out.push(Aspect { aspect: "worker", label: live.worker_name(&worker), key: format!("worker:{worker}") });
+    }
     if let Some(w) = &s.work {
         // A quick session (docs/projects.md §3.1) has a project and no work.
         if !w.id.is_empty() {
@@ -116,126 +106,6 @@ pub fn use_facets() -> Facets {
     expect_context::<Facets>()
 }
 
-/// The value you're pointing at: tiles without it dim.
-#[derive(Clone, Copy)]
-pub struct Spotlight(pub RwSignal<Option<String>>);
-
-/// How long the pointer rests on a value before the other tiles dim:
-/// passing over a bar on the way somewhere else doesn't flicker the screen.
-const SPOTLIGHT_DWELL_MS: u64 = 400;
-
-pub fn use_spotlight() -> Spotlight {
-    expect_context::<Spotlight>()
-}
-
-/// A session's shown aspects in a tile's bar: shapes, named when the bar is
-/// wide (a container query on the bar).
-#[component]
-pub fn AspectStrip(#[prop(into)] session: Signal<Option<Session>>) -> impl IntoView {
-    let spot = use_spotlight();
-    // Set once the pointer has rested on a value; leaving cancels it and
-    // clears what it lit.
-    let timer = StoredValue::new(None::<TimeoutHandle>);
-    let rest_on = move |key: Option<String>| {
-        if let Some(t) = timer.get_value() {
-            t.clear();
-        }
-        timer.set_value(None);
-        match key {
-            Some(k) => timer
-                .set_value(set_timeout_with_handle(move || spot.0.set(Some(k)), std::time::Duration::from_millis(SPOTLIGHT_DWELL_MS)).ok()),
-            None => {
-                if spot.0.get_untracked().is_some() {
-                    spot.0.set(None);
-                }
-            }
-        }
-    };
-    on_cleanup(move || {
-        if let Some(t) = timer.try_get_value().flatten() {
-            t.clear();
-        }
-    });
-    let open = RwSignal::new(None::<(f64, f64)>);
-    let picked = RwSignal::new(None::<Aspect>);
-    let aspects = Memo::new(move |_| session.get().map(|s| shown(&s)).unwrap_or_default());
-    view! {
-        <span class="flex min-w-0 shrink items-center gap-0.5">
-            <For each=move || aspects.get() key=|a| (a.key.clone(), a.label.clone()) let(a)>
-                {
-                    let (enter, click) = (a.key.clone(), a.clone());
-                    let mark = Signal::derive({ let k = a.key.clone(); move || live_mark(&k) });
-                    view! {
-                        <button class="flex min-w-0 items-center gap-1 rounded px-1 py-0.5 text-[11px] text-zinc-600 hover:bg-black/10 dark:text-zinc-300 dark:hover:bg-white/10"
-                            title=format!("{}: {}", a.what(), a.label)
-                            on:mouseenter=move |_| rest_on(Some(enter.clone()))
-                            on:mouseleave=move |_| rest_on(None)
-                            on:click=move |ev| { ev.stop_propagation(); rest_on(None); picked.set(Some(click.clone())); open.set(Some(below(&ev, 380.0))) }>
-                            <Glyph mark shape=a.shape() size=10 />
-                            <span class="hidden max-w-28 truncate @2xl:inline">{a.label.clone()}</span>
-                        </button>
-                    }
-                }
-            </For>
-            <Popover at=open class="w-[380px]">
-                {move || picked.get().zip(session.get_untracked()).map(|(a, s)| view! { <AspectCard a session=s on_done=move |()| open.set(None) /> })}
-            </Popover>
-        </span>
-    }
-}
-
-/// One value of an aspect: what it is, the other sessions with it, the way
-/// to its page, and its palette.
-#[component]
-fn AspectCard(a: Aspect, session: Session, #[prop(into)] on_done: Callback<()>) -> impl IntoView {
-    let live = api::live();
-    let key = StoredValue::new(a.key.clone());
-    let me = session.id.clone();
-    let others = Memo::new(move |_| {
-        live.sessions.with(|ss| {
-            ss.iter()
-                .filter(|s| s.id != me && s.parent_id.is_none() && of(s).iter().any(|x| x.key == key.get_value()))
-                .map(|s| (s.id.clone(), s.title.clone(), crate::marks::of(s)))
-                .collect::<Vec<_>>()
-        })
-    });
-    let mark = Signal::derive(move || live_mark(&key.get_value()));
-    let page = a.view();
-    let (sid, title) = (session.id.clone(), session.title.clone());
-    let is_work = a.aspect == "work";
-    view! {
-        <div class="space-y-2 p-1">
-            <div class="flex items-center gap-2">
-                <Glyph mark shape=a.shape() size=14 />
-                <span class="text-[11px] uppercase tracking-wide text-zinc-500">{a.what()}</span>
-                <span class="min-w-0 flex-1 truncate font-medium" title=a.label.clone()>{a.label.clone()}</span>
-                {page.map(|v| view! { <Go to=v class="shrink-0 text-xs text-blue-600 hover:underline dark:text-blue-400">"Open"</Go> })}
-            </div>
-            {is_work.then(|| view! { <crate::work::SessionWork session_id=sid title=Signal::stored(title) /> })}
-            {move || {
-                let list = others.get();
-                let n = list.len();
-                view! {
-                    <div class="space-y-0.5">
-                        <div class="text-[11px] text-zinc-500">{match n { 0 => "No other session has it".to_owned(), 1 => "1 other session".to_owned(), n => format!("{n} other sessions") }}</div>
-                        {list.into_iter().take(8).map(|(id, title, mk)| view! {
-                            <Go to=View::session(id) class="flex items-center gap-1.5 rounded px-1 py-0.5 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800">
-                                <Glyph mark=Signal::stored(mk) shape=Shape::Circle size=8 />
-                                <span class="min-w-0 flex-1 truncate">{title}</span>
-                            </Go>
-                        }).collect_view()}
-                        {(n > 8).then(|| view! { <div class="px-1 text-[11px] text-zinc-400">{format!("+{}", n - 8)}</div> })}
-                    </div>
-                }
-            }}
-            <div class="border-t border-zinc-200 pt-2 dark:border-zinc-800">
-                <div class="pb-1 text-[11px] text-zinc-500">"Its mark, wherever it shows"</div>
-                <ValuePalette key=a.key.clone() on_pick=on_done />
-            </div>
-        </div>
-    }
-}
-
 /// A session's shown aspects as small shapes, named on hover (rows in the
 /// rail and the dock).
 #[component]
@@ -269,7 +139,7 @@ pub fn AspectChips(s: Session) -> impl IntoView {
                     {list.into_iter().map(|a| {
                         let k = a.key.clone();
                         view! {
-                            <span class="inline-flex min-w-0 items-center gap-1 text-xs text-zinc-500" title=a.what()>
+                            <span class="inline-flex min-w-0 items-center gap-1 text-xs text-muted" title=a.what()>
                                 <Glyph mark=Signal::derive(move || live_mark(&k)) shape=a.shape() size=9 />
                                 <span class="max-w-40 truncate">{a.label.clone()}</span>
                             </span>
@@ -298,7 +168,7 @@ pub fn FacetsSetting() -> impl IntoView {
     };
     let what = |aspect: &str| match aspect {
         "worker" => ("Worker", "The machine it runs on"),
-        "work" => ("Work", "The work it serves; its tile gets a stripe in the work's mark too"),
+        "work" => ("Work", "The work it serves"),
         "project" => ("Project", "The project its work is in"),
         "realm" => ("Realm", "When it isn't home"),
         "repo" => ("Repo", "The git repository it works in"),
@@ -307,8 +177,8 @@ pub fn FacetsSetting() -> impl IntoView {
     view! {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <h2 class="font-medium">"Session aspects"</h2>
-            <p class="text-xs text-zinc-500">
-                "What a session's tile bar, its row and its dock line show, each in its own shape. Every value wears the same mark everywhere: click one in a tile's bar to change it, or point at it to dim the tiles without it."
+            <p class="text-xs text-muted">
+                "What a session's row and its dock line show, each in its own shape. Every value wears the same mark everywhere."
             </p>
             <div class="grid gap-2 sm:grid-cols-2">
                 {ASPECTS.into_iter().map(|aspect| {
@@ -320,13 +190,13 @@ pub fn FacetsSetting() -> impl IntoView {
                             <span class="mt-1"><Glyph mark=Signal::stored("slate".to_owned()) shape=Shape::of(aspect) size=11 /></span>
                             <span>
                                 <span class="block text-sm font-medium">{label}</span>
-                                <span class="block text-xs text-zinc-500">{hint}</span>
+                                <span class="block text-xs text-muted">{hint}</span>
                             </span>
                         </label>
                     }
                 }).collect_view()}
             </div>
-            <p class="text-xs text-zinc-500">"Kept in carbon6, for this realm."</p>
+            <p class="text-xs text-muted">"Kept in carbon6, for this realm."</p>
             {move || error.get().map(|e| view! { <p class="text-xs text-red-600">{e}</p> })}
         </section>
     }

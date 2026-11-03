@@ -52,15 +52,16 @@ pub fn SearchBox() -> impl IntoView {
     let ws = use_workspace();
     let text = RwSignal::new(String::new());
     let input = NodeRef::<leptos::html::Input>::new();
-    let _hotkey = window_event_listener(leptos::ev::keydown, move |ev| {
+    let hotkey = window_event_listener(leptos::ev::keydown, move |ev| {
         if ev.key() == "k" && (ev.meta_key() || ev.ctrl_key()) {
             ev.prevent_default();
-            if let Some(el) = input.get_untracked() {
+            if let Some(el) = input.try_get_untracked().flatten() {
                 let _ = el.focus();
                 el.select();
             }
         }
     });
+    on_cleanup(move || hotkey.remove());
     view! {
         <input
             node_ref=input
@@ -134,13 +135,13 @@ pub fn SearchPage(q: String, kind: String, worker: String) -> impl IntoView {
                 </select>
             </div>
             <crate::labels::LabelFilterBar />
-            <Suspense fallback=|| view! { <p class="text-sm text-zinc-500">"Searching…"</p> }>
+            <Suspense fallback=|| view! { <p class="text-sm text-muted">"Searching…"</p> }>
                 {move || results.get().map(|r| match r {
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
-                    Ok(None) => view! { <p class="text-sm text-zinc-500">"Search every message, tool call and tool output in your sessions."</p> }.into_any(),
+                    Ok(None) => view! { <p class="text-sm text-muted">"Search every message, tool call and tool output in your sessions."</p> }.into_any(),
                     Ok(Some(r)) if r.results.is_empty() => view! {
                         <Ignored words=r.ignored.clone() />
-                        <p class="text-sm text-zinc-500">{move || if filter.with(Vec::is_empty) { "No matches." } else { "No matches in sessions with these labels." }}</p>
+                        <p class="text-sm text-muted">{move || if filter.with(Vec::is_empty) { "No matches." } else { "No matches in sessions with these labels." }}</p>
                     }.into_any(),
                     Ok(Some(r)) => {
                         let q = q();
@@ -148,7 +149,7 @@ pub fn SearchPage(q: String, kind: String, worker: String) -> impl IntoView {
                             <div class="space-y-3">
                                 <Ignored words=r.ignored.clone() />
                                 {r.results.into_iter().map(|res| view! { <ResultCard res q=q.clone() /> }).collect_view()}
-                                {r.truncated.then(|| view! { <p class="text-xs text-zinc-500">"Showing the best matches; add words to narrow the search."</p> })}
+                                {r.truncated.then(|| view! { <p class="text-xs text-muted">"Showing the best matches; add words to narrow the search."</p> })}
                             </div>
                         }.into_any()
                     }
@@ -204,9 +205,9 @@ fn ResultCard(res: SearchResult, q: String) -> impl IntoView {
             <div class="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-0.5 border-b border-zinc-100 px-4 py-2 dark:border-zinc-800">
                 <div class="min-w-0 truncate">
                     <Go to=title_view class="font-medium hover:underline" title="Open beside the results (⌘-click: new tile)">{s.title.clone()}</Go>
-                    {parent.map(|p| view! { <span class="ml-2 text-xs text-zinc-500">{format!("in “{p}”")}</span> })}
+                    {parent.map(|p| view! { <span class="ml-2 text-xs text-muted">{format!("in “{p}”")}</span> })}
                 </div>
-                <div class="flex shrink-0 items-center gap-2 text-xs text-zinc-500">
+                <div class="flex shrink-0 items-center gap-2 text-xs text-muted">
                     {badge.map(|b| view! { <span class="rounded bg-sky-100 px-1.5 text-sky-800 dark:bg-sky-950 dark:text-sky-300">{b}</span> })}
                     <span>{res.worker_name.clone()}</span>
                     <span class="font-mono">{s.model.clone()}</span>
@@ -216,7 +217,7 @@ fn ResultCard(res: SearchResult, q: String) -> impl IntoView {
             <div class="divide-y divide-zinc-100 dark:divide-zinc-800">
                 {res.hits.into_iter().map(|h| { let to = at(Some(h.anchor.clone()), Some(h.seq)); view! { <HitRow h to /> } }).collect_view()}
             </div>
-            {(more > 0).then(|| view! { <p class="px-4 py-1.5 text-xs text-zinc-500">{format!("{more} more match{} in this session", if more == 1 { "" } else { "es" })}</p> })}
+            {(more > 0).then(|| view! { <p class="px-4 py-1.5 text-xs text-muted">{format!("{more} more match{} in this session", if more == 1 { "" } else { "es" })}</p> })}
         </div>
     }
 }

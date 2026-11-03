@@ -95,10 +95,10 @@ pub(crate) fn MessageList(place: Place, at: Option<String>) -> impl IntoView {
         });
     });
     let load_older = move || {
-        if loading_older.get_untracked() || older_done.get_untracked() {
+        if loading_older.try_get_untracked() != Some(false) || older_done.try_get_untracked() != Some(false) {
             return;
         }
-        let Some(before) = msgs.with_untracked(|l| l.last().and_then(|m| m["created_at"].as_i64())) else { return };
+        let Some(before) = msgs.try_with_untracked(|l| l.last().and_then(|m| m["created_at"].as_i64())).flatten() else { return };
         loading_older.set(true);
         let p = mp.clone();
         spawn_local(async move {
@@ -140,6 +140,10 @@ pub(crate) fn MessageList(place: Place, at: Option<String>) -> impl IntoView {
     let lo = load_older.clone();
     Effect::new(move || {
         if let Some(el) = top.get() {
+            // One at a time: one left observing would load for a list gone.
+            if let Some(o) = observer.try_get_value().flatten() {
+                o.disconnect();
+            }
             let lo = lo.clone();
             let cb = wasm_bindgen::closure::Closure::<dyn Fn(js_sys::Array)>::new(move |entries: js_sys::Array| {
                 if entries.iter().any(|e| e.unchecked_into::<web_sys::IntersectionObserverEntry>().is_intersecting()) {
@@ -180,7 +184,7 @@ pub(crate) fn MessageList(place: Place, at: Option<String>) -> impl IntoView {
     view! {
         <div class="flex min-h-0 flex-1 flex-col-reverse overflow-y-auto">
             <div class="pb-2">
-                <div node_ref=top class="px-4 py-2 text-center text-xs text-zinc-500">
+                <div node_ref=top class="px-4 py-2 text-center text-xs text-muted">
                     {move || if older_done.get() {
                         view! { <span>{format!("The start of {}", shown.name)}</span> }.into_any()
                     } else {
@@ -281,6 +285,12 @@ pub(crate) fn Message(
     let my_reactions: Vec<String> =
         meta["my_reactions"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(str::to_owned)).collect();
     let picker = RwSignal::new(false);
+    let pop = StoredValue::new(crate::util::dismissable(
+        move || picker.get(),
+        move || {
+            picker.try_set(false);
+        },
+    ));
     let editing = {
         let id = id.clone();
         Memo::new(move |_| chat.editing.get().as_deref() == Some(id.as_str()))
@@ -314,7 +324,7 @@ pub(crate) fn Message(
         let jump = ts.clone();
         let reply = thread_ts.clone().filter(|t| *t != ts);
         view! {
-            <button class="mb-0.5 block text-[11px] font-medium text-zinc-500 hover:underline"
+            <button class="mb-0.5 block text-[11px] font-medium text-muted hover:underline"
                 on:click=move |_| match &reply {
                     Some(t) => { chat.open(p.clone(), Some(t.clone())); chat.thread.set(Some((p.clone(), t.clone()))); }
                     None => chat.open(p.clone(), Some(jump.clone())),
@@ -334,7 +344,7 @@ pub(crate) fn Message(
             view! {
                 <div class="absolute -top-3 right-3 z-20 hidden items-center gap-0.5 rounded-md border border-zinc-200 bg-white px-1 py-0.5 text-xs shadow-sm group-hover:flex dark:border-zinc-700 dark:bg-zinc-900">
                     {QUICK.iter().map(|n| { let react = react.clone(); view! { <button class=btn title=format!(":{n}:") on:click=move |_| react(n.to_string(), false)>{text::face(n)}</button> } }).collect_view()}
-                    <button class=btn title="Add a reaction" on:click=move |_| picker.update(|p| *p = !*p)>"☺+"</button>
+                    <button class=btn title="Add a reaction" data-pop=pop.get_value() on:click=move |_| picker.update(|p| *p = !*p)>"☺+"</button>
                     {(!in_thread).then(|| view! { <button class=btn title="Reply in a thread" on:click=move |_| open_thread()>"💬"</button> })}
                     <button class=btn title="Save for later" on:click=move |_| chat.act("memex.chat.save", json!({"id": id1}))>"🔖"</button>
                     <button class=btn title="Copy link" on:click=move |_| { let _ = window().navigator().clipboard().write_text(&url1); }>"🔗"</button>
@@ -369,7 +379,7 @@ pub(crate) fn Message(
                 if highlight { "bg-amber-50 dark:bg-amber-950/40" } else { "hover:bg-zinc-50 dark:hover:bg-zinc-900/60" })>
             <div class="w-9 shrink-0">
                 {if compact {
-                    view! { <span class="invisible block pt-0.5 text-right text-[10px] text-zinc-400 group-hover:visible" title=full(at)>{time(at)}</span> }.into_any()
+                    view! { <span class="invisible block pt-0.5 text-right text-[10px] text-muted group-hover:visible" title=full(at)>{time(at)}</span> }.into_any()
                 } else {
                     view! { <Avatar url=avatar name=who.clone() /> }.into_any()
                 }}
@@ -380,7 +390,7 @@ pub(crate) fn Message(
                     <div class="flex items-baseline gap-2">
                         <crate::people::Person class="font-semibold" label=who.clone() name=who.clone() address=email.clone() about=about.clone() />
                         {bot.then(|| view! { <span class="rounded bg-zinc-200 px-1 text-[9px] font-semibold text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400">"APP"</span> })}
-                        <span class="text-[11px] text-zinc-500" title=full(at)>{time(at)}</span>
+                        <span class="text-[11px] text-muted" title=full(at)>{time(at)}</span>
                     </div>
                 })}
                 {move || if editing.get() {
@@ -389,7 +399,7 @@ pub(crate) fn Message(
                     view! {
                         <div class="leading-relaxed">
                             {(!files_only).then(|| text::render(&shown_text, &known, opener))}
-                            {(meta["edited"] == true).then(|| view! { <span class="ml-1 text-[11px] text-zinc-400">"(edited)"</span> })}
+                            {(meta["edited"] == true).then(|| view! { <span class="ml-1 text-[11px] text-muted">"(edited)"</span> })}
                         </div>
                     }.into_any()
                 }}
@@ -415,8 +425,8 @@ pub(crate) fn Message(
                                     </button>
                                 }
                             }).collect_view()}
-                            <button class="rounded-full border border-zinc-200 px-1.5 text-xs text-zinc-500 hover:border-zinc-400 dark:border-zinc-700" title="Add a reaction"
-                                on:click=move |_| picker.update(|p| *p = !*p)>"☺+"</button>
+                            <button class="rounded-full border border-zinc-200 px-1.5 text-xs text-muted hover:border-zinc-400 dark:border-zinc-700" title="Add a reaction"
+                                data-pop=pop.get_value() on:click=move |_| picker.update(|p| *p = !*p)>"☺+"</button>
                         </div>
                     }
                 })}
@@ -425,7 +435,7 @@ pub(crate) fn Message(
                     view! {
                         <button class="mt-1 flex items-center gap-2 rounded-md px-1 py-0.5 text-xs hover:bg-white hover:ring-1 hover:ring-zinc-200 dark:hover:bg-zinc-900 dark:hover:ring-zinc-700" on:click=move |_| open_thread()>
                             <span class="font-semibold text-sky-700 dark:text-sky-400">{format!("{replies} repl{}", if replies == 1 { "y" } else { "ies" })}</span>
-                            <span class="text-zinc-500">"View thread"</span>
+                            <span class="text-muted">"View thread"</span>
                         </button>
                     }
                 })}
@@ -433,7 +443,7 @@ pub(crate) fn Message(
             {actions}
             {move || picker.get().then(|| {
                 let react = react.clone();
-                view! { <EmojiPicker pick=Callback::new(move |n: String| { react(n, false); picker.set(false); }) close=picker /> }
+                view! { <div class="contents" data-pop=pop.get_value()><EmojiPicker pick=Callback::new(move |n: String| { react(n, false); picker.set(false); }) close=picker /></div> }
             })}
         </div>
     }
@@ -508,7 +518,7 @@ fn EditBox(text: String, place: Place, ts: String, thread_ts: Option<String>) ->
             <div class="flex gap-2 text-xs">
                 <button class="rounded-md bg-sky-700 px-2 py-1 text-white" on:click=move |_| s2()>"Save"</button>
                 <button class="rounded-md px-2 py-1 hover:bg-zinc-100 dark:hover:bg-zinc-800" on:click=move |_| chat.editing.set(None)>"Cancel"</button>
-                <span class="self-center text-zinc-500">"Enter to save · Esc to cancel"</span>
+                <span class="self-center text-muted">"Enter to save · Esc to cancel"</span>
             </div>
         </div>
     }
