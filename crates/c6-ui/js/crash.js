@@ -1,10 +1,29 @@
 // When the app breaks, a small banner says so and offers a reload, instead
 // of a page that no longer answers. A Rust panic calls it (its hook), and so
 // does any trap in the WebAssembly (what follows a panic, or a stack or
-// memory gone bad), whichever comes first. Plain DOM and a plain listener:
-// what broke can't draw it.
+// memory gone bad), whichever comes first, and so does an error from the
+// bindings that leaves a handler stuck: an event handler entered again
+// while it runs ("recursive use of an object…"), or one called after it was
+// dropped. Those are plain Errors, not traps, and after one the page's
+// shared key and click handlers can stay broken (Enter types a new line,
+// Send does nothing) until a reload. Plain DOM and a plain listener: what
+// broke can't draw it. What broke goes to the head's log too.
 window.c6Crashed = (() => {
-  const show = () => {
+  let told = false;
+  const tell = (message, stack) => {
+    if (told) return;
+    told = true;
+    try {
+      fetch("/api/v1/ui/error", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+        body: JSON.stringify({ message: String(message || ""), stack: String(stack || ""), page: location.pathname }),
+      }).catch(() => {});
+    } catch (_) {}
+  };
+  const show = (message, stack) => {
+    tell(message, stack);
     if (document.getElementById("c6-crashed")) return;
     const bar = document.createElement("div");
     bar.id = "c6-crashed";
@@ -24,12 +43,14 @@ window.c6Crashed = (() => {
     bar.append(text, button);
     (document.body || document.documentElement).append(bar);
   };
-  const trapped = (e) => typeof WebAssembly !== "undefined" && e instanceof WebAssembly.RuntimeError;
+  const stuck = /recursive use of an object detected|closure invoked (recursively or )?after being dropped|already (mutably )?borrowed/i;
+  const breaks = (e) =>
+    (typeof WebAssembly !== "undefined" && e instanceof WebAssembly.RuntimeError) || (e && stuck.test(String(e.message || e)));
   window.addEventListener("error", (ev) => {
-    if (trapped(ev.error)) show();
+    if (breaks(ev.error)) show(ev.error && ev.error.message, ev.error && ev.error.stack);
   });
   window.addEventListener("unhandledrejection", (ev) => {
-    if (trapped(ev.reason)) show();
+    if (breaks(ev.reason)) show(ev.reason && ev.reason.message, ev.reason && ev.reason.stack);
   });
   return show;
 })();

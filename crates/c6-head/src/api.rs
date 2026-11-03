@@ -164,6 +164,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/workers/{id}/terminals/{tid}", delete(close_terminal))
         .route("/api/v1/workers/{id}/terminals/{tid}/attach", get(attach_terminal))
         .route("/api/v1/live", get(live))
+        .route("/api/v1/ui/error", post(ui_error))
         .route("/api/v1/search", get(search))
         .route("/api/v1/sessions/{id}/matches", get(session_matches))
         .route("/api/v1/sessions/{id}/decisions", get(session_decisions))
@@ -836,6 +837,14 @@ pub async fn sessions_snapshot(st: &HeadState, caller: &Caller) -> anyhow::Resul
             api::Session { work: tag.cloned(), ..crate::convert::session_with_activity(r, working.get(&r.id), st.assistant.head_id()) }
         })
         .collect())
+}
+
+/// The web UI broke (a panic, or an error that leaves it unable to answer):
+/// what it said, for the head's log, since nobody reads a browser's console.
+async fn ui_error(Json(e): Json<serde_json::Value>) -> StatusCode {
+    let text = |k: &str| e[k].as_str().unwrap_or("").chars().take(2000).collect::<String>();
+    tracing::warn!(page = %text("page"), message = %text("message"), stack = %text("stack"), "the web UI broke");
+    StatusCode::NO_CONTENT
 }
 
 async fn list_sessions(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<Vec<api::Session>>> {

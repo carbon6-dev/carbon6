@@ -66,7 +66,7 @@ use workspace::{Go, View};
 extern "C" {
     /// js/crash.js: the banner that offers a reload.
     #[wasm_bindgen(catch, js_name = c6Crashed)]
-    fn js_crashed() -> Result<(), wasm_bindgen::JsValue>;
+    fn js_crashed(message: &str) -> Result<(), wasm_bindgen::JsValue>;
 }
 
 fn main() {
@@ -75,7 +75,7 @@ fn main() {
     // console's "panicked at …" the page says so and offers a reload.
     std::panic::set_hook(Box::new(|info| {
         console_error_panic_hook::hook(info);
-        let _ = js_crashed();
+        let _ = js_crashed(&info.to_string());
     }));
     // Each page is one realm's app or the console (docs/realms-ux.md).
     if place::resolve() {

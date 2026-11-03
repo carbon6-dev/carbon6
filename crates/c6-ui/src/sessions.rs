@@ -1075,7 +1075,7 @@ fn RailCard(s: Session, x: f64, y: f64, hover: Hover, like_this: RwSignal<Option
             {s.awaiting_approval.then(|| view! { <p class="text-xs font-medium text-amber-600">"A tool call waits for your approval"</p> })}
             <div class="space-y-0.5 text-xs text-muted">
                 <div class="truncate"><span title=s.on_head.then_some(api::HEAD_TITLE)>{worker}</span> " · " {s.model.clone()}</div>
-                <div class="break-all font-mono">{place}</div>
+                <div class="break-all font-mono">{place.clone()}</div>
                 <div>{move || format!("active {}", ago(now.get() - updated))}</div>
             </div>
             {(!s.labels.is_empty() || !crate::labels::shown_auto(&s.auto_labels).is_empty()).then(|| view! {
@@ -1142,29 +1142,33 @@ pub fn NewSessionDialog(seed: SessionSeed, #[prop(into)] on_close: Callback<()>)
     let connections = LocalResource::new(api::connections);
     let seed = StoredValue::new(seed);
     view! {
-        <div class="fixed inset-0 z-30 flex items-start justify-center overflow-y-auto bg-black/40 px-4 py-16" on:click=move |_| on_close.run(())
-            on:keydown=move |ev| {
-                // Not the session's Esc, which stops its turn.
-                if ev.key() == "Escape" {
-                    ev.stop_propagation();
-                    on_close.run(());
-                }
-            }>
-            <div class="w-full max-w-3xl space-y-3 rounded-lg bg-white p-4 shadow-xl outline-none dark:bg-zinc-900" tabindex="-1" on:click=|ev| ev.stop_propagation()>
-                <div class="flex items-center gap-2">
-                    <h2 class="flex-1 font-medium">"New session like this one"</h2>
-                    <button class=format!("{BUTTON_QUIET} text-xs text-muted") title="Close (Esc)" on:click=move |_| on_close.run(())>"✕"</button>
+        // Over every tile, wherever it was opened from: inside a tile it
+        // could show behind the others.
+        <leptos::portal::Portal>
+            <div class="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 px-4 py-16" on:click=move |_| on_close.run(())
+                on:keydown=move |ev| {
+                    // Not the session's Esc, which stops its turn.
+                    if ev.key() == "Escape" {
+                        ev.stop_propagation();
+                        on_close.run(());
+                    }
+                }>
+                <div class="w-full max-w-3xl space-y-3 rounded-lg bg-white p-4 shadow-xl outline-none dark:bg-zinc-900" tabindex="-1" on:click=|ev| ev.stop_propagation()>
+                    <div class="flex items-center gap-2">
+                        <h2 class="flex-1 font-medium">"New session like this one"</h2>
+                        <button class=format!("{BUTTON_QUIET} text-xs text-muted") title="Close (Esc)" on:click=move |_| on_close.run(())>"✕"</button>
+                    </div>
+                    <p class="text-xs text-muted">"A new, empty session with this one's worker, folder, model and labels (so the same agents, skills and hooks). Change anything before starting it."</p>
+                    <Suspense fallback=|| view! { <p class="text-sm text-muted">"Loading…"</p> }>
+                        {move || connections.get().map(|r| match r {
+                            Ok(conns) if conns.is_empty() => view! { <p class="text-sm text-muted">"Add an LLM connection in Settings to start a session."</p> }.into_any(),
+                            Ok(conns) => view! { <SessionForm connections=conns seed=seed.get_value() on_started=on_close on_cancel=on_close /> }.into_any(),
+                            Err(e) => view! { <ErrorBox message=e /> }.into_any(),
+                        })}
+                    </Suspense>
                 </div>
-                <p class="text-xs text-muted">"A new, empty session with this one's worker, folder, model and labels (so the same agents, skills and hooks). Change anything before starting it."</p>
-                <Suspense fallback=|| view! { <p class="text-sm text-muted">"Loading…"</p> }>
-                    {move || connections.get().map(|r| match r {
-                        Ok(conns) if conns.is_empty() => view! { <p class="text-sm text-muted">"Add an LLM connection in Settings to start a session."</p> }.into_any(),
-                        Ok(conns) => view! { <SessionForm connections=conns seed=seed.get_value() on_started=on_close on_cancel=on_close /> }.into_any(),
-                        Err(e) => view! { <ErrorBox message=e /> }.into_any(),
-                    })}
-                </Suspense>
             </div>
-        </div>
+        </leptos::portal::Portal>
     }
 }
 
@@ -1195,7 +1199,7 @@ pub fn SaveTemplateDialog(seed: SessionSeed, #[prop(into)] on_close: Callback<()
     };
     let model = if seed.model.is_empty() { "by routing rules".to_owned() } else { seed.model.clone() };
     let seed = StoredValue::new(seed);
-    let save = move |_| {
+    let save = Callback::new(move |_: leptos::ev::MouseEvent| {
         let seed = seed.get_value();
         let template = c6_api::Template {
             name: name.get_untracked().trim().to_owned(),
@@ -1232,49 +1236,53 @@ pub fn SaveTemplateDialog(seed: SessionSeed, #[prop(into)] on_close: Callback<()
                 on_close.run(());
             }
         });
-    };
+    });
     view! {
-        <div class="fixed inset-0 z-30 flex items-start justify-center overflow-y-auto bg-black/40 px-4 py-16" on:click=move |_| on_close.run(())
-            on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); on_close.run(()); }>
-            <div class="w-full max-w-xl space-y-3 rounded-lg bg-white p-4 text-sm shadow-xl outline-none dark:bg-zinc-900" tabindex="-1" on:click=|ev| ev.stop_propagation()>
-                <div class="flex items-center gap-2">
-                    <h2 class="flex-1 font-medium">"Save as template"</h2>
-                    <button class=format!("{BUTTON_QUIET} text-xs text-muted") title="Close (Esc)" on:click=move |_| on_close.run(())>"✕"</button>
-                </div>
-                <p class="text-xs text-muted">"Sessions from it run where this one does, on its model and with its labels."</p>
-                <div class="space-y-0.5 text-xs text-muted">
-                    <div class="break-all font-mono">{place}</div>
-                    <div>{model}</div>
-                </div>
-                <label class="block space-y-0.5">
-                    <span class="text-xs text-muted">"Name"</span>
-                    <input class=format!("{INPUT} py-1 font-mono text-xs") prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev)) />
-                </label>
-                <label class="block space-y-0.5">
-                    <span class="text-xs text-muted">"Description (agents read it to choose the template)"</span>
-                    <input class=format!("{INPUT} py-1") prop:value=move || description.get() on:input=move |ev| description.set(event_target_value(&ev)) />
-                </label>
-                <label class="block space-y-0.5">
-                    <span class="text-xs text-muted">"Prompt (optional: standing instructions; a subagent's task fills {{input}}, or follows)"</span>
-                    <textarea class=format!("{INPUT} min-h-20 font-mono text-xs") prop:value=move || prompt.get() on:input=move |ev| prompt.set(event_target_value(&ev))></textarea>
-                </label>
-                <label class="flex items-start gap-2">
-                    <input type="checkbox" class="mt-1" prop:checked=move || agents.get() on:change=move |ev| agents.set(event_target_checked(&ev)) />
-                    <span>"Agents may start it"<span class="block text-xs text-muted">"Any session's agent can start it as a remote subagent, here, whatever worker it runs on"</span></span>
-                </label>
-                <label class="flex items-start gap-2">
-                    <input type="checkbox" class="mt-1" prop:checked=move || worktree.get() on:change=move |ev| worktree.set(event_target_checked(&ev)) />
-                    <span>"New git worktree"<span class="block text-xs text-muted">"Each session works in a new worktree of the folder, on a new c6/… branch"</span></span>
-                </label>
-                <div class="flex items-center justify-end gap-3">
-                    {move || status.get().map(|r| match r {
-                        Ok(m) => view! { <span class="text-xs text-emerald-600">{m}</span> }.into_any(),
-                        Err(e) => view! { <span class="text-xs text-red-600">{e}</span> }.into_any(),
-                    })}
-                    <button class=BUTTON on:click=save>"Save"</button>
+        // Over every tile, wherever it was opened from: inside a tile it
+        // could show behind the others.
+        <leptos::portal::Portal>
+            <div class="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 px-4 py-16" on:click=move |_| on_close.run(())
+                on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); on_close.run(()); }>
+                <div class="w-full max-w-xl space-y-3 rounded-lg bg-white p-4 text-sm shadow-xl outline-none dark:bg-zinc-900" tabindex="-1" on:click=|ev| ev.stop_propagation()>
+                    <div class="flex items-center gap-2">
+                        <h2 class="flex-1 font-medium">"Save as template"</h2>
+                        <button class=format!("{BUTTON_QUIET} text-xs text-muted") title="Close (Esc)" on:click=move |_| on_close.run(())>"✕"</button>
+                    </div>
+                    <p class="text-xs text-muted">"Sessions from it run where this one does, on its model and with its labels."</p>
+                    <div class="space-y-0.5 text-xs text-muted">
+                        <div class="break-all font-mono">{place.clone()}</div>
+                        <div>{model.clone()}</div>
+                    </div>
+                    <label class="block space-y-0.5">
+                        <span class="text-xs text-muted">"Name"</span>
+                        <input class=format!("{INPUT} py-1 font-mono text-xs") prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev)) />
+                    </label>
+                    <label class="block space-y-0.5">
+                        <span class="text-xs text-muted">"Description (agents read it to choose the template)"</span>
+                        <input class=format!("{INPUT} py-1") prop:value=move || description.get() on:input=move |ev| description.set(event_target_value(&ev)) />
+                    </label>
+                    <label class="block space-y-0.5">
+                        <span class="text-xs text-muted">"Prompt (optional: standing instructions; a subagent's task fills {{input}}, or follows)"</span>
+                        <textarea class=format!("{INPUT} min-h-20 font-mono text-xs") prop:value=move || prompt.get() on:input=move |ev| prompt.set(event_target_value(&ev))></textarea>
+                    </label>
+                    <label class="flex items-start gap-2">
+                        <input type="checkbox" class="mt-1" prop:checked=move || agents.get() on:change=move |ev| agents.set(event_target_checked(&ev)) />
+                        <span>"Agents may start it"<span class="block text-xs text-muted">"Any session's agent can start it as a remote subagent, here, whatever worker it runs on"</span></span>
+                    </label>
+                    <label class="flex items-start gap-2">
+                        <input type="checkbox" class="mt-1" prop:checked=move || worktree.get() on:change=move |ev| worktree.set(event_target_checked(&ev)) />
+                        <span>"New git worktree"<span class="block text-xs text-muted">"Each session works in a new worktree of the folder, on a new c6/… branch"</span></span>
+                    </label>
+                    <div class="flex items-center justify-end gap-3">
+                        {move || status.get().map(|r| match r {
+                            Ok(m) => view! { <span class="text-xs text-emerald-600">{m}</span> }.into_any(),
+                            Err(e) => view! { <span class="text-xs text-red-600">{e}</span> }.into_any(),
+                        })}
+                        <button class=BUTTON on:click=move |ev| save.run(ev)>"Save"</button>
+                    </div>
                 </div>
             </div>
-        </div>
+        </leptos::portal::Portal>
     }
 }
 
@@ -1303,32 +1311,36 @@ pub fn SessionDialog(
     let (seed, work, work_refs) = (StoredValue::new(seed), StoredValue::new(work), StoredValue::new(work_refs));
     let todo = StoredValue::new(todo.unwrap_or_default());
     view! {
-        <div class="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 px-4 py-16" on:click=move |_| on_close.run(())
-            on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); on_close.run(()); }>
-            <div class="w-full max-w-3xl space-y-3 rounded-lg bg-white p-4 text-left shadow-xl outline-none dark:bg-zinc-900" tabindex="-1" on:click=|ev| ev.stop_propagation()>
-                <div class="flex items-center gap-2">
-                    <h2 class="flex-1 font-medium">{title}</h2>
-                    <button class=format!("{BUTTON_QUIET} text-xs text-muted") title="Close (Esc)" on:click=move |_| on_close.run(())>"✕"</button>
+        // Over every tile, wherever it was opened from: inside a tile it
+        // could show behind the others.
+        <leptos::portal::Portal>
+            <div class="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 px-4 py-16" on:click=move |_| on_close.run(())
+                on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); on_close.run(()); }>
+                <div class="w-full max-w-3xl space-y-3 rounded-lg bg-white p-4 text-left shadow-xl outline-none dark:bg-zinc-900" tabindex="-1" on:click=|ev| ev.stop_propagation()>
+                    <div class="flex items-center gap-2">
+                        <h2 class="flex-1 font-medium">{title.clone()}</h2>
+                        <button class=format!("{BUTTON_QUIET} text-xs text-muted") title="Close (Esc)" on:click=move |_| on_close.run(())>"✕"</button>
+                    </div>
+                    <p class="text-xs text-muted">{note.clone()}</p>
+                    <Suspense fallback=|| view! { <p class="text-sm text-muted">"Loading…"</p> }>
+                        {move || connections.get().map(|r| match r {
+                            Ok(conns) if conns.is_empty() => view! { <p class="text-sm text-muted">"Add an LLM connection in Settings to start a session."</p> }.into_any(),
+                            Ok(conns) => match seed.get_value() {
+                                Some(seed) => view! {
+                                    <SessionForm connections=conns seed first_message=first.get_value() on_session=on_session.unwrap_or(Callback::new(|_| ()))
+                                        work=work.get_value().unwrap_or_default() work_refs=work_refs.get_value() todo=todo.get_value() on_started=on_close on_cancel=on_close />
+                                }.into_any(),
+                                None => view! {
+                                    <SessionForm connections=conns first_message=first.get_value() on_session=on_session.unwrap_or(Callback::new(|_| ()))
+                                        work=work.get_value().unwrap_or_default() work_refs=work_refs.get_value() todo=todo.get_value() on_started=on_close on_cancel=on_close />
+                                }.into_any(),
+                            },
+                            Err(e) => view! { <ErrorBox message=e /> }.into_any(),
+                        })}
+                    </Suspense>
                 </div>
-                <p class="text-xs text-muted">{note}</p>
-                <Suspense fallback=|| view! { <p class="text-sm text-muted">"Loading…"</p> }>
-                    {move || connections.get().map(|r| match r {
-                        Ok(conns) if conns.is_empty() => view! { <p class="text-sm text-muted">"Add an LLM connection in Settings to start a session."</p> }.into_any(),
-                        Ok(conns) => match seed.get_value() {
-                            Some(seed) => view! {
-                                <SessionForm connections=conns seed first_message=first.get_value() on_session=on_session.unwrap_or(Callback::new(|_| ()))
-                                    work=work.get_value().unwrap_or_default() work_refs=work_refs.get_value() todo=todo.get_value() on_started=on_close on_cancel=on_close />
-                            }.into_any(),
-                            None => view! {
-                                <SessionForm connections=conns first_message=first.get_value() on_session=on_session.unwrap_or(Callback::new(|_| ()))
-                                    work=work.get_value().unwrap_or_default() work_refs=work_refs.get_value() todo=todo.get_value() on_started=on_close on_cancel=on_close />
-                            }.into_any(),
-                        },
-                        Err(e) => view! { <ErrorBox message=e /> }.into_any(),
-                    })}
-                </Suspense>
             </div>
-        </div>
+        </leptos::portal::Portal>
     }
 }
 
