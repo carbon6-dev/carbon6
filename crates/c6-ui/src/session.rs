@@ -5181,11 +5181,13 @@ fn Composer(
                             // beside it for Send now (at once).
                             view! {
                                 // One split button: Send, then its ▾ (Send now) past a
-                                // full-height darker line, so the two read as one.
-                                <div class="relative flex items-stretch overflow-hidden rounded-md">
-                                    <button class=format!("{SEND} rounded-none {SEND_READY}") title=format!("{send_label}: the agent reads it at its next step") aria-label=send_label
+                                // full-height darker line, so the two read as one. Its
+                                // halves are rounded, not the box: a clipping box hid
+                                // the menu above it.
+                                <div class="relative flex items-stretch">
+                                    <button class=format!("{SEND} rounded-l-md rounded-r-none {SEND_READY}") title=format!("{send_label}: the agent reads it at its next step") aria-label=send_label
                                         prop:disabled=move || disabled.get() on:click=move |_| send()>{send_icon()}</button>
-                                    <button class="flex w-4 shrink-0 items-center justify-center border-l border-sky-800 bg-sky-600 text-white hover:bg-sky-700"
+                                    <button class="flex w-4 shrink-0 items-center justify-center rounded-r-md border-l border-sky-800 bg-sky-600 text-white hover:bg-sky-700 pointer-coarse:w-7"
                                         title="More ways to send" aria-label="More ways to send"
                                         aria-haspopup="menu" prop:aria-expanded=move || send_menu.get().to_string() data-pop=send_pop.get_value()
                                         on:click=move |ev| { ev.stop_propagation(); send_menu.update(|o| *o = !*o); }>
@@ -5193,7 +5195,7 @@ fn Composer(
                                     </button>
                                     {move || send_menu.get().then(|| view! {
                                         <div role="menu" data-pop=send_pop.get_value() class="absolute bottom-full right-0 z-40 mb-1 w-max rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
-                                            <button role="menuitem" class="flex w-full items-center gap-4 px-3 py-1.5 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                                            <button role="menuitem" class="flex w-full items-center gap-4 px-3 py-1.5 text-left hover:bg-zinc-100 pointer-coarse:py-3 dark:hover:bg-zinc-800"
                                                 title="The agent gets it now, not at its next step (Claude Code moves what it waits on to the background; its background agents go on)" on:click=move |_| send_now()>
                                                 <span>"Send now"</span>
                                                 <span class="text-xs text-muted">"⌘/Ctrl ⇧ ↵"</span>
