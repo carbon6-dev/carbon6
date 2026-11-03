@@ -1,8 +1,8 @@
 //! Sessions name themselves (docs/suggestions.md §7): once a session's
 //! first turn finishes, the model a `task:name` routing rule picks (else
-//! the session's own) reads how it started and gives it a short name in
-//! place of its first line, once. A name you give it wins, and so does
-//! Undo; subagents and side chats keep their titles.
+//! the `task:suggest` rule's, else the session's own) reads how it
+//! started and gives it a short name in place of its first line, once. A
+//! name you give it wins; subagents and side chats keep their titles.
 
 use c6_api as api;
 use c6_proto::{TurnEndReason, content_block, session_event};
@@ -148,7 +148,6 @@ async fn after_turn(st: &HeadState, id: &str, state: &str) -> anyhow::Result<()>
     tx.commit().await?;
     if named {
         st.registry.bump();
-        st.hub.publish(id, api::StreamMsg::Named { title: name, from: row.title });
     }
     Ok(())
 }

@@ -2720,12 +2720,6 @@ pub enum StreamMsg {
     Window {
         from: u64,
     },
-    /// The session named itself after its first turn (docs/suggestions.md
-    /// §7): `title`, in place of `from` (what Undo puts back).
-    Named {
-        title: String,
-        from: String,
-    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

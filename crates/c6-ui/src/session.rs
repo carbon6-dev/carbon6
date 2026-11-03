@@ -182,9 +182,6 @@ pub(crate) struct Feed {
     /// Secrets the assistant's operations returned, for you (shown while
     /// this page is open; never logged).
     secrets: RwSignal<Vec<SecretCard>>,
-    /// The session named itself just now (docs/suggestions.md §7): its new
-    /// name and the title it had, for Undo (shown for a few seconds).
-    named: RwSignal<Option<(String, String)>>,
     /// The log has been replayed up to where the session was when opened.
     pub(crate) synced: RwSignal<bool>,
     /// The first event shown: before it, `events` has only the summary's
@@ -299,14 +296,13 @@ impl Feed {
             edit_rows: RwSignal::new(Vec::new()),
             activity: RwSignal::new(None),
             secrets: RwSignal::new(Vec::new()),
-            named: RwSignal::new(None),
             synced: RwSignal::new(false),
             from: RwSignal::new(0),
             to: RwSignal::new(None),
             loading: RwSignal::new(false),
             id: StoredValue::new(id.clone()),
         };
-        let Feed { events, streaming, queued, activity, secrets, named, synced, from, to, .. } = feed;
+        let Feed { events, streaming, queued, activity, secrets, synced, from, to, .. } = feed;
         // The replay arrives all at once (not an event at a time, each
         // drawn and scrolled to).
         let replay = StoredValue::new(Vec::<Event>::new());
@@ -381,7 +377,6 @@ impl Feed {
                     synced.set(true);
                 }
                 StreamMsg::Secret { call_id, title, value, note } => secrets.update(|s| s.push(SecretCard { call_id, title, value, note })),
-                StreamMsg::Named { title, from } => named.set(Some((title, from))),
             },
             move || {
                 // Connecting again (a phone waking, the network back): what
@@ -1345,54 +1340,6 @@ pub fn RenameForm(session: String, title: String, #[prop(into)] on_done: Callbac
     }
 }
 
-/// The session named itself after its first turn: says so for a few
-/// seconds, with Undo (which puts its first line back, as your choice).
-#[component]
-fn NamedNote(session: String, named: RwSignal<Option<(String, String)>>) -> impl IntoView {
-    let id = StoredValue::new(session);
-    let error = RwSignal::new(None::<String>);
-    Effect::new(move || {
-        let Some(shown) = named.get() else { return };
-        error.set(None);
-        set_timeout(
-            move || {
-                if named.try_with_untracked(|n| n.as_ref() == Some(&shown)) == Some(true) {
-                    named.set(None);
-                }
-            },
-            std::time::Duration::from_secs(8),
-        );
-    });
-    let undo = move |from: String| {
-        spawn_local(async move {
-            match api::rename(id.get_value(), from).await {
-                Ok(()) => {
-                    let _ = named.try_set(None);
-                }
-                Err(e) => {
-                    let _ = error.try_set(Some(e));
-                }
-            }
-        });
-    };
-    move || {
-        named.get().map(|(title, from)| {
-            view! {
-                <div class="flex items-start gap-3 rounded-md border border-zinc-200 px-3 py-2 text-sm dark:border-zinc-800" role="status">
-                    <div class="min-w-0 flex-1">
-                        <p class="truncate">{format!("Named \"{title}\"")}</p>
-                        {move || match error.get() {
-                            Some(e) => view! { <p class="text-xs text-red-600">{e}</p> }.into_any(),
-                            None => view! { <p class="text-xs text-muted">"from the first turn"</p> }.into_any(),
-                        }}
-                    </div>
-                    <button class="text-sm text-muted underline" on:click=move |_| undo(from.clone())>"Undo"</button>
-                </div>
-            }
-        })
-    }
-}
-
 /// The tile bar's ⋯ for a session: what you can do with it. `on_rename`
 /// opens the tile's rename box; `on_done` closes the menu, after any
 /// choice.
@@ -1943,7 +1890,7 @@ fn Transcript(
     running: Signal<bool>,
     #[prop(optional)] timeline: Option<crate::timeline::Timeline>,
 ) -> impl IntoView {
-    let Feed { events, streaming, queued, edit_open, edit_rows, secrets, named, from, to, .. } = feed;
+    let Feed { events, streaming, queued, edit_open, edit_rows, secrets, from, to, .. } = feed;
     let id = StoredValue::new(session.id.clone());
     let worker_id = session.worker_id;
     // Pulling a queued message (and the ones after it) into the edit box:
@@ -2213,7 +2160,6 @@ fn Transcript(
             })}
             <crate::decisions::SessionDecisions session=id.get_value() />
             {move || secrets.get().into_iter().map(|c| view! { <SecretCardView card=c on_dismiss=Callback::new(move |id: String| secrets.update(|s| s.retain(|x| x.call_id != id))) /> }).collect_view()}
-            <NamedNote session=id.get_value() named />
             // What streams in: the same elements, their text growing (not
             // drawn again for every token).
             {move || (has_thinking.get() || has_text.get()).then(|| view! {

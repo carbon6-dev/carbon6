@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use c6_api::{Event, EventKind, Session, SessionDetail, SessionStatus, StreamMsg};
+use c6_api::{Event, EventKind, Session, SessionDetail, SessionStatus};
 use c6_head::HeadConfig;
 use c6_testkit::{MockLlm, NAMING, Reply, eventually};
 use c6_worker::{ConnState, Worker, conn, enroll};
@@ -147,26 +147,14 @@ async fn sessions_name_themselves_after_their_first_turn() {
     let (worker, stop) = env.worker(state.path()).await;
 
     // 1. The first turn finishes: the small model names it, in place of its
-    // first line, and whoever looks hears what it was (for Undo).
+    // first line.
     let gate = env.mock.push_gated(Reply::Text("Fixed the off-by-one in the pager.".into()));
     env.mock.push_about(NAMING, Reply::Text("\"pager off-by-one fix\".".into()));
     let s = env.create(&worker, "fix the pager bug in the list view").await;
     assert_eq!(s.title, "fix the pager bug in the list view");
-    let mut live = env.head.state.hub.subscribe(&s.id);
     gate.notify_one();
     env.idle(&s.id, 1).await;
     eventually("the session named", async || (env.title(&s.id).await == "Pager off-by-one fix").then_some(())).await;
-    let named = eventually("word of its name", async || {
-        loop {
-            match live.try_recv() {
-                Ok(StreamMsg::Named { title, from }) => return Some((title, from)),
-                Ok(_) => {}
-                Err(_) => return None,
-            }
-        }
-    })
-    .await;
-    assert_eq!(named, ("Pager off-by-one fix".to_owned(), "fix the pager bug in the list view".to_owned()));
     let calls = env.naming_calls();
     assert_eq!(calls.len(), 1, "{calls:?}");
     assert_eq!(calls[0].0, "small", "the task:name rule's model");
