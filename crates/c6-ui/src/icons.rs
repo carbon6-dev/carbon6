@@ -76,25 +76,6 @@ pub fn ellipsis() -> impl IntoView {
     })
 }
 
-/// Lucide `pencil`: edit.
-pub fn pencil() -> impl IntoView {
-    icon(view! {
-        <path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z" />
-        <path d="m15 5 4 4" />
-    })
-}
-
-/// Lucide `trash-2`: delete.
-pub fn trash() -> impl IntoView {
-    icon(view! {
-        <path d="M10 11v6" />
-        <path d="M14 11v6" />
-        <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
-        <path d="M3 6h18" />
-        <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-    })
-}
-
 /// Lucide `star`, filled when `on` (pinned).
 pub fn star(on: bool) -> impl IntoView {
     view! {

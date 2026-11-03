@@ -1725,7 +1725,6 @@ fn BlockView(
 ) -> impl IntoView {
     let bid = StoredValue::new(b.id.clone());
     let block = StoredValue::new(b.clone());
-    let pending = b.kind == "pending";
     // Its open comment threads: a marker with their count.
     let threads = expect_context::<ThreadsCtx>();
     let open_n =
@@ -1847,14 +1846,11 @@ fn BlockView(
             }))}
             // In its right margin, inside the block: outside it, the pointer
             // left the block on its way and the buttons hid, and at the
-            // panel's edge they sat over the scrollbar. ✎ and 💬 show on
-            // hover (always on a touch screen, which has none); with open
-            // comments, a lasting marker with their count opens them.
+            // panel's edge they sat over the scrollbar. 💬 shows on hover
+            // (always on a touch screen, which has none); with open
+            // comments, a lasting marker with their count opens them. A
+            // block is edited by a double-click, or Edit in the doc's bar.
             <div data-marks="" class="absolute right-0.5 top-0.5 flex items-center">
-                {move || (!pending && !is_open.get()).then(|| view! {
-                    <button class="invisible rounded px-1 text-xs text-muted hover:bg-zinc-100 hover:text-zinc-900 group-hover:visible pointer-coarse:visible dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
-                        title="Edit this block in Markdown (or double-click it)" aria-label="Edit this block" on:click=move |_| start()>"✎"</button>
-                })}
                 {move || match open_n.get() {
                     0 => view! {
                         <button class="invisible rounded px-1 text-xs text-muted hover:bg-zinc-100 group-hover:visible pointer-coarse:visible dark:hover:bg-zinc-800"
@@ -2263,7 +2259,9 @@ fn said(c: &c6_api::docs::DocComment, under: Option<AnyView>) -> AnyView {
 
 /// An icon button on your comment: shown on hover with a mouse (and to the
 /// keyboard), always on a touch screen.
-const COMMENT_TOOL: &str = "rounded p-0.5 text-muted opacity-0 hover:bg-zinc-100 hover:text-zinc-900 focus-visible:opacity-100 group-hover/said:opacity-100 pointer-coarse:opacity-100 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
+/// A row of a comment's ⋯ menu: tall enough to tap on a phone.
+const MENU_ROW: &str = "block w-full px-3 py-1.5 text-left hover:bg-zinc-100 pointer-coarse:py-3 dark:hover:bg-zinc-800";
+const COMMENT_TOOL: &str = "rounded px-1.5 leading-none text-muted opacity-0 pointer-coarse:px-2.5 pointer-coarse:py-1.5 hover:bg-zinc-100 hover:text-zinc-900 focus-visible:opacity-100 group-hover/said:opacity-100 pointer-coarse:opacity-100 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
 
 /// Your comment that no agent has received yet: as `said`, with edit and
 /// delete beside who wrote it. Edit makes it a box like the reply's (Enter
@@ -2281,6 +2279,8 @@ fn MyComment(c: c6_api::docs::DocComment, thread: String) -> impl IntoView {
     let deleting = RwSignal::new(false);
     let busy = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
+    let menu = RwSignal::new(false);
+    let pop = StoredValue::new(crate::util::dismissable(move || menu.get(), move || menu.set(false)));
     let area = NodeRef::<leptos::html::Textarea>::new();
     crate::util::autosize(area, move || text.track());
     // Into the box as it opens, the cursor after the text.
@@ -2352,9 +2352,18 @@ fn MyComment(c: c6_api::docs::DocComment, thread: String) -> impl IntoView {
         <div class="group/said flex flex-col items-end">
             <div class="mb-0.5 flex items-center gap-0.5 text-xs text-muted">
                 {move || (!editing.get() && !deleting.get()).then(|| view! {
-                    <button class=COMMENT_TOOL title="Edit your comment (no agent has it yet)" aria-label="Edit your comment" on:click=edit>{crate::icons::pencil()}</button>
-                    <button class=COMMENT_TOOL title="Delete your comment" aria-label="Delete your comment"
-                        on:click=move |_| { error.set(None); deleting.set(true) }>{crate::icons::trash()}</button>
+                    <div class="relative">
+                        <button class=COMMENT_TOOL title="Edit or delete your comment (no agent has it yet)" aria-label="Edit or delete your comment"
+                            aria-haspopup="menu" prop:aria-expanded=move || menu.get().to_string() data-pop=pop.get_value()
+                            on:click=move |ev| { ev.stop_propagation(); menu.update(|o| *o = !*o) }>"⋯"</button>
+                        {move || menu.get().then(|| view! {
+                            <div role="menu" data-pop=pop.get_value() class="absolute right-0 top-full z-30 mt-1 w-32 rounded-md border border-zinc-200 bg-white py-1 text-sm text-zinc-900 shadow-lg dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100">
+                                <button role="menuitem" class=MENU_ROW on:click=move |ev| { menu.set(false); edit(ev) }>"Edit"</button>
+                                <button role="menuitem" class=format!("{MENU_ROW} text-red-700 dark:text-red-400")
+                                    on:click=move |_| { menu.set(false); error.set(None); deleting.set(true) }>"Delete"</button>
+                            </div>
+                        })}
+                    </div>
                 })}
                 <span class="ml-1">{format!("You · {when}")}</span>
             </div>
@@ -2377,10 +2386,14 @@ fn MyComment(c: c6_api::docs::DocComment, thread: String) -> impl IntoView {
                 .into_any()
             }}
             {move || deleting.get().then(|| view! {
-                <div class="mt-1 flex items-center gap-2 text-xs">
-                    <span class="text-soft">"Delete this comment?"</span>
-                    <button class="font-medium text-red-700 hover:underline disabled:opacity-50 dark:text-red-400" disabled=move || busy.get() on:click=delete>"Delete"</button>
-                    <button class="text-muted hover:underline" on:click=move |_| deleting.set(false)>"Cancel"</button>
+                <div class="mt-1.5 flex flex-col items-end gap-2">
+                    <span class="text-xs text-soft">"Delete this comment?"</span>
+                    <div class="flex gap-3">
+                        <button class="rounded-md border border-zinc-300 px-3 py-1.5 text-sm hover:bg-zinc-100 pointer-coarse:px-4 pointer-coarse:py-2 dark:border-zinc-600 dark:hover:bg-zinc-800"
+                            on:click=move |_| deleting.set(false)>"Cancel"</button>
+                        <button class="rounded-md bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50 pointer-coarse:px-4 pointer-coarse:py-2"
+                            disabled=move || busy.get() on:click=delete>"Delete"</button>
+                    </div>
                 </div>
             })}
             {move || error.get().map(|e| view! { <div class="w-full"><ErrorBox message=e /></div> })}
@@ -2501,9 +2514,8 @@ fn Thread(id: String, about: bool) -> impl IntoView {
                         {t.detached.then(|| view! { <span class="rounded bg-zinc-100 px-1 dark:bg-zinc-800" title="What it was about is gone or changed">"detached"</span> })}
                         {waiting.then(|| view! { <AgentOnIt session=t.agent.clone() /> })}
                         {t.unsent.then(|| view! {
-                            <span>"not sent yet"</span>
-                            <button class="text-sky-700 hover:underline dark:text-sky-400" title="Your last comment here hasn't gone to an agent: send the thread now"
-                                on:click=send_unsent>"Send now"</button>
+                            <button class="rounded-md border border-sky-600 px-2 py-0.5 font-medium text-sky-700 hover:bg-sky-50 pointer-coarse:py-1.5 dark:border-sky-500 dark:text-sky-300 dark:hover:bg-sky-950"
+                                title="Your last comment here hasn't gone to an agent: send the thread now" on:click=send_unsent>"Send now"</button>
                         })}
                         {resolved.then(|| view! { <span>{format!("resolved by {}", author(&t.resolved_by))}</span> })}
                         <span class="flex-1"></span>
