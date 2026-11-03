@@ -114,8 +114,12 @@ pub(crate) async fn rule_for(st: &HeadState, row: &crate::store::SessionRow, lab
     // The realm's rules, then root's (setting_for merges them).
     let routes: Vec<api::Route> =
         serde_json::from_str(&st.store.setting_for(crate::sessions::ROUTES, &row.realm).await?.unwrap_or_default()).unwrap_or_default();
-    for r in routes.iter().filter(|r| r.enabled && r.applies_to.iter().any(|l| l == label)) {
-        if !api::labels::applies(&r.applies_to, &labels) {
+    for r in routes.iter().filter(|r| r.enabled && r.applies_to.iter().any(|l| l.trim() == label)) {
+        // Its task: labels are the tasks it serves, any of them (a rule for
+        // task:suggest and task:name serves both); the rest must all match
+        // the session.
+        let rest: Vec<String> = r.applies_to.iter().filter(|l| !l.trim().starts_with("task:")).cloned().collect();
+        if !api::labels::applies(&rest, &labels) {
             continue;
         }
         let want = r.connection.trim();

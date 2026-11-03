@@ -51,10 +51,11 @@ impl Env {
             .await
             .unwrap();
         let env = Self { head, api, http, mock, conn_id: conn["id"].as_str().unwrap().to_owned(), _head_dir: head_dir };
-        // Names go to a small model.
+        // Names go to a small model, on a rule that serves suggestions
+        // too (its task labels are any of them, not all).
         env.put(
             "/settings/routes",
-            json!([{"name": "names", "applies_to": ["task:name"], "connection": env.conn_id, "model": "small", "enabled": true}]),
+            json!([{"name": "names", "applies_to": ["task:suggest", "task:name"], "connection": env.conn_id, "model": "small", "enabled": true}]),
         )
         .await;
         env
