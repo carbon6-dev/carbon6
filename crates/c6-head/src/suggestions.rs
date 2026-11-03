@@ -127,7 +127,10 @@ pub(crate) async fn rule_for(st: &HeadState, row: &crate::store::SessionRow, lab
                 .find(|c| (c.id == want || c.name == want) && crate::realms::available(&c.realms, &row.realm))
                 .map(|c| c.id.clone())
         };
-        if let Some(c) = connection {
+        // Claude Code runs only as a session on a worker, so it can't
+        // answer a one-off call: the next rule, or the fallback, does.
+        let one_off = |id: &str| connections.iter().find(|c| c.id == id).is_none_or(|c| c.kind != "claude_code");
+        if let Some(c) = connection.filter(|c| one_off(c)) {
             return Ok(Some((c, r.model.trim().to_owned())));
         }
     }
@@ -210,6 +213,11 @@ async fn make(st: &HeadState, row: &crate::store::SessionRow, for_seq: i64) -> a
         &[("title", &row.title), ("labels", &labels), ("exchanges", &exchanges(st, &row.id, for_seq as u64).await?)],
     );
     let (connection, model) = model_for(st, row, ROUTE_LABEL).await?;
+    let kind = st.store.connections().await?.into_iter().find(|c| c.id == connection).map(|c| c.kind);
+    anyhow::ensure!(
+        kind.as_deref() != Some("claude_code"),
+        "a Claude Code session needs a {ROUTE_LABEL} rule with an API connection (Settings → Model routing)"
+    );
     let origin = c6_llm::activity::Origin {
         what: "suggestion".into(),
         about: row.title.clone(),

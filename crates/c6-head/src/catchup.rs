@@ -629,7 +629,7 @@ pub(crate) async fn ask(st: &HeadState, row: &SessionRow, label: &str, what: &st
     let kind = st.store.connections().await?.into_iter().find(|c| c.id == connection).map(|c| c.kind);
     anyhow::ensure!(
         kind.as_deref() != Some("claude_code"),
-        "a Claude Code session needs a model for this: add a {label} or {} rule in Settings → Model routing",
+        "a Claude Code session needs a model for this: add a {label} or {} rule with an API connection in Settings → Model routing",
         crate::suggestions::ROUTE_LABEL
     );
     let origin = c6_llm::activity::Origin {
