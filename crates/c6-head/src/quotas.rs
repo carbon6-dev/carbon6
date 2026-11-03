@@ -8,7 +8,9 @@
 //!   `/status`, every few minutes and soon after a session on one ends a
 //!   turn.
 //!
-//! Kept in memory (they are fresh again within minutes of a restart).
+//! Kept in memory, and the last seen in a setting (`quotas_last`), so a
+//! restarted head shows them until fresh ones come: Claude Code reports
+//! only now and then, not every turn.
 //! A notification (event `quota`) goes out when a window passes 80% and
 //! 95%, and when it is used up, once per window.
 
@@ -26,6 +28,8 @@ use tracing::warn;
 use crate::HeadState;
 use crate::api::ApiResult;
 
+/// A head setting: the last windows seen, kept across restarts.
+const KEPT: &str = "quotas_last";
 /// A head setting: the ChatGPT usage endpoint, for a stand-in or a proxy.
 pub const CHATGPT_USAGE_URL: &str = "chatgpt_usage_url";
 /// Where Codex reads a ChatGPT plan's usage windows.
@@ -229,6 +233,24 @@ fn record(st: &HeadState, q: api::ConnectionQuota, name: &str) {
     st.quotas.by_connection.lock().unwrap().insert(q.connection_id.clone(), q);
 }
 
+/// Keeps what's known now for the next start.
+async fn keep(st: &HeadState) {
+    let Ok(json) = serde_json::to_string(&st.quotas.all()) else { return };
+    if let Err(e) = st.store.set_setting(KEPT, &json).await {
+        warn!("keeping plan limits: {e:#}");
+    }
+}
+
+/// What was known before a restart, under anything already reported since.
+async fn restore(st: &HeadState) {
+    let Ok(Some(json)) = st.store.setting(KEPT).await else { return };
+    let Ok(kept) = serde_json::from_str::<Vec<api::ConnectionQuota>>(&json) else { return };
+    let mut by = st.quotas.by_connection.lock().unwrap();
+    for q in kept {
+        by.entry(q.connection_id.clone()).or_insert(q);
+    }
+}
+
 /// "in 2h 10m", "in 3 days".
 fn in_words(ms: i64) -> String {
     let m = (ms / 60_000).max(0);
@@ -269,6 +291,7 @@ pub async fn from_claude_code(st: &HeadState, session_id: &str, json: &str) {
         error: String::new(),
     };
     record(st, q, &c.name);
+    keep(st).await;
 }
 
 /// A turn ended on `connection`: a ChatGPT plan's windows are read soon.
@@ -327,12 +350,14 @@ pub async fn poll_chatgpt(st: &HeadState) {
             }
         };
         record(st, q, &c.name);
+        keep(st).await;
     }
 }
 
 /// Reads ChatGPT plans every few minutes, and soon after a turn on one.
 pub fn spawn(st: std::sync::Arc<HeadState>) {
     tokio::spawn(async move {
+        restore(&st).await;
         loop {
             poll_chatgpt(&st).await;
             tokio::select! {
