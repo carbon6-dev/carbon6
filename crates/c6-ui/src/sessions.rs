@@ -1454,6 +1454,9 @@ fn SessionForm(
     let (todo, todo_work) = (StoredValue::new(todo), StoredValue::new(work_pick.get_untracked()));
     let pending = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
+    // Images and files for the first message: pasted, dropped or picked.
+    let attachments = RwSignal::new(Vec::<c6_api::AttachmentUpload>::new());
+    let picker = NodeRef::<leptos::html::Input>::new();
     let conns = StoredValue::new(connections);
     // Effort only where the connection passes it on to the model.
     // On Auto, the rule sets it.
@@ -1599,7 +1602,7 @@ fn SessionForm(
             model: model.get_untracked(),
             title: None,
             prompt: Some(prompt.get_untracked()).filter(|p| !p.trim().is_empty()),
-            attachments: Vec::new(),
+            attachments: attachments.get_untracked(),
             labels: c6_api::labels::parse_labels(&labels.get_untracked()),
             effort: Some(effort.get_untracked()).filter(|e| !e.is_empty() && effort_supported()),
             worktree: worktree.get_untracked() && !on_ssh,
@@ -1754,8 +1757,42 @@ fn SessionForm(
             />
         })}
         <div class="space-y-2">
-        <section class="rounded-xl border border-zinc-200 bg-white focus-within:border-zinc-400 dark:border-zinc-800 dark:bg-zinc-900 dark:focus-within:border-zinc-600">
+        <section class="rounded-xl border border-zinc-200 bg-white focus-within:border-zinc-400 dark:border-zinc-800 dark:bg-zinc-900 dark:focus-within:border-zinc-600"
+            on:dragover=|ev| ev.prevent_default()
+            on:drop=move |ev| {
+                let ev: web_sys::Event = ev.into();
+                if crate::session::js_has_files(&ev) {
+                    ev.prevent_default();
+                    crate::session::add_attachments(ev, attachments, error);
+                }
+            }>
+            {move || (!attachments.with(Vec::is_empty)).then(|| view! {
+                <div class="flex flex-wrap gap-2 px-2 pt-2">
+                    {attachments.get().into_iter().enumerate().map(|(i, a)| {
+                        let image = a.mime.starts_with("image/");
+                        view! {
+                            <div class="flex items-center gap-1.5 rounded-md border border-zinc-200 bg-white p-1 pr-2 text-xs dark:border-zinc-700 dark:bg-zinc-900">
+                                {if image {
+                                    view! { <img class="h-10 w-10 rounded object-cover" src=format!("data:{};base64,{}", a.mime, a.data) /> }.into_any()
+                                } else {
+                                    view! { <span class="px-1">"📄"</span> }.into_any()
+                                }}
+                                <span class="max-w-40 truncate">{a.name.clone()}</span>
+                                <button type="button" class="text-muted hover:text-zinc-900 dark:hover:text-zinc-100" title="Remove"
+                                    on:click=move |_| attachments.update(|v| { if i < v.len() { v.remove(i); } })>"✕"</button>
+                            </div>
+                        }
+                    }).collect_view()}
+                </div>
+            })}
             <textarea node_ref=prompt_box rows="2"
+                on:paste=move |ev| {
+                    let ev: web_sys::Event = ev.into();
+                    if crate::session::js_has_files(&ev) {
+                        ev.prevent_default();
+                        crate::session::add_attachments(ev, attachments, error);
+                    }
+                }
                 class=format!("block w-full bg-transparent px-3 pb-1 pt-2.5 text-sm outline-none disabled:text-muted {PLACEHOLDER} {GROWS}")
                 placeholder=move || match template.get() {
                     Some(t) if t.template.prompt.contains("{{input}}") => format!("Input for {} (its {{{{input}}}})", t.template.name),
@@ -1771,6 +1808,17 @@ fn SessionForm(
                 }
             ></textarea>
             <div class="flex min-w-0 items-center gap-1.5 px-2 pb-2">
+                {move || fixed().is_none().then(|| view! {
+                    <button type="button" class="flex size-6.5 shrink-0 items-center justify-center rounded-md text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                        title="Attach images or files (or paste / drop them)" aria-label="Attach images or files"
+                        on:click=move |_| { if let Some(i) = picker.get_untracked() { i.click(); } }>
+                        <svg viewBox="0 0 16 16" class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+                            <path d="M8 2.5v11M2.5 8h11" />
+                        </svg>
+                    </button>
+                })}
+                <input node_ref=picker type="file" multiple class="hidden"
+                    on:change=move |ev| crate::session::add_attachments(ev.into(), attachments, error) />
                 // A desktop's summary line, then its buttons.
                 {move || match template.get() {
                     Some(t) => view! {

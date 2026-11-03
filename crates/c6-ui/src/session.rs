@@ -3063,9 +3063,26 @@ pub(crate) fn tokens(n: u64) -> String {
     }
 }
 
+/// The files a paste, drop or picker brought (`ev`), added to `attachments`
+/// within the head's limits; else why not, in `error`.
+pub(crate) fn add_attachments(ev: web_sys::Event, attachments: RwSignal<Vec<c6_api::AttachmentUpload>>, error: RwSignal<Option<String>>) {
+    spawn_local(async move {
+        match js_read_files(&ev).await.ok().and_then(|v| v.as_string()) {
+            Some(json) => match serde_json::from_str::<Vec<c6_api::AttachmentUpload>>(&json) {
+                Ok(files) => match too_large(&attachments.get_untracked(), &files) {
+                    Some(e) => error.set(Some(e)),
+                    None => attachments.update(|a| a.extend(files)),
+                },
+                Err(e) => error.set(Some(e.to_string())),
+            },
+            None => error.set(Some("could not read the file".into())),
+        }
+    });
+}
+
 /// Why `adding` can't join the attachments already `held`, if it can't: the
 /// head takes 10 MB a file and 20 MB a message (c6-head sessions.rs).
-fn too_large(held: &[c6_api::AttachmentUpload], adding: &[c6_api::AttachmentUpload]) -> Option<String> {
+pub(crate) fn too_large(held: &[c6_api::AttachmentUpload], adding: &[c6_api::AttachmentUpload]) -> Option<String> {
     const MB: usize = 1024 * 1024;
     let size = |a: &c6_api::AttachmentUpload| a.data.trim().len() / 4 * 3;
     let mb = |n: usize| format!("{:.1} MB", n as f64 / MB as f64);
@@ -4442,10 +4459,10 @@ fn QueueEditRow(id: u64, rows: RwSignal<Vec<QueueRow>>) -> impl IntoView {
 #[wasm_bindgen::prelude::wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_namespace = c6Files, js_name = has)]
-    fn js_has_files(ev: &web_sys::Event) -> bool;
+    pub(crate) fn js_has_files(ev: &web_sys::Event) -> bool;
 
     #[wasm_bindgen(catch, js_namespace = c6Files, js_name = read)]
-    async fn js_read_files(ev: &web_sys::Event) -> Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>;
+    pub(crate) async fn js_read_files(ev: &web_sys::Event) -> Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>;
 }
 
 /// The slash command being typed: the text up to the caret, while it is
