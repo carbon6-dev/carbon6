@@ -3009,7 +3009,8 @@ fn subject_of(text: &str) -> (String, Option<String>) {
 }
 
 /// A button on the dark backdrop behind a full-size image.
-const FULL_BUTTON: &str = "rounded-md border border-zinc-500 px-2 py-0.5 hover:bg-white/10";
+const FULL_BUTTON: &str =
+    "shrink-0 whitespace-nowrap rounded-md bg-zinc-800 px-3 py-1.5 text-zinc-100 ring-1 ring-zinc-600 hover:bg-zinc-700";
 
 /// An image full size over the page, focused so Esc closes it, as Close or
 /// a click outside it does. `info` (its size, say) shows by its name, and
@@ -3031,15 +3032,21 @@ pub(crate) fn FullImage(
         }
     });
     view! {
-        <div node_ref=el tabindex="-1" class="fixed inset-0 z-50 flex flex-col items-center justify-center gap-3 bg-black/75 p-4 outline-none"
+        <div node_ref=el tabindex="-1" class="fixed inset-0 z-50 flex flex-col items-center justify-center gap-3 bg-black/90 p-4 outline-none backdrop-blur-sm"
             on:click=move |_| close.run(())
             on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); close.run(()) }>
             <img class=if fill { "h-[80dvh] w-[92vw] rounded-md bg-white object-contain shadow-2xl" } else { "max-h-[80dvh] max-w-[92vw] rounded-md object-contain shadow-2xl" } src=src alt=name.clone() on:click=|ev| ev.stop_propagation() />
-            <div class="flex items-center gap-3 text-sm text-zinc-100" on:click=|ev| ev.stop_propagation()>
-                <span class="max-w-[60vw] truncate">{name}</span>
-                {(!info.is_empty()).then(|| view! { <span class="text-muted">{info}</span> })}
+            // The name gets its own line (cut short), so the buttons never wrap
+            // or run into it on a phone.
+            <div class="flex w-full max-w-[92vw] flex-col items-center gap-2 text-sm text-zinc-100" on:click=|ev| ev.stop_propagation()>
+                <div class="flex min-w-0 max-w-full items-baseline gap-2">
+                    <span class="truncate">{name}</span>
+                    {(!info.is_empty()).then(|| view! { <span class="shrink-0 text-zinc-400">{info}</span> })}
+                </div>
+                <div class="flex items-center gap-2">
                 {children.map(|c| c())}
                 <button class=FULL_BUTTON title="Close (Esc)" on:click=move |_| close.run(())>"Close"</button>
+                </div>
             </div>
         </div>
     }
@@ -3066,7 +3073,7 @@ fn TranscriptImage(src: String, name: String) -> impl IntoView {
             let href = full.clone();
             view! {
                 <FullImage src=full.clone() name=title.clone() close=move |_| open.set(false)>
-                    <a class=FULL_BUTTON href=href target="_blank" on:click=move |_| open.set(false)>"Open in a new tab"</a>
+                    <a class=FULL_BUTTON href=href target="_blank" on:click=move |_| open.set(false)>"Open in new tab"</a>
                 </FullImage>
             }
         })}
