@@ -3556,9 +3556,14 @@ fn subagent_name(r: &Session) -> Option<String> {
 }
 
 /// Scrolls the element with this id into view.
-fn scroll_to(id: &str) {
-    if let Some(el) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id(id)) {
-        el.scroll_into_view();
+/// Scrolls to the element `id`; whether there was one.
+fn scroll_to(id: &str) -> bool {
+    match web_sys::window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id(id)) {
+        Some(el) => {
+            el.scroll_into_view();
+            true
+        }
+        None => false,
     }
 }
 
@@ -4159,9 +4164,20 @@ fn ToolCard(
                 })}
                 {move || continued.and_then(|c| c.get()).map(|cid| {
                     let target = format!("sub-{cid}");
+                    // Its thread may be far above what's drawn: then its
+                    // own session, beside.
+                    let col = use_column();
                     view! {
                         <button class="text-[11px] text-violet-700 hover:underline dark:text-violet-400" title="Go to its thread"
-                            on:click=move |ev| { ev.prevent_default(); ev.stop_propagation(); scroll_to(&target); }>"↻ its thread"</button>
+                            on:click=move |ev| {
+                                ev.prevent_default();
+                                ev.stop_propagation();
+                                if !scroll_to(&target)
+                                    && let Some(c) = col
+                                {
+                                    c.open(View::session(cid.clone()), crate::workspace::How::Beside);
+                                }
+                            }>"↻ its thread"</button>
                     }
                 })}
                 {move || result.get().map(|r| view! { <span class="shrink-0 whitespace-nowrap text-[11px] text-muted">{format!("{:.1}s", r.duration_ms as f64 / 1000.0)}</span> })}
