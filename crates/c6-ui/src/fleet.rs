@@ -172,6 +172,7 @@ pub fn Fleet(workers: ReadSignal<Vec<Worker>>) -> impl IntoView {
                             <th class="px-3 py-2 font-medium">"Host"</th>
                             <th class="px-3 py-2 font-medium">"Platform"</th>
                             <th class="px-3 py-2 font-medium">"Version"</th>
+                            <th class="px-3 py-2 font-medium" title="Your labels for it: a template's pool picks by them">"Labels"</th>
                             <th class="px-3 py-2 font-medium">"Last seen"</th>
                             <th class="px-3 py-2 font-medium text-right">"RTT"</th>
                             <th class="px-3 py-2"></th>
@@ -182,7 +183,7 @@ pub fn Fleet(workers: ReadSignal<Vec<Worker>>) -> impl IntoView {
                             let ws = workers.get();
                             if ws.is_empty() {
                                 view! {
-                                    <tr><td colspan="7" class="px-3 py-10 text-center text-muted">
+                                    <tr><td colspan="8" class="px-3 py-10 text-center text-muted">
                                         "No workers yet. Add one to get started."
                                     </td></tr>
                                 }.into_any()
@@ -243,6 +244,22 @@ fn WorkerRow(w: Worker, now: RwSignal<i64>, error: RwSignal<Option<String>>) -> 
             <td class="px-3 py-2 text-zinc-600 dark:text-zinc-400">{w.hostname}</td>
             <td class="px-3 py-2 text-zinc-600 dark:text-zinc-400">{format!("{}/{}", w.os, w.arch)}</td>
             <td class="px-3 py-2 font-mono text-xs text-zinc-600 dark:text-zinc-400">{w.version.unwrap_or_default()}</td>
+            <td class="px-3 py-2">
+                {(!revoked && w.role != "memex" && !crate::place::is_console()).then(|| w.labels.join(", "))}
+                {(!revoked && w.role != "memex" && crate::place::is_console()).then(|| {
+                    let wid = w.id.to_string();
+                    view! {
+                        <input class="w-36 rounded border border-zinc-200 bg-transparent px-1.5 py-0.5 font-mono text-xs dark:border-zinc-700"
+                            placeholder="none" title="Labels, comma-separated (e.g. dev-vm): a template that picks one worker picks from those with its labels"
+                            prop:value=w.labels.join(", ")
+                            on:change=move |ev| {
+                                let labels = c6_api::labels::parse_labels(&event_target_value(&ev));
+                                let wid = wid.clone();
+                                spawn_local(async move { error.set(api::set_worker_labels(wid, labels).await.err()); });
+                            } />
+                    }
+                })}
+            </td>
             <td class="px-3 py-2 text-zinc-600 dark:text-zinc-400">
                 {move || if online { "now".to_owned() } else { last_seen.map(|t| ago(now.get() - t)).unwrap_or_else(|| "never".into()) }}
             </td>

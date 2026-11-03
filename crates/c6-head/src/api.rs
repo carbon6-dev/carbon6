@@ -259,6 +259,8 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/grants/{id}", get(get_grant).delete(revoke_grant))
         .route("/api/v1/grants/{id}/uses", get(grant_uses))
         .route("/api/v1/workers/{id}/realms", put(set_worker_realms))
+        .route("/api/v1/workers/{id}/labels", put(set_worker_labels))
+        .route("/api/v1/starts", get(start_plan))
         .route("/api/v1/connections/{id}/realms", put(set_connection_realms))
         .route("/api/v1/settings/prompts", get(list_prompts))
         .route("/api/v1/settings/prompts/{name}", put(put_prompt))
@@ -341,6 +343,7 @@ pub async fn workers_snapshot(st: &HeadState) -> anyhow::Result<Vec<api::Worker>
                 capabilities: live.map(|l| l.capabilities).unwrap_or_default(),
                 role: r.role,
                 realms: serde_json::from_str(&r.realms).unwrap_or_default(),
+                labels: serde_json::from_str(&r.labels).unwrap_or_default(),
             })
         })
         .collect())
@@ -872,6 +875,8 @@ async fn create_session(
     let s = crate::sessions::create(&st, req).await?;
     // The work it belongs to (docs/work.md §4), and the to-do it's on.
     crate::work::on_new_session(&st, &s, work.as_deref(), &refs, &prompt, todo.as_deref()).await;
+    // Its worktree may be its work's place (docs/dev-starts.md §4).
+    crate::starts::record_place(&st, &s.id).await;
     Ok(Json(s))
 }
 
@@ -1217,6 +1222,9 @@ async fn update_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>
     }
     if let Some(a) = req.archived {
         found &= st.store.set_archived(&id, a).await?;
+        if a && found {
+            crate::starts::session_archived(&st, &id).await;
+        }
     }
     if !found {
         return Err(ApiErr(StatusCode::NOT_FOUND, "no such session".into()));
@@ -4049,6 +4057,29 @@ async fn set_worker_realms(
 ) -> ApiResult<StatusCode> {
     crate::realms::set_availability(&st, "workers", &id, &r.realms).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Your labels for a worker (docs/dev-starts.md §3).
+async fn set_worker_labels(
+    State(st): State<Arc<HeadState>>,
+    Path(id): Path<String>,
+    Json(r): Json<api::WorkerLabelsIn>,
+) -> ApiResult<StatusCode> {
+    let labels = crate::sessions::check_labels(&r.labels)?;
+    if !st.store.set_worker_labels(&id, &labels).await? {
+        return Err(ApiErr(StatusCode::NOT_FOUND, "no such worker".into()));
+    }
+    st.registry.bump();
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// What a new session for some work starts with (docs/dev-starts.md §4).
+async fn start_plan(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(q): Query<api::starts::StartQuery>,
+) -> ApiResult<Json<api::starts::StartPlan>> {
+    Ok(Json(crate::starts::plan(&st, &caller, &q).await?))
 }
 
 async fn set_connection_realms(

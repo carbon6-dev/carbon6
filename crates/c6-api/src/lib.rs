@@ -7,6 +7,7 @@ pub mod marks;
 pub mod projects;
 pub mod prompts;
 pub mod slides;
+pub mod starts;
 pub mod work;
 use serde::{Deserialize, Serialize};
 pub use uuid::Uuid;
@@ -76,6 +77,17 @@ pub struct Worker {
     /// The realms it may run sessions for (empty: all).
     #[serde(default)]
     pub realms: Vec<String>,
+    /// Your labels for it, which a template's pool picks by
+    /// (docs/dev-starts.md §3).
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+/// `PUT /api/v1/workers/{id}/labels`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct WorkerLabelsIn {
+    pub labels: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1739,6 +1751,10 @@ pub struct CreateSession {
     /// Run in a new git worktree on a new `c6/…` branch.
     #[serde(default)]
     pub worktree: bool,
+    /// How the new worktree is made (docs/dev-starts.md §2); none: the
+    /// defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_options: Option<starts::WorktreeOptions>,
     /// The realm to run in. Default: the API token's realm, else home.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub realm: Option<String>,
@@ -2977,7 +2993,7 @@ pub struct WebSearchSetting {
 
 /// A session template: where and how to start a session (or one per
 /// target, a fleet run), and what to ask (`/api/v1/settings/templates`).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Template {
     pub name: String,
@@ -3019,10 +3035,21 @@ pub struct Template {
     /// Off: it cannot be run (by hand, schedule or webhook).
     #[serde(default = "enabled_default")]
     pub enabled: bool,
-    /// Its sessions run in a new git worktree of `cwd`, on a new `c6/…`
-    /// branch.
+    /// Its sessions run in a new git worktree of `cwd`, made as
+    /// `worktree_options` say (by default on a new `c6/…` branch).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub worktree: bool,
+    /// How that worktree is made, and what happens to it when the work ends
+    /// (docs/dev-starts.md §2).
+    #[serde(default, skip_serializing_if = "starts::WorktreeOptions::is_default")]
+    pub worktree_options: starts::WorktreeOptions,
+    /// Pick one worker (docs/dev-starts.md §3): of `workers` and the workers
+    /// with any of `worker_labels` (none named: every one), the online one
+    /// running the fewest sessions.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pick: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worker_labels: Vec<String>,
     /// Agents may start it as a remote subagent (`Task` with `template`),
     /// and sessions may start it on the workers, hosts or SSH targets it
     /// names: ticking it is your grant (docs/remote-subagents.md §4).
@@ -3844,7 +3871,10 @@ pub fn valid_command_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || "_-:.".contains(c))
 }
 
-pub const HOOK_EVENTS: [&str; 5] = ["PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop", "SessionStart"];
+pub const HOOK_EVENTS: [&str; 6] = ["PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop", "SessionStart", "WorkEnded"];
+
+/// Hook events of carbon6's own, which Claude Code doesn't know.
+pub const CARBON6_HOOK_EVENTS: [&str; 1] = ["WorkEnded"];
 
 /// `PUT /api/v1/sessions/{id}/labels`: the labels you attach to a session.
 #[derive(Clone, Debug, Serialize, Deserialize)]

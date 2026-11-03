@@ -33,7 +33,7 @@ New `Template` fields, editable in **Settings → Templates** and through `setti
 
 | Field | Meaning |
 |---|---|
-| `worktree: bool` | Run in a new git worktree of `cwd` on a new `c6/…` branch, as the dialog's checkbox does. |
+| `worktree: bool` | Run in a new git worktree of `cwd` on a new `c6/…` branch, as the dialog's checkbox does. Its branch, base, fetching, tracking, setup commands and what happens when the work ends are `worktree_options`, and a template may pick one worker from a labelled pool (`pick`, `worker_labels`): docs/dev-starts.md. |
 | `agents: bool` | **Agents may start it.** The template shows up in `Task`'s list for sessions in its realm (§6). Off: only `template_start`, runs, triggers and automations can use it. |
 | `title: String` | Optional title for its sessions; `{{input}}`-style fields allowed. Empty: the template's name, as today. |
 

@@ -4803,6 +4803,7 @@ fn Composer(
                         attachments: Vec::new(),
                         effort: Some(m.effort.get_untracked()).filter(|e| !e.is_empty()),
                         worktree: false,
+                        worktree_options: None,
                         realm: None,
                     };
                     match api::create_session(req).await {

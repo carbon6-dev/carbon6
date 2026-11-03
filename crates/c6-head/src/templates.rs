@@ -84,6 +84,10 @@ pub fn check(templates: &[api::Template]) -> anyhow::Result<()> {
         }
         crate::sessions::check_labels(&t.labels)?;
         crate::sessions::check_selector(&t.hosts)?;
+        api::starts::check_options(&t.worktree_options).map_err(|e| bad_request(format!("template {n:?}: {e}")))?;
+        if t.pick && (!t.ssh.is_empty() || !t.hosts.is_empty()) {
+            return Err(bad_request(format!("template {n:?}: a pool picks a worker, so it names no SSH targets or hosts")));
+        }
     }
     Ok(())
 }
@@ -163,7 +167,11 @@ async fn targets(
     let snapshot = crate::api::workers_snapshot(st).await?;
     let all: Vec<api::Worker> = snapshot.iter().filter(|w| serves(w, realm)).cloned().collect();
     let online: Vec<&api::Worker> = all.iter().filter(|w| w.status == api::WorkerStatus::Online).collect();
-    let mut workers: Vec<&api::Worker> = if t.workers.is_empty() {
+    let mut workers: Vec<&api::Worker> = if t.pick {
+        // One of a pool: the least busy (docs/dev-starts.md §3).
+        let (w, _) = crate::starts::pick(st, t, realm).await?;
+        all.iter().filter(|x| x.id == w.id).collect()
+    } else if t.workers.is_empty() {
         online.first().copied().into_iter().collect()
     } else if t.workers.iter().any(|w| w == "*") {
         online.clone()
@@ -315,6 +323,7 @@ async fn start(
             ssh,
             effort: Some(t.effort.clone()).filter(|e| !e.is_empty()),
             worktree: t.worktree,
+            worktree_options: t.worktree.then(|| t.worktree_options.clone()),
             realm: Some(realm.to_owned()),
             work: None,
             work_refs: Vec::new(),
@@ -433,6 +442,7 @@ pub async fn start_subagent(
         ssh: ssh.clone(),
         effort: Some(t.effort.clone()).filter(|e| !e.is_empty()),
         worktree: t.worktree,
+        worktree_options: t.worktree.then(|| t.worktree_options.clone()),
         realm: Some(realm.clone()),
         work: None,
         work_refs: Vec::new(),

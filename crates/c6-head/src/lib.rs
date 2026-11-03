@@ -58,6 +58,7 @@ pub mod secrets;
 pub mod series;
 pub mod sessions;
 pub mod slack;
+pub mod starts;
 pub mod store;
 pub mod suggestions;
 pub mod telemetry;

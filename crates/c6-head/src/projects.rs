@@ -253,7 +253,10 @@ pub async fn list(st: &HeadState, caller: &Caller, closed: bool) -> anyhow::Resu
 }
 
 pub async fn patch(st: &HeadState, id: &str, p: &ProjectPatch, caller: &Caller) -> anyhow::Result<ProjectItem> {
-    visible(st, id, caller).await?;
+    let row = visible(st, id, caller).await?;
+    if let Some(t) = p.start_with.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        crate::starts::check_template(st, &row.realm, t).await?;
+    }
     let title = p.title.as_deref().map(check_title).transpose()?;
     let purpose = p.purpose.as_deref().map(check_purpose).transpose()?;
     if let Some(s) = &p.status
@@ -279,6 +282,9 @@ pub async fn patch(st: &HeadState, id: &str, p: &ProjectPatch, caller: &Caller) 
         }
         if p.dismiss_offer {
             f.offer = None;
+        }
+        if let Some(t) = &p.start_with {
+            f.start_with = t.trim().to_owned();
         }
         Ok(true)
     })
@@ -1030,6 +1036,7 @@ async fn quick(st: &HeadState, id: &str, session: &str, caller: &Caller) -> anyh
 pub async fn archive_session(st: &HeadState, id: &str, session: &str, caller: &Caller, by: &str) -> anyhow::Result<ProjectItem> {
     quick(st, id, session, caller).await?;
     st.store.set_archived(session, true).await?;
+    crate::starts::session_archived(st, session).await;
     drop_session_from(st, id, session, by).await?;
     st.registry.bump();
     get(st, id, caller).await

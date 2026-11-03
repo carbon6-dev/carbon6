@@ -423,6 +423,31 @@ pub async fn set_availability(what: &'static str, id: String, realms: Vec<String
         .await
 }
 
+/// Your labels for a worker, which a template's pool picks by.
+pub async fn set_worker_labels(id: String, labels: Vec<String>) -> Result<(), String> {
+    empty(
+        Request::put(&format!("/api/v1/workers/{id}/labels"))
+            .json(&c6_api::WorkerLabelsIn { labels })
+            .map_err(|e| e.to_string())?
+            .send()
+            .await,
+    )
+    .await
+}
+
+/// What a new session for some work starts with (docs/dev-starts.md §4).
+pub async fn start_plan(q: c6_api::starts::StartQuery) -> Result<c6_api::starts::StartPlan, String> {
+    let url = format!(
+        "/api/v1/starts?work={}&todo={}&template={}&worker={}&text={}",
+        enc(&q.work),
+        enc(&q.todo),
+        enc(&q.template),
+        enc(&q.worker),
+        enc(&q.text.chars().take(200).collect::<String>())
+    );
+    json(Request::get(&url).send().await).await
+}
+
 async fn check(resp: Result<Response, gloo_net::Error>) -> Result<Response, String> {
     let resp = resp.map_err(|e| e.to_string())?;
     if resp.ok() {

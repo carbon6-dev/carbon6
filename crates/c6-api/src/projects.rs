@@ -53,6 +53,9 @@ pub struct ProjectFields {
     /// them or keep them as work.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sessions: Vec<QuickSession>,
+    /// The template its work starts with (docs/dev-starts.md §4).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub start_with: String,
 }
 
 /// A session in the project with no work item of its own.
@@ -301,6 +304,9 @@ pub struct ProjectPatch {
     pub dismiss_offer: bool,
     #[serde(default)]
     pub labels: Option<Vec<String>>,
+    /// The template its work starts with ("" for none).
+    #[serde(default)]
+    pub start_with: Option<String>,
 }
 
 /// `POST /api/v1/projects/{id}/work`: a work item moves into the project

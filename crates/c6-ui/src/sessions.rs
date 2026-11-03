@@ -1217,6 +1217,7 @@ pub fn SaveTemplateDialog(seed: SessionSeed, #[prop(into)] on_close: Callback<()
             worktree: worktree.get_untracked() && !seed.cwd.is_empty() && seed.ssh.is_none(),
             agents: agents.get_untracked(),
             title: String::new(),
+            ..Default::default()
         };
         spawn_local(async move {
             let result = async {
@@ -1452,6 +1453,11 @@ fn SessionForm(
     }
     let work_refs = StoredValue::new(work_refs);
     let (todo, todo_work) = (StoredValue::new(todo), StoredValue::new(work_pick.get_untracked()));
+    // What its work starts with (docs/dev-starts.md §4): its template, the
+    // worker it picks (or its worktree's) and why, and the branch.
+    let plan = RwSignal::new(None::<c6_api::starts::StartPlan>);
+    let worktree_options = RwSignal::new(None::<c6_api::starts::WorktreeOptions>);
+    let branch = RwSignal::new(String::new());
     let pending = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
     // Images and files for the first message: pasted, dropped or picked.
@@ -1462,10 +1468,70 @@ fn SessionForm(
     // On Auto, the rule sets it.
     let effort_supported = move || conns.with_value(|cs| cs.iter().find(|c| c.id == connection.get()).is_some_and(|c| c.supports_effort));
 
+    let chosen_by_hand = RwSignal::new(seeded);
+    let ask_plan = move |other: String| {
+        let w = work_pick.get_untracked();
+        if w.is_empty() || matches!(w.as_str(), "new" | "none" | "guess") {
+            plan.set(None);
+            worktree_options.set(None);
+            return;
+        }
+        let q = c6_api::starts::StartQuery {
+            work: w,
+            todo: todo.get_value(),
+            worker: other,
+            text: prompt.get_untracked(),
+            ..Default::default()
+        };
+        spawn_local(async move {
+            let Ok(p) = api::start_plan(q).await else { return };
+            if p.template.is_empty() && !p.reuse && !p.offline {
+                plan.try_set(None);
+                return;
+            }
+            chosen_by_hand.try_set(true);
+            plan.try_set(Some(p.clone()));
+            if let Some(id) = p.worker_id {
+                worker.try_set(id.to_string());
+            }
+            remote.try_set(false);
+            cwd.try_set(p.cwd.clone());
+            worktree.try_set(p.worktree);
+            branch.try_set(p.options.branch.clone());
+            worktree_options.try_set(p.worktree.then(|| p.options.clone()));
+            if !p.connection_id.is_empty() {
+                connection.try_set(p.connection_id.clone());
+                model.try_set(p.model.clone());
+            }
+            if !p.effort.is_empty() {
+                effort.try_set(p.effort.clone());
+            }
+            let mut l = c6_api::labels::parse_labels(&labels.get_untracked());
+            l.extend(p.labels.iter().filter(|x| !l.contains(x)).cloned().collect::<Vec<_>>());
+            labels.try_set(l.join(", "));
+            if prompt.get_untracked().trim().is_empty() && !p.prompt.is_empty() {
+                prompt.try_set(p.prompt.clone());
+            }
+        });
+    };
+    // Asked again when you pick other work, or another worker than the one
+    // its worktree is on.
+    Effect::new(move || {
+        work_pick.track();
+        ask_plan(String::new());
+    });
+    Effect::new(move || {
+        let w = worker.get();
+        let moved =
+            plan.with_untracked(|p| p.as_ref().is_some_and(|p| (p.reuse || p.offline) && p.worker_id.is_none_or(|id| id.to_string() != w)));
+        if moved && !w.is_empty() {
+            ask_plan(w);
+        }
+    });
+
     // Pick a worker once the fleet loads: the last one used if it is online,
     // otherwise an online one. A worker the user picks by hand is kept, and
     // so is a seed's.
-    let chosen_by_hand = RwSignal::new(seeded);
     Effect::new(move || {
         // The memex is a node, not a worker: it runs no sessions.
         let ws: Vec<c6_api::Worker> = live.workers.get().into_iter().filter(|w| w.role != "memex").collect();
@@ -1488,6 +1554,11 @@ fn SessionForm(
     Effect::new(move |first: Option<()>| {
         let w = worker.get();
         if first.is_none() && seeded {
+            return;
+        }
+        // The plan's folder on the plan's worker.
+        if let Some(p) = plan.get_untracked().filter(|p| p.worker_id.is_some_and(|id| id.to_string() == w)) {
+            cwd.set(p.cwd);
             return;
         }
         let remembered = storage_get(&format!("c6.cwd.{w}")).unwrap_or_default();
@@ -1606,6 +1677,11 @@ fn SessionForm(
             labels: c6_api::labels::parse_labels(&labels.get_untracked()),
             effort: Some(effort.get_untracked()).filter(|e| !e.is_empty() && effort_supported()),
             worktree: worktree.get_untracked() && !on_ssh,
+            // As its work's template says, with the branch as you left it.
+            worktree_options: worktree_options
+                .get_untracked()
+                .filter(|_| worktree.get_untracked() && !on_ssh)
+                .map(|o| c6_api::starts::WorktreeOptions { branch: branch.get_untracked().trim().to_owned(), ..o }),
             // A seed's realm; else the realm you are looking at (else home).
             realm: if seeded { Some(seed_realm.get_value()) } else { Some(crate::api::realm().get_untracked()) }.filter(|r| !r.is_empty()),
             // "An agent picks" asks for its guess.
@@ -1890,6 +1966,26 @@ fn SessionForm(
                     }
                 }).collect_view()}
             </Popover>
+            {move || plan.get().map(|p| {
+                let tone = if p.offline { "text-amber-700 dark:text-amber-400" } else { "text-muted" };
+                view! {
+                    <div class=format!("flex flex-wrap items-center gap-x-3 gap-y-1 px-1 text-xs {tone}") data-start-plan="">
+                        {(!p.template.is_empty()).then(|| view! { <span>"Template " <span class="font-medium text-soft">{p.template.clone()}</span></span> })}
+                        <span data-start-why="">{p.why.clone()}</span>
+                        {move || (worktree.get() && worktree_options.with(Option::is_some)).then(|| view! {
+                            <label class="inline-flex items-center gap-1">"New branch"
+                                <input class="w-56 rounded border border-zinc-200 bg-transparent px-1.5 py-0.5 font-mono text-xs dark:border-zinc-700" data-start-branch=""
+                                    prop:value=move || branch.get() on:input=move |ev| branch.set(event_target_value(&ev)) />
+                            </label>
+                            {worktree_options.with(|o| o.as_ref().map(|o| {
+                                let base = if o.base.is_empty() { "HEAD".to_owned() } else { o.base.clone() };
+                                format!("from {base}{}", if o.fetch { " (fetched)" } else { "" })
+                            }))}
+                        })}
+                        {p.reuse.then(|| view! { <span class="font-mono">{format!("in its worktree, on {}", p.options.branch)}</span> })}
+                    </div>
+                }
+            })}
             <div class:hidden=move || !changing.get()>
                 <div class="fixed inset-0 z-40 bg-black/30 md:hidden" on:click=move |_| changing.set(false)></div>
                 <div data-pop=fields_pop

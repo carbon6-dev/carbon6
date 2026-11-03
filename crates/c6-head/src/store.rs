@@ -28,6 +28,8 @@ pub struct WorkerRow {
     pub role: String,
     /// The realms it is available to (JSON array; empty: all).
     pub realms: String,
+    /// Your labels for it (JSON array).
+    pub labels: String,
 }
 
 impl WorkerRow {
@@ -1041,6 +1043,15 @@ impl Store {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    pub async fn set_worker_labels(&self, id: &str, labels: &[String]) -> anyhow::Result<bool> {
+        let r = sqlx::query("UPDATE workers SET labels = ? WHERE id = ? AND role != 'head'")
+            .bind(serde_json::to_string(labels)?)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
     }
 
     pub async fn set_archived(&self, id: &str, archived: bool) -> anyhow::Result<bool> {

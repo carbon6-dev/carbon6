@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use c6_agent::{Conversation, EventSink, PendingInput, TurnConfig, build_system_prompt, history_from_events, run_turn};
 use c6_llm::{Block, Message, Provider, Role, ToolProfile, model_info};
 use c6_proto::{
-    BackgroundTask, Checkpoint, CreateSession, EphemeralEvent, ErrorEvent, ModelSpec, ModelSwitched, Rewound, SessionActivity,
+    BackgroundTask, Checkpoint, CreateSession, EphemeralEvent, ErrorEvent, ModelSpec, ModelSwitched, Notice, Rewound, SessionActivity,
     SessionCommand, SessionEvent, SessionStarted, TurnEndReason, TurnEnded, TurnStarted, ephemeral_event, session_command, session_event,
 };
 use c6_tools::{SessionTools, Skill, SkillTool, Tool};
@@ -113,6 +113,8 @@ struct Place {
     repo_root: String,
     ssh_target: String,
     system: String,
+    /// What the worktree's setup commands printed.
+    setup_log: String,
 }
 
 /// The repository's git remote (origin, else the first) as
@@ -571,9 +573,20 @@ impl SessionManager {
             return Err(format!("working directory {} does not exist on this worker", cwd.display()));
         }
         let cwd = cwd.canonicalize().unwrap_or(cwd);
+        // A new worktree, made and set up as its template says
+        // (docs/dev-starts.md §2); the setup's output goes in the transcript.
+        let mut setup_log = String::new();
         let (cwd, worktree_branch, repo_root) = if spec.worktree {
-            let (path, branch, root) = self.create_worktree(session_id, &cwd).await?;
-            (path, branch, root)
+            let ws = spec.worktree_spec.clone().unwrap_or_default();
+            let made = crate::worktree::create(&self.worktrees, session_id, &cwd, &ws).await?;
+            match crate::worktree::setup(&made, &ws.setup).await {
+                Ok(log) => setup_log = log,
+                Err(e) => {
+                    crate::worktree::discard(&made).await;
+                    return Err(e);
+                }
+            }
+            (made.cwd, made.branch, made.root)
         } else {
             (cwd, String::new(), String::new())
         };
@@ -596,6 +609,7 @@ impl SessionManager {
                 repo_root,
                 ssh_target: String::new(),
                 system: String::new(),
+                setup_log,
             },
             labels,
             system_prompt,
@@ -644,6 +658,7 @@ impl SessionManager {
             repo_root: String::new(),
             ssh_target: target,
             system,
+            setup_log: String::new(),
         };
         self.finish_create(session_id, command_id, spec, place, labels, prompt).await
     }
@@ -657,7 +672,7 @@ impl SessionManager {
         labels: Vec<String>,
         system_prompt: String,
     ) -> Result<(), String> {
-        let Place { cwd, local, home, repo, worktree_branch, repo_root, ssh_target, system } = place;
+        let Place { cwd, local, home, repo, worktree_branch, repo_root, ssh_target, system, setup_log } = place;
         let model = spec.model.clone().unwrap_or_default();
         let mut setup_errors = Vec::new();
         let mut session_tools = Vec::new();
@@ -696,6 +711,13 @@ impl SessionManager {
         // Non-fatal setup problems (an MCP server that would not start) are
         // shown in the session.
         let mut next_seq = 2;
+        if !setup_log.trim().is_empty() {
+            let notice =
+                Notice { title: "Worktree set up".into(), message: setup_log.trim_end().to_owned(), priority: "low".into(), quiet: true };
+            let ev = SessionEvent { seq: next_seq, ts_ms: c6_core::now_ms(), kind: Some(session_event::Kind::Notice(notice)) };
+            self.journal.append(session_id, &ev).await.map_err(|e| format!("worker error: {e:#}"))?;
+            next_seq += 1;
+        }
         for message in setup_errors {
             let ev =
                 SessionEvent { seq: next_seq, ts_ms: c6_core::now_ms(), kind: Some(session_event::Kind::Error(ErrorEvent { message })) };
@@ -706,38 +728,6 @@ impl SessionManager {
         let conv = Conversation { history: history_from_events(&seed_events(&spec)), context_tokens: 0 };
         self.spawn(session_id, spec, started, conv, next_seq, 0, Some(session_tools)).await.map_err(|e| format!("worker error: {e:#}"))?;
         Ok(())
-    }
-
-    /// `git worktree add` on a new `c6/<id>` branch from HEAD. Returns the
-    /// session directory (same relative position as `cwd` in the repo), the
-    /// branch, and the repo root.
-    async fn create_worktree(&self, session_id: &str, cwd: &std::path::Path) -> Result<(PathBuf, String, String), String> {
-        let root = cwd
-            .ancestors()
-            .find(|d| d.join(".git").exists())
-            .ok_or_else(|| format!("{} is not inside a git repository, so a worktree cannot be created", cwd.display()))?
-            .to_owned();
-        let repo = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "repo".into());
-        let short: String =
-            session_id.chars().filter(|c| c.is_ascii_hexdigit()).rev().take(8).collect::<Vec<_>>().into_iter().rev().collect();
-        let branch = format!("c6/{short}");
-        let path = self.worktrees.join(&repo).join(&short);
-        std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| format!("creating {}: {e}", self.worktrees.display()))?;
-        let out = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .args(["worktree", "add", "-b", &branch])
-            .arg(&path)
-            .arg("HEAD")
-            .output()
-            .await
-            .map_err(|e| format!("running git: {e}"))?;
-        if !out.status.success() {
-            return Err(format!("git worktree add failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
-        }
-        let rel = cwd.strip_prefix(&root).unwrap_or(std::path::Path::new(""));
-        info!(session = %session_id, %branch, path = %path.display(), "worktree created");
-        Ok((path.join(rel), branch, root.display().to_string()))
     }
 
     /// The session's actor, starting it from the journal if needed.

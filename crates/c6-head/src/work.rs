@@ -499,8 +499,34 @@ pub async fn of(st: &HeadState, reference: &str, caller: &Caller) -> anyhow::Res
     view(st, found).await
 }
 
+/// A work item's realm and fields.
+pub(crate) async fn fields_of(st: &HeadState, id: &str) -> Option<(String, WorkFields)> {
+    load(st, id).await.ok().flatten().map(|r| (r.realm, r.fields))
+}
+
+/// Records where a work item's work lives, or forgets it (`None`). With
+/// `first`, only when it has none yet; returns whether it changed.
+pub(crate) async fn set_place(st: &HeadState, id: &str, place: Option<api::starts::WorkPlace>, first: bool) -> anyhow::Result<bool> {
+    let mut changed = false;
+    modify(st, id, "carbon6", None, |f| {
+        if (first && f.place.is_some()) || f.place == place {
+            return Ok(false);
+        }
+        f.place = place;
+        changed = true;
+        Ok(true)
+    })
+    .await?;
+    Ok(changed)
+}
+
 pub async fn patch(st: &HeadState, id: &str, p: &api::work::WorkPatch, caller: &Caller) -> anyhow::Result<WorkItem> {
     visible(st, id, caller).await?;
+    if let Some(t) = p.start_with.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        let realm = visible(st, id, caller).await?.realm;
+        crate::starts::check_template(st, &realm, t).await?;
+    }
+    let mut ended = false;
     let title = p.title.as_deref().map(check_title).transpose()?;
     if let Some(s) = &p.status
         && !matches!(s.as_str(), "open" | "done" | "dropped")
@@ -534,9 +560,17 @@ pub async fn patch(st: &HeadState, id: &str, p: &api::work::WorkPatch, caller: &
                 if s == "open" {
                     f.moved_at = now_ms();
                 }
+                // Its place goes as its template says (docs/dev-starts.md §5).
+                ended = s != "open" && f.place.is_some();
             }
             f.status = s.clone();
             f.offer = None;
+        }
+        if let Some(t) = &p.start_with {
+            f.start_with = t.trim().to_owned();
+        }
+        if p.forget_place {
+            f.place = None;
         }
         if let Some(until) = p.snooze_until {
             f.snoozed_until = (until > now_ms()).then_some(until);
@@ -547,6 +581,9 @@ pub async fn patch(st: &HeadState, id: &str, p: &api::work::WorkPatch, caller: &
         Ok(true)
     })
     .await?;
+    if ended {
+        crate::starts::work_ended(st, id).await;
+    }
     // Work opening or closing moves its project.
     if p.status.is_some()
         && let Some(project) = project_of(st, id).await

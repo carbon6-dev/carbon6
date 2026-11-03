@@ -228,6 +228,24 @@ pub async fn create_linked(st: &HeadState, req: api::CreateSession, instance: &s
     };
     let mut spec = session_spec(st, &row, req.worktree, Vec::new()).await?;
     spec.depth = link.as_ref().map_or(0, |l| l.depth);
+    // How its worktree is made (docs/dev-starts.md §2): {{name}} from its
+    // title; the worker fills in {{id}}.
+    if req.worktree {
+        let mut o = req.worktree_options.clone().unwrap_or_default();
+        o.branch = api::starts::branch_name(&o.branch, &row.title, None);
+        api::starts::check_options(&o).map_err(bad_request)?;
+        if req.worktree_options.is_some() {
+            let template = labels.iter().find_map(|l| l.strip_prefix("template:")).unwrap_or("");
+            crate::starts::remember(st, &row.id, &o, template).await?;
+        }
+        spec.worktree_spec = Some(c6_proto::WorktreeSpec {
+            branch: o.branch,
+            base: o.base.trim().to_owned(),
+            fetch: o.fetch,
+            track: o.track,
+            setup: o.setup,
+        });
+    }
     // Context from the memex, for what is known at creation.
     let mut brief_labels = labels.clone();
     brief_labels.extend(api::labels::auto_labels(
@@ -514,6 +532,7 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         claude_code: Some(claude_code_choice(st, &row.realm).await?),
         claude_code_tools: claude_code_tools(st, Some(&row.realm)).await?.tools,
         claude_code_tools_chosen: true,
+        worktree_spec: None,
     })
 }
 
@@ -1912,6 +1931,7 @@ pub async fn ingest(st: &HeadState, worker_id: WorkerId, batch: SessionEventBatc
     crate::memex::on_events(st, &batch.session_id, &ing.events).await;
     crate::decisions::on_events(st, &batch.session_id, &ing.events).await;
     crate::naming::on_events(st, &batch.session_id, &ing.events).await;
+    crate::starts::on_events(st, &batch.session_id, &ing.events).await;
     // How a run's session went: its first turn's end.
     for ev in &ing.events {
         if let Some(c6_proto::session_event::Kind::TurnEnded(t)) = &ev.kind {

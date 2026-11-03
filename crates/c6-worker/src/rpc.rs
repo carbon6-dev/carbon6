@@ -114,6 +114,12 @@ pub async fn handle(worker: &Arc<Worker>, method: &str, params: Value) -> anyhow
             Ok(worker.sessions.task_snapshot(session, task).unwrap_or(Value::Null))
         }
         "ssh.check" => ssh_check(params["target"].as_str().unwrap_or_default()).await,
+        // A work item's place, when its work ends (docs/dev-starts.md §5).
+        "worktree.end" => {
+            let labels: Vec<String> = serde_json::from_value(params["labels"].clone()).unwrap_or_default();
+            let req: c6_api::starts::WorktreeEnd = serde_json::from_value(params)?;
+            Ok(serde_json::to_value(crate::worktree::end(&req, &labels).await)?)
+        }
         "kit.job" => kit_job(worker, &params).await,
         "session.queue_op" => session_queue_op(worker, &params).await,
         "update.apply" => crate::update::apply(worker, &params).await,

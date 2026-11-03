@@ -48,6 +48,8 @@ Some tasks don't outlive their session: draft a short doc for the project, summa
 - **Only in projects:** a session outside any project is unfiled or serves work, as before.
 - Attaching it to a work item (from its header) makes it that work's session instead.
 
+**A project can name the template its work starts with** ("Start with", on the project or on one of its work items): + Work, quick sessions, a to-do's ▶ Start, Plan the next phase and Pick up all open the form filled from it, on the worker its pool picks, in the work's own worktree once it has one (docs/dev-starts.md).
+
 **Documents belong to the project, not to its work.** A doc or deck made while doing a piece of work (the design doc of phase 1, the deck for its review) is attached to the project, so it stays when the work closes. Work can refer to the same document too. A project's **plan** is a doc like any other: made with the project from the editable template `project.plan` (purpose, phases, open questions), and changed by you and by sessions.
 
 ## 4. Its state

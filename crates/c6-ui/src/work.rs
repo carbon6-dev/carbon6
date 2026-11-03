@@ -729,7 +729,18 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
                             {w.fields.snoozed_until.filter(|_| w.state == "snoozed").map(|_| view! {
                                 <button class=BUTTON_QUIET on:click=move |_| patch(WorkPatch { snooze_until: Some(0), ..Default::default() })>"Wake it"</button>
                             })}
+                            <span class="flex-1"></span>
+                            <crate::projects::StartWith current=w.fields.start_with.clone() realm=w.realm.clone()
+                                none=if w.fields.project.is_empty() { "Start: as set in the form" } else { "Start: as its project does" }
+                                on_pick=Callback::new(move |t| patch(WorkPatch { start_with: Some(t), ..Default::default() })) />
                         </div>
+                        {w.fields.place.clone().map(|pl| view! {
+                            <p class="text-xs text-muted" data-work-place="" title="Where its sessions go: later starts reuse this worktree">
+                                "Its worktree: " <span class="font-mono">{format!("{} on {}", pl.path, pl.worker)}</span>
+                                " · branch " <span class="font-mono">{pl.branch.clone()}</span>
+                                {(!pl.cleanup.is_empty() && pl.cleanup != "off").then(|| format!(" · when the work ends: {}", if pl.cleanup == "ask" { "ask" } else { "remove it if safe" }))}
+                            </p>
+                        })}
                         {move || merging.get().then(|| {
                             let me = w3.id.clone();
                             view! {

@@ -52,6 +52,14 @@ pub struct WorkFields {
     /// The project is an agent's guess (one click changes it).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub project_guess: bool,
+    /// The template its sessions start with (docs/dev-starts.md §4); empty:
+    /// its project's.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub start_with: String,
+    /// Where its work lives: the worker, worktree and branch its first
+    /// session made, until the work ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub place: Option<crate::starts::WorkPlace>,
 }
 
 /// One step of a piece of work, to start as a session later.
@@ -267,6 +275,12 @@ pub struct WorkPatch {
     /// Its phase in the project ("" for none).
     #[serde(default)]
     pub phase: Option<String>,
+    /// The template its sessions start with ("" for its project's).
+    #[serde(default)]
+    pub start_with: Option<String>,
+    /// Forget where its work lives (nothing is removed).
+    #[serde(default)]
+    pub forget_place: bool,
 }
 
 /// A session's open work, as the live list names it.

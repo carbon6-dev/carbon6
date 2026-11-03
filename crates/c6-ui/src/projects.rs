@@ -355,6 +355,9 @@ pub fn ProjectPage(id: String) -> impl IntoView {
                                     {if closed { "Reopen" } else { "Resume" }}
                                 </button>
                             })}
+                            <span class="flex-1"></span>
+                            <StartWith current=p.fields.start_with.clone() realm=p.realm.clone() none="Start work: as set in the form"
+                                on_pick=Callback::new(move |t| patch(ProjectPatch { start_with: Some(t), ..Default::default() })) />
                         </div>
                         {move || merging.get().then(|| {
                             let me = mine.clone();
@@ -860,5 +863,38 @@ fn Documents(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> im
                 <button class=BUTTON_QUIET on:click=move |_| add_link()>"Link"</button>
             </div>
         </section>
+    }
+}
+
+/// A project's or work item's "start with" template (docs/dev-starts.md
+/// §4): its sessions start from it, wherever they are started.
+#[component]
+pub fn StartWith(current: String, realm: String, none: &'static str, #[prop(into)] on_pick: Callback<String>) -> impl IntoView {
+    let templates = LocalResource::new(api::all_templates);
+    let realm = StoredValue::new(realm);
+    let current = StoredValue::new(current);
+    view! {
+        <label class="inline-flex items-center gap-1 text-xs text-muted" title="The template its work's sessions start with: worker, folder, worktree and branch, model">
+            "Start with"
+            <select class=format!("{INPUT} w-auto! py-0.5 text-xs") data-start-with="" prop:value=move || current.get_value()
+                on:change=move |ev| on_pick.run(event_target_value(&ev))>
+                <option value="">{none}</option>
+                {move || {
+                    let mut names: Vec<String> = templates
+                        .get()
+                        .and_then(Result::ok)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|t| t.template.enabled && (t.realm == realm.get_value() || realm.get_value().is_empty()))
+                        .map(|t| t.template.name)
+                        .collect();
+                    let c = current.get_value();
+                    if !c.is_empty() && !names.contains(&c) {
+                        names.push(c);
+                    }
+                    names.into_iter().map(|n| view! { <option value=n.clone() selected=n == current.get_value()>{n.clone()}</option> }).collect_view()
+                }}
+            </select>
+        </label>
     }
 }

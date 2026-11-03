@@ -57,6 +57,8 @@ pub struct HookRunner {
     cwd: PathBuf,
     project_dir: PathBuf,
     events: HashMap<String, Vec<Command>>,
+    /// More environment for every command (WorkEnded's C6_WORKTREE, …).
+    env: Vec<(String, String)>,
 }
 
 /// What a set of hooks decided.
@@ -93,14 +95,21 @@ impl HookRunner {
                 events.entry(h.event.clone()).or_default().push(h);
             }
         }
-        (!events.is_empty()).then(|| Self { session_id: session_id.to_owned(), cwd: cwd.to_owned(), project_dir, events })
+        (!events.is_empty()).then(|| Self { session_id: session_id.to_owned(), cwd: cwd.to_owned(), project_dir, events, env: Vec::new() })
+    }
+
+    /// The same hooks, each command also given `env`.
+    pub fn with_env(mut self, env: &[(&str, &str)]) -> Self {
+        self.env = env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
+        self
     }
 
     /// The hooks as Claude Code settings (`--settings`), for Claude Code
-    /// sessions, which run hooks themselves.
+    /// sessions, which run hooks themselves (carbon6's own events, which
+    /// the worker runs, left out).
     pub fn claude_settings(&self) -> String {
         let mut hooks = serde_json::Map::new();
-        for (event, cmds) in &self.events {
+        for (event, cmds) in self.events.iter().filter(|(e, _)| !c6_api::CARBON6_HOOK_EVENTS.contains(&e.as_str())) {
             let groups: Vec<Value> = cmds
                 .iter()
                 .map(|c| {
@@ -168,12 +177,37 @@ impl HookRunner {
         v
     }
 
+    /// Runs the hooks for `event` and says how each went, one line each
+    /// (for events nothing waits on, such as WorkEnded).
+    pub async fn run_reporting(&self, event: &str, mut payload: Value) -> Vec<String> {
+        let commands: Vec<&Command> = self.events.get(event).into_iter().flatten().collect();
+        payload["hook_event_name"] = json!(event);
+        payload["cwd"] = json!(self.cwd.display().to_string());
+        let input = payload.to_string();
+        let outcomes = futures::future::join_all(commands.iter().map(|c| self.exec(c, &input))).await;
+        commands
+            .iter()
+            .zip(outcomes)
+            .map(|(c, (code, stdout, stderr))| {
+                let said = if stderr.trim().is_empty() { stdout } else { stderr };
+                let said = said.trim().lines().last().unwrap_or("").to_owned();
+                match code {
+                    Some(0) if said.is_empty() => format!("`{}` ran", c.command),
+                    Some(0) => format!("`{}`: {said}", c.command),
+                    Some(n) => format!("`{}` failed (exit {n}): {said}", c.command),
+                    None => format!("`{}` failed: {said}", c.command),
+                }
+            })
+            .collect()
+    }
+
     /// (exit code, stdout, stderr); no code on timeout or failure to start.
     async fn exec(&self, c: &Command, input: &str) -> (Option<i32>, String, String) {
         let child = tokio::process::Command::new("sh")
             .arg("-c")
             .arg(&c.command)
             .current_dir(&self.cwd)
+            .envs(self.env.iter().map(|(k, v)| (k, v)))
             .env("C6_PROJECT_DIR", &self.project_dir)
             .env("CLAUDE_PROJECT_DIR", &self.project_dir)
             .stdin(Stdio::piped())

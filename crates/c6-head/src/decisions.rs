@@ -375,6 +375,7 @@ async fn act(
             }
             _ => {}
         },
+        (Some("worktree"), Some(_), Some(_)) => crate::starts::decided(st, d, option).await?,
         (Some("publish"), _, _) => {
             crate::commons::answer(st, d, option == Some("Publish")).await?;
         }
@@ -829,13 +830,44 @@ async fn start_task(st: &HeadState, d: &api::Decision) -> anyhow::Result<()> {
         .ok_or_else(|| bad_request("no worker is online to start it"))?;
     let mut labels: Vec<String> = c["labels"].as_array().into_iter().flatten().filter_map(|l| l.as_str().map(str::to_owned)).collect();
     labels.extend(["task-card".to_owned(), format!("from:{}", s("session"))]);
-    let req: api::CreateSession = serde_json::from_value(json!({
+    let mut req: api::CreateSession = serde_json::from_value(json!({
         "worker_id": worker.id, "cwd": s("cwd"), "connection_id": "", "model": "", "realm": d.realm,
         "ssh": if s("ssh").is_empty() { Value::Null } else { json!(s("ssh")) },
         "worktree": c["worktree"].as_bool().unwrap_or(false),
         "prompt": s("prompt"), "title": d.title, "labels": labels,
     }))?;
+    // A card raised in some work's session starts as that work does: back
+    // in its worktree, or with its template (docs/dev-starts.md §4).
+    let mut work = crate::work::holding(st, &format!("session:{}", s("session"))).await?.into_iter().next();
+    let mut planned = false;
+    if let Some(w) = &work {
+        let q = api::starts::StartQuery { work: w.clone(), text: d.title.clone(), ..Default::default() };
+        match crate::starts::plan(st, &Caller::root(), &q).await {
+            Ok(p) if (p.reuse || !p.template.is_empty()) && !p.offline && p.worker_id.is_some() => {
+                req.worker_id = p.worker_id.unwrap_or(req.worker_id);
+                req.cwd = p.cwd;
+                req.ssh = None;
+                req.worktree = p.worktree;
+                req.worktree_options = p.worktree.then_some(p.options);
+                req.connection_id = p.connection_id;
+                req.model = p.model;
+                req.effort = Some(p.effort).filter(|e| !e.is_empty());
+                req.labels.extend(p.labels);
+                planned = true;
+            }
+            Ok(_) => {}
+            Err(e) => warn!(decision = d.id, "planning its start: {e:#}"),
+        }
+    }
     let session = crate::sessions::create(st, req).await?;
+    // It joins that work only when it starts as the work does.
+    if !planned {
+        work = None;
+    }
+    if let Some(w) = &work {
+        crate::work::on_new_session(st, &session, Some(w), &[], &s("prompt"), None).await;
+        crate::starts::record_place(st, &session.id).await;
+    }
     let mut sessions = d.sessions.clone();
     sessions.push(session.id.clone());
     sqlx::query("UPDATE decisions SET sessions = ?, updated_at = ? WHERE id = ?")

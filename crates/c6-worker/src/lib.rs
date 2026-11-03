@@ -20,6 +20,7 @@ pub mod rpc;
 pub mod session;
 mod subagent;
 pub mod update;
+pub mod worktree;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

@@ -676,6 +676,21 @@ message CreateSession {
   // The choice as a newer head makes it (it also fills 33 and 34 for older
   // workers); a newer worker uses this when set.
   ClaudeCodeToolChoice claude_code = 35;
+  // With `worktree`: how it is made (docs/dev-starts.md §2); unset: a
+  // `c6/<id>` branch from HEAD.
+  WorktreeSpec worktree_spec = 36;
+}
+
+// How a new git worktree is made: the branch ({{id}} is the session's
+// short id), what it starts from (empty: HEAD), whether to fetch that from
+// its remote first and track it, and shell lines run in it before the
+// first turn.
+message WorktreeSpec {
+  string branch = 1;
+  string base = 2;
+  bool fetch = 3;
+  bool track = 4;
+  repeated string setup = 5;
 }
 
 // carbon6's tools a Claude Code session gets over the MCP bridge

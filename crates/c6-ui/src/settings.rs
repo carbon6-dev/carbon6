@@ -2624,6 +2624,8 @@ enum FieldKind {
     Json,
     /// Yes or no (a checkbox); the placeholder says what it does.
     Check,
+    /// Lines (e.g. shell commands), one per line; stored as a list.
+    Lines,
 }
 
 /// A field of a list setting's items. The first is the item's name, shown
@@ -3021,10 +3023,53 @@ const TEMPLATE_FIELDS: &[Field] = &[
     Field { key: "effort", label: "Effort", placeholder: "", kind: FieldKind::Choice(&["", "low", "medium", "high", "xhigh", "max"]) },
     Field { key: "labels", label: "Labels", placeholder: "e.g. ops, daily", kind: FieldKind::Labels },
     Field {
+        key: "pick",
+        label: "Pick one worker",
+        placeholder: "One session, on the least busy online worker of Workers and Worker labels (both empty: any worker)",
+        kind: FieldKind::Check,
+    },
+    Field {
+        key: "worker_labels",
+        label: "Worker labels",
+        placeholder: "with Pick one: workers with any of these labels (set on the Workers page)",
+        kind: FieldKind::Labels,
+    },
+    Field {
         key: "worktree",
         label: "New git worktree",
-        placeholder: "Each session works in a new worktree of the folder, on a new c6/… branch",
+        placeholder: "Each session works in a new worktree of the folder, made as below (by default on a new c6/… branch from HEAD)",
         kind: FieldKind::Check,
+    },
+    Field {
+        key: "worktree_options.branch",
+        label: "Branch",
+        placeholder: "c6/{{id}}; {{name}} is the work's title in snake_case, e.g. me/{{name}}",
+        kind: FieldKind::Mono,
+    },
+    Field { key: "worktree_options.base", label: "Base", placeholder: "HEAD; or a branch, e.g. origin/main", kind: FieldKind::Mono },
+    Field {
+        key: "worktree_options.fetch",
+        label: "Fetch the base first",
+        placeholder: "git fetch its remote before branching, so the branch starts from the latest",
+        kind: FieldKind::Check,
+    },
+    Field {
+        key: "worktree_options.track",
+        label: "Track the base",
+        placeholder: "The new branch tracks the base (off: --no-track)",
+        kind: FieldKind::Check,
+    },
+    Field {
+        key: "worktree_options.cleanup",
+        label: "When the work ends",
+        placeholder: "Keep the worktree (off)",
+        kind: FieldKind::Choice(&["", "ask", "auto"]),
+    },
+    Field {
+        key: "worktree_options.setup",
+        label: "Setup commands",
+        placeholder: "one per line, run in the new worktree before the first turn; e.g. git submodule update --init --recursive",
+        kind: FieldKind::Lines,
     },
     Field {
         key: "agents",
@@ -3077,6 +3122,24 @@ fn template_examples() -> Vec<(&'static str, serde_json::Value)> {
                 &[("workers", &["*"]), ("labels", &["ops"])],
             ),
         ),
+        ("Dev work in its own worktree, on the least busy dev worker", {
+            let mut v = t(
+                &[
+                    ("name", "dev"),
+                    ("description", "A worktree per piece of work, from the latest main line"),
+                    ("cwd", "~/src/app"),
+                    ("prompt", "Work on this in the worktree you are in, on its branch."),
+                ],
+                &[("worker_labels", &["dev"])],
+            );
+            v["pick"] = serde_json::json!(true);
+            v["worktree"] = serde_json::json!(true);
+            v["worktree_options"] = serde_json::json!({
+                "branch": "me/{{name}}", "base": "origin/main", "fetch": true, "cleanup": "ask",
+                "setup": ["git submodule update --init --recursive"],
+            });
+            v
+        }),
         (
             "Research digest",
             t(
@@ -3325,6 +3388,29 @@ fn ListSetting(
     }
 }
 
+/// An item's field: `a.b` is field b of the object in a.
+fn field_value<'a>(m: &'a serde_json::Map<String, serde_json::Value>, k: &str) -> Option<&'a serde_json::Value> {
+    match k.split_once('.') {
+        Some((a, b)) => m.get(a)?.get(b),
+        None => m.get(k),
+    }
+}
+
+fn set_field(m: &mut serde_json::Map<String, serde_json::Value>, k: &str, v: serde_json::Value) {
+    match k.split_once('.') {
+        Some((a, b)) => {
+            let o = m.entry(a.to_owned()).or_insert_with(|| serde_json::json!({}));
+            if !o.is_object() {
+                *o = serde_json::json!({});
+            }
+            o[b] = v;
+        }
+        None => {
+            m.insert(k.into(), v);
+        }
+    }
+}
+
 #[component]
 fn ListItem(
     item: RwSignal<serde_json::Map<String, serde_json::Value>>,
@@ -3334,9 +3420,11 @@ fn ListItem(
     // Labels fields hold lists, shown as comma-separated text.
     let get = move |k: &'static str| {
         let json = fields.iter().any(|f| f.key == k && f.kind == FieldKind::Json);
+        let lines = fields.iter().any(|f| f.key == k && f.kind == FieldKind::Lines);
         move || {
-            item.with(|m| match m.get(k) {
+            item.with(|m| match field_value(m, k) {
                 Some(v) if json => serde_json::to_string_pretty(v).unwrap_or_default(),
+                Some(serde_json::Value::Array(a)) if lines => a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join("\n"),
                 Some(serde_json::Value::Array(a)) => a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "),
                 Some(serde_json::Value::Number(n)) => n.to_string(),
                 Some(v) => v.as_str().unwrap_or("").to_owned(),
@@ -3348,8 +3436,17 @@ fn ListItem(
         let labels = fields.iter().any(|f| f.key == k && f.kind == FieldKind::Labels);
         let list = fields.iter().any(|f| f.key == k && f.kind == FieldKind::List);
         let json = fields.iter().any(|f| f.key == k && f.kind == FieldKind::Json);
+        let lines = fields.iter().any(|f| f.key == k && f.kind == FieldKind::Lines);
         item.update(|m| {
-            let value = if json {
+            let value = if lines {
+                serde_json::Value::Array(
+                    v.lines()
+                        .map(str::trim_end)
+                        .filter(|l| !l.trim().is_empty())
+                        .map(|l| serde_json::Value::String(l.to_owned()))
+                        .collect(),
+                )
+            } else if json {
                 // Kept as text until it parses (the head then says what is wrong).
                 serde_json::from_str(&v).unwrap_or(serde_json::Value::String(v))
             } else if labels {
@@ -3361,13 +3458,15 @@ fn ListItem(
             } else {
                 serde_json::Value::String(v)
             };
-            m.insert(k.into(), value);
+            set_field(m, k, value);
         })
     };
     let enabled = move || item.with(|m| m.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true));
     let (first, rest) = fields.split_first().expect("a name field");
-    let lines: Vec<&'static Field> = rest.iter().filter(|f| !matches!(f.kind, FieldKind::Text | FieldKind::Json)).collect();
-    let texts: Vec<&'static Field> = rest.iter().filter(|f| matches!(f.kind, FieldKind::Text | FieldKind::Json)).collect();
+    let lines: Vec<&'static Field> =
+        rest.iter().filter(|f| !matches!(f.kind, FieldKind::Text | FieldKind::Json | FieldKind::Lines)).collect();
+    let texts: Vec<&'static Field> =
+        rest.iter().filter(|f| matches!(f.kind, FieldKind::Text | FieldKind::Json | FieldKind::Lines)).collect();
     let input_class = |f: &Field| {
         format!(
             "{INPUT} py-1 {}",
@@ -3390,11 +3489,11 @@ fn ListItem(
             </div>
             <div class="grid gap-2 sm:grid-cols-2">
                 {lines.into_iter().map(|f| if f.kind == FieldKind::Check {
-                    let checked = move || item.with(|m| m.get(f.key).and_then(|v| v.as_bool()).unwrap_or(false));
+                    let checked = move || item.with(|m| field_value(m, f.key).and_then(|v| v.as_bool()).unwrap_or(false));
                     view! {
                         <label class="flex items-start gap-2 text-sm sm:col-span-2" title=f.placeholder>
                             <input type="checkbox" class="mt-1" prop:checked=checked
-                                on:change=move |ev| item.update(|m| { m.insert(f.key.into(), serde_json::Value::Bool(event_target_checked(&ev))); }) />
+                                on:change=move |ev| item.update(|m| set_field(m, f.key, serde_json::Value::Bool(event_target_checked(&ev)))) />
                             <span>{f.label}<span class="block text-xs text-muted">{f.placeholder}</span></span>
                         </label>
                     }.into_any()
@@ -3403,7 +3502,7 @@ fn ListItem(
                         <label class="space-y-0.5">
                             <span class="text-xs text-muted">{f.label}</span>
                             <select class=format!("{INPUT} py-1 text-sm") prop:value=get(f.key) on:change=move |ev| set(f.key, event_target_value(&ev))>
-                                {options.iter().map(|o| view! { <option value=*o>{*o}</option> }).collect_view()}
+                                {options.iter().map(|o| view! { <option value=*o>{if o.is_empty() { f.placeholder } else { *o }}</option> }).collect_view()}
                             </select>
                         </label>
                     }.into_any()
