@@ -3610,9 +3610,16 @@ fn subagent_thread(id: String, subagents: Subagents, waiting: Signal<bool>) -> A
                     <button class="flex w-full items-center gap-2 py-1 text-left text-xs text-muted hover:text-zinc-900 dark:hover:text-zinc-200" on:click=toggle>
                         <span class="inline-block w-3 shrink-0 text-[9px]">"▶"</span>
                         <span class="shrink-0 font-medium text-violet-700 dark:text-violet-400">"Subagent"</span>
-                        {move || row.with(|r| r.as_ref().and_then(subagent_name)).map(|a| view! { <span class="font-mono" title="Started from this template, where it says">{a}</span> })}
+                        {move || row.with(|r| r.as_ref().and_then(subagent_name)).map(|a| view! { <span class="shrink-0 whitespace-nowrap font-mono" title="Started from this template, where it says">{a}</span> })}
                         <span class=format!("shrink-0 {tone}")>{pill}</span>
-                        <span class="ml-auto shrink-0 font-mono">{move || runs_on(row, connections)}</span>
+                        // Where and on what it runs gives way first (cut
+                        // short, whole on hover): squeezed, the name went a
+                        // letter a line.
+                        {move || {
+                            let on = runs_on(row, connections);
+                            let title = on.clone();
+                            view! { <span class="ml-auto min-w-0 truncate font-mono" title=title>{on}</span> }
+                        }}
                     </button>
                 }.into_any()
             }}
@@ -3675,12 +3682,12 @@ fn SubagentLive(id: String, row: Memo<Option<Session>>, open: RwSignal<bool>, to
         <button class="flex w-full items-center gap-2 py-1 text-left text-xs text-muted hover:text-zinc-900 dark:hover:text-zinc-200" on:click=move |ev| toggle.run(ev)>
             <span class="inline-block w-3 shrink-0 text-[9px] transition-transform" class:rotate-90=move || open.get()>"▶"</span>
             <span class="shrink-0 font-medium text-violet-700 dark:text-violet-400">"Subagent"</span>
-            {move || row.with(|r| r.as_ref().and_then(subagent_name)).map(|a| view! { <span class="font-mono" title="Started from this template, where it says">{a}</span> })}
+            {move || row.with(|r| r.as_ref().and_then(subagent_name)).map(|a| view! { <span class="shrink-0 whitespace-nowrap font-mono" title="Started from this template, where it says">{a}</span> })}
             {move || {
                 let (pill, tone) = subagent_state(running.get(), end.get());
                 view! { <span class=format!("shrink-0 {tone}")>{pill}</span> }
             }}
-            <span class="shrink-0">{move || {
+            <span class="shrink-0 whitespace-nowrap">{move || {
                 let n = calls.get();
                 let mut parts = vec![format!("{n} call{}", if n == 1 { "" } else { "s" })];
                 parts.extend(elapsed());
@@ -3690,7 +3697,11 @@ fn SubagentLive(id: String, row: Memo<Option<Session>>, open: RwSignal<bool>, to
                 }
                 parts.join(" · ")
             }}</span>
-            <span class="ml-auto shrink-0 font-mono">{move || runs_on(row, connections)}</span>
+            {move || {
+                let on = runs_on(row, connections);
+                let title = on.clone();
+                view! { <span class="ml-auto min-w-0 truncate font-mono" title=title>{on}</span> }
+            }}
             <Go to=View::session(id.clone()) class="shrink-0 text-violet-700 hover:underline dark:text-violet-400" stop=true>"↗"</Go>
         </button>
         {move || if open.get() {
