@@ -129,7 +129,11 @@ pub fn NeedsYou() -> impl IntoView {
     let shown = RwSignal::new(Attention::default());
     let loaded = RwSignal::new(false);
     let failed = RwSignal::new(None::<String>);
+    // While "Mark all seen" is on its way, a list loaded before it would
+    // put the rows back for a moment.
+    let marking = StoredValue::new(false);
     Effect::new(move || match list.get() {
+        Some(Ok(_)) if marking.get_value() => {}
         Some(Ok(a)) => {
             failed.set(None);
             loaded.set(true);
@@ -183,9 +187,13 @@ pub fn NeedsYou() -> impl IntoView {
         let (w, l) = counts();
         pill(if w > 0 { w } else { l })
     };
+    // The rows go at once; the head can take a while to mark them all.
     let mark_all = move |_| {
+        marking.set_value(true);
+        shown.update(|a| a.worth.clear());
         spawn_local(async move {
             let _ = api::attention_seen(Vec::new()).await;
+            marking.try_set_value(false);
             let _ = tick.try_update(|t| *t += 1);
         });
     };

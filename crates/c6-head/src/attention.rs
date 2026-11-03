@@ -358,12 +358,19 @@ pub async fn seen(st: &HeadState, caller: &Caller, keys: &[String]) -> anyhow::R
     } else {
         keys.iter().filter_map(|k| k.strip_prefix("session:")).map(str::to_owned).collect()
     };
+    // One change for them all, not one per session: each change has every
+    // open page load its lists again.
     let now = now_ms();
+    let mut any = false;
     for id in &sessions {
         match st.store.session(id).await? {
-            Some(s) if here.is_none_or(|r| r == s.realm) => crate::work::seen_session(st, id, now).await?,
+            Some(s) if here.is_none_or(|r| r == s.realm) => any |= st.store.mark_seen(id, now).await?,
             _ => {}
         }
+    }
+    if any {
+        st.registry.bump();
+        st.attention.changed();
     }
     for realm in memex_realms(st, here).await? {
         let answers = match crate::docs::comments::answered_in(st, &realm, ANSWERS).await {
