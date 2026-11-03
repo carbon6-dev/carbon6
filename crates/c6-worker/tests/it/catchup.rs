@@ -2,9 +2,8 @@
 //! off until a session's own switch (or its realm's default for new
 //! sessions) turns them on; what it did since you looked (or your last
 //! message) counted, and summed up by the model a `task:catchup` rule
-//! picks, else the session's own; its turns, whatever its switches say,
-//! each with a line from `task:timeline`'s model, else the session's own,
-//! made once and kept.
+//! picks, else the session's own; its turns, whatever its switches say
+//! (their lines from a model are off until the timeline is redesigned).
 
 use c6_head::HeadConfig;
 use c6_testkit::{MockLlm, Reply, eventually};
@@ -166,8 +165,8 @@ async fn catching_up_on_a_session_and_its_timeline() {
     assert_eq!(get(format!("sessions/{b}/catchup?since={prompt_seq}")).await["steps"], 7);
 
     // 7. The timeline: its turns, who started them and their steps; an
-    // hour's lines from the session's own model (no task:timeline rule),
-    // made once.
+    // hour's lines are off until it is redesigned, so opening one makes
+    // no model call.
     let turns = get(format!("sessions/{b}/timeline")).await;
     let turns = turns.as_array().unwrap().clone();
     assert_eq!(turns.len(), 2, "{turns:?}");
@@ -179,21 +178,14 @@ async fn catching_up_on_a_session_and_its_timeline() {
         (turns[1]["words"].clone(), turns[1]["steps"].clone(), turns[1]["reply"].clone()),
         (json!("and again"), json!(1), json!("Done again."))
     );
-    assert!(turns[0].get("summary").is_none(), "no line until its hour is opened");
     let at = turns[0]["at"].as_i64().unwrap();
     let hour = at - at.rem_euclid(3_600_000);
-    let n = |i: usize| turns[i]["turn"].as_u64().unwrap();
-    mock.push(Reply::Text(format!("{}: Ran five commands\n{}: Did it again", n(0), n(1))));
-    let got = get(format!("sessions/{b}/timeline?hour={hour}")).await;
-    assert_eq!(got[0]["summary"], "Ran five commands", "{got}");
-    assert_eq!(mock.requests().last().unwrap()["model"], "m", "the session's own model");
     let calls = mock.requests().len();
-    assert_eq!(get(format!("sessions/{b}/timeline")).await[0]["summary"], "Ran five commands", "kept");
-    get(format!("sessions/{b}/timeline?hour={hour}")).await;
-    assert_eq!(mock.requests().len(), calls, "no second call for the same turns");
+    let got = get(format!("sessions/{b}/timeline?hour={hour}")).await;
+    assert!(got[0].get("summary").is_none(), "{got}");
+    assert_eq!(mock.requests().len(), calls, "no model call for an hour's lines");
 
-    // 8. Routed the other way: catch-ups on the session's own model, the
-    // timeline's lines on task:timeline's.
+    // 8. Catch-ups on the session's own model, with a rule for another task.
     ok(send(
         M::PUT,
         "settings/routes".into(),
@@ -208,12 +200,6 @@ async fn catching_up_on_a_session_and_its_timeline() {
     mock.push(Reply::Text("Five more.".into()));
     assert_eq!(get(format!("sessions/{b}/catchup?summary=true")).await["summary"], "Five more.");
     assert_eq!(mock.requests().last().unwrap()["model"], "m", "no task:catchup rule: the session's own");
-    let third = get(format!("sessions/{b}/timeline")).await.as_array().unwrap().last().cloned().unwrap();
-    let at = third["at"].as_i64().unwrap();
-    mock.push(Reply::Text(format!("{}: Ran five more", third["turn"])));
-    let got = get(format!("sessions/{b}/timeline?hour={}", at - at.rem_euclid(3_600_000))).await;
-    assert_eq!(got.as_array().unwrap().last().unwrap()["summary"], "Ran five more", "{got}");
-    assert_eq!(mock.requests().last().unwrap()["model"], "tiny", "the task:timeline rule's model");
 
     // 9. A session's own switches, and only for its realm.
     ok(send(M::PUT, format!("sessions/{a}/view"), None, json!({"catchup": true, "fold": false})).await).await;

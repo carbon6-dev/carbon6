@@ -275,11 +275,13 @@ pub fn Glance(chrome: SessionChrome, #[prop(optional, into)] on_done: Option<Cal
                 <crate::outputs::Recent events on_pick=show_output />
             </Show>
             // Its turns by hour, each going to its place in the transcript.
-            <div class=HEADING>"Timeline"</div>
-            <crate::timeline::Outline timeline=chrome.timeline on_go=move |t: c6_api::TimelineTurn| {
-                chrome.go_turn(&t);
-                done();
-            } />
+            {crate::timeline::SHOWN.then(|| view! {
+                <div class=HEADING>"Timeline"</div>
+                <crate::timeline::Outline timeline=chrome.timeline on_go=move |t: c6_api::TimelineTurn| {
+                    chrome.go_turn(&t);
+                    done();
+                } />
+            })}
         </div>
         <Popover at=work_at class="w-[min(24rem,calc(100vw-1rem))] p-3">
             {move || session.get_untracked().map(|s| {

@@ -569,7 +569,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     let timeline = crate::timeline::Timeline::new(
         id.clone(),
         events,
-        Signal::derive(move || view_settings.with(|v| v.as_ref().is_some_and(|v| v.fold))),
+        Signal::derive(move || crate::timeline::SHOWN && view_settings.with(|v| v.as_ref().is_some_and(|v| v.fold))),
     );
     provide_context(timeline);
     let reach = RwSignal::new(HashMap::new());
@@ -1463,8 +1463,10 @@ pub fn SessionMenu(chrome: SessionChrome, #[prop(into)] on_rename: Callback<()>,
                 <div class=MENU_RULE></div>
                 <MenuSwitch on=flag(|v| v.catchup) label="Catch-up" hint="a card when you come back"
                     on_change=move |on| set_view(|v, on| v.catchup = on, on) />
-                <MenuSwitch on=flag(|v| v.fold) label="Fold finished turns" hint="one row per finished turn"
-                    on_change=move |on| set_view(|v, on| v.fold = on, on) />
+                {crate::timeline::SHOWN.then(|| view! {
+                    <MenuSwitch on=flag(|v| v.fold) label="Fold finished turns" hint="one row per finished turn"
+                        on_change=move |on| set_view(|v, on| v.fold = on, on) />
+                })}
             </Show>
             <div class=MENU_RULE></div>
             <button class=format!("{MENU_ITEM} text-red-600 dark:text-red-400") title="Archive the session and close this column" on:click=move |_| {

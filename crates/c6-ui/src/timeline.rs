@@ -416,6 +416,10 @@ fn watch_sight(el: NodeRef<leptos::html::Div>, seen: RwSignal<bool>) {
 /// latest open, each open hour's turns a line each, newest first; `on_go`:
 /// to a turn in the transcript. An open hour's lines are asked for only
 /// while the outline is on screen.
+/// Off until it is redesigned: no outline in the glance, no folded turns,
+/// and so no turns read and no lines asked for.
+pub const SHOWN: bool = false;
+
 #[component]
 pub fn Outline(timeline: Timeline, #[prop(into)] on_go: Callback<TimelineTurn>) -> impl IntoView {
     let tl = timeline;

@@ -18,6 +18,8 @@ use crate::store::SessionRow;
 /// The routing label a rule names to pick the timeline's model.
 pub const ROUTE_LABEL: &str = "task:timeline";
 const HOUR: i64 = 3_600_000;
+/// Whether a turn's line is made (off until the timeline is redesigned).
+const LINES: bool = false;
 /// A turn's events read at most to describe it to the model.
 const TURN_EVENTS: u64 = 2_000;
 /// A turn's tool calls told to the model at most.
@@ -163,7 +165,13 @@ pub async fn get(st: &HeadState, id: &str, q: &api::TimelineQuery, caller: &Call
     let mut list = turns(st, id).await?;
     if let Some(h) = q.hour {
         list.retain(|t| t.at >= h && t.at < h + HOUR);
-        make_lines(st, &row, &mut list).await;
+        // Off until the timeline is redesigned: no model call, even for a
+        // page from before.
+        if LINES {
+            make_lines(st, &row, &mut list).await;
+        } else {
+            known_lines(st, &row.id, &mut list);
+        }
     } else {
         known_lines(st, &row.id, &mut list);
     }

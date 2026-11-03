@@ -25,6 +25,8 @@ Status: built (2026-11-02), for review live. Decided with you in doc:01a19de1 ("
 
 ## 3. Timeline
 
+**Off until it is redesigned (2026-11-03):** one line per turn was too low-level to be useful. The page shows no outline in the glance and no folded turns (nor their switches), and the head makes no model call for an hour's lines (`LINES` in crates/c6-head/src/timeline.rs; `SHOWN` in crates/c6-ui/src/timeline.rs turns the page's side back on). What follows is how it was built.
+
 Two views of a session's turns (decided as "A + B as a switch"):
 
 - **The outline, always there:** the glance's last section, **TIMELINE** (a column beside the transcript when the session is wide, else in the glance the context ring ◔ opens; a sheet on a phone). Newest first: each hour is a row, "▾ 22:00 · 3 turns", closed but for the latest, at the top. An open hour lists a line per turn, newest first: who started it ("You: …", "From <session>", "Task done: …", "Comments on <doc>"), what it did, and its steps. Clicking a line scrolls the transcript to the turn and flashes it, loading older events first when the turn starts before what's loaded (as Find and the catch-up's Jump to it do), and opens it if it's folded.

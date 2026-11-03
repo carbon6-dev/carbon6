@@ -1300,11 +1300,13 @@ fn SuggestionsSetting() -> impl IntoView {
                     on:change=move |ev| set(|s, on| s.catchup = on, event_target_checked(&ev)) />
                 "Catch-up"<span class="text-muted">"a card when you come back"</span>
             </label>
-            <label class="flex items-center gap-2 text-sm">
-                <input type="checkbox" prop:checked=move || shown.with(|s| s.fold)
-                    on:change=move |ev| set(|s, on| s.fold = on, event_target_checked(&ev)) />
-                "Fold finished turns"<span class="text-muted">"one row per finished turn"</span>
-            </label>
+            {crate::timeline::SHOWN.then(|| view! {
+                <label class="flex items-center gap-2 text-sm">
+                    <input type="checkbox" prop:checked=move || shown.with(|s| s.fold)
+                        on:change=move |ev| set(|s, on| s.fold = on, event_target_checked(&ev)) />
+                    "Fold finished turns"<span class="text-muted">"one row per finished turn"</span>
+                </label>
+            })}
             {move || error.get().map(|e| view! { <p class="text-sm text-red-600">{e}</p> })}
         </section>
     }
@@ -2972,7 +2974,6 @@ fn route_examples() -> Vec<(&'static str, serde_json::Value)> {
         ("Suggested next messages on a small model", r("Suggestions", &["task:suggest"], "claude-haiku-4-5", "", "")),
         ("Session names on a small model", r("Names", &["task:name"], "claude-haiku-4-5", "", "")),
         ("Catch-up cards on a small model", r("Catch-up", &["task:catchup"], "claude-haiku-4-5", "", "")),
-        ("Timeline lines on a small model", r("Timeline", &["task:timeline"], "claude-haiku-4-5", "", "")),
     ]
 }
 
