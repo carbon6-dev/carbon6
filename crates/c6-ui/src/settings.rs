@@ -1282,7 +1282,7 @@ fn SuggestionsSetting() -> impl IntoView {
     view! {
         <section class="space-y-2 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <h2 class="font-medium">"Suggested next messages"</h2>
-            <p class="text-sm text-muted">"When a turn finishes, the message box offers what you'd likely type next; Tab takes it. A small model call per finished turn, only while you're looking at the session: a routing rule with the label task:suggest picks the model (else the session's own), and the prompt is session.suggest. Names: once a session's first turn finishes, one call gives it a short name in place of its first line; a name you give it stays (task:name, session.name)."</p>
+            <p class="text-sm text-muted">"When a turn finishes, the message box offers what you'd likely type next; Tab takes it. A small model call per finished turn, only while you're looking at the session: a routing rule with the label task:suggest picks the model (else the session's own), and the prompt is session.suggest. Names: once a session's first turn finishes, one call gives it a short name in place of its first line; a name you give it stays (task:name, else task:suggest; session.name)."</p>
             <label class="flex items-center gap-2 text-sm">
                 <input type="checkbox" prop:checked=move || shown.with(|s| s.enabled)
                     on:change=move |ev| set(|s, on| s.enabled = on, event_target_checked(&ev)) />
@@ -1294,7 +1294,7 @@ fn SuggestionsSetting() -> impl IntoView {
                 "Name sessions"<span class="text-muted">"a short name after the first turn"</span>
             </label>
             <h3 class="pt-2 text-sm font-medium">"New sessions start with"</h3>
-            <p class="text-sm text-muted">"Each session has its own switches in its ⋯ menu; these are what a new one starts with. Catch-up: when you come back to a session that did 5 steps or more (or waits on you), a card says what happened since you looked, counted, and in a paragraph from a small model (a routing rule with the label task:catchup picks it, else the session's own; the prompt is session.catchup). Fold finished turns: the transcript shows each finished turn as one row (who started it, what it did, its steps), opened in place by a click; what it did is written when you open its hour in the glance's timeline (task:timeline, session.timeline)."</p>
+            <p class="text-sm text-muted">"Each session has its own switches in its ⋯ menu; these are what a new one starts with. Catch-up: when you come back to a session that did 5 steps or more (or waits on you), a card says what happened since you looked, counted, and in a paragraph from a small model (a routing rule with the label task:catchup picks it, else task:suggest's, else the session's own; the prompt is session.catchup). Fold finished turns: the transcript shows each finished turn as one row (who started it, what it did, its steps), opened in place by a click; what it did is written when you open its hour in the glance's timeline (task:timeline, else task:suggest; session.timeline)."</p>
             <label class="flex items-center gap-2 text-sm">
                 <input type="checkbox" prop:checked=move || shown.with(|s| s.catchup)
                     on:change=move |ev| set(|s, on| s.catchup = on, event_target_checked(&ev)) />

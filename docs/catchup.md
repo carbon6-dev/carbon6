@@ -6,7 +6,7 @@ Status: built (2026-11-02), for review live. Decided with you in doc:01a19de1 ("
 
 - **Per session:** ⋯ → **Catch-up** ("a card when you come back") and **Fold finished turns** ("one row per finished turn"), between its actions and Archive. Kept on the head (`GET`/`PUT /api/v1/sessions/{id}/view`: `catchup`, `fold`; a settings key per session, `session_view:<id>`, no table of its own), so they follow you across devices. A switch moves once the head has it. The glance's outline has no switch.
 - **New sessions:** Settings → Suggestions → *New sessions start with* (per realm, like the suggestions switch; off by default). A session started then gets its realm's choice; changing it later leaves existing sessions alone.
-- **Routing:** a rule for `task:catchup` picks the catch-up's model, one for `task:timeline` the timeline's (on a connection the session's realm may use, its realm's rules first, as `task:suggest`); without one, the session's own model. Prompts: `session.catchup`, `session.timeline` (Settings → Prompts).
+- **Routing:** a rule for `task:catchup` picks the catch-up's model, one for `task:timeline` the timeline's (on a connection the session's realm may use, its realm's rules first, as `task:suggest`); without one, the `task:suggest` rule's, else the session's own model (a Claude Code session needs one of those rules: its own model can't take a one-off call). Prompts: `session.catchup`, `session.timeline` (Settings → Prompts).
 
 ## 2. Catch-up
 
