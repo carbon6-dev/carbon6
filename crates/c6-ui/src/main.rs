@@ -1,6 +1,7 @@
 //! carbon6 web UI (Leptos CSR). Talks only to the head's `/api/v1`.
 
 mod activity;
+mod adopt;
 mod analytics;
 mod api;
 mod aspects;

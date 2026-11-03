@@ -1596,7 +1596,7 @@ pub async fn project_patch(id: String, p: &ProjectPatch) -> Result<ProjectItem, 
 pub async fn project_work(id: String, work: String, phase: String) -> Result<ProjectItem, String> {
     send_json(
         Request::post(&format!("/api/v1/projects/{}/work", enc(&id))),
-        &c6_api::projects::ProjectWorkIn { work, phase, title: String::new() },
+        &c6_api::projects::ProjectWorkIn { work, phase, ..Default::default() },
     )
     .await
 }
@@ -1607,12 +1607,17 @@ pub async fn project_proposals() -> Result<Vec<c6_api::projects::ProjectProposal
 }
 
 /// A new work item, made in a project (and a phase).
-pub async fn project_new_work(id: String, title: String, phase: String) -> Result<ProjectItem, String> {
+pub async fn project_new_work(id: String, title: String, done_when: String, phase: String) -> Result<ProjectItem, String> {
     send_json(
         Request::post(&format!("/api/v1/projects/{}/work", enc(&id))),
-        &c6_api::projects::ProjectWorkIn { work: String::new(), phase, title },
+        &c6_api::projects::ProjectWorkIn { work: String::new(), phase, title, done_when },
     )
     .await
+}
+
+/// A session joins the project as a quick session (one serving work can't).
+pub async fn project_session_add(id: String, session: String) -> Result<ProjectItem, String> {
+    send_json(Request::post(&format!("/api/v1/projects/{}/sessions", enc(&id))), &c6_api::projects::ProjectSessionIn { session }).await
 }
 
 pub async fn project_detach(id: String, d: &c6_api::projects::ProjectDetach) -> Result<ProjectItem, String> {

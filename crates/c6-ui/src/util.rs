@@ -574,6 +574,41 @@ pub fn Choices(choices: Vec<(String, String)>, value: RwSignal<String>, #[prop(o
     .into_any()
 }
 
+thread_local! {
+    /// What [`kept`] resources last loaded, by key.
+    static KEPT: std::cell::RefCell<std::collections::HashMap<String, std::rc::Rc<dyn std::any::Any>>> = Default::default();
+}
+
+/// A resource whose last value outlives its component: one rebuilt by a
+/// reload starts with what it showed last, not empty, and the signal
+/// changes only when a fetch brings something different. `key` names the
+/// query; components asking the same thing share it.
+pub fn kept<T, Fut>(key: impl Into<String>, fetch: impl Fn() -> Fut + 'static) -> Signal<Option<T>>
+where
+    T: Clone + PartialEq + Send + Sync + 'static,
+    Fut: Future<Output = T> + 'static,
+{
+    let key = StoredValue::new(key.into());
+    let value = RwSignal::new(KEPT.with(|c| c.borrow().get(&key.get_value()).and_then(|v| v.downcast_ref::<T>().cloned())));
+    let fetched = LocalResource::new(fetch);
+    Effect::new(move || {
+        if let Some(v) = fetched.get() {
+            KEPT.with(|c| c.borrow_mut().insert(key.get_value(), std::rc::Rc::new(v.clone())));
+            if value.try_get_untracked().is_some_and(|cur| cur.as_ref() != Some(&v)) {
+                let _ = value.try_set(Some(v));
+            }
+        }
+    });
+    value.into()
+}
+
+/// A resource's value that holds while it reloads and changes only when
+/// the reload brings something different, so a list drawn from it isn't
+/// redrawn by every reload.
+pub fn steady<T: Clone + PartialEq + Send + Sync + 'static>(r: LocalResource<T>) -> Memo<Option<T>> {
+    Memo::new(move |prev: Option<&Option<T>>| r.get().or_else(|| prev.cloned().flatten()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

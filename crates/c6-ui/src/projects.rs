@@ -7,6 +7,7 @@ use c6_api::projects::{ProjectDetach, ProjectItem, ProjectNew, ProjectPatch, sta
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
+use crate::adopt::{AdoptPick, Adoptable};
 use crate::api;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT, ago, now_ms};
 use crate::workspace::{Go, How, View, use_column, use_workspace};
@@ -59,16 +60,17 @@ pub fn ProjectsPage() -> impl IntoView {
     let tick = RwSignal::new(0u32);
     crate::decisions::reload_quietly(tick);
     let show_closed = RwSignal::new(false);
-    let list = LocalResource::new(move || {
+    // Steady: a reload that brings the same list back doesn't redraw it.
+    let list = crate::util::steady(LocalResource::new(move || {
         tick.track();
         api::realm().track();
         api::projects_list(false)
-    });
-    let closed = LocalResource::new(move || {
+    }));
+    let closed = crate::util::steady(LocalResource::new(move || {
         let on = show_closed.get();
         tick.track();
         async move { if on { api::projects_list(true).await } else { Ok(Vec::new()) } }
-    });
+    }));
     let error = RwSignal::new(None::<String>);
     let adding = RwSignal::new(false);
     let (title, purpose) = (RwSignal::new(String::new()), RwSignal::new(String::new()));
@@ -183,17 +185,21 @@ pub fn ProjectPage(id: String) -> impl IntoView {
         tick.track();
         api::project_get(id.get_value())
     });
+    // Redrawn only when the project changed: a reload after a session
+    // somewhere moved mostly brings the same project back.
     let shown = RwSignal::new(None::<Result<ProjectItem, String>>);
     Effect::new(move || {
-        if let Some(r) = loaded.get() {
+        if let Some(r) = loaded.get()
+            && shown.with_untracked(|s| s.as_ref() != Some(&r))
+        {
             shown.set(Some(r));
         }
     });
-    let all_work = LocalResource::new(move || {
+    let all_work = crate::util::kept("work:open", move || {
         tick.track();
         api::work_list(false)
     });
-    let others = LocalResource::new(move || {
+    let others = crate::util::kept("projects:open", move || {
         tick.track();
         api::projects_list(false)
     });
@@ -206,6 +212,8 @@ pub fn ProjectPage(id: String) -> impl IntoView {
     let editing = RwSignal::new(false);
     let (title, purpose) = (RwSignal::new(String::new()), RwSignal::new(String::new()));
     let merging = RwSignal::new(false);
+    let new_work = RwSignal::new(false);
+    let realm = StoredValue::new(String::new());
     // A planning session to start: its first message, the session to start
     // like, its work, and what it's for.
     let starting = RwSignal::new(None::<(String, Option<c6_api::Session>, String, String)>);
@@ -254,6 +262,23 @@ pub fn ProjectPage(id: String) -> impl IntoView {
         });
         starting.set(Some((String::new(), seed, format!("project:{}", id.get_value()), "Quick session".to_owned())));
     });
+    // Sessions to attach as quick sessions, and attaching one: out of the
+    // work it serves first.
+    let quick_adoptable = Signal::derive(move || {
+        let me = id.get_value();
+        live.sessions.with(|ss| {
+            crate::adopt::sessions(ss, &realm.get_value(), |s| s.work.as_ref().is_some_and(|w| w.id.is_empty() && w.project == me))
+        })
+    });
+    let quick_adopt = Callback::new(move |session: String| {
+        spawn_local(async move {
+            let r = match crate::adopt::free_session(&session).await {
+                Ok(()) => api::project_session_add(id.get_value(), session).await,
+                Err(e) => Err(e),
+            };
+            apply(r);
+        })
+    });
     let save = move || {
         editing.set(false);
         patch(ProjectPatch { title: Some(title.get_untracked()), purpose: Some(purpose.get_untracked()), ..Default::default() });
@@ -273,6 +298,13 @@ pub fn ProjectPage(id: String) -> impl IntoView {
                     let open: Vec<_> = p.work.iter().filter(|w| !matches!(w.state.as_str(), "done" | "dropped")).cloned().collect();
                     let done: Vec<_> = p.work.iter().filter(|w| matches!(w.state.as_str(), "done" | "dropped")).cloned().collect();
                     let in_it: Vec<String> = p.work.iter().map(|w| w.id.clone()).collect();
+                    realm.set_value(p.realm.clone());
+                    // New work goes in the current phase unless you pick another.
+                    let mut phase_list: Vec<(String, String, bool)> =
+                        p.fields.phases.iter().filter(|x| x.state != "done").map(|x| (x.id.clone(), x.title.clone(), x.state == "current")).collect();
+                    if !phase_list.is_empty() && !phase_list.iter().any(|x| x.2) {
+                        phase_list[0].2 = true;
+                    }
                     view! {
                         <header class="space-y-1">
                             {move || if editing.get() {
@@ -379,7 +411,7 @@ pub fn ProjectPage(id: String) -> impl IntoView {
                             }
                         })}
                         <Proposed p=p.clone() apply=apply_cb />
-                        <QuickSessions p=p.clone() apply=apply_cb start=quick_cb />
+                        <QuickSessions p=p.clone() apply=apply_cb start=quick_cb adoptable=quick_adoptable adopt=quick_adopt />
                         <section class="space-y-1">
                             <div class="flex flex-wrap items-center gap-2">
                                 <h2 class="flex-1 text-xs font-medium uppercase tracking-wide text-muted">{format!("Work ({} open)", open.len())}</h2>
@@ -409,17 +441,23 @@ pub fn ProjectPage(id: String) -> impl IntoView {
                                 }).collect_view().into_any()
                             }}
                             <div class="flex items-center gap-2 pt-1 text-sm">
-                                <select class=format!("{INPUT} w-auto! max-w-full") on:change=move |ev| {
-                                    let work = event_target_value(&ev);
-                                    if work.is_empty() { return; }
-                                    spawn_local(async move { apply(api::project_work(id.get_value(), work, String::new()).await) });
-                                }>
-                                    <option value="">"+ Bring in open work…"</option>
-                                    {move || all_work.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|w| !in_it.contains(&w.id)).map(|w| view! {
-                                        <option value=w.id.clone()>{if w.project_title.is_empty() { w.fields.title.clone() } else { format!("{} (in {})", w.fields.title, w.project_title) }}</option>
-                                    }).collect_view()}
-                                </select>
+                                {active.then(|| view! {
+                                    <button class=format!("{BUTTON_QUIET} text-xs") title="A new work item in this project; its sessions start as the project says"
+                                        on:click=move |_| new_work.update(|n| *n = !*n)>"+ New work"</button>
+                                })}
+                                <AdoptPick placeholder="+ Bring in open work…" class=format!("{INPUT} w-auto! max-w-full")
+                                    title="Open work: what's in no project first, then work in other projects (choosing it moves it here)"
+                                    items=Signal::derive(move || {
+                                        all_work.get().and_then(Result::ok).unwrap_or_default().into_iter()
+                                            .filter(|w| !in_it.contains(&w.id) && w.realm == realm.get_value())
+                                            .map(|w| Adoptable::new(w.id, w.fields.title, w.project_title))
+                                            .collect::<Vec<_>>()
+                                    })
+                                    on_pick=Callback::new(move |work: String| spawn_local(async move {
+                                        apply(api::project_work(id.get_value(), work, String::new()).await)
+                                    })) />
                             </div>
+                            {move || new_work.get().then(|| view! { <NewWork project=id.get_value() phases=phase_list.clone() apply=apply_cb close=Callback::new(move |()| new_work.set(false)) /> })}
                         </section>
                         <Documents p=p.clone() apply=apply_cb />
                         {(!done.is_empty()).then(|| view! {
@@ -460,7 +498,13 @@ pub fn ProjectPage(id: String) -> impl IntoView {
 /// item. Running ones first; an ended one waits for you to archive it or
 /// keep it as work.
 #[component]
-fn QuickSessions(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>, start: Callback<()>) -> impl IntoView {
+fn QuickSessions(
+    p: ProjectItem,
+    apply: Callback<Result<ProjectItem, String>>,
+    start: Callback<()>,
+    adoptable: Signal<Vec<Adoptable>>,
+    adopt: Callback<String>,
+) -> impl IntoView {
     let active = p.fields.status == "active";
     if p.live_sessions.is_empty() && !active {
         return ().into_any();
@@ -510,6 +554,9 @@ fn QuickSessions(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>, s
                 {active.then(|| view! {
                     <button class=format!("{BUTTON_QUIET} text-xs") title="A quick task in this project with no work item, such as drafting a doc"
                         on:click=move |_| start.run(())>"+ Session"</button>
+                    <AdoptPick placeholder="Attach a session…" class="max-w-56 cursor-pointer rounded bg-transparent px-1 text-xs text-muted hover:bg-zinc-200/60 dark:hover:bg-zinc-800"
+                        title="A running session as a quick session here: free ones first, then ones serving work or in another project (choosing it moves it here)"
+                        items=adoptable on_pick=adopt />
                 })}
             </div>
             {if n == 0 {
@@ -652,7 +699,7 @@ fn PhaseGroup(
         adding.set(false);
         new_title.set(String::new());
         spawn_local(async move {
-            apply.run(api::project_new_work(project.get_value(), t, phase.get_value()).await);
+            apply.run(api::project_new_work(project.get_value(), t, String::new(), phase.get_value()).await);
         });
     };
     let real = !phase.get_value().is_empty();
@@ -676,6 +723,58 @@ fn PhaseGroup(
                 <button class=BUTTON on:click=move |_| add()>"Add"</button>
             </div>
         })}
+    }
+}
+
+/// A new work item in the project: its title, what done means, and its
+/// phase when the project has phases (the current one unless you pick
+/// another). Its sessions start as the project's "Start with" says.
+#[component]
+fn NewWork(
+    project: String,
+    phases: Vec<(String, String, bool)>,
+    apply: Callback<Result<ProjectItem, String>>,
+    close: Callback<()>,
+) -> impl IntoView {
+    let project = StoredValue::new(project);
+    let title = RwSignal::new(String::new());
+    let done_when = RwSignal::new(String::new());
+    let phase = RwSignal::new(phases.iter().find(|x| x.2).map(|x| x.0.clone()).unwrap_or_default());
+    let add = move || {
+        let t = title.get_untracked();
+        if t.trim().is_empty() {
+            return;
+        }
+        // Closing disposes the form: read it all first.
+        let (p, d, ph) = (project.get_value(), done_when.get_untracked(), phase.get_untracked());
+        close.run(());
+        spawn_local(async move { apply.run(api::project_new_work(p, t, d, ph).await) });
+    };
+    let enter = move |ev: web_sys::KeyboardEvent| {
+        if ev.key() == "Enter" {
+            add()
+        }
+    };
+    view! {
+        <div class="space-y-2 rounded-lg border border-zinc-200 p-3 text-sm dark:border-zinc-800" data-new-work="">
+            <input class=INPUT placeholder="New work: what you mean to finish" prop:value=move || title.get()
+                on:input=move |ev| title.set(event_target_value(&ev)) on:keydown=enter />
+            <input class=INPUT placeholder="Done when (optional): how you'll know it's finished" prop:value=move || done_when.get()
+                on:input=move |ev| done_when.set(event_target_value(&ev)) on:keydown=enter />
+            <div class="flex flex-wrap items-center gap-2">
+                {(!phases.is_empty()).then(|| view! {
+                    <label class="flex items-center gap-1 text-xs text-muted">"Phase"
+                        <select class=format!("{INPUT} w-auto! py-0.5 text-xs") on:change=move |ev| phase.set(event_target_value(&ev))>
+                            {phases.iter().map(|(id, t, current)| view! { <option value=id.clone() selected=*current>{t.clone()}</option> }).collect_view()}
+                            <option value="">"No phase"</option>
+                        </select>
+                    </label>
+                })}
+                <span class="flex-1"></span>
+                <button class=BUTTON_QUIET on:click=move |_| close.run(())>"Cancel"</button>
+                <button class=BUTTON on:click=move |_| add()>"Add"</button>
+            </div>
+        </div>
     }
 }
 
@@ -755,7 +854,7 @@ fn WorkRow(
 #[component]
 fn Documents(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> impl IntoView {
     let id = StoredValue::new(p.id.clone());
-    let all_docs = LocalResource::new(|| async { api::docs_list(&c6_api::docs::DocQuery::default()).await });
+    let all_docs = crate::util::kept("docs:all", || async { api::docs_list(&c6_api::docs::DocQuery::default()).await });
     let mine: Vec<String> = p.docs.iter().map(|d| d.doc.clone()).collect();
     let role = RwSignal::new(String::new());
     let (link, link_title) = (RwSignal::new(String::new()), RwSignal::new(String::new()));
@@ -870,7 +969,7 @@ fn Documents(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> im
 /// §4): its sessions start from it, wherever they are started.
 #[component]
 pub fn StartWith(current: String, realm: String, none: &'static str, #[prop(into)] on_pick: Callback<String>) -> impl IntoView {
-    let templates = LocalResource::new(api::all_templates);
+    let templates = crate::util::kept("templates", api::all_templates);
     let realm = StoredValue::new(realm);
     let current = StoredValue::new(current);
     view! {

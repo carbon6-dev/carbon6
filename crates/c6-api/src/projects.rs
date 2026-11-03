@@ -322,6 +322,9 @@ pub struct ProjectWorkIn {
     pub phase: String,
     #[serde(default)]
     pub title: String,
+    /// A new work item's done-when.
+    #[serde(default)]
+    pub done_when: String,
 }
 
 /// `POST /api/v1/projects/{id}/sessions`: a session joins the project as a

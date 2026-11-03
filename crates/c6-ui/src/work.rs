@@ -35,9 +35,12 @@ fn mark_seen(id: String, after: impl Fn(Result<WorkItem, String>) + 'static) {
     spawn_local(async move { after(api::work_seen(id).await) });
 }
 
+/// Open work as last loaded (none until it first is).
+type OpenWork = Memo<Option<Result<Vec<WorkItem>, String>>>;
+
 /// Loads open work again when sessions change (at most every 10 s, not
 /// while you type) and every half minute.
-fn open_work() -> (LocalResource<Result<Vec<WorkItem>, String>>, RwSignal<u32>) {
+fn open_work() -> (OpenWork, RwSignal<u32>) {
     let tick = RwSignal::new(0u32);
     crate::decisions::reload_quietly(tick);
     let due = StoredValue::new(false);
@@ -52,7 +55,7 @@ fn open_work() -> (LocalResource<Result<Vec<WorkItem>, String>>, RwSignal<u32>) 
         api::realm().track();
         api::work_list(false)
     });
-    (list, tick)
+    (crate::util::steady(list), tick)
 }
 
 /// The header link, with how much needs a look.
@@ -137,11 +140,11 @@ fn resume(w: &WorkItem) -> bool {
 pub fn WorkPage() -> impl IntoView {
     let (list, tick) = open_work();
     let show_closed = RwSignal::new(false);
-    let closed = LocalResource::new(move || {
+    let closed = crate::util::steady(LocalResource::new(move || {
         let on = show_closed.get();
         tick.track();
         async move { if on { api::work_list(true).await } else { Ok(Vec::new()) } }
-    });
+    }));
     let picked = RwSignal::new(0usize);
     let error = RwSignal::new(None::<String>);
     let adding = RwSignal::new(false);
@@ -563,9 +566,12 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
         tick.track();
         api::work_get(id.get_value())
     });
+    // Redrawn only when the work changed (see ProjectPage).
     let shown = RwSignal::new(None::<Result<WorkItem, String>>);
     Effect::new(move || {
-        if let Some(r) = item.get() {
+        if let Some(r) = item.get()
+            && shown.with_untracked(|s| s.as_ref() != Some(&r))
+        {
             shown.set(Some(r));
         }
     });
@@ -585,8 +591,24 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
     let pickup = RwSignal::new(None::<(String, Option<Session>, Option<String>)>);
     let new_todo = RwSignal::new(String::new());
     let live = api::live();
-    let others = LocalResource::new(|| api::work_list(false));
+    let others = crate::util::kept("work:open", || api::work_list(false));
     let merging = RwSignal::new(false);
+    // Sessions to attach: free ones first, then ones serving other work or
+    // in a project; attaching one moves it here.
+    let realm = StoredValue::new(String::new());
+    let session_adoptable = Signal::derive(move || {
+        let me = id.get_value();
+        live.sessions.with(|ss| crate::adopt::sessions(ss, &realm.get_value(), |s| s.work.as_ref().is_some_and(|w| w.id == me)))
+    });
+    let adopt_session = move |session: String| {
+        spawn_local(async move {
+            let r = match crate::adopt::free_session(&session).await {
+                Ok(()) => api::work_attach(id.get_value(), format!("session:{session}"), String::new()).await,
+                Err(e) => Err(e),
+            };
+            apply(r);
+        })
+    };
     let pick_up = move |w: WorkItem| {
         let seed = last_session(&w).and_then(|s| live.sessions.with_untracked(|ss| ss.iter().find(|x| x.id == s).cloned()));
         spawn_local(async move {
@@ -662,6 +684,7 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
                     let w1 = w.clone();
                     let w2 = w.clone();
                     let w3 = w.clone();
+                    realm.set_value(w.realm.clone());
                     view! {
                         <header class="space-y-1">
                             {move || if editing.get() {
@@ -864,6 +887,9 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
                                     on:keydown=move |ev| if ev.key() == "Enter" { attach() } />
                                 <button class=BUTTON_QUIET on:click=move |_| attach()>"Attach"</button>
                             </div>
+                            <crate::adopt::AdoptPick placeholder="Attach a session…" class=format!("{INPUT} w-auto! max-w-full")
+                                title="A running session: free ones first, then ones serving other work or in a project (choosing it moves it here)"
+                                items=session_adoptable on_pick=Callback::new(adopt_session) />
                         </section>
                     }.into_any()
                 }
@@ -1015,7 +1041,7 @@ pub fn SessionWork(session_id: String, title: Signal<String>) -> impl IntoView {
 #[component]
 fn ProjectPick(w: WorkItem, apply: Callback<Result<WorkItem, String>>) -> impl IntoView {
     let id = StoredValue::new(w.id.clone());
-    let projects = LocalResource::new(|| api::projects_list(false));
+    let projects = crate::util::kept("projects:open", || api::projects_list(false));
     let current = w.fields.project.clone();
     let cur = current.clone();
     view! {

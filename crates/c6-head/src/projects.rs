@@ -300,7 +300,7 @@ pub async fn add_work(st: &HeadState, id: &str, w: &ProjectWorkIn, caller: &Call
         return Err(bad_request(format!("the project has no phase {phase}")));
     }
     if w.work.trim().is_empty() {
-        let n = api::work::WorkNew { title: w.title.clone(), ..Default::default() };
+        let n = api::work::WorkNew { title: w.title.clone(), done_when: w.done_when.clone(), ..Default::default() };
         crate::work::create_in_project(st, caller, &n, id, phase, by).await?;
     } else {
         crate::work::set_project(st, &w.work, &p.realm, id, phase, by).await?;
