@@ -238,7 +238,14 @@ pub fn QuotaNote(#[prop(into)] connection: Signal<String>, #[prop(optional)] chi
         Some(if chip {
             view! {
                 <span class="text-muted" aria-hidden="true">"·"</span>
-                <span class=format!("whitespace-nowrap {}", t.class()) title=sentence(w)>{format!("{:.0}%", left(w))}</span>
+                // A small bar of what's left before the number, so the
+                // grey of plenty still reads as usage.
+                <span class=format!("inline-flex items-center gap-1 whitespace-nowrap {}", t.class()) title=sentence(w)>
+                    <span class="inline-block h-1 w-3.5 overflow-hidden rounded-full bg-zinc-300 dark:bg-zinc-700" aria-hidden="true">
+                        <span class=format!("block h-full rounded-full {}", t.bar()) style=format!("width: {:.0}%", left(w))></span>
+                    </span>
+                    {format!("{:.0}%", left(w))}
+                </span>
             }
             .into_any()
         } else {
@@ -249,7 +256,7 @@ pub fn QuotaNote(#[prop(into)] connection: Signal<String>, #[prop(optional)] chi
     }
 }
 
-/// The model menu's Plan section, above its Model section: each window's
+/// The model menu's Usage section, above its Model section: each window's
 /// bar of what's left and when it starts afresh, then a divider. Nothing
 /// without a plan.
 #[component]
@@ -259,7 +266,7 @@ pub fn PlanMenu(#[prop(into)] connection: Signal<String>) -> impl IntoView {
         let error = (!q.error.is_empty()).then(|| q.error.clone());
         Some(view! {
             <div class="space-y-2 border-b border-zinc-200 pb-2 dark:border-zinc-700">
-                <div class="font-medium uppercase tracking-wide text-muted">"Plan"</div>
+                <div class="font-medium uppercase tracking-wide text-muted">"Usage"</div>
                 {q.windows.iter().map(|w| {
                     let t = tone(w);
                     let pct = left(w);
