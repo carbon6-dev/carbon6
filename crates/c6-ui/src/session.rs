@@ -310,6 +310,7 @@ impl Feed {
         // The replay arrives all at once (not an event at a time, each
         // drawn and scrolled to).
         let replay = StoredValue::new(Vec::<Event>::new());
+        let again = StoredValue::new(false);
         // How far the log has come: streamed text that arrives late is
         // already in its messages.
         let logged = StoredValue::new(Logged::default());
@@ -318,7 +319,7 @@ impl Feed {
             move |msg| match msg {
                 // Replayed turns don't start and stop it again (the log says
                 // whether one is running).
-                StreamMsg::Event { event } if !synced.get_untracked() => {
+                StreamMsg::Event { event } if !synced.get_untracked() || again.get_value() => {
                     logged.update_value(|l| l.note(&event));
                     let last =
                         replay.with_value(|r| r.last().map(|e| e.seq)).or_else(|| events.with_untracked(|e| e.last().map(|e| e.seq)));
@@ -360,15 +361,35 @@ impl Feed {
                     if let Window::At(at) = window {
                         to.set(bound(&r, at));
                     }
+                    // Missed while away: what streamed for it goes, and
+                    // whether a turn runs is as its last start or end says.
+                    if again.get_value() && !r.is_empty() {
+                        streaming.update(|s| logged.update_value(|l| r.iter().for_each(|e| l.event(s, e))));
+                        let running = r.iter().rev().find_map(|e| match e.kind {
+                            EventKind::TurnStarted { .. } => Some(true),
+                            EventKind::TurnEnded { .. } => Some(false),
+                            _ => None,
+                        });
+                        if let Some(running) = running {
+                            activity.set(Some(running));
+                        }
+                    }
                     if !r.is_empty() {
                         events.update(|evs| evs.extend(r));
                     }
+                    again.set_value(false);
                     synced.set(true);
                 }
                 StreamMsg::Secret { call_id, title, value, note } => secrets.update(|s| s.push(SecretCard { call_id, title, value, note })),
                 StreamMsg::Named { title, from } => named.set(Some((title, from))),
             },
             move || {
+                // Connecting again (a phone waking, the network back): what
+                // was missed arrives all at once too, not drawn and scrolled
+                // to an event at a time (it stuttered).
+                if synced.try_get_untracked() == Some(true) {
+                    again.set_value(true);
+                }
                 let last = replay.with_value(|r| r.last().map(|e| e.seq)).or_else(|| events.with_untracked(|e| e.last().map(|e| e.seq)));
                 match (last, window) {
                     (Some(n), _) => format!("after={n}"),
