@@ -23,12 +23,13 @@ fn conversations(all: &[Session], realm: &str) -> Vec<Session> {
     list
 }
 
-/// The header's Chat: your conversations, in a tile of their own.
+/// Your Ask conversations, in a tile of their own (the narrow menu's; the
+/// header has the Ask button, whose box links here).
 #[component]
 pub fn ChatLink(class: &'static str) -> impl IntoView {
     view! {
         <Go to=View::Chats class=class title="Your Ask conversations: talk to a model about anything, or about your setup (⌘J asks from anywhere)">
-            "Chat"
+            "Ask conversations"
         </Go>
     }
 }
@@ -61,7 +62,7 @@ pub fn ChatsPage() -> impl IntoView {
     view! {
         <main class="mx-auto max-w-3xl space-y-4 px-4 py-5" data-hold-reloads="">
             <header class="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-                <h1 class="text-xl font-semibold">"Chat"</h1>
+                <h1 class="text-xl font-semibold">"Ask"</h1>
                 <span class="text-sm text-zinc-500">"Ask anything, or about your setup: no worker or folder needed. ⌘J asks from any page."</span>
             </header>
             <NewChat

@@ -155,7 +155,6 @@ fn Main() -> impl IntoView {
                                 </span>
                             </Go>
                             <decisions::DecisionLink class=NAV />
-                            <chats::ChatLink class=NAV />
                             <projects::ProjectsLink class=NAV />
                             <work::WorkLink class=NAV />
                             <docs::DocsLink class=NAV />
