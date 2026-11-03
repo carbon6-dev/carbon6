@@ -1645,6 +1645,7 @@ fn SessionStrip(chrome: SessionChrome) -> impl IntoView {
 /// Stop, a subagent going to its thread. Show all lists every one.
 #[component]
 fn BackgroundWork(chrome: SessionChrome, #[prop(into)] on_done: Callback<()>) -> impl IntoView {
+    let col = use_column();
     let all = RwSignal::new(false);
     let now = crate::util::clock();
     let subagents = Memo::new(move |_| {
@@ -1676,7 +1677,15 @@ fn BackgroundWork(chrome: SessionChrome, #[prop(into)] on_done: Callback<()>) ->
                             let (from, to) = (s.created_at, s.updated_at);
                             view! {
                                 <button class="flex w-full items-center gap-2 rounded px-1 py-1.5 text-left pointer-fine:hover:bg-zinc-100 dark:pointer-fine:hover:bg-zinc-800"
-                                    title="Go to its thread" on:click=move |_| { chrome.subagents.go(id.clone()); on_done.run(()) }>
+                                    title="Go to it" on:click=move |_| {
+                                        let own = id.clone();
+                                        chrome.subagents.go(id.clone(), move || {
+                                            if let Some(c) = col {
+                                                c.open(View::Session { id: own, target: None }, crate::workspace::How::Beside);
+                                            }
+                                        });
+                                        on_done.run(())
+                                    }>
                                     <span class=format!("w-24 shrink-0 {tone}")>{pill}</span>
                                     <span class="min-w-0 flex-1 truncate">{s.title.clone()}</span>
                                     <span class="shrink-0 tabular-nums text-muted">{move || crate::tasks::elapsed(if running { now.get() - from } else { to - from })}</span>
@@ -1857,8 +1866,10 @@ impl SubagentTree {
         self.list.with(|l| l.iter().filter(|(s, _)| s.status == SessionStatus::Running).map(|(s, _)| s.title.clone()).collect())
     }
 
-    /// Goes to a subagent's thread in the transcript.
-    pub(crate) fn go(&self, id: String) {
+    /// Goes to a subagent's thread in the transcript, else the call it
+    /// hangs from (a command Claude Code reports as a subagent has no
+    /// thread), else `elsewhere` (its own session, say): never nothing.
+    pub(crate) fn go(&self, id: String, elsewhere: impl FnOnce() + 'static) {
         // Open the threads on the way down, then the one itself.
         let mut chain = vec![id.clone()];
         let rows = self.list.get_untracked();
@@ -1869,6 +1880,7 @@ impl SubagentTree {
         }
         // The call it hangs from in this session's transcript: its turn opens.
         let call = chain.last().and_then(|top| rows.iter().find(|(s, _)| s.id == *top)).and_then(|(s, _)| s.parent_call_id.clone());
+        let anchors: Vec<String> = [Some(format!("sub-{id}")), call.clone().map(|c| format!("call-{c}"))].into_iter().flatten().collect();
         let seq = call.and_then(|call| {
             self.events.with_untracked(|evs| {
                 evs.iter()
@@ -1886,7 +1898,7 @@ impl SubagentTree {
             self.timeline.pin(seq);
         }
         self.force_open.0.update(|ids| ids.extend(chain));
-        reveal_when_rendered(self.root.get_value(), format!("sub-{id}"), "[]".into(), 0);
+        reveal_or(self.root.get_value(), anchors, 0, elsewhere);
     }
 }
 
@@ -3058,6 +3070,24 @@ fn reveal_when_rendered(root: String, id: String, terms: String, tries: u32) {
             // Nested side chats load their events one after another.
             if !js_reveal(&root, &id, &terms) && tries < 200 {
                 reveal_when_rendered(root, id, terms, tries + 1);
+            }
+        },
+        std::time::Duration::from_millis(50),
+    );
+}
+
+/// Reveals the first of `ids` that exists, trying for about a second and a
+/// half (a thread opens, a turn unfolds), else does `elsewhere`.
+fn reveal_or(root: String, ids: Vec<String>, tries: u32, elsewhere: impl FnOnce() + 'static) {
+    set_timeout(
+        move || {
+            if ids.iter().any(|id| js_reveal(&root, id, "[]")) {
+                return;
+            }
+            if tries < 30 {
+                reveal_or(root, ids, tries + 1, elsewhere);
+            } else {
+                elsewhere();
             }
         },
         std::time::Duration::from_millis(50),
