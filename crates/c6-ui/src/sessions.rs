@@ -1818,7 +1818,7 @@ fn SessionForm(
                     </button>
                 })}
                 <input node_ref=picker type="file" multiple class="hidden"
-                    on:change=move |ev| crate::session::add_attachments(ev.into(), attachments, error) />
+                    on:change=move |ev| crate::session::add_attachments(ev, attachments, error) />
                 // A desktop's summary line, then its buttons.
                 {move || match template.get() {
                     Some(t) => view! {
