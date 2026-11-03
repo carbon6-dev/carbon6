@@ -102,6 +102,12 @@ pub async fn seen(st: &HeadState, session_id: &str, for_seq: i64, accepted: bool
 /// else the session's own. A rule whose connection the session's realm may
 /// not use is passed over.
 pub(crate) async fn model_for(st: &HeadState, row: &crate::store::SessionRow, label: &str) -> anyhow::Result<(String, String)> {
+    Ok(rule_for(st, row, label).await?.unwrap_or_else(|| (row.connection_id.clone(), row.model.clone())))
+}
+
+/// The connection and model a routing rule for `label` gives this session,
+/// if one does.
+pub(crate) async fn rule_for(st: &HeadState, row: &crate::store::SessionRow, label: &str) -> anyhow::Result<Option<(String, String)>> {
     let mut labels = row.all_labels();
     labels.push(label.into());
     let connections = st.store.connections().await?;
@@ -122,10 +128,10 @@ pub(crate) async fn model_for(st: &HeadState, row: &crate::store::SessionRow, la
                 .map(|c| c.id.clone())
         };
         if let Some(c) = connection {
-            return Ok((c, r.model.trim().to_owned()));
+            return Ok(Some((c, r.model.trim().to_owned())));
         }
     }
-    Ok((row.connection_id.clone(), row.model.clone()))
+    Ok(None)
 }
 
 /// The last exchanges, as the model reads them: your messages, the agent's

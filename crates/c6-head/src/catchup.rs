@@ -617,8 +617,21 @@ pub(crate) async fn ask(st: &HeadState, row: &SessionRow, label: &str, what: &st
     if let Some(why) = crate::usage::blocked(st, &row.all_labels(), &row.realm).await? {
         anyhow::bail!("over budget: {why}");
     }
-    let (connection, model) = crate::suggestions::model_for(st, row, label).await?;
+    // Its own rule, else the one for suggested next messages (a small
+    // model you already chose), else the session's own model.
+    let (connection, model) = match crate::suggestions::rule_for(st, row, label).await? {
+        Some(m) => m,
+        None => crate::suggestions::model_for(st, row, crate::suggestions::ROUTE_LABEL).await?,
+    };
     anyhow::ensure!(!connection.is_empty(), "the session has no connection to ask");
+    // Claude Code runs only on a worker, as a session: it can't answer a
+    // one-off call.
+    let kind = st.store.connections().await?.into_iter().find(|c| c.id == connection).map(|c| c.kind);
+    anyhow::ensure!(
+        kind.as_deref() != Some("claude_code"),
+        "a Claude Code session needs a model for this: add a {label} or {} rule in Settings → Model routing",
+        crate::suggestions::ROUTE_LABEL
+    );
     let origin = c6_llm::activity::Origin {
         what: what.into(),
         about: row.title.clone(),
