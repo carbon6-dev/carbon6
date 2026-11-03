@@ -883,6 +883,8 @@ pub struct Workspace {
     pub drop_at: RwSignal<Option<Drop>>,
     /// The catch-ups of sessions you came back to, by session.
     pub catchups: RwSignal<HashMap<String, crate::catchup::Card>>,
+    /// When this page last had each session on screen.
+    pub looked: StoredValue<crate::catchup::Looked>,
     /// Counts the views the head has taken (recently viewed loads again).
     pub viewed: RwSignal<u32>,
 }
@@ -921,6 +923,7 @@ impl Workspace {
             drop_at: RwSignal::new(None),
             viewed: RwSignal::new(0),
             catchups: RwSignal::new(HashMap::new()),
+            looked: StoredValue::new(crate::catchup::Looked::restore()),
         };
         // A link or redirect to a particular view opens it (the home page
         // just restores the workspace).
@@ -1217,6 +1220,18 @@ impl Workspace {
         });
     }
 
+    /// When this page last had a session on screen.
+    pub fn looked_at(&self, id: &str) -> Option<i64> {
+        self.looked.with_value(|l| l.get(id))
+    }
+
+    /// These sessions are on screen now, or were until now (`save`: kept
+    /// in the browser at once).
+    pub fn mark_looked<'a>(&self, ids: impl IntoIterator<Item = &'a String>, save: bool) {
+        let now = crate::util::now_ms();
+        self.looked.update_value(|l| l.note(ids, now, save));
+    }
+
     pub fn dismiss(&self, id: &str) {
         self.attention.update(|a| a.retain(|x| x != id));
     }
@@ -1266,20 +1281,30 @@ impl Workspace {
         let told = StoredValue::new(HashMap::<String, i64>::new());
         // The sessions in view (with the page): one that comes into view
         // again is one you came back to, and is asked first what it did
-        // since you looked (its catch-up), then told seen.
+        // since it was last on screen here (its catch-up), then told seen.
         let in_view = StoredValue::new(HashSet::<String>::new());
         Effect::new(move || {
             let sessions = live.sessions.get();
             let visible = ws.layout.with(Layout::visible_sessions);
             if !page.get() {
+                // Out of sight: on screen until now.
+                in_view.with_value(|was| ws.mark_looked(was, true));
                 in_view.set_value(HashSet::new());
                 return;
             }
             let now: HashSet<String> = sessions.iter().filter(|s| visible.contains(&s.id)).map(|s| s.id.clone()).collect();
-            let back: HashSet<String> = in_view.with_value(|was| now.difference(was).cloned().collect());
+            let (back, gone): (HashSet<String>, Vec<String>) =
+                in_view.with_value(|was| (now.difference(was).cloned().collect(), was.difference(&now).cloned().collect()));
+            // When each one back was last on screen, read before it's on
+            // screen again; those still in view, and those gone from it,
+            // were on screen until now.
+            let looked: HashMap<String, i64> = back.iter().filter_map(|id| Some((id.clone(), ws.looked_at(id)?))).collect();
+            let looked_at = move |id: &str| looked.get(id).copied();
+            ws.mark_looked(now.difference(&back), false);
+            ws.mark_looked(&gone, true);
             in_view.set_value(now);
             for s in sessions.iter().filter(|s| back.contains(&s.id) && !matches!(s.status, SessionStatus::Idle | SessionStatus::Failed)) {
-                leptos::task::spawn_local(crate::catchup::look(ws.catchups, s.id.clone()));
+                leptos::task::spawn_local(crate::catchup::look(ws.catchups, s.id.clone(), looked_at(&s.id)));
             }
             for s in sessions.iter().filter(|s| visible.contains(&s.id) && matches!(s.status, SessionStatus::Idle | SessionStatus::Failed))
             {
@@ -1291,8 +1316,9 @@ impl Workspace {
                 });
                 let id = s.id.clone();
                 if back.contains(&id) {
+                    let at = looked_at(&id);
                     leptos::task::spawn_local(async move {
-                        crate::catchup::look(ws.catchups, id.clone()).await;
+                        crate::catchup::look(ws.catchups, id.clone(), at).await;
                         api::session_seen(id).await;
                     });
                 } else {

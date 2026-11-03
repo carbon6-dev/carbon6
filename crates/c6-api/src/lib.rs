@@ -4713,6 +4713,12 @@ pub struct CatchupQuery {
     /// already).
     #[serde(default)]
     pub summary: bool,
+    /// When you last had the session on screen (the page remembers it), in
+    /// ms: without `since`, what you last looked at is the later of this
+    /// and the last finished turn you saw (a turn still running moves only
+    /// this one).
+    #[serde(default)]
+    pub looked_at: Option<UnixMs>,
 }
 
 /// What a session did since you last looked (`GET /api/v1/sessions/{id}/catchup`).

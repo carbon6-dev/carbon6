@@ -83,8 +83,9 @@ pub(crate) async fn visible(st: &HeadState, id: &str, caller: &Caller) -> anyhow
     }
 }
 
-/// What the session did since you last looked (or since event `since`);
-/// None while its catch-up is off.
+/// What the session did since you last looked (or since event `since`;
+/// `looked_at`: when the page last had it on screen); None while its
+/// catch-up is off.
 pub async fn get(st: &HeadState, id: &str, q: &api::CatchupQuery, caller: &Caller) -> anyhow::Result<Option<api::Catchup>> {
     let row = visible(st, id, caller).await?;
     if !st.store.session_view(id).await?.catchup {
@@ -98,7 +99,11 @@ pub async fn get(st: &HeadState, id: &str, q: &api::CatchupQuery, caller: &Calle
             (s, at, read(st, id, s, last).await?)
         }
         None => {
+            // What you last looked at: the last finished turn you saw, or
+            // when you last had it on screen (a turn still running), never
+            // later than now.
             let (_, seen_at) = st.store.turn_seen(id).await?;
+            let seen_at = seen_at.max(q.looked_at.unwrap_or(0).min(now_ms()));
             let seen = if seen_at > 0 { st.store.seq_at(id, seen_at).await? } else { 0 };
             let after = read(st, id, seen, last).await?;
             let (s, at) = since(&after, seen, seen_at);
@@ -222,6 +227,24 @@ fn command_of(name: &str, input: &serde_json::Value) -> Option<String> {
     })
 }
 
+/// A command, in a line: what its call says it does (Claude Code's Bash
+/// has a `description`), else its first line without a leading
+/// `cd <dir> &&` (or `;`).
+fn command_words(input: &serde_json::Value, cmd: &str) -> String {
+    if let Some(d) = input.get("description").and_then(|d| d.as_str()).filter(|d| !d.trim().is_empty()) {
+        return clip(d, 120);
+    }
+    let mut line = cmd.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    while let Some(after) = line.strip_prefix("cd ") {
+        let cut = [after.find("&&").map(|i| i + 2), after.find(';').map(|i| i + 1)].into_iter().flatten().min();
+        match cut.map(|i| after[i..].trim_start()) {
+            Some(rest) if !rest.is_empty() => line = rest,
+            _ => break,
+        }
+    }
+    clip(line, 120)
+}
+
 /// The files an editing tool changes (write, edit, a patch).
 fn paths_of(name: &str, input: &serde_json::Value) -> Vec<String> {
     let s = |k: &str| input.get(k).and_then(|v| v.as_str()).filter(|p| !p.is_empty()).map(str::to_owned);
@@ -302,29 +325,59 @@ pub(crate) fn rows(events: &[Event], waiting: Vec<CatchupItem>) -> Vec<CatchupRo
         out.push(CatchupRow { kind: "waiting".into(), text: format!("{} waiting on you", waiting.len()), items: waiting });
     }
 
-    // Background tasks and subagents that ended.
-    let mut finished = Vec::new();
+    // Background tasks and subagents that ended, each once (as it ended).
+    // A Claude Code task still in the foreground as it ended was a command
+    // (counted with the commands) or a subagent (counted by its call).
+    let mut tasks: Vec<(&str, &str, &Event)> = Vec::new(); // id, first description, last event
+    let mut at: HashMap<&str, usize> = HashMap::new();
     for e in events {
-        match &e.kind {
-            EventKind::BackgroundTask { kind, description, state, exit_code, .. } if state != "started" => {
-                let bad = matches!(state.as_str(), "failed" | "lost") || (state == "finished" && kind != "claude_code" && *exit_code != 0);
-                let what = if kind == "agent" { format!("Subagent: {description}") } else { format!("Task: {description}") };
-                finished.push(CatchupItem { text: what, seq: e.seq, call: String::new(), failed: bad });
-            }
-            // One that ran in the foreground ends with its call's result.
-            EventKind::SubagentSpawned { call_id, description, background_task_id, .. } if background_task_id.is_empty() => {
-                if let Some(bad) = failed.get(call_id.as_str()) {
-                    finished.push(CatchupItem {
-                        text: format!("Subagent: {description}"),
-                        seq: e.seq,
-                        call: call_id.clone(),
-                        failed: *bad,
-                    });
+        if let EventKind::BackgroundTask { task_id, description, .. } = &e.kind {
+            match at.get(task_id.as_str()) {
+                Some(&i) => {
+                    if tasks[i].1.is_empty() {
+                        tasks[i].1 = description;
+                    }
+                    tasks[i].2 = e;
+                }
+                None => {
+                    at.insert(task_id, tasks.len());
+                    tasks.push((task_id, description, e));
                 }
             }
-            _ => {}
         }
     }
+    let mut finished = Vec::new();
+    // What tasks counted here (or as commands) were called: a subagent's
+    // call by the same description is the same work.
+    let mut theirs: HashSet<&str> = HashSet::new();
+    for (_, description, e) in &tasks {
+        let EventKind::BackgroundTask { kind, native_type, foreground, state, exit_code, .. } = &e.kind else { continue };
+        let agent = kind == "agent" || native_type.ends_with("_agent");
+        if *foreground && agent {
+            continue;
+        }
+        theirs.insert(description);
+        if *foreground || state == "started" {
+            continue;
+        }
+        let bad = matches!(state.as_str(), "failed" | "lost") || (state == "finished" && kind != "claude_code" && *exit_code != 0);
+        let what = if agent { format!("Subagent: {description}") } else { format!("Task: {description}") };
+        finished.push(CatchupItem { text: what, seq: e.seq, call: String::new(), failed: bad });
+    }
+    let shell: HashSet<&str> = calls.iter().filter(|c| command_of(c.name, &c.input).is_some()).map(|c| c.id).collect();
+    for e in events {
+        // One that ran in the foreground ends with its call's result (a
+        // command of Claude Code's is mirrored as a subagent too: not one).
+        if let EventKind::SubagentSpawned { call_id, description, background_task_id, .. } = &e.kind
+            && background_task_id.is_empty()
+            && !shell.contains(call_id.as_str())
+            && !theirs.contains(description.as_str())
+            && let Some(bad) = failed.get(call_id.as_str())
+        {
+            finished.push(CatchupItem { text: format!("Subagent: {description}"), seq: e.seq, call: call_id.clone(), failed: *bad });
+        }
+    }
+    finished.sort_by_key(|f| f.seq);
     if !finished.is_empty() {
         let bad = finished.iter().filter(|f| f.failed).count();
         let mut text = format!("{} finished", finished.len());
@@ -348,7 +401,7 @@ pub(crate) fn rows(events: &[Event], waiting: Vec<CatchupItem>) -> Vec<CatchupRo
             files.push(CatchupItem { text: p, seq: c.seq, call: c.id.to_owned(), failed: false });
         }
         if let Some(cmd) = command_of(c.name, &c.input) {
-            let head = clip(cmd.lines().next().unwrap_or(""), 120);
+            let head = command_words(&c.input, &cmd);
             if !bad && cmd.contains("git commit") {
                 commits.push(CatchupItem {
                     text: commit_message(&cmd).unwrap_or_else(|| head.clone()),
@@ -691,6 +744,36 @@ pub(crate) mod tests {
         }
     }
 
+    /// A Claude Code task (`native_type`: the CLI's `local_bash`,
+    /// `local_agent`), in the foreground or not.
+    fn native(id: &str, native_type: &str, description: &str, state: &str, foreground: bool) -> EventKind {
+        EventKind::BackgroundTask {
+            task_id: id.into(),
+            kind: "claude_code".into(),
+            description: description.into(),
+            state: state.into(),
+            exit_code: 0,
+            elapsed_ms: 10,
+            notify: false,
+            native_type: native_type.into(),
+            foreground,
+        }
+    }
+
+    fn spawned(call: &str, description: &str) -> EventKind {
+        EventKind::SubagentSpawned {
+            call_id: call.into(),
+            child_session_id: format!("child-{call}"),
+            agent: String::new(),
+            description: description.into(),
+            background_task_id: String::new(),
+            connection_id: String::new(),
+            model: String::new(),
+            effort: String::new(),
+            remote: None,
+        }
+    }
+
     /// A morning's work: your message, edits and commands (one failed),
     /// a commit, a task that failed, another session's message and a
     /// question still open.
@@ -778,6 +861,86 @@ pub(crate) mod tests {
         assert!(rows[3].items[0].failed && !rows[3].items[1].failed);
         // Nothing: no rows.
         assert!(super::rows(&[], Vec::new()).is_empty());
+    }
+
+    /// Claude Code's own tasks: a command in the foreground is a command
+    /// (not finished work, though the worker mirrors it as a subagent too),
+    /// each task counts once, as it ended, and only agents are subagents.
+    #[test]
+    fn finished_is_background_work_each_once() {
+        use serde_json::json;
+        let bash = json!({"command": "cd /home/me/.local/state/c6w/worktrees/x && cargo test", "description": "Run the tests"});
+        let evs = vec![
+            // A command in the foreground: started, mirrored, ended.
+            ev(1, 1, reply(1, "", &[("c1", "Bash", bash)])),
+            ev(2, 2, native("claude:fg", "local_bash", "Run the tests", "started", true)),
+            ev(3, 3, spawned("c1", "Run the tests")),
+            ev(4, 4, native("claude:fg", "local_bash", "Run the tests", "finished", true)),
+            ev(5, 5, result("c1", "ok", false)),
+            // A subagent in the background: its call returns at once.
+            ev(6, 6, reply(1, "", &[("c2", "Agent", json!({"description": "Review it", "prompt": "Review."}))])),
+            ev(7, 7, native("claude:bg", "local_agent", "Review it", "started", false)),
+            ev(8, 8, spawned("c2", "Review it")),
+            ev(9, 9, result("c2", "Async agent launched", false)),
+            // A subagent in the foreground: counted by its call.
+            ev(10, 10, reply(1, "", &[("c3", "Agent", json!({"description": "Plan it", "prompt": "Plan."}))])),
+            ev(11, 11, native("claude:plan", "local_agent", "Plan it", "started", true)),
+            ev(12, 12, spawned("c3", "Plan it")),
+            ev(13, 13, native("claude:plan", "local_agent", "Plan it", "finished", true)),
+            ev(14, 14, result("c3", "Planned.", false)),
+            // A command moved to the background, then ended.
+            ev(15, 15, native("claude:build", "local_bash", "Long build", "started", true)),
+            ev(16, 16, native("claude:build", "local_bash", "Long build", "started", false)),
+            ev(17, 17, native("claude:build", "local_bash", "Long build", "failed", false)),
+            ev(18, 18, native("claude:bg", "local_agent", "Review it", "finished", false)),
+            // One of carbon6's own, and one still running.
+            ev(19, 19, task("npm run e2e", "finished", 2)),
+            ev(20, 20, native("claude:later", "local_bash", "Watch the logs", "started", false)),
+        ];
+        let rows = rows(&evs, Vec::new());
+        let finished = rows.iter().find(|r| r.kind == "finished").unwrap();
+        assert_eq!(finished.text, "4 finished · 2 failed");
+        let items: Vec<(&str, u64, &str, bool)> =
+            finished.items.iter().map(|i| (i.text.as_str(), i.seq, i.call.as_str(), i.failed)).collect();
+        assert_eq!(
+            items,
+            [
+                ("Subagent: Plan it", 12, "c3", false),
+                ("Task: Long build", 17, "", true),
+                ("Subagent: Review it", 18, "", false),
+                ("Task: npm run e2e", 19, "", true),
+            ]
+        );
+        let commands = rows.iter().find(|r| r.kind == "commands").unwrap();
+        assert_eq!((commands.text.as_str(), commands.items[0].text.as_str()), ("1 command run", "Run the tests"));
+    }
+
+    /// A command reads as what its call says it does, else its first line
+    /// without the `cd` before it.
+    #[test]
+    fn commands_read_as_what_they_do() {
+        use serde_json::json;
+        let words = |input: serde_json::Value| {
+            let cmd = command_of("Bash", &input).unwrap();
+            command_words(&input, &cmd)
+        };
+        assert_eq!(words(json!({"command": "cd /a/b && make check", "description": "Run the checks"})), "Run the checks");
+        assert_eq!(words(json!({"command": "cd /a/b && make check", "description": " "})), "make check");
+        assert_eq!(words(json!({"command": "cd /a/b; cd c && cargo test -q\necho done"})), "cargo test -q");
+        assert_eq!(words(json!({"command": "\n  git status"})), "git status");
+        assert_eq!(words(json!({"command": "cd /a/b"})), "cd /a/b");
+        assert_eq!(words(json!({"command": "cd /a/b &&"})), "cd /a/b &&");
+        // carbon6's shell, as argv.
+        let input = json!({"command": ["bash", "-lc", "cd /w && npm test"]});
+        assert_eq!(command_words(&input, &command_of("shell", &input).unwrap()), "npm test");
+        // The commands row says them so.
+        let evs = vec![
+            ev(1, 1, reply(1, "", &[("c1", "Bash", json!({"command": "cd /home/me/x && cargo build", "description": "Build it"}))])),
+            ev(2, 2, reply(1, "", &[("c2", "Bash", json!({"command": "cd /home/me/x && git log -1"}))])),
+        ];
+        let rows = rows(&evs, Vec::new());
+        let texts: Vec<&str> = rows[0].items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, ["Build it", "git log -1"]);
     }
 
     #[test]

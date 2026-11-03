@@ -10,18 +10,18 @@ Status: built (2026-11-02), for review live. Decided with you in doc:01a19de1 ("
 
 ## 2. Catch-up
 
-- **Since:** the later of what you last saw (the last event when the session was last marked seen, carbon6's seen turn) and your last message to it. A card is offered for 5 steps or more since then, or anything waiting on you. A step is a tool call, or a reply that called none.
+- **Since:** the later of what you last saw and your last message to it. What you last saw is the later of the last finished turn you saw (the last event when the session was last marked seen, carbon6's seen turn) and when the page last had the session on screen (a tile showing it, with the page in view), so a session that stays in one long turn doesn't offer again what you watched or caught up on. The page remembers that time per session (as the session leaves the screen, as the page is hidden, while it's on screen, and as you act on the card: Caught up, ×), in the browser too (a reload, a phone unlocked), and sends it with its ask; it's never later than the head's clock. A card is offered for 5 steps or more since then, or anything waiting on you. A step is a tool call, or a reply that called none.
 - **When:** as a session comes into view (a tile opened, the page shown again), the page asks for its catch-up before it marks the session seen. The paragraph is made only when the card is shown, and kept in the head's memory by session, since and last event.
 - **The card:** "Since you looked · 42m", one paragraph from the small model, and rows counted by the head (never the model), each only when not zero and each opening to its items, which go to their place in the transcript:
   - waiting on you (open approvals and questions, the session's open decisions), first;
-  - finished (background tasks and subagents that ended; failures noted);
+  - finished (background tasks and subagents that ended, each once, as it ended; failures noted): "Subagent: …" for an agent, "Task: …" for the rest. A Claude Code task that ended still in the foreground isn't one: a command (Claude Code reports each foreground Bash command as a task, and the worker mirrors it as a subagent too; it's counted with the commands) or a subagent (counted by its call's result). One moved to the background counts as it ends;
   - files changed (distinct paths from write, edit and patch tools) and commits (`git commit` in shell commands);
-  - commands run (shell calls), with failures;
+  - commands run (shell calls), with failures, each as its call says what it does (Claude Code's Bash `description`), else its first line without a leading `cd <dir> &&` (or `;`);
   - messages from other sessions and doc comments delivered.
 - **What the model reads:** only what happened since, condensed: messages (first 300 characters), each turn's final reply (500), a line per tool call (its name and target, never its output), and the counts; at most about 6,000 tokens, the newest kept, older lines only counted.
-- **Actions:** *Jump to it* scrolls the transcript to where you left off, marked by a dashed "you were here · 42m ago" line; *Caught up ✓* marks it seen and the card goes; × puts the card away (it comes again with what's new next time).
+- **Actions:** *Jump to it* scrolls the transcript to where you left off, marked by a dashed "you were here · 42m ago" line; *Caught up ✓* marks it seen and the card goes; × puts the card away (it comes again with what's new from then next time). A card that's open stays as it is when you come back, brought up to date from where it started.
 - **Where:** a wide session: the first section of the glance column ("SINCE YOU LOOKED · 42m"). Narrower: a "Catch up · N new" pill at the top of the transcript opens it in a popover; on a phone, in a sheet.
-- `GET /api/v1/sessions/{id}/catchup` (`since=<seq>` to count from an earlier answer's point, `summary=true` for the paragraph); 204 while its catch-up is off.
+- `GET /api/v1/sessions/{id}/catchup` (`since=<seq>` to count from an earlier answer's point, `looked_at=<ms>` when the page last had it on screen, `summary=true` for the paragraph); 204 while its catch-up is off.
 
 ## 3. Timeline
 
@@ -36,4 +36,4 @@ Two views of a session's turns (decided as "A + B as a switch"):
 ## 4. Not yet
 
 - The catch-up says nothing of what changed in subagents' own transcripts beyond their ends.
-- The card isn't shared across devices: each page asks for it as the session comes into view there.
+- The card isn't shared across devices: each page asks for it as the session comes into view there, and when a page last had a session on screen is that page's own (in a turn that goes on, a phone offers what you watched on a desktop).

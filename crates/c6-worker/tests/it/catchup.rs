@@ -156,6 +156,12 @@ async fn catching_up_on_a_session_and_its_timeline() {
     assert_eq!((c["since_seq"].clone(), c["steps"].clone(), c["offer"].clone()), (json!(again), json!(1), json!(false)), "{c}");
     assert_eq!(c["summary"], "", "no paragraph for what isn't worth a card");
     assert_eq!(mock.requests().len(), calls + 1, "and no call");
+    // The page had it on screen since (as in a turn that goes on): nothing
+    // new from then; from before your message, your message stands.
+    let c = get(format!("sessions/{b}/catchup?looked_at={}", c6_core::now_ms())).await;
+    assert_eq!((c["since_seq"].clone(), c["steps"].clone()), (c["last_seq"].clone(), json!(0)), "{c}");
+    assert!(c["since_at"].as_i64() > Some(0), "{c}");
+    assert_eq!(get(format!("sessions/{b}/catchup?looked_at=1")).await["since_seq"], again);
     // From an event, as an earlier answer said.
     assert_eq!(get(format!("sessions/{b}/catchup?since={prompt_seq}")).await["steps"], 7);
 

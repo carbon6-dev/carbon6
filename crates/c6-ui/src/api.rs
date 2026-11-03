@@ -1269,11 +1269,13 @@ pub async fn set_session_view(id: String, v: c6_api::SessionViewSettings) -> Res
     empty(Request::put(&format!("/api/v1/sessions/{id}/view")).json(&v).map_err(|e| e.to_string())?.send().await).await
 }
 
-/// What a session did since you last looked (or since event `since`),
-/// with the paragraph if `summary`; None while its catch-up is off.
-pub async fn catchup(id: String, since: Option<u64>, summary: bool) -> Result<Option<c6_api::Catchup>, String> {
+/// What a session did since you last looked (or since event `since`;
+/// `looked_at`: when this page last had it on screen), with the paragraph
+/// if `summary`; None while its catch-up is off.
+pub async fn catchup(id: String, since: Option<u64>, looked_at: Option<i64>, summary: bool) -> Result<Option<c6_api::Catchup>, String> {
     let since = since.map(|s| format!("&since={s}")).unwrap_or_default();
-    let resp = check(Request::get(&format!("/api/v1/sessions/{id}/catchup?summary={summary}{since}")).send().await).await?;
+    let looked = looked_at.map(|t| format!("&looked_at={t}")).unwrap_or_default();
+    let resp = check(Request::get(&format!("/api/v1/sessions/{id}/catchup?summary={summary}{since}{looked}")).send().await).await?;
     if resp.status() == 204 {
         return Ok(None);
     }

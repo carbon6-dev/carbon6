@@ -4,7 +4,8 @@
 //! counted by the head (waiting on you, finished, files changed and
 //! commits, commands, messages), each opening to its items, which go to
 //! their place in the transcript. Asked for as the session comes into view,
-//! before it's marked seen; kept until you're caught up.
+//! before it's marked seen, from when this page last had it on screen;
+//! kept until you're caught up.
 
 use std::collections::{HashMap, HashSet};
 
@@ -30,12 +31,73 @@ pub fn cards() -> Option<RwSignal<HashMap<String, Card>>> {
     use_context::<crate::workspace::Workspace>().map(|w| w.catchups)
 }
 
-/// You came back to a session: what it did since you looked, as a card if
-/// it's worth one. A card still open is brought up to date from where it
-/// started.
-pub async fn look(cards: RwSignal<HashMap<String, Card>>, id: String) {
+const LOOKED_KEY: &str = "c6.looked";
+/// Sessions whose time on screen the browser keeps, at most (the latest).
+const MAX_LOOKED: usize = 500;
+/// How often the times of sessions still on screen are saved, at most.
+const SAVE_EVERY_MS: i64 = 30_000;
+
+/// When this page last had each session on screen, kept in the browser too
+/// (a reload, a phone's page shown again): a catch-up counts from then, so
+/// what you watched in a turn that goes on isn't offered again.
+#[derive(Default)]
+pub struct Looked {
+    at: HashMap<String, i64>,
+    /// When it was last saved.
+    saved: i64,
+}
+
+impl Looked {
+    pub fn restore() -> Self {
+        let at = crate::util::storage_get(LOOKED_KEY).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        Self { at, saved: 0 }
+    }
+
+    pub fn get(&self, id: &str) -> Option<i64> {
+        self.at.get(id).copied()
+    }
+
+    /// `ids` are on screen at `now`, or were until then; saved at once if
+    /// `save` (they left it), else at most every [`SAVE_EVERY_MS`].
+    pub fn note<'a>(&mut self, ids: impl IntoIterator<Item = &'a String>, now: i64, save: bool) {
+        let mut any = false;
+        for id in ids {
+            self.at.insert(id.clone(), now);
+            any = true;
+        }
+        if !any {
+            return;
+        }
+        keep_latest(&mut self.at, MAX_LOOKED);
+        if save || now - self.saved >= SAVE_EVERY_MS {
+            self.saved = now;
+            crate::util::storage_set(LOOKED_KEY, &serde_json::to_string(&self.at).unwrap_or_default());
+        }
+    }
+}
+
+/// The `max` latest times, the rest forgotten.
+fn keep_latest(at: &mut HashMap<String, i64>, max: usize) {
+    if at.len() <= max {
+        return;
+    }
+    let mut times: Vec<i64> = at.values().copied().collect();
+    times.sort_unstable_by(|a, b| b.cmp(a));
+    let oldest = times[max - 1];
+    at.retain(|_, t| *t >= oldest);
+    // Ties at the edge: any of them.
+    while at.len() > max {
+        let Some(k) = at.iter().find(|(_, t)| **t == oldest).map(|(k, _)| k.clone()) else { break };
+        at.remove(&k);
+    }
+}
+
+/// You came back to a session (`looked_at`: when this page last had it on
+/// screen): what it did since you looked, as a card if it's worth one. A
+/// card still open is brought up to date from where it started.
+pub async fn look(cards: RwSignal<HashMap<String, Card>>, id: String, looked_at: Option<i64>) {
     let open = cards.with_untracked(|m| m.get(&id).filter(|c| c.open).map(|c| (c.c.since_seq, c.c.since_at)));
-    let Ok(Some(mut c)) = api::catchup(id.clone(), open.map(|o| o.0), false).await else { return };
+    let Ok(Some(mut c)) = api::catchup(id.clone(), open.map(|o| o.0), looked_at, false).await else { return };
     if let Some((_, at)) = open {
         c.since_at = at;
     }
@@ -63,7 +125,7 @@ fn ask_summary(cards: RwSignal<HashMap<String, Card>>, id: String) {
         }
     });
     spawn_local(async move {
-        let got = api::catchup(id.clone(), Some(card.c.since_seq), true).await;
+        let got = api::catchup(id.clone(), Some(card.c.since_seq), None, true).await;
         cards.update(|m| {
             let Some(c) = m.get_mut(&id).filter(|c| c.c.since_seq == card.c.since_seq) else { return };
             c.pending = false;
@@ -75,22 +137,25 @@ fn ask_summary(cards: RwSignal<HashMap<String, Card>>, id: String) {
     });
 }
 
-/// You're caught up: the card and its line go, and the head hears you've
-/// seen it.
-pub fn caught_up(cards: RwSignal<HashMap<String, Card>>, id: String) {
-    cards.update(|m| {
+/// You're caught up: the card and its line go, the head hears you've seen
+/// it, and the next catch-up counts from now.
+pub fn caught_up(ws: crate::workspace::Workspace, id: String) {
+    ws.catchups.update(|m| {
         m.remove(&id);
     });
+    ws.mark_looked([&id], true);
     spawn_local(api::session_seen(id));
 }
 
-/// The card put away (it comes again with what's new when you come back).
-pub fn put_away(cards: RwSignal<HashMap<String, Card>>, id: &str) {
-    cards.update(|m| {
+/// The card put away (it comes again with what's new from now when you
+/// come back).
+pub fn put_away(ws: crate::workspace::Workspace, id: &str) {
+    ws.catchups.update(|m| {
         if let Some(c) = m.get_mut(id) {
             c.open = false;
         }
     });
+    ws.mark_looked([&id.to_owned()], true);
 }
 
 /// How long since: "42m", "3h", "2d".
@@ -138,7 +203,8 @@ pub fn CatchupBody(
     class: String,
     #[prop(optional, into)] on_done: Option<Callback<()>>,
 ) -> impl IntoView {
-    let Some(cards) = cards() else { return ().into_any() };
+    let Some(ws) = use_context::<crate::workspace::Workspace>() else { return ().into_any() };
+    let cards = ws.catchups;
     let id = StoredValue::new(session);
     let card = Memo::new(move |_| cards.with(|m| m.get(&id.get_value()).cloned()));
     Effect::new(move || {
@@ -166,7 +232,7 @@ pub fn CatchupBody(
                                 {format!("{} · {since}", if caps { "SINCE YOU LOOKED" } else { "Since you looked" })}
                             </span>
                             <button class=crate::icons::BAR_BUTTON title="Put it away" aria-label="Close"
-                                on:click=move |_| { put_away(cards, &id.get_value()); done() }>{crate::icons::x()}</button>
+                                on:click=move |_| { put_away(ws, &id.get_value()); done() }>{crate::icons::x()}</button>
                         </div>
                     }}
                     {if !c.summary.is_empty() {
@@ -223,7 +289,7 @@ pub fn CatchupBody(
                             }>"Jump to it"</button>
                         <span class="flex-1"></span>
                         <button class=crate::util::BUTTON title="Mark it all seen and put the card away"
-                            on:click=move |_| { caught_up(cards, id.get_value()); done() }>"Caught up ✓"</button>
+                            on:click=move |_| { caught_up(ws, id.get_value()); done() }>"Caught up ✓"</button>
                     </div>
                 </div>
             }
@@ -255,5 +321,25 @@ pub fn CatchupSheet(session: String, jump: Callback<(u64, String)>, open: RwSign
             on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); close() }>
             <CatchupBody session jump on_done=move |()| close() />
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keeps_the_latest_times_on_screen() {
+        let mut at: HashMap<String, i64> = (0..10).map(|i| (format!("s{i}"), i)).collect();
+        keep_latest(&mut at, 10);
+        assert_eq!(at.len(), 10);
+        keep_latest(&mut at, 4);
+        let mut kept: Vec<i64> = at.values().copied().collect();
+        kept.sort();
+        assert_eq!(kept, [6, 7, 8, 9]);
+        // Ties at the edge: still no more than the most.
+        let mut at: HashMap<String, i64> = (0..5).map(|i| (format!("s{i}"), 1)).collect();
+        keep_latest(&mut at, 3);
+        assert_eq!(at.len(), 3);
     }
 }
