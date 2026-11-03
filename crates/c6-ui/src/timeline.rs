@@ -1,12 +1,13 @@
 //! A session's turns, two ways. An outline by hour in its glance, always
-//! there: each hour a row ("14:00 · 3 turns"), closed but for the latest;
-//! an open hour lists a line per turn (who started it, what it did, its
-//! steps), and a line goes to its turn in the transcript. And, with "Fold
-//! finished turns" on (⋯), the transcript itself shows each finished turn
-//! as one row, opened in place by a click; the running turn stays open, as
-//! does one you opened or went to. What a turn did comes from a small
-//! model when its hour is opened in the outline (the head keeps it); until
-//! then, the first sentence of its last reply.
+//! there, newest first: each hour a row ("14:00 · 3 turns"), closed but
+//! for the latest; an open hour lists a line per turn, newest first (who
+//! started it, what it did, its steps), and a line goes to its turn in the
+//! transcript. And, with "Fold finished turns" on (⋯), the transcript
+//! itself shows each finished turn as one row, opened in place by a click;
+//! the running turn stays open, as do the latest finished one (until a
+//! newer one starts) and one you opened or went to. What a turn did comes
+//! from a small model when its hour is open in the outline on screen (the
+//! head keeps it); until then, the first sentence of its last reply.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
@@ -183,13 +184,19 @@ impl Piece {
 /// `evs` with each finished turn folded into its row. `open` says of a
 /// finished turn: folded (`Some(false)`), its row and its events
 /// (`Some(true)`), or as it is, with no row (None: one that was rewound).
-/// A running turn is always as it is. Only the events shown are copied.
-pub fn fold(evs: &[Event], open: impl Fn(&Span) -> Option<bool>) -> Vec<Piece> {
+/// A running turn is always as it is, and so is the latest turn while no
+/// newer one has started (`to_end`: `evs` reach the log's end, so their
+/// last turn is the latest), so the reply you just watched stays. Only the
+/// events shown are copied.
+pub fn fold(evs: &[Event], to_end: bool, open: impl Fn(&Span) -> Option<bool>) -> Vec<Piece> {
     let mut out = Vec::new();
     let mut at = 0;
-    for (s, r) in spans(evs) {
+    let all = spans(evs);
+    let last = all.len().checked_sub(1);
+    for (i, (s, r)) in all.into_iter().enumerate() {
         out.extend(evs[at..r.start].iter().cloned().map(Piece::Event));
-        let shown = if s.end.is_none() { None } else { open(&s) };
+        let latest = to_end && Some(i) == last;
+        let shown = if s.end.is_none() || latest { None } else { open(&s) };
         let events = shown != Some(false);
         if shown.is_some() {
             out.push(Piece::Turn(s));
@@ -333,9 +340,11 @@ impl Timeline {
 
     /// `evs` as the transcript draws them while finished turns fold: each
     /// one row, its events too while it's open, but one that was rewound
-    /// (`rewound`, of its first event) as it is (tracked).
-    pub fn pieces(&self, evs: &[Event], rewound: impl Fn(u64) -> bool) -> Vec<Piece> {
-        self.pins.with(|p| fold(evs, |s| (!rewound(s.start)).then(|| p.range(s.start..=s.end.unwrap_or(u64::MAX)).next().is_some())))
+    /// (`rewound`, of its first event) as it is, and the latest while no
+    /// newer one started (`to_end`: see [`fold`]) (tracked).
+    pub fn pieces(&self, evs: &[Event], to_end: bool, rewound: impl Fn(u64) -> bool) -> Vec<Piece> {
+        self.pins
+            .with(|p| fold(evs, to_end, |s| (!rewound(s.start)).then(|| p.range(s.start..=s.end.unwrap_or(u64::MAX)).next().is_some())))
     }
 }
 
@@ -375,9 +384,38 @@ pub fn TurnRow(session: String, span: Span, timeline: Timeline) -> impl IntoView
     }
 }
 
-/// The glance's outline of a session's turns: its hours, the latest open,
-/// each open hour's turns a line each; `on_go`: to a turn in the
-/// transcript.
+/// Hours, and the turns in each, newest first (`hours` gives them oldest
+/// first): the latest activity at the top.
+pub fn newest_first(mut hours: Vec<Hour>) -> Vec<Hour> {
+    hours.reverse();
+    for h in &mut hours {
+        h.turns.reverse();
+    }
+    hours
+}
+
+/// Keeps `seen` saying whether `el` is on screen (not in a hidden tile, nor
+/// scrolled out of its glance).
+fn watch_sight(el: NodeRef<leptos::html::Div>, seen: RwSignal<bool>) {
+    Effect::new(move || {
+        let Some(el) = el.get() else { return };
+        let cb = wasm_bindgen::closure::Closure::<dyn FnMut(js_sys::Array)>::new(move |entries: js_sys::Array| {
+            if let Some(e) = entries.iter().last() {
+                let _ = seen.try_set(wasm_bindgen::JsCast::unchecked_into::<web_sys::IntersectionObserverEntry>(e).is_intersecting());
+            }
+        });
+        if let Ok(o) = web_sys::IntersectionObserver::new(wasm_bindgen::JsCast::unchecked_ref(cb.as_ref())) {
+            o.observe(&el);
+            let kept = send_wrapper::SendWrapper::new((o, cb));
+            on_cleanup(move || kept.0.disconnect());
+        }
+    });
+}
+
+/// The glance's outline of a session's turns: its hours, newest first, the
+/// latest open, each open hour's turns a line each, newest first; `on_go`:
+/// to a turn in the transcript. An open hour's lines are asked for only
+/// while the outline is on screen.
 #[component]
 pub fn Outline(timeline: Timeline, #[prop(into)] on_go: Callback<TimelineTurn>) -> impl IntoView {
     let tl = timeline;
@@ -387,15 +425,18 @@ pub fn Outline(timeline: Timeline, #[prop(into)] on_go: Callback<TimelineTurn>) 
     });
     let all = Memo::new(move |_| {
         tl.state.with(|s| match s {
-            Loaded::Turns(t) => hours(t, local_offset),
+            Loaded::Turns(t) => newest_first(hours(t, local_offset)),
             _ => Vec::new(),
         })
     });
+    let root = NodeRef::<leptos::html::Div>::new();
+    let seen = RwSignal::new(false);
+    watch_sight(root, seen);
     let open = RwSignal::new(HashSet::<i64>::new());
     // The latest hour opens by itself, once (and a new one as it starts).
     let opened_by_itself = StoredValue::new(HashSet::<i64>::new());
     Effect::new(move || {
-        let Some(latest) = all.with(|a| a.last().map(|h| h.start)) else { return };
+        let Some(latest) = all.with(|a| a.first().map(|h| h.start)) else { return };
         if opened_by_itself.with_value(|o| !o.contains(&latest)) {
             opened_by_itself.update_value(|o| {
                 o.insert(latest);
@@ -405,8 +446,11 @@ pub fn Outline(timeline: Timeline, #[prop(into)] on_go: Callback<TimelineTurn>) 
             });
         }
     });
-    // An open hour's lines, made as it opens.
+    // An open hour's lines, made as it opens (while it can be seen).
     Effect::new(move || {
+        if !seen.get() {
+            return;
+        }
         let open = open.get();
         all.with(|a| {
             for h in a.iter().filter(|h| open.contains(&h.start)) {
@@ -415,41 +459,43 @@ pub fn Outline(timeline: Timeline, #[prop(into)] on_go: Callback<TimelineTurn>) 
         });
     });
     view! {
-        {move || match tl.state.get() {
-            Loaded::Reading => view! { <p class="px-1.5 py-1 text-xs text-muted">"Reading its turns…"</p> }.into_any(),
-            Loaded::Turns(t) if t.is_empty() => view! { <p class="px-1.5 py-1 text-xs text-muted">"No turns yet."</p> }.into_any(),
-            Loaded::Turns(_) => ().into_any(),
-            Loaded::Failed(e) => view! {
-                <p class="px-1.5 py-1 text-xs text-red-600">
-                    {format!("Couldn't read its turns: {e} ")}
-                    <button class="underline" on:click=move |_| tl.loaded.refetch()>"Try again"</button>
-                </p>
-            }
-            .into_any(),
-        }}
-        <For each=move || all.get() key=|h| (h.start, h.turns.len(), h.turns.iter().map(|t| t.steps).sum::<u64>(), h.running) let:h>
-            {
-                let start = h.start;
-                let is_open = move || open.with(|o| o.contains(&start));
-                let label = format!("{} · {}", hour_label(start), hour_counts(&h));
-                let turns_here = h.turns.clone();
-                view! {
-                    <div>
-                        <button class=format!("{LINE} font-medium") aria-expanded=move || is_open().to_string()
-                            on:click=move |_| open.update(|o| if !o.remove(&start) { o.insert(start); })>
-                            <span class="w-3 shrink-0 text-muted">{move || if is_open() { "▾" } else { "▸" }}</span>
-                            <span class="tabular-nums">{label}</span>
-                            {h.running.then(|| view! { <span class="size-1.5 shrink-0 self-center animate-pulse rounded-full bg-blue-500"></span> })}
-                        </button>
-                        <Show when=is_open>
-                            <div class="mb-1 ml-3 border-l border-zinc-200 pl-1 dark:border-zinc-800">
-                                {turns_here.clone().into_iter().map(|t| outline_turn(t, tl, on_go)).collect_view()}
-                            </div>
-                        </Show>
-                    </div>
+        <div node_ref=root>
+            {move || match tl.state.get() {
+                Loaded::Reading => view! { <p class="px-1.5 py-1 text-xs text-muted">"Reading its turns…"</p> }.into_any(),
+                Loaded::Turns(t) if t.is_empty() => view! { <p class="px-1.5 py-1 text-xs text-muted">"No turns yet."</p> }.into_any(),
+                Loaded::Turns(_) => ().into_any(),
+                Loaded::Failed(e) => view! {
+                    <p class="px-1.5 py-1 text-xs text-red-600">
+                        {format!("Couldn't read its turns: {e} ")}
+                        <button class="underline" on:click=move |_| tl.loaded.refetch()>"Try again"</button>
+                    </p>
                 }
-            }
-        </For>
+                .into_any(),
+            }}
+            <For each=move || all.get() key=|h| (h.start, h.turns.len(), h.turns.iter().map(|t| t.steps).sum::<u64>(), h.running) let:h>
+                {
+                    let start = h.start;
+                    let is_open = move || open.with(|o| o.contains(&start));
+                    let label = format!("{} · {}", hour_label(start), hour_counts(&h));
+                    let turns_here = h.turns.clone();
+                    view! {
+                        <div>
+                            <button class=format!("{LINE} font-medium") aria-expanded=move || is_open().to_string()
+                                on:click=move |_| open.update(|o| if !o.remove(&start) { o.insert(start); })>
+                                <span class="w-3 shrink-0 text-muted">{move || if is_open() { "▾" } else { "▸" }}</span>
+                                <span class="tabular-nums">{label}</span>
+                                {h.running.then(|| view! { <span class="size-1.5 shrink-0 self-center animate-pulse rounded-full bg-blue-500"></span> })}
+                            </button>
+                            <Show when=is_open>
+                                <div class="mb-1 ml-3 border-l border-zinc-200 pl-1 dark:border-zinc-800">
+                                    {turns_here.clone().into_iter().map(|t| outline_turn(t, tl, on_go)).collect_view()}
+                                </div>
+                            </Show>
+                        </div>
+                    }
+                }
+            </For>
+        </div>
     }
 }
 
@@ -493,6 +539,9 @@ mod tests {
         assert_eq!(summary, [(h(9), vec![1, 2], false), (h(10), vec![3], false), (h(12), vec![4], true)]);
         assert_eq!(hour_counts(&got[0]), "2 turns");
         assert_eq!(hour_counts(&got[1]), "1 turn");
+        // The outline shows them newest first, and so the turns in an hour.
+        let shown: Vec<(i64, Vec<u64>)> = newest_first(got).iter().map(|h| (h.start, h.turns.iter().map(|t| t.turn).collect())).collect();
+        assert_eq!(shown, [(h(12), vec![4]), (h(10), vec![3]), (h(9), vec![2, 1])]);
         // Half an hour ahead of UTC: 9:35 UTC is 10:05 local, in the hour
         // that started at 9:30 UTC.
         let got = hours(&[turn(1, h(9) + 35 * 60_000, 1, 9)], |_| 30 * 60_000);
@@ -620,11 +669,11 @@ mod tests {
         let evs = log();
         // All folded: a row each, the events between them, the running turn
         // in full.
-        let got = fold(&evs, |_| Some(false));
+        let got = fold(&evs, true, |_| Some(false));
         assert_eq!(keys(&got), [(1, false), (2, true), (7, false), (8, true), (12, true), (14, false), (15, false), (16, false)]);
         assert!(matches!(&got[1], Piece::Turn(s) if s.end == Some(6) && s.steps == 3));
         // One opened: its row, then its events.
-        let got = fold(&evs, |s| Some(s.start == 8));
+        let got = fold(&evs, true, |s| Some(s.start == 8));
         assert_eq!(
             keys(&got),
             [
@@ -643,10 +692,25 @@ mod tests {
             ]
         );
         // One rewound: as it is, with no row.
-        let got = fold(&evs, |s| (s.start != 2).then_some(false));
+        let got = fold(&evs, true, |s| (s.start != 2).then_some(false));
         assert_eq!(keys(&got)[..7], [(1, false), (2, false), (3, false), (4, false), (5, false), (6, false), (7, false)]);
         // Its end not yet loaded (a window drawn part way): open.
-        let got = fold(&evs[..4], |_| Some(false));
+        let got = fold(&evs[..4], true, |_| Some(false));
         assert_eq!(keys(&got), [(1, false), (2, false), (3, false), (4, false)]);
+    }
+
+    #[test]
+    fn the_latest_finished_turn_stays_open_until_a_newer_one_starts() {
+        let evs = log();
+        // Turn 2 just ended, nothing newer: its reply stays; turn 1 folds.
+        let got = fold(&evs[..11], true, |_| Some(false));
+        assert_eq!(keys(&got), [(1, false), (2, true), (7, false), (8, false), (9, false), (10, false), (11, false)]);
+        // Turn 3 started: turn 2 folds, turn 3 runs.
+        let got = fold(&evs[..12], true, |_| Some(false));
+        assert_eq!(keys(&got), [(1, false), (2, true), (7, false), (8, true), (12, false)]);
+        // Drawn only part way (a jump back): newer turns follow, so the
+        // last one drawn folds.
+        let got = fold(&evs[..11], false, |_| Some(false));
+        assert_eq!(keys(&got), [(1, false), (2, true), (7, false), (8, true)]);
     }
 }

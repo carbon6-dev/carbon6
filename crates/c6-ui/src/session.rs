@@ -1957,7 +1957,7 @@ fn Transcript(
         events.with(|evs| {
             let shown = &evs[evs.partition_point(|e| e.seq < from)..evs.partition_point(|e| e.seq < to)];
             match timeline {
-                Some(tl) if tl.fold.get() => rewound.with(|(by, _)| tl.pieces(shown, |seq| by.contains_key(&seq))),
+                Some(tl) if tl.fold.get() => rewound.with(|(by, _)| tl.pieces(shown, to == u64::MAX, |seq| by.contains_key(&seq))),
                 _ => shown.iter().cloned().map(crate::timeline::Piece::Event).collect::<Vec<_>>(),
             }
         })
