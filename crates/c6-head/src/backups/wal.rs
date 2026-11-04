@@ -68,7 +68,9 @@ fn checksum(big_endian: bool, data: &[u8], s: &mut (u32, u32)) {
 pub fn scan(wal: &Path, from: &Cursor) -> anyhow::Result<Scan> {
     let mut f = match std::fs::File::open(wal) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Scan { restarted: from.frames > 0, cursor: Cursor::default(), ..Default::default() }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Scan { restarted: from.frames > 0, cursor: Cursor::default(), ..Default::default() });
+        }
         Err(e) => return Err(e).with_context(|| format!("reading {}", wal.display())),
     };
     let mut h = [0u8; HEADER];
@@ -176,7 +178,8 @@ mod tests {
     use super::*;
 
     async fn pool(path: &Path) -> SqlitePool {
-        let opts = SqliteConnectOptions::from_str("sqlite:").unwrap().filename(path).create_if_missing(true).journal_mode(SqliteJournalMode::Wal);
+        let opts =
+            SqliteConnectOptions::from_str("sqlite:").unwrap().filename(path).create_if_missing(true).journal_mode(SqliteJournalMode::Wal);
         c6_core::wal::manual_pool(SqlitePoolOptions::new().max_connections(1)).connect_with(opts).await.unwrap()
     }
 

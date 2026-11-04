@@ -6,8 +6,8 @@
 //! disk; each destination's sender takes it from there at its own pace, so
 //! a slow or unreachable destination never holds up the head.
 
-pub mod crypt;
 mod capture;
+pub mod crypt;
 pub mod dest;
 mod gens;
 pub mod restore;
@@ -423,7 +423,18 @@ fn behind_ms(st: &HeadState, dest: &str) -> Option<i64> {
     let mut oldest: Option<i64> = None;
     for (rel, db) in &state.dbs {
         let sent = match ds.gens.get(rel) {
+            // A base copy not all there yet: what it holds waits since then.
+            Some(g) if g.epoch == db.epoch && !g.lost && !g.complete => {
+                oldest = Some(oldest.map_or(g.base_at, |o: i64| o.min(g.base_at)));
+                g.sent_seq
+            }
             Some(g) if g.epoch == db.epoch && !g.lost => g.sent_seq,
+            // Fell too far behind: its changes have waited since then.
+            Some(g) if g.lost => {
+                let t = g.lost_at.unwrap_or(g.base_at);
+                oldest = Some(oldest.map_or(t, |o: i64| o.min(t)));
+                continue;
+            }
             // No base copy there yet: everything waits.
             _ => 0,
         };
@@ -531,7 +542,8 @@ pub fn spawn(st: Arc<HeadState>) {
             if on(&s) {
                 for d in s.destinations.iter().filter(|d| d.enabled).cloned() {
                     // A destination still busy with its last turn carries on.
-                    let busy = st.backups.senders.lock().unwrap_or_else(|e| e.into_inner()).get(&d.name).is_some_and(|l| l.try_lock().is_err());
+                    let busy =
+                        st.backups.senders.lock().unwrap_or_else(|e| e.into_inner()).get(&d.name).is_some_and(|l| l.try_lock().is_err());
                     if busy {
                         continue;
                     }

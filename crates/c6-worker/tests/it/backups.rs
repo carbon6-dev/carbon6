@@ -206,9 +206,9 @@ async fn databases_come_back_as_of_any_time() {
         http: reqwest::Client::new(),
     };
     let back2 = tempfile::tempdir().unwrap();
-    let r = backups::restore::restore(&s3, &private, None, back2.path())
-        .await
-        .unwrap_or_else(|e| panic!("{e:#}: {:?}", mock.keys().iter().filter(|k| !k.contains("/chunks/") && !k.contains("/seg/")).collect::<Vec<_>>()));
+    let r = backups::restore::restore(&s3, &private, None, back2.path()).await.unwrap_or_else(|e| {
+        panic!("{e:#}: {:?}", mock.keys().iter().filter(|k| !k.contains("/chunks/") && !k.contains("/seg/")).collect::<Vec<_>>())
+    });
     assert!(r.ok(), "{}", r.text());
     let restored = c6_head::start(config(back2.path())).await.unwrap();
     let rapi = format!("http://127.0.0.1:{}/api/v1", restored.ui_addrs[0].port());
@@ -220,9 +220,115 @@ async fn databases_come_back_as_of_any_time() {
     let back3 = tempfile::tempdir().unwrap();
     assert!(backups::restore::restore(&nas_dest, &other, None, back3.path()).await.is_err());
     assert!(backups::restore::restore(&nas_dest, &private, None, dir.path()).await.is_err());
+    // Changed outside the head (another program wrote and checkpointed it):
+    // the next pass starts new base copies, which have the change.
+    {
+        use sqlx::Connection;
+        let opts = sqlx::sqlite::SqliteConnectOptions::new().filename(dir.path().join("c6h.db"));
+        let mut c = sqlx::SqliteConnection::connect_with(&opts).await.unwrap();
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('written_outside', 'yes')").execute(&mut c).await.unwrap();
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&mut c).await.unwrap();
+        c.close().await.unwrap();
+    }
+    backups::run(&st, false).await.unwrap();
+    let status = backups::run(&st, false).await.unwrap();
+    assert!(status.destinations.iter().all(|d| d.last_error.is_empty()), "{status:?}");
+    let back4 = tempfile::tempdir().unwrap();
+    backups::restore::restore(&nas_dest, &private, None, back4.path()).await.unwrap();
+    {
+        use sqlx::Connection;
+        let opts = sqlx::sqlite::SqliteConnectOptions::new().filename(back4.path().join("c6h.db"));
+        let mut c = sqlx::SqliteConnection::connect_with(&opts).await.unwrap();
+        let v: Option<String> =
+            sqlx::query_scalar("SELECT value FROM settings WHERE key = 'written_outside'").fetch_optional(&mut c).await.unwrap();
+        assert_eq!(v.as_deref(), Some("yes"), "the outside change is backed up too");
+    }
     // Without your key: every object of the newest base copies is there.
     let key = backups::head_key(&st).await.unwrap();
     let v = backups::restore::verify(&nas_dest, &key).await.unwrap();
     assert!(v.contains("all there"), "{v}");
+    head.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn base_copies_send_what_changed_and_old_ones_go() {
+    let mock = c6_testkit::MockS3::start("AKTEST", "bucket").await;
+    let (dir, nas) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let head = c6_head::start(config(dir.path())).await.unwrap();
+    let st = head.state.clone();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let private = set_up(&st, nas.path(), &mock.endpoint()).await;
+    let mut s = backups::settings(&st).await;
+    for d in &mut s.destinations {
+        d.keep = 2;
+    }
+    backups::put_settings(&st, s).await.unwrap();
+    for i in 0..50 {
+        add_work(&api, &format!("work {i}")).await;
+    }
+    backups::run(&st, false).await.unwrap();
+    let chunks = |m: &c6_testkit::MockS3| m.keys().iter().filter(|k| k.starts_with("c6/chunks/")).count();
+    let first = chunks(&mock);
+    assert!(first > 0);
+
+    // A new base copy of an unchanged database sends no chunk again.
+    add_work(&api, "one more").await;
+    let (puts, _) = mock.puts();
+    backups::run(&st, true).await.unwrap();
+    let (after, _) = mock.puts();
+    let gens_now = |m: &c6_testkit::MockS3| {
+        let mut g: Vec<String> = m.keys().iter().filter(|k| k.ends_with("/manifest")).cloned().collect();
+        g.sort();
+        g
+    };
+    eprintln!("a second base copy wrote {} objects ({} chunks in all, {first} at first)", after - puts, chunks(&mock));
+    assert!(chunks(&mock) <= first + 2 * gens_now(&mock).len(), "few new chunks: {} then {first}", chunks(&mock));
+
+    // Keep 2: a third base copy drops the first, and chunks nothing uses.
+    backups::run(&st, true).await.unwrap();
+    let dbs = gens_now(&mock).iter().map(|k| k.split('/').nth(2).unwrap().to_owned()).collect::<std::collections::BTreeSet<_>>();
+    for db in &dbs {
+        assert_eq!(gens_now(&mock).iter().filter(|k| k.contains(db.as_str())).count(), 2, "{:?}", gens_now(&mock));
+    }
+    let nas_manifests = walk(nas.path()).into_iter().filter(|k| k.ends_with("/manifest")).count();
+    assert_eq!(nas_manifests, 2 * dbs.len());
+    let status = backups::status(&st).await.unwrap();
+    assert!(status.destinations.iter().all(|d| d.stored_objects > 0 && d.stored_bytes > 0), "{status:?}");
+
+    // Too far behind: S3 starts again from a new base copy, and has it all.
+    let mut s = backups::settings(&st).await;
+    s.spool_limit_mb = 0;
+    backups::put_settings(&st, s).await.unwrap();
+    mock.set_down(true);
+    add_work(&api, "while S3 was down").await;
+    let status = backups::run(&st, false).await.unwrap();
+    let s3 = status.destinations.iter().find(|d| d.name == "s3").unwrap();
+    assert!(!s3.last_error.is_empty() && s3.behind_ms.is_some(), "{s3:?}");
+    let c6h = s3.generations.iter().find(|g| g.database == "c6h.db").unwrap();
+    assert!(!c6h.complete, "its changes didn't get there: {s3:?}");
+    mock.set_down(false);
+    // Back: its next base copies catch it up (a forced pass, so as not to
+    // wait out the retry delay after a base copy failed partway).
+    backups::run(&st, true).await.unwrap();
+    let status = backups::run(&st, false).await.unwrap();
+    let s3 = status.destinations.iter().find(|d| d.name == "s3").unwrap();
+    assert_eq!(s3.last_error, "", "{s3:?}");
+    assert!(s3.behind_ms.is_none(), "{s3:?}");
+    let o = c6_head::backups::dest::S3 {
+        endpoint: mock.endpoint(),
+        bucket: "bucket".into(),
+        region: "us-east-1".into(),
+        prefix: "c6/".into(),
+        access_key: "AKTEST".into(),
+        secret_key: "secret".into(),
+        http: reqwest::Client::new(),
+    };
+    let back = tempfile::tempdir().unwrap();
+    let r = backups::restore::restore(&o, &private, None, back.path()).await.unwrap();
+    assert!(r.ok(), "{}", r.text());
+    let restored = c6_head::start(config(back.path())).await.unwrap();
+    let rapi = format!("http://127.0.0.1:{}/api/v1", restored.ui_addrs[0].port());
+    assert!(work_titles(&rapi).await.contains(&"while S3 was down".to_owned()));
+    restored.shutdown().await.unwrap();
     head.shutdown().await.unwrap();
 }

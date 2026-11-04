@@ -99,7 +99,8 @@ pub async fn restore(o: &dyn Objects, private: &str, at: Option<i64>, to: &Path)
         if !parts.iter().any(|p| p == "manifest") {
             continue;
         }
-        let m: Manifest = serde_json::from_slice(&crypt::open(&key, &o.get(&format!("db/{dbk}/{id}/manifest")).await?.context("manifest")?)?)?;
+        let m: Manifest =
+            serde_json::from_slice(&crypt::open(&key, &o.get(&format!("db/{dbk}/{id}/manifest")).await?.context("manifest")?)?)?;
         if m.base_at > at {
             continue;
         }
@@ -225,11 +226,8 @@ pub async fn verify(o: &dyn Objects, head: &HeadKey) -> anyhow::Result<String> {
         // Every object is there; the manifest, the log and a sample of chunks
         // are read back and hashed (not every chunk: that would read the
         // whole backup back each time).
-        let sample: Vec<(&String, &String)> = i
-            .hashes
-            .iter()
-            .filter(|(n, _)| !n.starts_with("chunks/") || rand::random::<u8>() < 16)
-            .collect();
+        let sample: Vec<(&String, &String)> =
+            i.hashes.iter().filter(|(n, _)| !n.starts_with("chunks/") || rand::random::<u8>() < 16).collect();
         for (name, _) in &i.hashes {
             anyhow::ensure!(names.contains(name.as_str()), "{name} is missing");
         }

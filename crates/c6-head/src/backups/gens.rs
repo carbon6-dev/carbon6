@@ -27,6 +27,9 @@ pub const CHUNK: usize = 4 << 20;
 /// when the database's log grows past this meanwhile.
 const MAX_LOG_DURING_BASE: u64 = 1 << 30;
 
+/// How long to wait after a base copy failed partway.
+const BASE_RETRY_MS: i64 = 5 * 60_000;
+
 /// A destination's generation of one database.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DestGen {
@@ -43,6 +46,9 @@ pub struct DestGen {
     /// It fell too far behind (or broke): it takes no more segments.
     #[serde(default)]
     pub lost: bool,
+    /// When it was lost (its changes have waited since).
+    #[serde(default)]
+    pub lost_at: Option<i64>,
     /// When a base copy last failed here, to wait before the next.
     #[serde(default)]
     pub failed_at: Option<i64>,
@@ -85,8 +91,9 @@ fn needs_base(st: &HeadState, s: &BackupSettings, d: &BackupDestination, rel: &s
         (state.dests.get(&d.name).and_then(|x| x.gens.get(rel)).cloned(), state.dbs.get(rel).map(|x| x.epoch).unwrap_or(0))
     });
     let Some(g) = g else { return true };
-    // After a failure, wait a while before reading the database again.
-    if g.failed_at.is_some_and(|t| now_ms() - t < 15 * 60_000) && !force {
+    // After a base copy failed partway, wait a while before reading the
+    // database again (one that couldn't reach the destination read nothing).
+    if g.failed_at.is_some_and(|t| now_ms() - t < BASE_RETRY_MS) && !force {
         return false;
     }
     force || !g.complete || g.lost || g.epoch != epoch || now_ms() - g.base_at > s.generation_days as i64 * 86_400_000
@@ -94,7 +101,8 @@ fn needs_base(st: &HeadState, s: &BackupSettings, d: &BackupDestination, rel: &s
 
 /// Takes a base copy of `rel` for one destination.
 async fn base_copy(st: &HeadState, d: &BackupDestination, o: &dyn Objects, to: &PublicKey, key: &HeadKey, rel: &str) -> anyhow::Result<()> {
-    let have: BTreeSet<String> = o.list("chunks/").await?.into_iter().filter_map(|l| l.name.strip_prefix("chunks/").map(str::to_owned)).collect();
+    let have: BTreeSet<String> =
+        o.list("chunks/").await?.into_iter().filter_map(|l| l.name.strip_prefix("chunks/").map(str::to_owned)).collect();
     let start = capture::begin_base(st, rel).await?;
     let base_at = now_ms();
     let id = format!("{base_at:013}-{:04x}", rand::random::<u16>());
@@ -103,7 +111,17 @@ async fn base_copy(st: &HeadState, d: &BackupDestination, o: &dyn Objects, to: &
         let failed_at = ds.gens.get(rel).and_then(|g| g.failed_at);
         ds.gens.insert(
             rel.to_owned(),
-            DestGen { id: id.clone(), base_at, epoch: start.epoch, start_seq: start.start_seq, sent_seq: start.start_seq, complete: false, lost: false, failed_at },
+            DestGen {
+                id: id.clone(),
+                base_at,
+                epoch: start.epoch,
+                start_seq: start.start_seq,
+                sent_seq: start.start_seq,
+                complete: false,
+                lost: false,
+                lost_at: None,
+                failed_at,
+            },
         );
     });
     let r = async {
@@ -191,7 +209,15 @@ fn page_size_of(path: &std::path::Path) -> anyhow::Result<u32> {
 
 /// Sends a database's spooled segments that this destination's generation
 /// still needs.
-async fn send_segments(st: &HeadState, s: &BackupSettings, d: &BackupDestination, o: &dyn Objects, to: &PublicKey, key: &HeadKey, rel: &str) -> anyhow::Result<()> {
+async fn send_segments(
+    st: &HeadState,
+    s: &BackupSettings,
+    d: &BackupDestination,
+    o: &dyn Objects,
+    to: &PublicKey,
+    key: &HeadKey,
+    rel: &str,
+) -> anyhow::Result<()> {
     let (g, epoch) = st.backups.with(st, |state| {
         (state.dests.get(&d.name).and_then(|x| x.gens.get(rel)).cloned(), state.dbs.get(rel).map(|x| x.epoch).unwrap_or(0))
     });
@@ -206,6 +232,7 @@ async fn send_segments(st: &HeadState, s: &BackupSettings, d: &BackupDestination
         st.backups.with(st, |state| {
             if let Some(g) = state.dests.get_mut(&d.name).and_then(|x| x.gens.get_mut(rel)) {
                 g.lost = true;
+                g.lost_at.get_or_insert(now_ms());
             }
         });
         anyhow::bail!("{rel}: more than {} MB of changes waited to be sent; a new base copy follows", s.spool_limit_mb);
@@ -305,7 +332,8 @@ async fn retain(st: &HeadState, d: &BackupDestination, o: &dyn Objects, key: &He
             ["chunks", name] => !making && !used.contains(*name),
             // Small files older than the oldest kept generation, but the newest.
             ["files", t] => {
-                oldest_kept.as_ref().is_some_and(|o| *t < &o[..13]) && all.iter().filter(|x| x.name.starts_with("files/")).last().is_some_and(|x| x.name != l.name)
+                oldest_kept.as_ref().is_some_and(|o| *t < &o[..13])
+                    && all.iter().filter(|x| x.name.starts_with("files/")).last().is_some_and(|x| x.name != l.name)
             }
             _ => false,
         };
@@ -326,7 +354,15 @@ async fn retain(st: &HeadState, d: &BackupDestination, o: &dyn Objects, key: &He
 
 /// A destination's databases: base copies where needed, then segments,
 /// then pruning after any base copy.
-pub async fn send(st: &HeadState, s: &BackupSettings, d: &BackupDestination, o: &dyn Objects, to: &PublicKey, key: &HeadKey, force: bool) -> anyhow::Result<()> {
+pub async fn send(
+    st: &HeadState,
+    s: &BackupSettings,
+    d: &BackupDestination,
+    o: &dyn Objects,
+    to: &PublicKey,
+    key: &HeadKey,
+    force: bool,
+) -> anyhow::Result<()> {
     let mut copied = false;
     let mut first_error = None;
     for rel in capture::databases(&st.data_dir) {
