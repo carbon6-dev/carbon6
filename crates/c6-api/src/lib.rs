@@ -3810,6 +3810,15 @@ pub struct TestChannel {
     pub name: String,
 }
 
+/// `GET|PUT /api/v1/system/upgrades/backups`: how many copies of each
+/// database the upgrades keep in its `backups/` (older ones are removed).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UpgradeBackups {
+    /// At least 1: the copy the last upgrade made always stays.
+    pub keep: u32,
+}
+
 /// `GET /api/v1/system/upgrades`: an upgrade of one of carbon6's
 /// databases, newest first (docs/os.md §13).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

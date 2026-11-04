@@ -227,6 +227,45 @@ pub async fn check_upgrade(path: &Path) -> anyhow::Result<c6_core::upgrade::Repo
 pub const PER_REALM: &[&str] =
     &["session_suggestions", "web_search", "assistant", "subagent_limits", "claude_code_tools", "brief", "work", "docs", "attention_seen"];
 
+/// How many backups of each database upgrades keep (docs/os.md §13).
+const KEEP_BACKUPS: &str = "upgrade_backups_keep";
+
+fn parse_keep(v: &str) -> usize {
+    v.trim().parse::<usize>().map_or(c6_core::upgrade::KEEP_BACKUPS, |n| n.max(1))
+}
+
+/// The setting in a database not yet opened (and maybe not yet upgraded):
+/// the default when there's none or it can't be read.
+async fn peek_keep_backups(path: &Path) -> usize {
+    if !path.exists() {
+        return c6_core::upgrade::KEEP_BACKUPS;
+    }
+    let read = async {
+        let opts = SqliteConnectOptions::from_str("sqlite:")?.filename(path).read_only(true);
+        let mut c = <sqlx::SqliteConnection as sqlx::Connection>::connect_with(&opts).await?;
+        let v: Option<String> =
+            sqlx::query_scalar("SELECT value FROM settings WHERE key = ?").bind(KEEP_BACKUPS).fetch_optional(&mut c).await?;
+        sqlx::Connection::close(c).await?;
+        anyhow::Ok(v)
+    };
+    read.await.ok().flatten().as_deref().map_or(c6_core::upgrade::KEEP_BACKUPS, parse_keep)
+}
+
+/// Removes older backups of every database in the head's folder (its own,
+/// the knowledge store's, each realm's), keeping the newest `keep`.
+pub fn prune_backups(data_dir: &Path, keep: usize) {
+    let knowledge = data_dir.join("knowledge");
+    let mut dbs = vec![data_dir.join("c6h.db"), knowledge.join("memex.db")];
+    if let Ok(realms) = std::fs::read_dir(knowledge.join("realms")) {
+        dbs.extend(realms.flatten().map(|r| r.path().join("memex.db")));
+    }
+    for db in dbs {
+        if let Err(e) = c6_core::upgrade::prune_backups(&db, keep) {
+            tracing::warn!(database = %db.display(), error = %format!("{e:#}"), "removing older backups failed");
+        }
+    }
+}
+
 fn own_key(key: &str, realm: &str) -> String {
     format!("{key}@{realm}")
 }
@@ -258,6 +297,11 @@ impl Store {
     /// Opens the database, upgrading it first if needed, with the upgrade's
     /// report (`None` when nothing needed doing).
     pub async fn open_reporting(path: &Path) -> anyhow::Result<(Self, Option<c6_core::upgrade::Report>)> {
+        // Every database in the head's folder keeps as many backups as it
+        // says, read before this one's upgrade removes any.
+        if let Some(dir) = path.parent() {
+            c6_core::upgrade::keep_backups(dir, peek_keep_backups(path).await);
+        }
         let opts = SqliteConnectOptions::from_str("sqlite:")?
             .filename(path)
             .create_if_missing(true)
@@ -274,6 +318,21 @@ impl Store {
     /// Earlier upgrades of this database, newest first.
     pub async fn upgrades(&self) -> anyhow::Result<Vec<c6_core::upgrade::Report>> {
         c6_core::upgrade::reports(&self.pool).await
+    }
+
+    /// How many backups of each database upgrades keep.
+    pub async fn keep_backups(&self) -> anyhow::Result<usize> {
+        Ok(self.raw_setting(KEEP_BACKUPS).await?.as_deref().map_or(c6_core::upgrade::KEEP_BACKUPS, parse_keep))
+    }
+
+    /// Sets it for every database in this database's folder.
+    pub async fn set_keep_backups(&self, keep: usize) -> anyhow::Result<()> {
+        let keep = keep.max(1);
+        self.set_setting(KEEP_BACKUPS, &keep.to_string()).await?;
+        if let Some(dir) = self.pool.connect_options().get_filename().parent() {
+            c6_core::upgrade::keep_backups(dir, keep);
+        }
+        Ok(())
     }
 
     pub async fn create_enrollment(&self, secret_hash: &str, name: Option<&str>, now: i64, expires_at: i64) -> anyhow::Result<()> {

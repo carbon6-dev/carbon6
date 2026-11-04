@@ -7,10 +7,12 @@
 //! so the database is exactly as it was and the previous build still runs
 //! on it. Every table must keep at least as many rows as it had, unless a
 //! pending migration says it moves or drops that table. Each upgrade leaves
-//! a report in the database's `upgrades` table.
+//! a report in the database's `upgrades` table. After a successful upgrade
+//! only the newest few backups of that database are kept (`keep_backups`).
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Mutex;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -220,6 +222,9 @@ pub async fn open(
     match outcome {
         Ok(report) => {
             info!(database = %database, from = ?report.from_version, to = report.to_version, backup = ?report.backup, "upgraded");
+            if let Err(e) = prune(path, kept_for(path), Some(&backup)) {
+                warn!(database = %database, error = %format!("{e:#}"), "removing older backups failed");
+            }
             Ok((pool, Some(report)))
         }
         Err(e) => {
@@ -410,6 +415,80 @@ fn backup_path(path: &Path, from: i64, to: i64) -> PathBuf {
     candidate
 }
 
+/// How many backups of each database to keep when nothing says otherwise.
+pub const KEEP_BACKUPS: usize = 3;
+
+/// How many backups each database under a folder keeps (the nearest folder
+/// set wins). Per folder, not one global, so heads sharing a process (tests)
+/// each keep their own.
+static KEEP: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(Vec::new());
+
+/// Databases under `dir` keep their newest `keep` backups (at least one: the
+/// copy the last upgrade made).
+pub fn keep_backups(dir: &Path, keep: usize) {
+    let mut k = KEEP.lock().unwrap_or_else(|e| e.into_inner());
+    k.retain(|(d, _)| d != dir);
+    k.push((dir.to_owned(), keep.max(1)));
+}
+
+fn kept_for(path: &Path) -> usize {
+    let k = KEEP.lock().unwrap_or_else(|e| e.into_inner());
+    k.iter().filter(|(d, _)| path.starts_with(d)).max_by_key(|(d, _)| d.components().count()).map_or(KEEP_BACKUPS, |(_, n)| *n)
+}
+
+/// Removes all but the newest `keep` (at least one) backups of the database
+/// at `path` from `backups/` beside it. Files that aren't its backups stay.
+/// The paths removed.
+pub fn prune_backups(path: &Path, keep: usize) -> anyhow::Result<Vec<PathBuf>> {
+    prune(path, keep, None)
+}
+
+fn prune(path: &Path, keep: usize, made: Option<&Path>) -> anyhow::Result<Vec<PathBuf>> {
+    let dir = path.parent().unwrap_or(Path::new(".")).join("backups");
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "db".into());
+    let Ok(entries) = std::fs::read_dir(&dir) else { return Ok(Vec::new()) };
+    let mut found: Vec<((String, i64, u32), PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            backup_order(&stem, &name).map(|o| (o, e.path()))
+        })
+        .collect();
+    // Newest first.
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut removed = Vec::new();
+    for (_, p) in found.into_iter().skip(keep.max(1)) {
+        if made.is_some_and(|m| m == p) {
+            continue;
+        }
+        std::fs::remove_file(&p).with_context(|| format!("removing {}", p.display()))?;
+        removed.push(p);
+    }
+    if !removed.is_empty() {
+        info!(database = %path.display(), removed = removed.len(), "removed older backups");
+    }
+    Ok(removed)
+}
+
+/// Where a backup of database `stem` (`<stem>-vFROM-to-vTO-YYYYMMDD-HHMMSS[-n].db`)
+/// sorts: by when it was made, then version, then attempt. `None`: not one.
+fn backup_order(stem: &str, name: &str) -> Option<(String, i64, u32)> {
+    let rest = name.strip_prefix(stem)?.strip_prefix("-v")?.strip_suffix(".db")?;
+    let (from, rest) = rest.split_once("-to-v")?;
+    let mut parts = rest.split('-');
+    let to: i64 = parts.next()?.parse().ok()?;
+    let (day, time) = (parts.next()?, parts.next()?);
+    let attempt: u32 = match parts.next() {
+        None => 1,
+        Some(n) => n.parse().ok()?,
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if parts.next().is_some() || !digits(from) || !(digits(day) && day.len() == 8) || !(digits(time) && time.len() == 6) {
+        return None;
+    }
+    Some((format!("{day}{time}"), to, attempt))
+}
+
 /// `YYYYMMDD-HHMMSS` in UTC.
 fn utc_stamp(ms: i64) -> String {
     let secs = ms.div_euclid(1000);
@@ -521,6 +600,41 @@ mod tests {
         assert_eq!(all.iter().map(|r| r.to_version).collect::<Vec<_>>(), vec![2, 1]);
         assert!(r.text().contains("version 1 → 2") && r.text().contains("applied 0002 tags"), "{}", r.text());
         pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn upgrades_keep_only_the_newest_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = at_v1(dir.path()).await;
+        keep_backups(dir.path(), 2);
+        // Another database's backups, and a file that isn't a backup, beside them.
+        std::fs::create_dir_all(dir.path().join("backups")).unwrap();
+        let other = dir.path().join("backups/app2-v0001-to-v0002-20260101-000000.db");
+        let note = dir.path().join("backups/app-v0001-notes.txt");
+        std::fs::write(&other, "").unwrap();
+        std::fs::write(&note, "").unwrap();
+        let mut migrations = vec![V1];
+        let sql: Vec<String> = (2..=5).map(|v| format!("CREATE TABLE t{v} (id INTEGER);")).collect();
+        let mut made = Vec::new();
+        for v in 2..=5 {
+            migrations.push((v, "more", &sql[v as usize - 2]));
+            let (pool, report) = open_db(&path, &migrator(dir.path(), &migrations).await, &Plan::default()).await.unwrap();
+            pool.close().await;
+            let backup = PathBuf::from(report.unwrap().backup.unwrap());
+            assert!(backup.exists(), "the copy this upgrade made is kept: {backup:?}");
+            made.push(backup);
+        }
+        let mut left = backups(dir.path());
+        left.sort();
+        let mut want = vec![made[2].clone(), made[3].clone(), other, note];
+        want.sort();
+        assert_eq!(left, want, "the newest two of this database's backups, and the rest untouched");
+        // The newest is the database just before the last upgrade.
+        assert_eq!(notes(&made[3]).await, vec!["a", "b", "c"]);
+
+        // Keeping fewer, even none, still keeps the last one.
+        assert_eq!(prune_backups(&path, 0).unwrap(), vec![made[2].clone()]);
+        assert!(made[3].exists());
     }
 
     #[tokio::test]

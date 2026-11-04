@@ -207,6 +207,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/catalog", get(get_catalog))
         .route("/api/v1/openapi.json", get(get_openapi))
         .route("/api/v1/system/upgrades", get(get_upgrades))
+        .route("/api/v1/system/upgrades/backups", get(get_upgrade_backups).put(put_upgrade_backups))
         .route("/api/v1/system/updates", get(get_updates))
         .route("/api/v1/system/activity", get(get_activity))
         .route("/api/v1/system/activity/counts", get(get_activity_counts))
@@ -4114,6 +4115,19 @@ async fn get_upgrades(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<ap
     }
     out.sort_by_key(|u| std::cmp::Reverse(u.at));
     Ok(Json(out))
+}
+
+async fn get_upgrade_backups(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::UpgradeBackups>> {
+    Ok(Json(api::UpgradeBackups { keep: st.store.keep_backups().await? as u32 }))
+}
+
+async fn put_upgrade_backups(State(st): State<Arc<HeadState>>, Json(b): Json<api::UpgradeBackups>) -> ApiResult<StatusCode> {
+    if b.keep == 0 {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, "keep at least 1 (the copy the last upgrade made)".into()));
+    }
+    st.store.set_keep_backups(b.keep as usize).await?;
+    crate::store::prune_backups(&st.data_dir, b.keep as usize);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// The API as OpenAPI 3.1, for code generation.

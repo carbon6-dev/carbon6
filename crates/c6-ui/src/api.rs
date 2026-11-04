@@ -764,6 +764,14 @@ pub async fn upgrades() -> Result<Vec<c6_api::Upgrade>, String> {
     json(Request::get("/api/v1/system/upgrades").send().await).await
 }
 
+pub async fn upgrade_backups() -> Result<c6_api::UpgradeBackups, String> {
+    json(Request::get("/api/v1/system/upgrades/backups").send().await).await
+}
+
+pub async fn put_upgrade_backups(b: c6_api::UpgradeBackups) -> Result<(), String> {
+    empty(Request::put("/api/v1/system/upgrades/backups").json(&b).map_err(|e| e.to_string())?.send().await).await
+}
+
 pub async fn hosts() -> Result<Vec<c6_api::HostStatus>, String> {
     json(Request::get("/api/v1/hosts").send().await).await
 }

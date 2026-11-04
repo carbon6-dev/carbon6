@@ -785,7 +785,7 @@ carbon6 already holds real data. Every step of the build order upgrades it to th
 
 ### 13.1 Principles
 
-1. **A backup first.** Before a step changes data, the head copies its database (SQLite `VACUUM INTO`) next to it, with the version and time in the name. The memex does the same for its store. Backups stay until you delete them. `master.key` is never touched.
+1. **A backup first.** Before a step changes data, the head copies its database (SQLite `VACUUM INTO`) next to it, with the version and time in the name. The memex does the same for its store. Each database keeps its newest 3 backups (Settings → Upgrades, `system.upgrades.backups.put`, at least 1); older ones are removed after a successful upgrade, when the head starts, and when the setting changes. The copy the last upgrade made is never removed. `master.key` is never touched.
 2. **All or nothing.** Each step's migration runs in one transaction per database. If it fails, it rolls back and the head refuses to start, saying why. The database is unchanged, so the previous version still runs on it.
 3. **Nothing is lost.** Every field moves somewhere. Anything without a place in the new shape is kept in a `legacy` field on the new record, never dropped.
 4. **Identity is kept.** Session, item, thing and fact ids stay the same, so links, `@`-mentions and history keep working. Where an id has to change (action items' numbers become decision ids), a map is kept, so old references such as "action item #12" still resolve.
@@ -802,6 +802,7 @@ carbon6 already holds real data. Every step of the build order upgrades it to th
   - **Backup:** pending migrations are found by comparing the migrator with `_sqlx_migrations`. Before any runs, the database is copied with `VACUUM INTO` to `backups/<name>-v<from>-to-v<to>-<UTC time>.db`.
   - **Checks:** after migrating, every table's row count is compared with before. A table may shrink or vanish only if a pending migration names it in the store's `Plan` (`Allow`). `Check`s compare a query on the backup (attached as `before`) with one on the upgraded database.
   - **Restore:** a failed migration, lost rows or a failed check close the pool, put the backup back (removing the WAL files), and return an error naming the backup.
+  - **Pruning:** `c6_core::upgrade::keep_backups(dir, n)` sets how many backups databases under `dir` keep; after a successful upgrade the oldest beyond `n` are removed, sorted by the time in their names. The head reads its setting (`upgrade_backups_keep`) from `c6h.db` before opening it, so its own upgrade already keeps what you chose, then prunes `c6h.db`, `knowledge/memex.db` and each realm's `memex.db` at start.
   - **Reports:** each upgrade's report is stored in the database's own `upgrades` table.
 - **Commands:** `c6h upgrade [--check]` and `c6m upgrade [--check]`. `--check` copies the database to a temporary directory and upgrades the copy.
 - **Seeing them:** `GET /api/v1/system/upgrades` (operation `system.upgrades`) and **Settings → System** list the head's and the memex's reports.

@@ -725,6 +725,8 @@ fn build() -> Vec<Op> {
         op!("system.updates.settings.get", "system", "GET" "/api/v1/settings/updates", Read, Input::None, "When carbon6 updates itself: off, notify, approve (a decision for each release) or auto (within a window, up to patch or minor)."),
         op!("system.updates.settings.put", "system", "PUT" "/api/v1/settings/updates", Write, Input::Body(schema::<api::UpdateSettings>), "Sets when carbon6 updates itself."),
         op!("system.upgrades", "system", "GET" "/api/v1/system/upgrades", Read, Input::None, "Upgrades of carbon6's databases (the head's and the memex's), newest first: versions, what changed, and where the backup is."),
+        op!("system.upgrades.backups.get", "system", "GET" "/api/v1/system/upgrades/backups", Read, Input::None, "How many copies of each database the upgrades keep (the copy made before each upgrade; older ones are removed)."),
+        op!("system.upgrades.backups.put", "system", "PUT" "/api/v1/system/upgrades/backups", Write, Input::Body(schema::<api::UpgradeBackups>), "Sets how many copies of each database to keep (at least 1), and removes older ones now."),
         op!("auth.tokens.list", "account", "GET" "/api/v1/auth/tokens", Read, Input::None, "API tokens (for the c6 CLI and scripts)."),
         op!("auth.tokens.create", "account", "POST" "/api/v1/auth/tokens", Secret, Input::Body(schema::<api::CreateApiToken>), "Creates an API token for the c6 CLI or a script.", secret = &["token"]),
         op!("auth.tokens.delete", "account", "DELETE" "/api/v1/auth/tokens/{id}", Destructive, Input::None, "Deletes an API token (it stops working).", choices = &[("id", "auth.tokens.list")]),

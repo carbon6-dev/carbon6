@@ -1631,10 +1631,34 @@ fn UpdatesSetting() -> impl IntoView {
 #[component]
 fn Upgrades() -> impl IntoView {
     let list = LocalResource::new(crate::api::upgrades);
+    let keep = LocalResource::new(crate::api::upgrade_backups);
+    let error = RwSignal::new(None::<String>);
+    let save = move |n: u32| {
+        leptos::task::spawn_local(async move {
+            match crate::api::put_upgrade_backups(c6_api::UpgradeBackups { keep: n }).await {
+                Ok(()) => error.set(None),
+                Err(e) => error.set(Some(e)),
+            }
+            keep.refetch();
+        })
+    };
+    let keep_changed = move |v: String| match v.trim().parse::<u32>() {
+        Ok(n) if n >= 1 => save(n),
+        _ => error.set(Some("keep at least 1".into())),
+    };
     view! {
         <section class="space-y-2 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <h2 class="font-medium">"Upgrades"</h2>
             <p class="text-sm text-muted">"Each new version of carbon6 upgrades its databases when it starts (or with c6h upgrade). The database is copied to backups/ next to it first; a failed upgrade puts the copy back, so nothing changes. To go back to an earlier version, stop carbon6 and put the backup in place of the database. To see what an upgrade would do first: c6h upgrade --check."</p>
+            {move || keep.get().and_then(Result::ok).map(|k| view! {
+                <label class="flex items-center gap-2 text-sm">
+                    "Keep the newest"
+                    <input type="number" min="1" max="100" class=format!("{INPUT} w-20!") prop:value=k.keep.to_string()
+                        on:change=move |ev| keep_changed(event_target_value(&ev)) />
+                    "copies of each database; older ones are removed"
+                </label>
+            })}
+            {move || error.get().map(|e| view! { <p class="text-sm text-red-600">{e}</p> })}
             {move || list.get().map(|r| match r {
                 Err(e) => view! { <p class="text-sm text-red-600">{e}</p> }.into_any(),
                 Ok(v) if v.is_empty() => view! { <p class="text-sm text-muted">"No upgrades yet."</p> }.into_any(),

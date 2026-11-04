@@ -279,6 +279,8 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     let updater = updates::Updater::new(&cfg);
     updates::before_open(&updater, &cfg.data_dir)?;
     let store = store::Store::open(&cfg.data_dir.join("c6h.db")).await?;
+    // Backups left by earlier upgrades, beyond the ones to keep.
+    store::prune_backups(&cfg.data_dir, store.keep_backups().await?);
     let shutdown = CancellationToken::new();
     let registry = registry::Registry::new(shutdown.clone());
     let secrets = secrets::Secrets::load_or_create(&cfg.data_dir.join("master.key"))?;

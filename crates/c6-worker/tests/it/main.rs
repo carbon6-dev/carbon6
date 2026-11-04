@@ -69,6 +69,7 @@ mod suggestions;
 mod task_cards;
 mod triggers;
 mod updates;
+mod upgrade_backups;
 mod usage;
 mod views;
 mod websearch;
