@@ -140,12 +140,16 @@ pub async fn objects(st: &HeadState, d: &BackupDestination) -> anyhow::Result<Ar
     match d.kind.as_str() {
         "folder" => Ok(Arc::new(dest::Folder::new(Path::new(d.path.trim())))),
         "s3" => {
+            // Root's secrets, else home's (where Settings → Secrets puts them).
             let secret = |name: &str| {
                 let name = name.trim().to_owned();
                 async move {
-                    crate::secrets::value_in(st, crate::realms::ROOT, &name)
-                        .await?
-                        .ok_or_else(|| anyhow::anyhow!("no secret {name:?} (add it under Settings → Secrets)"))
+                    for realm in [crate::realms::ROOT, crate::realms::HOME] {
+                        if let Some(v) = crate::secrets::value_in(st, realm, &name).await? {
+                            return Ok(v);
+                        }
+                    }
+                    Err(anyhow::anyhow!("no secret {name:?} (add it under Settings → Secrets)"))
                 }
             };
             Ok(Arc::new(dest::S3 {

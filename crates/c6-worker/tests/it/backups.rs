@@ -49,7 +49,8 @@ pub(crate) fn s3(name: &str, endpoint: &str) -> BackupDestination {
 /// Sets up backups to a folder and the stand-in S3; your private key.
 pub(crate) async fn set_up(st: &c6_head::HeadState, nas: &Path, s3_endpoint: &str) -> String {
     c6_head::secrets::put_in(st, "root", "S3_KEY", "AKTEST", "").await.unwrap();
-    c6_head::secrets::put_in(st, "root", "S3_SECRET", "secret", "").await.unwrap();
+    // As Settings → Secrets keeps them: in home.
+    c6_head::secrets::put_in(st, "home", "S3_SECRET", "secret", "").await.unwrap();
     let pair = backups::new_key(st).await.unwrap();
     let mut s = backups::settings(st).await;
     s.destinations = vec![folder("nas", nas), s3("s3", s3_endpoint)];
