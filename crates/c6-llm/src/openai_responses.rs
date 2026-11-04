@@ -4,6 +4,7 @@
 //! "Sign in with ChatGPT".
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -12,6 +13,44 @@ use serde_json::{Value, json};
 use crate::http;
 use crate::sse::SseDecoder;
 use crate::{Block, EventStream, LlmError, ModelClient, ModelEvent, ModelRequest, Role, Usage};
+
+/// ChatGPT's default Codex plan windows, as reported on a model response.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ChatGptLimits {
+    pub primary: Option<ChatGptWindow>,
+    pub secondary: Option<ChatGptWindow>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChatGptWindow {
+    pub used_percent: f64,
+    pub window_minutes: Option<i64>,
+    /// Unix seconds (not milliseconds or seconds from now).
+    pub resets_at: Option<i64>,
+}
+
+/// Called once response headers arrive, before the stream is consumed.
+pub type ChatGptLimitsHook = Arc<dyn Fn(ChatGptLimits) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+
+/// The legacy/default `x-codex` family, as in Codex's
+/// `codex-rs/codex-api/src/rate_limits.rs`. A window needs a finite usage
+/// percentage; malformed optional fields do not discard its usage.
+pub fn parse_chatgpt_limits(headers: &reqwest::header::HeaderMap) -> Option<ChatGptLimits> {
+    let window = |which: &str| {
+        let prefix = format!("x-codex-{which}");
+        let value = |suffix: &str| headers.get(format!("{prefix}-{suffix}")).and_then(|v| v.to_str().ok());
+        let used_percent = value("used-percent")?.parse::<f64>().ok().filter(|v| v.is_finite())?;
+        let window_minutes = value("window-minutes").and_then(|v| v.parse::<i64>().ok()).filter(|m| *m > 0);
+        let resets_at = value("reset-at").and_then(|v| v.parse::<i64>().ok()).filter(|s| *s > 0);
+        // Codex ignores an empty all-zero window too.
+        if used_percent == 0.0 && window_minutes.is_none() && resets_at.is_none() {
+            return None;
+        }
+        Some(ChatGptWindow { used_percent, window_minutes, resets_at })
+    };
+    let limits = ChatGptLimits { primary: window("primary"), secondary: window("secondary") };
+    (limits.primary.is_some() || limits.secondary.is_some()).then_some(limits)
+}
 
 pub struct OpenAiResponses {
     http: reqwest::Client,
@@ -23,6 +62,7 @@ pub struct OpenAiResponses {
     official: bool,
     /// Attempts at each request (`http::post_json`).
     attempts: u32,
+    limits_hook: Option<ChatGptLimitsHook>,
 }
 
 impl OpenAiResponses {
@@ -33,7 +73,7 @@ impl OpenAiResponses {
         }
         let official = url::Url::parse(base_url).ok().and_then(|u| u.host_str().map(|h| h == "api.openai.com")).unwrap_or(false);
         let base_url = base_url.trim_end_matches('/').to_owned();
-        Ok(Self { http: http::client()?, base_url, headers, plan, official, attempts: http::MAX_ATTEMPTS })
+        Ok(Self { http: http::client()?, base_url, headers, plan, official, attempts: http::MAX_ATTEMPTS, limits_hook: None })
     }
 
     /// Gives up after the first failed attempt.
@@ -149,10 +189,20 @@ fn input_items(msgs: &[crate::Message]) -> Vec<Value> {
 
 #[async_trait]
 impl ModelClient for OpenAiResponses {
+    fn set_chatgpt_limits_hook(&mut self, hook: ChatGptLimitsHook) {
+        self.limits_hook = Some(hook);
+    }
+
     async fn stream(&self, req: &ModelRequest) -> Result<EventStream, LlmError> {
         let body = self.request_body(req);
         let headers = self.request_headers(req);
         let resp = http::post_json(&self.http, &format!("{}/responses", self.base_url), &headers, &body, self.attempts).await?;
+        if self.plan
+            && let Some(hook) = &self.limits_hook
+            && let Some(limits) = parse_chatgpt_limits(resp.headers())
+        {
+            hook(limits).await;
+        }
         let state = State::new(resp.bytes_stream().boxed());
         Ok(futures::stream::unfold(state, |mut st| async move {
             loop {
@@ -311,6 +361,63 @@ fn item_block(item: &Value) -> Option<Block> {
 mod tests {
     use super::*;
     use crate::{Accumulator, Message, ToolSpec};
+
+    #[test]
+    fn chatgpt_limit_headers_and_units() {
+        let headers = reqwest::header::HeaderMap::from_iter([
+            ("x-codex-primary-used-percent".parse().unwrap(), "34.5".parse().unwrap()),
+            ("x-codex-primary-window-minutes".parse().unwrap(), "300".parse().unwrap()),
+            ("x-codex-primary-reset-at".parse().unwrap(), "1793750400".parse().unwrap()),
+            ("x-codex-secondary-used-percent".parse().unwrap(), "0".parse().unwrap()),
+            ("x-codex-secondary-window-minutes".parse().unwrap(), "10080".parse().unwrap()),
+            ("x-codex-secondary-reset-at".parse().unwrap(), "1794355200".parse().unwrap()),
+        ]);
+        assert_eq!(
+            parse_chatgpt_limits(&headers),
+            Some(ChatGptLimits {
+                primary: Some(ChatGptWindow { used_percent: 34.5, window_minutes: Some(300), resets_at: Some(1_793_750_400) }),
+                secondary: Some(ChatGptWindow { used_percent: 0.0, window_minutes: Some(10080), resets_at: Some(1_794_355_200) }),
+            })
+        );
+    }
+
+    #[test]
+    fn chatgpt_missing_and_malformed_limit_headers() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let mut headers = HeaderMap::new();
+        assert_eq!(parse_chatgpt_limits(&headers), None);
+        // Length and reset alone must not invent zero usage.
+        headers.insert("x-codex-primary-window-minutes", HeaderValue::from_static("300"));
+        headers.insert("x-codex-primary-reset-at", HeaderValue::from_static("1793750400"));
+        assert_eq!(parse_chatgpt_limits(&headers), None);
+        for bad in ["bad", "NaN", "inf", "-inf", ""] {
+            headers.insert("x-codex-primary-used-percent", HeaderValue::from_str(bad).unwrap());
+            assert_eq!(parse_chatgpt_limits(&headers), None, "{bad}");
+        }
+        headers.insert("x-codex-primary-used-percent", HeaderValue::from_bytes(b"\xff").unwrap());
+        assert_eq!(parse_chatgpt_limits(&headers), None);
+        headers.insert("x-codex-primary-used-percent", HeaderValue::from_static("101.5"));
+        for bad in ["bad", "-1", "0", "1.5", "999999999999999999999999"] {
+            headers.insert("x-codex-primary-window-minutes", HeaderValue::from_str(bad).unwrap());
+            headers.insert("x-codex-primary-reset-at", HeaderValue::from_str(bad).unwrap());
+            assert_eq!(
+                parse_chatgpt_limits(&headers),
+                Some(ChatGptLimits {
+                    primary: Some(ChatGptWindow { used_percent: 101.5, window_minutes: None, resets_at: None }),
+                    secondary: None,
+                }),
+                "{bad}"
+            );
+        }
+        headers.clear();
+        headers.insert("x-codex-primary-used-percent", HeaderValue::from_static("bad"));
+        headers.insert("x-codex-secondary-used-percent", HeaderValue::from_static("12"));
+        let limits = parse_chatgpt_limits(&headers).unwrap();
+        assert!(limits.primary.is_none());
+        assert_eq!(limits.secondary.unwrap().used_percent, 12.0, "a malformed primary doesn't discard the secondary");
+        headers.insert("x-codex-secondary-used-percent", HeaderValue::from_static("0"));
+        assert_eq!(parse_chatgpt_limits(&headers), None, "Codex ignores an all-zero window");
+    }
 
     #[test]
     fn incomplete_output_limit_is_normalized() {

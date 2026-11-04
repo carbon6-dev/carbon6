@@ -4,26 +4,30 @@
 //!
 //! - **Claude Code** reports them itself (`rate_limit_event` in its
 //!   stream), so they arrive with its sessions' turns, for free.
-//! - **ChatGPT plans** are read from the usage endpoint Codex reads for its
-//!   `/status`, every few minutes and soon after a session on one ends a
-//!   turn.
+//! - **ChatGPT plans** come from `x-codex` rate-limit headers on model
+//!   replies to the head (including pool members). Workers do not yet
+//!   forward these headers. The usage endpoint is a fallback until headers
+//!   arrive or it rejects this connection's OAuth app; that refusal is
+//!   logged once, not shown as an error on header data.
 //!
 //! Kept in memory, and the last seen in a setting (`quotas_last`), so a
 //! restarted head shows them until fresh ones come: Claude Code reports
-//! only now and then, not every turn.
+//! only now and then, not every turn. Saves are coalesced to at most one a
+//! minute, including a trailing save if replies keep arriving.
 //! A notification (event `quota`) goes out when a window passes 80% and
 //! 95%, and when it is used up, once per window.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::{Json, Router, routing::get};
 use c6_api as api;
 use c6_core::now_ms;
 use serde_json::Value;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::HeadState;
 use crate::api::ApiResult;
@@ -38,6 +42,7 @@ const CHATGPT_USAGE: &str = "https://chatgpt.com/backend-api/wham/usage";
 const POLL: Duration = Duration::from_secs(180);
 /// A read this recent is not repeated when a turn ends.
 const FRESH_MS: i64 = 60_000;
+const KEEP_EVERY: Duration = Duration::from_secs(60);
 /// Warn when a window passes these.
 const THRESHOLDS: [f64; 2] = [80.0, 95.0];
 
@@ -48,6 +53,10 @@ pub struct Quotas {
     /// What was already said: connection, window, the window's reset and
     /// the threshold (100 for used up).
     told: Mutex<HashSet<(String, String, i64, u32)>>,
+    /// Headers have superseded polling, or the endpoint refused this app.
+    endpoint_disabled: Mutex<HashSet<String>>,
+    dirty: AtomicBool,
+    last_kept: tokio::sync::Mutex<Option<Instant>>,
     /// A ChatGPT read is wanted soon (a turn ended on it).
     wake: tokio::sync::Notify,
 }
@@ -231,14 +240,23 @@ fn record(st: &HeadState, q: api::ConnectionQuota, name: &str) {
         });
     }
     st.quotas.by_connection.lock().unwrap().insert(q.connection_id.clone(), q);
+    st.quotas.dirty.store(true, Ordering::Relaxed);
 }
 
 /// Keeps what's known now for the next start.
 async fn keep(st: &HeadState) {
+    // Serialize writers, including concurrent model replies, and keep a
+    // dirty snapshot for the periodic trailing save rather than losing it.
+    let mut last = st.quotas.last_kept.lock().await;
+    if last.is_some_and(|at| at.elapsed() < KEEP_EVERY) || !st.quotas.dirty.swap(false, Ordering::Relaxed) {
+        return;
+    }
     let Ok(json) = serde_json::to_string(&st.quotas.all()) else { return };
     if let Err(e) = st.store.set_setting(KEPT, &json).await {
         warn!("keeping plan limits: {e:#}");
+        st.quotas.dirty.store(true, Ordering::Relaxed);
     }
+    *last = Some(Instant::now());
 }
 
 /// What was known before a restart, under anything already reported since.
@@ -294,6 +312,54 @@ pub async fn from_claude_code(st: &HeadState, session_id: &str, json: &str) {
     keep(st).await;
 }
 
+/// Installed on head clients before their wrappers. A weak head avoids a
+/// cycle through its pools; recording is awaited before yielding the stream.
+pub(crate) fn chatgpt_hook(st: &HeadState, connection: &str) -> Option<c6_llm::openai_responses::ChatGptLimitsHook> {
+    let head = std::sync::Arc::downgrade(&st.arc()?);
+    let connection = connection.to_owned();
+    Some(std::sync::Arc::new(move |limits| {
+        let (head, connection) = (head.clone(), connection.clone());
+        Box::pin(async move {
+            if let Some(st) = head.upgrade() {
+                from_chatgpt(&st, &connection, limits).await;
+            }
+        })
+    }))
+}
+
+/// ChatGPT headers use minutes for lengths and Unix seconds for resets.
+/// Partial snapshots keep windows the response didn't report.
+async fn from_chatgpt(st: &HeadState, connection: &str, limits: c6_llm::openai_responses::ChatGptLimits) {
+    let Ok(Some(c)) = st.store.connection(connection).await else { return };
+    if c.kind != "chatgpt" || (limits.primary.is_none() && limits.secondary.is_none()) {
+        return;
+    }
+    st.quotas.endpoint_disabled.lock().unwrap().insert(c.id.clone());
+    let mut windows = st.quotas.get(&c.id).filter(|q| q.source == "chatgpt").map(|q| q.windows).unwrap_or_default();
+    for (window, fallback) in [(limits.primary, "5h"), (limits.secondary, "week")] {
+        let Some(w) = window else { continue };
+        let name = w.window_minutes.and_then(|m| m.checked_mul(60)).map(span_name).unwrap_or_else(|| fallback.into());
+        let used_percent = w.used_percent.clamp(0.0, 100.0);
+        let window = api::QuotaWindow {
+            name,
+            used_percent,
+            resets_at: w.resets_at.and_then(|s| s.checked_mul(1000)),
+            status: if used_percent >= 100.0 { "rejected".into() } else { String::new() },
+        };
+        match windows.iter_mut().find(|x| x.name == window.name) {
+            Some(x) => *x = window,
+            None => windows.push(window),
+        }
+    }
+    windows.sort_by_key(|w| order(&w.name));
+    record(
+        st,
+        api::ConnectionQuota { connection_id: c.id, source: "chatgpt".into(), windows, updated_at: now_ms(), error: String::new() },
+        &c.name,
+    );
+    keep(st).await;
+}
+
 /// A turn ended on `connection`: a ChatGPT plan's windows are read soon.
 pub async fn turn_ended(st: &HeadState, session_id: &str) {
     let Ok(Some(s)) = st.store.session(session_id).await else { return };
@@ -307,8 +373,9 @@ async fn usage_url(st: &HeadState) -> String {
     st.store.setting(CHATGPT_USAGE_URL).await.ok().flatten().filter(|u| !u.trim().is_empty()).unwrap_or_else(|| CHATGPT_USAGE.into())
 }
 
-/// Reads one ChatGPT plan's windows with the head's own sign-in.
-async fn read_chatgpt(st: &HeadState, c: &crate::store::ConnectionRow, url: &str) -> anyhow::Result<Vec<api::QuotaWindow>> {
+/// Reads one ChatGPT plan's windows with the head's own sign-in. `None`
+/// means the endpoint refuses this OAuth app, not that the plan is used up.
+async fn read_chatgpt(st: &HeadState, c: &crate::store::ConnectionRow, url: &str) -> anyhow::Result<Option<Vec<api::QuotaWindow>>> {
     let tokens = crate::sessions::chatgpt_tokens(st, &c.id).await?;
     let mut req = st.http.get(url).bearer_auth(&tokens.access_token).header("accept", "application/json");
     if !tokens.workspace.is_empty() {
@@ -317,10 +384,15 @@ async fn read_chatgpt(st: &HeadState, c: &crate::store::ConnectionRow, url: &str
     let r = req.send().await?;
     let status = r.status();
     let body: Value = r.json().await.unwrap_or(Value::Null);
+    if !status.is_success()
+        && (body["type"] == "rejected_by_access_enforcement" || body["error"]["type"] == "rejected_by_access_enforcement")
+    {
+        return Ok(None);
+    }
     anyhow::ensure!(status.is_success(), "the usage endpoint answered {status}");
     let windows = parse_chatgpt(&body, now_ms());
     anyhow::ensure!(!windows.is_empty(), "the usage endpoint named no limits");
-    Ok(windows)
+    Ok(Some(windows))
 }
 
 /// Reads every ChatGPT plan's windows now.
@@ -328,28 +400,50 @@ pub async fn poll_chatgpt(st: &HeadState) {
     let Ok(connections) = st.store.connections().await else { return };
     let url = usage_url(st).await;
     for c in connections.iter().filter(|c| c.kind == "chatgpt") {
-        let q = match read_chatgpt(st, c, &url).await {
-            Ok(windows) => api::ConnectionQuota {
-                connection_id: c.id.clone(),
-                source: "chatgpt".into(),
-                windows,
-                updated_at: now_ms(),
-                error: String::new(),
-            },
-            Err(e) => {
-                warn!(connection = %c.name, "reading the plan's usage: {e:#}");
-                // The last good windows stay, marked with why they're old.
-                let mut q = st.quotas.get(&c.id).unwrap_or(api::ConnectionQuota {
+        if st.quotas.endpoint_disabled.lock().unwrap().contains(&c.id) {
+            continue;
+        }
+        let result = read_chatgpt(st, c, &url).await;
+        {
+            // Hold this through the update: a response hook must either
+            // supersede the poll afterwards or prevent its write entirely.
+            let mut disabled = st.quotas.endpoint_disabled.lock().unwrap();
+            let q = match result {
+                Ok(None) => {
+                    if disabled.insert(c.id.clone()) {
+                        info!(connection = %c.name, "ChatGPT's usage endpoint refused this OAuth app; using model response headers instead");
+                    }
+                    // An earlier failed poll must not poison the header path.
+                    if let Some(mut q) = st.quotas.get(&c.id) {
+                        q.error.clear();
+                        st.quotas.by_connection.lock().unwrap().insert(c.id.clone(), q);
+                    }
+                    continue;
+                }
+                // A model reply can arrive while this request is in flight.
+                _ if disabled.contains(&c.id) => continue,
+                Ok(Some(windows)) => api::ConnectionQuota {
                     connection_id: c.id.clone(),
                     source: "chatgpt".into(),
-                    ..Default::default()
-                });
-                q.error = format!("{e:#}");
-                st.quotas.by_connection.lock().unwrap().insert(c.id.clone(), q);
-                continue;
-            }
-        };
-        record(st, q, &c.name);
+                    windows,
+                    updated_at: now_ms(),
+                    error: String::new(),
+                },
+                Err(e) => {
+                    warn!(connection = %c.name, "reading the plan's usage: {e:#}");
+                    // The last good windows stay, marked with why they're old.
+                    let mut q = st.quotas.get(&c.id).unwrap_or(api::ConnectionQuota {
+                        connection_id: c.id.clone(),
+                        source: "chatgpt".into(),
+                        ..Default::default()
+                    });
+                    q.error = format!("{e:#}");
+                    st.quotas.by_connection.lock().unwrap().insert(c.id.clone(), q);
+                    continue;
+                }
+            };
+            record(st, q, &c.name);
+        }
         keep(st).await;
     }
 }
@@ -358,6 +452,15 @@ pub async fn poll_chatgpt(st: &HeadState) {
 pub fn spawn(st: std::sync::Arc<HeadState>) {
     tokio::spawn(async move {
         restore(&st).await;
+        let keeper = st.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = keeper.shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(KEEP_EVERY) => keep(&keeper).await,
+                }
+            }
+        });
         loop {
             poll_chatgpt(&st).await;
             tokio::select! {
@@ -393,6 +496,193 @@ async fn list(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn chatgpt_reply_headers_reach_quota_api_and_persist_without_poll_errors() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::response::IntoResponse;
+        use c6_llm::{ModelRequest, activity::Origin};
+        use futures::StreamExt;
+
+        let asked = Arc::new(AtomicUsize::new(0));
+        let refusal = Arc::new(AtomicBool::new(false));
+        let headers = Arc::new(Mutex::new(HeaderMap::from_iter([
+            ("x-codex-primary-used-percent".parse().unwrap(), "34.5".parse().unwrap()),
+            ("x-codex-primary-window-minutes".parse().unwrap(), "300".parse().unwrap()),
+            ("x-codex-primary-reset-at".parse().unwrap(), "4102441200".parse().unwrap()),
+            ("x-codex-secondary-used-percent".parse().unwrap(), "85".parse().unwrap()),
+            ("x-codex-secondary-window-minutes".parse().unwrap(), "10080".parse().unwrap()),
+            ("x-codex-secondary-reset-at".parse().unwrap(), "4102444800".parse().unwrap()),
+        ])));
+        let (a, r, h) = (asked.clone(), refusal.clone(), headers.clone());
+        // The catalog source-scans this module's literal routes; this one
+        // is the stand-in's, not a head API operation.
+        let models_path = "/models";
+        let app = Router::new()
+            .route(
+                "/usage",
+                get(move || {
+                    let (a, r) = (a.clone(), r.clone());
+                    async move {
+                        a.fetch_add(1, Ordering::Relaxed);
+                        let body = if r.load(Ordering::Relaxed) {
+                            json!({"type":"rejected_by_access_enforcement","code":"no_matching_rule"})
+                        } else {
+                            json!({"detail":"Unauthorized"})
+                        };
+                        (StatusCode::UNAUTHORIZED, Json(body))
+                    }
+                }),
+            )
+            .route(models_path, get(|| async { Json(json!({"data":[{"id":"test"}]})) }))
+            .route(
+                "/responses",
+                axum::routing::post(move |req: HeaderMap| {
+                    let h = h.clone();
+                    async move {
+                        assert_eq!(req["authorization"], "Bearer tok");
+                        (h.lock().unwrap().clone(), "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n")
+                            .into_response()
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stand = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::HeadConfig {
+            data_dir: dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            auth: false,
+            ..Default::default()
+        };
+        let head = crate::start(config.clone()).await.unwrap();
+        let st = &head.state;
+        st.store.set_setting(CHATGPT_USAGE_URL, &format!("{stand}/usage")).await.unwrap();
+        let tokens = json!({"client_id":"c", "access_token":"tok", "refresh_token":"r", "expires_at_ms":i64::MAX / 2, "scope":"chatgpt.tokens.use.direct", "workspace":""});
+        let row = crate::store::ConnectionRow {
+            id: "gpt".into(),
+            name: "ChatGPT".into(),
+            kind: "chatgpt".into(),
+            base_url: stand,
+            api_key: Some(st.secrets.encrypt(&tokens.to_string()).unwrap()),
+            default_model: None,
+            context_window: None,
+            created_at: 0,
+            realms: "[]".into(),
+            members: "[]".into(),
+            subagent_model: None,
+            compact_at: None,
+        };
+        st.store.insert_connection(&row).await.unwrap();
+        let http = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{}/api/v1/connections/quotas", head.ui_addrs[0].port());
+        let quotas = async || -> Vec<api::ConnectionQuota> { http.get(&url).send().await.unwrap().json().await.unwrap() };
+
+        poll_chatgpt(st).await;
+        assert!(quotas().await[0].error.contains("401"));
+        refusal.store(true, Ordering::Relaxed);
+        poll_chatgpt(st).await;
+        let reads = asked.load(Ordering::Relaxed);
+        poll_chatgpt(st).await;
+        assert_eq!(asked.load(Ordering::Relaxed), reads, "access enforcement stops further polling");
+        assert!(quotas().await[0].error.is_empty());
+
+        let request = ModelRequest {
+            model: "test".into(),
+            system: String::new(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: None,
+            cache_key: None,
+            effort: None,
+            web_search: false,
+            json: false,
+        };
+        let client = crate::pools::client(st, "gpt", "home", Origin::default()).await.unwrap();
+        let mut stream = client.stream(&request).await.unwrap();
+        // Recording happens before the stream is consumed, even if a caller drops it.
+        let q = quotas().await.remove(0);
+        assert_eq!(q.source, "chatgpt");
+        assert!(q.error.is_empty());
+        assert!(st.quotas.told.lock().unwrap().contains(&("gpt".into(), "week".into(), 4_102_444_800_000, 80)));
+        assert_eq!(
+            q.windows.iter().map(|w| (w.name.as_str(), w.used_percent, w.resets_at)).collect::<Vec<_>>(),
+            [("5h", 34.5, Some(4_102_441_200_000)), ("week", 85.0, Some(4_102_444_800_000))]
+        );
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+        let saved = st.store.setting(KEPT).await.unwrap().unwrap();
+        assert_eq!(serde_json::from_str::<Vec<api::ConnectionQuota>>(&saved).unwrap(), vec![q.clone()]);
+
+        // A pool's reply belongs to its ChatGPT member. An omitted primary
+        // window keeps the old one; usage is clamped and used-up is explicit.
+        let pool = crate::store::ConnectionRow {
+            id: "pool".into(),
+            name: "Pool".into(),
+            kind: "pool".into(),
+            api_key: None,
+            members: r#"[{"connection_id":"gpt","slots":1}]"#.into(),
+            ..row.clone()
+        };
+        st.store.insert_connection(&pool).await.unwrap();
+        {
+            let mut h = headers.lock().unwrap();
+            h.clear();
+            h.insert("x-codex-secondary-used-percent", "101".parse().unwrap());
+            h.insert("x-codex-secondary-window-minutes", "10080".parse().unwrap());
+            h.insert("x-codex-secondary-reset-at", "4102444800".parse().unwrap());
+        }
+        // Pin the save gate ahead, avoiding any assertion about machine speed.
+        *st.quotas.last_kept.lock().await = Some(Instant::now() + Duration::from_secs(86400));
+        let client = crate::pools::client(st, "pool", "home", Origin::default()).await.unwrap();
+        let mut stream = client.stream(&request).await.unwrap();
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+        let current = quotas().await;
+        assert_eq!(current.len(), 1, "no limits attributed to the pool itself");
+        assert_eq!(current[0].windows[0], q.windows[0]);
+        assert_eq!((current[0].windows[1].used_percent, current[0].windows[1].status.as_str()), (100.0, "rejected"));
+        assert!(st.quotas.told.lock().unwrap().contains(&("gpt".into(), "week".into(), 4_102_444_800_000, 100)));
+        assert_eq!(st.store.setting(KEPT).await.unwrap().unwrap(), saved, "replies inside the save gate only update memory");
+        assert!(st.quotas.dirty.load(Ordering::Relaxed));
+        *st.quotas.last_kept.lock().await = None;
+        keep(st).await; // The periodic trailing save uses this same path.
+        assert!(!st.quotas.dirty.load(Ordering::Relaxed));
+        assert_eq!(serde_json::from_str::<Vec<api::ConnectionQuota>>(&st.store.setting(KEPT).await.unwrap().unwrap()).unwrap(), current);
+
+        poll_chatgpt(st).await;
+        assert_eq!(asked.load(Ordering::Relaxed), reads);
+        assert!(quotas().await[0].error.is_empty());
+        // A non-plan Responses connection ignores identical headers.
+        let api_row = crate::store::ConnectionRow {
+            id: "api".into(),
+            kind: "openai".into(),
+            api_key: Some(st.secrets.encrypt("tok").unwrap()),
+            ..row
+        };
+        st.store.insert_connection(&api_row).await.unwrap();
+        let client = crate::pools::client(st, "api", "home", Origin::default()).await.unwrap();
+        let mut stream = client.stream(&request).await.unwrap();
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+        assert_eq!(quotas().await.len(), 1);
+        head.shutdown().await.unwrap();
+
+        let head = crate::start(config).await.unwrap();
+        c6_testkit::eventually("restored ChatGPT windows", async || head.state.quotas.get("gpt")).await;
+        assert_eq!(head.state.quotas.get("gpt").unwrap().windows, current[0].windows);
+        head.shutdown().await.unwrap();
+        server.abort();
+    }
 
     #[test]
     fn claude_codes_report_as_it_comes() {

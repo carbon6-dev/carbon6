@@ -203,6 +203,10 @@ pub type EventStream = BoxStream<'static, Result<ModelEvent, LlmError>>;
 
 #[async_trait]
 pub trait ModelClient: Send + Sync {
+    /// ChatGPT response headers only; other providers ignore this hook.
+    /// Set before wrapping a client with activity tracking or time limits.
+    fn set_chatgpt_limits_hook(&mut self, _hook: openai_responses::ChatGptLimitsHook) {}
+
     /// Starts a streaming completion. Dropping the stream cancels the request.
     async fn stream(&self, req: &ModelRequest) -> Result<EventStream, LlmError>;
 }

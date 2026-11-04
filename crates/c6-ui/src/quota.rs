@@ -21,7 +21,7 @@ thread_local! {
 }
 
 /// Read now and every minute (Claude Code's come with its turns, ChatGPT's
-/// every few minutes on the head).
+/// with model replies to the head).
 pub fn provide() {
     let q = RwSignal::new(Vec::new());
     let load = move || {
