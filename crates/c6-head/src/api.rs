@@ -1575,7 +1575,7 @@ async fn put_claude_code_tools(State(st): State<Arc<HeadState>>, Json(t): Json<a
             ),
         ));
     }
-    let v = api::ClaudeCodeTools { automatic: t.automatic, tools: named, core: t.core, available: Vec::new() };
+    let v = api::ClaudeCodeTools { automatic: t.automatic, tools: named, core: t.core, native_all: t.native_all, available: Vec::new() };
     st.store.set_setting(crate::sessions::CLAUDE_CODE_TOOLS, &serde_json::to_string(&v).map_err(anyhow::Error::from)?).await?;
     Ok(StatusCode::NO_CONTENT)
 }

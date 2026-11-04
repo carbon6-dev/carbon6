@@ -83,6 +83,8 @@ impl HostedClaude {
             tools: names.clone(),
             worker: c6_core::build().to_owned(),
             extra_args: LOCKED_DOWN.iter().map(|a| (*a).to_owned()).collect(),
+            // Locked down by its own flags: none of Claude Code's tools.
+            native: None,
         };
         if let Some(p) = self.process.take_if(|p| p.launch() != &launch && p.idle_until(std::time::Duration::ZERO).is_some()) {
             p.close().await;

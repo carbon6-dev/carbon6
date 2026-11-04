@@ -105,6 +105,117 @@ pub struct Launch {
     /// `--strict-mcp-config`, so Claude Code has only carbon6's tools there
     /// (docs/ask.md §3).
     pub extra_args: Vec<String>,
+    /// Claude Code's own tools it keeps (`None`: all of them, as without
+    /// carbon6). With a list it gets nothing else: no other MCP server, no
+    /// settings files, skills or plugins but `agents-md`, and a hook denies
+    /// any other tool (docs/background.md §4, Claude Code's own tools).
+    pub native: Option<Vec<String>>,
+}
+
+/// The built-in plugins a locked-down process keeps: `agents-md`, which
+/// gives a project with no CLAUDE.md its AGENTS.md (carbon6 leaves project
+/// instructions to Claude Code).
+const KEPT_PLUGINS: &[&str] = &["cc-plugin-agents-md"];
+/// The built-in plugins it turns off, which carbon6 has no use for: usage
+/// events for plugins, and writing Claude Code mods.
+const OFF_PLUGINS: &[&str] = &["telemetry@builtin", "plugin-authoring@builtin"];
+
+/// The arguments that keep a process to `native` of Claude Code's own tools
+/// and carbon6's MCP server.
+fn locked_args(native: &[String]) -> Vec<String> {
+    ["--tools", &native.join(","), "--strict-mcp-config", "--setting-sources", "", "--disable-slash-commands"].map(str::to_owned).to_vec()
+}
+
+/// Its settings (`--settings`): the head's hooks (`hooks`, settings JSON),
+/// plus a `PreToolUse` hook on every tool that runs [`guard`] through
+/// `guard_cmd`, and the built-in plugins turned off.
+fn locked_settings(hooks: Option<&str>, guard_cmd: &str) -> String {
+    let mut v: Value = hooks.and_then(|h| serde_json::from_str(h).ok()).unwrap_or_else(|| serde_json::json!({}));
+    if !v.is_object() {
+        v = serde_json::json!({});
+    }
+    let guard = serde_json::json!({"matcher": "*", "hooks": [{"type": "command", "command": guard_cmd, "timeout": 10}]});
+    match v["hooks"]["PreToolUse"].as_array_mut() {
+        Some(groups) => groups.insert(0, guard),
+        None => v["hooks"]["PreToolUse"] = serde_json::json!([guard]),
+    }
+    let plugins = &mut v["enabledPlugins"];
+    for p in OFF_PLUGINS {
+        plugins[*p] = Value::Bool(false);
+    }
+    v.to_string()
+}
+
+/// The hook command: this worker's `c6w claude-guard` with the tools it
+/// allows.
+fn guard_command(native: &[String]) -> String {
+    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "c6w".into());
+    // A worker updated in place still names its new binary.
+    let exe = exe.strip_suffix(" (deleted)").unwrap_or(&exe);
+    let mut cmd = shell_quote(exe) + " claude-guard";
+    for t in native {
+        cmd.push(' ');
+        cmd.push_str(&shell_quote(t));
+    }
+    cmd
+}
+
+fn shell_quote(s: &str) -> String {
+    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-+=:,@".contains(&b)) {
+        s.to_owned()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
+/// `c6w claude-guard`: a `PreToolUse` hook's verdict on the call in `input`
+/// (the hook's JSON). `Ok` lets it run: one of `allowed`, or carbon6's
+/// over MCP. `Err` is why not, which Claude Code shows the model (the hook
+/// exits 2); anything it cannot read is refused, so it never fails open.
+pub fn guard(allowed: &[String], input: &str) -> Result<(), String> {
+    let v: Value = serde_json::from_str(input).map_err(|e| format!("carbon6 could not read this tool call ({e}), so it is not run"))?;
+    let Some(name) = v["tool_name"].as_str().filter(|n| !n.is_empty()) else {
+        return Err("carbon6 could not tell which tool this is, so it is not run".into());
+    };
+    if name.starts_with("mcp__carbon6__") || allowed.iter().any(|a| a == name) {
+        return Ok(());
+    }
+    Err(format!(
+        "{name} is not available in carbon6 sessions. Use {} or carbon6's tools (mcp__carbon6__*) instead.",
+        if allowed.is_empty() { "none of Claude Code's own tools".to_owned() } else { allowed.join(", ") }
+    ))
+}
+
+/// What a locked-down process has that it should not (its `system/init`):
+/// its tools beyond `native` and carbon6's, other MCP servers, plugins
+/// beyond those kept. Empty: as it should be.
+fn unexpected(init: &Value, native: &[String]) -> Vec<String> {
+    let names = |key: &str, field: Option<&str>| -> Vec<String> {
+        init[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|x| match field {
+                Some(f) => x[f].as_str(),
+                None => x.as_str(),
+            })
+            .map(str::to_owned)
+            .collect()
+    };
+    let mut out = Vec::new();
+    let tools: Vec<String> = names("tools", None).into_iter().filter(|t| !t.starts_with("mcp__carbon6__") && !native.contains(t)).collect();
+    if !tools.is_empty() {
+        out.push(format!("tools {}", tools.join(", ")));
+    }
+    let servers: Vec<String> = names("mcp_servers", Some("name")).into_iter().filter(|s| s != "carbon6").collect();
+    if !servers.is_empty() {
+        out.push(format!("MCP servers {}", servers.join(", ")));
+    }
+    let plugins: Vec<String> = names("plugins", Some("name")).into_iter().filter(|p| !KEPT_PLUGINS.contains(&p.as_str())).collect();
+    if !plugins.is_empty() {
+        out.push(format!("plugins {}", plugins.join(", ")));
+    }
+    out
 }
 
 /// Where a session's process takes its input. Shared with the session's
@@ -220,6 +331,8 @@ pub(crate) struct Process {
     /// It answered a Send now without saying how it took it (an older
     /// Claude Code, which may have stopped the whole turn): said once.
     old_send_now: bool,
+    /// Its `system/init` was checked against what it was allowed (once).
+    checked_init: bool,
     registration: Option<crate::mcp_bridge::Registration>,
     /// Where its process group is recorded while it runs, so a worker that
     /// starts after a crash can stop it ([`sweep_orphans`]).
@@ -312,8 +425,16 @@ impl Process {
         if let Some(e) = &launch.effort {
             cmd.args(["--effort", e]);
         }
-        if let Some(s) = &launch.settings {
-            cmd.args(["--settings", &*no_nul(s)]);
+        match &launch.native {
+            Some(native) => {
+                let settings = locked_settings(launch.settings.as_deref(), &guard_command(native));
+                cmd.args(["--settings", &*no_nul(&settings)]).args(locked_args(native)).env("ENABLE_CLAUDEAI_MCP_SERVERS", "false");
+            }
+            None => {
+                if let Some(s) = &launch.settings {
+                    cmd.args(["--settings", &*no_nul(s)]);
+                }
+            }
         }
         if let Some(p) = launch.system_prompt.as_deref().filter(|p| !p.trim().is_empty()) {
             // From a file in its private folder: the guidance carries memory
@@ -409,6 +530,7 @@ impl Process {
             idle_since: tokio::time::Instant::now(),
             send_now: None,
             old_send_now: false,
+            checked_init: false,
             registration: mcp,
             pidfile: None,
             _output_root: output_root,
@@ -628,6 +750,43 @@ impl Process {
 
     /// Its answer to a control request; only a Send now's matters. `running`:
     /// a turn is under way (the one the Send now was asked in, if its turn).
+    /// Its first `system/init` (one comes with each turn): what it has,
+    /// logged, and for a locked-down process, a note in the transcript if
+    /// it has anything carbon6 did not allow (a Claude Code that ignores
+    /// a flag, or a tool it added since).
+    async fn check_init(&mut self, init: &Value, sink: &Arc<dyn EventSink>) -> anyhow::Result<()> {
+        if std::mem::replace(&mut self.checked_init, true) {
+            return Ok(());
+        }
+        let session = &self.launch.conversation;
+        info!(
+            %session,
+            version = %init["claude_code_version"].as_str().unwrap_or("?"),
+            tools = %init["tools"],
+            mcp_servers = %init["mcp_servers"],
+            plugins = %init["plugins"],
+            "Claude Code started"
+        );
+        let Some(native) = &self.launch.native else { return Ok(()) };
+        let extra = unexpected(init, native);
+        if extra.is_empty() {
+            return Ok(());
+        }
+        warn!(%session, extra = %extra.join("; "), "Claude Code has what carbon6 did not allow");
+        sink.append(session_event::Kind::Notice(c6_proto::Notice {
+            title: "Claude Code has tools carbon6 did not allow".into(),
+            message: format!(
+                "Besides {} and carbon6's tools, this Claude Code process has {}. carbon6 refuses their calls, but this Claude Code may not honour all of carbon6's launch flags.",
+                native.join(", "),
+                extra.join("; ")
+            ),
+            priority: "normal".into(),
+            quiet: true,
+        }))
+        .await?;
+        Ok(())
+    }
+
     async fn control_response(&mut self, v: &Value, running: bool, sink: &Arc<dyn EventSink>) -> anyhow::Result<()> {
         let r = &v["response"];
         let Some(asked) = self.send_now.take_if(|s| r["request_id"].as_str() == Some(s.request_id.as_str())) else { return Ok(()) };
@@ -832,7 +991,7 @@ impl Process {
                         self.confirm(uuid, &mut started, sink).await?;
                     }
                 }
-                "system" if v["subtype"] == "init" => {}
+                "system" if v["subtype"] == "init" => self.check_init(&v, sink).await?,
                 "control_response" => self.control_response(&v, true, sink).await?,
                 "result" if main => {
                     // A Send now not answered yet whose turn ends stopped: the
@@ -1927,6 +2086,113 @@ cat <<'EOF'
 EOF
 "#;
         script(dir, "claude", script_body)
+    }
+
+    /// A process kept to some of Claude Code's own tools gets the flags for
+    /// it, the guard hook beside the head's hooks, the built-in plugins off
+    /// and claude.ai's connectors off; what its `system/init` shows beyond
+    /// that is noted once in the transcript.
+    #[tokio::test]
+    async fn a_locked_down_process_gets_only_its_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = script(
+            dir.path(),
+            "claude",
+            r#"#!/bin/sh
+read -r prompt
+printf '%s\n' "$@" > args.txt
+printf '%s' "$ENABLE_CLAUDEAI_MCP_SERVERS" > claudeai.txt
+while [ $# -gt 0 ]; do [ "$1" = "--settings" ] && printf '%s' "$2" > settings.txt; shift; done
+cat <<'EOF'
+{"type":"system","subtype":"init","session_id":"s","tools":["Bash","Read","WebSearch","mcp__carbon6__doc","mcp__claude_ai_Gmail__send_message"],"mcp_servers":[{"name":"carbon6","status":"connected"},{"name":"claude.ai Gmail","status":"connected"}],"plugins":[{"name":"cc-plugin-agents-md"},{"name":"cc-plugin-telemetry"}]}
+{"type":"system","subtype":"init","session_id":"s","tools":["Bash","Read","WebSearch"]}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Done."}],"stop_reason":"end_turn"},"parent_tool_use_id":null}
+{"type":"result","subtype":"success","is_error":false,"result":"Done.","usage":{"input_tokens":1,"output_tokens":1}}
+EOF
+"#,
+        );
+        let vec_sink = Arc::new(VecSink::default());
+        let sink: Arc<dyn EventSink> = vec_sink.clone();
+        let launch = Launch {
+            conversation: "0199-locked".into(),
+            settings: Some(r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"check"}]}]}}"#.into()),
+            native: Some(vec!["Bash".into(), "Read".into()]),
+            ..Default::default()
+        };
+        let mut p = Process::spawn(&bin, launch, false, dir.path(), "opus", Arc::default(), None, None).unwrap();
+        let end = run(&mut p, 1, &[input("c1", "hi")], &sink).await;
+        assert_eq!(end.reason, Some(TurnEndReason::Completed));
+        let args: Vec<String> = std::fs::read_to_string(dir.path().join("args.txt")).unwrap().lines().map(str::to_owned).collect();
+        let after = |flag: &str| args.iter().position(|a| a == flag).map(|i| args[i + 1].clone());
+        assert_eq!(after("--tools").as_deref(), Some("Bash,Read"));
+        assert_eq!(after("--setting-sources").as_deref(), Some(""), "no settings files");
+        assert!(args.iter().any(|a| a == "--strict-mcp-config") && args.iter().any(|a| a == "--disable-slash-commands"), "{args:?}");
+        assert_eq!(std::fs::read_to_string(dir.path().join("claudeai.txt")).unwrap(), "false");
+        let settings: Value = serde_json::from_str(&std::fs::read_to_string(dir.path().join("settings.txt")).unwrap()).unwrap();
+        let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 2, "the guard, then the head's hook");
+        assert_eq!(pre[0]["matcher"], "*");
+        assert!(pre[0]["hooks"][0]["command"].as_str().unwrap().ends_with(" claude-guard Bash Read"), "{}", pre[0]);
+        assert_eq!(pre[1]["hooks"][0]["command"], "check");
+        assert_eq!(settings["enabledPlugins"], serde_json::json!({"telemetry@builtin": false, "plugin-authoring@builtin": false}));
+        let notes: Vec<String> = vec_sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Some(session_event::Kind::Notice(n)) => Some(n.message.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notes.len(), 1, "once a process: {notes:?}");
+        for extra in ["WebSearch", "mcp__claude_ai_Gmail__send_message", "MCP servers claude.ai Gmail", "plugins cc-plugin-telemetry"] {
+            assert!(notes[0].contains(extra), "{extra}: {}", notes[0]);
+        }
+        assert!(!notes[0].contains("mcp__carbon6__doc") && !notes[0].contains("agents-md"), "{}", notes[0]);
+    }
+
+    /// Without a list it starts as it would without carbon6.
+    #[tokio::test]
+    async fn an_unlocked_process_keeps_claude_codes_own_setup() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_claude(dir.path());
+        let vec_sink = Arc::new(VecSink::default());
+        let sink: Arc<dyn EventSink> = vec_sink.clone();
+        let mut p = spawn(&bin, dir.path(), "0199-open", false, None);
+        assert_eq!(run(&mut p, 1, &[input("c1", "list")], &sink).await.reason, Some(TurnEndReason::Completed));
+        let args = std::fs::read_to_string(dir.path().join("args.txt")).unwrap();
+        for flag in ["--tools", "--strict-mcp-config", "--setting-sources", "--disable-slash-commands", "--settings"] {
+            assert!(!args.lines().any(|a| a == flag), "{flag} in {args}");
+        }
+        assert!(!vec_sink.0.lock().unwrap().iter().any(|e| matches!(e.kind, Some(session_event::Kind::Notice(_)))), "nothing to note");
+    }
+
+    /// The guard lets through the tools it was given and carbon6's, and
+    /// refuses the rest and anything it cannot read.
+    #[test]
+    fn the_guard_refuses_other_tools() {
+        let allowed = vec!["Bash".to_owned(), "Read".to_owned()];
+        let call = |name: &str| {
+            guard(&allowed, &serde_json::json!({"hook_event_name": "PreToolUse", "tool_name": name, "tool_input": {}}).to_string())
+        };
+        assert_eq!(call("Bash"), Ok(()));
+        assert_eq!(call("mcp__carbon6__Task"), Ok(()));
+        let err = call("WebSearch").unwrap_err();
+        assert!(err.contains("WebSearch") && err.contains("Bash, Read") && err.contains("mcp__carbon6__"), "{err}");
+        assert!(call("mcp__claude_ai_Gmail__send_message").is_err());
+        assert!(call("bash").is_err(), "names exactly");
+        assert!(guard(&allowed, "not json").is_err());
+        assert!(guard(&allowed, r#"{"tool_input":{"tool_name":"Bash"}}"#).is_err());
+        assert!(guard(&[], &serde_json::json!({"tool_name": "Read"}).to_string()).is_err(), "none allowed");
+    }
+
+    #[test]
+    fn guard_commands_quote_what_needs_it() {
+        assert_eq!(shell_quote("/usr/local/bin/c6w"), "/usr/local/bin/c6w");
+        assert_eq!(shell_quote("/opt/my tools/c6w"), "'/opt/my tools/c6w'");
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert!(guard_command(&["Bash".into()]).ends_with(" claude-guard Bash"));
     }
 
     /// Usage is recorded per model call, from its messages (the last says the

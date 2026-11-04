@@ -1447,6 +1447,7 @@ pub async fn claude_code_tools(st: &HeadState, realm: Option<&str>) -> anyhow::R
         automatic: true,
         tools: Vec::new(),
         core: None,
+        native_all: false,
         available: Vec::new(),
     });
     if t.automatic {
@@ -1463,6 +1464,7 @@ pub async fn claude_code_choice(st: &HeadState, realm: &str) -> anyhow::Result<c
         tools: if t.automatic { Vec::new() } else { t.tools },
         core_chosen: t.core.is_some(),
         core: t.core.unwrap_or_default(),
+        native_all: t.native_all,
     })
 }
 
