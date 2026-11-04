@@ -1717,6 +1717,7 @@ fn Connections(signed_in: bool) -> impl IntoView {
                             Err(e) => view! { <div class="p-3"><ErrorBox message=e /></div> }.into_any(),
                         })}
                     </Suspense>
+                    <crate::quota::UnmatchedCodexLimits list_rows=true />
                 </div>
             </section>
             {move || signed_in().then(|| view! {
@@ -1725,7 +1726,6 @@ fn Connections(signed_in: bool) -> impl IntoView {
                 </div>
             })}
             <AddConnection all on_added=move || connections.refetch() />
-            <crate::quota::UnmatchedCodexLimits />
             <ChatGptSignIn on_added=move || connections.refetch() />
     }
 }

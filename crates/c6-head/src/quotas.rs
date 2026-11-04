@@ -66,6 +66,8 @@ pub struct Quotas {
     wake: tokio::sync::Notify,
     /// Serializes partial ChatGPT snapshots from headers and worker calls.
     updates: tokio::sync::Mutex<()>,
+    /// One masked diagnostic per worker's unmatched spell, reset on a match.
+    codex_unmatched_logged: Mutex<HashSet<String>>,
 }
 
 impl Quotas {
@@ -237,7 +239,7 @@ fn record(st: &HeadState, q: api::ConnectionQuota, name: &str) {
         let (title, priority) = if level == 100 {
             (format!("{name}: its {} limit is used up", w.name), "high")
         } else {
-            (format!("{name}: {:.0}% of its {} limit used", w.used_percent, w.name), "normal")
+            (format!("{name}: {:.0}% of its {} limit left", (100.0 - w.used_percent).clamp(0.0, 100.0), w.name), "normal")
         };
         st.notifier.send(crate::notify::Note {
             event: "quota",
@@ -427,31 +429,97 @@ pub async fn codex_config(st: &HeadState, from: c6_core::WorkerId) -> anyhow::Re
 }
 
 fn chatgpt_account(st: &HeadState, c: &crate::store::ConnectionRow) -> Option<String> {
+    chatgpt_identity(st, c).map(|t| t.workspace).filter(|s| !s.is_empty())
+}
+
+fn chatgpt_identity(st: &HeadState, c: &crate::store::ConnectionRow) -> Option<crate::oauth::ChatGptTokens> {
     c.api_key
         .as_deref()
         .and_then(|blob| st.secrets.decrypt(blob).ok())
         .and_then(|s| serde_json::from_str::<crate::oauth::ChatGptTokens>(&s).ok())
-        .map(|t| t.workspace)
-        .filter(|s| !s.is_empty())
 }
 
-/// Only exact, nonempty verified workspace ids match. Never infer from an
-/// email, plan type, worker name, or the existence of just one connection.
+fn email(s: &str) -> Option<String> {
+    let s = s.trim();
+    let (local, domain) = s.split_once('@')?;
+    (!local.is_empty() && !domain.is_empty() && !domain.contains('@') && !s.chars().any(char::is_whitespace)).then(|| s.to_lowercase())
+}
+
+fn masked_email(s: &str) -> String {
+    email(s)
+        .and_then(|s| s.split_once('@').map(|(local, domain)| format!("{}***@{domain}", local.chars().next().unwrap())))
+        .unwrap_or_else(|| "<missing>".into())
+}
+
+fn masked_account(s: Option<&str>) -> String {
+    s.filter(|s| !s.is_empty()).map(|s| s.chars().take(8).collect()).unwrap_or_else(|| "<missing>".into())
+}
+
+/// Ids are authoritative (and may name several connections). Only when no
+/// id matches do we try email, accepting exactly one connection, never a
+/// display name, subject, partial address, or merely the only connection.
+fn codex_matches(identities: &[(Option<String>, Option<String>)], account: Option<&str>, address: Option<&str>) -> (Vec<usize>, String) {
+    if identities.is_empty() {
+        return (Vec::new(), "No email or account-id match: no ChatGPT connections to compare".into());
+    }
+    let ids: Vec<_> = identities
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (id, _))| (account.is_some_and(|a| !a.is_empty()) && id.as_deref() == account).then_some(i))
+        .collect();
+    if !ids.is_empty() {
+        return (ids, String::new());
+    }
+    let address = address.and_then(email);
+    let emails: Vec<_> = identities
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (_, e))| (address.is_some() && e.as_deref().and_then(email) == address).then_some(i))
+        .collect();
+    if emails.len() == 1 {
+        return (emails, String::new());
+    }
+    let id_reason = if account.is_none_or(str::is_empty) {
+        "Codex has no account id"
+    } else if identities.iter().all(|(id, _)| id.as_ref().is_none_or(String::is_empty)) {
+        "connections have no account id"
+    } else {
+        "no account-id match"
+    };
+    let email_reason = if address.is_none() {
+        "Codex has no email"
+    } else if emails.len() > 1 {
+        "ambiguous email: more than one connection matches"
+    } else if identities.iter().all(|(_, e)| e.as_deref().and_then(email).is_none()) {
+        "connections have no email"
+    } else {
+        "emails differ"
+    };
+    (Vec::new(), format!("No email or account-id match: {id_reason}; {email_reason}"))
+}
+
 pub async fn from_codex(st: &HeadState, from: c6_core::WorkerId, report: api::CodexLimitsReport) -> anyhow::Result<()> {
     anyhow::ensure!(codex_enabled(st, from).await?, "Codex plan reads are not enabled for this worker");
     let worker = st.store.worker(from).await?.ok_or_else(|| crate::bad_request("worker not found"))?;
     anyhow::ensure!(report.windows.len() <= 2 && report.error.len() <= 256, "invalid Codex snapshot");
     anyhow::ensure!(
-        report.account_id.as_ref().is_none_or(|s| s.len() <= 256) && report.plan_type.as_ref().is_none_or(|s| s.len() <= 80),
+        report.account_id.as_ref().is_none_or(|s| s.len() <= 256)
+            && report.plan_type.as_ref().is_none_or(|s| s.len() <= 80)
+            && report.email.as_ref().is_none_or(|s| s.len() <= 320)
+            && report.command.as_ref().is_none_or(|s| s.len() <= 4096),
         "invalid Codex account metadata"
     );
-    let origin = api::QuotaOrigin {
+    let mut origin = api::QuotaOrigin {
         source: "codex-cli".into(),
         observed_at: report.observed_at.clamp(0, now_ms()),
         worker_id: worker.id.clone(),
         worker_name: worker.name,
         account_id: report.account_id.filter(|s| !s.is_empty()),
         plan_type: report.plan_type,
+        email: report.email.filter(|s| email(s).is_some()),
+        command: report.command,
+        command_from_shell: report.command_from_shell,
+        unmatched_reason: String::new(),
     };
     let key = format!("codex-cli:{}", worker.id);
     let _guard = st.quotas.updates.lock().await;
@@ -459,10 +527,14 @@ pub async fn from_codex(st: &HeadState, from: c6_core::WorkerId, report: api::Co
         let mut q = st.quotas.get(&key).unwrap_or(api::ConnectionQuota {
             connection_id: key.clone(),
             source: "codex-cli".into(),
-            origin: Some(origin),
+            origin: Some(origin.clone()),
             ..Default::default()
         });
         q.error = report.error;
+        if let Some(old) = &mut q.origin {
+            old.command = origin.command;
+            old.command_from_shell = origin.command_from_shell;
+        }
         st.quotas.by_connection.lock().unwrap().insert(key, q);
         st.quotas.dirty.store(true, Ordering::Relaxed);
     } else {
@@ -487,19 +559,28 @@ pub async fn from_codex(st: &HeadState, from: c6_core::WorkerId, report: api::Co
             }
         }
         anyhow::ensure!(limits.primary.is_some(), "Codex snapshot has no windows");
-        let mut matches = Vec::new();
-        if let Some(account) = &origin.account_id {
-            for c in st.store.connections().await?.into_iter().filter(|c| c.kind == "chatgpt") {
-                if chatgpt_account(st, &c).as_ref() == Some(account) {
-                    matches.push(c);
-                }
-            }
-        }
+        let connections: Vec<_> = st.store.connections().await?.into_iter().filter(|c| c.kind == "chatgpt").collect();
+        let identities: Vec<_> = connections
+            .iter()
+            .map(|c| {
+                let t = chatgpt_identity(st, c);
+                (t.as_ref().map(|t| t.workspace.clone()).filter(|s| !s.is_empty()), t.map(|t| t.email).filter(|s| !s.is_empty()))
+            })
+            .collect();
+        let (matches, reason) = codex_matches(&identities, origin.account_id.as_deref(), origin.email.as_deref());
+        origin.unmatched_reason = reason;
         if matches.is_empty() {
+            if st.quotas.codex_unmatched_logged.lock().unwrap().insert(worker.id.clone()) {
+                let comparisons = codex_comparisons(&identities, &origin);
+                info!(worker_id = %worker.id, account = %masked_account(origin.account_id.as_deref()),
+                    email = %masked_email(origin.email.as_deref().unwrap_or("")),
+                    reason = %origin.unmatched_reason, ?comparisons, "Codex plan limits match no ChatGPT connection");
+            }
             // A different Codex login replaces the previous unmatched account,
             // rather than mixing its missing windows into the new account.
             if let Some(old) = st.quotas.get(&key).and_then(|q| q.origin)
-                && old.account_id != origin.account_id
+                && (old.account_id != origin.account_id
+                    || (origin.account_id.is_none() && old.email.as_deref().and_then(email) != origin.email.as_deref().and_then(email)))
             {
                 if old.observed_at > origin.observed_at {
                     return Ok(());
@@ -508,8 +589,10 @@ pub async fn from_codex(st: &HeadState, from: c6_core::WorkerId, report: api::Co
             }
             record_chatgpt(st, &key, "", limits, origin, false);
         } else {
+            st.quotas.codex_unmatched_logged.lock().unwrap().remove(&worker.id);
             st.quotas.by_connection.lock().unwrap().remove(&key);
-            for c in matches {
+            for i in matches {
+                let c = &connections[i];
                 record_chatgpt(st, &c.id, &c.name, limits.clone(), origin.clone(), true);
             }
         }
@@ -517,6 +600,37 @@ pub async fn from_codex(st: &HeadState, from: c6_core::WorkerId, report: api::Co
     drop(_guard);
     keep(st).await;
     Ok(())
+}
+
+fn codex_comparisons(identities: &[(Option<String>, Option<String>)], origin: &api::QuotaOrigin) -> Vec<String> {
+    identities
+        .iter()
+        .enumerate()
+        .map(|(i, (account, address))| {
+            let id_reason = if account.as_ref().is_none_or(String::is_empty) {
+                "connection has no account id"
+            } else if origin.account_id.is_none() {
+                "Codex has no account id"
+            } else {
+                "account ids differ"
+            };
+            let email_reason = if address.as_deref().and_then(email).is_none() {
+                "connection has no email"
+            } else if origin.email.is_none() {
+                "Codex has no email"
+            } else if address.as_deref().and_then(email) == origin.email.as_deref().and_then(email) {
+                "email matches (ambiguous)"
+            } else {
+                "emails differ"
+            };
+            format!(
+                "connection #{}: account {}; {id_reason}; email {}; {email_reason}",
+                i + 1,
+                masked_account(account.as_deref()),
+                masked_email(address.as_deref().unwrap_or(""))
+            )
+        })
+        .collect()
 }
 
 /// A turn ended on `connection`: a ChatGPT plan's windows are read soon.
@@ -655,6 +769,57 @@ async fn list(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_identity_email_is_not_published_or_persisted() {
+        let origin = api::QuotaOrigin { email: Some("private@example.test".into()), ..Default::default() };
+        let value = serde_json::to_value(&origin).unwrap();
+        assert!(value.get("email").is_none());
+        assert!(!value.to_string().contains("private@example.test"));
+        let restored: api::QuotaOrigin = serde_json::from_value(value).unwrap();
+        assert!(restored.email.is_none());
+        // Worker reports still carry the identity to the head for matching.
+        let report = api::CodexLimitsReport { email: origin.email, ..Default::default() };
+        assert_eq!(serde_json::to_value(report).unwrap()["email"], "private@example.test");
+    }
+
+    #[test]
+    fn codex_matches_ids_first_then_only_one_case_insensitive_email() {
+        let identities = vec![
+            (Some("account-a".into()), Some("first@example.test".into())),
+            (None, Some("Ada@Example.Test".into())),
+            (Some("account-a".into()), Some("other@example.test".into())),
+        ];
+        assert_eq!(codex_matches(&identities, Some("account-a"), Some("ada@example.test")).0, [0, 2], "ids take priority");
+        assert_eq!(codex_matches(&identities, Some("unknown"), Some("ADA@EXAMPLE.TEST")).0, [1]);
+        assert_eq!(codex_matches(&identities, None, Some("ada@example.test")).0, [1], "workspace absent in dynamically registered tokens");
+        for address in [None, Some(""), Some("nobody@example.test"), Some("ada+alias@example.test"), Some("not-an-email")] {
+            assert!(codex_matches(&identities, None, address).0.is_empty(), "never infer from a name, partial email or alias");
+        }
+        let ambiguous = vec![(None, Some("Ada@Example.Test".into())), (None, Some("ada@example.test".into()))];
+        let (matches, reason) = codex_matches(&ambiguous, Some("account-a"), Some("ada@example.test"));
+        assert!(matches.is_empty());
+        assert!(reason.contains("connections have no account id") && reason.contains("ambiguous email"));
+        assert!(codex_matches(&[(None, None)], None, None).0.is_empty(), "even the only connection needs a real identity match");
+        assert!(codex_matches(&[], None, None).1.contains("no ChatGPT connections"));
+    }
+
+    #[test]
+    fn codex_diagnostics_only_contain_masked_comparison_values() {
+        let identities = vec![(None, Some("different@example.test".into())), (Some("12345678-secret-account".into()), None)];
+        let origin = api::QuotaOrigin {
+            account_id: Some("93837d23-secret-account".into()),
+            email: Some("actual@example.test".into()),
+            ..Default::default()
+        };
+        let comparisons = codex_comparisons(&identities, &origin).join("; ");
+        assert!(comparisons.contains("connection has no account id") && comparisons.contains("emails differ"));
+        assert!(comparisons.contains("connection has no email"));
+        assert!(comparisons.contains("12345678") && !comparisons.contains("secret-account"));
+        assert!(comparisons.contains("d***@example.test") && !comparisons.contains("different@example.test"));
+        assert_eq!(masked_email(origin.email.as_deref().unwrap()), "a***@example.test");
+        assert_eq!(masked_account(origin.account_id.as_deref()), "93837d23");
+    }
     use serde_json::json;
 
     #[tokio::test]

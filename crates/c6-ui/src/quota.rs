@@ -53,33 +53,56 @@ fn source_note(w: &QuotaWindow) -> Option<String> {
     w.origin.as_ref().filter(|o| o.source == "codex-cli").map(|o| format!("via Codex on {}", o.worker_name))
 }
 
-/// Worker diagnostics and snapshots with no exact connection-account match
+/// Worker diagnostics and snapshots with no safe connection-account match
 /// live separately, never in a model picker or a connection's bars.
 #[component]
-pub fn UnmatchedCodexLimits() -> impl IntoView {
+pub fn UnmatchedCodexLimits(#[prop(default = false)] list_rows: bool) -> impl IntoView {
     move || {
         all()
             .into_iter()
             .filter(|q| q.connection_id.starts_with("codex-cli:"))
-            .map(|q| {
-                let origin = q.origin.as_ref();
-                let worker = origin.map(|o| o.worker_name.as_str()).unwrap_or("unknown worker");
-                let account = origin
-                    .and_then(|o| o.account_id.as_deref())
-                    .map(|s| s.chars().take(8).collect::<String>())
-                    .unwrap_or_else(|| "unknown".into());
-                let label = format!("From Codex on {worker}, account {account} — no matching ChatGPT connection");
-                let error = q.error.clone();
-                view! {
-                    <div class="space-y-1 text-xs text-muted">
-                        <div>{label}</div>
-                        <QuotaBars q />
-                        {(!error.is_empty()).then(|| view! { <div>{error}</div> })}
-                    </div>
-                }
-            })
+            .map(move |q| view! { <UnmatchedCodexRow q list_rows /> })
             .collect_view()
     }
+}
+
+fn unmatched_label(q: &ConnectionQuota) -> String {
+    let origin = q.origin.as_ref();
+    let worker = origin.map(|o| o.worker_name.as_str()).unwrap_or("unknown worker");
+    let account =
+        origin.and_then(|o| o.account_id.as_deref()).map(|s| s.chars().take(8).collect::<String>()).unwrap_or_else(|| "unknown".into());
+    format!("Codex on {worker} · account {account}, matches no connection")
+}
+
+#[component]
+fn UnmatchedCodexRow(q: ConnectionQuota, list_rows: bool) -> impl IntoView {
+    let label = unmatched_label(&q);
+    let reason = q
+        .origin
+        .as_ref()
+        .map(|o| o.unmatched_reason.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "No email or account-id match".into());
+    let error = q.error.clone();
+    view! {
+        <div class=if list_rows { "space-y-1 px-4 py-3 text-xs text-muted" } else { "space-y-1 text-xs text-muted" }>
+            <div class="font-medium">{label}</div>
+            <div>{reason}</div>
+            <QuotaBars q />
+            {(!error.is_empty()).then(|| view! { <div>{error}</div> })}
+        </div>
+    }
+}
+
+/// Last executable actually selected on a worker, including matched windows.
+pub fn codex_command(worker: &str) -> Option<(String, bool)> {
+    let quotas = all();
+    quotas
+        .iter()
+        .flat_map(|q| q.origin.iter().chain(q.windows.iter().filter_map(|w| w.origin.as_ref())))
+        .filter(|o| o.worker_id == worker && o.command.is_some())
+        .max_by_key(|o| o.observed_at)
+        .and_then(|o| o.command.clone().map(|p| (p, o.command_from_shell)))
 }
 
 /// How much is left, by level: more than half (quiet grey), half down to
@@ -142,15 +165,13 @@ pub fn tone(w: &QuotaWindow) -> Tone {
     level(left(w), &w.status)
 }
 
-/// The tightest window's percent left and its level: what the message
-/// box's model chip shows.
-pub fn tightest_left(q: &ConnectionQuota) -> Option<(f64, Tone)> {
-    q.tightest().map(|w| (left(w), tone(w)))
-}
-
 /// Used up: nothing left, or the provider says so.
 fn used_up(w: &QuotaWindow) -> bool {
     left(w) == 0.0 || w.status == "rejected"
+}
+
+fn remaining(w: &QuotaWindow) -> String {
+    if used_up(w) { "used up".to_owned() } else { format!("{:.0}% left", left(w)) }
 }
 
 /// A window's name to read: "5h" "5-hour", "30m" "30-minute", "week
@@ -210,23 +231,19 @@ pub fn resets_at(at: i64, now: i64, at_east: i64, now_east: i64, sep: &str) -> S
     }
 }
 
-/// One window as a sentence, for a hover: "Week: 90% left, resets Sun Nov
+/// One window as a sentence, for a hover: "Week: 90% left · resets Sun Nov
 /// 8, 9:00 am" (`when` gives the reset's phrase).
 pub fn sentence_at(w: &QuotaWindow, when: &dyn Fn(i64) -> String) -> String {
-    let what = if used_up(w) { "used up".to_owned() } else { format!("{:.0}% left", left(w)) };
-    match w.resets_at {
-        Some(at) => format!("{}: {what}, resets {}", window_label(&w.name), when(at)),
-        None => format!("{}: {what}", window_label(&w.name)),
-    }
+    line_at(w, when)
 }
 
-/// One window, for Settings and the Usage page: "5-hour: 34% used · resets
+/// One window, for Settings and the Usage page: "5-hour: 66% left · resets
 /// today 3:40 pm".
 pub fn line_at(w: &QuotaWindow, when: &dyn Fn(i64) -> String) -> String {
-    let used = if used_up(w) { "used up".to_owned() } else { format!("{:.0}% used", w.used_percent) };
+    let remaining = remaining(w);
     match w.resets_at {
-        Some(at) => format!("{}: {used} · resets {}", window_label(&w.name), when(at)),
-        None => format!("{}: {used}", window_label(&w.name)),
+        Some(at) => format!("{}: {remaining} · resets {}", window_label(&w.name), when(at)),
+        None => format!("{}: {remaining}", window_label(&w.name)),
     }
 }
 
@@ -253,15 +270,15 @@ pub fn line(w: &QuotaWindow) -> String {
 /// The option text for a connection in a picker: its name, and what's left
 /// of its plan's tightest window ("Max · 90% left").
 pub fn option_label(id: &str, name: &str) -> String {
-    match of(id).as_ref().and_then(tightest_left) {
-        Some((left, _)) => format!("{name} · {left:.0}% left"),
+    match of(id).as_ref().and_then(|q| q.tightest().map(remaining)) {
+        Some(left) => format!("{name} · {left}"),
         None => name.to_owned(),
     }
 }
 
 /// What's left of the chosen connection's plan: beside a picker "90% left"
 /// (every window on hover), or `chip`, after the model in the message
-/// box's chip, "· 90%" (the tightest window on hover). Nothing without a
+/// box's chip, "· 90% left" (the tightest window on hover). Nothing without a
 /// plan.
 #[component]
 pub fn QuotaNote(#[prop(into)] connection: Signal<String>, #[prop(optional)] chip: bool) -> impl IntoView {
@@ -278,14 +295,13 @@ pub fn QuotaNote(#[prop(into)] connection: Signal<String>, #[prop(optional)] chi
                     <span class="inline-block h-1 w-3.5 overflow-hidden rounded-full bg-zinc-300 dark:bg-zinc-700" aria-hidden="true">
                         <span class=format!("block h-full rounded-full {}", t.bar()) style=format!("width: {:.0}%", left(w))></span>
                     </span>
-                    {format!("{:.0}%", left(w))}
+                    {remaining(w)}
                 </span>
             }
             .into_any()
         } else {
             let title = q.windows.iter().map(sentence).collect::<Vec<_>>().join("\n");
-            view! { <span class=format!("whitespace-nowrap text-xs {}", t.class()) title=title>{format!("{:.0}% left", left(w))}</span> }
-                .into_any()
+            view! { <span class=format!("whitespace-nowrap text-xs {}", t.class()) title=title>{remaining(w)}</span> }.into_any()
         })
     }
 }
@@ -311,9 +327,9 @@ pub fn PlanMenu(#[prop(into)] connection: Signal<String>) -> impl IntoView {
                                 <div class="h-1 min-w-0 flex-1 overflow-hidden rounded bg-zinc-200 dark:bg-zinc-800">
                                     <div class=format!("h-full {}", t.bar()) style=format!("width:{pct:.0}%")></div>
                                 </div>
-                                <span class=format!("shrink-0 whitespace-nowrap {}", t.class())>{format!("{pct:.0}% left")}</span>
+                                <span class=format!("shrink-0 whitespace-nowrap {}", t.class())>{remaining(w)}</span>
                             </div>
-                            {w.resets_at.map(|at| view! { <div class="text-muted">{format!("resets {}", resets(at, " · "))}</div> })}
+                            {w.resets_at.map(|at| view! { <div class="text-muted">{format!("resets {}", resets(at, ", "))}</div> })}
                             {source_note(w).map(|note| view! { <div class="text-muted">{note}</div> })}
                         </div>
                     }
@@ -324,7 +340,7 @@ pub fn PlanMenu(#[prop(into)] connection: Signal<String>) -> impl IntoView {
     }
 }
 
-/// A connection's windows as bars of what's used, for Settings and the
+/// A connection's windows as bars of what's left, for Settings and the
 /// Usage page.
 #[component]
 pub fn QuotaBars(q: ConnectionQuota) -> impl IntoView {
@@ -333,9 +349,8 @@ pub fn QuotaBars(q: ConnectionQuota) -> impl IntoView {
         <div class="space-y-1">
             {q.windows.iter().map(|w| {
                 let t = tone(w);
-                let pct = w.used_percent.clamp(0.0, 100.0);
-                // The words stay grey until it's low.
-                let text = if t >= Tone::Low { t.class() } else { "text-muted" };
+                let pct = left(w);
+                let text = t.class();
                 view! {
                     <div class="flex items-center gap-2 text-xs">
                         <div class="h-1.5 w-28 shrink-0 overflow-hidden rounded bg-zinc-200 dark:bg-zinc-800">
@@ -354,6 +369,38 @@ pub fn QuotaBars(q: ConnectionQuota) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unmatched_codex_row_names_worker_masks_account_and_explains_no_match() {
+        let q = ConnectionQuota {
+            connection_id: "codex-cli:worker".into(),
+            origin: Some(c6_api::QuotaOrigin {
+                worker_name: "thalassa".into(),
+                account_id: Some("93837d23-secret".into()),
+                unmatched_reason: "No email or account-id match: connections have no account id; emails differ".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(unmatched_label(&q), "Codex on thalassa · account 93837d23, matches no connection");
+        let owner = Owner::new();
+        let html = owner.with(|| view! { <UnmatchedCodexRow q list_rows=true /> }.to_html());
+        assert!(html.contains("px-4 py-3"), "styled as a connection-list row");
+        assert!(html.contains("emails differ"));
+        assert!(!html.contains("93837d23-secret"));
+    }
+
+    #[test]
+    fn settings_and_usage_bars_show_remaining_not_used() {
+        let owner = Owner::new();
+        for (used, left, text) in [(37.0, 63.0, "Week: 63% left"), (100.0, 0.0, "Week: used up")] {
+            let q = ConnectionQuota { windows: vec![w("week", used, None, "")], ..Default::default() };
+            let html = owner.with(|| view! { <QuotaBars q /> }.to_html());
+            assert!(html.contains(text), "{html}");
+            assert!(html.contains(&format!("width:{left:.1}%")), "{html}");
+            assert!(!html.contains("% used"));
+        }
+    }
 
     fn w(name: &str, used: f64, resets_at: Option<i64>, status: &str) -> QuotaWindow {
         QuotaWindow { name: name.into(), used_percent: used, resets_at, status: status.into(), ..Default::default() }
@@ -390,6 +437,7 @@ mod tests {
 
     #[test]
     fn the_chip_shows_the_tightest_window() {
+        let tightest_left = |q: &ConnectionQuota| q.tightest().map(|w| (left(w), tone(w)));
         let q = ConnectionQuota {
             windows: vec![w("5h", 34.0, None, ""), w("week", 71.0, None, ""), w("week (Opus)", 12.0, None, "")],
             ..Default::default()
@@ -465,10 +513,11 @@ mod tests {
     #[test]
     fn a_window_reads_with_its_reset() {
         let when = |_: i64| "Sun Nov 8, 9:00 am".to_owned();
-        assert_eq!(sentence_at(&w("week", 10.0, Some(1), ""), &when), "Week: 90% left, resets Sun Nov 8, 9:00 am");
-        assert_eq!(sentence_at(&w("5h", 100.0, Some(1), "rejected"), &when), "5-hour: used up, resets Sun Nov 8, 9:00 am");
+        assert_eq!(sentence_at(&w("week", 10.0, Some(1), ""), &when), "Week: 90% left · resets Sun Nov 8, 9:00 am");
+        assert_eq!(sentence_at(&w("5h", 100.0, Some(1), "rejected"), &when), "5-hour: used up · resets Sun Nov 8, 9:00 am");
         assert_eq!(sentence_at(&w("week", 71.0, None, ""), &when), "Week: 29% left");
-        assert_eq!(line_at(&w("5h", 34.4, Some(1), ""), &when), "5-hour: 34% used · resets Sun Nov 8, 9:00 am");
+        assert_eq!(line_at(&w("5h", 34.4, Some(1), ""), &when), "5-hour: 66% left · resets Sun Nov 8, 9:00 am");
+        assert_eq!(line_at(&w("week", 37.0, Some(1), ""), &when), "Week: 63% left · resets Sun Nov 8, 9:00 am");
         assert_eq!(line_at(&w("week", 100.0, None, "rejected"), &when), "Week: used up");
     }
 }

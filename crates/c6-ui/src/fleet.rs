@@ -207,7 +207,7 @@ fn CodexLimitsSettings(workers: ReadSignal<Vec<Worker>>) -> impl IntoView {
     view! {
         <section class="space-y-2 text-sm">
             <h2 class="font-medium">"ChatGPT plan limits"</h2>
-            <p class="text-muted">"Read ChatGPT plan limits from this machine's Codex. Uses its existing sign-in, never a model turn. Only matching accounts update a connection. Optionally set an absolute Codex command path if it isn't on the worker service's PATH."</p>
+            <p class="text-muted">"Read ChatGPT plan limits from this machine's Codex. Uses its existing sign-in, never a model turn. Finds Codex through the user's login shell; an optional absolute command path overrides discovery. Matches by account id or a unique email. One Codex install reports one account, not every ChatGPT account."</p>
             {move || error.get().map(|e| view! { <p class="text-muted">{e}</p> })}
             <For each=move || workers.get().into_iter().filter(|w| w.role != "memex" && w.status != WorkerStatus::Revoked)
                 key=|w| (w.id, w.name.clone()) children=move |w| {
@@ -216,6 +216,7 @@ fn CodexLimitsSettings(workers: ReadSignal<Vec<Worker>>) -> impl IntoView {
                 let value_id = id.clone();
                 let command_id = id.clone();
                 let quota_id = format!("codex-cli:{id}");
+                let found_id = id.clone();
                 view! {
                     <div class="space-y-1">
                     <div class="flex flex-wrap items-center gap-2">
@@ -244,7 +245,7 @@ fn CodexLimitsSettings(workers: ReadSignal<Vec<Worker>>) -> impl IntoView {
                     <label class="flex items-center gap-2">
                         <span class="text-muted">"Codex command"</span>
                         <input type="text" class="rounded border border-zinc-300 bg-transparent px-2 py-1 dark:border-zinc-700"
-                            placeholder="codex (on PATH)"
+                            placeholder="auto-discover Codex"
                             title="Optional absolute executable path, without arguments or ~ expansion. Its folder is added to PATH for Codex only."
                             disabled=move || pending.get() || !matches!(settings.get(), Some(Ok(_)))
                             prop:value=move || settings.get().and_then(Result::ok).and_then(|s| s.commands.get(&value_id).cloned()).unwrap_or_default()
@@ -266,6 +267,7 @@ fn CodexLimitsSettings(workers: ReadSignal<Vec<Worker>>) -> impl IntoView {
                             } />
                     </label>
                     </div>
+                    {move || crate::quota::codex_command(&found_id).map(|(p, shell)| view! { <p class="break-all text-xs text-muted">"Codex command used: "{p}{if shell { " (from user's shell)" } else { " (manual override)" }}</p> })}
                     {move || crate::quota::all().into_iter().find(|q| q.connection_id == quota_id && !q.error.is_empty())
                         .map(|q| view! { <p class="text-muted">{q.error}</p> })}
                     </div>

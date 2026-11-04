@@ -57,6 +57,9 @@ while IFS= read -r line; do
                 i=0; while [ "$i" -lt 2000 ]; do printf '%080d\n' 0 >&2; i=$((i+1)); done
                 cat response
             fi;;
+        *'"method":"account/read"'*)
+            [ "$mode" = old-account ] && { echo '{"id":4,"error":{"code":-32601,"message":"secret-unsupported"}}'; continue; }
+            echo '{"id":4,"result":{"account":{"type":"chatgpt","email":"codex-user@example.test","planType":"plus"},"requiresOpenaiAuth":true}}';;
         *) echo forbidden > forbidden; exit 92;;
     esac
 done
@@ -75,23 +78,25 @@ fn requests(dir: &Path) -> Vec<Value> {
 
 #[tokio::test]
 async fn newline_rpc_handshake_and_old_version_retry() {
-    for mode in ["new", "old", "old-request"] {
+    for mode in ["new", "old", "old-request", "old-account"] {
         let dir = tempfile::tempdir().unwrap();
         let binary = fake(dir.path(), mode, result(Some("account-a"))).await;
         let report =
             within("Codex plan read", codex_limits::read(&binary, c6_testkit::wait::deadline(), &CancellationToken::new())).await.unwrap();
         assert_eq!(report.account_id.as_deref(), Some("account-a"));
         assert_eq!(report.plan_type.as_deref(), Some("plus"));
+        assert_eq!(report.email.as_deref(), (mode != "old-account").then_some("codex-user@example.test"));
         assert_eq!(report.windows.iter().map(|w| (w.window_minutes, w.used_percent)).collect::<Vec<_>>(), [(10080, 71.0), (300, 34.0)]);
         let asked = requests(dir.path());
         assert_eq!(asked[0]["method"], "initialize");
         assert_eq!(asked[0]["params"]["clientInfo"]["name"], "carbon6");
         assert_eq!(asked[1], json!({"method":"initialized"}));
         assert_eq!(asked[2], json!({"id":2,"method":"account/rateLimits/read","params":{"excludeResetCreditDetails":true}}));
-        assert_eq!(asked.len(), if mode == "new" { 3 } else { 4 });
-        if mode != "new" {
+        assert_eq!(asked.len(), if mode == "old" || mode == "old-request" { 5 } else { 4 });
+        if mode == "old" || mode == "old-request" {
             assert_eq!(asked[3], json!({"id":3,"method":"account/rateLimits/read"}));
         }
+        assert_eq!(asked.last().unwrap(), &json!({"id":4,"method":"account/read","params":{"refreshToken":false}}));
         assert!(!dir.path().join("forbidden").exists(), "never starts a turn");
         let pid = std::fs::read_to_string(dir.path().join("pid")).unwrap();
         assert!(nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid.trim().parse().unwrap()), None).is_err(), "app server reaped");
@@ -181,7 +186,8 @@ async fn fake_codex_worker_reports_only_after_opt_in_and_matches_exact_accounts(
     // No accidental live ChatGPT endpoint reads by the head's legacy poller.
     head.state.store.set_setting(c6_head::quotas::CHATGPT_USAGE_URL, "http://127.0.0.1:1/unused").await.unwrap();
     for (id, account) in [("matching", "account-a"), ("different", "account-b"), ("legacy", "")] {
-        let tokens = json!({"client_id":"c","access_token":"never-used","refresh_token":"r","expires_at_ms":i64::MAX/2,"scope":"openid","workspace":account});
+        let tokens = json!({"client_id":"c","access_token":"never-used","refresh_token":"r","expires_at_ms":i64::MAX/2,"scope":"openid","workspace":account,
+            "email":if id == "legacy" { "codex-user@example.test" } else { "different@example.test" }});
         head.state
             .store
             .insert_connection(&c6_head::store::ConnectionRow {
@@ -256,6 +262,28 @@ async fn fake_codex_worker_reports_only_after_opt_in_and_matches_exact_accounts(
         assert_eq!(unmatched.windows.len(), 2);
         assert_eq!(head.state.quotas.get("matching").unwrap().windows[0].used_percent, 34.0);
     }
+    let mut by_email = codex_limits::parse(&result(None)).unwrap();
+    by_email.email = Some("CODEX-USER@EXAMPLE.TEST".into());
+    c6_head::quotas::from_codex(&head.state, worker.identity.meta.worker_id, by_email.clone()).await.unwrap();
+    let legacy = quotas().await.into_iter().find(|q| q.connection_id == "legacy").unwrap();
+    assert_eq!(legacy.source, "codex-cli");
+    assert_eq!(legacy.windows[0].used_percent, 34.0);
+    assert!(!quotas().await.iter().any(|q| q.connection_id.starts_with("codex-cli:")));
+    // Two connections with the same email are deliberately ambiguous, even
+    // though their names or the report's plan type might suggest a choice.
+    let mut duplicate = head.state.store.connection("legacy").await.unwrap().unwrap();
+    duplicate.id = "same-email".into();
+    head.state.store.insert_connection(&duplicate).await.unwrap();
+    by_email.windows[0].used_percent = 77.0;
+    c6_head::quotas::from_codex(&head.state, worker.identity.meta.worker_id, by_email.clone()).await.unwrap();
+    let unmatched = quotas().await.into_iter().find(|q| q.connection_id.starts_with("codex-cli:")).unwrap();
+    assert!(unmatched.origin.unwrap().unmatched_reason.contains("ambiguous email"));
+    assert_eq!(head.state.quotas.get("legacy").unwrap().windows[0].used_percent, 34.0, "never updates an ambiguous connection");
+    assert_eq!(head.state.quotas.get("legacy").unwrap().windows[1].used_percent, 71.0, "the ambiguous newer week is not attributed");
+    by_email.email = Some("nobody@example.test".into());
+    c6_head::quotas::from_codex(&head.state, worker.identity.meta.worker_id, by_email).await.unwrap();
+    let unmatched = quotas().await.into_iter().find(|q| q.connection_id.starts_with("codex-cli:")).unwrap();
+    assert!(unmatched.origin.unwrap().unmatched_reason.contains("emails differ"));
     let failed = CodexLimitsReport { observed_at: c6_core::now_ms(), error: "Codex not found: set its path".into(), ..Default::default() };
     c6_head::quotas::from_codex(&head.state, worker.identity.meta.worker_id, failed).await.unwrap();
     let unmatched = quotas().await.into_iter().find(|q| q.connection_id.starts_with("codex-cli:")).unwrap();
