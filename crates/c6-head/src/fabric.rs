@@ -193,6 +193,8 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
             "sessions" => crate::sessions::sessions_for(st, &session, &params).await,
             // The work it belongs to (docs/work.md §4).
             "work" => crate::work::for_session(st, &target, &params).await,
+            // Anything you can do, by your rule for agents (docs/agent-actions.md).
+            "op" => crate::agent_ops::for_session(st, &target, &params).await,
             // Documents (docs/docs.md §9).
             "doc" => crate::docs::session::for_session(st, &target, &params).await,
             // Collections, in the session's realm (docs/os.md §4.1).

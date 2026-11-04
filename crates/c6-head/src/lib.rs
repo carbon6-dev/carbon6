@@ -1,6 +1,7 @@
 //! The carbon6 head (`c6h`): system of record, worker hub and web UI server.
 
 pub mod activity;
+pub mod agent_ops;
 pub mod analytics;
 pub mod api;
 pub mod apps;

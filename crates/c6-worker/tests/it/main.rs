@@ -2,6 +2,7 @@
 //! parallel). Tests that set environment variables (ssh, hosts,
 //! templates) stay binaries of their own.
 
+mod agent_actions;
 mod agents;
 mod analytics;
 mod api_reference;

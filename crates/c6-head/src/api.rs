@@ -3322,6 +3322,9 @@ async fn reach(st: &HeadState, caller: &Caller, asked: &api::InRealm, name: &str
 
 /// Who a write is by, for history.
 fn writer(caller: &Caller) -> String {
+    if let Some(a) = crate::agent_ops::actor() {
+        return a;
+    }
     match &caller.realm {
         _ if caller.console => crate::assistant::BY_CONSOLE.into(),
         Some(r) => format!("token:{r}"),
@@ -4186,7 +4189,7 @@ async fn add_work(
     Extension(caller): Extension<Caller>,
     Json(w): Json<api::work::WorkNew>,
 ) -> ApiResult<Json<api::work::WorkItem>> {
-    Ok(Json(crate::work::create(&st, &caller, &w, "you").await?))
+    Ok(Json(crate::work::create(&st, &caller, &w, &crate::agent_ops::by("you")).await?))
 }
 
 async fn work_of(
@@ -4220,7 +4223,7 @@ async fn attach_work(
     Path(id): Path<String>,
     Json(r): Json<api::work::WorkRef>,
 ) -> ApiResult<Json<api::work::WorkItem>> {
-    Ok(Json(crate::work::attach(&st, &id, &r, &caller, "you").await?))
+    Ok(Json(crate::work::attach(&st, &id, &r, &caller, &crate::agent_ops::by("you")).await?))
 }
 
 async fn detach_work(

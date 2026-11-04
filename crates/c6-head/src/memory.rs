@@ -98,7 +98,7 @@ pub async fn put(st: &HeadState, mut m: api::Memory, realm: &str) -> anyhow::Res
         m.id = uuid::Uuid::now_v7().simple().to_string()[20..].to_owned();
     }
     let mut tx = st.store.pool.begin_with("BEGIN IMMEDIATE").await?;
-    upsert(&mut tx, &m.id, &m.scope, &m.text, None, realm, "you").await?;
+    upsert(&mut tx, &m.id, &m.scope, &m.text, None, realm, &crate::agent_ops::by("you")).await?;
     tx.commit().await?;
     let realm = realm_of(st, &m.id).await?.unwrap_or_else(|| realm.to_owned());
     if crate::memex::has_memex(&realm) {
@@ -119,7 +119,7 @@ async fn realm_of(st: &HeadState, id: &str) -> anyhow::Result<Option<String>> {
 pub async fn delete(st: &HeadState, id: &str) -> anyhow::Result<()> {
     let realm = realm_of(st, id).await?.ok_or_else(|| not_found("no such note"))?;
     let mut tx = st.store.pool.begin_with("BEGIN IMMEDIATE").await?;
-    remove(&mut tx, id, "you").await?;
+    remove(&mut tx, id, &crate::agent_ops::by("you")).await?;
     tx.commit().await?;
     if crate::memex::has_memex(&realm) {
         let params = json!({"source": "memory", "external_id": id});

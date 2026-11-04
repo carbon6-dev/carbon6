@@ -191,6 +191,13 @@ as a log entry: \"Fixed the pager's off-by-one and ran the tests\", \"Answered h
 as <turn number>: <line>, and nothing else.";
 
 /// When an agent proposes a task card (docs/task-cards.md).
+/// When agents use the `carbon6` tool (docs/agent-actions.md).
+pub const CARBON6: &str = "When the user asks you to do something in carbon6 itself (make a work item or a project, add to-dos, \
+put something on a project, rename, close or move something), do it with the carbon6 tool rather than describing it or writing a \
+document about it: find the operation, then call it. Making things is free, even inside the user's own. Changing or deleting \
+their things asks them first; say so, and carry on when you hear their answer. Use work and doc for this session's own work and \
+documents.";
+
 pub const TASK_CARDS: &str = "While you work you may notice things worth doing that do not belong in the task you were given. Propose \
 each as a task card with task_propose instead of doing it (it would bloat this change) or forgetting it; the user can start it as a \
 separate session with one click, and you carry on.\n\

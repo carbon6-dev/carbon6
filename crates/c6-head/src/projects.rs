@@ -264,7 +264,7 @@ pub async fn patch(st: &HeadState, id: &str, p: &ProjectPatch, caller: &Caller) 
     {
         return Err(bad_request("a project is active, paused, done or dropped"));
     }
-    modify(st, id, "you", p.labels.clone(), |f| {
+    modify(st, id, &crate::agent_ops::by("you"), p.labels.clone(), |f| {
         if let Some(t) = title {
             f.title = t;
         }
@@ -315,10 +315,10 @@ pub async fn detach(st: &HeadState, id: &str, d: &ProjectDetach, caller: &Caller
         if crate::work::project_of(st, w).await.as_deref() != Some(id) {
             return Err(bad_request(format!("work {w} is not in this project")));
         }
-        crate::work::set_project(st, w, &p.realm, "", "", "you").await?;
+        crate::work::set_project(st, w, &p.realm, "", "", &crate::agent_ops::by("you")).await?;
     }
     if d.doc.is_some() || d.link.is_some() {
-        modify(st, id, "you", None, |f| {
+        modify(st, id, &crate::agent_ops::by("you"), None, |f| {
             let before = f.documents.len() + f.links.len();
             if let Some(doc) = d.doc.as_deref() {
                 let doc = doc.trim_start_matches("doc:");
@@ -346,9 +346,9 @@ pub async fn merge(st: &HeadState, id: &str, m: &ProjectMerge, caller: &Caller) 
         return Err(bad_request("projects merge only within a realm"));
     }
     for w in crate::work::in_project(st, &m.from).await? {
-        crate::work::set_project(st, &w, &into.realm, id, "", "you").await?;
+        crate::work::set_project(st, &w, &into.realm, id, "", &crate::agent_ops::by("you")).await?;
     }
-    modify(st, id, "you", None, |f| {
+    modify(st, id, &crate::agent_ops::by("you"), None, |f| {
         for d in &other.fields.documents {
             if !f.documents.iter().any(|x| x.doc == d.doc) {
                 // At most one plan: the one it had wins.
@@ -370,7 +370,8 @@ pub async fn merge(st: &HeadState, id: &str, m: &ProjectMerge, caller: &Caller) 
     .await?;
     let mut tx = st.store.pool.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query("DELETE FROM records WHERE collection = ? AND id = ?").bind(PROJECTS).bind(&m.from).execute(&mut *tx).await?;
-    history(&mut tx, &m.from, other.version + 1, "delete", &serde_json::to_value(&other.fields)?, "you", now_ms()).await?;
+    history(&mut tx, &m.from, other.version + 1, "delete", &serde_json::to_value(&other.fields)?, &crate::agent_ops::by("you"), now_ms())
+        .await?;
     tx.commit().await?;
     st.registry.bump();
     get(st, id, caller).await
@@ -1017,7 +1018,7 @@ async fn drop_session_from(st: &HeadState, id: &str, session: &str, by: &str) ->
 /// A session now serves a work item: it is no project's quick session.
 pub async fn session_joined_work(st: &HeadState, session: &str) {
     if let Some(p) = of_session(st, session).await
-        && let Err(e) = drop_session_from(st, &p, session, "you").await
+        && let Err(e) = drop_session_from(st, &p, session, &crate::agent_ops::by("you")).await
     {
         tracing::warn!(project = %p, %session, "leaving the quick sessions: {e:#}");
     }

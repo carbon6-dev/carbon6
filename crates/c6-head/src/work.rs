@@ -545,9 +545,9 @@ pub async fn patch(st: &HeadState, id: &str, p: &api::work::WorkPatch, caller: &
                 return Err(bad_request(format!("the project has no phase {phase}")));
             }
         }
-        set_project(st, id, &row.realm, &project, &phase, "you").await?;
+        set_project(st, id, &row.realm, &project, &phase, &crate::agent_ops::by("you")).await?;
     }
-    modify(st, id, "you", p.labels.clone(), |f| {
+    modify(st, id, &crate::agent_ops::by("you"), p.labels.clone(), |f| {
         if let Some(t) = title {
             f.title = t;
         }
@@ -609,7 +609,7 @@ pub async fn attach(st: &HeadState, id: &str, r: &WorkRef, caller: &Caller, by: 
 
 pub async fn detach(st: &HeadState, id: &str, r: &WorkRef, caller: &Caller) -> anyhow::Result<WorkItem> {
     visible(st, id, caller).await?;
-    modify(st, id, "you", None, |f| {
+    modify(st, id, &crate::agent_ops::by("you"), None, |f| {
         let before = f.attached.len();
         f.attached.retain(|a| a.reference != r.reference.trim());
         Ok(f.attached.len() != before)
@@ -659,7 +659,7 @@ pub async fn merge(st: &HeadState, id: &str, from: &str, caller: &Caller) -> any
     if into.realm != other.realm {
         return Err(bad_request("work merges only within a realm"));
     }
-    modify(st, id, "you", None, |f| {
+    modify(st, id, &crate::agent_ops::by("you"), None, |f| {
         let new: Vec<Attached> =
             other.fields.attached.iter().filter(|a| !f.attached.iter().any(|x| x.reference == a.reference)).cloned().collect();
         f.attached.extend(new);
@@ -673,7 +673,8 @@ pub async fn merge(st: &HeadState, id: &str, from: &str, caller: &Caller) -> any
     .await?;
     let mut tx = st.store.pool.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query("DELETE FROM records WHERE collection = ? AND id = ?").bind(WORK).bind(from).execute(&mut *tx).await?;
-    history(&mut tx, from, other.version + 1, "delete", &serde_json::to_value(&other.fields)?, "you", now_ms()).await?;
+    history(&mut tx, from, other.version + 1, "delete", &serde_json::to_value(&other.fields)?, &crate::agent_ops::by("you"), now_ms())
+        .await?;
     tx.commit().await?;
     refresh(st, id);
     get(st, id, caller).await
@@ -738,8 +739,8 @@ fn tick(t: &mut Todo, done: bool, by: &str, evidence: &str) -> bool {
 
 pub async fn todo_add(st: &HeadState, id: &str, n: &TodoNew, caller: &Caller) -> anyhow::Result<WorkItem> {
     visible(st, id, caller).await?;
-    let t = new_todo(&n.text, &n.prompt, "you")?;
-    modify(st, id, "you", None, |f| add_todo_to(f, t)).await?;
+    let t = new_todo(&n.text, &n.prompt, &crate::agent_ops::by("you"))?;
+    modify(st, id, &crate::agent_ops::by("you"), None, |f| add_todo_to(f, t)).await?;
     get(st, id, caller).await
 }
 
@@ -748,7 +749,7 @@ pub async fn todo_edit(st: &HeadState, id: &str, todo: &str, p: &TodoPatch, call
     let text = p.text.as_deref().map(check_todo_text).transpose()?;
     let prompt = p.prompt.as_deref().map(check_todo_prompt).transpose()?;
     let mut ticked = false;
-    modify(st, id, "you", None, |f| {
+    modify(st, id, &crate::agent_ops::by("you"), None, |f| {
         let t = todo_mut(f, todo)?;
         if let Some(text) = text {
             t.text = text;
@@ -757,7 +758,7 @@ pub async fn todo_edit(st: &HeadState, id: &str, todo: &str, p: &TodoPatch, call
             t.prompt = prompt;
         }
         if let Some(done) = p.done {
-            ticked = tick(t, done, "you", "");
+            ticked = tick(t, done, &crate::agent_ops::by("you"), "");
         }
         f.moved_at = now_ms();
         Ok(true)
@@ -771,7 +772,7 @@ pub async fn todo_edit(st: &HeadState, id: &str, todo: &str, p: &TodoPatch, call
 
 pub async fn todo_remove(st: &HeadState, id: &str, todo: &str, caller: &Caller) -> anyhow::Result<WorkItem> {
     visible(st, id, caller).await?;
-    modify(st, id, "you", None, |f| {
+    modify(st, id, &crate::agent_ops::by("you"), None, |f| {
         todo_mut(f, todo)?;
         f.todos.retain(|t| t.id != todo);
         Ok(true)
@@ -1119,10 +1120,12 @@ pub async fn on_new_session(st: &HeadState, s: &api::Session, work: Option<&str>
     let result = match asked {
         "none" => Ok(()),
         // A quick session in a project (docs/projects.md §3.1).
-        p if p.starts_with("project:") => crate::projects::add_session(st, &p["project:".len()..], &s.id, "you").await,
+        p if p.starts_with("project:") => {
+            crate::projects::add_session(st, &p["project:".len()..], &s.id, &crate::agent_ops::by("you")).await
+        }
         "new" => {
             let title = first_line(if s.title.trim().is_empty() { prompt } else { &s.title });
-            new_with(st, &s.realm, &title, "", &all, "you").await.map(|_| ())
+            new_with(st, &s.realm, &title, "", &all, &crate::agent_ops::by("you")).await.map(|_| ())
         }
         "" | "guess" => {
             let mut held = None;
@@ -1135,7 +1138,7 @@ pub async fn on_new_session(st: &HeadState, s: &api::Session, work: Option<&str>
                 }
             }
             match held {
-                Some(id) => add_all(st, &id, &all, "you").await,
+                Some(id) => add_all(st, &id, &all, &crate::agent_ops::by("you")).await,
                 None if asked == "guess" && settings(st, &s.realm).await.guess => {
                     if let Some(arc) = st.arc() {
                         let (s, prompt) = (s.clone(), prompt.to_owned());
@@ -1151,10 +1154,10 @@ pub async fn on_new_session(st: &HeadState, s: &api::Session, work: Option<&str>
             }
         }
         id => match load(st, id).await {
-            Ok(Some(r)) if r.realm == s.realm => match add_all(st, id, &all, "you").await {
+            Ok(Some(r)) if r.realm == s.realm => match add_all(st, id, &all, &crate::agent_ops::by("you")).await {
                 Ok(()) => match todo.map(str::trim).filter(|t| !t.is_empty()) {
                     Some(t) => {
-                        modify(st, id, "you", None, |f| {
+                        modify(st, id, &crate::agent_ops::by("you"), None, |f| {
                             todo_mut(f, t)?.session = s.id.clone();
                             Ok(true)
                         })
@@ -1190,18 +1193,18 @@ pub async fn keep_todo(st: &HeadState, d: &api::Decision, into_session_work: boo
             }
         }
     }
-    let mut todo = new_todo(&d.title, d.context["prompt"].as_str().unwrap_or(""), "you")?;
+    let mut todo = new_todo(&d.title, d.context["prompt"].as_str().unwrap_or(""), &crate::agent_ops::by("you"))?;
     todo.from = format!("decision:{}", d.id);
     todo.origin = origin;
     let id = match target {
         Some(id) => {
-            modify(st, &id, "you", None, |f| add_todo_to(f, todo)).await?;
+            modify(st, &id, &crate::agent_ops::by("you"), None, |f| add_todo_to(f, todo)).await?;
             id
         }
         None => {
             let mut f = WorkFields { title: check_title(&d.title)?, status: "open".into(), ..Default::default() };
             add_todo_to(&mut f, todo)?;
-            insert(st, &d.realm, &f, &[], "you").await?
+            insert(st, &d.realm, &f, &[], &crate::agent_ops::by("you")).await?
         }
     };
     Ok(id)

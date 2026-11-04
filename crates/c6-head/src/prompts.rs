@@ -101,6 +101,11 @@ pub const DEFAULTS: &[Prompt] = &[
         default: c6_agent::CLAUDE_CODE_NOTE,
     },
     Prompt {
+        name: "session.carbon6",
+        description: "When agents do things in carbon6 for you with the carbon6 tool: making work, projects and to-dos, and asking before changing yours (docs/agent-actions.md).",
+        default: text::CARBON6,
+    },
+    Prompt {
         name: "session.task_cards",
         description: "When agents propose task cards: work for a separate session, started with one click (docs/task-cards.md).",
         default: text::TASK_CARDS,
@@ -354,7 +359,11 @@ pub async fn for_worker(st: &HeadState, realm: &str) -> String {
     let picked: Map<String, Value> = all
         .into_iter()
         .filter(|(k, _)| {
-            k.starts_with("session.subagent") || k.starts_with("session.compact") || k == "session.task_cards" || k == "session.claude_code"
+            k.starts_with("session.subagent")
+                || k.starts_with("session.compact")
+                || k == "session.task_cards"
+                || k == "session.claude_code"
+                || k == "session.carbon6"
         })
         .collect();
     Value::Object(picked).to_string()

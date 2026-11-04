@@ -62,6 +62,9 @@ struct Settling {
 /// token), the console's assistant (with your approval), else the realm's
 /// token.
 pub fn by_of(caller: &Caller) -> String {
+    if let Some(a) = crate::agent_ops::actor() {
+        return a;
+    }
     match (&caller.realm, caller.browser) {
         _ if caller.console => crate::assistant::BY_CONSOLE.into(),
         (Some(r), false) => format!("token:{r}"),
@@ -82,7 +85,7 @@ pub async fn realm_for(st: &HeadState, caller: &Caller, asked: Option<&str>) -> 
 }
 
 /// The realm's knowledge database.
-async fn pool(st: &HeadState, realm: &str) -> anyhow::Result<sqlx::SqlitePool> {
+pub(crate) async fn pool(st: &HeadState, realm: &str) -> anyhow::Result<sqlx::SqlitePool> {
     if !crate::memex::has_memex(realm) {
         return Err(bad_request("documents live in a realm: root keeps none"));
     }

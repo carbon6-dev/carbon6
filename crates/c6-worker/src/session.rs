@@ -2750,6 +2750,7 @@ pub(crate) async fn own_runtime(
             prompt.push_str(guidance.trim());
         }
     }
+    prompt.push_str(&carbon6_guidance(spec, &built.tools));
     if !built.skills.is_empty() {
         prompt.push_str("\n\n");
         prompt.push_str(&Skill::index(&built.skills, SkillTool::tool_name(profile == ToolProfile::Claude)));
@@ -2967,6 +2968,7 @@ fn builtin_tools(
     tools.push(Arc::new(c6_tools::records::Work::new(profile == ToolProfile::Claude)));
     // Documents written with the user (docs/docs.md §9).
     tools.push(Arc::new(c6_tools::records::Doc::new(profile == ToolProfile::Claude)));
+    tools.push(Arc::new(c6_tools::records::Carbon6::new(profile == ToolProfile::Claude)));
     tools.push(Arc::new(c6_tools::records::SeriesRecord::new(profile == ToolProfile::Claude)));
     tools.push(Arc::new(c6_tools::records::SeriesQuery::new(profile == ToolProfile::Claude)));
     // Collections: typed tables in the session's realm.
@@ -3077,7 +3079,8 @@ pub const CLAUDE_CODE_DEFAULT_TOOLS: &[&str] = &["Task", "SendMessage", "TaskOut
 /// carbon6's tools loaded into Claude Code's prompt up front unless
 /// Settings → Agents says otherwise; the rest wait behind its tool search:
 /// subagents, documents, the work it serves, memory and task cards.
-pub const CLAUDE_CODE_CORE_TOOLS: &[&str] = &["Task", "SendMessage", "doc", "Work", "Remember", "Forget", "TaskPropose", "TaskWithdraw"];
+pub const CLAUDE_CODE_CORE_TOOLS: &[&str] =
+    &["Task", "SendMessage", "doc", "Work", "Carbon6", "Remember", "Forget", "TaskPropose", "TaskWithdraw"];
 
 /// The tools chosen for the session's Claude Code: `None` for every one the
 /// session has (automatic), else those named (from an older head that
@@ -3169,6 +3172,7 @@ fn claude_code_guidance(spec: &CreateSession, labels: &[String], tools: &[Arc<dy
             out.push_str(guidance.trim());
         }
     }
+    out.push_str(&carbon6_guidance(spec, tools));
     if (has_tool(tools, "memex_search") || has_tool(tools, "memex_get")) && !spec.memex_brief.trim().is_empty() {
         out.push_str("\n\n# Memex\n\n");
         out.push_str(spec.memex_brief.trim());
@@ -3381,6 +3385,15 @@ fn prune_browser_profiles(dir: &Path, age: std::time::Duration) {
 /// Where a session's prompt says when to propose task cards; a subagent,
 /// which has no such tools, leaves the section out.
 pub(crate) const TASK_CARDS_HEADING: &str = "\n\n# Task cards\n\n";
+
+/// Where the `carbon6` tool's guidance starts in the system prompt.
+const CARBON6_HEADING: &str = "\n\n# Doing things in carbon6\n\n";
+
+/// The `carbon6` tool's guidance (an editable prompt), if it has the tool.
+fn carbon6_guidance(spec: &CreateSession, tools: &[Arc<dyn Tool>]) -> String {
+    let guidance = spec_prompt(spec, "session.carbon6", "");
+    if has_tool(tools, "carbon6") && !guidance.trim().is_empty() { format!("{CARBON6_HEADING}{}", guidance.trim()) } else { String::new() }
+}
 
 /// The system prompt's sections from the head's context: your notes, the
 /// memex brief and the secrets that apply.

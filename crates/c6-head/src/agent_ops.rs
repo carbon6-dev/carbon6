@@ -1,0 +1,620 @@
+//! Agents act like you (docs/agent-actions.md): a session's agent runs the
+//! catalog's operations in its realm, as `session:<id>`. Reading and making
+//! things is free; changing what it (or its family: root, side chats,
+//! subagents) made is free; changing anything else needs your OK once per
+//! thing; deleting what isn't its own needs your OK each time; and
+//! administration is yours.
+
+use c6_core::now_ms;
+use serde_json::{Value, json};
+
+use crate::HeadState;
+use crate::catalog::{self, Effect, Op, Via};
+
+tokio::task_local! {
+    /// Who an internal call writes as, when an agent makes it
+    /// (`session:<id>`): what it makes records it as the maker.
+    pub static ACTOR: String;
+}
+
+/// Who the current call writes as: the agent making it, else `default`.
+pub fn by(default: &str) -> String {
+    ACTOR.try_with(Clone::clone).unwrap_or_else(|_| default.to_owned())
+}
+
+/// The agent making the current call, if one is.
+pub fn actor() -> Option<String> {
+    ACTOR.try_with(Clone::clone).ok()
+}
+
+/// What an operation is to an agent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Class {
+    Read,
+    /// Makes something new (inside anything): free.
+    Make,
+    /// Changes something that exists: free on its own, else your OK once.
+    Change,
+    /// Deletes or otherwise can't be undone: free on its own, else your OK each time.
+    Delete,
+    /// Yours alone (administration, your attention, approvals, secrets).
+    Never,
+}
+
+/// Areas that are administration (and their reads, which may show more
+/// than the realm's own things), or that have their own, opt-in tools.
+const NEVER_AREAS: &[&str] = &["account", "assistant", "chat", "mail", "photos", "notifications", "settings", "connections", "fleet"];
+
+/// Reads in a never-area that show nothing an agent shouldn't see.
+const READ_OK: &[&str] = &["connections.list", "connections.quotas", "connections.models", "workers.list", "commands.list"];
+
+/// Yours alone, wherever they are.
+const NEVER: &[&str] = &[
+    // Approvals and answers to your decisions.
+    "sessions.approvals.decide",
+    "workflows.steps.decide",
+    "decisions.answer",
+    "decisions.session",
+    // Your attention: what you've seen.
+    "sessions.seen",
+    "sessions.viewed",
+    "sessions.suggestion.seen",
+    "work.seen",
+    "attention.seen",
+    // How things behave, and how your screens look.
+    "work.settings.put",
+    "docs.settings.put",
+    "decks.themes.put",
+    "settings.memex.put",
+    "imports.settings.put",
+    "sessions.view.set",
+    "sessions.grouping.put",
+    "sessions.facets.put",
+    "sessions.suggestions.settings.put",
+    "sessions.subagent_model.set",
+    "marks.set",
+    // Your Google account for documents; your files into the memex.
+    "docs.google_connect",
+    "docs.google_remove",
+    "memex.upload",
+    "memex.scan",
+    "memex.merge",
+    "google.sync",
+    // Starting and steering sessions has its own tools (task,
+    // template_start, message_session) with their own limits.
+    "sessions.create",
+    "sessions.send",
+    "sessions.side_chat",
+    "sessions.queue.edit",
+    "sessions.queue.now",
+    "sessions.queue.pull",
+    "sessions.queue.cancel",
+    "sessions.queue.dismiss",
+    "sessions.notices.deliver",
+    "sessions.interrupt",
+    "sessions.resume",
+    "sessions.rewind",
+    "sessions.tasks.stop",
+    // Apps and packages: installing is administration.
+    "packages.add",
+    "packages.delete",
+    "installs.add",
+    "installs.upgrade",
+    "installs.remove",
+    "installs.set_settings",
+    "apps.install",
+    "apps.upgrade",
+    "apps.remove",
+    "apps.accounts.connect",
+    "apps.accounts.remove",
+];
+
+/// Makes something new, even inside something that isn't its own.
+const MAKE: &[&str] = &[
+    "work.add",
+    "work.todos.add",
+    "projects.add",
+    "projects.propose",
+    "docs.create",
+    "docs.import",
+    "docs.comment",
+    "docs.reply",
+    "docs.export",
+    "decks.bring_in",
+    "collections.create",
+    "records.create",
+    "series.create",
+    "series.record",
+    "triggers.create",
+    "templates.run",
+    "workflows.run",
+    "decisions.add",
+    "memories.create",
+    "memex.notes.create",
+    "memex.trails.append",
+    "memex.ingest",
+    "memex.summarize",
+    "memex.relations.write",
+    "memex.commitment.set",
+    "memex.review.decide",
+    "knowledge.record",
+    "knowledge.set",
+    "claims.add",
+    "things.create",
+    "views.act",
+    "apps.operations.call",
+    // Puts something new on a work item or project (what it moves there is
+    // checked on its own).
+    "work.attach",
+    "projects.docs",
+    "projects.links",
+    "projects.sessions.add",
+];
+
+/// An operation's class for a call: bringing new work into a project is
+/// making it; bringing existing work is changing that work.
+fn class_of(op: &Op, args: &Value) -> Class {
+    if op.name == "projects.work" && args["body"]["work"].as_str().is_none_or(|w| w.trim().is_empty()) {
+        return Class::Make;
+    }
+    class(op)
+}
+
+/// An operation's class for agents.
+pub fn class(op: &Op) -> Class {
+    // How carbon6 behaves (settings and lists) is yours to change.
+    if op.effect != Effect::Read && (op.name.starts_with("settings.") || op.name.contains(".settings.")) {
+        return Class::Never;
+    }
+    if op.effect == Effect::Secret || NEVER.contains(&op.name) {
+        return Class::Never;
+    }
+    if op.area == "system" {
+        return if op.effect == Effect::Read { Class::Read } else { Class::Never };
+    }
+    if NEVER_AREAS.contains(&op.area) {
+        return if READ_OK.contains(&op.name) { Class::Read } else { Class::Never };
+    }
+    if MAKE.contains(&op.name) {
+        return Class::Make;
+    }
+    match op.effect {
+        Effect::Read => Class::Read,
+        Effect::Write => Class::Change,
+        Effect::Destructive => Class::Delete,
+        Effect::Secret => Class::Never,
+    }
+}
+
+fn arg(args: &Value, k: &str) -> String {
+    match (&args[k], &args["body"][k]) {
+        (Value::String(s), _) | (_, Value::String(s)) => s.trim().to_owned(),
+        (Value::Number(n), _) | (_, Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// What a change or delete acts on (`work:<id>`, `project:<id>`, …), from
+/// its path parameters. `None`: nothing to own (it can't be checked).
+pub fn thing(op: &Op, args: &Value) -> Option<String> {
+    let (id, name) = (arg(args, "id"), arg(args, "name"));
+    let pre = op.name.split('.').next().unwrap_or("");
+    let t = match pre {
+        "work" if !id.is_empty() => format!("work:{id}"),
+        "projects" if !id.is_empty() => format!("project:{id}"),
+        "docs" if !id.is_empty() => format!("doc:{id}"),
+        "collections" if !name.is_empty() => format!("collection:{name}"),
+        "records" if !name.is_empty() && !id.is_empty() => format!("record:{name}/{id}"),
+        "series" if !name.is_empty() => format!("series:{name}"),
+        "triggers" if !id.is_empty() => format!("trigger:{id}"),
+        "memories" if !id.is_empty() => format!("memory:{id}"),
+        "decisions" if !id.is_empty() => format!("decision:{id}"),
+        "sessions" if !id.is_empty() => format!("session:{id}"),
+        "memex" if op.name.starts_with("memex.trails.") && !id.is_empty() => format!("trail:{id}"),
+        "memex" if !id.is_empty() => format!("memex:{id}"),
+        "claims" if !id.is_empty() => format!("claim:{id}"),
+        "memex" | "knowledge" => return None,
+        _ => return None,
+    };
+    Some(t)
+}
+
+/// Something else a call moves, beside what it acts on: an existing work
+/// item brought into a project, a session attached to work or a project.
+fn moved(op: &Op, args: &Value) -> Vec<String> {
+    let body = &args["body"];
+    let s = |k: &str| body[k].as_str().map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned);
+    let mut out = Vec::new();
+    match op.name {
+        "projects.work" => out.extend(s("work").map(|w| format!("work:{w}"))),
+        "projects.sessions.add" => out.extend(s("session").map(|x| format!("session:{x}"))),
+        "work.attach" | "work.merge" => {
+            if let Some(r) = s("ref").or_else(|| s("reference")).filter(|r| r.starts_with("session:")) {
+                out.push(r);
+            }
+            if let Some(w) = s("from").or_else(|| s("other")) {
+                out.push(format!("work:{w}"));
+            }
+        }
+        "projects.merge" => out.extend(s("from").or_else(|| s("other")).map(|p| format!("project:{p}"))),
+        _ => {}
+    }
+    out
+}
+
+/// The session a session works for: its root (side chats and subagents are
+/// one family with it).
+async fn root_of(st: &HeadState, session: &str) -> String {
+    match st.store.session(session).await.ok().flatten() {
+        Some(s) => s.root_id.clone().or(s.parent_id.clone()).unwrap_or(s.id),
+        None => session.to_owned(),
+    }
+}
+
+/// Who made a thing, as recorded (`session:<id>`, `you`, …).
+async fn maker(st: &HeadState, realm: &str, thing: &str) -> Option<String> {
+    let (kind, id) = thing.split_once(':')?;
+    let pool = &st.store.pool;
+    let one = |sql: &'static str, a: String, b: Option<String>| async move {
+        let mut q = sqlx::query_scalar::<_, String>(sql).bind(a);
+        if let Some(b) = b {
+            q = q.bind(b);
+        }
+        q.fetch_optional(pool).await.ok().flatten()
+    };
+    match kind {
+        "work" | "project" | "memory" => one("SELECT created_by FROM records WHERE id = ?", id.to_owned(), None).await,
+        "record" => {
+            let (c, r) = id.split_once('/')?;
+            one("SELECT created_by FROM records WHERE collection = ? AND id = ?", c.to_owned(), Some(r.to_owned())).await
+        }
+        "collection" => one("SELECT created_by FROM collections WHERE name = ? AND realm = ?", id.to_owned(), Some(realm.to_owned())).await,
+        "series" => one("SELECT created_by FROM series WHERE name = ? AND realm = ?", id.to_owned(), Some(realm.to_owned())).await,
+        "trigger" => one("SELECT owner FROM triggers WHERE id = ?", id.to_owned(), None).await,
+        "decision" => one("SELECT source FROM decisions WHERE CAST(id AS TEXT) = ?", id.to_owned(), None).await,
+        "session" => Some(format!("session:{id}")),
+        "doc" => {
+            let pool = crate::docs::pool(st, realm).await.ok()?;
+            sqlx::query_scalar("SELECT created_by FROM docs WHERE id = ?").bind(id).fetch_optional(&pool).await.ok().flatten()
+        }
+        _ => None,
+    }
+}
+
+/// Whether `thing` is the session family's own: it made it, or it's the
+/// work or project the family belongs to.
+async fn own(st: &HeadState, realm: &str, root: &str, thing: &str) -> bool {
+    if let Some(m) = maker(st, realm, thing).await
+        && let Some(s) = m.split_whitespace().next().and_then(|m| m.strip_prefix("session:"))
+        && root_of(st, s).await == root
+    {
+        return true;
+    }
+    let work = crate::work::holding(st, &format!("session:{root}")).await.unwrap_or_default();
+    if let Some(w) = thing.strip_prefix("work:") {
+        return work.iter().any(|x| x == w);
+    }
+    if let Some(p) = thing.strip_prefix("project:") {
+        for w in &work {
+            if crate::work::project_of(st, w).await.as_deref() == Some(p) {
+                return true;
+            }
+        }
+        return crate::projects::of_session(st, root).await.as_deref() == Some(p);
+    }
+    false
+}
+
+/// Whether you let the session family change `thing` (an earlier Allow).
+async fn allowed(st: &HeadState, realm: &str, root: &str, thing: &str) -> bool {
+    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM agent_writers WHERE realm = ? AND thing = ? AND writer = ?")
+        .bind(realm)
+        .bind(thing)
+        .bind(format!("session:{root}"))
+        .fetch_one(&st.store.pool)
+        .await
+        .is_ok_and(|n| n > 0)
+}
+
+/// Lets the session family change `thing` from now on.
+pub async fn grant(st: &HeadState, realm: &str, thing: &str, root: &str) -> anyhow::Result<()> {
+    sqlx::query("INSERT OR IGNORE INTO agent_writers (realm, thing, writer, granted_at) VALUES (?, ?, ?, ?)")
+        .bind(realm)
+        .bind(thing)
+        .bind(format!("session:{root}"))
+        .bind(now_ms())
+        .execute(&st.store.pool)
+        .await?;
+    Ok(())
+}
+
+/// A thing as you'd recognize it: its title where it has one.
+async fn label(st: &HeadState, realm: &str, thing: &str) -> String {
+    let (kind, id) = thing.split_once(':').unwrap_or(("", thing));
+    let title = match kind {
+        "work" | "project" => sqlx::query_scalar::<_, String>("SELECT json_extract(fields, '$.title') FROM records WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&st.store.pool)
+            .await
+            .ok()
+            .flatten(),
+        "session" => st.store.session(id).await.ok().flatten().map(|s| s.title).filter(|t| !t.trim().is_empty()),
+        "doc" => crate::docs::title_of(st, realm, id).await.map(|t| t.0),
+        _ => None,
+    };
+    let what = match kind {
+        "work" => "work item",
+        "project" => "project",
+        "doc" => "document",
+        "record" => "record",
+        "collection" => "collection",
+        "series" => "series",
+        "trigger" => "trigger",
+        "memory" => "memory note",
+        "decision" => "decision",
+        "session" => "session",
+        "trail" => "trail",
+        "claim" => "claim",
+        _ => "item",
+    };
+    match title {
+        Some(t) => format!("the {what} \"{t}\""),
+        None => format!("the {what} {id}"),
+    }
+}
+
+/// `session.op`: what the `carbon6` tool asks (find, or call an operation).
+pub async fn for_session(st: &HeadState, session: &str, p: &Value) -> anyhow::Result<Value> {
+    let realm = crate::realms::of_session(st, session).await?.unwrap_or_else(|| crate::realms::HOME.to_owned());
+    let root = root_of(st, session).await;
+    let name = p["op"].as_str().unwrap_or("").trim();
+    if name.is_empty() {
+        return Ok(json!({"text": find_text(p["find"].as_str().unwrap_or(""))}));
+    }
+    let op = catalog::find(name).ok_or_else(|| crate::bad_request(format!("no operation {name:?}; find it with find")))?;
+    let args = if p["input"].is_object() { p["input"].clone() } else { json!({}) };
+    if p["describe"].as_bool() == Some(true) {
+        return Ok(json!({"text": serde_json::to_string_pretty(&catalog::describe(op))?}));
+    }
+    call(st, op, args, &realm, &root, session).await
+}
+
+/// Runs `op` for a session family after the rule says it may.
+async fn call(st: &HeadState, op: &'static Op, args: Value, realm: &str, root: &str, session: &str) -> anyhow::Result<Value> {
+    let class = class_of(op, &args);
+    if class == Class::Never {
+        return Err(crate::forbidden(format!("{} is the user's alone; tell them what you'd like done", op.name)));
+    }
+    // An operation that names another realm stays in this one.
+    if let Some(r) = [&args["realm"], &args["body"]["realm"]].into_iter().find_map(|v| v.as_str()).filter(|r| !r.is_empty() && *r != realm)
+    {
+        return Err(crate::forbidden(format!("this session works in realm {realm}, not {r}")));
+    }
+    let mut needs: Vec<String> = Vec::new();
+    if matches!(class, Class::Change | Class::Delete) && op.name != "projects.work" {
+        match thing(op, &args) {
+            Some(t) => needs.push(t),
+            None => return Err(crate::forbidden(format!("{}: what it changes can't be told from its input", op.name))),
+        }
+    }
+    needs.extend(moved(op, &args));
+    let mut not_own = Vec::new();
+    for t in needs {
+        if t == format!("session:{root}") || own(st, realm, root, &t).await {
+            continue;
+        }
+        if let Some(doc) = t.strip_prefix("doc:")
+            && class != Class::Delete
+            && crate::docs::session::may_write(st, realm, doc, root).await?.is_ok()
+        {
+            continue;
+        }
+        if class != Class::Delete && allowed(st, realm, root, &t).await {
+            continue;
+        }
+        not_own.push(t);
+    }
+    if !not_own.is_empty() {
+        let d = ask(st, op, &args, realm, root, session, &not_own, class == Class::Delete).await?;
+        return Ok(json!({
+            "asked": d,
+            "text": format!(
+                "Not yet: {} isn't this session's, so the user is asked first (decision {d}). Nothing changed. You'll get a message when they answer{}.",
+                label(st, realm, &not_own[0]).await,
+                if class == Class::Delete { "; if they allow it, it's done for you" } else { "; then call again" }
+            ),
+        }));
+    }
+    run(st, op, args, realm, root).await
+}
+
+async fn run(st: &HeadState, op: &'static Op, args: Value, realm: &str, root: &str) -> anyhow::Result<Value> {
+    if matches!(op.via, Via::Memex { .. }) {
+        return crate::memex::call_as(
+            st,
+            realm,
+            match op.via {
+                Via::Memex { method } => method,
+                _ => unreachable!(),
+            },
+            args,
+            &format!("session:{root}"),
+        )
+        .await;
+    }
+    ACTOR.scope(format!("session:{root}"), crate::assistant::execute(st, op, args, &format!("session:{root}"), Some(realm))).await
+}
+
+/// Opens an approval card for what isn't the session's. A change, allowed,
+/// lets it change those things from then on; a delete is done on Allow.
+#[allow(clippy::too_many_arguments)]
+async fn ask(
+    st: &HeadState,
+    op: &Op,
+    args: &Value,
+    realm: &str,
+    root: &str,
+    session: &str,
+    things: &[String],
+    once: bool,
+) -> anyhow::Result<i64> {
+    let who = st.store.session(root).await?.map(|s| s.title).filter(|t| !t.trim().is_empty()).unwrap_or_else(|| "A session".into());
+    let what = label(st, realm, &things[0]).await;
+    let (title, document) = if once {
+        (
+            format!(
+                "Let {who} {} {what}?",
+                if op.name.ends_with(".delete") || op.name.ends_with(".remove") { "delete" } else { "do this to" }
+            ),
+            format!(
+                "The session wants to run **{}** ({}) on {what}, which isn't its own.\n\n```json\n{}\n```\n\nAllow runs it once, as shown.",
+                op.name,
+                op.summary,
+                serde_json::to_string_pretty(args).unwrap_or_default()
+            ),
+        )
+    } else {
+        let mut all = Vec::new();
+        for t in things {
+            all.push(label(st, realm, t).await);
+        }
+        (
+            format!("Let {who} change {what}?"),
+            format!(
+                "The session wants to run **{}** ({}) on {}, which isn't its own. Allow lets this session (with its side chats and \
+                 subagents) change {} from now on; other sessions still ask.\n\n```json\n{}\n```",
+                op.name,
+                op.summary,
+                all.join(", "),
+                if all.len() > 1 { "them" } else { "it" },
+                serde_json::to_string_pretty(args).unwrap_or_default()
+            ),
+        )
+    };
+    let d = c6_api::DecisionIn {
+        kind: "approve".into(),
+        title,
+        document,
+        context: json!({"session": session, "root": root, "op": op.name, "input": args, "things": things, "once": once, "realm": realm}),
+        source: format!("session:{session}"),
+        options: vec![
+            c6_api::DecisionOption { label: "Allow".into(), ..Default::default() },
+            c6_api::DecisionOption { label: "Deny".into(), ..Default::default() },
+        ],
+        ..Default::default()
+    };
+    let reference =
+        if once { format!("agentop:{realm}:{}", uuid::Uuid::now_v7()) } else { format!("agentop:{realm}:{root}/{}", things.join(",")) };
+    Ok(crate::decisions::open(st, &d, realm, &reference).await?.id)
+}
+
+/// Your answer to an approval card (`agentop:…`).
+pub async fn decided(st: &HeadState, d: &c6_api::Decision, option: Option<&str>) -> anyhow::Result<()> {
+    let c = &d.context;
+    let (realm, root, session) =
+        (c["realm"].as_str().unwrap_or_default(), c["root"].as_str().unwrap_or_default(), c["session"].as_str().unwrap_or_default());
+    let allow = option == Some("Allow");
+    let op_name = c["op"].as_str().unwrap_or_default();
+    let mut text = format!("The user {} decision #{} ({}).", if allow { "allowed" } else { "denied" }, d.id, d.title);
+    if allow {
+        if c["once"].as_bool() == Some(true) {
+            let op = catalog::find(op_name).ok_or_else(|| crate::bad_request("that operation is gone"))?;
+            match run(st, op, c["input"].clone(), realm, root).await {
+                Ok(v) => text.push_str(&format!(" {op_name} ran: {}", crate::util_clip(&v.to_string(), 1500))),
+                Err(e) => text.push_str(&format!(" {op_name} failed: {e:#}")),
+            }
+        } else {
+            for t in c["things"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                grant(st, realm, t, root).await?;
+            }
+            text.push_str(&format!(" You may now run {op_name} on it; call it again."));
+        }
+    }
+    if !session.is_empty()
+        && let Err(e) = crate::sessions::send_input(st, session, &c6_api::SendMessage { text, ..Default::default() }).await
+    {
+        tracing::warn!(decision = d.id, "telling the session: {e:#}");
+    }
+    Ok(())
+}
+
+/// Operations matching words, with how an agent may use each.
+fn find_text(query: &str) -> String {
+    let v = catalog::discover(query, None);
+    let mut out = String::new();
+    if let Some(areas) = v["areas"].as_array() {
+        out.push_str("Areas (operations); find with words to see operations:\n");
+        for a in areas {
+            out.push_str(&format!("- {}: {}\n", a["area"].as_str().unwrap_or(""), a["what"].as_str().unwrap_or("")));
+        }
+        return out;
+    }
+    let found: Vec<&Op> =
+        v["operations"].as_array().into_iter().flatten().filter_map(|o| o["op"].as_str()).filter_map(catalog::find).collect();
+    if found.is_empty() {
+        return format!("No operations match {query:?}; try other words.");
+    }
+    for (i, op) in found.iter().enumerate() {
+        let how = match class(op) {
+            Class::Read => "reads",
+            Class::Make => "makes something: free",
+            Class::Change => "changes: free on what this session made, else the user is asked once",
+            Class::Delete => "deletes: free on what this session made, else the user is asked each time",
+            Class::Never => "the user's alone",
+        };
+        if i == 0 {
+            out.push_str(&format!("{} ({how}):\n{}\n\n", op.name, serde_json::to_string(&catalog::describe(op)).unwrap_or_default()));
+        } else {
+            out.push_str(&format!("- {}: {} ({how})\n", op.name, op.summary));
+        }
+    }
+    out.push_str("\nCall one with op and input (path parameters at the top, the body under \"body\"); describe: true shows one in full.");
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every change or delete an agent may make names what it acts on, so
+    /// the rule can be applied: a new operation without that fails here.
+    #[test]
+    fn every_change_names_what_it_acts_on() {
+        let mut missing = Vec::new();
+        for op in catalog::ops() {
+            if !matches!(class(op), Class::Change | Class::Delete) {
+                continue;
+            }
+            let Via::Http { path, .. } = &op.via else {
+                // Memex operations name no thing: they're makes or reads.
+                missing.push(op.name);
+                continue;
+            };
+            let mut args = json!({});
+            for p in catalog::path_params(path) {
+                args[p] = json!("x");
+            }
+            if thing(op, &args).is_none() {
+                missing.push(op.name);
+            }
+        }
+        assert!(missing.is_empty(), "classify these for agents (agent_ops.rs): {missing:?}");
+    }
+
+    #[test]
+    fn classes() {
+        let c = |n: &str| class(catalog::find(n).unwrap());
+        assert_eq!(c("work.add"), Class::Make);
+        assert_eq!(c("projects.add"), Class::Make);
+        assert_eq!(c("projects.work"), Class::Change);
+        assert_eq!(c("work.edit"), Class::Change);
+        assert_eq!(c("work.todos.remove"), Class::Delete);
+        assert_eq!(c("work.list"), Class::Read);
+        assert_eq!(c("decisions.answer"), Class::Never);
+        assert_eq!(c("connections.create"), Class::Never);
+        assert_eq!(c("auth.tokens.list"), Class::Never);
+        assert_eq!(c("realms.create"), Class::Never);
+        assert_eq!(c("realms.list"), Class::Read);
+        assert_eq!(c("settings.prompts.put"), Class::Never);
+    }
+}

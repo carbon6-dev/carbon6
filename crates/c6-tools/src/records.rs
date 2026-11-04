@@ -184,6 +184,35 @@ records_tool!(
 );
 
 records_tool!(
+    Carbon6,
+    "carbon6",
+    "Carbon6",
+    Concurrency::Exclusive,
+    "Does in carbon6 what the user can do from its pages, in this session's realm (docs/agent-actions.md): work and its to-dos, \
+     projects, documents, collections and records, series, triggers, decisions, memory notes, knowledge. find (words, e.g. \
+     \"new work in a project\" or \"add a to-do\") lists the operations that match, the first in full, with what each may do. \
+     op and input run one: path parameters at the top of input, the body under \"body\" (describe: true shows one in full). Making \
+     things is free, even inside the user's (new work in their project, a to-do on their work item). Changing or deleting what this \
+     session made is free. Changing the user's things asks them once per thing, deleting them asks each time: the call says so, \
+     nothing changes, and you get a message when they answer. Settings, sign-in, connections, workers, realms and approvals are the \
+     user's alone. Prefer work and doc for this session's own work and documents.",
+    json!({"type": "object", "properties": {
+        "find": {"type": "string", "description": "Words for what you want to do"},
+        "op": {"type": "string", "description": "An operation's name, e.g. projects.work"},
+        "input": {"type": "object", "description": "Path parameters, then the body under \"body\" (or query parameters)"},
+        "describe": {"type": "boolean", "description": "Show the operation in full instead of running it"}
+    }, "additionalProperties": false}),
+    |ctx, input| {
+        let Some(head) = ctx.session.head() else { return ToolOutput::err("carbon6's head is not reachable from here") };
+        match head.call("session.op", input).await {
+            Ok(v) if v["text"].is_string() => ToolOutput::limited(v["text"].as_str().unwrap_or("").to_owned(), false),
+            Ok(v) => ToolOutput::limited(serde_json::to_string_pretty(&v).unwrap_or_default(), false),
+            Err(e) => ToolOutput::err(e),
+        }
+    }
+);
+
+records_tool!(
     Doc,
     "doc",
     "Doc",
