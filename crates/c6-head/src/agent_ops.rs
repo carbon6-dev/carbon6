@@ -88,6 +88,8 @@ const NEVER: &[&str] = &[
     "watchers.put",
     "watchers.reset",
     "watchers.run",
+    // Which workers run a local Codex for plan limits, and which program.
+    "workers.codex_limits.put",
     // Approvals and answers to your decisions.
     "sessions.approvals.decide",
     "workflows.steps.decide",
