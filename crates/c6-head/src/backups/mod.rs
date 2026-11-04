@@ -89,6 +89,17 @@ async fn set_sealed_setting(st: &HeadState, key: &str, value: &str) -> anyhow::R
 
 /// The head's own backup key, made the first time.
 pub async fn head_key(st: &HeadState) -> anyhow::Result<HeadKey> {
+    // Made once, even when two passes start together.
+    let mut cached = st.backups.key.lock().await;
+    if let Some(k) = cached.as_ref() {
+        return Ok(k.clone());
+    }
+    let k = load_or_make_head_key(st).await?;
+    *cached = Some(k.clone());
+    Ok(k)
+}
+
+async fn load_or_make_head_key(st: &HeadState) -> anyhow::Result<HeadKey> {
     if let Some(v) = sealed_setting(st, HEAD_KEY).await? {
         let bytes: [u8; 32] = hex::decode(v.trim())?.try_into().map_err(|_| anyhow::anyhow!("the backup head key is not 32 bytes"))?;
         return Ok(HeadKey(bytes));
@@ -203,6 +214,8 @@ pub struct Engine {
     sent: std::sync::Mutex<BTreeMap<String, u64>>,
     /// Settings changed, or a pass was asked for.
     pub(crate) wake: tokio::sync::Notify,
+    /// The head's backup key, once read.
+    key: tokio::sync::Mutex<Option<HeadKey>>,
     /// Reading the logs, one pass at a time, with each database's own
     /// connections (one holds the write lock while its log is read; the
     /// other checkpoints).

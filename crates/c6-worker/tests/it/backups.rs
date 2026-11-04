@@ -169,10 +169,8 @@ async fn databases_come_back_as_of_any_time() {
         assert!(d.generations.iter().any(|g| g.database == "c6h.db" && g.complete), "{d:?}");
         assert!(d.generations.iter().any(|g| g.database == "knowledge/memex.db" && g.complete), "{d:?}");
     }
-    eprintln!("after 1: {:?}", mock.keys().iter().filter(|k| !k.contains("/chunks/")).collect::<Vec<_>>());
     add_work(&api, "B").await;
     backups::run(&st, false).await.unwrap();
-    eprintln!("after 2: {:?}", mock.keys().iter().filter(|k| !k.contains("/chunks/")).collect::<Vec<_>>());
     let t1 = after(c6_core::now_ms()).await;
     add_work(&api, "C").await;
     let status = backups::run(&st, false).await.unwrap();
