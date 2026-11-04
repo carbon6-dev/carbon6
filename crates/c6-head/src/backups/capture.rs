@@ -123,6 +123,13 @@ async fn one(st: &HeadState, conns: &mut Conns, rel: &str, spool: bool, base: bo
         // upgraded: what follows can't build on earlier base copies.
         let outside = (ds.file.is_some() && ds.file != mark) || (scan.restarted && !ds.restart_ok);
         if outside || upgraded > ds.upgraded_at {
+            tracing::info!(
+                database = rel,
+                file_changed = ds.file.is_some() && ds.file != mark,
+                log_restarted = scan.restarted && !ds.restart_ok,
+                upgraded = upgraded > ds.upgraded_at,
+                "its line of changes starts again (new base copies follow)"
+            );
             ds.epoch += 1;
             ds.upgraded_at = upgraded;
             let _ = std::fs::remove_dir_all(super::state_dir(st).join("spool").join(rel.replace('/', "_")));

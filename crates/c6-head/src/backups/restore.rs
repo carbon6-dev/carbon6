@@ -24,6 +24,9 @@ pub struct Restored {
     pub config: Option<std::path::PathBuf>,
     /// The time of the newest change put back.
     pub up_to: i64,
+    /// Destinations switched off in the restored head (turn them back on
+    /// once the head it came from is stopped).
+    pub backups_off: usize,
 }
 
 impl Restored {
@@ -41,6 +44,12 @@ impl Restored {
             out.push_str(&format!("config file: {} (check its data_dir)\n", c.display()));
         }
         out.push_str(&format!("as of {}\n", when(self.up_to)));
+        if self.backups_off > 0 {
+            out.push_str(&format!(
+                "backups are off in the restored head ({} destinations): turn them on in Settings → Backups once the head it came from is stopped\n",
+                self.backups_off
+            ));
+        }
         out
     }
 }
@@ -147,6 +156,13 @@ pub async fn restore(o: &dyn Objects, private: &str, at: Option<i64>, to: &Path)
         let check = integrity(&path).await.unwrap_or_else(|e| format!("{e:#}"));
         done.databases.push((rel.clone(), m.base_at, n, check));
     }
+    // The restored head mustn't send to these destinations on its own: the
+    // head it came from may still be running, and both would write there.
+    if let Some((_, _, _, check)) = done.databases.iter().find(|d| d.0 == "c6h.db")
+        && check == "ok"
+    {
+        done.backups_off = pause_destinations(&to.join("c6h.db")).await?;
+    }
     // The CA, the master key and the config: the newest from before `at`
     // (or the first, if there is none that early).
     let files: Vec<&Listed> = all.iter().filter(|l| l.name.starts_with("files/")).collect();
@@ -184,6 +200,29 @@ pub async fn restore(o: &dyn Objects, private: &str, at: Option<i64>, to: &Path)
         }
     }
     Ok(done)
+}
+
+/// Switches off every backup destination in a restored `c6h.db`; how many.
+async fn pause_destinations(db: &Path) -> anyhow::Result<usize> {
+    let opts = sqlx::sqlite::SqliteConnectOptions::from_str("sqlite:")?.filename(db);
+    let mut c = sqlx::SqliteConnection::connect_with(&opts).await?;
+    let v: Option<String> =
+        sqlx::query_scalar("SELECT value FROM settings WHERE key = ?").bind(super::SETTING).fetch_optional(&mut c).await?;
+    let mut n = 0;
+    if let Some(mut s) = v.and_then(|v| serde_json::from_str::<c6_api::BackupSettings>(&v).ok()) {
+        for d in s.destinations.iter_mut().filter(|d| d.enabled) {
+            d.enabled = false;
+            n += 1;
+        }
+        sqlx::query("UPDATE settings SET value = ? WHERE key = ?")
+            .bind(serde_json::to_string(&s)?)
+            .bind(super::SETTING)
+            .execute(&mut c)
+            .await?;
+    }
+    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&mut c).await?;
+    c.close().await?;
+    Ok(n)
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {

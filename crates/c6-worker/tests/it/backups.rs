@@ -190,9 +190,11 @@ async fn databases_come_back_as_of_any_time() {
     let r = backups::restore::restore(&nas_dest, &private, Some(t1), back.path()).await.unwrap();
     assert!(r.ok(), "{}", r.text());
     assert!(back.path().join("master.key").is_file() && back.path().join("pki/ca.key").is_file());
+    assert_eq!(r.backups_off, 2, "{}", r.text());
     let restored = c6_head::start(config(back.path())).await.unwrap();
     let rapi = format!("http://127.0.0.1:{}/api/v1", restored.ui_addrs[0].port());
     assert_eq!(work_titles(&rapi).await, ["A", "B"]);
+    assert!(!backups::status(&restored.state).await.unwrap().on, "the restored head doesn't send to the same places");
     restored.shutdown().await.unwrap();
 
     // From S3, the newest: all three.

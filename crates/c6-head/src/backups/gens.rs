@@ -96,7 +96,21 @@ fn needs_base(st: &HeadState, s: &BackupSettings, d: &BackupDestination, rel: &s
     if g.failed_at.is_some_and(|t| now_ms() - t < BASE_RETRY_MS) && !force {
         return false;
     }
-    force || !g.complete || g.lost || g.epoch != epoch || now_ms() - g.base_at > s.generation_days as i64 * 86_400_000
+    let why = if force {
+        "asked"
+    } else if !g.complete {
+        "unfinished"
+    } else if g.lost {
+        "fell behind"
+    } else if g.epoch != epoch {
+        "new epoch"
+    } else if now_ms() - g.base_at > s.generation_days as i64 * 86_400_000 {
+        "due"
+    } else {
+        return false;
+    };
+    tracing::info!(database = rel, destination = %d.name, why, "a new base copy");
+    true
 }
 
 /// Takes a base copy of `rel` for one destination.

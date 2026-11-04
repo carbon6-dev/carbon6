@@ -99,6 +99,7 @@ Built 2026-11-04 on branch `backups`, one commit per step (§8). The code is in 
   - It refuses a folder that already has a `c6h.db`.
   - It writes the config file as `<name>.restored`, because its `data_dir` may differ, and checks every database with `PRAGMA integrity_check`.
   - It can't restore by a destination's name from the head's settings: those settings are inside what is being restored.
+  - It switches off every backup destination in the restored head. The head it came from may still be running, and two heads sending to the same place would each take base copies and prune the other's. Turn them back on in Settings → Backups once the old head is stopped. (Found when a test started a head on a restored folder.)
 - **Changed from §6: test restores.**
   - With your key kept, a full restore into a temporary folder, with an integrity check of each database. It doesn't compare row counts with the live head.
   - Without it, a check that every object of each database's newest base copy is there. The manifest and log are hashed, and about one chunk in sixteen is read back and hashed, rather than reading the whole backup back each week.
