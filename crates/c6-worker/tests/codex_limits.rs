@@ -256,8 +256,7 @@ async fn fake_codex_worker_reports_only_after_opt_in_and_matches_exact_accounts(
         assert_eq!(unmatched.windows.len(), 2);
         assert_eq!(head.state.quotas.get("matching").unwrap().windows[0].used_percent, 34.0);
     }
-    let failed =
-        CodexLimitsReport { observed_at: c6_core::now_ms(), error: "codex not found on this worker's PATH".into(), ..Default::default() };
+    let failed = CodexLimitsReport { observed_at: c6_core::now_ms(), error: "Codex not found: set its path".into(), ..Default::default() };
     c6_head::quotas::from_codex(&head.state, worker.identity.meta.worker_id, failed).await.unwrap();
     let unmatched = quotas().await.into_iter().find(|q| q.connection_id.starts_with("codex-cli:")).unwrap();
     assert_eq!(unmatched.windows.len(), 2, "errors retain the last windows");

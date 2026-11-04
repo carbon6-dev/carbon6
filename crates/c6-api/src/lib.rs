@@ -202,6 +202,10 @@ pub struct QuotaOrigin {
 pub struct CodexLimitsSettings {
     #[serde(default)]
     pub workers: Vec<String>,
+    /// Optional absolute executable paths, by worker id. No arguments or
+    /// shell expansion; absent/empty means `codex` on that worker's PATH.
+    #[serde(default)]
+    pub commands: std::collections::BTreeMap<String, String>,
 }
 
 /// `quotas.codex.report`, carried by the existing JSON HeadCall protocol.
