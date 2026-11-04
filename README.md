@@ -82,7 +82,7 @@ make docker-token      # an enrollment token from that head
 
 **Website.** [carbon6.dev](https://carbon6.dev) is a static site generated with Leptos from `site/`, with the docs, this README's guide and the changelog rendered from the repository. `make site-serve` builds it and serves it locally; the Site workflow publishes it to GitHub Pages. See [docs/site.md](docs/site.md).
 
-**With a local toolchain.** You need Rust with the `wasm32-unknown-unknown` target, plus [Trunk](https://trunkrs.dev), which downloads Tailwind and wasm-bindgen on first use. protoc is vendored.
+**With a local toolchain.** You need Rust with the `wasm32-unknown-unknown` target, plus [Trunk](https://trunkrs.dev), which downloads Tailwind and wasm-bindgen on first use. The version is pinned in `rust-toolchain.toml`: with rustup, `cargo` and `make` in the repo install and use it on their own. protoc is vendored.
 
 ```bash
 make build             # web UI, then release c6h and c6w into target/release
