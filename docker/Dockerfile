@@ -12,7 +12,8 @@
 #              built on ubuntu:${UBUNTU} (use with --output)
 #   deb-host   Ubuntu with systemd as PID 1, to try the packages in
 
-ARG RUST_VERSION=1.97
+# The Rust version: the Makefile passes it from rust-toolchain.toml.
+ARG RUST_VERSION
 ARG TRUNK_VERSION=0.21.14
 ARG UBUNTU=22.04
 
