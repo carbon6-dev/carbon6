@@ -453,7 +453,7 @@ pub async fn test_one(st: &HeadState, d: &BackupDestination) -> c6_api::BackupTe
             title: format!("A test restore from {} failed", d.name),
             message: crate::util_clip(&t.detail, 500),
             priority: "high",
-            path: Some("/settings/system".into()),
+            path: Some("/settings/backups".into()),
             ..Default::default()
         });
     }
@@ -516,7 +516,7 @@ async fn note_behind(st: &HeadState, s: &BackupSettings, d: &BackupDestination) 
             title: format!("Backups to {} are {} minutes behind", d.name, behind / 60_000),
             message: if error.is_empty() { "Changes are waiting to be sent.".into() } else { format!("The last try said: {error}") },
             priority: "high",
-            path: Some("/settings/system".into()),
+            path: Some("/settings/backups".into()),
             ..Default::default()
         });
     }

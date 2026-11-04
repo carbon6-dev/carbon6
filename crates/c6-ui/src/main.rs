@@ -7,6 +7,7 @@ mod api;
 mod aspects;
 mod assistant;
 mod auth;
+mod backups;
 mod brief;
 mod calendar;
 mod catchup;

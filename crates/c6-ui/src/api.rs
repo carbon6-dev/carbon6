@@ -764,6 +764,35 @@ pub async fn upgrades() -> Result<Vec<c6_api::Upgrade>, String> {
     json(Request::get("/api/v1/system/upgrades").send().await).await
 }
 
+pub async fn backups() -> Result<c6_api::BackupStatus, String> {
+    json(Request::get("/api/v1/system/backups").send().await).await
+}
+
+pub async fn backup_settings() -> Result<c6_api::BackupSettings, String> {
+    json(Request::get("/api/v1/system/backups/settings").send().await).await
+}
+
+pub async fn put_backup_settings(s: c6_api::BackupSettings) -> Result<(), String> {
+    empty(Request::put("/api/v1/system/backups/settings").json(&s).map_err(|e| e.to_string())?.send().await).await
+}
+
+pub async fn new_backup_key() -> Result<c6_api::BackupKeyPair, String> {
+    json(Request::post("/api/v1/system/backups/key").send().await).await
+}
+
+pub async fn put_backup_restore_key(key: String) -> Result<(), String> {
+    let b = c6_api::BackupRestoreKey { key };
+    empty(Request::put("/api/v1/system/backups/restore-key").json(&b).map_err(|e| e.to_string())?.send().await).await
+}
+
+pub async fn run_backups(base: bool) -> Result<c6_api::BackupStatus, String> {
+    json(Request::post("/api/v1/system/backups/run").json(&c6_api::BackupRun { base }).map_err(|e| e.to_string())?.send().await).await
+}
+
+pub async fn test_backups() -> Result<c6_api::BackupStatus, String> {
+    json(Request::post("/api/v1/system/backups/test").send().await).await
+}
+
 pub async fn upgrade_backups() -> Result<c6_api::UpgradeBackups, String> {
     json(Request::get("/api/v1/system/upgrades/backups").send().await).await
 }

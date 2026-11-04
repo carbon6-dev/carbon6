@@ -208,6 +208,12 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/openapi.json", get(get_openapi))
         .route("/api/v1/system/upgrades", get(get_upgrades))
         .route("/api/v1/system/upgrades/backups", get(get_upgrade_backups).put(put_upgrade_backups))
+        .route("/api/v1/system/backups", get(get_backups))
+        .route("/api/v1/system/backups/settings", get(get_backup_settings).put(put_backup_settings))
+        .route("/api/v1/system/backups/key", post(new_backup_key))
+        .route("/api/v1/system/backups/restore-key", put(put_backup_restore_key))
+        .route("/api/v1/system/backups/run", post(run_backups))
+        .route("/api/v1/system/backups/test", post(test_backups))
         .route("/api/v1/system/updates", get(get_updates))
         .route("/api/v1/system/activity", get(get_activity))
         .route("/api/v1/system/activity/counts", get(get_activity_counts))
@@ -4131,6 +4137,37 @@ async fn put_upgrade_backups(State(st): State<Arc<HeadState>>, Json(b): Json<api
     st.store.set_keep_backups(b.keep as usize).await?;
     crate::store::prune_backups(&st.data_dir, b.keep as usize);
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_backups(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::BackupStatus>> {
+    Ok(Json(crate::backups::status(&st).await?))
+}
+
+async fn get_backup_settings(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::BackupSettings>> {
+    Ok(Json(crate::backups::settings(&st).await))
+}
+
+async fn put_backup_settings(State(st): State<Arc<HeadState>>, Json(s): Json<api::BackupSettings>) -> ApiResult<StatusCode> {
+    crate::backups::put_settings(&st, s).await.map_err(|e| ApiErr(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn new_backup_key(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::BackupKeyPair>> {
+    Ok(Json(crate::backups::new_key(&st).await?))
+}
+
+async fn put_backup_restore_key(State(st): State<Arc<HeadState>>, Json(k): Json<api::BackupRestoreKey>) -> ApiResult<StatusCode> {
+    crate::backups::set_restore_key(&st, &k.key).await.map_err(|e| ApiErr(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn run_backups(State(st): State<Arc<HeadState>>, body: Option<Json<api::BackupRun>>) -> ApiResult<Json<api::BackupStatus>> {
+    let base = body.map(|b| b.0.base).unwrap_or(false);
+    Ok(Json(crate::backups::run(&st, base).await?))
+}
+
+async fn test_backups(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::BackupStatus>> {
+    Ok(Json(crate::backups::test_now(&st, None).await?))
 }
 
 /// The API as OpenAPI 3.1, for code generation.
