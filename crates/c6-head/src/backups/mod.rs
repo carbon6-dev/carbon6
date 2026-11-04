@@ -7,7 +7,11 @@
 //! a slow or unreachable destination never holds up the head.
 
 pub mod crypt;
+mod capture;
 pub mod dest;
+mod gens;
+pub mod restore;
+pub mod wal;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -158,6 +162,9 @@ struct State {
     files_hash: String,
     #[serde(default)]
     dests: BTreeMap<String, DestState>,
+    /// Per database (its path in the head's folder): how far its log was read.
+    #[serde(default)]
+    dbs: BTreeMap<String, capture::DbState>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -175,18 +182,35 @@ struct DestState {
     stored_bytes: u64,
     #[serde(default)]
     stored_objects: u64,
+    /// Per database: the base copy its changes build on there.
+    #[serde(default)]
+    gens: BTreeMap<String, gens::DestGen>,
+    /// When something waiting for it was first not sent (for "behind").
+    #[serde(default)]
+    behind_since: Option<i64>,
+    /// When it was last told about being behind.
+    #[serde(default)]
+    behind_noted: bool,
+    #[serde(default)]
+    last_test: Option<c6_api::BackupTest>,
 }
 
 /// The engine (one per head): its state, and what wakes its loops.
 #[derive(Default)]
 pub struct Engine {
     state: std::sync::Mutex<Option<State>>,
-    /// One pass at a time.
-    pass: tokio::sync::Mutex<()>,
     /// Bytes sent per destination since the head started.
     sent: std::sync::Mutex<BTreeMap<String, u64>>,
     /// Settings changed, or a pass was asked for.
     pub(crate) wake: tokio::sync::Notify,
+    /// Reading the logs, one pass at a time, with each database's own
+    /// connections (one holds the write lock while its log is read; the
+    /// other checkpoints).
+    capture: tokio::sync::Mutex<BTreeMap<String, capture::Conns>>,
+    /// Databases whose checkpoints wait for a base copy, and how many copies.
+    paused: std::sync::Mutex<BTreeMap<String, u32>>,
+    /// One sender per destination at a time.
+    senders: std::sync::Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl Engine {
@@ -279,7 +303,7 @@ const BLOB_BATCH: usize = 200;
 
 /// A blob log entry: where a blob goes back to, and its object's name.
 #[derive(Serialize, Deserialize)]
-pub(crate) struct BlobEntry {
+pub struct BlobEntry {
     pub path: String,
     pub name: String,
 }
@@ -346,31 +370,89 @@ async fn send_to(st: &HeadState, s: &BackupSettings, d: &BackupDestination) -> a
     Ok(())
 }
 
-/// One pass: what changed goes to every enabled destination. `base`: new
-/// base copies too.
-pub async fn run(st: &HeadState, base: bool) -> anyhow::Result<c6_api::BackupStatus> {
-    {
-        let _pass = st.backups.pass.lock().await;
-        let s = settings(st).await;
-        if !s.recipient.is_empty() {
-            for d in s.destinations.iter().filter(|d| d.enabled) {
-                let r = send_to(st, &s, d).await;
-                st.backups.with(st, |state| {
-                    let ds = state.dests.entry(d.name.clone()).or_default();
-                    match &r {
-                        Ok(()) => {
-                            ds.last_ok_at = Some(now_ms());
-                            ds.last_error.clear();
-                        }
-                        Err(e) => ds.last_error = format!("{e:#}"),
-                    }
-                });
-                if let Err(e) = r {
-                    warn!(destination = %d.name, "backup: {e:#}");
-                }
+/// Whether backups are on: a key to encrypt to and a destination.
+fn on(s: &BackupSettings) -> bool {
+    !s.recipient.is_empty() && s.destinations.iter().any(|d| d.enabled)
+}
+
+/// One destination's turn: what changed, then how far behind it is.
+async fn send_one(st: &HeadState, s: &BackupSettings, d: &BackupDestination, force: bool) {
+    let lock = st.backups.senders.lock().unwrap_or_else(|e| e.into_inner()).entry(d.name.clone()).or_default().clone();
+    let _turn = lock.lock().await;
+    let r = async {
+        send_to(st, s, d).await?;
+        let to = crypt::public_key(&s.recipient)?;
+        let key = head_key(st).await?;
+        let o = objects(st, d).await?;
+        gens::send(st, s, d, o.as_ref(), &to, &key, force).await
+    }
+    .await;
+    st.backups.with(st, |state| {
+        let ds = state.dests.entry(d.name.clone()).or_default();
+        match &r {
+            Ok(()) => {
+                ds.last_ok_at = Some(now_ms());
+                ds.last_error.clear();
             }
+            Err(e) => ds.last_error = format!("{e:#}"),
         }
-        let _ = base;
+    });
+    if let Err(e) = &r {
+        warn!(destination = %d.name, "backup: {e:#}");
+    }
+    note_behind(st, s, d).await;
+}
+
+/// How long the oldest change not yet at `dest` has waited.
+fn behind_ms(st: &HeadState, dest: &str) -> Option<i64> {
+    let state = st.backups.with(st, |state| state.clone());
+    let ds = state.dests.get(dest)?;
+    let mut oldest: Option<i64> = None;
+    for (rel, db) in &state.dbs {
+        let sent = match ds.gens.get(rel) {
+            Some(g) if g.epoch == db.epoch && !g.lost => g.sent_seq,
+            // No base copy there yet: everything waits.
+            _ => 0,
+        };
+        if let Some((_, ms, _)) = capture::spooled(&capture::spool_dir(st, rel, db.epoch)).into_iter().find(|(seq, _, _)| *seq > sent) {
+            oldest = Some(oldest.map_or(ms, |o: i64| o.min(ms)));
+        }
+    }
+    oldest.map(|o| now_ms() - o)
+}
+
+/// Tells you once when a destination falls behind past the limit.
+async fn note_behind(st: &HeadState, s: &BackupSettings, d: &BackupDestination) {
+    let behind = behind_ms(st, &d.name).unwrap_or(0);
+    let over = behind > s.behind_alert_minutes as i64 * 60_000;
+    let (tell, error) = st.backups.with(st, |state| {
+        let ds = state.dests.entry(d.name.clone()).or_default();
+        let tell = over && !ds.behind_noted;
+        ds.behind_noted = over;
+        (tell, ds.last_error.clone())
+    });
+    if tell {
+        st.notifier.send(crate::notify::Note {
+            event: "backup",
+            title: format!("Backups to {} are {} minutes behind", d.name, behind / 60_000),
+            message: if error.is_empty() { "Changes are waiting to be sent.".into() } else { format!("The last try said: {error}") },
+            priority: "high",
+            path: Some("/settings/system".into()),
+            ..Default::default()
+        });
+    }
+}
+
+/// One pass: reads what changed and sends it to every enabled destination.
+/// `base`: new base copies too.
+pub async fn run(st: &HeadState, base: bool) -> anyhow::Result<c6_api::BackupStatus> {
+    let s = settings(st).await;
+    capture::pass(st, on(&s)).await?;
+    if on(&s) {
+        for d in s.destinations.iter().filter(|d| d.enabled) {
+            send_one(st, &s, d, base).await;
+        }
+        gens::clean_spool(st, &s);
     }
     status(st).await
 }
@@ -380,6 +462,7 @@ pub async fn status(st: &HeadState) -> anyhow::Result<c6_api::BackupStatus> {
     let s = settings(st).await;
     let state = st.backups.with(st, |state| state.clone());
     let sent = st.backups.sent.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let paused = st.backups.paused.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let destinations = s
         .destinations
         .iter()
@@ -389,37 +472,67 @@ pub async fn status(st: &HeadState) -> anyhow::Result<c6_api::BackupStatus> {
                 name: d.name.clone(),
                 enabled: d.enabled,
                 last_ok_at: ds.last_ok_at,
-                last_error: ds.last_error,
-                behind_ms: None,
+                last_error: ds.last_error.clone(),
+                behind_ms: behind_ms(st, &d.name),
                 sent_bytes: sent.get(&d.name).copied().unwrap_or(0),
                 stored_bytes: ds.stored_bytes,
                 stored_objects: ds.stored_objects,
-                generations: Vec::new(),
-                last_test: None,
+                generations: ds
+                    .gens
+                    .iter()
+                    .map(|(rel, g)| c6_api::BackupGeneration {
+                        database: rel.clone(),
+                        base_at: g.base_at,
+                        complete: g.complete && !g.lost,
+                        segments: g.sent_seq.saturating_sub(g.start_seq),
+                    })
+                    .collect(),
+                last_test: ds.last_test.clone(),
             }
         })
         .collect();
     Ok(c6_api::BackupStatus {
-        on: !s.recipient.is_empty() && s.destinations.iter().any(|d| d.enabled),
+        on: on(&s),
         recipient: s.recipient.clone(),
         restore_key: restore_key(st).await.is_some(),
         destinations,
-        databases: Vec::new(),
+        databases: state
+            .dbs
+            .iter()
+            .map(|(rel, db)| c6_api::BackupDatabaseStatus { path: rel.clone(), segments: db.seq, base_running: paused.contains_key(rel) })
+            .collect(),
     })
 }
 
-/// Sends changes every interval, and when woken.
+/// Reads the logs every interval (checkpointing them, whether or not
+/// backups are on), and keeps each destination's sender going.
 pub fn spawn(st: Arc<HeadState>) {
+    let capture_st = st.clone();
     tokio::spawn(async move {
+        let st = capture_st;
         loop {
-            let every = std::time::Duration::from_secs(settings(&st).await.interval_secs.max(5));
+            let s = settings(&st).await;
+            if let Err(e) = capture::pass(&st, on(&s)).await {
+                warn!("reading the databases' logs: {e:#}");
+            }
+            if on(&s) {
+                for d in s.destinations.iter().filter(|d| d.enabled).cloned() {
+                    // A destination still busy with its last turn carries on.
+                    let busy = st.backups.senders.lock().unwrap_or_else(|e| e.into_inner()).get(&d.name).is_some_and(|l| l.try_lock().is_err());
+                    if busy {
+                        continue;
+                    }
+                    let (st, s) = (st.clone(), s.clone());
+                    tokio::spawn(async move {
+                        send_one(&st, &s, &d, false).await;
+                        gens::clean_spool(&st, &s);
+                    });
+                }
+            }
             tokio::select! {
                 _ = st.shutdown.cancelled() => return,
                 _ = st.backups.wake.notified() => {}
-                _ = tokio::time::sleep(every) => {}
-            }
-            if let Err(e) = run(&st, false).await {
-                warn!("backup pass: {e:#}");
+                _ = tokio::time::sleep(std::time::Duration::from_secs(s.interval_secs.max(5))) => {}
             }
         }
     });

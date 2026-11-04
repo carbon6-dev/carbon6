@@ -301,6 +301,9 @@ impl Store {
         // says, read before this one's upgrade removes any.
         if let Some(dir) = path.parent() {
             c6_core::upgrade::keep_backups(dir, peek_keep_backups(path).await);
+            // The head checkpoints the databases in its folder itself
+            // (docs/backups.md §3).
+            c6_core::wal::manual_under(dir);
         }
         let opts = SqliteConnectOptions::from_str("sqlite:")?
             .filename(path)

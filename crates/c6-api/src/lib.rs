@@ -3499,7 +3499,7 @@ pub struct Channel {
 }
 
 /// Events a channel can carry: (name, description).
-pub const NOTIFY_EVENTS: [(&str, &str); 12] = [
+pub const NOTIFY_EVENTS: [(&str, &str); 13] = [
     ("approval", "a tool call waits for your approval (with Allow / Deny links)"),
     ("decision", "something needs your decision (with a link to answer, when it has options)"),
     ("failed", "a turn ended with an error"),
@@ -3512,11 +3512,12 @@ pub const NOTIFY_EVENTS: [(&str, &str); 12] = [
     ("host", "a host's scheduled check failed, or it is reachable again"),
     ("work", "work you left open went quiet, or has needed you for a while"),
     ("quota", "a plan's usage limit (Claude Code, ChatGPT) passed 80% or 95%, or ran out"),
+    ("backup", "backups fell behind, or a test restore failed"),
 ];
 
 /// The events a channel without a list carries.
-pub const DEFAULT_NOTIFY_EVENTS: [&str; 10] =
-    ["approval", "decision", "failed", "notice", "automation", "trigger", "budget", "host", "work", "quota"];
+pub const DEFAULT_NOTIFY_EVENTS: [&str; 11] =
+    ["approval", "decision", "failed", "notice", "automation", "trigger", "budget", "host", "work", "quota", "backup"];
 
 /// A machine reached over SSH through a worker (`/api/v1/settings/hosts`).
 /// Sessions on it get its labels; templates can target hosts by label.

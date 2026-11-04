@@ -90,17 +90,15 @@ async fn blobs_and_keys_go_to_both_destinations_once() {
         serde_json::from_slice(&crypt::open(&key, &std::fs::read(nas.path().join(files)).unwrap()).unwrap()).unwrap();
     assert!(files["files"]["master.key"].is_string() && files["files"]["pki/ca.key"].is_string(), "{files}");
 
-    // Nothing new: nothing sent.
-    let before = mock.puts();
-    let n = walk(nas.path()).len();
+    // Nothing new: no blob sent again. A new one: just it, and its log entry.
+    let blob_objects = |prefix: &str| mock.keys().iter().filter(|k| k.starts_with(&format!("c6/{prefix}"))).count();
+    let nas_objects = |prefix: &str| walk(nas.path()).iter().filter(|k| k.starts_with(prefix)).count();
     backups::run(&st, false).await.unwrap();
-    assert_eq!(mock.puts(), before, "nothing changed, nothing sent");
-    assert_eq!(walk(nas.path()).len(), n);
-    // A new blob: just it, and its log entry.
+    assert_eq!((blob_objects("blobs/"), blob_objects("bloblog/")), (1, 1));
     std::fs::write(blobs.join("ab34"), b"another").unwrap();
     backups::run(&st, false).await.unwrap();
-    assert_eq!(mock.puts().0, before.0 + 2);
-    assert_eq!(walk(nas.path()).len(), n + 2);
+    assert_eq!((blob_objects("blobs/"), blob_objects("bloblog/")), (2, 2));
+    assert_eq!((nas_objects("blobs/"), nas_objects("bloblog/")), (2, 2));
 
     // An unreachable destination says so, and the other carries on.
     mock.set_down(true);
@@ -108,7 +106,7 @@ async fn blobs_and_keys_go_to_both_destinations_once() {
     let status = backups::run(&st, false).await.unwrap();
     let s3 = status.destinations.iter().find(|d| d.name == "s3").unwrap();
     assert!(s3.last_error.contains("503"), "{s3:?}");
-    assert_eq!(walk(nas.path()).len(), n + 4);
+    assert_eq!(nas_objects("blobs/"), 3);
     mock.set_down(false);
     let status = backups::run(&st, false).await.unwrap();
     assert!(status.destinations.iter().all(|d| d.last_error.is_empty()), "{status:?}");
@@ -132,4 +130,101 @@ pub(crate) fn walk(root: &Path) -> Vec<String> {
     }
     out.sort();
     out
+}
+
+async fn work_titles(api: &str) -> Vec<String> {
+    let v: serde_json::Value = reqwest::get(format!("{api}/work?state=all")).await.unwrap().json().await.unwrap();
+    let mut t: Vec<String> = v.as_array().unwrap().iter().filter_map(|w| w["title"].as_str().map(str::to_owned)).collect();
+    t.sort();
+    t
+}
+
+async fn add_work(api: &str, title: &str) {
+    let r = reqwest::Client::new().post(format!("{api}/work")).json(&serde_json::json!({"title": title})).send().await.unwrap();
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+}
+
+/// The time after `t`, once the clock has passed it.
+async fn after(t: i64) -> i64 {
+    while c6_core::now_ms() <= t {
+        tokio::task::yield_now().await;
+    }
+    c6_core::now_ms()
+}
+
+#[tokio::test]
+async fn databases_come_back_as_of_any_time() {
+    let mock = c6_testkit::MockS3::start("AKTEST", "bucket").await;
+    let (dir, nas) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let head = c6_head::start(config(dir.path())).await.unwrap();
+    let st = head.state.clone();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let private = set_up(&st, nas.path(), &mock.endpoint()).await;
+    add_work(&api, "A").await;
+
+    // The first pass takes base copies of every database at both.
+    let status = backups::run(&st, false).await.unwrap();
+    for d in &status.destinations {
+        assert_eq!(d.last_error, "", "{d:?}");
+        assert!(d.generations.iter().any(|g| g.database == "c6h.db" && g.complete), "{d:?}");
+        assert!(d.generations.iter().any(|g| g.database == "knowledge/memex.db" && g.complete), "{d:?}");
+    }
+    eprintln!("after 1: {:?}", mock.keys().iter().filter(|k| !k.contains("/chunks/")).collect::<Vec<_>>());
+    add_work(&api, "B").await;
+    backups::run(&st, false).await.unwrap();
+    eprintln!("after 2: {:?}", mock.keys().iter().filter(|k| !k.contains("/chunks/")).collect::<Vec<_>>());
+    let t1 = after(c6_core::now_ms()).await;
+    add_work(&api, "C").await;
+    let status = backups::run(&st, false).await.unwrap();
+    assert!(status.destinations.iter().all(|d| d.behind_ms.is_none() && d.last_error.is_empty()), "{status:?}");
+
+    // Quiet: nothing is sent.
+    let (puts, bytes) = mock.puts();
+    backups::run(&st, false).await.unwrap();
+    backups::run(&st, false).await.unwrap();
+    let quiet = mock.puts();
+    assert!(quiet.0 - puts <= 2, "at most the head's own housekeeping: {puts} → {}", quiet.0);
+    eprintln!("quiet passes sent {} objects, {} bytes", quiet.0 - puts, quiet.1 - bytes);
+
+    // From the NAS as of t1: A and B, not C.
+    let nas_dest = c6_head::backups::dest::Folder::new(nas.path());
+    let back = tempfile::tempdir().unwrap();
+    let r = backups::restore::restore(&nas_dest, &private, Some(t1), back.path()).await.unwrap();
+    assert!(r.ok(), "{}", r.text());
+    assert!(back.path().join("master.key").is_file() && back.path().join("pki/ca.key").is_file());
+    let restored = c6_head::start(config(back.path())).await.unwrap();
+    let rapi = format!("http://127.0.0.1:{}/api/v1", restored.ui_addrs[0].port());
+    assert_eq!(work_titles(&rapi).await, ["A", "B"]);
+    restored.shutdown().await.unwrap();
+
+    // From S3, the newest: all three.
+    let s3 = c6_head::backups::dest::S3 {
+        endpoint: mock.endpoint(),
+        bucket: "bucket".into(),
+        region: "us-east-1".into(),
+        prefix: "c6/".into(),
+        access_key: "AKTEST".into(),
+        secret_key: "secret".into(),
+        http: reqwest::Client::new(),
+    };
+    let back2 = tempfile::tempdir().unwrap();
+    let r = backups::restore::restore(&s3, &private, None, back2.path())
+        .await
+        .unwrap_or_else(|e| panic!("{e:#}: {:?}", mock.keys().iter().filter(|k| !k.contains("/chunks/") && !k.contains("/seg/")).collect::<Vec<_>>()));
+    assert!(r.ok(), "{}", r.text());
+    let restored = c6_head::start(config(back2.path())).await.unwrap();
+    let rapi = format!("http://127.0.0.1:{}/api/v1", restored.ui_addrs[0].port());
+    assert_eq!(work_titles(&rapi).await, ["A", "B", "C"]);
+    restored.shutdown().await.unwrap();
+
+    // Another key can't, and a restore won't overwrite a data folder.
+    let (_, other) = crypt::new_key_pair();
+    let back3 = tempfile::tempdir().unwrap();
+    assert!(backups::restore::restore(&nas_dest, &other, None, back3.path()).await.is_err());
+    assert!(backups::restore::restore(&nas_dest, &private, None, dir.path()).await.is_err());
+    // Without your key: every object of the newest base copies is there.
+    let key = backups::head_key(&st).await.unwrap();
+    let v = backups::restore::verify(&nas_dest, &key).await.unwrap();
+    assert!(v.contains("all there"), "{v}");
+    head.shutdown().await.unwrap();
 }
