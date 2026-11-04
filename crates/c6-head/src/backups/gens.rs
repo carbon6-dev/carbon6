@@ -333,7 +333,7 @@ async fn retain(st: &HeadState, d: &BackupDestination, o: &dyn Objects, key: &He
             // Small files older than the oldest kept generation, but the newest.
             ["files", t] => {
                 oldest_kept.as_ref().is_some_and(|o| *t < &o[..13])
-                    && all.iter().filter(|x| x.name.starts_with("files/")).last().is_some_and(|x| x.name != l.name)
+                    && all.iter().rfind(|x| x.name.starts_with("files/")).is_some_and(|x| x.name != l.name)
             }
             _ => false,
         };

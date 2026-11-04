@@ -228,7 +228,7 @@ pub async fn verify(o: &dyn Objects, head: &HeadKey) -> anyhow::Result<String> {
         // whole backup back each time).
         let sample: Vec<(&String, &String)> =
             i.hashes.iter().filter(|(n, _)| !n.starts_with("chunks/") || rand::random::<u8>() < 16).collect();
-        for (name, _) in &i.hashes {
+        for name in i.hashes.keys() {
             anyhow::ensure!(names.contains(name.as_str()), "{name} is missing");
         }
         for (name, hash) in sample {

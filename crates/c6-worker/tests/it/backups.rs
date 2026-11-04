@@ -366,5 +366,18 @@ async fn test_restores_say_whether_a_backup_would_come_back() {
     let status = backups::test_now(&st, Some("nas")).await.unwrap();
     let t = status.destinations.iter().find(|d| d.name == "nas").unwrap().last_test.clone().unwrap();
     assert!(!t.ok && t.detail.contains("changed"), "{t:?}");
+
+    // Through the API, as the Settings page uses it.
+    let http = reqwest::Client::new();
+    let st_api: serde_json::Value = http.get(format!("{api}/system/backups")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(st_api["on"], true, "{st_api}");
+    let mut set: serde_json::Value = http.get(format!("{api}/system/backups/settings")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(set["destinations"].as_array().unwrap().len(), 2);
+    set["destinations"][0]["kind"] = "ftp".into();
+    let r = http.put(format!("{api}/system/backups/settings")).json(&set).send().await.unwrap();
+    assert_eq!(r.status(), 400, "{}", r.text().await.unwrap());
+    let r: serde_json::Value =
+        http.post(format!("{api}/system/backups/run")).json(&serde_json::json!({})).send().await.unwrap().json().await.unwrap();
+    assert!(r["destinations"].as_array().unwrap().iter().any(|d| d["name"] == "s3" && d["last_error"] == ""), "{r}");
     head.shutdown().await.unwrap();
 }

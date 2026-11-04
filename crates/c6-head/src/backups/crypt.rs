@@ -112,6 +112,12 @@ pub fn open(key: &StaticSecret, sealed: &[u8]) -> anyhow::Result<Vec<u8>> {
 #[derive(Clone)]
 pub struct HeadKey(pub [u8; 32]);
 
+impl Default for HeadKey {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HeadKey {
     pub fn new() -> Self {
         Self(rand::random())
