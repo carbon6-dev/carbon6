@@ -42,6 +42,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/google/connect", post(google_connect))
         .route("/api/v1/google/install", post(google_install))
         .route("/api/v1/settings/session_imports", get(get_session_imports).put(put_session_imports))
+        .route("/api/v1/settings/codex_limits", get(get_codex_limits).put(put_codex_limits))
         .route("/api/v1/imports", get(list_imports))
         .route("/api/v1/google/accounts", get(google_accounts))
         .route("/api/v1/google/accounts/{id}", delete(google_remove))
@@ -2334,6 +2335,21 @@ async fn slack_remove(
 /// Importing sessions from Claude Code and Codex (docs/imports.md).
 async fn get_session_imports(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::SessionImports>> {
     Ok(Json(crate::imports::settings(&st).await?))
+}
+
+async fn get_codex_limits(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::CodexLimitsSettings>> {
+    Ok(Json(crate::quotas::codex_settings(&st).await?))
+}
+
+async fn put_codex_limits(State(st): State<Arc<HeadState>>, Json(s): Json<api::CodexLimitsSettings>) -> ApiResult<StatusCode> {
+    for id in &s.workers {
+        let id = parse_worker_id(id)?;
+        if st.store.worker(id).await?.is_none() {
+            return Err(crate::bad_request("worker not found").into());
+        }
+    }
+    st.store.set_setting(crate::quotas::CODEX_SETTINGS, &serde_json::to_string(&s).map_err(anyhow::Error::from)?).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn put_session_imports(State(st): State<Arc<HeadState>>, Json(s): Json<api::SessionImports>) -> ApiResult<StatusCode> {

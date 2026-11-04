@@ -1725,6 +1725,7 @@ fn Connections(signed_in: bool) -> impl IntoView {
                 </div>
             })}
             <AddConnection all on_added=move || connections.refetch() />
+            <crate::quota::UnmatchedCodexLimits />
             <ChatGptSignIn on_added=move || connections.refetch() />
     }
 }

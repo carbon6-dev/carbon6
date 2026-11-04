@@ -3,6 +3,7 @@
 
 pub mod checkpoint;
 pub mod claude_code;
+pub mod codex_limits;
 pub mod commands;
 pub mod conn;
 pub mod enroll;
@@ -59,6 +60,11 @@ pub struct Overrides {
     pub update_as_version: Option<String>,
     /// Runs the head's kit jobs (instead of `C6_KIT_JOBS`).
     pub kit_jobs: Option<bool>,
+    /// Codex plan-limit polling: test binary and timing, never global env.
+    pub codex_bin: Option<PathBuf>,
+    pub codex_timeout: Option<std::time::Duration>,
+    pub codex_every: Option<std::time::Duration>,
+    pub codex_config_every: Option<std::time::Duration>,
 }
 
 /// Everything a running worker shares between its connection and sessions.

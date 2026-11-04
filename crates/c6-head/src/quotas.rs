@@ -64,6 +64,8 @@ pub struct Quotas {
     last_kept: tokio::sync::Mutex<Option<Instant>>,
     /// A ChatGPT read is wanted soon (a turn ended on it).
     wake: tokio::sync::Notify,
+    /// Serializes partial ChatGPT snapshots from headers and worker calls.
+    updates: tokio::sync::Mutex<()>,
 }
 
 impl Quotas {
@@ -92,6 +94,7 @@ pub fn parse_claude_code(info: &Value) -> Vec<api::QuotaWindow> {
                 used_percent: pct(&w["utilization"]),
                 resets_at: at(&w["resetsAt"]),
                 status: status_of(w["status"].as_str().unwrap_or("")),
+                ..Default::default()
             });
         }
     }
@@ -103,6 +106,7 @@ pub fn parse_claude_code(info: &Value) -> Vec<api::QuotaWindow> {
             used_percent: pct(&info["utilization"]),
             resets_at: at(&info["resetsAt"]),
             status: status_of(info["status"].as_str().unwrap_or("")),
+            ..Default::default()
         });
     }
     // The one the event is about may be rejected while its window says
@@ -152,7 +156,7 @@ pub fn parse_chatgpt(body: &Value, now: i64) -> Vec<api::QuotaWindow> {
                 .or_else(|| w["reset_after_seconds"].as_i64().map(|s| now + s.max(0) * 1000));
             let used = w["used_percent"].as_f64().unwrap_or(0.0);
             let status = if used >= 100.0 || (limited && used >= 99.0) { "rejected" } else { "" };
-            api::QuotaWindow { name, used_percent: used.clamp(0.0, 100.0), resets_at, status: status.into() }
+            api::QuotaWindow { name, used_percent: used.clamp(0.0, 100.0), resets_at, status: status.into(), ..Default::default() }
         })
         .collect();
     out.sort_by_key(|w| order(&w.name));
@@ -312,6 +316,7 @@ pub async fn from_claude_code(st: &HeadState, session_id: &str, json: &str) {
         windows: merged,
         updated_at: now_ms(),
         error: String::new(),
+        ..Default::default()
     };
     record(st, q, &c.name);
     keep(st).await;
@@ -339,8 +344,35 @@ async fn from_chatgpt(st: &HeadState, connection: &str, limits: c6_llm::openai_r
     if c.kind != "chatgpt" || (limits.primary.is_none() && limits.secondary.is_none()) {
         return;
     }
-    st.quotas.endpoint_disabled.lock().unwrap().insert(c.id.clone());
-    let mut windows = st.quotas.get(&c.id).filter(|q| q.source == "chatgpt").map(|q| q.windows).unwrap_or_default();
+    let origin =
+        api::QuotaOrigin { source: "chatgpt".into(), observed_at: now_ms(), account_id: chatgpt_account(st, &c), ..Default::default() };
+    let _guard = st.quotas.updates.lock().await;
+    record_chatgpt(st, &c.id, &c.name, limits, origin, true);
+    if CHATGPT_HEADERS_LOGGED.lock().unwrap().insert(c.id) {
+        let names =
+            st.quotas.get(connection).map(|q| q.windows.iter().map(|w| w.name.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+        info!("ChatGPT plan limits from reply headers: {names}");
+    }
+    drop(_guard);
+    keep(st).await;
+}
+
+fn record_chatgpt(
+    st: &HeadState,
+    connection: &str,
+    name: &str,
+    limits: c6_llm::openai_responses::ChatGptLimits,
+    origin: api::QuotaOrigin,
+    matched: bool,
+) {
+    if matched {
+        st.quotas.endpoint_disabled.lock().unwrap().insert(connection.to_owned());
+    }
+    let previous = st.quotas.get(connection).filter(|q| {
+        !q.origin.as_ref().is_some_and(|o| o.account_id.is_some() && origin.account_id.is_some() && o.account_id != origin.account_id)
+    });
+    let previous_at = previous.as_ref().map(|q| q.updated_at).unwrap_or(0);
+    let mut windows = previous.as_ref().map(|q| q.windows.clone()).unwrap_or_default();
     for (window, fallback) in [(limits.primary, "5h"), (limits.secondary, "week")] {
         let Some(w) = window else { continue };
         let name = w.window_minutes.and_then(|m| m.checked_mul(60)).map(span_name).unwrap_or_else(|| fallback.into());
@@ -350,23 +382,138 @@ async fn from_chatgpt(st: &HeadState, connection: &str, limits: c6_llm::openai_r
             used_percent,
             resets_at: w.resets_at.and_then(|s| s.checked_mul(1000)),
             status: if used_percent >= 100.0 { "rejected".into() } else { String::new() },
+            origin: Some(origin.clone()),
         };
         match windows.iter_mut().find(|x| x.name == window.name) {
-            Some(x) => *x = window,
+            Some(x) if x.origin.as_ref().map(|o| o.observed_at).unwrap_or(previous_at) <= origin.observed_at => *x = window,
+            Some(_) => {}
             None => windows.push(window),
         }
     }
     windows.sort_by_key(|w| order(&w.name));
-    let names = windows.iter().map(|w| w.name.as_str()).collect::<Vec<_>>().join(", ");
-    record(
-        st,
-        api::ConnectionQuota { connection_id: c.id.clone(), source: "chatgpt".into(), windows, updated_at: now_ms(), error: String::new() },
-        &c.name,
-    );
-    if CHATGPT_HEADERS_LOGGED.lock().unwrap().insert(c.id) {
-        info!("ChatGPT plan limits from reply headers: {names}");
+    let newest = windows.iter().filter_map(|w| w.origin.as_ref()).max_by_key(|o| o.observed_at).cloned().unwrap_or(origin);
+    let q = api::ConnectionQuota {
+        connection_id: connection.into(),
+        source: newest.source.clone(),
+        windows,
+        updated_at: newest.observed_at.max(previous_at),
+        error: String::new(),
+        origin: Some(newest),
+    };
+    if matched {
+        record(st, q, name);
+    } else {
+        // Unattributed data must not notify as though sessions use this plan.
+        st.quotas.by_connection.lock().unwrap().insert(connection.into(), q);
+        st.quotas.dirty.store(true, Ordering::Relaxed);
     }
+}
+
+pub const CODEX_SETTINGS: &str = "codex_limits";
+
+pub async fn codex_settings(st: &HeadState) -> anyhow::Result<api::CodexLimitsSettings> {
+    Ok(st.store.setting(CODEX_SETTINGS).await?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default())
+}
+
+async fn codex_enabled(st: &HeadState, from: c6_core::WorkerId) -> anyhow::Result<bool> {
+    Ok(codex_settings(st).await?.workers.contains(&from.to_string()))
+}
+
+pub async fn codex_config(st: &HeadState, from: c6_core::WorkerId) -> anyhow::Result<Value> {
+    Ok(serde_json::json!({"enabled": codex_enabled(st, from).await?}))
+}
+
+fn chatgpt_account(st: &HeadState, c: &crate::store::ConnectionRow) -> Option<String> {
+    c.api_key
+        .as_deref()
+        .and_then(|blob| st.secrets.decrypt(blob).ok())
+        .and_then(|s| serde_json::from_str::<crate::oauth::ChatGptTokens>(&s).ok())
+        .map(|t| t.workspace)
+        .filter(|s| !s.is_empty())
+}
+
+/// Only exact, nonempty verified workspace ids match. Never infer from an
+/// email, plan type, worker name, or the existence of just one connection.
+pub async fn from_codex(st: &HeadState, from: c6_core::WorkerId, report: api::CodexLimitsReport) -> anyhow::Result<()> {
+    anyhow::ensure!(codex_enabled(st, from).await?, "Codex plan reads are not enabled for this worker");
+    let worker = st.store.worker(from).await?.ok_or_else(|| crate::bad_request("worker not found"))?;
+    anyhow::ensure!(report.windows.len() <= 2 && report.error.len() <= 256, "invalid Codex snapshot");
+    anyhow::ensure!(
+        report.account_id.as_ref().is_none_or(|s| s.len() <= 256) && report.plan_type.as_ref().is_none_or(|s| s.len() <= 80),
+        "invalid Codex account metadata"
+    );
+    let origin = api::QuotaOrigin {
+        source: "codex-cli".into(),
+        observed_at: report.observed_at.clamp(0, now_ms()),
+        worker_id: worker.id.clone(),
+        worker_name: worker.name,
+        account_id: report.account_id.filter(|s| !s.is_empty()),
+        plan_type: report.plan_type,
+    };
+    let key = format!("codex-cli:{}", worker.id);
+    let _guard = st.quotas.updates.lock().await;
+    if !report.error.is_empty() {
+        let mut q = st.quotas.get(&key).unwrap_or(api::ConnectionQuota {
+            connection_id: key.clone(),
+            source: "codex-cli".into(),
+            origin: Some(origin),
+            ..Default::default()
+        });
+        q.error = report.error;
+        st.quotas.by_connection.lock().unwrap().insert(key, q);
+        st.quotas.dirty.store(true, Ordering::Relaxed);
+    } else {
+        let mut limits = c6_llm::openai_responses::ChatGptLimits::default();
+        for (i, w) in report.windows.into_iter().enumerate() {
+            anyhow::ensure!(
+                w.used_percent.is_finite()
+                    && (0.0..=100.0).contains(&w.used_percent)
+                    && w.window_minutes > 0
+                    && w.window_minutes <= i64::MAX / 60,
+                "invalid Codex window"
+            );
+            let w = c6_llm::openai_responses::ChatGptWindow {
+                used_percent: w.used_percent,
+                window_minutes: Some(w.window_minutes),
+                resets_at: w.resets_at,
+            };
+            if i == 0 {
+                limits.primary = Some(w);
+            } else {
+                limits.secondary = Some(w);
+            }
+        }
+        anyhow::ensure!(limits.primary.is_some(), "Codex snapshot has no windows");
+        let mut matches = Vec::new();
+        if let Some(account) = &origin.account_id {
+            for c in st.store.connections().await?.into_iter().filter(|c| c.kind == "chatgpt") {
+                if chatgpt_account(st, &c).as_ref() == Some(account) {
+                    matches.push(c);
+                }
+            }
+        }
+        if matches.is_empty() {
+            // A different Codex login replaces the previous unmatched account,
+            // rather than mixing its missing windows into the new account.
+            if let Some(old) = st.quotas.get(&key).and_then(|q| q.origin)
+                && old.account_id != origin.account_id
+            {
+                if old.observed_at > origin.observed_at {
+                    return Ok(());
+                }
+                st.quotas.by_connection.lock().unwrap().remove(&key);
+            }
+            record_chatgpt(st, &key, "", limits, origin, false);
+        } else {
+            st.quotas.by_connection.lock().unwrap().remove(&key);
+            for c in matches {
+                record_chatgpt(st, &c.id, &c.name, limits.clone(), origin.clone(), true);
+            }
+        }
+    }
+    drop(_guard);
     keep(st).await;
+    Ok(())
 }
 
 /// A turn ended on `connection`: a ChatGPT plan's windows are read soon.
@@ -437,6 +584,7 @@ pub async fn poll_chatgpt(st: &HeadState) {
                     windows,
                     updated_at: now_ms(),
                     error: String::new(),
+                    ..Default::default()
                 },
                 Err(e) => {
                     warn!(connection = %c.name, "reading the plan's usage: {e:#}");
@@ -701,7 +849,13 @@ mod tests {
             "unifiedWindows":{"seven_day":{"utilization":0.5,"resetsAt":1793750400,"status":"allowed"}}});
         assert_eq!(
             parse_claude_code(&info),
-            [api::QuotaWindow { name: "week".into(), used_percent: 50.0, resets_at: Some(1_793_750_400_000), status: "allowed".into() }]
+            [api::QuotaWindow {
+                name: "week".into(),
+                used_percent: 50.0,
+                resets_at: Some(1_793_750_400_000),
+                status: "allowed".into(),
+                ..Default::default()
+            }]
         );
         // Both windows, the short one first; a warning; the one the event is
         // about rejected.
@@ -727,8 +881,20 @@ mod tests {
         assert_eq!(
             w,
             [
-                api::QuotaWindow { name: "5h".into(), used_percent: 34.0, resets_at: Some(1_000 + 7_800_000), status: String::new() },
-                api::QuotaWindow { name: "week".into(), used_percent: 71.5, resets_at: Some(1_793_750_400_000), status: String::new() },
+                api::QuotaWindow {
+                    name: "5h".into(),
+                    used_percent: 34.0,
+                    resets_at: Some(1_000 + 7_800_000),
+                    status: String::new(),
+                    ..Default::default()
+                },
+                api::QuotaWindow {
+                    name: "week".into(),
+                    used_percent: 71.5,
+                    resets_at: Some(1_793_750_400_000),
+                    status: String::new(),
+                    ..Default::default()
+                },
             ]
         );
         // At the top level, with fields missing; a used-up window.
@@ -744,5 +910,69 @@ mod tests {
             ("5h".into(), "week".into(), "day".into(), "30m".into())
         );
         assert_eq!(in_words(2 * 3_600_000 + 10 * 60_000), "in 2h 10m");
+    }
+
+    #[tokio::test]
+    async fn chatgpt_sources_merge_newest_per_window_and_keep_provenance() {
+        use c6_llm::openai_responses::{ChatGptLimits, ChatGptWindow};
+        let dir = tempfile::tempdir().unwrap();
+        let head = crate::start(crate::HeadConfig {
+            data_dir: dir.path().into(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            auth: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let window = |used, mins| Some(ChatGptWindow { used_percent: used, window_minutes: Some(mins), resets_at: Some(4_102_444_800) });
+        let origin = |source: &str, at| api::QuotaOrigin {
+            source: source.into(),
+            observed_at: at,
+            worker_name: "test-worker".into(),
+            ..Default::default()
+        };
+        record_chatgpt(
+            &head.state,
+            "gpt",
+            "GPT",
+            ChatGptLimits { primary: window(10.0, 300), secondary: window(20.0, 10080) },
+            origin("codex-cli", 100),
+            true,
+        );
+        record_chatgpt(
+            &head.state,
+            "gpt",
+            "GPT",
+            ChatGptLimits { primary: window(30.0, 300), secondary: None },
+            origin("chatgpt", 300),
+            true,
+        );
+        record_chatgpt(
+            &head.state,
+            "gpt",
+            "GPT",
+            ChatGptLimits { primary: window(25.0, 300), secondary: window(40.0, 10080) },
+            origin("codex-cli", 200),
+            true,
+        );
+        let q = head.state.quotas.get("gpt").unwrap();
+        assert_eq!(q.updated_at, 300);
+        assert_eq!(q.source, "chatgpt");
+        assert_eq!(
+            q.windows.iter().map(|w| (w.name.as_str(), w.used_percent, w.origin.as_ref().unwrap().source.as_str())).collect::<Vec<_>>(),
+            [("5h", 30.0, "chatgpt"), ("week", 40.0, "codex-cli")]
+        );
+        keep(&head.state).await;
+        let kept = head.state.store.setting(KEPT).await.unwrap().unwrap();
+        let restored: Vec<api::ConnectionQuota> = serde_json::from_str(&kept).unwrap();
+        assert_eq!(restored, [q]);
+        let old: api::ConnectionQuota = serde_json::from_str(
+            r#"{"connection_id":"old","source":"chatgpt","windows":[{"name":"5h","used_percent":10}],"updated_at":1}"#,
+        )
+        .unwrap();
+        assert!(old.origin.is_none() && old.windows[0].origin.is_none());
+        head.shutdown().await.unwrap();
     }
 }
