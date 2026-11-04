@@ -3848,6 +3848,7 @@ fn ClaudeCodeToolsSetting() -> impl IntoView {
             }
         })
     };
+    let native_all = move |on: bool| setting.update(|s| s.iter_mut().for_each(|s| s.native_all = on));
     let automatic = move |on: bool| {
         setting.update(|s| {
             if let Some(s) = s {
@@ -3862,16 +3863,32 @@ fn ClaudeCodeToolsSetting() -> impl IntoView {
     view! {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <div>
-                <h2 class="font-medium">"carbon6 tools in Claude Code sessions"</h2>
+                <h2 class="font-medium">"Tools in Claude Code sessions"</h2>
                 <p class="text-sm text-muted">
-                    "Claude Code brings its own tools for files, the shell and the web. These are carbon6's, offered to it as mcp__carbon6__…; carbon6's policies apply to them, and its guidance for them goes into Claude Code's system prompt. A routing rule's tool list narrows them further. Running sessions take changes up with their next message (Claude Code starts again, resuming its conversation, once it has nothing running)."
+                    "Claude Code keeps its own tools for files and the shell. The rest are carbon6's, offered to it as mcp__carbon6__…; carbon6's policies apply to them, and its guidance for them goes into Claude Code's system prompt. A routing rule's tool list narrows both. Running sessions take changes up with their next message (Claude Code starts again, resuming its conversation, once it has nothing running)."
                 </p>
             </div>
             {move || setting.get().map(|s| {
                 let auto = s.automatic;
+                let all = s.native_all;
                 let offered = s.tools.clone();
                 let core = s.core.clone().unwrap_or_default();
                 view! {
+                    <h3 class="text-sm font-medium">"Claude Code's own tools"</h3>
+                    <div class="flex flex-wrap gap-4 text-sm">
+                        <label class="flex items-center gap-2">
+                            <input type="radio" name="cc-native" prop:checked=!all on:change=move |_| native_all(false) />
+                            "Coding tools only: Bash, Read, Write, Edit and its tool search"
+                        </label>
+                        <label class="flex items-center gap-2">
+                            <input type="radio" name="cc-native" prop:checked=all on:change=move |_| native_all(true) />
+                            "All, as without carbon6"
+                        </label>
+                    </div>
+                    <p class="text-xs text-muted">
+                        "Coding tools only: nothing else of Claude Code's (its subagents, web, schedules, artifacts), no MCP server but carbon6's, no settings files, skills or plugins, and a hook refuses any other tool. All: its own tools, settings, MCP servers, skills and plugins, out of carbon6's reach; for now, while coding tools only is new."
+                    </p>
+                    <h3 class="text-sm font-medium">"carbon6's tools"</h3>
                     <div class="flex flex-wrap gap-4 text-sm">
                         <label class="flex items-center gap-2">
                             <input type="radio" name="cc-tools" prop:checked=auto on:change=move |_| automatic(true) />

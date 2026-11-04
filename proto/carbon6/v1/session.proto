@@ -706,6 +706,12 @@ message ClaudeCodeToolChoice {
   repeated string core = 3;
   // `core` is the choice (an empty one: none); unset: the defaults.
   bool core_chosen = 4;
+  // Claude Code's own tools as they are without carbon6 (today's
+  // behaviour, an escape hatch for now). Unset: only its coding tools
+  // (Bash, Read, Write, Edit, ToolSearch), narrowed by a routing rule's
+  // tool list, with nothing else from settings files, MCP servers, skills
+  // or plugins (docs/background.md §4, Claude Code's own tools).
+  bool native_all = 5;
 }
 
 // What makes a session a subagent: who started it, and as which agent.

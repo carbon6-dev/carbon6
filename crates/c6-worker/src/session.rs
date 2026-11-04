@@ -2388,6 +2388,8 @@ impl Actor {
             applicable_secrets(&self.spec, &labels).into_iter().map(|(n, _)| n).collect()
         };
         let claude_settings = self.hooks.as_ref().filter(|_| claude_code).map(|h| h.claude_settings());
+        // Claude Code's own tools it keeps (none of its others).
+        let claude_native = claude_code_native(&self.spec);
         // carbon6's subagents, offered to Claude Code over MCP.
         let bridge_tools = if claude_code { self.claude_code_subagent_tools() } else { Vec::new() };
         let bridge_core = claude_code_core(&self.spec);
@@ -2485,6 +2487,7 @@ impl Actor {
                     tools: bridge_names,
                     worker: c6_core::build().to_owned(),
                     extra_args: Vec::new(),
+                    native: claude_native,
                 };
                 let process = claude.take();
                 let result = claude_turn(
@@ -3097,6 +3100,29 @@ fn claude_code_choice(spec: &CreateSession) -> Option<Vec<String>> {
     }
 }
 
+/// Claude Code's own tools a session keeps unless Settings → Agents says
+/// all (docs/background.md §4, Claude Code's own tools): its coding tools,
+/// and its tool search for carbon6's tools not loaded up front. The rest
+/// (its subagents, web, schedules, artifacts…) are off; carbon6's come
+/// over MCP instead.
+pub const CLAUDE_CODE_NATIVE_TOOLS: &[&str] = &["Bash", "Read", "Write", "Edit", "ToolSearch"];
+
+/// The Claude Code tools the session's process gets: `None` for all of
+/// them (the escape hatch), else the coding tools a routing rule's tool
+/// list allows (its tool search always: it only finds carbon6's tools).
+pub(crate) fn claude_code_native(spec: &CreateSession) -> Option<Vec<String>> {
+    if spec.claude_code.as_ref().is_some_and(|c| c.native_all) {
+        return None;
+    }
+    Some(
+        CLAUDE_CODE_NATIVE_TOOLS
+            .iter()
+            .filter(|t| **t == "ToolSearch" || c6_tools::tool_allowed(&spec.tools, t))
+            .map(|t| (*t).to_owned())
+            .collect(),
+    )
+}
+
 /// Those of them loaded up front (`_meta` anthropic/alwaysLoad).
 fn claude_code_core(spec: &CreateSession) -> Vec<String> {
     match &spec.claude_code {
@@ -3111,17 +3137,26 @@ fn is_chosen(chosen: &[String], name: &str) -> bool {
 }
 
 /// carbon6's tools that may be offered to Claude Code beyond its subagents
-/// and documents: carbon6's own, without those Claude Code has equivalents
-/// of (files, shell, web, plan, skills, its own background tasks), in
-/// Claude Code's naming.
+/// and documents: carbon6's own, without those Claude Code keeps its own
+/// of (files, shell, plan, skills, its own background tasks), in Claude
+/// Code's naming. Its own web tools are off unless it keeps all its tools,
+/// so carbon6's `WebFetch` comes instead, and `WebSearch` where a search
+/// provider is set up whose key (Brave, Tavily) the session has.
 fn claude_code_extras(spec: &CreateSession, labels: &[String], chrome: Option<PathBuf>) -> Vec<Arc<dyn Tool>> {
     let own: HashSet<String> = c6_tools::tools_for(ToolProfile::Claude).iter().map(|t| t.spec().name).collect();
+    let web = claude_code_native(spec).is_some();
+    let search = || {
+        let cfg: c6_tools::SearchConfig = serde_json::from_str(&spec.web_search_json).unwrap_or_default();
+        !matches!(cfg.provider.as_str(), "brave" | "tavily") || applicable_secrets(spec, labels).iter().any(|(n, _)| *n == cfg.secret)
+    };
     let (tools, _) = builtin_tools(spec, ToolProfile::Claude, labels, chrome);
     tools
         .into_iter()
-        .filter(|t| {
-            let name = t.spec().name;
-            !own.contains(&name) && !matches!(name.as_str(), "WebSearch" | "Skill" | "Doc")
+        .filter(|t| match t.spec().name.as_str() {
+            "WebFetch" => web,
+            "WebSearch" => web && search(),
+            "Skill" | "Doc" => false,
+            name => !own.contains(name),
         })
         .collect()
 }
@@ -3943,8 +3978,8 @@ mod claude_code_tools_tests {
         assert!(default.starts_with(c6_agent::CLAUDE_CODE_NOTE));
     }
 
-    /// Claude Code is offered carbon6's own tools, not copies of its own,
-    /// with the defaults first.
+    /// Claude Code is offered carbon6's own tools, not copies of those it
+    /// keeps, with the defaults first; carbon6's web fetch, as its own is off.
     #[test]
     fn claude_code_is_offered_carbon6s_own_tools() {
         let names: Vec<String> = claude_code_tool_names().into_iter().map(|(n, _)| n).collect();
@@ -3952,26 +3987,55 @@ mod claude_code_tools_tests {
             &names[..CLAUDE_CODE_DEFAULT_TOOLS.len()],
             ["Task", "SendMessage", "TaskOutput", "TaskStop", "doc", "MessageSession", "ListSessions"]
         );
-        for offered in ["PublishFile", "Remember", "Forget", "TodoAdd", "TaskPropose", "TaskWithdraw", "MemexSearch", "MailSend"] {
+        for offered in
+            ["PublishFile", "Remember", "Forget", "TodoAdd", "TaskPropose", "TaskWithdraw", "MemexSearch", "MailSend", "WebFetch"]
+        {
             assert!(names.iter().any(|n| n == offered), "{offered} in {names:?}");
         }
-        for own in [
-            "Bash",
-            "Read",
-            "Write",
-            "Edit",
-            "Grep",
-            "Glob",
-            "WebFetch",
-            "WebSearch",
-            "TodoWrite",
-            "Skill",
-            "BashOutput",
-            "KillShell",
-            "Doc",
-        ] {
+        for own in ["Bash", "Read", "Write", "Edit", "Grep", "Glob", "TodoWrite", "Skill", "BashOutput", "KillShell", "Doc"] {
             assert!(!names.iter().any(|n| n == own), "{own} is Claude Code's own");
         }
+    }
+
+    /// Claude Code keeps only its coding tools, those a routing rule's
+    /// list allows (its tool search always), unless Settings says all.
+    #[test]
+    fn claude_code_keeps_its_coding_tools_as_the_route_allows() {
+        let native = |tools: &[&str], all: bool| {
+            claude_code_native(&CreateSession {
+                tools: tools.iter().map(|t| (*t).to_owned()).collect(),
+                claude_code: Some(c6_proto::ClaudeCodeToolChoice { automatic: true, native_all: all, ..Default::default() }),
+                ..Default::default()
+            })
+        };
+        assert_eq!(native(&[], false).unwrap(), CLAUDE_CODE_NATIVE_TOOLS);
+        assert_eq!(claude_code_native(&CreateSession::default()).unwrap(), CLAUDE_CODE_NATIVE_TOOLS, "an older head: locked down");
+        assert_eq!(native(&["read_file", "web_fetch"], false).unwrap(), ["Read", "ToolSearch"], "no shell: no Bash");
+        assert_eq!(native(&["shell", "apply_patch"], false).unwrap(), ["Bash", "Edit", "ToolSearch"]);
+        assert_eq!(native(&[], true), None);
+        assert_eq!(native(&["read_file"], true), None, "all is all");
+    }
+
+    /// With Claude Code's web tools off, carbon6's come over MCP: fetch
+    /// always, search where a provider is set up and the session has its
+    /// key; with all its tools, neither.
+    #[test]
+    fn carbon6s_web_tools_replace_claude_codes() {
+        let names = |spec: &CreateSession| -> Vec<String> {
+            claude_code_extras(spec, &[], None).iter().map(|t| t.spec().name).filter(|n| n.starts_with("Web")).collect()
+        };
+        let brave = r#"{"provider":"brave","secret":"BRAVE_KEY"}"#;
+        let spec = |search: &str, secrets: &str, all: bool| CreateSession {
+            web_search_json: search.into(),
+            secrets_json: secrets.into(),
+            claude_code: Some(c6_proto::ClaudeCodeToolChoice { automatic: true, native_all: all, ..Default::default() }),
+            ..Default::default()
+        };
+        assert_eq!(names(&spec("", "", false)), ["WebFetch"]);
+        assert_eq!(names(&spec(brave, "", false)), ["WebFetch"], "no key: no search");
+        assert_eq!(names(&spec(brave, r#"[{"name":"BRAVE_KEY"}]"#, false)), ["WebFetch", "WebSearch"]);
+        assert_eq!(names(&spec(r#"{"provider":"searxng","url":"http://s"}"#, "", false)), ["WebFetch", "WebSearch"], "no key needed");
+        assert!(names(&spec(brave, r#"[{"name":"BRAVE_KEY"}]"#, true)).is_empty(), "Claude Code has its own");
     }
 
     /// The guidance carbon6's loop gives in its system prompt goes with the

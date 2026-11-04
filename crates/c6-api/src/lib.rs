@@ -1924,6 +1924,13 @@ pub struct ClaudeCodeTools {
     /// (subagents, documents, work, memory and task cards).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub core: Option<Vec<String>>,
+    /// Claude Code's own tools as they are without carbon6: all of them,
+    /// with its settings files, MCP servers, skills and plugins (today's
+    /// behaviour, an escape hatch for now). Off (the default): only its
+    /// coding tools (Bash, Read, Write, Edit, ToolSearch), narrowed by a
+    /// routing rule's tool list, and carbon6's over MCP for the rest.
+    #[serde(default)]
+    pub native_all: bool,
     /// Every tool that may be chosen, with what it does (ignored when set).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub available: Vec<ToolChoice>,

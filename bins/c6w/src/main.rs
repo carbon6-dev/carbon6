@@ -41,14 +41,23 @@ enum Command {
     /// `c6w-update.service`; docs/updates.md §6).
     #[command(hide = true)]
     UpdateInstall { dir: PathBuf },
+    /// A Claude Code session's `PreToolUse` hook: lets a call run only if
+    /// its tool is one of `allowed` or carbon6's, else refuses it (exit 2,
+    /// the reason on stderr; docs/background.md §4).
+    #[command(hide = true)]
+    ClaudeGuard { allowed: Vec<String> },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // The exact version this build is (docs/updates.md).
     c6_core::set_build(option_env!("C6_BUILD_VERSION"));
-    tracing_subscriber::fmt().with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())).init();
     let cli = Cli::parse();
+    // Before logging starts: Claude Code reads the hook's output.
+    if let Command::ClaudeGuard { allowed } = &cli.command {
+        claude_guard(allowed);
+    }
+    tracing_subscriber::fmt().with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())).init();
     let state_dir = cli.state_dir.unwrap_or_else(identity::default_state_dir);
 
     match cli.command {
@@ -100,6 +109,7 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => anyhow::bail!(e),
             }
         }
+        Command::ClaudeGuard { .. } => unreachable!("handled above"),
         Command::Status => {
             let id = Identity::load(&state_dir)?;
             println!("worker:  {} ({})", id.meta.worker_name, id.meta.worker_id);
@@ -121,4 +131,22 @@ fn restart() -> ! {
         eprintln!("restarting: {err}");
     }
     std::process::exit(c6_core::update::RESTART_CODE)
+}
+
+/// Runs the guard on the hook's input and exits: 0 lets the call run, 2
+/// refuses it with the reason on stderr (also when the input can't be read).
+fn claude_guard(allowed: &[String]) -> ! {
+    use std::io::Read;
+    let mut input = String::new();
+    let verdict = match std::io::stdin().read_to_string(&mut input) {
+        Ok(_) => c6_worker::claude_code::guard(allowed, &input),
+        Err(e) => Err(format!("carbon6 could not read this tool call ({e}), so it is not run")),
+    };
+    match verdict {
+        Ok(()) => std::process::exit(0),
+        Err(reason) => {
+            eprintln!("{reason}");
+            std::process::exit(2)
+        }
+    }
 }
