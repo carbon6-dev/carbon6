@@ -106,6 +106,16 @@ async fn claude_code_gets_carbon6s_tools_and_takes_up_changes() {
     let setting: Value = http.get(format!("{api}/settings/claude-code-tools")).send().await.unwrap().json().await.unwrap();
     assert_eq!(setting["automatic"], true);
     assert_eq!(setting["native_all"], false, "Claude Code keeps only its coding tools by default");
+    assert_eq!(setting["settings"], json!({"includeCoAuthoredBy": false, "gitAttribution": false}), "no co-author lines by default");
+    // Extra settings must be an object, without the keys carbon6 sets.
+    for (bad, says) in [
+        (json!({"automatic": true, "tools": [], "settings": [1]}), "JSON object"),
+        (json!({"automatic": true, "tools": [], "settings": {"hooks": {}, "env": {}}}), "hooks, env"),
+    ] {
+        let r = http.put(format!("{api}/settings/claude-code-tools")).json(&bad).send().await.unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(r.text().await.unwrap().contains(says));
+    }
     assert_eq!(
         setting["core"],
         json!(["Task", "SendMessage", "doc", "Work", "Carbon6", "Remember", "Forget", "TaskPropose", "TaskWithdraw"])
@@ -183,6 +193,7 @@ async fn claude_code_gets_carbon6s_tools_and_takes_up_changes() {
         assert!(first.contains(flag), "only its coding tools: {flag} in {first}");
     }
     assert!(first.contains("claude-guard Bash Read Write Edit ToolSearch"), "the guard hook: {first}");
+    assert!(first.contains(r#""gitAttribution":false"#) && first.contains(r#""includeCoAuthoredBy":false"#), "the default extras: {first}");
 
     // Nothing changed: the same process.
     send("again").await;
@@ -219,14 +230,16 @@ async fn claude_code_gets_carbon6s_tools_and_takes_up_changes() {
     assert_eq!(restarts().await, 2);
 
     // The escape hatch: all of Claude Code's own tools, as without carbon6.
-    choose(json!({"automatic": true, "tools": [], "native_all": true})).await;
+    // The extra settings apply there too.
+    choose(json!({"automatic": true, "tools": [], "native_all": true, "settings": {"effortLevel": "high"}})).await;
     send("all").await;
     turns_ended(8).await;
     assert_eq!(spawns(), 4);
     let last = file("spawns.txt").lines().last().unwrap().to_owned();
-    for flag in ["--tools", "--strict-mcp-config", "--setting-sources", "claude-guard"] {
+    for flag in ["--tools", "--strict-mcp-config", "--setting-sources", "claude-guard", "includeCoAuthoredBy"] {
         assert!(!last.contains(flag), "{flag} in {last}");
     }
+    assert!(last.contains(r#"--settings {"effortLevel":"high"}"#), "{last}");
     stop.cancel();
     head.shutdown().await.unwrap();
 }
