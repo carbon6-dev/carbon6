@@ -6,7 +6,7 @@ license.workspace = true
 
 [features]
 # Upgrading SQLite databases (the head's and the memex's).
-upgrade = ["dep:sqlx", "dep:anyhow", "dep:tracing"]
+upgrade = ["dep:sqlx", "dep:anyhow", "dep:tracing", "dep:libsqlite3-sys"]
 # Verifying signed releases to update to (docs/updates.md).
 update = ["dep:ring"]
 
@@ -14,6 +14,8 @@ update = ["dep:ring"]
 anyhow = { version = "1.0.104", optional = true }
 sqlx = { version = "0.9.0", default-features = false, features = ["sqlite", "runtime-tokio", "migrate"], optional = true }
 tracing = { version = "0.1.44", optional = true }
+# The same SQLite sqlx links, for the one option it doesn't expose.
+libsqlite3-sys = { version = "0.37", default-features = false, optional = true }
 base64 = "0.23.1"
 hex = "0.4.3"
 ring = { version = "0.17.14", optional = true }

@@ -13,6 +13,8 @@ pub mod enrollment;
 pub mod update;
 #[cfg(feature = "upgrade")]
 pub mod upgrade;
+#[cfg(feature = "upgrade")]
+pub mod wal;
 
 /// Wire protocol version. The head accepts `PROTOCOL_VERSION` and
 /// `PROTOCOL_VERSION - 1`.

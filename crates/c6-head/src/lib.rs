@@ -8,6 +8,7 @@ pub mod apps;
 pub mod assistant;
 pub mod attention;
 pub mod auth;
+pub mod backups;
 pub mod catalog;
 pub mod catchup;
 pub mod claims;
@@ -195,6 +196,10 @@ pub struct HeadState {
     /// Catch-ups' paragraphs and timelines' turns and lines, made when
     /// looked at.
     pub(crate) catchup: catchup::Cache,
+    /// Backups to a folder and S3 (docs/backups.md).
+    pub backups: backups::Engine,
+    /// The config file it was started from (for backups).
+    pub(crate) config_file: Option<std::path::PathBuf>,
     /// Itself, for what must outlive a borrow (set once it is made).
     me: std::sync::OnceLock<std::sync::Weak<HeadState>>,
 }
@@ -319,6 +324,8 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         attention: Default::default(),
         messages_sent: Default::default(),
         catchup: Default::default(),
+        backups: Default::default(),
+        config_file: cfg.config_file.clone(),
         me: Default::default(),
     });
     let _ = state.me.set(Arc::downgrade(&state));
@@ -369,6 +376,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     work::spawn_sweeper(state.clone());
     // ChatGPT plans' usage windows (Claude Code's come with its turns).
     quotas::spawn(state.clone());
+    backups::spawn(state.clone());
     // Close abandoned assistant waits before rebuilding their decisions,
     // otherwise reconciliation could reopen a card recovery just settled.
     assistant::start(state.clone(), api::router(state.clone())).await?;

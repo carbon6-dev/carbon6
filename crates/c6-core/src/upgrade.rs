@@ -132,6 +132,8 @@ pub async fn open(
     plan: &Plan,
 ) -> anyhow::Result<(SqlitePool, Option<Report>)> {
     let existed = path.exists();
+    // The head checkpoints its own databases (docs/backups.md §3).
+    let pool_opts = if crate::wal::is_manual(path) { crate::wal::manual_pool(pool_opts) } else { pool_opts };
     let pool = pool_opts.clone().connect_with(opts.clone()).await.with_context(|| format!("opening {}", path.display()))?;
     let applied = applied_versions(&pool).await?;
     let pending: Vec<(i64, String)> = migrator

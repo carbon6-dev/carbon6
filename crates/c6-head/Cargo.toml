@@ -18,6 +18,9 @@ c6-memex.workspace = true
 c6-proto.workspace = true
 c6-worker.workspace = true
 chacha20poly1305 = "0.11.0"
+# Backups: wrapping keys to your public key, and compressing what is sent (docs/backups.md).
+x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
+flate2 = "1.1.10"
 clap = { version = "4.6.7", features = ["derive"] }
 dirs = "7.0.0"
 futures = "0.3.34"

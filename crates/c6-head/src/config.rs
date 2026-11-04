@@ -62,6 +62,10 @@ pub struct HeadConfig {
     /// The `claude` Ask runs on a Claude Code connection, instead of the one
     /// found on this machine (tests; docs/ask.md §3).
     pub claude_bin: Option<PathBuf>,
+    /// The file this was loaded from, which backups keep a copy of
+    /// (docs/backups.md §2). Not a setting.
+    #[serde(skip)]
+    pub config_file: Option<PathBuf>,
 }
 
 impl Default for HeadConfig {
@@ -82,6 +86,7 @@ impl Default for HeadConfig {
             ui_tls_key: None,
             ui_tls_head_ca: false,
             claude_bin: None,
+            config_file: None,
             memex_dirs: None,
             update_source: "https://github.com/carbon6-dev/carbon6".into(),
             update_keys: Vec::new(),
@@ -118,6 +123,9 @@ impl HeadConfig {
             }
             dirs.push(PathBuf::from("/var/lib/c6m"));
             cfg.memex_dirs = Some(dirs);
+        }
+        if path.exists() {
+            cfg.config_file = Some(path.to_owned());
         }
         if let Some(h) = std::env::var("C6H_ADVERTISE_HOST").ok().filter(|h| !h.is_empty()) {
             cfg.advertise_host = Some(h);

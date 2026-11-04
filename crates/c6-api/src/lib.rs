@@ -3819,6 +3819,194 @@ pub struct UpgradeBackups {
     pub keep: u32,
 }
 
+/// `GET|PUT /api/v1/system/backups/settings`: backups to a folder and to
+/// S3, encrypted to your public key (docs/backups.md).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct BackupSettings {
+    /// The public key backups are encrypted to (`c6pub1…`); empty: off.
+    #[serde(default)]
+    pub recipient: String,
+    /// How often changes are sent (seconds).
+    #[serde(default = "backup_interval")]
+    pub interval_secs: u64,
+    /// How often each database starts a new base copy (days).
+    #[serde(default = "backup_generation_days")]
+    pub generation_days: u32,
+    /// How much unsent change a destination may fall behind before it
+    /// starts again from a new base copy (MB).
+    #[serde(default = "backup_spool_mb")]
+    pub spool_limit_mb: u64,
+    /// Notify when a destination is this far behind (minutes).
+    #[serde(default = "backup_behind_minutes")]
+    pub behind_alert_minutes: u32,
+    /// How often a test restore runs (days; 0: never).
+    #[serde(default = "backup_test_days")]
+    pub test_days: u32,
+    #[serde(default)]
+    pub destinations: Vec<BackupDestination>,
+}
+
+fn backup_interval() -> u64 {
+    30
+}
+fn backup_generation_days() -> u32 {
+    7
+}
+fn backup_spool_mb() -> u64 {
+    1024
+}
+fn backup_behind_minutes() -> u32 {
+    10
+}
+fn backup_test_days() -> u32 {
+    7
+}
+fn backup_keep() -> u32 {
+    4
+}
+
+impl Default for BackupSettings {
+    fn default() -> Self {
+        Self {
+            recipient: String::new(),
+            interval_secs: backup_interval(),
+            generation_days: backup_generation_days(),
+            spool_limit_mb: backup_spool_mb(),
+            behind_alert_minutes: backup_behind_minutes(),
+            test_days: backup_test_days(),
+            destinations: Vec::new(),
+        }
+    }
+}
+
+/// Where backups go.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct BackupDestination {
+    pub name: String,
+    /// "folder" or "s3".
+    pub kind: String,
+    /// folder: the folder (an NFS mount, a disk).
+    #[serde(default)]
+    pub path: String,
+    /// s3: the endpoint URL (https://s3.us-east-1.amazonaws.com, an R2 or MinIO URL).
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub bucket: String,
+    #[serde(default)]
+    pub region: String,
+    /// s3: where in the bucket (e.g. "carbon6/").
+    #[serde(default)]
+    pub prefix: String,
+    /// s3: the secrets holding the access key id and the secret key.
+    #[serde(default)]
+    pub access_key_secret: String,
+    #[serde(default)]
+    pub secret_key_secret: String,
+    /// How many base copies (with their changes) to keep per database.
+    #[serde(default = "backup_keep")]
+    pub keep: u32,
+    #[serde(default = "enabled_default")]
+    pub enabled: bool,
+}
+
+/// `POST /api/v1/system/backups/key`: a new key pair. The private key is
+/// shown this once; the public key becomes the one backups are encrypted to.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct BackupKeyPair {
+    pub public: String,
+    pub private: String,
+}
+
+/// `PUT /api/v1/system/backups/restore-key`: the private key, for test
+/// restores to decrypt (kept under the head's master key); empty removes it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct BackupRestoreKey {
+    #[serde(default)]
+    pub key: String,
+}
+
+/// `POST /api/v1/system/backups/run`: send changes now; `base`: start new
+/// base copies too.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct BackupRun {
+    #[serde(default)]
+    pub base: bool,
+}
+
+/// `GET /api/v1/system/backups`: how backups stand.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct BackupStatus {
+    /// A public key is set and a destination is enabled.
+    pub on: bool,
+    pub recipient: String,
+    /// Test restores can decrypt (a restore key is kept).
+    pub restore_key: bool,
+    pub destinations: Vec<BackupDestinationStatus>,
+    pub databases: Vec<BackupDatabaseStatus>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct BackupDestinationStatus {
+    pub name: String,
+    pub enabled: bool,
+    /// When everything was last sent without an error.
+    pub last_ok_at: Option<i64>,
+    #[serde(default)]
+    pub last_error: String,
+    /// How long the oldest change not yet sent has waited (ms; none: up to date).
+    pub behind_ms: Option<i64>,
+    /// Bytes sent since the head started.
+    pub sent_bytes: u64,
+    /// What it keeps, as last counted (bytes; objects).
+    pub stored_bytes: u64,
+    pub stored_objects: u64,
+    /// Per database: the base copy its changes build on.
+    pub generations: Vec<BackupGeneration>,
+    pub last_test: Option<BackupTest>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct BackupGeneration {
+    pub database: String,
+    /// When its base copy was taken.
+    pub base_at: i64,
+    /// Whether the base copy is complete there.
+    pub complete: bool,
+    /// Changes sent on top of it.
+    pub segments: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct BackupTest {
+    pub at: i64,
+    pub ok: bool,
+    /// Whether it decrypted and checked the databases (with the restore
+    /// key), or only that every object is there and whole.
+    pub decrypted: bool,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct BackupDatabaseStatus {
+    /// Its path in the head's folder.
+    pub path: String,
+    /// Changes read from its log so far.
+    pub segments: u64,
+    /// A base copy is being taken (its checkpoints wait).
+    pub base_running: bool,
+}
+
 /// `GET /api/v1/system/upgrades`: an upgrade of one of carbon6's
 /// databases, newest first (docs/os.md §13).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

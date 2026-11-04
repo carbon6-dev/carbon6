@@ -1,7 +1,9 @@
 //! Test support: a scripted OpenAI-compatible server, and waiting on
 //! conditions (docs/testing.md).
 
+pub mod s3;
 pub mod wait;
+pub use s3::MockS3;
 pub use wait::{eventually, eventually_or, have, need, port, runnable, within};
 
 /// Raise this test process's soft open-file limit, if possible, before its
