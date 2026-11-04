@@ -8,6 +8,9 @@ SHELL := /bin/bash
 
 DOCKER       ?= docker
 DOCKERFILE   := docker/Dockerfile
+# The Rust version, from rust-toolchain.toml (the one place it is set).
+RUST_VERSION := $(shell sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+DOCKER_BUILD  = $(DOCKER) buildx build -f $(DOCKERFILE) --build-arg RUST_VERSION=$(RUST_VERSION)
 IMAGE_PREFIX ?= carbon6
 TAG          ?= dev
 LINT_IMAGE    = $(IMAGE_PREFIX)/lint:$(TAG)
@@ -60,18 +63,18 @@ help: ## Show this help
 ##@ Docker (no local toolchain needed)
 
 docker-build: ## Build Linux binaries for this machine's architecture into dist/linux-<arch>/
-	$(DOCKER) buildx build -f $(DOCKERFILE) --target artifacts --platform linux/$(ARCH) --output type=local,dest=dist/linux-$(ARCH) .
+	$(DOCKER_BUILD) --target artifacts --platform linux/$(ARCH) --output type=local,dest=dist/linux-$(ARCH) .
 	@ls -l dist/linux-$(ARCH)
 
 docker-build-all: ## Build Linux binaries for amd64 and arm64 into dist/linux_{amd64,arm64}/ (the other arch is emulated: slow)
-	$(DOCKER) buildx build -f $(DOCKERFILE) --target artifacts --platform linux/amd64,linux/arm64 --output type=local,dest=dist .
+	$(DOCKER_BUILD) --target artifacts --platform linux/amd64,linux/arm64 --output type=local,dest=dist .
 	@ls -l dist/*/
 
 docker-test: ## Run the full test suite in Docker
-	$(DOCKER) buildx build -f $(DOCKERFILE) --target test --progress plain .
+	$(DOCKER_BUILD) --target test --progress plain .
 
 docker-lint-image:
-	$(DOCKER) buildx build -f $(DOCKERFILE) --target lint --load -t $(LINT_IMAGE) .
+	$(DOCKER_BUILD) --target lint --load -t $(LINT_IMAGE) .
 
 docker-check: docker-lint-image ## Run `make check` in Docker on this checkout: formatting, clippy (also for the web UI's wasm) and the test lint, with the Rust version the Dockerfile pins (the build is kept in the volume c6-lint-cache)
 	$(DOCKER_LINT) make check
@@ -80,11 +83,11 @@ docker-fmt: docker-lint-image ## Format the source in Docker with the Rust versi
 	$(DOCKER_LINT) sh -c 'cargo fmt --all && cargo fmt --manifest-path site/Cargo.toml --all'
 
 docker-images: ## Build runtime images carbon6/c6h:dev and carbon6/c6w:dev (IMAGE_PREFIX, TAG)
-	$(DOCKER) buildx build -f $(DOCKERFILE) --target c6h --load -t $(IMAGE_PREFIX)/c6h:$(TAG) .
-	$(DOCKER) buildx build -f $(DOCKERFILE) --target c6w --load -t $(IMAGE_PREFIX)/c6w:$(TAG) .
+	$(DOCKER_BUILD) --target c6h --load -t $(IMAGE_PREFIX)/c6h:$(TAG) .
+	$(DOCKER_BUILD) --target c6w --load -t $(IMAGE_PREFIX)/c6w:$(TAG) .
 
 docker-head: ## Run the head in Docker: UI on 127.0.0.1:7700, workers on :7701, data in volume c6h-data
-	$(DOCKER) buildx build -f $(DOCKERFILE) --target c6h --load -t $(IMAGE_PREFIX)/c6h:$(TAG) .
+	$(DOCKER_BUILD) --target c6h --load -t $(IMAGE_PREFIX)/c6h:$(TAG) .
 	-$(DOCKER) rm -f c6h >/dev/null 2>&1
 	$(DOCKER) run -d --name c6h --restart unless-stopped \
 		-p 127.0.0.1:$(UI_PORT):7700 -p 127.0.0.1:$(WORKER_PORT):7701 \
@@ -105,12 +108,12 @@ docker-login-link: ## Print a one-time web UI login link from the running head c
 
 docker-deb: ## Build .deb packages of c6h and c6w (systemd units included) and the c6 CLI for this machine's architecture into dist/deb/ubuntu-<UBUNTU>/ (UBUNTU=22.04; they install on later releases too)
 	rm -f $(DEB_DIR)/*_$(ARCH).deb $(DEB_DIR)/*-linux-$(ARCH).tar.gz
-	$(DOCKER) buildx build -f $(DOCKERFILE) --target debs --platform linux/$(ARCH) $(DEB_ARGS) --output type=local,dest=$(DEB_DIR) .
+	$(DOCKER_BUILD) --target debs --platform linux/$(ARCH) $(DEB_ARGS) --output type=local,dest=$(DEB_DIR) .
 	@ls -l $(DEB_DIR)
 
 docker-deb-all: ## Build the .deb packages for amd64 and arm64 into dist/deb/ubuntu-<UBUNTU>/ (the other arch is emulated: slow)
 	rm -rf $(DEB_DIR)
-	$(DOCKER) buildx build -f $(DOCKERFILE) --target debs --platform linux/amd64,linux/arm64 $(DEB_ARGS) --output type=local,dest=$(DEB_DIR),platform-split=false .
+	$(DOCKER_BUILD) --target debs --platform linux/amd64,linux/arm64 $(DEB_ARGS) --output type=local,dest=$(DEB_DIR),platform-split=false .
 	@ls -l $(DEB_DIR)
 
 docker-deb-test: docker-deb deb-smoke ## docker-deb, then install the packages in an Ubuntu container under systemd: head serves, the worker attaches, c6 sees it, upgrade, remove (ARCH=amd64|arm64: the other is emulated)
@@ -122,7 +125,7 @@ deb: build ## On Ubuntu $(UBUNTU) itself (CI): the .debs and Linux tarball from 
 deb-test: deb deb-smoke ## deb, then the systemd smoke test
 
 deb-smoke: ## Install the .debs in dist/deb/ubuntu-<UBUNTU>/ in an Ubuntu container under systemd: head serves, the worker attaches, c6 sees it, upgrade, remove
-	$(DOCKER) buildx build -f $(DOCKERFILE) --target deb-host --platform linux/$(ARCH) --build-arg UBUNTU=$(UBUNTU) --load -t $(IMAGE_PREFIX)/deb-host:$(UBUNTU)-$(ARCH) .
+	$(DOCKER_BUILD) --target deb-host --platform linux/$(ARCH) --build-arg UBUNTU=$(UBUNTU) --load -t $(IMAGE_PREFIX)/deb-host:$(UBUNTU)-$(ARCH) .
 	DOCKER=$(DOCKER) packaging/deb/smoke-test.sh $(IMAGE_PREFIX)/deb-host:$(UBUNTU)-$(ARCH) $(DEB_DIR) $(ARCH)
 
 ##@ Homebrew (macOS, local toolchain)

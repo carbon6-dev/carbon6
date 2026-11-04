@@ -19,7 +19,7 @@ Status: built (2026-10-15); reworked 2026-10-23 so packages are built once per c
 | **CI** (`.github/workflows/ci.yml`) | every push to `main`; or by hand, as a dry run | the tests, the packages, and for a release commit the tag and the publication (§4) |
 | **Test** (`.github/workflows/test.yml`) | pull requests, and from CI | `make check`, then `cargo test --locked` on Ubuntu 24.04 and macOS 15, and the suite again with every core busy (docs/testing.md) |
 
-**Toolchain:** the Rust and Trunk versions come from `docker/Dockerfile` (`RUST_VERSION`, `TRUNK_VERSION`), through `.github/actions/rust`. The Docker builds use the same versions, so local and CI builds match.
+**Toolchain:** the Rust version is set in one place, `rust-toolchain.toml`: rustup uses it for local builds, CI installs it through `.github/actions/rust`, and the Makefile passes it to the Docker builds (`RUST_VERSION`). Trunk's version comes from `docker/Dockerfile` (`TRUNK_VERSION`). So local, CI and Docker builds match.
 
 ## 3. Versions
 
