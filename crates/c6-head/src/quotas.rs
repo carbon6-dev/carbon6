@@ -420,7 +420,10 @@ async fn codex_enabled(st: &HeadState, from: c6_core::WorkerId) -> anyhow::Resul
 }
 
 pub async fn codex_config(st: &HeadState, from: c6_core::WorkerId) -> anyhow::Result<Value> {
-    Ok(serde_json::json!({"enabled": codex_enabled(st, from).await?}))
+    let settings = codex_settings(st).await?;
+    let id = from.to_string();
+    let command = settings.commands.get(&id).filter(|c| !c.trim().is_empty());
+    Ok(serde_json::json!({"enabled": settings.workers.contains(&id), "command": command}))
 }
 
 fn chatgpt_account(st: &HeadState, c: &crate::store::ConnectionRow) -> Option<String> {

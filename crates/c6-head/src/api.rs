@@ -2342,10 +2342,17 @@ async fn get_codex_limits(State(st): State<Arc<HeadState>>) -> ApiResult<Json<ap
 }
 
 async fn put_codex_limits(State(st): State<Arc<HeadState>>, Json(s): Json<api::CodexLimitsSettings>) -> ApiResult<StatusCode> {
-    for id in &s.workers {
+    for id in s.workers.iter().chain(s.commands.keys()) {
         let id = parse_worker_id(id)?;
         if st.store.worker(id).await?.is_none() {
             return Err(crate::bad_request("worker not found").into());
+        }
+    }
+    for command in s.commands.values() {
+        if !command.trim().is_empty() && !std::path::Path::new(command).is_absolute() {
+            return Err(
+                crate::bad_request("Codex command must be an absolute path to an executable, without arguments or ~ expansion").into()
+            );
         }
     }
     st.store.set_setting(crate::quotas::CODEX_SETTINGS, &serde_json::to_string(&s).map_err(anyhow::Error::from)?).await?;

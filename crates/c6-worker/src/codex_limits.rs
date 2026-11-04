@@ -63,9 +63,19 @@ async fn response(rx: &mut mpsc::Receiver<Result<Value, &'static str>>, id: u64)
 }
 
 /// Runs only initialize, initialized and account/rateLimits/read. Inherits
-/// PATH, HOME and CODEX_HOME unchanged. Output never enters diagnostics.
+/// the environment except that an absolute executable's own folder comes
+/// first on the child's PATH (e.g. nvm's node beside codex). Output never
+/// enters diagnostics; the worker's environment is never modified.
 pub async fn read(binary: &Path, timeout: Duration, stop: &CancellationToken) -> anyhow::Result<CodexLimitsReport> {
-    let mut child = tokio::process::Command::new(binary)
+    let mut command = tokio::process::Command::new(binary);
+    if binary.is_absolute()
+        && let Some(folder) = binary.parent()
+    {
+        let inherited = std::env::var_os("PATH");
+        let folders = std::iter::once(folder.to_owned()).chain(inherited.iter().flat_map(std::env::split_paths));
+        command.env("PATH", std::env::join_paths(folders).context("could not build Codex command's PATH")?);
+    }
+    let mut child = command
         .args(["app-server", "--listen", "stdio://"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -75,7 +85,7 @@ pub async fn read(binary: &Path, timeout: Duration, stop: &CancellationToken) ->
         .spawn()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                anyhow::anyhow!("codex not found on this worker's PATH")
+                anyhow::anyhow!("Codex not found: set its path")
             } else {
                 anyhow::anyhow!("could not start Codex app server ({})", e.kind())
             }
@@ -163,6 +173,7 @@ pub fn spawn(worker: Arc<Worker>, stop: CancellationToken) {
         let mut next = Instant::now();
         let mut backoff = POLL;
         let mut was_enabled = false;
+        let mut previous_command = None;
         loop {
             if worker.link.is_connected() {
                 let config = tokio::select! {
@@ -170,11 +181,17 @@ pub fn spawn(worker: Arc<Worker>, stop: CancellationToken) {
                     c = worker.link.call("quotas.codex.config", json!({})) => c,
                 };
                 let enabled = config.as_ref().is_ok_and(|c| c["enabled"] == true);
-                if enabled && (!was_enabled || Instant::now() >= next) {
+                let command =
+                    config.as_ref().ok().and_then(|c| c["command"].as_str()).filter(|c| !c.trim().is_empty()).map(std::path::PathBuf::from);
+                let command_changed = command != previous_command;
+                if enabled && (!was_enabled || command_changed || Instant::now() >= next) {
+                    if !was_enabled || command_changed {
+                        backoff = POLL;
+                    }
                     let (binary, timeout, every) = {
                         let o = worker.overrides.lock().unwrap();
                         (
-                            o.codex_bin.clone().unwrap_or_else(|| "codex".into()),
+                            o.codex_bin.clone().or_else(|| command.clone()).unwrap_or_else(|| "codex".into()),
                             o.codex_timeout.unwrap_or(TIMEOUT),
                             o.codex_every.unwrap_or(POLL),
                         )
@@ -201,6 +218,7 @@ pub fn spawn(worker: Arc<Worker>, stop: CancellationToken) {
                 }
                 if config.is_ok() {
                     was_enabled = enabled;
+                    previous_command = command;
                 }
             }
             let delay = if worker.link.is_connected() {
