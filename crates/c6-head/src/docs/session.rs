@@ -71,6 +71,16 @@ pub async fn may_write(st: &HeadState, realm: &str, id: &str, session: &str) -> 
         if granted > 0 {
             return Ok(Ok(()));
         }
+        // Your OK through the carbon6 tool (docs/agent-actions.md).
+        let allowed: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_writers WHERE realm = ? AND thing = ? AND writer = ?")
+            .bind(realm)
+            .bind(format!("doc:{id}"))
+            .bind(&by)
+            .fetch_one(&st.store.pool)
+            .await?;
+        if allowed > 0 {
+            return Ok(Ok(()));
+        }
     }
     Ok(Err(s.write))
 }

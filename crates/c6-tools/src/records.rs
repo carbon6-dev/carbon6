@@ -165,9 +165,14 @@ records_tool!(
      the project, its purpose, where it stands and its documents. action todo adds a to-do the user can start as a session \
      later: text (one line) and prompt (what that session is told; make it stand alone). action todo_done ticks one off when it is \
      done: id and evidence (one line). action propose (work in a project only, when planning a phase): a piece of work for the \
-     project, for the user to accept: title and done_when.",
+     project, for the user to accept: title and done_when. action create makes a new work item: title, done_when, and project (its \
+     name or id) to put it in a project; it returns the new work's id. With work (a work item's id), get, todo, todo_done, attach \
+     and edit (title, done_when, status) act on that work item instead of this session's: free on work this session made, else the \
+     user is asked once.",
     json!({"type": "object", "properties": {
-        "action": {"type": "string", "enum": ["get", "attach", "todo", "todo_done", "propose"]},
+        "action": {"type": "string", "enum": ["get", "attach", "todo", "todo_done", "propose", "create", "edit"]},
+        "work": {"type": "string", "description": "Another work item's id (default: this session's work)"},
+        "project": {"type": "string", "description": "create: the project to put it in (name or id)"},
         "ref": {"type": "string"},
         "title": {"type": "string"},
         "status": {"type": "string", "enum": ["running", "waiting", "done", "failed"]},

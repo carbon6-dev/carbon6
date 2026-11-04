@@ -173,5 +173,23 @@ async fn agents_make_and_change_things_by_your_rule() {
     assert!(outs.iter().any(|o| o.contains("not commons")), "{outs:?}");
     let cs = get("connections".into()).await;
     assert_eq!(cs.as_array().unwrap().len(), 1);
+
+    // 6. The work tool does the same: new work in a project named as you'd
+    // say it, then a to-do on it by its id.
+    let create = json!({"action": "create", "title": "Chaos drills", "done_when": "a drill a week", "project": "falcon"});
+    mock.push(Reply::ToolCalls(vec![("work".into(), create.to_string())]));
+    mock.push(Reply::Text("Made.".into()));
+    send(M::POST, format!("sessions/{sid}/messages"), json!({"text": "new work for drills"})).await;
+    let ev = turns(sid.clone(), 8).await;
+    let made: Value = serde_json::from_str(&last_result(&ev)).unwrap_or_else(|_| panic!("{}", last_result(&ev)));
+    let did = made["work"].as_str().unwrap().to_owned();
+    assert_eq!(made["project"], pid.as_str());
+    mock.push(Reply::ToolCalls(vec![("work".into(), json!({"action": "todo", "work": did, "text": "Schedule the first"}).to_string())]));
+    mock.push(Reply::Text("Noted.".into()));
+    send(M::POST, format!("sessions/{sid}/messages"), json!({"text": "and a to-do"})).await;
+    turns(sid.clone(), 9).await;
+    let d = get(format!("work/{did}")).await;
+    assert_eq!(d["todos"][0]["text"], "Schedule the first", "{d}");
+    assert_eq!(d["todos"][0]["origin"], sid.as_str(), "the to-do says which session added it");
     stop.cancel();
 }

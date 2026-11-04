@@ -379,6 +379,96 @@ pub async fn for_session(st: &HeadState, session: &str, p: &Value) -> anyhow::Re
     call(st, op, args, &realm, &root, session).await
 }
 
+/// Runs operation `name` for `session` by the rule (the narrow tools'
+/// way into it).
+pub async fn call_for(st: &HeadState, session: &str, name: &str, args: Value) -> anyhow::Result<Value> {
+    let realm = crate::realms::of_session(st, session).await?.unwrap_or_else(|| crate::realms::HOME.to_owned());
+    let root = root_of(st, session).await;
+    let op = catalog::find(name).ok_or_else(|| anyhow::anyhow!("no operation {name}"))?;
+    call(st, op, args, &realm, &root, session).await
+}
+
+/// The `work` tool's `create`, and its actions on a work item other than
+/// the session's own (`work`: its id): through the same rule.
+pub async fn work_tool(st: &HeadState, session: &str, p: &Value) -> anyhow::Result<Value> {
+    let s = |k: &str| p[k].as_str().map(str::trim).unwrap_or("").to_owned();
+    let action = p["action"].as_str().unwrap_or("get");
+    if action == "create" {
+        let title = s("title");
+        if title.is_empty() {
+            return Err(crate::bad_request("create takes the work's title (and done_when, and a project by name or id)"));
+        }
+        let project = s("project");
+        if project.is_empty() {
+            return call_for(st, session, "work.add", json!({"body": {"title": title, "done_when": s("done_when")}})).await;
+        }
+        let realm = crate::realms::of_session(st, session).await?.unwrap_or_else(|| crate::realms::HOME.to_owned());
+        let id = project_id(st, &realm, &project).await?;
+        let made = call_for(st, session, "projects.work", json!({"id": id, "body": {"title": title, "done_when": s("done_when")}})).await?;
+        // The work item it made (newest of that title in the project).
+        let work: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM records WHERE collection = 'work' AND realm = ? AND json_extract(fields, '$.title') = ? \
+             AND json_extract(fields, '$.project') = ? ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(&realm)
+        .bind(&title)
+        .bind(&id)
+        .fetch_optional(&st.store.pool)
+        .await?;
+        return Ok(match work {
+            Some(w) => json!({"did": "created", "work": w, "project": id, "note": "Add to-dos to it with action todo and work: its id."}),
+            None => made,
+        });
+    }
+    let work = s("work");
+    let id = s("id");
+    match action {
+        "get" => call_for(st, session, "work.get", json!({"id": work})).await,
+        "todo" => call_for(st, session, "work.todos.add", json!({"id": work, "body": {"text": s("text"), "prompt": s("prompt")}})).await,
+        "todo_done" => call_for(st, session, "work.todos.edit", json!({"id": work, "todo": id, "body": {"done": true}})).await,
+        "attach" => call_for(st, session, "work.attach", json!({"id": work, "body": {"ref": s("ref"), "title": s("title")}})).await,
+        "edit" => {
+            let mut body = json!({});
+            for k in ["title", "done_when", "status"] {
+                if !s(k).is_empty() {
+                    body[k] = json!(s(k));
+                }
+            }
+            call_for(st, session, "work.edit", json!({"id": work, "body": body})).await
+        }
+        other => Err(crate::bad_request(format!("with work, the actions are get, todo, todo_done, attach and edit, not {other:?}"))),
+    }
+}
+
+/// A project of the realm, by id or (case aside) title.
+async fn project_id(st: &HeadState, realm: &str, project: &str) -> anyhow::Result<String> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, json_extract(fields, '$.title') FROM records WHERE collection = ? AND realm = ? \
+         AND json_extract(fields, '$.status') NOT IN ('done', 'dropped')",
+    )
+    .bind(crate::projects::PROJECTS)
+    .bind(realm)
+    .fetch_all(&st.store.pool)
+    .await?;
+    if let Some((id, _)) = rows.iter().find(|(id, _)| id == project) {
+        return Ok(id.clone());
+    }
+    let want = project.to_lowercase();
+    let hits: Vec<&(String, String)> = rows.iter().filter(|(_, t)| t.to_lowercase() == want).collect();
+    let hits = if hits.is_empty() { rows.iter().filter(|(_, t)| t.to_lowercase().contains(&want)).collect() } else { hits };
+    match hits.as_slice() {
+        [one] => Ok(one.0.clone()),
+        [] => Err(crate::bad_request(format!(
+            "no open project {project:?}; the realm's are: {}",
+            rows.iter().map(|(_, t)| format!("{t:?}")).collect::<Vec<_>>().join(", ")
+        ))),
+        many => Err(crate::bad_request(format!(
+            "{project:?} could be {}; give its id",
+            many.iter().map(|(id, t)| format!("{t:?} ({id})")).collect::<Vec<_>>().join(", ")
+        ))),
+    }
+}
+
 /// Runs `op` for a session family after the rule says it may.
 async fn call(st: &HeadState, op: &'static Op, args: Value, realm: &str, root: &str, session: &str) -> anyhow::Result<Value> {
     let class = class_of(op, &args);

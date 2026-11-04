@@ -739,7 +739,11 @@ fn tick(t: &mut Todo, done: bool, by: &str, evidence: &str) -> bool {
 
 pub async fn todo_add(st: &HeadState, id: &str, n: &TodoNew, caller: &Caller) -> anyhow::Result<WorkItem> {
     visible(st, id, caller).await?;
-    let t = new_todo(&n.text, &n.prompt, &crate::agent_ops::by("you"))?;
+    let mut t = new_todo(&n.text, &n.prompt, &crate::agent_ops::by("you"))?;
+    // An agent's to-do starts from its session's worker and folder.
+    if let Some(s) = crate::agent_ops::actor().as_deref().and_then(|a| a.strip_prefix("session:")) {
+        t.origin = s.to_owned();
+    }
     modify(st, id, &crate::agent_ops::by("you"), None, |f| add_todo_to(f, t)).await?;
     get(st, id, caller).await
 }
@@ -1841,6 +1845,10 @@ pub fn spawn_sweeper(st: std::sync::Arc<HeadState>) {
 /// The `work` tool: what the session's work is, attaching what it made
 /// (a pull request, a CI run, a document) with how it stands.
 pub async fn for_session(st: &HeadState, session_id: &str, p: &Value) -> anyhow::Result<Value> {
+    // New work, or another work item: by your rule for agents (docs/agent-actions.md).
+    if p["action"] == "create" || p["work"].as_str().is_some_and(|w| !w.trim().is_empty()) {
+        return crate::agent_ops::work_tool(st, session_id, p).await;
+    }
     let ids = holding(st, &format!("session:{session_id}")).await?;
     if ids.is_empty() {
         return Ok(json!({"work": [], "note": "This session belongs to no work item; the user can add it to one in its header."}));
