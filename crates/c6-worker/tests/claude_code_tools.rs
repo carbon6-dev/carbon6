@@ -104,7 +104,10 @@ async fn claude_code_gets_carbon6s_tools_and_takes_up_changes() {
     // Automatic by default, with the defaults up front, and what may be chosen.
     let setting: Value = http.get(format!("{api}/settings/claude-code-tools")).send().await.unwrap().json().await.unwrap();
     assert_eq!(setting["automatic"], true);
-    assert_eq!(setting["core"], json!(["Task", "SendMessage", "doc", "Work", "Remember", "Forget", "TaskPropose", "TaskWithdraw"]));
+    assert_eq!(
+        setting["core"],
+        json!(["Task", "SendMessage", "doc", "Work", "Carbon6", "Remember", "Forget", "TaskPropose", "TaskWithdraw"])
+    );
     let available: Vec<&str> = setting["available"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert!(available.contains(&"PublishFile") && !available.contains(&"Bash"), "{available:?}");
     // Not carbon6's to offer: Claude Code has its own (also not up front).

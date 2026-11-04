@@ -490,7 +490,17 @@ async fn call(st: &HeadState, op: &'static Op, args: Value, realm: &str, root: &
     if matches!(class, Class::Change | Class::Delete) && op.name != "projects.work" {
         match thing(op, &args) {
             Some(t) => needs.push(t),
-            None => return Err(crate::forbidden(format!("{}: what it changes can't be told from its input", op.name))),
+            None => {
+                let want = match &op.via {
+                    Via::Http { path, .. } => catalog::path_params(path).join(", "),
+                    Via::Memex { .. } => String::new(),
+                };
+                return Err(crate::bad_request(format!(
+                    "{} needs {} at the top of input (its path parameters); the body goes under \"body\"",
+                    op.name,
+                    if want.is_empty() { "what it acts on".to_owned() } else { want }
+                )));
+            }
         }
     }
     needs.extend(moved(op, &args));
@@ -558,10 +568,7 @@ async fn ask(
     let what = label(st, realm, &things[0]).await;
     let (title, document) = if once {
         (
-            format!(
-                "Let {who} {} {what}?",
-                if op.name.ends_with(".delete") || op.name.ends_with(".remove") { "delete" } else { "do this to" }
-            ),
+            format!("Let {who} do this to {what}: {}?", lower_first(op.summary.trim_end_matches('.'))),
             format!(
                 "The session wants to run **{}** ({}) on {what}, which isn't its own.\n\n```json\n{}\n```\n\nAllow runs it once, as shown.",
                 op.name,
@@ -602,6 +609,11 @@ async fn ask(
     let reference =
         if once { format!("agentop:{realm}:{}", uuid::Uuid::now_v7()) } else { format!("agentop:{realm}:{root}/{}", things.join(",")) };
     Ok(crate::decisions::open(st, &d, realm, &reference).await?.id)
+}
+
+fn lower_first(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_lowercase().chain(c).collect()).unwrap_or_default()
 }
 
 /// Your answer to an approval card (`agentop:…`).
