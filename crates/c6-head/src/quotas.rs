@@ -9,6 +9,9 @@
 //!   forward these headers. The usage endpoint is a fallback until headers
 //!   arrive or it rejects this connection's OAuth app; that refusal is
 //!   logged once, not shown as an error on header data.
+//!   The first header snapshot per connection logs its window names at
+//!   INFO; c6-llm separately diagnoses a missing snapshot once per process
+//!   with filtered header names (never values) and whether a hook is set.
 //!
 //! Kept in memory, and the last seen in a setting (`quotas_last`), so a
 //! restarted head shows them until fresh ones come: Claude Code reports
@@ -18,8 +21,8 @@
 //! 95%, and when it is used up, once per window.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::extract::State;
@@ -45,6 +48,8 @@ const FRESH_MS: i64 = 60_000;
 const KEEP_EVERY: Duration = Duration::from_secs(60);
 /// Warn when a window passes these.
 const THRESHOLDS: [f64; 2] = [80.0, 95.0];
+/// A header snapshot's first successful recording, per connection per process.
+static CHATGPT_HEADERS_LOGGED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
 
 /// The head's view of every connection's plan limits.
 #[derive(Default)]
@@ -352,11 +357,15 @@ async fn from_chatgpt(st: &HeadState, connection: &str, limits: c6_llm::openai_r
         }
     }
     windows.sort_by_key(|w| order(&w.name));
+    let names = windows.iter().map(|w| w.name.as_str()).collect::<Vec<_>>().join(", ");
     record(
         st,
-        api::ConnectionQuota { connection_id: c.id, source: "chatgpt".into(), windows, updated_at: now_ms(), error: String::new() },
+        api::ConnectionQuota { connection_id: c.id.clone(), source: "chatgpt".into(), windows, updated_at: now_ms(), error: String::new() },
         &c.name,
     );
+    if CHATGPT_HEADERS_LOGGED.lock().unwrap().insert(c.id) {
+        info!("ChatGPT plan limits from reply headers: {names}");
+    }
     keep(st).await;
 }
 
