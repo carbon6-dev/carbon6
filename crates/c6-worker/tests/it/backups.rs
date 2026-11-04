@@ -332,3 +332,39 @@ async fn base_copies_send_what_changed_and_old_ones_go() {
     restored.shutdown().await.unwrap();
     head.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_restores_say_whether_a_backup_would_come_back() {
+    let mock = c6_testkit::MockS3::start("AKTEST", "bucket").await;
+    let (dir, nas) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let head = c6_head::start(config(dir.path())).await.unwrap();
+    let st = head.state.clone();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let private = set_up(&st, nas.path(), &mock.endpoint()).await;
+    add_work(&api, "A").await;
+    backups::run(&st, false).await.unwrap();
+
+    // Without your key: a check that everything is there.
+    let status = backups::test_now(&st, None).await.unwrap();
+    for d in &status.destinations {
+        let t = d.last_test.as_ref().unwrap();
+        assert!(t.ok && !t.decrypted, "{t:?}");
+    }
+    // With it: a full restore, every database checked.
+    assert!(backups::set_restore_key(&st, &crypt::new_key_pair().1).await.is_err(), "only the key backups are for");
+    backups::set_restore_key(&st, &private).await.unwrap();
+    let status = backups::test_now(&st, Some("nas")).await.unwrap();
+    let t = status.destinations.iter().find(|d| d.name == "nas").unwrap().last_test.clone().unwrap();
+    assert!(t.ok && t.decrypted && t.detail.contains("integrity ok"), "{t:?}");
+
+    // A damaged object fails it.
+    let chunk = walk(nas.path()).into_iter().find(|n| n.starts_with("chunks/")).unwrap();
+    let mut b = std::fs::read(nas.path().join(&chunk)).unwrap();
+    let last = b.len() - 1;
+    b[last] ^= 1;
+    std::fs::write(nas.path().join(&chunk), b).unwrap();
+    let status = backups::test_now(&st, Some("nas")).await.unwrap();
+    let t = status.destinations.iter().find(|d| d.name == "nas").unwrap().last_test.clone().unwrap();
+    assert!(!t.ok && t.detail.contains("changed"), "{t:?}");
+    head.shutdown().await.unwrap();
+}

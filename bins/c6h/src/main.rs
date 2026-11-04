@@ -46,6 +46,32 @@ enum Command {
         #[arg(long)]
         realm: Option<String>,
     },
+    /// Rebuild the head's data folder from a backup (docs/backups.md §6),
+    /// with the head stopped: its databases as of a time, its blobs, CA,
+    /// master key and config file.
+    Restore {
+        /// Where the backups are: a folder, or s3://bucket/prefix (with
+        /// AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY set).
+        #[arg(long)]
+        from: String,
+        /// As of when (2026-11-04T09:30:00Z, or 2026-11-04 09:30 in UTC);
+        /// the newest without it.
+        #[arg(long)]
+        at: Option<String>,
+        /// The folder to rebuild (empty or new); the config's data folder
+        /// without it.
+        #[arg(long)]
+        to: Option<PathBuf>,
+        /// A file holding your backup key (c6key1…); else C6_BACKUP_KEY, else
+        /// it asks.
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+        /// s3: the endpoint (R2, MinIO…); AWS's for the region without it.
+        #[arg(long)]
+        endpoint: Option<String>,
+        #[arg(long)]
+        region: Option<String>,
+    },
     /// Upgrade the head's database to this version without starting the
     /// head (starting it upgrades too). A backup is made first, and a failed
     /// upgrade restores it.
@@ -131,6 +157,27 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::ApiToken { name, realm } => {
             println!("{}", c6_head::offline_api_token(cfg, &name, realm.as_deref()).await.context("creating API token")?);
+            Ok(())
+        }
+        Command::Restore { from, at, to, key_file, endpoint, region } => {
+            use c6_head::backups::restore;
+            let source = restore::source(&from, endpoint.as_deref(), region.as_deref())?;
+            let at = at.as_deref().map(restore::parse_time).transpose()?;
+            let key = match (key_file, std::env::var("C6_BACKUP_KEY").ok().filter(|k| !k.trim().is_empty())) {
+                (Some(f), _) => std::fs::read_to_string(&f).with_context(|| format!("reading {}", f.display()))?,
+                (None, Some(k)) => k,
+                (None, None) => {
+                    eprint!("Your backup key (c6key1…): ");
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    line
+                }
+            };
+            let to = to.unwrap_or_else(|| cfg.data_dir.clone());
+            let r = restore::restore(source.as_ref(), key.trim(), at, &to).await?;
+            print!("{}", r.text());
+            anyhow::ensure!(r.ok(), "a database didn't check out; see above");
+            eprintln!("Restored into {}. Start the head on it; workers trust it as before (point them at its address).", to.display());
             Ok(())
         }
         Command::Upgrade { check } => {

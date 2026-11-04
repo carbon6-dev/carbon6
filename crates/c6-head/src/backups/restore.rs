@@ -239,3 +239,66 @@ pub async fn verify(o: &dyn Objects, head: &HeadKey) -> anyhow::Result<String> {
     }
     Ok(format!("{} databases' newest base copies are all there ({checked} objects checked by hash)", newest.len()))
 }
+
+/// A destination given on the command line: a folder, or
+/// `s3://<bucket>/<prefix>` (keys from AWS_ACCESS_KEY_ID and
+/// AWS_SECRET_ACCESS_KEY).
+pub fn source(from: &str, endpoint: Option<&str>, region: Option<&str>) -> anyhow::Result<Box<dyn Objects>> {
+    if let Some(rest) = from.strip_prefix("s3://") {
+        let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
+        let region = region.unwrap_or("us-east-1").to_owned();
+        let endpoint = endpoint.map(str::to_owned).unwrap_or_else(|| format!("https://s3.{region}.amazonaws.com"));
+        let env = |k: &str| std::env::var(k).with_context(|| format!("set {k} to read from S3"));
+        let mut prefix = prefix.to_owned();
+        if !prefix.is_empty() && !prefix.ends_with('/') {
+            prefix.push('/');
+        }
+        c6_llm::install_crypto_provider();
+        return Ok(Box::new(super::dest::S3 {
+            endpoint,
+            bucket: bucket.to_owned(),
+            region,
+            prefix,
+            access_key: env("AWS_ACCESS_KEY_ID")?,
+            secret_key: env("AWS_SECRET_ACCESS_KEY")?,
+            http: reqwest::Client::new(),
+        }));
+    }
+    let path = Path::new(from.strip_prefix("folder:").unwrap_or(from));
+    anyhow::ensure!(path.is_dir(), "{} is not a folder (or s3://bucket/prefix)", path.display());
+    Ok(Box::new(super::dest::Folder::new(path)))
+}
+
+/// A time on the command line: RFC 3339 (2026-11-04T09:30:00Z), a date
+/// and time in UTC (2026-11-04 09:30), or milliseconds since 1970.
+pub fn parse_time(s: &str) -> anyhow::Result<i64> {
+    let s = s.trim();
+    if let Ok(ms) = s.parse::<i64>() {
+        return Ok(ms);
+    }
+    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Ok(t.timestamp_millis());
+    }
+    for f in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"] {
+        if let Ok(t) = chrono::NaiveDateTime::parse_from_str(s, f) {
+            return Ok(t.and_utc().timestamp_millis());
+        }
+    }
+    bail!("{s:?} is not a time (2026-11-04T09:30:00Z, 2026-11-04 09:30 in UTC, or ms since 1970)")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn times_and_names() {
+        assert_eq!(parse_time("1700000000000").unwrap(), 1_700_000_000_000);
+        assert_eq!(parse_time("2023-11-14T22:13:20Z").unwrap(), 1_700_000_000_000);
+        assert_eq!(parse_time("2023-11-14 22:13:20").unwrap(), 1_700_000_000_000);
+        assert!(parse_time("yesterday").is_err());
+        assert_eq!(name_ms("db/k/g/seg/000000000004-0001700000000123"), Some(1_700_000_000_123));
+        assert_eq!(name_ms("files/0001700000000000"), Some(1_700_000_000_000));
+        assert_eq!(name_ms("bloblog/0001700000000000-0a0b0c0d"), Some(1_700_000_000_000));
+    }
+}

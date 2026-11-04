@@ -414,6 +414,61 @@ async fn send_one(st: &HeadState, s: &BackupSettings, d: &BackupDestination, for
         warn!(destination = %d.name, "backup: {e:#}");
     }
     note_behind(st, s, d).await;
+    // A test restore when one is due (and this destination is reachable).
+    let last = st.backups.with(st, |state| state.dests.get(&d.name).and_then(|x| x.last_test.as_ref().map(|t| t.at)));
+    let due = s.test_days > 0 && last.is_none_or(|t| now_ms() - t > s.test_days as i64 * 86_400_000);
+    let has_base = st.backups.with(st, |state| state.dests.get(&d.name).is_some_and(|x| x.gens.values().any(|g| g.complete)));
+    if r.is_ok() && due && has_base {
+        test_one(st, d).await;
+    }
+}
+
+/// A test restore at one destination: with your key kept for it, a full
+/// restore into a temporary folder, checking every database; without it,
+/// that every object of the newest base copies is there and whole.
+pub async fn test_one(st: &HeadState, d: &BackupDestination) -> c6_api::BackupTest {
+    let r = async {
+        let o = objects(st, d).await?;
+        match restore_key(st).await {
+            Some(key) => {
+                let dir = std::env::temp_dir().join(format!("c6-backup-test-{}", uuid::Uuid::now_v7()));
+                let r = restore::restore(o.as_ref(), &key, None, &dir).await;
+                let _ = std::fs::remove_dir_all(&dir);
+                let r = r?;
+                anyhow::ensure!(r.ok(), "{}", r.text());
+                anyhow::Ok((true, r.text()))
+            }
+            None => Ok((false, restore::verify(o.as_ref(), &head_key(st).await?).await?)),
+        }
+    }
+    .await;
+    let t = match r {
+        Ok((decrypted, detail)) => c6_api::BackupTest { at: now_ms(), ok: true, decrypted, detail },
+        Err(e) => c6_api::BackupTest { at: now_ms(), ok: false, decrypted: false, detail: format!("{e:#}") },
+    };
+    st.backups.with(st, |state| state.dests.entry(d.name.clone()).or_default().last_test = Some(t.clone()));
+    if !t.ok {
+        st.notifier.send(crate::notify::Note {
+            event: "backup",
+            title: format!("A test restore from {} failed", d.name),
+            message: crate::util_clip(&t.detail, 500),
+            priority: "high",
+            path: Some("/settings/system".into()),
+            ..Default::default()
+        });
+    }
+    t
+}
+
+/// Test restores now, at every enabled destination (or the one named).
+pub async fn test_now(st: &HeadState, name: Option<&str>) -> anyhow::Result<c6_api::BackupStatus> {
+    let s = settings(st).await;
+    for d in s.destinations.iter().filter(|d| d.enabled && name.is_none_or(|n| n == d.name)) {
+        let lock = st.backups.senders.lock().unwrap_or_else(|e| e.into_inner()).entry(d.name.clone()).or_default().clone();
+        let _turn = lock.lock().await;
+        test_one(st, d).await;
+    }
+    status(st).await
 }
 
 /// How long the oldest change not yet at `dest` has waited.
