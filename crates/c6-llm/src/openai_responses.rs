@@ -4,11 +4,12 @@
 //! "Sign in with ChatGPT".
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{Value, json};
+use tracing::info;
 
 use crate::http;
 use crate::sse::SseDecoder;
@@ -50,6 +51,17 @@ pub fn parse_chatgpt_limits(headers: &reqwest::header::HeaderMap) -> Option<Chat
     };
     let limits = ChatGptLimits { primary: window("primary"), secondary: window("secondary") };
     (limits.primary.is_some() || limits.secondary.is_some()).then_some(limits)
+}
+
+/// Diagnostic names only: never retain or log response header values.
+fn usage_header_names(headers: &reqwest::header::HeaderMap) -> Vec<&str> {
+    let mut names: Vec<_> = headers
+        .keys()
+        .map(|name| name.as_str())
+        .filter(|name| name.starts_with("x-") || ["codex", "rate", "limit", "usage", "quota"].iter().any(|part| name.contains(part)))
+        .collect();
+    names.sort_unstable();
+    names
 }
 
 pub struct OpenAiResponses {
@@ -197,11 +209,26 @@ impl ModelClient for OpenAiResponses {
         let body = self.request_body(req);
         let headers = self.request_headers(req);
         let resp = http::post_json(&self.http, &format!("{}/responses", self.base_url), &headers, &body, self.attempts).await?;
-        if self.plan
-            && let Some(hook) = &self.limits_hook
-            && let Some(limits) = parse_chatgpt_limits(resp.headers())
-        {
-            hook(limits).await;
+        if self.plan {
+            match parse_chatgpt_limits(resp.headers()) {
+                Some(limits) => {
+                    if let Some(hook) = &self.limits_hook {
+                        hook(limits).await;
+                    }
+                }
+                None => {
+                    // Clients are rebuilt for head calls; this must be
+                    // process-wide, not once per client or connection.
+                    static MISSING_LIMITS: Once = Once::new();
+                    MISSING_LIMITS.call_once(|| {
+                        info!(
+                            header_names = ?usage_header_names(resp.headers()),
+                            limits_hook_installed = self.limits_hook.is_some(),
+                            "ChatGPT reply has no usable x-codex usage headers"
+                        );
+                    });
+                }
+            }
         }
         let state = State::new(resp.bytes_stream().boxed());
         Ok(futures::stream::unfold(state, |mut st| async move {
@@ -361,6 +388,30 @@ fn item_block(item: &Value) -> Option<Block> {
 mod tests {
     use super::*;
     use crate::{Accumulator, Message, ToolSpec};
+
+    #[test]
+    fn usage_diagnostic_filters_and_sorts_only_header_names() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        for name in [
+            "x-request-id",
+            "codex-status",
+            "ratelimit-remaining",
+            "request-limit",
+            "server-usage",
+            "quota-window",
+            "content-type",
+            "authorization",
+            "set-cookie",
+            "chatgpt-account-id",
+        ] {
+            headers.insert(name, "sensitive-header-value".parse().unwrap());
+        }
+        assert_eq!(
+            usage_header_names(&headers),
+            ["codex-status", "quota-window", "ratelimit-remaining", "request-limit", "server-usage", "x-request-id"]
+        );
+        assert!(usage_header_names(&reqwest::header::HeaderMap::new()).is_empty());
+    }
 
     #[test]
     fn chatgpt_limit_headers_and_units() {

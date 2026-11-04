@@ -1,19 +1,36 @@
 //! Plan limits per connection (docs/analytics.md, "Plan limits"): Claude
 //! Code reports its subscription's windows as its sessions run; a ChatGPT
-//! plan's are read from its usage endpoint with the head's own sign-in.
+//! plan's come from model reply headers (or the usage endpoint fallback).
 //! Passing 80% and 95%, and running out, are notified once per window.
+//! Header diagnostics are bounded, with no header values or account data.
 //! A binary of its own: it sets C6_CLAUDE_BIN.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use axum::http::HeaderMap;
 use c6_api::{ConnectionQuota, EventKind};
 use c6_head::HeadConfig;
 use c6_testkit::eventually;
 use c6_worker::{ConnState, Identity, Worker, conn, enroll};
+use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
+use tracing::instrument::WithSubscriber;
+
+struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// A `claude` that reports its subscription's limits with each turn: the
 /// week at 50%; "HOT" puts it at 96% with a warning; "OUT" uses up the 5h
@@ -47,8 +64,8 @@ done
 type Seen = Arc<Mutex<Vec<(String, Value)>>>;
 
 /// A stand-in for ChatGPT's usage endpoint (answering `body`, recording each
-/// request's headers) and for a notification webhook.
-async fn stand_in(body: Arc<Mutex<Value>>) -> (String, Arc<Mutex<Vec<axum::http::HeaderMap>>>, Seen) {
+/// request's headers), model replies, and a notification webhook.
+async fn stand_in(body: Arc<Mutex<Value>>, reply_headers: Arc<Mutex<HeaderMap>>) -> (String, Arc<Mutex<Vec<axum::http::HeaderMap>>>, Seen) {
     let asked: Arc<Mutex<Vec<axum::http::HeaderMap>>> = Arc::default();
     let notes: Seen = Arc::default();
     let (a, n) = (asked.clone(), notes.clone());
@@ -61,6 +78,13 @@ async fn stand_in(body: Arc<Mutex<Value>>) -> (String, Arc<Mutex<Vec<axum::http:
                     a.lock().unwrap().push(h);
                     axum::Json(body.lock().unwrap().clone())
                 }
+            }),
+        )
+        .route(
+            "/responses",
+            axum::routing::post(move || {
+                let headers = reply_headers.clone();
+                async move { (headers.lock().unwrap().clone(), "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n") }
             }),
         )
         .route(
@@ -106,7 +130,8 @@ async fn plan_limits_from_claude_code_and_chatgpt() {
     let usage = Arc::new(Mutex::new(json!({"rate_limit":{"limit_reached":false,
         "primary_window":{"used_percent":34.0,"limit_window_seconds":18000,"reset_after_seconds":7800},
         "secondary_window":{"used_percent":71.0,"limit_window_seconds":604800,"resets_at":4102444800i64}}})));
-    let (stand, asked, notes) = stand_in(usage.clone()).await;
+    let reply_headers = Arc::new(Mutex::new(HeaderMap::new()));
+    let (stand, asked, notes) = stand_in(usage.clone(), reply_headers.clone()).await;
     let put = async |path: &str, v: Value| {
         let r = http.put(format!("{api}/settings/{path}")).json(&v).send().await.unwrap();
         assert!(r.status().is_success(), "{path}: {}", r.status());
@@ -123,7 +148,7 @@ async fn plan_limits_from_claude_code_and_chatgpt() {
         id: "gpt".into(),
         name: "ChatGPT (me)".into(),
         kind: "chatgpt".into(),
-        base_url: "https://api.openai.com/v1".into(),
+        base_url: stand.clone(),
         api_key: Some(head.state.secrets.encrypt(&tokens.to_string()).unwrap()),
         default_model: None,
         context_window: None,
@@ -161,6 +186,104 @@ async fn plan_limits_from_claude_code_and_chatgpt() {
     let gpt = quotas().await.into_iter().find(|q| q.connection_id == "gpt").unwrap();
     assert_eq!(gpt.windows.len(), 2);
     assert!(gpt.error.contains("named no limits"), "{}", gpt.error);
+
+    // This binary has one test, so both process-wide diagnostics start
+    // untouched. Capture only these calls, not other tests or head tasks.
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let captured = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(move || LogCapture(captured.clone()))
+        .finish();
+    async {
+        let request = c6_llm::ModelRequest {
+            model: "test".into(),
+            system: String::new(),
+            messages: vec![],
+            tools: vec![],
+            max_output_tokens: None,
+            cache_key: None,
+            effort: None,
+            web_search: false,
+            json: false,
+        };
+        let call = async |connection: &str| {
+            let client = c6_head::pools::client(&head.state, connection, "home", Default::default()).await.unwrap();
+            let mut stream = client.stream(&request).await.unwrap();
+            while let Some(event) = stream.next().await {
+                event.unwrap();
+            }
+        };
+        let other = c6_head::store::ConnectionRow { id: "gpt-2".into(), ..row.clone() };
+        head.state.store.insert_connection(&other).await.unwrap();
+        {
+            let mut headers = reply_headers.lock().unwrap();
+            for name in
+                ["x-request-id", "ratelimit-remaining", "usage-status", "quota-status", "authorization", "set-cookie", "chatgpt-account-id"]
+            {
+                headers.insert(name, "sensitive-response-header-value".parse().unwrap());
+            }
+        }
+        // A non-plan response must not consume the missing-headers gate.
+        let api_client = c6_llm::client_for("openai", &stand, "api-key-secret", Default::default()).unwrap();
+        let mut stream = api_client.stream(&request).await.unwrap();
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+        assert!(logs.lock().unwrap().is_empty());
+        call("gpt").await;
+        call("gpt").await; // A freshly constructed client must not repeat it.
+        call("gpt-2").await; // Nor may another connection repeat it.
+        let log = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert_eq!(log.matches("ChatGPT reply has no usable x-codex usage headers").count(), 1, "{log}");
+        assert!(log.contains("limits_hook_installed=true"), "{log}");
+        for name in ["x-request-id", "ratelimit-remaining", "usage-status", "quota-status"] {
+            assert!(log.contains(name), "{log}");
+        }
+        for name in ["authorization", "set-cookie", "chatgpt-account-id"] {
+            assert!(!log.contains(name), "{log}");
+        }
+        // Even a plan client without a hook shares the process-wide gate.
+        let unhooked = c6_llm::client_for("chatgpt", &stand, "tok-1", Default::default()).unwrap();
+        let mut stream = unhooked.stream(&request).await.unwrap();
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+        assert_eq!(logs.lock().unwrap().as_slice(), log.as_bytes());
+        {
+            let mut headers = reply_headers.lock().unwrap();
+            for (name, value) in [
+                ("x-codex-primary-used-percent", "34"),
+                ("x-codex-primary-window-minutes", "300"),
+                ("x-codex-primary-reset-at", "4102441200"),
+                ("x-codex-secondary-used-percent", "71"),
+                ("x-codex-secondary-window-minutes", "10080"),
+                ("x-codex-secondary-reset-at", "4102444800"),
+            ] {
+                headers.insert(name, value.parse().unwrap());
+            }
+        }
+        call("gpt").await;
+        call("gpt").await;
+        call("gpt-2").await;
+        call("gpt-2").await;
+        let log = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert_eq!(log.matches("ChatGPT plan limits from reply headers: 5h, week").count(), 2, "{log}");
+        assert_eq!(log.matches("ChatGPT reply has no usable x-codex usage headers").count(), 1, "{log}");
+        for secret in ["sensitive-response-header-value", "tok-1", "ws-9", "api-key-secret", "ChatGPT (me)"] {
+            assert!(!log.contains(secret), "{log}");
+        }
+        let q = quotas().await;
+        for id in ["gpt", "gpt-2"] {
+            let q = q.iter().find(|q| q.connection_id == id).unwrap();
+            assert!(q.error.is_empty());
+            assert_eq!(q.windows.iter().map(|w| (w.name.as_str(), w.used_percent)).collect::<Vec<_>>(), [("5h", 34.0), ("week", 71.0)]);
+        }
+    }
+    .with_subscriber(subscriber)
+    .await;
 
     // Claude Code: its sessions' turns bring its subscription's windows.
     let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
