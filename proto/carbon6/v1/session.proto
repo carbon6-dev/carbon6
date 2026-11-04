@@ -712,6 +712,10 @@ message ClaudeCodeToolChoice {
   // tool list, with nothing else from settings files, MCP servers, skills
   // or plugins (docs/background.md §4, Claude Code's own tools).
   bool native_all = 5;
+  // Extra Claude Code settings (a JSON object) merged into the --settings
+  // carbon6 passes, without the keys carbon6 sets itself. Empty: the
+  // default, no Claude co-author or attribution lines.
+  string settings_json = 6;
 }
 
 // What makes a session a subagent: who started it, and as which agent.

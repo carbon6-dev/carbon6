@@ -1555,6 +1555,7 @@ async fn get_claude_code_tools(State(st): State<Arc<HeadState>>) -> ApiResult<Js
         c6_worker::session::claude_code_tool_names().into_iter().map(|(name, description)| api::ToolChoice { name, description }).collect();
     let mut t = crate::sessions::claude_code_tools(&st, None).await?;
     t.core.get_or_insert_with(|| c6_worker::session::CLAUDE_CODE_CORE_TOOLS.iter().map(|n| (*n).to_owned()).collect());
+    t.settings.get_or_insert_with(|| serde_json::from_str(api::CLAUDE_CODE_SETTINGS_DEFAULT).unwrap_or_default());
     t.available = available;
     Ok(Json(t))
 }
@@ -1575,7 +1576,17 @@ async fn put_claude_code_tools(State(st): State<Arc<HeadState>>, Json(t): Json<a
             ),
         ));
     }
-    let v = api::ClaudeCodeTools { automatic: t.automatic, tools: named, core: t.core, native_all: t.native_all, available: Vec::new() };
+    if let Some(e) = t.settings.as_ref().and_then(api::claude_code_settings_error) {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, e));
+    }
+    let v = api::ClaudeCodeTools {
+        automatic: t.automatic,
+        tools: named,
+        core: t.core,
+        native_all: t.native_all,
+        settings: t.settings,
+        available: Vec::new(),
+    };
     st.store.set_setting(crate::sessions::CLAUDE_CODE_TOOLS, &serde_json::to_string(&v).map_err(anyhow::Error::from)?).await?;
     Ok(StatusCode::NO_CONTENT)
 }

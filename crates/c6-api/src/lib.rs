@@ -1905,6 +1905,33 @@ impl Default for SubagentLimits {
     }
 }
 
+/// Extra Claude Code settings when none are set: no Claude co-author or
+/// attribution lines in commits and pull requests.
+pub const CLAUDE_CODE_SETTINGS_DEFAULT: &str = r#"{"includeCoAuthoredBy":false,"gitAttribution":false}"#;
+
+/// Claude Code settings carbon6 sets itself or that would undo its
+/// lockdown (hooks, plugins, MCP servers, environment), so extra settings
+/// may not name them.
+pub const CLAUDE_CODE_SETTINGS_PROTECTED: &[&str] = &[
+    "hooks",
+    "disableAllHooks",
+    "allowManagedHooksOnly",
+    "enabledPlugins",
+    "extraKnownMarketplaces",
+    "env",
+    "mcpServers",
+    "enableAllProjectMcpServers",
+    "enabledMcpjsonServers",
+    "disabledMcpjsonServers",
+];
+
+/// What's wrong with `v` as extra Claude Code settings, if anything.
+pub fn claude_code_settings_error(v: &serde_json::Value) -> Option<String> {
+    let Some(obj) = v.as_object() else { return Some("extra Claude Code settings must be a JSON object".into()) };
+    let taken: Vec<&str> = CLAUDE_CODE_SETTINGS_PROTECTED.iter().copied().filter(|k| obj.contains_key(*k)).collect();
+    (!taken.is_empty()).then(|| format!("carbon6 sets these Claude Code settings itself: {}", taken.join(", ")))
+}
+
 /// `GET`/`PUT /api/v1/settings/claude-code-tools`: carbon6's tools that
 /// Claude Code sessions get over carbon6's MCP server (docs/background.md
 /// §4). A routing rule's tool list narrows them further.
@@ -1931,6 +1958,12 @@ pub struct ClaudeCodeTools {
     /// routing rule's tool list, and carbon6's over MCP for the rest.
     #[serde(default)]
     pub native_all: bool,
+    /// Extra Claude Code settings: a JSON object merged into the settings
+    /// carbon6 passes to Claude Code (`--settings`), in either mode. None:
+    /// [`CLAUDE_CODE_SETTINGS_DEFAULT`]. The keys carbon6 sets itself
+    /// ([`CLAUDE_CODE_SETTINGS_PROTECTED`]) are refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<serde_json::Value>,
     /// Every tool that may be chosen, with what it does (ignored when set).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub available: Vec<ToolChoice>,

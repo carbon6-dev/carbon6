@@ -3818,10 +3818,14 @@ fn SubagentLimitsSetting() -> impl IntoView {
 #[component]
 fn ClaudeCodeToolsSetting() -> impl IntoView {
     let setting = RwSignal::new(None::<c6_api::ClaudeCodeTools>);
+    // The extra Claude Code settings, as typed (JSON).
+    let extra = RwSignal::new(String::new());
     let loaded = LocalResource::new(move || api::get_setting("claude-code-tools"));
     Effect::new(move || {
         if let Some(Ok(v)) = loaded.get() {
-            setting.set(serde_json::from_value(v).ok());
+            let s: Option<c6_api::ClaudeCodeTools> = serde_json::from_value(v).ok();
+            extra.set(s.as_ref().and_then(|s| s.settings.as_ref()).and_then(|v| serde_json::to_string_pretty(v).ok()).unwrap_or_default());
+            setting.set(s);
         }
     });
     let status = RwSignal::new(None::<Result<&'static str, String>>);
@@ -3830,6 +3834,20 @@ fn ClaudeCodeToolsSetting() -> impl IntoView {
         v.available.clear();
         if v.automatic {
             v.tools.clear();
+        }
+        let text = extra.get_untracked();
+        let parsed = if text.trim().is_empty() { Ok(serde_json::json!({})) } else { serde_json::from_str::<serde_json::Value>(&text) };
+        match parsed.map_err(|e| format!("Extra Claude Code settings: not JSON ({e})")).and_then(|x| {
+            match c6_api::claude_code_settings_error(&x) {
+                Some(e) => Err(format!("Extra Claude Code settings: {e}")),
+                None => Ok(x),
+            }
+        }) {
+            Ok(x) => v.settings = Some(x),
+            Err(e) => {
+                status.set(Some(Err(e)));
+                return;
+            }
         }
         let v = serde_json::to_value(v).unwrap_or_default();
         spawn_local(async move {
@@ -3888,6 +3906,15 @@ fn ClaudeCodeToolsSetting() -> impl IntoView {
                     <p class="text-xs text-muted">
                         "Coding tools only: nothing else of Claude Code's (its subagents, web, schedules, artifacts), no MCP server but carbon6's, no settings files, skills or plugins, and a hook refuses any other tool. All: its own tools, settings, MCP servers, skills and plugins, out of carbon6's reach; for now, while coding tools only is new."
                     </p>
+                    <h3 class="text-sm font-medium">"Extra Claude Code settings"</h3>
+                    <p class="text-xs text-muted">
+                        {format!(
+                            "A JSON object merged into the settings carbon6 passes to Claude Code, in either mode (Claude Code reads no settings files of its own with coding tools only). The default turns off Claude's co-author and attribution lines in commits and pull requests; empty means none. carbon6 sets these itself, so they are refused: {}.",
+                            c6_api::CLAUDE_CODE_SETTINGS_PROTECTED.join(", ")
+                        )}
+                    </p>
+                    <textarea class=format!("{INPUT} h-24 font-mono text-xs") aria-label="Extra Claude Code settings" spellcheck="false"
+                        prop:value=move || extra.get() on:input=move |ev| extra.set(event_target_value(&ev))></textarea>
                     <h3 class="text-sm font-medium">"carbon6's tools"</h3>
                     <div class="flex flex-wrap gap-4 text-sm">
                         <label class="flex items-center gap-2">

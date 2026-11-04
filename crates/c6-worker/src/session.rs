@@ -2387,7 +2387,8 @@ impl Actor {
             );
             applicable_secrets(&self.spec, &labels).into_iter().map(|(n, _)| n).collect()
         };
-        let claude_settings = self.hooks.as_ref().filter(|_| claude_code).map(|h| h.claude_settings());
+        let claude_settings =
+            claude_code.then(|| claude_code_settings(&self.spec, self.hooks.as_ref().map(|h| h.claude_settings()).as_deref()));
         // Claude Code's own tools it keeps (none of its others).
         let claude_native = claude_code_native(&self.spec);
         // carbon6's subagents, offered to Claude Code over MCP.
@@ -3121,6 +3122,25 @@ pub(crate) fn claude_code_native(spec: &CreateSession) -> Option<Vec<String>> {
             .map(|t| (*t).to_owned())
             .collect(),
     )
+}
+
+/// The settings carbon6 passes to Claude Code (`--settings`): the extra
+/// settings of Settings → Agents (by default no Claude co-author lines),
+/// without the keys carbon6 sets itself, then the head's hooks (`hooks`,
+/// settings JSON). The lockdown adds its guard and plugin switches.
+pub(crate) fn claude_code_settings(spec: &CreateSession, hooks: Option<&str>) -> String {
+    let raw = spec.claude_code.as_ref().map(|c| c.settings_json.as_str()).filter(|s| !s.trim().is_empty());
+    let mut v: serde_json::Value = serde_json::from_str(raw.unwrap_or(c6_api::CLAUDE_CODE_SETTINGS_DEFAULT))
+        .ok()
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::from_str(c6_api::CLAUDE_CODE_SETTINGS_DEFAULT).unwrap_or_default());
+    if let Some(obj) = v.as_object_mut() {
+        obj.retain(|k, _| !c6_api::CLAUDE_CODE_SETTINGS_PROTECTED.contains(&k.as_str()));
+        if let Some(h) = hooks.and_then(|h| serde_json::from_str::<serde_json::Value>(h).ok()).and_then(|h| h.get("hooks").cloned()) {
+            obj.insert("hooks".into(), h);
+        }
+    }
+    v.to_string()
 }
 
 /// Those of them loaded up front (`_meta` anthropic/alwaysLoad).
@@ -3995,6 +4015,33 @@ mod claude_code_tools_tests {
         for own in ["Bash", "Read", "Write", "Edit", "Grep", "Glob", "TodoWrite", "Skill", "BashOutput", "KillShell", "Doc"] {
             assert!(!names.iter().any(|n| n == own), "{own} is Claude Code's own");
         }
+    }
+
+    /// carbon6's settings for Claude Code: the extra settings (by default,
+    /// no co-author lines), never the keys carbon6 sets, then the head's hooks.
+    #[test]
+    fn claude_code_settings_take_the_extras_but_not_carbon6s_keys() {
+        let settings = |extra: &str, hooks: Option<&str>| -> serde_json::Value {
+            let spec = CreateSession {
+                claude_code: Some(c6_proto::ClaudeCodeToolChoice { settings_json: extra.into(), ..Default::default() }),
+                ..Default::default()
+            };
+            serde_json::from_str(&claude_code_settings(&spec, hooks)).unwrap()
+        };
+        let default = serde_json::json!({"includeCoAuthoredBy": false, "gitAttribution": false});
+        assert_eq!(settings("", None), default);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&claude_code_settings(&CreateSession::default(), None)).unwrap(), default);
+        assert_eq!(settings("not json", None), default, "unreadable: the default");
+        assert_eq!(settings("{}", None), serde_json::json!({}), "set to nothing: nothing");
+        let hooks = r#"{"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"head"}]}]}}"#;
+        let v = settings(
+            r#"{"effortLevel":"high","hooks":{"PreToolUse":[]},"env":{"ENABLE_CLAUDEAI_MCP_SERVERS":"true"},"enabledPlugins":{"x@y":true},"disableAllHooks":true}"#,
+            Some(hooks),
+        );
+        assert_eq!(v["effortLevel"], "high", "passes through");
+        assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"], "head", "the head's hooks, not the setting's");
+        assert!(v["hooks"].get("PreToolUse").is_none() && v.get("env").is_none() && v.get("enabledPlugins").is_none(), "{v}");
+        assert!(v.get("disableAllHooks").is_none(), "{v}");
     }
 
     /// Claude Code keeps only its coding tools, those a routing rule's
