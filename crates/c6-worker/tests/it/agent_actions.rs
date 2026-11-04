@@ -193,5 +193,30 @@ async fn agents_make_and_change_things_by_your_rule() {
     let d = get(format!("work/{did}")).await;
     assert_eq!(d["todos"][0]["text"], "Schedule the first", "{d}");
     assert_eq!(d["todos"][0]["origin"], sid.as_str(), "the to-do says which session added it");
+
+    // 7. Your mail only within the session's knowledge scope, and sending in
+    // your name asks each time.
+    let threads = json!({"op": "mail.threads", "input": {}});
+    mock.push(tool(threads.clone()));
+    mock.push(Reply::Text("Can't.".into()));
+    send(M::POST, format!("sessions/{sid}/messages"), json!({"text": "read my mail"})).await;
+    let ev = turns(sid.clone(), 10).await;
+    assert!(last_result(&ev).contains("knowledge scope to include email"), "{}", last_result(&ev));
+    let r = send(M::PUT, "settings/memex_scopes".into(), json!([{"name": "mail", "kinds": ["email"]}])).await;
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    let mail = json!({"op": "mail.send", "input": {"to": ["a@example.com"], "subject": "Hi", "body": "Hello"}});
+    mock.push(Reply::ToolCalls(vec![("carbon6".into(), threads.to_string()), ("carbon6".into(), mail.to_string())]));
+    mock.push(Reply::Text("Asked.".into()));
+    send(M::POST, format!("sessions/{sid}/messages"), json!({"text": "read my mail and send a note"})).await;
+    let ev = turns(sid.clone(), 11).await;
+    let outs: Vec<String> =
+        ev.iter().filter(|e| e["type"] == "tool_result").rev().take(2).map(|e| e["output"].as_str().unwrap_or("").to_owned()).collect();
+    assert!(outs.iter().all(|o| !o.contains("knowledge scope")), "within its scope now: {outs:?}");
+    assert!(outs.iter().any(|o| o.contains("Not yet") && o.contains("in the user's name")), "{outs:?}");
+    let ds = get("decisions".into()).await;
+    assert!(
+        ds.as_array().unwrap().iter().any(|d| d["document"].as_str().unwrap_or("").contains("mail.send")),
+        "a card for this one send: {ds}"
+    );
     stop.cancel();
 }

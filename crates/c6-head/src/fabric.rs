@@ -99,6 +99,16 @@ pub async fn memex_call(st: &HeadState, method: &str, params: Value) -> anyhow::
     }
 }
 
+/// The item kinds a session's knowledge calls may see: what its labels'
+/// memex scopes allow, or for an app's session what its install approved
+/// (docs/apps.md §5.2).
+pub async fn session_scope(st: &HeadState, session: &crate::store::SessionRow) -> anyhow::Result<Vec<String>> {
+    if let Some(i) = crate::instances::of_session(&st.store.pool, &session.id).await? {
+        return Ok(crate::instances::approved_reads(&st.store.pool, i.id).await?.items.kinds);
+    }
+    Ok(crate::memex::scope_for(st, &session.all_labels()).await)
+}
+
 pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Value) -> anyhow::Result<Value> {
     let role = st.registry.get(from).map(|l| l.role).unwrap_or_default();
     if role == "memex" {
@@ -215,11 +225,7 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
         return Err(bad_request("that session is not on this worker"));
     }
     let labels = session.all_labels();
-    params["scope"] = json!(crate::memex::scope_for(st, &labels).await);
-    // An app's session sees the item kinds its install approved (docs/apps.md §5.2).
-    if let Some(i) = crate::instances::of_session(&st.store.pool, &session_id).await? {
-        params["scope"] = json!(crate::instances::approved_reads(&st.store.pool, i.id).await?.items.kinds);
-    }
+    params["scope"] = json!(session_scope(st, &session).await?);
     params["made_by"] = json!(format!("session:{session_id}"));
     let owner = crate::claims::owner_of_session(st, &session_id).await;
     if method.starts_with("memex.claims.") || method == "memex.things.create" {

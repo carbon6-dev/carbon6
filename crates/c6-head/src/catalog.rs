@@ -1006,8 +1006,67 @@ pub fn docs() -> &'static [(String, String)] {
     })
 }
 
+/// A text's words for matching: lower case, "to-do" as one word, plurals
+/// singular, and words for the same action as one (remove and delete,
+/// add and create, rename and edit…), so a query in your words finds the
+/// operation named in carbon6's.
 fn words(s: &str) -> Vec<String> {
-    s.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() > 2).map(|w| w.chars().take(6).collect()).collect()
+    let mut t = s.to_lowercase();
+    for (from, to) in [("to-dos", "todo"), ("to-do", "todo"), ("to dos", "todo"), ("to do", "todo")] {
+        t = t.replace(from, to);
+    }
+    t.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() > 2 && !STOP.contains(w))
+        .map(|w| {
+            let w = if let Some(stem) = w.strip_suffix("ies") {
+                format!("{stem}y")
+            } else if w.len() > 3 && w.ends_with('s') && !w.ends_with("ss") {
+                w[..w.len() - 1].to_owned()
+            } else {
+                w.to_owned()
+            };
+            let w = SAME.iter().find(|(_, ws)| ws.contains(&w.as_str())).map_or(w, |(canon, _)| (*canon).to_owned());
+            w.chars().take(6).collect()
+        })
+        .collect()
+}
+
+/// Words that say nothing about which operation is meant.
+const STOP: &[&str] = &["the", "and", "for", "from", "with", "this", "that", "into", "its", "new", "all", "one", "some", "any"];
+
+/// Words for the same thing, matched as the first.
+const SAME: &[(&str, &[&str])] = &[
+    ("delete", &["remove", "drop", "erase", "discard", "trash"]),
+    ("create", &["add", "make"]),
+    ("edit", &["update", "change", "rename", "modify", "retitle"]),
+    ("list", &["show", "browse"]),
+    ("get", &["read", "fetch"]),
+    ("todo", &["checklist"]),
+    ("done", &["tick", "complete", "finish", "close"]),
+    ("search", &["find", "look", "query"]),
+    ("mail", &["email", "gmail", "inbox"]),
+    ("chat", &["slack", "channel"]),
+    ("calendar", &["meeting", "invite", "invitation"]),
+];
+
+/// Operations matching a query, best first: a word in an operation's name
+/// counts twice what it does in its summary or area. With an area, its
+/// operations rank first rather than hiding the rest.
+pub fn ranked(query: &str, area: Option<&str>) -> Vec<&'static Op> {
+    let q = words(query);
+    // Ties go to the plainer operation (fewer words in its name).
+    let mut found: Vec<(usize, usize, usize, &'static Op)> = ops()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, o)| {
+            let name = words(&o.name.replace(['.', '_'], " "));
+            let rest = words(&format!("{} {}", o.area, o.summary));
+            let s: usize = q.iter().map(|w| if name.contains(w) { 2 } else { usize::from(rest.contains(w)) }).sum();
+            (s > 0).then(|| (s * 2 + usize::from(area == Some(o.area)), name.len(), i, o))
+        })
+        .collect();
+    found.sort_by_key(|f| (std::cmp::Reverse(f.0), f.1, f.2));
+    found.into_iter().map(|(_, _, _, o)| o).collect()
 }
 
 /// Operations and documentation matching a query (all areas when empty).
@@ -1025,20 +1084,12 @@ pub fn discover(query: &str, area: Option<&str>) -> Value {
         let t = words(text);
         q.iter().filter(|w| t.contains(w)).count()
     };
-    // With a query, an area ranks its operations first rather than hiding
-    // the rest.
-    let mut found: Vec<(usize, &Op)> = ops()
-        .iter()
-        .map(|o| (score(&format!("{} {} {} {}", o.name.replace(['.', '_'], " "), o.area, o.summary, o.name)), o))
-        .filter(|(s, _)| *s > 0)
-        .map(|(s, o)| (s * 2 + usize::from(area == Some(o.area)), o))
-        .collect();
-    found.sort_by_key(|f| std::cmp::Reverse(f.0));
+    let found = ranked(query, area);
     let mut docs: Vec<(usize, &(String, String))> =
         docs().iter().map(|d| (score(&format!("{} {}", d.0, d.1)) * 2 / 3 + score(&d.0), d)).filter(|(s, _)| *s > 0).collect();
     docs.sort_by_key(|d| std::cmp::Reverse(d.0));
     json!({
-        "operations": found.iter().take(12).map(|(_, o)| brief(o)).collect::<Vec<_>>(),
+        "operations": found.iter().take(12).map(|o| brief(o)).collect::<Vec<_>>(),
         "docs": docs.iter().take(2).map(|(_, (t, b))| json!({"section": t, "text": crate::util_clip(b.trim(), 700)})).collect::<Vec<_>>(),
     })
 }

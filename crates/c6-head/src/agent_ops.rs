@@ -43,13 +43,41 @@ pub enum Class {
     Change,
     /// Deletes or otherwise can't be undone: free on its own, else your OK each time.
     Delete,
+    /// Acts outside carbon6 in your name (sends mail, posts in Slack, answers
+    /// an invitation, changes your calendar or mailbox): your OK each time.
+    Outside,
     /// Yours alone (administration, your attention, approvals, secrets).
     Never,
 }
 
 /// Areas that are administration (and their reads, which may show more
 /// than the realm's own things), or that have their own, opt-in tools.
-const NEVER_AREAS: &[&str] = &["account", "assistant", "chat", "mail", "photos", "notifications", "settings", "connections", "fleet"];
+const NEVER_AREAS: &[&str] = &["account", "assistant", "notifications", "settings", "connections", "fleet"];
+
+/// The item kind a session's knowledge scope must include for an operation
+/// on your mail, calendar, chat or photos (as for the memex tools).
+fn kind_needed(op: &Op) -> Option<&'static str> {
+    match op.name.split('.').next().unwrap_or("") {
+        "mail" | "contacts" => Some("email"),
+        "calendar" => Some("event"),
+        "chat" => Some("chat"),
+        "photos" => Some("photo"),
+        _ => None,
+    }
+}
+
+/// Whether an operation reaches the knowledge store (and so runs within
+/// the session's scope).
+fn knowledge_op(op: &Op) -> bool {
+    matches!(op.via, Via::Memex { .. }) || ["memex.", "knowledge.", "claims.", "things."].iter().any(|p| op.name.starts_with(p))
+}
+
+/// In your name, outside carbon6: your OK each time. The first ones only
+/// while Settings → Memex says sending needs your approval (as the memex
+/// tools' built-in policy).
+const SENDS: &[&str] =
+    &["mail.send", "mail.requests.send", "calendar.create", "calendar.rsvp", "chat.post", "chat.edit", "chat.delete", "chat.react"];
+const OUTSIDE: &[&str] = &["mail.modify", "mail.cancel", "calendar.update", "calendar.delete", "contacts.create", "contacts.create_many"];
 
 /// Reads in a never-area that show nothing an agent shouldn't see.
 const READ_OK: &[&str] = &["connections.list", "connections.quotas", "connections.models", "workers.list", "commands.list"];
@@ -86,6 +114,15 @@ const NEVER: &[&str] = &[
     "memex.scan",
     "memex.merge",
     "google.sync",
+    // Your accounts' set-up, and what you've read, saved or chosen to see.
+    "calendar.select",
+    "mail.triage.seen",
+    "chat.unread",
+    "chat.mark_read",
+    "chat.thread_read",
+    "chat.prefs",
+    "chat.sections",
+    "chat.save",
     // Starting and steering sessions has its own tools (task,
     // template_start, message_session) with their own limits.
     "sessions.create",
@@ -149,6 +186,18 @@ const MAKE: &[&str] = &[
     "things.create",
     "views.act",
     "apps.operations.call",
+    // Drafts and your requests' and triage's state stay in carbon6 (and
+    // your drafts folder) until you send.
+    "mail.draft",
+    "mail.drafts.set",
+    "mail.drafts.link",
+    "mail.drafts.clear",
+    "mail.requests.draft",
+    "mail.requests.set",
+    "mail.requests.merge",
+    "mail.triage.set",
+    "mail.triage.mark",
+    "mail.triage.unmark",
     // Puts something new on a work item or project (what it moves there is
     // checked on its own).
     "work.attach",
@@ -180,6 +229,13 @@ pub fn class(op: &Op) -> Class {
     }
     if NEVER_AREAS.contains(&op.area) {
         return if READ_OK.contains(&op.name) { Class::Read } else { Class::Never };
+    }
+    // Connecting Google and Slack is yours; their status is a read.
+    if op.name.starts_with("google.") || op.name.starts_with("slack.") {
+        return if op.effect == Effect::Read { Class::Read } else { Class::Never };
+    }
+    if SENDS.contains(&op.name) || OUTSIDE.contains(&op.name) {
+        return Class::Outside;
     }
     if MAKE.contains(&op.name) {
         return Class::Make;
@@ -345,6 +401,14 @@ async fn label(st: &HeadState, realm: &str, thing: &str) -> String {
             .ok()
             .flatten(),
         "session" => st.store.session(id).await.ok().flatten().map(|s| s.title).filter(|t| !t.trim().is_empty()),
+        "account" => {
+            return match id {
+                "event" => "your calendar".into(),
+                "chat" => "your Slack".into(),
+                "photo" => "your photos".into(),
+                _ => "your mail".into(),
+            };
+        }
         "doc" => crate::docs::title_of(st, realm, id).await.map(|t| t.0),
         _ => None,
     };
@@ -477,9 +541,38 @@ async fn project_id(st: &HeadState, realm: &str, project: &str) -> anyhow::Resul
 
 /// Runs `op` for a session family after the rule says it may.
 async fn call(st: &HeadState, op: &'static Op, args: Value, realm: &str, root: &str, session: &str) -> anyhow::Result<Value> {
-    let class = class_of(op, &args);
+    let mut class = class_of(op, &args);
     if class == Class::Never {
         return Err(crate::forbidden(format!("{} is the user's alone; tell them what you'd like done", op.name)));
+    }
+    if knowledge_op(op) || kind_needed(op).is_some() {
+        if !crate::memex::ready(st) {
+            return Err(crate::forbidden("the knowledge store isn't open on this head"));
+        }
+        if let Some(k) = kind_needed(op)
+            && !scope_of(st, root).await?.iter().any(|s| s == k)
+        {
+            return Err(crate::forbidden(format!(
+                "{} needs this session's knowledge scope to include {k}, and it doesn't: the user decides that in Settings → Memex \
+                 (scopes by label)",
+                op.name
+            )));
+        }
+    }
+    if class == Class::Outside && SENDS.contains(&op.name) && !sending_needs_approval(st).await {
+        class = Class::Make;
+    }
+    if class == Class::Outside {
+        let account = format!("account:{}", kind_needed(op).unwrap_or("email"));
+        let d = ask(st, op, &args, realm, root, session, &[account], true).await?;
+        return Ok(json!({
+            "asked": d,
+            "text": format!(
+                "Not yet: {} acts in the user's name outside carbon6, so they're asked each time (decision {d}). Nothing happened yet. \
+                 You'll get a message when they answer; if they allow it, it's done for you.",
+                op.name
+            ),
+        }));
     }
     // An operation that names another realm stays in this one.
     if let Some(r) = [&args["realm"], &args["body"]["realm"]].into_iter().find_map(|v| v.as_str()).filter(|r| !r.is_empty() && *r != realm)
@@ -535,6 +628,28 @@ async fn call(st: &HeadState, op: &'static Op, args: Value, realm: &str, root: &
 }
 
 async fn run(st: &HeadState, op: &'static Op, args: Value, realm: &str, root: &str) -> anyhow::Result<Value> {
+    // Every knowledge call made for it sees what the session's scope allows,
+    // however it reaches the memex.
+    if knowledge_op(op) || kind_needed(op).is_some() {
+        let scope = scope_of(st, root).await?;
+        return Box::pin(crate::memex::SCOPE.scope(scope, run_unscoped(st, op, args, realm, root))).await;
+    }
+    run_unscoped(st, op, args, realm, root).await
+}
+
+/// The item kinds the session family's knowledge calls may see.
+async fn scope_of(st: &HeadState, root: &str) -> anyhow::Result<Vec<String>> {
+    match st.store.session(root).await? {
+        Some(s) => crate::fabric::session_scope(st, &s).await,
+        None => Ok(c6_api::MEMEX_DEFAULT_SCOPE.iter().map(|k| k.to_string()).collect()),
+    }
+}
+
+async fn sending_needs_approval(st: &HeadState) -> bool {
+    crate::memex::settings(st).await.ok().and_then(|s| s.send_needs_approval).unwrap_or(true)
+}
+
+async fn run_unscoped(st: &HeadState, op: &'static Op, args: Value, realm: &str, root: &str) -> anyhow::Result<Value> {
     if matches!(op.via, Via::Memex { .. }) {
         return crate::memex::call_as(
             st,
@@ -566,7 +681,17 @@ async fn ask(
 ) -> anyhow::Result<i64> {
     let who = st.store.session(root).await?.map(|s| s.title).filter(|t| !t.trim().is_empty()).unwrap_or_else(|| "A session".into());
     let what = label(st, realm, &things[0]).await;
-    let (title, document) = if once {
+    let (title, document) = if things[0].starts_with("account:") {
+        (
+            format!("Let {who} {}?", lower_first(op.summary.trim_end_matches('.'))),
+            format!(
+                "The session wants to run **{}** ({}) with {what}, in your name.\n\n```json\n{}\n```\n\nAllow runs it once, as shown.",
+                op.name,
+                op.summary,
+                serde_json::to_string_pretty(args).unwrap_or_default()
+            ),
+        )
+    } else if once {
         (
             format!("Let {who} do this to {what}: {}?", lower_first(op.summary.trim_end_matches('.'))),
             format!(
@@ -657,8 +782,9 @@ fn find_text(query: &str) -> String {
         }
         return out;
     }
-    let found: Vec<&Op> =
-        v["operations"].as_array().into_iter().flatten().filter_map(|o| o["op"].as_str()).filter_map(catalog::find).collect();
+    // Only what an agent may use: the user's own operations would crowd out
+    // the ones it can call.
+    let found: Vec<&Op> = catalog::ranked(query, None).into_iter().filter(|o| class(o) != Class::Never).take(10).collect();
     if found.is_empty() {
         return format!("No operations match {query:?}; try other words.");
     }
@@ -668,6 +794,7 @@ fn find_text(query: &str) -> String {
             Class::Make => "makes something: free",
             Class::Change => "changes: free on what this session made, else the user is asked once",
             Class::Delete => "deletes: free on what this session made, else the user is asked each time",
+            Class::Outside => "acts in the user's name outside carbon6: they're asked each time",
             Class::Never => "the user's alone",
         };
         if i == 0 {
@@ -724,5 +851,41 @@ mod tests {
         assert_eq!(c("realms.create"), Class::Never);
         assert_eq!(c("realms.list"), Class::Read);
         assert_eq!(c("settings.prompts.put"), Class::Never);
+        // Your mail, calendar and chat: by the session's scope; in your
+        // name outside carbon6, each time; your set-up and what you've read, never.
+        assert_eq!(c("mail.threads"), Class::Read);
+        assert_eq!(c("mail.draft"), Class::Make);
+        assert_eq!(c("mail.send"), Class::Outside);
+        assert_eq!(c("calendar.create"), Class::Outside);
+        assert_eq!(c("chat.post"), Class::Outside);
+        assert_eq!(c("mail.modify"), Class::Outside);
+        assert_eq!(c("photos.list"), Class::Read);
+        assert_eq!(c("google.status"), Class::Read);
+        assert_eq!(c("google.connect"), Class::Never);
+        assert_eq!(c("calendar.select"), Class::Never);
+        assert_eq!(c("chat.mark_read"), Class::Never);
+        assert_eq!(kind_needed(catalog::find("mail.threads").unwrap()), Some("email"));
+        assert_eq!(kind_needed(catalog::find("calendar.events").unwrap()), Some("event"));
+        assert_eq!(kind_needed(catalog::find("chat.messages").unwrap()), Some("chat"));
+        assert_eq!(kind_needed(catalog::find("work.add").unwrap()), None);
+    }
+
+    /// Asked in your words, find puts the operation you mean first.
+    #[test]
+    fn find_understands_everyday_words() {
+        let first = |q: &str| catalog::ranked(q, None).into_iter().find(|o| class(o) != Class::Never).map(|o| o.name).unwrap_or_default();
+        assert_eq!(first("remove a to-do"), "work.todos.remove");
+        assert_eq!(first("delete a todo from a work item"), "work.todos.remove");
+        assert_eq!(first("add a to-do to work"), "work.todos.add");
+        assert_eq!(first("tick off a to-do"), "work.todos.edit");
+        assert_eq!(first("create a project"), "projects.add");
+        assert_eq!(first("rename a project"), "projects.edit");
+        let top = |q: &str, n: usize| -> Vec<&str> {
+            catalog::ranked(q, None).into_iter().filter(|o| class(o) != Class::Never).take(n).map(|o| o.name).collect()
+        };
+        assert!(top("create a new work in the project", 3).contains(&"projects.work"), "{:?}", top("create a new work in the project", 3));
+        assert_eq!(first("send an email"), "mail.send");
+        // What an agent can't use isn't offered.
+        assert!(!find_text("create an API token").contains("auth.tokens.create"));
     }
 }
