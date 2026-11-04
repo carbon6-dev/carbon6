@@ -48,7 +48,7 @@ pub fn parse(result: &Value) -> anyhow::Result<CodexLimitsReport> {
         account_id: text("accountId"),
         plan_type: text("planType"),
         windows,
-        error: String::new(),
+        ..Default::default()
     })
 }
 
@@ -62,20 +62,12 @@ async fn response(rx: &mut mpsc::Receiver<Result<Value, &'static str>>, id: u64)
     bail!("Codex app server closed stdout before replying")
 }
 
-/// Runs only initialize, initialized and account/rateLimits/read. Inherits
+/// Runs only initialize, initialized, account/rateLimits/read and account/read. Inherits
 /// the environment except that an absolute executable's own folder comes
 /// first on the child's PATH (e.g. nvm's node beside codex). Output never
 /// enters diagnostics; the worker's environment is never modified.
 pub async fn read(binary: &Path, timeout: Duration, stop: &CancellationToken) -> anyhow::Result<CodexLimitsReport> {
-    let mut command = tokio::process::Command::new(binary);
-    if binary.is_absolute()
-        && let Some(folder) = binary.parent()
-    {
-        let inherited = std::env::var_os("PATH");
-        let folders = std::iter::once(folder.to_owned()).chain(inherited.iter().flat_map(std::env::split_paths));
-        command.env("PATH", std::env::join_paths(folders).context("could not build Codex command's PATH")?);
-    }
-    let mut child = command
+    let mut child = command(binary)?
         .args(["app-server", "--listen", "stdio://"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -134,7 +126,21 @@ pub async fn read(binary: &Path, timeout: Duration, stop: &CancellationToken) ->
             reply = response(&mut rx, 3).await?;
         }
         ensure!(reply["error"].is_null(), "Codex could not read plan limits (check its ChatGPT sign-in)");
-        parse(&reply["result"])
+        let mut report = parse(&reply["result"])?;
+        // Codex app-server-protocol GetAccountParams/GetAccountResponse,
+        // pinned at 9fcaeb733522adf09b4e1c594bc90f344374a926. Read only:
+        // do not proactively refresh auth, start login, or request a turn.
+        stdin.write_all(b"{\"id\":4,\"method\":\"account/read\",\"params\":{\"refreshToken\":false}}\n").await?;
+        let account = response(&mut rx, 4).await?;
+        if account["error"].is_null() && account["result"]["account"]["type"] == "chatgpt" {
+            let account = &account["result"]["account"];
+            report.email = account["email"].as_str().filter(|s| !s.trim().is_empty()).map(str::to_owned);
+            if report.plan_type.is_none() {
+                report.plan_type = account["planType"].as_str().map(str::to_owned);
+            }
+        }
+        // An unsupported account/read still permits the stronger id match.
+        Ok(report)
     };
     let result = tokio::select! {
         _ = stop.cancelled() => Err(anyhow::anyhow!("Codex plan read cancelled")),
@@ -174,6 +180,7 @@ pub fn spawn(worker: Arc<Worker>, stop: CancellationToken) {
         let mut backoff = POLL;
         let mut was_enabled = false;
         let mut previous_command = None;
+        let mut discovered: Option<std::path::PathBuf> = None;
         loop {
             if worker.link.is_connected() {
                 let config = tokio::select! {
@@ -184,29 +191,54 @@ pub fn spawn(worker: Arc<Worker>, stop: CancellationToken) {
                 let command =
                     config.as_ref().ok().and_then(|c| c["command"].as_str()).filter(|c| !c.trim().is_empty()).map(std::path::PathBuf::from);
                 let command_changed = command != previous_command;
+                if config.is_ok() && (command_changed || enabled != was_enabled) {
+                    discovered = None;
+                }
                 if enabled && (!was_enabled || command_changed || Instant::now() >= next) {
                     if !was_enabled || command_changed {
                         backoff = POLL;
                     }
-                    let (binary, timeout, every) = {
+                    let (binary, shell, shell_timeout, timeout, every) = {
                         let o = worker.overrides.lock().unwrap();
                         (
-                            o.codex_bin.clone().or_else(|| command.clone()).unwrap_or_else(|| "codex".into()),
+                            o.codex_bin.clone().or_else(|| command.clone()),
+                            std::env::var_os("SHELL"),
+                            o.codex_shell_timeout.unwrap_or(Duration::from_secs(5)),
                             o.codex_timeout.unwrap_or(TIMEOUT),
                             o.codex_every.unwrap_or(POLL),
                         )
                     };
-                    let report = match read(&binary, timeout, &stop).await {
+                    let command_from_shell = binary.is_none();
+                    let binary = match binary {
+                        Some(binary) => Ok(binary),
+                        None => match &discovered {
+                            Some(binary) => Ok(binary.clone()),
+                            None => {
+                                let result = discovery::from_shell(shell.as_deref(), shell_timeout, &stop).await;
+                                discovered = result.as_ref().ok().cloned();
+                                result
+                            }
+                        },
+                    };
+                    let selected = binary.as_ref().ok().map(|p| p.to_string_lossy().into_owned());
+                    let result = match binary {
+                        Ok(binary) => read(&binary, timeout, &stop).await,
+                        Err(e) => Err(e),
+                    };
+                    let mut report = match result {
                         Ok(r) => {
                             backoff = every;
                             r
                         }
                         Err(e) => {
+                            discovered = None;
                             backoff = (backoff * 2).min(Duration::from_secs(3600));
                             tracing::warn!("reading Codex plan limits: {e}");
                             CodexLimitsReport { observed_at: c6_core::now_ms(), error: e.to_string(), ..Default::default() }
                         }
                     };
+                    report.command = selected;
+                    report.command_from_shell = command_from_shell;
                     if stop.is_cancelled() {
                         return;
                     }
@@ -233,3 +265,17 @@ pub fn spawn(worker: Arc<Worker>, stop: CancellationToken) {
         }
     });
 }
+
+fn command(binary: &Path) -> anyhow::Result<tokio::process::Command> {
+    let mut command = tokio::process::Command::new(binary);
+    if binary.is_absolute()
+        && let Some(folder) = binary.parent()
+    {
+        let inherited = std::env::var_os("PATH");
+        let folders = std::iter::once(folder.to_owned()).chain(inherited.iter().flat_map(std::env::split_paths));
+        command.env("PATH", std::env::join_paths(folders).context("could not build Codex command's PATH")?);
+    }
+    Ok(command)
+}
+
+mod discovery;

@@ -62,6 +62,7 @@ pub struct Overrides {
     pub kit_jobs: Option<bool>,
     /// Codex plan-limit polling: test binary and timing, never global env.
     pub codex_bin: Option<PathBuf>,
+    pub codex_shell_timeout: Option<std::time::Duration>,
     pub codex_timeout: Option<std::time::Duration>,
     pub codex_every: Option<std::time::Duration>,
     pub codex_config_every: Option<std::time::Duration>,

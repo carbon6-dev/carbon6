@@ -194,6 +194,18 @@ pub struct QuotaOrigin {
     pub account_id: Option<String>,
     #[serde(default)]
     pub plan_type: Option<String>,
+    /// Transient identity for conservative merging; never copied into the
+    /// quota API or persisted quota history.
+    #[serde(skip)]
+    #[cfg_attr(feature = "schema", schemars(skip))]
+    pub email: Option<String>,
+    /// Executable selected on the worker (manual override or discovered).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub command_from_shell: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub unmatched_reason: String,
 }
 
 /// Opt-in workers, by id (like session imports, but no session files are read).
@@ -203,7 +215,7 @@ pub struct CodexLimitsSettings {
     #[serde(default)]
     pub workers: Vec<String>,
     /// Optional absolute executable paths, by worker id. No arguments or
-    /// shell expansion; absent/empty means `codex` on that worker's PATH.
+    /// shell expansion; absent/empty discovers Codex through the user's shell.
     #[serde(default)]
     pub commands: std::collections::BTreeMap<String, String>,
 }
@@ -214,6 +226,12 @@ pub struct CodexLimitsReport {
     pub observed_at: UnixMs,
     pub account_id: Option<String>,
     pub plan_type: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub command_from_shell: bool,
     pub windows: Vec<CodexPlanWindow>,
     /// A bounded diagnostic, never stderr or credentials.
     #[serde(default)]

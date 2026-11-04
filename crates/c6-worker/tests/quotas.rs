@@ -177,7 +177,7 @@ async fn plan_limits_from_claude_code_and_chatgpt() {
     c6_head::quotas::poll_chatgpt(&head.state).await;
     usage.lock().unwrap()["rate_limit"]["secondary_window"]["used_percent"] = json!(97.0);
     c6_head::quotas::poll_chatgpt(&head.state).await;
-    let want = ["ChatGPT (me): 85% of its week limit used", "ChatGPT (me): 97% of its week limit used"];
+    let want = ["ChatGPT (me): 15% of its week limit left", "ChatGPT (me): 3% of its week limit left"];
     eventually("the notifications", async || (titles(&notes) == want).then_some(())).await;
 
     // A failed read keeps the last windows and says why.
@@ -350,7 +350,7 @@ async fn plan_limits_from_claude_code_and_chatgpt() {
     eventually("the week near its limit", async || cc_quota().await.filter(|q| q.windows[1].used_percent == 96.0)).await;
     eventually("Claude Code's notifications", async || {
         let t = titles(&notes);
-        (t.contains(&"cc: its 5h limit is used up".to_owned()) && t.contains(&"cc: 96% of its week limit used".to_owned())).then_some(())
+        (t.contains(&"cc: its 5h limit is used up".to_owned()) && t.contains(&"cc: 4% of its week limit left".to_owned())).then_some(())
     })
     .await;
     // Nothing of it in the session's own stream or log.
