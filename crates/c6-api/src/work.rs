@@ -213,6 +213,9 @@ pub struct WorkItem {
     /// Its project's title (empty: none).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub project_title: String,
+    /// The session whose agent made it (empty: you, or something else).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub made_by: String,
 }
 
 /// An attached thing as it is now.

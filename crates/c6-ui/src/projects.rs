@@ -294,6 +294,7 @@ pub fn ProjectPage(id: String) -> impl IntoView {
                     let closed = matches!(p.fields.status.as_str(), "done" | "dropped");
                     let (t, pu) = (p.fields.title.clone(), p.fields.purpose.clone());
                     let mine = p.id.clone();
+                    let made_by = p.made_by.clone();
                     let mark_key = format!("project:{}", p.id);
                     let open: Vec<_> = p.work.iter().filter(|w| !matches!(w.state.as_str(), "done" | "dropped")).cloned().collect();
                     let done: Vec<_> = p.work.iter().filter(|w| matches!(w.state.as_str(), "done" | "dropped")).cloned().collect();
@@ -328,6 +329,7 @@ pub fn ProjectPage(id: String) -> impl IntoView {
                                         <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| { title.set(t2.clone()); purpose.set(p2.clone()); editing.set(true); }>"Edit"</button>
                                     </div>
                                     <p class="whitespace-pre-wrap text-sm text-zinc-600 dark:text-zinc-400">{if pu.is_empty() { "Purpose: not said yet".to_owned() } else { pu.clone() }}</p>
+                                    <crate::work::MadeBy session=made_by.clone() />
                                 }.into_any()
                             }}
                             <div class="flex flex-wrap items-center gap-2 text-sm">

@@ -98,6 +98,8 @@ async fn agents_make_and_change_things_by_your_rule() {
     assert_eq!(made["project"], pid.as_str(), "{made}");
     let rec = get(format!("collections/work/records/{mid}")).await;
     assert_eq!(rec["created_by"], format!("session:{sid}"), "the session made it: {rec}");
+    assert_eq!(made["made_by"], sid.as_str(), "the work item says which session made it");
+    assert!(get(format!("projects/{pid}")).await.get("made_by").is_none(), "you made the project");
 
     // 2. To-dos on the work it made, and renaming it: free.
     mock.push(Reply::ToolCalls(vec![

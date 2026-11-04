@@ -22,6 +22,12 @@ pub fn by(default: &str) -> String {
     ACTOR.try_with(Clone::clone).unwrap_or_else(|_| default.to_owned())
 }
 
+/// The session a `created_by` names (`session:<id>`, maybe with a grant
+/// after it), else empty.
+pub fn made_by(created_by: &str) -> String {
+    created_by.split_whitespace().next().and_then(|m| m.strip_prefix("session:")).unwrap_or_default().to_owned()
+}
+
 /// The agent making the current call, if one is.
 pub fn actor() -> Option<String> {
     ACTOR.try_with(Clone::clone).ok()

@@ -56,6 +56,7 @@ struct Stored {
     labels: Vec<String>,
     created_at: i64,
     updated_at: i64,
+    created_by: String,
 }
 
 fn stored(r: &sqlx::sqlite::SqliteRow) -> Stored {
@@ -67,6 +68,7 @@ fn stored(r: &sqlx::sqlite::SqliteRow) -> Stored {
         labels: serde_json::from_str(&r.get::<String, _>("labels")).unwrap_or_default(),
         created_at: r.get("created_at"),
         updated_at: r.get("updated_at"),
+        created_by: r.try_get("created_by").unwrap_or_default(),
     }
 }
 
@@ -851,6 +853,7 @@ async fn view_at(st: &HeadState, rows: Vec<Stored>, now: i64) -> anyhow::Result<
             labels: r.labels,
             created_at: r.created_at,
             updated_at: r.updated_at,
+            made_by: crate::agent_ops::made_by(&r.created_by),
         });
     }
     Ok(out)

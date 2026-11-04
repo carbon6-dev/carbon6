@@ -723,6 +723,7 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
                                 })}
                             </div>
                             <ProjectPick w=w.clone() apply=Callback::new(apply) />
+                            <MadeBy session=w.made_by.clone() />
                         </header>
                         {w.fields.offer.clone().filter(|_| open).map(|o| view! {
                             <div class="flex flex-wrap items-center gap-2 rounded-lg border border-emerald-300 bg-emerald-50 p-3 text-sm dark:border-emerald-800 dark:bg-emerald-950/30">
@@ -833,6 +834,9 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
                                             } />
                                         <span class=if done { "min-w-0 flex-1 truncate text-muted line-through" } else { "min-w-0 flex-1 truncate" } title=what>{t.text.clone()}</span>
                                         {t.from.starts_with("decision:").then(|| view! { <span class="shrink-0 text-[11px] text-muted" title="An agent proposed it as a task card">"task card"</span> })}
+                                        {t.by.strip_prefix("session:").filter(|_| !t.from.starts_with("decision:")).map(|s| view! {
+                                            <Go to=View::session(s.to_owned()) class="shrink-0 text-[11px] text-muted hover:underline" title="An agent added it; this opens its session">"by an agent"</Go>
+                                        })}
                                         {ticked_by.map(|why| view! { <span class="shrink-0 text-[11px] text-emerald-700 dark:text-emerald-400" title=why>"✓ agent"</span> })}
                                         {(!t.session.is_empty()).then(|| view! {
                                             <Go to=View::session(t.session.clone()) class="shrink-0 text-xs text-sky-700 hover:underline dark:text-sky-400">"session ↗"</Go>
@@ -1035,6 +1039,19 @@ pub fn SessionWork(session_id: String, title: Signal<String>) -> impl IntoView {
             {move || error.get().map(|e| view! { <span class="text-red-600">{e}</span> })}
         </span>
     }
+}
+
+/// Which session's agent made something (nothing when you did).
+#[component]
+pub(crate) fn MadeBy(session: String) -> impl IntoView {
+    (!session.is_empty()).then(|| {
+        view! {
+            <p class="text-xs text-muted">
+                "Made by an agent: "
+                <Go to=View::Session { id: session.clone(), target: None } class="hover:underline">"its session"</Go>
+            </p>
+        }
+    })
 }
 
 /// The project a piece of work is in: a link, and a menu to move it.

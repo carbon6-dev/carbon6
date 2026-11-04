@@ -239,6 +239,9 @@ pub struct ProjectItem {
     pub labels: Vec<String>,
     pub created_at: UnixMs,
     pub updated_at: UnixMs,
+    /// The session whose agent made it (empty: you, or something else).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub made_by: String,
 }
 
 /// `POST /api/v1/projects`.

@@ -40,6 +40,7 @@ pub(crate) struct Stored {
     pub labels: Vec<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    pub created_by: String,
 }
 
 fn stored(r: &sqlx::sqlite::SqliteRow) -> Stored {
@@ -51,6 +52,7 @@ fn stored(r: &sqlx::sqlite::SqliteRow) -> Stored {
         labels: serde_json::from_str(&r.get::<String, _>("labels")).unwrap_or_default(),
         created_at: r.get("created_at"),
         updated_at: r.get("updated_at"),
+        created_by: r.try_get("created_by").unwrap_or_default(),
     }
 }
 
@@ -423,6 +425,7 @@ pub(crate) async fn view(st: &HeadState, rows: Vec<Stored>) -> anyhow::Result<Ve
             labels: r.labels,
             created_at: r.created_at,
             updated_at: r.updated_at,
+            made_by: crate::agent_ops::made_by(&r.created_by),
         });
     }
     Ok(out)
