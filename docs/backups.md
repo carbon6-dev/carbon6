@@ -65,3 +65,46 @@ Each destination keeps the last N generations (a setting, 4 by default: about a 
 5. **Settings → Backups,** status, notifications and the catalog operations.
 
 Every step is tested against a folder destination and a stand-in S3 on loopback, with no time-based waits (docs/testing.md).
+
+## 9. As built
+
+Built 2026-11-04 on branch `backups`, one commit per step (§8). The code is in `crates/c6-head/src/backups/` (`mod.rs` settings, passes and status; `crypt.rs`; `dest.rs`; `wal.rs`; `capture.rs`; `gens.rs`; `restore.rs`), `crates/c6-core/src/wal.rs`, `crates/c6-ui/src/backups.rs`, and `c6h restore`.
+
+- **The head always checkpoints its databases itself,** backups on or not. Every connection to a database in the head's folder (`c6_core::wal::manual_under`, set when `c6h.db` opens) has `wal_autocheckpoint = 0`, `journal_size_limit` 64 MB, and SQLite's checkpoint on close turned off (`SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`, through `libsqlite3-sys`). The log therefore keeps every change, across restarts too, until the head has read it. `c6h` subcommands (upgrade, login link…) open their databases the same way, so nothing they write is missed either.
+- **A pass, per database, every interval:** on its own connection, `BEGIN IMMEDIATE` (no one else can write), read the frames committed since the last pass, write them as a segment into the local spool (`<data>/backup-state/spool/`, plaintext like the databases beside it), `PRAGMA wal_checkpoint(PASSIVE)` on a second connection, `ROLLBACK`. The lock is held for milliseconds. Nothing waits on a destination.
+- **Changed from §3: the checkpoint doesn't wait for destinations.** Segments wait in the spool instead, and each destination's sender drains it at its own pace. The limit is on the spool: a destination with more than `spool_limit_mb` unsent falls back to a new base copy and stops holding the spool. The WAL therefore never grows because a destination is down.
+- **Changed from §3: generations are per destination,** so one slow destination never makes the others take base copies.
+- **The line of changes** breaks (an epoch, after which earlier base copies take no more segments) when:
+  - the database file changed but no checkpoint by the head changed it (another program wrote and checkpointed it, or a failed upgrade put its copy back);
+  - the log started over without a full checkpoint by the head;
+  - its `upgrades` table has a newer upgrade, which covers the design's "after a schema upgrade".
+
+  The next pass at each destination then takes a new base copy.
+- **Base copies** pause that database's checkpoints for the whole copy, upload included. If its log passes 1 GB meanwhile, the copy gives up and the chunks it sent are kept, so the next try sends fewer. After a copy fails partway it waits 5 minutes. One that couldn't reach the destination read nothing, and tries again next pass.
+- **Changed from §4: not the age format.**
+  - **Encryption:** X25519 to your key, then HKDF-SHA256, then a ChaCha20-Poly1305-wrapped data key, with an XChaCha20-Poly1305 body. Content is compressed with deflate (`flate2`, already in the tree) rather than zstd.
+  - **Keys** are text: `c6pub1…` and `c6key1…`.
+  - **The head's own key** names objects (HMAC-SHA256) and encrypts the indexes it reads back. It is kept under the master key and, wrapped to your key, at `keys/head`.
+- **Objects at a destination:**
+  - `keys/head`, `keys/recipient`;
+  - `files/<ms>`: the CA, `master.key` and the config file;
+  - `blobs/<name>` and `bloblog/<ms>-…`, which say where each blob goes back to;
+  - `chunks/<name>`;
+  - `db/<db>/<generation>/{manifest, index, wal0, seg/<seq>-<ms>}`.
+
+  A generation is complete once its manifest is there.
+- **Retention** keeps the newest `keep` complete generations per database and the chunks their indexes name. It also keeps the files objects from the oldest kept generation on, and always the newest one. **Not done:** blobs are never pruned at a destination.
+- **Changed from §6: `c6h restore`.**
+  - Its flags are `--from <folder | s3://bucket/prefix> [--endpoint] [--region] [--at <time>] [--to <folder>] [--key-file]`. The key comes from `--key-file`, else `C6_BACKUP_KEY`, else it asks.
+  - It refuses a folder that already has a `c6h.db`.
+  - It writes the config file as `<name>.restored`, because its `data_dir` may differ, and checks every database with `PRAGMA integrity_check`.
+  - It can't restore by a destination's name from the head's settings: those settings are inside what is being restored.
+- **Changed from §6: test restores.**
+  - With your key kept, a full restore into a temporary folder, with an integrity check of each database. It doesn't compare row counts with the live head.
+  - Without it, a check that every object of each database's newest base copy is there. The manifest and log are hashed, and about one chunk in sixteen is read back and hashed, rather than reading the whole backup back each week.
+  - A failure notifies (event `backup`, on by default, as is "behind").
+- **Settings → Backups** (a console page) covers the key (made there, the private key shown once), destinations, limits, status per destination and per base copy, the restore key for tests, and Send now, New base copies now and Test restore now. Its operations are `system.backups.*`, which are administration, so agents don't get them.
+- **Cost while quiet,** measured in the tests:
+  - Passes with nothing changed sent no objects and no bytes.
+  - Each pass, per database, takes the write lock for a moment, reads the log's header, and runs a checkpoint only if the log has frames.
+  - The blob scan reads only blob folders whose time changed since the destination last had all of theirs.

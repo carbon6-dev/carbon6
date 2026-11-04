@@ -214,6 +214,10 @@ pub struct Engine {
     sent: std::sync::Mutex<BTreeMap<String, u64>>,
     /// Settings changed, or a pass was asked for.
     pub(crate) wake: tokio::sync::Notify,
+    /// Per destination: the blobs it has, and each blob folder's time when
+    /// it last had all of that folder's.
+    #[allow(clippy::type_complexity)]
+    blobs: std::sync::Mutex<BTreeMap<String, (BTreeSet<String>, BTreeMap<String, std::time::SystemTime>)>>,
     /// The head's backup key, once read.
     key: tokio::sync::Mutex<Option<HeadKey>>,
     /// Reading the logs, one pass at a time, with each database's own
@@ -288,21 +292,30 @@ fn small_files(st: &HeadState) -> anyhow::Result<(Vec<u8>, String)> {
     Ok((body, hash))
 }
 
-/// Every blob's path under `knowledge/blobs`.
-fn blob_paths(st: &HeadState) -> Vec<String> {
+/// The blobs under `knowledge/blobs` not yet at a destination, skipping
+/// folders unchanged since it last had all of theirs; with each folder's
+/// time, to record once it has them.
+fn new_blobs(st: &HeadState, have: &BTreeSet<String>, seen: &BTreeMap<String, std::time::SystemTime>) -> (Vec<String>, BTreeMap<String, std::time::SystemTime>) {
     let root = st.data_dir.join("knowledge").join("blobs");
-    let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(&root) else { return out };
+    let (mut out, mut times) = (Vec::new(), BTreeMap::new());
+    let Ok(rd) = std::fs::read_dir(&root) else { return (out, times) };
     for d in rd.flatten() {
+        let dir = d.file_name().to_string_lossy().into_owned();
+        let Ok(t) = d.metadata().and_then(|m| m.modified()) else { continue };
+        times.insert(dir.clone(), t);
+        if seen.get(&dir) == Some(&t) {
+            continue;
+        }
         let Ok(files) = std::fs::read_dir(d.path()) else { continue };
         for f in files.flatten() {
-            if f.file_type().is_ok_and(|t| t.is_file()) {
-                out.push(format!("{}/{}", d.file_name().to_string_lossy(), f.file_name().to_string_lossy()));
+            let path = format!("{dir}/{}", f.file_name().to_string_lossy());
+            if f.file_type().is_ok_and(|t| t.is_file()) && !have.contains(&path) {
+                out.push(path);
             }
         }
     }
     out.sort();
-    out
+    (out, times)
 }
 
 /// The blobs a destination has, as recorded (one name per line).
@@ -323,8 +336,14 @@ pub struct BlobEntry {
 
 async fn send_blobs(st: &HeadState, d: &str, o: &dyn Objects, to: &x25519_dalek::PublicKey, key: &HeadKey) -> anyhow::Result<()> {
     let file = blobs_sent_file(st, d, key);
-    let have: BTreeSet<String> = std::fs::read_to_string(&file).unwrap_or_default().lines().map(str::to_owned).collect();
-    let todo: Vec<String> = blob_paths(st).into_iter().filter(|p| !have.contains(p)).collect();
+    let (have, seen) = {
+        let mut cache = st.backups.blobs.lock().unwrap_or_else(|e| e.into_inner());
+        let c = cache.entry(d.to_owned()).or_insert_with(|| {
+            (std::fs::read_to_string(&file).unwrap_or_default().lines().map(str::to_owned).collect(), BTreeMap::new())
+        });
+        (c.0.clone(), c.1.clone())
+    };
+    let (todo, times) = new_blobs(st, &have, &seen);
     for batch in todo.chunks(BLOB_BATCH) {
         let mut entries = Vec::new();
         for path in batch {
@@ -348,6 +367,15 @@ async fn send_blobs(st: &HeadState, d: &str, o: &dyn Objects, to: &x25519_dalek:
         for e in &entries {
             writeln!(f, "{}", e.path)?;
         }
+        let mut cache = st.backups.blobs.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = cache.get_mut(d) {
+            c.0.extend(entries.into_iter().map(|e| e.path));
+        }
+    }
+    // All of them sent: unchanged folders needn't be read next time.
+    let mut cache = st.backups.blobs.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(c) = cache.get_mut(d) {
+        c.1 = times;
     }
     Ok(())
 }
@@ -371,6 +399,7 @@ async fn send_to(st: &HeadState, s: &BackupSettings, d: &BackupDestination) -> a
         });
         // Objects for another key are no use to this one.
         let _ = std::fs::remove_file(blobs_sent_file(st, &d.name, &key));
+        st.backups.blobs.lock().unwrap_or_else(|e| e.into_inner()).remove(&d.name);
     }
     let (files, hash) = small_files(st)?;
     if st.backups.with(st, |state| state.dests.get(&d.name).is_none_or(|x| x.files_hash != hash)) {
