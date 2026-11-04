@@ -194,6 +194,49 @@ pub fn Fleet(workers: ReadSignal<Vec<Worker>>) -> impl IntoView {
                     </tbody>
                 </table>
             </div>
+            {crate::place::is_console().then(|| view! { <CodexLimitsSettings workers /> })}
+        </section>
+    }
+}
+
+#[component]
+fn CodexLimitsSettings(workers: ReadSignal<Vec<Worker>>) -> impl IntoView {
+    let settings = LocalResource::new(api::codex_limits);
+    let pending = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    view! {
+        <section class="space-y-2 text-sm">
+            <h2 class="font-medium">"ChatGPT plan limits"</h2>
+            <p class="text-muted">"Read ChatGPT plan limits from this machine's Codex. Uses its existing sign-in, never a model turn. Only matching accounts update a connection."</p>
+            {move || error.get().map(|e| view! { <p class="text-muted">{e}</p> })}
+            {move || workers.get().into_iter().filter(|w| w.role != "memex" && w.status != WorkerStatus::Revoked).map(|w| {
+                let id = w.id.to_string();
+                let checked_id = id.clone();
+                view! {
+                    <label class="flex items-center gap-2">
+                        <input type="checkbox"
+                            disabled=move || pending.get() || !matches!(settings.get(), Some(Ok(_)))
+                            prop:checked=move || settings.get().and_then(Result::ok).is_some_and(|s| s.workers.contains(&checked_id))
+                            on:change=move |ev| {
+                                let enabled = event_target_checked(&ev);
+                                let id = id.clone();
+                                pending.set(true);
+                                spawn_local(async move {
+                                    let result = async {
+                                        let mut s = api::codex_limits().await?;
+                                        s.workers.retain(|w| w != &id);
+                                        if enabled { s.workers.push(id); }
+                                        api::set_codex_limits(s).await
+                                    }.await;
+                                    error.set(result.err());
+                                    settings.refetch();
+                                    pending.set(false);
+                                });
+                            } />
+                        {w.name}
+                    </label>
+                }
+            }).collect_view()}
         </section>
     }
 }

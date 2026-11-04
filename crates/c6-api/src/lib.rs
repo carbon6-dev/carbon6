@@ -175,16 +175,63 @@ pub struct QuotaWindow {
     /// the provider said; empty when it didn't.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub status: String,
+    /// Observation time and provenance; absent in older saved snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<QuotaOrigin>,
+}
+
+/// Where a plan snapshot was observed. Worker identity is supplied by the head.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct QuotaOrigin {
+    pub source: String,
+    pub observed_at: UnixMs,
+    #[serde(default)]
+    pub worker_id: String,
+    #[serde(default)]
+    pub worker_name: String,
+    #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default)]
+    pub plan_type: Option<String>,
+}
+
+/// Opt-in workers, by id (like session imports, but no session files are read).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct CodexLimitsSettings {
+    #[serde(default)]
+    pub workers: Vec<String>,
+}
+
+/// `quotas.codex.report`, carried by the existing JSON HeadCall protocol.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CodexLimitsReport {
+    pub observed_at: UnixMs,
+    pub account_id: Option<String>,
+    pub plan_type: Option<String>,
+    pub windows: Vec<CodexPlanWindow>,
+    /// A bounded diagnostic, never stderr or credentials.
+    #[serde(default)]
+    pub error: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CodexPlanWindow {
+    pub used_percent: f64,
+    pub window_minutes: i64,
+    /// Unix seconds.
+    pub resets_at: Option<i64>,
 }
 
 /// A connection's plan limits, as last seen (docs/analytics.md, "Plan
 /// limits"): from Claude Code's own reports as its sessions run, or read
-/// from ChatGPT's usage endpoint every few minutes.
+/// from ChatGPT reply headers or an opted-in worker's local Codex.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ConnectionQuota {
     pub connection_id: String,
-    /// "claude_code" or "chatgpt".
+    /// "claude_code", "chatgpt" (headers/legacy endpoint), or "codex-cli".
     pub source: String,
     pub windows: Vec<QuotaWindow>,
     /// When they were last seen.
@@ -192,6 +239,8 @@ pub struct ConnectionQuota {
     /// Why the last read failed (the windows are the last good ones).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<QuotaOrigin>,
 }
 
 impl ConnectionQuota {

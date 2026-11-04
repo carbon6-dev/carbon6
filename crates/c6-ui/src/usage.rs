@@ -78,13 +78,14 @@ fn PlanLimits() -> impl IntoView {
     let connections = LocalResource::new(api::connections);
     move || {
         let quotas = crate::quota::all();
+        let has_unmatched = quotas.iter().any(|q| q.connection_id.starts_with("codex-cli:"));
         let names = connections.get().and_then(Result::ok).unwrap_or_default();
         let rows: Vec<_> = quotas
             .into_iter()
-            .filter(|q| !q.windows.is_empty())
+            .filter(|q| !q.windows.is_empty() && !q.connection_id.starts_with("codex-cli:"))
             .map(|q| (names.iter().find(|c| c.id == q.connection_id).map(|c| c.name.clone()).unwrap_or_else(|| q.connection_id.clone()), q))
             .collect();
-        (!rows.is_empty()).then(|| {
+        (!rows.is_empty() || has_unmatched).then(|| {
             view! {
                 <section class="space-y-2 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
                     <h2 class="text-sm font-medium">"Plan limits"</h2>
@@ -94,6 +95,7 @@ fn PlanLimits() -> impl IntoView {
                             <crate::quota::QuotaBars q />
                         </div>
                     }).collect_view()}
+                    <crate::quota::UnmatchedCodexLimits />
                 </section>
             }
         })

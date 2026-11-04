@@ -249,6 +249,14 @@ pub async fn session_imports() -> Result<c6_api::SessionImports, String> {
     json(Request::get("/api/v1/settings/session_imports").send().await).await
 }
 
+pub async fn codex_limits() -> Result<c6_api::CodexLimitsSettings, String> {
+    json(Request::get("/api/v1/settings/codex_limits").send().await).await
+}
+
+pub async fn set_codex_limits(s: c6_api::CodexLimitsSettings) -> Result<(), String> {
+    empty(Request::put("/api/v1/settings/codex_limits").json(&s).map_err(|e| e.to_string())?.send().await).await
+}
+
 pub async fn set_session_imports(s: c6_api::SessionImports) -> Result<(), String> {
     empty(Request::put("/api/v1/settings/session_imports").json(&s).map_err(|e| e.to_string())?.send().await).await
 }

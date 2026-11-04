@@ -77,6 +77,7 @@ pub async fn run(worker: Arc<Worker>, state: watch::Sender<ConnState>, shutdown:
     crate::update::on_start(&worker, &shutdown)?;
     // Sessions from Claude Code and Codex, when the head says this worker imports.
     crate::imports::spawn(worker.clone(), shutdown.clone());
+    crate::codex_limits::spawn(worker.clone(), shutdown.clone());
     sweep_kits(shutdown.clone());
     let mut backoff = MIN_BACKOFF;
     loop {

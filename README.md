@@ -188,6 +188,7 @@ Collections are typed tables of records in a realm, for anything apps and agents
   - MCP servers, slash commands, agents, skills and hooks are configured in the UI (Settings) and stored on the head. Settings is grouped (General, Models, Agents and tools, Automation, Memory and memex, System), with one page per setting.
 - **Worker:** its identity lives in `~/.local/state/c6w` (Linux) or `~/Library/Application Support/c6w` (macOS).
   - For Claude Code sessions, install `claude` on the worker and sign in there; set `C6_CLAUDE_BIN` if it is not on the worker's PATH.
+  - Optional ChatGPT plan limits: on the **Workers** page, under **ChatGPT plan limits**, check the worker to read limits from its installed, signed-in `codex`. Off by default; uses the worker service user's normal `PATH`, `HOME` and `CODEX_HOME`. It never reads Codex credentials or starts a model turn. Only an exact ChatGPT account/workspace match updates a connection; other snapshots and failures appear separately in Settings → Connections. See [Plan limits](docs/analytics.md#4-plan-limits) for settings and protocol details.
 
 ### Updates
 

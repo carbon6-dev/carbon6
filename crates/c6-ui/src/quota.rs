@@ -49,6 +49,39 @@ pub fn of(connection: &str) -> Option<ConnectionQuota> {
     q.0.with(|v| v.iter().find(|q| q.connection_id == connection && !q.windows.is_empty()).cloned())
 }
 
+fn source_note(w: &QuotaWindow) -> Option<String> {
+    w.origin.as_ref().filter(|o| o.source == "codex-cli").map(|o| format!("via Codex on {}", o.worker_name))
+}
+
+/// Worker diagnostics and snapshots with no exact connection-account match
+/// live separately, never in a model picker or a connection's bars.
+#[component]
+pub fn UnmatchedCodexLimits() -> impl IntoView {
+    move || {
+        all()
+            .into_iter()
+            .filter(|q| q.connection_id.starts_with("codex-cli:"))
+            .map(|q| {
+                let origin = q.origin.as_ref();
+                let worker = origin.map(|o| o.worker_name.as_str()).unwrap_or("unknown worker");
+                let account = origin
+                    .and_then(|o| o.account_id.as_deref())
+                    .map(|s| s.chars().take(8).collect::<String>())
+                    .unwrap_or_else(|| "unknown".into());
+                let label = format!("From Codex on {worker}, account {account} — no matching ChatGPT connection");
+                let error = q.error.clone();
+                view! {
+                    <div class="space-y-1 text-xs text-muted">
+                        <div>{label}</div>
+                        <QuotaBars q />
+                        {(!error.is_empty()).then(|| view! { <div>{error}</div> })}
+                    </div>
+                }
+            })
+            .collect_view()
+    }
+}
+
 /// How much is left, by level: more than half (quiet grey), half down to
 /// a fifth (yellow), a fifth down to 5% (amber), under 5% (red).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -209,7 +242,8 @@ pub fn resets(at: i64, sep: &str) -> String {
 }
 
 pub fn sentence(w: &QuotaWindow) -> String {
-    sentence_at(w, &|at| resets(at, ", "))
+    let sentence = sentence_at(w, &|at| resets(at, ", "));
+    source_note(w).map(|note| format!("{sentence} ({note})")).unwrap_or(sentence)
 }
 
 pub fn line(w: &QuotaWindow) -> String {
@@ -280,6 +314,7 @@ pub fn PlanMenu(#[prop(into)] connection: Signal<String>) -> impl IntoView {
                                 <span class=format!("shrink-0 whitespace-nowrap {}", t.class())>{format!("{pct:.0}% left")}</span>
                             </div>
                             {w.resets_at.map(|at| view! { <div class="text-muted">{format!("resets {}", resets(at, " · "))}</div> })}
+                            {source_note(w).map(|note| view! { <div class="text-muted">{note}</div> })}
                         </div>
                     }
                 }).collect_view()}
@@ -307,6 +342,7 @@ pub fn QuotaBars(q: ConnectionQuota) -> impl IntoView {
                             <div class=format!("h-full {}", t.bar()) style=format!("width:{pct:.1}%")></div>
                         </div>
                         <span class=text>{line(w)}</span>
+                        {source_note(w).map(|note| view! { <span class="text-muted">{note}</span> })}
                     </div>
                 }
             }).collect_view()}
@@ -320,7 +356,7 @@ mod tests {
     use super::*;
 
     fn w(name: &str, used: f64, resets_at: Option<i64>, status: &str) -> QuotaWindow {
-        QuotaWindow { name: name.into(), used_percent: used, resets_at, status: status.into() }
+        QuotaWindow { name: name.into(), used_percent: used, resets_at, status: status.into(), ..Default::default() }
     }
 
     #[test]
@@ -372,6 +408,17 @@ mod tests {
         assert_eq!(window_label("week (Opus)"), "Week (Opus)");
         assert_eq!(window_label("overage"), "Overage");
         assert_eq!(window_label(""), "");
+    }
+
+    #[test]
+    fn codex_provenance_is_quiet_and_specific_to_each_window() {
+        let mut window = w("5h", 20.0, None, "");
+        assert_eq!(source_note(&window), None);
+        window.origin = Some(c6_api::QuotaOrigin { source: "codex-cli".into(), worker_name: "test-machine".into(), ..Default::default() });
+        assert_eq!(source_note(&window).as_deref(), Some("via Codex on test-machine"));
+        assert_eq!(sentence(&window), "5-hour: 80% left (via Codex on test-machine)");
+        window.origin.as_mut().unwrap().source = "chatgpt".into();
+        assert_eq!(source_note(&window), None);
     }
 
     // Mon Nov 2 2026, 10:15 am UTC.
