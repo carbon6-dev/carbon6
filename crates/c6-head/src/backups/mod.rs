@@ -295,7 +295,11 @@ fn small_files(st: &HeadState) -> anyhow::Result<(Vec<u8>, String)> {
 /// The blobs under `knowledge/blobs` not yet at a destination, skipping
 /// folders unchanged since it last had all of theirs; with each folder's
 /// time, to record once it has them.
-fn new_blobs(st: &HeadState, have: &BTreeSet<String>, seen: &BTreeMap<String, std::time::SystemTime>) -> (Vec<String>, BTreeMap<String, std::time::SystemTime>) {
+fn new_blobs(
+    st: &HeadState,
+    have: &BTreeSet<String>,
+    seen: &BTreeMap<String, std::time::SystemTime>,
+) -> (Vec<String>, BTreeMap<String, std::time::SystemTime>) {
     let root = st.data_dir.join("knowledge").join("blobs");
     let (mut out, mut times) = (Vec::new(), BTreeMap::new());
     let Ok(rd) = std::fs::read_dir(&root) else { return (out, times) };
@@ -338,9 +342,9 @@ async fn send_blobs(st: &HeadState, d: &str, o: &dyn Objects, to: &x25519_dalek:
     let file = blobs_sent_file(st, d, key);
     let (have, seen) = {
         let mut cache = st.backups.blobs.lock().unwrap_or_else(|e| e.into_inner());
-        let c = cache.entry(d.to_owned()).or_insert_with(|| {
-            (std::fs::read_to_string(&file).unwrap_or_default().lines().map(str::to_owned).collect(), BTreeMap::new())
-        });
+        let c = cache
+            .entry(d.to_owned())
+            .or_insert_with(|| (std::fs::read_to_string(&file).unwrap_or_default().lines().map(str::to_owned).collect(), BTreeMap::new()));
         (c.0.clone(), c.1.clone())
     };
     let (todo, times) = new_blobs(st, &have, &seen);
