@@ -484,7 +484,9 @@ pub async fn set(m: &Memex, id: i64, status: &str, until: Option<i64>) -> anyhow
 
 /// Two requests that are one: `from`'s conversations join `into`.
 pub async fn merge(m: &Memex, into: i64, from: i64) -> anyhow::Result<api::Request> {
-    let mut tx = m.store.pool.begin().await?;
+    // Take the writer before resolving ids: a deferred read snapshot cannot
+    // upgrade after another writer commits (busy_timeout cannot help it).
+    let mut tx = m.store.pool.begin_with("BEGIN IMMEDIATE").await?;
     let into = request_id(&mut *tx, into).await?;
     let from = request_id(&mut *tx, from).await?;
     anyhow::ensure!(into != from, "a request is already itself");
@@ -566,6 +568,37 @@ pub async fn method(m: &Memex, method: &str, params: &Value) -> anyhow::Result<V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn concurrent_merges_wait_for_the_writer_before_reading() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        const PAIRS: i64 = 12;
+        for id in 1..=2 * PAIRS {
+            sqlx::query("INSERT INTO requests (id, person, title, category, created_at, updated_at) VALUES (?, 'pat@example.net', 'Ask', 'needs_you', 0, 0)")
+                .bind(id).execute(&m.store.pool).await.unwrap();
+        }
+        let ready = std::sync::Arc::new(tokio::sync::Barrier::new(PAIRS as usize));
+        let mut merges = tokio::task::JoinSet::new();
+        for into in 1..=PAIRS {
+            let (m, ready) = (m.clone(), ready.clone());
+            merges.spawn(async move {
+                ready.wait().await;
+                merge(&m, into, into + PAIRS).await.unwrap()
+            });
+        }
+        c6_testkit::within("all concurrent merges", async {
+            while let Some(r) = merges.join_next().await {
+                let r = r.unwrap();
+                assert!((1..=PAIRS).contains(&r.id));
+            }
+        })
+        .await;
+        for into in 1..=PAIRS {
+            assert_eq!(get(&m, into + PAIRS).await.unwrap().id, into);
+        }
+    }
 
     #[tokio::test]
     async fn merge_redirects_keep_old_ids_sources_and_history_across_reopening() {
