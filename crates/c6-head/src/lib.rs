@@ -310,7 +310,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         hub: Default::default(),
         oauth: Default::default(),
         terminals: Default::default(),
-        auth: auth::Auth::new(cfg.auth),
+        auth: auth::Auth::new(&cfg),
         ui_ca: ui_tls.as_ref().and_then(|t| t.ca.clone()),
         otlp: telemetry::Otlp::from_config(cfg.otlp_endpoint.as_deref(), cfg.otlp_headers.clone()),
         http,

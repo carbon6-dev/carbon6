@@ -12,6 +12,9 @@ use serde::Deserialize;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HeadConfig {
+    /// The loaded config's path, for admin-command hints; not a TOML setting.
+    #[serde(skip)]
+    pub config_path: Option<PathBuf>,
     /// Database, PKI and blobs live here.
     pub data_dir: PathBuf,
     /// Addresses to bind. Empty means every private (RFC 1918, CGNAT/tailnet,
@@ -76,6 +79,7 @@ pub struct HeadConfig {
 impl Default for HeadConfig {
     fn default() -> Self {
         Self {
+            config_path: None,
             data_dir: default_data_dir(),
             bind: Vec::new(),
             ui_port: 7700,
@@ -135,6 +139,7 @@ impl HeadConfig {
         };
         // A head run from its config runs the shipped watchers as they ship.
         cfg.watchers.get_or_insert(true);
+        cfg.config_path = Some(std::path::absolute(path)?);
         // A head run from its config looks where c6m kept its state.
         if cfg.memex_dirs.is_none() {
             let mut dirs = Vec::new();
@@ -154,6 +159,20 @@ impl HeadConfig {
             cfg.extra_names.extend(names.split(',').map(str::trim).filter(|n| !n.is_empty()).map(str::to_owned));
         }
         Ok(cfg)
+    }
+
+    /// A shell command targeting this head, not another install's database.
+    pub fn login_link_command(&self) -> String {
+        let Some(path) = self.config_path.as_ref().filter(|p| **p != default_config_path()) else {
+            return "c6h login-link".into();
+        };
+        let path = path.to_string_lossy();
+        let quoted = if path.chars().all(|c| c.is_ascii_alphanumeric() || "/._-".contains(c)) {
+            path.into_owned()
+        } else {
+            format!("'{}'", path.replace('\'', "'\\''"))
+        };
+        format!("c6h --config {quoted} login-link")
     }
 
     /// The IPs to bind, after applying the private-only policy.
@@ -316,6 +335,31 @@ fn is_ula(ip: &Ipv6Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_link_hints_target_the_loaded_config() {
+        assert_eq!(HeadConfig::default().login_link_command(), "c6h login-link");
+        let cfg = HeadConfig { config_path: Some(default_config_path()), ..Default::default() };
+        assert_eq!(cfg.login_link_command(), "c6h login-link");
+        for (path, expected) in [
+            ("/etc/c6h/c6h.toml", "c6h --config /etc/c6h/c6h.toml login-link"),
+            ("/custom/head config.toml", "c6h --config '/custom/head config.toml' login-link"),
+            ("/custom/head's $(id).toml", "c6h --config '/custom/head'\\''s $(id).toml' login-link"),
+        ] {
+            let cfg = HeadConfig { config_path: Some(path.into()), ..Default::default() };
+            assert_eq!(cfg.login_link_command(), expected);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("head.toml");
+        // Remember even a missing config (which loads defaults).
+        assert_eq!(HeadConfig::load(&path).unwrap().config_path.as_deref(), Some(path.as_path()));
+        std::fs::write(&path, "ui_port = 1234\n").unwrap();
+        let cfg = HeadConfig::load(&path).unwrap();
+        assert_eq!(cfg.config_path.as_deref(), Some(path.as_path()));
+        assert_eq!(cfg.ui_port, 1234);
+        let relative = Path::new("relative-head.toml");
+        assert_eq!(HeadConfig::load(relative).unwrap().config_path, Some(std::path::absolute(relative).unwrap()));
+    }
 
     #[test]
     fn homebrew_config_uses_the_binarys_prefix() {

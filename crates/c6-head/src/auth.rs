@@ -45,6 +45,7 @@ pub struct Tls;
 
 pub struct Auth {
     pub required: bool,
+    pub login_link_command: String,
     challenges: Mutex<HashMap<String, Pending>>,
     /// Wrong one-time codes since the last cancellation.
     code_failures: Mutex<u32>,
@@ -58,8 +59,13 @@ struct Pending {
 }
 
 impl Auth {
-    pub fn new(required: bool) -> Self {
-        Self { required, challenges: Mutex::default(), code_failures: Mutex::default() }
+    pub fn new(cfg: &crate::HeadConfig) -> Self {
+        Self {
+            required: cfg.auth,
+            login_link_command: cfg.login_link_command(),
+            challenges: Mutex::default(),
+            code_failures: Mutex::default(),
+        }
     }
 
     fn issue(&self, register: bool, here: &Here) -> String {
@@ -526,7 +532,11 @@ async fn redeem_link(
     Json(req): Json<api::RedeemLink>,
 ) -> Res<Response> {
     if !st.store.redeem_login_link(req.token.trim()).await? {
-        return Err(bad_request("this login link is invalid, expired or already used; run `c6h login-link` for a new one").into());
+        return Err(bad_request(format!(
+            "this login link is invalid, expired or already used; run `{}` for a new one",
+            st.auth.login_link_command
+        ))
+        .into());
     }
     sign_in(&st, "link", &headers, is_tls(tls)).await
 }
@@ -799,6 +809,33 @@ mod tests {
     fn cookie(r: &reqwest::Response) -> String {
         let c = r.headers().get("set-cookie").expect("sets a cookie").to_str().unwrap();
         c.split(';').next().unwrap().to_owned()
+    }
+
+    #[tokio::test]
+    async fn invalid_link_hints_target_the_running_heads_config() {
+        for path in [None, Some("/etc/c6h/c6h.toml"), Some("/custom/head config.toml")] {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = crate::HeadConfig {
+                config_path: path.map(Into::into),
+                data_dir: dir.path().to_owned(),
+                bind: vec!["127.0.0.1".parse().unwrap()],
+                ui_port: 0,
+                worker_port: 0,
+                ..Default::default()
+            };
+            let command = cfg.login_link_command();
+            let head = crate::start(cfg).await.unwrap();
+            let r = reqwest::Client::new()
+                .post(format!("http://{}/api/v1/auth/link", head.ui_addrs[0]))
+                .json(&json!({"token": "invalid"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+            assert!(r.text().await.unwrap().contains(&format!("run `{command}` for a new one")));
+            assert_eq!(head.state.auth.login_link_command, command);
+            head.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]
