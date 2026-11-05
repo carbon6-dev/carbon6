@@ -16,6 +16,16 @@ pub use uuid::Uuid;
 /// Timestamps are Unix milliseconds.
 pub type UnixMs = i64;
 
+/// Display only, for this head's user across realms and devices.
+/// `GET/PUT /api/v1/settings/transcript`; never sent to models.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TranscriptSettings {
+    /// Hidden by default; when shown, thinking starts expanded.
+    #[serde(default)]
+    pub show_thinking: bool,
+}
+
 /// Non-destructive inspection of a background shell command, subagent or observed Claude Code task.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

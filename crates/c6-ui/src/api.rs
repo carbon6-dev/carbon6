@@ -704,6 +704,14 @@ pub async fn get_setting(name: &'static str) -> Result<serde_json::Value, String
     json(Request::get(&format!("/api/v1/settings/{name}{}", in_realm('?'))).send().await).await
 }
 
+pub async fn transcript_settings() -> Result<c6_api::TranscriptSettings, String> {
+    json(Request::get("/api/v1/settings/transcript").send().await).await
+}
+
+pub async fn put_transcript_settings(settings: c6_api::TranscriptSettings) -> Result<(), String> {
+    empty(Request::put("/api/v1/settings/transcript").json(&settings).map_err(|e| e.to_string())?.send().await).await
+}
+
 /// A settings list's own entries in `realm` (the console, choosing which
 /// realm's rules it edits; "root": the defaults every realm inherits).
 pub async fn get_setting_in(name: &'static str, realm: String) -> Result<serde_json::Value, String> {
