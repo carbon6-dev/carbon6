@@ -3501,7 +3501,7 @@ fn render_event(
                         ContentBlock::ServerTool { label } => view! {
                             <p class="flex items-center gap-2 text-xs text-muted"><span>{crate::icons::search()}</span><span class="font-mono">{label.clone()}</span></p>
                         }.into_any(),
-                        ContentBlock::Text { text } => view! { <div class="md" on:click=crate::mentions::link_clicks() inner_html=markdown::to_html(text)></div> }.into_any(),
+                        ContentBlock::Text { text, citations } => view! { <div class="md" on:click=crate::mentions::link_clicks() inner_html=markdown::with_citations(text, citations)></div> }.into_any(),
                         ContentBlock::Thinking { text } => view! { <Thinking text=text.clone() show=crate::settings::show_thinking() /> }.into_any(),
                         ContentBlock::ToolUse { id, name, input_json } => {
                             // Memos: a card redraws for its own result and output, not
@@ -3913,7 +3913,8 @@ fn SubagentPeek(events: RwSignal<Vec<Event>>, streaming: RwSignal<Streaming>) ->
                     EventKind::Assistant { blocks, .. } => {
                         for b in blocks {
                             match b {
-                                ContentBlock::Text { text } if !text.trim().is_empty() => {
+                                ContentBlock::Text { text, .. } if !text.trim().is_empty() => {
+                                    let text = c6_api::citations::clean(text);
                                     out.push(("", text.trim().lines().next().unwrap_or_default().to_owned()))
                                 }
                                 ContentBlock::ToolUse { name, input_json, .. } => {
@@ -5688,7 +5689,10 @@ mod tests {
         assert!(thinking_only(&event(vec![thinking.clone()], "tool_use")), "no empty event or branching controls");
         assert!(!thinking_only(&event(vec![thinking.clone()], "interrupted")), "keep the interruption notice");
         assert!(
-            !thinking_only(&event(vec![thinking.clone(), ContentBlock::Text { text: "Status update".into() }], "end_turn")),
+            !thinking_only(&event(
+                vec![thinking.clone(), ContentBlock::Text { text: "Status update".into(), citations: vec![] }],
+                "end_turn"
+            )),
             "keep ordinary text"
         );
         assert!(

@@ -426,14 +426,14 @@ fn MissionCard(id: String) -> impl IntoView {
         }
         let live_text = feed.streaming.with(|s| s.text.clone());
         if !live_text.trim().is_empty() {
-            return live_text;
+            return c6_api::citations::clean(&live_text).into_owned();
         }
         feed.events.with(|evs| {
             evs.iter()
                 .rev()
                 .find_map(|e| match &e.kind {
                     EventKind::Assistant { blocks, .. } => blocks.iter().rev().find_map(|b| match b {
-                        ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.clone()),
+                        ContentBlock::Text { text, .. } if !text.trim().is_empty() => Some(c6_api::citations::clean(text).into_owned()),
                         _ => None,
                     }),
                     // From another session's agent, not you.

@@ -31,14 +31,16 @@ pub fn markdown(session: &SessionRow, events: &[SessionEvent]) -> String {
             }
             Some(Kind::Assistant(a)) => {
                 let mut said = false;
-                for b in &a.blocks {
+                for (index, b) in a.blocks.iter().enumerate() {
                     match &b.block {
                         Some(content_block::Block::Text(t)) if !t.trim().is_empty() => {
                             if !said {
                                 out.push_str("\n## Assistant\n");
                                 said = true;
                             }
-                            out.push_str(&format!("\n{}\n", t.trim_end()));
+                            let citations = c6_api::citations::annotations(&b.annotations_json);
+                            let text = c6_api::citations::markdown_scoped(t, &citations, &format!("{}-{index}", ev.seq));
+                            out.push_str(&format!("\n{text}\n"));
                         }
                         Some(content_block::Block::ToolUse(u)) => {
                             tools.insert(u.id.clone(), (u.name.clone(), u.input_json.clone()));
@@ -63,7 +65,7 @@ pub fn markdown(session: &SessionRow, events: &[SessionEvent]) -> String {
             _ => {}
         }
     }
-    out
+    c6_api::citations::clean(&out).into_owned()
 }
 
 fn clip(s: &str) -> String {

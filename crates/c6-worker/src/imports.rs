@@ -117,7 +117,7 @@ impl Builder {
         if let content_block::Block::ToolUse(t) = &b {
             self.tools.insert(t.id.clone(), t.name.clone());
         }
-        self.current.get_or_insert_with(|| (id.to_owned(), Vec::new(), None)).1.push(ContentBlock { block: Some(b) });
+        self.current.get_or_insert_with(|| (id.to_owned(), Vec::new(), None)).1.push(ContentBlock { block: Some(b), ..Default::default() });
     }
 
     fn usage(&mut self, id: &str, u: Usage) {

@@ -607,7 +607,7 @@ mod tests {
         let mut blocks: Vec<ContentBlock> =
             (0..calls).map(|i| ContentBlock::ToolUse { id: format!("c{seq}{i}"), name: "Bash".into(), input_json: "{}".into() }).collect();
         if calls == 0 {
-            blocks.push(ContentBlock::Text { text: "Done.".into() });
+            blocks.push(ContentBlock::Text { text: "Done.".into(), citations: vec![] });
         }
         ev(seq, EventKind::Assistant { turn, blocks, stop_reason: String::new() })
     }

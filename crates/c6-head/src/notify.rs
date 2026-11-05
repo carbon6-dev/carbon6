@@ -57,7 +57,9 @@ impl Default for Notifier {
 }
 
 impl Notifier {
-    pub fn send(&self, note: Note) {
+    pub fn send(&self, mut note: Note) {
+        note.title = api::citations::clean(&note.title).into_owned();
+        note.message = api::citations::clean(&note.message).into_owned();
         let _ = self.tx.send(note);
     }
 }
@@ -510,5 +512,25 @@ pub async fn approve_answer(State(st): State<Arc<HeadState>>, Path(token): Path<
         }
         Ok(false) => page("Not sent", "<p>The session's worker is not connected. Try again when it is back.</p>"),
         Err(e) => page("Not sent", &format!("<p>{}</p>", esc(&format!("{e:#}")))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notification_copy_is_cleaned_without_mutating_the_original_note() {
+        let notifier = Notifier::default();
+        let note = Note {
+            title: "Done \u{e200}cite\u{e202}turn1search1\u{e201}".into(),
+            message: "Fact \u{e200}cite\u{e202}turn1search1\u{e202}turn1search2\u{e201}.".into(),
+            ..Default::default()
+        };
+        notifier.send(note.clone());
+        let got = notifier.rx.lock().unwrap().as_mut().unwrap().try_recv().unwrap();
+        assert_eq!(got.title, "Done");
+        assert_eq!(got.message, "Fact.");
+        assert!(note.message.contains('\u{e200}'));
     }
 }

@@ -200,7 +200,10 @@ async fn assistant_reload_restores_usage_since_compaction() {
             Kind::Usage(Usage { input_tokens: 190_000, ..Default::default() }),
             Kind::Compaction(Compaction { summary: "earlier work".into(), ..Default::default() }),
             Kind::Assistant(AssistantMessage {
-                blocks: vec![ContentBlock { block: Some(content_block::Block::Text("large history ".repeat(65_000))) }],
+                blocks: vec![ContentBlock {
+                    block: Some(content_block::Block::Text("large history ".repeat(65_000))),
+                    ..Default::default()
+                }],
                 ..Default::default()
             }),
         ];

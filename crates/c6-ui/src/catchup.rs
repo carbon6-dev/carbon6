@@ -236,7 +236,7 @@ pub fn CatchupBody(
                         </div>
                     }}
                     {if !c.summary.is_empty() {
-                        view! { <p class="leading-snug">{c.summary.clone()}</p> }.into_any()
+                        view! { <p class="leading-snug">{c6_api::citations::clean(&c.summary).into_owned()}</p> }.into_any()
                     } else if card.pending {
                         view! { <p class="animate-pulse text-xs text-muted">"Summing up…"</p> }.into_any()
                     } else {

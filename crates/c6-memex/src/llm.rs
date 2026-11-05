@@ -166,7 +166,7 @@ async fn answer(client: &dyn c6_llm::ModelClient, req: &ModelRequest) -> anyhow:
         acc.push(&ev?);
     }
     let msg = acc.finish(true);
-    Ok(msg.blocks.iter().filter_map(|b| if let Block::Text(t) = b { Some(t.as_str()) } else { None }).collect())
+    Ok(msg.blocks.iter().filter_map(Block::text).collect())
 }
 
 /// Resolves once this call's task is no longer current.

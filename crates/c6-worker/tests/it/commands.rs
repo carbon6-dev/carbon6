@@ -67,7 +67,8 @@ async fn slash_commands_compact_and_export() {
     assert_eq!(names, ["clear", "compact", "export", "greet", "init", "review"]);
     assert_eq!(list[3]["argument_hint"], "<name>");
 
-    mock.push(Reply::Text("Bonjour, Ada !".into()));
+    let citation = "\u{e200}cite\u{e202}turn601432view0\u{e202}turn601432view1\u{e201}";
+    mock.push(Reply::Text(format!("Bonjour, Ada ! {citation}")));
     let s: Session = http
         .post(format!("{api}/sessions"))
         .json(&json!({"worker_id": wid, "cwd": p.display().to_string(), "connection_id": conn.id, "model": "m", "prompt": "/greet Ada"}))
@@ -101,6 +102,7 @@ async fn slash_commands_compact_and_export() {
     let evs = ended(2).await;
     let req = mock.requests()[1]["messages"].to_string();
     assert!(req.contains("The user asked to compact") && req.contains("focus on: the greeting"), "{req}");
+    assert!(req.contains(citation), "display cleanup must not change model history: {req}");
     assert!(evs.iter().any(|e| matches!(&e.kind, EventKind::Compaction { summary, .. } if summary == "SUMMARY: greeted Ada.")));
 
     // The next turn starts from the summary.
@@ -117,6 +119,7 @@ async fn slash_commands_compact_and_export() {
     let md = r.text().await.unwrap();
     assert!(md.contains("## You\n\n/greet Ada") && md.contains("Expanded /greet") && md.contains("Bonjour, Ada !"), "{md}");
     assert!(md.contains("SUMMARY: greeted Ada.") && md.contains("thanks"), "{md}");
+    assert!(!md.contains(['\u{e200}', '\u{e201}', '\u{e202}']), "{md}");
 
     stop.cancel();
     head.shutdown().await.unwrap();

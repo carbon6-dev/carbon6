@@ -1439,7 +1439,7 @@ pub(crate) async fn ask_as(
     .bind(realm)
     .execute(&st.store.pool)
     .await?;
-    let text: String = msg.blocks.iter().filter_map(|b| if let Block::Text(t) = b { Some(t.as_str()) } else { None }).collect();
+    let text: String = msg.blocks.iter().filter_map(Block::text).collect();
     json_of(&text).ok_or_else(|| anyhow::anyhow!("{model} gave no JSON: {}", text.chars().take(200).collect::<String>()))
 }
 

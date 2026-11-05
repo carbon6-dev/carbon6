@@ -537,7 +537,9 @@ async fn follow(c: &Client, id: &str, mut after: u64, json: bool) -> anyhow::Res
                 EventKind::Assistant { blocks, .. } => {
                     for b in blocks {
                         match b {
-                            ContentBlock::Text { text } if !text.trim().is_empty() => writeln!(out, "{}", text.trim_end())?,
+                            ContentBlock::Text { text, .. } if !text.trim().is_empty() => {
+                                writeln!(out, "{}", c6_api::citations::clean(text).trim_end())?;
+                            }
                             ContentBlock::ToolUse { id, name, input_json } => {
                                 tools.insert(id.clone(), name.clone());
                                 eprintln!("\x1b[2m→ {name} {}\x1b[0m", trim(&input_json.replace('\n', " "), 120));
@@ -599,7 +601,7 @@ async fn fleet(c: &Client, run_id: &str, sessions: &[Session]) -> anyhow::Result
                     .rev()
                     .find_map(|e| match &e.kind {
                         EventKind::Assistant { blocks, .. } => blocks.iter().rev().find_map(|b| match b {
-                            ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.clone()),
+                            ContentBlock::Text { text, .. } if !text.trim().is_empty() => Some(c6_api::citations::clean(text).into_owned()),
                             _ => None,
                         }),
                         _ => None,

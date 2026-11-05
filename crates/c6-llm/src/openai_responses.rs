@@ -161,7 +161,9 @@ fn input_items(msgs: &[crate::Message]) -> Vec<Value> {
                             flush(&mut parts, &mut items);
                             items.push(json!({"type": "function_call_output", "call_id": id, "output": content}))
                         }
-                        Block::Text(t) if !t.is_empty() => parts.push(json!({"type": "input_text", "text": t})),
+                        Block::Text(t) | Block::AnnotatedText { text: t, .. } if !t.is_empty() => {
+                            parts.push(json!({"type": "input_text", "text": t}));
+                        }
                         Block::Image { media_type, data } => {
                             parts.push(json!({"type": "input_image", "image_url": crate::data_url(media_type, data)}))
                         }
@@ -178,7 +180,7 @@ fn input_items(msgs: &[crate::Message]) -> Vec<Value> {
                                 if summary.is_empty() { vec![] } else { vec![json!({"type": "summary_text", "text": summary})] };
                             items.push(json!({"type": "reasoning", "id": id, "encrypted_content": encrypted, "summary": summary}));
                         }
-                        Block::Text(t) if !t.is_empty() => {
+                        Block::Text(t) | Block::AnnotatedText { text: t, .. } if !t.is_empty() => {
                             items.push(json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": t}]}))
                         }
                         Block::ToolUse { id, name, input_json } => {
@@ -265,13 +267,21 @@ struct State {
     bytes: futures::stream::BoxStream<'static, reqwest::Result<bytes::Bytes>>,
     decoder: SseDecoder,
     pending: VecDeque<Result<ModelEvent, LlmError>>,
+    annotations: HashMap<(u32, usize), Vec<Value>>,
     saw_tool_call: bool,
     finished: bool,
 }
 
 impl State {
     fn new(bytes: futures::stream::BoxStream<'static, reqwest::Result<bytes::Bytes>>) -> Self {
-        Self { bytes, decoder: SseDecoder::default(), pending: VecDeque::new(), saw_tool_call: false, finished: false }
+        Self {
+            bytes,
+            decoder: SseDecoder::default(),
+            pending: VecDeque::new(),
+            annotations: HashMap::new(),
+            saw_tool_call: false,
+            finished: false,
+        }
     }
 
     fn handle(&mut self, data: &str) {
@@ -293,10 +303,27 @@ impl State {
                     self.pending.push_back(Ok(ModelEvent::ThinkingDelta(d.to_owned())));
                 }
             }
+            "response.output_text.annotation.added" => {
+                if let Some(annotation) = v.get("annotation").filter(|a| a.is_object()) {
+                    let index = v["output_index"].as_u64().unwrap_or(0) as u32;
+                    let part = v["content_index"].as_u64().unwrap_or(0) as usize;
+                    self.annotations.entry((index, part)).or_default().push(annotation.clone());
+                }
+            }
             // Finished items define the message; deltas above are display only.
             "response.output_item.done" => {
                 let index = v["output_index"].as_u64().unwrap_or(0) as u32;
-                if let Some(block) = item_block(&v["item"]) {
+                let mut item = v["item"].clone();
+                if let Some(parts) = item["content"].as_array_mut() {
+                    for (part, content) in parts.iter_mut().enumerate() {
+                        if let Some(annotations) = self.annotations.remove(&(index, part))
+                            && content["annotations"].as_array().is_none_or(Vec::is_empty)
+                        {
+                            content["annotations"] = json!(annotations);
+                        }
+                    }
+                }
+                if let Some(block) = item_block(&item) {
                     self.saw_tool_call |= matches!(block, Block::ToolUse { .. });
                     self.pending.push_back(Ok(ModelEvent::Block { index, block }));
                 }
@@ -348,16 +375,31 @@ fn classify(msg: &str) -> LlmError {
 fn item_block(item: &Value) -> Option<Block> {
     match item["type"].as_str()? {
         "message" => {
-            let text: String = item["content"]
-                .as_array()?
-                .iter()
-                .filter_map(|c| match c["type"].as_str() {
-                    Some("output_text") => c["text"].as_str(),
-                    Some("refusal") => c["refusal"].as_str(),
+            let mut text = String::new();
+            let mut annotations = Vec::new();
+            for part in item["content"].as_array()? {
+                let t = match part["type"].as_str() {
+                    Some("output_text") => part["text"].as_str(),
+                    Some("refusal") => part["refusal"].as_str(),
                     _ => None,
-                })
-                .collect();
-            Some(Block::Text(text))
+                };
+                let Some(t) = t else { continue };
+                let offset = text.chars().count() as u64;
+                for mut annotation in part["annotations"].as_array().into_iter().flatten().cloned() {
+                    for key in ["start_index", "end_index"] {
+                        if let Some(n) = annotation[key].as_u64() {
+                            annotation[key] = json!(n + offset);
+                        }
+                    }
+                    annotations.push(annotation);
+                }
+                text.push_str(t);
+            }
+            Some(if annotations.is_empty() {
+                Block::Text(text)
+            } else {
+                Block::AnnotatedText { text, annotations_json: serde_json::to_string(&annotations).unwrap() }
+            })
         }
         "function_call" => Some(Block::ToolUse {
             id: item["call_id"].as_str()?.to_owned(),
@@ -388,6 +430,75 @@ fn item_block(item: &Value) -> Option<Block> {
 mod tests {
     use super::*;
     use crate::{Accumulator, Message, ToolSpec};
+
+    #[test]
+    fn streamed_citations_survive_finished_items_without_changing_model_replay() {
+        let text = "A fact. \u{e200}cite\u{e202}turn347046search1\u{e201}";
+        let annotation = json!({"type": "url_citation", "url": "https://source.test/fact", "title": "The source", "start_index": 8, "end_index": text.chars().count()});
+        let mut st = State::new(futures::stream::empty().boxed());
+        for event in [
+            json!({"type": "response.output_text.delta", "delta": text}),
+            json!({"type": "response.output_text.annotation.added", "annotation": annotation}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {"type": "message", "content": [{"type": "output_text", "text": text, "annotations": [annotation]}]}}),
+        ] {
+            st.handle(&event.to_string());
+        }
+        let mut acc = Accumulator::default();
+        for event in st.pending {
+            acc.push(&event.unwrap());
+        }
+        // Finished annotations are authoritative, including after interruption.
+        let message = acc.finish(false);
+        let [Block::AnnotatedText { text: kept, annotations_json }] = message.blocks.as_slice() else { panic!("missing annotations") };
+        assert_eq!(kept, text);
+        assert_eq!(serde_json::from_str::<Value>(annotations_json).unwrap(), json!([annotation]));
+        assert_eq!(input_items(&[message]), input_items(&[Message { role: Role::Assistant, blocks: vec![Block::Text(text.into())] }]));
+    }
+
+    #[test]
+    fn annotation_events_are_kept_when_the_finished_item_omits_them() {
+        let annotation = json!({"type": "url_citation", "url": "https://source.test", "title": "Source", "start_index": 0, "end_index": 4});
+        let mut st = State::new(futures::stream::empty().boxed());
+        st.handle(
+            &json!({"type": "response.output_text.annotation.added", "output_index": 3, "content_index": 1, "annotation": annotation})
+                .to_string(),
+        );
+        st.handle(
+            &json!({"type": "response.output_item.done", "output_index": 3, "item": {"type": "message", "content": [
+                {"type": "output_text", "text": "Été. "},
+                {"type": "output_text", "text": "Fact."}
+            ]}})
+            .to_string(),
+        );
+        let mut acc = Accumulator::default();
+        for event in st.pending {
+            acc.push(&event.unwrap());
+        }
+        let message = acc.finish(true);
+        let [Block::AnnotatedText { text, annotations_json }] = message.blocks.as_slice() else { panic!("missing streamed annotation") };
+        assert_eq!(text, "Été. Fact.");
+        let annotations: Value = serde_json::from_str(annotations_json).unwrap();
+        assert_eq!(annotations[0]["url"], annotation["url"]);
+        assert_eq!(annotations[0]["start_index"], 5);
+        assert_eq!(annotations[0]["end_index"], 9);
+    }
+
+    #[test]
+    fn annotations_follow_concatenated_text_offsets_and_plain_messages_stay_plain() {
+        let block = item_block(&json!({"type": "message", "content": [
+            {"type": "output_text", "text": "Été. "},
+            {"type": "output_text", "text": "Fact.", "annotations": [{"type": "url_citation", "url": "https://source.test", "title": "Source", "start_index": 0, "end_index": 4}]}
+        ]})).unwrap();
+        let Block::AnnotatedText { text, annotations_json } = block else { panic!("missing annotations") };
+        assert_eq!(text, "Été. Fact.");
+        let annotations: Value = serde_json::from_str(&annotations_json).unwrap();
+        assert_eq!(annotations[0]["start_index"], 5);
+        assert_eq!(annotations[0]["end_index"], 9);
+        assert_eq!(
+            item_block(&json!({"type": "message", "content": [{"type": "output_text", "text": "Plain."}]})),
+            Some(Block::Text("Plain.".into()))
+        );
+    }
 
     #[test]
     fn usage_diagnostic_filters_and_sorts_only_header_names() {

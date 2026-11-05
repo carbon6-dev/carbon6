@@ -136,7 +136,7 @@ pub fn portable_messages(msgs: Vec<Message>) -> Vec<Message> {
     let mut out: Vec<Message> = Vec::new();
     for mut m in msgs {
         if m.role == Role::Assistant {
-            m.blocks.retain(|b| matches!(b, Block::Text(_) | Block::ToolUse { .. }));
+            m.blocks.retain(|b| b.text().is_some() || matches!(b, Block::ToolUse { .. }));
             if m.blocks.is_empty() {
                 continue;
             }
@@ -231,7 +231,7 @@ pub(crate) fn messages_digest(msgs: &[Message], budget: usize) -> String {
             let mut typed = false;
             for b in &m.blocks {
                 match (m.role, b) {
-                    (Role::User, Block::Text(t)) => {
+                    (Role::User, Block::Text(t) | Block::AnnotatedText { text: t, .. }) => {
                         typed = true;
                         out.push_str(&format!("\n## User\n{}\n", clip(t, 4000)));
                     }
@@ -239,7 +239,9 @@ pub(crate) fn messages_digest(msgs: &[Message], budget: usize) -> String {
                     (_, Block::ToolResult { content, is_error, .. }) => {
                         out.push_str(&format!("[tool {}]\n{}\n", if *is_error { "error" } else { "result" }, clip(content, 1500)))
                     }
-                    (Role::Assistant, Block::Text(t)) => out.push_str(&format!("\n## Assistant\n{t}\n")),
+                    (Role::Assistant, Block::Text(t) | Block::AnnotatedText { text: t, .. }) => {
+                        out.push_str(&format!("\n## Assistant\n{t}\n"));
+                    }
                     (_, Block::ToolUse { name, input_json, .. }) => {
                         out.push_str(&format!("\n[tool call {name}: {}]\n", clip(input_json, 1500)))
                     }
@@ -284,7 +286,11 @@ pub fn compacted_context(summary: &str) -> String {
 
 pub(crate) fn block_from_proto(b: &c6_proto::ContentBlock) -> Option<Block> {
     match b.block.as_ref()? {
-        content_block::Block::Text(t) => Some(Block::Text(t.clone())),
+        content_block::Block::Text(t) => Some(if b.annotations_json.is_empty() {
+            Block::Text(t.clone())
+        } else {
+            Block::AnnotatedText { text: t.clone(), annotations_json: b.annotations_json.clone() }
+        }),
         content_block::Block::Thinking(t) => Some(Block::Thinking(t.clone())),
         content_block::Block::ToolUse(u) => {
             Some(Block::ToolUse { id: u.id.clone(), name: u.name.clone(), input_json: u.input_json.clone() })
@@ -302,7 +308,7 @@ pub(crate) fn block_from_proto(b: &c6_proto::ContentBlock) -> Option<Block> {
 
 pub(crate) fn block_to_proto(b: &Block) -> Option<c6_proto::ContentBlock> {
     let block = match b {
-        Block::Text(t) => content_block::Block::Text(t.clone()),
+        Block::Text(t) | Block::AnnotatedText { text: t, .. } => content_block::Block::Text(t.clone()),
         Block::Thinking(t) => content_block::Block::Thinking(t.clone()),
         Block::ToolUse { id, name, input_json } => {
             content_block::Block::ToolUse(c6_proto::ToolUse { id: id.clone(), name: name.clone(), input_json: input_json.clone() })
@@ -322,7 +328,11 @@ pub(crate) fn block_to_proto(b: &Block) -> Option<c6_proto::ContentBlock> {
         // Images come from users and are kept as attachments.
         Block::ToolResult { .. } | Block::Image { .. } => return None,
     };
-    Some(c6_proto::ContentBlock { block: Some(block) })
+    let annotations_json = match b {
+        Block::AnnotatedText { annotations_json, .. } => annotations_json.clone(),
+        _ => String::new(),
+    };
+    Some(c6_proto::ContentBlock { block: Some(block), annotations_json })
 }
 
 /// How a tool's images reach the model: each after a line saying where it
@@ -510,7 +520,23 @@ mod tests {
     }
 
     fn tool_use(id: &str) -> ContentBlock {
-        ContentBlock { block: Some(content_block::Block::ToolUse(ToolUse { id: id.into(), name: "bash".into(), input_json: "{}".into() })) }
+        ContentBlock {
+            block: Some(content_block::Block::ToolUse(ToolUse { id: id.into(), name: "bash".into(), input_json: "{}".into() })),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn citation_annotations_round_trip_through_the_journal_block() {
+        let block = Block::AnnotatedText {
+            text: "Fact. \u{e200}cite\u{e202}turn1search1\u{e201}".into(),
+            annotations_json: r#"[{"type":"url_citation","url":"https://source.test","title":"Source","start_index":6,"end_index":33}]"#
+                .into(),
+        };
+        let proto = block_to_proto(&block).unwrap();
+        assert_eq!(block_from_proto(&proto), Some(block));
+        let old = ContentBlock { block: Some(content_block::Block::Text("Old reply".into())), ..Default::default() };
+        assert_eq!(block_from_proto(&old), Some(Block::Text("Old reply".into())));
     }
 
     #[test]
@@ -588,6 +614,7 @@ mod tests {
                                 text: "secret plan".into(),
                                 signature: "SIG-123".into(),
                             })),
+                            ..Default::default()
                         },
                         ContentBlock {
                             block: Some(content_block::Block::Reasoning(c6_proto::Reasoning {
@@ -595,8 +622,9 @@ mod tests {
                                 encrypted_content: "opaque-blob".into(),
                                 summary: String::new(),
                             })),
+                            ..Default::default()
                         },
-                        ContentBlock { block: Some(content_block::Block::Text("Looking.".into())) },
+                        ContentBlock { block: Some(content_block::Block::Text("Looking.".into())), ..Default::default() },
                         tool_use("t1"),
                     ],
                     stop_reason: "tool_calls".into(),

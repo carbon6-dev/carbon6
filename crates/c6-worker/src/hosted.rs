@@ -194,9 +194,7 @@ impl ClaudeOnce {
 /// The conversation as one prompt: a single message as it is, more as a
 /// transcript.
 fn once_prompt(req: &c6_llm::ModelRequest) -> String {
-    let text = |m: &c6_llm::Message| -> String {
-        m.blocks.iter().filter_map(|b| if let c6_llm::Block::Text(t) = b { Some(t.as_str()) } else { None }).collect::<Vec<_>>().join("\n")
-    };
+    let text = |m: &c6_llm::Message| -> String { m.blocks.iter().filter_map(c6_llm::Block::text).collect::<Vec<_>>().join("\n") };
     if let [only] = req.messages.as_slice() {
         return text(only);
     }
