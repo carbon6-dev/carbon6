@@ -531,7 +531,7 @@ pub fn details_pop(menu: NodeRef<leptos::html::Details>) -> (String, impl Fn(web
     (pop, toggled)
 }
 
-/// A "⋯" button and its menu. With `row`, it's a row's: on touch screens
+/// An ellipsis button and its menu. With `row`, it's a row's: on touch screens
 /// always there, elsewhere on hover or keyboard focus (style/input.css).
 /// The menu is fixed to the screen, so a scrolling list doesn't clip it,
 /// and goes away as `dismissable` says.
@@ -566,7 +566,7 @@ pub fn Menu(items: Vec<(&'static str, Callback<()>)>, #[prop(optional)] row: boo
                     (r.bottom(), window().inner_width().ok().and_then(|w| w.as_f64()).unwrap_or(0.0) - r.right())
                 });
                 open.set(at.or(Some((0.0, 0.0))));
-            }>"⋯"</button>
+            }>{crate::icons::ellipsis()}</button>
         {move || open.get().map(|(top, right)| view! {
             <div role="menu" data-pop=pop.clone() class="fixed z-50 min-w-40 rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900"
                 style=format!("top: {}px; right: {}px", top + 4.0, right.max(8.0))>
@@ -589,7 +589,7 @@ pub fn Menu(items: Vec<(&'static str, Callback<()>)>, #[prop(optional)] row: boo
 pub fn OpenIn(link: c6_api::Link) -> impl IntoView {
     view! {
         <a class="inline-flex items-center rounded-md px-3 py-1.5 text-sm text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800"
-            href=link.url target="_blank" rel="noopener noreferrer">{format!("Open in {} ↗", link.service)}</a>
+            href=link.url target="_blank" rel="noopener noreferrer">{format!("Open in {}", link.service)}</a>
     }
 }
 

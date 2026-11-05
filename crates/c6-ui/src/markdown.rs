@@ -265,14 +265,14 @@ fn given_text(inner: &[Event], bare: &[&str]) -> Option<String> {
     Some(out)
 }
 
-/// A mention: the thing's mark (a document's ▤), then the text given or
+/// A mention: the thing's mark (a document's "Doc" label), then the text given or
 /// its title, on a tint of its colour. `data-ref` says what it is, for the
 /// click that opens it and the card hovering shows (`mentions.rs`).
 fn mention(kind: Kind, id: &str, rest: &str, given: Option<String>, here: &Here) -> String {
     let known = (here.known)(kind, id);
     let label = given.unwrap_or_else(|| esc(&known.title.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| kind.short(id))));
     let (colour, glyph) = match kind {
-        Kind::Doc => (DOC_COLOUR, "<span class=\"c6-mention-doc\">▤</span>".to_owned()),
+        Kind::Doc => (DOC_COLOUR, "<span class=\"c6-mention-doc\">Doc </span>".to_owned()),
         _ => {
             let mark = known.mark.unwrap_or_else(|| c6_api::marks::hashed(id).to_owned());
             let shape = crate::marks::Shape::of(kind.name()).css(7);
@@ -371,7 +371,7 @@ mod tests {
                 format!("https://head.example/{segment}/{ID}"),
             ] {
                 let out = render(&format!("See [the plan]({href}) now."), &h);
-                let text = if kind == "doc" { "▤the plan" } else { "the plan" };
+                let text = if kind == "doc" { "Doc the plan" } else { "the plan" };
                 assert_eq!(
                     mentions(&out),
                     vec![(format!("{kind}:{ID}"), format!("/r/home/{segment}/{ID}"), text.to_owned())],
@@ -417,7 +417,7 @@ mod tests {
         assert!(out.contains(&format!("--m:{}", crate::marks::colour_hex("rose"))), "its mark's colour: {out}");
         // Nothing known: its kind and the id's start.
         let out = render(&format!("work:{ID} [`doc:{ID}`](doc:{ID})"), &here(&nothing));
-        assert_eq!(mentions(&out).iter().map(|m| m.2.as_str()).collect::<Vec<_>>(), ["work 01a18f50", "▤document 01a18f50"], "{out}");
+        assert_eq!(mentions(&out).iter().map(|m| m.2.as_str()).collect::<Vec<_>>(), ["work 01a18f50", "Doc document 01a18f50"], "{out}");
     }
 
     #[test]

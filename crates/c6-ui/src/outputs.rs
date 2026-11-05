@@ -101,7 +101,7 @@ pub fn Outputs(session: String, events: RwSignal<Vec<Event>>, chosen: RwSignal<O
                                     {versions.iter().enumerate().rev().map(|(i, x)| view! { <option value=x.seq.to_string()>{format!("v{}{}", i + 1, if i + 1 == n { " (latest)" } else { "" })}</option> }).collect_view()}
                                 </select>
                             })}
-                            <a class=format!("{BUTTON_QUIET} text-xs") href=u.clone() target="_blank" rel="noopener">"Open ↗"</a>
+                            <a class=format!("{BUTTON_QUIET} text-xs") href=u.clone() target="_blank" rel="noopener">"Open"</a>
                             <a class=format!("{BUTTON_QUIET} text-xs") href=format!("{u}?download=1")>"Download"</a>
                         </div>
                         <Preview url=u mime=v.mime.clone() />
@@ -182,12 +182,12 @@ pub fn published_line(session: &str, seq: u64, name: &str, title: &str, mime: &s
     view! {
         <div class="space-y-1">
             <p class="flex flex-wrap items-center gap-2 text-xs text-muted">
-                <span>"📦"</span>
+                <span>{crate::icons::package()}</span>
                 <span>"Published"</span>
                 <span class="font-medium text-zinc-700 dark:text-zinc-300">{title.to_owned()}</span>
                 <span class="font-mono">{format!("{name} · {}", size(size_bytes))}</span>
                 <a class="underline" href=u.clone() target="_blank" rel="noopener">"open"</a>
-                <span>"· see Outputs (⋯)"</span>
+                <span>"· see Outputs in the menu"</span>
             </p>
             {image.then(|| view! {
                 <a href=u.clone() target="_blank" rel="noopener" title="Open full size">

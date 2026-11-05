@@ -246,7 +246,7 @@ fn AppsMenu() -> impl IntoView {
     let item = "rounded-md px-2 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800";
     view! {
         <details node_ref=menu data-pop=pop on:toggle=toggled class="relative shrink-0">
-            <summary class=format!("{NAV} cursor-pointer list-none whitespace-nowrap")>"Apps ▾"</summary>
+            <summary class=format!("{NAV} cursor-pointer list-none whitespace-nowrap")>"Apps "{crate::icons::chevron_down()}</summary>
             <div class="absolute left-0 top-8 z-40 flex w-48 flex-col rounded-lg border border-zinc-200 bg-white p-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900" on:click=close>
                 {move || feeds.get().and_then(Result::ok).map(|f| view! {
                     {(f["mail"] == true).then(|| view! { <Go to=View::Mail class=item own=true>"Mail"</Go> })}
@@ -280,8 +280,8 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
     };
     view! {
         <details node_ref=menu data-pop=pop on:toggle=toggled class="relative xl:hidden">
-            <summary class="cursor-pointer list-none rounded-md px-2 py-1 text-sm text-zinc-600 dark:text-zinc-400">
-                "☰"
+            <summary class="cursor-pointer list-none rounded-md px-2 py-1 text-sm text-zinc-600 dark:text-zinc-400" aria-label="Menu">
+                {crate::icons::menu()}
                 {move || (attention.get() > 0).then(|| view! { <span class="ml-1 rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white">{attention.get()}</span> })}
             </summary>
             <div class="fixed inset-x-2 top-12 z-40 max-h-[80dvh] space-y-1 overflow-y-auto rounded-lg border border-zinc-200 bg-white p-2 shadow-lg sm:absolute sm:inset-x-auto sm:left-0 sm:top-9 sm:w-64 dark:border-zinc-700 dark:bg-zinc-900" on:click=close>
@@ -411,7 +411,7 @@ fn PlaceMenu() -> impl IntoView {
                 {move || (elsewhere() > 0).then(|| view! {
                     <span class="rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white" title="Waiting on you in other realms">{elsewhere()}</span>
                 })}
-                <span class="text-muted">"▾"</span>
+                <span class="text-muted">{crate::icons::chevron_down()}</span>
             </summary>
             // On a phone, the width of the screen (anchored at the chip, it
             // would run off its edge).
@@ -425,7 +425,7 @@ fn PlaceMenu() -> impl IntoView {
                             <RealmGlyph id=p.id.clone() />
                             <span class="min-w-0 flex-1 truncate">{p.name.clone()}</span>
                             {(p.waiting > 0).then(|| view! { <span class="rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white" title="Waiting on you">{p.waiting}</span> })}
-                            {current.then(|| view! { <span class="text-muted">"✓"</span> })}
+                            {current.then(|| view! { <span class="text-muted">{crate::icons::check()}</span> })}
                         </a>
                     }
                 }).collect_view()}
@@ -461,7 +461,7 @@ fn PlaceLinks() -> impl IntoView {
                         <RealmGlyph id=p.id.clone() />
                         <span class="min-w-0 flex-1 truncate">{p.name.clone()}</span>
                         {(p.waiting > 0).then(|| view! { <span class="rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white">{p.waiting}</span> })}
-                        {current.then(|| view! { <span class="text-muted">"✓"</span> })}
+                        {current.then(|| view! { <span class="text-muted">{crate::icons::check()}</span> })}
                     </a>
                 }
             }).collect_view()}
@@ -585,7 +585,7 @@ fn UpdatedBanner() -> impl IntoView {
                 <div class="flex shrink-0 items-center gap-3 border-b border-sky-200 bg-sky-50 px-3 py-1.5 text-sm text-sky-900 dark:border-sky-900 dark:bg-sky-950 dark:text-sky-200">
                     <span class="min-w-0 flex-1">{format!("carbon6 was updated to {} (this page is {}). Reload to use the new version.", short_version(&now), short_version(&was))}</span>
                     <button class="rounded-md bg-sky-600 px-3 py-1 text-xs font-medium text-white hover:bg-sky-700" on:click=move |_| { let _ = window().location().reload(); }>"Reload"</button>
-                    <button class="rounded px-1.5 text-sky-700 hover:bg-sky-100 dark:text-sky-300 dark:hover:bg-sky-900" title="Not now" on:click=move |_| dismissed.set(Some(n2.clone()))>"✕"</button>
+                    <button class="rounded px-1.5 text-sky-700 hover:bg-sky-100 dark:text-sky-300 dark:hover:bg-sky-900" title="Not now" on:click=move |_| dismissed.set(Some(n2.clone()))>{crate::icons::x()}</button>
                 </div>
             }
         })}

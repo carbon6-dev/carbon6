@@ -145,13 +145,13 @@ pub fn running_counts(events: &[Event]) -> (usize, usize) {
         .fold((0, 0), |(tasks, servers), t| if t.notify || t.kind == "claude_code" { (tasks + 1, servers) } else { (tasks, servers + 1) })
 }
 
-/// The line for the bottom of a transcript: "⏳ 1 task running · 1 server".
+/// The line for the bottom of a transcript: "1 task running · 1 server".
 pub fn running_line(tasks: usize, servers: usize) -> String {
     let plural = |n: usize, one: &str, many: &str| if n == 1 { format!("1 {one}") } else { format!("{n} {many}") };
     match (tasks, servers) {
-        (0, s) => format!("⏳ {} running", plural(s, "server", "servers")),
-        (t, 0) => format!("⏳ {} running", plural(t, "background task", "background tasks")),
-        (t, s) => format!("⏳ {} running · {}", plural(t, "task", "tasks"), plural(s, "server", "servers")),
+        (0, s) => format!("{} running", plural(s, "server", "servers")),
+        (t, 0) => format!("{} running", plural(t, "background task", "background tasks")),
+        (t, s) => format!("{} running · {}", plural(t, "task", "tasks"), plural(s, "server", "servers")),
     }
 }
 
@@ -379,19 +379,19 @@ fn TaskStream(label: &'static str, stream: c6_api::TaskStream) -> impl IntoView 
 pub fn ended_line(task_id: &str, kind: &str, description: &str, state: &str, exit_code: i32, elapsed_ms: u64) -> Option<AnyView> {
     let agent = kind == "agent";
     let native = kind == "claude_code";
-    let (icon, what, tone) = match state {
+    let (what, tone) = match state {
         "started" => return None,
-        "finished" if native => ("✓", "finished".to_owned(), "text-muted"),
-        "finished" if agent && exit_code == 0 => ("✓", "finished".to_owned(), "text-muted"),
-        "finished" if agent => ("✗", "failed".to_owned(), "text-red-600 dark:text-red-400"),
-        "finished" if exit_code == 0 => ("✓", "exited 0".to_owned(), "text-muted"),
-        "finished" => ("✗", format!("exited {exit_code}"), "text-red-600 dark:text-red-400"),
-        "failed" => ("✗", "failed".to_owned(), "text-red-600 dark:text-red-400"),
-        "stopped" if native => ("■", "stopped by Claude Code".to_owned(), "text-muted"),
-        "stopped" => ("■", "stopped by the agent".to_owned(), "text-muted"),
-        "stopped_by_user" => ("■", "stopped by you".to_owned(), "text-muted"),
-        "lost" => ("!", "lost (worker restarted or CLI exited)".to_owned(), "text-amber-700 dark:text-amber-400"),
-        other => ("·", other.to_owned(), "text-muted"),
+        "finished" if native => ("finished".to_owned(), "text-muted"),
+        "finished" if agent && exit_code == 0 => ("finished".to_owned(), "text-muted"),
+        "finished" if agent => ("failed".to_owned(), "text-red-600 dark:text-red-400"),
+        "finished" if exit_code == 0 => ("exited 0".to_owned(), "text-muted"),
+        "finished" => (format!("exited {exit_code}"), "text-red-600 dark:text-red-400"),
+        "failed" => ("failed".to_owned(), "text-red-600 dark:text-red-400"),
+        "stopped" if native => ("stopped by Claude Code".to_owned(), "text-muted"),
+        "stopped" => ("stopped by the agent".to_owned(), "text-muted"),
+        "stopped_by_user" => ("stopped by you".to_owned(), "text-muted"),
+        "lost" => ("lost (worker restarted or CLI exited)".to_owned(), "text-amber-700 dark:text-amber-400"),
+        other => (other.to_owned(), "text-muted"),
     };
     let label = if agent { format!("agent: {description}") } else { description.to_owned() };
     let time = if state == "lost" { String::new() } else { format!(" · {}", elapsed(elapsed_ms as i64)) };
@@ -399,9 +399,9 @@ pub fn ended_line(task_id: &str, kind: &str, description: &str, state: &str, exi
     Some(
         view! {
             <p class=format!("flex items-center gap-2 text-xs {tone}")>
-                <span>"⚙"</span>
+                <span>{crate::icons::square_terminal()}</span>
                 <span class="min-w-0 truncate" title=format!("{title} · {task_id}")>{label}</span>
-                <span class="shrink-0">{format!("{icon} {what}{time}")}</span>
+                <span class="shrink-0">{format!("{what}{time}")}</span>
             </p>
         }
         .into_any(),
@@ -625,8 +625,8 @@ mod tests {
             with("done", "finished", "shell", true),
         ];
         assert_eq!(running_counts(&evs), (2, 1), "Claude Code's own count as tasks");
-        assert_eq!(running_line(2, 1), "⏳ 2 tasks running · 1 server");
-        assert_eq!(running_line(1, 0), "⏳ 1 background task running");
-        assert_eq!(running_line(0, 2), "⏳ 2 servers running");
+        assert_eq!(running_line(2, 1), "2 tasks running · 1 server");
+        assert_eq!(running_line(1, 0), "1 background task running");
+        assert_eq!(running_line(0, 2), "2 servers running");
     }
 }

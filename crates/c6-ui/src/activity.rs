@@ -132,7 +132,7 @@ fn DockActivity(open: RwSignal<bool>, fold: &'static str, kept: RwSignal<bool>, 
             <div class="flex items-center justify-between pb-1 pl-1.5 pr-3 pt-3 text-[11px] font-semibold uppercase tracking-wide text-muted">
                 <span class="flex items-center gap-1.5">
                     <button class=fold title=move || if open.get() { "Fold" } else { "Unfold" } on:click=move |_| open.update(|o| *o = !*o)>
-                        {move || if open.get() { "▾" } else { "▸" }}
+                        {move || if open.get() { crate::icons::chevron_down().into_any() } else { crate::icons::chevron_right().into_any() }}
                     </button>
                     "Activity"
                     {move || (!open.get() && !items.with(Vec::is_empty)).then(|| view! {
@@ -140,7 +140,7 @@ fn DockActivity(open: RwSignal<bool>, fold: &'static str, kept: RwSignal<bool>, 
                     })}
                 </span>
                 <span class="flex items-center gap-2">
-                    <Go to=View::Mission class="font-normal normal-case tracking-normal hover:text-zinc-900 dark:hover:text-zinc-100" title="Mission control">"⊞ all"</Go>
+                    <Go to=View::Mission class="font-normal normal-case tracking-normal hover:text-zinc-900 dark:hover:text-zinc-100" title="Mission control">"All"</Go>
                     <button class="font-normal normal-case tracking-normal hover:text-zinc-900 dark:hover:text-zinc-100"
                         title=move || if kept.get() { "Hide the sidebar: it slides out when you point at the left edge (⌘\\)" } else { "Keep the sidebar open (⌘\\)" }
                         on:click=move |_| toggle.run(())>
@@ -170,7 +170,7 @@ fn DockActivity(open: RwSignal<bool>, fold: &'static str, kept: RwSignal<bool>, 
                     let items = items.get();
                     if items.is_empty() && hidden.with(Vec::is_empty) {
                         let msg = if filter.with(Vec::is_empty) {
-                            "Running sessions, ones that finish while you're elsewhere, and ones you pin (☆) show here."
+                            "Running sessions, ones that finish while you're elsewhere, and ones you pin show here."
                         } else {
                             "Nothing with these labels is running, finished or pinned."
                         };
@@ -240,7 +240,7 @@ fn MinimizedItem(key: u64, n: usize, views: Vec<View>) -> impl IntoView {
             </button>
             {tile_badge(n)}
             <button class="row-action flex h-8 w-6 shrink-0 items-center justify-center text-xs text-muted hover:text-zinc-900 dark:hover:text-zinc-100"
-                title="Close this tile" aria-label="Close" on:click=move |_| ws.close_tile(key)>"✕"</button>
+                title="Close this tile" aria-label="Close" on:click=move |_| ws.close_tile(key)>{crate::icons::x()}</button>
         </div>
     }
 }
@@ -284,7 +284,7 @@ fn DockItem(s: Session, t: Tracked) -> impl IntoView {
             {move || number.get().map(tile_badge)}
             {dismissable.then(|| {
                 let id = id.clone();
-                view! { <button class="row-action flex h-8 w-6 shrink-0 items-center justify-center text-xs text-muted hover:text-zinc-900 dark:hover:text-zinc-100" title="Dismiss" aria-label="Dismiss" on:click=move |_| ws.dismiss(&id)>"✕"</button> }
+                view! { <button class="row-action flex h-8 w-6 shrink-0 items-center justify-center text-xs text-muted hover:text-zinc-900 dark:hover:text-zinc-100" title="Dismiss" aria-label="Dismiss" on:click=move |_| ws.dismiss(&id)>{crate::icons::x()}</button> }
             })}
             <crate::sessions::SessionMenu id=id.clone() />
         </div>
@@ -338,7 +338,7 @@ pub fn InboxPage() -> impl IntoView {
                 <button class="-mt-4 text-xs text-muted underline" on:click=move |_| ws.attention.set(Vec::new())>"Mark all seen"</button>
             })}
             {section("Running", Tracked::Running, "No sessions are running.")}
-            {section("Pinned", Tracked::Pinned, "Pin a session with ☆ in its header to keep it here.")}
+            {section("Pinned", Tracked::Pinned, "Pin a session with Pin in its header to keep it here.")}
         </main>
     }
 }
@@ -511,7 +511,7 @@ fn MissionCard(id: String) -> impl IntoView {
                 <crate::sessions::SessionMenu id=open_id.clone() />
             </div>
             <div class="relative min-h-0 flex-1 overflow-hidden px-3 py-2">
-                {move || tool.get().map(|t| view! { <div class="mb-1 truncate font-mono text-[11px] text-blue-600 dark:text-blue-400">{format!("▶ {t}")}</div> })}
+                {move || tool.get().map(|t| view! { <div class="mb-1 truncate font-mono text-[11px] text-blue-600 dark:text-blue-400">{t}</div> })}
                 // Bottom-anchored, so the newest words show.
                 <div class="absolute inset-x-3 bottom-2 top-7 flex flex-col justify-end overflow-hidden">
                     <p class="whitespace-pre-wrap break-words text-xs leading-relaxed text-zinc-600 dark:text-zinc-400">{move || {
@@ -861,7 +861,7 @@ pub fn MobileBar() -> impl IntoView {
             <button class="shrink-0 rounded-md px-2.5 py-1.5 text-xs text-muted" title="New tile" on:click=move |_| ws.new_tile()>"+"</button>
             <button class="shrink-0 rounded-md px-2.5 py-1.5 text-xs tabular-nums text-zinc-600 dark:text-zinc-400"
                 title="Your tiles, and the sessions you viewed lately" aria-haspopup="dialog" aria-expanded=move || sheet.get().to_string()
-                on:click=move |_| sheet.set(true)>{move || sheet_label(tiles.with(Vec::len))}</button>
+                on:click=move |_| sheet.set(true)>{crate::icons::chevron_right()}" "{move || sheet_label(tiles.with(Vec::len))}</button>
             <Show when=move || sheet.get()>
                 <TabSheet close=Callback::new(move |()| sheet.set(false)) />
             </Show>
@@ -914,9 +914,9 @@ fn TabMenu(at: (f64, f64), alone: bool, pick: Callback<TabAction>, close: Callba
     }
 }
 
-/// The phone bar's sheet button: ▸ and how many tiles are shown.
+/// The phone bar's sheet button: how many tiles are shown, beside its icon.
 fn sheet_label(open: usize) -> String {
-    format!("▸ {open}")
+    open.to_string()
 }
 
 /// How far down a sheet's handle is swiped to close it.
@@ -1031,7 +1031,7 @@ fn TabSheet(close: Callback<()>) -> impl IntoView {
                     })
                 }}
                 <div class="my-1 border-t border-zinc-200 dark:border-zinc-800"></div>
-                <button class=link on:click=move |_| { ws.open(None, View::Sessions, How::OwnTile); close.run(()) }>"All sessions →"</button>
+                <button class=link on:click=move |_| { ws.open(None, View::Sessions, How::OwnTile); close.run(()) }>"All sessions"</button>
                 <button class=link on:click=move |_| { ws.new_tile(); close.run(()) }>"+ New tile"</button>
             </div>
         </div>
@@ -1095,7 +1095,7 @@ mod tests {
 
     #[test]
     fn the_sheet_says_how_many_tiles_and_goes_when_swiped_down() {
-        assert_eq!(sheet_label(3), "▸ 3");
+        assert_eq!(sheet_label(3), "3");
         assert!(swiped_down(100.0, 150.0));
         assert!(!swiped_down(100.0, 120.0), "a nudge");
         assert!(!swiped_down(100.0, 20.0), "up");

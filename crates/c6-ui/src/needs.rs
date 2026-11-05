@@ -119,7 +119,7 @@ fn load_error(e: &str) -> String {
 /// Another realm's row.
 fn elsewhere_text(e: &AttentionElsewhere) -> String {
     let name = if e.id == "root" { "the console" } else { e.name.as_str() };
-    format!("{} waiting in {name} →", e.waiting)
+    format!("{} waiting in {name}", e.waiting)
 }
 
 #[component]
@@ -412,8 +412,8 @@ mod tests {
     #[test]
     fn other_realms_say_only_how_many() {
         let e = AttentionElsewhere { id: "lab".into(), name: "Lab".into(), waiting: 2 };
-        assert_eq!(elsewhere_text(&e), "2 waiting in Lab →");
-        assert_eq!(elsewhere_text(&AttentionElsewhere { id: "root".into(), ..e }), "2 waiting in the console →");
+        assert_eq!(elsewhere_text(&e), "2 waiting in Lab");
+        assert_eq!(elsewhere_text(&AttentionElsewhere { id: "root".into(), ..e }), "2 waiting in the console");
     }
 
     #[test]

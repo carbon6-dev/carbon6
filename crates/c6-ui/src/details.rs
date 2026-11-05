@@ -182,7 +182,7 @@ pub fn Glance(chrome: SessionChrome, #[prop(optional, into)] on_done: Option<Cal
         serves().then(|| {
             let body = move || match item.get().and_then(Result::ok).and_then(|w| w.into_iter().next()) {
                 Some(w) => view! {
-                    <span title=w.why.clone()>{format!("◆ {}", w.fields.title)}</span>
+                    <span title=w.why.clone()>{format!("Work {}", w.fields.title)}</span>
                     <span class=MUTED>{format!(" · {}", c6_api::work::state_label(&w.state))}</span>
                 }
                 .into_any(),

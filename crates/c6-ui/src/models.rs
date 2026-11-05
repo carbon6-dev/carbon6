@@ -85,7 +85,7 @@ pub fn ModelInput(
                 <button type="button" tabindex="-1" title="Every model the connection offers"
                     prop:disabled=move || disabled.get()
                     class="rounded-r-md border border-l-0 border-zinc-300 px-2 text-xs text-muted hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
-                    on:mousedown=move |ev| { ev.prevent_default(); shown.update(|s| *s = !*s); }>"▾"</button>
+                    on:mousedown=move |ev| { ev.prevent_default(); shown.update(|s| *s = !*s); }>{crate::icons::chevron_down()}</button>
             </div>
             {move || (shown.get() && !disabled.get()).then(|| view! {
                 <div class=move || format!("absolute z-30 w-full min-w-56 overflow-auto rounded-md border border-zinc-200 bg-white py-1 text-xs shadow-lg dark:border-zinc-700 dark:bg-zinc-900 {}",

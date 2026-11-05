@@ -60,6 +60,21 @@ Use `NEXTEST=1 make test-under-load RUNS=5` for repeated workspace runs. Do not 
 
 SQLite contention regressions use a real temporary WAL database and simultaneous operations on its connection pool, not just an in-memory database or serial calls. A transaction that reads before writing must take the writer with `BEGIN IMMEDIATE` before its first read: `busy_timeout` cannot repair a stale read snapshot's upgrade to a write. Related rows must commit together too (for example, a claim and all its evidence); fault injection should verify that a failed insert leaves none of a partial operation behind. Neither a longer timeout nor a retry is a fix for these atomicity bugs.
 
+## App-owned icons: native UI regression
+
+`cargo test -p c6-ui` renders representative session notices, memory events,
+published outputs, file attachments, approvals, questions and secret cards. Their
+fixture content is plain text, so emoji or symbol-icons in the resulting markup
+are a regression in the app, not a restriction on user content. A source guard
+also scans app-owned Rust, HTML and JS (excluding test modules and comments).
+Intentional typography and keyboard/prose directions are allowed; trailing
+decorative action arrows are not. Slack's emoji table and vendored terminal
+Unicode data remain content, not app icons.
+
+After building with `env -u NO_COLOR make ui`, check arbitrary Tailwind utilities
+used by changed markup against the generated CSS, not merely the source class
+strings. The shared SVGs use ordinary size/alignment utilities.
+
 ## Tile focus and first click: manual browser check
 
 Focus and active-pane selection run on pointerdown. The pane header and its conditional buttons must stay mounted when only focus/active changes: detaching the original target between pointerdown and click loses its click. Use cached boolean conditions (`Show`) for their presence, not a closure that rebuilds them on every position change. Growing a tile still waits until click bubbles, after the action. The native `c6-ui` tests don't exercise browser event dispatch, so check this in a browser:
@@ -79,7 +94,7 @@ The `c6-ui` workspace unit tests cover input direction and stop/resume decisions
 
 1. Open it normally: it starts at the bottom and follows new text. While there, roll the wheel up one notch (also try a tiny trackpad movement). It must stay up as tokens arrive or the window resizes, even if less than 120px from the end. Repeat during a smooth glide.
 2. Focus the transcript and try Up, Page Up, Home and Shift+Space. Each stops following immediately. Down/Page Down/End and scrolling down resume only at the very bottom (less than 4px); being merely near the bottom does not resume. Check the scrollbar too.
-3. Scroll more than a screen away, click **↓ Latest** (or its new-event count), and confirm that streaming follows again. Fold/show the tile while following, and while just a few pixels above the bottom with following off; each keeps its prior choice and position.
+3. Scroll more than a screen away, click **Latest** (or its new-event count), and confirm that streaming follows again. Fold/show the tile while following, and while just a few pixels above the bottom with following off; each keeps its prior choice and position.
 4. Open a search hit near the end. Its anchor must stay put through streaming and resize, not start following because it is near the end. Click Latest to resume.
 5. On a phone, tap without dragging: following stays on. Drag toward older content by a small distance: it stops immediately and stays off through touch inertia. Drag back to the bottom or use Latest: it resumes. Try reversing direction within one gesture.
 6. Check that horizontal scrolling and typing/navigation in text fields do not change transcript following. With reduced motion enabled, repeat the small upward scroll and Latest checks.
