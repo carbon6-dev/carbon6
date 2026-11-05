@@ -4583,13 +4583,15 @@ fn Composer(
     let area = NodeRef::<leptos::html::Textarea>::new();
     // A suggestion shown in the empty box is sized to show all of it (on a
     // phone it ran past two lines and was cut off); typing sizes to the text.
-    Effect::new(move || {
-        let hint = shown_next();
-        if let Some(el) = area.get() {
-            crate::util::fit_hint(&el, hint.as_deref());
-        }
-    });
-    crate::util::autosize(area, move || text.track());
+    crate::util::autosize_hint(
+        area,
+        move || {
+            text.track();
+            next.track();
+            running.track();
+        },
+        shown_next,
+    );
     // One path for a tap and Tab: fill the draft, never send it. Focus in the
     // gesture handler itself so a phone can open its software keyboard.
     let accept_next = move || {

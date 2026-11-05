@@ -2165,7 +2165,7 @@ fn NewComment(block: String, done: Callback<()>) -> impl IntoView {
 
 /// A comment box: one line, growing with its text to about eight, then
 /// scrolling.
-const COMMENT_GROWS: &str = "block max-h-44 resize-none overflow-y-auto";
+const COMMENT_GROWS: &str = "grows block max-h-44 resize-none overflow-y-auto";
 
 /// "Send to agent", as a switch: what you write goes on to an agent.
 #[component]

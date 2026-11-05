@@ -12,6 +12,12 @@ When a turn finishes and the session is waiting for you, the message box offers 
 
 Tap **Use suggestion** below the box, or press **Tab**, to accept it. It becomes your message, which you can edit or send; accepting it never sends it. Typing anything else replaces it, and **Esc** dismisses it. It's a guess to save typing; carbon6 never sends it on its own.
 
+The message box keeps at least one line of text visible. Autosizing leaves hidden
+tiles untouched and measures again when their width changes or they return to
+view, including when an empty box is showing a long suggestion. The shared sizing
+helper also covers queue edits, questions, new sessions, Ask and document comments;
+its ResizeObserver is disconnected when the box unmounts.
+
 ## 2. When one is made
 
 - **Only for a finished turn.** A turn that ended in an error or was interrupted gets none: what to do next there is yours to decide.
