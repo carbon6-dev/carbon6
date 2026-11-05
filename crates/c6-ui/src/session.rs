@@ -616,7 +616,9 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             // Back at the end: what you scrolled back to goes again.
             feed.trim();
             request_animation_frame(move || {
-                if let Some(el) = scroller.try_get_untracked().flatten() {
+                if stick.try_get_untracked() == Some(true)
+                    && let Some(el) = scroller.try_get_untracked().flatten()
+                {
                     crate::workspace::glide_to_end(&el);
                 }
             });

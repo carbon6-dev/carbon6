@@ -31,6 +31,7 @@ One line each, read-only: **Runs on** (worker, online dot, model and effort, run
 - The glance is a column 24px to the right of the transcript, 288px wide where it starts and growing with the room to 380px (`clamp(18rem, 100% − 59.5rem, 23.75rem)`), its values wrapping rather than cut short, which keeps its reading width (56rem); the two are centred together in the session's column, the glance stays in sight as the transcript scrolls, and the message box and the find bar line up with the transcript. That needs the session's column to be at least 1240px wide (896 + 24 + 288 and 16px either side); narrower, the glance is behind the context ring: a popover, a sheet from the bottom on a phone. ⌘I opens and closes it there; Esc closes it.
 - The bar's only count is *◌ N*; the state word is the session's own turn.
 - The branch has no "based on" yet.
+- **Transcript scrolling:** opening a session follows the latest reply; opening a search hit stays at its anchor. Any upward wheel/trackpad movement, vertical touch drag toward older content, or Up/Page Up/Home (Shift+Space too) immediately stops following, even a pixel from the bottom, and cancels a running glide. New text and resizes do not re-enable it. Scrolling down to the very bottom (less than 4px away), or clicking **↓ Latest**, resumes following. Folding and showing the tile preserves that choice and position. Touching without dragging and editing a text field do not stop following.
 
 ## 5. Not yet
 

@@ -1480,6 +1480,45 @@ pub fn Go(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScrollIntent {
+    Away,
+    Toward,
+    Scrollbar,
+}
+
+impl ScrollIntent {
+    fn from_delta(delta: f64) -> Option<Self> {
+        if delta < 0.0 {
+            Some(Self::Away)
+        } else if delta > 0.0 {
+            Some(Self::Toward)
+        } else {
+            None
+        }
+    }
+
+    fn from_key(key: &str, shift: bool) -> Option<Self> {
+        match key {
+            "ArrowUp" | "PageUp" | "Home" => Some(Self::Away),
+            "ArrowDown" | "PageDown" | "End" => Some(Self::Toward),
+            " " => Some(if shift { Self::Away } else { Self::Toward }),
+            _ => None,
+        }
+    }
+}
+
+/// Input decides whether to stop; only a user return to the very end resumes.
+/// Upward input stops before the browser's default scroll, without needing a gap.
+fn scroll_follow(following: bool, intent: Option<ScrollIntent>, gap: Option<i32>) -> bool {
+    match (intent, gap) {
+        (Some(ScrollIntent::Away), None) => false,
+        (Some(ScrollIntent::Toward), Some(gap)) if gap < 4 => true,
+        (Some(ScrollIntent::Scrollbar), Some(gap)) => gap < 4,
+        _ => following,
+    }
+}
+
 /// A scrolling area that remembers its position while its column is folded
 /// away: where it was, or the end if it was at the end.
 ///
@@ -1503,7 +1542,7 @@ pub fn ScrollBox(
                 let (top, end) = c.scroll.get_value();
                 request_animation_frame(move || {
                     if let Some(el) = node.try_get_untracked().flatten() {
-                        if end || follow.is_some_and(|f| f.try_get_untracked() == Some(true)) {
+                        if follow.map_or(end, |f| f.try_get_untracked() == Some(true)) {
                             el.set_scroll_top(el.scroll_height());
                         } else if top > 0 {
                             el.set_scroll_top(top);
@@ -1513,9 +1552,18 @@ pub fn ScrollBox(
             }
         });
     }
-    // You moved it (rather than content arriving, or it being hidden).
-    let by_you = StoredValue::new(false);
+    // Direction comes from input, never from scrollTop changes: those can be
+    // caused by rendering, restoring a hidden tile, or our own smooth glide.
+    let intent = StoredValue::new(None::<ScrollIntent>);
+    let touch = StoredValue::new(None::<(i32, i32)>);
     if let Some(follow) = follow {
+        Effect::new(move || {
+            if follow.get() || intent.get_value() == Some(ScrollIntent::Toward) {
+                // Opening / Latest explicitly follows; an anchor jump explicitly
+                // stops. Neither should inherit a pending user return to the end.
+                intent.set_value(None);
+            }
+        });
         let observer = StoredValue::new_local(None::<web_sys::ResizeObserver>);
         Effect::new(move || {
             let Some(el) = node.get() else { return };
@@ -1551,27 +1599,74 @@ pub fn ScrollBox(
             }
         });
     }
-    let yours = move || by_you.set_value(true);
+    let yours = move |direction: ScrollIntent| {
+        let (Some(f), Some(el)) = (follow, node.get_untracked()) else { return };
+        if direction != ScrollIntent::Toward && el.scroll_height() <= el.client_height() {
+            return;
+        }
+        intent.set_value(Some(direction));
+        let now = f.get_untracked();
+        // A downward input while already at the end need not emit a scroll
+        // event (e.g. the prior upward trackpad movement rounded to zero px).
+        let gap = (direction == ScrollIntent::Toward).then(|| el.scroll_height() - el.scroll_top() - el.client_height());
+        let next = scroll_follow(now, Some(direction), gap);
+        if now != next {
+            f.set(next);
+        }
+        if matches!(direction, ScrollIntent::Away | ScrollIntent::Scrollbar) {
+            // Cancel an already-running smooth glide without moving the box or
+            // preventing the browser's wheel, touch or keyboard default action.
+            let opts = web_sys::ScrollToOptions::new();
+            opts.set_top(el.scroll_top() as f64);
+            opts.set_behavior(web_sys::ScrollBehavior::Instant);
+            el.scroll_to_with_scroll_to_options(&opts);
+        }
+    };
     view! {
         <div node_ref=node class=format!("min-h-0 flex-1 overflow-y-auto {class}")
-            // Up: stop following now, not when the scroll event says so: a small
-            // roll stays within `at_end`'s reach, and content arriving first
-            // would take you back down.
-            on:wheel=move |ev: web_sys::WheelEvent| if ev.delta_y() < 0.0 {
-                yours();
-                if let (Some(f), Some(el)) = (follow, node.get_untracked())
-                    && el.scroll_height() > el.client_height()
-                {
-                    f.set(false);
+            tabindex=follow.map(|_| 0)
+            on:wheel=move |ev: web_sys::WheelEvent| {
+                if let Some(direction) = ScrollIntent::from_delta(ev.delta_y()) {
+                    yours(direction);
                 }
             }
-            on:touchstart=move |_| yours()
-            on:keydown=move |ev: web_sys::KeyboardEvent| if matches!(ev.key().as_str(), "ArrowUp" | "PageUp" | "Home" | " ") { yours() }
+            on:touchstart=move |ev: web_sys::TouchEvent| {
+                touch.set_value(ev.touches().item(0).map(|t| (t.identifier(), t.client_y())));
+            }
+            on:touchmove=move |ev: web_sys::TouchEvent| {
+                let Some((id, y)) = touch.get_value() else { return };
+                let touches = ev.touches();
+                if let Some(t) = (0..touches.length()).filter_map(|i| touches.item(i)).find(|t| t.identifier() == id) {
+                    touch.set_value(Some((id, t.client_y())));
+                    // Finger down means the transcript moves up.
+                    if let Some(direction) = ScrollIntent::from_delta((y - t.client_y()) as f64) {
+                        yours(direction);
+                    }
+                }
+            }
+            on:touchend=move |_| touch.set_value(None)
+            on:touchcancel=move |_| touch.set_value(None)
+            on:keydown=move |ev: web_sys::KeyboardEvent| {
+                let in_field = ev.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                    .is_some_and(|el| el.closest("input, textarea, select, [contenteditable]:not([contenteditable=false])").ok().flatten().is_some());
+                if !ev.default_prevented() && !in_field
+                    && let Some(direction) = ScrollIntent::from_key(&ev.key(), ev.shift_key())
+                {
+                    yours(direction);
+                }
+            }
             // The scroll bar: a press on the box itself, not its content.
             on:pointerdown=move |ev: web_sys::PointerEvent| {
-                if ev.target().is_some_and(|t| node.get_untracked().is_some_and(|el| AsRef::<web_sys::EventTarget>::as_ref(&el) == &t)) {
-                    yours();
+                if ev.pointer_type() == "mouse"
+                    && ev.target().is_some_and(|t| node.get_untracked().is_some_and(|el| AsRef::<web_sys::EventTarget>::as_ref(&el) == &t))
+                {
+                    yours(ScrollIntent::Scrollbar);
                 }
+            }
+            on:scrollend=move |_| {
+                // Keep permission through touch/trackpad inertia, not through a
+                // later unrelated resize or programmatic scroll to the bottom.
+                intent.set_value(None);
             }
             on:scroll=move |_| {
             let Some(el) = node.get_untracked() else { return };
@@ -1586,16 +1681,11 @@ pub fn ScrollBox(
                 c.scroll.set_value((el.scroll_top(), end));
             }
             if let Some(f) = follow {
-                if by_you.get_value() {
-                    // You moved it: it follows again only once you are back at the
-                    // very end, not merely near it (a small step up is still near).
-                    let back = el.scroll_height() - el.scroll_top() - el.client_height() < 4;
-                    f.set(back);
-                    if back {
-                        by_you.set_value(false);
-                    }
-                } else if end {
-                    f.set(true);
+                let now = f.get_untracked();
+                let gap = el.scroll_height() - el.scroll_top() - el.client_height();
+                let next = scroll_follow(now, intent.get_value(), Some(gap));
+                if now != next {
+                    f.set(next);
                 }
             }
             if let Some(f) = on_scroll {
@@ -1605,7 +1695,6 @@ pub fn ScrollBox(
     }
 }
 
-/// Whether a scrolling area is at (or within a line or two of) its end.
 /// Follows the end of a scroll box: a short glide down to what just arrived
 /// (rather than a jump for each line), straight there when it is more than
 /// a screen away (as when it opens) or motion is reduced.
@@ -1621,8 +1710,9 @@ pub fn glide_to_end(el: &web_sys::Element) {
     el.scroll_to_with_scroll_to_options(&opts);
 }
 
+/// Whether a scrolling area is at its end (allowing a few pixels of rounding).
 pub fn at_end(el: &web_sys::Element) -> bool {
-    el.scroll_height() - el.scroll_top() - el.client_height() < 120
+    el.scroll_height() - el.scroll_top() - el.client_height() < 4
 }
 
 /// Where a tile goes, as fractions of the workspace.
@@ -1988,6 +2078,74 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upward_input_stops_following_before_any_scroll_and_even_one_pixel_from_end() {
+        assert!(!scroll_follow(true, Some(ScrollIntent::Away), None));
+        for gap in [120, 40, 4, 3, 1, 0, -1] {
+            assert!(!scroll_follow(false, Some(ScrollIntent::Away), Some(gap)), "gap {gap}");
+        }
+    }
+
+    #[test]
+    fn programmatic_scrolls_never_change_following() {
+        for following in [false, true] {
+            for gap in [400, 119, 3, 0, -1] {
+                assert_eq!(scroll_follow(following, None, Some(gap)), following, "gap {gap}");
+            }
+        }
+    }
+
+    #[test]
+    fn latest_can_resume_before_the_old_upward_intent_is_cleared() {
+        assert!(!scroll_follow(true, Some(ScrollIntent::Away), None));
+        // Latest explicitly sets following. Its own scroll event must not
+        // replay the earlier upward input while the reactive effect is pending.
+        assert!(scroll_follow(true, Some(ScrollIntent::Away), Some(0)));
+    }
+
+    #[test]
+    fn downward_input_resumes_only_after_reaching_the_very_end() {
+        assert!(!scroll_follow(false, Some(ScrollIntent::Toward), None));
+        for gap in [120, 40, 4] {
+            assert!(!scroll_follow(false, Some(ScrollIntent::Toward), Some(gap)), "gap {gap}");
+        }
+        for gap in [3, 1, 0, -1] {
+            assert!(scroll_follow(false, Some(ScrollIntent::Toward), Some(gap)), "gap {gap}");
+        }
+        // Content growth while following is not a reason to stop.
+        assert!(scroll_follow(true, Some(ScrollIntent::Toward), Some(400)));
+    }
+
+    #[test]
+    fn scrollbar_follows_only_at_the_very_end() {
+        assert!(scroll_follow(true, Some(ScrollIntent::Scrollbar), None));
+        assert!(!scroll_follow(true, Some(ScrollIntent::Scrollbar), Some(4)));
+        assert!(scroll_follow(false, Some(ScrollIntent::Scrollbar), Some(3)));
+    }
+
+    #[test]
+    fn wheel_and_touch_direction_ignore_zero_movement() {
+        assert_eq!(ScrollIntent::from_delta(-0.5), Some(ScrollIntent::Away));
+        assert_eq!(ScrollIntent::from_delta(0.5), Some(ScrollIntent::Toward));
+        assert_eq!(ScrollIntent::from_delta(0.0), None);
+        // Finger down scrolls up; finger up scrolls down.
+        assert_eq!(ScrollIntent::from_delta(100.0 - 101.0), Some(ScrollIntent::Away));
+        assert_eq!(ScrollIntent::from_delta(100.0 - 99.0), Some(ScrollIntent::Toward));
+    }
+
+    #[test]
+    fn scroll_keys_have_direction_and_shift_space_scrolls_up() {
+        for key in ["ArrowUp", "PageUp", "Home"] {
+            assert_eq!(ScrollIntent::from_key(key, false), Some(ScrollIntent::Away), "{key}");
+        }
+        for key in ["ArrowDown", "PageDown", "End", " "] {
+            assert_eq!(ScrollIntent::from_key(key, false), Some(ScrollIntent::Toward), "{key}");
+        }
+        assert_eq!(ScrollIntent::from_key(" ", true), Some(ScrollIntent::Away));
+        assert_eq!(ScrollIntent::from_key("a", false), None);
+        assert_eq!(ScrollIntent::from_key("Tab", false), None);
+    }
 
     #[test]
     fn tile_status_is_the_sessions_own_turn_not_what_runs_beside_it() {
