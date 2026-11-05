@@ -2,6 +2,8 @@
 
 A subagent becomes a session like any other: it has an actor, a log, a place in its parent's transcript you can watch live, and a reply box. Stopping one, or losing it to a worker restart, leaves its work in place. The agent that started it, or you, can read that work and continue the same subagent with its history instead of starting over. Subagents can start subagents of their own.
 
+Native sessions on every tool profile can use subagents, including GPT models on a ChatGPT connection (the Codex profile). Generic and Codex expose `task` and `send_message`; Claude exposes `Task` and `SendMessage`. Start or continue in the foreground, or set `run_in_background: true` for a pushed report. `bash_output` / `BashOutput` reads output or status, and `kill_shell` / `KillShell` stops a background subagent. These are the same implementations across profiles: named agents, allowed connections and templates, tool policies, depth, hop, concurrency and rate limits all apply unchanged. At the depth limit both start and message tools are removed, while output and stop remain available if the tool policy allows them.
+
 ## 1. Where things stand
 
 What exists today (native sessions):
