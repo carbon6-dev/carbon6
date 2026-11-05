@@ -189,10 +189,10 @@ impl Journal {
         Ok(rows.iter().map(|r| r.get("id")).collect())
     }
 
-    /// Cached sessions, including idle ones whose notices need a timer
-    /// after a restart. The event log remains the source of truth.
-    pub async fn session_ids(&self) -> anyhow::Result<Vec<String>> {
-        let rows = sqlx::query("SELECT id FROM sessions").fetch_all(&self.pool).await?;
+    /// Cached sessions active since the cutoff, whose notice logs may
+    /// need recovery. Filter here so older sessions' logs aren't read.
+    pub async fn recent_session_ids(&self, since_ms: i64) -> anyhow::Result<Vec<String>> {
+        let rows = sqlx::query("SELECT id FROM sessions WHERE last_activity >= ?").bind(since_ms).fetch_all(&self.pool).await?;
         Ok(rows.iter().map(|r| r.get("id")).collect())
     }
 
