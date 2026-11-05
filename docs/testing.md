@@ -83,3 +83,20 @@ The `c6-ui` workspace unit tests cover input direction and stop/resume decisions
 4. Open a search hit near the end. Its anchor must stay put through streaming and resize, not start following because it is near the end. Click Latest to resume.
 5. On a phone, tap without dragging: following stays on. Drag toward older content by a small distance: it stops immediately and stays off through touch inertia. Drag back to the bottom or use Latest: it resumes. Try reversing direction within one gesture.
 6. Check that horizontal scrolling and typing/navigation in text fields do not change transcript following. With reduced motion enabled, repeat the small upward scroll and Latest checks.
+
+### Observer lifetime regression
+
+The transcript-follow and glance-width ResizeObservers retain their Rust
+callbacks alongside the observer, disconnect before dropping either on replacement
+or unmount, and never `forget()` the closure. The message box uses the same
+ownership pattern. The transcript's on-sight IntersectionObserver retains its
+callback until cleanup too (as the glance outline already does).
+
+In browser automation, wrap the native observers before loading the app and
+record each callback and its observed elements. Open and close session tiles
+repeatedly. Every observer attached to a removed textarea, transcript, glance or
+on-sight marker must disconnect. Retaining a JS reference to its callback and
+invoking it after unmount should throw the wasm-bindgen dropped-closure error,
+not call a leaked Rust closure. While mounted, resize the tile, append a streamed
+reply and scroll: width measurement, transcript following and visibility still
+work, without callbacks or reactive reads after disposal.

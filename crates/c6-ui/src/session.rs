@@ -1050,13 +1050,16 @@ struct GlanceBeside(RwSignal<bool>);
 /// Keeps `wide` saying whether the element is wide enough for the glance
 /// beside it, as it resizes (its tile, a pane beside it, the window).
 fn watch_width(el: NodeRef<leptos::html::Div>, wide: RwSignal<bool>) {
-    let observer = StoredValue::new_local(None::<web_sys::ResizeObserver>);
+    type ResizeWatch = (web_sys::ResizeObserver, wasm_bindgen::closure::Closure<dyn Fn(js_sys::Array)>);
+    let observer = StoredValue::new_local(None::<ResizeWatch>);
     Effect::new(move || {
         let Some(node) = el.get() else { return };
         // One at a time: an element drawn anew isn't watched twice.
-        if let Some(o) = observer.try_get_value().flatten() {
-            o.disconnect();
-        }
+        observer.update_value(|o| {
+            if let Some((ro, _)) = o.take() {
+                ro.disconnect();
+            }
+        });
         let measure = wasm_bindgen::closure::Closure::<dyn Fn(js_sys::Array)>::new(move |_: js_sys::Array| {
             // A last resize may come after the pane has gone; hidden (a
             // phone's other pane), it keeps what it was.
@@ -1071,14 +1074,15 @@ fn watch_width(el: NodeRef<leptos::html::Div>, wide: RwSignal<bool>) {
         });
         if let Ok(obs) = web_sys::ResizeObserver::new(wasm_bindgen::JsCast::unchecked_ref(measure.as_ref())) {
             obs.observe(&node);
-            observer.set_value(Some(obs));
+            observer.set_value(Some((obs, measure)));
         }
-        measure.forget();
     });
     on_cleanup(move || {
-        if let Some(o) = observer.try_get_value().flatten() {
-            o.disconnect();
-        }
+        observer.update_value(|o| {
+            if let Some((ro, _)) = o.take() {
+                ro.disconnect();
+            }
+        });
     });
 }
 
@@ -2311,10 +2315,9 @@ fn on_sight(el: NodeRef<leptos::html::Div>, f: impl Fn() + Clone + 'static) {
         opts.set_root_margin("200px");
         if let Ok(o) = web_sys::IntersectionObserver::new_with_options(wasm_bindgen::JsCast::unchecked_ref(cb.as_ref()), &opts) {
             o.observe(&el);
-            let o = send_wrapper::SendWrapper::new(o);
-            on_cleanup(move || o.disconnect());
+            let kept = send_wrapper::SendWrapper::new((o, cb));
+            on_cleanup(move || kept.0.disconnect());
         }
-        cb.forget();
     });
 }
 
