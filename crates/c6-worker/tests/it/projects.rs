@@ -600,6 +600,12 @@ async fn quick_sessions_need_you_until_archived_or_kept_as_work() {
         let p = get(format!("projects/{pid}")).await;
         p["live_sessions"].as_array().unwrap().iter().find(|q| q["id"] == id).map(|q| q["state"].as_str().unwrap().to_owned())
     };
+    let ended = async |id: &str| -> Option<()> {
+        // A newly created session is briefly idle before its queued prompt
+        // starts. The project's "ended" alone is not a turn-end signal.
+        let s = get(format!("sessions/{id}")).await;
+        (s["session"]["end_reason"] == "completed" && quick_state(id).await.as_deref() == Some("ended")).then_some(())
+    };
 
     // 1. A quick session: in the project with no work, told its context.
     let s1 = ok(send(M::POST, "sessions".into(), start("Draft a short welcome note", &format!("project:{pid}"))).await)["id"]
@@ -618,7 +624,7 @@ async fn quick_sessions_need_you_until_archived_or_kept_as_work() {
     assert_eq!(get(format!("projects/of-session/{s1}")).await[0]["id"], pid.as_str());
 
     // 2. Ended: the project needs you, and still does once you've seen it.
-    eventually("the quick session to end", async || (quick_state(&s1).await.as_deref() == Some("ended")).then_some(())).await;
+    eventually("the quick session to end", async || ended(&s1).await).await;
     let p = get(format!("projects/{pid}")).await;
     assert_eq!(
         (p["state"].as_str(), p["why"].as_str()),
@@ -645,7 +651,7 @@ async fn quick_sessions_need_you_until_archived_or_kept_as_work() {
         .as_str()
         .unwrap()
         .to_owned();
-    eventually("the second quick session to end", async || (quick_state(&s2).await.as_deref() == Some("ended")).then_some(())).await;
+    eventually("the second quick session to end", async || ended(&s2).await).await;
     let p = ok(send(M::POST, format!("projects/{pid}/sessions/{s2}/archive"), Value::Null).await);
     assert!(p["live_sessions"].as_array().unwrap().is_empty());
     let listed = get("sessions".into()).await;
@@ -679,7 +685,7 @@ async fn quick_sessions_need_you_until_archived_or_kept_as_work() {
         p["docs"].as_array().unwrap().iter().any(|d| d["title"] == "Welcome note").then_some(())
     })
     .await;
-    eventually("the doc session to end", async || (quick_state(&s5).await.as_deref() == Some("ended")).then_some(())).await;
+    eventually("the doc session to end", async || ended(&s5).await).await;
 
     // 6. An agent's guess may pick "just this project".
     ok(send(M::PUT, "settings/work".into(), settings(true)).await);

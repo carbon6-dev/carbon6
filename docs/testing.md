@@ -12,9 +12,11 @@ A test is a claim: *this invariant holds*. It must fail **if and only if** the i
    - No `tokio::time::timeout(Duration::…)`, no local deadline loops, and no copies of `eventually` with their own 10, 20 or 30 seconds.
 2. **Assert once the thing is finished.**
    - Count events, read files or compare states after an explicit sign that the work is done, never during it. Signs: the turn ended (`turn_ended`), the session is idle, the state is `done`, the mock got its request, the text streamed.
+   - A session is also briefly idle after `started`, before its queued prompt starts. For a first turn, require `turn_ended` (or idle **and** `end_reason`), not idle or a quick project's `ended` alone.
    - Example: the imports test counted a turn's events when its reply appeared, before the turn's usage and end arrived (0.3.5).
 3. **Act on a signal, not after a pause.**
    - To interrupt a stream, interrupt once its first text has arrived, not 300 ms after starting.
+   - To restart a head during a turn, gate a mock response and wait for its request before stopping the head. Release it while the head is down and check offline progress in the worker's journal, then restart and wait for the new attachment. This places the restart inside the turn even when setup or reconnect is slow, without losing offline-progress coverage.
    - A pause that a slow machine could outlast is a race.
 4. **"Nothing happens" checks may sleep.**
    - A pause before asserting that something did *not* happen can't fail falsely. A slow machine only makes it a weaker check.
@@ -24,6 +26,7 @@ A test is a claim: *this invariant holds*. It must fail **if and only if** the i
    - **Ports:** bind port 0. A server that must come back on the same port (a head restarting while its workers keep its address) takes `c6_testkit::port()`. Those ports come from a range below every OS's ephemeral range, so no test binding port 0 is ever handed one, and each is held by a file lock for the life of its test process, so tests in other processes (nextest runs each test as its own) never share one. Never pick a free port, release it, and bind it later: another test can take it in between.
    - **Files:** each test works in its own temporary folders, never `$HOME` or the repository.
    - **Programs it writes:** a script a test writes and then runs can fail with "Text file busy" while a process another test just started still holds it open for writing. Wait with `c6_testkit::runnable(path, args)` before using it.
+   - **Child processes:** own and clean up the whole process group, including on a panic. Killing just a shell leaves its children holding nextest's output handles open (`LEAK`), even after the test returns.
 6. **What a test needs from the machine, CI has.**
    - A test that needs Chrome, git or a shell says so with `c6_testkit::need(what, present)` or `have(tool)`. On a laptop without it, the test skips. In CI (`GITHUB_ACTIONS`) a missing tool fails, so coverage never disappears quietly.
    - Tests that build container images (`C6_TEST_KITS`) are opt-in and don't run in CI.
@@ -46,6 +49,10 @@ A line that must break a rule says why: `// test-lint: allow (<reason>)`. Today 
 ## Checked under load
 
 The suite is also run with every CPU core kept busy by other processes, to surface timing assumptions a lint can't see (rule 2). A failure there is a bug in the test or the product, never "just load".
+
+Use `NEXTEST=1 make test-under-load RUNS=5` for repeated workspace runs. Do not rebuild test binaries in the same target directory while nextest is running: Cargo can remove binaries nextest has listed but not yet started.
+
+SQLite contention regressions use a real temporary WAL database and simultaneous operations on its connection pool, not just an in-memory database or serial calls. A transaction that reads before writing must take the writer with `BEGIN IMMEDIATE` before its first read: `busy_timeout` cannot repair a stale read snapshot's upgrade to a write. Related rows must commit together too (for example, a claim and all its evidence); fault injection should verify that a failed insert leaves none of a partial operation behind. Neither a longer timeout nor a retry is a fix for these atomicity bugs.
 
 ## Tile focus and first click: manual browser check
 
