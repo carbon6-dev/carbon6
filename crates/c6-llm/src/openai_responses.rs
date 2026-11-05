@@ -504,7 +504,10 @@ mod tests {
             }],
         }];
         let items = input_items(&msgs);
-        assert_eq!(items, [json!({"type": "web_search_call", "id": "ws_1", "status": "completed", "action": {"type": "search", "query": "q"}})]);
+        assert_eq!(
+            items,
+            [json!({"type": "web_search_call", "id": "ws_1", "status": "completed", "action": {"type": "search", "query": "q"}})]
+        );
     }
 
     #[test]
