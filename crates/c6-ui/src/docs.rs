@@ -13,7 +13,7 @@ use serde_json::{Map, Value};
 
 use crate::api;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT, ago, now_ms};
-use crate::workspace::{Go, How, View, use_column, use_workspace};
+use crate::workspace::{Go, How, Rect, View, use_column, use_workspace};
 
 fn since(at: i64) -> String {
     ago(now_ms() - at)
@@ -755,10 +755,9 @@ struct ThreadsCtx {
     commenting: RwSignal<Option<String>>,
     /// The comments panel is open.
     panel: RwSignal<bool>,
-    /// The block whose comments show in a popover by its 💬, and where it
-    /// hangs in the page (top and right, in pixels).
+    /// The block whose comments show in a popover by its 💬.
     pop: RwSignal<Option<String>>,
-    pop_at: RwSignal<(f64, f64)>,
+    pop_node: NodeRef<leptos::html::Div>,
     tabs: Memo<Vec<DocTab>>,
     /// The page: what the popover hangs in, and blocks are found in.
     root: NodeRef<leptos::html::Div>,
@@ -771,7 +770,7 @@ struct ThreadsCtx {
 }
 
 impl ThreadsCtx {
-    /// A block's 💬 (`marker`) pressed: its popover opens under it (with a
+    /// A block's 💬 (`marker`) pressed: its popover opens by it (with a
     /// new comment box, `new`), or closes if it was open.
     fn toggle_pop(self, block: String, marker: &web_sys::Element, new: bool) {
         if !new && self.pop.get_untracked().as_deref() == Some(block.as_str()) {
@@ -786,11 +785,10 @@ impl ThreadsCtx {
         }
     }
 
-    /// The popover hangs under `marker`, its right edge on the marker's.
+    /// Prefer below the marker, but keep the whole box in the visible tile.
     fn place_pop(self, marker: &web_sys::Element) {
-        let Some(root) = self.root.try_get_untracked().flatten() else { return };
-        let (r, m) = (root.get_bounding_client_rect(), marker.get_bounding_client_rect());
-        let _ = self.pop_at.try_set((m.bottom() - r.top() + 4.0, (r.right() - m.right()).max(8.0)));
+        let Some(node) = self.pop_node.try_get_untracked().flatten() else { return };
+        place_popover(&node, marker, self.root);
     }
 
     /// The popover goes, and the new comment in it (its draft stays).
@@ -802,6 +800,129 @@ impl ThreadsCtx {
             let _ = self.pop.try_set(None);
         }
     }
+}
+
+fn rect(r: web_sys::DomRect) -> Rect {
+    Rect { left: r.left(), top: r.top(), width: r.width(), height: r.height() }
+}
+
+/// The part of the layout viewport not covered by a phone's keyboard.
+fn visible_viewport() -> Rect {
+    let w = window();
+    match w.visual_viewport() {
+        Some(v) => Rect { left: v.offset_left(), top: v.offset_top(), width: v.width(), height: v.height() },
+        None => Rect {
+            width: w.inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(0.0),
+            height: w.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(0.0),
+            ..Rect::default()
+        },
+    }
+}
+
+/// Prefer below, then above; if neither fits, clamp and scroll the box.
+/// `area` is the intersection of the scrolling tile and visual viewport.
+fn popover_at(anchor: Rect, area: Rect, size: (f64, f64)) -> Rect {
+    let (left, top) = (area.left + 8.0, area.top + 8.0);
+    let (width, height) = (size.0.min((area.width - 16.0).max(0.0)), size.1.min((area.height - 16.0).max(0.0)));
+    let below = anchor.top + anchor.height + 4.0;
+    let y = if below + height <= area.top + area.height - 8.0 { below } else { anchor.top - height - 4.0 };
+    Rect {
+        left: (anchor.left + anchor.width - width).clamp(left, (area.left + area.width - 8.0 - width).max(left)),
+        top: y.clamp(top, (area.top + area.height - 8.0 - height).max(top)),
+        width,
+        height,
+    }
+}
+
+fn place_popover(node: &web_sys::HtmlElement, anchor: &web_sys::Element, root: NodeRef<leptos::html::Div>) {
+    let Some(area) = root.try_get_untracked().flatten().and_then(|r| r.parent_element()) else { return };
+    let Some(parent) = node.offset_parent() else { return };
+    let (mut a, v) = (rect(area.get_bounding_client_rect()), visible_viewport());
+    // The scrollport excludes borders and the reserved scrollbar gutter.
+    a.left += f64::from(area.client_left());
+    a.top += f64::from(area.client_top());
+    a.width = f64::from(area.client_width());
+    a.height = f64::from(area.client_height());
+    let (left, top) = (a.left.max(v.left), a.top.max(v.top));
+    let visible = Rect {
+        left,
+        top,
+        width: ((a.left + a.width).min(v.left + v.width) - left).max(0.0),
+        height: ((a.top + a.height).min(v.top + v.height) - top).max(0.0),
+    };
+    let style = node.style();
+    // Constrain before measuring: wrapping and a growing draft change height.
+    let _ = style.set_property("max-width", &format!("{}px", (visible.width - 16.0).max(0.0)));
+    let _ = style.set_property("max-height", &format!("{}px", (visible.height - 16.0).max(0.0)));
+    let r = node.get_bounding_client_rect();
+    let at = popover_at(rect(anchor.get_bounding_client_rect()), visible, (r.width(), r.height()));
+    let p = parent.get_bounding_client_rect();
+    let _ = style.set_property("left", &format!("{}px", at.left - p.left() - f64::from(parent.client_left())));
+    let _ = style.set_property("top", &format!("{}px", at.top - p.top() - f64::from(parent.client_top())));
+}
+
+/// Follow the tile, content, scrolling and keyboard without remounting a draft.
+fn follow_popover(node: NodeRef<leptos::html::Div>, place: impl Fn() + Clone + 'static) {
+    use wasm_bindgen::{JsCast, closure::Closure};
+    let root = expect_context::<ThreadsCtx>().root;
+    Effect::new(move || {
+        let (Some(node), Some(root)) = (node.get(), root.get()) else { return };
+        let place = place.clone();
+        place();
+        let alive = std::rc::Rc::new(std::cell::Cell::new(true));
+        let on = Closure::<dyn Fn()>::new({
+            let (place, alive) = (place.clone(), alive.clone());
+            move || {
+                let (place, alive) = (place.clone(), alive.clone());
+                // Resizing the observed box during delivery makes an observer
+                // loop. Measure on the next frame, only while it still exists.
+                request_animation_frame(move || {
+                    if alive.get() {
+                        place();
+                    }
+                });
+            }
+        });
+        let callback = on.as_ref().unchecked_ref();
+        let observer = web_sys::ResizeObserver::new(callback).ok();
+        if let Some(ro) = observer.clone() {
+            let alive = alive.clone();
+            // A panel can mount during the tile's observer delivery (docked
+            // becomes floating). Register its ancestors outside that delivery.
+            request_animation_frame(move || {
+                if alive.get() {
+                    ro.observe(&node);
+                    ro.observe(&root);
+                    if let Some(area) = root.parent_element() {
+                        ro.observe(&area);
+                    }
+                }
+            });
+        }
+        // Capture catches nested scroll areas too; repositioning never closes it.
+        let _ = document().add_event_listener_with_callback_and_bool("scroll", callback, true);
+        let _ = window().add_event_listener_with_callback("resize", callback);
+        let viewport = window().visual_viewport();
+        if let Some(v) = &viewport {
+            let _ = v.add_event_listener_with_callback("resize", callback);
+            let _ = v.add_event_listener_with_callback("scroll", callback);
+        }
+        let hooks = send_wrapper::SendWrapper::new((observer, viewport, on, alive));
+        on_cleanup(move || {
+            let (observer, viewport, on, alive) = &*hooks;
+            alive.set(false);
+            if let Some(ro) = observer {
+                ro.disconnect();
+            }
+            let callback = on.as_ref().unchecked_ref();
+            let _ = document().remove_event_listener_with_callback_and_bool("scroll", callback, true);
+            let _ = window().remove_event_listener_with_callback("resize", callback);
+            if let Some(v) = viewport {
+                let _ = v.remove_event_listener_with_callback("resize", callback);
+                let _ = v.remove_event_listener_with_callback("scroll", callback);
+            }
+        });
+    });
 }
 
 /// Where a block is drawn in the page.
@@ -1023,7 +1144,7 @@ pub fn DocPage(id: String) -> impl IntoView {
         commenting: RwSignal::new(None),
         panel,
         pop,
-        pop_at: RwSignal::new((0.0, 0.0)),
+        pop_node: NodeRef::new(),
         tabs,
         root,
         reveal,
@@ -1314,7 +1435,7 @@ pub fn DocPage(id: String) -> impl IntoView {
                         ("History", Callback::new(move |()| history.update(|x| *x = !*x))),
                     ] />
                 </div>
-                {move || floating.get().then(|| view! { <FloatingPanel tile_h /> })}
+                {move || floating.get().then(|| view! { <FloatingPanel /> })}
             </div>
         }
     };
@@ -1493,15 +1614,21 @@ fn UsedIn(items: Signal<Vec<(View, String)>>) -> impl IntoView {
 /// The comments panel over the doc's right side, hanging from the bar; a
 /// press outside it (or Escape) closes it.
 #[component]
-fn FloatingPanel(tile_h: RwSignal<f64>) -> impl IntoView {
+fn FloatingPanel() -> impl IntoView {
     let ctx = expect_context::<ThreadsCtx>();
     let node = NodeRef::<leptos::html::Div>::new();
     dismiss(node, "[data-opens=comments]", move || {
         let _ = ctx.panel.try_set(false);
     });
+    follow_popover(node, move || {
+        if let Some(el) = node.try_get_untracked().flatten()
+            && let Some(bar) = el.parent_element()
+        {
+            place_popover(&el, &bar, ctx.root);
+        }
+    });
     view! {
-        <div node_ref=node class="absolute right-2 top-full z-10 mt-1 flex w-[26rem] max-w-[calc(100%-1rem)] flex-col overflow-hidden rounded-lg border border-zinc-200 bg-white shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
-            style=move || format!("max-height: {}px", (tile_h.get() - 72.0).max(240.0))>
+        <div node_ref=node class="absolute z-10 flex w-[26rem] max-w-[calc(100%-1rem)] flex-col overflow-hidden rounded-lg border border-zinc-200 bg-white shadow-xl dark:border-zinc-700 dark:bg-zinc-900">
             <CommentsPanel />
         </div>
     }
@@ -1511,6 +1638,16 @@ fn FloatingPanel(tile_h: RwSignal<f64>) -> impl IntoView {
 /// a tap above it or Escape closes it.
 #[component]
 fn Sheet(close: Callback<()>, children: Children) -> impl IntoView {
+    let node = NodeRef::<leptos::html::Div>::new();
+    follow_popover(node, move || {
+        if let Some(el) = node.try_get_untracked().flatten() {
+            let v = visible_viewport();
+            let height = window().inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(v.top + v.height);
+            let style = web_sys::HtmlElement::style(&el);
+            let _ = style.set_property("bottom", &format!("{}px", (height - v.top - v.height).max(0.0)));
+            let _ = style.set_property("max-height", &format!("{}px", v.height * 0.85));
+        }
+    });
     let keys = window_event_listener(leptos::ev::keydown, move |ev| {
         if ev.key() == "Escape" && !ev.default_prevented() {
             close.run(());
@@ -1519,7 +1656,7 @@ fn Sheet(close: Callback<()>, children: Children) -> impl IntoView {
     on_cleanup(move || keys.remove());
     view! {
         <div class="fixed inset-0 z-40 bg-black/30" on:click=move |_| close.run(())></div>
-        <div class="fixed inset-x-0 bottom-0 z-50 flex max-h-[85dvh] flex-col overflow-hidden rounded-t-xl border-t border-zinc-200 bg-white shadow-2xl dark:border-zinc-700 dark:bg-zinc-900">
+        <div node_ref=node class="fixed inset-x-0 bottom-0 z-50 flex max-h-[85dvh] flex-col overflow-hidden rounded-t-xl border-t border-zinc-200 bg-white shadow-2xl dark:border-zinc-700 dark:bg-zinc-900">
             {children()}
         </div>
     }
@@ -1572,16 +1709,26 @@ fn CommentsPanel() -> impl IntoView {
     }
 }
 
-/// A block's comments, in a popover under its 💬 over the doc: a press
+/// A block's comments, in a popover by its 💬 over the doc: a press
 /// outside it or Escape closes it.
 #[component]
 fn BlockPop(block: String) -> impl IntoView {
     let ctx = expect_context::<ThreadsCtx>();
-    let node = NodeRef::<leptos::html::Div>::new();
+    let node = ctx.pop_node;
+    let bid = StoredValue::new(block.clone());
+    follow_popover(node, move || {
+        let marker = ctx
+            .root
+            .try_get_untracked()
+            .flatten()
+            .and_then(|r| r.query_selector(&format!("{} > [data-marks]", block_sel(&bid.get_value()))).ok().flatten());
+        if let Some(m) = marker {
+            ctx.place_pop(&m);
+        }
+    });
     dismiss(node, "[data-marks]", move || ctx.close_pop());
     view! {
-        <div node_ref=node class="absolute z-30 max-h-[70vh] w-96 max-w-[calc(100%-1rem)] space-y-2 overflow-y-auto overscroll-contain rounded-lg border border-zinc-200 bg-white p-2 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
-            style=move || ctx.pop_at.with(|(top, right)| format!("top: {top}px; right: {right}px"))>
+        <div node_ref=node class="absolute z-30 w-96 space-y-2 overflow-y-auto overscroll-contain rounded-lg border border-zinc-200 bg-white p-2 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900">
             <PopBody block />
         </div>
     }
@@ -2915,6 +3062,33 @@ fn base64_of(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn comment_popover_flips_clamps_and_shrinks_to_the_visible_tile() {
+        use super::{Rect, popover_at};
+        let area = Rect { left: 100.0, top: 60.0, width: 600.0, height: 400.0 };
+        let mut anchor = Rect { left: 650.0, top: 100.0, width: 20.0, height: 20.0 };
+        let below = popover_at(anchor, area, (384.0, 160.0));
+        assert_eq!((below.left, below.top), (286.0, 124.0));
+        anchor.top = 420.0;
+        let above = popover_at(anchor, area, (384.0, 160.0));
+        assert_eq!((above.left, above.top), (286.0, 256.0));
+        // A long thread or a keyboard-shortened viewport: the box scrolls.
+        for width in [320.0, 390.0, 1400.0] {
+            let area = Rect { left: 30.0, top: 120.0, width, height: 220.0 };
+            for (x, y) in [(-100.0, -100.0), (300.0, 200.0), (2000.0, 2000.0)] {
+                let at = popover_at(Rect { left: x, top: y, ..anchor }, area, (384.0, 600.0));
+                assert!(at.left >= area.left + 8.0 && at.top >= area.top + 8.0);
+                assert!(at.left + at.width <= area.left + area.width - 8.0);
+                assert!(at.top + at.height <= area.top + area.height - 8.0);
+                assert_eq!(at.height, 204.0);
+                assert_eq!(at.width, 384.0_f64.min(width - 16.0));
+            }
+        }
+        // A hidden tile has no room, not an inverted clamp range or panic.
+        let hidden = popover_at(anchor, Rect::default(), (384.0, 160.0));
+        assert_eq!((hidden.width, hidden.height), (0.0, 0.0));
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn agents_comments_render_their_markdown() {
