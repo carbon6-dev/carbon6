@@ -188,7 +188,7 @@ fn input_items(msgs: &[crate::Message]) -> Vec<Value> {
                         }
                         Block::Opaque { provider, json, .. } if provider == "openai" => {
                             if let Ok(v) = serde_json::from_str::<Value>(json) {
-                                items.push(v);
+                                items.push(replayable(v));
                             }
                         }
                         // Other providers' reasoning is not replayable here.
@@ -372,6 +372,16 @@ fn classify(msg: &str) -> LlmError {
     if http::is_context_overflow(msg) { LlmError::ContextOverflow(msg.to_owned()) } else { LlmError::Protocol(msg.to_owned()) }
 }
 
+/// A kept built-in item as the API takes it back. Replies can carry `content`
+/// on items whose input form refuses it (HTTP 400 "Unknown parameter"), which
+/// would fail every later turn of the session.
+fn replayable(mut item: Value) -> Value {
+    if let Some(fields) = item.as_object_mut() {
+        fields.remove("content");
+    }
+    item
+}
+
 fn item_block(item: &Value) -> Option<Block> {
     match item["type"].as_str()? {
         "message" => {
@@ -481,6 +491,20 @@ mod tests {
         assert_eq!(annotations[0]["url"], annotation["url"]);
         assert_eq!(annotations[0]["start_index"], 5);
         assert_eq!(annotations[0]["end_index"], 9);
+    }
+
+    #[test]
+    fn kept_built_in_items_replay_without_content_the_api_refuses() {
+        let msgs = [crate::Message {
+            role: Role::Assistant,
+            blocks: vec![Block::Opaque {
+                provider: "openai".into(),
+                json: json!({"type": "web_search_call", "id": "ws_1", "status": "completed", "action": {"type": "search", "query": "q"}, "content": [{"type": "output_text", "text": "x"}]}).to_string(),
+                label: "web_search: q".into(),
+            }],
+        }];
+        let items = input_items(&msgs);
+        assert_eq!(items, [json!({"type": "web_search_call", "id": "ws_1", "status": "completed", "action": {"type": "search", "query": "q"}})]);
     }
 
     #[test]
