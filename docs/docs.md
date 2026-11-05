@@ -101,6 +101,7 @@ How agents write docs (lead with the answer, sections sized to the ask, tables f
 
 ## 8. Comments
 
+- **Writing in a tile.** A block's comment popover opens below its marker when it fits, otherwise above, and stays inside the visible scrolling tile and viewport. Long threads scroll inside the popover. The floating comments panel uses the same bounds; on phones the comments sheet stays above the on-screen keyboard, including browsers that resize only the visual viewport.
 - **A thread** is anchored to 3 to 6 quoted words, to a block, to a slide, or to the whole tab. If what it was anchored to is edited away, the thread stays, marked "detached", showing what it had.
 - **Show it in the doc.** Click a thread's quote (either line) or its locate icon to scroll to and flash the block. In a deck, this selects and flashes the slide holding it. Both controls work from the keyboard. If the block or quoted words are gone, the locate icon is disabled; clicking the quote says "That part of the doc is gone" inline. Whole-tab threads have no block to jump to.
 - **Send it to an agent.** A comment can be sent (`to: agent`) instead of just left. It goes, as a message, to the session that already answered the thread, else the session that last wrote that part, else the latest session of the document's project or work; never to a new session. A busy session gets it queued. The message is the prompt `docs.comment`: the document, the thread, and how to answer. This is what decks.md §4's "comments per page" asked for.

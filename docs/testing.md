@@ -79,6 +79,27 @@ After building with `env -u NO_COLOR make ui`, check arbitrary Tailwind utilitie
 used by changed markup against the generated CSS, not merely the source class
 strings. The shared SVGs use ordinary size/alignment utilities.
 
+## Doc comments: placement browser check
+
+`cargo test -p c6-ui` checks the pure popover placement with offset tile bounds,
+above/below anchors, oversized threads and 320px/390px/desktop widths. In a
+browser, repeat at those widths (with touch on phones):
+
+1. Open a long doc, also with its comments panel beside it on a wide desktop
+   tile. Start a comment on a block near the bottom of the visible tile. The
+   popover flips above; the text box, Cancel and Comment remain reachable.
+2. Type a long draft, scroll the doc, resize the tile/window and open an existing
+   long thread. The box stays inside the visible tile, scrolling its contents
+   when necessary, without losing the draft or focus. Cancel, posting, outside
+   press and Escape still work.
+3. On phones, open the keyboard in a block's sheet and in the comments panel
+   (also on a deck). The sheet and its scrolling contents remain above the
+   keyboard, including when only `visualViewport` shrinks or pans. Close the
+   keyboard and check that the sheet returns to the screen bottom.
+4. Check the floating comments panel in a short desktop tile too. Chip editors
+   and comment ellipsis actions remain in normal flow, not clipped floating
+   menus; ref chips still open their destination.
+
 ## Tile focus and first click: manual browser check
 
 Focus and active-pane selection run on pointerdown. The pane header and its conditional buttons must stay mounted when only focus/active changes: detaching the original target between pointerdown and click loses its click. Use cached boolean conditions (`Show`) for their presence, not a closure that rebuilds them on every position change. Growing a tile still waits until click bubbles, after the action. The native `c6-ui` tests don't exercise browser event dispatch, so check this in a browser:
