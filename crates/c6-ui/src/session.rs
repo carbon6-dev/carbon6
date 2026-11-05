@@ -3584,11 +3584,14 @@ fn thinking_only(kind: &EventKind) -> bool {
 
 #[component]
 fn Thinking(#[prop(into)] text: Signal<String>, #[prop(into)] show: Signal<bool>) -> impl IntoView {
+    // Its Markdown as the agent's text renders it; links open like theirs
+    // where there's a workspace to open them in.
+    let (col, ws) = (crate::workspace::use_column(), use_context::<crate::workspace::Workspace>());
     view! {
         <Show when=move || show.get()>
             <details class="border-l-2 border-zinc-300 pl-3 text-sm text-muted dark:border-zinc-700" open=true>
                 <summary class="cursor-pointer select-none text-xs">"Thinking"</summary>
-                <div class="mt-1 whitespace-pre-wrap text-xs">{move || text.get()}</div>
+                <div class="md mt-1 text-xs" on:click=move |ev| if let Some(ws) = ws { crate::mentions::follow_link(&ev, col, ws); } inner_html=move || markdown::to_html(&text.get())></div>
             </details>
         </Show>
     }
@@ -5636,6 +5639,8 @@ mod tests {
             let shown = render(true);
             assert!(shown.contains("Reasoning, not a status update"), "{shown}");
             assert!(shown.contains(">Thinking</summary>"), "{shown}");
+            let bold = view! { <Thinking text="**Preparing process flag extract**".to_owned() show=Signal::stored(true) /> }.to_html();
+            assert!(bold.contains("<strong>Preparing process flag extract</strong>") && !bold.contains("**"), "thinking renders its Markdown: {bold}");
             let details = shown.split('>').find(|s| s.contains("<details")).unwrap();
             assert!(details.contains(" open"), "thinking starts expanded: {shown}");
         });
