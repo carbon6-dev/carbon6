@@ -2011,7 +2011,7 @@ fn Transcript(
     let here = Memo::new(move |_| {
         cards.and_then(|c| c.with(|m| m.get(&id.get_value()).map(|c| (c.c.since_seq, c.c.since_at)))).filter(|(s, _)| *s > 0)
     });
-    // Ticks while a turn runs, for its elapsed time.
+    // Ticks for a turn's elapsed time and, while idle, the notice grace.
     let now = RwSignal::new(js_sys::Date::now() as i64);
     let ticker = set_interval_with_handle(move || now.set(js_sys::Date::now() as i64), std::time::Duration::from_secs(1)).ok();
     on_cleanup(move || {
@@ -2244,7 +2244,7 @@ fn Transcript(
             })}
             {move || edit_open.get().then(|| view! { <QueueEditBox rows=edit_rows session_id=id.get_value() on_close=Callback::new(move |_| { edit_open.set(false); edit_rows.update(Vec::clear); }) /> })}
             {move || queued.get().into_iter().map(|q| view! { <Queued q session_id=id.get_value() worker_id=worker_id pull=pull /> }).collect_view()}
-            {move || (!running.get()).then(|| view! { <WaitingNotices events session_id=id.get_value() /> })}
+            {move || (!running.get()).then(|| view! { <WaitingNotices events now session_id=id.get_value() /> })}
             // What still runs in the background, while or after it works.
             <crate::tasks::RunningTasks session=id.get_value() events />
         </div>
@@ -2330,11 +2330,14 @@ fn SubagentWaiting(chrome: SessionChrome) -> impl IntoView {
     }
 }
 
-/// The notices no turn has taken (docs/background.md §5): from a session
+/// Don't flash the held-notices box while an idle agent takes its input.
+const NOTICE_GRACE_MS: i64 = 3_000;
+
+/// The notices no turn has taken after the grace (docs/background.md §5): from a session
 /// message, or a background task's end or a subagent's report, each held
 /// by the hourly limit or for your next message. Its first line, and who
 /// sent it.
-fn waiting_notices(evs: &[Event]) -> Vec<(String, String, i64)> {
+fn waiting_notices(evs: &[Event], now: i64) -> Vec<(String, String, i64)> {
     let taken: std::collections::HashSet<&str> = evs
         .iter()
         .filter_map(|e| match &e.kind {
@@ -2344,7 +2347,9 @@ fn waiting_notices(evs: &[Event]) -> Vec<(String, String, i64)> {
         .collect();
     evs.iter()
         .filter_map(|e| match &e.kind {
-            EventKind::NoticeQueued { command_id, text, from_title, deliver_at_ms, .. } if !taken.contains(command_id.as_str()) => {
+            EventKind::NoticeQueued { command_id, text, from_title, deliver_at_ms, .. }
+                if !taken.contains(command_id.as_str()) && now.saturating_sub(e.ts) >= NOTICE_GRACE_MS =>
+            {
                 Some((from_title.clone(), text.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().to_owned(), *deliver_at_ms))
             }
             _ => None,
@@ -2355,8 +2360,8 @@ fn waiting_notices(evs: &[Event]) -> Vec<(String, String, i64)> {
 /// While the session is idle: the notices waiting for its agent, and a way
 /// to deliver them now.
 #[component]
-fn WaitingNotices(events: RwSignal<Vec<Event>>, session_id: String) -> impl IntoView {
-    let waiting = Memo::new(move |_| events.with(|evs| waiting_notices(evs)));
+fn WaitingNotices(events: RwSignal<Vec<Event>>, now: RwSignal<i64>, session_id: String) -> impl IntoView {
+    let waiting = Memo::new(move |_| events.with(|evs| waiting_notices(evs, now.get())));
     let status = RwSignal::new(None::<String>);
     let id = StoredValue::new(session_id);
     let deliver = move |_| {
@@ -5888,7 +5893,7 @@ mod tests {
     /// A notice is waiting until a turn takes it.
     #[test]
     fn notices_wait_until_a_turn_takes_them() {
-        let ev = |seq, kind| Event { seq, ts: 0, kind };
+        let ev = |seq, ts, kind| Event { seq, ts, kind };
         let queued = |id: &str, from: &str| EventKind::NoticeQueued {
             command_id: id.into(),
             text: format!("about {id}\nmore"),
@@ -5908,8 +5913,45 @@ mod tests {
             from_session_id: String::new(),
             from_title: String::new(),
         };
-        let evs = [ev(1, queued("task:bg1:finished", "")), ev(2, user("task:bg1:finished")), ev(3, queued("m-2", "Alice"))];
-        assert_eq!(waiting_notices(&evs), [("Alice".to_owned(), "about m-2".to_owned(), 42)]);
+        let ts = 10_000;
+        let evs = [ev(1, ts, queued("task:bg1:finished", "")), ev(2, ts + 47, user("task:bg1:finished"))];
+        assert!(waiting_notices(&evs, ts + 47).is_empty());
+        assert!(waiting_notices(&evs, ts + NOTICE_GRACE_MS).is_empty());
+
+        let mut evs = evs.to_vec();
+        evs.push(ev(3, ts, queued("m-2", "Alice")));
+        assert_eq!(waiting_notices(&evs, ts + NOTICE_GRACE_MS + 1), [("Alice".to_owned(), "about m-2".to_owned(), 42)]);
+    }
+
+    #[test]
+    fn notices_show_only_after_their_own_timestamp_grace_including_quota_holds() {
+        let ts = 10_000;
+        let mut ev = Event {
+            seq: 1,
+            ts,
+            kind: EventKind::NoticeQueued {
+                command_id: "m-1".into(),
+                text: "\nReady\nMore details".into(),
+                command: String::new(),
+                from_title: "Alice".into(),
+                deliver_at_ms: 0,
+            },
+        };
+        let expected = |at| [("Alice".to_owned(), "Ready".to_owned(), at)];
+        let evs = std::slice::from_ref(&ev);
+        assert!(waiting_notices(evs, ts - 1).is_empty());
+        assert!(waiting_notices(evs, ts + 47).is_empty());
+        assert!(waiting_notices(evs, ts + NOTICE_GRACE_MS - 1).is_empty());
+        assert_eq!(waiting_notices(evs, ts + NOTICE_GRACE_MS), expected(0));
+        assert_eq!(waiting_notices(evs, ts + NOTICE_GRACE_MS + 60_000), expected(0));
+
+        let delivery = ts + 3_600_000;
+        if let EventKind::NoticeQueued { deliver_at_ms, .. } = &mut ev.kind {
+            *deliver_at_ms = delivery;
+        }
+        let evs = std::slice::from_ref(&ev);
+        assert!(waiting_notices(evs, ts + NOTICE_GRACE_MS - 1).is_empty());
+        assert_eq!(waiting_notices(evs, ts + NOTICE_GRACE_MS + 1), expected(delivery));
     }
 
     /// A message to another session reads as one, in every tool profile's
