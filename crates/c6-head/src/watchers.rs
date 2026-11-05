@@ -390,6 +390,13 @@ fn tool_uses(e: &SessionEvent) -> Vec<&c6_proto::ToolUse> {
     }
 }
 
+/// Whether a shell tool's output ends with a non-zero exit code.
+fn failed_exit(output: &str) -> bool {
+    static RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\[exit code [1-9][0-9]*\]\s*$").unwrap());
+    RE.is_match(output)
+}
+
 /// What in these events (since a watcher's position) may wake it.
 fn reasons(events: &[SessionEvent]) -> Vec<&'static str> {
     let mut out = Vec::new();
@@ -422,8 +429,11 @@ fn reasons(events: &[SessionEvent]) -> Vec<&'static str> {
             Some(Kind::Rewound(_)) => add("correction"),
             Some(Kind::Approval(a)) if a.state == "denied" => add("correction"),
             Some(Kind::ToolResult(r)) => {
-                last_results.push(r.is_error);
-                if r.is_error {
+                // A shell command that exits non-zero failed too, though
+                // the tool call didn't.
+                let failed = r.is_error || failed_exit(&r.output);
+                last_results.push(failed);
+                if failed {
                     *errors_by_tool.entry(r.tool.clone()).or_default() += 1;
                     continue;
                 }
@@ -472,7 +482,9 @@ fn digest(events: &[SessionEvent]) -> String {
                     }
                 }
             }
-            Some(Kind::ToolResult(r)) if r.is_error => lines.push(format!("[{}]   ✗ {} failed: {}", e.seq, r.tool, clip(&r.output, 400))),
+            Some(Kind::ToolResult(r)) if r.is_error || failed_exit(&r.output) => {
+                lines.push(format!("[{}]   ✗ {} failed: {}", e.seq, r.tool, clip(&r.output, 400)))
+            }
             Some(Kind::ToolResult(r)) => lines.push(format!("[{}]   ✓ {}: {}", e.seq, r.tool, clip(&r.output, 160))),
             Some(Kind::Approval(a)) if a.state != "requested" => lines.push(format!("[{}] approval of {}: {}", e.seq, a.tool, a.state)),
             Some(Kind::Rewound(_)) => lines.push(format!("[{}] the user rewound the conversation", e.seq)),
@@ -1603,7 +1615,8 @@ async fn ask(
         system: String::new(),
         messages: vec![Message { role: Role::User, blocks: vec![Block::Text(prompt)] }],
         tools: Vec::new(),
-        max_output_tokens: Some(4096),
+        // Room for a thinking model's reasoning before its answer.
+        max_output_tokens: Some(8192),
         cache_key: None,
         effort: Some("low".into()),
         web_search: false,
@@ -1754,16 +1767,26 @@ pub fn spawn(st: std::sync::Arc<HeadState>) {
                 } else {
                     continue;
                 };
-                let last: i64 = sqlx::query_scalar("SELECT last_wake_at FROM watcher_state WHERE watcher = ? AND key = '*'")
+                let mut last: i64 = sqlx::query_scalar("SELECT last_wake_at FROM watcher_state WHERE watcher = ? AND key = '*'")
                     .bind(&d.name)
                     .fetch_optional(&st.store.pool)
                     .await
                     .ok()
                     .flatten()
                     .unwrap_or(0);
-                // Never woken: due now (a wake with nothing to read is a
-                // skip, with no model call).
-                if last > 0 && now_ms() - last < period {
+                // Never woken: a period from when this head first had it
+                // on, not at once (kept, so restarts don't put it off).
+                if last == 0 {
+                    let key = format!("watchers.first_on.{}", d.name);
+                    last = match st.store.setting(&key).await.ok().flatten().and_then(|v| v.parse().ok()) {
+                        Some(t) => t,
+                        None => {
+                            let _ = st.store.set_setting(&key, &now_ms().to_string()).await;
+                            now_ms()
+                        }
+                    };
+                }
+                if now_ms() - last < period {
                     continue;
                 }
                 let reason = d.wakes.iter().find(|w| matches!(w.as_str(), "hourly" | "daily" | "weekly")).cloned().unwrap_or_default();
@@ -1771,4 +1794,38 @@ pub fn spawn(st: std::sync::Arc<HeadState>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(output: &str, is_error: bool) -> SessionEvent {
+        SessionEvent {
+            seq: 1,
+            ts_ms: 0,
+            kind: Some(Kind::ToolResult(c6_proto::ToolResult {
+                tool: "bash".into(),
+                output: output.into(),
+                is_error,
+                ..Default::default()
+            })),
+        }
+    }
+
+    #[test]
+    fn failed_commands_count_as_failures() {
+        let three = vec![result("No such file\n[exit code 1]", false); 3];
+        assert!(reasons(&three).contains(&"tool_failures"));
+        let fine = vec![result("ok\n[exit code 0]", false); 3];
+        assert!(!reasons(&fine).contains(&"tool_failures"));
+    }
+
+    #[test]
+    fn corrections_are_recognized() {
+        assert!(corrects("no, use pnpm"));
+        assert!(corrects("Don't do that"));
+        assert!(corrects("please make sure memory is accounted for"));
+        assert!(!corrects("thanks, looks good"));
+    }
 }

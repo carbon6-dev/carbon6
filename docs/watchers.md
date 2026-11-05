@@ -164,13 +164,13 @@ Steps 1–5 are built. Step 6 (moving the work and project notes, suggestions, n
   - **What wakes it:**
     - `correction`: an interruption, a rewind, a denied approval, or a message of yours that reads like one ("no", "don't", "instead", "make sure", "always"…);
     - `loop`: the same call three times;
-    - `tool_failures`: three failures in a row, or three of one tool;
+    - `tool_failures`: three failures in a row, or three of one tool (a shell command that exits non-zero counts as a failure, though the tool call itself succeeded);
     - `commit`, `edits` and `turn_end`.
   - Only a match with the watcher's wakes calls its model. Anything else counts as a skip and writes nothing to its session.
   - A watcher's first wake reads from a little before the session's end, not from its start.
 - **One model call per wake, not a tool loop.** The agenda and what changed go to the model, which answers JSON (findings, its new notes, a reply). The head then does what the findings ask, within the watcher's `outputs`. This was simpler, cheaper and easier to bound than giving a watcher tools.
   - The turn in its session shows what woke it and the digest, its answer, its usage, and a quiet notice per thing done.
-  - Its model: a routing rule for `task:watch:<name>`, else the watched session's (when the head can ask it), else the assistant's, else what a new session would get.
+  - Its model: a routing rule for `task:watch:<name>`, else the watched session's (when the head can ask it), else the assistant's, else what a new session would get. Up to 8,192 output tokens, room for a thinking model's reasoning (with less, qwen3.6 sometimes answered with nothing).
 - **Outputs.**
   - **Notes to the agent:** a message from the watcher's session (`sessions::message_from_watcher`), only at or above `note_severity`, and at most `notes_per_hour` per session; the rest are marks.
   - **Marks:** a finding on the session, shown in the Glance's Watchers line. carbon6's marks (`marks.rs`) are colours of aspects, so a watcher mark is a finding rather than one of those.
@@ -193,7 +193,7 @@ Steps 1–5 are built. Step 6 (moving the work and project notes, suggestions, n
   - The web UI's crash reports and failed calls to carbon6's tools are counted too.
   - All are grouped by their message with ids and numbers taken out (`watch_signals`), without a model.
   - Hourly, or when you run it, only groups at or over `threshold` that grew since it last looked go to the model.
-- **The schedule.** Every minute the head runs the watchers over everything (scope `all`) that are due: hourly, daily or weekly, counted from their last wake.
+- **The schedule.** Every minute the head runs the watchers over everything (scope `all`) that are due: hourly, daily or weekly, counted from their last wake. One that never woke is due a period after the head first had it on (the setting `watchers.first_on.<name>`), not at once, so a weekly roll-up doesn't run at every fresh start.
   - One with nothing new skips without a model call: the weekly roll-up with no findings, the improvement watcher with no grown groups.
   - On start, the head knows its watchers' sessions again and wakes those whose sessions moved while it was down.
 - **Lifetime.** Archiving a session ends its watchers. Those that wake on `session_end` take a last turn first, then their sessions are archived. Archiving a watcher's session stops it following.
@@ -203,3 +203,20 @@ Steps 1–5 are built. Step 6 (moving the work and project notes, suggestions, n
   - `idle`, `daily` signals of a session (only scheduled watchers use daily/weekly);
   - a watcher replying in the watched session's transcript other than through its notes;
   - watchers as packages.
+
+### Seen with a real model (2026-11-05)
+
+A scratch head (port 17890) and worker, with local Ollama qwen3.6:27b as both the sessions' and the watchers' model. The head ran from a config file, so the shipped watchers were on.
+
+- **Stuck detection.**
+  - The first session was told to retry a failing `cat` five times. That woke stuck detection (`loop`, 2,983 tokens), and it rightly found nothing: the user had asked for the retries.
+  - This showed that a shell command exiting non-zero isn't a tool error, so `tool_failures` never counted failed commands. Fixed: such output counts as a failure.
+  - The second session polled for a file that never came, varying its commands, so no wake reason matched (3 skips, no model call). Long waits aren't a wake reason yet.
+  - Woken by hand (`watchers.run`), stuck detection found it stuck in 1 turn (2,406 + 197 tokens) and sent the agent an important note: "Stop the long polling loop… inspect the status/logs of the deployment process". The note was queued for the agent's next step, behind its running command.
+- **The retrospective.** Your correction ("no, don't retry blindly… make sure every shell script you write here starts with set -euo pipefail") woke it (`correction`, 3,708 tokens). It proposed one lesson for every session, about bounding polling loops, as an approval card (decision 1), and Allow added the memory note. qwen raised no directive from that message.
+- **Review.** After the agent wrote `hello.sh` and committed it, review woke on `edits`/`commit`, with a standard ("Every shell script starts with set -euo pipefail.", `enforced_by: review`) in its prompt.
+  - qwen answered with nothing, so there's no finding. The failed wake didn't move its position, so its next wake reads the same changes again.
+  - A weekly roll-up and one retrospective wake also failed, with an empty answer or with Ollama's "error decoding response body" while it served several calls at once.
+  - A scheduled watcher that never woke used to wake at start: that's how the weekly roll-up ran there. Fixed: it waits a period from when the head first had it on.
+  - Watchers now get 8,192 output tokens, room for reasoning.
+- **Totals for the run:** stuck woke 2 times and skipped 18; the retrospective woke 2 and skipped 9; most of the session's turns were skips, with no model call.
