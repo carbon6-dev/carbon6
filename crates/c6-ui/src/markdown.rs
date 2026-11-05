@@ -4,7 +4,6 @@
 //! carbon6's own things (sessions, documents, work, projects) show as
 //! mentions: the thing's mark and title on a tint of its colour.
 
-use leptos::prelude::RenderHtml;
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, TagEnd, html};
 
 /// A carbon6 thing a message can name.
@@ -273,7 +272,7 @@ fn mention(kind: Kind, id: &str, rest: &str, given: Option<String>, here: &Here)
     let known = (here.known)(kind, id);
     let label = given.unwrap_or_else(|| esc(&known.title.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| kind.short(id))));
     let (colour, glyph) = match kind {
-        Kind::Doc => (DOC_COLOUR, format!("<span class=\"c6-mention-doc\">{}</span>", crate::icons::file().to_html())),
+        Kind::Doc => (DOC_COLOUR, format!("<span class=\"c6-mention-doc\">{}</span>", crate::icons::html::file())),
         _ => {
             let mark = known.mark.unwrap_or_else(|| c6_api::marks::hashed(id).to_owned());
             let shape = crate::marks::Shape::of(kind.name()).css(7);

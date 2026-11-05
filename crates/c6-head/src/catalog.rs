@@ -894,7 +894,7 @@ pub fn list_schema(key: &str) -> Option<Value> {
 /// these).
 pub const NOT_OPERATIONS: &[(&str, &str, &str, Scope)] = &[
     ("GET", "/api/v1/live", "a live WebSocket for the UI", Scope::Realm),
-    ("POST", "/api/v1/ui/error", "the web UI reporting that it broke, for the head's log", Scope::Realm),
+    ("POST", "/api/v1/ui/error", "the web UI reporting that it broke, for the head's log", Scope::Device),
     ("GET", "/api/v1/docs/{id}/exports/{export}/file", "an export's file, to download (docs.exports gives its address)", Scope::Realm),
     ("GET", "/api/v1/docs/{id}/files/{blob}", "a document's picture or file (an image or file embed names it)", Scope::Realm),
     ("GET", "/api/v1/head/fs/list", "the head's own files, for the UI's file picker only", Scope::Admin),

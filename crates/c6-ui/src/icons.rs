@@ -15,6 +15,35 @@ fn icon(paths: impl IntoView + 'static) -> impl IntoView {
     }
 }
 
+/// The same icon as markup, for HTML built as a string (markdown, doc chips).
+/// Rendering a view to HTML needs leptos's `ssr` feature, which the browser
+/// build lacks: there `.to_html()` panics and breaks the page.
+fn icon_html(paths: &str) -> String {
+    format!(
+        "<svg viewBox=\"0 0 24 24\" class=\"inline-block size-4 max-w-full shrink-0 align-text-bottom\" fill=\"none\" stroke=\"currentColor\" \
+         stroke-width=\"2.25\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\">{paths}</svg>"
+    )
+}
+
+/// Icons used in HTML strings, as markup.
+pub mod html {
+    pub fn calendar() -> String {
+        super::icon_html(r#"<rect x="3" y="5" width="18" height="16" rx="2"></rect><path d="M16 3v4M8 3v4M3 11h18M8 15h2m4 0h2"></path>"#)
+    }
+
+    pub fn file() -> String {
+        super::icon_html(r#"<path d="M14 3H5v18h14V8ZM14 3v5h5M8 12h8M8 16h6"></path>"#)
+    }
+
+    pub fn chevron_down() -> String {
+        super::icon_html(r#"<path d="m6 9 6 6 6-6"></path>"#)
+    }
+
+    pub fn arrow_up_right() -> String {
+        super::icon_html(r#"<path d="M7 17 17 7M7 7h10v10"></path>"#)
+    }
+}
+
 /// Lucide `file-diff`: a session's changes.
 pub fn file_diff() -> impl IntoView {
     icon(view! {
@@ -85,6 +114,8 @@ pub fn list_ordered() -> impl IntoView {
     icon(view! { <path d="M9 6h12M9 12h12M9 18h12M3 3h1v6M3 9h2M3 14a1 1 0 0 1 2 0c0 1-2 2-2 3h2M3 20h2" /> })
 }
 
+/// App code draws it as `html::calendar` (in doc chips); tests compare the two.
+#[cfg(test)]
 pub fn calendar() -> impl IntoView {
     icon(view! { <rect x="3" y="5" width="18" height="16" rx="2" /><path d="M16 3v4M8 3v4M3 11h18M8 15h2m4 0h2" /> })
 }
@@ -408,6 +439,54 @@ pub(crate) mod tests {
             }
             assert_no_icon_glyphs(&html);
         }
+    }
+
+    /// The markup copies draw what the components draw.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn markup_icons_match_their_components() {
+        let norm = |s: String| s.replace("<!>", "").replace("/>", ">");
+        for (markup, view) in [
+            (html::calendar(), calendar().into_any()),
+            (html::file(), file().into_any()),
+            (html::chevron_down(), chevron_down().into_any()),
+            (html::arrow_up_right(), arrow_up_right().into_any()),
+        ] {
+            let drawn = view.to_html();
+            for part in markup.split(['<', '>']).filter(|p| p.contains("d=\"") || p.contains("rect ")) {
+                assert!(norm(drawn.clone()).contains(part.trim_end_matches('/').trim()), "{part} missing from {drawn}");
+            }
+            assert!(markup.starts_with("<svg viewBox=\"0 0 24 24\"") && markup.contains("aria-hidden=\"true\""), "{markup}");
+        }
+    }
+
+    /// `.to_html()` panics in the browser build (no `ssr` feature), so app
+    /// code builds HTML strings from `icons::html`, never from a view.
+    #[test]
+    fn app_code_never_renders_views_to_html() {
+        fn check(path: &Path) {
+            if path.is_dir() {
+                for entry in std::fs::read_dir(path).unwrap() {
+                    check(&entry.unwrap().path());
+                }
+                return;
+            }
+            if path.extension().is_none_or(|e| e != "rs") {
+                return;
+            }
+            let src = std::fs::read_to_string(path).unwrap();
+            let app = src.split("#[cfg(test)]").next().unwrap_or("");
+            for (n, line) in app.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                assert!(
+                    !code.contains(".to_html()"),
+                    "{}:{}: .to_html() breaks the page in the browser; use icons::html",
+                    path.display(),
+                    n + 1
+                );
+            }
+        }
+        check(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
     }
 
     #[test]
