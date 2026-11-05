@@ -92,7 +92,7 @@ pub fn SignIn(status: c6_api::AuthStatus) -> impl IntoView {
             <CodeSignIn />
             <p class="text-sm text-muted">
                 "Or run "<code class="rounded bg-zinc-100 px-1 font-mono dark:bg-zinc-800">"c6h login-link"</code>
-                " on the head and open the link it prints."
+                " on the head (with its "<code class="font-mono">"--config"</code>", if it runs with one) and open the link it prints."
             </p>
         </div>
     }
@@ -205,7 +205,7 @@ pub fn SignInSettings(after_link: bool) -> impl IntoView {
             <div class="flex items-start justify-between gap-3">
                 <div>
                     <h2 class="text-lg font-semibold">"Sign-in"</h2>
-                    <p class="text-sm text-muted">"Passkeys sign this head in with Touch ID, Face ID or a security key. Lost them all? "<code class="font-mono">"c6h login-link"</code>" on the head gets you back in."</p>
+                    <p class="text-sm text-muted">"Passkeys sign this head in with Touch ID, Face ID or a security key. Lost them all? "<code class="font-mono">"c6h login-link"</code>" on the head (with its "<code class="font-mono">"--config"</code>", if it runs with one) gets you back in."</p>
                 </div>
                 <button class=format!("{BUTTON_QUIET} shrink-0 text-xs text-muted") on:click=sign_out>"Sign out"</button>
             </div>
