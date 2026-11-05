@@ -1,0 +1,5 @@
+[profile.default]
+# Keep failures visible immediately and with their complete stdout/stderr at
+# the end, where long parallel runs and tailed CI logs won't bury the panic.
+failure-output = "immediate-final"
+final-status-level = "fail"
