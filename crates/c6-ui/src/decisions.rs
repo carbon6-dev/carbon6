@@ -136,7 +136,7 @@ fn Cards(list: LocalResource<Result<Vec<Decision>, String>>, refresh: Callback<(
             2 if !in_session => view! { <p class="text-sm text-muted">"Nothing here."</p> }.into_any(),
             3 => view! {
                 <div class=if in_session { "space-y-2" } else { "space-y-4" } data-decisions="">
-                {in_session.then(|| view! { <p class="text-xs font-medium uppercase tracking-wide text-muted">"Waiting for you"</p> })}
+                {waiting_heading(in_session, groups)}
                 <For each=move || groups.get() key=|(g, _)| g.clone() let:group>
                     <div class="space-y-2">
                         {(!group.0.is_empty()).then(|| {
@@ -161,6 +161,15 @@ fn Cards(list: LocalResource<Result<Vec<Decision>, String>>, refresh: Callback<(
             .into_any(),
             _ => ().into_any(),
         }
+    }
+}
+
+/// Task offers have their own heading; they are not waiting for an answer.
+fn waiting_heading(in_session: bool, groups: Memo<Vec<(String, Vec<Decision>)>>) -> impl IntoView {
+    view! {
+        <Show when=move || in_session && groups.with(|gs| gs.iter().any(|(_, ds)| ds.iter().any(|d| d.kind != "task")))>
+            <p class="text-xs font-medium uppercase tracking-wide text-muted">"Waiting for you"</p>
+        </Show>
     }
 }
 
@@ -630,6 +639,27 @@ pub fn FactRow(f: c6_api::Fact, on_change: Callback<()>) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waiting_heading_requires_a_non_task_decision_in_the_session() {
+        let html = |in_session: bool, kinds: &[&str]| {
+            let owner = Owner::new();
+            owner.with(|| {
+                untrack(|| {
+                    let decisions: Vec<Decision> = kinds.iter().map(|k| Decision { kind: (*k).into(), ..Default::default() }).collect();
+                    let groups = Memo::new(move |_| vec![("Suggested tasks".into(), decisions.clone())]);
+                    waiting_heading(in_session, groups).to_html()
+                })
+            })
+        };
+        for kinds in [vec![], vec!["task"], vec!["task", "task"]] {
+            assert!(!html(true, &kinds).contains("Waiting for you"));
+        }
+        for kinds in [vec!["question"], vec!["task", "approve"], vec!["confirm", "task"]] {
+            assert!(html(true, &kinds).contains("Waiting for you"));
+            assert!(!html(false, &kinds).contains("Waiting for you"));
+        }
+    }
 
     #[test]
     fn task_actions_keep_the_existing_head_answers() {
