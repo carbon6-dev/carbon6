@@ -1503,6 +1503,48 @@ async fn insert_command(tx: &mut sqlx::SqliteConnection, c: &NewCommand<'_>, hel
 }
 
 impl Store {
+    /// Rebuild the session-message rate window from durable commands once
+    /// on head startup. Pending, delivered, rejected and withdrawn sends
+    /// all used a slot. A restore's replay is not a new send.
+    pub(crate) async fn recent_session_messages(
+        &self,
+        since: i64,
+    ) -> anyhow::Result<std::collections::HashMap<String, std::collections::VecDeque<i64>>> {
+        use c6_proto::{SessionCommand, session_command};
+        use prost::Message;
+
+        let rows = sqlx::query(
+            "SELECT c.created_at, c.data, previous.data AS previous_data FROM commands c \
+             LEFT JOIN commands previous ON previous.seq = c.seq - 1 AND previous.session_id = c.session_id \
+             WHERE c.created_at >= ? ORDER BY c.created_at, c.seq",
+        )
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut sent: std::collections::HashMap<String, std::collections::VecDeque<i64>> = Default::default();
+        for row in rows {
+            let data: Vec<u8> = row.get("data");
+            let Ok(SessionCommand { kind: Some(session_command::Kind::Input(input)), .. }) = SessionCommand::decode(data.as_slice()) else {
+                continue;
+            };
+            if input.from_session_id.is_empty() {
+                continue;
+            }
+            // replace_with_restore inserts Restore and its Input together
+            // in that order, retaining the original send's command row.
+            let previous: Option<Vec<u8>> = row.get("previous_data");
+            if previous
+                .as_deref()
+                .and_then(|data| SessionCommand::decode(data).ok())
+                .is_some_and(|c| matches!(c.kind, Some(session_command::Kind::Restore(_))))
+            {
+                continue;
+            }
+            sent.entry(input.from_session_id).or_default().push_back(row.get("created_at"));
+        }
+        Ok(sent)
+    }
+
     pub async fn enqueue_command(&self, c: &NewCommand<'_>) -> anyhow::Result<()> {
         let mut conn = self.pool.acquire().await?;
         insert_command(&mut conn, c, false).await
@@ -1732,6 +1774,100 @@ mod tests {
 
     fn command<'a>(id: &'a str, session_id: &'a str, worker_id: WorkerId, text: Option<&'a str>) -> NewCommand<'a> {
         NewCommand { id, session_id, worker_id, data: id.as_bytes().to_vec(), text }
+    }
+
+    #[tokio::test]
+    async fn message_rate_window_counts_senders_states_and_age_but_not_restore_replays() {
+        use c6_proto::{SessionCommand, UserInput, session_command};
+        use prost::Message;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("c6h.db")).await.unwrap();
+        let worker = WorkerId::new();
+        let input = |id: &'static str, from: &str| NewCommand {
+            id,
+            session_id: "target",
+            worker_id: worker,
+            data: SessionCommand {
+                command_id: id.into(),
+                session_id: "target".into(),
+                kind: Some(session_command::Kind::Input(UserInput { from_session_id: from.into(), ..Default::default() })),
+            }
+            .encode_to_vec(),
+            text: None,
+        };
+        for (id, from, state, at) in [
+            ("old", "alice", "done", 999),
+            ("pending", "alice", "pending", 1_000),
+            ("done", "alice", "done", 1_001),
+            ("rejected", "alice", "rejected", 1_002),
+            ("bob", "bob", "pending", 1_003),
+            ("user", "", "pending", 1_004),
+        ] {
+            let c = input(id, from);
+            store.enqueue_command(&c).await.unwrap();
+            sqlx::query("UPDATE commands SET created_at = ?, state = ? WHERE id = ?")
+                .bind(at)
+                .bind(state)
+                .bind(id)
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        }
+        let restore = NewCommand {
+            id: "restore",
+            session_id: "target",
+            worker_id: worker,
+            data: SessionCommand { kind: Some(session_command::Kind::Restore(Default::default())), ..Default::default() }.encode_to_vec(),
+            text: None,
+        };
+        store.replace_with_restore("pending", &restore, &input("replay", "alice")).await.unwrap();
+        let sent = store.recent_session_messages(1_000).await.unwrap();
+        assert_eq!(sent["alice"], [1_000, 1_001, 1_002]);
+        assert_eq!(sent["bob"], [1_003]);
+        assert_eq!(sent.len(), 2, "person/API inputs do not count as session sends");
+    }
+
+    #[tokio::test]
+    async fn session_message_limit_survives_a_head_restart_and_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = || crate::HeadConfig {
+            data_dir: dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            auth: false,
+            ..Default::default()
+        };
+        let head = crate::start(config()).await.unwrap();
+        let worker = WorkerId::new();
+        let (alice, bob) = (session("alice", worker), session("bob", worker));
+        for s in [&alice, &bob] {
+            head.state.store.create_session(s, &[], false).await.unwrap();
+        }
+        let limits = c6_api::SubagentLimits { messages_per_hour: 2, ..Default::default() };
+        head.state.store.set_setting(crate::sessions::SUBAGENT_LIMITS, &serde_json::to_string(&limits).unwrap()).await.unwrap();
+        let message = serde_json::json!({"to": "bob", "message": "queued while offline"});
+        for _ in 0..2 {
+            crate::sessions::message_from(&head.state, &alice, &message).await.unwrap();
+        }
+        assert!(crate::sessions::message_from(&head.state, &alice, &message).await.unwrap_err().to_string().contains("last hour"));
+        head.shutdown().await.unwrap();
+
+        let head = crate::start(config()).await.unwrap();
+        assert!(crate::sessions::message_from(&head.state, &alice, &message).await.unwrap_err().to_string().contains("last hour"));
+        // The window belongs to the sending session, not the recipient.
+        crate::sessions::message_from(&head.state, &bob, &serde_json::json!({"to": "alice", "message": "reply"})).await.unwrap();
+        sqlx::query("UPDATE commands SET created_at = ?")
+            .bind(c6_core::now_ms() - 3_600_001)
+            .execute(&head.state.store.pool)
+            .await
+            .unwrap();
+        head.shutdown().await.unwrap();
+
+        let head = crate::start(config()).await.unwrap();
+        crate::sessions::message_from(&head.state, &alice, &message).await.unwrap();
+        head.shutdown().await.unwrap();
     }
 
     #[tokio::test]
