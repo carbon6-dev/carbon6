@@ -4,6 +4,7 @@ self.addEventListener("install", () => self.skipWaiting());
 self.addEventListener("activate", (e) => e.waitUntil(self.clients.claim()));
 
 self.addEventListener("push", (e) => {
+  if (typeof self.registration.showNotification !== "function") return;
   let d = {};
   try {
     d = e.data ? e.data.json() : {};
