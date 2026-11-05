@@ -842,6 +842,19 @@ async fn do_task_here(st: &HeadState, d: &api::Decision) -> anyhow::Result<()> {
 }
 
 /// "Start it": a session that does the card's task, where its session worked.
+/// A task card's labels a new session can take. An agent may copy automatic
+/// ones (`folder:`, `worker:`…) from its own session, and the session sets those itself.
+fn card_labels(labels: &Value) -> Vec<String> {
+    labels
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|l| l.as_str())
+        .filter(|l| c6_api::labels::check_user_label(l).is_ok())
+        .map(str::to_owned)
+        .collect()
+}
+
 async fn start_task(st: &HeadState, d: &api::Decision) -> anyhow::Result<()> {
     let c = &d.context;
     let s = |k: &str| c[k].as_str().unwrap_or("").to_owned();
@@ -855,7 +868,7 @@ async fn start_task(st: &HeadState, d: &api::Decision) -> anyhow::Result<()> {
         .find(|w| w.id == s("worker"))
         .or_else(|| workers.iter().find(online))
         .ok_or_else(|| bad_request("no worker is online to start it"))?;
-    let mut labels: Vec<String> = c["labels"].as_array().into_iter().flatten().filter_map(|l| l.as_str().map(str::to_owned)).collect();
+    let mut labels = card_labels(&c["labels"]);
     labels.extend(["task-card".to_owned(), format!("from:{}", s("session"))]);
     let mut req: api::CreateSession = serde_json::from_value(json!({
         "worker_id": worker.id, "cwd": s("cwd"), "connection_id": "", "model": "", "realm": d.realm,
@@ -905,4 +918,16 @@ async fn start_task(st: &HeadState, d: &api::Decision) -> anyhow::Result<()> {
         .await?;
     info!(decision = d.id, session = %session.id, "task card started");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_card_drops_automatic_labels_its_agent_copied() {
+        let labels = json!(["vpn", "folder:~/projects/mainland-vpn", "worker:zmbp", "client:acme", 7]);
+        assert_eq!(card_labels(&labels), ["vpn", "client:acme"]);
+        assert!(card_labels(&Value::Null).is_empty());
+    }
 }
