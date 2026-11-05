@@ -90,7 +90,12 @@ pub async fn ask(
                 context_window: grant.context_window,
             };
             let window = c6_llm::window::known(&task.connection_id, &task.model, &endpoint).await;
-            let client = c6_llm::client_for(&endpoint.kind, &endpoint.base_url, &endpoint.bearer, endpoint.headers)?;
+            let mut client = c6_llm::client_for(&endpoint.kind, &endpoint.base_url, &endpoint.bearer, endpoint.headers)?;
+            if endpoint.kind == "chatgpt"
+                && let Some(hook) = m.link.chatgpt_limits_hook(&task.connection_id)
+            {
+                client.set_chatgpt_limits_hook(hook);
+            }
             (c6_llm::activity::track(c6_llm::limit::limited(client, limits), origin), window)
         }
     };
