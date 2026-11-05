@@ -278,6 +278,7 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
     let things: Vec<String> =
         d.context["things"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default();
     let session = d.context["session"].as_str().map(str::to_owned);
+    let task_session = StoredValue::new(session.clone());
     let open = matches!(d.state.as_str(), "open" | "snoozed");
     let tone = match (d.waiting && open, d.priority.as_str()) {
         (true, _) => "border-sky-300 dark:border-sky-900",
@@ -325,7 +326,14 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
             {answered.map(|a| view! { <p class="text-sm text-emerald-700 dark:text-emerald-400">{format!("Answered: {a}")}</p> })}
             {(!d.note.is_empty()).then(|| view! { <p class="text-sm text-zinc-600 dark:text-zinc-400">{format!("Note: {}", d.note)}</p> })}
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
-            {open.then(|| view! {
+            {open.then(|| if d.kind == "task" {
+                let live = api::live();
+                let proposing = Memo::new(move |_| live.sessions.with(|ss| ss.iter().find(|s| Some(&s.id) == task_session.read_value().as_ref()).cloned()));
+                let session_title = Signal::derive(move || proposing.get().map(|s| s.title).filter(|t| !t.is_empty())
+                    .or_else(|| task_session.get_value()).unwrap_or_else(|| "the proposing session".into()));
+                let work_title = Signal::derive(move || proposing.get().and_then(|s| s.work).map(|w| w.title));
+                view! { <TaskActions busy session_title work_title answer=Callback::new(move |o| answer(Some(o))) /> }.into_any()
+            } else { view! {
                 {values.get_value().into_iter().map(|(f, v)| {
                     let label = format!("{}{}", if f.label.is_empty() { f.name.clone() } else { f.label.clone() }, if f.required { " *" } else { "" });
                     let input = if !f.choices.is_empty() {
@@ -356,9 +364,107 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
                         <button class=format!("{BUTTON_QUIET} text-muted") on:click=move |_| set(json!({"state": "dismissed"}))>"Dismiss"</button>
                     })}
                 </div>
-            })}
+            }.into_any() })}
             {(!open && d.state == "dismissed").then(|| view! { <button class=BUTTON_QUIET on:click=move |_| set(json!({"state": "open"}))>"Reopen"</button> })}
         </section>
+    }
+}
+
+/// Task labels are presentation only: keep the existing answers understood by
+/// the head, including cards raised before the controls were restyled.
+#[derive(Clone, Copy)]
+enum TaskAction {
+    Start,
+    Here,
+    Save,
+    SaveNew,
+    NotNow,
+}
+
+impl TaskAction {
+    fn option(self) -> &'static str {
+        match self {
+            Self::Start => "Start it",
+            Self::Here => "Do it here",
+            Self::Save => "Add to this work",
+            Self::SaveNew => "Add as new work",
+            Self::NotNow => "Not now",
+        }
+    }
+}
+
+/// The same two-row action hierarchy in the transcript and Decisions. Like
+/// Send's split button, saving is the main action and the arrow offers where.
+#[component]
+fn TaskActions(
+    busy: RwSignal<bool>,
+    session_title: Signal<String>,
+    work_title: Signal<Option<String>>,
+    answer: Callback<String>,
+) -> impl IntoView {
+    let menu = RwSignal::new(false);
+    let pop = StoredValue::new(crate::util::dismissable(
+        move || menu.get(),
+        move || {
+            menu.try_set(false);
+        },
+    ));
+    task_actions(busy, session_title, work_title, answer, menu, pop)
+}
+
+fn task_actions(
+    busy: RwSignal<bool>,
+    session_title: Signal<String>,
+    work_title: Signal<Option<String>>,
+    answer: Callback<String>,
+    menu: RwSignal<bool>,
+    pop: StoredValue<String>,
+) -> impl IntoView {
+    let act = move |action: TaskAction| {
+        menu.set(false);
+        answer.run(action.option().into());
+    };
+    let save_title = move || {
+        work_title
+            .get()
+            .map(|w| format!("A to-do in “{w}”, to start later"))
+            .unwrap_or_else(|| "A to-do in the session's work, to start later (new work if it belongs to none)".into())
+    };
+    view! {
+        <div class="space-y-2">
+            <div class="flex flex-wrap items-center gap-2">
+                <button class=format!("{BUTTON} pointer-coarse:min-h-11") disabled=move || busy.get()
+                    title="A new session does it, with the prompt shown above"
+                    on:click=move |_| act(TaskAction::Start)>"Start session"</button>
+                <button class=format!("{BUTTON_QUIET} pointer-coarse:min-h-11") disabled=move || busy.get()
+                    title=move || format!("The session that proposed it, {}, does it after what it's doing now", session_title.get())
+                    on:click=move |_| act(TaskAction::Here)>"Do it here"</button>
+            </div>
+            <div class="flex flex-wrap items-center gap-2">
+                <div class="relative inline-flex items-stretch">
+                    <button class=format!("{BUTTON_QUIET} rounded-r-none pointer-coarse:min-h-11") disabled=move || busy.get()
+                        title=save_title on:click=move |_| act(TaskAction::Save)>"Save for later"</button>
+                    <button class="flex w-7 items-center justify-center rounded-r-md border-l border-zinc-200 text-sm hover:bg-zinc-100 pointer-coarse:min-h-11 pointer-coarse:min-w-11 dark:border-zinc-700 dark:hover:bg-zinc-800"
+                        disabled=move || busy.get() title="Choose where to save the to-do" aria-label="Choose where to save the to-do"
+                        aria-haspopup="menu" aria-expanded=move || menu.get().to_string() data-pop=pop.get_value()
+                        on:click=move |ev| { ev.stop_propagation(); menu.update(|m| *m = !*m); }>
+                        <svg viewBox="0 0 10 10" class="h-2.5 w-2.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 4 5 6.5 7.5 4" /></svg>
+                    </button>
+                    {move || menu.get().then(|| view! {
+                        <div role="menu" data-pop=pop.get_value() class="absolute left-0 top-full z-40 mt-1 w-max max-w-[calc(100vw-3rem)] rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
+                            <button role="menuitem" class="block w-full px-3 py-1.5 text-left hover:bg-zinc-100 pointer-coarse:min-h-11 dark:hover:bg-zinc-800"
+                                disabled=move || busy.get() title=save_title on:click=move |_| act(TaskAction::Save)>
+                                {move || work_title.get().map(|w| format!("To-do in “{w}”")).unwrap_or_else(|| "To-do in this work (new work if none)".into())}
+                            </button>
+                            <button role="menuitem" class="block w-full px-3 py-1.5 text-left hover:bg-zinc-100 pointer-coarse:min-h-11 dark:hover:bg-zinc-800"
+                                disabled=move || busy.get() on:click=move |_| act(TaskAction::SaveNew)>"To-do in new work"</button>
+                        </div>
+                    })}
+                </div>
+                <button class=format!("{BUTTON_QUIET} text-muted pointer-coarse:min-h-11") disabled=move || busy.get()
+                    title="Put this card away" on:click=move |_| act(TaskAction::NotNow)>"Not now"</button>
+            </div>
+        </div>
     }
 }
 
@@ -453,5 +559,85 @@ pub fn FactRow(f: c6_api::Fact, on_change: Callback<()>) -> impl IntoView {
                 </div>
             })}
         </li>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_actions_keep_the_existing_head_answers() {
+        for (action, expected) in [
+            (TaskAction::Start, "Start it"),
+            (TaskAction::Here, "Do it here"),
+            (TaskAction::Save, "Add to this work"),
+            (TaskAction::SaveNew, "Add as new work"),
+            (TaskAction::NotNow, "Not now"),
+        ] {
+            assert_eq!(action.option(), expected);
+        }
+    }
+
+    fn actions_html(busy: bool, work: Option<&str>, menu_open: bool) -> String {
+        let owner = Owner::new();
+        owner.with(|| {
+            untrack(|| {
+                let busy = RwSignal::new(busy);
+                let session_title = Signal::stored("The proposing session".to_owned());
+                let work_title = Signal::stored(work.map(str::to_owned));
+                task_actions(
+                    busy,
+                    session_title,
+                    work_title,
+                    Callback::new(|_| ()),
+                    RwSignal::new(menu_open),
+                    StoredValue::new("test-pop".into()),
+                )
+                .to_html()
+            })
+        })
+    }
+
+    #[test]
+    fn task_actions_have_one_primary_and_no_general_decision_controls() {
+        let html = actions_html(false, Some("Improve C6"), false);
+        for label in ["Start session", "Do it here", "Save for later", "Not now"] {
+            assert!(html.contains(label), "missing {label}: {html}");
+        }
+        for removed in ["Start it", "Add to this work", "Add as new work", "Work on it", "Tomorrow", "Dismiss", "<input", "<textarea"] {
+            assert!(!html.contains(removed), "unexpected {removed}: {html}");
+        }
+        assert_eq!(html.matches(BUTTON).count(), 1);
+        assert_eq!(html.matches("<button").count(), 5);
+        assert_eq!(html.matches("pointer-coarse:min-h-11").count(), 5);
+        assert!(html.contains("pointer-coarse:min-w-11"));
+        assert!(html.contains("The session that proposed it, The proposing session, does it after"));
+        assert!(html.contains("A to-do in “Improve C6”, to start later"));
+        assert!(html.contains("aria-haspopup=\"menu\""));
+        assert!(html.contains("aria-expanded=\"false\""));
+        assert!(!html.contains("role=\"menu\""));
+    }
+
+    #[test]
+    fn task_actions_are_disabled_together_while_answering_and_explain_no_work_fallback() {
+        let html = actions_html(true, None, true);
+        assert_eq!(html.matches("<button").count(), 7);
+        for button in html.split("<button").skip(1) {
+            let opening = button.split('>').next().unwrap();
+            assert!(opening.split_whitespace().any(|a| matches!(a, "disabled" | "disabled=\"\"" | "disabled=\"true\"")), "{opening}");
+        }
+        assert!(html.contains("new work if it belongs to none"));
+        assert!(html.contains("To-do in this work (new work if none)"));
+    }
+
+    #[test]
+    fn task_save_menu_names_the_work_and_offers_new_work() {
+        let html = actions_html(false, Some("Improve C6"), true);
+        assert!(html.contains("aria-expanded=\"true\""));
+        assert!(html.contains("role=\"menu\""));
+        assert_eq!(html.matches("role=\"menuitem\"").count(), 2);
+        assert!(html.contains("To-do in “Improve C6”"));
+        assert!(html.contains("To-do in new work"));
     }
 }

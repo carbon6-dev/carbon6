@@ -7,10 +7,12 @@ Status: built (2026-10-20). Decided: shown in the session that raised them and i
 While an agent works, it notices things worth doing that don't belong in the current change: dead code, a stale doc, a missing test, a confirmed TODO, a security issue spotted in passing. Instead of doing them, which bloats the change, or forgetting them, it proposes each as a **task card**:
 
 - A title and one or two lines on why now.
-- **Start it** begins a new session that does the task: same worker, folder and realm, with a self-contained prompt the agent wrote.
-- **Do it here** has the session that proposed it do it, as your next message to it.
-- **Add to this work** keeps it as a to-do in the work its session belongs to (docs/work.md); **Add as new work** keeps it as a piece of work of its own.
-- **Not now** dismisses the card.
+- **Start session** is the primary button. It begins a new session that does the task: same worker, folder and realm, with a self-contained prompt the agent wrote.
+- **Do it here** is secondary. It has the session that proposed it do it, as your next message to it; its tooltip names that session.
+- **Save for later ▾** keeps it as a to-do in the work its session belongs to (docs/work.md), creating new work if it belongs to none. The separate arrow offers **To-do in “{its work}”** (or **To-do in this work (new work if none)** when the work is not available in the live session list) and **To-do in new work**.
+- **Not now** is quiet; it puts the card away.
+
+These controls have two rows: Start session / Do it here, then Save for later ▾ / Not now. They wrap on narrow screens and have at least 44px touch targets with a coarse pointer. Task cards have no note field, Work on it, Tomorrow or Dismiss controls; other decisions keep their existing controls. Both the transcript and Decisions use the same card renderer. Saved cards are ordinary work to-dos, with their existing start and completion controls.
 
 The current session carries on undisturbed, never waiting on a card.
 
@@ -37,6 +39,8 @@ A decision, so it's kept, listed and answered like everything else that needs yo
 - `context: {session, prompt, worker, cwd, repo, worktree, labels}`;
 - `document`: the why, then the prompt in a collapsed block, so you see exactly what the new session will be told.
 
+The stored option labels above remain the action identifiers for compatibility with existing cards and the head. The UI maps **Start session** to `Start it`, **Save for later** and its current-work destination to `Add to this work`, and its new-work destination to `Add as new work`. Do it here and Not now keep their identifiers. No backend action or schema changes are needed for the restyle.
+
 Where it shows:
 
 - **The session:** under **Waiting for you** (that panel is already built), as a compact card with its answers.
@@ -44,7 +48,7 @@ Where it shows:
 
 ## 4. Starting one
 
-**Start it** creates a session like "Work on it" does today, but from the card's own prompt:
+**Start session** creates a session from the card's own prompt, not a helper to settle the decision:
 
 - same worker (or any online one, if it's gone), folder, repo and realm;
 - a fresh worktree if `worktree`;
@@ -58,8 +62,8 @@ The new session is on its own from there: nothing it does is reported back to th
 ### 4.1 The other answers
 
 - **Do it here** sends the card's prompt to the session that proposed it, as a message from you ("Do the task you proposed here … (task card #N: title)"). If the session is in a turn, the message waits for it, as yours do.
-- **Add to this work** adds the card as a to-do (docs/work.md §12) to the open work, in the card's realm, that holds the session (its root, for a subagent): its title as the text, its prompt as the prompt, `from: decision:<id>`, and the session as its origin. If no work holds the session, it makes new work, as below.
-- **Add as new work** makes a work item titled like the card, with that one to-do.
+- **Save for later / To-do in “{its work}”** adds the card as a to-do (docs/work.md §12) to the open work, in the card's realm, that holds the session (its root, for a subagent): its title as the text, its prompt as the prompt, `from: decision:<id>`, and the session as its origin. If no work holds the session, it makes new work, as below. The work name follows the live session list; the action always uses the session's current work when clicked.
+- **To-do in new work** makes a work item titled like the card, with that one to-do.
 - **Starting it later:** ▶ Start on the to-do opens the new-session form where the proposing session worked, with the card's prompt (by `work.todo`). The session joins the work and can tick the to-do off.
 
 ## 5. Not doing
