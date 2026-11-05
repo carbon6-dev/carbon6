@@ -1987,46 +1987,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn foreground_bash_native_task_is_not_mirrored_as_a_subagent() {
-        let dir = tempfile::tempdir().unwrap();
-        let tools = Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()));
-        let observer = Observer {
-            tools,
-            journal: Arc::new(crate::journal::Journal::open(&dir.path().join("journal.db")).await.unwrap()),
-            link: Arc::default(),
-            session_id: "carbon6-session".into(),
-            spec: CreateSession::default(),
-            started: SessionStarted::default(),
-        };
-        let sink = Arc::new(VecSink::default());
-        let mut mapper = Mapper {
-            turn: 1,
-            scope: "cli-conversation".into(),
-            output_root: Some(dir.path().to_owned()),
-            saw_output: false,
-            result: None,
-            interrupted: false,
-            observer: Some(Arc::new(observer)),
-            calls: HashMap::new(),
-            mcp_calls: HashSet::new(),
-            children: HashMap::new(),
-            backgrounded: HashSet::new(),
-            task_calls: HashMap::new(),
-            call_usage: HashMap::new(),
-            per_call: false,
-        };
-        // Recorded stream shapes for a foreground Bash tool call and its
-        // native local_bash lifecycle; Bash can also carry parent_tool_use_id.
-        for line in [
-            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"bash-call","name":"Bash","input":{"command":"pwd","description":"Run pwd"}}]},"parent_tool_use_id":null}"#,
-            r#"{"type":"system","subtype":"task_started","task_id":"bash-task","run_id":"run-1","description":"Run pwd","task_type":"local_bash","is_backgrounded":false,"parent_tool_use_id":"bash-call"}"#,
-            r#"{"type":"system","subtype":"task_notification","task_id":"bash-task","run_id":"run-1","status":"completed","summary":"Done","parent_tool_use_id":"bash-call"}"#,
-            r#"{"type":"assistant","parent_tool_use_id":"bash-call","message":{"content":[{"type":"text","text":"pwd completed"}]}}"#,
-        ] {
-            mapper.handle(&serde_json::from_str(line).unwrap(), &(sink.clone() as Arc<dyn EventSink>)).await.unwrap();
+    async fn bash_native_tasks_are_not_mirrored_as_subagents() {
+        for (backgrounded, moved) in [(false, false), (false, true), (true, false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let tools = Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()));
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            tools.background.set_sink(Some(tx));
+            let journal = Arc::new(crate::journal::Journal::open(&dir.path().join("journal.db")).await.unwrap());
+            let observer = Observer {
+                tools,
+                journal: journal.clone(),
+                link: Arc::default(),
+                session_id: "carbon6-session".into(),
+                spec: CreateSession::default(),
+                started: SessionStarted::default(),
+            };
+            let vec_sink = Arc::new(VecSink::default());
+            let sink: Arc<dyn EventSink> = vec_sink.clone();
+            let mut mapper = Mapper {
+                turn: 1,
+                scope: "cli-conversation".into(),
+                output_root: Some(dir.path().to_owned()),
+                saw_output: false,
+                result: None,
+                interrupted: false,
+                observer: Some(Arc::new(observer)),
+                calls: HashMap::new(),
+                mcp_calls: HashSet::new(),
+                children: HashMap::new(),
+                backgrounded: HashSet::new(),
+                task_calls: HashMap::new(),
+                call_usage: HashMap::new(),
+                per_call: false,
+            };
+            // Recorded stream shapes for a foreground Bash tool call and its
+            // native local_bash lifecycle; Bash can also carry parent_tool_use_id.
+            for line in [
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"bash-call","name":"Bash","input":{"command":"pwd","description":"Run pwd"}}]},"parent_tool_use_id":null}"#,
+                r#"{"type":"system","subtype":"task_started","task_id":"bash-task","run_id":"run-1","tool_use_id":"bash-call","description":"Run pwd","task_type":"local_bash","is_backgrounded":false,"parent_tool_use_id":"bash-call"}"#,
+                r#"{"type":"assistant","parent_tool_use_id":"bash-call","message":{"content":[{"type":"text","text":"pwd running"}]}}"#,
+            ] {
+                let mut v: Value = serde_json::from_str(line).unwrap();
+                if v["subtype"] == "task_started" {
+                    v["is_backgrounded"] = backgrounded.into();
+                }
+                mapper.handle(&v, &sink).await.unwrap();
+            }
+            if moved {
+                mapper.handle(&serde_json::json!({"type":"system","subtype":"task_updated","task_id":"bash-task","run_id":"run-1","patch":{"is_backgrounded":true}}), &sink).await.unwrap();
+                mapper.handle(&serde_json::json!({"type":"assistant","parent_tool_use_id":"bash-call","message":{"content":[{"type":"text","text":"pwd backgrounded"}]}}), &sink).await.unwrap();
+            }
+            for line in [
+                r#"{"type":"system","subtype":"task_notification","task_id":"bash-task","run_id":"run-1","status":"completed","summary":"Done","parent_tool_use_id":"bash-call"}"#,
+                r#"{"type":"assistant","parent_tool_use_id":"bash-call","message":{"content":[{"type":"text","text":"pwd completed"}]}}"#,
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"bash-call","content":"Done"}]},"parent_tool_use_id":null}"#,
+            ] {
+                mapper.handle(&serde_json::from_str(line).unwrap(), &sink).await.unwrap();
+            }
+            assert!(mapper.children.is_empty());
+            assert!(!vec_sink.0.lock().unwrap().iter().any(|event| matches!(event.kind, Some(session_event::Kind::SubagentSpawned(_)))));
+            assert!(journal.unacked().await.unwrap().is_empty(), "no child session was journaled");
+            let tasks: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            assert_eq!(tasks.len(), if moved { 3 } else { 2 });
+            assert_eq!((tasks[0].native_type.as_str(), tasks[0].foreground), ("local_bash", !backgrounded));
+            assert_eq!(tasks.last().unwrap().state, c6_tools::TaskState::Finished, "Bash still has its native task lifecycle");
         }
-        assert!(mapper.children.is_empty());
-        assert!(!sink.0.lock().unwrap().iter().any(|event| matches!(event.kind, Some(session_event::Kind::SubagentSpawned(_)))));
     }
 
     #[tokio::test]
@@ -3307,6 +3332,7 @@ done
             r#"{"type":"system","subtype":"task_started","task_id":"b1","tool_use_id":"toolu_b","description":"make","task_type":"local_bash","is_backgrounded":false}"#,
             r#"{"type":"system","subtype":"task_updated","task_id":"a1","patch":{"is_backgrounded":true}}"#,
             r#"{"type":"system","subtype":"task_updated","task_id":"b1","patch":{"is_backgrounded":true}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"make continues in the background"}]},"parent_tool_use_id":"toolu_b"}"#,
             r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_a","content":"Moved to the background."},{"type":"tool_result","tool_use_id":"toolu_b","content":"Moved to the background."}]},"parent_tool_use_id":null}"#,
         ] {
             mapper.handle(&serde_json::from_str(line).unwrap(), &sink).await.unwrap();
@@ -3323,6 +3349,18 @@ done
             "each is reported again once it is in the background"
         );
         assert_eq!((&events[2].id, &events[3].id), (&events[0].id, &events[1].id), "the same tasks");
+        assert_eq!(mapper.children.len(), 1, "only the local_agent task has a child session");
+        let spawned: Vec<_> = vec_sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Some(session_event::Kind::SubagentSpawned(s)) => Some(s.call_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(spawned, ["toolu_a"]);
         let child = mapper.children.get("toolu_a").expect("mirrored");
         assert!(child.open, "the subagent goes on after its call returns");
         let child_id = child.id.clone();
