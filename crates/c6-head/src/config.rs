@@ -112,11 +112,13 @@ pub fn default_config_path() -> PathBuf {
     config_path_for(exe.as_deref())
 }
 
-/// A Homebrew binary uses its service's config for admin commands too.
+/// A Homebrew binary uses its service's config for admin commands too,
+/// once the formula has written it (else the user's, as before).
 /// Resolve symlinks before calling: bin/ and opt/ both point into Cellar/.
 fn config_path_for(exe: Option<&Path>) -> PathBuf {
-    if let Some(prefix) = exe.and_then(|p| p.ancestors().find(|p| p.file_name().is_some_and(|n| n == "Cellar"))).and_then(Path::parent) {
-        return prefix.join("etc/c6h/c6h.toml");
+    let prefix = exe.and_then(|p| p.ancestors().find(|p| p.file_name().is_some_and(|n| n == "Cellar"))).and_then(Path::parent);
+    if let Some(brew) = prefix.map(|p| p.join("etc/c6h/c6h.toml")).filter(|p| p.is_file()) {
+        return brew;
     }
     dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("c6h").join("c6h.toml")
 }
@@ -317,9 +319,15 @@ mod tests {
 
     #[test]
     fn homebrew_config_uses_the_binarys_prefix() {
-        for prefix in ["/opt/homebrew", "/usr/local", "/home/linuxbrew/.linuxbrew", "/custom/brew"] {
-            let exe = PathBuf::from(prefix).join("Cellar/c6h/0.3.10/bin/c6h");
-            assert_eq!(config_path_for(Some(&exe)), PathBuf::from(prefix).join("etc/c6h/c6h.toml"));
+        let user = dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("c6h/c6h.toml");
+        for prefix in ["opt/homebrew", "usr/local", "home/linuxbrew/.linuxbrew", "custom/brew"] {
+            let dir = tempfile::tempdir().unwrap();
+            let exe = dir.path().join(prefix).join("Cellar/c6h/0.3.10/bin/c6h");
+            let config = dir.path().join(prefix).join("etc/c6h/c6h.toml");
+            assert_eq!(config_path_for(Some(&exe)), user, "no service config yet: the user's");
+            std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+            std::fs::write(&config, "").unwrap();
+            assert_eq!(config_path_for(Some(&exe)), config);
         }
     }
 
