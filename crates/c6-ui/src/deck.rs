@@ -158,6 +158,14 @@ pub fn DeckView(
         editing.set(None);
     };
     select(current.get_untracked().min(total.saturating_sub(1)));
+    // Comment jumps can pick a slide from outside the deck panel.
+    Effect::new(move |_| {
+        if let Some(i) = picked.get().as_deref().and_then(|sid| all.with_value(|a| a.iter().position(|s| s.id == sid)))
+            && i != current.get_untracked()
+        {
+            select(i);
+        }
+    });
     let sel = move || all.with_value(|a| a.get(current.get()).cloned());
     let edit_slide = move || {
         let Some(s) = sel() else { return };
@@ -276,7 +284,7 @@ pub fn DeckView(
                         let hash = s.hash.clone();
                         let pending = s.kind == "pending";
                         view! {
-                            <div class="c6deck" data-deck=id.get_value() on:dblclick=move |_| if !pending { edit_slide() }>
+                            <div class="c6deck" data-deck=id.get_value() data-block=s.id.clone() on:dblclick=move |_| if !pending { edit_slide() }>
                                 <SlideBox html width=Signal::derive(move || main_width.get()) />
                             </div>
                             <div class="flex flex-wrap items-center gap-2 text-sm">
