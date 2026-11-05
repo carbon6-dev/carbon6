@@ -108,6 +108,16 @@ fn default_data_dir() -> PathBuf {
 }
 
 pub fn default_config_path() -> PathBuf {
+    let exe = std::env::current_exe().and_then(|p| p.canonicalize()).ok();
+    config_path_for(exe.as_deref())
+}
+
+/// A Homebrew binary uses its service's config for admin commands too.
+/// Resolve symlinks before calling: bin/ and opt/ both point into Cellar/.
+fn config_path_for(exe: Option<&Path>) -> PathBuf {
+    if let Some(prefix) = exe.and_then(|p| p.ancestors().find(|p| p.file_name().is_some_and(|n| n == "Cellar"))).and_then(Path::parent) {
+        return prefix.join("etc/c6h/c6h.toml");
+    }
     dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("c6h").join("c6h.toml")
 }
 
@@ -304,6 +314,42 @@ fn is_ula(ip: &Ipv6Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn homebrew_config_uses_the_binarys_prefix() {
+        for prefix in ["/opt/homebrew", "/usr/local", "/home/linuxbrew/.linuxbrew", "/custom/brew"] {
+            let exe = PathBuf::from(prefix).join("Cellar/c6h/0.3.10/bin/c6h");
+            assert_eq!(config_path_for(Some(&exe)), PathBuf::from(prefix).join("etc/c6h/c6h.toml"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn homebrew_symlinks_find_the_service_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path();
+        let exe = prefix.join("Cellar/c6h/0.3.10/bin/c6h");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "").unwrap();
+        let config = prefix.join("etc/c6h/c6h.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, "data_dir = '/brew/service/data'\n").unwrap();
+        for link in [prefix.join("bin/c6h"), prefix.join("opt/c6h/bin/c6h")] {
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&exe, &link).unwrap();
+            let path = config_path_for(Some(&link.canonicalize().unwrap()));
+            assert_eq!(path, config);
+            assert_eq!(HeadConfig::load(&path).unwrap().data_dir, Path::new("/brew/service/data"));
+        }
+    }
+
+    #[test]
+    fn other_installs_keep_the_user_config() {
+        let expected = dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("c6h/c6h.toml");
+        for exe in [None, Some(Path::new("/usr/bin/c6h")), Some(Path::new("/repo/target/debug/c6h"))] {
+            assert_eq!(config_path_for(exe), expected);
+        }
+    }
 
     #[test]
     fn wildcard_expands_to_interfaces() {

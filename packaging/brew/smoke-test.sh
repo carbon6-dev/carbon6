@@ -50,18 +50,18 @@ grep -q "^data_dir = \"$prefix/var/c6h\"" "$prefix/etc/c6h/c6h.toml" || fail "th
 step "Head (brew services)"
 brew services start "$tap/c6h"
 until_ok 'curl -fsS -o /dev/null http://127.0.0.1:7700/' "the head's UI does not answer on :7700"
-config=$prefix/etc/c6h/c6h.toml
-c6h --config "$config" login-link | grep -q '^http' || fail "login-link"
+# Admin commands must find the service's config from the Homebrew binary.
+c6h login-link | grep -q '^http' || fail "login-link"
 
 step "Worker, as its service runs it"
-token() { c6h --config "$config" enroll-token --name "$1" | awk '{print $3}'; }
+token() { c6h enroll-token --name "$1" | awk '{print $3}'; }
 c6w --state-dir "$state/w" enroll "$(token smoke-worker)"
 NO_COLOR=1 /bin/zsh -lc "exec $prefix/opt/c6w/bin/c6w --state-dir '$state/w' run" >"$state/w.log" 2>&1 &
 worker=$!
 until_ok "grep -q 'attached to head' '$state/w.log'" "the worker did not attach"
 
 step "CLI"
-C6_URL=http://127.0.0.1:7700 C6_TOKEN=$(c6h --config "$config" api-token smoke) c6 workers | tee "$state/workers"
+C6_URL=http://127.0.0.1:7700 C6_TOKEN=$(c6h api-token smoke) c6 workers | tee "$state/workers"
 grep -qE 'online +smoke-worker' "$state/workers" || fail "c6 workers does not list the worker online"
 
 step "Clean stop (SIGTERM)"
