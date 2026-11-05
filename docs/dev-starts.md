@@ -40,13 +40,13 @@ A template's **workers** still work as before (empty: the online one; a list or 
 
 ## 5. When the work ends
 
-When a work item with a place is closed (done or dropped), or a session with a worktree in no work is archived:
+When a work item with a place is closed (done or dropped), or a session with remembered `worktree_options` and no open work is archived:
 
 - **off:** nothing is removed.
 - **ask:** a decision, "Remove the worktree and branch?", with **Remove** and **Keep**.
-- **automatic:** it is removed at once.
+- **automatic (`auto`):** the worker is asked to remove the worktree and its branch at once, subject to the safety checks below.
 
-Removing is done by the worker, and only when nothing would be lost: the worktree has no uncommitted changes, and the branch's commits are on a remote or merged into the base. Otherwise nothing is removed, and you are told what's left ("3 commits on vinayakb/kafka_ingest are on no remote"). Either way, the work item then forgets its place.
+Removing is done by the worker, and only when nothing would be lost: the worktree has no uncommitted changes, and every commit on its branch is on a remote or in another local branch. Otherwise nothing is removed, and you are told what's left ("3 commits on vinayakb/kafka_ingest are on no remote"). Either way, the work item then forgets its place. Cleanup defaults to `off`; archiving a session without remembered worktree options leaves its worktree and branch alone. Archiving a session attached to open work leaves cleanup to closing that work.
 
 ## 6. The "work ended" hook
 
