@@ -124,7 +124,8 @@ async fn work_starts_from_its_template_goes_back_to_its_place_and_cleans_up_when
         .unwrap();
         eventually("the session to finish its turn", async || {
             let d: SessionDetail = http.get(format!("{api}/sessions/{}", s.id)).send().await.ok()?.json().await.ok()?;
-            (d.session.status == SessionStatus::Idle).then_some(())
+            // Started is idle too, before the queued prompt's turn starts.
+            (d.session.status == SessionStatus::Idle && d.session.end_reason == Some(c6_api::TurnEndReason::Completed)).then_some(())
         })
         .await;
         s
@@ -183,7 +184,7 @@ async fn work_starts_from_its_template_goes_back_to_its_place_and_cleans_up_when
     let s = run.sessions[0].clone();
     eventually("the run's session", async || {
         let d: SessionDetail = http.get(format!("{api}/sessions/{}", s.id)).send().await.ok()?.json().await.ok()?;
-        (d.session.status == SessionStatus::Idle).then_some(())
+        (d.session.status == SessionStatus::Idle && d.session.end_reason == Some(c6_api::TurnEndReason::Completed)).then_some(())
     })
     .await;
     let made = std::path::PathBuf::from(sh(&clone, "git worktree list --porcelain | grep '^worktree ' | tail -1 | cut -c10-"));

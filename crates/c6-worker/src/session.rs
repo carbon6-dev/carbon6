@@ -3978,24 +3978,27 @@ mod label_tests {
         assert_eq!(repo_slug(d).await, "github.com/acme/app", "origin wins");
     }
 
-    #[test]
-    fn stops_orphaned_background_commands() {
+    #[tokio::test]
+    async fn stops_orphaned_background_commands() {
         use std::os::unix::process::CommandExt;
-        let spawn = |cmd: &str| std::process::Command::new("/bin/sh").args(["-c", cmd]).process_group(0).spawn().unwrap();
+        struct Group(std::process::Child);
+        impl Drop for Group {
+            fn drop(&mut self) {
+                // Killing only the shell leaves its sleep child holding the
+                // test's stdout/stderr open. Clean up even on assertion failure.
+                let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(self.0.id() as i32), nix::sys::signal::Signal::SIGKILL);
+                let _ = self.0.wait();
+            }
+        }
+        let spawn = |cmd: &str| Group(std::process::Command::new("/bin/sh").args(["-c", cmd]).process_group(0).spawn().unwrap());
         let mut orphan = spawn("sleep 77; echo orphan-test");
         let mut other = spawn("sleep 78; echo other-test");
-        let pid = |c: &std::process::Child| c.id() as i32;
+        let pid = |c: &Group| c.0.id() as i32;
         // A different command under that pid is left alone.
         stop_orphan(pid(&other), "sleep 77; echo orphan-test");
         stop_orphan(pid(&orphan), "sleep 77; echo orphan-test");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while orphan.try_wait().unwrap().is_none() {
-            assert!(std::time::Instant::now() < deadline, "the orphan was not stopped");
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        assert!(other.try_wait().unwrap().is_none(), "another command was stopped");
-        other.kill().unwrap();
-        let _ = other.wait();
+        c6_testkit::eventually("the orphan to stop", async || orphan.0.try_wait().unwrap()).await;
+        assert!(other.0.try_wait().unwrap().is_none(), "another command was stopped");
     }
 }
 

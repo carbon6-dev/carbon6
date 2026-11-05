@@ -70,11 +70,6 @@ impl Env {
         enroll::enroll(&e.token).await.unwrap().save(state).unwrap();
     }
 
-    async fn restart_head(&mut self) {
-        self.head.take().unwrap().shutdown().await.unwrap();
-        self.head = Some(crate::restart_head(cfg(self.head_dir.path(), self.ports.0, self.ports.1)).await);
-    }
-
     async fn create(&self, worker: &Worker, cwd: &Path, prompt: &str) -> String {
         let s: Value = self
             .http
@@ -115,19 +110,59 @@ async fn head_restarts_during_a_long_turn() {
     let (worker, stop) = run_worker(state.path()).await;
     let project = tempfile::tempdir().unwrap();
     const STEPS: usize = 15;
+    let mut restarts = Vec::new();
     for i in 0..STEPS {
-        env.mock.push(Reply::ToolCalls(vec![("bash".into(), format!(r#"{{"command":"sleep 0.1; echo step-{i}"}}"#))]));
+        let reply = Reply::ToolCalls(vec![("bash".into(), format!(r#"{{"command":"echo step-{i}"}}"#))]);
+        if i % 5 == 0 {
+            restarts.push((i, env.mock.push_gated(reply)));
+        } else {
+            env.mock.push(reply);
+        }
     }
     env.mock.push(Reply::Text("finished".into()));
     let id = env.create(&worker, project.path(), "do the steps").await;
 
-    for _ in 0..3 {
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        env.restart_head().await;
+    for (step, gate) in restarts {
+        // Restart at known points in a live turn, not a delay that can
+        // expire during setup or after all the steps on a loaded machine.
+        c6_testkit::eventually_or("the next gated step", async || (env.mock.requests().len() > step).then_some(()), || env.mock.log())
+            .await;
+        env.head.take().unwrap().shutdown().await.unwrap();
+        gate.notify_one();
+        // Keep the offline-progress coverage: this tool result must be
+        // journaled with no head, before a new attachment can upload it.
+        let result = eventually("the next step to finish offline", async || {
+            let (_, events) = worker.journal.load_session(&id).await.unwrap()?;
+            let result = events
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    Some(c6_proto::session_event::Kind::ToolResult(r)) => Some(r.clone()),
+                    _ => None,
+                })
+                .nth(step);
+            assert!(
+                result.is_some() || !events.iter().any(|e| matches!(e.kind, Some(c6_proto::session_event::Kind::TurnEnded(_)))),
+                "the turn ended before step {step}: {events:?}"
+            );
+            result
+        })
+        .await;
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(result.output, format!("step-{step}\n"));
+        env.head = Some(crate::restart_head(cfg(env.head_dir.path(), env.ports.0, env.ports.1)).await);
+        eventually("the worker to reattach", async || {
+            (env.head.as_ref().unwrap().state.registry.get(worker.identity.meta.worker_id).is_some() && worker.link.is_connected())
+                .then_some(())
+        })
+        .await;
     }
-    // Started + user + turn_started + STEPS×(assistant, usage, tool_result) + assistant + usage + turn_ended
-    let min = (3 + STEPS * 3 + 3) as u64;
-    env.idle_after(&id, min).await;
+    // Wait for a terminal event, not the expected successful event count:
+    // an early error should fail the assertions, not turn into a timeout.
+    let ended = eventually("the restarted turn to end", async || {
+        env.detail(&id).await.filter(|d| d.session.status == SessionStatus::Idle && d.session.end_reason.is_some())
+    })
+    .await;
+    assert_eq!(ended.session.end_reason, Some(TurnEndReason::Completed), "{ended:?}");
     let (_, journal) = worker.journal.load_session(&id).await.unwrap().unwrap();
     let head_log = env.head.as_ref().unwrap().state.store.events_after(&id, 0, 100_000).await.unwrap();
     assert_eq!(head_log, journal, "head and worker agree byte for byte");
