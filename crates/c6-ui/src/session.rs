@@ -4902,6 +4902,9 @@ fn Composer(
     });
     let picker = NodeRef::<leptos::html::Input>::new();
     let touch = crate::util::touch_first();
+    // Desktop stays compact; touch gets a 36px primary target. The take
+    // button shares this size and the toolbar's 4px right inset.
+    const TAP_SEND: &str = "pointer-coarse:size-9";
     let send_label = if touch { "Send" } else { "Send (Enter)" };
     // Esc stops the session the page shows (not a side chat's).
     let stop_label = if touch || inline { "Stop" } else { "Stop (Esc)" };
@@ -5018,7 +5021,7 @@ fn Composer(
                     <div class="relative">
                     <textarea
                         node_ref=area
-                        class=move || format!("block w-full bg-transparent px-3 pb-1.5 pt-2 text-sm outline-none {} {}", crate::util::GROWS, match (shown_next().is_some(), touch) { (true, true) => "pr-9 placeholder:italic", (true, false) => "placeholder:italic", _ => "" })
+                        class=move || format!("block w-full bg-transparent px-3 pb-1.5 pt-2 text-sm outline-none {} {}", crate::util::GROWS, match (shown_next().is_some(), touch) { (true, true) => "pr-11 placeholder:italic", (true, false) => "placeholder:italic", _ => "" })
                         rows="1"
                         enterkeyhint=if touch { "enter" } else { "send" }
                         data-pop=suggest_pop.get_value()
@@ -5095,7 +5098,7 @@ fn Composer(
                     // character, which a phone may show as a coloured emoji.
                     {move || (touch && shown_next().is_some()).then(|| view! {
                         <button type="button"
-                            class="absolute right-1.5 top-1.5 flex h-6 w-6 items-center justify-center rounded border border-sky-300 bg-sky-50 text-sky-700 hover:bg-sky-100 disabled:opacity-50 dark:border-sky-800 dark:bg-sky-950 dark:text-sky-300 dark:hover:bg-sky-900"
+                            class=format!("{SEND} {TAP_SEND} absolute right-1 top-1.5 rounded border border-sky-300 bg-sky-50 text-sky-700 hover:bg-sky-100 dark:border-sky-800 dark:bg-sky-950 dark:text-sky-300 dark:hover:bg-sky-900")
                             title="Use the suggestion: it goes in the box to edit or send, not sent" aria-label="Use the suggestion"
                             prop:disabled=move || disabled.get()
                             // Keep the box's focus (and a phone's keyboard) as it's tapped.
@@ -5222,9 +5225,9 @@ fn Composer(
                                 // halves are rounded, not the box: a clipping box hid
                                 // the menu above it.
                                 <div class="relative flex items-stretch">
-                                    <button class=format!("{SEND} rounded-l-md rounded-r-none {SEND_READY}") title=format!("{send_label}: the agent reads it at its next step") aria-label=send_label
+                                    <button class=format!("{SEND} {TAP_SEND} rounded-l-md rounded-r-none {SEND_READY}") title=format!("{send_label}: the agent reads it at its next step") aria-label=send_label
                                         prop:disabled=move || disabled.get() || !draft_ready.get() on:click=move |_| send()>{send_icon()}</button>
-                                    <button class="flex w-4 shrink-0 items-center justify-center rounded-r-md border-l border-sky-800 bg-sky-600 text-white hover:bg-sky-700 pointer-coarse:w-7"
+                                    <button class="flex h-5.5 w-4 shrink-0 items-center justify-center rounded-r-md border-l border-sky-800 bg-sky-600 text-white hover:bg-sky-700 pointer-coarse:h-9 pointer-coarse:w-7"
                                         title="More ways to send" aria-label="More ways to send"
                                         aria-haspopup="menu" prop:aria-expanded=move || send_menu.get().to_string() data-pop=send_pop.get_value()
                                         on:click=move |ev| { ev.stop_propagation(); send_menu.update(|o| *o = !*o); }>
@@ -5245,7 +5248,7 @@ fn Composer(
                             view! { <button class=STOP title=stop_label aria-label="Stop" on:click=stop>{stop_icon()}</button> }.into_any()
                         } else {
                             view! {
-                                <button class=move || format!("{SEND} {SEND_SHAPE} {}", if has_text.get() { SEND_READY } else { SEND_EMPTY })
+                                <button class=move || format!("{SEND} {TAP_SEND} {SEND_SHAPE} {}", if has_text.get() { SEND_READY } else { SEND_EMPTY })
                                     title=send_label aria-label=send_label prop:disabled=move || disabled.get() || !draft_ready.get() on:click=move |_| send()>{send_icon()}</button>
                             }.into_any()
                         }}
