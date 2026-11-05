@@ -83,7 +83,14 @@ fn dot(kind: &str) -> &'static str {
 /// the Brief.
 fn target(i: &AttentionItem) -> View {
     match (i.kind.as_str(), &i.session_id, &i.doc_id) {
-        ("approval" | "question" | "turn_ended" | "failed", Some(s), _) => View::session(s.clone()),
+        ("approval" | "question", Some(s), _) => View::Session {
+            id: s.clone(),
+            target: i
+                .call_id
+                .as_ref()
+                .map(|call| crate::workspace::Target { anchor: Some(crate::session::waiting_card_id(s, call)), ..Default::default() }),
+        },
+        ("turn_ended" | "failed", Some(s), _) => View::session(s.clone()),
         ("comment_answer", _, Some(d)) => View::Docs { id: d.clone() },
         ("brief", ..) => View::Brief,
         _ => View::Decisions,
@@ -369,6 +376,21 @@ mod tests {
     #[test]
     fn a_failed_load_says_why() {
         assert_eq!(load_error("no realm \"mach5\""), "Couldn't load what needs you: no realm \"mach5\"");
+    }
+
+    #[test]
+    fn approvals_and_questions_open_at_the_answerable_card_not_the_session_tail() {
+        for kind in ["approval", "question"] {
+            let i = AttentionItem { session_id: Some("child".into()), call_id: Some("call-1".into()), ..item(kind) };
+            assert_eq!(
+                target(&i),
+                View::Session {
+                    id: "child".into(),
+                    target: Some(crate::workspace::Target { anchor: Some("waiting-child-call-1".into()), ..Default::default() }),
+                }
+            );
+        }
+        assert_eq!(target(&item("decision")), View::Decisions);
     }
 
     #[test]

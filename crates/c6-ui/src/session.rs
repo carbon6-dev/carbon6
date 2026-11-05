@@ -605,6 +605,20 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                     reveal_when_rendered(root.clone(), el, terms.clone(), 0);
                 });
             }
+            None if anchor.starts_with(&format!("waiting-{id}-")) => {
+                let call = anchor.strip_prefix(&format!("waiting-{id}-")).unwrap_or_default().to_owned();
+                let done = RwSignal::new(false);
+                Effect::new(move || {
+                    if done.get_untracked() {
+                        return;
+                    }
+                    let seq = events.with(|evs| waiting_call_seq(evs, &call));
+                    let Some(seq) = seq else { return };
+                    done.set(true);
+                    timeline.pin(seq);
+                    reveal_when_rendered(root.clone(), anchor.clone(), terms.clone(), 0);
+                });
+            }
             None => reveal_when_rendered(root, anchor, terms, 0),
         }
     }
@@ -651,15 +665,21 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     let git = crate::details::git_state(git_at, events);
     let meta_root = StoredValue::new(root.clone());
     let subagents = SubagentTree::new(id_stored, detail, events, force_open, meta_root, timeline);
-    // What waits on you in it: approvals (while its row says it waits;
-    // a subagent's isn't in the live list) and questions.
-    let waiting = {
-        let id = id.clone();
-        Memo::new(move |_| {
-            let asks = live.sessions.with(|ss| ss.iter().find(|s| s.id == id).is_none_or(|s| s.awaiting_approval));
-            events.with(|evs| waiting_on_you(evs)).into_iter().filter(|w| asks || !w.approval).collect::<Vec<_>>()
-        })
-    };
+    // Unlike the live session list, this includes approvals/questions in
+    // subagents, even when their threads (or this session's old turns)
+    // aren't drawn. Keep the last answer while a ping reloads it.
+    let waiting_list = LocalResource::new(move || {
+        live.attention.track();
+        live.connected.track();
+        api::session_waiting(id_stored.get_value())
+    });
+    let waiting_shown = RwSignal::new(Vec::new());
+    Effect::new(move || {
+        if let Some(Ok(items)) = waiting_list.get() {
+            waiting_shown.set(items);
+        }
+    });
+    let waiting = Memo::new(move |_| waiting_shown.with(|items| events.with(|evs| waiting_on_you(&id_stored.get_value(), evs, items))));
     // What runs in its background now: subagents and tasks (servers too),
     // a line each.
     let busy = Memo::new(move |_| {
@@ -966,6 +986,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             }
         })}
         </ScrollBox>
+            <SubagentWaiting chrome />
             {move || {
                 // Claude Code's own subagents take no messages.
                 if detail.get().and_then(|d| d.ok()).is_some_and(|d| d.session.observed) {
@@ -1121,7 +1142,7 @@ pub struct SessionChrome {
     pub(crate) running: Signal<bool>,
     /// The background tasks and subagents that run now, a line each.
     busy: Memo<Vec<String>>,
-    /// What waits on you in it (approvals, questions), oldest first.
+    /// Its decisions/cards and approvals/questions throughout its subagents.
     pub(crate) waiting: Memo<Vec<Waiting>>,
     /// Its pane's root, where its transcript's events are found.
     root: StoredValue<String>,
@@ -1207,11 +1228,35 @@ impl SessionChrome {
         self.sheet.set(false);
     }
 
-    /// Goes to what waits on you in the transcript (an approval's or a
-    /// question's card).
-    pub(crate) fn go_waiting(&self, seq: u64) {
-        self.timeline.pin(seq);
-        reveal_when_rendered(self.root.get_value(), format!("{}-e{seq}", self.id.get_value()), "[]".into(), 0);
+    /// Goes to the answerable card: here, in a drawn subagent thread, or
+    /// in its own session if that thread isn't drawn.
+    pub(crate) fn go_waiting(&self, waiting: Waiting) {
+        match waiting.target {
+            WaitingTarget::Decision(id) => {
+                reveal_when_rendered(self.root.get_value(), crate::decisions::card_id(id), "[]".into(), 0);
+            }
+            WaitingTarget::Call { session, call, seq } => {
+                let anchor = waiting_card_id(&session, &call);
+                let view = View::Session {
+                    id: session.clone(),
+                    target: Some(Target { anchor: Some(anchor.clone()), at: seq, ..Default::default() }),
+                };
+                let col = self.col;
+                let elsewhere = move || {
+                    if let Some(c) = col {
+                        c.open(view, crate::workspace::How::Beside);
+                    }
+                };
+                if session == self.id.get_value() {
+                    if let Some(seq) = seq {
+                        self.timeline.pin(seq);
+                    }
+                    reveal_or(self.root.get_value(), vec![anchor], 0, elsewhere);
+                } else {
+                    self.subagents.go_to(session, Some(anchor), elsewhere);
+                }
+            }
+        }
     }
 
     /// Goes to a turn in the transcript (loaded back to it, if it starts
@@ -1260,7 +1305,7 @@ impl SessionChrome {
     /// A click on its state in the tile's bar (see [`Self::status_title`]).
     pub(crate) fn status_click(&self, ev: &web_sys::MouseEvent) {
         if let Some(w) = self.waiting.with_untracked(|w| w.first().cloned()) {
-            self.go_waiting(w.seq);
+            self.go_waiting(w);
         } else if !self.busy.with_untracked(Vec::is_empty) {
             self.toggle_background(ev);
         } else {
@@ -1787,6 +1832,8 @@ impl SubagentTree {
         let tree = LocalResource::new(move || {
             marks.track();
             working.track();
+            live.attention.track();
+            live.connected.track();
             api::descendants(session.get_value())
         });
         let list = Memo::new(move |_| {
@@ -1798,7 +1845,8 @@ impl SubagentTree {
                 .map(|s| {
                     let mut depth = 0;
                     let mut up = s.parent_id.clone();
-                    while let Some(p) = up.filter(|p| *p != session.get_value() && depth < 16) {
+                    let mut seen = std::collections::HashSet::new();
+                    while let Some(p) = up.filter(|p| *p != session.get_value() && seen.insert(p.clone())) {
                         depth += 1;
                         up = parent_of.get(&p).cloned().flatten();
                     }
@@ -1823,17 +1871,24 @@ impl SubagentTree {
     /// hangs from (a command Claude Code reports as a subagent has no
     /// thread), else `elsewhere` (its own session, say): never nothing.
     pub(crate) fn go(&self, id: String, elsewhere: impl FnOnce() + 'static) {
+        self.go_to(id, None, elsewhere);
+    }
+
+    fn go_to(&self, id: String, card: Option<String>, elsewhere: impl FnOnce() + 'static) {
         // Open the threads on the way down, then the one itself.
         let mut chain = vec![id.clone()];
         let rows = self.list.get_untracked();
         let mut up = rows.iter().find(|(s, _)| s.id == id).and_then(|(s, _)| s.parent_id.clone());
-        while let Some(p) = up.filter(|p| *p != self.session.get_value() && chain.len() < 16) {
+        while let Some(p) = up.filter(|p| *p != self.session.get_value() && !chain.contains(p)) {
             chain.push(p.clone());
             up = rows.iter().find(|(s, _)| s.id == p).and_then(|(s, _)| s.parent_id.clone());
         }
         // The call it hangs from in this session's transcript: its turn opens.
         let call = chain.last().and_then(|top| rows.iter().find(|(s, _)| s.id == *top)).and_then(|(s, _)| s.parent_call_id.clone());
-        let anchors: Vec<String> = [Some(format!("sub-{id}")), call.clone().map(|c| format!("call-{c}"))].into_iter().flatten().collect();
+        let anchors = match card {
+            Some(card) => vec![card],
+            None => [Some(format!("sub-{id}")), call.clone().map(|c| format!("call-{c}"))].into_iter().flatten().collect(),
+        };
         let seq = call.and_then(|call| {
             self.events.with_untracked(|evs| {
                 evs.iter()
@@ -2194,46 +2249,83 @@ fn Transcript(
     }
 }
 
-/// Something in a session that waits on you: an approval or a question, in
-/// a line ("approval: cargo publish"), and the event whose card shows it.
+/// An answerable card, independent of whether its events are drawn.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Waiting {
-    pub(crate) seq: u64,
     pub(crate) what: String,
-    approval: bool,
+    kind: String,
+    title: String,
+    target: WaitingTarget,
 }
 
-/// What waits on you in a session's log: tool calls held for approval with
-/// no decision or result yet, and questions not answered or cancelled.
-fn waiting_on_you(evs: &[Event]) -> Vec<Waiting> {
-    let decided = decided_calls(evs);
-    let done: std::collections::HashSet<&str> = evs
+#[derive(Clone, Debug, PartialEq)]
+enum WaitingTarget {
+    Decision(i64),
+    Call { session: String, call: String, seq: Option<u64> },
+}
+
+pub(crate) fn waiting_card_id(session: &str, call: &str) -> String {
+    format!("waiting-{session}-{call}")
+}
+
+fn waiting_call_seq(evs: &[Event], call: &str) -> Option<u64> {
+    evs.iter().find_map(|e| match &e.kind {
+        EventKind::Approval { call_id, state, .. } if call_id == call && state == "requested" => Some(e.seq),
+        EventKind::Question { call_id, state, .. } if call_id == call && state == "asked" => Some(e.seq),
+        _ => None,
+    })
+}
+
+/// The head's open decisions are authoritative, even outside the loaded
+/// event window. A loaded event gives a more precise jump within this pane.
+fn waiting_on_you(session: &str, evs: &[Event], items: &[c6_api::AttentionItem]) -> Vec<Waiting> {
+    items
         .iter()
-        .filter_map(|e| match &e.kind {
-            EventKind::ToolResult { call_id, .. } => Some(call_id.as_str()),
-            EventKind::Question { call_id, state, .. } if state != "asked" => Some(call_id.as_str()),
-            _ => None,
-        })
-        .collect();
-    let line = |s: &str| s.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().chars().take(80).collect::<String>();
-    evs.iter()
-        .filter_map(|e| match &e.kind {
-            EventKind::Approval { call_id, state, tool, input, .. }
-                if state == "requested" && !decided.contains(call_id) && !done.contains(call_id.as_str()) =>
-            {
-                let parsed = serde_json::from_str::<serde_json::Value>(input).unwrap_or(serde_json::Value::Null);
-                let what = match parsed["command"].as_str() {
-                    Some(c) => c.to_owned(),
-                    None => Some(summarize(tool, &parsed)).filter(|s| !s.is_empty()).unwrap_or_else(|| tool_label(tool).0),
-                };
-                Some(Waiting { seq: e.seq, what: format!("approval: {}", line(&what)), approval: true })
-            }
-            EventKind::Question { call_id, title, state, .. } if state == "asked" && !done.contains(call_id.as_str()) => {
-                Some(Waiting { seq: e.seq, what: format!("question: {}", line(title)), approval: false })
-            }
-            _ => None,
+        .filter_map(|i| {
+            let target = match (i.kind.as_str(), &i.session_id, &i.call_id) {
+                ("approval" | "question", Some(s), Some(call)) => {
+                    let seq = (s == session).then(|| waiting_call_seq(evs, call)).flatten();
+                    WaitingTarget::Call { session: s.clone(), call: call.clone(), seq }
+                }
+                _ => WaitingTarget::Decision(i.decision_id?),
+            };
+            let child = matches!(&target, WaitingTarget::Call { session: s, .. } if s != session);
+            Some(Waiting {
+                what: format!("{}: {}{}", i.kind, i.title, if child { format!(" · {}", i.detail) } else { String::new() }),
+                kind: i.kind.clone(),
+                title: i.detail.clone(),
+                target,
+            })
         })
         .collect()
+}
+
+/// One line per waiting card, in the held-notices style, outside the
+/// transcript's scroll area so an old/offscreen thread can't hide it.
+#[component]
+fn SubagentWaiting(chrome: SessionChrome) -> impl IntoView {
+    move || {
+        let id = chrome.id.get_value();
+        let children = chrome.waiting.with(|ws| {
+            ws.iter().filter(|w| matches!(&w.target, WaitingTarget::Call { session, .. } if *session != id)).cloned().collect::<Vec<_>>()
+        });
+        (!children.is_empty()).then(|| view! {
+            <div class=format!("{READING_ROW} shrink-0 px-4 pt-2")>
+                <div class=format!("{READING} space-y-1 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm dark:border-amber-800 dark:bg-amber-950")>
+                    {children.into_iter().map(|w| {
+                        let line = format!("1 {} waiting in {}", w.kind, w.title);
+                        view! {
+                            <div class="flex items-center gap-3">
+                                <span class="min-w-0 flex-1 truncate text-amber-800 dark:text-amber-300" title=w.what.clone()>{line}</span>
+                                <button class=BUTTON on:click=move |_| chrome.go_waiting(w.clone())>"Show"</button>
+                            </div>
+                        }
+                    }).collect_view()}
+                </div>
+                {glance_room(chrome.wide)}
+            </div>
+        })
+    }
 }
 
 /// The notices no turn has taken (docs/background.md §5): from a session
@@ -5327,7 +5419,7 @@ fn ApprovalCard(
         });
     };
     view! {
-        <div class="space-y-2 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm dark:border-amber-900 dark:bg-amber-950/60">
+        <div id=waiting_card_id(&sid.get_value(), &call.get_value()) class="space-y-2 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm dark:border-amber-900 dark:bg-amber-950/60">
             <div class="flex flex-wrap items-center gap-2">
                 <span>"⚠"</span>
                 <span class="font-medium">"Waiting for your approval"</span>
@@ -5411,7 +5503,7 @@ fn QuestionCard(session: String, call_id: String, title: String, fields: Vec<c6_
         });
     };
     view! {
-        <div class="space-y-3 rounded-lg border border-sky-300 bg-sky-50 p-3 text-sm dark:border-sky-900 dark:bg-sky-950/40">
+        <div id=waiting_card_id(&sid.get_value(), &call.get_value()) class="space-y-3 rounded-lg border border-sky-300 bg-sky-50 p-3 text-sm dark:border-sky-900 dark:bg-sky-950/40">
             <p class="flex items-center gap-2 font-medium"><span>"✎"</span><span>{title}</span></p>
             {move || open.get().then(|| view! {
                 <div class="space-y-2">
@@ -5485,7 +5577,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn what_waits_on_you_is_an_open_approval_or_question() {
+    fn what_waits_on_you_includes_decisions_cards_and_subagents_outside_the_loaded_log() {
         let approval = |seq: u64, call: &str, state: &str| Event {
             seq,
             ts: 0,
@@ -5517,12 +5609,38 @@ mod tests {
             question(5, "q2", "asked"),
             question(6, "q2", "answered"),
         ];
-        let w = waiting_on_you(&evs);
+        let item = |kind: &str, session: &str, call: Option<&str>, decision: i64| c6_api::AttentionItem {
+            kind: kind.into(),
+            title: "Choose a branch".into(),
+            detail: "Nested agent".into(),
+            session_id: Some(session.into()),
+            call_id: call.map(str::to_owned),
+            decision_id: Some(decision),
+            ..Default::default()
+        };
+        let items = [
+            item("approval", "parent", Some("a1"), 1),
+            item("question", "parent", Some("q1"), 2),
+            item("decision", "parent", None, 3),
+            item("task", "parent", None, 4),
+            item("approval", "nested", Some("a3"), 5),
+            item("question", "nested", Some("q3"), 6),
+        ];
+        let w = waiting_on_you("parent", &evs, &items);
+        assert_eq!(w.len(), 6);
+        assert_eq!(w[0].target, WaitingTarget::Call { session: "parent".into(), call: "a1".into(), seq: Some(1) });
+        assert_eq!(w[1].target, WaitingTarget::Call { session: "parent".into(), call: "q1".into(), seq: Some(2) });
+        assert_eq!(w[2].target, WaitingTarget::Decision(3));
+        assert_eq!(w[3].target, WaitingTarget::Decision(4));
+        assert_eq!(w[4].target, WaitingTarget::Call { session: "nested".into(), call: "a3".into(), seq: None });
+        assert!(w[5].what.contains("Nested agent"));
+        // Answered cards don't survive just because their old log is loaded.
+        assert!(waiting_on_you("parent", &evs, &[]).is_empty());
+        // An approval outside the event window still has an answerable target.
         assert_eq!(
-            w.iter().map(|w| (w.seq, w.what.as_str())).collect::<Vec<_>>(),
-            [(1, "approval: cargo publish"), (2, "question: Which branch?")]
+            waiting_on_you("parent", &[], &items)[0].target,
+            WaitingTarget::Call { session: "parent".into(), call: "a1".into(), seq: None }
         );
-        assert!(w[0].approval && !w[1].approval);
     }
 
     /// Text streamed for a turn the log says ended is already in its

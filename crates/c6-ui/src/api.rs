@@ -1421,6 +1421,10 @@ pub async fn session_decisions(id: String) -> Result<Vec<c6_api::Decision>, Stri
     json(Request::get(&format!("/api/v1/sessions/{id}/decisions")).send().await).await
 }
 
+pub async fn session_waiting(id: String) -> Result<Vec<c6_api::AttentionItem>, String> {
+    json(Request::get(&format!("/api/v1/sessions/{id}/waiting")).send().await).await
+}
+
 pub async fn decision_count() -> Result<i64, String> {
     let v: serde_json::Value = json(Request::get("/api/v1/decisions/count").send().await).await?;
     Ok(v["open"].as_i64().unwrap_or(0))

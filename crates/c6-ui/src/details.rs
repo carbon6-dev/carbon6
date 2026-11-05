@@ -236,19 +236,19 @@ pub fn Glance(chrome: SessionChrome, #[prop(optional, into)] on_done: Option<Cal
         })
     };
 
-    // What waits on you (an approval, a question), each going to its card.
+    // Everything that waits on you here, each going where it is answered.
     let waiting = move || {
         let list = chrome.waiting.get();
         (!list.is_empty()).then(|| {
             view! {
                 <div class=HEADING>"Waiting on you"</div>
                 {list.into_iter().map(|w| {
-                    let seq = w.seq;
+                    let what = w.what.clone();
                     view! {
                         <button class=format!("{LINE} {ACTS}") title="Go to it in the transcript"
-                            on:click=move |_| { chrome.go_waiting(seq); done(); }>
+                            on:click=move |_| { chrome.go_waiting(w.clone()); done(); }>
                             <span class="size-1.5 shrink-0 self-center rounded-full bg-amber-500"></span>
-                            <span class="line-clamp-2 min-w-0 flex-1 text-amber-800 [overflow-wrap:anywhere] dark:text-amber-300">{w.what.clone()}</span>
+                            <span class="line-clamp-2 min-w-0 flex-1 text-amber-800 [overflow-wrap:anywhere] dark:text-amber-300">{what}</span>
                         </button>
                     }
                 }).collect_view()}
