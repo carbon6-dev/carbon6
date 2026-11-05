@@ -240,6 +240,9 @@ pub(crate) enum ActorMsg {
 /// the hour allows, or for your next message.
 const AUTO_TURNS_PER_HOUR: usize = c6_api::DEFAULT_AUTO_TURNS_PER_HOUR as usize;
 const HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
+/// Only recently active sessions re-arm held notices at worker startup:
+/// don't scan dormant logs or wake days-old conversations on upgrade.
+const NOTICE_RECOVERY_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// Why a rewind may not go back past a handoff (the head says the same).
 const HANDOFF_REWIND: &str = "can only rewind to a message after the last switch between Claude Code and carbon6's agent: \
@@ -392,8 +395,9 @@ impl SessionManager {
         }
         // An idle session with only held notices has no open task to load
         // it above. Restore its actor too, so its hourly timer is armed
-        // without waiting for another command from the head.
-        for session_id in self.journal.session_ids().await? {
+        // without waiting for another command from the head. Only scan
+        // recently active sessions; dormant notices wait for explicit use.
+        for session_id in self.journal.recent_session_ids(c6_core::now_ms() - NOTICE_RECOVERY_WINDOW_MS).await? {
             let events = self.journal.events_after(&session_id, 0, u32::MAX).await?;
             if notices_of(&events).2.iter().any(|(_, wake)| *wake)
                 && let Err(e) = self.actor(&session_id).await
@@ -4377,6 +4381,33 @@ mod notice_tests {
         assert!(mock.requests().is_empty(), "restart must not reset the limit");
         mock.push(c6_testkit::Reply::Text("Saw them after restart.".into()));
         tokio::time::advance(HOUR).await;
+        delivered(&manager, &mock).await;
+    }
+
+    #[tokio::test]
+    async fn recovery_leaves_old_held_notices_for_explicit_input() {
+        let (dir, manager, mock) = at_limit().await;
+        seed_held(&manager).await;
+        // The log's events are recent: it is last_activity, not event
+        // timestamps, that bounds the SQL scan at startup.
+        let db = sqlx::SqlitePool::connect(&format!("sqlite:{}", dir.path().join("journal.db").display())).await.unwrap();
+        sqlx::query("UPDATE sessions SET last_activity = ? WHERE id = 'held'")
+            .bind(c6_core::now_ms() - NOTICE_RECOVERY_WINDOW_MS - 1000)
+            .execute(&db)
+            .await
+            .unwrap();
+        db.close().await;
+        let _clock = pause_clock();
+        manager.recover().await.unwrap();
+        assert!(manager.active().is_empty(), "startup must not restore an old session's actor");
+        tokio::time::advance(HOUR).await;
+        let events = manager.journal.events_after("held", 0, u32::MAX).await.unwrap();
+        assert_eq!(notices_of(&events).2.len(), 2, "old held notices remain pending");
+        assert!(mock.requests().is_empty(), "old notices must not cause an upgrade burst");
+
+        // Deliver now still loads the actor and delivers the batch.
+        mock.push(c6_testkit::Reply::Text("Saw the old notices when asked.".into()));
+        manager.actor("held").await.unwrap().unwrap().send(ActorMsg::ReleaseNotices).unwrap();
         delivered(&manager, &mock).await;
     }
 
