@@ -366,8 +366,8 @@ pub(crate) fn rows(events: &[Event], waiting: Vec<CatchupItem>) -> Vec<CatchupRo
     }
     let shell: HashSet<&str> = calls.iter().filter(|c| command_of(c.name, &c.input).is_some()).map(|c| c.id).collect();
     for e in events {
-        // One that ran in the foreground ends with its call's result (a
-        // command of Claude Code's is mirrored as a subagent too: not one).
+        // One that ran in the foreground ends with its call's result. Older
+        // workers also mirrored Claude Code shell commands: not subagents.
         if let EventKind::SubagentSpawned { call_id, description, background_task_id, .. } = &e.kind
             && background_task_id.is_empty()
             && !shell.contains(call_id.as_str())
@@ -877,14 +877,14 @@ pub(crate) mod tests {
     }
 
     /// Claude Code's own tasks: a command in the foreground is a command
-    /// (not finished work, though the worker mirrors it as a subagent too),
+    /// (not finished work, even if an older worker mirrored it as a subagent),
     /// each task counts once, as it ended, and only agents are subagents.
     #[test]
     fn finished_is_background_work_each_once() {
         use serde_json::json;
         let bash = json!({"command": "cd /home/me/.local/state/c6w/worktrees/x && cargo test", "description": "Run the tests"});
         let evs = vec![
-            // A command in the foreground: started, mirrored, ended.
+            // An older worker's foreground command: started, mirrored, ended.
             ev(1, 1, reply(1, "", &[("c1", "Bash", bash)])),
             ev(2, 2, native("claude:fg", "local_bash", "Run the tests", "started", true)),
             ev(3, 3, spawned("c1", "Run the tests")),
