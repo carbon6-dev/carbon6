@@ -2540,9 +2540,11 @@ fn ColumnView(tile: u64, col: u64) -> impl IntoView {
             on:pointerdown=move |_| ws.set_active(tile, col)
         >
             // A pane has its own header only beside another; alone, the tile's bar names it.
-            {move || pos.get().is_some_and(|p| p.len == 2).then(|| view! {
+            // Keep it mounted when only focus/active changes on pointerdown,
+            // or its controls disappear before their click can arrive.
+            <Show when=move || pos.get().is_some_and(|p| p.len == 2)>
                 <ColumnHeader label pos=Signal::derive(move || pos.get()) view=Signal::derive(move || view.get()) />
-            })}
+            </Show>
             <div class="relative flex min-h-0 flex-1 flex-col">
                 {move || view.get().map(render_view)}
             </div>
@@ -2569,9 +2571,9 @@ fn ColumnHeader(label: Signal<String>, pos: Signal<Option<Pos>>, view: Signal<Op
             "flex h-7 shrink-0 items-center gap-1 border-b border-zinc-100 px-2 text-[11px] pointer-coarse:h-11 pointer-coarse:gap-0 dark:border-zinc-900 {}",
             if ctx.active.get() { "text-zinc-700 dark:text-zinc-300" } else { "text-muted" },
         )>
-            {move || pos.get().filter(|p| p.index == 1).map(|_| view! {
+            <Show when=move || pos.get().is_some_and(|p| p.index == 1)>
                 <button class=format!("{btn} md:hidden") title="Back to the list" aria-label="Back to the list" on:click=move |_| ws.show_list(ctx.tile)>{crate::icons::chevron_left()}</button>
-            })}
+            </Show>
             <span class="min-w-0 flex-1 truncate">{label}</span>
             {move || session().map(|id| view! {
                 <button class=btn title=move || if pinned() { "Unpin" } else { "Pin to the dock" } aria-label=move || if pinned() { "Unpin" } else { "Pin" }
@@ -2579,9 +2581,9 @@ fn ColumnHeader(label: Signal<String>, pos: Signal<Option<Pos>>, view: Signal<Op
                     {move || crate::icons::star(pinned())}
                 </button>
             })}
-            {move || pos.get().filter(|p| p.len == 2).map(|_| view! {
+            <Show when=move || pos.get().is_some_and(|p| p.len == 2)>
                 <button class=btn title="Close this pane" aria-label="Close this pane" on:click=move |_| ctx.close()>{crate::icons::x()}</button>
-            })}
+            </Show>
         </div>
     }
 }
