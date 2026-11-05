@@ -24,6 +24,7 @@ The current session carries on undisturbed, never waiting on a card.
   - `worktree: true` starts the task in a fresh git worktree, so it doesn't touch the current one. That's the default when this session uses one.
   - Returns the card's id.
 - **And its pair,** `task_withdraw {id, why}`: the agent withdraws a card that went stale, for example because it fixed the thing after all or the user asked for it in this session.
+  - If this session's card was already answered, the tool says what happened, for example `Task card #177 was already answered: Not now.` It still refuses unknown ids and cards proposed by another session.
 - **When to propose:** that guidance is an editable prompt, `session.task_cards` (Settings → Prompts), added to the session's instructions when the tool is on. Not tool text in code. The default says:
   - **propose:** dead code, stale docs, missing coverage, a confirmed TODO, a security issue noticed in passing;
   - **don't propose:** vague code-smell observations, trivial fixes better done now, low-confidence hunches, or anything the user asked for in this session;
@@ -60,6 +61,8 @@ The card is answered with "Start it" and names the new session ("working session
 
 The new session is on its own from there: nothing it does is reported back to the session that proposed the card. You see its result in the new session (linked from the card), and the `from:<session>` label ties the two together.
 
+The answer itself does reach the proposing agent, as quiet context for its next input: `You chose Start session on task card #177 "Remove the dead retry module".` This does not report the new session's progress or result.
+
 ### 4.1 The other answers
 
 - **Do it here** sends the card's prompt to the session that proposed it, as a message from you ("Do the task you proposed here … (task card #N: title)"). If the session is in a turn, the message waits for it, as yours do.
@@ -67,6 +70,18 @@ The new session is on its own from there: nothing it does is reported back to th
 - **Save elsewhere… → New work** makes a work item titled like the card, with that one to-do.
 - **Save elsewhere… → an existing work item** files the same to-do, with its prompt and origin, into the chosen open work item, without moving the proposing session.
 - **Starting it later:** ▶ Start on the to-do opens the new-session form where the proposing session worked, with the card's prompt (by `work.todo`). The session joins the work and can tick the to-do off.
+
+Start session, the Save answers (including Save for later's new-work fallback), and Not now also tell the proposing agent what you chose. The one-line notes are:
+
+- `You chose Start session on task card #177 "Remove the dead retry module".`
+- `You saved task card #177 "Remove the dead retry module" as a to-do on "Cleanup".`
+- `You chose Not now on task card #177 "Remove the dead retry module".`
+
+The Save note names the actual destination work. Titles are quoted and newlines escaped, so the note stays one line. Do it here already sends the task as your message and gets no extra note. A failed answer sends no note.
+
+These notes never start or interrupt a turn, change the session's status, or add a queued-input count or held-notice pill. Even during a busy turn, they wait for the next input rather than joining that turn. Delivery uses the head's existing durable command queue (`SessionCommand.quiet_note`) and the worker's journaled `NoticeQueued` / deferred-notice machinery, marked `quiet` and non-waking. The command survives a head restart while the worker is offline; the journaled note survives a worker reload and is delivered once with the next input. No schema migration is needed. Only workers advertising `quiet_notes` receive this additive, optional command. An older worker silently skips the note (the head logs at debug), including one queued while it was offline; there is no waking fallback. `queue_ops` alone only promises queued-input editing/cancellation, not quiet-note support.
+
+If the worker has trimmed the session, restoration preserves the quiet command instead of turning it into an ordinary message. A worker that rejects a note leaves it pending for reconnection, without marking the session failed or immediately retrying in a loop.
 
 ## 5. Not doing
 
@@ -85,4 +100,7 @@ The new session is on its own from there: nothing it does is reported back to th
    - Start it creates the session with the card's prompt, worker, folder and realm;
    - withdraw settles the card;
    - a duplicate title raises the same card;
+   - each non-waking answer reaches the next input, without a new turn, status change, queue count or held-notice pill;
+   - busy and offline delivery, head/worker restarts, journal trimming/restoration, rejected notes and older workers preserve quietness;
+   - withdrawing an answered card reports the answer without exposing another session's cards;
    - a subagent doesn't get the tool.

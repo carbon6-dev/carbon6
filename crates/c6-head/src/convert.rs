@@ -173,6 +173,7 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
         // Shown in the queue (as with the agent), not the transcript.
         Kind::InputDelivered(_) => return None,
         // Shown when a turn takes it; until then, it waits.
+        Kind::NoticeQueued(n) if n.quiet => return None,
         Kind::NoticeQueued(n) => api::EventKind::NoticeQueued {
             command_id: n.command_id.clone(),
             text: n.text.clone(),
