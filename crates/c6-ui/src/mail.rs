@@ -442,7 +442,7 @@ pub(crate) fn Thread(
     view! {
         <section class="space-y-3">
             <div class="flex flex-wrap items-center gap-1 text-sm">
-                {(!embedded).then(|| view! { <button class=BUTTON_QUIET on:click=move |_| open.set(None)>"Back"</button> })}
+                {(!embedded).then(|| view! { <button class=BUTTON_QUIET on:click=move |_| open.set(None)>{crate::icons::arrow_left()}" Back"</button> })}
                 <span class="flex-1"></span>
                 <button class=BUTTON_QUIET on:click=move |_| modify(vec![], vec!["INBOX"], true)>"Archive"</button>
                 <button class=BUTTON_QUIET on:click=move |_| modify(vec!["INBOX"], vec![], false)>"Move to inbox"</button>

@@ -773,13 +773,13 @@ fn ConversationPane(place: Place, at: Option<String>) -> impl IntoView {
                     </button>
                     {(c["muted"] == true).then(|| view! { <span class="rounded bg-zinc-200 px-1 text-[10px] text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400">"muted"</span> })}
                     <span class="min-w-0 flex-1 truncate text-xs text-muted" title=c["topic"].as_str().unwrap_or("").to_owned()>{c["topic"].as_str().unwrap_or("").to_owned()}</span>
-                    {c["members"].as_i64().map(|n| view! { <span class="text-xs text-muted" title="Members">{format!("{n} members")}</span> })}
+                    {c["members"].as_i64().map(|n| view! { <span class="text-xs text-muted" title="Members">{crate::icons::user()}" "{n}</span> })}
                     {c["user_status"].as_str().filter(|s| !s.is_empty()).map(|s| view! { <span class="text-xs text-muted">{text::status(s)}</span> })}
                 }
             })}
             <span class="flex-1"></span>
             <button class=move || format!("rounded px-2 py-0.5 text-xs {}", if chat.details.get() { "bg-zinc-200 dark:bg-zinc-800" } else { "text-muted hover:bg-zinc-100 dark:hover:bg-zinc-800" })
-                title="Details" on:click=move |_| { chat.thread.set(None); chat.details.update(|d| *d = !*d); }>"Details"</button>
+                title="Details" on:click=move |_| { chat.thread.set(None); chat.details.update(|d| *d = !*d); }>{crate::icons::info()}" Details"</button>
         </header>
         <MessageList place=place.clone() at />
         <Composer place thread_ts=None />

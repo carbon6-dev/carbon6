@@ -699,7 +699,9 @@ fn grouped(
                         <span class="min-w-0 truncate">{name}</span>
                         <span class="ml-auto shrink-0 tabular-nums">{count}</span>
                         {(running > 0).then(|| view! {
-                            <span class="shrink-0 text-blue-600 dark:text-blue-400">{if compact { format!("· {running} running") } else { format!("{running} running") }}</span>
+                            <span class="shrink-0 text-blue-600 dark:text-blue-400">{if compact {
+                                view! { {format!("· {running}")}{crate::icons::play()} }.into_any()
+                            } else { format!("{running} running").into_any() }}</span>
                         })}
                     </button>
                     <div class=body class:hidden=move || is_folded.get()>

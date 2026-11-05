@@ -129,6 +129,7 @@ pub fn NotifyToggle() -> impl IntoView {
     };
     view! {
         <button class="hidden text-xs text-muted hover:text-zinc-900 md:inline dark:hover:text-zinc-100" title=title disabled=!available on:click=click>
+            {move || if state.get() { crate::icons::bell().into_any() } else { crate::icons::bell_off().into_any() }}" "
             {move || match (state.get(), filter.with(Vec::is_empty)) {
                 (true, true) => "Notifications on",
                 (true, false) => "Notifications filtered",
@@ -162,6 +163,7 @@ mod tests {
             provide_context(crate::labels::LabelFilter(RwSignal::new(Vec::new())));
             let html = view! { <NotifyToggle /> }.to_html();
             assert!(html.contains("Notifications off"), "{html}");
+            assert!(html.contains("<svg"), "keep the notification bell: {html}");
             assert!(html.contains("disabled"), "{html}");
             assert!(html.contains("Browser notifications are not available here"), "{html}");
         });

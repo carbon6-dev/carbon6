@@ -289,7 +289,7 @@ pub fn CatchupBody(
                             }>"Jump to it"</button>
                         <span class="flex-1"></span>
                         <button class=crate::util::BUTTON title="Mark it all seen and put the card away"
-                            on:click=move |_| { caught_up(ws, id.get_value()); done() }>"Caught up"</button>
+                            on:click=move |_| { caught_up(ws, id.get_value()); done() }>"Caught up "{crate::icons::check()}</button>
                     </div>
                 </div>
             }

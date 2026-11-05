@@ -63,12 +63,16 @@ SQLite contention regressions use a real temporary WAL database and simultaneous
 ## App-owned icons: native UI regression
 
 `cargo test -p c6-ui` renders representative session notices, memory events,
-published outputs, file attachments, approvals, questions and secret cards. Their
+published outputs, file attachments, approvals, questions and secret cards, plus
+task/subagent states, document chips and mentions, and explorer diagram labels. Their
 fixture content is plain text, so emoji or symbol-icons in the resulting markup
 are a regression in the app, not a restriction on user content. A source guard
 also scans app-owned Rust, HTML and JS (excluding test modules and comments).
-Intentional typography and keyboard/prose directions are allowed; trailing
-decorative action arrows are not. Slack's emoji table and vendored terminal
+Use drawn SVG icons instead of emoji; don't drop icons or replace them with
+words alone. Rendered-markup regressions assert that restored icons produce
+`<svg>` elements, not just that glyphs are absent. Keep trailing action arrows
+as drawn SVGs too, in their original position beside the original label.
+Intentional typography and keyboard/prose directions are allowed. Slack's emoji table and vendored terminal
 Unicode data remain content, not app icons.
 
 After building with `env -u NO_COLOR make ui`, check arbitrary Tailwind utilities
@@ -94,7 +98,7 @@ The `c6-ui` workspace unit tests cover input direction and stop/resume decisions
 
 1. Open it normally: it starts at the bottom and follows new text. While there, roll the wheel up one notch (also try a tiny trackpad movement). It must stay up as tokens arrive or the window resizes, even if less than 120px from the end. Repeat during a smooth glide.
 2. Focus the transcript and try Up, Page Up, Home and Shift+Space. Each stops following immediately. Down/Page Down/End and scrolling down resume only at the very bottom (less than 4px); being merely near the bottom does not resume. Check the scrollbar too.
-3. Scroll more than a screen away, click **Latest** (or its new-event count), and confirm that streaming follows again. Fold/show the tile while following, and while just a few pixels above the bottom with following off; each keeps its prior choice and position.
+3. Scroll more than a screen away, click **Latest** with its drawn down-arrow (or its new-event count), and confirm that streaming follows again. Fold/show the tile while following, and while just a few pixels above the bottom with following off; each keeps its prior choice and position.
 4. Open a search hit near the end. Its anchor must stay put through streaming and resize, not start following because it is near the end. Click Latest to resume.
 5. On a phone, tap without dragging: following stays on. Drag toward older content by a small distance: it stops immediately and stays off through touch inertia. Drag back to the bottom or use Latest: it resumes. Try reversing direction within one gesture.
 6. Check that horizontal scrolling and typing/navigation in text fields do not change transcript following. With reduced motion enabled, repeat the small upward scroll and Latest checks.

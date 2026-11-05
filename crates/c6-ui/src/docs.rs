@@ -156,8 +156,9 @@ fn chips_html(text: &str, attrs: &Value, refs: &std::collections::HashMap<String
         const CHIP: &str = "mx-0.5 rounded px-1 py-px text-[0.92em]";
         let html = match v["type"].as_str().unwrap_or("") {
             "date" => format!(
-                "<button type=\"button\" data-chip=\"{}\" title=\"A date: click to change it\" class=\"{CHIP} bg-sky-50 text-sky-800 hover:bg-sky-100 dark:bg-sky-950/40 dark:text-sky-300\">Date: {}</button>",
+                "<button type=\"button\" data-chip=\"{}\" title=\"A date: click to change it\" class=\"{CHIP} bg-sky-50 text-sky-800 hover:bg-sky-100 dark:bg-sky-950/40 dark:text-sky-300\">{} {}</button>",
                 esc(key),
+                crate::icons::calendar().to_html(),
                 esc(&s("value"))
             ),
             "mention" => format!(
@@ -165,9 +166,10 @@ fn chips_html(text: &str, attrs: &Value, refs: &std::collections::HashMap<String
                 esc(&if s("name").is_empty() { s("user") } else { s("name") })
             ),
             "dropdown" => format!(
-                "<button type=\"button\" data-chip=\"{}\" title=\"Pick another\" class=\"{CHIP} bg-zinc-100 text-zinc-800 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-200\">{}</button>",
+                "<button type=\"button\" data-chip=\"{}\" title=\"Pick another\" class=\"{CHIP} bg-zinc-100 text-zinc-800 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-200\">{} {}</button>",
                 esc(key),
-                esc(&s("value"))
+                esc(&s("value")),
+                crate::icons::chevron_down().to_html()
             ),
             "ref" => {
                 let r = s("ref");
@@ -178,9 +180,10 @@ fn chips_html(text: &str, attrs: &Value, refs: &std::collections::HashMap<String
                     .unwrap_or_else(|| if s("title").is_empty() { r.clone() } else { s("title") });
                 let state = live.map(|l| l.state.clone()).unwrap_or_default();
                 format!(
-                    "<button type=\"button\" data-ref=\"{}\" title=\"{}\" class=\"{CHIP} bg-emerald-50 text-emerald-800 hover:underline dark:bg-emerald-950/40 dark:text-emerald-300\">{}{}</button>",
+                    "<button type=\"button\" data-ref=\"{}\" title=\"{}\" class=\"{CHIP} bg-emerald-50 text-emerald-800 hover:underline dark:bg-emerald-950/40 dark:text-emerald-300\">{} {}{}</button>",
                     esc(&r),
                     esc(&r),
+                    crate::icons::arrow_up_right().to_html(),
                     esc(&title),
                     if state.is_empty() {
                         String::new()
@@ -368,6 +371,17 @@ fn Expandable(src: String, name: String, fill: bool, new_tab: Option<String>, ch
     }
 }
 
+/// A file embed's drawn paperclip, original name and size.
+fn file_embed(href: String, name: String, size: Option<u64>) -> impl IntoView {
+    view! {
+        <a href=href class="my-1 inline-flex items-center gap-2 rounded border border-zinc-200 px-2 py-1 text-sm text-sky-700 hover:bg-zinc-50 dark:border-zinc-800 dark:text-sky-400 dark:hover:bg-zinc-900"
+            on:click=|ev| ev.stop_propagation()>
+            {crate::icons::paperclip()} {name}
+            <span class="text-xs text-muted">{size.map(|n| format!("{} KB", n.div_ceil(1024))).unwrap_or_default()}</span>
+        </a>
+    }
+}
+
 /// An embed (docs/docs.md §3): a picture, a file, a diagram, a chart drawn
 /// from its rows, or a live view of the realm.
 #[component]
@@ -388,13 +402,7 @@ fn Embed(v: Value) -> impl IntoView {
                 </figure>
             }.into_any()
         }
-        "file" => view! {
-            <a href=file_url(&s("blob")) class="my-1 inline-flex items-center gap-2 rounded border border-zinc-200 px-2 py-1 text-sm text-sky-700 hover:bg-zinc-50 dark:border-zinc-800 dark:text-sky-400 dark:hover:bg-zinc-900"
-                on:click=|ev| ev.stop_propagation()>
-                "File: " {s("name")}
-                <span class="text-xs text-muted">{v["size"].as_u64().map(|n| format!("{} KB", n.div_ceil(1024))).unwrap_or_default()}</span>
-            </a>
-        }.into_any(),
+        "file" => file_embed(file_url(&s("blob")), s("name"), v["size"].as_u64()).into_any(),
         // An agent's SVG, drawn as a picture: it can't run or restyle the page.
         "diagram" => {
             let svg = s("svg");
@@ -694,7 +702,7 @@ pub fn DocsPage() -> impl IntoView {
                                     {(d.pending > 0).then(|| view! {
                                         <span class="shrink-0 rounded bg-violet-100 px-1.5 text-[11px] text-violet-800 dark:bg-violet-900/40 dark:text-violet-300"
                                             title=format!("Still being written by {}", d.writers.iter().map(|w| author_named(w)).collect::<Vec<_>>().join(", "))>
-                                            {format!("{} to write", d.pending)}
+                                            {crate::icons::pencil()}" "{format!("{} to write", d.pending)}
                                         </span>
                                     })}
                                     {d.labels.iter().map(|l| view! { <span class="shrink-0 text-[11px] text-muted">{format!("#{l}")}</span> }).collect_view()}
@@ -1286,17 +1294,17 @@ pub fn DocPage(id: String) -> impl IntoView {
                     <button data-opens="comments" class=move || format!("{BAR} {}", if panel.get() { "bg-zinc-100 dark:bg-zinc-800" } else { "" })
                         title=move || if panel.get() { "Hide the comments" } else { "Show the comments" }
                         on:click=move |_| panel.update(|p| *p = !*p)>
-                        {move || match open_n.get() { 0 => "Comments".to_owned(), n => format!("Comments: {n} open") }}
+                        {crate::icons::message()}" "{move || match open_n.get() { 0 => "Comments".to_owned(), n => format!("{n} open") }}
                     </button>
                     // A comment on the whole doc, wherever you've scrolled to.
                     <button data-opens="comments" class=BAR title="Comment on the whole doc"
                         on:click=move |_| { panel.set(true); threads.focus.set(Some(String::new())); threads.commenting.set(Some(String::new())); }>"+ Comment"</button>
-                    {move || (unsent.get() > 0).then(|| send_all_button(threads))}
+                    {move || (unsent.get() > 0).then(|| send_all_button(threads, true))}
                     {move || (!is_deck.get()).then(|| view! {
                         <button class=move || format!("{BAR} {}", if edit_all.get() { "bg-zinc-100 font-medium dark:bg-zinc-800" } else { "" })
                             title=move || if edit_all.get() { "Back to reading" } else { "Edit the doc: a click on a block opens it in Markdown" }
                             on:click=toggle_edit>
-                            {move || if edit_all.get() { "Done" } else { "Edit" }}
+                            {move || if edit_all.get() { view! { "Done" }.into_any() } else { view! { {crate::icons::pencil()}" Edit" }.into_any() }}
                         </button>
                     })}
                     <UsedIn items=used />
@@ -1321,7 +1329,7 @@ pub fn DocPage(id: String) -> impl IntoView {
                 </p>
                 {move || summary.with(|s| (s.pending > 0).then(|| view! {
                     <p class="text-sm text-violet-700 dark:text-violet-300">
-                        {format!("Being written by {}: {} {} to go", s.writers.iter().map(|w| author_named(w)).collect::<Vec<_>>().join(", "), s.pending, if s.pending == 1 { "part" } else { "parts" })}
+                        {crate::icons::pencil()}" "{format!("Being written by {}: {} {} to go", s.writers.iter().map(|w| author_named(w)).collect::<Vec<_>>().join(", "), s.pending, if s.pending == 1 { "part" } else { "parts" })}
                     </p>
                 }))}
             </header>
@@ -1436,12 +1444,12 @@ pub fn DocPage(id: String) -> impl IntoView {
 
 /// "Send N to agent": your open comments not sent yet go, each thread to
 /// its session.
-fn send_all_button(ctx: ThreadsCtx) -> impl IntoView {
+fn send_all_button(ctx: ThreadsCtx, arrow: bool) -> impl IntoView {
     view! {
         <button class="shrink-0 rounded-md bg-sky-600 px-2 py-1 text-xs font-medium text-white hover:bg-sky-700 disabled:opacity-50"
             title="Your open comments that haven't gone to an agent: each thread goes to its session, which answers in it"
             disabled=move || ctx.sending.get() on:click=move |_| ctx.send_all.run(())>
-            {move || format!("Send {} to agent", ctx.unsent.get())}
+            {move || format!("Send {} to agent", ctx.unsent.get())}{arrow.then(|| view! { " "{crate::icons::arrow_up()} })}
         </button>
     }
 }
@@ -1551,13 +1559,13 @@ fn CommentsPanel() -> impl IntoView {
             {move || new_on.get().map(|b| view! { <NewComment block=b done=Callback::new(move |()| ctx.commenting.set(None)) /> })}
             <For each=move || ids.get() key=|id| id.clone() children=move |id| view! { <Thread id about=true /> } />
             {move || ids.with(Vec::is_empty).then(|| view! {
-                <p class="text-muted">{if resolved.get() { "No resolved comments." } else { "No open comments. Press Comment by a block to start one." }}</p>
+                <p class="text-muted">{if resolved.get() { view! { "No resolved comments." }.into_any() } else { view! { "No open comments. Press "{crate::icons::message()}" by a block to start one." }.into_any() }}</p>
             })}
         </div>
         {move || (ctx.unsent.get() > 0).then(|| view! {
             <div class="flex shrink-0 items-center gap-2 border-t border-zinc-200 px-3 py-2 dark:border-zinc-800">
                 <span class="flex-1 text-xs text-muted">{move || format!("{} not sent yet", ctx.unsent.get())}</span>
-                {send_all_button(ctx)}
+                {send_all_button(ctx, false)}
             </div>
         })}
     }
@@ -1875,7 +1883,7 @@ fn Shown(b: DocBlock, kind: String) -> impl IntoView {
             let who = b.attrs["by"].as_str().map(author_named).unwrap_or_else(|| "an agent".into());
             view! {
                 <div class="rounded border border-dashed border-violet-300 px-3 py-2 text-sm text-violet-800 dark:border-violet-800 dark:text-violet-300">
-                    <span class="animate-pulse">"Writing: "</span>{b.attrs["intent"].as_str().unwrap_or("").to_owned()}
+                    <span class="animate-pulse">{crate::icons::pencil()}" "</span>{b.attrs["intent"].as_str().unwrap_or("").to_owned()}
                     <span class="text-xs text-violet-500">{format!(" — {who} is writing this")}</span>
                 </div>
             }
@@ -1918,6 +1926,7 @@ fn Shown(b: DocBlock, kind: String) -> impl IntoView {
 struct Subject {
     thumb: Option<String>,
     text: String,
+    file: bool,
     /// It's in the doc, to go to.
     here: bool,
 }
@@ -1926,14 +1935,14 @@ struct Subject {
 /// or diagram with its caption, "Whole tab"; once gone, what it said
 /// (`about`).
 fn subject(tabs: &[DocTab], block: &str, about: &str, doc: &str) -> Subject {
-    let words = |text: String| Subject { thumb: None, text, here: true };
+    let words = |text: String| Subject { thumb: None, text, file: false, here: true };
     if block.is_empty() {
-        return Subject { thumb: None, text: "Whole tab".into(), here: false };
+        return Subject { thumb: None, text: "Whole tab".into(), file: false, here: false };
     }
     let found =
         tabs.iter().flat_map(|t| &t.blocks).find_map(|b| if b.id == block { Some(b) } else { b.children.iter().find(|c| c.id == block) });
     let Some(b) = found else {
-        return Subject { thumb: None, text: first_line(about, &Value::Null), here: false };
+        return Subject { thumb: None, text: first_line(about, &Value::Null), file: false, here: false };
     };
     let v = &b.attrs;
     let s = |k: &str| v[k].as_str().unwrap_or("").to_owned();
@@ -1945,15 +1954,17 @@ fn subject(tabs: &[DocTab], block: &str, about: &str, doc: &str) -> Subject {
                 if s("caption").is_empty() { if s("alt").is_empty() { s("name") } else { s("alt") } } else { s("caption") },
                 "A picture",
             ),
+            file: false,
             here: true,
         },
         ("embed", "diagram") => Subject {
             thumb: Some(format!("data:image/svg+xml;base64,{}", base64_of(s("svg").as_bytes()))),
             text: either(s("title"), "A diagram"),
+            file: false,
             here: true,
         },
         ("embed", "chart") => words(either(s("title"), "A chart")),
-        ("embed", "file") => words(format!("File: {}", s("name"))),
+        ("embed", "file") => Subject { file: true, ..words(s("name")) },
         ("embed", "view") => words(format!("View · {}", s("view"))),
         ("slide", _) => {
             words(either(b.children.iter().map(|c| first_line(&c.text, &c.attrs)).find(|l| !l.is_empty()).unwrap_or_default(), "A slide"))
@@ -2065,7 +2076,7 @@ fn About(t: Memo<DocThread>) -> impl IntoView {
                 <img src=src alt="" class="h-8 w-8 shrink-0 rounded border border-zinc-200 bg-white object-contain dark:border-zinc-700" />
             })}
             <div class="min-w-0 flex-1">
-                <p class="line-clamp-2 break-words">{move || what.with(|w| w.text.clone())}</p>
+                <p class="line-clamp-2 break-words">{move || what.with(|w| w.file).then(crate::icons::paperclip)}" "{move || what.with(|w| w.text.clone())}</p>
                 {move || t.with(|t| t.anchor.quote.clone()).chars().next().is_some().then(|| view! {
                     <p class="truncate text-xs text-muted">{move || format!("“{}”", t.with(|t| t.anchor.quote.clone()))}</p>
                 })}
@@ -2871,6 +2882,32 @@ fn base64_of(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn document_chips_and_file_embeds_keep_their_drawn_icons() {
+        use super::*;
+        use serde_json::json;
+        let owner = Owner::new();
+        owner.with(|| {
+            for (kind, attrs, label, icon_first) in [
+                ("date", json!({"type": "date", "value": "2026-11-05"}), "2026-11-05", true),
+                ("dropdown", json!({"type": "dropdown", "value": "Ready"}), "Ready", false),
+                ("ref", json!({"type": "ref", "ref": "work:w1", "title": "The plan"}), "The plan", true),
+            ] {
+                let html = chips_html("<?c6 block chip?>", &json!({"chips": {"chip": attrs}}), &Default::default());
+                let svg = html.find("<svg").unwrap_or_else(|| panic!("{kind} lost its icon: {html}"));
+                let text = html.rfind(label).unwrap_or_else(|| panic!("{kind} lost its text: {html}"));
+                assert_eq!(svg < text, icon_first, "{kind} moved its icon: {html}");
+                crate::icons::tests::assert_no_icon_glyphs(&html);
+            }
+            let html = file_embed("/file".into(), "notes.txt".into(), Some(42)).to_html();
+            assert!(html.contains("href=\"/file\""), "keep the download link: {html}");
+            assert!(html.contains("<svg"), "file lost its paperclip: {html}");
+            assert!(html.contains("notes.txt"), "{html}");
+            crate::icons::tests::assert_no_icon_glyphs(&html);
+        });
+    }
+
     #[test]
     fn base64_as_the_head_reads_it() {
         assert_eq!(super::base64_of(b"Man"), "TWFu");

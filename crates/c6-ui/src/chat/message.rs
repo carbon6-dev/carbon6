@@ -228,7 +228,7 @@ pub(crate) fn MessageList(place: Place, at: Option<String>) -> impl IntoView {
                 }}
                 {move || jumped.get().is_some().then(|| view! {
                     <div class="sticky bottom-0 flex justify-center p-2">
-                        <button class="rounded-full bg-sky-700 px-3 py-1 text-xs text-white shadow" on:click=move |_| { jumped.set(None); older_done.set(false); }>"Jump to the newest"</button>
+                        <button class="rounded-full bg-sky-700 px-3 py-1 text-xs text-white shadow" on:click=move |_| { jumped.set(None); older_done.set(false); }>"Jump to the newest "{crate::icons::arrow_down()}</button>
                     </div>
                 })}
             </div>

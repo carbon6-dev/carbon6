@@ -589,7 +589,7 @@ pub fn Menu(items: Vec<(&'static str, Callback<()>)>, #[prop(optional)] row: boo
 pub fn OpenIn(link: c6_api::Link) -> impl IntoView {
     view! {
         <a class="inline-flex items-center rounded-md px-3 py-1.5 text-sm text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800"
-            href=link.url target="_blank" rel="noopener noreferrer">{format!("Open in {}", link.service)}</a>
+            href=link.url target="_blank" rel="noopener noreferrer">{format!("Open in {}", link.service)}" "{crate::icons::arrow_up_right()}</a>
     }
 }
 
