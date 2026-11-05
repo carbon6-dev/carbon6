@@ -15,6 +15,11 @@ An Ask conversation is a session the head runs (label `assistant`), in the realm
 - Opening Chat also opens your latest conversation beside the list, so it reads as "back to where I was".
 - **New chat** at the top of the list: the question, the model (an API or ChatGPT connection, or the assistant's default), and the switch for your mail, chat and calendar (§4). ✦ Ask (⌘J) still asks from anywhere with the page you're on as context; its conversations are the same ones and show in the list. (⌘K stays search.)
 - A conversation continues like any session: you write in its reply box, and its model can be changed there (Claude Code shows switched off, with why, when the head's machine has no `claude`).
+- Reply-box drafts keep their attachments with their text across reloads, using
+  the same browser-local, realm-scoped storage and 20 MB total draft-payload cap
+  as worker sessions (README, **Drafts survive a reload**). Older attachments may
+  be evicted; the box reports anything it couldn't keep. The initial Ask dialogs
+  do not accept uploads; this applies to an existing conversation's reply box.
 
 ## 2. Work on a machine: delegation that waits
 

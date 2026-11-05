@@ -1426,6 +1426,7 @@ fn SessionForm(
     let worktree =
         RwSignal::new(if seeded { seed.worktree && seed.ssh.is_none() } else { storage_get("c6.worktree").as_deref() == Some("1") });
     // A fresh form keeps what you typed until the session starts.
+    let saved_draft = !seeded && first_message.is_none();
     let prompt = match first_message {
         Some(m) => RwSignal::new(m),
         None if !seeded => crate::util::draft("new"),
@@ -1461,7 +1462,7 @@ fn SessionForm(
     let pending = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
     // Images and files for the first message: pasted, dropped or picked.
-    let attachments = RwSignal::new(Vec::<c6_api::AttachmentUpload>::new());
+    let (attachments, draft_note, draft_ready) = crate::util::draft_attachments(saved_draft.then_some("new"));
     let picker = NodeRef::<leptos::html::Input>::new();
     let conns = StoredValue::new(connections);
     // Effort only where the connection passes it on to the model.
@@ -1644,7 +1645,7 @@ fn SessionForm(
     };
 
     let submit = move || {
-        if pending.get_untracked() {
+        if pending.get_untracked() || !draft_ready.get_untracked() {
             return;
         }
         if let Some(t) = template.get_untracked() {
@@ -1719,7 +1720,9 @@ fn SessionForm(
                 // The new session takes the form's tile (Back returns to
                 // the form); from a popup, a tile of its own.
                 Ok(s) => {
-                    if !seeded {
+                    if saved_draft {
+                        // Clear storage, not signals: opening the session
+                        // disposes this form and its pending render effects.
                         crate::util::forget_draft("new");
                     }
                     if let Some(f) = on_session {
@@ -1842,6 +1845,8 @@ fn SessionForm(
                     crate::session::add_attachments(ev, attachments, error);
                 }
             }>
+            {move || (!draft_ready.get()).then(|| view! { <p class="px-2 pt-2 text-xs text-muted" role="status">"Restoring draft attachments…"</p> })}
+            {move || draft_note.get().map(|note| view! { <p class="px-2 pt-2 text-xs text-muted" role="status">{note}</p> })}
             {move || (!attachments.with(Vec::is_empty)).then(|| view! {
                 <div class="flex flex-wrap gap-2 px-2 pt-2">
                     {attachments.get().into_iter().enumerate().map(|(i, a)| {
@@ -1940,7 +1945,7 @@ fn SessionForm(
                 <span class="flex-1"></span>
                 {on_cancel.map(|c| view! { <button class=tool on:click=move |_| c.run(())>"Cancel"</button> })}
                 <button class=move || format!("{SEND} {SEND_SHAPE} {}", if ready() { SEND_READY } else { SEND_EMPTY })
-                    title=send_title aria-label=send_title prop:disabled=move || pending.get() on:click=move |_| submit()>
+                    title=send_title aria-label=send_title prop:disabled=move || pending.get() || !draft_ready.get() on:click=move |_| submit()>
                     {move || if pending.get() {
                         view! { <span class="h-2.5 w-2.5 animate-spin rounded-full border-2 border-current border-t-transparent"></span> }.into_any()
                     } else {
