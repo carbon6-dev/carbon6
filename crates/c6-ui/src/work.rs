@@ -92,16 +92,16 @@ fn moved(w: &WorkItem) -> i64 {
     w.live.iter().map(|l| l.at).max().unwrap_or(0).max(w.fields.moved_at)
 }
 
-/// The kind of thing a ref points at, as a mark.
+/// The kind of thing a ref points at, as a plain label.
 fn kind_mark(reference: &str) -> &'static str {
     match reference.split(':').next().unwrap_or("") {
-        "session" => "◆",
-        "request" => "✉",
-        "thread" => "✉",
-        "chat" => "💬",
-        "decision" => "?",
-        "doc" => "▤",
-        _ => "↗",
+        "session" => "Session",
+        "request" => "Request",
+        "thread" => "Mail",
+        "chat" => "Chat",
+        "decision" => "Decision",
+        "doc" => "Doc",
+        _ => "Link",
     }
 }
 
@@ -395,7 +395,7 @@ fn Row(w: WorkItem, index: usize, picked: RwSignal<usize>, open_item: Callback<(
                 })}
                 {(todos > 0).then(|| view! {
                     <span class="rounded bg-violet-100 px-1.5 text-[11px] text-violet-800 dark:bg-violet-950 dark:text-violet-300" title="To-dos done of all">
-                        {format!("☐ {}/{todos}", todos - left)}
+                        {format!("To-dos {}/{todos}", todos - left)}
                     </span>
                 })}
                 {w.live.iter().take(6).map(|l| view! {
@@ -794,7 +794,7 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
                                             Ok(()) => { let _ = set_timeout_with_handle(reload, std::time::Duration::from_secs(5)); }
                                             Err(e) => error.set(Some(e)),
                                         }
-                                    })>"↻"</button>
+                                    })>{crate::icons::rotate()}</button>
                             </div>
                             {match w.fields.note.clone() {
                                 Some(n) => view! {
@@ -806,7 +806,7 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
                                 }.into_any(),
                                 None => view! {
                                     <p class="text-sm text-muted">{if w.fields.attached.is_empty() && !w.fields.todos.is_empty() {
-                                        "Nothing started yet: ▶ Start a to-do below, or Pick up the whole work."
+                                        "Nothing started yet: Start a to-do below, or Pick up the whole work."
                                     } else if w.fields.attached.is_empty() {
                                         "Nothing belongs to it yet: start a session on it (Pick up), or attach something below."
                                     } else {
@@ -837,16 +837,16 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
                                         {t.by.strip_prefix("session:").filter(|_| !t.from.starts_with("decision:")).map(|s| view! {
                                             <Go to=View::session(s.to_owned()) class="shrink-0 text-[11px] text-muted hover:underline" title="An agent added it; this opens its session">"by an agent"</Go>
                                         })}
-                                        {ticked_by.map(|why| view! { <span class="shrink-0 text-[11px] text-emerald-700 dark:text-emerald-400" title=why>"✓ agent"</span> })}
+                                        {ticked_by.map(|why| view! { <span class="shrink-0 text-[11px] text-emerald-700 dark:text-emerald-400" title=why>"Done by agent"</span> })}
                                         {(!t.session.is_empty()).then(|| view! {
-                                            <Go to=View::session(t.session.clone()) class="shrink-0 text-xs text-sky-700 hover:underline dark:text-sky-400">"session ↗"</Go>
+                                            <Go to=View::session(t.session.clone()) class="shrink-0 text-xs text-sky-700 hover:underline dark:text-sky-400">"session"</Go>
                                         })}
                                         {(!done && open).then(|| view! {
                                             <button class=format!("{BUTTON_QUIET} shrink-0 text-xs") title="Start a session that does it"
-                                                on:click=move |_| start_todo(tid2.clone())>"▶ Start"</button>
+                                                on:click=move |_| start_todo(tid2.clone())>"Start"</button>
                                         })}
                                         <button class="shrink-0 text-xs text-muted hover:text-red-600" title="Take it off this work"
-                                            on:click=move |_| { let todo = tid3.clone(); spawn_local(async move { apply(api::work_todo_remove(id.get_value(), todo).await) }); }>"✕"</button>
+                                            on:click=move |_| { let todo = tid3.clone(); spawn_local(async move { apply(api::work_todo_remove(id.get_value(), todo).await) }); }>{crate::icons::x()}</button>
                                     </div>
                                 }
                             }).collect_view()}
@@ -878,7 +878,7 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
                                         {(by == "guess").then(|| view! { <span class="shrink-0 text-[11px] text-muted" title="An agent put it here; take it off if it doesn't belong">"guessed"</span> })}
                                         {(l.at > 0).then(|| view! { <span class="shrink-0 text-xs text-muted">{since(l.at)}</span> })}
                                         <button class="shrink-0 text-xs text-muted hover:text-red-600" title="Take it off this work"
-                                            on:click=move |_| { let r = r.clone(); spawn_local(async move { apply(api::work_detach(id.get_value(), r).await) }); }>"✕"</button>
+                                            on:click=move |_| { let r = r.clone(); spawn_local(async move { apply(api::work_detach(id.get_value(), r).await) }); }>{crate::icons::x()}</button>
                                     </div>
                                 }
                             }).collect_view()}
@@ -1134,7 +1134,7 @@ pub fn LeftOpen() -> impl IntoView {
                             <span class="shrink-0 rounded bg-rose-100 px-1.5 py-0.5 text-[11px] font-medium text-rose-800 dark:bg-rose-900/40 dark:text-rose-300">
                                 {c6_api::projects::state_label(&p.state)}
                             </span>
-                            <span class="min-w-0 flex-1 truncate">{format!("◇ {}", p.fields.title)}</span>
+                            <span class="min-w-0 flex-1 truncate">{format!("Project {}", p.fields.title)}</span>
                             <span class="hidden max-w-[50%] truncate text-xs text-muted sm:inline">{p.why.clone()}</span>
                         </Go>
                     }).collect_view()}

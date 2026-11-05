@@ -339,9 +339,9 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
             })}
             <div class="flex flex-wrap items-center gap-2 text-xs text-muted">
                 {(!in_session).then(|| view! { <span>{format!("from {}", d.source)}</span> })}
-                {session.filter(|_| !in_session).map(|s| view! { <Go to=View::session(s) class="text-sky-700 hover:underline dark:text-sky-400">"the session ↗"</Go> })}
+                {session.filter(|_| !in_session).map(|s| view! { <Go to=View::session(s) class="text-sky-700 hover:underline dark:text-sky-400">"the session"</Go> })}
                 {things.into_iter().map(|k| view! { <span class="rounded bg-violet-100 px-1 font-mono text-violet-800 dark:bg-violet-950 dark:text-violet-300">{k}</span> }).collect_view()}
-                {d.sessions.iter().map(|s| view! { <Go to=View::session(s.clone()) class="text-sky-700 hover:underline dark:text-sky-400">"working session ↗"</Go> }).collect_view()}
+                {d.sessions.iter().map(|s| view! { <Go to=View::session(s.clone()) class="text-sky-700 hover:underline dark:text-sky-400">"working session"</Go> }).collect_view()}
                 {deadline.map(|t| view! { <span class="text-amber-700 dark:text-amber-400">{t}</span> })}
             </div>
             {(!facts.is_empty()).then(|| view! { <FactList ids=facts on_change=refresh /> })}

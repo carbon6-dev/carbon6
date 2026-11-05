@@ -225,7 +225,7 @@ pub fn DeckView(
                 </select>
                 <span class="text-muted">{format!("{total} slides")}</span>
                 <span class="flex-1"></span>
-                <button class=BUTTON on:click=move |_| present(false)>"▶ Present"</button>
+                <button class=BUTTON on:click=move |_| present(false)>"Present"</button>
                 <button class=BUTTON_QUIET title="Notes, the next slide and a timer, in a window of its own" on:click=move |_| { present(true); present(false); }>"Presenter view"</button>
             </div>
             <div class="flex gap-3">
@@ -281,7 +281,7 @@ pub fn DeckView(
                             </div>
                             <div class="flex flex-wrap items-center gap-2 text-sm">
                                 <span class="text-muted">{format!("Slide {} of {total}", i + 1)}</span>
-                                {let c = s.id.clone(); view! { <button class=BUTTON_QUIET title="Comment on this slide" on:click=move |_| commenting.set(Some(c.clone()))>"💬"</button> }}
+                                {let c = s.id.clone(); view! { <button class=BUTTON_QUIET title="Comment on this slide" on:click=move |_| commenting.set(Some(c.clone()))>{crate::icons::message()}</button> }}
                                 {(!pending).then(|| view! {
                                     <select class=format!("{INPUT} w-auto!") title="Its layout" on:change=move |ev| {
                                         send.run(vec![replace_slide(&sid, Some(event_target_value(&ev)), None, None)]);
@@ -294,7 +294,7 @@ pub fn DeckView(
                                     </label>
                                     <button class=BUTTON_QUIET on:click=move |_| edit_slide()>"Edit slide"</button>
                                 })}
-                                {pending.then(|| view! { <span class="text-violet-700 dark:text-violet-300">{format!("✎ being written by {}", crate::docs::author(s.attrs["by"].as_str().unwrap_or("")))}</span> })}
+                                {pending.then(|| view! { <span class="text-violet-700 dark:text-violet-300">{format!("being written by {}", crate::docs::author(s.attrs["by"].as_str().unwrap_or("")))}</span> })}
                                 <span class="flex-1"></span>
                                 <button class="text-xs text-muted hover:text-red-600" title="Delete this slide"
                                     on:click=move |_| send.run(vec![DocOp::Delete { id: sid3.clone(), if_rev: Some(rev), if_hash: Some(hash.clone()) }])>"Delete slide"</button>
@@ -416,8 +416,8 @@ pub fn Present(id: String, presenter: bool) -> impl IntoView {
                                 <div class="c6deck space-y-2" data-deck=d.summary.id.clone()>
                                     <SlideBox html=current width=Signal::derive(move || width.get()) />
                                     <div class="flex items-center gap-3 text-sm text-muted">
-                                        <button class="rounded bg-zinc-800 px-3 py-1" on:click=move |_| go(-1)>"◀"</button>
-                                        <button class="rounded bg-zinc-800 px-3 py-1" on:click=move |_| go(1)>"▶"</button>
+                                        <button class="rounded bg-zinc-800 px-3 py-1" title="Previous slide" on:click=move |_| go(-1)>{crate::icons::chevron_left()}</button>
+                                        <button class="rounded bg-zinc-800 px-3 py-1" title="Next slide" on:click=move |_| go(1)>{crate::icons::chevron_right()}</button>
                                         <span>{format!("{} / {}", i + 1, list.len())}</span>
                                         <span class="font-mono">{move || { let s = (now.get() - started).max(0) / 1000; format!("{:02}:{:02}", s / 60, s % 60) }}</span>
                                     </div>
@@ -557,7 +557,7 @@ pub fn BringIn() -> impl IntoView {
                         Ok(v) => view! {
                             <ul class="space-y-0.5 text-sm">
                                 {v["made"].as_array().cloned().unwrap_or_default().into_iter().map(|m| view! {
-                                    <li>{format!("✓ {}", m["title"].as_str().unwrap_or(""))}</li>
+                                    <li>{format!("Done: {}", m["title"].as_str().unwrap_or(""))}</li>
                                 }).collect_view()}
                                 {v["skipped"].as_array().cloned().unwrap_or_default().into_iter().map(|m| view! {
                                     <li class="text-muted">{format!("– {}: {}", m["title"].as_str().unwrap_or(""), m["why"].as_str().unwrap_or(""))}</li>

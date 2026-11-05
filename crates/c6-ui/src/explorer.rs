@@ -20,25 +20,25 @@ fn when(at: Option<i64>) -> String {
 }
 
 /// A kind's mark and color.
-fn badge(kind: &str) -> (&'static str, &'static str) {
+fn badge(kind: &str) -> (AnyView, &'static str) {
     match kind {
-        "collection" => ("▦", "text-sky-600"),
-        "record" => ("▤", "text-sky-500"),
-        "series" => ("∿", "text-cyan-600"),
-        "thing" => ("◆", "text-violet-600"),
-        "item" => ("✉", "text-violet-500"),
-        "fact" => ("✓", "text-emerald-600"),
-        "session" => ("▶", "text-amber-600"),
-        "decision" => ("?", "text-rose-600"),
-        "trigger" => ("⚡", "text-orange-600"),
-        "grant" => ("⇄", "text-teal-600"),
-        "view" => ("◱", "text-indigo-600"),
-        "entry" => ("⚙", "text-muted"),
-        "secret" => ("🔒", "text-muted"),
-        "realm" => ("◎", "text-zinc-700"),
-        "template" => ("✎", "text-amber-700"),
-        "event" => ("◇", "text-muted"),
-        _ => ("•", "text-muted"),
+        "collection" => (crate::icons::folder().into_any(), "text-sky-600"),
+        "record" => (crate::icons::file().into_any(), "text-sky-500"),
+        "series" => (crate::icons::chart().into_any(), "text-cyan-600"),
+        "thing" => (crate::icons::diamond().into_any(), "text-violet-600"),
+        "item" => (crate::icons::mail().into_any(), "text-violet-500"),
+        "fact" => (crate::icons::check().into_any(), "text-emerald-600"),
+        "session" => (crate::icons::play().into_any(), "text-amber-600"),
+        "decision" => (view! { "?" }.into_any(), "text-rose-600"),
+        "trigger" => (crate::icons::zap().into_any(), "text-orange-600"),
+        "grant" => (crate::icons::arrows_left_right().into_any(), "text-teal-600"),
+        "view" => (crate::icons::maximize().into_any(), "text-indigo-600"),
+        "entry" => (crate::icons::square_terminal().into_any(), "text-muted"),
+        "secret" => (crate::icons::lock().into_any(), "text-muted"),
+        "realm" => (crate::icons::circle().into_any(), "text-zinc-700"),
+        "template" => (crate::icons::pencil().into_any(), "text-amber-700"),
+        "event" => (crate::icons::diamond().into_any(), "text-muted"),
+        _ => (crate::icons::circle().into_any(), "text-muted"),
     }
 }
 
@@ -146,7 +146,7 @@ pub fn RealmsMap() -> impl IntoView {
                                                             } else {
                                                                 let _ = window().location().set_href(&to);
                                                             }
-                                                        }>"Open ↗"</span>
+                                                        }>"Open"</span>
                                                 }
                                             })}
                                         </div>
@@ -290,7 +290,7 @@ fn Inventory(summary: RealmSummary, realm: String, section: String) -> impl Into
                             <span class="text-xs text-muted" title=tip>{count}</span>
                         };
                         match &e.link {
-                            Some(l) => view! { <Go to=View::from_path(l) class=class>{inner}<span class="text-xs text-muted">"↗"</span></Go> }.into_any(),
+                            Some(l) => view! { <Go to=View::from_path(l) class=class>{inner}<span class="text-xs text-muted">{crate::icons::square_arrow_out()}</span></Go> }.into_any(),
                             None => view! { <Ex to=explore(&realm, &e.section, "", "") class=class>{inner}</Ex> }.into_any(),
                         }
                     }).collect_view()}
@@ -448,7 +448,7 @@ fn Wiring(realm: String) -> impl IntoView {
                     }
                     targets.iter().position(|(k, n)| format!("{k}:{n}") == key).map(|i| (490.0, ypos(i)))
                 };
-                let label = |kind: &str, name: &str| format!("{} {name}", badge(kind).0);
+                let label = |kind: &str, name: &str| format!("{kind} {name}");
                 let node = |x: f64, y: f64, text: String, to: Option<View>| {
                     let t = view! { <text x=format!("{x:.0}") y=format!("{:.0}", y + 4.0) text-anchor="middle" class="fill-zinc-800 text-[11px] dark:fill-zinc-200">{text}</text> };
                     match to {
@@ -520,7 +520,7 @@ fn SearchResults(realm: String, q: String, selected: String) -> impl IntoView {
     view! {
         <div class="space-y-3">
             <div class="flex items-center gap-2">
-                <Ex to=explore(&realm, "", "", "") class="text-sm text-muted hover:underline lg:hidden">"← Overview"</Ex>
+                <Ex to=explore(&realm, "", "", "") class="text-sm text-muted hover:underline lg:hidden">"Overview"</Ex>
                 <h2 class="font-medium">{format!("“{q}”")}</h2>
             </div>
             {move || found.get().map(|r| match r {
@@ -558,7 +558,7 @@ fn SectionList(realm: String, section: String, selected: String) -> impl IntoVie
     view! {
         <div class="space-y-2">
             <div class="flex flex-wrap items-center gap-2">
-                <Ex to=explore(&realm, "", "", "") class="text-sm text-muted hover:underline lg:hidden">"← Overview"</Ex>
+                <Ex to=explore(&realm, "", "", "") class="text-sm text-muted hover:underline lg:hidden">"Overview"</Ex>
                 <h2 class="font-medium">{title}</h2>
                 {(what == "collection").then(|| view! { <Ex to=explore(&realm, &section, "collection", &arg) class="text-xs text-muted underline">"about this collection"</Ex> })}
                 <span class="flex-1"></span>
@@ -599,13 +599,13 @@ fn ObjectPane(realm: String, section: String, kind: String, id: String) -> impl 
                 view! {
                     <div class="space-y-3">
                         <div class="flex items-start gap-2">
-                            <Ex to=back.clone() class="text-sm text-muted hover:underline lg:hidden">"←"</Ex>
+                            <Ex to=back.clone() class="text-sm text-muted hover:underline lg:hidden" title="Back to the overview">{crate::icons::chevron_left()}</Ex>
                             <span class=format!("text-lg {color}")>{mark}</span>
                             <div class="min-w-0 flex-1">
                                 <h2 class="break-words font-medium">{o.title.clone()}</h2>
                                 <p class="text-xs text-muted">{format!("{} · {}", o.kind, o.sub)}</p>
                             </div>
-                            {o.open.clone().map(|p| view! { <Go to=View::from_path(&p) class="shrink-0 text-xs text-muted underline" title="Edit it where it lives">"Open ↗"</Go> })}
+                            {o.open.clone().map(|p| view! { <Go to=View::from_path(&p) class="shrink-0 text-xs text-muted underline" title="Edit it where it lives">"Open"</Go> })}
                         </div>
                         {(!o.fields.is_empty()).then(|| view! {
                             <dl class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-sm">
@@ -692,7 +692,7 @@ fn Neighborhood(realm: String, section: String, object: ExObject) -> impl IntoVi
                         }).collect_view()}
                         {refs.iter().enumerate().map(|(i, r)| {
                             let (x, y) = pos[i];
-                            let (mark, color) = badge(&r.kind);
+                            let (_, color) = badge(&r.kind);
                             let depth = nodes[i]["depth"].as_u64().unwrap_or(0);
                             let to = explore(&realm, &section, &r.kind, &r.id);
                             let size = match depth { 0 => "text-[12px] font-semibold", 1 => "text-[10px]", _ => "text-[9px] opacity-80" };
@@ -700,7 +700,7 @@ fn Neighborhood(realm: String, section: String, object: ExObject) -> impl IntoVi
                             view! {
                                 <a href=href on:click={ let nav = nav.clone(); move |ev: web_sys::MouseEvent| follow(ev, to.clone(), &nav) }>
                                     <text x=format!("{x:.0}") y=format!("{:.0}", y + 4.0) text-anchor="middle" class=format!("fill-current {color} {size}")>
-                                        {format!("{mark} {}", short(&r.title))}
+                                        {short(&r.title)}
                                         <title>{format!("{} {}: {}", r.kind, r.title, r.sub)}</title>
                                     </text>
                                 </a>

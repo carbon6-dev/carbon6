@@ -835,7 +835,7 @@ fn Apps() -> impl IntoView {
                             // Waiting on your answer: in the console's Decisions.
                             {matches!(i.state.as_str(), "installing" | "upgrading" | "removing").then(|| view! {
                                 <a rel="external" href="/admin/decisions" class="rounded bg-amber-100 px-1.5 text-xs text-amber-900 hover:underline dark:bg-amber-950 dark:text-amber-200">
-                                    {format!("Waiting for your answer{} →", i.decision.map(|d| format!(" (#{d})")).unwrap_or_default())}
+                                    {format!("Waiting for your answer{}", i.decision.map(|d| format!(" (#{d})")).unwrap_or_default())}
                                 </a>
                             })}
                             {(!i.problems.is_empty()).then(|| view! { <span class="w-full text-xs text-red-600">{i.problems.join("; ")}</span> })}
@@ -1242,7 +1242,7 @@ fn SessionImportsSetting() -> impl IntoView {
                     <div class="flex items-center gap-2">
                         <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="~/work" prop:value=r.folder.clone()
                             on:change=move |ev| { let f = event_target_value(&ev); s.update(|v| v.rules[i].folder = f); } />
-                        <span class="text-xs text-muted">"→"</span>
+                        <span class="text-xs text-muted">{crate::icons::chevron_right()}</span>
                         <input class=format!("{INPUT} w-32 py-1 font-mono text-xs") placeholder="work" prop:value=r.realm.clone()
                             on:change=move |ev| { let x = event_target_value(&ev); s.update(|v| v.rules[i].realm = x); } />
                         <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| s.update(|v| { v.rules.remove(i); })>"Remove"</button>
@@ -1304,7 +1304,7 @@ fn SuggestionsSetting() -> impl IntoView {
                 "Name sessions"<span class="text-muted">"a short name after the first turn"</span>
             </label>
             <h3 class="pt-2 text-sm font-medium">"New sessions start with"</h3>
-            <p class="text-sm text-muted">"Each session has its own switches in its ⋯ menu; these are what a new one starts with. Catch-up: when you come back to a session that did 5 steps or more (or waits on you), a card says what happened since you looked, counted, and in a paragraph from a small model (a routing rule with the label task:catchup picks it, else task:suggest's, else the session's own; the prompt is session.catchup). Fold finished turns: the transcript shows each finished turn as one row (who started it, what it did, its steps), opened in place by a click; what it did is written when you open its hour in the glance's timeline (task:timeline, else task:suggest; session.timeline)."</p>
+            <p class="text-sm text-muted">"Each session has its own switches in its menu; these are what a new one starts with. Catch-up: when you come back to a session that did 5 steps or more (or waits on you), a card says what happened since you looked, counted, and in a paragraph from a small model (a routing rule with the label task:catchup picks it, else task:suggest's, else the session's own; the prompt is session.catchup). Fold finished turns: the transcript shows each finished turn as one row (who started it, what it did, its steps), opened in place by a click; what it did is written when you open its hour in the glance's timeline (task:timeline, else task:suggest; session.timeline)."</p>
             <label class="flex items-center gap-2 text-sm">
                 <input type="checkbox" prop:checked=move || shown.with(|s| s.catchup)
                     on:change=move |ev| set(|s, on| s.catchup = on, event_target_checked(&ev)) />
@@ -1897,8 +1897,8 @@ fn ConnectionRow(
             <div class="min-w-0 flex-1">
                 <div class="font-medium">{c.name.clone()}</div>
                 {move || check.get().map(|r| match r {
-                    Ok(m) => view! { <div class="text-xs text-emerald-700 dark:text-emerald-400">{format!("✓ Connected · {} models", m.len())}</div> }.into_any(),
-                    Err(e) => view! { <div class="text-xs text-red-600">{format!("✕ {e}")}</div> }.into_any(),
+                    Ok(m) => view! { <div class="text-xs text-emerald-700 dark:text-emerald-400">{format!("Connected · {} models", m.len())}</div> }.into_any(),
+                    Err(e) => view! { <div class="text-xs text-red-600">{e}</div> }.into_any(),
                 })}
                 <div class="truncate font-mono text-xs text-muted">
                     {kind_label(&c.kind)} {(!matches!(c.kind.as_str(), "claude_code" | "pool")).then(|| format!(" · {}", c.base_url))}
@@ -2064,11 +2064,11 @@ fn AddConnection(all: Signal<Vec<Connection>>, on_added: impl Fn() + Copy + Send
             {move || tested.get().map(|r| match r {
                 Ok(models) => view! {
                     <p class="text-sm text-emerald-700 dark:text-emerald-400">
-                        {format!("✓ Connected · {} model{} available", models.len(), if models.len() == 1 { "" } else { "s" })}
+                        {format!("Connected · {} model{} available", models.len(), if models.len() == 1 { "" } else { "s" })}
                         {(!models.is_empty()).then(|| view! { <span class="text-muted">" (listed in the model field)"</span> })}
                     </p>
                 }.into_any(),
-                Err(e) => view! { <p class="text-sm text-red-600">{format!("✕ {e}")}</p> }.into_any(),
+                Err(e) => view! { <p class="text-sm text-red-600">{e}</p> }.into_any(),
             })}
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             <div class="flex justify-end gap-2">
@@ -2320,7 +2320,7 @@ fn WorkflowRunsPanel() -> impl IntoView {
                                                 title=tip>
                                                 {format!("{} · {}", s.id, s.status)}
                                                 {sessions.into_iter().map(|sid| view! {
-                                                    <button class="underline" title="Open the session" on:click=move |_| ws.open(None, crate::workspace::View::session(sid.clone()), crate::workspace::How::Beside)>"↗"</button>
+                                                    <button class="underline" title="Open the session" on:click=move |_| ws.open(None, crate::workspace::View::session(sid.clone()), crate::workspace::How::Beside)>{crate::icons::square_arrow_out()}</button>
                                                 }).collect_view()}
                                             </span>
                                             {waiting.then(|| view! {

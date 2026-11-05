@@ -221,7 +221,7 @@ pub(crate) fn ConvIcon(c: Value) -> impl IntoView {
             let n = c["channel_name"].as_str().unwrap_or("").split(", ").count();
             view! { <span class="flex h-4 w-4 shrink-0 items-center justify-center rounded bg-zinc-200 text-[9px] font-semibold dark:bg-zinc-800">{n.to_string()}</span> }.into_any()
         }
-        "private" => view! { <span class="w-4 shrink-0 text-center text-xs text-muted">"🔒"</span> }.into_any(),
+        "private" => view! { <span class="w-4 shrink-0 text-center text-xs text-muted">{crate::icons::lock()}</span> }.into_any(),
         _ => view! { <span class="w-4 shrink-0 text-center text-muted">"#"</span> }.into_any(),
     }
 }
@@ -493,7 +493,7 @@ fn Sidebar() -> impl IntoView {
                 .sum::<i64>()
         })
     };
-    let nav = move |label: &'static str, icon: &'static str, pane: Pane, count: Signal<i64>, strong: bool| {
+    let nav = move |label: &'static str, icon: AnyView, pane: Pane, count: Signal<i64>, strong: bool| {
         let (here, go) = (pane.clone(), pane);
         view! {
             <button class=move || format!("flex w-full items-center gap-2 rounded-md px-2 py-1 text-left {}",
@@ -528,10 +528,10 @@ fn Sidebar() -> impl IntoView {
             </div>
             <div class="min-h-0 flex-1 space-y-3 overflow-y-auto p-2">
                 <div class="space-y-0.5">
-                    {nav("Unreads", "≡", Pane::Unreads, Signal::derive(move || total("unread")), false)}
-                    {nav("Threads", "💬", Pane::Threads, Signal::derive(move || chat.threads_new.get() as i64), true)}
-                    {nav("Activity", "@", Pane::Activity, Signal::derive(move || total("mentions")), true)}
-                    {nav("Saved", "🔖", Pane::Saved, Signal::derive(|| 0), false)}
+                    {nav("Unreads", crate::icons::menu().into_any(), Pane::Unreads, Signal::derive(move || total("unread")), false)}
+                    {nav("Threads", crate::icons::message().into_any(), Pane::Threads, Signal::derive(move || chat.threads_new.get() as i64), true)}
+                    {nav("Activity", view! { "@" }.into_any(), Pane::Activity, Signal::derive(move || total("mentions")), true)}
+                    {nav("Saved", crate::icons::bookmark().into_any(), Pane::Saved, Signal::derive(|| 0), false)}
                 </div>
                 <input class="w-full rounded-md border border-zinc-200 bg-white px-2 py-1 text-xs dark:border-zinc-800 dark:bg-zinc-900" type="search"
                     placeholder="Filter conversations" prop:value=move || filter.get() on:input=move |ev| filter.set(event_target_value(&ev)) />
@@ -568,7 +568,7 @@ fn Section(name: String, list: Vec<Value>, prefs_tick: RwSignal<u32>) -> impl In
                     storage_set(&format!("c6.chat.fold.{n1}"), if folded { "0" } else { "1" });
                     prefs_tick.update(|t| *t += 1);
                 }>
-                    <span class="w-3">{if folded { "▸" } else { "▾" }}</span>{name.clone()}
+                    <span class="w-3">{if folded { crate::icons::chevron_right().into_any() } else { crate::icons::chevron_down().into_any() }}</span>{name.clone()}
                 </button>
                 <button class="hidden text-[10px] normal-case group-hover:inline hover:underline" title="Sort"
                     on:click=move |_| {
@@ -585,7 +585,7 @@ fn Section(name: String, list: Vec<Value>, prefs_tick: RwSignal<u32>) -> impl In
                                 }
                                 chat.act("memex.chat.sections", json!({"workspace": w, "names": names}));
                             }
-                        }>"✕"</button>
+                        }>{crate::icons::x()}</button>
                 })}
             </div>
             <div class="mt-0.5 space-y-px">
@@ -627,7 +627,7 @@ fn ConvRow(c: Value) -> impl IntoView {
             </button>
             <button class="absolute right-1 top-0.5 hidden rounded px-1 text-xs text-muted hover:bg-zinc-300 group-hover:block dark:hover:bg-zinc-700"
                 title="Options" aria-haspopup="menu" aria-expanded=move || menu.get().to_string() data-pop=pop.get_value()
-                on:click=move |_| menu.update(|m| *m = !*m)>"⋯"</button>
+                on:click=move |_| menu.update(|m| *m = !*m)>{crate::icons::ellipsis()}</button>
             {move || menu.get().then(|| view! { <div class="contents" data-pop=pop.get_value()><ConvMenu c=c.clone() close=menu /></div> })}
         </div>
     }
@@ -769,17 +769,17 @@ fn ConversationPane(place: Place, at: Option<String>) -> impl IntoView {
                 view! {
                     <button class="text-sm text-muted hover:text-amber-500" title=if starred { "Unstar" } else { "Star" }
                         on:click=move |_| chat.act("memex.chat.prefs", json!({"workspace": w, "channel": ch, "starred": !starred}))>
-                        {if starred { "★" } else { "☆" }}
+                        {if starred { crate::icons::star(true).into_any() } else { crate::icons::star(false).into_any() }}
                     </button>
                     {(c["muted"] == true).then(|| view! { <span class="rounded bg-zinc-200 px-1 text-[10px] text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400">"muted"</span> })}
                     <span class="min-w-0 flex-1 truncate text-xs text-muted" title=c["topic"].as_str().unwrap_or("").to_owned()>{c["topic"].as_str().unwrap_or("").to_owned()}</span>
-                    {c["members"].as_i64().map(|n| view! { <span class="text-xs text-muted" title="Members">{format!("👤 {n}")}</span> })}
+                    {c["members"].as_i64().map(|n| view! { <span class="text-xs text-muted" title="Members">{format!("{n} members")}</span> })}
                     {c["user_status"].as_str().filter(|s| !s.is_empty()).map(|s| view! { <span class="text-xs text-muted">{text::status(s)}</span> })}
                 }
             })}
             <span class="flex-1"></span>
             <button class=move || format!("rounded px-2 py-0.5 text-xs {}", if chat.details.get() { "bg-zinc-200 dark:bg-zinc-800" } else { "text-muted hover:bg-zinc-100 dark:hover:bg-zinc-800" })
-                title="Details" on:click=move |_| { chat.thread.set(None); chat.details.update(|d| *d = !*d); }>"ⓘ Details"</button>
+                title="Details" on:click=move |_| { chat.thread.set(None); chat.details.update(|d| *d = !*d); }>"Details"</button>
         </header>
         <MessageList place=place.clone() at />
         <Composer place thread_ts=None />
@@ -817,7 +817,7 @@ fn ThreadPane(place: Place, thread_ts: String) -> impl IntoView {
         <header class="flex items-center gap-2 border-b border-zinc-200 px-4 py-2 dark:border-zinc-800">
             <span class="font-semibold">"Thread"</span>
             <span class="flex-1 truncate text-xs text-muted">{name}</span>
-            <button class="text-xs text-muted hover:text-zinc-900 dark:hover:text-zinc-100" title="Close (Esc)" on:click=move |_| chat.thread.set(None)>"✕"</button>
+            <button class="text-xs text-muted hover:text-zinc-900 dark:hover:text-zinc-100" title="Close (Esc)" on:click=move |_| chat.thread.set(None)>{crate::icons::x()}</button>
         </header>
         <div class="min-h-0 flex-1 overflow-y-auto py-2">
             {move || messages.get().map(|r| match r {

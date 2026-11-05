@@ -33,7 +33,7 @@ pub fn ViewsMenu(class: &'static str) -> impl IntoView {
         (!vs.is_empty()).then(|| {
             view! {
                 <details node_ref=menu data-pop=pop.get_value() on:toggle=toggled class="relative shrink-0">
-                    <summary class=format!("{class} cursor-pointer list-none whitespace-nowrap")>"Views ▾"</summary>
+                    <summary class=format!("{class} cursor-pointer list-none whitespace-nowrap")>"Views "{crate::icons::chevron_down()}</summary>
                     <div class="absolute left-0 top-8 z-40 flex w-56 flex-col rounded-lg border border-zinc-200 bg-white p-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900" on:click=close>
                         {vs.into_iter().map(|v| {
                             let title = if v.title.is_empty() { v.name.clone() } else { v.title.clone() };
@@ -276,8 +276,8 @@ fn BoardView(view: ViewDef) -> impl IntoView {
                                                 <Go to=View::App { name: view.name.clone(), record: rec.id.clone() } class="font-medium hover:underline">{if title.is_empty() { "(open)".to_owned() } else { title }}</Go>
                                                 {details.into_iter().map(|d| view! { <p class="truncate text-xs text-muted">{d}</p> }).collect_view()}
                                                 <div class="flex flex-wrap items-center gap-1">
-                                                    {p.map(|to| { let t = to.clone(); view! { <button class=format!("{BUTTON_QUIET} text-xs") title=format!("Move to {t}") on:click=move |_| set(c1.clone(), r1.clone(), f1.clone(), to.clone())>"←"</button> } })}
-                                                    {n.map(|to| { let t = to.clone(); view! { <button class=format!("{BUTTON_QUIET} text-xs") title=format!("Move to {t}") on:click=move |_| set(c2.clone(), r2.clone(), f2.clone(), to.clone())>"→"</button> } })}
+                                                    {p.map(|to| { let t = to.clone(); view! { <button class=format!("{BUTTON_QUIET} text-xs") title=format!("Move to {t}") on:click=move |_| set(c1.clone(), r1.clone(), f1.clone(), to.clone())>{crate::icons::chevron_left()}</button> } })}
+                                                    {n.map(|to| { let t = to.clone(); view! { <button class=format!("{BUTTON_QUIET} text-xs") title=format!("Move to {t}") on:click=move |_| set(c2.clone(), r2.clone(), f2.clone(), to.clone())>{crate::icons::chevron_right()}</button> } })}
                                                     <Actions view=view.clone() record=rec.id.clone() tick error />
                                                 </div>
                                             </div>
@@ -321,10 +321,11 @@ fn RecordBody(view: ViewDef, id: String) -> impl IntoView {
             Err(e) => view! { <ErrorBox message=e /> }.into_any(),
             Ok((rec, history)) => {
                 let view = v.get_value();
+                let back_title = if view.title.is_empty() { view.name.clone() } else { view.title.clone() };
                 let fields: Vec<(String, String)> = rec.fields.as_object().map(|o| o.iter().map(|(k, v)| (k.clone(), text_of(Some(v)))).collect()).unwrap_or_default();
                 view! {
                     <div class="flex flex-wrap items-center gap-2">
-                        <Go to=View::App { name: view.name.clone(), record: String::new() } class="text-sm text-muted hover:underline">{format!("← {}", if view.title.is_empty() { view.name.clone() } else { view.title.clone() })}</Go>
+                        <Go to=View::App { name: view.name.clone(), record: String::new() } class="text-sm text-muted hover:underline">{back_title}</Go>
                         <span class="flex-1"></span>
                         <Actions view=view.clone() record=rec.id.clone() tick error />
                     </div>

@@ -16,6 +16,29 @@ Left to right: back and forward, the session's mark, its title (double-click to 
 - With another view beside the session in its tile (a doc), the bar speaks for that view; the session's icons and ⋯ are in a slim strip at the top of the session. A pane of its own beside it leaves the bar the session's.
 - **Gone:** the second bar and its tabs, the drawer, ⚙, the ◆ pill, the aspect marks (and the dimming of other tiles when pointing at one).
 
+## Icons throughout the app
+
+App-owned chrome uses the SVGs in `crates/c6-ui/src/icons.rs` or plain words,
+never emoji or Unicode pictograms (including checkmarks, crosses, stars and
+disclosure triangles). New icons follow the same 24-unit viewBox, rounded
+`currentColor` strokes and 16px size; compact wrappers constrain them to the
+surrounding text. Decorative SVGs are hidden from accessibility APIs; icon-only
+controls retain a title or accessible label.
+
+Notices use a drawn bell, files a drawn page, secrets a drawn key, and published
+outputs the existing package icon. Memory events, task/subagent states and
+already-labelled actions use words where a second mark adds nothing. Mail
+attachments share a file icon; the filename and type distinguish formats.
+Chat actions and document comments use drawn message, bookmark, link and
+reaction icons, not emoji. The same rule applies to explorer badges and menus.
+
+Keep intentional typography (`› ‹ … · ×`, quotes, dashes and list bullets),
+keyboard symbols and directions within prose (not trailing action arrows), and
+the worker/SSH relationship separator. Imported/user-authored emoji in messages, reactions, status text,
+documents and terminal output remain content, including Slack's emoji picker
+and the terminal vendor's Unicode-width data. The native UI tests render
+representative session cards and scan app-owned Rust/HTML/JS to guard this rule.
+
 ## 2. Panes
 
 Changes, Terminal, Files and Outputs are views of their own (`/sessions/{id}/changes`, `/terminal`, `/files`, `/outputs`), each with its name and the session's title. Clicking an icon opens its pane, or closes it if open; ⌘/Ctrl-click opens it in a new tile. Opened beside the session, the session stays and a list beside it goes back in the tile's history; the two share the tile evenly.

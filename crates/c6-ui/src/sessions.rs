@@ -282,17 +282,17 @@ fn ListMenus(choices: ListChoices) -> impl IntoView {
     let button = "inline-flex shrink-0 items-center gap-1 rounded-md border border-zinc-200 px-2.5 py-1.5 text-xs text-soft hover:bg-zinc-100 dark:border-zinc-800 dark:hover:bg-zinc-800";
     view! {
         <button class=button aria-haspopup="dialog" on:click=move |ev| show_at.set(Some(below(&ev, 320.0)))>
-            {move || choices.show_label()} <span class="text-muted">"▾"</span>
+            {move || choices.show_label()} <span class="text-muted">{crate::icons::chevron_down()}</span>
         </button>
         <button class=button aria-haspopup="dialog" on:click=move |ev| sort_at.set(Some(below(&ev, 224.0)))>
-            {move || format!("Sort: {}", choices.sort.get().label())} <span class="text-muted">"▾"</span>
+            {move || format!("Sort: {}", choices.sort.get().label())} <span class="text-muted">{crate::icons::chevron_down()}</span>
         </button>
         <button class=button aria-haspopup="dialog" on:click=move |ev| group_at.set(Some(below(&ev, 320.0)))>
             {move || match choices.grouping.levels.get().as_slice() {
                 [] => "Group: none".to_owned(),
                 levels => format!("Group: {}", levels.join(" › ")),
             }}
-            <span class="text-muted">"▾"</span>
+            <span class="text-muted">{crate::icons::chevron_down()}</span>
         </button>
         <Popover at=show_at class="w-80 space-y-3">
             <div class="space-y-2"><ShowChips choices /></div>
@@ -694,12 +694,12 @@ fn grouped(
             view! {
                 <div>
                     <button class=button on:click=toggle title=format!("{key}: {}", value.clone().unwrap_or_else(|| format!("no {key}")))>
-                        <span class="w-3 shrink-0 text-sm text-muted">{move || if is_folded.get() { "▸" } else { "▾" }}</span>
+                        <span class="w-3 shrink-0 text-sm text-muted">{move || if is_folded.get() { crate::icons::chevron_right().into_any() } else { crate::icons::chevron_down().into_any() }}</span>
                         {(!compact).then(|| view! { <span class="shrink-0 text-muted">{format!("{key}:")}</span> })}
                         <span class="min-w-0 truncate">{name}</span>
                         <span class="ml-auto shrink-0 tabular-nums">{count}</span>
                         {(running > 0).then(|| view! {
-                            <span class="shrink-0 text-blue-600 dark:text-blue-400">{if compact { format!("· {running}▶") } else { format!("{running} running") }}</span>
+                            <span class="shrink-0 text-blue-600 dark:text-blue-400">{if compact { format!("· {running} running") } else { format!("{running} running") }}</span>
                         })}
                     </button>
                     <div class=body class:hidden=move || is_folded.get()>
@@ -785,7 +785,7 @@ pub fn GroupBar(grouping: Grouping) -> impl IntoView {
     }
 }
 
-/// A session's "⋯" in a list (its row, a card, the dock): archive it
+/// A session's menu in a list (its row, a card, the dock): archive it
 /// without opening it, with Undo rather than a question; and what the list
 /// adds (`dismiss`).
 #[component]
@@ -916,7 +916,7 @@ pub fn SessionsRail(open: RwSignal<bool>) -> impl IntoView {
     view! {
         <div class="flex items-center gap-1 pb-1 pl-1.5 pr-3 pt-2 text-[11px] font-semibold uppercase tracking-wide text-muted">
             <button class=crate::activity::FOLD title=move || if open.get() { "Fold" } else { "Unfold" } on:click=move |_| open.update(|o| *o = !*o)>
-                {move || if open.get() { "▾" } else { "▸" }}
+                {move || if open.get() { crate::icons::chevron_down().into_any() } else { crate::icons::chevron_right().into_any() }}
             </button>
             <span class="flex-1 pl-0.5">"Sessions"
                 {move || (!open.get()).then(|| view! { <span class="ml-1.5 rounded-full bg-zinc-200 px-1.5 font-normal tabular-nums dark:bg-zinc-800">{sessions.with(Vec::len)}</span> })}
@@ -924,11 +924,12 @@ pub fn SessionsRail(open: RwSignal<bool>) -> impl IntoView {
             <button class=small title="Group by label keys (shared with the sessions list)"
                 on:click=move |ev| group_at.set(Some(crate::workspace::below(&ev, 288.0)))>
                 {move || match grouping.levels.get().as_slice() {
-                    [] => "group ▾".to_owned(),
-                    levels => format!("{} ▾", levels.join("›")),
+                    [] => "group".to_owned(),
+                    levels => levels.join("›"),
                 }}
+                {crate::icons::chevron_down()}
             </button>
-            <Go to=View::Sessions class=small title="All sessions, and a new one">"＋"</Go>
+            <Go to=View::Sessions class=small title="All sessions, and a new one">"New"</Go>
         </div>
         <crate::workspace::Popover at=group_at class="w-72">
             <GroupBar grouping />
@@ -1156,7 +1157,7 @@ pub fn NewSessionDialog(seed: SessionSeed, #[prop(into)] on_close: Callback<()>)
                 <div class="w-full max-w-3xl space-y-3 rounded-lg bg-white p-4 shadow-xl outline-none dark:bg-zinc-900" tabindex="-1" on:click=|ev| ev.stop_propagation()>
                     <div class="flex items-center gap-2">
                         <h2 class="flex-1 font-medium">"New session like this one"</h2>
-                        <button class=format!("{BUTTON_QUIET} text-xs text-muted") title="Close (Esc)" on:click=move |_| on_close.run(())>"✕"</button>
+                        <button class=format!("{BUTTON_QUIET} text-xs text-muted") title="Close (Esc)" on:click=move |_| on_close.run(())>{crate::icons::x()}</button>
                     </div>
                     <p class="text-xs text-muted">"A new, empty session with this one's worker, folder, model and labels (so the same agents, skills and hooks). Change anything before starting it."</p>
                     <Suspense fallback=|| view! { <p class="text-sm text-muted">"Loading…"</p> }>
@@ -1247,7 +1248,7 @@ pub fn SaveTemplateDialog(seed: SessionSeed, #[prop(into)] on_close: Callback<()
                 <div class="w-full max-w-xl space-y-3 rounded-lg bg-white p-4 text-sm shadow-xl outline-none dark:bg-zinc-900" tabindex="-1" on:click=|ev| ev.stop_propagation()>
                     <div class="flex items-center gap-2">
                         <h2 class="flex-1 font-medium">"Save as template"</h2>
-                        <button class=format!("{BUTTON_QUIET} text-xs text-muted") title="Close (Esc)" on:click=move |_| on_close.run(())>"✕"</button>
+                        <button class=format!("{BUTTON_QUIET} text-xs text-muted") title="Close (Esc)" on:click=move |_| on_close.run(())>{crate::icons::x()}</button>
                     </div>
                     <p class="text-xs text-muted">"Sessions from it run where this one does, on its model and with its labels."</p>
                     <div class="space-y-0.5 text-xs text-muted">
@@ -1320,7 +1321,7 @@ pub fn SessionDialog(
                 <div class="w-full max-w-3xl space-y-3 rounded-lg bg-white p-4 text-left shadow-xl outline-none dark:bg-zinc-900" tabindex="-1" on:click=|ev| ev.stop_propagation()>
                     <div class="flex items-center gap-2">
                         <h2 class="flex-1 font-medium">{title.clone()}</h2>
-                        <button class=format!("{BUTTON_QUIET} text-xs text-muted") title="Close (Esc)" on:click=move |_| on_close.run(())>"✕"</button>
+                        <button class=format!("{BUTTON_QUIET} text-xs text-muted") title="Close (Esc)" on:click=move |_| on_close.run(())>{crate::icons::x()}</button>
                     </div>
                     <p class="text-xs text-muted">{note.clone()}</p>
                     <Suspense fallback=|| view! { <p class="text-sm text-muted">"Loading…"</p> }>
@@ -1856,11 +1857,11 @@ fn SessionForm(
                                 {if image {
                                     view! { <img class="h-10 w-10 rounded object-cover" src=format!("data:{};base64,{}", a.mime, a.data) /> }.into_any()
                                 } else {
-                                    view! { <span class="px-1">"📄"</span> }.into_any()
+                                    view! { <span class="px-1">{crate::icons::file()}</span> }.into_any()
                                 }}
                                 <span class="max-w-40 truncate">{a.name.clone()}</span>
                                 <button type="button" class="text-muted hover:text-zinc-900 dark:hover:text-zinc-100" title="Remove"
-                                    on:click=move |_| attachments.update(|v| { if i < v.len() { v.remove(i); } })>"✕"</button>
+                                    on:click=move |_| attachments.update(|v| { if i < v.len() { v.remove(i); } })>{crate::icons::x()}</button>
                             </div>
                         }
                     }).collect_view()}
@@ -1919,7 +1920,7 @@ fn SessionForm(
                     class="inline-flex h-8 min-w-0 items-center gap-1 rounded-md border border-zinc-200 px-2 text-xs text-soft md:hidden dark:border-zinc-700"
                     title="Where and how it runs" on:click=move |_| changing.update(|c| *c = !*c)>
                     <span class="min-w-0 truncate">{move || template.with(|t| t.as_ref().map(template_label)).unwrap_or_else(|| line(true))}</span>
-                    <span class="text-muted">"▾"</span>
+                    <span class="text-muted">{crate::icons::chevron_down()}</span>
                 </button>
                 <button type="button" role="switch" aria-checked=move || worktree.get().to_string()
                     title="A new git worktree: a c6/… branch and a separate checkout for this session"
@@ -1939,7 +1940,7 @@ fn SessionForm(
                 {move || (page && !templates.with(Vec::is_empty)).then(|| view! {
                     <button class=format!("{tool} hidden md:inline-flex") aria-haspopup="menu" title="Run a template: it sets where and how its sessions run"
                         on:click=move |ev| template_at.set(Some(below(&ev, 320.0)))>
-                        "Template" <span class="text-muted">"▾"</span>
+                        "Template" <span class="text-muted">{crate::icons::chevron_down()}</span>
                     </button>
                 })}
                 <span class="flex-1"></span>
