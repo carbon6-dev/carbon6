@@ -158,11 +158,13 @@ impl Worker {
 /// What a worker says it can do in its Hello: Claude Code, the head's kit
 /// jobs (a container runtime, `kits`, unless turned off), editing and
 /// cancelling queued inputs (`queue_ops`), Send now (`send_now`:
-/// `UserInput.send_now`, `Interrupt.send_now`), and its extension's.
+/// `UserInput.send_now`, `Interrupt.send_now`), quiet context notes
+/// (`quiet_notes`), and its extension's.
 pub(crate) fn capabilities(worker: &Worker, claude_code: bool, runtime: bool) -> Vec<String> {
     let mut c: Vec<String> = claude_code.then(|| "claude_code".to_owned()).into_iter().collect();
     c.push("queue_ops".into());
     c.push("send_now".into());
+    c.push("quiet_notes".into());
     if runtime && worker.runs_kit_jobs() {
         c.push("kits".into());
     }

@@ -7,6 +7,7 @@ use c6_api::{Connection, Decision, Event, EventKind, Session};
 use c6_head::HeadConfig;
 use c6_testkit::{MockLlm, Reply, eventually};
 use c6_worker::{ConnState, Identity, Worker, conn, enroll};
+use prost::Message;
 use serde_json::{Value, json};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -196,4 +197,399 @@ async fn agents_propose_tasks_you_start_with_one_click() {
 
     stop.cancel();
     head.shutdown().await.unwrap();
+}
+
+struct Cards {
+    head: Option<c6_head::Head>,
+    config: HeadConfig,
+    _head_dir: tempfile::TempDir,
+    state: tempfile::TempDir,
+    project: tempfile::TempDir,
+    worker: std::sync::Arc<Worker>,
+    stop: CancellationToken,
+    http: reqwest::Client,
+    api: String,
+    mock: MockLlm,
+    connection: String,
+}
+
+impl Cards {
+    async fn new() -> Self {
+        let mock = MockLlm::start().await;
+        let (head_dir, state, project) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let config = HeadConfig {
+            data_dir: head_dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: c6_testkit::port(),
+            worker_port: c6_testkit::port(),
+            auth: false,
+            ..Default::default()
+        };
+        let head = c6_head::start(config.clone()).await.unwrap();
+        let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+        let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
+        enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
+        let worker = crate::open_worker(state.path()).await;
+        let mut this = Self {
+            head: Some(head),
+            config,
+            _head_dir: head_dir,
+            state,
+            project,
+            worker,
+            stop: CancellationToken::new(),
+            http: reqwest::Client::new(),
+            api,
+            mock,
+            connection: String::new(),
+        };
+        this.attach().await;
+        let conn: Connection =
+            serde_json::from_value(this.post("connections", json!({"name": "m", "base_url": this.mock.base_url()})).await).unwrap();
+        this.connection = conn.id;
+        let r = this.http.put(format!("{}/settings/work", this.api)).json(&json!({"notes": false})).send().await.unwrap();
+        assert!(r.status().is_success());
+        this
+    }
+
+    fn head(&self) -> &std::sync::Arc<c6_head::HeadState> {
+        &self.head.as_ref().unwrap().state
+    }
+
+    async fn attach(&mut self) {
+        self.stop = CancellationToken::new();
+        let (tx, mut rx) = watch::channel(ConnState::Connecting);
+        tokio::spawn(conn::run(self.worker.clone(), tx, self.stop.clone()));
+        c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
+    }
+
+    async fn detach(&self) {
+        self.stop.cancel();
+        eventually("the worker to detach", async || self.head().registry.get(self.worker.identity.meta.worker_id).is_none().then_some(()))
+            .await;
+    }
+
+    async fn post(&self, path: &str, body: Value) -> Value {
+        let r = self.http.post(format!("{}/{path}", self.api)).json(&body).send().await.unwrap();
+        let status = r.status();
+        let text = r.text().await.unwrap();
+        assert!(status.is_success(), "{path}: {status} {text}");
+        serde_json::from_str(&text).unwrap_or(Value::Null)
+    }
+
+    async fn get(&self, path: &str) -> Value {
+        self.http.get(format!("{}/{path}", self.api)).send().await.unwrap().json().await.unwrap()
+    }
+
+    async fn events(&self, session: &str) -> Vec<Event> {
+        serde_json::from_value(self.get(&format!("sessions/{session}/events")).await).unwrap()
+    }
+
+    async fn idle(&self, session: &str, turns: usize) {
+        eventually("the session to finish its turn", async || {
+            let d = self.get(&format!("sessions/{session}")).await;
+            let ended = self.events(session).await.iter().filter(|e| matches!(e.kind, EventKind::TurnEnded { .. })).count();
+            (d["session"]["status"] == "idle" && ended == turns && d["queued"].as_array()?.is_empty()).then_some(())
+        })
+        .await;
+    }
+
+    async fn start(&self, work: bool) -> Session {
+        self.mock.push(Reply::Text("Finished the original task.".into()));
+        let session: Session = serde_json::from_value(
+            self.post(
+                "sessions",
+                json!({
+                    "worker_id": self.worker.identity.meta.worker_id.0, "cwd": self.project.path(),
+                    "connection_id": self.connection, "model": "m", "prompt": "finish the original task",
+                    "work": if work { Some("new") } else { None },
+                }),
+            )
+            .await,
+        )
+        .unwrap();
+        self.idle(&session.id, 1).await;
+        session
+    }
+
+    async fn propose(&self, session: &str, title: &str) -> Decision {
+        let card = c6_head::decisions::task_card(
+            self.head(),
+            session,
+            "task_propose",
+            &json!({
+                "title": title, "why": "A separate cleanup", "prompt": "Clean up src/retry.rs and run the tests."
+            }),
+        )
+        .await
+        .unwrap();
+        serde_json::from_value(self.get(&format!("decisions/{}", card["id"])).await).unwrap()
+    }
+
+    async fn recorded(&self, session: &str, text: &str) {
+        eventually("the quiet note to be journaled", async || {
+            let evs = self.worker.journal.events_after(session, 0, u32::MAX).await.ok()?;
+            evs.iter()
+                .any(|e| matches!(&e.kind, Some(c6_proto::session_event::Kind::NoticeQueued(n)) if n.quiet && !n.wake && n.text == text))
+                .then_some(())
+        })
+        .await;
+    }
+
+    async fn assert_quiet(&self, session: &str, turns: usize, requests: usize) {
+        // A negative assertion: give any unintended automatic turn a chance
+        // to show itself, after the note was explicitly recorded.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(self.mock.requests().len(), requests, "a quiet note never calls the model");
+        let detail = self.get(&format!("sessions/{session}")).await;
+        assert_eq!(detail["session"]["status"], "idle", "{detail}");
+        assert!(detail["queued"].as_array().unwrap().is_empty(), "no queued-input count: {detail}");
+        let evs = self.events(session).await;
+        assert!(!evs.iter().any(|e| matches!(e.kind, EventKind::NoticeQueued { .. })), "no held-notice pill: {evs:?}");
+        assert_eq!(evs.iter().filter(|e| matches!(e.kind, EventKind::TurnStarted { .. })).count(), turns);
+    }
+
+    async fn close(mut self) {
+        self.stop.cancel();
+        self.head.take().unwrap().shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn task_card_answers_are_quiet_context_and_withdraw_explains_them() {
+    let t = Cards::new().await;
+    let session = t.start(true).await;
+    let other = t.start(false).await;
+    let elsewhere: WorkItem = serde_json::from_value(t.post("work", json!({"title": "Other cleanup"})).await).unwrap();
+    let mut turns = 1;
+    for option in [
+        "Not now".to_owned(),
+        "Add to this work".into(),
+        "Add as new work".into(),
+        format!("Add to work:{}", elsewhere.id),
+        "Start it".into(),
+    ] {
+        let title = if option == "Not now" { "Cleanup \"later\"\nsecond line".to_owned() } else { format!("Cleanup for {option}") };
+        let card = t.propose(&session.id, &title).await;
+        let requests = t.mock.requests().len() + usize::from(option == "Start it");
+        if option == "Start it" {
+            t.mock.push(Reply::Text("Started the separate task.".into()));
+        }
+        let answered = t.post(&format!("decisions/{}/answer", card.id), json!({"option": option})).await;
+        let text = match option.as_str() {
+            "Not now" => format!("You chose Not now on task card #{} {:?}.", card.id, card.title),
+            "Start it" => {
+                t.idle(answered["sessions"][0].as_str().unwrap(), 1).await;
+                format!("You chose Start session on task card #{} {:?}.", card.id, card.title)
+            }
+            _ => {
+                let works: Vec<WorkItem> = serde_json::from_value(t.get("work").await).unwrap();
+                let work = works.iter().find(|w| w.fields.todos.iter().any(|todo| todo.from == format!("decision:{}", card.id))).unwrap();
+                format!("You saved task card #{} {:?} as a to-do on {:?}.", card.id, card.title, work.fields.title)
+            }
+        };
+        assert_eq!(text.lines().count(), 1, "the note stays one line even for multiline titles");
+        t.recorded(&session.id, &text).await;
+        t.assert_quiet(&session.id, turns, requests).await;
+        let withdraw = |id| json!({"id": id, "why": "No longer needed"});
+        let error = c6_head::decisions::task_card(t.head(), &session.id, "task_withdraw", &withdraw(card.id)).await.unwrap_err();
+        assert_eq!(error.to_string(), format!("Task card #{} was already answered: {option}.", card.id));
+        for (sid, id) in [(&other.id, card.id), (&session.id, i64::MAX)] {
+            let error = c6_head::decisions::task_card(t.head(), sid, "task_withdraw", &withdraw(id)).await.unwrap_err();
+            assert_eq!(error.to_string(), "no open task card of this session by that id");
+        }
+        t.mock.push(Reply::Text("I saw the card's answer.".into()));
+        t.post(&format!("sessions/{}/messages", session.id), json!({"text": "continue"})).await;
+        turns += 1;
+        t.idle(&session.id, turns).await;
+        let encoded = serde_json::to_string(&text).unwrap();
+        assert!(
+            t.mock.requests().last().unwrap()["messages"].to_string().contains(&encoded[1..encoded.len() - 1]),
+            "{text}: {}",
+            t.mock.log()
+        );
+        let told = t.events(&session.id).await.iter().filter(|e| matches!(&e.kind, EventKind::User { text: s, .. } if s == &text)).count();
+        assert_eq!(told, 1, "the note is delivered once");
+    }
+
+    // Save for later without session work creates a new destination, too.
+    let card = t.propose(&other.id, "Standalone cleanup").await;
+    t.post(&format!("decisions/{}/answer", card.id), json!({"option": "Add to this work"})).await;
+    let text = format!("You saved task card #{} {:?} as a to-do on {:?}.", card.id, card.title, card.title);
+    t.recorded(&other.id, &text).await;
+    t.assert_quiet(&other.id, 1, t.mock.requests().len()).await;
+    t.mock.push(Reply::Text("Saved for later.".into()));
+    t.post(&format!("sessions/{}/messages", other.id), json!({"text": "continue"})).await;
+    t.idle(&other.id, 2).await;
+    assert!(t.events(&other.id).await.iter().any(|e| matches!(&e.kind, EventKind::User { text: s, .. } if s == &text)));
+
+    // An unsuccessful save leaves the card open, without announcing a save.
+    let card = t.propose(&session.id, "An invalid destination").await;
+    let before = t.worker.journal.events_after(&session.id, 0, u32::MAX).await.unwrap();
+    let r = t
+        .http
+        .post(format!("{}/decisions/{}/answer", t.api, card.id))
+        .json(&json!({"option": "Add to work:does-not-exist"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(!r.status().is_success());
+    assert_eq!(t.get(&format!("decisions/{}", card.id)).await["state"], "open");
+    assert_eq!(t.worker.journal.events_after(&session.id, 0, u32::MAX).await.unwrap(), before);
+    c6_head::decisions::task_card(t.head(), &session.id, "task_withdraw", &json!({"id": card.id, "why": "No destination"})).await.unwrap();
+    t.close().await;
+}
+
+#[tokio::test]
+async fn a_busy_task_card_note_waits_for_input_and_survives_restarts() {
+    let mut t = Cards::new().await;
+    let session = t.start(false).await;
+    let card = t.propose(&session.id, "A busy cleanup").await;
+    let gate = t.mock.push_gated(Reply::Text("The current turn is busy.".into()));
+    t.post(&format!("sessions/{}/messages", session.id), json!({"text": "do the next step"})).await;
+    eventually("the busy turn to reach the model and head", async || {
+        (t.mock.requests().len() == 2 && t.get(&format!("sessions/{}", session.id)).await["session"]["status"] == "running").then_some(())
+    })
+    .await;
+    t.post(&format!("decisions/{}/answer", card.id), json!({"option": "Not now"})).await;
+    let text = format!("You chose Not now on task card #{} {:?}.", card.id, card.title);
+    t.recorded(&session.id, &text).await;
+    assert_eq!(t.get(&format!("sessions/{}", session.id)).await["session"]["status"], "running");
+    gate.notify_one();
+    t.idle(&session.id, 2).await;
+    t.assert_quiet(&session.id, 2, 2).await;
+    assert!(
+        !t.events(&session.id).await.iter().any(|e| matches!(&e.kind, EventKind::User { text: s, .. } if s == &text)),
+        "not injected into the busy turn"
+    );
+
+    // A queued command survives a head restart; a recorded note survives
+    // a worker reload. Both remain invisible until the next explicit input.
+    t.detach().await;
+    let offline = t.propose(&session.id, "An offline cleanup").await;
+    t.post(&format!("decisions/{}/answer", offline.id), json!({"option": "Not now"})).await;
+    let offline_text = format!("You chose Not now on task card #{} {:?}.", offline.id, offline.title);
+    t.head.take().unwrap().shutdown().await.unwrap();
+    t.head = Some(c6_head::start(t.config.clone()).await.unwrap());
+    // In-process shutdown leaves existing HTTP keep-alive tasks alive;
+    // a real process restart closes those sockets.
+    t.http = reqwest::Client::new();
+    drop(t.worker);
+    t.worker = crate::open_worker(t.state.path()).await;
+    t.attach().await;
+    t.recorded(&session.id, &offline_text).await;
+    t.assert_quiet(&session.id, 2, 2).await;
+    t.mock.push(Reply::Text("Both answers received.".into()));
+    t.post(&format!("sessions/{}/messages", session.id), json!({"text": "continue after restart"})).await;
+    t.idle(&session.id, 3).await;
+    let events = t.events(&session.id).await;
+    for expected in [&text, &offline_text] {
+        assert_eq!(events.iter().filter(|e| matches!(&e.kind, EventKind::User { text, .. } if text == expected)).count(), 1);
+    }
+    let messages = t.mock.requests().last().unwrap()["messages"].to_string();
+    assert!(messages.contains("A busy cleanup") && messages.contains("An offline cleanup"), "{messages}");
+    t.close().await;
+}
+
+#[tokio::test]
+async fn a_task_card_note_restores_a_trimmed_session_without_waking() {
+    let mut t = Cards::new().await;
+    let session = t.start(false).await;
+    t.detach().await;
+    let journal = t.worker.journal.clone();
+    let events = journal.events_after(&session.id, 0, u32::MAX).await.unwrap();
+    journal.set_acked(&session.id, events.last().unwrap().seq).await.unwrap();
+    drop(t.worker);
+    assert_eq!(journal.trim(c6_core::now_ms() + 1000, &[]).await.unwrap(), 1);
+    t.worker = crate::open_worker(t.state.path()).await;
+    t.attach().await;
+    assert!(!t.worker.journal.has_session(&session.id).await.unwrap());
+    let card = t.propose(&session.id, "A cleanup after journal trimming").await;
+    t.post(&format!("decisions/{}/answer", card.id), json!({"option": "Not now"})).await;
+    let text = format!("You chose Not now on task card #{} {:?}.", card.id, card.title);
+    t.recorded(&session.id, &text).await;
+    t.assert_quiet(&session.id, 1, 1).await;
+    t.mock.push(Reply::Text("I saw the restored note.".into()));
+    t.post(&format!("sessions/{}/messages", session.id), json!({"text": "continue after trimming"})).await;
+    t.idle(&session.id, 2).await;
+    assert_eq!(t.events(&session.id).await.iter().filter(|e| matches!(&e.kind, EventKind::User { text: s, .. } if s == &text)).count(), 1);
+
+    // Other rejection reasons cannot turn quiet context into a failed
+    // session (commands without queue text usually describe a Create).
+    t.detach().await;
+    let card = t.propose(&session.id, "A note the worker cannot record").await;
+    t.post(&format!("decisions/{}/answer", card.id), json!({"option": "Not now"})).await;
+    let pending = t.head().store.pending_commands(t.worker.identity.meta.worker_id, 0).await.unwrap();
+    let is_note = |c: &c6_head::store::CommandRow| {
+        matches!(c6_proto::SessionCommand::decode(c.data.as_slice()).unwrap().kind, Some(c6_proto::session_command::Kind::QuietNote(_)))
+    };
+    let note = pending.iter().find(|c| is_note(c)).unwrap();
+    c6_head::sessions::on_rejected(
+        t.head(),
+        t.worker.identity.meta.worker_id,
+        c6_proto::CommandRejected {
+            command_id: note.id.clone(),
+            session_id: session.id.clone(),
+            reason: "could not record context".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(t.head().store.pending_commands(t.worker.identity.meta.worker_id, 0).await.unwrap().iter().any(is_note));
+    t.assert_quiet(&session.id, 2, 2).await;
+    t.attach().await;
+    let text = format!("You chose Not now on task card #{} {:?}.", card.id, card.title);
+    t.recorded(&session.id, &text).await;
+    t.assert_quiet(&session.id, 2, 2).await;
+    t.close().await;
+}
+
+#[tokio::test]
+async fn old_workers_skip_task_card_notes_without_waking() {
+    let t = Cards::new().await;
+    let session = t.start(false).await;
+    t.detach().await;
+    let offline = t.propose(&session.id, "Queued before the old worker attaches").await;
+    t.post(&format!("decisions/{}/answer", offline.id), json!({"option": "Not now"})).await;
+    let identity = &t.worker.identity;
+    let channel = tonic::transport::Endpoint::from_shared(identity.meta.head_url.clone())
+        .unwrap()
+        .tls_config(identity.tls_config())
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let events = t.worker.journal.events_after(&session.id, 0, u32::MAX).await.unwrap();
+    tx.send(c6_proto::WorkerMsg {
+        msg: Some(c6_proto::worker_msg::Msg::Hello(c6_proto::Hello {
+            protocol_version: c6_core::PROTOCOL_VERSION,
+            capabilities: vec!["queue_ops".into()],
+            sessions: vec![c6_proto::SessionCursor { session_id: session.id.clone(), seq: events.last().unwrap().seq }],
+            ..Default::default()
+        })),
+    })
+    .await
+    .unwrap();
+    let mut inbound = c6_proto::worker_hub_client::WorkerHubClient::new(channel)
+        .attach(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(matches!(inbound.message().await.unwrap().unwrap().msg, Some(c6_proto::head_msg::Msg::Welcome(_))));
+    eventually("the old worker's queued note to be skipped", async || {
+        t.head().store.pending_commands(t.worker.identity.meta.worker_id, 0).await.ok()?.is_empty().then_some(())
+    })
+    .await;
+    let card = t.propose(&session.id, "Already on an old worker").await;
+    t.post(&format!("decisions/{}/answer", card.id), json!({"option": "Not now"})).await;
+    let pending = t.head().store.pending_commands(t.worker.identity.meta.worker_id, 0).await.unwrap();
+    assert!(pending.is_empty(), "the connected old worker's note was skipped at enqueue");
+    tx.send(c6_proto::WorkerMsg { msg: Some(c6_proto::worker_msg::Msg::Ping(c6_proto::Ping::default())) }).await.unwrap();
+    let reply = c6_testkit::within("the old worker's pong, with no note before it", inbound.message()).await.unwrap().unwrap();
+    assert!(matches!(reply.msg, Some(c6_proto::head_msg::Msg::Pong(_))), "{reply:?}");
+    t.assert_quiet(&session.id, 1, 1).await;
+    drop(inbound);
+    drop(tx);
+    t.close().await;
 }

@@ -370,16 +370,19 @@ async fn act(
             crate::updates::answer(st, version, option).await?;
         }
         (Some("task"), Some(_), Some(_)) => match option {
-            Some(TASK_START) => start_task(st, d).await?,
+            Some(TASK_START) => {
+                start_task(st, d).await?;
+                task_answer_note(st, d, format!("You chose Start session on task card #{} {:?}.", d.id, d.title)).await;
+            }
             Some(TASK_HERE) => do_task_here(st, d).await?,
-            Some(TASK_TO_WORK) => {
-                crate::work::keep_todo(st, d, true, None).await?;
+            Some(o) if matches!(o, TASK_TO_WORK | TASK_TO_NEW_WORK) || o.starts_with(TASK_TO_WORK_PREFIX) => {
+                let id = crate::work::keep_todo(st, d, o == TASK_TO_WORK, o.strip_prefix(TASK_TO_WORK_PREFIX)).await?;
+                let work = crate::work::get(st, &id, &Caller::root()).await?;
+                task_answer_note(st, d, format!("You saved task card #{} {:?} as a to-do on {:?}.", d.id, d.title, work.fields.title))
+                    .await;
             }
-            Some(TASK_TO_NEW_WORK) => {
-                crate::work::keep_todo(st, d, false, None).await?;
-            }
-            Some(o) if o.starts_with(TASK_TO_WORK_PREFIX) => {
-                crate::work::keep_todo(st, d, false, o.strip_prefix(TASK_TO_WORK_PREFIX)).await?;
+            Some("Not now") => {
+                task_answer_note(st, d, format!("You chose Not now on task card #{} {:?}.", d.id, d.title)).await;
             }
             _ => {}
         },
@@ -735,12 +738,18 @@ pub async fn task_card(st: &HeadState, session_id: &str, what: &str, params: &Va
     let prefix = format!("task:{session_id}:");
     if what == "task_withdraw" {
         let id = params["id"].as_i64().ok_or_else(|| bad_request("id is required"))?;
-        let reference: Option<String> = sqlx::query_scalar("SELECT ref FROM decisions WHERE id = ? AND state IN ('open', 'snoozed')")
-            .bind(id)
-            .fetch_optional(&st.store.pool)
-            .await?;
+        let reference: Option<String> =
+            sqlx::query_scalar("SELECT ref FROM decisions WHERE id = ?").bind(id).fetch_optional(&st.store.pool).await?;
         let reference =
             reference.filter(|r| r.starts_with(&prefix)).ok_or_else(|| not_found("no open task card of this session by that id"))?;
+        let d = get(st, id).await?.ok_or_else(|| not_found("no such task card"))?;
+        if d.state == "answered" {
+            let option = d.answer.as_ref().and_then(|a| a["option"].as_str()).unwrap_or("(no option)");
+            return Err(bad_request(format!("Task card #{id} was already answered: {option}.")));
+        }
+        if !matches!(d.state.as_str(), "open" | "snoozed") {
+            return Err(bad_request(format!("Task card #{id} was already {}.", d.state)));
+        }
         let why = params["why"].as_str().unwrap_or("").trim().to_owned();
         settle_ref(st, &reference, "withdrawn", json!({"why": why}), &format!("session:{session_id}")).await;
         return Ok(json!({"id": id}));
@@ -806,6 +815,15 @@ pub async fn task_card(st: &HeadState, session_id: &str, what: &str, params: &Va
     };
     let decision = open(st, &d, &realm, &format!("{prefix}{}", uuid::Uuid::now_v7())).await?;
     Ok(json!({"id": decision.id, "count": decision.count}))
+}
+
+/// The proposer hears an answer without being asked to act on it.
+async fn task_answer_note(st: &HeadState, d: &api::Decision, text: String) {
+    if let Some(session) = d.context["session"].as_str()
+        && let Err(e) = crate::sessions::quiet_note(st, session, text).await
+    {
+        warn!(decision = d.id, "telling the session quietly: {e:#}");
+    }
 }
 
 /// "Do it here": the card's task, as a message to the session that

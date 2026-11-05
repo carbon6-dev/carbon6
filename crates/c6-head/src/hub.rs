@@ -277,6 +277,14 @@ async fn deliver_pending(
         }
         for row in rows {
             let cmd = SessionCommand::decode(row.data.as_slice())?;
+            if matches!(cmd.kind, Some(c6_proto::session_command::Kind::QuietNote(_)))
+                && !st.registry.get(worker_id).is_some_and(|w| w.capabilities.iter().any(|c| c == "quiet_notes"))
+            {
+                tracing::debug!(%worker_id, command = %row.id, "skipping quiet context: the worker does not support it");
+                st.store.cancel_pending_command(&row.id).await?;
+                *delivered = row.seq;
+                continue;
+            }
             if tx.send(Ok(head(head_msg::Msg::Command(cmd)))).await.is_err() {
                 return Ok(false);
             }

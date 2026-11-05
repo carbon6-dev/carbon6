@@ -1007,6 +1007,27 @@ pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage
     send_input_as(st, session_id, req, Uuid::now_v7().to_string(), "", None).await
 }
 
+/// Context for the agent's next input, through the durable command queue.
+/// Older workers must never receive it as an ordinary, waking input.
+pub async fn quiet_note(st: &HeadState, session_id: &str, text: String) -> anyhow::Result<()> {
+    let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    let worker_id: WorkerId = session.worker_id.parse()?;
+    if st.registry.get(worker_id).is_some_and(|w| !w.capabilities.iter().any(|c| c == "quiet_notes")) {
+        tracing::debug!(%session_id, "skipping quiet context: the worker does not support it");
+        return Ok(());
+    }
+    let id = Uuid::now_v7().to_string();
+    let data = SessionCommand {
+        command_id: id.clone(),
+        session_id: session_id.to_owned(),
+        kind: Some(session_command::Kind::QuietNote(c6_proto::QuietNote { text })),
+    }
+    .encode_to_vec();
+    st.store.enqueue_command(&NewCommand { id: &id, session_id, worker_id, data, text: None }).await?;
+    st.registry.deliver(worker_id);
+    Ok(())
+}
+
 /// Queues an input as command `id`; `delegated_by`: a remote subagent's
 /// parent's call that sent it (docs/remote-subagents.md).
 pub async fn send_input_as(
@@ -2145,6 +2166,12 @@ pub async fn on_ephemeral(st: &HeadState, worker_id: WorkerId, ev: EphemeralEven
 }
 
 pub async fn on_rejected(st: &HeadState, worker_id: WorkerId, r: CommandRejected) -> anyhow::Result<()> {
+    let quiet = st.store.pending_input(&r.command_id).await?.is_some_and(|(_, _, data)| {
+        matches!(SessionCommand::decode(data.as_slice()).ok(), Some(SessionCommand {
+            session_id, kind: Some(session_command::Kind::QuietNote(_)), ..
+        }) if session_id == r.session_id)
+    });
+    let quiet = quiet && st.store.session(&r.session_id).await?.is_some_and(|s| s.worker_id == worker_id.to_string());
     // The worker lost (or trimmed) this session: send it the log, then the
     // input again. At most once a minute per session, so a worker that
     // cannot restore does not loop.
@@ -2154,6 +2181,12 @@ pub async fn on_rejected(st: &HeadState, worker_id: WorkerId, r: CommandRejected
             Ok(false) => {}
             Err(e) => warn!(session = %r.session_id, "restoring session: {e:#}"),
         }
+    }
+    if quiet {
+        // Leave it pending for the next connection, without a failed
+        // session, user input, or an immediate rejection/retry loop.
+        debug!(session = %r.session_id, reason = %r.reason, "holding rejected quiet context until the worker reconnects");
+        return Ok(());
     }
     if let Some(session_id) = st.store.reject_command(worker_id, &r.command_id, &r.reason).await? {
         warn!(session = %session_id, reason = %r.reason, "worker rejected command");
@@ -2176,9 +2209,10 @@ async fn restore(st: &HeadState, worker_id: WorkerId, session_id: &str, command_
     }
     let Some((text, _created_at, data)) = st.store.pending_input(command_id).await? else { return Ok(false) };
     // The same input (model switch, attachments and all), under a new id.
-    let input = match SessionCommand::decode(data.as_slice()).ok().and_then(|c| c.kind) {
-        Some(session_command::Kind::Input(i)) => i,
-        _ => UserInput { text: text.clone(), ..Default::default() },
+    let (input, quiet_note) = match SessionCommand::decode(data.as_slice()).ok().and_then(|c| c.kind) {
+        Some(session_command::Kind::Input(i)) => (i, None),
+        Some(session_command::Kind::QuietNote(n)) => (UserInput::default(), Some(n)),
+        _ => (UserInput { text: text.clone(), ..Default::default() }, None),
     };
     let events = st.store.events_after(session_id, 0, i64::MAX).await?;
     if events.is_empty() {
@@ -2229,11 +2263,23 @@ async fn restore(st: &HeadState, worker_id: WorkerId, session_id: &str, command_
         kind: Some(session_command::Kind::Restore(c6_proto::Restore { spec: Some(spec), events })),
     };
     let input_id = Uuid::now_v7().to_string();
+    let (data, shown) = match quiet_note {
+        Some(note) => (
+            SessionCommand {
+                command_id: input_id.clone(),
+                session_id: session_id.to_owned(),
+                kind: Some(session_command::Kind::QuietNote(note)),
+            }
+            .encode_to_vec(),
+            None,
+        ),
+        None => (input_command(&input_id, session_id, input), Some(text.as_str())),
+    };
     st.store
         .replace_with_restore(
             command_id,
             &NewCommand { id: &restore_id, session_id, worker_id, data: cmd.encode_to_vec(), text: None },
-            &NewCommand { id: &input_id, session_id, worker_id, data: input_command(&input_id, session_id, input), text: Some(&text) },
+            &NewCommand { id: &input_id, session_id, worker_id, data, text: shown },
         )
         .await?;
     // A parent's call waiting on that input waits on its copy.
