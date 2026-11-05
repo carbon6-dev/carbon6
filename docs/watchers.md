@@ -1,6 +1,6 @@
 # Watchers
 
-Status: ideas, being shaped with you (2026-11-05). Nothing is decided or built yet. Open questions are in §9.
+Status: decided with you (2026-11-05), being built. Decisions are in §9.
 
 Some sessions run for days. Learning from them (retrospectives), reviewing them, and keeping them consistent with each other can't wait for them to end. A **watcher** is a standing agent with its own agenda. It follows one session, a set of sessions, or everything, and acts on what it sees as things happen. carbon6 already has a few watchers in all but name: the work item's note, suggested next messages, session names and catch-ups each read sessions and react. Watchers make that one mechanism.
 
@@ -117,14 +117,20 @@ So directives don't each become a watcher (which would multiply watchers and cos
 - **Realms stay separate.** A watcher in a realm acts in that realm. Only root's watchers see across realms.
 - **One mechanism.** Over time, suggestions, naming, catch-ups and the work and project notes move onto watchers: one Settings page, one budget view, one way to see why something was said.
 
-## 9. Open questions
+## 9. Decisions (2026-11-05)
 
-- Should a watcher's notes go straight into the watched session, or wait for you at first?
-- Which watchers come pre-installed and on, and which ship off? Candidates: retrospective, incremental review, stuck detection, improving carbon6.
-- For retrospectives:
-  - Approve every lesson, or auto-apply narrowly scoped memory notes and review the rest?
-  - Per-session lessons plus a weekly document, or only the weekly one?
-  - Should lessons about a repo become task cards automatically?
+- **Notes into the watched session** go straight in, but only for findings rated important or above, and at most a few per hour per session. The rest go to the Watchers page and appear as a mark on the session. Each watcher has a switch that sends everything to you instead.
+- **Pre-installed, and on by default:**
+  - stuck detection: on;
+  - continuous retrospective: on;
+  - incremental review: on for sessions labelled `repo:…`;
+  - carbon6 improvement: off (you turn it on in root).
+- **Retrospective lessons:**
+  - Memory notes scoped to one repo or one worker are applied automatically, and listed in the weekly document so you can undo them.
+  - Prompts, policies, routing rules and more widely scoped notes always ask you.
+- **Cadence:** lessons as sessions run, plus a weekly document that rolls them up and proposes pruning.
+- **Repo lessons** become task cards for you to start, never automatically.
+- **Standards** are memory notes with an "enforced by" field (§7).
 
 ## 10. How it would be built (proposed)
 
