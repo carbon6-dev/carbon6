@@ -44,7 +44,7 @@ The stored option labels above remain the action identifiers for compatibility w
 
 Where it shows:
 
-- **The session:** under **Waiting for you** (that panel is already built), as a compact card with its answers.
+- **The session:** under **Suggested tasks**, as a compact card with its answers. **Waiting for you** appears only when non-task decisions are listed too; a task-only panel has no empty waiting heading.
 - **Decisions:** in the "Suggested tasks" group, low priority, below what waits on you. It sends no notification to your phone, since task cards aren't urgent.
 
 ## 4. Starting one
@@ -79,7 +79,7 @@ The new session is on its own from there: nothing it does is reported back to th
 1. **Tools:** `task_propose` and `task_withdraw` in c6-tools, and the head's `session.task_propose` and `session.task_withdraw`, which open and settle the decision with its context.
 2. **Prompt:** `session.task_cards`, appended to the base prompt for sessions with the tool.
 3. **Start it:** the decision's answer starts the session (`decisions::act` for `task:`), worktree included.
-4. **UI:** the compact card in the session's Waiting for you, with the prompt collapsed. Decisions groups it under Suggested tasks.
+4. **UI:** the compact card in the session's Suggested tasks, with the prompt collapsed. Decisions groups it under Suggested tasks too.
 5. **Tests:**
    - a scripted agent proposes a task: the card appears in the session and in Decisions;
    - Start it creates the session with the card's prompt, worker, folder and realm;
