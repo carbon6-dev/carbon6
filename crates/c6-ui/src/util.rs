@@ -51,6 +51,9 @@ pub fn StatusPill(status: SessionStatus) -> impl IntoView {
 /// its placeholder) is sized to show all of it: measured as if typed, then
 /// emptied again. Without one, as `fit`.
 pub fn fit_hint(el: &web_sys::HtmlTextAreaElement, hint: Option<&str>) {
+    if el.client_width() == 0 {
+        return;
+    }
     match hint.filter(|h| !h.is_empty()) {
         Some(h) if el.value().is_empty() => {
             el.set_value(h);
@@ -64,6 +67,11 @@ pub fn fit_hint(el: &web_sys::HtmlTextAreaElement, hint: Option<&str>) {
 }
 
 pub fn fit(el: &web_sys::HtmlTextAreaElement) {
+    // Hidden tiles have no layout: scrollHeight would turn a restored draft
+    // into a zero-height box. Leave even its existing inline style alone.
+    if el.client_width() == 0 {
+        return;
+    }
     // Empty, it keeps its own rows: a long hint doesn't size it.
     if el.value().is_empty() {
         let _ = el.set_attribute("style", "overflow-y:hidden");
@@ -82,10 +90,18 @@ pub fn fit(el: &web_sys::HtmlTextAreaElement) {
 /// Keeps a message box sized to its text as `track` changes it (typed, sent,
 /// put back to edit).
 pub fn autosize(node: NodeRef<leptos::html::Textarea>, track: impl Fn() + 'static) {
+    autosize_hint(node, track, || None);
+}
+
+/// Like `autosize`, preserving the placeholder's size on reveal and resize.
+pub fn autosize_hint(node: NodeRef<leptos::html::Textarea>, track: impl Fn() + 'static, hint: impl Fn() -> Option<String> + 'static) {
+    use wasm_bindgen::JsCast;
+    let hint = StoredValue::new_local(hint);
     let refit = move || {
         request_animation_frame(move || {
             if let Some(el) = node.try_get_untracked().flatten() {
-                fit(&el);
+                let hint = hint.try_with_value(|h| untrack(h)).flatten();
+                fit_hint(&el, hint.as_deref());
             }
         })
     };
@@ -95,12 +111,49 @@ pub fn autosize(node: NodeRef<leptos::html::Textarea>, track: impl Fn() + 'stati
     });
     // Narrower (a phone turned, a tile resized), its text takes more lines.
     let resized = window_event_listener(leptos::ev::resize, move |_| refit());
-    on_cleanup(move || resized.remove());
+    let visible = window_event_listener_untyped("visibilitychange", move |_| refit());
+    on_cleanup(move || {
+        resized.remove();
+        visible.remove();
+    });
+    // Observe width and hidden -> visible transitions, not our own height
+    // writes. Queue writes outside the observer's layout delivery loop.
+    type ResizeWatch = (web_sys::ResizeObserver, wasm_bindgen::closure::Closure<dyn FnMut(js_sys::Array)>);
+    let observer = StoredValue::new_local(None::<ResizeWatch>);
+    Effect::new(move || {
+        let Some(el) = node.get() else { return };
+        observer.update_value(|o| {
+            if let Some((ro, _)) = o.take() {
+                ro.disconnect();
+            }
+        });
+        let mut width = -1;
+        let callback = wasm_bindgen::closure::Closure::<dyn FnMut(js_sys::Array)>::new(move |_| {
+            if let Some(el) = node.try_get_untracked().flatten() {
+                let next = el.client_width();
+                if next != width {
+                    width = next;
+                    refit();
+                }
+            }
+        });
+        if let Ok(ro) = web_sys::ResizeObserver::new(callback.as_ref().unchecked_ref()) {
+            ro.observe(&el);
+            observer.set_value(Some((ro, callback)));
+        }
+    });
+    on_cleanup(move || {
+        observer.update_value(|o| {
+            if let Some((ro, _)) = o.take() {
+                ro.disconnect();
+            }
+        });
+    });
 }
 
 /// The class of a message box that grows with its text up to 40% of the
 /// window, then scrolls.
-pub const GROWS: &str = "max-h-[40dvh] resize-none overflow-y-auto";
+pub const GROWS: &str = "grows max-h-[40dvh] resize-none overflow-y-auto";
 
 /// A touch screen is the main way in (a phone or tablet): there, Return
 /// in a message box is a new line, as on a phone's keyboard.

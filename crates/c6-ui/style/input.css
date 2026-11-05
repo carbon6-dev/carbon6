@@ -46,8 +46,12 @@ html.dark {
   input, textarea, select { font-size: 16px !important; }
 }
 
-/* Rendered markdown from model output. */
 @layer components {
+  /* At least one line plus padding/borders, even after a bad measurement.
+     Components, not utilities: a box's explicit larger min-height still wins. */
+  .grows { min-height: calc(1lh + 1.25rem); }
+
+  /* Rendered markdown from model output. */
   /* Long words and inline code wrap rather than widen the transcript. */
   .md { @apply text-sm leading-relaxed; overflow-wrap: anywhere; }
   .md > * + * { @apply mt-3; }
