@@ -2046,9 +2046,6 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
             {move || hint().map(|at| view! {
                 <div class=format!("pointer-events-none absolute z-20 rounded-md border-2 border-blue-500 bg-blue-500/15 {at}")></div>
             })}
-            {move || feedback.get().and_then(Result::err).map(|reason| view! {
-                <div class="pointer-events-none absolute inset-x-0 top-0 z-20 rounded-md bg-zinc-100 p-2 text-center text-xs text-muted dark:bg-zinc-800" role="status">{reason}</div>
-            })}
             // The tile's own bar: its history, its name (and a session's
             // colour, state, what runs in it, its panes and its actions),
             // and what you can do to the whole tile.
