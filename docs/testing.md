@@ -143,6 +143,17 @@ The `c6-ui` workspace unit tests cover input direction and stop/resume decisions
 5. On a phone, tap without dragging: following stays on. Drag toward older content by a small distance: it stops immediately and stays off through touch inertia. Drag back to the bottom or use Latest: it resumes. Try reversing direction within one gesture.
 6. Check that horizontal scrolling and typing/navigation in text fields do not change transcript following. With reduced motion enabled, repeat the small upward scroll and Latest checks.
 
+### Tool-card arrival regression
+
+The native `session::tests::tool_output_keeps_one_bounded_area_before_and_after_the_result` renders the production output area before output, during streaming, and after success or an error (including truncation and images). Its height and single output box must be the same in every state. Native tests deliberately render this small component, not the recursive session/subagent transcript.
+
+In a browser, repeat at 320px, 390px and desktop widths:
+
+1. Start a shell call that emits several lines before finishing. Its summary appears immediately; it stays collapsed throughout. Open it while running: the output scrolls within a fixed-height area, which remains the same height when the result replaces the live text. An error must behave the same way. Plans start open and retain that choice.
+2. Retain DOM handles for the card, its `details`, and its output `pre`. Deliver output chunks, its result, and another assistant event: all three handles must remain connected and refer to the same nodes. A user-opened card stays open; a user-closed card stays closed.
+3. Create a session and a document with long titles. Their pending link areas must already occupy the completed card's height, with the input title when known. The result activates the destination without adding a row or horizontal overflow. Keep all status, document/deck and navigation icons.
+4. With a long transcript following the bottom, repeat through completion: it stays at the bottom without a transient expansion/collapse. Scroll up deliberately before a result arrives: the viewport stays at that position. Repeat on a touch viewport and with reduced motion.
+
 ### Observer lifetime regression
 
 The transcript-follow and glance-width ResizeObservers retain their Rust

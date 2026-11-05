@@ -4170,7 +4170,7 @@ fn MadeSession(id: String, title: String) -> impl IntoView {
     };
     let hashed = c6_api::marks::hashed(&id).to_owned();
     view! {
-        <div class="mt-1.5 flex basis-full cursor-pointer items-stretch overflow-hidden rounded-md border border-zinc-200 bg-white hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900 dark:hover:bg-zinc-800"
+        <div class="flex h-full cursor-pointer items-stretch overflow-hidden rounded-md border border-zinc-200 bg-white hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900 dark:hover:bg-zinc-800"
             title="Open the session (⌘-click: in a new tile)" on:click=open>
             <span class="w-1 shrink-0" style=move || crate::marks::fill(&row.with(|r| r.as_ref().map(crate::marks::of)).unwrap_or_else(|| hashed.clone()))></span>
             {move || {
@@ -4191,9 +4191,9 @@ fn MadeSession(id: String, title: String) -> impl IntoView {
                 let place = s.as_ref().map(|s| live.session_worker(s));
                 view! {
                     <div class="flex min-w-0 flex-1 flex-col px-2 py-1 md:flex-row md:items-center md:gap-2">
-                        <span class="truncate text-sm font-medium">{title}</span>
-                        <span class="flex min-w-0 shrink-0 items-center gap-1.5 text-xs">
-                            <span class=cls>{(word == "running").then(crate::icons::circle)}" "{word}</span>
+                        <span class="min-w-0 truncate text-sm font-medium">{title}</span>
+                        <span class="flex min-w-0 items-center gap-1.5 text-xs">
+                            <span class=format!("shrink-0 {cls}")>{(word == "running").then(crate::icons::circle)}" "{word}</span>
                             {place.map(|p| view! { <span class="truncate text-muted">{format!("· {p}")}</span> })}
                         </span>
                     </div>
@@ -4201,6 +4201,48 @@ fn MadeSession(id: String, title: String) -> impl IntoView {
             }}
             <button class="mr-1.5 hidden shrink-0 self-center rounded-md border border-zinc-200 px-2 py-0.5 text-xs hover:bg-zinc-100 md:block dark:border-zinc-700 dark:hover:bg-zinc-700"
                 on:click=open>"Open"</button>
+        </div>
+    }
+}
+
+#[component]
+fn ToolOutput(result: Signal<Option<ToolResultView>>, live_output: Signal<Option<String>>) -> impl IntoView {
+    let live_box = NodeRef::<leptos::html::Div>::new();
+    let live_tail = StoredValue::new(true);
+    #[cfg(target_arch = "wasm32")]
+    Effect::new(move || {
+        live_output.track();
+        result.track();
+        if live_tail.get_value() {
+            request_animation_frame(move || {
+                if let Some(el) = live_box.try_get_untracked().flatten() {
+                    el.set_scroll_top(el.scroll_height());
+                }
+            });
+        }
+    });
+    // Live and final output share a single, bounded disclosure. Neither
+    // arriving output nor its result changes the height of an open card.
+    view! {
+        <div node_ref=live_box class="h-48 overflow-auto rounded bg-zinc-100 p-2 dark:bg-zinc-900"
+            on:scroll=move |_| if let Some(el) = live_box.get_untracked() { live_tail.set_value(el.scroll_height() - el.scroll_top() - el.client_height() < 24) }>
+            <pre class=move || format!("whitespace-pre-wrap font-mono text-xs {}", if result.with(|r| r.as_ref().is_some_and(|r| r.is_error)) { "text-red-700 dark:text-red-300" } else { "" })>
+                {move || result.get().map(|r| r.output).or_else(|| live_output.get()).unwrap_or_else(|| "Waiting for output…".into())}
+            </pre>
+            {move || result.with(|r| r.as_ref().is_some_and(|r| r.truncated)).then(|| view! { <p class="text-[11px] text-muted">"Output was truncated for the model."</p> })}
+            // Images belong to the same bounded area, not a new row on arrival.
+            {move || result.get().filter(|r| !r.images.is_empty()).map(|r| view! {
+                <div class="mt-2 flex flex-wrap gap-2">
+                    {r.images.into_iter().map(|u| {
+                        let href = u.clone();
+                        view! {
+                            <a href=href target="_blank" title="What the model saw">
+                                <img src=u class="max-h-40 rounded border border-zinc-200 dark:border-zinc-700" loading="lazy" />
+                            </a>
+                        }
+                    }).collect_view()}
+                </div>
+            })}
         </div>
     }
 }
@@ -4256,9 +4298,14 @@ fn ToolCard(
     let worded = matches!(kind.as_str(), "c6_call" | "c6_discover" | "c6_describe");
     let made_session = (op == "sessions.create")
         .then(|| Memo::new(move |_| result.with(|r| r.as_ref().filter(|r| !r.is_error).and_then(|r| made_session(&r.output)))));
+    let session_title = input.pointer("/input/body/title").and_then(|v| v.as_str()).unwrap_or("Starting session…").to_owned();
     // A document it wrote: a card that opens it (docs/docs.md §12).
-    let doc_card = (kind == "doc" || op == "docs.create").then(|| {
-        let action = if op == "docs.create" { "created" } else { input.get("action").and_then(|v| v.as_str()).unwrap_or("") }.to_owned();
+    let action = input.get("action").and_then(|v| v.as_str()).unwrap_or("");
+    let doc_input = if op == "docs.create" { input.pointer("/input/body").unwrap_or(&input) } else { &input };
+    let doc_title = doc_input.get("title").and_then(|v| v.as_str()).unwrap_or("Document…").to_owned();
+    let deck = doc_input.get("kind").and_then(|v| v.as_str()) == Some("deck");
+    let doc_card = (kind == "doc" && matches!(action, "create" | "edit" | "restore") || op == "docs.create").then(|| {
+        let action = if op == "docs.create" { "created" } else { action }.to_owned();
         Signal::derive(move || {
             let r = result.get().filter(|r| !r.is_error)?;
             let v: serde_json::Value = serde_json::from_str(&r.output).ok()?;
@@ -4285,19 +4332,6 @@ fn ToolCard(
         let to = input.get("to").and_then(|v| v.as_str()).unwrap_or_default().to_owned();
         let title = Memo::new(move |_| result.get().filter(|r| !r.is_error).and_then(|r| r.output.split('"').nth(1).map(str::to_owned)));
         (to, title)
-    });
-    let live_shown = Memo::new(move |_| result.with(Option::is_none) && live_output.with(Option::is_some));
-    let live_box = NodeRef::<leptos::html::Pre>::new();
-    let live_tail = StoredValue::new(true);
-    Effect::new(move || {
-        live_output.track();
-        if live_tail.get_value() {
-            request_animation_frame(move || {
-                if let Some(el) = live_box.try_get_untracked().flatten() {
-                    el.set_scroll_top(el.scroll_height());
-                }
-            });
-        }
     });
     // Where a search hit in this call's output scrolls to.
     let dom_id = format!("call-{call_id}");
@@ -4353,7 +4387,21 @@ fn ToolCard(
                     }
                 })}
                 {move || result.get().map(|r| view! { <span class="shrink-0 whitespace-nowrap text-[11px] text-muted">{format!("{:.1}s", r.duration_ms as f64 / 1000.0)}</span> })}
-                {move || made_session.and_then(|m| m.get()).map(|(id, title)| view! { <MadeSession id title /> })}
+                // Reserve its final phone/desktop height before the result
+                // gives us a destination. A title must not add a new row.
+                {made_session.map(|made| view! {
+                    <div class="mt-1.5 h-12 min-w-0 basis-full md:h-8">
+                        {move || match made.get() {
+                            Some((id, title)) => view! { <MadeSession id title /> }.into_any(),
+                            None => view! {
+                                <div class="flex h-full items-center gap-2 rounded-md border border-zinc-200 px-2 text-sm text-muted dark:border-zinc-700">
+                                    {crate::icons::circle()}
+                                    <span class="min-w-0 truncate">{let title = session_title.clone(); move || if result.with(Option::is_some) { "Session not created".to_owned() } else { title.clone() }}</span>
+                                </div>
+                            }.into_any(),
+                        }}
+                    </div>
+                })}
             </summary>
             <div class="space-y-2 border-t border-zinc-200 px-3 py-2 dark:border-zinc-800">
                 {plan.map(|items| view! {
@@ -4369,43 +4417,27 @@ fn ToolCard(
                     </ul>
                 })}
                 {detail_input.map(|d| view! { <pre class="max-h-64 overflow-auto whitespace-pre-wrap font-mono text-xs text-zinc-600 dark:text-zinc-400">{d}</pre> })}
-                {move || result.get().map(|r| view! {
-                    <pre class=format!("max-h-80 overflow-auto whitespace-pre-wrap rounded bg-zinc-100 p-2 font-mono text-xs dark:bg-zinc-900 {}", if r.is_error { "text-red-700 dark:text-red-300" } else { "" })>
-                        {r.output}
-                    </pre>
-                    {r.truncated.then(|| view! { <p class="text-[11px] text-muted">"Output was truncated for the model."</p> })}
-                })}
+                <ToolOutput result live_output />
             </div>
         </details>
-        {move || doc_card.and_then(|c| c.get()).map(|(id, title, kind, what)| view! {
-            <div class="mx-3 mb-2">
-                <crate::workspace::Go to=crate::workspace::View::Docs { id } class="inline-flex items-center gap-2 rounded-md border border-zinc-200 px-2 py-1 text-sm hover:bg-zinc-50 dark:border-zinc-700 dark:hover:bg-zinc-900">
-                    <span class="text-muted">{if kind == "deck" { crate::icons::chart().into_any() } else { crate::icons::file().into_any() }}</span>
-                    <span class="font-medium">{title}</span>
-                    <span class="text-xs text-muted">{what}</span>
-                </crate::workspace::Go>
+        {doc_card.map(|doc| view! {
+            <div class="mx-3 mb-2 h-8 min-w-0">
+                {move || match doc.get() {
+                    Some((id, title, kind, what)) => view! {
+                        <crate::workspace::Go to=crate::workspace::View::Docs { id } class="inline-flex h-full max-w-full items-center gap-2 rounded-md border border-zinc-200 px-2 text-sm hover:bg-zinc-50 dark:border-zinc-700 dark:hover:bg-zinc-900">
+                            <span class="shrink-0 text-muted">{if kind == "deck" { crate::icons::chart().into_any() } else { crate::icons::file().into_any() }}</span>
+                            <span class="min-w-0 truncate font-medium">{title}</span>
+                            <span class="shrink-0 text-xs text-muted">{what}</span>
+                        </crate::workspace::Go>
+                    }.into_any(),
+                    None => view! {
+                        <div class="inline-flex h-full max-w-full items-center gap-2 rounded-md border border-zinc-200 px-2 text-sm text-muted dark:border-zinc-700">
+                            <span class="shrink-0">{if deck { crate::icons::chart().into_any() } else { crate::icons::file().into_any() }}</span>
+                            <span class="min-w-0 truncate">{let title = doc_title.clone(); move || if result.with(Option::is_some) { "No document returned".to_owned() } else { title.clone() }}</span>
+                        </div>
+                    }.into_any(),
+                }}
             </div>
-        })}
-        // What the tool showed the model, visible without expanding the card.
-        {move || result.get().filter(|r| !r.images.is_empty()).map(|r| view! {
-            <div class="mx-3 mb-2 flex flex-wrap gap-2">
-                {r.images.into_iter().map(|u| {
-                    let href = u.clone();
-                    view! {
-                    <a href=href target="_blank" title="What the model saw">
-                        <img src=u class="max-h-40 rounded border border-zinc-200 dark:border-zinc-700" loading="lazy" />
-                    </a>
-                    }
-                }).collect_view()}
-            </div>
-        })}
-        // Live output of a running tool, visible without expanding the card:
-        // one box whose text grows, following its end unless you scroll up in it.
-        {move || live_shown.get().then(|| view! {
-            <pre node_ref=live_box class="mx-3 mb-2 max-h-48 overflow-auto whitespace-pre-wrap rounded bg-zinc-100 p-2 font-mono text-xs dark:bg-zinc-900"
-                on:scroll=move |_| if let Some(el) = live_box.get_untracked() { live_tail.set_value(el.scroll_height() - el.scroll_top() - el.client_height() < 24) }>
-                {move || live_output.get().unwrap_or_default()}
-            </pre>
         })}
         {thread.map(|(s, child)| {
             let waiting = Signal::derive(move || result.with(Option::is_none));
@@ -5687,6 +5719,47 @@ mod tests {
         assert!(html.contains("review"), "{html}");
         // This state never had a symbol; don't invent one during restoration.
         assert!(!subagent_state(false, Some(TurnEndReason::Interrupted)).0.to_html().contains("<svg"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn tool_output_keeps_one_bounded_area_before_and_after_the_result() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let result = RwSignal::new(None::<ToolResultView>);
+            let live_output = RwSignal::new(None::<String>);
+            let render = || view! { <ToolOutput result=result.into() live_output=live_output.into() /> }.to_html();
+            let success =
+                ToolResultView { output: "Build finished".into(), is_error: false, truncated: false, duration_ms: 100, images: Vec::new() };
+            // Drive the same signals that switch live to final output in a
+            // mounted card; rendering a native view consumes it each time.
+            let pending = render();
+            live_output.set(Some("Building…".into()));
+            let live = render();
+            live_output.set(Some("stale live output".into()));
+            result.set(Some(success.clone()));
+            let finished = render();
+            live_output.set(None);
+            result.set(Some(ToolResultView {
+                output: "Build failed".into(),
+                is_error: true,
+                truncated: true,
+                images: vec!["/image.png".into()],
+                ..success
+            }));
+            let error = render();
+            for html in [&pending, &live, &finished, &error] {
+                assert!(html.starts_with("<div class=\"h-48 overflow-auto"), "one fixed output area from its first frame: {html}");
+                assert_eq!(html.matches("<pre").count(), 1, "never add a second live-output box: {html}");
+                assert!(!html.contains("<details"), "the output cannot change its parent's open state: {html}");
+            }
+            assert!(pending.contains("Waiting for output…"), "{pending}");
+            assert!(live.contains("Building…"), "{live}");
+            assert!(finished.contains("Build finished") && !finished.contains("stale live output"), "{finished}");
+            assert!(error.contains("Build failed") && error.contains("text-red-700"), "{error}");
+            assert!(error.contains("Output was truncated for the model."), "{error}");
+            assert!(error.contains("<img") && error.contains("/image.png"), "keep the model's images: {error}");
+        });
     }
 
     #[cfg(not(target_arch = "wasm32"))]
