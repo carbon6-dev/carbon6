@@ -334,6 +334,15 @@ impl Cards {
                 .then_some(())
         })
         .await;
+        eventually("the card answer to show once as your message without a turn", async || {
+            let evs = self.events(session).await;
+            (evs.iter()
+                .filter(|e| matches!(&e.kind, EventKind::User { text: s, command, .. } if s == text && command == "card-answer"))
+                .count()
+                == 1)
+                .then_some(())
+        })
+        .await;
     }
 
     async fn assert_quiet(&self, session: &str, turns: usize, requests: usize) {
@@ -375,22 +384,45 @@ async fn task_card_answers_are_quiet_context_and_withdraw_explains_them() {
         if option == "Start it" {
             t.mock.push(Reply::Text("Started the separate task.".into()));
         }
+        let mut live = t.head().hub.subscribe(&session.id);
         let answered = t.post(&format!("decisions/{}/answer", card.id), json!({"option": option})).await;
         let text = match option.as_str() {
-            "Not now" => format!("You chose Not now on task card #{} {:?}.", card.id, card.title),
+            "Not now" => format!("Not now: task card #{} {:?}.", card.id, card.title),
             "Start it" => {
                 t.idle(answered["sessions"][0].as_str().unwrap(), 1).await;
-                format!("You chose Start session on task card #{} {:?}.", card.id, card.title)
+                format!("Start session: task card #{} {:?}.", card.id, card.title)
             }
             _ => {
                 let works: Vec<WorkItem> = serde_json::from_value(t.get("work").await).unwrap();
                 let work = works.iter().find(|w| w.fields.todos.iter().any(|todo| todo.from == format!("decision:{}", card.id))).unwrap();
-                format!("You saved task card #{} {:?} as a to-do on {:?}.", card.id, card.title, work.fields.title)
+                format!("Save for later: task card #{} {:?} (to-do on {:?}).", card.id, card.title, work.fields.title)
             }
         };
         assert_eq!(text.lines().count(), 1, "the note stays one line even for multiline titles");
         t.recorded(&session.id, &text).await;
         t.assert_quiet(&session.id, turns, requests).await;
+        let shown = eventually("the card answer to stream as your message without a turn", async || {
+            while let Ok(msg) = live.try_recv() {
+                if let c6_api::StreamMsg::Event { event } = msg
+                    && matches!(&event.kind, EventKind::User { text: s, command, .. } if s == &text && command == "card-answer")
+                {
+                    return Some(event);
+                }
+            }
+            None
+        })
+        .await;
+        assert!(t.events(&session.id).await.contains(&shown), "reload uses the same journal position as live view");
+        // Redelivery before and after consumption must neither show nor send
+        // another copy. The marker is in the existing command id, so even a
+        // quiet_notes worker predating this UI behavior preserves it.
+        let EventKind::User { command_id, .. } = &shown.kind else { unreachable!() };
+        let command = c6_proto::SessionCommand {
+            command_id: command_id.clone(),
+            session_id: session.id.clone(),
+            kind: Some(c6_proto::session_command::Kind::QuietNote(c6_proto::QuietNote { text: text.clone() })),
+        };
+        t.worker.sessions.handle(command.clone()).await.unwrap();
         let withdraw = |id| json!({"id": id, "why": "No longer needed"});
         let error = c6_head::decisions::task_card(t.head(), &session.id, "task_withdraw", &withdraw(card.id)).await.unwrap_err();
         assert_eq!(error.to_string(), format!("Task card #{} was already answered: {option}.", card.id));
@@ -403,11 +435,23 @@ async fn task_card_answers_are_quiet_context_and_withdraw_explains_them() {
         turns += 1;
         t.idle(&session.id, turns).await;
         let encoded = serde_json::to_string(&text).unwrap();
-        assert!(
-            t.mock.requests().last().unwrap()["messages"].to_string().contains(&encoded[1..encoded.len() - 1]),
+        assert_eq!(
+            t.mock.requests().last().unwrap()["messages"].to_string().matches(&encoded[1..encoded.len() - 1]).count(),
+            1,
             "{text}: {}",
             t.mock.log()
         );
+        t.worker.sessions.handle(command).await.unwrap();
+        t.assert_quiet(&session.id, turns, requests + 1).await;
+        let journal = t.worker.journal.events_after(&session.id, 0, u32::MAX).await.unwrap();
+        assert_eq!(
+            journal
+                .iter()
+                .filter(|e| matches!(&e.kind, Some(c6_proto::session_event::Kind::NoticeQueued(n)) if n.command_id == *command_id))
+                .count(),
+            1
+        );
+        assert!(!std::iter::from_fn(|| live.try_recv().ok()).any(|msg| matches!(msg, c6_api::StreamMsg::Event { event } if matches!(&event.kind, EventKind::User { text: s, .. } if s == &text))), "no second live line when consumed or redelivered");
         let told = t.events(&session.id).await.iter().filter(|e| matches!(&e.kind, EventKind::User { text: s, .. } if s == &text)).count();
         assert_eq!(told, 1, "the note is delivered once");
     }
@@ -415,7 +459,7 @@ async fn task_card_answers_are_quiet_context_and_withdraw_explains_them() {
     // Save for later without session work creates a new destination, too.
     let card = t.propose(&other.id, "Standalone cleanup").await;
     t.post(&format!("decisions/{}/answer", card.id), json!({"option": "Add to this work"})).await;
-    let text = format!("You saved task card #{} {:?} as a to-do on {:?}.", card.id, card.title, card.title);
+    let text = format!("Save for later: task card #{} {:?} (to-do on {:?}).", card.id, card.title, card.title);
     t.recorded(&other.id, &text).await;
     t.assert_quiet(&other.id, 1, t.mock.requests().len()).await;
     t.mock.push(Reply::Text("Saved for later.".into()));
@@ -452,23 +496,20 @@ async fn a_busy_task_card_note_waits_for_input_and_survives_restarts() {
     })
     .await;
     t.post(&format!("decisions/{}/answer", card.id), json!({"option": "Not now"})).await;
-    let text = format!("You chose Not now on task card #{} {:?}.", card.id, card.title);
+    let text = format!("Not now: task card #{} {:?}.", card.id, card.title);
     t.recorded(&session.id, &text).await;
     assert_eq!(t.get(&format!("sessions/{}", session.id)).await["session"]["status"], "running");
     gate.notify_one();
     t.idle(&session.id, 2).await;
     t.assert_quiet(&session.id, 2, 2).await;
-    assert!(
-        !t.events(&session.id).await.iter().any(|e| matches!(&e.kind, EventKind::User { text: s, .. } if s == &text)),
-        "not injected into the busy turn"
-    );
+    assert!(!t.mock.requests()[1]["messages"].to_string().contains("A busy cleanup"), "not injected into the busy turn");
 
     // A queued command survives a head restart; a recorded note survives
-    // a worker reload. Both remain invisible until the next explicit input.
+    // a worker reload. Both show as your messages before the next input.
     t.detach().await;
     let offline = t.propose(&session.id, "An offline cleanup").await;
     t.post(&format!("decisions/{}/answer", offline.id), json!({"option": "Not now"})).await;
-    let offline_text = format!("You chose Not now on task card #{} {:?}.", offline.id, offline.title);
+    let offline_text = format!("Not now: task card #{} {:?}.", offline.id, offline.title);
     t.head.take().unwrap().shutdown().await.unwrap();
     t.head = Some(c6_head::start(t.config.clone()).await.unwrap());
     // In-process shutdown leaves existing HTTP keep-alive tasks alive;
@@ -477,6 +518,7 @@ async fn a_busy_task_card_note_waits_for_input_and_survives_restarts() {
     drop(t.worker);
     t.worker = crate::open_worker(t.state.path()).await;
     t.attach().await;
+    t.recorded(&session.id, &text).await;
     t.recorded(&session.id, &offline_text).await;
     t.assert_quiet(&session.id, 2, 2).await;
     t.mock.push(Reply::Text("Both answers received.".into()));
@@ -487,7 +529,23 @@ async fn a_busy_task_card_note_waits_for_input_and_survives_restarts() {
         assert_eq!(events.iter().filter(|e| matches!(&e.kind, EventKind::User { text, .. } if text == expected)).count(), 1);
     }
     let messages = t.mock.requests().last().unwrap()["messages"].to_string();
-    assert!(messages.contains("A busy cleanup") && messages.contains("An offline cleanup"), "{messages}");
+    assert_eq!(messages.matches("A busy cleanup").count(), 1, "{messages}");
+    assert_eq!(messages.matches("An offline cleanup").count(), 1, "{messages}");
+    // Reload after consumption, too: the raw User receipt still prevents
+    // replaying the arrival, although the API no longer shows that receipt.
+    t.detach().await;
+    drop(t.worker);
+    t.worker = crate::open_worker(t.state.path()).await;
+    t.attach().await;
+    t.recorded(&session.id, &text).await;
+    t.recorded(&session.id, &offline_text).await;
+    t.assert_quiet(&session.id, 3, 3).await;
+    t.mock.push(Reply::Text("Both answers still appear only once.".into()));
+    t.post(&format!("sessions/{}/messages", session.id), json!({"text": "continue after consumption and reload"})).await;
+    t.idle(&session.id, 4).await;
+    let messages = t.mock.requests().last().unwrap()["messages"].to_string();
+    assert_eq!(messages.matches("A busy cleanup").count(), 1, "{messages}");
+    assert_eq!(messages.matches("An offline cleanup").count(), 1, "{messages}");
     t.close().await;
 }
 
@@ -506,12 +564,13 @@ async fn a_task_card_note_restores_a_trimmed_session_without_waking() {
     assert!(!t.worker.journal.has_session(&session.id).await.unwrap());
     let card = t.propose(&session.id, "A cleanup after journal trimming").await;
     t.post(&format!("decisions/{}/answer", card.id), json!({"option": "Not now"})).await;
-    let text = format!("You chose Not now on task card #{} {:?}.", card.id, card.title);
+    let text = format!("Not now: task card #{} {:?}.", card.id, card.title);
     t.recorded(&session.id, &text).await;
     t.assert_quiet(&session.id, 1, 1).await;
     t.mock.push(Reply::Text("I saw the restored note.".into()));
     t.post(&format!("sessions/{}/messages", session.id), json!({"text": "continue after trimming"})).await;
     t.idle(&session.id, 2).await;
+    assert_eq!(t.mock.requests().last().unwrap()["messages"].to_string().matches("A cleanup after journal trimming").count(), 1);
     assert_eq!(t.events(&session.id).await.iter().filter(|e| matches!(&e.kind, EventKind::User { text: s, .. } if s == &text)).count(), 1);
 
     // Other rejection reasons cannot turn quiet context into a failed
@@ -538,7 +597,7 @@ async fn a_task_card_note_restores_a_trimmed_session_without_waking() {
     assert!(t.head().store.pending_commands(t.worker.identity.meta.worker_id, 0).await.unwrap().iter().any(is_note));
     t.assert_quiet(&session.id, 2, 2).await;
     t.attach().await;
-    let text = format!("You chose Not now on task card #{} {:?}.", card.id, card.title);
+    let text = format!("Not now: task card #{} {:?}.", card.id, card.title);
     t.recorded(&session.id, &text).await;
     t.assert_quiet(&session.id, 2, 2).await;
     t.close().await;

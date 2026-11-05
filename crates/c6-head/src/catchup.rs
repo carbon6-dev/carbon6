@@ -151,7 +151,7 @@ pub(crate) fn worth_a_card(steps: u64, waiting: usize) -> bool {
 /// document's comments or the agent's that started it.
 fn yours(kind: &EventKind) -> bool {
     matches!(kind, EventKind::User { text, command, from_session_id, delegated_by, .. }
-        if from_session_id.is_empty() && delegated_by.is_empty() && command != "task-notification" && command != "stop-hook" && doc_comment(text).is_none())
+        if from_session_id.is_empty() && delegated_by.is_empty() && !matches!(command.as_str(), "task-notification" | "stop-hook" | "card-answer") && doc_comment(text).is_none())
 }
 
 /// Where a catch-up starts, and when: after `seen`, the last event before
@@ -726,6 +726,14 @@ pub(crate) mod tests {
         k
     }
 
+    pub(crate) fn card_answer() -> EventKind {
+        let mut k = user("Not now: task card #185 \"Cleanup\".");
+        if let EventKind::User { command, .. } = &mut k {
+            *command = "card-answer".into();
+        }
+        k
+    }
+
     pub(crate) fn reply(turn: u64, text: &str, tools: &[(&str, &str, serde_json::Value)]) -> EventKind {
         let mut blocks = Vec::new();
         if !text.is_empty() {
@@ -852,6 +860,7 @@ pub(crate) mod tests {
             ev(30, 3000, from_session("Release prep", "hi")),
             ev(31, 3001, notice("<background-task>\nCommand: make\n</background-task>")),
             ev(32, 3002, user("A comment on the document \"Plan\" (doc:d1) is for you. Thread t1")),
+            ev(33, 3003, card_answer()),
         ];
         assert_eq!(since(&others, 29, 2900), (29, 2900));
     }

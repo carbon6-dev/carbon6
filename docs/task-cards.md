@@ -61,7 +61,7 @@ The card is answered with "Start it" and names the new session ("working session
 
 The new session is on its own from there: nothing it does is reported back to the session that proposed the card. You see its result in the new session (linked from the card), and the `from:<session>` label ties the two together.
 
-The answer itself does reach the proposing agent, as quiet context for its next input: `You chose Start session on task card #177 "Remove the dead retry module".` This does not report the new session's progress or result.
+The click sends your message to the proposing session: `Start session: task card #177 "Remove the dead retry module".` It shows in that session's transcript immediately when the worker records it, and reaches the agent with its next input. This does not report the new session's progress or result.
 
 ### 4.1 The other answers
 
@@ -71,15 +71,21 @@ The answer itself does reach the proposing agent, as quiet context for its next 
 - **Save elsewhere… → an existing work item** files the same to-do, with its prompt and origin, into the chosen open work item, without moving the proposing session.
 - **Starting it later:** ▶ Start on the to-do opens the new-session form where the proposing session worked, with the card's prompt (by `work.todo`). The session joins the work and can tick the to-do off.
 
-Start session, the Save answers (including Save for later's new-work fallback), and Not now also tell the proposing agent what you chose. The one-line notes are:
+Start session, the Save answers (including Save for later's new-work fallback), and Not now send text in your voice. What you see as your own right-aligned transcript message is exactly what the proposing agent gets:
 
-- `You chose Start session on task card #177 "Remove the dead retry module".`
-- `You saved task card #177 "Remove the dead retry module" as a to-do on "Cleanup".`
-- `You chose Not now on task card #177 "Remove the dead retry module".`
+- `Start session: task card #177 "Remove the dead retry module".`
+- `Save for later: task card #177 "Remove the dead retry module" (to-do on "Cleanup").`
+- `Not now: task card #177 "Remove the dead retry module".`
 
-The Save note names the actual destination work. Titles are quoted and newlines escaped, so the note stays one line. Do it here already sends the task as your message and gets no extra note. A failed answer sends no note.
+The Save text names the actual destination work, including Save elsewhere's destinations. Titles are quoted and newlines escaped, so the message stays one line. There is no separate system-note label or style. Do it here already sends the task as your message and gets no extra message. A failed answer sends no message.
 
-These notes never start or interrupt a turn, change the session's status, or add a queued-input count or held-notice pill. Even during a busy turn, they wait for the next input rather than joining that turn. Delivery uses the head's existing durable command queue (`SessionCommand.quiet_note`) and the worker's journaled `NoticeQueued` / deferred-notice machinery, marked `quiet` and non-waking. The command survives a head restart while the worker is offline; the journaled note survives a worker reload and is delivered once with the next input. No schema migration is needed. Only workers advertising `quiet_notes` receive this additive, optional command. An older worker silently skips the note (the head logs at debug), including one queued while it was offline; there is no waking fallback. `queue_ops` alone only promises queued-input editing/cancellation, not quiet-note support.
+These messages never start or interrupt a turn, change the session's status, or add a queued-input count or held-notice pill. Even during a busy turn, they wait for the next input rather than joining that turn. Delivery still uses the head's durable command queue (`SessionCommand.quiet_note`) and the worker's journaled `NoticeQueued` / deferred-notice machinery, marked `quiet` and non-waking. The command survives a head restart while the worker is offline; the journaled message survives a worker reload and is delivered once with the next input.
+
+New card-answer commands have a `card-answer:` id prefix, preserved when restoring a trimmed session. The head converts their quiet `NoticeQueued` arrival into an API `User` event (`command: "card-answer"`), at the arrival's original sequence and timestamp. This same conversion serves live view and journal reload, for local and remote workers, without running a turn. The later journaled `User` event is still the worker's consumption receipt for model history and recovery, but the head omits it from the API: it cannot create a second transcript line. The existing command-id deduplication prevents redelivery from creating another arrival or agent copy. Older, unmarked quiet notes retain their existing behavior.
+
+The arrival is searchable at its visible position, but does not reset unread catch-up activity or become a turn's starting message in the outline. It has no edit, rewind or side-chat controls: those require a model-history input, not a display-only arrival. Other user messages keep their existing controls and icons.
+
+No schema migration or new wire field is needed. Only workers advertising `quiet_notes` receive the optional command; their existing machinery preserves the id prefix without any worker update. An older worker without that capability silently skips the message (the head logs at debug), including one queued while it was offline; there is no waking fallback. `queue_ops` alone only promises queued-input editing/cancellation, not quiet-note support.
 
 If the worker has trimmed the session, restoration preserves the quiet command instead of turning it into an ordinary message. A worker that rejects a note leaves it pending for reconnection, without marking the session failed or immediately retrying in a loop.
 
@@ -100,7 +106,8 @@ If the worker has trimmed the session, restoration preserves the quiet command i
    - Start it creates the session with the card's prompt, worker, folder and realm;
    - withdraw settles the card;
    - a duplicate title raises the same card;
-   - each non-waking answer reaches the next input, without a new turn, status change, queue count or held-notice pill;
+   - each non-waking answer shows immediately as your message, streams at the same journal position as reload, and reaches the next input once, without a new turn, status change, queue count or held-notice pill;
+   - consuming or redelivering an answer never adds another transcript line; the UI renders the normal right-aligned user bubble, not a system note;
    - busy and offline delivery, head/worker restarts, journal trimming/restoration, rejected notes and older workers preserve quietness;
    - withdrawing an answered card reports the answer without exposing another session's cards;
    - a subagent doesn't get the tool.
