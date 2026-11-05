@@ -124,16 +124,16 @@ the entire layout unchanged; every blue preview must change the visible layout.
 In a desktop browser (also check touch-capable desktop/tablet native dragging):
 
 1. Open sixteen tiles (four columns, four tiles each). Drag a tile from a shared
-   column over another tile's left and right fifths. Neither edge turns blue;
-   the hint explains that four columns are open and to drop above or below,
-   and the cursor forbids the drop. Releasing leaves the layout unchanged.
+   column over another tile's left and right fifths. Neither edge turns blue,
+   no text covers the tile's bar, and the cursor forbids the drop. Releasing
+   leaves the layout unchanged.
 2. Drop the same tile in the middle of another tile's top or bottom half. It
    joins that column at the highlighted position, even with many tiles there.
    Repeat in the padding between stacked tiles; the gap accepts the drop too.
 3. Move over a valid destination, then back over the source or out of the grid.
    No old highlight remains. Moving between child elements inside a destination
    must keep the preview. Dropping onto the source, immediately before/after its
-   current position, or beside its singleton column shows **Already here**.
+   current position, or beside its singleton column shows no highlight and does nothing.
 4. With fewer than four occupied columns, move a tile into a new column. With
    four columns, a tile alone in its column can still move that column to a
    different place. Minimize/close a different tile during a drag: the drop uses
