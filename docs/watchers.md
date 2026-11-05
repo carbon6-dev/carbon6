@@ -143,3 +143,63 @@ So directives don't each become a watcher (which would multiply watchers and cos
 4. **The decisions ledger and consistency watcher, and the guard's hook into policies.**
 5. **The carbon6 improvement watcher.**
 6. **Moving the existing ad-hoc watchers over:** the work and project notes, suggestions, naming, catch-ups.
+
+## 11. As built (2026-11-05)
+
+Steps 1–5 are built. Step 6 (moving the work and project notes, suggestions, naming and catch-ups onto watchers) is not: those keep their own code for now.
+
+- **Where it lives.**
+  - `crates/c6-head/src/watchers.rs`: the runtime, outputs, ledger, guard, signals and schedule.
+  - `crates/c6-api/src/watchers.rs`: definitions and the shipped ones (`preinstalled()`).
+  - Migration `0063_watchers.sql`: `watcher_state` (position, notes, counts per watcher and key), `watcher_spend` (tokens a day), `watcher_findings`, `watch_signals`.
+  - The agendas are the editable prompts `watch.stuck`, `watch.retro`, `watch.retro-weekly`, `watch.review`, `watch.consistency`, `watch.guard`, `watch.improve`, plus `watch.answer` (the answer's shape, added after every agenda).
+  - The UI is in `crates/c6-ui/src/watchers.rs`: Settings → Watchers (console), and a Watchers line in the session's Glance.
+- **Definitions.** The setting `watchers` holds only the definitions you saved. A shipped watcher you never saved follows carbon6's version; one you saved keeps yours (`newer_default` says when carbon6's differs). Reset takes yours back.
+- **`watchers` in the head's config.** A head run from its config file runs the shipped watchers as they ship (`watchers = false` turns them all off). A head built in code, such as a test's, starts them off. Definitions you saved apply either way.
+- **Pre-installed, as decided (§9):**
+  - **on:** `stuck` (wakes on `tool_failures`, `loop`), `retro` (wakes on `correction`, `session_end`), `review` (sessions with a `repo:` label, wakes on `commit`, `edits`) and `retro-weekly`;
+  - **off:** `consistency`, `guard` and `improve`.
+- **Waking.** Every batch of a session's events with a boundary in it pokes each watcher that applies to it: a user message, a tool result, a turn's end, an approval, a rewind.
+  - A wake (one at a time per watcher and session, coalescing what comes meanwhile) reads up to 400 events from its position and works out what happened, with no model.
+  - **What wakes it:**
+    - `correction`: an interruption, a rewind, a denied approval, or a message of yours that reads like one ("no", "don't", "instead", "make sure", "always"…);
+    - `loop`: the same call three times;
+    - `tool_failures`: three failures in a row, or three of one tool;
+    - `commit`, `edits` and `turn_end`.
+  - Only a match with the watcher's wakes calls its model. Anything else counts as a skip and writes nothing to its session.
+  - A watcher's first wake reads from a little before the session's end, not from its start.
+- **One model call per wake, not a tool loop.** The agenda and what changed go to the model, which answers JSON (findings, its new notes, a reply). The head then does what the findings ask, within the watcher's `outputs`. This was simpler, cheaper and easier to bound than giving a watcher tools.
+  - The turn in its session shows what woke it and the digest, its answer, its usage, and a quiet notice per thing done.
+  - Its model: a routing rule for `task:watch:<name>`, else the watched session's (when the head can ask it), else the assistant's, else what a new session would get.
+- **Outputs.**
+  - **Notes to the agent:** a message from the watcher's session (`sessions::message_from_watcher`), only at or above `note_severity`, and at most `notes_per_hour` per session; the rest are marks.
+  - **Marks:** a finding on the session, shown in the Glance's Watchers line. carbon6's marks (`marks.rs`) are colours of aspects, so a watcher mark is a finding rather than one of those.
+  - **Lessons:** memory notes scoped to `repo:…` or `worker:…` are applied at once (written by `watcher:<name>`). Others become an approval card, and Allow adds the note.
+  - **Directives:** a card asking Here only / Audit now / From now on.
+    - Audit now: a task card.
+    - From now on: a memory note with `enforced_by: review`, and a task card for a mechanical check when the model said one could check it.
+  - **Changes** to a prompt, policy or routing rule: a card. Allow records your agreement; the watcher doesn't edit those settings itself. A memory note to retire is deleted on Allow.
+  - **Task cards** start from the watched session. The improvement watcher's start from the newest session in a carbon6 checkout, else its own session.
+  - **Documents** (the weekly retrospective) go to home when the watcher's realm is root.
+- **Standards.** Memory notes gained `enforced_by` (kept when an edit doesn't say). The review watcher's prompt gets the notes in the session's realm whose `enforced_by` names it and whose scope matches the session.
+- **Review** reads the session's uncommitted changes from its worker (`git.diff`) along with the digest. After a commit the diff is empty, so the digest's tool calls carry what was changed.
+- **The decisions ledger** is one document per project (else per realm), made on first use and put on the project as notes. The consistency watcher appends a line per new decision, and tells sessions that go against an entry.
+- **The guard** is a policy action, `judge`. While the guard watcher is on, the head adds a built-in policy with its pattern.
+  - A worker's matching call asks the head (`session.guard`), which asks the guard's model. A risky call waits for your approval with the guard's reason; one judged safe runs.
+  - If the head can't judge, the call waits for you.
+  - Policies apply where carbon6's loop runs the tools (and to carbon6's tools under Claude Code). Claude Code's own tools follow Claude Code's permissions.
+- **The improvement watcher.**
+  - A tracing layer in `c6h` (`SignalLayer`) keeps the head's warnings and errors.
+  - The web UI's crash reports and failed calls to carbon6's tools are counted too.
+  - All are grouped by their message with ids and numbers taken out (`watch_signals`), without a model.
+  - Hourly, or when you run it, only groups at or over `threshold` that grew since it last looked go to the model.
+- **The schedule.** Every minute the head runs the watchers over everything (scope `all`) that are due: hourly, daily or weekly, counted from their last wake.
+  - One with nothing new skips without a model call: the weekly roll-up with no findings, the improvement watcher with no grown groups.
+  - On start, the head knows its watchers' sessions again and wakes those whose sessions moved while it was down.
+- **Lifetime.** Archiving a session ends its watchers. Those that wake on `session_end` take a last turn first, then their sessions are archived. Archiving a watcher's session stops it following.
+- **Out of the session list.** Watcher sessions are left out of the session list. Per-session ones open from the Glance; all of them from Settings → Watchers' findings.
+- **Not built:**
+  - step 6;
+  - `idle`, `daily` signals of a session (only scheduled watchers use daily/weekly);
+  - a watcher replying in the watched session's transcript other than through its notes;
+  - watchers as packages.
