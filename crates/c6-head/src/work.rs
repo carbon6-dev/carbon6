@@ -1189,11 +1189,19 @@ pub async fn on_new_session(st: &HeadState, s: &api::Session, work: Option<&str>
 
 /// A task card kept as a to-do (docs/task-cards.md §4.1): added to the
 /// work its session belongs to (`into_session_work`), else to new work
-/// named after it. Returns the work item's id.
-pub async fn keep_todo(st: &HeadState, d: &api::Decision, into_session_work: bool) -> anyhow::Result<String> {
+/// named after it. An explicit target must be open and in the card's realm
+/// (the answer endpoint already checks the caller can see that realm).
+/// Returns the work item's id.
+pub async fn keep_todo(st: &HeadState, d: &api::Decision, into_session_work: bool, destination: Option<&str>) -> anyhow::Result<String> {
     let origin = d.context["session"].as_str().unwrap_or("").to_owned();
-    let mut target = None;
-    if into_session_work && !origin.is_empty() {
+    let mut target = match destination {
+        Some(id) => {
+            load(st, id).await?.filter(|w| w.realm == d.realm).ok_or_else(|| not_found("no such work item in this realm"))?;
+            Some(id.to_owned())
+        }
+        None => None,
+    };
+    if target.is_none() && into_session_work && !origin.is_empty() {
         let root = match st.store.session(&origin).await? {
             Some(s) => s.root_id.clone().or(s.parent_id.clone()).unwrap_or(s.id),
             None => origin.clone(),
@@ -1210,7 +1218,15 @@ pub async fn keep_todo(st: &HeadState, d: &api::Decision, into_session_work: boo
     todo.origin = origin;
     let id = match target {
         Some(id) => {
-            modify(st, &id, &crate::agent_ops::by("you"), None, |f| add_todo_to(f, todo)).await?;
+            modify(st, &id, &crate::agent_ops::by("you"), None, |f| {
+                // Recheck under the writer lock: it may have been closed
+                // since the chooser loaded (or this target was resolved).
+                if f.status != "open" {
+                    return Err(bad_request("choose an open work item"));
+                }
+                add_todo_to(f, todo)
+            })
+            .await?;
             id
         }
         None => {
@@ -2017,6 +2033,108 @@ pub async fn for_session(st: &HeadState, session_id: &str, p: &Value) -> anyhow:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No worker is needed: these are one-off calls made by the head.
+    async fn routing_fixture() -> (tempfile::TempDir, crate::Head, c6_testkit::MockLlm, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let head = crate::start(crate::HeadConfig {
+            data_dir: dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            auth: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let mock = c6_testkit::MockLlm::start().await;
+        for (id, kind) in [("cc", "claude_code"), ("api", "openai_compat")] {
+            sqlx::query("INSERT INTO connections (id, name, kind, base_url, created_at) VALUES (?, ?, ?, ?, 0)")
+                .bind(id)
+                .bind(id)
+                .bind(kind)
+                .bind(mock.base_url())
+                .execute(&head.state.store.pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, realm, labels) \
+             VALUES ('session', '', 'Fix the pager', '', 'cc', 'opus', 'idle', 1, 1, ?, '[\"repo:notes\"]')",
+        )
+        .bind(crate::realms::HOME)
+        .execute(&head.state.store.pool)
+        .await
+        .unwrap();
+        let fields = WorkFields {
+            title: "Fix the pager".into(),
+            status: "open".into(),
+            attached: vec![Attached { reference: "session:session".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let id = insert(&head.state, crate::realms::HOME, &fields, &[], "you").await.unwrap();
+        (dir, head, mock, id)
+    }
+
+    #[tokio::test]
+    async fn task_card_saves_elsewhere_only_to_open_work_in_its_realm() {
+        let (_dir, head, _mock, original) = routing_fixture().await;
+        let st = &head.state;
+        let realm = crate::realms::HOME;
+        crate::realms::create(st, &api::RealmIn { id: "elsewhere".into(), ..Default::default() }, "you").await.unwrap();
+        let mut destinations = Vec::new();
+        for (realm, status) in [(realm, "open"), (realm, "done"), ("elsewhere", "open")] {
+            let fields = WorkFields { title: "Another work item".into(), status: status.into(), ..Default::default() };
+            destinations.push(insert(st, realm, &fields, &[], "you").await.unwrap());
+        }
+        let card = crate::decisions::task_card(
+            st,
+            "session",
+            "task_propose",
+            &json!({
+                "title": "Split the config", "prompt": "Split src/config.rs into load.rs and check.rs."
+            }),
+        )
+        .await
+        .unwrap();
+        let id = card["id"].as_i64().unwrap();
+        // This card has only the original options, like a card saved before
+        // the chooser existed. An arbitrary destination still works.
+        let url = format!("http://127.0.0.1:{}/api/v1/decisions/{id}/answer", head.ui_addrs[0].port());
+        let http = reqwest::Client::new();
+        for target in ["", "missing", &destinations[1], &destinations[2]] {
+            let response = http.post(&url).json(&json!({"option": format!("Add to work:{target}")})).send().await.unwrap();
+            assert!(response.status().is_client_error(), "{}", response.text().await.unwrap());
+            assert_eq!(crate::decisions::get(st, id).await.unwrap().unwrap().state, "open");
+        }
+        let response = http.post(&url).json(&json!({"option": format!("Add to work:{}", destinations[0])})).send().await.unwrap();
+        assert!(response.status().is_success(), "{}", response.text().await.unwrap());
+        let saved = load(st, &destinations[0]).await.unwrap().unwrap();
+        let todo = &saved.fields.todos[0];
+        assert_eq!(saved.fields.todos.len(), 1);
+        assert_eq!(todo.text, "Split the config");
+        assert_eq!(todo.prompt, "Split src/config.rs into load.rs and check.rs.");
+        assert_eq!(todo.origin, "session");
+        assert_eq!(todo.from, format!("decision:{id}"));
+        assert!(todo.done_at.is_none());
+        assert!(load(st, &original).await.unwrap().unwrap().fields.todos.is_empty());
+        for id in &destinations[1..] {
+            assert!(load(st, id).await.unwrap().unwrap().fields.todos.is_empty());
+        }
+        assert_eq!(crate::decisions::get(st, id).await.unwrap().unwrap().state, "answered");
+        // Other kinds of decision cannot use the task-only dynamic option.
+        let question =
+            crate::decisions::open(st, &api::DecisionIn { title: "A question".into(), ..Default::default() }, realm, "").await.unwrap();
+        let result = crate::decisions::answer(
+            st,
+            question.id,
+            &api::DecisionAnswer { option: Some(format!("Add to work:{}", destinations[0])), ..Default::default() },
+            "test",
+        )
+        .await;
+        assert!(result.is_err());
+        head.shutdown().await.unwrap();
+    }
 
     fn live(reference: &str, state: &str, at: i64) -> LiveAttached {
         LiveAttached { reference: reference.into(), title: reference.into(), state: state.into(), at, ..Default::default() }

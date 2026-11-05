@@ -256,8 +256,12 @@ pub async fn answer(st: &HeadState, id: i64, a: &api::DecisionAnswer, via: &str)
         return Err(bad_request(format!("decision {id} is already {}", d.state)));
     }
     let option = a.option.as_deref().map(str::trim).filter(|o| !o.is_empty());
+    let reference: String = sqlx::query_scalar("SELECT ref FROM decisions WHERE id = ?").bind(id).fetch_one(&st.store.pool).await?;
+    // Destinations are chosen at answer time, including for older cards.
+    // The work writer checks that the target is open and in this realm.
+    let task_destination = d.kind == "task" && reference.starts_with("task:") && option.is_some_and(|o| o.starts_with(TASK_TO_WORK_PREFIX));
     match option {
-        Some(o) if !d.options.iter().any(|x| x.label == o) => {
+        Some(o) if !task_destination && !d.options.iter().any(|x| x.label == o) => {
             return Err(bad_request(format!("{o:?} is not one of its options")));
         }
         None if !d.options.is_empty() => return Err(bad_request("choose one of its options")),
@@ -279,7 +283,6 @@ pub async fn answer(st: &HeadState, id: i64, a: &api::DecisionAnswer, via: &str)
         return Err(bad_request("answer only the fields it asks for"));
     }
     let answer = json!({"option": option, "values": a.values});
-    let reference: String = sqlx::query_scalar("SELECT ref FROM decisions WHERE id = ?").bind(id).fetch_one(&st.store.pool).await?;
     // What waits on it first: if that fails, the decision stays open.
     act(st, &d, &reference, option, &a.values, &a.note).await?;
     record(st, id, "answered", &answer, &a.note, via).await?;
@@ -370,10 +373,13 @@ async fn act(
             Some(TASK_START) => start_task(st, d).await?,
             Some(TASK_HERE) => do_task_here(st, d).await?,
             Some(TASK_TO_WORK) => {
-                crate::work::keep_todo(st, d, true).await?;
+                crate::work::keep_todo(st, d, true, None).await?;
             }
             Some(TASK_TO_NEW_WORK) => {
-                crate::work::keep_todo(st, d, false).await?;
+                crate::work::keep_todo(st, d, false, None).await?;
+            }
+            Some(o) if o.starts_with(TASK_TO_WORK_PREFIX) => {
+                crate::work::keep_todo(st, d, false, o.strip_prefix(TASK_TO_WORK_PREFIX)).await?;
             }
             _ => {}
         },
@@ -720,6 +726,7 @@ pub const TASK_START: &str = "Start it";
 pub const TASK_HERE: &str = "Do it here";
 pub const TASK_TO_WORK: &str = "Add to this work";
 pub const TASK_TO_NEW_WORK: &str = "Add as new work";
+pub const TASK_TO_WORK_PREFIX: &str = "Add to work:";
 
 /// An agent proposes a task for a separate session, or withdraws one
 /// (docs/task-cards.md): a card in its session and in Decisions.

@@ -345,7 +345,7 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
                 let session_title = Signal::derive(move || proposing.get().map(|s| s.title).filter(|t| !t.is_empty())
                     .or_else(|| task_session.get_value()).unwrap_or_else(|| "the proposing session".into()));
                 let work_title = Signal::derive(move || proposing.get().and_then(|s| s.work).map(|w| w.title));
-                view! { <TaskActions busy session_title work_title answer=Callback::new(move |o| answer(Some(o))) /> }.into_any()
+                view! { <TaskActions busy session_title work_title realm=d.realm.clone() answer=Callback::new(move |o| answer(Some(o))) /> }.into_any()
             } else { view! {
                 {values.get_value().into_iter().map(|(f, v)| {
                     let label = format!("{}{}", if f.label.is_empty() { f.name.clone() } else { f.label.clone() }, if f.required { " *" } else { "" });
@@ -406,23 +406,37 @@ impl TaskAction {
     }
 }
 
-/// The same two-row action hierarchy in the transcript and Decisions. Like
-/// Send's split button, saving is the main action and the arrow offers where.
+// An inset outline keeps secondary buttons exactly as tall as the primary.
+const TASK_SECONDARY: &str = "ring-1 ring-inset ring-zinc-300 disabled:opacity-50 dark:ring-zinc-600";
+
+/// One wrapping action row in the transcript and Decisions. The uncommon
+/// destination picker lives in a portal, outside the tile and composer.
 #[component]
 fn TaskActions(
     busy: RwSignal<bool>,
     session_title: Signal<String>,
     work_title: Signal<Option<String>>,
+    realm: String,
     answer: Callback<String>,
 ) -> impl IntoView {
-    let menu = RwSignal::new(false);
-    let pop = StoredValue::new(crate::util::dismissable(
-        move || menu.get(),
-        move || {
-            menu.try_set(false);
-        },
-    ));
-    task_actions(busy, session_title, work_title, answer, menu, pop)
+    let chooser = RwSignal::new(false);
+    let realm = StoredValue::new(realm);
+    let trigger = NodeRef::<leptos::html::Button>::new();
+    let close = Callback::new(move |()| {
+        chooser.set(false);
+        if let Some(button) = trigger.get() {
+            let _ = button.focus();
+        }
+    });
+    view! {
+        {task_actions(busy, session_title, work_title, answer, chooser, trigger)}
+        <Show when=move || chooser.get()>
+            <TaskWorkChooser busy realm=realm.get_value() answer=Callback::new(move |option| {
+                close.run(());
+                answer.run(option);
+            }) close />
+        </Show>
+    }
 }
 
 fn task_actions(
@@ -430,13 +444,10 @@ fn task_actions(
     session_title: Signal<String>,
     work_title: Signal<Option<String>>,
     answer: Callback<String>,
-    menu: RwSignal<bool>,
-    pop: StoredValue<String>,
+    chooser: RwSignal<bool>,
+    trigger: NodeRef<leptos::html::Button>,
 ) -> impl IntoView {
-    let act = move |action: TaskAction| {
-        menu.set(false);
-        answer.run(action.option().into());
-    };
+    let act = move |action: TaskAction| answer.run(action.option().into());
     let save_title = move || {
         work_title
             .get()
@@ -444,40 +455,81 @@ fn task_actions(
             .unwrap_or_else(|| "A to-do in the session's work, to start later (new work if it belongs to none)".into())
     };
     view! {
-        <div class="space-y-2">
-            <div class="flex flex-wrap items-center gap-2">
-                <button class=format!("{BUTTON} pointer-coarse:min-h-11") disabled=move || busy.get()
-                    title="A new session does it, with the prompt shown above"
-                    on:click=move |_| act(TaskAction::Start)>"Start session"</button>
-                <button class=format!("{BUTTON_QUIET} pointer-coarse:min-h-11") disabled=move || busy.get()
-                    title=move || format!("The session that proposed it, {}, does it after what it's doing now", session_title.get())
-                    on:click=move |_| act(TaskAction::Here)>"Do it here"</button>
-            </div>
-            <div class="flex flex-wrap items-center gap-2">
-                <div class="relative inline-flex items-stretch">
-                    <button class=format!("{BUTTON_QUIET} rounded-r-none pointer-coarse:min-h-11") disabled=move || busy.get()
-                        title=save_title on:click=move |_| act(TaskAction::Save)>"Save for later"</button>
-                    <button class="flex w-7 items-center justify-center rounded-r-md border-l border-zinc-200 text-sm hover:bg-zinc-100 pointer-coarse:min-h-11 pointer-coarse:min-w-11 dark:border-zinc-700 dark:hover:bg-zinc-800"
-                        disabled=move || busy.get() title="Choose where to save the to-do" aria-label="Choose where to save the to-do"
-                        aria-haspopup="menu" aria-expanded=move || menu.get().to_string() data-pop=pop.get_value()
-                        on:click=move |ev| { ev.stop_propagation(); menu.update(|m| *m = !*m); }>
-                        <svg viewBox="0 0 10 10" class="h-2.5 w-2.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 4 5 6.5 7.5 4" /></svg>
-                    </button>
-                    {move || menu.get().then(|| view! {
-                        <div role="menu" data-pop=pop.get_value() class="absolute left-0 top-full z-40 mt-1 w-max max-w-[calc(100vw-3rem)] rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
-                            <button role="menuitem" class="block w-full px-3 py-1.5 text-left hover:bg-zinc-100 pointer-coarse:min-h-11 dark:hover:bg-zinc-800"
-                                disabled=move || busy.get() title=save_title on:click=move |_| act(TaskAction::Save)>
-                                {move || work_title.get().map(|w| format!("To-do in “{w}”")).unwrap_or_else(|| "To-do in this work (new work if none)".into())}
-                            </button>
-                            <button role="menuitem" class="block w-full px-3 py-1.5 text-left hover:bg-zinc-100 pointer-coarse:min-h-11 dark:hover:bg-zinc-800"
-                                disabled=move || busy.get() on:click=move |_| act(TaskAction::SaveNew)>"To-do in new work"</button>
-                        </div>
-                    })}
-                </div>
-                <button class=format!("{BUTTON_QUIET} text-muted pointer-coarse:min-h-11") disabled=move || busy.get()
-                    title="Put this card away" on:click=move |_| act(TaskAction::NotNow)>"Not now"</button>
-            </div>
+        <div class="flex flex-wrap items-center gap-2">
+            <button class=format!("{BUTTON} pointer-coarse:min-h-11") disabled=move || busy.get()
+                title="A new session does it, with the prompt shown above"
+                on:click=move |_| act(TaskAction::Start)>"Start session"</button>
+            <button class=format!("{BUTTON_QUIET} {TASK_SECONDARY} pointer-coarse:min-h-11") disabled=move || busy.get()
+                title=move || format!("The session that proposed it, {}, does it after what it's doing now", session_title.get())
+                on:click=move |_| act(TaskAction::Here)>"Do it here"</button>
+            <button class=format!("{BUTTON_QUIET} {TASK_SECONDARY} pointer-coarse:min-h-11") disabled=move || busy.get()
+                title=save_title on:click=move |_| act(TaskAction::Save)>"Save for later"</button>
+            <button class=format!("{BUTTON_QUIET} text-muted pointer-coarse:min-h-11") disabled=move || busy.get()
+                title="Put this card away" on:click=move |_| act(TaskAction::NotNow)>"Not now"</button>
+            <button node_ref=trigger class="rounded-md px-1 py-1.5 text-xs text-muted hover:underline disabled:opacity-50 pointer-coarse:min-h-11"
+                disabled=move || busy.get() aria-haspopup="dialog" aria-expanded=move || chooser.get().to_string()
+                on:click=move |_| chooser.set(true)>"Save elsewhere…"</button>
         </div>
+    }
+}
+
+#[component]
+fn TaskWorkChooser(busy: RwSignal<bool>, realm: String, answer: Callback<String>, close: Callback<()>) -> impl IntoView {
+    let realm = StoredValue::new(realm);
+    let works = LocalResource::new(move || api::task_work_list(realm.get_value()));
+    let query = RwSignal::new(String::new());
+    let search = NodeRef::<leptos::html::Input>::new();
+    Effect::new(move || {
+        if let Some(input) = search.get() {
+            let _ = input.focus();
+        }
+    });
+    let rows =
+        Signal::derive(move || task_work_options(&works.get().and_then(Result::ok).unwrap_or_default(), &realm.get_value(), &query.get()));
+    view! {
+        <leptos::portal::Portal>
+            <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" on:click=move |_| close.run(())
+                on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); close.run(()); }>
+                <div role="dialog" aria-modal="true" aria-label="Save elsewhere"
+                    class="flex max-h-[80dvh] w-full max-w-lg flex-col gap-3 overflow-hidden rounded-lg bg-white p-4 text-left shadow-xl dark:bg-zinc-900"
+                    on:click=|ev| ev.stop_propagation()>
+                    <div class="flex shrink-0 items-center gap-2">
+                        <h2 class="flex-1 font-medium">"Save elsewhere"</h2>
+                        <button class=format!("{BUTTON_QUIET} pointer-coarse:min-h-11") aria-label="Close" on:click=move |_| close.run(())>"✕"</button>
+                    </div>
+                    <input node_ref=search class=format!("{INPUT} shrink-0") type="search" aria-label="Search open work" placeholder="Search open work…"
+                        prop:value=move || query.get() on:input=move |ev| query.set(event_target_value(&ev)) />
+                    <div class="min-h-0 overflow-y-auto">
+                        {task_work_choices(busy, rows, answer)}
+                        <Suspense fallback=|| view! { <p class="p-2 text-sm text-muted">"Loading work…"</p> }>
+                            {move || works.get().map(|r| match r {
+                                Err(e) => view! { <ErrorBox message=e /> }.into_any(),
+                                Ok(_) => view! { <Show when=move || rows.get().is_empty()><p class="p-2 text-sm text-muted">"No matching open work."</p></Show> }.into_any(),
+                            })}
+                        </Suspense>
+                    </div>
+                </div>
+            </div>
+        </leptos::portal::Portal>
+    }
+}
+
+fn task_work_options(works: &[c6_api::work::WorkItem], realm: &str, query: &str) -> Vec<(String, String)> {
+    let query = query.trim().to_lowercase();
+    works
+        .iter()
+        .filter(|w| w.realm == realm && w.fields.status == "open" && w.fields.title.to_lowercase().contains(&query))
+        .map(|w| (format!("Add to work:{}", w.id), w.fields.title.clone()))
+        .collect()
+}
+
+fn task_work_choices(busy: RwSignal<bool>, rows: Signal<Vec<(String, String)>>, answer: Callback<String>) -> impl IntoView {
+    let class = "block w-full break-words rounded-md px-3 py-2 text-left text-sm hover:bg-zinc-100 disabled:opacity-50 pointer-coarse:min-h-11 dark:hover:bg-zinc-800";
+    view! {
+        <button class=class disabled=move || busy.get() on:click=move |_| answer.run(TaskAction::SaveNew.option().into())>"New work"</button>
+        <For each=move || rows.get() key=|(option, _)| option.clone() let:row>
+            <button class=class disabled=move || busy.get() on:click=move |_| answer.run(row.0.clone())>{row.1}</button>
+        </For>
     }
 }
 
@@ -592,65 +644,86 @@ mod tests {
         }
     }
 
-    fn actions_html(busy: bool, work: Option<&str>, menu_open: bool) -> String {
+    fn actions_html(busy: bool, work: Option<&str>) -> String {
         let owner = Owner::new();
         owner.with(|| {
             untrack(|| {
                 let busy = RwSignal::new(busy);
                 let session_title = Signal::stored("The proposing session".to_owned());
                 let work_title = Signal::stored(work.map(str::to_owned));
-                task_actions(
-                    busy,
-                    session_title,
-                    work_title,
-                    Callback::new(|_| ()),
-                    RwSignal::new(menu_open),
-                    StoredValue::new("test-pop".into()),
-                )
-                .to_html()
+                task_actions(busy, session_title, work_title, Callback::new(|_| ()), RwSignal::new(false), NodeRef::new()).to_html()
             })
         })
     }
 
     #[test]
     fn task_actions_have_one_primary_and_no_general_decision_controls() {
-        let html = actions_html(false, Some("Improve C6"), false);
-        for label in ["Start session", "Do it here", "Save for later", "Not now"] {
+        let html = actions_html(false, Some("Improve C6"));
+        for label in ["Start session", "Do it here", "Save for later", "Not now", "Save elsewhere…"] {
             assert!(html.contains(label), "missing {label}: {html}");
         }
-        for removed in ["Start it", "Add to this work", "Add as new work", "Work on it", "Tomorrow", "Dismiss", "<input", "<textarea"] {
+        for removed in [
+            "Start it",
+            "Add to this work",
+            "Add as new work",
+            "Work on it",
+            "Tomorrow",
+            "Dismiss",
+            "<input",
+            "<textarea",
+            "▾",
+            "<svg",
+            "absolute",
+            "role=\"menu\"",
+        ] {
             assert!(!html.contains(removed), "unexpected {removed}: {html}");
         }
         assert_eq!(html.matches(BUTTON).count(), 1);
+        assert_eq!(html.matches(TASK_SECONDARY).count(), 2);
         assert_eq!(html.matches("<button").count(), 5);
         assert_eq!(html.matches("pointer-coarse:min-h-11").count(), 5);
-        assert!(html.contains("pointer-coarse:min-w-11"));
+        assert_eq!(html.matches("flex flex-wrap items-center gap-2").count(), 1);
         assert!(html.contains("The session that proposed it, The proposing session, does it after"));
         assert!(html.contains("A to-do in “Improve C6”, to start later"));
-        assert!(html.contains("aria-haspopup=\"menu\""));
+        assert!(html.contains("aria-haspopup=\"dialog\""));
         assert!(html.contains("aria-expanded=\"false\""));
         assert!(!html.contains("role=\"menu\""));
     }
 
     #[test]
     fn task_actions_are_disabled_together_while_answering_and_explain_no_work_fallback() {
-        let html = actions_html(true, None, true);
-        assert_eq!(html.matches("<button").count(), 7);
+        let html = actions_html(true, None);
+        assert_eq!(html.matches("<button").count(), 5);
         for button in html.split("<button").skip(1) {
             let opening = button.split('>').next().unwrap();
             assert!(opening.split_whitespace().any(|a| matches!(a, "disabled" | "disabled=\"\"" | "disabled=\"true\"")), "{opening}");
         }
         assert!(html.contains("new work if it belongs to none"));
-        assert!(html.contains("To-do in this work (new work if none)"));
     }
 
     #[test]
-    fn task_save_menu_names_the_work_and_offers_new_work() {
-        let html = actions_html(false, Some("Improve C6"), true);
-        assert!(html.contains("aria-expanded=\"true\""));
-        assert!(html.contains("role=\"menu\""));
-        assert_eq!(html.matches("role=\"menuitem\"").count(), 2);
-        assert!(html.contains("To-do in “Improve C6”"));
-        assert!(html.contains("To-do in new work"));
+    fn task_work_chooser_offers_new_work_and_searchable_open_work_in_its_realm() {
+        let work = |id: &str, realm: &str, title: &str, status: &str| c6_api::work::WorkItem {
+            id: id.into(),
+            realm: realm.into(),
+            fields: c6_api::work::WorkFields { title: title.into(), status: status.into(), ..Default::default() },
+            ..Default::default()
+        };
+        let works = vec![
+            work("one", "home", "Improve C6", "open"),
+            work("two", "home", "Fix the pager", "open"),
+            work("closed", "home", "Old C6", "done"),
+            work("private", "other", "Other C6", "open"),
+        ];
+        let all = task_work_options(&works, "home", "");
+        assert_eq!(all, [("Add to work:one".into(), "Improve C6".into()), ("Add to work:two".into(), "Fix the pager".into())]);
+        assert_eq!(task_work_options(&works, "home", " C6 "), all[..1]);
+        assert!(task_work_options(&works, "home", "missing").is_empty());
+        let owner = Owner::new();
+        let html = owner.with(|| untrack(|| task_work_choices(RwSignal::new(false), Signal::stored(all), Callback::new(|_| ())).to_html()));
+        assert_eq!(html.matches("New work").count(), 1);
+        assert!(html.contains("Improve C6") && html.contains("Fix the pager"));
+        assert_eq!(html.matches("<button").count(), 3);
+        assert!(!html.contains("Save for later"));
     }
 }
