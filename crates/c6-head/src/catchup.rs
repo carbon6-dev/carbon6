@@ -624,8 +624,8 @@ pub(crate) async fn ask(st: &HeadState, row: &SessionRow, label: &str, what: &st
         None => crate::suggestions::model_for(st, row, crate::suggestions::ROUTE_LABEL).await?,
     };
     anyhow::ensure!(!connection.is_empty(), "the session has no connection to ask");
-    // Claude Code runs only on a worker, as a session: it can't answer a
-    // one-off call.
+    // Not Claude Code: names and catch-ups come with every session, and
+    // would spend the Claude plan's limits.
     let kind = st.store.connections().await?.into_iter().find(|c| c.id == connection).map(|c| c.kind);
     anyhow::ensure!(
         kind.as_deref() != Some("claude_code"),

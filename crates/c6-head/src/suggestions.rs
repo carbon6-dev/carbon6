@@ -131,8 +131,8 @@ pub(crate) async fn rule_for(st: &HeadState, row: &crate::store::SessionRow, lab
                 .find(|c| (c.id == want || c.name == want) && crate::realms::available(&c.realms, &row.realm))
                 .map(|c| c.id.clone())
         };
-        // Claude Code runs only as a session on a worker, so it can't
-        // answer a one-off call: the next rule, or the fallback, does.
+        // Not Claude Code: these calls come after every turn, and would
+        // spend the Claude plan's limits. The next rule, or the fallback, does.
         let one_off = |id: &str| connections.iter().find(|c| c.id == id).is_none_or(|c| c.kind != "claude_code");
         if let Some(c) = connection.filter(|c| one_off(c)) {
             return Ok(Some((c, r.model.trim().to_owned())));

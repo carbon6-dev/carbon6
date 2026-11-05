@@ -22,7 +22,7 @@ use c6_llm::{Accumulator, Block, Message, ModelRequest, Role};
 use futures::StreamExt;
 use serde_json::{Value, json};
 use sqlx::Row;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::realms::Caller;
 use crate::{HeadState, bad_request, not_found};
@@ -1299,12 +1299,22 @@ pub(crate) async fn model_for_route(
             connections.iter().find(|c| (c.id == want || c.name == want) && usable(c)).map(|c| c.id.clone())
         };
         if let Some(c) = connection {
+            // One the head can't ask itself: the next rule, or the fallback.
+            if let Some(why) = crate::pools::cannot_answer(st, &c).await {
+                warn!(rule = %route.name, "{label}: passing over a rule: {why}");
+                continue;
+            }
             let model = route.model.trim();
             let model = if model.is_empty() { fallback.as_ref().map(|f| f.1.clone()).unwrap_or_default() } else { model.to_owned() };
             return Ok(Some((c, model)));
         }
     }
-    Ok(fallback.filter(|(c, _)| !c.is_empty()))
+    let Some((c, m)) = fallback.filter(|(c, _)| !c.is_empty()) else { return Ok(None) };
+    if let Some(why) = crate::pools::cannot_answer(st, &c).await {
+        warn!("{label}: skipped: {why}; add a routing rule for {label} with another connection");
+        return Ok(None);
+    }
+    Ok(Some((c, m)))
 }
 
 /// Asks the model, for JSON. Its tokens count in the realm's usage, as
@@ -1540,17 +1550,28 @@ async fn note(st: &HeadState, id: &str) -> anyhow::Result<()> {
     if r.fields.status != "open" || r.fields.attached.is_empty() || !settings(st, &r.realm).await.notes {
         return Ok(());
     }
-    // The model: the rule's, else that of the session that moved last.
-    let mut latest: Option<crate::store::SessionRow> = None;
+    // The model: the rule's, else that of the session that moved last
+    // whose connection the head can ask itself.
+    let mut sessions: Vec<crate::store::SessionRow> = Vec::new();
     for a in &r.fields.attached {
         if let Some(sid) = a.reference.strip_prefix("session:")
             && let Some(s) = st.store.session(sid).await?
-            && latest.as_ref().is_none_or(|l| l.updated_at < s.updated_at)
         {
-            latest = Some(s);
+            sessions.push(s);
         }
     }
-    let fallback = latest.as_ref().map(|s| (s.connection_id.clone(), s.model.clone()));
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+    let mut fallback = None;
+    for s in &sessions {
+        match crate::pools::cannot_answer(st, &s.connection_id).await {
+            Some(why) => info!(work = %id, session = %s.id, "its note passes over this session's model: {why}"),
+            None => {
+                fallback = Some((s.connection_id.clone(), s.model.clone()));
+                break;
+            }
+        }
+    }
+    let fallback = fallback.or_else(|| sessions.first().map(|s| (s.connection_id.clone(), s.model.clone())));
     let Some(model) = model_for(st, &r.realm, fallback).await? else { return Ok(()) };
     let item = view(st, vec![r]).await?.remove(0);
     let attached = described(st, &item).await?;

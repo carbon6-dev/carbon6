@@ -174,3 +174,90 @@ impl HostedClaude {
         }
     }
 }
+
+/// Claude Code answering one call, for what the head asks a model itself
+/// (a work item's note, a project's, a guess at its project): `claude -p`
+/// with the prompt on stdin and one JSON result out, locked down as Ask is
+/// and in an empty folder of its own.
+pub struct ClaudeOnce {
+    bin: PathBuf,
+}
+
+impl ClaudeOnce {
+    pub fn new(bin: PathBuf) -> Self {
+        Self { bin }
+    }
+}
+
+/// The conversation as one prompt: a single message as it is, more as a
+/// transcript.
+fn once_prompt(req: &c6_llm::ModelRequest) -> String {
+    let text = |m: &c6_llm::Message| -> String {
+        m.blocks.iter().filter_map(|b| if let c6_llm::Block::Text(t) = b { Some(t.as_str()) } else { None }).collect::<Vec<_>>().join("\n")
+    };
+    if let [only] = req.messages.as_slice() {
+        return text(only);
+    }
+    req.messages
+        .iter()
+        .map(|m| format!("{}: {}", if m.role == c6_llm::Role::User { "User" } else { "Assistant" }, text(m)))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+#[async_trait::async_trait]
+impl c6_llm::ModelClient for ClaudeOnce {
+    async fn stream(&self, req: &c6_llm::ModelRequest) -> Result<c6_llm::EventStream, c6_llm::LlmError> {
+        use c6_llm::{LlmError, ModelEvent, Usage};
+        use tokio::io::AsyncWriteExt;
+        let dir = std::env::temp_dir().join(format!("c6-claude-once-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).map_err(|e| LlmError::Config(format!("making a folder for Claude Code: {e}")))?;
+        let mut cmd = tokio::process::Command::new(&self.bin);
+        cmd.args(["-p", "--output-format", "json"]).args(LOCKED_DOWN);
+        if !req.model.trim().is_empty() {
+            cmd.args(["--model", req.model.trim()]);
+        }
+        if !req.system.trim().is_empty() {
+            cmd.args(["--append-system-prompt", &req.system]);
+        }
+        cmd.current_dir(&dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let result = async {
+            let mut child = cmd.spawn().map_err(|e| LlmError::Config(format!("failed to start Claude Code: {e}")))?;
+            let mut stdin = child.stdin.take().expect("piped");
+            stdin.write_all(once_prompt(req).as_bytes()).await.map_err(|e| LlmError::Network(format!("writing to Claude Code: {e}")))?;
+            drop(stdin);
+            let out = child.wait_with_output().await.map_err(|e| LlmError::Network(format!("reading Claude Code: {e}")))?;
+            let v: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|_| {
+                let err = String::from_utf8_lossy(&out.stderr);
+                LlmError::Protocol(format!(
+                    "Claude Code exited ({}) with no result: {}",
+                    out.status,
+                    err.trim().chars().take(400).collect::<String>()
+                ))
+            })?;
+            let text = v["result"].as_str().unwrap_or_default().to_owned();
+            if v["is_error"].as_bool() == Some(true) || !out.status.success() {
+                return Err(LlmError::Protocol(format!("Claude Code: {}", text.chars().take(400).collect::<String>())));
+            }
+            let n = |k: &str| v["usage"][k].as_u64().unwrap_or(0);
+            let usage = Usage {
+                input_tokens: n("input_tokens"),
+                output_tokens: n("output_tokens"),
+                cache_read_tokens: n("cache_read_input_tokens"),
+                cache_write_tokens: n("cache_creation_input_tokens"),
+                reasoning_tokens: 0,
+            };
+            Ok((text, usage))
+        }
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let (text, usage) = result?;
+        let events =
+            vec![Ok(ModelEvent::TextDelta(text)), Ok(ModelEvent::Usage(usage)), Ok(ModelEvent::Done { stop_reason: "end_turn".into() })];
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}

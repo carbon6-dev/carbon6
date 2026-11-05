@@ -205,9 +205,14 @@ pub struct HeadState {
 }
 
 impl HeadState {
-    /// The `claude` Ask runs on a Claude Code connection (docs/ask.md §3).
+    /// The `claude` the head runs for a Claude Code connection (Ask, and
+    /// the steps it asks a model itself; docs/ask.md §3): the configured
+    /// one when set (none if it isn't a file), else the one on its PATH.
     pub(crate) fn claude_bin(&self) -> Option<std::path::PathBuf> {
-        self.claude_bin.clone().filter(|p| p.is_file()).or_else(c6_worker::hosted::claude_bin)
+        match &self.claude_bin {
+            Some(p) => Some(p.clone()).filter(|p| p.is_file()),
+            None => c6_worker::hosted::claude_bin(),
+        }
     }
 
     /// The head, shared (none while it is being made or once it stopped).

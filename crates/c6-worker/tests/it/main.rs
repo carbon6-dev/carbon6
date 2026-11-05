@@ -76,6 +76,7 @@ mod usage;
 mod views;
 mod websearch;
 mod work;
+mod work_claude_code;
 mod worker_access;
 mod workflows;
 

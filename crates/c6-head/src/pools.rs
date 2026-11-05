@@ -84,10 +84,25 @@ pub async fn client(
     if let Some(pool) = get(st, connection_id).await? {
         return Ok(Box::new(c6_llm::pool::PoolClient::new(pool, realm, origin)));
     }
+    // Claude Code answers through the `claude` on the head machine.
+    if st.store.connections().await?.iter().any(|c| c.id == connection_id && c.kind == "claude_code") {
+        let bin = st.claude_bin().ok_or_else(|| anyhow::anyhow!("{}", NO_CLAUDE))?;
+        return Ok(c6_llm::activity::track(Box::new(c6_worker::hosted::ClaudeOnce::new(bin)), origin));
+    }
     let req = CredentialRequest { connection_id: connection_id.to_owned(), ..Default::default() };
     let g = crate::sessions::credential_for(st, None, "head", req).await;
     anyhow::ensure!(g.error.is_empty(), "{}", g.error);
     Ok(c6_llm::activity::track(c6_llm::client_for(&g.kind, &g.base_url, &g.bearer, g.headers)?, origin))
+}
+
+const NO_CLAUDE: &str = "Claude Code (`claude`) is not on the head machine's PATH";
+
+/// Why the head can't ask `connection_id` a one-off question itself, if it
+/// can't: a Claude Code connection with no `claude` on the head machine.
+pub async fn cannot_answer(st: &HeadState, connection_id: &str) -> Option<String> {
+    let connections = st.store.connections().await.ok()?;
+    let c = connections.iter().find(|c| c.id == connection_id)?;
+    (c.kind == "claude_code" && st.claude_bin().is_none()).then(|| format!("{} runs on Claude Code, and {NO_CLAUDE}", c.name))
 }
 
 /// A recorded or per-turn window for a head session. Pools use the
