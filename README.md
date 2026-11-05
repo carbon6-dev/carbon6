@@ -90,6 +90,8 @@ make test              # every test at once with cargo nextest (brew install car
 make check             # the code must be formatted (cargo fmt), and every target, and the web UI for wasm, must build and pass clippy without warnings (CI runs it too)
 ```
 
+`cargo build -p c6-head` also works before the web UI is built (UI requests then say to run `make ui`). Incremental head builds watch `crates/c6-ui/dist` when it exists, or its existing parent until it is created: an unchanged build is a no-op in either case, and building the UI later picks it up automatically.
+
 ## Run
 
 On the head machine:
