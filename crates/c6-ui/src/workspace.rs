@@ -1564,13 +1564,16 @@ pub fn ScrollBox(
                 intent.set_value(None);
             }
         });
-        let observer = StoredValue::new_local(None::<web_sys::ResizeObserver>);
+        type ResizeWatch = (web_sys::ResizeObserver, wasm_bindgen::closure::Closure<dyn Fn(js_sys::Array)>);
+        let observer = StoredValue::new_local(None::<ResizeWatch>);
         Effect::new(move || {
             let Some(el) = node.get() else { return };
             // One at a time: a box drawn anew isn't watched twice.
-            if let Some(o) = observer.try_get_value().flatten() {
-                o.disconnect();
-            }
+            observer.update_value(|o| {
+                if let Some((ro, _)) = o.take() {
+                    ro.disconnect();
+                }
+            });
             let to_end = wasm_bindgen::closure::Closure::<dyn Fn(js_sys::Array)>::new(move |_: js_sys::Array| {
                 // A last resize may come after the box has gone.
                 if let Some(el) = node.try_get_untracked().flatten()
@@ -1589,14 +1592,15 @@ pub fn ScrollBox(
                         obs.observe(&child);
                     }
                 }
-                observer.set_value(Some(obs));
+                observer.set_value(Some((obs, to_end)));
             }
-            to_end.forget();
         });
         on_cleanup(move || {
-            if let Some(o) = observer.try_get_value().flatten() {
-                o.disconnect();
-            }
+            observer.update_value(|o| {
+                if let Some((ro, _)) = o.take() {
+                    ro.disconnect();
+                }
+            });
         });
     }
     let yours = move |direction: ScrollIntent| {
