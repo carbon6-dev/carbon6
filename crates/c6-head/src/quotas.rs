@@ -869,7 +869,13 @@ mod tests {
                     let h = h.clone();
                     async move {
                         assert_eq!(req["authorization"], "Bearer tok");
-                        (h.lock().unwrap().clone(), "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n")
+                        (
+                            h.lock().unwrap().clone(),
+                            concat!(
+                                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+                                "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n"
+                            ),
+                        )
                             .into_response()
                     }
                 }),
@@ -945,6 +951,39 @@ mod tests {
         }
         let saved = st.store.setting(KEPT).await.unwrap().unwrap();
         assert_eq!(serde_json::from_str::<Vec<api::ConnectionQuota>>(&saved).unwrap(), vec![q.clone()]);
+        // Pin the save gate ahead, avoiding any assertion about machine speed.
+        *st.quotas.last_kept.lock().await = Some(Instant::now() + Duration::from_secs(86400));
+
+        // The memex runs in this head too: a direct ChatGPT call must use
+        // the same quota hook, not just calls through pools::client.
+        {
+            let mut h = headers.lock().unwrap();
+            h.clear();
+            h.insert("x-codex-secondary-used-percent", "90".parse().unwrap());
+            h.insert("x-codex-secondary-window-minutes", "10080".parse().unwrap());
+            h.insert("x-codex-secondary-reset-at", "4102444800".parse().unwrap());
+        }
+        // Use the head's real local link without background settings refreshes.
+        let memex_dir = tempfile::tempdir().unwrap();
+        let memex = c6_memex::Memex::open(memex_dir.path(), st.local_link.get().unwrap().clone()).await.unwrap();
+        let task = c6_memex::llm::Task { connection_id: "gpt".into(), model: "test".into(), effort: Some("none".into()) };
+        memex.set_tasks(c6_memex::Tasks { understanding: Some(task.clone()), ..Default::default() });
+        let answer = c6_memex::llm::ask(
+            &memex,
+            &task,
+            "quota test",
+            "",
+            "",
+            vec![c6_llm::Block::Text("hi".into())],
+            c6_memex::llm::Output::Text(16),
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer, "ok");
+        let memex_quotas = quotas().await;
+        assert_eq!(memex_quotas.len(), 1);
+        assert_eq!(memex_quotas[0].connection_id, "gpt");
+        assert_eq!(memex_quotas[0].windows[1].used_percent, 90.0);
 
         // A pool's reply belongs to its ChatGPT member. An omitted primary
         // window keeps the old one; usage is clamped and used-up is explicit.
@@ -964,8 +1003,6 @@ mod tests {
             h.insert("x-codex-secondary-window-minutes", "10080".parse().unwrap());
             h.insert("x-codex-secondary-reset-at", "4102444800".parse().unwrap());
         }
-        // Pin the save gate ahead, avoiding any assertion about machine speed.
-        *st.quotas.last_kept.lock().await = Some(Instant::now() + Duration::from_secs(86400));
         let client = crate::pools::client(st, "pool", "home", Origin::default()).await.unwrap();
         let mut stream = client.stream(&request).await.unwrap();
         while let Some(event) = stream.next().await {

@@ -26,6 +26,10 @@ const COALESCE: Duration = Duration::from_millis(25);
 pub trait LocalHead: Send + Sync {
     async fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String>;
     async fn credential(&self, connection_id: &str) -> CredentialGrant;
+    /// Records ChatGPT reply headers on calls made in the head's process.
+    fn chatgpt_limits_hook(&self, _connection_id: &str) -> Option<c6_llm::openai_responses::ChatGptLimitsHook> {
+        None
+    }
     /// The pool a connection is, if it is one: the head spreads its calls
     /// over the pool's members.
     async fn pool(&self, _connection_id: &str) -> Option<Arc<c6_llm::pool::Pool>> {
@@ -179,6 +183,11 @@ impl HeadLink {
     /// one (pools are only for what runs in the head).
     pub async fn pool(&self, connection_id: &str) -> Option<Arc<c6_llm::pool::Pool>> {
         self.local.get()?.pool(connection_id).await
+    }
+
+    /// The head's quota recorder, only when it is in this process.
+    pub fn chatgpt_limits_hook(&self, connection_id: &str) -> Option<c6_llm::openai_responses::ChatGptLimitsHook> {
+        self.local.get()?.chatgpt_limits_hook(connection_id)
     }
 
     /// New credentials, after the provider refused the ones it had (HTTP
