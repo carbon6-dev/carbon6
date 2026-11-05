@@ -48,6 +48,9 @@ pub(crate) struct Who {
 /// Who sent a message that starts a turn.
 pub(crate) fn who(kind: &EventKind) -> Option<Who> {
     let EventKind::User { text, command, from_session_id, from_title, delegated_by, .. } = kind else { return None };
+    if command == "card-answer" {
+        return None; // Displayed at arrival, not input to this turn.
+    }
     let words = |t: &str| clip(t.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or(""), 60);
     let (by, from, words) = if !from_session_id.is_empty() {
         ("session", from_title.clone(), words(text))
@@ -304,8 +307,21 @@ pub(crate) fn parse_lines(text: &str) -> HashMap<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catchup::tests::{ev, from_session, notice, reply, result, user};
+    use crate::catchup::tests::{card_answer, ev, from_session, notice, reply, result, user};
     use serde_json::json;
+
+    #[test]
+    fn card_arrivals_never_start_or_attribute_a_turn() {
+        let mut t = Turns::default();
+        for e in [ev(1, 0, card_answer()), ev(2, 10, user("continue")), ev(3, 20, EventKind::TurnStarted { turn: 1, context_window: 0 })] {
+            t.feed(&e);
+        }
+        assert_eq!((t.list[0].start_seq, t.list[0].words.as_str()), (2, "continue"));
+        let mut t = Turns::default();
+        t.feed(&ev(1, 0, EventKind::TurnStarted { turn: 1, context_window: 0 }));
+        t.feed(&ev(2, 10, card_answer()));
+        assert!(t.list[0].by.is_empty(), "the card answer was not delivered into the running turn");
+    }
 
     #[test]
     fn turns_say_who_started_them_and_how_many_steps() {

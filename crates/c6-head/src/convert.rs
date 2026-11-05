@@ -23,6 +23,9 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
                 effort: m.effort,
             }
         }
+        // Its arrival already showed as your message. This event is only the
+        // receipt used for recovery and model history, not another message.
+        Kind::User(u) if u.command_id.starts_with(crate::sessions::CARD_ANSWER_PREFIX) => return None,
         Kind::User(u) => api::EventKind::User {
             command_id: u.command_id.clone(),
             text: u.text.clone(),
@@ -179,7 +182,22 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
         }
         // Shown in the queue (as with the agent), not the transcript.
         Kind::InputDelivered(_) => return None,
-        // Shown when a turn takes it; until then, it waits.
+        // A card click is your message now, at this journal position, even
+        // though the worker holds it until the next input. The same conversion
+        // serves live events, reload and catchup, on local and remote workers.
+        Kind::NoticeQueued(n) if n.quiet && n.command_id.starts_with(crate::sessions::CARD_ANSWER_PREFIX) => api::EventKind::User {
+            command_id: n.command_id.clone(),
+            text: n.text.clone(),
+            attachments: Vec::new(),
+            command: "card-answer".into(),
+            prompt: String::new(),
+            blocked: String::new(),
+            delegated_by: String::new(),
+            wake: false,
+            from_session_id: String::new(),
+            from_title: String::new(),
+        },
+        // Other notices show when a turn takes them; until then, they wait.
         Kind::NoticeQueued(n) if n.quiet => return None,
         Kind::NoticeQueued(n) => api::EventKind::NoticeQueued {
             command_id: n.command_id.clone(),
@@ -285,6 +303,36 @@ pub fn queued(c: &CommandRow) -> api::QueuedInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn card_answer_arrival_is_your_message_and_consumption_is_only_a_receipt() {
+        let id = format!("{}test", crate::sessions::CARD_ANSWER_PREFIX);
+        let text = "Not now: task card #185 \"Cleanup\".";
+        let arrival = SessionEvent {
+            seq: 17,
+            ts_ms: 1234,
+            kind: Some(session_event::Kind::NoticeQueued(c6_proto::NoticeQueued {
+                command_id: id.clone(),
+                text: text.into(),
+                command: "task-notification".into(),
+                quiet: true,
+                ..Default::default()
+            })),
+        };
+        let shown = event(&arrival).unwrap();
+        assert_eq!((shown.seq, shown.ts), (17, 1234), "show where the answer arrived, not where it was consumed");
+        assert!(matches!(shown.kind, api::EventKind::User { command_id, text: s, command, prompt, wake: false, .. }
+            if command_id == id && s == text && command == "card-answer" && prompt.is_empty()));
+        let receipt = SessionEvent {
+            kind: Some(session_event::Kind::User(c6_proto::UserMessage { command_id: id, text: text.into(), ..Default::default() })),
+            ..Default::default()
+        };
+        assert!(event(&receipt).is_none(), "taking the note must not render another line");
+        let mut legacy = arrival;
+        let Some(session_event::Kind::NoticeQueued(n)) = &mut legacy.kind else { unreachable!() };
+        n.command_id = "legacy-quiet-note".into();
+        assert!(event(&legacy).is_none(), "unmarked quiet notes keep their existing behavior");
+    }
 
     #[test]
     fn text_annotations_reach_the_browser_while_raw_text_and_server_tool_icons_are_kept() {

@@ -133,7 +133,7 @@ pub fn spans(evs: &[Event]) -> Vec<(Span, Range<usize>)> {
     let mut open: Option<(Span, usize)> = None;
     for (i, e) in evs.iter().enumerate() {
         match &e.kind {
-            EventKind::User { .. } if open.is_none() && next.is_none() => next = Some(i),
+            EventKind::User { command, .. } if command != "card-answer" && open.is_none() && next.is_none() => next = Some(i),
             EventKind::TurnStarted { turn, .. } => {
                 if let Some((mut s, from)) = open.take() {
                     s.end = Some(e.seq.saturating_sub(1));
@@ -666,6 +666,22 @@ mod tests {
         // next one's message is in none.
         let got: Vec<(u64, u64)> = spans(&evs[3..]).into_iter().map(|(s, _)| (s.turn, s.start)).collect();
         assert_eq!(got, [(2, 8), (3, 12), (4, 14)]);
+    }
+
+    #[test]
+    fn card_arrivals_stay_visible_between_turns_without_starting_one() {
+        let mut card = user(1, "Not now: task card #185 \"Cleanup\".");
+        if let EventKind::User { command, .. } = &mut card.kind {
+            *command = "card-answer".into();
+        }
+        let evs = [card, user(2, "continue"), started(3, 1), ended(4, 1)];
+        assert!(spans(&evs[..1]).is_empty(), "no turn for the card answer");
+        assert_eq!(spans(&evs)[0].0.start, 2, "the actual input starts the turn");
+        assert_eq!(
+            keys(&fold(&evs, false, |_| Some(false))),
+            [(1, false), (2, true)],
+            "folding preserves the arrival as its own visible line"
+        );
     }
 
     #[test]

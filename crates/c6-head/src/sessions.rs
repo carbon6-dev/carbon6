@@ -1007,7 +1007,15 @@ pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage
     send_input_as(st, session_id, req, Uuid::now_v7().to_string(), "", None).await
 }
 
-/// Context for the agent's next input, through the durable command queue.
+// Identifies both the journaled arrival and its later consumption, including
+// on workers that already support quiet_notes. No new worker protocol needed.
+pub(crate) const CARD_ANSWER_PREFIX: &str = "card-answer:";
+
+fn quiet_note_id() -> String {
+    format!("{CARD_ANSWER_PREFIX}{}", Uuid::now_v7())
+}
+
+/// A card answer from you, held for the agent's next input, through the durable command queue.
 /// Older workers must never receive it as an ordinary, waking input.
 pub async fn quiet_note(st: &HeadState, session_id: &str, text: String) -> anyhow::Result<()> {
     let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
@@ -1016,7 +1024,7 @@ pub async fn quiet_note(st: &HeadState, session_id: &str, text: String) -> anyho
         tracing::debug!(%session_id, "skipping quiet context: the worker does not support it");
         return Ok(());
     }
-    let id = Uuid::now_v7().to_string();
+    let id = quiet_note_id();
     let data = SessionCommand {
         command_id: id.clone(),
         session_id: session_id.to_owned(),
@@ -2262,7 +2270,8 @@ async fn restore(st: &HeadState, worker_id: WorkerId, session_id: &str, command_
         session_id: session_id.to_owned(),
         kind: Some(session_command::Kind::Restore(c6_proto::Restore { spec: Some(spec), events })),
     };
-    let input_id = Uuid::now_v7().to_string();
+    let input_id =
+        if quiet_note.is_some() && command_id.starts_with(CARD_ANSWER_PREFIX) { quiet_note_id() } else { Uuid::now_v7().to_string() };
     let (data, shown) = match quiet_note {
         Some(note) => (
             SessionCommand {

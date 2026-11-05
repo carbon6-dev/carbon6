@@ -372,17 +372,17 @@ async fn act(
         (Some("task"), Some(_), Some(_)) => match option {
             Some(TASK_START) => {
                 start_task(st, d).await?;
-                task_answer_note(st, d, format!("You chose Start session on task card #{} {:?}.", d.id, d.title)).await;
+                task_answer_note(st, d, format!("Start session: task card #{} {:?}.", d.id, d.title)).await;
             }
             Some(TASK_HERE) => do_task_here(st, d).await?,
             Some(o) if matches!(o, TASK_TO_WORK | TASK_TO_NEW_WORK) || o.starts_with(TASK_TO_WORK_PREFIX) => {
                 let id = crate::work::keep_todo(st, d, o == TASK_TO_WORK, o.strip_prefix(TASK_TO_WORK_PREFIX)).await?;
                 let work = crate::work::get(st, &id, &Caller::root()).await?;
-                task_answer_note(st, d, format!("You saved task card #{} {:?} as a to-do on {:?}.", d.id, d.title, work.fields.title))
+                task_answer_note(st, d, format!("Save for later: task card #{} {:?} (to-do on {:?}).", d.id, d.title, work.fields.title))
                     .await;
             }
             Some("Not now") => {
-                task_answer_note(st, d, format!("You chose Not now on task card #{} {:?}.", d.id, d.title)).await;
+                task_answer_note(st, d, format!("Not now: task card #{} {:?}.", d.id, d.title)).await;
             }
             _ => {}
         },

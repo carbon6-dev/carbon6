@@ -2135,7 +2135,7 @@ fn Transcript(
                     crate::timeline::Piece::Event(e) => {
                         let seq = e.seq;
                         let only_thinking = thinking_only(&e.kind);
-                        let anchorable = can_branch && matches!(e.kind, EventKind::User { .. } | EventKind::Assistant { .. });
+                        let anchorable = can_branch && can_anchor(&e.kind);
                         let user_text = match &e.kind {
                             EventKind::User { text, .. } => Some(text.clone()),
                             _ => None,
@@ -3371,6 +3371,60 @@ fn memory_line(op: &str, id: &str, scope: &str, text: &str) -> AnyView {
     view! { <p class="flex items-start gap-2 text-xs text-muted"><span>{crate::icons::brain()}</span><span class="whitespace-pre-wrap">{what}</span></p> }.into_any()
 }
 
+// A card answer is visible before its model input exists. It cannot anchor
+// a rewind, edit or side chat: those use model history, not display arrivals.
+fn can_anchor(kind: &EventKind) -> bool {
+    matches!(kind, EventKind::Assistant { .. }) || matches!(kind, EventKind::User { command, .. } if command != "card-answer")
+}
+
+/// Your transcript message, including card-button answers. Kept separate so
+/// native UI tests exercise the same right-aligned markup as the live view.
+fn user_message(session: &str, e: &Event) -> AnyView {
+    let EventKind::User { text, attachments, command, prompt, blocked, delegated_by, .. } = &e.kind else {
+        return ().into_any();
+    };
+    let url = |i: usize| crate::api::url(&format!("/api/v1/sessions/{session}/attachments/{}/{i}", e.seq));
+    // In a subagent: who sent it.
+    let from = if !delegated_by.is_empty() {
+        Some((crate::icons::arrow_down_right().into_any(), "from the agent that started it"))
+    } else if command == "resume" {
+        Some((crate::icons::rotate().into_any(), "resumed by you"))
+    } else {
+        None
+    };
+    let delegated = !delegated_by.is_empty();
+    let shown = attachments
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            if a.mime.starts_with("image/") {
+                view! { <TranscriptImage src=url(i) name=a.name.clone() /> }.into_any()
+            } else {
+                transcript_file(url(i), a.name.clone(), a.size)
+            }
+        })
+        .collect_view();
+    view! {
+        <div class="flex flex-col items-end gap-1.5">
+            {from.map(|(icon, text)| view! { <p class="text-[11px] text-violet-700 dark:text-violet-400">{icon}" "{text}</p> })}
+            {(!attachments.is_empty()).then(|| view! { <div class="flex max-w-[85%] flex-wrap justify-end gap-1.5">{shown}</div> })}
+            {(!text.is_empty()).then(|| view! {
+                <div class=format!("max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm bg-zinc-200 px-4 py-2 text-sm dark:bg-zinc-800 {}", if blocked.is_empty() { "" } else { "line-through opacity-60" })>{text.clone()}</div>
+            })}
+            {(!blocked.is_empty()).then(|| view! {
+                <p class="max-w-[85%] text-right text-xs text-red-600 dark:text-red-400">{format!("Not sent: a UserPromptSubmit hook blocked it. {blocked}")}</p>
+            })}
+            {(!prompt.is_empty()).then(|| view! {
+                <details class="max-w-[85%] text-xs text-muted">
+                    <summary class="cursor-pointer select-none text-right">{if delegated { "sent with the subagent note".to_owned() } else if command.is_empty() { "sent with hook context".to_owned() } else { format!("/{command} expanded to") }}</summary>
+                    <pre class="mt-1 max-h-80 overflow-auto whitespace-pre-wrap rounded-md bg-zinc-100 p-3 font-mono text-[11px] dark:bg-zinc-900">{prompt.clone()}</pre>
+                </details>
+            })}
+        </div>
+    }
+    .into_any()
+}
+
 fn render_event(
     session: &str,
     e: &Event,
@@ -3451,48 +3505,7 @@ fn render_event(
             <SessionMessage from=from_session_id.clone() title=from_title.clone() text=text.clone() prompt=prompt.clone() />
         }
         .into_any(),
-        EventKind::User { text, attachments, command, prompt, blocked, delegated_by, .. } => {
-            let url = |i: usize| crate::api::url(&format!("/api/v1/sessions/{session}/attachments/{}/{i}", e.seq));
-            // In a subagent: who sent it.
-            let from = if !delegated_by.is_empty() {
-                Some((crate::icons::arrow_down_right().into_any(), "from the agent that started it"))
-            } else if command == "resume" {
-                Some((crate::icons::rotate().into_any(), "resumed by you"))
-            } else {
-                None
-            };
-            let delegated = !delegated_by.is_empty();
-            let shown = attachments
-                .iter()
-                .enumerate()
-                .map(|(i, a)| {
-                    if a.mime.starts_with("image/") {
-                        view! { <TranscriptImage src=url(i) name=a.name.clone() /> }.into_any()
-                    } else {
-                        transcript_file(url(i), a.name.clone(), a.size)
-                    }
-                })
-                .collect_view();
-            view! {
-                <div class="flex flex-col items-end gap-1.5">
-                    {from.map(|(icon, text)| view! { <p class="text-[11px] text-violet-700 dark:text-violet-400">{icon}" "{text}</p> })}
-                    {(!attachments.is_empty()).then(|| view! { <div class="flex max-w-[85%] flex-wrap justify-end gap-1.5">{shown}</div> })}
-                    {(!text.is_empty()).then(|| view! {
-                        <div class=format!("max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm bg-zinc-200 px-4 py-2 text-sm dark:bg-zinc-800 {}", if blocked.is_empty() { "" } else { "line-through opacity-60" })>{text.clone()}</div>
-                    })}
-                    {(!blocked.is_empty()).then(|| view! {
-                        <p class="max-w-[85%] text-right text-xs text-red-600 dark:text-red-400">{format!("Not sent: a UserPromptSubmit hook blocked it. {blocked}")}</p>
-                    })}
-                    {(!prompt.is_empty()).then(|| view! {
-                        <details class="max-w-[85%] text-xs text-muted">
-                            <summary class="cursor-pointer select-none text-right">{if delegated { "sent with the subagent note".to_owned() } else if command.is_empty() { "sent with hook context".to_owned() } else { format!("/{command} expanded to") }}</summary>
-                            <pre class="mt-1 max-h-80 overflow-auto whitespace-pre-wrap rounded-md bg-zinc-100 p-3 font-mono text-[11px] dark:bg-zinc-900">{prompt.clone()}</pre>
-                        </details>
-                    })}
-                </div>
-            }
-            .into_any()
-        }
+        EventKind::User { .. } => user_message(session, e),
         EventKind::Assistant { blocks, stop_reason, .. } => {
             let interrupted = stop_reason == "interrupted";
             view! {
@@ -5653,6 +5666,29 @@ fn SecretCardView(card: SecretCard, on_dismiss: Callback<String>) -> impl IntoVi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn card_button_answer_renders_as_your_right_aligned_message() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let e: Event = serde_json::from_value(serde_json::json!({
+                "seq": 17, "ts": 1234, "type": "user", "command_id": "card-answer:test",
+                "command": "card-answer", "text": "Not now: task card #185 \"Cleanup\"."
+            }))
+            .unwrap();
+            let html = user_message("s1", &e).to_html();
+            assert!(html.contains("items-end"), "right aligned like your other messages: {html}");
+            assert!(html.contains("rounded-br-sm") && html.contains("bg-zinc-200"), "the normal user bubble: {html}");
+            assert!(html.contains("Not now: task card #185 \"Cleanup\"."), "the exact message: {html}");
+            assert!(
+                !html.contains("<details") && !html.contains("the agent was told") && !html.contains("system note"),
+                "no separate note label: {html}"
+            );
+            assert!(!can_anchor(&e.kind), "arrival is not a model-history edit, rewind or side-chat target");
+            assert!(waiting_notices(&[e], 1234 + NOTICE_GRACE_MS).is_empty(), "not a held-notice pill");
+        });
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
