@@ -504,7 +504,7 @@ fn TaskWorkChooser(busy: RwSignal<bool>, realm: String, answer: Callback<String>
                     on:click=|ev| ev.stop_propagation()>
                     <div class="flex shrink-0 items-center gap-2">
                         <h2 class="flex-1 font-medium">"Save elsewhere"</h2>
-                        <button class=format!("{BUTTON_QUIET} pointer-coarse:min-h-11") aria-label="Close" on:click=move |_| close.run(())>"✕"</button>
+                        <button class=format!("{BUTTON_QUIET} pointer-coarse:min-h-11") aria-label="Close" on:click=move |_| close.run(())>{crate::icons::x()}</button>
                     </div>
                     <input node_ref=search class=format!("{INPUT} shrink-0") type="search" aria-label="Search open work" placeholder="Search open work…"
                         prop:value=move || query.get() on:input=move |ev| query.set(event_target_value(&ev)) />
