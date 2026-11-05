@@ -2381,6 +2381,8 @@ pub enum EventKind {
         command: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         from_title: String,
+        #[serde(default)]
+        deliver_at_ms: i64,
     },
 }
 

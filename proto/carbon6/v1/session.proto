@@ -77,6 +77,9 @@ message NoticeQueued {
   string from_session_id = 6;
   string from_title = 7;
   uint32 hops = 8;
+  // When the hourly limit next permits this notice's automatic delivery
+  // (Unix milliseconds); zero if it is not held by the limit.
+  int64 deliver_at_ms = 9;
 }
 
 // The session's default for its subagents changed (you picked one in the
@@ -528,8 +531,8 @@ message DelegationEnded {
   // What it did (a <subagent …> digest), when the turn did not complete
   // with a report.
   string digest = 5;
-  // For a turn no call waited on: what you said to it, and whether its
-  // report should wake the parent.
+  // For a turn no call waited on: its inputs with sender attribution
+  // (older heads send plain text), and whether its report wakes the parent.
   repeated string said = 6;
   bool wake = 7;
 }

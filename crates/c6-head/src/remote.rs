@@ -136,9 +136,7 @@ async fn relay(st: &HeadState, child_id: &str, end_seq: u64, reason: i32) -> any
                 if u.delegated_by.is_empty() && u.command != "task-notification" {
                     yours = true;
                     wake |= u.wake;
-                    if u.command != "resume" {
-                        said.push(u.text.clone());
-                    }
+                    said.push(c6_worker::report_input(child_id, &u.command, &u.text, &u.from_session_id, &u.from_title));
                 }
             }
             Some(session_event::Kind::Assistant(a)) => {

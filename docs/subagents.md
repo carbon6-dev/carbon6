@@ -156,6 +156,8 @@ A subagent's thread (§9) has a reply box and, after an interrupted, failed or l
   The parent never acts on stale information, and nothing runs behind your back unless you ask for it. To only *ask* a subagent something, use a side chat on it (↳ Ask); side chats don't report back.
 - **In a tree,** the rule repeats one level at a time. A report from a woken parent goes to its own parent under the same rule, and `wake` carries up only as far as you ticked it (stored on the `UserMessage`).
 
+The report names the input's source, in both the parent's transcript and its waiting-notices pill. A direct user message says so; a Resume request says the subagent resumed, without claiming you wrote the resume prompt. A session message names its sending session; when the sender is the subagent itself, it says the subagent resumed itself. Local workers and the head's remote-subagent relay use the same attribution. Old workers' unlabelled input text is shown neutrally rather than guessed to be yours.
+
 ### History after an interrupt
 
 This comes from `history_from_events`. A tool call that was cut off gets its repaired "interrupted" result, so the model sees exactly where it stopped.

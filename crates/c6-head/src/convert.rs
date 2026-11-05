@@ -178,6 +178,7 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
             text: n.text.clone(),
             command: n.command.clone(),
             from_title: n.from_title.clone(),
+            deliver_at_ms: n.deliver_at_ms,
         },
     };
     Some(api::Event { seq: ev.seq, ts: ev.ts_ms, kind })
