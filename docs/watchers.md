@@ -161,6 +161,7 @@ Steps 1–5 are built. Step 6 (moving the work and project notes, suggestions, n
   - **off:** `consistency`, `guard` and `improve`.
 - **Waking.** Every batch of a session's events with a boundary in it pokes each watcher that applies to it: a user message, a tool result, a turn's end, an approval, a rewind.
   - A wake (one at a time per watcher and session, coalescing what comes meanwhile) reads up to 400 events from its position and works out what happened, with no model.
+  - The digest uses plain display text, stripping provider citation markers without changing the recorded text or annotations. Queued quiet notices are left out of the digest and wake reasons. When the agent's next input takes them, their `task-notification` events appear as agent notices, not user messages or corrections.
   - **What wakes it:**
     - `correction`: an interruption, a rewind, a denied approval, or a message of yours that reads like one ("no", "don't", "instead", "make sure", "always"…);
     - `loop`: the same call three times;
