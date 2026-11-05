@@ -125,6 +125,8 @@ The worker checks the manifest's signature again itself, so a compromised head c
 
 Each binary knows how it was installed from where it runs (`current_exe`):
 
+The head also uses its resolved executable location to choose its default config: a Homebrew binary under `Cellar/` reads that prefix's `etc/c6h/c6h.toml`, just like the brew service. Plain `c6h login-link` (and other admin commands) therefore uses the service's database. `--config <path>` always overrides this; other install methods keep the user-config default (the .deb service and its admin commands pass `/etc/c6h/c6h.toml` explicitly).
+
 | Method | Detected by | Install | Restart |
 |---|---|---|---|
 | **brew** | under `$(brew --prefix)/Cellar/` | `brew upgrade carbon6-dev/carbon6/<bin>` (which updates the tap first). Not the downloaded asset: brew stays the owner of the files, and checks the bottle against the formula's checksum. Only CI's publish job writes the tap. Afterwards, `brew list --versions` must show the new version. | exit 75. The formula's `keep_alive successful_exit: false` restarts it from `opt/`, which now points to the new keg. |

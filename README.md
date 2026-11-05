@@ -73,7 +73,7 @@ make docker-token      # an enrollment token from that head
 
 **Homebrew (macOS).** `make brew` builds bottles and formulas of `c6h`, `c6w` and `c6` for this Mac's architecture into `dist/brew/` (with the local toolchain) and adds them to a local tap, `carbon6/local`. `make brew-install` installs or upgrades them from it and restarts their running services. Bottles need neither Xcode nor the Command Line Tools to install, and work on macOS 11 and later. The services run as you, under launchd:
 
-- **`c6h`:** `brew services start c6h`. Its config is `$(brew --prefix)/etc/c6h/c6h.toml` (kept across upgrades), its data `$(brew --prefix)/var/c6h`. Sign in with `c6h --config $(brew --prefix)/etc/c6h/c6h.toml login-link`.
+- **`c6h`:** `brew services start c6h`. Its config is `$(brew --prefix)/etc/c6h/c6h.toml` (kept across upgrades), its data `$(brew --prefix)/var/c6h`. Sign in with `c6h login-link`: a Homebrew binary finds this config automatically, including for other admin commands. An explicit `--config <path>` overrides it.
 - **`c6w`:** `c6w enroll <token>`, then `brew services start c6w`. It starts through a login shell, so sessions get your `PATH`.
 - Logs are in `$(brew --prefix)/var/log/c6h.log` (and `c6w.log`). The worker keeps the standard state folder (`~/Library/Application Support/c6w`), the same one `make dev-worker` uses.
 - `make brew-test` installs the bottles from a scratch tap and runs them, as CI does, then removes them.
