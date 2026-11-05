@@ -100,3 +100,13 @@ invoking it after unmount should throw the wasm-bindgen dropped-closure error,
 not call a leaked Rust closure. While mounted, resize the tile, append a streamed
 reply and scroll: width measurement, transcript following and visibility still
 work, without callbacks or reactive reads after disposal.
+
+## Task card actions: manual phone check
+
+Check both a session transcript and Decisions, with a coarse pointer at 320px and 390px widths, and on desktop. Use a realm with several open work items and a closed one.
+
+1. The actions read **Start session**, **Do it here**, **Save for later**, **Not now** in that order. Only Start session is filled; the next two have identical visible outlines and heights. They share one wrapping row, with no split arrow or stray divider. Coarse-pointer targets are at least 44px tall; desktop buttons remain compact.
+2. Save for later's tooltip names the proposing session's work. Clicking it sends `Add to this work`, without a picker. With no work, it creates new work. Do it here's tooltip names the proposing session.
+3. **Save elsewhere…** opens over the workspace, not inside the card. Scroll the transcript so the card is directly above the message box, then open it again: the whole dialog remains visible, with a scrolling list rather than content clipped by the composer. Try light/dark mode and the phone keyboard.
+4. The chooser offers **New work** once and open work only in the card's realm. Search is case-insensitive. A nonmatching search shows an empty-state message but keeps New work available. The New work choice sends `Add as new work`; an existing work item sends `Add to work:<id>` and receives the card's title, prompt and origin as a to-do.
+5. Close, outside click and Escape dismiss the chooser; Escape must not stop the session. Focus returns to Save elsewhere. A failed save leaves the card open with an error; all action buttons disable while a save is pending. Check the chooser with a long list and a long work title.

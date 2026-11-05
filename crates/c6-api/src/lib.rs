@@ -2651,7 +2651,8 @@ pub struct DecisionEdit {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DecisionAnswer {
-    /// One of its options (when it has options).
+    /// One of its options (when it has options). Task cards also accept
+    /// `Add to work:<id>` for an open work item in the card's realm.
     #[serde(default)]
     pub option: Option<String>,
     /// Its form's fields.
