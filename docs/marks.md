@@ -1,6 +1,6 @@
 # Marks: telling sessions apart at a glance — Design
 
-Status: built (2026-10-30). Decided with you:
+Status: built (2026-10-30), description updated to the current UI (2026-11-05; see [session-header.md](session-header.md)). Decided with you:
 - a session has more to tell apart than its own colour: **its worker, its work, its project, its realm, its repo, its model**;
 - each **value** of each aspect (this worker, that piece of work) has a **mark**, the same everywhere it shows;
 - twelve colours are too few: marks are **20 colours, plain or in one of 4 patterns** (horizontal stripes, vertical stripes, diagonal stripes, dots): 100 marks;
@@ -10,7 +10,7 @@ Status: built (2026-10-30). Decided with you:
 
 A mark is a colour (`sky`, `navy`…) or a colour in a pattern (`navy/dots`). The colours: sky, emerald, amber, rose, violet, teal, orange, indigo, lime, pink, cyan, fuchsia (the original twelve), then red, yellow, blue, brown, navy, olive, maroon and slate. The patterns: `hstripes`, `vstripes`, `diagonal`, `dots`, drawn in the colour on a pale tint of it. New things take marks in order, all plain colours before any pattern (`c6_api::marks::all`), the one least used first.
 
-A session's own mark is its `colour` (any mark now; old sessions keep theirs). Its tile's bar has the mark as a stripe along its top (the bar keeps the panel's own colours, so its text reads whatever the mark); its dot, its rail row, its dock line and its list row wear the mark itself.
+A session's own mark is its `colour` (any mark now; old sessions keep theirs). When the tile bar represents the session, it has the mark as a stripe along its top and as a circular button before the title (the bar keeps the panel's own colours, so its text reads whatever the mark). The session's rail row and dock line carry a short stripe; its list row has a dot. These identity marks are separate from the session's state dot, whose colour says running, failed, needs you, etc.
 
 ## 2. Aspects and shapes
 
@@ -24,16 +24,18 @@ A session's own mark is its `colour` (any mark now; old sessions keep theirs). I
 | repo | ⬟ pentagon | `repo:<name>` | from the name |
 | model | ⬭ pill | `model:<name>` | from the name |
 
-Marks you or the head picked live in the head (`marks` table) and reach every browser with the live feed (`LiveEvent::Marks`), so a change shows everywhere at once. Taking away a repo's, model's or realm's mark goes back to the one from its name; a worker, work item or project gets one picked again. Sessions in the live list carry the open work they serve and its project (`Session.work`; subagents and side chats their tree's). A session belongs to a project only through its work (docs/projects.md).
+Marks you or the head picked live in the head (`marks` table) and reach every browser with the live feed (`LiveEvent::Marks`), so a change shows everywhere at once. Taking away a repo's, model's or realm's mark goes back to the one from its name; a worker, work item or project gets one picked again. Sessions in the live list carry the open work they serve and its project (`Session.work`; subagents and side chats their tree's). A project's quick session can carry its project without a work item, so it has a project aspect but no work aspect (docs/projects.md). Sessions run on the head have no worker aspect.
 
 ## 3. Where they show
 
-- **A tile's bar**: the session's dot, then its shown aspects as shapes; when the tile is wide (a container query) each is named too. Pointing at one dims every tile whose session doesn't share that value. Clicking one shows the value, the other sessions with it, a way to its page (worker, work), for work the "change…" control, and the palette.
-- **The rail, the dock, the sessions list**: the session's mark, and its shown aspects as small shapes (named chips in the list and the rail's card).
+- **A tile's bar**, on desktop and phone: the session's top stripe and circular mark button, then its title and a separate state dot (with a state word except on a narrow phone). Clicking the mark button opens the session's palette. There are **no aspect marks or named aspect chips in the bar**, and no aspect-hover dimming of other tiles. When the bar represents another view beside the session, it does not show the session's mark; the session's own slim strip has its controls and actions, not a second set of identity or aspect marks.
+- **The phone header**: the app's top navigation header does not repeat the session's dot or aspects; the session's mark remains in its tile bar below it. The phone uses the same tile-bar mark button as desktop, not a separate aspect row.
+- **The rail and dock**: the session's short mark stripe, then its title and its shown aspects as small shapes, named on hover. A separate state dot says how it is doing. The rail's hover card shows named aspect chips and the session's palette.
+- **The sessions list**: the session's mark dot, with its shown aspects as named shape-and-label chips below its title and location. These chips and the rail/dock aspect shapes describe the values; they are not buttons opening aspect palettes or related-session popovers.
 - **Workers** (list and page), **Work** (list, item page, the Brief's "Left open", a session's work line), **Projects** (list, page, its work, and project links in Work): the value's own mark, clickable to change on the worker, work and project pages and in the workers list.
 - **The realm switcher**: each realm's triangle.
 
-Which aspects show is a per-realm setting (`session_facets`, Settings → Appearance): worker, work, project and realm by default. A realm shows only when it isn't home, and not on a realm's own page.
+Which aspects show in these rows and cards is a per-realm setting (`session_facets`, Settings → Appearance): worker, work, project and realm by default. It does not add aspects to the tile bar or phone header. A realm aspect shows only when it isn't home and the UI is not scoped to a realm.
 
 ## 4. API
 
