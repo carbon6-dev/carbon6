@@ -3,6 +3,9 @@
 use c6_api::SessionStatus;
 use leptos::prelude::*;
 
+mod drafts;
+pub use drafts::attachments as draft_attachments;
+
 pub fn now_ms() -> i64 {
     js_sys::Date::now() as i64
 }
@@ -212,10 +215,15 @@ pub fn draft(key: &str) -> RwSignal<String> {
 /// Drops a draft that was sent, from code that may outlive its box.
 pub fn forget_draft(key: &str) {
     storage_remove(&format!("c6.draft.{key}"));
+    drafts::forget(key);
 }
 
 fn placed_key(key: &str) -> String {
-    match (crate::place::header(), key.strip_prefix("c6.")) {
+    placed_key_in(crate::place::header().as_deref(), key)
+}
+
+fn placed_key_in(place: Option<&str>, key: &str) -> String {
+    match (place, key.strip_prefix("c6.")) {
         (Some(p), Some(rest)) => format!("c6.{p}.{rest}"),
         _ => key.to_owned(),
     }
@@ -229,6 +237,12 @@ pub fn storage_get_global(key: &str) -> Option<String> {
 pub fn storage_set_global(key: &str, value: &str) {
     if let Ok(Some(s)) = window().local_storage() {
         let _ = s.set_item(key, value);
+    }
+}
+
+fn storage_remove_global(key: &str) {
+    if let Ok(Some(s)) = window().local_storage() {
+        let _ = s.remove_item(key);
     }
 }
 
@@ -665,6 +679,16 @@ pub fn steady<T: Clone + PartialEq + Send + Sync + 'static>(r: LocalResource<T>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attachment_drafts_use_the_text_drafts_place_and_key() {
+        for key in ["new", "ask", "session-123"] {
+            let key = format!("c6.draft.{key}");
+            assert_eq!(placed_key_in(None, &key), key);
+            assert_eq!(placed_key_in(Some("home"), &key), key.replacen("c6.", "c6.home.", 1));
+            assert_ne!(placed_key_in(Some("admin"), &key), placed_key_in(Some("work"), &key));
+        }
+    }
 
     #[test]
     fn what_pops_up_within_another_keeps_it_open() {

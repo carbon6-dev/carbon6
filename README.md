@@ -577,6 +577,17 @@ Hover one of your messages: **↶ Rewind** takes the conversation back to before
 
 Paste, drop or pick (📎) images and text files into the message box; they go with the message (images as images, for models that see them; text files inline). Type `@` to mention a file or folder in the session's folder: a fuzzy finder completes the path, and the worker attaches the file (or a folder's listing) when the message arrives, so the model has it without a tool call. Files over 256 KB are mentioned but not inlined. Limits: 10 MB per upload, 20 MB per message. The Claude Code backend gets text only.
 
+**Drafts survive a reload**, including attachments in session and Ask reply boxes
+and the ordinary new-session form. Text stays in this browser's localStorage;
+attachment names, types, data and order stay in IndexedDB, scoped to the same
+realm and draft. Sending or removing the attachments clears their saved copy.
+The browser keeps at most 20 MB of attachment draft payloads (including base64
+and metadata), evicting the oldest modified drafts' attachments first, not their
+text. A quiet note reports attachments that couldn't be kept or restored. Storage
+is local to this browser and origin, not a backup or a cross-device sync; clearing
+site data clears drafts too. Seeded start forms without a saved text draft remain
+temporary.
+
 ### Slash commands
 
 Type `/` in the message box for the command list.

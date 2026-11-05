@@ -4546,7 +4546,7 @@ fn Composer(
     // Connection kinds: a switch into or out of Claude Code is a handoff.
     let kinds = LocalResource::new(api::connections);
     let text = crate::util::draft(&id);
-    let attachments = RwSignal::new(Vec::<c6_api::AttachmentUpload>::new());
+    let (attachments, draft_note, draft_ready) = crate::util::draft_attachments(Some(&id));
     // What you'd likely type next (docs/suggestions.md): fetched when a turn
     // ends, shown faintly while the box is empty, taken with a tap or Tab.
     let next = RwSignal::new(None::<c6_api::Suggestion>);
@@ -4764,7 +4764,8 @@ fn Composer(
     let send_with = move |now: bool| {
         let t = text.get_untracked();
         let uploads = attachments.get_untracked();
-        if (t.trim().is_empty() && uploads.is_empty()) || disabled.get_untracked() {
+        let saved_note = draft_note.get_untracked();
+        if (t.trim().is_empty() && uploads.is_empty()) || disabled.get_untracked() || !draft_ready.get_untracked() {
             return;
         }
         // Commands the UI runs (unless a custom command took the name).
@@ -4833,6 +4834,10 @@ fn Composer(
         // Sent: the suggestion was for before this message.
         next.set(None);
         attachments.set(Vec::new());
+        draft_note.set(None);
+        // Also clear a loss marker when no files survived restoration: the
+        // empty attachment signal alone would not trigger a storage write.
+        crate::util::forget_draft(&id.get_value());
         mention.set(None);
         command.set(None);
         let waking = wake.is_some_and(|w| w.get_untracked());
@@ -4841,6 +4846,7 @@ fn Composer(
                 error.set(Some(e));
                 text.set(t);
                 attachments.set(uploads);
+                draft_note.set(saved_note);
             } else {
                 error.set(None);
             }
@@ -4917,6 +4923,8 @@ fn Composer(
             <div class=if inline { "" } else { READING_ROW }>
             <div class=if inline { "space-y-2" } else { "w-full min-w-0 max-w-4xl space-y-2 px-2 py-1.5 sm:px-3 sm:py-2" }>
                 {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+                {move || (!draft_ready.get()).then(|| view! { <p class="text-xs text-muted" role="status">"Restoring draft attachments…"</p> })}
+                {move || draft_note.get().map(|note| view! { <p class="text-xs text-muted" role="status">{note}</p> })}
                 // One box: what's attached, the text, and a toolbar along its
                 // bottom edge (📎, the chips, Send).
                 <div class="relative rounded-xl border border-zinc-300 bg-white has-[textarea:focus]:border-zinc-400 has-[textarea:focus]:ring-2 has-[textarea:focus]:ring-zinc-300/60 dark:border-zinc-700 dark:bg-zinc-900 dark:has-[textarea:focus]:border-zinc-500 dark:has-[textarea:focus]:ring-zinc-700/60">
@@ -5215,7 +5223,7 @@ fn Composer(
                                 // the menu above it.
                                 <div class="relative flex items-stretch">
                                     <button class=format!("{SEND} rounded-l-md rounded-r-none {SEND_READY}") title=format!("{send_label}: the agent reads it at its next step") aria-label=send_label
-                                        prop:disabled=move || disabled.get() on:click=move |_| send()>{send_icon()}</button>
+                                        prop:disabled=move || disabled.get() || !draft_ready.get() on:click=move |_| send()>{send_icon()}</button>
                                     <button class="flex w-4 shrink-0 items-center justify-center rounded-r-md border-l border-sky-800 bg-sky-600 text-white hover:bg-sky-700 pointer-coarse:w-7"
                                         title="More ways to send" aria-label="More ways to send"
                                         aria-haspopup="menu" prop:aria-expanded=move || send_menu.get().to_string() data-pop=send_pop.get_value()
@@ -5238,7 +5246,7 @@ fn Composer(
                         } else {
                             view! {
                                 <button class=move || format!("{SEND} {SEND_SHAPE} {}", if has_text.get() { SEND_READY } else { SEND_EMPTY })
-                                    title=send_label aria-label=send_label prop:disabled=move || disabled.get() on:click=move |_| send()>{send_icon()}</button>
+                                    title=send_label aria-label=send_label prop:disabled=move || disabled.get() || !draft_ready.get() on:click=move |_| send()>{send_icon()}</button>
                             }.into_any()
                         }}
                         // Stop (or Esc twice) while Claude Code's own agents run
