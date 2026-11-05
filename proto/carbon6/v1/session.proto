@@ -354,6 +354,9 @@ message ContentBlock {
     Reasoning reasoning = 6;            // OpenAI Responses
     Opaque opaque = 7;                  // provider-run tools (web search …)
   }
+  // Display-only annotations on text (Responses url_citation, including
+  // title, URL and character offsets). Absent in older events.
+  string annotations_json = 8;
 }
 
 // A provider-specific block kept verbatim (e.g. Anthropic server_tool_use

@@ -40,7 +40,7 @@ impl Accumulator {
                 }
             }
             ModelEvent::Block { index, block } => {
-                if matches!(block, Block::Text(_)) {
+                if block.text().is_some() {
                     self.partial_text.clear();
                 }
                 self.finished.insert(*index, block.clone());
@@ -64,7 +64,7 @@ impl Accumulator {
             if complete {
                 self.finished.into_values().collect()
             } else {
-                let mut text: Vec<Block> = self.finished.into_values().filter(|b| matches!(b, Block::Text(_))).collect();
+                let mut text: Vec<Block> = self.finished.into_values().filter(|b| b.text().is_some()).collect();
                 if !self.partial_text.is_empty() {
                     text.push(Block::Text(self.partial_text));
                 }

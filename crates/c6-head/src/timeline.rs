@@ -131,7 +131,7 @@ fn text_of(blocks: &[ContentBlock]) -> String {
     blocks
         .iter()
         .filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Text { text, .. } => Some(api::citations::clean(text)),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -188,7 +188,7 @@ fn known_lines(st: &HeadState, session: &str, list: &mut [TimelineTurn]) -> Vec<
     let mut missing = Vec::new();
     for (i, t) in list.iter_mut().enumerate() {
         match lines.get(&key(session, t)) {
-            Some(l) => t.summary = l.clone(),
+            Some(l) => t.summary = api::citations::clean(l).into_owned(),
             None if t.end_seq > 0 => missing.push(i),
             None => {}
         }

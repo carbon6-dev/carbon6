@@ -57,7 +57,7 @@ impl OpenAiChat {
                             Block::ToolResult { id, content, .. } => {
                                 messages.push(json!({"role": "tool", "tool_call_id": id, "content": content}));
                             }
-                            Block::Text(t) => text.push_str(t),
+                            Block::Text(t) | Block::AnnotatedText { text: t, .. } => text.push_str(t),
                             Block::Image { media_type, data } => {
                                 images.push(json!({"type": "image_url", "image_url": {"url": crate::data_url(media_type, data)}}))
                             }
@@ -74,8 +74,7 @@ impl OpenAiChat {
                     }
                 }
                 Role::Assistant => {
-                    let text: String =
-                        m.blocks.iter().filter_map(|b| if let Block::Text(t) = b { Some(t.as_str()) } else { None }).collect();
+                    let text: String = m.blocks.iter().filter_map(Block::text).collect();
                     let calls: Vec<Value> = m
                         .tool_uses()
                         .map(|(id, name, args)| json!({"id": id, "type": "function", "function": {"name": name, "arguments": args}}))

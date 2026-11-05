@@ -4601,7 +4601,7 @@ mod handoff_tests {
         ev(seq, session_event::Kind::User(UserMessage { text: t.into(), ..Default::default() }))
     }
     fn assistant(seq: u64, blocks: Vec<content_block::Block>) -> SessionEvent {
-        let blocks = blocks.into_iter().map(|b| ContentBlock { block: Some(b) }).collect();
+        let blocks = blocks.into_iter().map(|b| ContentBlock { block: Some(b), ..Default::default() }).collect();
         ev(seq, session_event::Kind::Assistant(AssistantMessage { turn: 1, blocks, stop_reason: String::new() }))
     }
     fn switched(seq: u64, m: ModelSpec, handoff: Option<Handoff>) -> SessionEvent {

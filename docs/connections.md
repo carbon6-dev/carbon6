@@ -57,3 +57,30 @@ less than the task's answer limit fails without calling the model. This is a
 failed read, not a temporary connection failure. With no known window, output
 limits stay as before. Pools use the smallest effective member window unless
 the pool itself has a setting (docs/pools.md).
+
+## Web-search citations
+
+OpenAI Responses and the ChatGPT connection send text deltas for the live reply
+and completed message items with `output_text.annotations`. Carbon6 keeps those
+annotations (including `url_citation` URLs, titles and character offsets) as
+display metadata on the journal's text block, and exposes URL citations on the
+HTTP text block. This is an additive protobuf field and optional JSON field;
+older events need no migration. The original text, including provider citation
+markers, is replayed unchanged. Annotation metadata is not sent to the model.
+Streamed `response.output_text.annotation.added` events are also kept, as a
+fallback if a completed content item omits its annotations.
+
+Resolved citations show as small superscript numbered links with source titles
+on hover. Repeated URLs share a number within the reply. Markdown session exports
+keep portable numbered links with message-specific reference definitions. A
+source list is not added below the reply: the links themselves carry the URL and
+title, matching the transcript's existing compact style.
+
+Provider-run searches are kept as opaque tool items and displayed as server tools.
+The stored ChatGPT calls inspected on November 5, 2026 contained search queries
+or opened-page URLs, not a map from `turn…search…` ids to source URLs. The database
+fixtures had no useful citation examples. Carbon6 therefore does not guess links
+for old replies, live text awaiting annotations, or unresolved markers: those
+markers are hidden without leaving spaces before punctuation. Catch-up and
+timeline previews, activity previews, notifications, copied rendered text and
+exports use the same display cleanup. Inline and fenced code stay literal.

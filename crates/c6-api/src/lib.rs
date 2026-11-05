@@ -1,6 +1,7 @@
 //! JSON types for the head's `/api/v1`, shared by `c6h` and the web UI.
 //! Must stay wasm-compatible: no tokio, no std-only dependencies.
 
+pub mod citations;
 pub mod docs;
 pub mod labels;
 pub mod marks;
@@ -2406,7 +2407,7 @@ impl EventKind {
         if calls > 0 {
             return calls;
         }
-        blocks.iter().any(|b| matches!(b, ContentBlock::Text { text } if !text.trim().is_empty())) as u64
+        blocks.iter().any(|b| matches!(b, ContentBlock::Text { text, .. } if !text.trim().is_empty())) as u64
     }
 
     /// What a window's summary needs from before it (usage, the model,
@@ -2438,6 +2439,8 @@ pub enum ContentBlock {
     },
     Text {
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        citations: Vec<citations::UrlCitation>,
     },
     Thinking {
         text: String,

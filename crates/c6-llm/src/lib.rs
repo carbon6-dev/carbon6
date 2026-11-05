@@ -33,6 +33,12 @@ pub enum Role {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Block {
     Text(String),
+    /// Display metadata from a Responses message. Only `text` is replayed,
+    /// exactly as received; annotations never become model input.
+    AnnotatedText {
+        text: String,
+        annotations_json: String,
+    },
     /// Unsigned reasoning text (Chat Completions servers). Display only.
     Thinking(String),
     /// Anthropic thinking. Must go back unchanged, even with empty text.
@@ -76,6 +82,15 @@ pub enum Block {
 pub struct Message {
     pub role: Role,
     pub blocks: Vec<Block>,
+}
+
+impl Block {
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) | Self::AnnotatedText { text, .. } => Some(text),
+            _ => None,
+        }
+    }
 }
 
 impl Message {

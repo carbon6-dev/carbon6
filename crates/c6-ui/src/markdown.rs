@@ -84,24 +84,46 @@ pub struct Here<'a> {
 pub const DOC_COLOUR: &str = "#0ea5e9";
 
 pub fn to_html(src: &str) -> String {
+    with_citations(src, &[])
+}
+
+pub fn with_citations(src: &str, citations: &[c6_api::citations::UrlCitation]) -> String {
     // Titles and marks as the message renders, untracked: a message isn't
     // drawn again for every change to a session (its hover card shows
     // those). Outside the app (no live feed) nothing is known.
     let live = leptos::prelude::use_context::<crate::api::LiveFeed>();
     let origin = live.and_then(|_| leptos::prelude::window().location().origin().ok()).unwrap_or_default();
     let here = Here { origin, realm: crate::place::realm(), base: crate::place::base(), known: &crate::mentions::known };
-    render(src, &here)
+    if citations.is_empty() { render(src, &here) } else { render_citations(src, citations, &here) }
 }
 
 /// Markdown as HTML, with its links to carbon6 things (`session:<id>`,
 /// `/docs/<id>`, a bare `work:<uuid>`…) as mentions. None in code or in
 /// another link.
 pub fn render(src: &str, here: &Here) -> String {
+    render_citations(src, &[], here)
+}
+
+fn render_citations(src: &str, citations: &[c6_api::citations::UrlCitation], here: &Here) -> String {
+    let src = c6_api::citations::markdown(src, citations);
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     // Raw HTML first, as text: the mentions are the only HTML let through.
-    let events = Parser::new_ext(src, opts).map(|ev| match ev {
+    let events = Parser::new_ext(&src, opts).map(|ev| match ev {
         Event::Html(h) | Event::InlineHtml(h) => Event::Text(h),
         other => other,
+    });
+    // String markup only: Leptos views cannot be rendered to strings in wasm.
+    // Reference links we just generated get a small superscript, not raw HTML
+    // from the model. All URLs still pass through the normal sanitizer.
+    let mut links = Vec::new();
+    let events = events.flat_map(|ev| match &ev {
+        Event::Start(Tag::Link { id, .. }) => {
+            let citation = !citations.is_empty() && c6_api::citations::reference(id);
+            links.push(citation);
+            if citation { vec![Event::InlineHtml("<sup>".into()), ev] } else { vec![ev] }
+        }
+        Event::End(TagEnd::Link) if links.pop().unwrap_or(false) => vec![ev, Event::InlineHtml("</sup>".into())],
+        _ => vec![ev],
     });
     let mut out: Vec<Event> = Vec::new();
     // Inside a code block, an image or a web link: no mentions there.
@@ -321,6 +343,58 @@ mod tests {
 
     fn nothing(_: Kind, _: &str) -> Known {
         Known::default()
+    }
+
+    #[test]
+    fn single_and_grouped_citations_render_as_numbered_superscript_links() {
+        for marker in
+            ["\u{e200}cite\u{e202}turn347046search1\u{e201}", "\u{e200}cite\u{e202}turn919800search4\u{e202}turn919800search5\u{e201}"]
+        {
+            let text = format!("Fact{marker}.");
+            let mut citations = vec![c6_api::citations::UrlCitation {
+                url: "https://source.test/one".into(),
+                title: "One & <two>".into(),
+                start_index: 4,
+                end_index: text.chars().count() - 1,
+            }];
+            if marker.contains("search5") {
+                citations.push(c6_api::citations::UrlCitation {
+                    url: "https://source.test/two".into(),
+                    title: "Second".into(),
+                    ..citations[0].clone()
+                });
+            }
+            let html = render_citations(&text, &citations, &here(&nothing));
+            assert!(html.contains("<sup><a href=\"https://source.test/one\" title=\"One &amp; &lt;two&gt;\">[1]</a></sup>"), "{html}");
+            assert_eq!(html.matches("<sup>").count(), citations.len(), "{html}");
+            assert!(html.ends_with("</sup>.</p>\n"), "{html}");
+            assert!(!html.contains(['\u{e200}', '\u{e201}', '\u{e202}']));
+        }
+    }
+
+    #[test]
+    fn unresolved_citations_disappear_without_spaces_before_punctuation() {
+        let marker = "\u{e200}cite\u{e202}turn347046search1\u{e201}";
+        assert_eq!(render(&format!("Fact {marker}."), &here(&nothing)), "<p>Fact.</p>\n");
+        assert_eq!(render(&format!("Fact. {marker}"), &here(&nothing)), "<p>Fact.</p>\n");
+        assert_eq!(render(&format!("`{marker}`"), &here(&nothing)), format!("<p><code>{marker}</code></p>\n"));
+        assert_eq!(render("An **ordinary** sentence.", &here(&nothing)), "<p>An <strong>ordinary</strong> sentence.</p>\n");
+    }
+
+    #[test]
+    fn citation_titles_cannot_inject_html_and_only_web_urls_become_links() {
+        let marker = "\u{e200}cite\u{e202}turn1search1\u{e201}";
+        let mut citation = c6_api::citations::UrlCitation {
+            url: "https://source.test/?q=\"<tag>".into(),
+            title: "\" onmouseover=\"alert(1)".into(),
+            start_index: 0,
+            end_index: marker.chars().count(),
+        };
+        let html = render_citations(marker, &[citation.clone()], &here(&nothing));
+        assert!(html.contains("title=\"&quot; onmouseover=&quot;alert(1)\""), "{html}");
+        assert!(!html.contains("<tag>"), "{html}");
+        citation.url = "javascript:alert(1)".into();
+        assert_eq!(render_citations(marker, &[citation], &here(&nothing)), "");
     }
 
     #[test]

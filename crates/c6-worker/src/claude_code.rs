@@ -1827,7 +1827,7 @@ fn assistant_block(b: &Value) -> Option<ContentBlock> {
         }),
         _ => return None,
     };
-    Some(ContentBlock { block: Some(block) })
+    Some(ContentBlock { block: Some(block), ..Default::default() })
 }
 
 #[cfg(test)]

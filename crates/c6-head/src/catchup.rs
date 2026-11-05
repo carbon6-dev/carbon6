@@ -286,6 +286,7 @@ pub(crate) fn target(name: &str, input: &serde_json::Value) -> String {
 
 /// The first `n` characters of a text, on one line, with … if cut.
 pub(crate) fn clip(text: &str, n: usize) -> String {
+    let text = api::citations::clean(text);
     let one: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if one.chars().count() <= n {
         return one;
@@ -483,7 +484,7 @@ pub(crate) fn condensed(events: &[Event]) -> String {
     let mut finals: HashMap<u64, u64> = HashMap::new();
     for e in events {
         if let EventKind::Assistant { turn, blocks, .. } = &e.kind
-            && blocks.iter().any(|b| matches!(b, ContentBlock::Text { text } if !text.trim().is_empty()))
+            && blocks.iter().any(|b| matches!(b, ContentBlock::Text { text, .. } if !text.trim().is_empty()))
         {
             finals.insert(*turn, e.seq);
         }
@@ -514,7 +515,7 @@ pub(crate) fn condensed(events: &[Event]) -> String {
                     let text: String = blocks
                         .iter()
                         .filter_map(|b| match b {
-                            ContentBlock::Text { text } => Some(text.as_str()),
+                            ContentBlock::Text { text, .. } => Some(text.as_str()),
                             _ => None,
                         })
                         .collect::<Vec<_>>()
@@ -676,14 +677,19 @@ pub(crate) async fn ask(st: &HeadState, row: &SessionRow, label: &str, what: &st
     .bind(&row.realm)
     .execute(&st.store.pool)
     .await?;
-    let text: String = msg.blocks.iter().filter_map(|b| if let Block::Text(t) = b { Some(t.as_str()) } else { None }).collect();
+    let text: String = msg.blocks.iter().filter_map(Block::text).collect();
     anyhow::ensure!(!text.trim().is_empty(), "{model} gave no answer");
-    Ok(text.trim().to_owned())
+    Ok(api::citations::clean(text.trim()).into_owned())
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn catchup_previews_remove_citations_before_clipping() {
+        assert_eq!(clip("Fact \u{e200}cite\u{e202}turn347046search1\u{e201}. More", 6), "Fact.…");
+    }
 
     pub(crate) fn ev(seq: u64, ts: i64, kind: EventKind) -> Event {
         Event { seq, ts, kind }
@@ -723,7 +729,7 @@ pub(crate) mod tests {
     pub(crate) fn reply(turn: u64, text: &str, tools: &[(&str, &str, serde_json::Value)]) -> EventKind {
         let mut blocks = Vec::new();
         if !text.is_empty() {
-            blocks.push(ContentBlock::Text { text: text.into() });
+            blocks.push(ContentBlock::Text { text: text.into(), citations: vec![] });
         }
         for (id, name, input) in tools {
             blocks.push(ContentBlock::ToolUse { id: (*id).into(), name: (*name).into(), input_json: input.to_string() });
