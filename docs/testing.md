@@ -92,6 +92,46 @@ Focus and active-pane selection run on pointerdown. The pane header and its cond
 
 For a browser-automation regression, keep the target element's DOM handle, send pointerdown, allow an animation frame, then send pointerup. Assert that the target stays connected through pointerdown and the action happens after one click. In particular, a split tile's pane-header close reproduces the old replacement reliably; an atomic synthetic `click()` can hide the interval where rendering occurs.
 
+## Tile drops: layout regressions and browser check
+
+The `workspace` unit tests exercise the same `check_drop` rules used by the
+preview and the move, including all source/target/direction combinations for
+2–16 tiles, minimized tiles, missing endpoints, and unchanged positions. There
+is a four-column limit, not a per-column tile limit. A rejected drop must leave
+the entire layout unchanged; every blue preview must change the visible layout.
+
+In a desktop browser (also check touch-capable desktop/tablet native dragging):
+
+1. Open sixteen tiles (four columns, four tiles each). Drag a tile from a shared
+   column over another tile's left and right fifths. Neither edge turns blue;
+   the hint explains that four columns are open and to drop above or below,
+   and the cursor forbids the drop. Releasing leaves the layout unchanged.
+2. Drop the same tile in the middle of another tile's top or bottom half. It
+   joins that column at the highlighted position, even with many tiles there.
+   Repeat in the padding between stacked tiles; the gap accepts the drop too.
+3. Move over a valid destination, then back over the source or out of the grid.
+   No old highlight remains. Moving between child elements inside a destination
+   must keep the preview. Dropping onto the source, immediately before/after its
+   current position, or beside its singleton column shows **Already here**.
+4. With fewer than four occupied columns, move a tile into a new column. With
+   four columns, a tile alone in its column can still move that column to a
+   different place. Minimize/close a different tile during a drag: the drop uses
+   stable tile keys, not stale indices. A source/destination hidden or closed
+   during the drag must no longer advertise an accepted drop; hiding/closing
+   the source cancels its drag state even if its bar never receives dragend.
+   Also minimize every tile in the leftmost column, then drag a tile from a
+   shared column beside another: it makes the promised fourth visible column,
+   rather than merging with the rightmost one. A minimized-only slot is free
+   for reuse, not a fifth saved column that squeezes two visible ones together.
+5. Start a drag on a tile-bar button as well as its title; both native drags
+   must follow the same rules. Dropping a tile over a message box still moves
+   the tile; dropping a file still attaches it, not moves a tile. End/cancel a
+   drag and check that all feedback disappears.
+6. On a phone, long-press a bottom tab and drag it across several tabs (also
+   with minimized tiles present). The insertion line and final reading order
+   must agree. This uses `step_tile`/the switcher's pointer handlers, not the
+   desktop `Drop` zones; a long press without movement still opens its menu.
+
 ## Transcript follow: manual browser check
 
 The `c6-ui` workspace unit tests cover input direction and stop/resume decisions. In a browser, use a long session with a streaming reply:
