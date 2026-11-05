@@ -65,13 +65,13 @@ Not goals:
   - a turn is running;
   - a native background task is running (`Background::list`, kind `claude_code`);
   - a carbon6 background subagent of the session is running;
-  - the last turn ended less than `claude_code_idle_minutes` ago (default 15).
+  - the last turn ended, or Claude Code last wrote between-turn output (including task lifecycle updates), less than `claude_code_idle_minutes` ago (default 15).
 - **Close it** by closing stdin, and kill the process group if it hasn't exited within 10 s. The next input starts a new process with `--resume`.
 - **The model is switched in place** with `set_model` at the next turn, so a switch keeps the process and its tasks.
 - **Restart it** when what it was started with changes and no background task would be lost: its conversation, its effort or its hooks (`claude_code::Launch`). While tasks run, the old process carries on.
 - **A handoff to carbon6's own loop** waits while Claude Code's own tasks run (§8), then stops the process (`Process::stop`).
 - **The CLI's own wait limit** (`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`) applies only once its input is closed (tested 2026-10-31: with input open, a task outlived a 15-second limit and woke the agent). carbon6 closes it only when idle with no tasks, or when the worker is gone, so the limit is set to 5 seconds: a process whose worker crashed stops its tasks and exits instead of working on unread.
-- **The idle time** is the `claude_code_idle_minutes` setting (default 15).
+- **The idle time** is the `claude_code_idle_minutes` setting (default 15). Between-turn output refreshes this clock before the actor rechecks it: when a long-running task completes, fails or stops, its notification starts a fresh idle interval, not the already-expired interval from the last foreground turn. Otherwise the actor could close stdin before Claude Code's self-started reply arrives; shutdown waits for exit but does not map output into turns. A self-started assistant message (even without a new `system/init`) opens a recorded task-notification turn, including its tool calls, and cancels any pending fallback wake (§5). This does not change the hourly-limit treatment of self-started turns.
 
 ### Inputs
 

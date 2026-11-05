@@ -324,7 +324,7 @@ pub(crate) struct Process {
     /// Of the turn you stopped: its last message, when it ended, and the
     /// tasks it reported ended (to find, or else name, what it queued).
     stop_mark: Option<StopMark>,
-    /// When its last turn ended (or it started).
+    /// When its last turn ended, it last wrote between turns, or it started.
     idle_since: tokio::time::Instant,
     /// A Send now it hasn't answered yet.
     send_now: Option<SendNow>,
@@ -584,6 +584,11 @@ impl Process {
     /// input written during the last turn): it is kept for that turn, and
     /// this returns true.
     pub async fn idle_line(&mut self, v: Value, sink: &Arc<dyn EventSink>) -> anyhow::Result<bool> {
+        // A long task can end after the last turn's idle deadline. Once
+        // its update clears tasks_running(), give Claude Code a fresh idle
+        // interval to reply, rather than closing stdin on the next actor
+        // iteration and leaving that reply unread during shutdown.
+        self.idle_since = tokio::time::Instant::now();
         if self.begins_turn(&v) {
             // Right after you stopped a turn, with nothing of yours waiting
             // and none of its tasks ended since, Claude Code starts a turn
@@ -2806,6 +2811,114 @@ done
         assert!(p.wake_due().is_none() && p.take_unwoken().is_none(), "nothing for the session to send");
         assert_eq!(run(&mut p, 2, &[], &sink).await.reason, Some(TurnEndReason::Completed));
         p.close().await;
+    }
+
+    /// A task outlives the idle interval. Its terminal notification must
+    /// not re-arm the last turn's expired deadline and close stdin before
+    /// the assistant-first reply (no init or requested turn) arrives.
+    #[tokio::test]
+    async fn a_long_background_task_ending_keeps_its_self_started_reply() {
+        for (subtype, status) in [
+            ("task_notification", "completed"),
+            ("task_notification", "failed"),
+            ("task_notification", "stopped"),
+            ("task_updated", "completed"),
+            ("task_updated", "failed"),
+            ("task_updated", "killed"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut terminal = serde_json::json!({"type": "system", "subtype": subtype, "task_id": "build", "tool_use_id": "toolu_build"});
+            if subtype == "task_updated" {
+                terminal["patch"] = serde_json::json!({"status": status});
+            } else {
+                terminal["status"] = status.into();
+                terminal["summary"] = "Build ended".into();
+            }
+            let bin = script(
+                dir.path(),
+                "claude-task-end",
+                &format!(
+                    r#"#!/bin/sh
+[ "$1" = --version ] && exit 0
+read -r prompt
+uuid=$(printf '%s' "$prompt" | sed -n 's/.*"uuid":"\([^"]*\)".*/\1/p')
+printf '{{"type":"user","isReplay":true,"uuid":"%s","message":{{"content":"echo"}}}}\n' "$uuid"
+cat <<'EOF'
+{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"toolu_build","name":"Bash","input":{{"command":"cargo build","run_in_background":true}}}}]}}}}
+{{"type":"system","subtype":"task_started","task_id":"build","tool_use_id":"toolu_build","description":"cargo build","task_type":"local_bash","is_backgrounded":true}}
+{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_build","content":"Running in background"}}]}}}}
+{{"type":"result","subtype":"success","is_error":false,"usage":{{}}}}
+EOF
+# Fixture controls, not user inputs: let the test age the idle clock,
+# then observe the task's end before the assistant starts replying.
+read -r control
+printf '%s\n' '{terminal}'
+read -r control
+cat <<'EOF'
+{{"type":"assistant","message":{{"content":[{{"type":"text","text":"The build ended; checking the output."}}]}}}}
+{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"toolu_after","name":"Bash","input":{{"command":"git status --short"}}}}]}}}}
+{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_after","content":"clean"}}]}}}}
+{{"type":"result","subtype":"success","is_error":false,"usage":{{}}}}
+EOF
+cat > /dev/null
+"#
+                ),
+            );
+            c6_testkit::runnable(&bin, &["--version"]).await;
+            let tools = Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()));
+            let vec_sink = Arc::new(VecSink::default());
+            let sink: Arc<dyn EventSink> = vec_sink.clone();
+            let mut p = spawn(&bin, dir.path(), "s", false, Some(observer(dir.path(), tools).await));
+            assert_eq!(run(&mut p, 1, &[input("c1", "build it")], &sink).await.reason, Some(TurnEndReason::Completed));
+            assert!(p.tasks_running());
+            assert!(p.idle_until(IDLE).is_none(), "running tasks keep the process up");
+            // Backdate only the product clock: no wall-clock wait or race
+            // with a real child process on a paused Tokio clock.
+            p.idle_since = tokio::time::Instant::now() - IDLE - Duration::from_secs(1);
+            write_line(&p.stdin, &serde_json::json!({"fixture": "finish task"})).await.unwrap();
+            c6_testkit::within("the long task's terminal notification", async {
+                while p.tasks_running() {
+                    let v = p.next_line().await.expect("still up");
+                    assert!(!p.idle_line(v, &sink).await.unwrap(), "only the task ended; no turn yet");
+                }
+            })
+            .await;
+            let after_first = vec_sink.0.lock().unwrap().len();
+            let deadline = p.idle_until(IDLE).expect("no running tasks");
+            write_line(&p.stdin, &serde_json::json!({"fixture": "reply"})).await.unwrap();
+            // The actor selects between these same futures. Prefer an
+            // expired timer so the old loss is deterministic even if the
+            // child already buffered its reply.
+            let v = c6_testkit::within("the self-started reply, not idle shutdown", async {
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(deadline) => None,
+                    v = p.next_line() => Some(v.expect("still up")),
+                }
+            })
+            .await;
+            let Some(v) = v else {
+                p.close().await;
+                panic!("idle shutdown discarded the reply after {subtype}: {status}");
+            };
+            assert!(p.idle_line(v, &sink).await.unwrap());
+            assert!(p.wake_due().is_none() && p.take_unwoken().is_none(), "no duplicate fallback notice");
+            assert_eq!(run(&mut p, 2, &[], &sink).await.reason, Some(TurnEndReason::Completed));
+            let events = vec_sink.0.lock().unwrap().clone();
+            let reply = &events[after_first..];
+            assert_eq!(
+                reply.iter().map(kind).collect::<Vec<_>>(),
+                ["user", "turn_started", "assistant", "assistant", "tool_result", "usage", "turn_ended"]
+            );
+            assert!(matches!(&reply[0].kind, Some(session_event::Kind::User(u)) if u.command == "task-notification"));
+            assert!(matches!(&reply[1].kind, Some(session_event::Kind::TurnStarted(t)) if t.turn == 2));
+            assert!(matches!(&reply[2].kind, Some(session_event::Kind::Assistant(a))
+                if a.turn == 2 && matches!(&a.blocks[0].block, Some(content_block::Block::Text(t)) if t == "The build ended; checking the output.")));
+            assert!(matches!(&reply[3].kind, Some(session_event::Kind::Assistant(a))
+                if a.turn == 2 && matches!(&a.blocks[0].block, Some(content_block::Block::ToolUse(t)) if t.id == "toolu_after" && t.name == "Bash")));
+            assert!(matches!(&reply[4].kind, Some(session_event::Kind::ToolResult(r)) if r.call_id == "toolu_after"));
+            p.close().await;
+        }
     }
 
     /// A stand-in `claude` that, as 2.1.311 does, starts a turn by itself
