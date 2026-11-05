@@ -125,7 +125,7 @@ pub async fn get(st: &HeadState, caller: &Caller) -> anyhow::Result<api::Attenti
 /// approval's or a question's from its reference).
 async fn waiting(st: &HeadState, realm: Option<&str>) -> anyhow::Result<Vec<api::AttentionItem>> {
     let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "SELECT id, title, ref, context, realm, updated_at FROM decisions WHERE {WAITING} AND (? IS NULL OR realm = ?) \
+        "SELECT id, kind, title, ref, context, realm, updated_at FROM decisions WHERE {WAITING} AND (? IS NULL OR realm = ?) \
          ORDER BY updated_at DESC, id DESC LIMIT 500"
     )))
     .bind(now_ms())
@@ -133,6 +133,35 @@ async fn waiting(st: &HeadState, realm: Option<&str>) -> anyhow::Result<Vec<api:
     .bind(realm)
     .fetch_all(&st.store.pool)
     .await?;
+    waiting_items(st, rows).await
+}
+
+/// Everything answerable in a session, including its offered task cards,
+/// and approvals/questions in its subagents at any depth. Side chats are
+/// independent conversations, not subagents. Don't use the live session
+/// list here: it deliberately contains only top-level sessions.
+pub async fn of_session(st: &HeadState, id: &str, caller: &Caller) -> anyhow::Result<Vec<api::AttentionItem>> {
+    let rows = sqlx::query(
+        "WITH RECURSIVE agents(id) AS (\
+             SELECT id FROM sessions WHERE parent_id = ?1 AND parent_call_id IS NOT NULL \
+             UNION SELECT s.id FROM sessions s JOIN agents a ON s.parent_id = a.id WHERE s.parent_call_id IS NOT NULL\
+         ) SELECT id, kind, title, ref, context, sessions, realm, updated_at FROM decisions \
+         WHERE (state = 'open' OR (state = 'snoozed' AND snooze_until <= ?2)) AND (?3 IS NULL OR realm = ?3) \
+         AND (json_extract(context, '$.session') = ?1 \
+              OR EXISTS (SELECT 1 FROM json_each(decisions.sessions) WHERE value = ?1) \
+              OR ((ref LIKE 'approval:%' OR ref LIKE 'question:%') \
+                  AND json_extract(context, '$.session') IN (SELECT id FROM agents))) \
+         ORDER BY updated_at, id",
+    )
+    .bind(id)
+    .bind(now_ms())
+    .bind(caller.listing_realm())
+    .fetch_all(&st.store.pool)
+    .await?;
+    waiting_items(st, rows).await
+}
+
+async fn waiting_items(st: &HeadState, rows: Vec<sqlx::sqlite::SqliteRow>) -> anyhow::Result<Vec<api::AttentionItem>> {
     let mut titles = HashMap::<String, String>::new();
     let mut out = Vec::new();
     for r in rows {
@@ -143,7 +172,11 @@ async fn waiting(st: &HeadState, realm: Option<&str>) -> anyhow::Result<Vec<api:
         let (kind, session, call) = match (parts.next(), parts.next(), parts.next()) {
             (Some("approval"), Some(s), Some(c)) => ("approval", Some(s.to_owned()), Some(c.to_owned())),
             (Some("question"), Some(s), Some(c)) => ("question", Some(s.to_owned()), Some(c.to_owned())),
-            _ => ("decision", context["session"].as_str().map(str::to_owned), None),
+            _ => (
+                if r.get::<String, _>("kind") == "task" { "task" } else { "decision" },
+                context["session"].as_str().map(str::to_owned),
+                None,
+            ),
         };
         let detail = match &session {
             Some(s) => session_title(st, &mut titles, s).await,
@@ -395,6 +428,203 @@ pub async fn seen(st: &HeadState, caller: &Caller, keys: &[String]) -> anyhow::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exercise real head ingestion, including the worker-created child
+    /// rows: neither the live-list filter nor nested ancestry may hide a
+    /// held call from attention or the normal notification sender.
+    #[tokio::test]
+    async fn subagent_approvals_reach_attention_notifications_and_the_parent_waiting_list() {
+        use c6_core::WorkerId;
+        use c6_proto::{Approval, Question, SessionEvent, SessionEventBatch, SessionStarted, session_event::Kind};
+        use serde_json::json;
+
+        let dir = tempfile::tempdir().unwrap();
+        let head = crate::start(crate::HeadConfig {
+            data_dir: dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            auth: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let st = &head.state;
+        let worker = WorkerId::new();
+        sqlx::query(
+            "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, labels) \
+                     VALUES ('parent', ?, 'Parent', '', 'c', 'm', 'running', 0, 0, '[\"project:test\"]')",
+        )
+        .bind(worker.to_string())
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |axum::Json(v): axum::Json<Value>| {
+                let sent = sent.clone();
+                async move {
+                    sent.send(v).unwrap();
+                    "ok"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hook = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        st.store.set_setting(crate::notify::PUBLIC_URL, "https://carbon6.test").await.unwrap();
+        st.store
+            .set_setting(
+                crate::notify::CHANNELS,
+                &json!([{
+                    "name": "phone", "kind": "webhook", "url": hook, "events": ["approval", "notice"], "applies_to": ["project:test"]
+                }])
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        let event = |seq, kind| SessionEvent { seq, ts_ms: now_ms(), kind: Some(kind) };
+        for (id, parent, call) in [("child", "parent", "task-1"), ("grandchild", "child", "task-2")] {
+            let events = vec![event(
+                1,
+                Kind::Started(SessionStarted {
+                    parent_session_id: parent.into(),
+                    parent_call_id: call.into(),
+                    title: id.into(),
+                    ..Default::default()
+                }),
+            )];
+            assert_eq!(crate::sessions::ingest(st, worker, SessionEventBatch { session_id: id.into(), events }).await.unwrap(), Some(1));
+        }
+        let held = SessionEventBatch {
+            session_id: "grandchild".into(),
+            events: vec![event(
+                2,
+                Kind::Approval(Approval {
+                    call_id: "push".into(),
+                    state: "requested".into(),
+                    tool: "bash".into(),
+                    input: r#"{"command":"git push"}"#.into(),
+                    policy: "Pushes and pull requests need your approval".into(),
+                    ..Default::default()
+                }),
+            )],
+        };
+        crate::sessions::ingest(st, worker, held.clone()).await.unwrap();
+        // A resent batch must not open another decision or notify again.
+        crate::sessions::ingest(st, worker, held).await.unwrap();
+        let note = c6_testkit::within("the subagent approval notification", received.recv()).await.unwrap();
+        assert_eq!(note["event"], "approval");
+        assert_eq!(note["session_id"], "grandchild");
+        assert_eq!(note["title"], "Approval needed: grandchild");
+        assert_eq!(note["priority"], "high");
+        assert!(note["approve_url"].as_str().unwrap().starts_with("https://carbon6.test/approve/"));
+        let waiting = get(st, &Caller::in_realm("home")).await.unwrap().waiting;
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(
+            (waiting[0].kind.as_str(), waiting[0].session_id.as_deref(), waiting[0].call_id.as_deref()),
+            ("approval", Some("grandchild"), Some("push"))
+        );
+        assert_eq!(waiting_count(st, "home").await.unwrap(), 1);
+        assert!(
+            st.store.sessions(Some("home"), 100).await.unwrap().iter().all(|s| s.id != "grandchild"),
+            "the live list excludes subagents"
+        );
+
+        crate::sessions::ingest(
+            st,
+            worker,
+            SessionEventBatch {
+                session_id: "child".into(),
+                events: vec![event(
+                    2,
+                    Kind::Question(Question {
+                        call_id: "branch".into(),
+                        state: "asked".into(),
+                        title: "Which branch?".into(),
+                        ..Default::default()
+                    }),
+                )],
+            },
+        )
+        .await
+        .unwrap();
+        for id in ["parent", "child"] {
+            let list = of_session(st, id, &Caller::in_realm("home")).await.unwrap();
+            assert_eq!(list.len(), 2, "{id}: {list:?}");
+            assert!(list.iter().any(|i| i.kind == "approval" && i.session_id.as_deref() == Some("grandchild")));
+            assert!(list.iter().any(|i| i.kind == "question" && i.session_id.as_deref() == Some("child")));
+        }
+        assert!(of_session(st, "parent", &Caller::in_realm("commons")).await.unwrap().is_empty());
+
+        // A session's own decisions and offered task cards belong in its
+        // header too, including decisions linked through working sessions.
+        for (kind, title) in [("question", "Choose a release"), ("task", "Review the release")] {
+            crate::decisions::open(
+                st,
+                &api::DecisionIn { kind: kind.into(), title: title.into(), context: json!({"session": "parent"}), ..Default::default() },
+                "home",
+                "",
+            )
+            .await
+            .unwrap();
+        }
+        let linked = crate::decisions::open(st, &api::DecisionIn { title: "Working on this".into(), ..Default::default() }, "home", "")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE decisions SET sessions = '[\"parent\"]' WHERE id = ?").bind(linked.id).execute(&st.store.pool).await.unwrap();
+        let list = of_session(st, "parent", &Caller::in_realm("home")).await.unwrap();
+        assert_eq!(list.len(), 5);
+        assert!(list.iter().any(|i| i.title == "Choose a release" && i.kind == "decision"));
+        assert!(list.iter().any(|i| i.title == "Review the release" && i.kind == "task"));
+        assert!(list.iter().any(|i| i.decision_id == Some(linked.id)));
+        assert_eq!(get(st, &Caller::in_realm("home")).await.unwrap().waiting.len(), 4, "offered tasks still don't inflate What needs you");
+
+        // The browser/API path has the same list, and is a realm-scoped
+        // read in the operation catalog (not an accidental admin route).
+        let url = format!("http://{}/api/v1/sessions/parent/waiting", head.ui_addrs[0]);
+        let home = st.store.create_api_token("home reader", Some("home")).await.unwrap().token.unwrap();
+        let response = st.http.get(&url).bearer_auth(home).send().await.unwrap().error_for_status().unwrap();
+        assert_eq!(response.json::<Vec<api::AttentionItem>>().await.unwrap(), list);
+        let other = st.store.create_api_token("other reader", Some("commons")).await.unwrap().token.unwrap();
+        assert_eq!(st.http.get(&url).bearer_auth(other).send().await.unwrap().status(), reqwest::StatusCode::NOT_FOUND);
+
+        // Settling a child call removes it from every ancestor, not just
+        // from the thread where it was answered.
+        crate::sessions::ingest(
+            st,
+            worker,
+            SessionEventBatch {
+                session_id: "grandchild".into(),
+                events: vec![event(3, Kind::Approval(Approval { call_id: "push".into(), state: "denied".into(), ..Default::default() }))],
+            },
+        )
+        .await
+        .unwrap();
+        assert!(of_session(st, "parent", &Caller::in_realm("home")).await.unwrap().iter().all(|i| i.kind != "approval"));
+        // A later note is a delivery barrier: a duplicate approval would
+        // arrive before this, not merely after a too-early try_recv.
+        crate::sessions::ingest(
+            st,
+            worker,
+            SessionEventBatch {
+                session_id: "grandchild".into(),
+                events: vec![event(
+                    4,
+                    Kind::Notice(c6_proto::Notice { title: "Delivery barrier".into(), message: "done".into(), ..Default::default() }),
+                )],
+            },
+        )
+        .await
+        .unwrap();
+        let next = c6_testkit::within("the notification delivery barrier", received.recv()).await.unwrap();
+        assert_eq!(next["event"], "notice", "the repeated request and its outcome send no second approval notification");
+        head.shutdown().await.unwrap();
+        server.abort();
+    }
 
     /// A burst of changes makes one ping at once and at most one after it;
     /// a change later makes another.

@@ -216,6 +216,15 @@ pub fn SessionDecisions(session: String) -> impl IntoView {
         }
     });
     let session = StoredValue::new(session);
+    let live = api::live();
+    let due = StoredValue::new(false);
+    Effect::new(move |seen: Option<()>| {
+        live.attention.track();
+        live.connected.track();
+        if seen.is_some() {
+            tick_quietly(tick, due);
+        }
+    });
     let list = LocalResource::new(move || {
         tick.track();
         api::session_decisions(session.get_value())
@@ -223,6 +232,10 @@ pub fn SessionDecisions(session: String) -> impl IntoView {
     reload_quietly(tick);
     let refresh = Callback::new(move |()| tick.update(|t| *t += 1));
     view! { <Cards list refresh in_session=true /> }
+}
+
+pub(crate) fn card_id(id: i64) -> String {
+    format!("decision-{id}")
 }
 
 #[component]
@@ -299,7 +312,7 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
         format!("{} {}", parts.join(" · "), if d.answered_via.is_empty() { String::new() } else { format!("(via {})", d.answered_via) })
     });
     view! {
-        <section class=format!("space-y-2 rounded-lg border p-3 {tone}")>
+        <section id=card_id(id) class=format!("space-y-2 rounded-lg border p-3 {tone}")>
             <div class="flex flex-wrap items-center gap-2">
                 <span class="rounded bg-zinc-100 px-1.5 text-[11px] dark:bg-zinc-800">{d.kind.clone()}</span>
                 {(d.waiting && open).then(|| view! { <span class="rounded bg-sky-100 px-1.5 text-[11px] text-sky-800 dark:bg-sky-950 dark:text-sky-300">"waiting"</span> })}

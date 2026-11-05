@@ -5238,7 +5238,7 @@ pub struct Attention {
     pub elsewhere: Vec<AttentionElsewhere>,
 }
 
-/// One thing that needs you.
+/// One thing that needs you (or an offered task in a session's waiting list).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AttentionItem {
@@ -5246,7 +5246,8 @@ pub struct AttentionItem {
     /// answers) or `brief`.
     pub key: String,
     /// Waiting: `approval`, `question` or `decision`. Worth a look:
-    /// `turn_ended`, `failed`, `comment_answer` or `brief`.
+    /// `turn_ended`, `failed`, `comment_answer` or `brief`. The session-scoped
+    /// waiting list also includes `task` (never in Attention.waiting).
     pub kind: String,
     pub title: String,
     /// Where it is: the session's title for an approval or a turn. For a

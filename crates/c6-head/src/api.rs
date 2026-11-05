@@ -169,6 +169,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/search", get(search))
         .route("/api/v1/sessions/{id}/matches", get(session_matches))
         .route("/api/v1/sessions/{id}/decisions", get(session_decisions))
+        .route("/api/v1/sessions/{id}/waiting", get(session_waiting))
         .route("/api/v1/sessions/{id}/suggestion", get(session_suggestion))
         .route("/api/v1/sessions/{id}/suggestion/seen", post(suggestion_seen))
         .route("/api/v1/sessions/{id}/name/suggestion", get(session_name_suggestion))
@@ -1007,6 +1008,15 @@ async fn session_decisions(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Vec<api::Decision>>> {
     Ok(Json(crate::decisions::of_session(&st, &id, &caller).await?))
+}
+
+/// What waits on you here and in this session's subagents.
+async fn session_waiting(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<api::AttentionItem>>> {
+    Ok(Json(crate::attention::of_session(&st, &id, &caller).await?))
 }
 
 /// What you'd likely type next (docs/suggestions.md): 204 when there's none.
