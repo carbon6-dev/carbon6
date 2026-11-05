@@ -41,6 +41,10 @@ mod tests {
             &["update_plan", "TodoWrite"],
             &["skill", "Skill", "load_skill"],
             &["memex_search", "MemexSearch"],
+            &["task", "Task"],
+            &["send_message", "SendMessage"],
+            &["bash_output", "BashOutput"],
+            &["kill_shell", "KillShell"],
         ] {
             for a in aliases {
                 for b in aliases {

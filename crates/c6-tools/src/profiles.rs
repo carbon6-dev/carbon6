@@ -36,6 +36,8 @@ pub fn tools_for(profile: ToolProfile) -> Vec<Arc<dyn Tool>> {
             Arc::new(WebFetch::generic()),
             Arc::new(BashOutput::generic()),
             Arc::new(KillShell::generic()),
+            Arc::new(Task::generic()),
+            Arc::new(SendMessage::generic()),
         ],
     }
 }
@@ -248,6 +250,92 @@ mod tests {
     use super::*;
     use crate::SessionTools;
 
+    struct Subagents;
+
+    #[async_trait]
+    impl crate::Subagents for Subagents {
+        async fn run(
+            &self,
+            _call: &str,
+            _description: &str,
+            prompt: &str,
+            _agent: Option<&crate::AgentDef>,
+            _choice: &crate::ModelChoice,
+            _background: Option<&str>,
+            cancel: tokio_util::sync::CancellationToken,
+        ) -> Result<String, String> {
+            if prompt == "wait" {
+                cancel.cancelled().await;
+                return Err("stopped".into());
+            }
+            Ok("subagent report".into())
+        }
+
+        async fn running(&self, _to: &str) -> Result<bool, String> {
+            Ok(false)
+        }
+
+        async fn send(
+            &self,
+            _call: &str,
+            _to: &str,
+            _message: &str,
+            _background: Option<&str>,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> Result<Option<String>, String> {
+            Ok(Some("continued report".into()))
+        }
+
+        async fn peek(&self, _to: &str) -> Result<String, String> {
+            Ok("subagent progress".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_tools_start_message_inspect_and_stop_subagents() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx {
+            session: Arc::new(SessionTools::new(dir.path().to_owned())),
+            cancel: Default::default(),
+            output: Arc::new(|_: &str| {}),
+            call_id: "call1".into(),
+        };
+        ctx.session.set_subagents(Some(Arc::new(Subagents)));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        ctx.session.background.set_sink(Some(tx));
+        let tools = tools_for(ToolProfile::Codex);
+        let get = |name: &str| tools.iter().find(|t| t.spec().name == name).unwrap().clone();
+        let task = get("task");
+        assert!(Task::is_task(&task.spec().name));
+        assert!(SendMessage::is_send(&get("send_message").spec().name));
+        let result = task.call(&ctx, json!({"description": "look", "prompt": "Look around."})).await;
+        assert!(!result.is_error && result.content == "subagent report", "{result:?}");
+        let send = get("send_message");
+        let result = send.call(&ctx, json!({"to": "child1", "message": "More."})).await;
+        assert!(!result.is_error && result.content == "continued report", "{result:?}");
+        for (name, input) in [
+            ("task", json!({"description": "look", "prompt": "Look around.", "run_in_background": true})),
+            ("send_message", json!({"to": "child1", "message": "More.", "run_in_background": true})),
+        ] {
+            let result = get(name).call(&ctx, input).await;
+            assert!(!result.is_error && result.content.contains("background"), "{result:?}");
+            let started = c6_testkit::within("subagent started", rx.recv()).await.unwrap();
+            assert_eq!((started.kind, started.state, started.notify), (crate::TaskKind::Agent, crate::TaskState::Started, true));
+            let finished = c6_testkit::within("subagent report notice", rx.recv()).await.unwrap();
+            assert_eq!((finished.state, finished.notify), (crate::TaskState::Finished, true));
+            assert!(finished.output.contains("report"), "{finished:?}");
+        }
+        let result = task.call(&ctx, json!({"description": "wait", "prompt": "wait", "run_in_background": true})).await;
+        let started = c6_testkit::within("waiting subagent started", rx.recv()).await.unwrap();
+        assert!(result.content.contains(&started.id), "{result:?}");
+        let result = get("bash_output").call(&ctx, json!({"id": started.id})).await;
+        assert!(!result.is_error && result.content == "subagent progress", "{result:?}");
+        let result = get("kill_shell").call(&ctx, json!({"id": started.id})).await;
+        assert!(!result.is_error && result.content.contains("Stopped"), "{result:?}");
+        let stopped = c6_testkit::within("subagent stopped", rx.recv()).await.unwrap();
+        assert_eq!(stopped.state, crate::TaskState::Stopped);
+    }
+
     #[tokio::test]
     async fn codex_background_flags_and_tools_reach_bash() {
         let dir = tempfile::tempdir().unwrap();
@@ -309,6 +397,6 @@ mod tests {
         assert_eq!(r.content, "it's\n");
 
         let names: Vec<String> = tools_for(ToolProfile::Codex).iter().map(|t| t.spec().name).collect();
-        assert_eq!(names, ["shell", "apply_patch", "update_plan", "web_fetch", "bash_output", "kill_shell"]);
+        assert_eq!(names, ["shell", "apply_patch", "update_plan", "web_fetch", "bash_output", "kill_shell", "task", "send_message"]);
     }
 }

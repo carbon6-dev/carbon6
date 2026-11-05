@@ -78,7 +78,7 @@ mod tests {
             let names = c6_tools::tools_for(profile).iter().map(|t| t.spec().name).collect::<Vec<_>>();
             assert_eq!(base_prompt_for_tools(BASE_PROMPT, &names, profile), BASE_PROMPT, "{profile:?}");
         }
-        for tool in ["shell", "apply_patch"] {
+        for tool in ["shell", "apply_patch", "task", "send_message", "bash_output", "kill_shell"] {
             let prompt = base_prompt_for_tools(BASE_PROMPT, &[tool.into()], ToolProfile::Codex);
             assert!(!prompt.contains("You have tools to") && !prompt.contains("- Use the dedicated tools"));
         }

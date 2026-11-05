@@ -155,17 +155,17 @@ impl Task {
             connections: Arc::default(),
             templates: Arc::default(),
             background: true,
-            kill_tool: "the kill tool",
+            kill_tool: "kill_shell",
         }
     }
 
     pub fn claude() -> Self {
-        Self { claude: true, ..Self::generic() }
+        Self { claude: true, ..Self::generic().stopped_with("KillShell") }
     }
 
     /// The same tool, offering these named agents too.
     pub fn with_agents(claude: bool, agents: Vec<AgentDef>) -> Self {
-        Self { claude, agents: Arc::new(agents), ..Self::generic() }
+        Self { agents: Arc::new(agents), ..if claude { Self::claude() } else { Self::generic() } }
     }
 
     /// The same tool, offering these connections for subagents to run on.
@@ -509,6 +509,9 @@ mod tests {
         assert!(spec.description.contains("- code-reviewer: Reviews code"));
         assert_eq!(spec.parameters["properties"]["subagent_type"]["enum"], json!(["general-purpose", "code-reviewer"]));
         assert!(spec.parameters["properties"].get("connection").is_none());
+        assert!(spec.parameters["properties"]["run_in_background"]["description"].as_str().unwrap().contains("KillShell"));
+        let spec = Task::with_agents(false, vec![]).stopped_with("custom_stop").spec();
+        assert!(spec.parameters["properties"]["run_in_background"]["description"].as_str().unwrap().contains("custom_stop"));
     }
 
     #[test]

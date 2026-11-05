@@ -5672,7 +5672,10 @@ mod tests {
             assert!(shown.contains("Reasoning, not a status update"), "{shown}");
             assert!(shown.contains(">Thinking</summary>"), "{shown}");
             let bold = view! { <Thinking text="**Preparing process flag extract**".to_owned() show=Signal::stored(true) /> }.to_html();
-            assert!(bold.contains("<strong>Preparing process flag extract</strong>") && !bold.contains("**"), "thinking renders its Markdown: {bold}");
+            assert!(
+                bold.contains("<strong>Preparing process flag extract</strong>") && !bold.contains("**"),
+                "thinking renders its Markdown: {bold}"
+            );
             let details = shown.split('>').find(|s| s.contains("<details")).unwrap();
             assert!(details.contains(" open"), "thinking starts expanded: {shown}");
         });
@@ -6132,6 +6135,42 @@ mod tests {
             ev(2, usage(1_000_000)),
         ]);
         assert_eq!((u.context, u.context_window), (Some(300_015), 1_000_000));
+    }
+
+    #[test]
+    fn codex_subagent_tools_use_the_same_cards_and_threads_as_claude() {
+        let task = serde_json::json!({"description": "Find code", "prompt": "Look around."});
+        let send = serde_json::json!({"to": "bg1", "message": "Check tests too.\nDetails"});
+        for name in ["task", "Task", "mcp__carbon6__Task"] {
+            assert_eq!(tool_kind(name), "task");
+            assert_eq!(summarize(name, &task), "Find code");
+        }
+        for name in ["send_message", "SendMessage", "mcp__carbon6__SendMessage"] {
+            assert_eq!(tool_kind(name), "send_message");
+            assert_eq!(summarize(name, &send), "Check tests too.");
+        }
+        for name in ["bash_output", "BashOutput", "mcp__carbon6__TaskOutput"] {
+            assert_eq!(tool_kind(name), "bash_output");
+        }
+        for name in ["kill_shell", "KillShell", "mcp__carbon6__TaskStop"] {
+            assert_eq!(tool_kind(name), "kill_shell");
+        }
+        let owner = Owner::new();
+        owner.with(|| {
+            let events = RwSignal::new(vec![Event {
+                seq: 1,
+                ts: 0,
+                kind: serde_json::from_value(serde_json::json!({
+                    "type": "subagent_spawned", "call_id": "call1", "child_session_id": "child1",
+                    "background_task_id": "bg1", "description": "Find code", "agent": ""
+                }))
+                .unwrap(),
+            }]);
+            let subagents = Subagents::new(events, Memo::new(|_| Vec::new()));
+            assert_eq!(subagents.by_call.get().get("call1").map(String::as_str), Some("child1"));
+            assert_eq!(subagents.resolve("bg1").as_deref(), Some("child1"));
+            assert_eq!(subagents.resolve("child1").as_deref(), Some("child1"));
+        });
     }
 
     #[test]

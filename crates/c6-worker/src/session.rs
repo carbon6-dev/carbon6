@@ -3710,12 +3710,46 @@ mod route_tool_tests {
     #[tokio::test]
     async fn tool_lists_filter_generic_claude_and_codex_tools() {
         let dir = tempfile::tempdir().unwrap();
-        let spec =
-            CreateSession { tools: ["Read", "Bash", "Edit", "TodoWrite", "Skill", "MemexSearch"].map(str::to_owned).to_vec(), ..spec() };
+        let spec = CreateSession {
+            tools: ["Read", "Bash", "Edit", "TodoWrite", "Skill", "MemexSearch", "Task", "SendMessage", "BashOutput", "KillShell"]
+                .map(str::to_owned)
+                .to_vec(),
+            ..spec()
+        };
         for (profile, expected) in [
-            (ToolProfile::Generic, vec!["bash", "edit", "load_skill", "memex_search", "read", "update_plan"]),
-            (ToolProfile::Claude, vec!["Bash", "Edit", "MemexSearch", "Read", "Skill", "TodoWrite"]),
-            (ToolProfile::Codex, vec!["apply_patch", "load_skill", "memex_search", "shell", "update_plan"]),
+            (
+                ToolProfile::Generic,
+                vec![
+                    "bash",
+                    "bash_output",
+                    "edit",
+                    "kill_shell",
+                    "load_skill",
+                    "memex_search",
+                    "read",
+                    "send_message",
+                    "task",
+                    "update_plan",
+                ],
+            ),
+            (
+                ToolProfile::Claude,
+                vec!["Bash", "BashOutput", "Edit", "KillShell", "MemexSearch", "Read", "SendMessage", "Skill", "Task", "TodoWrite"],
+            ),
+            (
+                ToolProfile::Codex,
+                vec![
+                    "apply_patch",
+                    "bash_output",
+                    "kill_shell",
+                    "load_skill",
+                    "memex_search",
+                    "send_message",
+                    "shell",
+                    "task",
+                    "update_plan",
+                ],
+            ),
         ] {
             let built = build_tools(&spec, dir.path(), profile, &[], &[]).await;
             let mut names: Vec<String> = built.tools.iter().map(|t| t.spec().name).collect();
@@ -3727,6 +3761,54 @@ mod route_tool_tests {
         let unavailable = CreateSession { tools: vec!["mcp__missing__tool".into()], ..spec };
         let built = build_tools(&unavailable, dir.path(), ToolProfile::Generic, &[], &[]).await;
         assert!(built.tools.is_empty() && built.skills.is_empty(), "an unavailable list must not fall back to all tools");
+    }
+
+    #[tokio::test]
+    async fn codex_subagents_offer_agents_connections_and_templates_and_obey_depth_and_tool_limits() {
+        use serde_json::json;
+
+        let dir = tempfile::tempdir().unwrap();
+        let spec = CreateSession {
+            model: Some(ModelSpec { connection_kind: "chatgpt".into(), model: "gpt-6.1-sol".into(), ..Default::default() }),
+            agents_json: json!([{"name": "finder", "description": "Find code", "prompt": "Look around."}]).to_string(),
+            subagent_connections_json: json!([{"id": "gpt", "name": "GPT", "kind": "chatgpt", "default_model": "gpt-6.1-sol"}]).to_string(),
+            subagent_templates_json: json!([{"name": "review", "place": "other-worker:/repo", "targets": ["other-worker"]}]).to_string(),
+            prompts_json: json!({"session.subagent_templates": "Available remote reviewers:"}).to_string(),
+            max_subagent_depth: 2,
+            ..Default::default()
+        };
+        for depth in [0, 1, 2] {
+            let spec = CreateSession { depth, ..spec.clone() };
+            let built = own_runtime(&HeadLink::default(), "s", &spec, dir.path(), &[], String::new(), "startup").await;
+            assert_eq!(built.profile, ToolProfile::Codex);
+            assert!(built.errors.is_empty(), "{:?}", built.errors);
+            let task = built.tools.iter().find(|t| c6_tools::Task::is_task(&t.spec().name));
+            assert_eq!(task.is_some(), depth < 2);
+            assert_eq!(built.tools.iter().any(|t| c6_tools::SendMessage::is_send(&t.spec().name)), depth < 2);
+            for name in ["bash_output", "kill_shell"] {
+                assert!(built.tools.iter().any(|t| t.spec().name == name), "{name} stays available at depth {depth}");
+            }
+            if let Some(task) = task {
+                let task = task.spec();
+                assert_eq!(task.name, "task");
+                let props = &task.parameters["properties"];
+                assert_eq!(props["subagent_type"]["enum"], json!(["general-purpose", "finder"]));
+                assert_eq!(props["connection"]["enum"], json!(["GPT"]));
+                assert_eq!(props["template"]["enum"], json!(["review"]));
+                assert_eq!(props["on"]["type"], "string");
+                assert_eq!(props["run_in_background"]["type"], "boolean");
+                assert!(props["run_in_background"]["description"].as_str().unwrap().contains("kill_shell"));
+                for text in ["gpt-6.1-sol", "Available remote reviewers:", "other-worker:/repo"] {
+                    assert!(task.description.contains(text), "{text}: {}", task.description);
+                }
+            }
+        }
+        let limited = CreateSession { delegation: Some(c6_proto::Delegation { depth: 2, ..Default::default() }), ..spec.clone() };
+        let built = build_tools(&limited, dir.path(), ToolProfile::Codex, &[], &[]).await;
+        assert!(!built.tools.iter().any(|t| c6_tools::Task::is_task(&t.spec().name) || c6_tools::SendMessage::is_send(&t.spec().name)));
+        let restricted = CreateSession { tools: vec!["BashOutput".into(), "KillShell".into()], ..spec };
+        let built = build_tools(&restricted, dir.path(), ToolProfile::Codex, &[], &[]).await;
+        assert_eq!(built.tools.iter().map(|t| t.spec().name).collect::<Vec<_>>(), ["bash_output", "kill_shell"]);
     }
 
     #[tokio::test]
