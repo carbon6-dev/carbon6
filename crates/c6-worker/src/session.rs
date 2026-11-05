@@ -483,6 +483,7 @@ impl SessionManager {
                     from_session_id: input.from_session_id,
                     from_title: input.from_title,
                     hops: input.hops,
+                    api_origin: input.api_origin,
                     send_now: input.send_now,
                     ..Default::default()
                 };
@@ -1620,7 +1621,7 @@ impl Actor {
                         if self.spec.delegation.is_some() && !input.is_compact() {
                             let r = self.report.get_or_insert_with(Default::default);
                             r.0.push(crate::subagent::report_input(
-                                &self.writer.session_id, &input.command, &input.text, &input.from_session_id, &input.from_title,
+                                &self.writer.session_id, &input.command, &input.text, &input.from_session_id, &input.from_title, input.api_origin.as_ref(),
                             ));
                             r.1 |= input.wake;
                         }
@@ -2068,6 +2069,7 @@ impl Actor {
                 &input.text,
                 &input.from_session_id,
                 &input.from_title,
+                input.api_origin.as_ref(),
             ));
             r.1 = true;
         }

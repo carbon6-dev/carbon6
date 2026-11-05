@@ -27,15 +27,22 @@ pub struct Caller {
     /// The console's assistant, acting in this realm with your approval
     /// (docs/assistant.md §Realms): what it writes is the console's.
     pub console: bool,
+    /// An API token's display name, never its secret. Some("") means an
+    /// API caller with no known token name (sign-in off).
+    pub api_token_name: Option<String>,
 }
 
 impl Caller {
     pub fn root() -> Self {
-        Self { realm: None, browser: false, console: false }
+        Self { realm: None, browser: false, console: false, api_token_name: None }
     }
 
     pub fn in_realm(realm: &str) -> Self {
-        Self { realm: Some(realm.to_owned()), browser: false, console: false }
+        Self { realm: Some(realm.to_owned()), browser: false, console: false, api_token_name: None }
+    }
+
+    pub fn api_origin(&self) -> Option<c6_proto::ApiMessageOrigin> {
+        self.api_token_name.as_ref().map(|name| c6_proto::ApiMessageOrigin { token_name: name.clone() })
     }
 
     /// Whose decisions and the like a caller lists: its realm's; the

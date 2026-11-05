@@ -311,6 +311,13 @@ message UserMessage {
   string from_session_id = 9;
   string from_title = 10;
   uint32 hops = 11;
+  // Present for HTTP API input; only the token's display name, never its secret.
+  ApiMessageOrigin api_origin = 12;
+}
+
+message ApiMessageOrigin {
+  // Empty when the API caller has no known token name (e.g. sign-in off).
+  string token_name = 1;
 }
 
 message Attachment {
@@ -788,6 +795,8 @@ message UserInput {
   // stops the turn and this starts the next. Older workers treat it as an
   // ordinary message (the head interrupts first for them).
   bool send_now = 14;
+  // Present for HTTP API input, retained in UserMessage for remote reports.
+  ApiMessageOrigin api_origin = 15;
 }
 
 message Interrupt {

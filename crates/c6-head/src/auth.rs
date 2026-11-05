@@ -256,15 +256,17 @@ impl Store {
     async fn check_api_token(&self, token: &str) -> anyhow::Result<Option<crate::realms::Caller>> {
         let hash = sha256_hex(token);
         let now = now_ms();
-        let Some(row) =
-            sqlx::query("SELECT last_used_at, realm FROM api_tokens WHERE token_hash = ?").bind(&hash).fetch_optional(&self.pool).await?
+        let Some(row) = sqlx::query("SELECT last_used_at, realm, name FROM api_tokens WHERE token_hash = ?")
+            .bind(&hash)
+            .fetch_optional(&self.pool)
+            .await?
         else {
             return Ok(None);
         };
         if now - row.get::<Option<i64>, _>("last_used_at").unwrap_or(0) > TOUCH_MS {
             sqlx::query("UPDATE api_tokens SET last_used_at = ? WHERE token_hash = ?").bind(now).bind(&hash).execute(&self.pool).await?;
         }
-        Ok(Some(crate::realms::Caller { realm: row.get("realm"), browser: false, console: false }))
+        Ok(Some(crate::realms::Caller { realm: row.get("realm"), api_token_name: Some(row.get("name")), ..Default::default() }))
     }
 
     async fn api_tokens(&self) -> anyhow::Result<Vec<api::ApiToken>> {
@@ -405,7 +407,10 @@ pub async fn require(State(st): State<Arc<HeadState>>, mut req: Request, next: N
             None if st.auth.required => {
                 return (StatusCode::UNAUTHORIZED, Json(api::ApiError { error: "invalid API token".into() })).into_response();
             }
-            None => return next.run(req).await,
+            None => {
+                req.extensions_mut().insert(Caller { api_token_name: Some(String::new()), ..Caller::root() });
+                return next.run(req).await;
+            }
         }
     }
     let place = browser_place(&req);

@@ -403,6 +403,15 @@ async fn the_parent_continues_a_stopped_subagent() {
 /// with the parent's next input, or at once with wake.
 #[tokio::test]
 async fn your_message_to_a_subagent_reports_back() {
+    message_to_a_subagent_reports_back(false).await;
+}
+
+#[tokio::test]
+async fn api_message_to_a_subagent_reports_back_with_its_token_name() {
+    message_to_a_subagent_reports_back(true).await;
+}
+
+async fn message_to_a_subagent_reports_back(via_api: bool) {
     let env = Env::new().await;
     let state = tempfile::tempdir().unwrap();
     env.enroll(state.path()).await;
@@ -410,16 +419,37 @@ async fn your_message_to_a_subagent_reports_back() {
     let project = tempfile::tempdir().unwrap();
     let (id, child_id) = interrupted_subagent(&env, &worker, project.path()).await;
     let parent_seq = env.detail(&id).await.unwrap().session.last_seq;
+    let http = if via_api {
+        let token = env.head.state.store.create_api_token("ops-controller", None).await.unwrap();
+        reqwest::Client::builder()
+            .default_headers(
+                [(reqwest::header::AUTHORIZATION, format!("Bearer {}", token.token.unwrap()).parse().unwrap())].into_iter().collect(),
+            )
+            .build()
+            .unwrap()
+    } else {
+        // A signed-in browser keeps the user attribution (including with
+        // sign-in disabled on this test head).
+        let token = env.head.state.store.create_login_link().await.unwrap();
+        let signed_in = env.http.post(format!("{}/auth/link", env.api)).json(&json!({"token": token})).send().await.unwrap();
+        let cookie = signed_in.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap();
+        reqwest::Client::builder()
+            .default_headers(
+                [
+                    (reqwest::header::COOKIE, cookie.parse().unwrap()),
+                    (reqwest::header::HeaderName::from_static("x-c6-realm"), "home".parse().unwrap()),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .build()
+            .unwrap()
+    };
 
     // Without wake: the parent stays idle.
     env.mock.push(Reply::Text("Half the haystack is searched.".into()));
-    let r = env
-        .http
-        .post(format!("{}/sessions/{child_id}/messages", env.api))
-        .json(&json!({"text": "How far did you get?"}))
-        .send()
-        .await
-        .unwrap();
+    let r =
+        http.post(format!("{}/sessions/{child_id}/messages", env.api)).json(&json!({"text": "How far did you get?"})).send().await.unwrap();
     assert!(r.status().is_success(), "{}", r.status());
     eventually("subagent answered", async || (turn_end(&env.events(&child_id).await) == Some(TurnEndReason::Completed)).then_some(()))
         .await;
@@ -439,13 +469,18 @@ async fn your_message_to_a_subagent_reports_back() {
     .await;
     let req = request_text(&env.mock.requests()[before]);
     assert!(req.contains("How far did you get?") && req.contains("Half the haystack is searched."), "{req}");
+    let label = if via_api {
+        format!("Sent to subagent {child_id} via the API (token \"ops-controller\"):")
+    } else {
+        format!("The user messaged subagent {child_id} directly:")
+    };
+    assert!(req.contains(&label.replace('"', "\\\"")), "{req}");
 
     // With wake: the parent starts a turn by itself.
     env.mock.push(Reply::Text("All of it now.".into())); // the subagent
     env.mock.push(Reply::Text("Great.".into())); // the parent, woken
     let seq = env.detail(&id).await.unwrap().session.last_seq;
-    env.http
-        .post(format!("{}/sessions/{child_id}/messages", env.api))
+    http.post(format!("{}/sessions/{child_id}/messages", env.api))
         .json(&json!({"text": "Search the rest.", "wake": true}))
         .send()
         .await
@@ -457,6 +492,7 @@ async fn your_message_to_a_subagent_reports_back() {
     .await;
     let notice = user_messages(&ev).into_iter().rev().find(|(_, c, _)| c == "task-notification").unwrap();
     assert!(notice.0.contains("All of it now."), "{notice:?}");
+    assert!(notice.0.contains(&label), "{notice:?}");
     let msgs = user_messages(&env.events(&child_id).await);
     assert_eq!(msgs.last().unwrap().0, "Search the rest.");
     stop.cancel();
@@ -466,6 +502,15 @@ async fn your_message_to_a_subagent_reports_back() {
 /// not resumed.
 #[tokio::test]
 async fn resume_continues_a_stopped_subagent() {
+    resume_stopped_subagent(false).await;
+}
+
+#[tokio::test]
+async fn api_resume_of_a_stopped_subagent_names_its_token() {
+    resume_stopped_subagent(true).await;
+}
+
+async fn resume_stopped_subagent(via_api: bool) {
     let env = Env::new().await;
     let state = tempfile::tempdir().unwrap();
     env.enroll(state.path()).await;
@@ -476,7 +521,12 @@ async fn resume_continues_a_stopped_subagent() {
     let r = env.http.post(format!("{}/sessions/{id}/resume", env.api)).json(&json!({})).send().await.unwrap();
     assert_eq!(r.status(), 400, "only subagents are resumed");
     env.mock.push(Reply::Text("Found it after all.".into()));
-    let r = env.http.post(format!("{}/sessions/{child_id}/resume", env.api)).json(&json!({})).send().await.unwrap();
+    let mut request = env.http.post(format!("{}/sessions/{child_id}/resume", env.api)).json(&json!({}));
+    if via_api {
+        let token = env.head.state.store.create_api_token("ops-controller", None).await.unwrap();
+        request = request.bearer_auth(token.token.unwrap());
+    }
+    let r = request.send().await.unwrap();
     assert!(r.status().is_success(), "{}", r.status());
     eventually("resumed", async || (turn_end(&env.events(&child_id).await) == Some(TurnEndReason::Completed)).then_some(())).await;
     let (text, command, _) = user_messages(&env.events(&child_id).await).pop().unwrap();
@@ -485,7 +535,12 @@ async fn resume_continues_a_stopped_subagent() {
     eventually("the parent to receive the attributed resume report", async || {
         env.events(&id).await.iter().find_map(|e| match &e.kind {
             EventKind::NoticeQueued { text, .. } if text.contains("Found it after all.") => {
-                assert!(text.starts_with(&format!("Subagent {child_id} resumed:")), "{text}");
+                let label = if via_api {
+                    format!("Sent to subagent {child_id} via the API (token \"ops-controller\"):")
+                } else {
+                    format!("Subagent {child_id} resumed:")
+                };
+                assert!(text.starts_with(&label), "{text}");
                 assert!(!text.contains("The user messaged"), "a resume prompt isn't a user message: {text}");
                 Some(())
             }

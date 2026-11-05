@@ -187,6 +187,7 @@ async fn session_queue_op(worker: &Arc<Worker>, p: &Value) -> anyhow::Result<Val
                 attachments: input.attachments,
                 command: input.command,
                 wake: input.wake,
+                api_origin: input.api_origin,
                 ..Default::default()
             })
         }

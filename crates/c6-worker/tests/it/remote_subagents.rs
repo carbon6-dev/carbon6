@@ -237,6 +237,15 @@ async fn a_template_runs_a_subagent_on_another_worker() {
 /// parent as a notice (here waking it).
 #[tokio::test]
 async fn stopping_and_messaging_a_remote_subagent() {
+    stopping_and_messaging_remote(false).await;
+}
+
+#[tokio::test]
+async fn api_message_to_a_remote_subagent_names_its_scoped_token() {
+    stopping_and_messaging_remote(true).await;
+}
+
+async fn stopping_and_messaging_remote(via_api: bool) {
     let env = Env::new().await;
     let (sa, sb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let (alpha, stop_a) = env.worker("alpha", sa.path()).await;
@@ -268,17 +277,37 @@ async fn stopping_and_messaging_a_remote_subagent() {
     let seq = last_seq(&env.events(&id).await);
     env.mock.push(Reply::Text("Fixed by hand.".into()));
     env.mock.push(Reply::Text("Noted.".into()));
-    env.message(&child_id, "Just fix it.", true).await;
+    let secret = if via_api {
+        let token = env.head.state.store.create_api_token("ops-controller", Some("home")).await.unwrap().token.unwrap();
+        let r = env
+            .http
+            .post(format!("{}/sessions/{child_id}/messages", env.api))
+            .bearer_auth(&token)
+            .json(&json!({"text": "Just fix it.", "wake": true}))
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success(), "{}", r.status());
+        Some(token)
+    } else {
+        env.message(&child_id, "Just fix it.", true).await;
+        None
+    };
     assert_eq!(env.turn_ended_after(&id, seq).await, TurnEndReason::Completed);
     let notice = env.events(&id).await.into_iter().find_map(|e| match e.kind {
         EventKind::User { text, command, .. } if command == "task-notification" => Some(text),
         _ => None,
     });
     let notice = notice.expect("a notice");
-    assert!(
-        notice.contains(&format!("The user messaged subagent {child_id} directly: \"Just fix it.\"")) && notice.contains("Fixed by hand."),
-        "{notice}"
-    );
+    let label = if via_api {
+        format!("Sent to subagent {child_id} via the API (token \"ops-controller\"): \"Just fix it.\"")
+    } else {
+        format!("The user messaged subagent {child_id} directly: \"Just fix it.\"")
+    };
+    assert!(notice.contains(&label) && notice.contains("Fixed by hand."), "{notice}");
+    if let Some(secret) = secret {
+        assert!(!notice.contains(&secret), "the token secret never enters the report");
+    }
     stop_a.cancel();
     stop_b.cancel();
 }
