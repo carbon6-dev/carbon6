@@ -246,8 +246,9 @@ async fn a_correction_becomes_lessons_and_a_standard_that_review_checks() {
     assert!(applied.reference.starts_with("memory:"), "{applied:?}");
     let notes: Vec<c6_api::Memory> = env.get("memories").await;
     assert!(notes.iter().any(|n| n.text == "Use pnpm, not npm, on this machine." && n.scope == worker_label), "{notes:?}");
-    env.found("retro", |f| f.kind == "lesson" && f.done == "asked").await;
-    env.found("retro", |f| f.kind == "directive" && f.done == "asked").await;
+    // Recorded as asked first; the reference says the decision exists.
+    env.found("retro", |f| f.kind == "lesson" && f.done == "asked" && f.reference.starts_with("decision:")).await;
+    env.found("retro", |f| f.kind == "directive" && f.done == "asked" && f.reference.starts_with("decision:")).await;
     let decisions: Vec<Value> = env.get("decisions").await;
     let ask = |t: &str| {
         decisions.iter().find(|d| d["title"].as_str().unwrap_or("").contains(t)).cloned().unwrap_or_else(|| panic!("{t}: {decisions:?}"))
