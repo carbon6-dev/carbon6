@@ -190,6 +190,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                 {move || match current.get().as_str() {
                     "appearance" => view! {
                         <AppearanceSetting />
+                        <TranscriptSetting />
                         <crate::aspects::FacetsSetting />
                     }.into_any(),
                     "account" => view! {
@@ -475,6 +476,73 @@ fn AppearanceSetting() -> impl IntoView {
                 {option("dark", "Dark", "Always dark")}
             </div>
             <p class="text-xs text-muted">"Kept in this browser, so each device can have its own."</p>
+        </section>
+    }
+}
+
+/// The user's display preference, shared by every mounted transcript.
+#[derive(Clone, Copy)]
+pub struct TranscriptDisplay {
+    pub show_thinking: RwSignal<bool>,
+    loaded: RwSignal<bool>,
+    error: RwSignal<Option<String>>,
+}
+
+impl TranscriptDisplay {
+    pub fn load() -> Self {
+        let display = Self {
+            show_thinking: RwSignal::new(c6_api::TranscriptSettings::default().show_thinking),
+            loaded: RwSignal::new(false),
+            error: RwSignal::new(None),
+        };
+        spawn_local(async move {
+            match api::transcript_settings().await {
+                Ok(settings) => {
+                    display.show_thinking.set(settings.show_thinking);
+                    display.loaded.set(true);
+                }
+                Err(e) => display.error.set(Some(e)),
+            }
+        });
+        display
+    }
+}
+
+pub fn show_thinking() -> RwSignal<bool> {
+    expect_context::<TranscriptDisplay>().show_thinking
+}
+
+#[component]
+fn TranscriptSetting() -> impl IntoView {
+    let display = expect_context::<TranscriptDisplay>();
+    let busy = RwSignal::new(false);
+    let toggle = move |ev| {
+        let show_thinking = event_target_checked(&ev);
+        let previous = display.show_thinking.get_untracked();
+        display.show_thinking.set(show_thinking);
+        busy.set(true);
+        display.error.set(None);
+        spawn_local(async move {
+            if let Err(e) = api::put_transcript_settings(c6_api::TranscriptSettings { show_thinking }).await {
+                display.show_thinking.set(previous);
+                display.error.set(Some(e));
+            }
+            busy.set(false);
+        });
+    };
+    view! {
+        <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+            <h2 class="font-medium">"Session transcripts"</h2>
+            <label class="flex cursor-pointer items-start gap-3">
+                <input type="checkbox" class="mt-1" prop:checked=move || display.show_thinking.get()
+                    disabled=move || !display.loaded.get() || busy.get() on:change=toggle />
+                <span>
+                    <span class="block text-sm font-medium">"Show thinking"</span>
+                    <span class="block text-xs text-muted">"Show model reasoning expanded, labelled Thinking; otherwise hide it from transcripts."</span>
+                </span>
+            </label>
+            <p class="text-xs text-muted">"Off by default. Kept in carbon6 across realms and devices; does not change what models receive."</p>
+            {move || display.error.get().map(|e| view! { <ErrorBox message=e /> })}
         </section>
     }
 }

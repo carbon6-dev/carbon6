@@ -115,6 +115,7 @@ fn Main() -> impl IntoView {
     provide_context(labels::LabelFilter::restored());
     provide_context(sessions::Grouping::load());
     provide_context(aspects::Facets::load());
+    provide_context(settings::TranscriptDisplay::load());
     // Plan limits per connection, beside every connection picker.
     quota::provide();
     // A signed-in browser opening a login link (to sign in again).

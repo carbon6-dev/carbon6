@@ -2101,8 +2101,9 @@ fn Transcript(
     let stream_text = Memo::new(move |_| streaming.with(|s| s.text.clone()));
     let stream_thinking = Memo::new(move |_| streaming.with(|s| s.thinking.clone()));
     let stream_status = Memo::new(move |_| streaming.with(|s| s.status.clone()));
+    let show_thinking = crate::settings::show_thinking();
     let has_text = Memo::new(move |_| stream_text.with(|t| !t.is_empty()));
-    let has_thinking = Memo::new(move |_| stream_thinking.with(|t| !t.is_empty()));
+    let has_thinking = Memo::new(move |_| show_thinking.get() && stream_thinking.with(|t| !t.is_empty()));
     // What arrives once the transcript is drawn fades in (not what it opens with).
     let arrived = Arrived(StoredValue::new(false));
     provide_context(arrived);
@@ -2133,6 +2134,7 @@ fn Transcript(
                     },
                     crate::timeline::Piece::Event(e) => {
                         let seq = e.seq;
+                        let only_thinking = thinking_only(&e.kind);
                         let anchorable = can_branch && matches!(e.kind, EventKind::User { .. } | EventKind::Assistant { .. });
                         let user_text = match &e.kind {
                             EventKind::User { text, .. } => Some(text.clone()),
@@ -2154,7 +2156,7 @@ fn Transcript(
                                 id=format!("{}-e{seq}", id.get_value())
                                 class=move || format!("group relative {arrive} {} {} {}",
                                     if anchorable { "pb-7" } else { "" },
-                                    if hidden() { "hidden" } else { "" },
+                                    if hidden() || (only_thinking && !show_thinking.get()) { "hidden" } else { "" },
                                     if by().is_some() { "opacity-50" } else { "" })
                             >
                                 {match marker {
@@ -2225,7 +2227,7 @@ fn Transcript(
             // drawn again for every token).
             {move || (has_thinking.get() || has_text.get()).then(|| view! {
                 <div class="space-y-2">
-                    {move || has_thinking.get().then(|| view! { <Thinking text=stream_thinking open=true /> })}
+                    {move || has_thinking.get().then(|| view! { <Thinking text=stream_thinking show=show_thinking /> })}
                     {move || has_text.get().then(|| view! { <div class="md" on:click=crate::mentions::link_clicks() inner_html=move || markdown::to_html(&stream_text.get())></div> })}
                 </div>
             })}
@@ -3492,7 +3494,7 @@ fn render_event(
                             <p class="flex items-center gap-2 text-xs text-muted"><span>{crate::icons::search()}</span><span class="font-mono">{label.clone()}</span></p>
                         }.into_any(),
                         ContentBlock::Text { text } => view! { <div class="md" on:click=crate::mentions::link_clicks() inner_html=markdown::to_html(text)></div> }.into_any(),
-                        ContentBlock::Thinking { text } => view! { <Thinking text=text.clone() open=false /> }.into_any(),
+                        ContentBlock::Thinking { text } => view! { <Thinking text=text.clone() show=crate::settings::show_thinking() /> }.into_any(),
                         ContentBlock::ToolUse { id, name, input_json } => {
                             // Memos: a card redraws for its own result and output, not
                             // for every other call's (or every streamed token).
@@ -3565,13 +3567,22 @@ fn render_event(
     }
 }
 
+/// A hidden reasoning-only reply must not leave an empty event (or its
+/// branching buttons and padding) between the tool cards around it.
+fn thinking_only(kind: &EventKind) -> bool {
+    matches!(kind, EventKind::Assistant { blocks, stop_reason, .. }
+        if stop_reason != "interrupted" && blocks.iter().all(|b| matches!(b, ContentBlock::Thinking { .. })))
+}
+
 #[component]
-fn Thinking(#[prop(into)] text: Signal<String>, open: bool) -> impl IntoView {
+fn Thinking(#[prop(into)] text: Signal<String>, #[prop(into)] show: Signal<bool>) -> impl IntoView {
     view! {
-        <details class="border-l-2 border-zinc-300 pl-3 text-sm text-muted dark:border-zinc-700" open=open>
-            <summary class="cursor-pointer select-none text-xs">"Thinking"</summary>
-            <div class="mt-1 whitespace-pre-wrap text-xs">{move || text.get()}</div>
-        </details>
+        <Show when=move || show.get()>
+            <details class="border-l-2 border-zinc-300 pl-3 text-sm text-muted dark:border-zinc-700" open=true>
+                <summary class="cursor-pointer select-none text-xs">"Thinking"</summary>
+                <div class="mt-1 whitespace-pre-wrap text-xs">{move || text.get()}</div>
+            </details>
+        </Show>
     }
 }
 
@@ -5594,6 +5605,48 @@ fn SecretCardView(card: SecretCard, on_dismiss: Callback<String>) -> impl IntoVi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn thinking_is_absent_by_default_and_expanded_when_enabled() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let render = |show| {
+                view! {
+                    <Thinking text="Reasoning, not a status update".to_owned() show=Signal::stored(show) />
+                }
+                .to_html()
+            };
+            let hidden = render(c6_api::TranscriptSettings::default().show_thinking);
+            assert!(!hidden.contains("Reasoning"), "hidden thinking must not enter the DOM: {hidden}");
+            assert!(!hidden.contains("<details"), "no empty thinking box: {hidden}");
+            assert!(!hidden.contains("<summary"), "no folded label: {hidden}");
+            let shown = render(true);
+            assert!(shown.contains("Reasoning, not a status update"), "{shown}");
+            assert!(shown.contains(">Thinking</summary>"), "{shown}");
+            let details = shown.split('>').find(|s| s.contains("<details")).unwrap();
+            assert!(details.contains(" open"), "thinking starts expanded: {shown}");
+        });
+    }
+
+    #[test]
+    fn thinking_only_events_hide_without_hiding_tools_text_or_interruption() {
+        let thinking = ContentBlock::Thinking { text: "Reasoning".into() };
+        let event = |blocks, stop_reason: &str| EventKind::Assistant { turn: 1, blocks, stop_reason: stop_reason.into() };
+        assert!(thinking_only(&event(vec![thinking.clone()], "tool_use")), "no empty event or branching controls");
+        assert!(!thinking_only(&event(vec![thinking.clone()], "interrupted")), "keep the interruption notice");
+        assert!(
+            !thinking_only(&event(vec![thinking.clone(), ContentBlock::Text { text: "Status update".into() }], "end_turn")),
+            "keep ordinary text"
+        );
+        assert!(
+            !thinking_only(&event(
+                vec![thinking, ContentBlock::ToolUse { id: "t1".into(), name: "bash".into(), input_json: "{}".into() }],
+                "tool_use"
+            )),
+            "a reasoning-plus-tools turn still shows its tool cards"
+        );
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]

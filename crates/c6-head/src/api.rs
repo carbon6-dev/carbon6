@@ -179,6 +179,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/settings/suggestions", get(get_suggestion_settings).put(put_suggestion_settings))
         .route("/api/v1/settings/session_grouping", get(get_session_grouping).put(put_session_grouping))
         .route("/api/v1/settings/session_facets", get(get_session_facets).put(put_session_facets))
+        .route("/api/v1/settings/transcript", get(get_transcript_settings).put(put_transcript_settings))
         .route("/api/v1/marks", get(get_marks).put(put_mark))
         .route("/api/v1/settings/own/{name}", get(get_own_setting).delete(drop_own_setting))
         .route("/api/v1/work", get(list_work).post(add_work))
@@ -1194,6 +1195,17 @@ async fn put_session_grouping(
 }
 
 const SESSION_FACETS: &str = "session_facets";
+
+/// One user per head: this preference is global, not realm-scoped.
+async fn get_transcript_settings(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::TranscriptSettings>> {
+    let raw = st.store.setting("transcript_display").await?;
+    Ok(Json(raw.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default()))
+}
+
+async fn put_transcript_settings(State(st): State<Arc<HeadState>>, Json(settings): Json<api::TranscriptSettings>) -> ApiResult<StatusCode> {
+    st.store.set_setting("transcript_display", &serde_json::to_string(&settings).map_err(anyhow::Error::from)?).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
 
 fn facets_key(caller: &Caller) -> String {
     match &caller.realm {

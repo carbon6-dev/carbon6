@@ -43,7 +43,7 @@ pub enum Scope {
     Shared,
     /// carbon6's administration: the console (root) only.
     Admin,
-    /// This browser's own business, from anywhere.
+    /// The user's display preferences and this browser's own business, from anywhere.
     Device,
 }
 
@@ -60,6 +60,8 @@ pub fn scope(name: &str) -> Option<Scope> {
         "push.devices",
         "realms.elsewhere",
         "sessions.locate",
+        "settings.transcript.get",
+        "settings.transcript.put",
     ];
     const SHARED: &[&str] =
         &["workers.list", "connections.list", "connections.models", "connections.quotas", "commands.list", "realms.list", "hosts.list"];
@@ -442,6 +444,8 @@ fn build() -> Vec<Op> {
         op!("sessions.grouping.put", "sessions", "PUT" "/api/v1/settings/session_grouping", Write, Input::Body(schema::<api::SessionGrouping>), "Sets how the session list is grouped: label keys such as repo, host or client, outermost first."),
         op!("sessions.facets.get", "sessions", "GET" "/api/v1/settings/session_facets", Read, Input::None, "Which aspects of a session (worker, work, project, realm, repo, model) its header shows, each as a shape in its mark."),
         op!("sessions.facets.put", "sessions", "PUT" "/api/v1/settings/session_facets", Write, Input::Body(schema::<api::marks::SessionFacets>), "Sets which aspects of a session its header shows: any of worker, work, project, realm, repo, model."),
+        op!("settings.transcript.get", "settings", "GET" "/api/v1/settings/transcript", Read, Input::None, "The user's transcript display preference across realms and devices: show_thinking defaults to false (hidden); true shows thinking expanded. Display only, with no effect on stored events or model input."),
+        op!("settings.transcript.put", "settings", "PUT" "/api/v1/settings/transcript", Write, Input::Body(schema::<api::TranscriptSettings>), "Saves the user's transcript display preference across realms and devices: show_thinking false hides thinking, true shows it expanded. Does not change stored events or model input."),
         op!("marks.list", "sessions", "GET" "/api/v1/marks", Read, Input::None, "The marks given to the values of sessions' aspects, by key (worker:<id>, work:<id>, project:<id>, realm:<id>, repo:<name>, model:<name>): a value without one wears a colour worked out from its name."),
         op!("marks.set", "sessions", "PUT" "/api/v1/marks", Write, Input::Body(schema::<api::marks::SetMark>), "Gives a worker, piece of work, project, realm, repo or model its mark (a colour, or <colour>/<pattern>: hstripes, vstripes, diagonal, dots), the same everywhere it shows; an empty mark takes it away."),
         op!("settings.own.get", "settings", "GET" "/api/v1/settings/own/{name}", Read, Input::None, "Whether this realm sets a setting itself (suggestions, web-search, assistant, subagent-limits) or follows root's."),

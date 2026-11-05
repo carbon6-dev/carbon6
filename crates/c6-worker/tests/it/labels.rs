@@ -322,3 +322,46 @@ async fn which_aspects_a_session_header_shows_is_kept() {
     assert_eq!(r.status(), 400);
     head.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn transcript_display_preference_round_trips_across_realms_and_restart() {
+    let head_dir = tempfile::tempdir().unwrap();
+    let config = || HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    };
+    let head = c6_head::start(config()).await.unwrap();
+    let url = format!("http://127.0.0.1:{}/api/v1/settings/transcript", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let get = async |place| {
+        let r = http.get(&url).header("X-C6-Realm", place).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        r.json::<c6_api::TranscriptSettings>().await.unwrap()
+    };
+    assert!(!get("home").await.show_thinking, "off on an existing head with no saved preference");
+    for on in [true, false, true] {
+        let r = http.put(&url).header("X-C6-Realm", "home").json(&json!({"show_thinking": on})).send().await.unwrap();
+        assert_eq!(r.status(), 204);
+        assert_eq!(get("home").await.show_thinking, on);
+        assert_eq!(get("admin").await.show_thinking, on, "one user preference, not a per-realm default");
+    }
+    let invalid = http.put(&url).json(&json!({"show_thinking": "yes"})).send().await.unwrap();
+    assert_eq!(invalid.status(), 422);
+    assert!(get("admin").await.show_thinking, "invalid writes leave the saved value alone");
+    head.shutdown().await.unwrap();
+
+    let head = c6_head::start(config()).await.unwrap();
+    let url = format!("http://127.0.0.1:{}/api/v1/settings/transcript", head.ui_addrs[0].port());
+    let other_device = reqwest::Client::new();
+    let saved = other_device.get(&url).send().await.unwrap().json::<c6_api::TranscriptSettings>().await.unwrap();
+    assert!(saved.show_thinking, "a new client after restart reads the same preference");
+    let r = other_device.put(&url).json(&json!({})).send().await.unwrap();
+    assert_eq!(r.status(), 204, "omitting the additive field uses its default");
+    let saved = other_device.get(&url).send().await.unwrap().json::<c6_api::TranscriptSettings>().await.unwrap();
+    assert!(!saved.show_thinking);
+    head.shutdown().await.unwrap();
+}

@@ -71,10 +71,10 @@ Fixing each call site doesn't last: every new page is another place to forget th
   - the realm's name and colour, and a switcher menu (your realms, then **Console**);
   - the nav: Sessions, Inbox, Decisions, Mission, Analytics, Collections, Views, Memex, Mail (when the realm has it), Settings, Ask;
   - "N waiting in other realms" when there is something (§6).
-- **Settings** has only what the realm owns:
+- **Settings** has what the realm owns, plus the user's display preferences:
   - its lists, with root's inherited entries shown read-only above its own;
   - its toggles;
-  - Appearance (this browser).
+  - Appearance (theme in this browser; Show thinking is the user's preference across realms and devices).
 
   System pages move to the console.
 - **The live feed** (`WS /api/v1/live`) sends only the realm's sessions, and only the workers it may use. So the dock, inbox, mission control and the session list are right by construction.
