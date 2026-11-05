@@ -555,6 +555,8 @@ The agent can start work in the background and carry on: long builds, test suite
 - **Limit.** Notices start at most 20 turns per hour in an idle session. Beyond that they're held until your next message, and the session says so.
 - **Worker restarts.** Tasks die with the worker; the agent is told they were lost, and a command left running by the old worker process is stopped.
 
+Agents can also message other sessions in their realm with `message_session`. Each send adds one to the last session message's hop count. The default `max_message_hops` is **4**: chains of up to four messages are allowed; a fifth is refused. Your next direct message resets that session's count to **0**. Settings → Agents → Limits also caps sends per session per hour (default **30**); that allowance survives head restarts. See [Session messages](docs/background.md#6-session-messages).
+
 ### Subagents
 
 The agent can hand work to a subagent with the Task tool. A subagent is a session of its own, shown as a thread under the call that started it (docs/subagents.md).

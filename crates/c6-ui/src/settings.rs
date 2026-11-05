@@ -3789,7 +3789,7 @@ fn SubagentLimitsSetting() -> impl IntoView {
                 </label>
             </div>
             <p class="text-sm text-muted">
-                "An agent can message another session of its realm. A reply to a message, and a reply to that, make a chain: one longer than this is refused, so two agents can't keep waking each other. A session sends at most this many messages an hour."
+                "An agent can message another session of its realm. Each send adds one to the last session message it received. The default chain limit is 4; a chain longer than the configured limit is refused, so two agents can't keep waking each other. Your next message resets the count to 0. A session sends at most this many messages an hour."
             </p>
             <div class="grid gap-2 sm:grid-cols-2">
                 <label class="space-y-0.5">
