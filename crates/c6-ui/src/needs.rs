@@ -122,6 +122,10 @@ fn elsewhere_text(e: &AttentionElsewhere) -> String {
     format!("{} waiting in {name}", e.waiting)
 }
 
+fn elsewhere_line(e: &AttentionElsewhere) -> impl IntoView {
+    view! { {elsewhere_text(e)}" "{crate::icons::arrow_right()} }
+}
+
 #[component]
 pub fn NeedsYou() -> impl IntoView {
     let live = api::live();
@@ -296,7 +300,7 @@ pub fn NeedsYou() -> impl IntoView {
                                         let to = if e.id == "root" { Place::Console } else { Place::Realm(e.id.clone()) };
                                         view! {
                                             <a rel="external" href=place::url_of(&to) class="block rounded-md px-2 py-1.5 text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800">
-                                                {elsewhere_text(e)}
+                                                {elsewhere_line(e)}
                                             </a>
                                         }
                                     }).collect_view()}
@@ -414,6 +418,16 @@ mod tests {
         let e = AttentionElsewhere { id: "lab".into(), name: "Lab".into(), waiting: 2 };
         assert_eq!(elsewhere_text(&e), "2 waiting in Lab");
         assert_eq!(elsewhere_text(&AttentionElsewhere { id: "root".into(), ..e }), "2 waiting in the console");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn other_realm_rows_keep_their_trailing_action_arrow() {
+        let e = AttentionElsewhere { id: "lab".into(), name: "Lab".into(), waiting: 2 };
+        let html = elsewhere_line(&e).to_html();
+        assert!(html.contains("2 waiting in Lab"), "{html}");
+        assert!(html.find("2 waiting in Lab").unwrap() < html.find("<svg").expect("keep the trailing SVG arrow"), "{html}");
+        crate::icons::tests::assert_no_icon_glyphs(&html);
     }
 
     #[test]

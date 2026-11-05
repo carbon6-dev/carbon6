@@ -145,7 +145,7 @@ pub fn running_counts(events: &[Event]) -> (usize, usize) {
         .fold((0, 0), |(tasks, servers), t| if t.notify || t.kind == "claude_code" { (tasks + 1, servers) } else { (tasks, servers + 1) })
 }
 
-/// The line for the bottom of a transcript: "1 task running · 1 server".
+/// The words beside the hourglass at the bottom of a transcript.
 pub fn running_line(tasks: usize, servers: usize) -> String {
     let plural = |n: usize, one: &str, many: &str| if n == 1 { format!("1 {one}") } else { format!("{n} {many}") };
     match (tasks, servers) {
@@ -225,7 +225,7 @@ pub fn RunningTasks(session: String, events: RwSignal<Vec<Event>>) -> impl IntoV
                         ev.stop_propagation();
                         at.set(if at.get_untracked().is_some() { None } else { Some(below(&ev, 384.0)) });
                     }>
-                    {move || counts.with(|(t, s)| format!("{} ›", running_line(*t, *s)))}
+                    {crate::icons::hourglass()}" "{move || counts.with(|(t, s)| running_line(*t, *s))}" "{crate::icons::chevron_right()}
                 </button>
                 <Popover at class="w-96 max-w-[calc(100vw-1rem)] space-y-2 text-xs">
                     <p class="text-muted">"Task history remains available when the worker is offline. Inspect streams with Refresh."</p>
@@ -379,6 +379,13 @@ fn TaskStream(label: &'static str, stream: c6_api::TaskStream) -> impl IntoView 
 pub fn ended_line(task_id: &str, kind: &str, description: &str, state: &str, exit_code: i32, elapsed_ms: u64) -> Option<AnyView> {
     let agent = kind == "agent";
     let native = kind == "claude_code";
+    let status_icon = match state {
+        "finished" if native || exit_code == 0 => crate::icons::check().into_any(),
+        "finished" | "failed" => crate::icons::x().into_any(),
+        "stopped" | "stopped_by_user" => crate::icons::stop().into_any(),
+        "lost" => crate::icons::warning().into_any(),
+        _ => crate::icons::circle().into_any(),
+    };
     let (what, tone) = match state {
         "started" => return None,
         "finished" if native => ("finished".to_owned(), "text-muted"),
@@ -401,7 +408,7 @@ pub fn ended_line(task_id: &str, kind: &str, description: &str, state: &str, exi
             <p class=format!("flex items-center gap-2 text-xs {tone}")>
                 <span>{crate::icons::square_terminal()}</span>
                 <span class="min-w-0 truncate" title=format!("{title} · {task_id}")>{label}</span>
-                <span class="shrink-0">{format!("{what}{time}")}</span>
+                <span class="shrink-0">{status_icon}" "{format!("{what}{time}")}</span>
             </p>
         }
         .into_any(),
@@ -411,6 +418,30 @@ pub fn ended_line(task_id: &str, kind: &str, description: &str, state: &str, exi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn task_endings_keep_both_the_task_and_status_icons() {
+        for (kind, state, exit_code, text) in [
+            ("claude_code", "finished", 1, "finished"),
+            ("agent", "finished", 0, "finished"),
+            ("agent", "finished", 1, "failed"),
+            ("shell", "finished", 0, "exited 0"),
+            ("shell", "finished", 1, "exited 1"),
+            ("shell", "failed", 1, "failed"),
+            ("claude_code", "stopped", 0, "stopped by Claude Code"),
+            ("shell", "stopped", 0, "stopped by the agent"),
+            ("shell", "stopped_by_user", 0, "stopped by you"),
+            ("shell", "lost", 0, "lost (worker restarted or CLI exited)"),
+            ("shell", "unknown", 0, "unknown"),
+        ] {
+            let html = ended_line("t1", kind, "Build", state, exit_code, 1000).unwrap().to_html();
+            assert_eq!(html.matches("<svg").count(), 2, "keep both icons for {kind}/{state}: {html}");
+            assert!(html.contains(text), "{html}");
+            crate::icons::tests::assert_no_icon_glyphs(&html);
+        }
+        assert!(ended_line("t1", "shell", "Build", "started", 0, 0).is_none());
+    }
 
     fn event(seq: u64, task: &str, state: &str) -> Event {
         Event {

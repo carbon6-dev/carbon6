@@ -296,9 +296,9 @@ pub(crate) fn Composer(place: Place, thread_ts: Option<String>) -> impl IntoView
                     <button class=format!("{tool} line-through") title="Strikethrough" on:click=move |_| wrap("~", "~")>"S"</button>
                     <button class=format!("{tool} font-mono") title="Code" on:click=move |_| wrap("`", "`")>"</>"</button>
                     <button class=tool title="Link" on:click=move |_| wrap("", " (https://)")>{crate::icons::link()}</button>
-                    <button class=tool title="Bulleted list" on:click=move |_| line("• ")>"List"</button>
-                    <button class=tool title="Numbered list" on:click=move |_| line("1. ")>"1. List"</button>
-                    <button class=tool title="Quote" on:click=move |_| line("> ")>"Quote"</button>
+                    <button class=tool title="Bulleted list" on:click=move |_| line("• ")>{crate::icons::list()}</button>
+                    <button class=tool title="Numbered list" on:click=move |_| line("1. ")>{crate::icons::list_ordered()}</button>
+                    <button class=tool title="Quote" on:click=move |_| line("> ")>{crate::icons::quote()}</button>
                     <button class=format!("{tool} font-mono") title="Code block" on:click=move |_| wrap("```\n", "\n```")>"{ }"</button>
                 </div>
                 <textarea node_ref=area data-pop=suggest_pop.get_value() class="block max-h-60 min-h-[2.5rem] w-full resize-none bg-transparent px-3 py-2 text-sm outline-none" rows="2"

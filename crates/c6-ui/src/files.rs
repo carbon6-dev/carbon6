@@ -190,7 +190,7 @@ fn StatusSummary(s: Value) -> impl IntoView {
         <div class="text-sm">
             <div class="flex flex-wrap items-center gap-2">
                 <span class="rounded bg-zinc-100 px-1.5 py-0.5 font-mono text-xs dark:bg-zinc-800">{branch}</span>
-                {s["upstream"].as_str().map(|u| view! { <span class="text-xs text-muted">{format!("Upstream {u} · {ahead} ahead, {behind} behind")}</span> })}
+                {s["upstream"].as_str().map(|u| view! { <span class="text-xs text-muted">{crate::icons::arrow_right()}" "{format!("Upstream {u} · {ahead} ahead, {behind} behind")}</span> })}
                 <span class="text-xs text-muted">{format!("{} changed file{}", files.len(), if files.len() == 1 { "" } else { "s" })}</span>
             </div>
             <ul class="mt-2 grid gap-x-4 font-mono text-xs sm:grid-cols-2">

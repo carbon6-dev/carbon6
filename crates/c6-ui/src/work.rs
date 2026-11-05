@@ -92,16 +92,15 @@ fn moved(w: &WorkItem) -> i64 {
     w.live.iter().map(|l| l.at).max().unwrap_or(0).max(w.fields.moved_at)
 }
 
-/// The kind of thing a ref points at, as a plain label.
-fn kind_mark(reference: &str) -> &'static str {
+/// The kind of thing a ref points at, as a drawn icon.
+fn kind_mark(reference: &str) -> AnyView {
     match reference.split(':').next().unwrap_or("") {
-        "session" => "Session",
-        "request" => "Request",
-        "thread" => "Mail",
-        "chat" => "Chat",
-        "decision" => "Decision",
-        "doc" => "Doc",
-        _ => "Link",
+        "session" => crate::icons::diamond().into_any(),
+        "request" | "thread" => crate::icons::mail().into_any(),
+        "chat" => crate::icons::message().into_any(),
+        "decision" => crate::icons::help().into_any(),
+        "doc" => crate::icons::file().into_any(),
+        _ => crate::icons::arrow_up_right().into_any(),
     }
 }
 
@@ -394,13 +393,13 @@ fn Row(w: WorkItem, index: usize, picked: RwSignal<usize>, open_item: Callback<(
                     </span>
                 })}
                 {(todos > 0).then(|| view! {
-                    <span class="rounded bg-violet-100 px-1.5 text-[11px] text-violet-800 dark:bg-violet-950 dark:text-violet-300" title="To-dos done of all">
-                        {format!("To-dos {}/{todos}", todos - left)}
+                    <span class="inline-flex items-center gap-1 rounded bg-violet-100 px-1.5 text-[11px] text-violet-800 dark:bg-violet-950 dark:text-violet-300" title="To-dos done of all">
+                        {crate::icons::check_box(false)}" "{format!("{}/{todos}", todos - left)}
                     </span>
                 })}
                 {w.live.iter().take(6).map(|l| view! {
                     <span class="max-w-48 truncate rounded bg-zinc-100 px-1.5 text-[11px] text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400" title=l.title.clone()>
-                        {format!("{} {}", kind_mark(&l.reference), l.title)}
+                        {kind_mark(&l.reference)}" "{l.title.clone()}
                     </span>
                 }).collect_view()}
                 {(w.live.len() > 6).then(|| view! { <span class="text-[11px] text-muted">{format!("+{}", w.live.len() - 6)}</span> })}
@@ -516,7 +515,7 @@ fn Proposals(ps: Vec<WorkProposal>, proposals: RwSignal<Option<Vec<WorkProposal>
                             </div>
                             {(!p.done_when.is_empty()).then(|| view! { <p class="text-xs text-muted">{format!("Done when: {}", p.done_when)}</p> })}
                             <ul class="mt-1 text-xs text-zinc-600 dark:text-zinc-400">
-                                {p.attach.iter().map(|a| view! { <li class="truncate">{format!("{} {}", kind_mark(&a.reference), a.title)}</li> }).collect_view()}
+                                {p.attach.iter().map(|a| view! { <li class="truncate">{kind_mark(&a.reference)}" "{a.title.clone()}</li> }).collect_view()}
                             </ul>
                         </div>
                     }
@@ -548,7 +547,7 @@ fn attached_view(reference: &str) -> Option<View> {
 fn AttachedLink(l: LiveAttached) -> impl IntoView {
     let class = "min-w-0 flex-1 truncate text-sky-700 hover:underline dark:text-sky-400";
     let r = l.reference.clone();
-    let text = format!("{} {}", kind_mark(&r), l.title);
+    let text = view! { {kind_mark(&r)}" "{l.title} };
     if let Some(to) = attached_view(&r) {
         view! { <Go to class=class>{text}</Go> }.into_any()
     } else {
@@ -806,11 +805,11 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
                                 }.into_any(),
                                 None => view! {
                                     <p class="text-sm text-muted">{if w.fields.attached.is_empty() && !w.fields.todos.is_empty() {
-                                        "Nothing started yet: Start a to-do below, or Pick up the whole work."
+                                        view! { "Nothing started yet: "{crate::icons::play()}" Start a to-do below, or Pick up the whole work." }.into_any()
                                     } else if w.fields.attached.is_empty() {
-                                        "Nothing belongs to it yet: start a session on it (Pick up), or attach something below."
+                                        view! { "Nothing belongs to it yet: start a session on it (Pick up), or attach something below." }.into_any()
                                     } else {
-                                        "No note yet: an agent writes one when something here moves."
+                                        view! { "No note yet: an agent writes one when something here moves." }.into_any()
                                     }}</p>
                                 }.into_any(),
                             }}
@@ -837,13 +836,13 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
                                         {t.by.strip_prefix("session:").filter(|_| !t.from.starts_with("decision:")).map(|s| view! {
                                             <Go to=View::session(s.to_owned()) class="shrink-0 text-[11px] text-muted hover:underline" title="An agent added it; this opens its session">"by an agent"</Go>
                                         })}
-                                        {ticked_by.map(|why| view! { <span class="shrink-0 text-[11px] text-emerald-700 dark:text-emerald-400" title=why>"Done by agent"</span> })}
+                                        {ticked_by.map(|why| view! { <span class="shrink-0 text-[11px] text-emerald-700 dark:text-emerald-400" title=why>{crate::icons::check()}" agent"</span> })}
                                         {(!t.session.is_empty()).then(|| view! {
-                                            <Go to=View::session(t.session.clone()) class="shrink-0 text-xs text-sky-700 hover:underline dark:text-sky-400">"session"</Go>
+                                            <Go to=View::session(t.session.clone()) class="shrink-0 text-xs text-sky-700 hover:underline dark:text-sky-400">"session "{crate::icons::arrow_up_right()}</Go>
                                         })}
                                         {(!done && open).then(|| view! {
                                             <button class=format!("{BUTTON_QUIET} shrink-0 text-xs") title="Start a session that does it"
-                                                on:click=move |_| start_todo(tid2.clone())>"Start"</button>
+                                                on:click=move |_| start_todo(tid2.clone())>{crate::icons::play()}" Start"</button>
                                         })}
                                         <button class="shrink-0 text-xs text-muted hover:text-red-600" title="Take it off this work"
                                             on:click=move |_| { let todo = tid3.clone(); spawn_local(async move { apply(api::work_todo_remove(id.get_value(), todo).await) }); }>{crate::icons::x()}</button>
@@ -1134,7 +1133,7 @@ pub fn LeftOpen() -> impl IntoView {
                             <span class="shrink-0 rounded bg-rose-100 px-1.5 py-0.5 text-[11px] font-medium text-rose-800 dark:bg-rose-900/40 dark:text-rose-300">
                                 {c6_api::projects::state_label(&p.state)}
                             </span>
-                            <span class="min-w-0 flex-1 truncate">{format!("Project {}", p.fields.title)}</span>
+                            <span class="min-w-0 flex-1 truncate">{crate::icons::diamond()}" "{p.fields.title}</span>
                             <span class="hidden max-w-[50%] truncate text-xs text-muted sm:inline">{p.why.clone()}</span>
                         </Go>
                     }).collect_view()}
@@ -1192,6 +1191,16 @@ pub fn RequestWork(id: i64, #[prop(into)] title: String) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn attached_kinds_still_have_drawn_marks_beside_their_titles() {
+        for reference in ["session:s1", "request:42", "thread:t1", "chat:c1", "decision:1", "doc:d1", "https://example.com"] {
+            let html = kind_mark(reference).to_html();
+            assert!(html.contains("<svg"), "{reference} lost its icon: {html}");
+            crate::icons::tests::assert_no_icon_glyphs(&html);
+        }
+    }
 
     #[test]
     fn message_attachments_open_their_contents_not_the_brief_or_an_inbox() {

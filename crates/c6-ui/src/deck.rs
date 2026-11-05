@@ -225,7 +225,7 @@ pub fn DeckView(
                 </select>
                 <span class="text-muted">{format!("{total} slides")}</span>
                 <span class="flex-1"></span>
-                <button class=BUTTON on:click=move |_| present(false)>"Present"</button>
+                <button class=BUTTON on:click=move |_| present(false)>{crate::icons::play()}" Present"</button>
                 <button class=BUTTON_QUIET title="Notes, the next slide and a timer, in a window of its own" on:click=move |_| { present(true); present(false); }>"Presenter view"</button>
             </div>
             <div class="flex gap-3">
@@ -294,7 +294,7 @@ pub fn DeckView(
                                     </label>
                                     <button class=BUTTON_QUIET on:click=move |_| edit_slide()>"Edit slide"</button>
                                 })}
-                                {pending.then(|| view! { <span class="text-violet-700 dark:text-violet-300">{format!("being written by {}", crate::docs::author(s.attrs["by"].as_str().unwrap_or("")))}</span> })}
+                                {pending.then(|| view! { <span class="text-violet-700 dark:text-violet-300">{crate::icons::pencil()}" "{format!("being written by {}", crate::docs::author(s.attrs["by"].as_str().unwrap_or("")))}</span> })}
                                 <span class="flex-1"></span>
                                 <button class="text-xs text-muted hover:text-red-600" title="Delete this slide"
                                     on:click=move |_| send.run(vec![DocOp::Delete { id: sid3.clone(), if_rev: Some(rev), if_hash: Some(hash.clone()) }])>"Delete slide"</button>
@@ -557,7 +557,7 @@ pub fn BringIn() -> impl IntoView {
                         Ok(v) => view! {
                             <ul class="space-y-0.5 text-sm">
                                 {v["made"].as_array().cloned().unwrap_or_default().into_iter().map(|m| view! {
-                                    <li>{format!("Done: {}", m["title"].as_str().unwrap_or(""))}</li>
+                                    <li>{crate::icons::check()}" "{m["title"].as_str().unwrap_or("").to_owned()}</li>
                                 }).collect_view()}
                                 {v["skipped"].as_array().cloned().unwrap_or_default().into_iter().map(|m| view! {
                                     <li class="text-muted">{format!("– {}: {}", m["title"].as_str().unwrap_or(""), m["why"].as_str().unwrap_or(""))}</li>

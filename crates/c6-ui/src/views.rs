@@ -325,7 +325,7 @@ fn RecordBody(view: ViewDef, id: String) -> impl IntoView {
                 let fields: Vec<(String, String)> = rec.fields.as_object().map(|o| o.iter().map(|(k, v)| (k.clone(), text_of(Some(v)))).collect()).unwrap_or_default();
                 view! {
                     <div class="flex flex-wrap items-center gap-2">
-                        <Go to=View::App { name: view.name.clone(), record: String::new() } class="text-sm text-muted hover:underline">{back_title}</Go>
+                        <Go to=View::App { name: view.name.clone(), record: String::new() } class="text-sm text-muted hover:underline">{crate::icons::arrow_left()}" "{back_title}</Go>
                         <span class="flex-1"></span>
                         <Actions view=view.clone() record=rec.id.clone() tick error />
                     </div>

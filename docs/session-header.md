@@ -18,22 +18,25 @@ Left to right: back and forward, the session's mark, its title (double-click to 
 
 ## Icons throughout the app
 
-App-owned chrome uses the SVGs in `crates/c6-ui/src/icons.rs` or plain words,
-never emoji or Unicode pictograms (including checkmarks, crosses, stars and
-disclosure triangles). New icons follow the same 24-unit viewBox, rounded
+App-owned chrome uses drawn SVG icons instead of emoji or Unicode pictograms
+(including checkmarks, crosses, stars and disclosure triangles). Don't drop
+icons or replace them with words alone: keep each icon in its original position
+and keep its accompanying text. This includes trailing action arrows and icons
+mentioned in help text. Use `crates/c6-ui/src/icons.rs`; new icons use its shared
+helper and follow the same 24-unit viewBox, rounded
 `currentColor` strokes and 16px size; compact wrappers constrain them to the
 surrounding text. Decorative SVGs are hidden from accessibility APIs; icon-only
 controls retain a title or accessible label.
 
 Notices use a drawn bell, files a drawn page, secrets a drawn key, and published
-outputs the existing package icon. Memory events, task/subagent states and
-already-labelled actions use words where a second mark adds nothing. Mail
+outputs the existing package icon. Memory events keep their brain, task and
+subagent states keep their status marks, and labelled actions keep their icons. Mail
 attachments share a file icon; the filename and type distinguish formats.
 Chat actions and document comments use drawn message, bookmark, link and
 reaction icons, not emoji. The same rule applies to explorer badges and menus.
 
 Keep intentional typography (`› ‹ … · ×`, quotes, dashes and list bullets),
-keyboard symbols and directions within prose (not trailing action arrows), and
+keyboard symbols and directions within prose (action arrows are drawn SVGs), and
 the worker/SSH relationship separator. Imported/user-authored emoji in messages, reactions, status text,
 documents and terminal output remain content, including Slack's emoji picker
 and the terminal vendor's Unicode-width data. The native UI tests render

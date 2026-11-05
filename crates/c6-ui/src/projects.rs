@@ -625,7 +625,7 @@ fn PhaseStrip(p: ProjectItem, change: Callback<c6_api::projects::PhaseIn>) -> im
                         <button class=format!("min-w-[7rem] flex-1 rounded-md border px-2 py-1 text-left text-xs {class}") title=ph.done_when.clone()
                             on:click=move |_| open_editor(Some(one.clone()))>
                             <div class="flex items-center gap-1 font-medium">
-                                {(ph.state == "done").then_some("Done · ")}
+                                {(ph.state == "done").then(crate::icons::check)}
                                 <span class="truncate">{ph.title.clone()}</span>
                             </div>
                             <div class="flex gap-1 text-[11px] opacity-80">
@@ -896,10 +896,12 @@ fn Documents(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> im
                 let doc = d.doc.clone();
                 let doc2 = d.doc.clone();
                 let current = d.role.clone();
+                let mark = if d.kind == "deck" { crate::icons::chart().into_any() } else { crate::icons::file().into_any() };
+                let title = d.title.clone();
                 view! {
                     <div class="flex items-center gap-2 rounded px-2 py-1 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900">
                         <Go to=View::Docs { id: d.doc.clone() } class="min-w-0 flex-1 truncate text-sky-700 hover:underline dark:text-sky-400">
-                            {format!("{} {}", if d.kind == "deck" { "Deck" } else { "Doc" }, d.title)}
+                            {mark}" "{title}
                         </Go>
                         <span class="shrink-0 text-xs text-muted">{(d.updated_at > 0).then(|| since(d.updated_at))}</span>
                         <select class="shrink-0 cursor-pointer rounded bg-transparent px-1 text-xs text-muted hover:bg-zinc-200/60 dark:hover:bg-zinc-800"
@@ -947,7 +949,7 @@ fn Documents(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> im
                         {if href.is_empty() {
                             view! { <span class="min-w-0 flex-1 truncate">{text}</span> }.into_any()
                         } else {
-                            view! { <a href=href target="_blank" rel="noopener noreferrer" class="min-w-0 flex-1 truncate text-sky-700 hover:underline dark:text-sky-400">{text}</a> }.into_any()
+                            view! { <a href=href target="_blank" rel="noopener noreferrer" class="min-w-0 flex-1 truncate text-sky-700 hover:underline dark:text-sky-400">{crate::icons::arrow_up_right()}" "{text}</a> }.into_any()
                         }}
                         <button class="shrink-0 text-xs text-muted hover:text-red-600" title="Remove link" on:click=move |_| {
                             let d = ProjectDetach { link: Some(r.clone()), ..Default::default() };

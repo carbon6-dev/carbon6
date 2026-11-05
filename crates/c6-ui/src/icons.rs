@@ -1,5 +1,6 @@
 //! Line icons from Lucide (lucide.dev, ISC licence), their path data copied inline,
-//! and small app icons drawn on the same grid. App chrome uses these, not emoji.
+//! and small app icons drawn on the same grid. Replace emoji with drawn SVGs;
+//! keep the icons, their positions and their accompanying labels.
 
 use leptos::prelude::*;
 
@@ -36,6 +37,60 @@ pub fn square_terminal() -> impl IntoView {
 /// App icons, on the same 24-unit grid as the line icons above.
 pub fn bell() -> impl IntoView {
     icon(view! { <path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" /> })
+}
+
+pub fn bell_off() -> impl IntoView {
+    icon(view! { <path d="m3 3 18 18M10 21h4M6 6c0 9-3 9-3 11h14M10 2.3A6 6 0 0 1 18 8c0 2 .3 4 .8 5" /> })
+}
+
+pub fn brain() -> impl IntoView {
+    icon(
+        view! { <path d="M12 5a3 3 0 0 0-6 0 4 4 0 0 0-3 6 4 4 0 0 0 1 7 4 4 0 0 0 8 1V5Zm0 0a3 3 0 0 1 6 0 4 4 0 0 1 3 6 4 4 0 0 1-1 7 4 4 0 0 1-8 1M6 5v3m12-3v3M4 12h3m13 0h-3M8 16v3m8-3v3" /> },
+    )
+}
+
+pub fn grid_plus() -> impl IntoView {
+    icon(view! { <rect x="3" y="3" width="18" height="18" rx="2" /><path d="M12 3v18M3 12h18M6 7h3M7.5 5.5v3" /> })
+}
+
+pub fn info() -> impl IntoView {
+    icon(view! { <circle cx="12" cy="12" r="9" /><path d="M12 11v6m0-10h.01" /> })
+}
+
+pub fn help() -> impl IntoView {
+    icon(view! { <circle cx="12" cy="12" r="9" /><path d="M9 9a3 3 0 0 1 6 0c0 2-3 2-3 4m0 4h.01" /> })
+}
+
+pub fn user() -> impl IntoView {
+    icon(view! { <circle cx="12" cy="7" r="4" /><path d="M4 21v-2a8 8 0 0 1 16 0v2" /> })
+}
+
+pub fn plus() -> impl IntoView {
+    icon(view! { <path d="M12 5v14M5 12h14" /> })
+}
+
+pub fn stop() -> impl IntoView {
+    icon(view! { <rect x="5" y="5" width="14" height="14" rx="1" fill="currentColor" /> })
+}
+
+pub fn quote() -> impl IntoView {
+    icon(view! { <path d="M3 12h6v6H3v-6c0-4 2-6 6-6M15 12h6v6h-6v-6c0-4 2-6 6-6" /> })
+}
+
+pub fn list() -> impl IntoView {
+    icon(view! { <path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" /> })
+}
+
+pub fn list_ordered() -> impl IntoView {
+    icon(view! { <path d="M9 6h12M9 12h12M9 18h12M3 3h1v6M3 9h2M3 14a1 1 0 0 1 2 0c0 1-2 2-2 3h2M3 20h2" /> })
+}
+
+pub fn calendar() -> impl IntoView {
+    icon(view! { <rect x="3" y="5" width="18" height="16" rx="2" /><path d="M16 3v4M8 3v4M3 11h18M8 15h2m4 0h2" /> })
+}
+
+pub fn layout_template() -> impl IntoView {
+    icon(view! { <rect x="3" y="3" width="18" height="18" rx="2" /><path d="M3 9h18M9 9v12" /> })
 }
 
 pub fn file() -> impl IntoView {
@@ -76,6 +131,30 @@ pub fn arrow_up() -> impl IntoView {
 
 pub fn arrow_down() -> impl IntoView {
     icon(view! { <path d="M12 3v18m-7-7 7 7 7-7" /> })
+}
+
+pub fn arrow_left() -> impl IntoView {
+    icon(view! { <path d="M21 12H3m7 7-7-7 7-7" /> })
+}
+
+pub fn arrow_right() -> impl IntoView {
+    icon(view! { <path d="M3 12h18m-7-7 7 7-7 7" /> })
+}
+
+pub fn arrow_up_right() -> impl IntoView {
+    icon(view! { <path d="M7 17 17 7M7 7h10v10" /> })
+}
+
+pub fn arrow_down_right() -> impl IntoView {
+    icon(view! { <path d="m7 7 10 10M7 17h10V7" /> })
+}
+
+pub fn corner_down_right() -> impl IntoView {
+    icon(view! { <path d="M3 3v9a3 3 0 0 0 3 3h15m-6-6 6 6-6 6" /> })
+}
+
+pub fn undo() -> impl IntoView {
+    icon(view! { <path d="M3 8h11a7 7 0 0 1 0 14M3 8l6-6m-6 6 6 6" /> })
 }
 
 pub fn rotate() -> impl IntoView {
@@ -273,6 +352,7 @@ pub const BAR_BUTTON: &str = "flex size-7 shrink-0 items-center justify-center r
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use super::*;
     use std::path::Path;
 
     // These are text, not pictograms: punctuation, keyboard shortcuts,
@@ -297,8 +377,41 @@ pub(crate) mod tests {
         assert_no_icon_glyphs("Back › ‹ … · × — – “text” · ⌘/Ctrl ⇧ ↵ · Settings → Memex · worker ⇄ host");
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn app_chrome_uses_svg_or_words_not_symbol_icons() {
+    fn restored_icons_share_the_accessible_svg_grid() {
+        for mark in [
+            bell_off().into_any(),
+            brain().into_any(),
+            grid_plus().into_any(),
+            info().into_any(),
+            help().into_any(),
+            user().into_any(),
+            plus().into_any(),
+            stop().into_any(),
+            quote().into_any(),
+            list().into_any(),
+            list_ordered().into_any(),
+            calendar().into_any(),
+            layout_template().into_any(),
+            arrow_left().into_any(),
+            arrow_right().into_any(),
+            arrow_up_right().into_any(),
+            arrow_down_right().into_any(),
+            corner_down_right().into_any(),
+            undo().into_any(),
+        ] {
+            let html = mark.to_html();
+            assert_eq!(html.matches("<svg").count(), 1, "{html}");
+            for attr in ["viewBox=\"0 0 24 24\"", "stroke=\"currentColor\"", "aria-hidden=\"true\"", "stroke-linecap=\"round\""] {
+                assert!(html.contains(attr), "{attr} missing: {html}");
+            }
+            assert_no_icon_glyphs(&html);
+        }
+    }
+
+    #[test]
+    fn app_chrome_uses_svg_not_symbol_icons() {
         fn check(path: &Path) {
             if path.is_dir() {
                 for entry in std::fs::read_dir(path).unwrap() {
@@ -320,11 +433,11 @@ pub(crate) mod tests {
                 if ["//", "/*", "*", "<!--"].iter().any(|prefix| line.trim_start().starts_with(prefix)) {
                     continue;
                 }
-                // Directions between words are prose; a trailing arrow on
-                // an already-labelled action is an unnecessary icon.
-                assert!(!line.contains("→\""), "{}:{}: use words, not a trailing action arrow", path.display(), i + 1);
+                // Directions between words are prose; action arrows must
+                // stay visible too, drawn as SVG rather than text glyphs.
+                assert!(!line.contains("→\""), "{}:{}: draw the trailing action arrow with icons.rs", path.display(), i + 1);
                 if let Some(c) = line.chars().find(|c| icon_glyph(*c)) {
-                    panic!("{}:{}: {c} is an icon glyph; use icons.rs or words", path.display(), i + 1);
+                    panic!("{}:{}: {c} is an icon glyph; replace it with an icons.rs SVG, not words alone", path.display(), i + 1);
                 }
             }
         }
