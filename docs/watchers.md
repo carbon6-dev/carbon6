@@ -100,11 +100,11 @@ You often ask for a quality in one implementation: "make sure memory is accounte
 2. **Audit now:** a task card for a one-off session that checks the codebase (or the scope you pick) for the same quality. For example, "is memory accounted for consistently?". It reports or fixes what it finds.
 3. **From now on:** the directive becomes a standing **standard** in that scope.
    - **Where possible, a mechanical check:** a lint rule, a test, a CI step, or a line in the repo's instructions. A check is cheaper and more reliable than a model, so the watcher proposes a task card to add one when the quality can be checked mechanically.
-   - **Otherwise, a judgement call:** the standard goes into a **standards list** for the scope (repo, project, labels). Each standard keeps its wording, scope, the turn it came from, and how it's enforced.
-     - The review watcher (§5.2) reads the list when it reviews a diff.
-     - New sessions in the scope are told the standards that apply, as memory notes are today.
+   - **Otherwise, a judgement call:** the standard is a **memory note** in the scope (repo, project, labels), with an **enforced by** field: which watcher checks it (usually review), or which mechanical check now covers it. It keeps its wording, scope, and the turn it came from, like any note. (Decided 2026-11-05: standards are memory notes, not a separate list.)
+     - New sessions in the scope get it as they get every memory note today.
+     - The review watcher (§5.2) reads the notes in its scope that name it as their enforcer when it reviews a diff.
 
-So directives don't each become a watcher (which would multiply watchers and cost). They become entries that one review watcher enforces. A standard that never finds anything, or that a mechanical check now covers, is proposed for retirement in the weekly roll-up.
+So directives don't each become a watcher (which would multiply watchers and cost). They become memory notes that one review watcher enforces. A standard that never finds anything, or that a mechanical check now covers, is proposed for retirement in the weekly roll-up.
 
 ## 8. What makes it work rather than nag
 
@@ -125,7 +125,6 @@ So directives don't each become a watcher (which would multiply watchers and cos
   - Approve every lesson, or auto-apply narrowly scoped memory notes and review the rest?
   - Per-session lessons plus a weekly document, or only the weekly one?
   - Should lessons about a repo become task cards automatically?
-- For standards: is the standards list a new thing, or a kind of memory note with an enforcement field?
 
 ## 10. How it would be built (proposed)
 
@@ -134,7 +133,7 @@ So directives don't each become a watcher (which would multiply watchers and cos
    - a Watchers page with each watcher's findings and cost;
    - watcher sessions shown like side chats.
 2. **Pre-installed:** continuous retrospective, incremental review and stuck detection, off by default and enabled per label.
-3. **Standards and directives:** the standards list, the "here / audit / from now on" question, and review reading the list.
+3. **Standards and directives:** the "enforced by" field on memory notes, the "here / audit / from now on" question, and review reading the notes it enforces.
 4. **The decisions ledger and consistency watcher, and the guard's hook into policies.**
 5. **The carbon6 improvement watcher.**
 6. **Moving the existing ad-hoc watchers over:** the work and project notes, suggestions, naming, catch-ups.
