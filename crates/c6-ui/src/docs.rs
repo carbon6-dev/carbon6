@@ -2237,6 +2237,17 @@ fn AgentName(id: String) -> impl IntoView {
     }
 }
 
+/// An agent's comment: agents write Markdown, so it renders as in the
+/// transcript, its links opening in the workspace where there is one.
+fn agent_text(text: &str) -> impl IntoView {
+    let (col, ws) = (crate::workspace::use_column(), use_context::<crate::workspace::Workspace>());
+    view! {
+        <div class="md max-w-[85%] break-words rounded-xl bg-zinc-100 px-3 py-1.5 dark:bg-zinc-800"
+            on:click=move |ev| if let Some(ws) = ws { crate::mentions::follow_link(&ev, col, ws); }
+            inner_html=crate::markdown::to_html(text)></div>
+    }
+}
+
 /// One comment: yours on the right, a quiet grey-blue; anyone else's on
 /// the left, grey, an agent's named by its session (its colour on the dot
 /// by the name). `under`: what goes beneath it (that it changed the doc).
@@ -2262,7 +2273,7 @@ fn said(c: &c6_api::docs::DocComment, under: Option<AnyView>) -> AnyView {
             <div class="mb-0.5 flex max-w-full items-center gap-1 text-xs text-muted">
                 {who}<span class="shrink-0">{format!("· {when}")}</span>
             </div>
-            <p class="max-w-[85%] whitespace-pre-wrap break-words rounded-xl bg-zinc-100 px-3 py-1.5 dark:bg-zinc-800">{text}</p>
+            {agent_text(&text)}
             {under}
         </div>
     }
@@ -2882,6 +2893,18 @@ fn base64_of(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn agents_comments_render_their_markdown() {
+        use super::*;
+        let owner = Owner::new();
+        owner.with(|| {
+            let html = agent_text("1. **Work the target back.** Then *check*.").to_html();
+            assert!(html.contains("<strong>Work the target back.</strong>") && !html.contains("**"), "{html}");
+            assert!(html.contains("<ol>") || html.contains("<ol "), "{html}");
+        });
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn document_chips_and_file_embeds_keep_their_drawn_icons() {
