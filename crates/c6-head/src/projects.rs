@@ -1229,13 +1229,7 @@ async fn note(st: &HeadState, id: &str) -> anyhow::Result<()> {
             break;
         }
     }
-    let model = match crate::work::model_for_route(st, &item.realm, ROUTE_LABEL, None).await? {
-        Some(m) => m,
-        None => match crate::work::model_for_route(st, &item.realm, crate::work::ROUTE_LABEL, fallback).await? {
-            Some(m) => m,
-            None => return Ok(()),
-        },
-    };
+    let model = crate::work::model_for_note(st, &item.realm, ROUTE_LABEL, fallback).await?;
     let phases = phase_list(&item.fields);
     let mut work = String::new();
     for w in &item.work {
@@ -1557,6 +1551,67 @@ async fn merge_project(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn project_note_uses_suggest_only_after_upstream_choices_and_explains_no_model() {
+        use crate::work::tests::{note_routes, routing_fixture};
+
+        let (_dir, head, mock, work) = routing_fixture().await;
+        let st = &head.state;
+        assert!(st.claude_bin().is_none());
+        let fields = ProjectFields {
+            title: "Pager overhaul".into(),
+            status: "active".into(),
+            phases: vec![api::projects::Phase { id: "phase".into(), title: "Ship".into(), state: "current".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let id = insert(st, crate::realms::HOME, &fields, &[], "you").await.unwrap();
+        // Attach finished work without scheduling a background note.
+        sqlx::query("UPDATE records SET fields = json_set(fields, '$.project', ?, '$.phase', 'phase', '$.status', 'done') WHERE id = ?")
+            .bind(&id)
+            .bind(&work)
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+        let suggest = (crate::suggestions::ROUTE_LABEL, "suggest");
+        let work_rule = (crate::work::ROUTE_LABEL, "work");
+        let project = (ROUTE_LABEL, "project");
+        for (routes, expected) in
+            [(vec![suggest], "suggest"), (vec![suggest, work_rule], "work"), (vec![suggest, work_rule, project], "project")]
+        {
+            note_routes(st, &routes).await;
+            mock.push(c6_testkit::Reply::Text(
+                serde_json::json!({"note": expected, "finished": true, "evidence": "Pager shipped", "phase_done": true, "phase_evidence": "Ship finished"})
+                    .to_string(),
+            ));
+            note(st, &id).await.unwrap();
+            let written = load(st, &id).await.unwrap().unwrap().fields;
+            assert_eq!(written.note.unwrap().text, expected);
+            assert!(written.offer.is_some());
+            assert!(written.phases[0].offer.is_some());
+            assert_eq!(mock.requests().last().unwrap()["model"], expected);
+        }
+
+        note_routes(st, &[]).await;
+        let before = mock.requests().len();
+        let error = note(st, &id).await.unwrap_err().to_string();
+        assert!(error.contains("no note was written"), "{error}");
+        assert!(error.contains("Claude Code (`claude`) is not on the head machine's PATH"), "{error}");
+        assert!(error.contains("task:projects, task:work or task:suggest"), "{error}");
+        assert_eq!(mock.requests().len(), before);
+        assert_eq!(load(st, &id).await.unwrap().unwrap().fields.note.unwrap().text, "project");
+
+        sqlx::query("UPDATE sessions SET connection_id = 'api', model = 'session' WHERE id = 'session'")
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+        note_routes(st, &[suggest]).await;
+        mock.push(c6_testkit::Reply::Text(serde_json::json!({"note": "session"}).to_string()));
+        note(st, &id).await.unwrap();
+        assert_eq!(mock.requests().last().unwrap()["model"], "session");
+        assert_eq!(load(st, &id).await.unwrap().unwrap().fields.note.unwrap().text, "session");
+        head.shutdown().await.unwrap();
+    }
 
     fn w(title: &str, state: &str) -> ProjectWork {
         ProjectWork { id: title.into(), title: title.into(), state: state.into(), why: format!("{title} why"), ..Default::default() }

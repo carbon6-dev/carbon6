@@ -1310,7 +1310,15 @@ pub(crate) async fn model_for_route(
         serde_json::from_str(&st.store.setting_for(crate::sessions::ROUTES, realm).await?.unwrap_or_default()).unwrap_or_default();
     let usable = |c: &crate::store::ConnectionRow| realm == crate::realms::ROOT || crate::realms::available(&c.realms, realm);
     for route in routes.iter().filter(|x| x.enabled && x.applies_to.iter().any(|l| l == route_label)) {
-        if !api::labels::applies(&route.applies_to, &labels) {
+        // The new suggestion fallback has suggestions' any-task semantics;
+        // leave the existing work/project selectors unchanged.
+        let selectors: Vec<String> = route
+            .applies_to
+            .iter()
+            .filter(|l| route_label != crate::suggestions::ROUTE_LABEL || !l.trim().starts_with("task:"))
+            .cloned()
+            .collect();
+        if !api::labels::applies(&selectors, &labels) {
             continue;
         }
         let want = route.connection.trim();
@@ -1336,6 +1344,38 @@ pub(crate) async fn model_for_route(
         return Ok(None);
     }
     Ok(Some((c, m)))
+}
+
+/// Notes retain their existing rules and session choice before trying the
+/// small model configured for suggestions. Claude Code remains askable
+/// wherever the head has `claude`.
+pub(crate) async fn model_for_note(
+    st: &HeadState,
+    realm: &str,
+    label: &str,
+    fallback: Option<(String, String)>,
+) -> anyhow::Result<(String, String)> {
+    if label != ROUTE_LABEL
+        && let Some(model) = model_for_route(st, realm, label, None).await?
+    {
+        return Ok(model);
+    }
+    if let Some(model) = model_for_route(st, realm, ROUTE_LABEL, fallback.clone()).await? {
+        return Ok(model);
+    }
+    if let Some(model) = model_for_route(st, realm, crate::suggestions::ROUTE_LABEL, None).await? {
+        return Ok(model);
+    }
+    let why = match fallback {
+        Some((connection, _)) => crate::pools::cannot_answer(st, &connection).await,
+        None => None,
+    }
+    .unwrap_or_else(|| "no attached session supplies a model the head can ask".into());
+    let rules = if label == ROUTE_LABEL { "task:work or task:suggest" } else { "task:projects, task:work or task:suggest" };
+    anyhow::bail!(
+        "no note was written: {why}; no askable {rules} rule; \
+         add a task:suggest rule with an API connection in Settings → Model routing, or install claude on the head"
+    )
 }
 
 /// Asks the model, for JSON. Its tokens count in the realm's usage, as
@@ -1593,7 +1633,7 @@ async fn note(st: &HeadState, id: &str) -> anyhow::Result<()> {
         }
     }
     let fallback = fallback.or_else(|| sessions.first().map(|s| (s.connection_id.clone(), s.model.clone())));
-    let Some(model) = model_for(st, &r.realm, fallback).await? else { return Ok(()) };
+    let model = model_for_note(st, &r.realm, ROUTE_LABEL, fallback).await?;
     let item = view(st, vec![r]).await?.remove(0);
     let attached = described(st, &item).await?;
     let previous = match &item.fields.note {
@@ -2031,13 +2071,14 @@ pub async fn for_session(st: &HeadState, session_id: &str, p: &Value) -> anyhow:
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// No worker is needed: these are one-off calls made by the head.
-    async fn routing_fixture() -> (tempfile::TempDir, crate::Head, c6_testkit::MockLlm, String) {
+    pub(crate) async fn routing_fixture() -> (tempfile::TempDir, crate::Head, c6_testkit::MockLlm, String) {
         let dir = tempfile::tempdir().unwrap();
         let head = crate::start(crate::HeadConfig {
+            claude_bin: Some(dir.path().join("no-claude-here")),
             data_dir: dir.path().to_owned(),
             bind: vec!["127.0.0.1".parse().unwrap()],
             ui_port: 0,
@@ -2074,6 +2115,76 @@ mod tests {
         };
         let id = insert(&head.state, crate::realms::HOME, &fields, &[], "you").await.unwrap();
         (dir, head, mock, id)
+    }
+
+    pub(crate) async fn note_routes(st: &HeadState, routes: &[(&str, &str)]) {
+        let routes: Vec<Value> = routes
+            .iter()
+            .map(|(label, model)| json!({"name": model, "applies_to": [label], "connection": "api", "model": model, "enabled": true}))
+            .collect();
+        st.store.set_setting(crate::sessions::ROUTES, &serde_json::to_string(&routes).unwrap()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn note_suggest_fallback_accepts_shared_task_rules_and_skips_unaskable_choices() {
+        let (_dir, head, mock, _id) = routing_fixture().await;
+        let st = &head.state;
+        let routes = json!([
+            {"name": "no claude", "applies_to": ["task:suggest", "task:name"], "connection": "cc", "model": "opus", "enabled": true},
+            {"name": "other context", "applies_to": ["task:suggest", "repo:elsewhere"], "connection": "api", "model": "wrong", "enabled": true},
+            {"name": "shared", "applies_to": ["task:suggest", "task:name"], "connection": "api", "model": "small", "enabled": true}
+        ]);
+        st.store.set_setting(crate::sessions::ROUTES, &routes.to_string()).await.unwrap();
+        let model = model_for_note(st, crate::realms::HOME, ROUTE_LABEL, Some(("cc".into(), "opus".into()))).await.unwrap();
+        assert_eq!(model, ("api".into(), "small".into()));
+        assert!(mock.requests().is_empty());
+        head.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn work_note_uses_suggest_only_after_upstream_choices_and_explains_no_model() {
+        let (_dir, head, mock, id) = routing_fixture().await;
+        let st = &head.state;
+        assert!(st.claude_bin().is_none());
+        let suggest = (crate::suggestions::ROUTE_LABEL, "suggest");
+        note_routes(st, &[suggest]).await;
+        mock.push(c6_testkit::Reply::Text(json!({"done": "Read logs", "left": "fix", "next": "suggest", "finished": false}).to_string()));
+        note(st, &id).await.unwrap();
+        assert_eq!(mock.requests().last().unwrap()["model"], "suggest");
+        assert_eq!(load(st, &id).await.unwrap().unwrap().fields.note.unwrap().next, "suggest");
+
+        note_routes(st, &[]).await;
+        let before = mock.requests().len();
+        let error = note(st, &id).await.unwrap_err().to_string();
+        assert!(error.contains("no note was written"), "{error}");
+        assert!(error.contains("Claude Code (`claude`) is not on the head machine's PATH"), "{error}");
+        assert!(error.contains("task:suggest rule with an API connection in Settings → Model routing"), "{error}");
+        assert_eq!(mock.requests().len(), before);
+        assert_eq!(load(st, &id).await.unwrap().unwrap().fields.note.unwrap().next, "suggest");
+
+        // Even with a suggest rule, the older askable session still wins.
+        sqlx::query(
+            "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, realm) \
+             VALUES ('older', '', 'API session', '', 'api', 'session', 'idle', 0, 0, ?)",
+        )
+        .bind(crate::realms::HOME)
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+        modify(st, &id, "test", None, |f| {
+            f.attached.push(Attached { reference: "session:older".into(), ..Default::default() });
+            Ok(true)
+        })
+        .await
+        .unwrap();
+        for (routes, expected) in [(vec![suggest], "session"), (vec![suggest, (ROUTE_LABEL, "work")], "work")] {
+            note_routes(st, &routes).await;
+            mock.push(c6_testkit::Reply::Text(json!({"next": expected, "finished": false}).to_string()));
+            note(st, &id).await.unwrap();
+            assert_eq!(mock.requests().last().unwrap()["model"], expected);
+            assert_eq!(load(st, &id).await.unwrap().unwrap().fields.note.unwrap().next, expected);
+        }
+        head.shutdown().await.unwrap();
     }
 
     #[tokio::test]
