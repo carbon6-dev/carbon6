@@ -4,6 +4,12 @@ Status: rules in force (2026-10-19); `make check` enforces what a pattern can ca
 
 A test is a claim: *this invariant holds*. It must fail **if and only if** the invariant is broken. A slow machine, a busy CI runner, another test running beside it, or the order tests run in must never fail it. The test suite runs on GitHub's runners (`ubuntu-24.04`, `macos-15`), which are shared, small and sometimes slow, and it must hold there.
 
+## Failure diagnostics
+
+`make test` enables panic backtraces (`RUST_BACKTRACE=1` unless already set, for both nextest and its `cargo test` fallback). Use `RUST_BACKTRACE=full make test` for every stack frame.
+
+`.config/nextest.toml` shows each failure's complete captured stdout and stderr both immediately and at the end of the run (`failure-output = "immediate-final"`, `final-status-level = "fail"`). The final status list alone does not include that output: nextest's default only prints it immediately, where a long parallel run can bury it. Keep capture enabled so concurrent tests' diagnostics stay together.
+
 ## Rules
 
 1. **Wait for a condition, never for a time.**
