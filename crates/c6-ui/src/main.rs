@@ -55,6 +55,7 @@ mod understanding;
 mod usage;
 mod util;
 mod views;
+mod watchers;
 mod when;
 mod work;
 mod workspace;

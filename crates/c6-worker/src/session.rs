@@ -943,6 +943,9 @@ impl SessionManager {
             // only while carbon6's loop runs the tools (`own_loop_hooks`).
             let (ap_tx, mut ap_rx) = mpsc::unbounded_channel();
             policies = crate::policy::Policies::new(&spec.policies_json, &labels, ap_tx);
+            if let Some(p) = &policies {
+                p.set_judge(session_tools.head());
+            }
             let actor_tx = tx.clone();
             tokio::spawn(async move {
                 while let Some(e) = ap_rx.recv().await {

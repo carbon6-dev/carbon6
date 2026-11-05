@@ -206,6 +206,10 @@ async fn head_worker(st: &HeadState) -> anyhow::Result<WorkerId> {
 
 fn dispatch(st: &Arc<HeadState>, cmd: SessionCommand) {
     let sid = cmd.session_id.clone();
+    // A watcher's session: you wrote to the watcher (docs/watchers.md §3).
+    if crate::watchers::owns(st, &sid) {
+        return crate::watchers::command(st, cmd);
+    }
     let mut actors = st.assistant.actors.lock().unwrap();
     if let Some(tx) = actors.get(&sid)
         && tx.send(cmd.clone()).is_ok()

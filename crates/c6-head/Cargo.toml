@@ -56,6 +56,7 @@ toml = "1.1.8"
 tonic = { version = "0.14.6", features = ["tls-ring"] }
 tower-http = { version = "0.7.1", features = ["trace"] }
 tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry"] }
 url = "2.5.8"
 uuid = { version = "1.28.0", features = ["v4", "v7", "serde"] }
 x509-parser = "0.18.1"

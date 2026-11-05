@@ -207,6 +207,13 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
             "op" => crate::agent_ops::for_session(st, &target, &params).await,
             // Documents (docs/docs.md §9).
             "doc" => crate::docs::session::for_session(st, &target, &params).await,
+            // The guard watcher judges a call a policy matched (docs/watchers.md §5.6).
+            "guard" => {
+                let row = st.store.session(&target).await?.ok_or_else(|| bad_request("no such session"))?;
+                let why =
+                    crate::watchers::guard(st, &row, params["tool"].as_str().unwrap_or(""), params["input"].as_str().unwrap_or("")).await?;
+                Ok(json!({"risky": why.is_some(), "why": why.unwrap_or_default()}))
+            }
             // Collections, in the session's realm (docs/os.md §4.1).
             "collections" | "records_query" | "records_get" | "records_put" | "records_delete" => {
                 let realm = crate::realms::of_session(st, &target).await?.unwrap_or_else(|| crate::realms::HOME.to_owned());

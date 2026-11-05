@@ -126,6 +126,46 @@ pub const DEFAULTS: &[Prompt] = &[
         default: text::WORK_ATTACH,
     },
     Prompt {
+        name: "watch.answer",
+        description: "How every watcher answers (docs/watchers.md §1), added after its agenda: findings, its notes, a reply.",
+        default: text::WATCH_ANSWER,
+    },
+    Prompt {
+        name: "watch.stuck",
+        description: "The stuck-detection watcher's agenda. Placeholders: {{title}}, {{labels}}, {{goal}}, {{reason}}, {{memory}}, {{digest}}.",
+        default: text::WATCH_STUCK,
+    },
+    Prompt {
+        name: "watch.retro",
+        description: "The continuous retrospective's agenda: lessons, directives, cards, changes. Placeholders: {{title}}, {{labels}}, {{goal}}, {{reason}}, {{memory}}, {{digest}}, {{notes}}.",
+        default: text::WATCH_RETRO,
+    },
+    Prompt {
+        name: "watch.retro-weekly",
+        description: "The weekly retrospective's agenda. Placeholders: {{findings}}, {{notes}}, {{memory}}.",
+        default: text::WATCH_RETRO_WEEKLY,
+    },
+    Prompt {
+        name: "watch.review",
+        description: "The review watcher's agenda. Placeholders: {{title}}, {{labels}}, {{goal}}, {{reason}}, {{memory}}, {{digest}}, {{diff}}, {{standards}}.",
+        default: text::WATCH_REVIEW,
+    },
+    Prompt {
+        name: "watch.consistency",
+        description: "The consistency watcher's agenda (the decisions ledger). Placeholders: {{title}}, {{labels}}, {{ledger}}, {{memory}}, {{digest}}.",
+        default: text::WATCH_CONSISTENCY,
+    },
+    Prompt {
+        name: "watch.guard",
+        description: "The guard's agenda: is this tool call risky? Placeholders: {{title}}, {{labels}}, {{tool}}, {{input}}, {{memory}}.",
+        default: text::WATCH_GUARD,
+    },
+    Prompt {
+        name: "watch.improve",
+        description: "The carbon6 improvement watcher's agenda. Placeholders: {{signals}}, {{memory}}.",
+        default: text::WATCH_IMPROVE,
+    },
+    Prompt {
         name: "work.summary",
         description: "A work item's \"where was I\" note, and when it looks done (docs/work.md §5). Placeholders: {{title}}, {{done_when}}, {{note}}, {{attached}}.",
         default: text::WORK_SUMMARY,

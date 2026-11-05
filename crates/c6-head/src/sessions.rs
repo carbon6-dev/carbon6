@@ -474,6 +474,20 @@ async fn with_builtin_policies(st: &HeadState, yours: String) -> String {
             }),
         );
     }
+    // The guard watcher: calls matching its pattern are judged before they
+    // run, and a risky one waits for you (docs/watchers.md §5.6).
+    if let Some(g) = crate::watchers::def(st, "guard").await.filter(|g| g.enabled && !g.pattern.is_empty()) {
+        list.insert(
+            0,
+            serde_json::json!({
+                "name": "Guard (watcher)",
+                "applies_to": g.applies_to,
+                "pattern": g.pattern,
+                "action": "judge",
+                "message": "The guard watcher judged this risky.",
+            }),
+        );
+    }
     serde_json::to_string(&list).unwrap_or(yours)
 }
 
@@ -1326,6 +1340,14 @@ pub async fn message_from_console(st: &HeadState, to_id: &str, text: &str, from_
     enqueue_message(st, &to, text, from_id, crate::assistant::FROM_CONSOLE, 1).await
 }
 
+/// A watcher's note to the session it follows (docs/watchers.md): as a
+/// message from the watcher's session, so the agent knows it isn't yours.
+pub async fn message_from_watcher(st: &HeadState, to_id: &str, text: &str, from_id: &str, from_title: &str) -> anyhow::Result<Value> {
+    let to = st.store.session(to_id).await?.ok_or_else(|| not_found("no such session"))?;
+    takes_messages(&to)?;
+    enqueue_message(st, &to, text, from_id, from_title, 1).await
+}
+
 /// A session another session's agent (or the console's) may message.
 pub fn takes_messages(to: &SessionRow) -> anyhow::Result<()> {
     if to.archived != 0 {
@@ -1928,6 +1950,7 @@ pub async fn ingest(st: &HeadState, worker_id: WorkerId, batch: SessionEventBatc
         st.attention.changed();
     }
     notify_events(st, &batch.session_id, &ing.events).await;
+    crate::watchers::on_events(st, &batch.session_id, &ing.events).await;
     crate::memex::on_events(st, &batch.session_id, &ing.events).await;
     crate::decisions::on_events(st, &batch.session_id, &ing.events).await;
     crate::naming::on_events(st, &batch.session_id, &ing.events).await;

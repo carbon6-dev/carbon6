@@ -84,6 +84,10 @@ const READ_OK: &[&str] = &["connections.list", "connections.quotas", "connection
 
 /// Yours alone, wherever they are.
 const NEVER: &[&str] = &[
+    // Watchers are yours to set and run (docs/watchers.md).
+    "watchers.put",
+    "watchers.reset",
+    "watchers.run",
     // Approvals and answers to your decisions.
     "sessions.approvals.decide",
     "workflows.steps.decide",

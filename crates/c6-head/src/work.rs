@@ -156,6 +156,11 @@ pub(crate) async fn next_step(st: &HeadState, id: &str) -> Option<String> {
 }
 
 /// The project a work item is in.
+/// A work item's title and "done when".
+pub async fn title_and_goal(st: &HeadState, id: &str) -> Option<(String, String)> {
+    load(st, id).await.ok().flatten().map(|r| (r.fields.title, r.fields.done_when))
+}
+
 pub async fn project_of(st: &HeadState, id: &str) -> Option<String> {
     load(st, id).await.ok().flatten().map(|r| r.fields.project).filter(|p| !p.is_empty())
 }

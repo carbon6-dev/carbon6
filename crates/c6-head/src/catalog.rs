@@ -90,7 +90,7 @@ pub fn scope(name: &str) -> Option<Scope> {
         "settings.vocabulary.get",
         "settings.vocabulary.put",
     ];
-    const ADMIN_AREAS: &[&str] = &["workers.", "connections.", "auth.", "system.", "installs.", "packages.", "grants."];
+    const ADMIN_AREAS: &[&str] = &["workers.", "connections.", "auth.", "system.", "installs.", "packages.", "grants.", "watchers."];
     const REALM_AREAS: &[&str] = &[
         "sessions.",
         "decisions.",
@@ -346,6 +346,10 @@ const AREAS: &[(&str, &str)] = &[
     ("views", "Views: a realm's configured screens (tables, boards, records, charts, feeds, pages) and their actions."),
     ("series", "Series: numbers over time in a realm (points with dimensions), summarized over windows; thresholds are triggers."),
     ("system", "carbon6 itself: realms, upgrades of its databases, and the backups made before each."),
+    (
+        "watchers",
+        "Watchers: standing agents with their own agenda that follow sessions (stuck detection, retrospectives, review, consistency, the guard, improving carbon6), what they found, and their sessions.",
+    ),
     (
         "decisions",
         "Decisions: every time carbon6 needs the user — agents' questions, approvals of tool calls and workflow steps, the assistant's questions, facts to confirm, disputes.",
@@ -724,6 +728,12 @@ fn build() -> Vec<Op> {
         op!("system.updates.skip", "system", "POST" "/api/v1/system/updates/{version}/skip", Write, Input::None, "Never updates to that release."),
         op!("system.updates.settings.get", "system", "GET" "/api/v1/settings/updates", Read, Input::None, "When carbon6 updates itself: off, notify, approve (a decision for each release) or auto (within a window, up to patch or minor)."),
         op!("system.updates.settings.put", "system", "PUT" "/api/v1/settings/updates", Write, Input::Body(schema::<api::UpdateSettings>), "Sets when carbon6 updates itself."),
+        op!("watchers.list", "watchers", "GET" "/api/v1/watchers", Read, Input::None, "The watchers (docs/watchers.md): each one's definition (agenda prompt, scope, what wakes it, what it may do, budget, on or off), whether carbon6 ships it and you changed it, and today's wakes, skips and tokens."),
+        op!("watchers.findings", "watchers", "GET" "/api/v1/watchers/findings", Read, Input::Query(schema::<api::watchers::FindingsQuery>), "What watchers found, newest first (watcher, session: the watched one), and what was done with each: sent to the agent, marked, applied, asked, carded."),
+        op!("watchers.put", "watchers", "PUT" "/api/v1/watchers/{name}", Write, Input::Body(schema::<api::watchers::WatcherDef>), "Saves a watcher's definition (a shipped one becomes yours, kept through updates): agenda, scope, applies_to, wakes, outputs, note_severity, notes_per_hour, to_you, daily_tokens, pattern, threshold, enabled.", choices = &[("name", "watchers.list")]),
+        op!("watchers.reset", "watchers", "DELETE" "/api/v1/watchers/{name}", Destructive, Input::None, "Takes back your version of a watcher: a shipped one returns to its default, one of your own is removed.", choices = &[("name", "watchers.list")]),
+        op!("watchers.run", "watchers", "POST" "/api/v1/watchers/{name}/run", Write, Input::Body(schema::<api::watchers::WatcherRun>), "Wakes a watcher now: for a session (session: its id) or its whole scope.", choices = &[("name", "watchers.list")]),
+        op!("sessions.watch", "sessions", "GET" "/api/v1/sessions/{id}/watch", Read, Input::None, "Who watches a session (watcher and its session) and what they found.", choices = &[("id", "sessions.list")]),
         op!("system.upgrades", "system", "GET" "/api/v1/system/upgrades", Read, Input::None, "Upgrades of carbon6's databases (the head's and the memex's), newest first: versions, what changed, and where the backup is."),
         op!("system.upgrades.backups.get", "system", "GET" "/api/v1/system/upgrades/backups", Read, Input::None, "How many copies of each database the upgrades keep (the copy made before each upgrade; older ones are removed)."),
         op!("system.upgrades.backups.put", "system", "PUT" "/api/v1/system/upgrades/backups", Write, Input::Body(schema::<api::UpgradeBackups>), "Sets how many copies of each database to keep (at least 1), and removes older ones now."),

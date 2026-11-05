@@ -73,6 +73,7 @@ pub mod ui_ca;
 pub mod updates;
 pub mod usage;
 pub mod views;
+pub mod watchers;
 mod webauthn;
 pub mod work;
 pub mod workflows;
@@ -198,6 +199,10 @@ pub struct HeadState {
     pub(crate) catchup: catchup::Cache,
     /// Backups to a folder and S3 (docs/backups.md).
     pub backups: backups::Engine,
+    /// Watchers' wakes under way, and which sessions are theirs.
+    pub(crate) watchers: watchers::Runtime,
+    /// HeadConfig's `watchers`: the shipped ones start as they ship.
+    pub(crate) watchers_as_shipped: bool,
     /// The config file it was started from (for backups).
     pub(crate) config_file: Option<std::path::PathBuf>,
     /// Itself, for what must outlive a borrow (set once it is made).
@@ -330,6 +335,8 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         messages_sent: Default::default(),
         catchup: Default::default(),
         backups: Default::default(),
+        watchers: Default::default(),
+        watchers_as_shipped: cfg.watchers.unwrap_or(false),
         config_file: cfg.config_file.clone(),
         me: Default::default(),
     });
@@ -385,6 +392,8 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     // Close abandoned assistant waits before rebuilding their decisions,
     // otherwise reconciliation could reopen a card recovery just settled.
     assistant::start(state.clone(), api::router(state.clone())).await?;
+    // Watchers take up where they were (docs/watchers.md).
+    watchers::spawn(state.clone());
     {
         let st = state.clone();
         tokio::spawn(async move {

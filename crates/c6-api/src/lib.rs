@@ -8,6 +8,7 @@ pub mod projects;
 pub mod prompts;
 pub mod slides;
 pub mod starts;
+pub mod watchers;
 pub mod work;
 use serde::{Deserialize, Serialize};
 pub use uuid::Uuid;
@@ -3398,6 +3399,11 @@ pub struct Memory {
     /// The session that wrote it, if an agent did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// A standard (docs/watchers.md §7): what checks it, a watcher (by name,
+    /// usually `review`) or a mechanical check (`check:<what>`); empty: a
+    /// plain note.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub enforced_by: String,
     #[serde(default)]
     pub updated_at: UnixMs,
 }

@@ -40,6 +40,9 @@ struct Rule {
     tools: String,
     pattern: Option<Regex>,
     deny: bool,
+    /// The guard watcher judges a matching call first (docs/watchers.md
+    /// §5.6): only a risky one waits for you.
+    judge: bool,
     message: String,
 }
 
@@ -56,6 +59,8 @@ pub struct ApprovalEvent {
 
 pub struct Policies {
     rules: Vec<Rule>,
+    /// Where `judge` rules ask (the session's way to the head).
+    head: Mutex<Option<Arc<dyn c6_tools::HeadCaller>>>,
     pending: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     log: mpsc::UnboundedSender<ApprovalEvent>,
 }
@@ -73,10 +78,16 @@ impl Policies {
                 tools: d.tools.trim().to_owned(),
                 pattern: Some(d.pattern.trim()).filter(|p| !p.is_empty()).and_then(|p| Regex::new(p).ok()),
                 deny: d.action == "deny",
+                judge: d.action == "judge",
                 message: d.message,
             })
             .collect();
-        (!rules.is_empty()).then(|| Arc::new(Self { rules, pending: Mutex::default(), log }))
+        (!rules.is_empty()).then(|| Arc::new(Self { rules, head: Mutex::default(), pending: Mutex::default(), log }))
+    }
+
+    /// Where `judge` rules ask whether a call is risky.
+    pub fn set_judge(&self, head: Option<Arc<dyn c6_tools::HeadCaller>>) {
+        *self.head.lock().unwrap() = head;
     }
 
     /// Your answer for a waiting call; false if nothing waits for it.
@@ -110,6 +121,20 @@ impl Policies {
         if only_lists(names, input) {
             return None;
         }
+        let mut message = rule.message.clone();
+        if rule.judge {
+            let head = self.head.lock().unwrap().clone();
+            let verdict = match head {
+                Some(h) => h.call("session.guard", serde_json::json!({"tool": tool, "input": input.to_string()})).await,
+                None => Err("no way to the head".into()),
+            };
+            match verdict {
+                Ok(v) if v["risky"] == false => return None,
+                Ok(v) => message = v["why"].as_str().filter(|w| !w.is_empty()).unwrap_or(&rule.message).to_owned(),
+                // Unjudged: it asks you, as an ask rule would.
+                Err(e) => message = format!("The guard couldn't judge it ({e}), so it asks you."),
+            }
+        }
         let mut shown = input.to_string();
         if shown.len() > 4000 {
             let mut cut = 4000;
@@ -125,7 +150,7 @@ impl Policies {
             tool: tool.to_owned(),
             input: shown,
             policy: rule.name.clone(),
-            message: rule.message.clone(),
+            message,
         };
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(call_id.to_owned(), tx);

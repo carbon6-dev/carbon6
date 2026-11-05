@@ -83,6 +83,7 @@ const GROUPS: &[(&str, &[Page])] = &[
             ("imports", "Imports", "Sessions from Claude Code and Codex"),
             ("backups", "Backups", "Encrypted copies to a folder and S3, kept current"),
             ("upgrades", "Upgrades", "carbon6's databases, their upgrades and backups"),
+            ("watchers", "Watchers", "Standing agents that follow sessions: retrospectives, review, stuck detection, the guard"),
         ],
     ),
 ];
@@ -93,8 +94,10 @@ fn page(id: &str) -> Option<(&'static str, &'static str, &'static str)> {
 
 /// Settings pages of the console (carbon6's administration, and the
 /// defaults every realm inherits); the rest are each realm's own.
-const CONSOLE_PAGES: &[&str] =
-    &["models", "routing", "spending", "account", "updates", "system", "apps", "grants", "imports", "backups", "upgrades", "memex"];
+const CONSOLE_PAGES: &[&str] = &[
+    "models", "routing", "spending", "account", "updates", "system", "apps", "grants", "imports", "backups", "upgrades", "memex",
+    "watchers",
+];
 
 pub fn in_console(id: &str) -> bool {
     CONSOLE_PAGES.contains(&id)
@@ -426,6 +429,9 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                     }.into_any(),
                     "upgrades" => view! {
                         <Upgrades />
+                    }.into_any(),
+                    "watchers" => view! {
+                        <crate::watchers::WatchersSettings />
                     }.into_any(),
                     _ => view! {
                         <Connections signed_in=note.get_value().as_deref() == Some("chatgpt") />

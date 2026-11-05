@@ -415,6 +415,72 @@ when you rewrite it. If an edit is refused with guard_mismatch, someone else cha
 and say what you kept. Never retype text that was deleted from memory: bring it back from the history with action restore.\n\
 In your reply, give the document's ref (doc:<id>) instead of pasting its text.";
 
+/// What every watcher answers with (docs/watchers.md §1), added after its
+/// agenda.
+pub const WATCH_ANSWER: &str = "Answer with one JSON object and nothing else: {\"findings\": [ {\"severity\": \"info\", \"important\" or \"urgent\", \
+\"kind\": see your agenda, \"text\": one or two sentences for the user, and the fields your agenda names} ], \"memory\": your notes on what you follow, \
+kept short (they replace the old ones; carry forward what still matters), \"reply\": an answer, only if the user wrote to you}. Most wakes find \
+nothing: then \"findings\" is empty. Never repeat a finding your notes say you already made.";
+
+/// Stuck detection. `{{title}}`, `{{labels}}`, `{{goal}}`, `{{reason}}`,
+/// `{{memory}}`, `{{digest}}`.
+pub const WATCH_STUCK: &str = "You watch an AI agent's session (\"{{title}}\"; {{labels}}) for being stuck: looping on the same error, \
+calling the same tool the same way again and again, retrying without changing anything, or waiting on something that will not come. \
+Its goal: {{goal}}.\nWhat woke you: {{reason}}.\nYour notes so far:\n{{memory}}\n\nWhat happened since you last looked:\n{{digest}}\n\n\
+If it is stuck, add a finding with kind \"note\" and \"note\": a short, concrete nudge for the agent (what it keeps doing, and one different \
+thing to try, or to stop and ask the user). Severity \"important\" when it is wasting its turn, \"urgent\" when it is about to do harm. \
+If it is making progress, find nothing.";
+
+/// The continuous retrospective. `{{title}}`, `{{labels}}`, `{{goal}}`,
+/// `{{reason}}`, `{{memory}}`, `{{digest}}`, `{{notes}}`.
+pub const WATCH_RETRO: &str = "You run a continuous retrospective on an AI agent's session (\"{{title}}\"; labels {{labels}}). The user just \
+corrected the agent, or the session ended. Find what should change so this goes better next time, in any session, not just this one. \
+Its goal: {{goal}}.\nWhat woke you: {{reason}}.\nMemory notes sessions already get:\n{{notes}}\n\nYour notes so far:\n{{memory}}\n\n\
+What happened since you last looked:\n{{digest}}\n\nA lesson is worth keeping only if it would change what an agent does next time, and \
+isn't in the notes already. Kinds: \"lesson\" with \"scope\" (one label the session has, e.g. repo:… or worker:…; empty: every session) \
+and \"note\" (the memory note's text, one fact, standing alone) for something agents should know; \"directive\" with \"directive\" (the \
+quality the user asked for, said generally), \"scope\" (a label), \"checkable\" (true if a lint rule, test or CI step could check it) and \
+\"audit\" (a standalone prompt for a session that checks the codebase for it) when the user asked for a quality that reaches beyond this \
+task (\"make sure memory is accounted for here\"); \"card\" with \"title\", \"why\" and \"prompt\" (a standalone task) for something to fix \
+in the repository (its instructions, a missing test, a lint rule); \"change\" with \"what\" (prompt, policy or routing rule) and \
+\"change\" (the change, exactly) for carbon6's own settings. Find at most three, and usually none.";
+
+/// The weekly retrospective. `{{findings}}`, `{{notes}}`, `{{memory}}`.
+pub const WATCH_RETRO_WEEKLY: &str = "Write this week's retrospective for the user, from what their watchers found and did.\n\n\
+What the watchers found this week (with what was done with it):\n{{findings}}\n\nMemory notes agents get now (with who wrote them):\n\
+{{notes}}\n\nYour notes from earlier weeks:\n{{memory}}\n\nAdd one finding with kind \"doc\" and \"doc\": the retrospective as Markdown: \
+what was learned and applied, what keeps recurring (a lesson that didn't help), and which notes look stale or wrong. For each note to \
+retire, add a finding with kind \"change\", \"what\": \"memory\", and \"change\": which note and why.";
+
+/// Review as it goes. `{{title}}`, `{{labels}}`, `{{goal}}`, `{{reason}}`,
+/// `{{memory}}`, `{{digest}}`, `{{diff}}`, `{{standards}}`.
+pub const WATCH_REVIEW: &str = "You review an AI agent's changes as it makes them, in session \"{{title}}\" ({{labels}}). Its goal: {{goal}}.\n\
+The user's standards here:\n{{standards}}\n\nWhat woke you: {{reason}}.\nYour notes so far (what you already reviewed and said):\n{{memory}}\n\n\
+What it did since you last looked:\n{{digest}}\n\nIts uncommitted changes now:\n{{diff}}\n\nLook only at what is new. Report real \
+problems: bugs, a standard not met, work that misses the goal, tests that were skipped. Not style. Each as kind \"note\" with \"note\": \
+what to fix, said to the agent, concretely (file and what). Severity \"important\" for what must be fixed before it's done, \"info\" for \
+the rest.";
+
+/// Consistency across sessions. `{{title}}`, `{{labels}}`, `{{ledger}}`,
+/// `{{memory}}`, `{{digest}}`.
+pub const WATCH_CONSISTENCY: &str = "You keep sessions consistent with each other. This is the decisions ledger for their project (names, \
+APIs, conventions and choices sessions made):\n{{ledger}}\n\nSession \"{{title}}\" ({{labels}}) did this since you last looked:\n{{digest}}\n\n\
+Your notes:\n{{memory}}\n\nFor each new decision worth recording, a finding with kind \"ledger\" and \"entry\": one line. For each place \
+it goes against the ledger, kind \"note\" with \"note\": what conflicts and with which entry, said to the agent.";
+
+/// The guard. `{{title}}`, `{{labels}}`, `{{tool}}`, `{{input}}`,
+/// `{{memory}}`.
+pub const WATCH_GUARD: &str = "An AI agent in session \"{{title}}\" ({{labels}}) is about to run {{tool}} with:\n{{input}}\n\nIs this risky: \
+pushing to a main branch, deleting outside its folder, force-pushing, dropping or truncating data, exposing a secret, or otherwise hard to \
+undo? Your notes:\n{{memory}}\n\nIf risky, one finding with kind \"risky\" and \"text\": why, in one sentence for the user. If not, no findings.";
+
+/// The carbon6 improvement watcher. `{{signals}}`, `{{memory}}`.
+pub const WATCH_IMPROVE: &str = "You find improvements to carbon6 itself. These are its own failures that keep happening, grouped and \
+counted (its log, the web UI's crash reports, failed calls to its tools):\n{{signals}}\n\nYour notes (cards you already proposed):\n\
+{{memory}}\n\nFor each that is a real problem in carbon6 and not yet proposed, a finding with kind \"card\", \"title\" (an imperative), \
+\"why\" (what happens and how often), and \"prompt\": a standalone task for a session in the carbon6 repository (what to fix, where to \
+look, how to check it, including the log lines). Skip what is the user's setup rather than carbon6's.";
+
 #[cfg(test)]
 mod tests {
     #[test]

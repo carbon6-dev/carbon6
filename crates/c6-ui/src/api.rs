@@ -793,6 +793,39 @@ pub async fn test_backups() -> Result<c6_api::BackupStatus, String> {
     json(Request::post("/api/v1/system/backups/test").send().await).await
 }
 
+// --- Watchers (docs/watchers.md) ---
+
+pub async fn watchers() -> Result<Vec<c6_api::watchers::Watcher>, String> {
+    json(Request::get("/api/v1/watchers").send().await).await
+}
+
+pub async fn put_watcher(d: c6_api::watchers::WatcherDef) -> Result<c6_api::watchers::WatcherDef, String> {
+    json(Request::put(&format!("/api/v1/watchers/{}", enc(&d.name))).json(&d).map_err(|e| e.to_string())?.send().await).await
+}
+
+pub async fn reset_watcher(name: String) -> Result<(), String> {
+    empty(Request::delete(&format!("/api/v1/watchers/{}", enc(&name))).send().await).await
+}
+
+pub async fn run_watcher(name: String) -> Result<(), String> {
+    empty(
+        Request::post(&format!("/api/v1/watchers/{}/run", enc(&name)))
+            .json(&serde_json::json!({}))
+            .map_err(|e| e.to_string())?
+            .send()
+            .await,
+    )
+    .await
+}
+
+pub async fn watcher_findings() -> Result<Vec<c6_api::watchers::Finding>, String> {
+    json(Request::get("/api/v1/watchers/findings?limit=50").send().await).await
+}
+
+pub async fn session_watch(id: String) -> Result<c6_api::watchers::SessionWatch, String> {
+    json(Request::get(&format!("/api/v1/sessions/{id}/watch")).send().await).await
+}
+
 pub async fn upgrade_backups() -> Result<c6_api::UpgradeBackups, String> {
     json(Request::get("/api/v1/system/upgrades/backups").send().await).await
 }

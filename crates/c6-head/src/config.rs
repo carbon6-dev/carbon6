@@ -48,6 +48,11 @@ pub struct HeadConfig {
     /// machine, to move its knowledge in (docs/knowledge.md §8). Loading a
     /// config file fills in c6m's usual folders; none: don't look.
     pub memex_dirs: Option<Vec<PathBuf>>,
+    /// Whether the watchers carbon6 ships start as they ship (some on;
+    /// docs/watchers.md §9). Loading a config file makes it true unless it
+    /// says otherwise; none (a head built in code, such as a test's): they
+    /// start off. The ones you saved are as you saved them either way.
+    pub watchers: Option<bool>,
     /// Where releases are looked for: the repository on GitHub, whose
     /// release files are downloaded (not its API; docs/updates.md).
     pub update_source: String,
@@ -88,6 +93,7 @@ impl Default for HeadConfig {
             claude_bin: None,
             config_file: None,
             memex_dirs: None,
+            watchers: None,
             update_source: "https://github.com/carbon6-dev/carbon6".into(),
             update_keys: Vec::new(),
             update_exe: None,
@@ -115,6 +121,8 @@ impl HeadConfig {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
+        // A head run from its config runs the shipped watchers as they ship.
+        cfg.watchers.get_or_insert(true);
         // A head run from its config looks where c6m kept its state.
         if cfg.memex_dirs.is_none() {
             let mut dirs = Vec::new();

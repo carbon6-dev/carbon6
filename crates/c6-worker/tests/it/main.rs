@@ -74,6 +74,7 @@ mod updates;
 mod upgrade_backups;
 mod usage;
 mod views;
+mod watchers;
 mod websearch;
 mod work;
 mod work_claude_code;

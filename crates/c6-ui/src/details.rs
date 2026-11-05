@@ -204,6 +204,14 @@ pub fn Glance(chrome: SessionChrome, #[prop(optional, into)] on_done: Option<Cal
         Some(line("Labels", body, Some(Callback::new(move |ev: web_sys::MouseEvent| labels_at.set(Some(below(&ev, 384.0)))))))
     };
 
+    // Its watchers (docs/watchers.md §3): who follows it, each opening its
+    // session, looked at again when the session's state changes.
+    let moved = Signal::derive(move || session.get().map(|s| format!("{:?}", s.status)).unwrap_or_default());
+    let watchers = move || {
+        let _ = session.get()?;
+        Some(line("Watchers", view! { <crate::watchers::SessionWatchers session_id=id.get_value() moved /> }, None))
+    };
+
     let context_at = RwSignal::new(None::<(f64, f64)>);
     let context = move || {
         usage.with(|u| {
@@ -269,6 +277,7 @@ pub fn Glance(chrome: SessionChrome, #[prop(optional, into)] on_done: Option<Cal
             {changes}
             {work}
             {labels}
+            {watchers}
             {context}
             <Show when=move || published.get()>
                 <div class=HEADING>"Newest outputs"</div>

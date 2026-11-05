@@ -207,6 +207,11 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/catalog", get(get_catalog))
         .route("/api/v1/openapi.json", get(get_openapi))
         .route("/api/v1/system/upgrades", get(get_upgrades))
+        .route("/api/v1/watchers", get(list_watchers))
+        .route("/api/v1/watchers/findings", get(watcher_findings))
+        .route("/api/v1/watchers/{name}", put(put_watcher).delete(reset_watcher))
+        .route("/api/v1/watchers/{name}/run", post(run_watcher))
+        .route("/api/v1/sessions/{id}/watch", get(session_watch))
         .route("/api/v1/system/upgrades/backups", get(get_upgrade_backups).put(put_upgrade_backups))
         .route("/api/v1/system/backups", get(get_backups))
         .route("/api/v1/system/backups/settings", get(get_backup_settings).put(put_backup_settings))
@@ -841,6 +846,8 @@ pub async fn sessions_snapshot(st: &HeadState, caller: &Caller) -> anyhow::Resul
         .sessions(caller.realm.as_deref(), SESSION_LIST_LIMIT)
         .await?
         .iter()
+        // A watcher's own session shows on the Watchers page, not here.
+        .filter(|r| !crate::watchers::is_watcher(r))
         .map(|r| {
             // Subagents and side chats serve their tree's work.
             let tag = work.get(&r.id).or_else(|| r.root_id.as_ref().and_then(|root| work.get(root)));
@@ -851,10 +858,52 @@ pub async fn sessions_snapshot(st: &HeadState, caller: &Caller) -> anyhow::Resul
 
 /// The web UI broke (a panic, or an error that leaves it unable to answer):
 /// what it said, for the head's log, since nobody reads a browser's console.
-async fn ui_error(Json(e): Json<serde_json::Value>) -> StatusCode {
+async fn ui_error(State(st): State<Arc<HeadState>>, Json(e): Json<serde_json::Value>) -> StatusCode {
     let text = |k: &str| e[k].as_str().unwrap_or("").chars().take(2000).collect::<String>();
     tracing::warn!(page = %text("page"), message = %text("message"), stack = %text("stack"), "the web UI broke");
+    crate::watchers::signal(&st, "ui", &format!("{} ({})", text("message"), text("page"))).await;
     StatusCode::NO_CONTENT
+}
+
+// --- Watchers (docs/watchers.md) ---
+
+async fn list_watchers(State(st): State<Arc<HeadState>>) -> ApiResult<Json<Vec<api::watchers::Watcher>>> {
+    Ok(Json(crate::watchers::list(&st).await?))
+}
+
+async fn put_watcher(
+    State(st): State<Arc<HeadState>>,
+    Path(name): Path<String>,
+    Json(mut d): Json<api::watchers::WatcherDef>,
+) -> ApiResult<Json<api::watchers::WatcherDef>> {
+    d.name = name;
+    Ok(Json(crate::watchers::save(&st, d).await?))
+}
+
+async fn reset_watcher(State(st): State<Arc<HeadState>>, Path(name): Path<String>) -> ApiResult<StatusCode> {
+    crate::watchers::reset(&st, &name).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn run_watcher(
+    State(st): State<Arc<HeadState>>,
+    Path(name): Path<String>,
+    Json(r): Json<api::watchers::WatcherRun>,
+) -> ApiResult<StatusCode> {
+    crate::watchers::run_now(&st, &name, r.session.as_deref()).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn watcher_findings(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Query(q): Query<api::watchers::FindingsQuery>,
+) -> ApiResult<Json<Vec<api::watchers::Finding>>> {
+    Ok(Json(crate::watchers::findings(&st, &q, caller.realm.as_deref()).await?))
+}
+
+async fn session_watch(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Json<api::watchers::SessionWatch>> {
+    Ok(Json(crate::watchers::of_session(&st, &id).await?))
 }
 
 async fn list_sessions(State(st): State<Arc<HeadState>>, Extension(caller): Extension<Caller>) -> ApiResult<Json<Vec<api::Session>>> {
@@ -1231,6 +1280,7 @@ async fn update_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>
         found &= st.store.set_archived(&id, a).await?;
         if a && found {
             crate::starts::session_archived(&st, &id).await;
+            crate::watchers::session_ended(&st, &id).await;
         }
     }
     if !found {

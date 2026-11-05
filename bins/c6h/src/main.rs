@@ -97,7 +97,16 @@ enum Command {
 async fn main() -> anyhow::Result<()> {
     // The exact version this build is (docs/updates.md).
     c6_core::set_build(option_env!("C6_BUILD_VERSION"));
-    tracing_subscriber::fmt().with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())).init();
+    {
+        use tracing_subscriber::prelude::*;
+        // The head's warnings and errors also go to the improvement
+        // watcher (docs/watchers.md §6).
+        tracing_subscriber::registry()
+            .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+            .with(tracing_subscriber::fmt::layer())
+            .with(c6_head::watchers::SignalLayer)
+            .init();
+    }
     let cli = Cli::parse();
     let path = cli.config.unwrap_or_else(c6_head::config::default_config_path);
     let cfg = HeadConfig::load(&path)?;

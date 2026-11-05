@@ -24,6 +24,7 @@ fn row(r: &sqlx::sqlite::SqliteRow) -> api::Memory {
         scope: fields["scope"].as_str().unwrap_or("").to_owned(),
         text: fields["text"].as_str().unwrap_or("").to_owned(),
         session_id: fields["session_id"].as_str().map(str::to_owned),
+        enforced_by: fields["enforced_by"].as_str().unwrap_or("").to_owned(),
         updated_at: r.get("updated_at"),
     }
 }
@@ -71,6 +72,7 @@ pub async fn for_sessions_of(st: &HeadState, realm: &str, instance: &str) -> any
                 scope: m["scope"].as_str().unwrap_or("").to_owned(),
                 text: m["text"].as_str().unwrap_or("").to_owned(),
                 session_id: None,
+                enforced_by: m["enforced_by"].as_str().unwrap_or("").to_owned(),
                 updated_at: 0,
             });
         }
@@ -90,15 +92,22 @@ fn check(m: &api::Memory) -> anyhow::Result<()> {
 
 /// Adds or replaces a note (by id). A new note goes in `realm`; an edited
 /// one stays where it is.
-pub async fn put(st: &HeadState, mut m: api::Memory, realm: &str) -> anyhow::Result<api::Memory> {
+pub async fn put(st: &HeadState, m: api::Memory, realm: &str) -> anyhow::Result<api::Memory> {
+    put_as(st, m, realm, &crate::agent_ops::by("you")).await
+}
+
+/// `put`, written by `by` (a watcher applying a lesson: `watcher:<name>`).
+pub async fn put_as(st: &HeadState, mut m: api::Memory, realm: &str, by: &str) -> anyhow::Result<api::Memory> {
     m.text = m.text.trim().to_owned();
+    m.enforced_by = m.enforced_by.trim().to_owned();
     m.scope = m.scope.trim().to_owned();
     check(&m)?;
     if m.id.is_empty() {
         m.id = uuid::Uuid::now_v7().simple().to_string()[20..].to_owned();
     }
     let mut tx = st.store.pool.begin_with("BEGIN IMMEDIATE").await?;
-    upsert(&mut tx, &m.id, &m.scope, &m.text, None, realm, &crate::agent_ops::by("you")).await?;
+    // An edit that doesn't say keeps what enforces it.
+    upsert(&mut tx, &m.id, &m.scope, &m.text, None, Some(m.enforced_by.as_str()).filter(|e| !e.is_empty()), realm, by).await?;
     tx.commit().await?;
     let realm = realm_of(st, &m.id).await?.unwrap_or_else(|| realm.to_owned());
     if crate::memex::has_memex(&realm) {
@@ -128,6 +137,7 @@ pub async fn delete(st: &HeadState, id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 /// Creates the note, or changes its scope and text (keeping who wrote it
 /// first, and its realm); either way a version in its history.
 async fn upsert(
@@ -136,6 +146,7 @@ async fn upsert(
     scope: &str,
     text: &str,
     session: Option<&str>,
+    enforced_by: Option<&str>,
     realm: &str,
     by: &str,
 ) -> anyhow::Result<()> {
@@ -149,7 +160,11 @@ async fn upsert(
         Some((old, version)) => {
             let old: Value = serde_json::from_str(&old).unwrap_or(Value::Null);
             let session = session.map(str::to_owned).or_else(|| old["session_id"].as_str().map(str::to_owned));
-            let fields = json!({"scope": scope, "text": text, "session_id": session});
+            let enforced = enforced_by.map(str::to_owned).unwrap_or_else(|| old["enforced_by"].as_str().unwrap_or("").to_owned());
+            let mut fields = json!({"scope": scope, "text": text, "session_id": session});
+            if !enforced.is_empty() {
+                fields["enforced_by"] = json!(enforced);
+            }
             sqlx::query("UPDATE records SET fields = ?, version = ?, updated_by = ?, updated_at = ? WHERE id = ?")
                 .bind(fields.to_string())
                 .bind(version + 1)
@@ -161,7 +176,10 @@ async fn upsert(
             (fields, version + 1)
         }
         None => {
-            let fields = json!({"scope": scope, "text": text, "session_id": session});
+            let mut fields = json!({"scope": scope, "text": text, "session_id": session});
+            if let Some(e) = enforced_by.filter(|e| !e.is_empty()) {
+                fields["enforced_by"] = json!(e);
+            }
             sqlx::query(
                 "INSERT INTO records (id, realm, collection, fields, version, created_by, updated_by, created_at, updated_at) \
                  VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)",
@@ -229,9 +247,24 @@ pub async fn apply(tx: &mut sqlx::SqliteConnection, session_id: &str, u: &c6_pro
                 .fetch_optional(&mut *tx)
                 .await?
                 .unwrap_or_else(|| crate::realms::HOME.to_owned());
-            upsert(tx, &u.id, u.scope.trim(), &text, Some(session_id), &realm, &by).await
+            upsert(tx, &u.id, u.scope.trim(), &text, Some(session_id), None, &realm, &by).await
         }
         "forget" => remove(tx, &u.id, &by).await,
         _ => Ok(()),
     }
+}
+
+/// The standards a watcher enforces for a session (docs/watchers.md §7):
+/// notes of its realm whose `enforced_by` names the watcher and whose scope
+/// is one of the session's labels (or none).
+pub async fn enforced_by(st: &HeadState, realm: &str, watcher: &str, labels: &[String]) -> anyhow::Result<Vec<api::Memory>> {
+    let rows = sqlx::query(
+        "SELECT * FROM records WHERE collection = ? AND realm = ? AND json_extract(fields, '$.enforced_by') = ? ORDER BY updated_at DESC",
+    )
+    .bind(MEMORY)
+    .bind(realm)
+    .bind(watcher)
+    .fetch_all(&st.store.pool)
+    .await?;
+    Ok(rows.iter().map(row).filter(|m| m.scope.is_empty() || api::labels::label_matches(&m.scope, labels)).collect())
 }
