@@ -311,6 +311,15 @@ pub fn square_arrow_out() -> impl IntoView {
     })
 }
 
+/// Lucide `locate-fixed`: show an anchor in its document.
+pub fn locate_fixed() -> impl IntoView {
+    icon(view! {
+        <path d="M2 12h3m14 0h3M12 2v3m0 14v3" />
+        <circle cx="12" cy="12" r="7" />
+        <circle cx="12" cy="12" r="3" />
+    })
+}
+
 /// Lucide `minus`: minimize.
 pub fn minus() -> impl IntoView {
     icon(view! { <path d="M5 12h14" /> })
@@ -430,6 +439,7 @@ pub(crate) mod tests {
             arrow_up_right().into_any(),
             arrow_down_right().into_any(),
             corner_down_right().into_any(),
+            locate_fixed().into_any(),
             undo().into_any(),
         ] {
             let html = mark.to_html();

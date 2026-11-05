@@ -760,7 +760,6 @@ struct ThreadsCtx {
     pop: RwSignal<Option<String>>,
     pop_at: RwSignal<(f64, f64)>,
     tabs: Memo<Vec<DocTab>>,
-    deck: Memo<bool>,
     /// The page: what the popover hangs in, and blocks are found in.
     root: NodeRef<leptos::html::Div>,
     /// Scrolls to blocks and flashes them (on their tab).
@@ -839,6 +838,19 @@ fn flash_blocks(root: NodeRef<leptos::html::Div>, ids: &[String]) {
         let _ = el.dyn_ref::<web_sys::HtmlElement>().map(web_sys::HtmlElement::offset_width);
         let _ = classes.add_1("c6-flash");
     }
+}
+
+/// Blocks as drawn (a slide for its children), on the first matching tab.
+fn reveal_targets(tabs: &[DocTab], ids: &[String]) -> Option<(String, Vec<String>)> {
+    tabs.iter().find_map(|t| {
+        let blocks: Vec<String> = t
+            .blocks
+            .iter()
+            .filter(|b| ids.iter().any(|i| *i == b.id || b.children.iter().any(|c| c.id == *i)))
+            .map(|b| b.id.clone())
+            .collect();
+        (!blocks.is_empty()).then(|| (t.id.clone(), blocks))
+    })
 }
 
 /// Closes a popover (`close`) on a press outside it (`node`), but not on
@@ -974,24 +986,14 @@ pub fn DocPage(id: String) -> impl IntoView {
     let pop = RwSignal::new(None::<String>);
     let shown_threads = RwSignal::new(Vec::<DocThread>::new());
     let reveal = Callback::new(move |ids: Vec<String>| {
-        // Each as the block drawn for it (a slide, for a block on one), on
-        // the tab of the first.
-        let mut on = None::<String>;
-        let mut els = Vec::new();
-        tabs.with_untracked(|ts| {
-            for t in ts {
-                for b in &t.blocks {
-                    if ids.iter().any(|i| *i == b.id || b.children.iter().any(|c| c.id == *i))
-                        && *on.get_or_insert_with(|| t.id.clone()) == t.id
-                    {
-                        els.push(b.id.clone());
-                    }
-                }
-            }
-        });
-        let Some(on) = on else { return };
+        let Some((on, mut els)) = tabs.with_untracked(|ts| reveal_targets(ts, &ids)) else { return };
         if on != current.get_untracked() {
             tab.set(on);
+        }
+        if is_deck.get_untracked() {
+            // Only one slide is drawn at a time. Select it before flashing.
+            els.truncate(1);
+            deck_pick.set(els.first().cloned());
         }
         // A sheet covers the doc.
         if fit.get_untracked() == Fit::Sheet {
@@ -1023,7 +1025,6 @@ pub fn DocPage(id: String) -> impl IntoView {
         pop,
         pop_at: RwSignal::new((0.0, 0.0)),
         tabs,
-        deck: is_deck,
         root,
         reveal,
         unsent,
@@ -2062,7 +2063,12 @@ fn first_line(md: &str, attrs: &Value) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ").replace("· ·", "·")
 }
 
-/// A thread's quote box: what it's about, and ↗ to go to it in the doc.
+/// A thread's anchor, or none when its block or quoted words are gone.
+fn comment_target(t: &DocThread, here: bool) -> Option<String> {
+    (here && !t.detached && !t.anchor.block.is_empty()).then(|| t.anchor.block.clone())
+}
+
+/// A thread's quote box: what it's about, and locate it in the doc.
 #[component]
 fn About(t: Memo<DocThread>) -> impl IntoView {
     let ctx = expect_context::<ThreadsCtx>();
@@ -2070,23 +2076,39 @@ fn About(t: Memo<DocThread>) -> impl IntoView {
         let (block, about) = t.with(|t| (t.anchor.block.clone(), t.about.clone()));
         ctx.tabs.with(|ts| subject(ts, &block, &about, &ctx.doc.get_value()))
     });
+    let target = Memo::new(move |_| t.with(|t| comment_target(t, what.with(|w| w.here))));
+    let gone = RwSignal::new(false);
+    let show = Callback::new(move |()| {
+        if let Some(block) = target.get_untracked() {
+            gone.set(false);
+            ctx.reveal.run(vec![block]);
+        } else {
+            gone.set(true);
+        }
+    });
     view! {
+        <>
         <div class="flex items-start gap-2 border-l-2 border-zinc-300 pl-2 dark:border-zinc-600">
             {move || what.with(|w| w.thumb.clone()).map(|src| view! {
                 <img src=src alt="" class="h-8 w-8 shrink-0 rounded border border-zinc-200 bg-white object-contain dark:border-zinc-700" />
             })}
-            <div class="min-w-0 flex-1">
-                <p class="line-clamp-2 break-words">{move || what.with(|w| w.file).then(crate::icons::paperclip)}" "{move || what.with(|w| w.text.clone())}</p>
+            <button type="button" class="min-w-0 flex-1 cursor-pointer select-text rounded text-left hover:bg-zinc-100 disabled:cursor-default dark:hover:bg-zinc-800"
+                title="Show it in the doc" aria-label="Show it in the doc"
+                disabled=move || t.with(|t| t.anchor.block.is_empty()) on:click=move |_| show.run(())>
+                <span class="line-clamp-2 break-words">{move || what.with(|w| w.file).then(crate::icons::paperclip)}" "{move || what.with(|w| w.text.clone())}</span>
                 {move || t.with(|t| t.anchor.quote.clone()).chars().next().is_some().then(|| view! {
-                    <p class="truncate text-xs text-muted">{move || format!("“{}”", t.with(|t| t.anchor.quote.clone()))}</p>
+                    <span class="block truncate text-xs text-muted">{move || format!("“{}”", t.with(|t| t.anchor.quote.clone()))}</span>
                 })}
-            </div>
-            {move || (what.with(|w| w.here) && !ctx.deck.get()).then(|| view! {
-                <button class="shrink-0 rounded px-1 text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+            </button>
+            {move || t.with(|t| !t.anchor.block.is_empty()).then(|| view! {
+                <button type="button" class="shrink-0 rounded px-1 text-muted enabled:hover:bg-zinc-100 enabled:hover:text-zinc-900 disabled:opacity-40 dark:enabled:hover:bg-zinc-800 dark:enabled:hover:text-zinc-100"
                     title="Show it in the doc" aria-label="Show it in the doc"
-                    on:click=move |_| ctx.reveal.run(vec![t.with_untracked(|t| t.anchor.block.clone())])>{crate::icons::square_arrow_out()}</button>
+                    disabled=move || target.with(Option::is_none)
+                    on:click=move |_| show.run(())>{crate::icons::locate_fixed()}</button>
             })}
         </div>
+        {move || gone.get().then(|| view! { <p class="mt-1 text-xs text-muted" role="status">"That part of the doc is gone"</p> })}
+        </>
     }
 }
 
@@ -2903,6 +2925,87 @@ mod tests {
             assert!(html.contains("<strong>Work the target back.</strong>") && !html.contains("**"), "{html}");
             assert!(html.contains("<ol>") || html.contains("<ol "), "{html}");
         });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn comment_quotes_are_labelled_buttons_and_gone_anchors_keep_an_inactive_icon() {
+        use super::*;
+        let owner = Owner::new();
+        owner.with(|| {
+            let tabs = RwSignal::new(vec![DocTab {
+                blocks: vec![DocBlock { id: "block.1".into(), text: "The release plan".into(), ..Default::default() }],
+                ..Default::default()
+            }]);
+            let thread = RwSignal::new(DocThread {
+                anchor: c6_api::docs::Anchor { block: "block.1".into(), quote: "release plan".into(), ..Default::default() },
+                about: "The release plan".into(),
+                ..Default::default()
+            });
+            provide_context(ThreadsCtx {
+                doc: StoredValue::new("doc.1".into()),
+                shown: RwSignal::new(vec![]),
+                tick: RwSignal::new(0),
+                focus: RwSignal::new(None),
+                commenting: RwSignal::new(None),
+                panel: RwSignal::new(false),
+                pop: RwSignal::new(None),
+                pop_at: RwSignal::new((0.0, 0.0)),
+                tabs: Memo::new(move |_| tabs.get()),
+                root: NodeRef::new(),
+                reveal: Callback::new(|_| {}),
+                unsent: Memo::new(|_| 0),
+                sending: RwSignal::new(false),
+                send_all: Callback::new(|_| {}),
+            });
+            let t = Memo::new(move |_| thread.get());
+            for (deleted, rewritten) in [(false, false), (false, true), (true, false)] {
+                thread.update(|t| t.detached = rewritten);
+                if deleted {
+                    tabs.set(vec![]);
+                }
+                let html = view! { <About t /> }.to_html();
+                let buttons: Vec<_> = html.split("<button").skip(1).map(|b| b.split("</button>").next().unwrap()).collect();
+                assert_eq!(buttons.len(), 2, "keep both the quote and locate button: {html}");
+                for button in &buttons {
+                    assert!(button.contains("type=\"button\""), "{button}");
+                    assert!(button.contains("title=\"Show it in the doc\""), "{button}");
+                    assert!(button.contains("aria-label=\"Show it in the doc\""), "{button}");
+                }
+                assert!(buttons[0].contains("The release plan"), "{html}");
+                assert!(buttons[0].contains("“release plan”"), "both lines are in the button: {html}");
+                let disabled = |button: &str| button.split('>').next().unwrap().split_whitespace().any(|a| a == "disabled");
+                assert!(!disabled(buttons[0]), "gone quotes still explain themselves: {html}");
+                assert!(buttons[1].contains("<svg"), "keep the locate icon: {html}");
+                assert!(buttons[1].contains("r=\"3\""), "use the crosshair, not the opening arrow: {html}");
+                assert_eq!(disabled(buttons[1]), deleted || rewritten, "{html}");
+                assert_eq!(comment_target(&thread.get_untracked(), !deleted), (!deleted && !rewritten).then(|| "block.1".into()));
+            }
+        });
+    }
+
+    #[test]
+    fn comment_reveal_finds_the_tab_and_slide_holding_a_block() {
+        use super::*;
+        let tabs = vec![DocTab {
+            id: "deck-tab".into(),
+            blocks: vec![
+                DocBlock { id: "slide.1".into(), kind: "slide".into(), ..Default::default() },
+                DocBlock {
+                    id: "slide.2".into(),
+                    kind: "slide".into(),
+                    children: vec![DocBlock { id: "words.1".into(), ..Default::default() }],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }];
+        let expected = Some(("deck-tab".into(), vec!["slide.2".into()]));
+        assert_eq!(reveal_targets(&tabs, &["words.1".into()]), expected);
+        assert_eq!(reveal_targets(&tabs, &["slide.2".into()]), expected);
+        assert_eq!(reveal_targets(&tabs, &["deleted.1".into()]), None);
+        assert_eq!(reveal_targets(&tabs, &[]), None);
+        assert_eq!(comment_target(&DocThread::default(), false), None, "whole-tab threads have no jump target");
     }
 
     #[cfg(not(target_arch = "wasm32"))]
