@@ -2236,7 +2236,7 @@ fn waiting_on_you(evs: &[Event]) -> Vec<Waiting> {
 /// message, or a background task's end or a subagent's report, each held
 /// by the hourly limit or for your next message. Its first line, and who
 /// sent it.
-fn waiting_notices(evs: &[Event]) -> Vec<(String, String)> {
+fn waiting_notices(evs: &[Event]) -> Vec<(String, String, i64)> {
     let taken: std::collections::HashSet<&str> = evs
         .iter()
         .filter_map(|e| match &e.kind {
@@ -2246,8 +2246,8 @@ fn waiting_notices(evs: &[Event]) -> Vec<(String, String)> {
         .collect();
     evs.iter()
         .filter_map(|e| match &e.kind {
-            EventKind::NoticeQueued { command_id, text, from_title, .. } if !taken.contains(command_id.as_str()) => {
-                Some((from_title.clone(), text.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().to_owned()))
+            EventKind::NoticeQueued { command_id, text, from_title, deliver_at_ms, .. } if !taken.contains(command_id.as_str()) => {
+                Some((from_title.clone(), text.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().to_owned(), *deliver_at_ms))
             }
             _ => None,
         })
@@ -2270,16 +2270,18 @@ fn WaitingNotices(events: RwSignal<Vec<Event>>, session_id: String) -> impl Into
         let w = waiting.get();
         (!w.is_empty()).then(|| {
             let n = w.len();
+            let delivery = w.iter().filter_map(|(_, _, at)| (*at > 0).then_some(*at)).min();
             view! {
                 <div class="space-y-1 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm dark:border-amber-800 dark:bg-amber-950">
                     <div class="flex items-center gap-3">
                         <span class="flex-1 text-amber-800 dark:text-amber-300">
                             {if n == 1 { "1 notice waiting for the agent".to_owned() } else { format!("{n} notices waiting for the agent") }}
+                            {delivery.map(|at| format!(" — delivers itself at {}", crate::when::time(at)))}
                         </span>
                         <button class=BUTTON on:click=deliver title="Start a turn with them now, whatever the hourly limit">"Deliver now"</button>
                     </div>
                     <ul class="space-y-0.5 text-xs text-zinc-600 dark:text-zinc-400">
-                        {w.into_iter().map(|(from, line)| view! {
+                        {w.into_iter().map(|(from, line, _)| view! {
                             <li class="truncate">{if from.is_empty() { line } else { format!("From {from}: {line}") }}</li>
                         }).collect_view()}
                     </ul>
@@ -5649,6 +5651,7 @@ mod tests {
             text: format!("about {id}\nmore"),
             command: String::new(),
             from_title: from.into(),
+            deliver_at_ms: 42,
         };
         let user = |id: &str| EventKind::User {
             command_id: id.into(),
@@ -5663,7 +5666,7 @@ mod tests {
             from_title: String::new(),
         };
         let evs = [ev(1, queued("task:bg1:finished", "")), ev(2, user("task:bg1:finished")), ev(3, queued("m-2", "Alice"))];
-        assert_eq!(waiting_notices(&evs), [("Alice".to_owned(), "about m-2".to_owned())]);
+        assert_eq!(waiting_notices(&evs), [("Alice".to_owned(), "about m-2".to_owned(), 42)]);
     }
 
     /// A message to another session reads as one, in every tool profile's

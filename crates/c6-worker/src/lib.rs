@@ -30,7 +30,7 @@ use anyhow::Context;
 
 pub use conn::ConnState;
 pub use identity::Identity;
-pub use subagent::{digest_text, spawned_children, status_of};
+pub use subagent::{digest_text, report_input, spawned_children, status_of};
 
 /// Idle, synced sessions stay in the journal this long.
 const JOURNAL_KEEP_MS: i64 = 7 * 24 * 3600 * 1000;
@@ -109,7 +109,7 @@ impl Worker {
         if orphans > 0 {
             tracing::warn!(orphans, "dropped journal events of sessions with no session row; the head will restore them");
         }
-        let trimmed = journal.trim(c6_core::now_ms() - JOURNAL_KEEP_MS, &[]).await?;
+        let trimmed = journal.trim(c6_core::now_ms() - JOURNAL_KEEP_MS, &sessions.active()).await?;
         if trimmed > 0 {
             tracing::info!(trimmed, "trimmed idle sessions from the journal");
         }

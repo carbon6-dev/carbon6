@@ -482,6 +482,17 @@ async fn resume_continues_a_stopped_subagent() {
     let (text, command, _) = user_messages(&env.events(&child_id).await).pop().unwrap();
     assert_eq!(command, "resume");
     assert!(text.contains("stopped partway"), "{text}");
+    eventually("the parent to receive the attributed resume report", async || {
+        env.events(&id).await.iter().find_map(|e| match &e.kind {
+            EventKind::NoticeQueued { text, .. } if text.contains("Found it after all.") => {
+                assert!(text.starts_with(&format!("Subagent {child_id} resumed:")), "{text}");
+                assert!(!text.contains("The user messaged"), "a resume prompt isn't a user message: {text}");
+                Some(())
+            }
+            _ => None,
+        })
+    })
+    .await;
     let r = env.http.post(format!("{}/sessions/{child_id}/resume", env.api)).json(&json!({})).send().await.unwrap();
     assert_eq!(r.status(), 400, "its last turn finished");
 

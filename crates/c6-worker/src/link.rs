@@ -42,6 +42,7 @@ pub struct HeadLink {
     /// Set when the head is in this process.
     local: std::sync::OnceLock<Arc<dyn LocalHead>>,
     outbound: Mutex<Option<mpsc::Sender<WorkerMsg>>>,
+    attached: tokio::sync::Notify,
     /// Deltas waiting for the next flush; `Some` while a flush is scheduled.
     ephemeral_buf: Arc<Mutex<Option<Vec<EphemeralEvent>>>>,
     waiters: Mutex<HashMap<u64, oneshot::Sender<CredentialGrant>>>,
@@ -64,6 +65,7 @@ impl HeadLink {
 
     pub(crate) fn connected(&self, tx: mpsc::Sender<WorkerMsg>) {
         *self.outbound.lock().unwrap() = Some(tx);
+        self.attached.notify_waiters();
     }
 
     pub(crate) fn disconnected(&self) {
@@ -107,6 +109,20 @@ impl HeadLink {
 
     pub fn is_connected(&self) -> bool {
         self.local.get().is_some() || self.outbound.lock().unwrap().is_some()
+    }
+
+    /// Automatic notice delivery waits for the head, particularly on
+    /// startup when no model credentials have been cached yet.
+    pub(crate) async fn wait_connected(&self) {
+        loop {
+            let attached = self.attached.notified();
+            tokio::pin!(attached);
+            attached.as_mut().enable();
+            if self.is_connected() {
+                return;
+            }
+            attached.await;
+        }
     }
 
     /// Best effort: dropped when disconnected or backed up. Consecutive

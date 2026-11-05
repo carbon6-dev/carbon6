@@ -189,6 +189,13 @@ impl Journal {
         Ok(rows.iter().map(|r| r.get("id")).collect())
     }
 
+    /// Cached sessions, including idle ones whose notices need a timer
+    /// after a restart. The event log remains the source of truth.
+    pub async fn session_ids(&self) -> anyhow::Result<Vec<String>> {
+        let rows = sqlx::query("SELECT id FROM sessions").fetch_all(&self.pool).await?;
+        Ok(rows.iter().map(|r| r.get("id")).collect())
+    }
+
     pub async fn open_turns(&self) -> anyhow::Result<Vec<(String, u64, u64)>> {
         let rows = sqlx::query("SELECT id, last_seq, open_turn FROM sessions WHERE open_turn IS NOT NULL").fetch_all(&self.pool).await?;
         Ok(rows.iter().map(|r| (r.get("id"), r.get::<i64, _>("last_seq") as u64, r.get::<i64, _>("open_turn") as u64)).collect())

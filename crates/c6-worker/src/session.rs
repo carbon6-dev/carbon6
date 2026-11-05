@@ -390,6 +390,17 @@ impl SessionManager {
                 warn!(session = %session_id, "resuming for lost background tasks: {e:#}");
             }
         }
+        // An idle session with only held notices has no open task to load
+        // it above. Restore its actor too, so its hourly timer is armed
+        // without waiting for another command from the head.
+        for session_id in self.journal.session_ids().await? {
+            let events = self.journal.events_after(&session_id, 0, u32::MAX).await?;
+            if notices_of(&events).2.iter().any(|(_, wake)| *wake)
+                && let Err(e) = self.actor(&session_id).await
+            {
+                warn!(session = %session_id, "resuming for held notices: {e:#}");
+            }
+        }
         Ok(())
     }
 
@@ -1441,7 +1452,7 @@ struct Actor {
     inbox: Arc<Mutex<Inbox>>,
     checkpoints: Arc<Checkpoints>,
     /// When background-task notices started turns (for the hourly limit).
-    auto_turns: VecDeque<std::time::Instant>,
+    auto_turns: VecDeque<tokio::time::Instant>,
     /// Notices held for your next message, and whether each would start a
     /// turn (those held by the hourly limit go once the hour allows).
     deferred: Vec<(PendingInput, bool)>,
@@ -1460,7 +1471,7 @@ struct Actor {
     /// Shared with the manager: a turn is running.
     running_flag: Arc<std::sync::atomic::AtomicBool>,
     /// A subagent's inputs since its last report that no call waits on
-    /// (yours, notices, messages joining a turn): what they said, and
+    /// (yours, notices, messages joining a turn): who said what, and
     /// whether the report should wake the parent.
     report: Option<(Vec<String>, bool)>,
     /// Shared with the manager: it runs Claude Code now.
@@ -1529,8 +1540,8 @@ impl Actor {
             // start a turn for them by itself.
             let wake_at = self.claude.as_ref().filter(|_| running.is_none()).and_then(|p| p.wake_due());
             // Notices the hourly limit held: once the hour allows.
-            let retry_at = (running.is_none() && self.deferred.iter().any(|(_, wake)| *wake))
-                .then(|| self.auto_turns.front().map_or_else(std::time::Instant::now, |t| *t + HOUR));
+            let waiting_to_wake = running.is_none() && self.deferred.iter().any(|(_, wake)| *wake);
+            let retry_at = (waiting_to_wake && self.link.is_connected()).then(|| self.next_auto_turn());
             tokio::select! {
                 msg = rx.recv() => match msg {
                     None => return,
@@ -1604,7 +1615,9 @@ impl Actor {
                         }
                         if self.spec.delegation.is_some() && !input.is_compact() {
                             let r = self.report.get_or_insert_with(Default::default);
-                            r.0.push(input.text.clone());
+                            r.0.push(crate::subagent::report_input(
+                                &self.writer.session_id, &input.command, &input.text, &input.from_session_id, &input.from_title,
+                            ));
                             r.1 |= input.wake;
                         }
                         let held = std::mem::take(&mut self.deferred);
@@ -1691,7 +1704,7 @@ impl Actor {
                         }
                     }
                     Some(ActorMsg::Reloaded { auto_turns_ms, noticed, pending }) => {
-                        let (now, now_ms) = (std::time::Instant::now(), c6_core::now_ms());
+                        let (now, now_ms) = (tokio::time::Instant::now(), c6_core::now_ms());
                         self.auto_turns = auto_turns_ms
                             .into_iter()
                             .filter_map(|t| now.checked_sub(std::time::Duration::from_millis(now_ms.saturating_sub(t).max(0) as u64)))
@@ -1869,9 +1882,10 @@ impl Actor {
                         }
                     }
                 }
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(retry_at.unwrap_or_else(std::time::Instant::now))), if retry_at.is_some() => {
+                _ = tokio::time::sleep_until(retry_at.unwrap_or_else(tokio::time::Instant::now)), if retry_at.is_some() => {
                     self.release_held();
                 }
+                _ = self.link.wait_connected(), if waiting_to_wake && retry_at.is_none() => {}
                 // Idle long enough, with no background tasks: close it.
                 _ = tokio::time::sleep_until(idle_until.unwrap_or_else(tokio::time::Instant::now)), if running.is_none() && idle_until.is_some() => {
                     info!(session = %self.writer.session_id, "closing an idle Claude Code process");
@@ -2023,8 +2037,8 @@ impl Actor {
 
     /// Takes a turn for notices if the hour allows one.
     fn take_auto_turn(&mut self) -> bool {
-        let now = std::time::Instant::now();
-        while self.auto_turns.front().is_some_and(|t| now.duration_since(*t) > HOUR) {
+        let now = tokio::time::Instant::now();
+        while self.auto_turns.front().is_some_and(|t| now.duration_since(*t) >= HOUR) {
             self.auto_turns.pop_front();
         }
         if self.auto_turns.len() >= self.auto_turn_limit() {
@@ -2034,15 +2048,35 @@ impl Actor {
         true
     }
 
+    /// The first slot with fewer than N turns in the preceding hour. A
+    /// manual Deliver now can leave more than N counted turns after load.
+    fn next_auto_turn(&self) -> tokio::time::Instant {
+        let now = tokio::time::Instant::now();
+        self.auto_turns.len().checked_sub(self.auto_turn_limit()).map_or(now, |i| (self.auto_turns[i] + HOUR).max(now))
+    }
+
+    fn report_notice(&mut self, input: &PendingInput) {
+        if self.spec.delegation.is_some() && input.command == "session-message" {
+            let r = self.report.get_or_insert_with(Default::default);
+            r.0.push(crate::subagent::report_input(
+                &self.writer.session_id,
+                &input.command,
+                &input.text,
+                &input.from_session_id,
+                &input.from_title,
+            ));
+            r.1 = true;
+        }
+    }
+
     /// The hour allows another automatic turn: the held notices start one
     /// together.
     fn release_held(&mut self) {
-        if self.deferred.is_empty() || !self.take_auto_turn() {
+        if !self.link.is_connected() || !self.deferred.iter().any(|(_, wake)| *wake) || !self.take_auto_turn() {
             return;
         }
-        let mut inbox = self.inbox.lock().unwrap();
         for (n, _) in std::mem::take(&mut self.deferred) {
-            inbox.push(n, None);
+            self.inbox.lock().unwrap().push(n, None);
         }
     }
 
@@ -2062,6 +2096,12 @@ impl Actor {
             from_session_id: input.from_session_id.clone(),
             from_title: input.from_title.clone(),
             hops: input.hops,
+            deliver_at_ms: if wake && !busy && self.inbox.lock().unwrap().queue.is_empty() {
+                let delay = self.next_auto_turn().saturating_duration_since(tokio::time::Instant::now());
+                if delay.is_zero() { 0 } else { c6_core::now_ms() + delay.as_millis() as i64 }
+            } else {
+                0
+            },
         };
         self.writer.append(session_event::Kind::NoticeQueued(queued)).await?;
         self.deliver_notice(input, busy, wake, true).await
@@ -2072,20 +2112,33 @@ impl Actor {
     /// beyond it, once the hour allows), else it waits for the next input.
     /// `announce`: say so in the log when the limit holds it.
     async fn deliver_notice(&mut self, input: PendingInput, busy: bool, wake: bool, announce: bool) -> anyhow::Result<()> {
+        self.report_notice(&input);
         // What the agent does next follows from this message's chain.
         if input.hops > 0 {
             self.session_tools.set_message_hops(input.hops);
         }
         if busy || !self.inbox.lock().unwrap().queue.is_empty() {
-            self.inbox.lock().unwrap().push(input, None);
+            let mut inbox = self.inbox.lock().unwrap();
+            for (held, _) in std::mem::take(&mut self.deferred) {
+                inbox.push(held, None);
+            }
+            inbox.push(input, None);
             return Ok(());
         }
         if !wake {
             self.deferred.push((input, false));
             return Ok(());
         }
+        if !self.link.is_connected() {
+            self.deferred.push((input, true));
+            return Ok(());
+        }
         if self.take_auto_turn() {
-            self.inbox.lock().unwrap().push(input, None);
+            let mut inbox = self.inbox.lock().unwrap();
+            for (held, _) in std::mem::take(&mut self.deferred) {
+                inbox.push(held, None);
+            }
+            inbox.push(input, None);
             return Ok(());
         }
         warn!(session = %self.writer.session_id, notice = %input.command_id, "notice held: too many automatic turns this hour");
@@ -4113,6 +4166,24 @@ mod claude_code_tools_tests {
 mod notice_tests {
     use super::*;
 
+    struct Head(String);
+
+    #[async_trait]
+    impl crate::link::LocalHead for Head {
+        async fn call(&self, _method: &str, _params: serde_json::Value) -> Result<serde_json::Value, String> {
+            Err("not needed by this test".into())
+        }
+
+        async fn credential(&self, connection_id: &str) -> c6_proto::CredentialGrant {
+            c6_proto::CredentialGrant {
+                connection_id: connection_id.into(),
+                kind: "openai_compat".into(),
+                base_url: self.0.clone(),
+                ..Default::default()
+            }
+        }
+    }
+
     fn ev(seq: u64, ts_ms: i64, kind: session_event::Kind) -> SessionEvent {
         SessionEvent { seq, ts_ms, kind: Some(kind) }
     }
@@ -4154,6 +4225,216 @@ mod notice_tests {
         assert_eq!(noticed, ["subagent:s", "task:bg1:finished", "task:bg2:finished"]);
         let pending: Vec<(&str, &str, bool)> = pending.iter().map(|(i, w)| (i.command_id.as_str(), i.text.as_str(), *w)).collect();
         assert_eq!(pending, [("subagent:s", "about subagent:s", false), ("task:bg2:finished", "about task:bg2:finished", true)]);
+    }
+
+    /// A log at the default limit, with no open task or turn: the case
+    /// startup recovery used to leave without an actor (and thus a timer).
+    async fn at_limit() -> (tempfile::TempDir, SessionManager, c6_testkit::MockLlm) {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = c6_testkit::MockLlm::start().await;
+        let journal = Arc::new(Journal::open(&dir.path().join("journal.db")).await.unwrap());
+        let model =
+            ModelSpec { connection_id: "mock".into(), connection_kind: "openai_compat".into(), model: "m".into(), ..Default::default() };
+        let spec = CreateSession { model: Some(model.clone()), cwd: dir.path().display().to_string(), ..Default::default() };
+        let now = c6_core::now_ms();
+        let mut events = vec![ev(
+            1,
+            now,
+            session_event::Kind::Started(SessionStarted {
+                model: Some(model),
+                cwd: spec.cwd.clone(),
+                tool_profile: "generic".into(),
+                ..Default::default()
+            }),
+        )];
+        for i in 0..AUTO_TURNS_PER_HOUR {
+            for kind in [
+                queued(&format!("n{i}"), true),
+                user(&format!("n{i}")),
+                turn(),
+                session_event::Kind::TurnEnded(TurnEnded { turn: i as u64 + 1, reason: TurnEndReason::Completed as i32 }),
+            ] {
+                events.push(ev(events.len() as u64 + 1, now, kind));
+            }
+        }
+        journal.import("held", &spec, &events).await.unwrap();
+        let manager =
+            SessionManager::new(journal, Arc::new(HeadLink::local(Arc::new(Head(mock.base_url())))), dir.path().join("worktrees"));
+        (dir, manager, mock)
+    }
+
+    // External I/O (SQLite and the mock server) must progress without
+    // Tokio automatically jumping to the hourly timer while we await it.
+    fn pause_clock() -> tokio_util::task::AbortOnDropHandle<()> {
+        tokio::time::pause();
+        tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        }))
+    }
+
+    async fn logged(manager: &SessionManager, predicate: impl Fn(&[SessionEvent]) -> bool) -> Vec<SessionEvent> {
+        c6_testkit::within("the notice actor to record its work", async {
+            loop {
+                let events = manager.journal.events_after("held", 0, u32::MAX).await.unwrap();
+                if predicate(&events) {
+                    return events;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+    }
+
+    async fn hold(manager: &SessionManager) -> mpsc::UnboundedSender<ActorMsg> {
+        let tx = manager.actor("held").await.unwrap().unwrap();
+        for text in ["report 21", "report 22"] {
+            tx.send(ActorMsg::ChildReport { text: text.into(), wake: true }).unwrap();
+        }
+        let events =
+            logged(manager, |events| events.iter().filter(|e| matches!(e.kind, Some(session_event::Kind::Error(_)))).count() == 2).await;
+        let held: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Some(session_event::Kind::NoticeQueued(n)) if n.text.starts_with("report ") => Some(n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(held.len(), 2);
+        assert!(held.iter().all(|n| n.deliver_at_ms > c6_core::now_ms()), "the UI gets the next free slot");
+        tx
+    }
+
+    async fn delivered(manager: &SessionManager, mock: &c6_testkit::MockLlm) {
+        // Only the hourly wait is simulated. The mock streams chunks on
+        // short timers, and the model's I/O must run on a live clock.
+        tokio::time::resume();
+        let events =
+            logged(manager, |events| events.iter().filter(|e| matches!(e.kind, Some(session_event::Kind::TurnEnded(_)))).count() == 21)
+                .await;
+        assert_eq!(mock.requests().len(), 1, "one turn takes the whole held batch");
+        let request = mock.requests()[0].to_string();
+        assert!(request.contains("report 21") && request.contains("report 22"), "{request}");
+        assert!(notices_of(&events).2.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_twenty_first_notice_delivers_itself_when_the_hour_frees_up() {
+        let (_dir, manager, mock) = at_limit().await;
+        let _clock = pause_clock();
+        let _tx = hold(&manager).await;
+        assert!(mock.requests().is_empty(), "the 21st notice is held");
+        tokio::time::advance(HOUR - std::time::Duration::from_secs(1)).await;
+        assert!(mock.requests().is_empty(), "not before a counted turn expires");
+        mock.push(c6_testkit::Reply::Text("Saw the batch.".into()));
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        delivered(&manager, &mock).await;
+    }
+
+    #[tokio::test]
+    async fn deliver_now_bypasses_the_hourly_timer() {
+        let (_dir, manager, mock) = at_limit().await;
+        let _clock = pause_clock();
+        let tx = hold(&manager).await;
+        mock.push(c6_testkit::Reply::Text("Saw them now.".into()));
+        tx.send(ActorMsg::ReleaseNotices).unwrap();
+        delivered(&manager, &mock).await;
+        tokio::time::pause();
+        tokio::time::advance(HOUR).await;
+        barrier(&manager, "after-old-timer").await;
+        assert_eq!(mock.requests().len(), 1, "the old timer doesn't deliver them twice");
+    }
+
+    #[tokio::test]
+    async fn non_waking_notices_still_wait_for_explicit_input() {
+        let (_dir, manager, mock) = at_limit().await;
+        let _clock = pause_clock();
+        let tx = manager.actor("held").await.unwrap().unwrap();
+        for text in ["report 21", "report 22"] {
+            tx.send(ActorMsg::ChildReport { text: text.into(), wake: false }).unwrap();
+        }
+        barrier(&manager, "held-without-wake").await;
+        tokio::time::advance(HOUR).await;
+        barrier(&manager, "hour-free").await;
+        let events = manager.journal.events_after("held", 0, u32::MAX).await.unwrap();
+        assert_eq!(notices_of(&events).2.len(), 2);
+        assert!(mock.requests().is_empty(), "a free slot doesn't grant permission to wake");
+        mock.push(c6_testkit::Reply::Text("Saw them when asked.".into()));
+        tx.send(ActorMsg::ReleaseNotices).unwrap();
+        delivered(&manager, &mock).await;
+    }
+
+    #[tokio::test]
+    async fn recovery_reschedules_pending_notices_without_an_open_task() {
+        let (_dir, manager, mock) = at_limit().await;
+        seed_held(&manager).await;
+        assert!(manager.journal.sessions_with_open_tasks().await.unwrap().is_empty());
+        let _clock = pause_clock();
+        manager.recover().await.unwrap();
+        assert_eq!(manager.active(), ["held"], "startup, not a new command, restores its actor");
+        barrier(&manager, "reloaded").await;
+        assert!(mock.requests().is_empty(), "restart must not reset the limit");
+        mock.push(c6_testkit::Reply::Text("Saw them after restart.".into()));
+        tokio::time::advance(HOUR).await;
+        delivered(&manager, &mock).await;
+    }
+
+    async fn seed_held(manager: &SessionManager) {
+        // Seed held notices without starting an actor, exactly as a fresh
+        // worker finds them on disk after its predecessor exited.
+        for (i, text) in ["report 21", "report 22"].into_iter().enumerate() {
+            let notice = c6_proto::NoticeQueued {
+                command_id: format!("held{i}"),
+                text: text.into(),
+                wake: true,
+                command: "task-notification".into(),
+                ..Default::default()
+            };
+            manager.journal.append("held", &ev(82 + i as u64, c6_core::now_ms(), session_event::Kind::NoticeQueued(notice))).await.unwrap();
+        }
+    }
+
+    async fn barrier(manager: &SessionManager, id: &str) {
+        // A recorded message after Reloaded is a barrier: the actor has
+        // reconstructed its counted turns and armed its timer.
+        let tx = manager.actor("held").await.unwrap().unwrap();
+        tx.send(ActorMsg::SetSubagentModel { command_id: id.into(), model: None }).unwrap();
+        logged(manager, |events| {
+            events.iter().any(|e| matches!(&e.kind, Some(session_event::Kind::SubagentModelSet(m)) if m.command_id == id))
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn overdue_notices_wait_for_the_head_after_restart() {
+        let (_dir, mut manager, mock) = at_limit().await;
+        seed_held(&manager).await;
+        let head = manager.link.clone();
+        manager.link = Arc::new(HeadLink::default());
+        let _clock = pause_clock();
+        manager.recover().await.unwrap();
+        barrier(&manager, "reloaded").await;
+        tokio::time::advance(HOUR).await;
+        barrier(&manager, "still-offline").await;
+        let events = manager.journal.events_after("held", 0, u32::MAX).await.unwrap();
+        assert_eq!(notices_of(&events).2.len(), 2, "offline delivery must not consume the held batch");
+        assert!(mock.requests().is_empty());
+
+        mock.push(c6_testkit::Reply::Text("Saw them once connected.".into()));
+        let (tx, mut rx) = mpsc::channel::<c6_proto::WorkerMsg>(32);
+        let link = manager.link.clone();
+        link.connected(tx);
+        let _head = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                if let Some(c6_proto::worker_msg::Msg::CredentialRequest(req)) = msg.msg {
+                    let mut grant = head.session_credential("held", &req.connection_id).await.unwrap();
+                    grant.request_id = req.request_id;
+                    link.on_grant(grant);
+                }
+            }
+        }));
+        delivered(&manager, &mock).await;
     }
 }
 
