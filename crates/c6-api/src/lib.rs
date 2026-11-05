@@ -1923,8 +1923,9 @@ pub struct SubagentLimits {
     /// up, in minutes.
     #[serde(default = "default_claude_code_idle_minutes")]
     pub claude_code_idle_minutes: u32,
-    /// How long a chain of messages between sessions may get: a message sent
-    /// from a turn a session message started is one more.
+    /// Longest chain of messages between sessions (default 4). A send adds
+    /// one to the last session message delivered; direct UI or HTTP API
+    /// input resets the session's count to 0. Sends beyond this limit are refused.
     #[serde(default = "default_max_message_hops")]
     pub max_message_hops: u32,
     /// How many messages one session may send other sessions per hour.
