@@ -125,7 +125,7 @@ The worker checks the manifest's signature again itself, so a compromised head c
 
 Each binary knows how it was installed from where it runs (`current_exe`):
 
-The head also uses its resolved executable location to choose its default config: a Homebrew binary under `Cellar/` reads that prefix's `etc/c6h/c6h.toml`, just like the brew service. Plain `c6h login-link` (and other admin commands) therefore uses the service's database. `--config <path>` always overrides this; other install methods keep the user-config default (the .deb service and its admin commands pass `/etc/c6h/c6h.toml` explicitly).
+The head also uses its resolved executable location to choose its default config: a Homebrew binary under `Cellar/` reads that prefix's `etc/c6h/c6h.toml`, just like the brew service, once the formula has written it (until then, the user config as before). Plain `c6h login-link` (and other admin commands) therefore uses the service's database. `--config <path>` always overrides this; other install methods keep the user-config default (the .deb service and its admin commands pass `/etc/c6h/c6h.toml` explicitly).
 
 | Method | Detected by | Install | Restart |
 |---|---|---|---|
