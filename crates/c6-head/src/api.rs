@@ -1826,13 +1826,14 @@ async fn put_hooks(State(st): State<Arc<HeadState>>, Json(hooks): Json<Vec<api::
 
 async fn send_message(
     State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<crate::realms::Caller>,
     Path(id): Path<String>,
     Json(req): Json<api::SendMessage>,
 ) -> ApiResult<Json<api::QueuedInput>> {
     // You answered: you'd seen how it stood (docs/work.md §3), not the
     // turn this starts.
     let at = now_ms();
-    let queued = crate::sessions::send_input(&st, &id, &req).await?;
+    let queued = crate::sessions::send_input_as(&st, &id, &req, uuid::Uuid::now_v7().to_string(), "", caller.api_origin()).await?;
     // The message is queued: failing to note this mustn't make the send
     // look failed (and get it sent twice).
     if let Err(e) = crate::work::seen_session(&st, &id, at).await {
@@ -2998,10 +2999,11 @@ async fn put_policies(State(st): State<Arc<HeadState>>, Json(p): Json<Vec<api::P
 
 async fn resume_session(
     State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<crate::realms::Caller>,
     Path(id): Path<String>,
     Json(req): Json<api::ResumeRequest>,
 ) -> ApiResult<Json<api::QueuedInput>> {
-    Ok(Json(crate::sessions::resume(&st, &id, &req).await?))
+    Ok(Json(crate::sessions::resume(&st, &id, &req, caller.api_origin()).await?))
 }
 
 async fn interrupt_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {

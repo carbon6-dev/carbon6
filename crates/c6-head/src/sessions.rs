@@ -1004,7 +1004,7 @@ pub async fn effective_config(st: &HeadState, session_id: &str) -> anyhow::Resul
 }
 
 pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage) -> anyhow::Result<api::QueuedInput> {
-    send_input_as(st, session_id, req, Uuid::now_v7().to_string(), "").await
+    send_input_as(st, session_id, req, Uuid::now_v7().to_string(), "", None).await
 }
 
 /// Queues an input as command `id`; `delegated_by`: a remote subagent's
@@ -1015,6 +1015,7 @@ pub async fn send_input_as(
     req: &api::SendMessage,
     id: String,
     delegated_by: &str,
+    api_origin: Option<c6_proto::ApiMessageOrigin>,
 ) -> anyhow::Result<api::QueuedInput> {
     let text = req.text.trim();
     let files = attachments(&req.attachments)?;
@@ -1052,6 +1053,7 @@ pub async fn send_input_as(
             wake,
             delegated_by: delegated_by.to_owned(),
             send_now: req.send_now,
+            api_origin,
             ..Default::default()
         },
     )
@@ -1485,7 +1487,12 @@ pub async fn subagent_limits(st: &HeadState, realm: Option<&str>) -> anyhow::Res
 
 /// Continues a subagent whose last turn did not finish, with the realm's
 /// resume prompt.
-pub async fn resume(st: &HeadState, session_id: &str, req: &api::ResumeRequest) -> anyhow::Result<api::QueuedInput> {
+pub async fn resume(
+    st: &HeadState,
+    session_id: &str,
+    req: &api::ResumeRequest,
+    api_origin: Option<c6_proto::ApiMessageOrigin>,
+) -> anyhow::Result<api::QueuedInput> {
     let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
     if session.parent_call_id.is_none() {
         return Err(bad_request("only subagents are resumed; send the session a message instead"));
@@ -1502,8 +1509,14 @@ pub async fn resume(st: &HeadState, session_id: &str, req: &api::ResumeRequest) 
     let text = crate::prompts::get(st, "session.subagent_resume", &session.realm).await;
     let worker_id: WorkerId = session.worker_id.parse()?;
     let id = Uuid::now_v7().to_string();
-    let input =
-        UserInput { text: text.clone(), command: "resume".into(), wake: req.wake, labels: session.head_labels(), ..Default::default() };
+    let input = UserInput {
+        text: text.clone(),
+        command: "resume".into(),
+        wake: req.wake,
+        labels: session.head_labels(),
+        api_origin,
+        ..Default::default()
+    };
     let data = input_command(&id, session_id, input);
     st.store.enqueue_command(&NewCommand { id: &id, session_id, worker_id, data, text: Some(&text) }).await?;
     publish_queue(st, session_id).await;
