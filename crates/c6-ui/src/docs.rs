@@ -3124,7 +3124,7 @@ mod tests {
                 commenting: RwSignal::new(None),
                 panel: RwSignal::new(false),
                 pop: RwSignal::new(None),
-                pop_at: RwSignal::new((0.0, 0.0)),
+                pop_node: NodeRef::new(),
                 tabs: Memo::new(move |_| tabs.get()),
                 root: NodeRef::new(),
                 reveal: Callback::new(|_| {}),
