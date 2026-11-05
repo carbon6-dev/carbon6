@@ -158,7 +158,7 @@ fn chips_html(text: &str, attrs: &Value, refs: &std::collections::HashMap<String
             "date" => format!(
                 "<button type=\"button\" data-chip=\"{}\" title=\"A date: click to change it\" class=\"{CHIP} bg-sky-50 text-sky-800 hover:bg-sky-100 dark:bg-sky-950/40 dark:text-sky-300\">{} {}</button>",
                 esc(key),
-                crate::icons::calendar().to_html(),
+                crate::icons::html::calendar(),
                 esc(&s("value"))
             ),
             "mention" => format!(
@@ -169,7 +169,7 @@ fn chips_html(text: &str, attrs: &Value, refs: &std::collections::HashMap<String
                 "<button type=\"button\" data-chip=\"{}\" title=\"Pick another\" class=\"{CHIP} bg-zinc-100 text-zinc-800 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-200\">{} {}</button>",
                 esc(key),
                 esc(&s("value")),
-                crate::icons::chevron_down().to_html()
+                crate::icons::html::chevron_down()
             ),
             "ref" => {
                 let r = s("ref");
@@ -183,7 +183,7 @@ fn chips_html(text: &str, attrs: &Value, refs: &std::collections::HashMap<String
                     "<button type=\"button\" data-ref=\"{}\" title=\"{}\" class=\"{CHIP} bg-emerald-50 text-emerald-800 hover:underline dark:bg-emerald-950/40 dark:text-emerald-300\">{} {}{}</button>",
                     esc(&r),
                     esc(&r),
-                    crate::icons::arrow_up_right().to_html(),
+                    crate::icons::html::arrow_up_right(),
                     esc(&title),
                     if state.is_empty() {
                         String::new()
