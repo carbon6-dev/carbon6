@@ -127,7 +127,7 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("web UI: {url}");
             }
             if auth {
-                eprintln!("sign in with a passkey, or run `c6h login-link` for a one-time link");
+                eprintln!("sign in with a passkey, or run `{}` for a one-time link", head.state.auth.login_link_command);
             }
             let token = head.shutdown_token();
             // Ctrl-C, or SIGTERM from systemd, launchd or `docker stop`.
