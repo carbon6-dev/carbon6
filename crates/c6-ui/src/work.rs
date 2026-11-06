@@ -341,10 +341,7 @@ pub fn WorkPage() -> impl IntoView {
                 }.into_any(),
             }}
             <div class="pt-2">
-                <label class="flex items-center gap-1.5 text-sm text-muted">
-                    <input type="checkbox" prop:checked=move || show_closed.get() on:change=move |ev| show_closed.set(event_target_checked(&ev)) />
-                    "Show closed work"
-                </label>
+                <crate::components::Switch on=move || show_closed.get() on_change=move |v| show_closed.set(v) label="Show closed work" />
                 {move || show_closed.get().then(|| view! {
                     <div class="mt-2 space-y-1">
                         {move || closed.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|w| {
@@ -826,8 +823,8 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
                                     format!("Ticked off by {}{}", t.done_by, if t.evidence.is_empty() { String::new() } else { format!(": {}", t.evidence) })
                                 });
                                 view! {
-                                    <div class="flex items-center gap-2 rounded px-2 py-1 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900">
-                                        <input type="checkbox" class="shrink-0" prop:checked=done title=if done { "Not done after all" } else { "Done" }
+                                    <div class="flex min-h-8 items-center gap-2 rounded px-2 py-1 text-sm hover:bg-zinc-50 pointer-coarse:min-h-11 dark:hover:bg-zinc-900">
+                                        <input type="checkbox" class=crate::components::CHECKBOX prop:checked=done title=if done { "Not done after all" } else { "Done" }
                                             on:change=move |_| {
                                                 let todo = tid.clone();
                                                 let p = c6_api::work::TodoPatch { done: Some(!done), ..Default::default() };

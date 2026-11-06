@@ -151,10 +151,7 @@ pub fn ProjectsPage() -> impl IntoView {
                 }.into_any(),
             }}
             <div class="pt-2">
-                <label class="flex items-center gap-1.5 text-sm text-muted">
-                    <input type="checkbox" prop:checked=move || show_closed.get() on:change=move |ev| show_closed.set(event_target_checked(&ev)) />
-                    "Show done and dropped projects"
-                </label>
+                <crate::components::Switch on=move || show_closed.get() on_change=move |v| show_closed.set(v) label="Show done and dropped projects" />
                 {move || show_closed.get().then(|| view! {
                     <div class="mt-2 space-y-1">
                         {move || closed.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|p| {

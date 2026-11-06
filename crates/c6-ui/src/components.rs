@@ -192,4 +192,30 @@ mod tests {
         assert!(html.contains("sr-only") && html.contains("running") && html.contains("<kbd"), "{html}");
     }
 
+    /// Deliberately small, stage-1 guard. The legacy button clusters stay until
+    /// step 5; do not pretend to ban them while they remain throughout chrome.
+    #[test]
+    fn switches_and_checkbox_styles_have_one_home() {
+        fn check(path: &std::path::Path) {
+            if path.is_dir() {
+                for entry in std::fs::read_dir(path).unwrap() {
+                    check(&entry.unwrap().path());
+                }
+                return;
+            }
+            if path.extension().is_none_or(|ext| ext != "rs") || path.ends_with("components.rs") {
+                return;
+            }
+            let source = std::fs::read_to_string(path).unwrap();
+            let app = source.split("#[cfg(test)]").next().unwrap();
+            assert!(!app.contains("role=\"switch\""), "{}: use components::Switch", path.display());
+            assert!(!app.contains("const SELECT:"), "{}: use components::SELECT", path.display());
+            for checkbox in app.split("<input").skip(1).filter_map(|input| input.split_once("/>").map(|(tag, _)| tag)) {
+                if checkbox.contains("type=\"checkbox\"") {
+                    assert!(checkbox.contains("components::CHECKBOX"), "{}: style a submitted choice with CHECKBOX", path.display());
+                }
+            }
+        }
+        check(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
+    }
 }

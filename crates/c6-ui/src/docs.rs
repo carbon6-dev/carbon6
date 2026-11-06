@@ -2335,7 +2335,7 @@ fn NewComment(block: String, done: Callback<()>) -> impl IntoView {
                 on:keydown=move |ev| if ev.key() == "Escape" { ev.prevent_default(); done.run(()) } else if crate::util::sends(&ev) { ev.prevent_default(); post() } />
             <div class="flex items-center gap-2">
                 <div class="flex-1">
-                    <AgentSwitch on=to_agent title="The session that last wrote it gets the thread (queued if busy), else the newest one of the document's work or project" />
+                    <crate::components::Switch on=move || to_agent.get() on_change=move |v| to_agent.set(v) label="Send to agent" title="The session that last wrote it gets the thread (queued if busy), else the newest one of the document's work or project" />
                 </div>
                 <button class=BUTTON_QUIET on:click=move |_| done.run(())>"Cancel"</button>
                 <button class=BUTTON on:click=move |_| post()>"Comment"</button>
@@ -2347,20 +2347,6 @@ fn NewComment(block: String, done: Callback<()>) -> impl IntoView {
 /// A comment box: one line, growing with its text to about eight, then
 /// scrolling.
 const COMMENT_GROWS: &str = "grows block max-h-44 resize-none overflow-y-auto";
-
-/// "Send to agent", as a switch: what you write goes on to an agent.
-#[component]
-fn AgentSwitch(on: RwSignal<bool>, #[prop(optional, into)] title: String) -> impl IntoView {
-    view! {
-        <button type="button" role="switch" aria-checked=move || on.get().to_string() title=title
-            class="inline-flex items-center gap-1.5 rounded text-xs text-soft" on:click=move |_| on.update(|v| *v = !*v)>
-            <span class=move || format!("relative h-3.5 w-[26px] shrink-0 rounded-full transition-colors {}", if on.get() { "bg-sky-600" } else { "bg-zinc-300 dark:bg-zinc-600" })>
-                <span class=move || format!("absolute left-0.5 top-0.5 h-2.5 w-2.5 rounded-full bg-white shadow-sm transition-transform {}", if on.get() { "translate-x-3" } else { "" })></span>
-            </span>
-            "Send to agent"
-        </button>
-    }
-}
 
 /// A thread waiting on its agent, live: working on it, or yet to start.
 /// (Who the agent is shows on its comments.)
@@ -2759,7 +2745,7 @@ fn Thread(id: String, about: bool) -> impl IntoView {
                 </button>
             </div>
             <div class="flex items-center gap-2">
-                <div class="flex-1"><AgentSwitch on=to_agent title="Send the thread to an agent" /></div>
+                <div class="flex-1"><crate::components::Switch on=move || to_agent.get() on_change=move |v| to_agent.set(v) label="Send to agent" title="Send the thread to an agent" /></div>
                 {move || open.get().then(|| view! {
                     <button class="text-xs text-muted hover:underline" on:click=move |_| spawn_local(async move { done(api::doc_thread_resolve(doc.get_value(), tid.get_value()).await) })>"Resolve"</button>
                 })}
@@ -3190,7 +3176,7 @@ mod tests {
             for (kind, attrs, label, icon_first) in [
                 ("date", json!({"type": "date", "value": "2026-11-05"}), "2026-11-05", true),
                 ("dropdown", json!({"type": "dropdown", "value": "Ready"}), "Ready", false),
-                ("ref", json!({"type": "ref", "ref": "work:w1", "title": "The plan"}), "The plan", true),
+                ("ref", json!({"type": "ref", "ref": "work:w1", "title": "The plan"}), "The plan", false),
             ] {
                 let html = chips_html("<?c6 block chip?>", &json!({"chips": {"chip": attrs}}), &Default::default());
                 let svg = html.find("<svg").unwrap_or_else(|| panic!("{kind} lost its icon: {html}"));

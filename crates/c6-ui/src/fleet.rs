@@ -222,12 +222,10 @@ fn CodexLimitsSettings(workers: ReadSignal<Vec<Worker>>) -> impl IntoView {
                 view! {
                     <div class="space-y-1">
                     <div class="flex flex-wrap items-center gap-2">
-                    <label class="flex items-center gap-2">
-                        <input type="checkbox"
+                    <crate::components::Switch
                             disabled=move || pending.get() || !matches!(settings.get(), Some(Ok(_)))
-                            prop:checked=move || settings.get().and_then(Result::ok).is_some_and(|s| s.workers.contains(&checked_id))
-                            on:change=move |ev| {
-                                let enabled = event_target_checked(&ev);
+                            on=move || settings.get().and_then(Result::ok).is_some_and(|s| s.workers.contains(&checked_id))
+                            on_change=move |enabled| {
                                 let id = id.clone();
                                 pending.set(true);
                                 spawn_local(async move {
@@ -241,9 +239,7 @@ fn CodexLimitsSettings(workers: ReadSignal<Vec<Worker>>) -> impl IntoView {
                                     settings.refetch();
                                     pending.set(false);
                                 });
-                            } />
-                        {w.name}
-                    </label>
+                            } label=w.name />
                     <label class="flex items-center gap-2">
                         <span class="text-muted">"Codex command"</span>
                         <input type="text" class="rounded border border-zinc-300 bg-transparent px-2 py-1 dark:border-zinc-700"

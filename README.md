@@ -94,6 +94,14 @@ make check             # the code must be formatted (cargo fmt), and every targe
 
 `cargo build -p c6-head` also works before the web UI is built (UI requests then say to run `make ui`). Incremental head builds watch `crates/c6-ui/dist` when it exists, or its existing parent until it is created: an unchanged build is a no-op in either case, and building the UI later picks it up automatically.
 
+### UI components
+
+Chrome uses `crates/c6-ui/src/icons.rs`: `icon(Icon::Bell, Size::S16)`, with Lucide **1.66.0** paths vendored under their ISC/Feather MIT notices in `crates/c6-ui/LUCIDE-LICENSE`. Sizes are 14, 16 and 20px, all with an absolute 1.5px stroke. Existing helper names remain compatibility wrappers over the same data. For HTML strings use `icons::html::icon` (or the existing markup helpers), **never** a view's `.to_html()` in browser code. Keep every existing icon; user text, Slack emoji and terminal output are not chrome. In-app link arrows are `ArrowUpRight`, new-tab arrows `ExternalLink`, both 14px after the words.
+
+`components.rs` owns `Switch`, the native `CHECKBOX` class, `BTN_PRIMARY` / `BTN_SECONDARY` / `BTN_QUIET` / `BTN_DANGER` / `BTN_DANGER_SOLID`, `BTN_MD` / `BTN_SM`, `IconButton`, `Pill`, `Badge`, `Chip`, `SECTION_LABEL`, `INPUT`, `SELECT`, `Disclosure`, `EmptyState` and `Kbd`. `util::BUTTON` and `BUTTON_QUIET`, and `icons::BAR_BUTTON`, remain aliases. Primary stays neutral; sky stays for Send. Use a trailing **Switch** for an immediate setting/filter, a native **checkbox** for choices submitted with a form, multi-select or a to-do. Labels go left, tracks right; switch/menu rows are at least 44px on touch. Buttons are at least 40px on touch. Native title tooltips keep their text; menu key hints use `Kbd`.
+
+The hidden signed-in `/dev/components` page (also `/r/<realm>/dev/components`) is a small live specimen: inspect it in both themes and pointer modes. The first-stage migration provides the foundations, icons and switches; existing button-tier, pill/badge and overlay call-site migrations wait for visual review. See [docs/testing.md](docs/testing.md#icons-and-components-browser-check).
+
 ## Run
 
 On the head machine:

@@ -174,8 +174,8 @@ pub fn BackupsSetting() -> impl IntoView {
                                                 <input type="number" min="1" class=format!("{INPUT} w-20!") prop:value=d.keep.to_string()
                                                     on:change=move |ev| if let Some(n) = number(event_target_value(&ev)) { edit(Box::new(move |s| if let Some(d) = s.destinations.get_mut(i) { d.keep = n as u32 })) } />
                                             </label>
-                                            <label class="flex items-center gap-1 pb-2 text-sm">
-                                                <input type="checkbox" prop:checked=d.enabled
+                                            <label class="flex min-h-8 items-center gap-1 pb-2 text-sm pointer-coarse:min-h-11">
+                                                <input type="checkbox" class=crate::components::CHECKBOX prop:checked=d.enabled
                                                     on:change=move |ev| { let on = event_target_checked(&ev); edit(Box::new(move |s| if let Some(d) = s.destinations.get_mut(i) { d.enabled = on })) } />
                                                 "On"
                                             </label>

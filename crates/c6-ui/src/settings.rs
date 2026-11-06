@@ -516,39 +516,26 @@ fn SessionBarSetting() -> impl IntoView {
     use c6_api::SessionBarColour;
     let display = expect_context::<SessionBarDisplay>();
     let busy = RwSignal::new(false);
-    let option = move |colour: SessionBarColour, label: &'static str, what: &'static str| {
-        let save = move |_| {
-            let previous = display.colour.get_untracked();
-            display.colour.set(colour);
-            busy.set(true);
-            display.error.set(None);
-            spawn_local(async move {
-                if let Err(e) = api::put_session_bar_settings(c6_api::SessionBarSettings { colour }).await {
-                    display.colour.set(previous);
-                    display.error.set(Some(e));
-                }
-                busy.set(false);
-            });
-        };
-        view! {
-            <label class="flex cursor-pointer items-start gap-3 rounded-md border border-zinc-200 px-3 py-2 has-checked:border-blue-500 has-checked:bg-blue-50 dark:border-zinc-800 dark:has-checked:border-blue-400 dark:has-checked:bg-blue-950">
-                <input type="radio" name="session-bar-colour" class="mt-1"
-                    prop:checked=move || display.colour.get() == colour
-                    disabled=move || !display.loaded.get() || busy.get() on:change=save />
-                <span>
-                    <span class="block text-sm font-medium">{label}</span>
-                    <span class="block text-xs text-muted">{what}</span>
-                </span>
-            </label>
-        }
+    let save = move |on: bool| {
+        let colour = if on { SessionBarColour::Tinted } else { SessionBarColour::DotOnly };
+        let previous = display.colour.get_untracked();
+        display.colour.set(colour);
+        busy.set(true);
+        display.error.set(None);
+        spawn_local(async move {
+            if let Err(e) = api::put_session_bar_settings(c6_api::SessionBarSettings { colour }).await {
+                display.colour.set(previous);
+                display.error.set(Some(e));
+            }
+            busy.set(false);
+        });
     };
     view! {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <h2 class="font-medium">"Session bar colour"</h2>
-            <div class="grid gap-2 sm:grid-cols-2">
-                {option(SessionBarColour::Tinted, "Coloured stripe", "Keep the session's colour along the bar's top edge (default)")}
-                {option(SessionBarColour::DotOnly, "Dot only", "Keep the bar neutral; show the session's colour only on its dot")}
-            </div>
+            <crate::components::Switch on=move || display.colour.get() == SessionBarColour::Tinted
+                on_change=save disabled=move || !display.loaded.get() || busy.get() label="Coloured stripe"
+                hint="On: keep the session's colour along the bar's top edge (default). Off: Dot only — keep the bar neutral; show the session's colour only on its dot." />
             <p class="text-xs text-muted">"Aspect marks keep their colours. Existing hover behaviour and click actions stay the same. Kept in carbon6 across realms and devices."</p>
             {move || display.error.get().map(|e| view! { <ErrorBox message=e /> })}
         </section>
@@ -599,8 +586,7 @@ pub fn transcript_times() -> RwSignal<c6_api::TranscriptTimes> {
 fn TranscriptSetting() -> impl IntoView {
     let display = expect_context::<TranscriptDisplay>();
     let busy = RwSignal::new(false);
-    let toggle = move |ev| {
-        let show_thinking = event_target_checked(&ev);
+    let toggle = move |show_thinking| {
         let previous = display.show_thinking.get_untracked();
         display.show_thinking.set(show_thinking);
         busy.set(true);
@@ -617,14 +603,9 @@ fn TranscriptSetting() -> impl IntoView {
     view! {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <h2 class="font-medium">"Session transcripts"</h2>
-            <label class="flex cursor-pointer items-start gap-3">
-                <input type="checkbox" class="mt-1" prop:checked=move || display.show_thinking.get()
-                    disabled=move || !display.loaded.get() || busy.get() on:change=toggle />
-                <span>
-                    <span class="block text-sm font-medium">"Show thinking"</span>
-                    <span class="block text-xs text-muted">"Show model reasoning expanded, labelled Thinking; otherwise hide it from transcripts."</span>
-                </span>
-            </label>
+            <crate::components::Switch on=move || display.show_thinking.get() on_change=toggle
+                disabled=move || !display.loaded.get() || busy.get() label="Show thinking"
+                hint="Show model reasoning expanded, labelled Thinking; otherwise hide it from transcripts." />
             <label class="block space-y-1">
                 <span class="block text-sm font-medium">"Times"</span>
                 <select class=INPUT disabled=move || !display.loaded.get() || busy.get()
@@ -855,14 +836,15 @@ fn Realms() -> impl IntoView {
                         <span class="min-w-0 flex-1 truncate text-muted">{r.description.clone()}</span>
                         <crate::workspace::Go to=crate::workspace::View::Explore { realm: r.id.clone(), section: String::new(), kind: String::new(), id: String::new() } class=format!("{BUTTON_QUIET} text-xs")>"Explore"</crate::workspace::Go>
                         {holds.then(|| view! {
-                            <label class="flex items-center gap-1 text-xs text-muted" title="Every realm reads commons, the knowledge shared by all, unless you turn it off">
-                                <input type="checkbox" prop:checked=reads on:change=move |ev| {
-                                    let r = c6_api::RealmIn { id: String::new(), name: cname.clone(), description: cdesc.clone(), reads_commons: Some(event_target_checked(&ev)) };
-                                    let cid = cid.clone();
-                                    run(Box::pin(async move { crate::api::update_realm(cid, r).await.map(|_| ()) }));
-                                } />
-                                "reads commons"
-                            </label>
+                            <div class="shrink-0">
+                                <crate::components::Switch on=move || reads label="reads commons"
+                                    title="Every realm reads commons, the knowledge shared by all, unless you turn it off"
+                                    on_change=move |on| {
+                                        let r = c6_api::RealmIn { id: String::new(), name: cname.clone(), description: cdesc.clone(), reads_commons: Some(on) };
+                                        let cid = cid.clone();
+                                        run(Box::pin(async move { crate::api::update_realm(cid, r).await.map(|_| ()) }));
+                                    } />
+                            </div>
                         })}
                         {removable.then(|| view! {
                             <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| {
@@ -1393,7 +1375,7 @@ fn SessionImportsSetting() -> impl IntoView {
                     let n2 = name.clone();
                     view! {
                         <label class="flex items-center gap-1">
-                            <input type="checkbox" prop:checked=move || s.get().workers.contains(&name)
+                            <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || s.get().workers.contains(&name)
                                 on:change=move |ev| { let on = event_target_checked(&ev); s.update(|v| v.workers = toggle(v.workers.clone(), &n2, on)); } />
                             {w.name.clone()}
                         </label>
@@ -1404,7 +1386,7 @@ fn SessionImportsSetting() -> impl IntoView {
                 <span class="text-muted">"From:"</span>
                 {[("claude_code", "Claude Code"), ("codex", "Codex")].into_iter().map(|(k, label)| view! {
                     <label class="flex items-center gap-1">
-                        <input type="checkbox" prop:checked=move || { let v = s.get(); v.sources.is_empty() || v.sources.iter().any(|x| x == k) }
+                        <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || { let v = s.get(); v.sources.is_empty() || v.sources.iter().any(|x| x == k) }
                             on:change=move |ev| {
                                 let on = event_target_checked(&ev);
                                 s.update(|v| {
@@ -1473,29 +1455,17 @@ fn SuggestionsSetting() -> impl IntoView {
         <section class="space-y-2 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <h2 class="font-medium">"Suggested next messages"</h2>
             <p class="text-sm text-muted">"When a turn finishes, the message box offers what you'd likely type next; Tab takes it. A small model call per finished turn, only while you're looking at the session: a routing rule with the label task:suggest picks the model (else the session's own), and the prompt is session.suggest. Names: once a session's first turn finishes, one call gives it a short name in place of its first line; a name you give it stays (task:name, else task:suggest; session.name)."</p>
-            <label class="flex items-center gap-2 text-sm">
-                <input type="checkbox" prop:checked=move || shown.with(|s| s.enabled)
-                    on:change=move |ev| set(|s, on| s.enabled = on, event_target_checked(&ev)) />
-                "Suggest next messages"
-            </label>
-            <label class="flex items-center gap-2 text-sm">
-                <input type="checkbox" prop:checked=move || shown.with(|s| s.names)
-                    on:change=move |ev| set(|s, on| s.names = on, event_target_checked(&ev)) />
-                "Name sessions"<span class="text-muted">"a short name after the first turn"</span>
-            </label>
+            <crate::components::Switch on=move || shown.with(|s| s.enabled) label="Suggest next messages"
+                on_change=move |on| set(|s, on| s.enabled = on, on) />
+            <crate::components::Switch on=move || shown.with(|s| s.names) label="Name sessions"
+                hint="a short name after the first turn" on_change=move |on| set(|s, on| s.names = on, on) />
             <h3 class="pt-2 text-sm font-medium">"New sessions start with"</h3>
             <p class="text-sm text-muted">"Each session has its own switches in its "{crate::icons::ellipsis()}" menu; these are what a new one starts with. Catch-up: when you come back to a session that did 5 steps or more (or waits on you), a card says what happened since you looked, counted, and in a paragraph from a small model (a routing rule with the label task:catchup picks it, else task:suggest's, else the session's own; the prompt is session.catchup). Fold finished turns: the transcript shows each finished turn as one row (who started it, what it did, its steps), opened in place by a click; what it did is written when you open its hour in the glance's timeline (task:timeline, else task:suggest; session.timeline)."</p>
-            <label class="flex items-center gap-2 text-sm">
-                <input type="checkbox" prop:checked=move || shown.with(|s| s.catchup)
-                    on:change=move |ev| set(|s, on| s.catchup = on, event_target_checked(&ev)) />
-                "Catch-up"<span class="text-muted">"a card when you come back"</span>
-            </label>
+            <crate::components::Switch on=move || shown.with(|s| s.catchup) label="Catch-up"
+                hint="a card when you come back" on_change=move |on| set(|s, on| s.catchup = on, on) />
             {crate::timeline::SHOWN.then(|| view! {
-                <label class="flex items-center gap-2 text-sm">
-                    <input type="checkbox" prop:checked=move || shown.with(|s| s.fold)
-                        on:change=move |ev| set(|s, on| s.fold = on, event_target_checked(&ev)) />
-                    "Fold finished turns"<span class="text-muted">"one row per finished turn"</span>
-                </label>
+                <crate::components::Switch on=move || shown.with(|s| s.fold) label="Fold finished turns"
+                    hint="one row per finished turn" on_change=move |on| set(|s, on| s.fold = on, on) />
             })}
             {move || error.get().map(|e| view! { <p class="text-sm text-red-600">{e}</p> })}
         </section>
@@ -1624,27 +1594,26 @@ fn WorkSetting() -> impl IntoView {
             <h2 class="font-medium">"Work"</h2>
             <p class="text-sm text-muted">"What you mean to finish, with the sessions, requests and links that belong to it (the Work panel). A small model call when you start a session (which work it serves) and when something attached moves (where it stands, and whether it looks done): a routing rule with the label task:work picks the model, else the session's own. The prompts are work.attach, work.summary, work.pickup and work.propose."</p>
             {move || shown.get().map(|s| view! {
-                <label class="flex items-center gap-2 text-sm">
-                    <input type="checkbox" prop:checked=s.guess on:change=move |ev| { let on = event_target_checked(&ev); save(&|s| s.guess = on) } />
-                    "An agent picks the work each new session serves (you can change it in the session's header)"
-                </label>
-                <label class="flex items-center gap-2 text-sm">
-                    <input type="checkbox" prop:checked=s.notes on:change=move |ev| { let on = event_target_checked(&ev); save(&|s| s.notes = on) } />
-                    "An agent keeps each piece of work's \"where was I\" note and says when it looks done"
-                </label>
-                <label class="flex items-center gap-2 text-sm">
-                    <input type="checkbox" prop:checked=s.project_context on:change=move |ev| { let on = event_target_checked(&ev); save(&|s| s.project_context = on) } />
-                    "A session started in work that is in a project is told the project's purpose, phase, where it stands and its documents (the prompt project.context)"
-                </label>
+                <crate::components::Switch on=move || shown.with(|s| s.as_ref().is_some_and(|s| s.guess))
+                    label="An agent picks the work each new session serves (you can change it in the session's header)"
+                    on_change=move |on| save(&|s| s.guess = on) />
+                <crate::components::Switch on=move || shown.with(|s| s.as_ref().is_some_and(|s| s.notes))
+                    label="An agent keeps each piece of work's \"where was I\" note and says when it looks done"
+                    on_change=move |on| save(&|s| s.notes = on) />
+                <crate::components::Switch on=move || shown.with(|s| s.as_ref().is_some_and(|s| s.project_context))
+                    label="A session started in work that is in a project is told the project's purpose, phase, where it stands and its documents (the prompt project.context)"
+                    on_change=move |on| save(&|s| s.project_context = on) />
                 <label class="flex items-center gap-2 text-sm">
                     "Gone quiet after"
                     <input type="number" min="1" max="90" class=format!("{INPUT} w-20!") prop:value=s.quiet_days.to_string()
                         on:change=move |ev| if let Some(n) = number(event_target_value(&ev)) { save(&|s| s.quiet_days = n) } />
                     "days without movement"
                 </label>
+                <crate::components::Switch on=move || shown.with(|s| s.as_ref().is_some_and(|s| s.nudge))
+                    label="Notify me when work goes quiet or needs me"
+                    on_change=move |on| save(&|s| s.nudge = on) />
                 <label class="flex items-center gap-2 text-sm">
-                    <input type="checkbox" prop:checked=s.nudge on:change=move |ev| { let on = event_target_checked(&ev); save(&|s| s.nudge = on) } />
-                    "Notify me when work goes quiet, or has needed me for"
+                    "Notify after work has needed me for"
                     <input type="number" min="1" max="720" class=format!("{INPUT} w-20!") prop:value=s.needs_hours.to_string()
                         on:change=move |ev| if let Some(n) = number(event_target_value(&ev)) { save(&|s| s.needs_hours = n) } />
                     "hours"
@@ -1813,7 +1782,7 @@ fn UpdatesSetting() -> impl IntoView {
                         on:change=move |ev| { let h = event_target_value(&ev).parse().unwrap_or(24); s.update(|v| v.drain_hours = h); } />
                 </label>
                 <label class="flex items-center gap-2">
-                    <input type="checkbox" prop:checked=move || s.get().parallel on:change=move |ev| { let on = event_target_checked(&ev); s.update(|v| v.parallel = on); } />
+                    <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || s.get().parallel on:change=move |ev| { let on = event_target_checked(&ev); s.update(|v| v.parallel = on); } />
                     "Update workers all at once (else one after another)"
                 </label>
             </div>
@@ -2780,7 +2749,7 @@ fn HookRow(hook: RwSignal<Hook>, on_remove: impl Fn() + Copy + Send + Sync + 'st
     view! {
         <div class=move || format!("space-y-2 rounded-md border border-zinc-200 p-3 dark:border-zinc-800 {}", if hook.with(|h| h.enabled) { "" } else { "opacity-60" })>
             <div class="flex flex-wrap items-center gap-2">
-                <input type="checkbox" title="Enabled" prop:checked=move || hook.with(|h| h.enabled)
+                <input type="checkbox" class=crate::components::CHECKBOX title="Enabled" prop:checked=move || hook.with(|h| h.enabled)
                     on:change=move |ev| hook.update(|h| h.enabled = event_target_checked(&ev)) />
                 <input class=format!("{INPUT} w-auto! min-w-0 flex-1 py-1") placeholder="Name (what it is for)" prop:value=move || hook.with(|h| h.name.clone())
                     on:input=move |ev| hook.update(|h| h.name = event_target_value(&ev)) />
@@ -3703,7 +3672,7 @@ fn ListItem(
     view! {
         <div class=move || format!("space-y-2 rounded-md border border-zinc-200 p-3 dark:border-zinc-800 {}", if enabled() { "" } else { "opacity-60" })>
             <div class="flex items-center gap-2">
-                <input type="checkbox" title="Enabled" prop:checked=enabled
+                <input type="checkbox" class=crate::components::CHECKBOX title="Enabled" prop:checked=enabled
                     on:change=move |ev| item.update(|m| { m.insert("enabled".into(), serde_json::Value::Bool(event_target_checked(&ev))); }) />
                 <input class=format!("{} w-auto! min-w-0 flex-1", input_class(first)) placeholder=first.placeholder prop:value=get(first.key)
                     on:input=move |ev| set(first.key, event_target_value(&ev)) />
@@ -3714,7 +3683,7 @@ fn ListItem(
                     let checked = move || item.with(|m| field_value(m, f.key).and_then(|v| v.as_bool()).unwrap_or(false));
                     view! {
                         <label class="flex items-start gap-2 text-sm sm:col-span-2" title=f.placeholder>
-                            <input type="checkbox" class="mt-1" prop:checked=checked
+                            <input type="checkbox" class=crate::components::CHECKBOX class:mt-1=true prop:checked=checked
                                 on:change=move |ev| item.update(|m| set_field(m, f.key, serde_json::Value::Bool(event_target_checked(&ev)))) />
                             <span>{f.label}<span class="block text-xs text-muted">{f.placeholder}</span></span>
                         </label>
@@ -4122,11 +4091,11 @@ fn ClaudeCodeToolsSetting() -> impl IntoView {
                             let (name, name2) = (t.name.clone(), t.name.clone());
                             view! {
                                 <div class="flex items-start gap-2 text-sm" title=t.description.clone()>
-                                    <input type="checkbox" class="mt-1" aria-label=format!("Offer {}", t.name) prop:checked=on prop:disabled=auto
+                                    <input type="checkbox" class=crate::components::CHECKBOX class:mt-1=true aria-label=format!("Offer {}", t.name) prop:checked=on prop:disabled=auto
                                         on:change=move |ev| toggle(name.clone(), event_target_checked(&ev), false) />
                                     <span class="min-w-0 flex-1"><span class="font-mono text-xs">{t.name.clone()}</span>" "<span class="text-xs text-muted">{t.description.clone()}</span></span>
                                     <label class="flex shrink-0 items-center gap-1 text-[11px] text-muted">
-                                        <input type="checkbox" prop:checked=up prop:disabled=!on
+                                        <input type="checkbox" class=crate::components::CHECKBOX prop:checked=up prop:disabled=!on
                                             on:change=move |ev| toggle(name2.clone(), event_target_checked(&ev), true) />
                                         "up front"
                                     </label>
@@ -4191,7 +4160,7 @@ fn BriefSetting() -> impl IntoView {
                 </label>
             </div>
             <label class="flex items-center gap-2 text-sm">
-                <input type="checkbox" prop:checked=move || setting.with(|s| s.urgent) on:change=move |ev| setting.update(|s| s.urgent = event_target_checked(&ev)) />
+                <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || setting.with(|s| s.urgent) on:change=move |ev| setting.update(|s| s.urgent = event_target_checked(&ev)) />
                 "Tell me at once about urgent requests"
             </label>
             <div class="flex items-center justify-end gap-3">
@@ -4267,7 +4236,7 @@ fn WebSearchSetting() -> impl IntoView {
                 }}
             </div>
             <label class="flex items-center gap-2 text-sm" class:hidden=move || provider().is_empty()>
-                <input type="checkbox" prop:checked=move || setting.with(|s| s.always) on:change=move |ev| setting.update(|s| s.always = event_target_checked(&ev)) />
+                <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || setting.with(|s| s.always) on:change=move |ev| setting.update(|s| s.always = event_target_checked(&ev)) />
                 "Offer it to every model, even those with a web search of their own"
             </label>
             <div class="flex items-center justify-end gap-3">
@@ -4478,15 +4447,14 @@ fn AutomationsSetting() -> impl IntoView {
                         let last = a.last_run_id.clone();
                         view! {
                             <div class=format!("space-y-1 py-2 text-sm {}", if enabled { "" } else { "opacity-60" })>
+                                <crate::components::Switch on=move || enabled label=a.name.clone() title="On" on_change=move |on| {
+                                    let id = id1.clone();
+                                    spawn_local(async move {
+                                        let _ = api::update_automation(id, c6_api::AutomationEdit { enabled: Some(on), ..Default::default() }).await;
+                                        list.refetch();
+                                    });
+                                } />
                                 <div class="flex flex-wrap items-center gap-2">
-                                    <input type="checkbox" title="On" prop:checked=enabled on:change=move |ev| {
-                                        let (id, on) = (id1.clone(), event_target_checked(&ev));
-                                        spawn_local(async move {
-                                            let _ = api::update_automation(id, c6_api::AutomationEdit { enabled: Some(on), ..Default::default() }).await;
-                                            list.refetch();
-                                        });
-                                    } />
-                                    <span class="font-medium">{a.name.clone()}</span>
                                     <span class="font-mono text-xs text-muted">{format!("{what} → {does}")}</span>
                                     <span class="flex-1"></span>
                                     <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| {
@@ -4813,15 +4781,33 @@ mod session_bar_tests {
             };
             provide_context(display);
             let render = || untrack(|| view! { <SessionBarSetting /> }.to_html());
+            let disabled_buttons = |html: &str| {
+                html.split("<button")
+                    .skip(1)
+                    .filter(|button| {
+                        button
+                            .split('>')
+                            .next()
+                            .unwrap()
+                            .split_ascii_whitespace()
+                            .any(|attr| attr == "disabled" || attr.starts_with("disabled="))
+                    })
+                    .count()
+            };
             let html = render();
             for text in ["Session bar colour", "Coloured stripe", "Dot only", "Aspect marks keep their colours", "Existing hover behaviour"]
             {
                 assert!(html.contains(text), "{text} missing: {html}");
             }
-            assert_eq!(html.matches(" disabled").count(), 2, "don't overwrite a preference before loading it");
+            assert_eq!(disabled_buttons(&html), 1, "don't overwrite a preference before loading it: {html}");
+            assert!(
+                html.contains("role=\"switch\"") && html.contains("aria-checked=\"true\""),
+                "use the shared immediate-setting switch: {html}"
+            );
             display.loaded.set(true);
-            assert!(!render().contains(" disabled"));
+            assert_eq!(disabled_buttons(&render()), 0);
             display.colour.set(c6_api::SessionBarColour::DotOnly);
+            assert!(render().contains("aria-checked=\"false\""));
             assert_eq!(expect_context::<SessionBarDisplay>().colour.get_untracked(), c6_api::SessionBarColour::DotOnly);
             display.error.set(Some("Could not save session bar colour".to_owned()));
             assert!(render().contains("Could not save session bar colour"));

@@ -6,6 +6,7 @@ use c6_api::{ContentBlock, Event, EventKind, QueuedInput, Session, SessionStatus
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
+use crate::components::Switch;
 use crate::details::GLANCE_WIDTH;
 use crate::icons::{Icon, Size, icon};
 use crate::models::ModelInput;
@@ -1433,10 +1434,10 @@ pub fn SessionMenu(chrome: SessionChrome, #[prop(into)] on_rename: Callback<()>,
             </Show>
             <Show when=move || view_settings.with(Option::is_some)>
                 <div class=MENU_RULE></div>
-                <MenuSwitch on=flag(|v| v.catchup) label="Catch-up" hint="a card when you come back"
+                <Switch on=flag(|v| v.catchup) label="Catch-up" hint="a card when you come back"
                     on_change=move |on| set_view(|v, on| v.catchup = on, on) />
                 {crate::timeline::SHOWN.then(|| view! {
-                    <MenuSwitch on=flag(|v| v.fold) label="Fold finished turns" hint="one row per finished turn"
+                    <Switch on=flag(|v| v.fold) label="Fold finished turns" hint="one row per finished turn"
                         on_change=move |on| set_view(|v, on| v.fold = on, on) />
                 })}
             </Show>
@@ -1456,26 +1457,6 @@ pub fn SessionMenu(chrome: SessionChrome, #[prop(into)] on_rename: Callback<()>,
                 });
             }>{move || if session().is_some_and(|s| s.archived) { "Unarchive" } else { "Archive" }}</button>
         </div>
-    }
-}
-
-/// An on/off item of the ⋯ menu: the switch, what it is and a hint. The
-/// menu stays open, so you see it change.
-#[component]
-fn MenuSwitch(
-    #[prop(into)] on: Signal<bool>,
-    on_change: impl Fn(bool) + 'static,
-    label: &'static str,
-    hint: &'static str,
-) -> impl IntoView {
-    view! {
-        <button type="button" role="switch" class=MENU_ITEM aria-checked=move || on.get().to_string() on:click=move |_| on_change(!on.get_untracked())>
-            <span class=move || format!("relative h-3.5 w-[26px] shrink-0 rounded-full transition-colors {}", if on.get() { "bg-sky-600" } else { "bg-zinc-300 dark:bg-zinc-600" })>
-                <span class=move || format!("absolute left-0.5 top-0.5 h-2.5 w-2.5 rounded-full bg-white shadow-sm transition-transform {}", if on.get() { "translate-x-3" } else { "" })></span>
-            </span>
-            {label}
-            <span class=MENU_HINT>{hint}</span>
-        </button>
     }
 }
 
@@ -2757,7 +2738,7 @@ fn RewindPanel(session: String, seq: u64, text: String, edit: bool, on_done: Cal
             }}
             <div class="flex flex-wrap items-center gap-3">
                 <label class="flex items-center gap-1.5 text-xs text-zinc-600 dark:text-zinc-400" title="Files in the session's folder go back to how they were before this message. Other sessions in the same folder see the change too.">
-                    <input type="checkbox" prop:checked=move || restore.get() on:change=move |ev| restore.set(event_target_checked(&ev)) />
+                    <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || restore.get() on:change=move |ev| restore.set(event_target_checked(&ev)) />
                     "Also restore files to before this message"
                 </label>
                 <span class="flex-1"></span>
@@ -3146,25 +3127,6 @@ const MENU_RULE: &str = "my-1 border-t border-zinc-200 dark:border-zinc-700";
 /// The message box's model chip: quiet, grey text with a background only on
 /// hover, so the toolbar doesn't compete with what you're typing.
 const CHIP: &str = "inline-flex h-6 max-w-full items-center gap-1 rounded-md px-1.5 text-muted hover:bg-zinc-100 hover:text-zinc-800 dark:hover:bg-zinc-800 dark:hover:text-zinc-100";
-
-/// A small on/off switch (the look of the document comments' "Send to agent").
-#[component]
-fn Switch(
-    #[prop(into)] on: Signal<bool>,
-    on_change: impl Fn(bool) + 'static,
-    label: &'static str,
-    #[prop(optional, into)] title: String,
-) -> impl IntoView {
-    view! {
-        <button type="button" role="switch" aria-checked=move || on.get().to_string() title=title
-            class="inline-flex items-center gap-1.5 rounded text-zinc-600 dark:text-zinc-400" on:click=move |_| on_change(!on.get_untracked())>
-            <span class=move || format!("relative h-3.5 w-[26px] shrink-0 rounded-full transition-colors {}", if on.get() { "bg-sky-600" } else { "bg-zinc-300 dark:bg-zinc-600" })>
-                <span class=move || format!("absolute left-0.5 top-0.5 h-2.5 w-2.5 rounded-full bg-white shadow-sm transition-transform {}", if on.get() { "translate-x-3" } else { "" })></span>
-            </span>
-            {label}
-        </button>
-    }
-}
 
 const SUBAGENTS_HELP: &str = "The agent starts a subagent with its Task tool when it decides a piece of work suits one (or you ask). This is the connection and model they run on, unless a call or a named agent asks for another. carbon6 runs them itself, whatever this session runs on.";
 
@@ -5777,7 +5739,7 @@ fn Composer(
                 {wake.map(|w| view! {
                     <label class="flex items-center gap-1.5 self-start text-xs text-muted"
                         title="Its report reaches the agent that started it at that agent's next step if it is working; otherwise with its next message, unless this wakes it now.">
-                        <input type="checkbox" prop:checked=move || w.get() on:change=move |ev| w.set(event_target_checked(&ev)) />
+                        <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || w.get() on:change=move |ev| w.set(event_target_checked(&ev)) />
                         "Wake the agent that started it"
                     </label>
                 })}
@@ -5921,7 +5883,7 @@ fn QuestionCard(session: String, call_id: String, title: String, fields: Vec<c6_
                                 view! { <crate::util::Choices choices value=v optional=!f.required /> }.into_any()
                             }
                             "boolean" => view! {
-                                <input type="checkbox" prop:checked=move || v.get() == "true" on:change=move |ev| v.set(event_target_checked(&ev).to_string()) />
+                                <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || v.get() == "true" on:change=move |ev| v.set(event_target_checked(&ev).to_string()) />
                             }.into_any(),
                             "longtext" => view! {
                                 <textarea class=format!("{INPUT} min-h-20 text-sm") prop:value=move || v.get() on:input=move |ev| v.set(event_target_value(&ev))></textarea>

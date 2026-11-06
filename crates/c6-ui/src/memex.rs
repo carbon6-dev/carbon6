@@ -584,12 +584,12 @@ pub fn MemexSettings() -> impl IntoView {
                     <span class="text-xs text-muted">"Embedding model"</span>
                     <ModelInput connection=conn value=model on_set=move |v| model.set(v) class=format!("{INPUT} py-1 text-xs") placeholder="e.g. nomic-embed-text, text-embedding-3-small" />
                 </label>
-                <label class="flex items-center gap-2 text-sm sm:col-span-3">
-                    <input type="checkbox" prop:checked=move || auto.get() on:change=move |ev| auto.set(event_target_checked(&ev)) />
+                <label class="flex min-h-8 items-center gap-2 text-sm pointer-coarse:min-h-11 sm:col-span-3">
+                    <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || auto.get() on:change=move |ev| auto.set(event_target_checked(&ev)) />
                     "Add people you correspond with (written to twice, heard from) to Google Contacts, in a carbon6 group"
                 </label>
-                <label class="flex items-center gap-2 text-sm sm:col-span-3">
-                    <input type="checkbox" prop:checked=move || approve.get() on:change=move |ev| approve.set(event_target_checked(&ev)) />
+                <label class="flex min-h-8 items-center gap-2 text-sm pointer-coarse:min-h-11 sm:col-span-3">
+                    <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || approve.get() on:change=move |ev| approve.set(event_target_checked(&ev)) />
                     "Agents' mail and calendar invitations wait for my approval"
                 </label>
                 {tasks.into_iter().map(|(k, c, m, e)| {

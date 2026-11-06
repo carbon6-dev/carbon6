@@ -148,10 +148,8 @@ fn ChatRow(s: Session, open: Callback<(String, How)>) -> impl IntoView {
             }}
             <div class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-zinc-500">
                 <span class="font-mono">{s.model.clone()}</span>
-                <label class="flex items-center gap-1" title="Let this conversation read your mail, chat and calendar">
-                    <input type="checkbox" prop:checked=personal on:change=move |ev| toggle(event_target_checked(&ev)) />
-                    "mail, chat, calendar"
-                </label>
+                <crate::components::Switch on=Signal::stored(personal) on_change=move |v| toggle(v)
+                    label="mail, chat, calendar" title="Let this conversation read your mail, chat and calendar" />
                 <span class="flex-1"></span>
                 <button class=BUTTON_QUIET on:click={ let t = s.title.clone(); move |_| renaming.set(Some(t.clone())) }>"Rename"</button>
                 <button class=BUTTON_QUIET on:click=archive>"Archive"</button>
@@ -218,8 +216,8 @@ fn NewChat(like: Signal<Option<(String, String)>>, on_started: Callback<Session>
 
             </div>
             <div class="flex flex-wrap items-center gap-3">
-                <label class="flex items-center gap-1 text-xs text-zinc-600 dark:text-zinc-400" title="Off: this switch does not add mail, chat or calendar to this conversation's knowledge scope. You can still @-mention one item in a message.">
-                    <input type="checkbox" prop:checked=move || personal.get() on:change=move |ev| personal.set(event_target_checked(&ev)) />
+                <label class="flex min-h-8 items-center gap-1 text-xs text-zinc-600 pointer-coarse:min-h-11 dark:text-zinc-400" title="Off: this switch does not add mail, chat or calendar to this conversation's knowledge scope. You can still @-mention one item in a message.">
+                    <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || personal.get() on:change=move |ev| personal.set(event_target_checked(&ev)) />
                     "Include my mail, chat and calendar"
                 </label>
                 <span class="flex-1"></span>

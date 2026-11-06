@@ -109,14 +109,13 @@ pub fn CalendarPage() -> impl IntoView {
                     {cs.into_iter().map(|c| {
                         let (acc, id) = (c.account.clone(), c.id.clone());
                         view! {
-                            <label class="flex items-center gap-1">
-                                <input type="checkbox" prop:checked=c.selected on:change=move |ev| {
-                                    let (acc, id, on) = (acc.clone(), id.clone(), event_target_checked(&ev));
-                                    spawn_local(async move { let _ = api::rpc("memex.calendar.select", json!({"account": acc, "id": id, "on": on})).await; refresh.update(|n| *n += 1); });
-                                } />
+                            <div class="flex items-center gap-1">
                                 <span class="h-2 w-2 rounded-full" style=format!("background:{}", if c.color.is_empty() { "#888".to_owned() } else { c.color.clone() })></span>
-                                {c.summary.clone()}
-                            </label>
+                                <crate::components::Switch on=Signal::stored(c.selected) on_change=move |on| {
+                                    let (acc, id) = (acc.clone(), id.clone());
+                                    spawn_local(async move { let _ = api::rpc("memex.calendar.select", json!({"account": acc, "id": id, "on": on})).await; refresh.update(|n| *n += 1); });
+                                } label=c.summary.clone() />
+                            </div>
                         }
                     }).collect_view()}
                 </div>
@@ -311,7 +310,7 @@ fn NewEvent(creating: RwSignal<bool>, refresh: RwSignal<u32>) -> impl IntoView {
                     <option value="">"Calendar…"</option>
                     {move || calendars.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|c| c.writable).map(|c| view! { <option value=format!("{}|{}", c.account, c.id)>{c.summary.clone()}</option> }).collect_view()}
                 </select>
-                <label class="flex items-center gap-2 text-sm"><input type="checkbox" prop:checked=move || all_day.get() on:change=move |ev| all_day.set(event_target_checked(&ev)) />"All day"</label>
+                <label class="flex min-h-8 items-center gap-2 text-sm pointer-coarse:min-h-11"><input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || all_day.get() on:change=move |ev| all_day.set(event_target_checked(&ev)) />"All day"</label>
             </div>
             <div class="flex justify-end gap-2">
                 <button class=BUTTON_QUIET on:click=move |_| creating.set(false)>"Cancel"</button>

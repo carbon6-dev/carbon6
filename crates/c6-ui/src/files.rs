@@ -38,10 +38,7 @@ pub fn FileBrowser(worker_id: String, #[prop(optional)] root: Option<String>) ->
                         on:input=move |ev| path_input.set(event_target_value(&ev))
                         on:keydown=move |ev| if ev.key() == "Enter" { dir.set(path_input.get_untracked()) } />
                 </div>
-                <label class="flex items-center gap-1.5 text-xs text-muted">
-                    <input type="checkbox" prop:checked=move || hidden.get() on:change=move |ev| hidden.set(event_target_checked(&ev)) />
-                    "Show hidden files"
-                </label>
+                <crate::components::Switch on=move || hidden.get() on_change=move |v| hidden.set(v) label="Show hidden files" />
                 <div class="max-h-[70vh] overflow-auto rounded-md border border-zinc-200 dark:border-zinc-800">
                     <Suspense fallback=|| view! { <p class="p-3 text-sm text-muted">"Loading…"</p> }>
                         {move || listing.get().map(|r| match r {
@@ -368,10 +365,7 @@ pub fn FolderPicker(
                 {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
                 <div class="flex flex-wrap items-center gap-2">
                     <button class=crate::util::BUTTON_QUIET on:click=move |_| { error.set(None); new_name.set(Some(String::new())) }>"New folder"</button>
-                    <label class="flex items-center gap-1.5 text-xs text-muted">
-                        <input type="checkbox" prop:checked=move || hidden.get() on:change=move |ev| hidden.set(event_target_checked(&ev)) />
-                        "Show hidden"
-                    </label>
+                    <crate::components::Switch on=move || hidden.get() on_change=move |v| hidden.set(v) label="Show hidden" />
                     <span class="flex-1"></span>
                     <button class=crate::util::BUTTON_QUIET on:click=move |_| on_cancel.run(())>"Cancel"</button>
                     <button class=crate::util::BUTTON disabled=move || current.get().is_none()
@@ -576,14 +570,9 @@ pub fn FilePicker(
                 {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
                 <div class="flex flex-wrap items-center gap-3">
                     {move || (source.get() != Source::Device).then(|| view! {
-                        <label class="flex items-center gap-1.5 text-xs text-muted">
-                            <input type="checkbox" prop:checked=move || all.get() on:change=move |ev| all.set(event_target_checked(&ev)) />
-                            {format!("All files (not only {})", extensions.join(", "))}
-                        </label>
-                        <label class="flex items-center gap-1.5 text-xs text-muted">
-                            <input type="checkbox" prop:checked=move || hidden.get() on:change=move |ev| hidden.set(event_target_checked(&ev)) />
-                            "Show hidden"
-                        </label>
+                        <crate::components::Switch on=move || all.get() on_change=move |v| all.set(v)
+                            label=format!("All files (not only {})", extensions.join(", ")) />
+                        <crate::components::Switch on=move || hidden.get() on_change=move |v| hidden.set(v) label="Show hidden" />
                     })}
                     <span class="flex-1"></span>
                     {move || busy.get().then(|| view! { <span class="text-xs text-muted">"Reading…"</span> })}

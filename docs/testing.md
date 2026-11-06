@@ -79,6 +79,39 @@ After building with `env -u NO_COLOR make ui`, check arbitrary Tailwind utilitie
 used by changed markup against the generated CSS, not merely the source class
 strings. The shared SVGs use ordinary size/alignment utilities.
 
+## Icons and components: browser check
+
+Native tests in `icons.rs` keep the chrome-glyph and no-browser-SSR guards,
+check every vendored icon at 14/16/20px (one outer SVG, 1.5px absolute stroke),
+and compare the markup helpers with the same path source. `components.rs`
+checks accessible names and trailing switches, bans local switch markup/SELECT
+constants, and requires the shared class on native checkboxes. The ad hoc
+button-class guard waits for the deferred button migration; existing buttons
+are not silently exempted by a growing allow-list.
+
+After `make ui`, open the signed-in `/dev/components` specimen. Repeat in light
+and dark, at desktop and phone widths, with fine and coarse pointer media:
+
+1. Icons are visible, inherit their colour and keep their weight at all three
+   sizes. There are no nested SVGs; filled stars and Stop stay filled.
+2. Check primary/secondary/quiet/danger buttons, small/default sizes, disabled
+   and keyboard-focus states. On coarse pointers buttons are at least 40px;
+   inputs/selects are at least 40px with 16px text. The select has one chevron.
+3. Toggle the specimen's switch by label, track, Space and Enter. The disabled
+   one never changes. Inspect Settings → Appearance, Suggestions and Work:
+   labels/descriptions remain left, tracks align right, saving/error/disabled
+   behaviour is unchanged. Form choices that need Save remain checkboxes.
+4. In a session's ⋯ menu, toggle Catch-up (and Fold finished turns when the
+   timeline feature is shown). The menu stays open; switch rows have the same
+   shape as Settings and at least 44px touch targets. Find's key hint is a keycap.
+5. Open Settings → Realms → Explore. Kind marks retain their original colours,
+   with the approved Lucide shapes. Follow an in-app link and inspect a new-tab
+   link: their trailing 14px arrows differ. Notifications has only its bell,
+   with on/filtered/off state in its title and accessible name.
+6. Watch the browser console and crash reporter through all of these: no
+   browser `.to_html()` calls, disposed-signal panics or horizontal overflow.
+   Check newly added arbitrary Tailwind selectors in the generated CSS too.
+
 ## Doc comments: placement browser check
 
 `cargo test -p c6-ui` checks the pure popover placement with offset tile bounds,

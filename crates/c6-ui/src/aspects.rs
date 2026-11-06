@@ -184,15 +184,15 @@ pub fn FacetsSetting() -> impl IntoView {
                 {ASPECTS.into_iter().map(|aspect| {
                     let (label, hint) = what(aspect);
                     view! {
-                        <label class="flex cursor-pointer items-start gap-3 rounded-md border border-zinc-200 px-3 py-2 has-checked:border-blue-500 has-checked:bg-blue-50 dark:border-zinc-800 dark:has-checked:border-blue-400 dark:has-checked:bg-blue-950">
-                            <input type="checkbox" class="mt-1" prop:checked=move || facets.shown.with(|s| s.iter().any(|a| a == aspect))
-                                on:change=move |ev| toggle(aspect, event_target_checked(&ev)) />
-                            <span class="mt-1"><Glyph mark=Signal::stored("slate".to_owned()) shape=Shape::of(aspect) size=11 /></span>
-                            <span>
-                                <span class="block text-sm font-medium">{label}</span>
-                                <span class="block text-xs text-muted">{hint}</span>
-                            </span>
-                        </label>
+                        <div class=move || format!("flex items-center gap-3 rounded-md border px-3 py-2 {}", if facets.shown.with(|s| s.iter().any(|a| a == aspect)) {
+                            "border-blue-500 bg-blue-50 dark:border-blue-400 dark:bg-blue-950"
+                        } else {
+                            "border-zinc-200 dark:border-zinc-800"
+                        })>
+                            <span><Glyph mark=Signal::stored("slate".to_owned()) shape=Shape::of(aspect) size=11 /></span>
+                            <crate::components::Switch on=move || facets.shown.with(|s| s.iter().any(|a| a == aspect))
+                                on_change=move |on| toggle(aspect, on) label hint />
+                        </div>
                     }
                 }).collect_view()}
             </div>

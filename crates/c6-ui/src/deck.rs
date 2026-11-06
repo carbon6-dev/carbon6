@@ -297,10 +297,8 @@ pub fn DeckView(
                                     }>
                                         {c6_api::docs::LAYOUTS.iter().map(|(l, _)| view! { <option value=*l selected=layout == *l>{*l}</option> }).collect_view()}
                                     </select>
-                                    <label class="flex items-center gap-1 text-muted">
-                                        <input type="checkbox" prop:checked=hidden on:change=move |ev| send.run(vec![replace_slide(&sid2, None, None, Some(event_target_checked(&ev)))]) />
-                                        "Hidden"
-                                    </label>
+                                    <crate::components::Switch on=Signal::stored(hidden)
+                                        on_change=move |v| send.run(vec![replace_slide(&sid2, None, None, Some(v))]) label="Hidden" />
                                     <button class=BUTTON_QUIET on:click=move |_| edit_slide()>"Edit slide"</button>
                                 })}
                                 {pending.then(|| view! { <span class="text-violet-700 dark:text-violet-300">{icon(Icon::PenLine, Size::S14)}" "{format!("being written by {}", crate::docs::author(s.attrs["by"].as_str().unwrap_or("")))}</span> })}

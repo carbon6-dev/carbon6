@@ -1385,12 +1385,12 @@ pub fn SaveTemplateDialog(seed: SessionSeed, #[prop(into)] on_close: Callback<()
                         <span class="text-xs text-muted">"Prompt (optional: standing instructions; a subagent's task fills {{input}}, or follows)"</span>
                         <textarea class=format!("{INPUT} min-h-20 font-mono text-xs") prop:value=move || prompt.get() on:input=move |ev| prompt.set(event_target_value(&ev))></textarea>
                     </label>
-                    <label class="flex items-start gap-2">
-                        <input type="checkbox" class="mt-1" prop:checked=move || agents.get() on:change=move |ev| agents.set(event_target_checked(&ev)) />
+                    <label class="flex min-h-8 items-start gap-2 pointer-coarse:min-h-11">
+                        <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || agents.get() on:change=move |ev| agents.set(event_target_checked(&ev)) />
                         <span>"Agents may start it"<span class="block text-xs text-muted">"Any session's agent can start it as a remote subagent, here, whatever worker it runs on"</span></span>
                     </label>
-                    <label class="flex items-start gap-2">
-                        <input type="checkbox" class="mt-1" prop:checked=move || worktree.get() on:change=move |ev| worktree.set(event_target_checked(&ev)) />
+                    <label class="flex min-h-8 items-start gap-2 pointer-coarse:min-h-11">
+                        <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || worktree.get() on:change=move |ev| worktree.set(event_target_checked(&ev)) />
                         <span>"New git worktree"<span class="block text-xs text-muted">"Each session works in a new worktree of the folder, on a new c6/… branch"</span></span>
                     </label>
                     <div class="flex items-center justify-end gap-3">
@@ -2044,16 +2044,16 @@ fn SessionForm(
                     }}</span>
                     <span class="text-muted">{crate::icons::chevron_down()}</span>
                 </button>
-                <button type="button" role="switch" aria-checked=move || worktree.get().to_string()
+                <label
                     title="A new git worktree: a c6/… branch and a separate checkout for this session"
                     class=move || if remote.get() || template.with(Option::is_some) { "hidden".to_owned() } else {
-                        format!("inline-flex h-6 shrink-0 items-center gap-1 rounded-md border px-1.5 text-xs pointer-coarse:h-8 {}",
+                        format!("inline-flex min-h-8 shrink-0 cursor-pointer items-center gap-1 rounded-md border px-1.5 text-xs pointer-coarse:min-h-11 {}",
                             if worktree.get() { "border-sky-300 bg-sky-50 text-sky-800 dark:border-sky-800 dark:bg-sky-950 dark:text-sky-300" } else { "border-zinc-300 text-soft hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800" })
-                    }
-                    on:click=move |_| worktree.update(|w| *w = !*w)>
-                    {move || icons::check_box(worktree.get())}
+                    }>
+                    <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || worktree.get()
+                        on:change=move |ev| worktree.set(event_target_checked(&ev)) />
                     "Worktree"
-                </button>
+                </label>
                 <button data-pop=fields_pop.clone() aria-expanded=move || changing.get().to_string()
                     class=move || if template.with(Option::is_some) { "hidden".to_owned() } else { format!("{tool} hidden md:inline-flex") }
                     title="Change where and how it runs" on:click=move |_| changing.update(|c| *c = !*c)>

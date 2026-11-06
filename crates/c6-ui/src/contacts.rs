@@ -106,8 +106,8 @@ pub fn ContactsPage() -> impl IntoView {
                         let (name, email) = (c.name.clone(), c.email.clone());
                         let (e1, e2, e3) = (email.clone(), email.clone(), email.clone());
                         view! {
-                            <label class="flex flex-wrap items-center gap-2 text-sm">
-                                <input type="checkbox" prop:checked=move || ticked.with(|t| t.contains(&e1))
+                            <label class="flex min-h-8 flex-wrap items-center gap-2 text-sm pointer-coarse:min-h-11">
+                                <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || ticked.with(|t| t.contains(&e1))
                                     on:change=move |ev| { let on = event_target_checked(&ev); ticked.update(|t| { if on { t.insert(e2.clone()); } else { t.remove(&e2); } }); } />
                                 <span>{if c.name.is_empty() { c.email.clone() } else { format!("{} <{}>", c.name, c.email) }}</span>
                                 <span class="text-xs text-muted">{format!("you wrote {} · they wrote {}", c.sent, c.received)}</span>
