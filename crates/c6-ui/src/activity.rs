@@ -67,7 +67,7 @@ pub fn Dock() -> impl IntoView {
     });
     // ⌘\ (Ctrl+\) hides it or keeps it open.
     let keys = window_event_listener(leptos::ev::keydown, move |ev| {
-        if (ev.meta_key() || ev.ctrl_key()) && !ev.alt_key() && ev.key() == "\\" {
+        if ev.key() == "\\" && crate::util::app_shortcut(&ev) {
             ev.prevent_default();
             toggle.try_run(());
         }

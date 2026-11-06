@@ -814,3 +814,31 @@ test prints each phase and checks browser errors both before and after the
 session/doc boundary; its live fixture accepts the live socket's query string
 and waits for readiness rather than depending on connection timing.
 
+## Global shortcuts: platform modifier and terminal focus
+
+`cargo test -p c6-ui util::tests::app_shortcuts` checks browser platform
+classification and every Meta/Ctrl/Alt/Shift combination without rendering
+app views. Workspace 1–9 and [ / ], sidebar \, Search K and Ask J use Meta
+only on macOS (`navigator.platform` starts with `Mac`), Ctrl only elsewhere.
+The opposite modifier, both together, Alt/Shift variants, composing events
+and events already prevented by a child must not trigger an app command.
+
+Run `ENGINE=both node crates/c6-ui/tests/keyboard-shortcuts.cjs` against the
+coordinator's final dist (`ROOT`, `PLAYWRIGHT_CORE`, `CHROMIUM` and
+`WEBKIT_EXECUTABLE` work as in `motion.cjs`; this script does not build the UI).
+It overrides `navigator.platform` before app startup to `MacIntel`, then
+`Linux x86_64` and `Win32`. With multiple tiles, send cancelable bubbling
+keydown events using each platform's modifier: 1–9 focus the numbered tile,
+[ / ] go back/forward in its history, \ toggles the sidebar, K focuses Search
+and J opens Ask. Verify the other modifier and the variants above leave
+the workspace and focus unchanged and are not prevented by these handlers.
+Repeat with focus on `.xterm-helper-textarea` inside `.xterm`: none of those
+commands may move tiles, toggle the sidebar, steal focus or prevent the event;
+terminal Ctrl+J, Ctrl+K, Ctrl+[ and Ctrl+\ must remain terminal input. Test both
+an event targeted at the textarea and one dispatched on `window` while the
+terminal stays focused, especially Ctrl+[ on macOS. The fixture uses a real
+focusable terminal-shaped DOM subtree without xterm's own key handlers, so the
+events actually bubble to the production window listeners. After leaving the
+terminal, shortcuts must work again. Normal Search and message inputs still
+allow these explicit app commands. Retained but hidden Search inputs must not
+claim K before the visible header input; the fixture checks actual visible focus.

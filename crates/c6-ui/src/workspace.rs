@@ -2408,7 +2408,7 @@ pub fn Tiles() -> impl IntoView {
         });
     });
     let keys = window_event_listener(leptos::ev::keydown, move |ev| {
-        if !(ev.meta_key() || ev.ctrl_key()) || ev.alt_key() {
+        if !crate::util::app_shortcut(&ev) {
             return;
         }
         match ev.key().as_str() {

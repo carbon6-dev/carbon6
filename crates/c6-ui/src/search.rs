@@ -53,12 +53,17 @@ pub fn SearchBox() -> impl IntoView {
     let text = RwSignal::new(String::new());
     let input = NodeRef::<leptos::html::Input>::new();
     let hotkey = window_event_listener(leptos::ev::keydown, move |ev| {
-        if ev.key() == "k" && (ev.meta_key() || ev.ctrl_key()) {
+        // Search also lives in retained, currently hidden menus/pages. Only
+        // the visible input may claim the shared command, or an earlier
+        // hidden listener would prevent the visible header from receiving it.
+        if ev.key().eq_ignore_ascii_case("k")
+            && crate::util::app_shortcut(&ev)
+            && let Some(el) = input.try_get_untracked().flatten()
+            && el.get_bounding_client_rect().width() > 0.0
+        {
             ev.prevent_default();
-            if let Some(el) = input.try_get_untracked().flatten() {
-                let _ = el.focus();
-                el.select();
-            }
+            let _ = el.focus();
+            el.select();
         }
     });
     on_cleanup(move || hotkey.remove());

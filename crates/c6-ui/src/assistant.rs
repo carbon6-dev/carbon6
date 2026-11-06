@@ -18,7 +18,7 @@ pub struct AskState(pub RwSignal<bool>);
 pub fn AskHost() -> impl IntoView {
     let open = expect_context::<AskState>().0;
     let hotkey = window_event_listener(leptos::ev::keydown, move |ev| {
-        if ev.key().eq_ignore_ascii_case("j") && (ev.meta_key() || ev.ctrl_key()) {
+        if ev.key().eq_ignore_ascii_case("j") && crate::util::app_shortcut(&ev) {
             ev.prevent_default();
             open.set(true);
         }

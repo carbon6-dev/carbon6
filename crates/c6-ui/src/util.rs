@@ -377,6 +377,32 @@ pub fn phone() -> bool {
     !window().match_media("(min-width: 48rem) and (min-height: 32rem)").ok().flatten().is_some_and(|m| m.matches())
 }
 
+fn mac_platform(platform: &str) -> bool {
+    platform.starts_with("Mac")
+}
+
+fn shortcut_modifiers(mac: bool, meta: bool, ctrl: bool, alt: bool, shift: bool) -> bool {
+    !alt && !shift && if mac { meta && !ctrl } else { ctrl && !meta }
+}
+
+/// Global app commands use this browser's command modifier, never terminal
+/// keystrokes. Check focus too: a window-dispatched event may have no element
+/// target, and a child may already have handled it before it bubbles here.
+pub fn app_shortcut(ev: &web_sys::KeyboardEvent) -> bool {
+    use wasm_bindgen::JsCast;
+
+    if ev.default_prevented() || ev.is_composing() {
+        return false;
+    }
+    let mac = mac_platform(&window().navigator().platform().unwrap_or_default());
+    if !shortcut_modifiers(mac, ev.meta_key(), ev.ctrl_key(), ev.alt_key(), ev.shift_key()) {
+        return false;
+    }
+    let in_terminal = |el: web_sys::Element| el.closest(".xterm").ok().flatten().is_some();
+    !ev.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()).is_some_and(in_terminal)
+        && !document().active_element().is_some_and(in_terminal)
+}
+
 /// The key that sends a message box: Enter (Shift+Enter for a new line);
 /// on a touch screen only ⌘/Ctrl+Enter, Return being a new line. ⌘/Ctrl+Enter
 /// sends everywhere.
@@ -939,6 +965,32 @@ pub fn steady<T: Clone + PartialEq + Send + Sync + 'static>(r: LocalResource<T>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_shortcuts_use_the_browser_platform() {
+        for platform in ["MacIntel", "MacPPC", "Mac68K"] {
+            assert!(mac_platform(platform), "{platform}");
+        }
+        for platform in ["Win32", "Win64", "Linux x86_64", "Linux aarch64", "iPhone", "iPad", ""] {
+            assert!(!mac_platform(platform), "{platform}");
+        }
+    }
+
+    #[test]
+    fn app_shortcuts_require_only_the_platform_command_modifier() {
+        // Exhaust all modifier combinations on both platforms: neither, the
+        // other platform's modifier, both, Alt and Shift must not act.
+        for mac in [false, true] {
+            for bits in 0..16 {
+                let (meta, ctrl, alt, shift) = (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0);
+                assert_eq!(
+                    shortcut_modifiers(mac, meta, ctrl, alt, shift),
+                    bits == if mac { 1 } else { 2 },
+                    "mac={mac}, meta={meta}, ctrl={ctrl}, alt={alt}, shift={shift}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn attachment_drafts_use_the_text_drafts_place_and_key() {
