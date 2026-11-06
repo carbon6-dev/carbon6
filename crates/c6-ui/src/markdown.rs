@@ -87,6 +87,16 @@ pub fn to_html(src: &str) -> String {
     with_citations(src, &[])
 }
 
+/// Plain text with carbon6 references as the usual mentions, not Markdown.
+/// Card-button messages can name a new session without interpreting the
+/// task's title as formatting or HTML.
+pub fn text_with_mentions(src: &str) -> String {
+    let here = Here { origin: String::new(), realm: crate::place::realm(), base: crate::place::base(), known: &crate::mentions::known };
+    let mut out = String::new();
+    html::push_html(&mut out, bare_mentions(src, &here).into_iter());
+    out
+}
+
 pub fn with_citations(src: &str, citations: &[c6_api::citations::UrlCitation]) -> String {
     // Titles and marks as the message renders, untracked: a message isn't
     // drawn again for every change to a session (its hover card shows

@@ -151,7 +151,7 @@ pub(crate) fn worth_a_card(steps: u64, waiting: usize) -> bool {
 /// document's comments or the agent's that started it.
 fn yours(kind: &EventKind) -> bool {
     matches!(kind, EventKind::User { text, command, from_session_id, delegated_by, .. }
-        if from_session_id.is_empty() && delegated_by.is_empty() && !matches!(command.as_str(), "task-notification" | "stop-hook" | "card-answer") && doc_comment(text).is_none())
+        if from_session_id.is_empty() && delegated_by.is_empty() && !matches!(command.as_str(), "task-notification" | "stop-hook") && doc_comment(text).is_none())
 }
 
 /// Where a catch-up starts, and when: after `seen`, the last event before
@@ -860,9 +860,9 @@ pub(crate) mod tests {
             ev(30, 3000, from_session("Release prep", "hi")),
             ev(31, 3001, notice("<background-task>\nCommand: make\n</background-task>")),
             ev(32, 3002, user("A comment on the document \"Plan\" (doc:d1) is for you. Thread t1")),
-            ev(33, 3003, card_answer()),
         ];
         assert_eq!(since(&others, 29, 2900), (29, 2900));
+        assert_eq!(since(&[ev(33, 3003, card_answer())], 29, 2900), (33, 3003), "a card button is your message");
     }
 
     #[test]

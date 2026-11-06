@@ -222,7 +222,6 @@ pub(crate) enum ActorMsg {
         wake: bool,
     },
     /// Context for the next input, never a reason to start a turn.
-    QuietNote(Box<PendingInput>),
     /// How a remote subagent's turn ended (from the head, as a command).
     RemoteReport(String, Box<c6_proto::DelegationEnded>),
     /// Deliver the held notices now, whatever the hourly limit (you asked).
@@ -559,21 +558,6 @@ impl SessionManager {
                 // Loading it delivers what it can; then the rest, now.
                 let actor = self.actor(&cmd.session_id).await.map_err(internal)?.ok_or("unknown session on this worker")?;
                 let _ = actor.send(ActorMsg::ReleaseNotices);
-                Ok(())
-            }
-            Some(session_command::Kind::QuietNote(note)) => {
-                if self.journal.is_applied(&cmd.command_id).await.map_err(internal)? {
-                    return Ok(());
-                }
-                let actor = self.actor(&cmd.session_id).await.map_err(internal)?.ok_or("unknown session on this worker")?;
-                let input = PendingInput {
-                    command_id: cmd.command_id,
-                    text: note.text,
-                    command: "task-notification".into(),
-                    quiet: true,
-                    ..Default::default()
-                };
-                let _ = actor.send(ActorMsg::QuietNote(Box::new(input)));
                 Ok(())
             }
             Some(session_command::Kind::StopTask(t)) => {
@@ -1298,7 +1282,6 @@ fn notices_of(events: &[SessionEvent]) -> (Vec<i64>, Vec<String>, Vec<(PendingIn
                     from_session_id: n.from_session_id.clone(),
                     from_title: n.from_title.clone(),
                     hops: n.hops,
-                    quiet: n.quiet,
                     ..Default::default()
                 },
                 n.wake,
@@ -1718,12 +1701,6 @@ impl Actor {
                             return;
                         }
                     }
-                    Some(ActorMsg::QuietNote(input)) => {
-                        if let Err(e) = self.notice(*input, running.is_some(), false).await {
-                            error!(session = %self.writer.session_id, "queueing quiet context: {e:#}");
-                            return;
-                        }
-                    }
                     Some(ActorMsg::ReleaseNotices) => {
                         let held = std::mem::take(&mut self.deferred);
                         info!(session = %self.writer.session_id, notices = held.len(), "delivering held notices: you asked");
@@ -2126,7 +2103,6 @@ impl Actor {
             from_session_id: input.from_session_id.clone(),
             from_title: input.from_title.clone(),
             hops: input.hops,
-            quiet: input.quiet,
             deliver_at_ms: if wake && !busy && self.inbox.lock().unwrap().queue.is_empty() {
                 let delay = self.next_auto_turn().saturating_duration_since(tokio::time::Instant::now());
                 if delay.is_zero() { 0 } else { c6_core::now_ms() + delay.as_millis() as i64 }
@@ -2143,10 +2119,6 @@ impl Actor {
     /// beyond it, once the hour allows), else it waits for the next input.
     /// `announce`: say so in the log when the limit holds it.
     async fn deliver_notice(&mut self, input: PendingInput, busy: bool, wake: bool, announce: bool) -> anyhow::Result<()> {
-        if input.quiet {
-            self.deferred.push((input, false));
-            return Ok(());
-        }
         self.report_notice(&input);
         // What the agent does next follows from this message's chain.
         if input.hops > 0 {

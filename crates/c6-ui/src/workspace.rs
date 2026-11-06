@@ -2303,6 +2303,32 @@ mod tests {
     }
 
     #[test]
+    fn a_started_session_opens_beside_the_card_and_is_shown_on_a_phone() {
+        for source in [View::session("proposer"), View::Decisions] {
+            // The card can be in the item beside a list, not the first pane.
+            let mut l = Layout::new(View::Sessions);
+            let tile = l.tiles[0].key;
+            let card = l.key();
+            l.tiles[0].columns.push(Column { key: card, view: source.clone() });
+            l.tiles[0].settle();
+            // Async completion must open beside the card, even if focus moved.
+            l.open_tile(View::Calendar);
+            l.open_after(tile, card, View::session("started"));
+            let t = l.tile(tile).unwrap();
+            assert_eq!(t.columns.len(), 2);
+            assert_eq!(t.columns[0].key, card, "keep the card's mounted pane");
+            assert_eq!(t.columns[0].view, source);
+            assert_eq!(t.columns[1].view, View::session("started"));
+            assert_eq!(t.back.last().unwrap()[0].view, View::Sessions, "the old list stays in history");
+            let started = t.columns[1].key;
+            assert_eq!(t.active, started, "keyboard actions target the new session");
+            assert!(l.pane_shown(tile, started, true), "a phone navigates to the new session");
+            assert!(!l.pane_shown(tile, card, true), "the phone does not stay on the card");
+            assert!(l.pane_shown(tile, card, false), "desktop keeps the card alongside");
+        }
+    }
+
+    #[test]
     fn a_pane_opens_beside_its_session_and_the_bar_still_speaks_for_it() {
         use crate::panes::Pane;
         // A session opened from the list: the tile shows both.

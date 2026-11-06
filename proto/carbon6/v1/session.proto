@@ -80,8 +80,6 @@ message NoticeQueued {
   // When the hourly limit next permits this notice's automatic delivery
   // (Unix milliseconds); zero if it is not held by the limit.
   int64 deliver_at_ms = 9;
-  // Context for the next input, not a notice to show as waiting in the UI.
-  bool quiet = 10;
 }
 
 // The session's default for its subagents changed (you picked one in the
@@ -527,14 +525,7 @@ message SessionCommand {
     SetSubagentModel set_subagent_model = 18;
     DelegationEnded delegation_ended = 19;
     ReleaseNotices release_notices = 20;
-    // Only sent to workers advertising quiet_notes.
-    QuietNote quiet_note = 21;
   }
-}
-
-// Context for the agent's next input: never starts or interrupts a turn.
-message QuietNote {
-  string text = 1;
 }
 
 // How a turn of a remote subagent ended, for its parent (this session):

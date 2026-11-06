@@ -95,8 +95,6 @@ pub struct PendingInput {
     /// Send now: a running turn gets it at once, not at its next step
     /// (docs/background.md §4). Not logged.
     pub send_now: bool,
-    /// A system note held for the next input, even during a running turn.
-    pub quiet: bool,
 }
 
 impl PendingInput {
