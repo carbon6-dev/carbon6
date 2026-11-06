@@ -451,6 +451,16 @@ including forget-before-teardown; browser checks exercise actual layout/storage:
 
 ## Transcript follow: manual browser check
 
+The native `child_lists_invalidate_on_spawn_not_tool_results_or_task_reports`
+checks the shared membership memo's downstream invalidation. In a browser,
+count `/children` and `/children?tree=1` requests while ordinary tool calls finish:
+they must not refetch for each result. Spawn a subagent: both lists refresh.
+Existing live working-count, attention/reconnect and explicit side-chat creation
+refreshes remain intact; verify a child finishing and a newly created side chat.
+Usage statistics are shared per feed between the header/details/transcript, not
+incrementally summarized. The shown event window already borrows with `.with`
+and must not be changed to `.get` (which would clone the whole retained log).
+
 The `c6-ui` workspace unit tests cover input direction and stop/resume decisions. In a browser, use a long session with a streaming reply:
 
 1. Open it normally: it starts at the bottom and follows new text. While there, roll the wheel up one notch (also try a tiny trackpad movement). It must stay up as tokens arrive or the window resizes, even if less than 120px from the end. Repeat during a smooth glide.

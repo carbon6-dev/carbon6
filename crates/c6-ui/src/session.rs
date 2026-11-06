@@ -186,6 +186,10 @@ pub(crate) struct QueueRow {
 #[derive(Clone, Copy)]
 pub(crate) struct Feed {
     pub(crate) events: RwSignal<Vec<Event>>,
+    /// Shared by the header, details and transcript; scan the log only once.
+    usage: Memo<UsageStats>,
+    /// Only a new child changes the tree's membership, not every tool result.
+    spawns: Memo<usize>,
     pub(crate) streaming: RwSignal<Streaming>,
     queued: RwSignal<Vec<QueuedInput>>,
     /// The queue-edit box is open (its messages are in `edit_rows`).
@@ -305,8 +309,11 @@ struct SecretCard {
 impl Feed {
     /// Follows the session's stream until the calling scope is cleaned up.
     pub(crate) fn open(id: String, window: Window) -> Self {
+        let events = RwSignal::new(Vec::<Event>::new());
         let feed = Feed {
-            events: RwSignal::new(Vec::new()),
+            events,
+            usage: Memo::new(move |_| events.with(|evs| UsageStats::from_events(evs))),
+            spawns: child_spawns(events),
             streaming: RwSignal::new(Streaming::default()),
             queued: RwSignal::new(Vec::new()),
             edit_open: RwSignal::new(false),
@@ -678,7 +685,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         }
     });
 
-    let usage = Memo::new(move |_| events.with(|evs| UsageStats::from_events(evs)));
+    let usage = feed.usage;
     let choice = ModelChoice::follow(events, Default::default());
     let model_label = Memo::new(move |_| {
         let (_, m, e) = choice.current.get();
@@ -710,7 +717,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     });
     let git = crate::details::git_state(git_at, events);
     let meta_root = StoredValue::new(root.clone());
-    let subagents = SubagentTree::new(id_stored, detail, events, force_open, meta_root, timeline);
+    let subagents = SubagentTree::new(id_stored, detail, feed, force_open, meta_root, timeline);
     // Unlike the live session list, this includes approvals/questions in
     // subagents, even when their threads (or this session's old turns)
     // aren't drawn. Keep the last answer while a ping reloads it.
@@ -1896,6 +1903,12 @@ fn Lineage(session: Session) -> impl IntoView {
     }
 }
 
+/// Membership invalidation shared by the child list and descendants tree.
+/// Running status/reports still refresh through the existing live-feed signals.
+fn child_spawns(events: RwSignal<Vec<Event>>) -> Memo<usize> {
+    Memo::new(move |_| events.with(|evs| evs.iter().filter(|e| matches!(e.kind, EventKind::SubagentSpawned { .. })).count()))
+}
+
 /// A session's subagents at any depth, each with its depth below it,
 /// fetched again as they start, end or report back.
 #[derive(Clone, Copy)]
@@ -1915,11 +1928,12 @@ impl SubagentTree {
     fn new(
         session: StoredValue<String>,
         detail: LocalResource<Result<c6_api::SessionDetail, String>>,
-        events: RwSignal<Vec<Event>>,
+        feed: Feed,
         force_open: ForceOpen,
         root: StoredValue<String>,
         timeline: crate::timeline::Timeline,
     ) -> Self {
+        let Feed { events, spawns, .. } = feed;
         let live = api::live();
         // How many work now in its whole tree (from the live session list).
         let top = Memo::new(move |_| detail.get().and_then(Result::ok).map(|d| d.session.root_id.unwrap_or(d.session.id)));
@@ -1927,21 +1941,9 @@ impl SubagentTree {
             let top = top.get();
             live.sessions.with(|ss| ss.iter().find(|s| Some(&s.id) == top.as_ref()).map_or(0, |s| s.subagents_running))
         });
-        let marks = Memo::new(move |_| {
-            events.with(|evs| {
-                evs.iter()
-                    .filter(|e| {
-                        matches!(
-                            e.kind,
-                            EventKind::ToolResult { .. } | EventKind::SubagentSpawned { .. } | EventKind::BackgroundTask { .. }
-                        )
-                    })
-                    .count()
-            })
-        });
         let tree = LocalResource::new(move || {
-            marks.track();
-            working.track();
+            spawns.get();
+            working.get();
             live.attention.track();
             live.connected.track();
             api::descendants(session.get_value())
@@ -2061,7 +2063,7 @@ fn Transcript(
     running: Signal<bool>,
     #[prop(optional)] timeline: Option<crate::timeline::Timeline>,
 ) -> impl IntoView {
-    let Feed { events, streaming, queued, edit_open, edit_rows, secrets, from, to, .. } = feed;
+    let Feed { events, usage, spawns, streaming, queued, edit_open, edit_rows, secrets, from, to, .. } = feed;
     let id = StoredValue::new(session.id.clone());
     let worker_id = session.worker_id;
     // Pulling a queued message (and the ones after it) into the edit box:
@@ -2115,7 +2117,6 @@ fn Transcript(
     on_sight(bottom, move || feed.later());
     let decided = Memo::new(move |_| events.with(|evs| decided_calls(evs)));
     let results = Memo::new(move |_| events.with(|evs| tool_results(&id.get_value(), evs)));
-    let usage = Memo::new(move |_| events.with(|evs| UsageStats::from_events(evs)));
     // Where you left off, while you catch up.
     let cards = crate::catchup::cards();
     let here = Memo::new(move |_| {
@@ -2131,25 +2132,16 @@ fn Transcript(
     });
 
     // Child sessions: subagents (threads under their calls) and side
-    // chats. Refreshed as subagents start and end, and after a side chat
-    // starts.
+    // chats. Membership refreshes on spawn/explicit creation; the live working
+    // count still refreshes status as children start and end.
     let refresh = RwSignal::new(0u32);
-    let marks = Memo::new(move |_| {
-        events.with(|evs| {
-            evs.iter()
-                .filter(|e| {
-                    matches!(e.kind, EventKind::ToolResult { .. } | EventKind::SubagentSpawned { .. } | EventKind::BackgroundTask { .. })
-                })
-                .count()
-        })
-    });
     // And as subagents anywhere in the tree start or stop working (your own
     // messages to them leave no event here).
     let working = tree_working(session.root_id.clone().unwrap_or_else(|| session.id.clone()));
     let children = LocalResource::new(move || {
-        marks.track();
+        spawns.get();
         refresh.track();
-        working.track();
+        working.get();
         api::children(id.get_value())
     });
     let child_list = Memo::new(move |_| children.get().and_then(Result::ok).unwrap_or_default());
@@ -4201,7 +4193,7 @@ fn SubagentLive(id: String, row: Memo<Option<Session>>, open: RwSignal<bool>, to
             t.clear();
         }
     });
-    let usage = Memo::new(move |_| feed.events.with(|evs| UsageStats::from_events(evs)));
+    let usage = feed.usage;
     // Time spent working: its turns, the running one so far.
     let elapsed = move || {
         let ms: i64 = usage.with(|u| u.turns.values().map(|t| t.ended.unwrap_or_else(|| now.get()) - t.started).sum());
@@ -6154,6 +6146,36 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn child_lists_invalidate_on_spawn_not_tool_results_or_task_reports() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let events = RwSignal::new(Vec::<Event>::new());
+            let spawns = child_spawns(events);
+            let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let fetched = {
+                let reads = reads.clone();
+                Memo::new(move |_| {
+                    spawns.get();
+                    reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                })
+            };
+            let append = |kind: serde_json::Value| events.update(|evs| evs.push(Event {
+                seq: evs.len() as u64 + 1, ts: 0, kind: serde_json::from_value(kind).unwrap(),
+            }));
+            assert_eq!(fetched.get_untracked(), 0);
+            let result = serde_json::json!({"type":"tool_result","call_id":"call","tool":"Bash","output":"done","is_error":false,"truncated":false,"duration_ms":10});
+            append(result.clone());
+            assert_eq!(fetched.get_untracked(), 0, "an ordinary tool result must not refetch children/descendants");
+            append(serde_json::json!({"type":"subagent_spawned","call_id":"call","child_session_id":"child","description":"Review"}));
+            assert_eq!(fetched.get_untracked(), 1, "a new child refreshes membership");
+            append(result);
+            append(serde_json::json!({"type":"background_task","task_id":"task","kind":"shell","description":"Build","state":"finished"}));
+            assert_eq!(fetched.get_untracked(), 1, "completion reports don't change membership");
+            assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 2, "only initial load and spawn triggered downstream work");
+        });
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
