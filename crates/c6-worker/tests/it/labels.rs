@@ -301,25 +301,40 @@ async fn sessions_get_colours_you_can_change() {
 #[tokio::test]
 async fn which_aspects_a_session_header_shows_is_kept() {
     let head_dir = tempfile::tempdir().unwrap();
-    let head = c6_head::start(HeadConfig {
+    let config = || HeadConfig {
         data_dir: head_dir.path().to_owned(),
         bind: vec!["127.0.0.1".parse().unwrap()],
         ui_port: 0,
         worker_port: 0,
         auth: false,
         ..Default::default()
-    })
-    .await
-    .unwrap();
-    let url = format!("http://127.0.0.1:{}/api/v1/settings/session_facets", head.ui_addrs[0].port());
+    };
+    let head = c6_head::start(config()).await.unwrap();
+    let url = format!("http://127.0.0.1:{}/api/v1/settings/session_facets?c6_realm=home", head.ui_addrs[0].port());
     let http = reqwest::Client::new();
     let get = async || http.get(&url).send().await.unwrap().json::<Value>().await.unwrap();
-    assert_eq!(get().await, json!({"shown": ["worker", "work", "project", "realm"]}), "the default");
+    assert_eq!(get().await, json!({"shown": ["worker", "work", "project", "realm"], "tile_bars": false}), "the default");
+    head.state.store.set_setting("session_facets:home", r#"{"shown":["worker","model"]}"#).await.unwrap();
+    assert_eq!(get().await, json!({"shown": ["worker", "model"], "tile_bars": false}), "an old saved setting is off without migration");
     let r = http.put(&url).json(&json!({"shown": ["model", "worker", "model"]})).send().await.unwrap();
     assert!(r.status().is_success());
-    assert_eq!(get().await, json!({"shown": ["worker", "model"]}), "in the aspects' order, each once");
+    assert_eq!(get().await, json!({"shown": ["worker", "model"], "tile_bars": false}), "old clients omit the opt-in; ordered, each once");
+    for tile_bars in [true, false, true] {
+        let r = http.put(&url).json(&json!({"shown": ["model", "worker", "model"], "tile_bars": tile_bars})).send().await.unwrap();
+        assert_eq!(r.status(), 204);
+        assert_eq!(get().await, json!({"shown": ["worker", "model"], "tile_bars": tile_bars}));
+    }
+    let other = http.get(&url).header("X-C6-Realm", "admin").send().await.unwrap().json::<Value>().await.unwrap();
+    assert_eq!(other, json!({"shown": ["worker", "work", "project", "realm"], "tile_bars": false}), "per realm, not user wide");
     let r = http.put(&url).json(&json!({"shown": ["colour"]})).send().await.unwrap();
     assert_eq!(r.status(), 400);
+    assert_eq!(get().await, json!({"shown": ["worker", "model"], "tile_bars": true}), "invalid writes do not change the opt-in");
+    head.shutdown().await.unwrap();
+
+    let head = c6_head::start(config()).await.unwrap();
+    let url = format!("http://127.0.0.1:{}/api/v1/settings/session_facets?c6_realm=home", head.ui_addrs[0].port());
+    let saved = reqwest::Client::new().get(&url).send().await.unwrap().json::<Value>().await.unwrap();
+    assert_eq!(saved, json!({"shown": ["worker", "model"], "tile_bars": true}), "a new device after restart keeps the opt-in");
     head.shutdown().await.unwrap();
 }
 

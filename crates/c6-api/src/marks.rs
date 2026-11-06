@@ -82,17 +82,33 @@ pub struct SetMark {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionFacets {
     pub shown: Vec<String>,
+    /// Opt in to aspect marks and resting-hover spotlight on desktop tile bars.
+    /// Older heads and saved settings omit this field, which means off.
+    #[serde(default)]
+    pub tile_bars: bool,
 }
 
 impl Default for SessionFacets {
     fn default() -> Self {
-        SessionFacets { shown: DEFAULT_SHOWN.into_iter().map(str::to_owned).collect() }
+        SessionFacets { shown: DEFAULT_SHOWN.into_iter().map(str::to_owned).collect(), tile_bars: false }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tile_bar_aspects_are_opt_in_and_round_trip() {
+        let default = SessionFacets::default();
+        assert!(!default.tile_bars);
+        let old: SessionFacets = serde_json::from_value(serde_json::json!({ "shown": default.shown })).unwrap();
+        assert_eq!(old, default, "an older head or stored preference leaves bars unchanged");
+        for tile_bars in [false, true] {
+            let setting = SessionFacets { tile_bars, ..default.clone() };
+            assert_eq!(serde_json::from_str::<SessionFacets>(&serde_json::to_string(&setting).unwrap()).unwrap(), setting);
+        }
+    }
 
     #[test]
     fn marks_are_colours_alone_or_in_a_pattern() {

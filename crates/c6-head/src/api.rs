@@ -1276,7 +1276,7 @@ async fn put_session_facets(
     }
     // In the aspects' own order, each once.
     let shown = api::marks::ASPECTS.into_iter().filter(|a| f.shown.iter().any(|x| x == a)).map(str::to_owned).collect();
-    let value = serde_json::to_string(&api::marks::SessionFacets { shown }).map_err(anyhow::Error::from)?;
+    let value = serde_json::to_string(&api::marks::SessionFacets { shown, tile_bars: f.tile_bars }).map_err(anyhow::Error::from)?;
     st.store.set_setting(&facets_key(&caller), &value).await?;
     Ok(StatusCode::NO_CONTENT)
 }

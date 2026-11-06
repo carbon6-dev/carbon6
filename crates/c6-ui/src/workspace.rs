@@ -2207,6 +2207,7 @@ pub fn arrange(tiles: &[(usize, u64)]) -> Vec<Rect> {
 pub fn Tiles() -> impl IntoView {
     let ws = use_workspace();
     let loading = expect_context::<TileLoading>();
+    let facets = crate::aspects::use_facets();
     let resize = window_event_listener(leptos::ev::resize, move |_| {
         loading.one_pane.set(crate::util::phone());
     });
@@ -2266,6 +2267,9 @@ pub fn Tiles() -> impl IntoView {
                 <For each=move || keys.get() key=|k| *k let:key>
                     <TileView key rect=Signal::derive(move || rects.with(|r| r.get(&key).copied().unwrap_or_default())) />
                 </For>
+                <Show when=move || crate::aspects::tile_bars_shown(facets.tile_bars.get(), loading.one_pane.get())>
+                    <crate::aspects::TileMarks keys />
+                </Show>
             </div>
         </div>
     }
@@ -2497,7 +2501,7 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
         >
         <section
             class=move || format!(
-                "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-white dark:bg-zinc-950 md:rounded-lg md:border md:shadow-sm {}",
+                "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-white data-[aspect-dim=true]:opacity-30 dark:bg-zinc-950 md:rounded-lg md:border md:shadow-sm {}",
                 if focused.get() && many.get() { "md:border-blue-400 md:ring-1 md:ring-blue-400/40 dark:md:border-blue-500" } else { "md:border-zinc-200 dark:md:border-zinc-800" },
             )
             on:pointerdown=move |_| ws.focus_tile_key(key)
@@ -2539,9 +2543,12 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                 </Show>
                 // A session of your own is renamed by double-clicking its name
                 // (or from ⋯).
-                <span node_ref=title_el class="min-w-0 flex-1 truncate px-1 font-medium text-zinc-800 dark:text-zinc-100"
-                    title=move || if renamable() { format!("{} · Double-click to rename", title.get()) } else { title.get() }
-                    on:dblclick=move |ev| if renamable() { ev.stop_propagation(); rename_under_title() }>{title}</span>
+                <div class="flex min-w-0 flex-1 items-center overflow-hidden">
+                    <span node_ref=title_el class="min-w-0 flex-1 truncate px-1 font-medium text-zinc-800 dark:text-zinc-100"
+                        title=move || if renamable() { format!("{} · Double-click to rename", title.get()) } else { title.get() }
+                        on:dblclick=move |ev| if renamable() { ev.stop_propagation(); rename_under_title() }>{title}</span>
+                    <span data-tile-aspects=key class="flex shrink-0 items-center"></span>
+                </div>
                 {move || chrome().map(|c| view! { <crate::session::SessionControls chrome=c /> })}
                 <Show when=move || shown.get().is_some()>
                     <button class=format!("{btn} hidden md:flex")

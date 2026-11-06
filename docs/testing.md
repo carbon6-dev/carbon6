@@ -418,6 +418,25 @@ Keep screenshots for both themes; validate new arbitrary utilities in built
 CSS as well as geometry. Emulated keyboard tests do not replace a physical
 phone keyboard/accessibility review.
 
+### Opt-in tile aspect marks
+
+After `env -u NO_COLOR make ui`, run the loopback production regression:
+
+```sh
+ENGINE=both SCREENSHOTS=/tmp/z2-screenshots \
+  /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/tile-marks.cjs
+```
+
+Like `motion.cjs`, it uses the local Playwright/browser paths (or their environment
+overrides), an owned ephemeral port, fake HTTP/WebSockets and fresh contexts.
+Check both themes with several actual 480px tiles: old-head/default off,
+opt-in on, the selected shapes, 400ms resting spotlight and cancellation,
+clicking a card and its palette, setting save/reload, and live off/on changes
+without replacing controls or composers. Fixed controls must stay 44px and at
+the same coordinates; only the title loses room. Resize to 320/390px and short
+landscape: no strips, pending dimming or popovers, even with the setting on.
+Keep off/on/card/phone screenshots and reject console/crash-reporter errors.
+
 ## Composer latency and draft persistence
 
 Textareas managed by `autosize` use CSS `field-sizing: content` when available.
