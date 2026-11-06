@@ -222,6 +222,8 @@ pub enum Input {
     Body(fn() -> Value),
     /// Query parameters, at the top level.
     Query(fn() -> Value),
+    /// A JSON body under `body`, plus query parameters at the top level.
+    BodyQuery(fn() -> Value, fn() -> Value),
     /// Memex parameters, at the top level (a hand-written schema).
     Params(&'static str),
     /// Memex parameters, at the top level (a type's schema).
@@ -307,9 +309,9 @@ macro_rules! op {
 macro_rules! list_setting {
     ($get:literal, $put:literal, $area:literal, $path:literal, $ty:ty, $what:literal) => {
         [
-            op!($get, $area, "GET" $path, Read, Input::None, $what),
-            op!($put, $area, "PUT" $path, Write, Input::Body(schema::<Vec<$ty>>),
-                "Replaces this whole list. Read it first and send every entry you want to keep.", replaces = $get),
+            op!($get, $area, "GET" $path, Read, Input::Query(schema::<api::InRealm>), $what),
+            op!($put, $area, "PUT" $path, Write, Input::BodyQuery(schema::<Vec<$ty>>, schema::<api::InRealm>),
+                "Replaces this whole list. Read it first in the same realm and send every entry you want to keep. Optional realm selects that realm's own list; omitted keeps the endpoint's default.", replaces = $get),
         ]
     };
 }
@@ -461,8 +463,8 @@ fn build() -> Vec<Op> {
         op!("commands.list", "settings", "GET" "/api/v1/commands", Read, Input::Query(schema::<ForSession>), "Slash commands available (for a session, by its labels)."),
 
         // Settings that shape sessions.
-        op!("settings.mcp_servers.get", "settings", "GET" "/api/v1/settings/mcp-servers", Read, Input::None, "MCP servers given to sessions (by label)."),
-        op!("settings.mcp_servers.put", "settings", "PUT" "/api/v1/settings/mcp-servers", Write, Input::Body(mcp_servers), "Replaces the MCP server list. Read it first and send every entry you want to keep.", replaces = "settings.mcp_servers.get"),
+        op!("settings.mcp_servers.get", "settings", "GET" "/api/v1/settings/mcp-servers", Read, Input::Query(schema::<api::InRealm>), "MCP servers given to sessions (by label)."),
+        op!("settings.mcp_servers.put", "settings", "PUT" "/api/v1/settings/mcp-servers", Write, Input::BodyQuery(mcp_servers, schema::<api::InRealm>), "Replaces the MCP server list. Read it first in the same realm and send every entry you want to keep. Optional realm selects that realm's own list; omitted keeps the endpoint's default.", replaces = "settings.mcp_servers.get"),
     ];
     v.extend(list_setting!("settings.skills.get", "settings.skills.put", "settings", "/api/v1/settings/skills", api::SkillDef, "Skills given to sessions (by label)."));
     v.extend(list_setting!("settings.commands.get", "settings.commands.put", "settings", "/api/v1/settings/commands", api::CommandDef, "Custom slash commands (by label)."));
@@ -962,22 +964,23 @@ pub fn input_schema(op: &Op) -> Value {
     }
     match op.input {
         Input::None => {}
-        Input::Body(f) => {
+        Input::Body(f) | Input::BodyQuery(f, _) => {
             props.insert("body".into(), f());
             required.push("body".into());
         }
-        Input::Query(f) => {
-            let s = f();
-            if let Some(p) = s["properties"].as_object() {
-                for (k, v) in p {
-                    props.insert(k.clone(), v.clone());
-                }
-            } else {
-                props.insert("query".into(), json!({"type": "object", "description": "query parameters"}));
-            }
-        }
+        Input::Query(_) => {}
         Input::Params(s) => return serde_json::from_str(s).unwrap_or_else(|_| any_object()),
         Input::Typed(f) => return f(),
+    }
+    if let Input::Query(f) | Input::BodyQuery(_, f) = op.input {
+        let s = f();
+        if let Some(p) = s["properties"].as_object() {
+            for (k, v) in p {
+                props.insert(k.clone(), v.clone());
+            }
+        } else {
+            props.insert("query".into(), json!({"type": "object", "description": "query parameters"}));
+        }
     }
     json!({"type": "object", "properties": props, "required": required})
 }
@@ -1220,6 +1223,11 @@ fn op_reference(op: &Op) -> String {
                 out.push('\n');
             }
             match input {
+                Input::BodyQuery(body, query) => {
+                    out.push_str(&format!("Query parameters (JSON Schema):\n{}\n", pretty(&query())));
+                    out.push_str(&format!("Body (JSON Schema):\n{}\n", pretty(&body())));
+                    Some("{…}".to_owned())
+                }
                 Input::Body(f) => {
                     out.push_str(&format!("Body (JSON Schema):\n{}\n", pretty(&f())));
                     Some("{…}".to_owned())
@@ -1348,18 +1356,16 @@ pub fn openapi(urls: &[String]) -> Value {
                 let mut entry = json!({
                     "operationId": op.name, "summary": op.summary, "tags": [op.area], "x-c6-effect": effect, "responses": responses,
                 });
-                match input {
-                    Input::Body(f) => entry["requestBody"] = json_body(hoist(f(), &mut defs)),
-                    Input::Query(f) => {
-                        let q = hoist(f(), &mut defs);
-                        let required: Vec<&str> = q["required"].as_array().into_iter().flatten().filter_map(|r| r.as_str()).collect();
-                        for (name, schema) in q["properties"].as_object().into_iter().flatten() {
-                            parameters.push(
-                                json!({"name": name, "in": "query", "required": required.contains(&name.as_str()), "schema": schema}),
-                            );
-                        }
+                if let Input::Body(f) | Input::BodyQuery(f, _) = input {
+                    entry["requestBody"] = json_body(hoist(f(), &mut defs));
+                }
+                if let Input::Query(f) | Input::BodyQuery(_, f) = input {
+                    let q = hoist(f(), &mut defs);
+                    let required: Vec<&str> = q["required"].as_array().into_iter().flatten().filter_map(|r| r.as_str()).collect();
+                    for (name, schema) in q["properties"].as_object().into_iter().flatten() {
+                        parameters
+                            .push(json!({"name": name, "in": "query", "required": required.contains(&name.as_str()), "schema": schema}));
                     }
-                    _ => {}
                 }
                 if !parameters.is_empty() {
                     entry["parameters"] = Value::Array(parameters);
@@ -1479,6 +1485,35 @@ mod tests {
         assert!(d["operations"].as_array().unwrap().iter().any(|o| o["op"] == "settings.memex.get"), "{d}");
         let all = discover("", None);
         assert_eq!(all["areas"].as_array().unwrap().len(), AREAS.len());
+    }
+
+    #[test]
+    fn list_settings_expose_realm_and_body_separately() {
+        let doc = openapi(&[]);
+        for put in ops().iter().filter(|op| op.name.starts_with("settings.") && op.replaces.is_some()) {
+            let get = find(put.replaces.unwrap()).unwrap();
+            for op in [get, put] {
+                let input = input_schema(op);
+                assert!(input["properties"]["realm"].is_object(), "{}: {input}", op.name);
+                assert!(!input["required"].as_array().unwrap().contains(&json!("realm")), "{}", op.name);
+                let Via::Http { method, path } = op.via else { panic!("{} is not HTTP", op.name) };
+                let entry = &doc["paths"][path][method.to_lowercase()];
+                assert!(
+                    entry["parameters"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|p| p["name"] == "realm" && p["in"] == "query" && p["required"] == false)
+                );
+                let reference = reference("", op.name, &[]).unwrap();
+                assert!(reference.contains("Query parameters (JSON Schema)") && reference.contains("\"realm\""), "{reference}");
+                if op.replaces.is_some() {
+                    assert!(input["required"].as_array().unwrap().contains(&json!("body")));
+                    assert_eq!(entry["requestBody"]["content"]["application/json"]["schema"]["type"], "array");
+                    assert!(reference.contains("Body (JSON Schema)"), "{reference}");
+                }
+            }
+        }
     }
 
     #[test]

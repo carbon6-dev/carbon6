@@ -32,6 +32,136 @@ async fn c6(home: &std::path::Path, args: &[&str]) -> Out {
 }
 
 #[tokio::test]
+async fn list_settings_target_the_requested_realm() {
+    let (data, home) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let head = c6_head::start(HeadConfig {
+        data_dir: data.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    c6_head::realms::create(&head.state, &c6_api::RealmIn { id: "c6".into(), ..Default::default() }, "test").await.unwrap();
+    let url = format!("http://127.0.0.1:{}", head.ui_addrs[0].port());
+    let token = head.state.store.create_api_token("test", None).await.unwrap().token.unwrap();
+    let http = reqwest::Client::new();
+    let read = async |list: &str, realm: &str| -> Value {
+        let r = http.get(format!("{url}/api/v1/settings/{list}")).query(&[("realm", realm)]).bearer_auth(&token).send().await.unwrap();
+        assert!(r.status().is_success());
+        r.json().await.unwrap()
+    };
+    let login = c6(home.path(), &["login", &url, "--token", &token]).await;
+    assert_eq!(login.code, 0, "{}", login.stderr);
+
+    for (list, default_realm, entry) in [
+        ("templates", "home", json!({"name": "unrelated", "prompt": "Keep me"})),
+        ("policies", "root", json!({"name": "unrelated", "action": "ask"})),
+    ] {
+        let get = format!("settings.{list}.get");
+        let put = format!("settings.{list}.put");
+        for op in [&get, &put] {
+            let out = c6(home.path(), &["ops", op]).await;
+            assert_eq!(out.code, 0, "{}", out.stderr);
+            let description: Value = serde_json::from_str(&out.stdout).unwrap();
+            assert!(description["input"]["properties"]["realm"].is_object(), "{description}");
+        }
+        // No realm still means the endpoint's historical default.
+        let seed = format!("body={}", json!([entry]));
+        let out = c6(home.path(), &["op", &put, &seed]).await;
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        let (before_home, before_root) = (read(list, "home").await, read(list, "root").await);
+        let out = c6(home.path(), &["op", &get]).await;
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        let default: Value = serde_json::from_str(&out.stdout).unwrap();
+        assert_eq!(default, if default_realm == "home" { before_home.clone() } else { before_root.clone() });
+        assert!(default.as_array().unwrap().iter().any(|v| v["name"] == "unrelated"));
+
+        // Establish an unrelated c6 entry, read it through the catalog,
+        // and keep it when replacing the list from a file.
+        let out = c6(home.path(), &["op", &put, "realm=c6", &seed]).await;
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        let out = c6(home.path(), &["op", &get, "realm=c6"]).await;
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        let mut wanted: Value = serde_json::from_str(&out.stdout).unwrap();
+        assert_eq!(wanted, read(list, "c6").await);
+        let added = if list == "templates" {
+            json!([{"name": "implement", "prompt": "Implement"}, {"name": "design", "prompt": "Design"}, {"name": "coordinator", "prompt": "Coordinate"}])
+        } else {
+            json!([{"name": "Implementers don't push", "action": "deny", "tools": "bash", "pattern": "git push"}])
+        };
+        wanted.as_array_mut().unwrap().extend(added.as_array().unwrap().iter().cloned());
+        let expected = if list == "templates" {
+            serde_json::to_value(serde_json::from_value::<Vec<c6_api::Template>>(wanted.clone()).unwrap()).unwrap()
+        } else {
+            serde_json::to_value(serde_json::from_value::<Vec<c6_api::Policy>>(wanted.clone()).unwrap()).unwrap()
+        };
+        let file = home.path().join(format!("{list}.json"));
+        std::fs::write(&file, wanted.to_string()).unwrap();
+        let body = format!("body=@{}", file.display());
+        let out = c6(home.path(), &["op", &put, "realm=c6", &body]).await;
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        let out = c6(home.path(), &["op", &get, r#"{"realm":"c6"}"#]).await;
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        let actual: Value = serde_json::from_str(&out.stdout).unwrap();
+        assert_eq!(actual, read(list, "c6").await);
+        assert_eq!(actual, expected);
+        for op in [&get, &put] {
+            let out = c6(home.path(), &["op", op, "realm=nowhere", &body]).await;
+            assert_ne!(out.code, 0);
+            assert!(out.stderr.contains("no realm"), "{}", out.stderr);
+        }
+        assert_eq!(read(list, "c6").await, actual);
+        assert_eq!(read(list, "home").await, before_home);
+        assert_eq!(read(list, "root").await, before_root);
+
+        // Explicit targeting does not grant a scoped token new powers:
+        // direct settings requests stay in c6; catalog calls remain admin-only.
+        let scoped = head.state.store.create_api_token("scoped", Some("c6")).await.unwrap().token.unwrap();
+        for realm in ["c6", "home", "root"] {
+            for method in [reqwest::Method::GET, reqwest::Method::PUT] {
+                let r = http
+                    .request(method, format!("{url}/api/v1/settings/{list}"))
+                    .query(&[("realm", realm)])
+                    .bearer_auth(&scoped)
+                    .json(&actual)
+                    .send()
+                    .await
+                    .unwrap();
+                if realm == "c6" {
+                    assert!(r.status().is_success(), "{}", r.status());
+                } else {
+                    assert_eq!(r.status(), reqwest::StatusCode::FORBIDDEN);
+                }
+            }
+            for op in [&get, &put] {
+                let r = http
+                    .post(format!("{url}/api/v1/catalog/call"))
+                    .bearer_auth(&scoped)
+                    .json(&json!({"op": op, "input": {"realm": realm, "body": actual}}))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(r.status(), reqwest::StatusCode::FORBIDDEN);
+            }
+        }
+        let scoped_home = tempfile::tempdir().unwrap();
+        let out = c6(scoped_home.path(), &["login", &url, "--token", &scoped]).await;
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        for op in [&get, &put] {
+            let out = c6(scoped_home.path(), &["op", op, "realm=home", &body]).await;
+            assert_ne!(out.code, 0);
+        }
+        assert_eq!(read(list, "c6").await, actual);
+        assert_eq!(read(list, "home").await, before_home);
+        assert_eq!(read(list, "root").await, before_root);
+    }
+    head.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn headless_cli() {
     let mock = MockLlm::start().await;
     let (head_dir, state, project, home) =

@@ -132,6 +132,7 @@ enum Command {
     },
     /// Run an operation (see `c6 ops`). Inputs are key=value (JSON values,
     /// or text), or one JSON object; a body is body=<json> or body=@file.
+    /// List settings accept realm=<id> beside body; use the same realm to read and replace.
     /// Prints the result as JSON.
     Op {
         name: String,

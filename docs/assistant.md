@@ -125,7 +125,11 @@ The tool waits for the submitted values, the same way an approval waits. Cancell
   - `POST /api/v1/assistant` (prompt and page context);
   - `GET`/`PUT /api/v1/settings/assistant`;
   - `GET /api/v1/catalog` and `POST /api/v1/catalog/call` (for the CLI: destructive operations need `confirmed`).
+  - List-setting operations expose optional top-level `realm` for both GET and PUT; PUT also requires `body` (the complete array). A catalog call with `{"op":"settings.templates.put","input":{"realm":"c6","body":[…]}}` dispatches to `PUT /api/v1/settings/templates?realm=c6`, with only the array in the HTTP body. Read with `{"op":"settings.templates.get","input":{"realm":"c6"}}` first and preserve unrelated entries; policies work the same way. The assistant's list-removal preview reads the same target as its replacement. The generated operation schemas, API reference and OpenAPI describe query and body separately.
+  - Existing authorization still applies: catalog calls are admin-only; realm-scoped direct settings calls cannot leave their realm.
+  - This adds no settings powers to ordinary session agents: their `carbon6` tool still refuses settings replacements (also when `realm` is explicit). Ask acts with your existing permissions; a nonroot Ask conversation cannot select another realm. Root Ask already has administration authority.
 - **CLI:** `c6 ops [words]` and `c6 op <name> key=value…`.
+  Use `c6 op settings.templates.get realm=c6` and `c6 op settings.templates.put realm=c6 body=@templates.json`. Omitted realm keeps the endpoint's existing scope (templates default to home; policies to root), not the invoking session's realm. `realm` belongs beside `body`, not inside it.
 - **UI:**
   - ✦ Ask in the header (⌘J), with the focused column as context;
   - question forms;
@@ -138,7 +142,7 @@ The tool waits for the submitted values, the same way an approval waits. Cancell
 Realms organise; they don't isolate. The following API admission and approval checks remain enforced, but neither shared-worker files nor delegation to agents with wider access is contained by realm membership (docs/realms-ux.md §8).
 
 - **A conversation works in one realm:** the realm whose page you open it from. From the console it is root, which administers carbon6 and reaches every realm.
-- **Its operations are admitted like that realm's API token.** It reaches the realm's sessions, collections, decisions, triggers, views, series and knowledge. Administration (workers, connections, realms, grants, settings) answers 403, and the assistant is told to send you to the console for it.
+- **Its operations are admitted like that realm's API token.** It reaches the realm's sessions, collections, decisions, triggers, views, series and knowledge. Console-only administration (workers, connections, realms, grants and global settings) answers 403, and the assistant is told to send you to the console for it. Settings admitted within a realm stay in that conversation's realm, even with an explicit `realm` input. This is Ask's existing user-facing authority, not the ordinary session agent's settings permissions.
 - **Its instructions** are the `assistant.base` prompt as the realm has it (a realm can override it), with `{{realm}}` naming the realm.
 - **Commons** is not a place to work in.
 - **From root it starts sessions in a realm, with your approval each time.** Sessions never run in root (or commons), so for work on a machine the assistant in root calls `sessions.create` naming the realm. Before anything starts you get an approval (also a decision and a notification) that names the realm, the worker and, when given, the folder, model, title and labels, with the first message in full. For this start call, the first message is the approved input from root: no attachments, work item, to-do or references, and no secret you gave the assistant. The first message is at most 4,000 characters, so the approval always shows all of it.

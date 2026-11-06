@@ -1381,7 +1381,10 @@ async fn policy_for(st: &HeadState, labels: &[String], input: &str) -> Option<ap
 /// Entries a list replacement would remove (by name or id).
 async fn removed_entries(st: &HeadState, op: &Op, args: &Value, realm: &str) -> anyhow::Result<Vec<String>> {
     let Some(get) = op.replaces.and_then(catalog::find) else { return Ok(Vec::new()) };
-    let current = execute(st, get, json!({}), "assistant", Some(realm)).await?;
+    // Only forward a query target when the replacement accepts one too.
+    // Body-only replacements (deck themes) keep their existing scope.
+    let target = if matches!(op.input, Input::BodyQuery(..)) { json!({"realm": args.get("realm")}) } else { json!({}) };
+    let current = execute(st, get, target, "assistant", Some(realm)).await?;
     let new = args["body"].as_array().cloned().unwrap_or_default();
     let key = |v: &Value| -> String {
         for k in ["name", "id", "path", "key"] {
@@ -1427,37 +1430,34 @@ async fn execute_as(st: &HeadState, op: &Op, mut args: Value, made_by: &str, rea
                 uri = uri.replace(&format!("{{{p}}}"), &encode(&v));
             }
             let mut body = axum::body::Body::empty();
-            match op.input {
-                Input::Body(_) => {
-                    let b = args.get("body").cloned().unwrap_or(Value::Null);
-                    if !b.is_null() {
-                        body = axum::body::Body::from(serde_json::to_vec(&b)?);
-                    }
+            if let Input::Body(_) | Input::BodyQuery(_, _) = op.input {
+                let b = args.get("body").cloned().unwrap_or(Value::Null);
+                if !b.is_null() {
+                    body = axum::body::Body::from(serde_json::to_vec(&b)?);
                 }
-                Input::Query(_) => {
-                    let mut q = Vec::new();
-                    if let Some(o) = args.as_object() {
-                        for (k, v) in o {
-                            if params.contains(&k.as_str()) || v.is_null() {
-                                continue;
-                            }
-                            let s = match v {
-                                Value::String(s) => s.clone(),
-                                Value::Array(a) => a
-                                    .iter()
-                                    .map(|x| x.as_str().map(str::to_owned).unwrap_or_else(|| x.to_string()))
-                                    .collect::<Vec<_>>()
-                                    .join(","),
-                                other => other.to_string(),
-                            };
-                            q.push(format!("{}={}", encode(k), encode(&s)));
+            }
+            if let Input::Query(_) | Input::BodyQuery(_, _) = op.input {
+                let mut q = Vec::new();
+                if let Some(o) = args.as_object() {
+                    for (k, v) in o {
+                        if params.contains(&k.as_str()) || v.is_null() || (k == "body" && matches!(op.input, Input::BodyQuery(..))) {
+                            continue;
                         }
-                    }
-                    if !q.is_empty() {
-                        uri = format!("{uri}?{}", q.join("&"));
+                        let s = match v {
+                            Value::String(s) => s.clone(),
+                            Value::Array(a) => a
+                                .iter()
+                                .map(|x| x.as_str().map(str::to_owned).unwrap_or_else(|| x.to_string()))
+                                .collect::<Vec<_>>()
+                                .join(","),
+                            other => other.to_string(),
+                        };
+                        q.push(format!("{}={}", encode(k), encode(&s)));
                     }
                 }
-                _ => {}
+                if !q.is_empty() {
+                    uri = format!("{uri}?{}", q.join("&"));
+                }
             }
             let mut req = axum::http::Request::builder()
                 .method(*method)
@@ -2076,6 +2076,56 @@ mod mention_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn list_removal_preview_uses_the_replacement_realm() {
+        let data = tempfile::tempdir().unwrap();
+        let head = crate::start(crate::HeadConfig {
+            data_dir: data.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            auth: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let st = &head.state;
+        crate::realms::create(st, &api::RealmIn { id: "c6".into(), ..Default::default() }, "test").await.unwrap();
+        for list in ["templates", "policies"] {
+            let put = catalog::find(&format!("settings.{list}.put")).unwrap();
+            for realm in ["home", "root", "c6"] {
+                let entry =
+                    if list == "templates" { json!({"name": realm, "prompt": "test"}) } else { json!({"name": realm, "action": "ask"}) };
+                execute(st, put, json!({"realm": realm, "body": [entry]}), "test", None).await.unwrap();
+            }
+            // A root assistant's explicit target, rather than its default
+            // list, is what it warns about removing.
+            let args = json!({"realm": "c6", "body": []});
+            assert_eq!(removed_entries(st, put, &args, "root").await.unwrap(), ["c6"]);
+            execute(st, put, args, "test", None).await.unwrap();
+            assert!(removed_entries(st, put, &json!({"realm": "c6", "body": []}), "root").await.unwrap().is_empty());
+            let default = if list == "templates" { "home" } else { "root" };
+            assert_eq!(removed_entries(st, put, &json!({"body": []}), "root").await.unwrap(), [default]);
+            // Explicit query parameters cannot escape a realm-scoped
+            // internal caller, either reading or replacing the list.
+            let get = catalog::find(put.replaces.unwrap()).unwrap();
+            for op in [get, put] {
+                let error = execute(st, op, json!({"realm": "home", "body": []}), "test", Some("c6")).await.unwrap_err();
+                assert!(error.to_string().contains("limited to realm c6"), "{error}");
+            }
+        }
+        // The deck-theme catalog PUT is still body-only: unlike settings
+        // lists, an extraneous realm must not redirect just its preview.
+        for realm in ["home", "c6"] {
+            let mut theme = api::slides::default_themes().remove(0);
+            theme.name = format!("{realm}-only");
+            crate::decks::put(st, realm, &[theme], "test").await.unwrap();
+        }
+        let put = catalog::find("decks.themes.put").unwrap();
+        assert_eq!(removed_entries(st, put, &json!({"realm": "c6", "body": []}), "root").await.unwrap(), ["home-only"]);
+        head.shutdown().await.unwrap();
+    }
 
     /// What the assistant in root asks you for before it goes into a realm
     /// (docs/assistant.md §Realms) is these operations, each one that

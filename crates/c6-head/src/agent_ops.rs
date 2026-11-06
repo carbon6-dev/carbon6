@@ -1025,6 +1025,13 @@ mod tests {
     }
 
     #[test]
+    fn settings_list_replacements_remain_the_users_alone() {
+        for op in catalog::ops().iter().filter(|op| op.name.starts_with("settings.") && op.replaces.is_some()) {
+            assert_eq!(class(op), Class::Never, "{}", op.name);
+        }
+    }
+
+    #[test]
     fn classes() {
         let c = |n: &str| class(catalog::find(n).unwrap());
         assert_eq!(c("work.add"), Class::Make);

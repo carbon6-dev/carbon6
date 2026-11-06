@@ -159,20 +159,26 @@ async fn agents_make_and_change_things_by_your_rule() {
     assert!(get(format!("work/{wid}")).await["todos"].as_array().is_none_or(Vec::is_empty), "removed once you allowed it");
 
     // 5. Administration is yours alone; so is another realm.
+    let templates_before = get("settings/templates".into()).await;
+    let policies_before = get("settings/policies".into()).await;
     mock.push(Reply::ToolCalls(vec![
         (
             "carbon6".into(),
             json!({"op": "connections.create", "input": {"body": {"name": "x", "base_url": "http://127.0.0.1:1"}}}).to_string(),
         ),
+        ("carbon6".into(), json!({"op": "settings.templates.put", "input": {"realm": "home", "body": []}}).to_string()),
+        ("carbon6".into(), json!({"op": "settings.policies.put", "input": {"realm": "root", "body": []}}).to_string()),
         ("carbon6".into(), json!({"op": "work.add", "input": {"body": {"title": "Elsewhere", "realm": "commons"}}}).to_string()),
     ]));
     mock.push(Reply::Text("Couldn't.".into()));
     send(M::POST, format!("sessions/{sid}/messages"), json!({"text": "add a connection"})).await;
     let ev = turns(sid.clone(), 7).await;
     let outs: Vec<String> =
-        ev.iter().filter(|e| e["type"] == "tool_result").rev().take(2).map(|e| e["output"].as_str().unwrap_or("").to_owned()).collect();
-    assert!(outs.iter().any(|o| o.contains("the user's alone")), "{outs:?}");
+        ev.iter().filter(|e| e["type"] == "tool_result").rev().take(4).map(|e| e["output"].as_str().unwrap_or("").to_owned()).collect();
+    assert_eq!(outs.iter().filter(|o| o.contains("the user's alone")).count(), 3, "{outs:?}");
     assert!(outs.iter().any(|o| o.contains("not commons")), "{outs:?}");
+    assert_eq!(get("settings/templates".into()).await, templates_before);
+    assert_eq!(get("settings/policies".into()).await, policies_before);
     let cs = get("connections".into()).await;
     assert_eq!(cs.as_array().unwrap().len(), 1);
 
