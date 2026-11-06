@@ -705,8 +705,8 @@ pub fn DocsPage() -> impl IntoView {
                 {filter("deck", "Decks")}
             </div>
             {move || making.get().map(|k| view! {
-                <div class="flex gap-2 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
-                    <input class=INPUT placeholder=if k == "deck" { "The deck's title" } else { "The doc's title" } prop:value=move || title.get()
+                <div class="flex flex-wrap gap-2 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
+                    <input class=format!("{INPUT} min-w-0 flex-1 basis-full @md/view:basis-40") placeholder=if k == "deck" { "The deck's title" } else { "The doc's title" } prop:value=move || title.get()
                         on:input=move |ev| title.set(event_target_value(&ev)) on:keydown=move |ev| if ev.key() == "Enter" { make() } />
                     <button class=BUTTON_QUIET on:click=move |_| making.set(None)>"Cancel"</button>
                     <button class=BUTTON on:click=move |_| make()>"Make it"</button>
@@ -735,7 +735,7 @@ pub fn DocsPage() -> impl IntoView {
                         {l.into_iter().map(|d| {
                             let id = d.id.clone();
                             view! {
-                                <a href=View::Docs { id: d.id.clone() }.href() class="flex items-center gap-2 px-2 py-2 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900"
+                                <a href=View::Docs { id: d.id.clone() }.href() class="flex flex-wrap items-center gap-2 px-2 py-2 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900"
                                     on:click=move |ev: web_sys::MouseEvent| {
                                         if ev.button() != 0 { return }
                                         ev.prevent_default();
@@ -748,9 +748,9 @@ pub fn DocsPage() -> impl IntoView {
                                             {crate::icons::icon(crate::icons::Icon::PenLine, crate::icons::Size::S14)}" "{format!("{} to write", d.pending)}
                                         </span>
                                     })}
-                                    {d.labels.iter().map(|l| view! { <span class="shrink-0 text-[11px] text-muted">{format!("#{l}")}</span> }).collect_view()}
+                                    {d.labels.iter().map(|l| view! { <span class="min-w-0 max-w-full text-[11px] text-muted wrap-anywhere">{format!("#{l}")}</span> }).collect_view()}
                                     // The session it came from, else who changed it last.
-                                    <span class="max-w-[40%] shrink truncate text-xs text-muted">
+                                    <span class="basis-full truncate text-xs text-muted @lg/view:max-w-[40%] @lg/view:basis-auto">
                                         {format!("{} · {}", if d.created_by.starts_with("session:") { format!("from {}", author_named(&d.created_by)) } else { author_named(&d.updated_by) }, since(d.updated_at))}
                                     </span>
                                 </a>
@@ -1345,7 +1345,7 @@ pub fn DocPage(id: String) -> impl IntoView {
                 || !window().match_media("(min-width: 48rem) and (min-height: 32rem)").ok().flatten().is_some_and(|m| m.matches());
             let f = if e.width() >= DOCKED_FROM {
                 Fit::Docked
-            } else if phone {
+            } else if phone || e.width() < 640.0 {
                 Fit::Sheet
             } else {
                 Fit::Floating
