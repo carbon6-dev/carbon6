@@ -365,10 +365,17 @@ fn ChipEditor(block: String, key: String, value: Value, ctx: ChipCtx) -> impl In
 fn Expandable(src: String, name: String, fill: bool, new_tab: Option<String>, children: Children) -> impl IntoView {
     let open = RwSignal::new(false);
     let href = new_tab.clone();
+    let drawing = new_tab.is_none();
     view! {
         // A block: a drawing has no size of its own, and in a box that
         // shrinks to fit its content it would shrink to nothing.
         <a href=href target="_blank" title="Show it bigger" class=if fill { "block w-full cursor-zoom-in" } else { "block w-fit max-w-full cursor-zoom-in" }
+            role=drawing.then_some("button") tabindex=drawing.then_some(0)
+            on:keydown=move |ev| if drawing && matches!(ev.key().as_str(), "Enter" | " ") {
+                ev.prevent_default();
+                ev.stop_propagation();
+                open.set(true);
+            }
             on:click=move |ev: web_sys::MouseEvent| {
                 ev.stop_propagation();
                 if new_tab.is_none() || (ev.button() == 0 && !(ev.meta_key() || ev.ctrl_key() || ev.shift_key() || ev.alt_key())) {
@@ -1852,7 +1859,7 @@ fn FloatingPanel(open: Signal<bool>) -> impl IntoView {
 /// A sheet from the bottom of the screen (a phone's), over a dimmed page;
 /// a tap above it or Escape closes it.
 #[component]
-fn Sheet(open: Signal<bool>, close: Callback<()>, children: Children) -> impl IntoView {
+fn Sheet(open: Signal<bool>, close: Callback<()>, children: ChildrenFn) -> impl IntoView {
     let node = NodeRef::<leptos::html::Div>::new();
     follow_popover(node, move || {
         if let Some(el) = node.try_get_untracked().flatten() {
@@ -1870,12 +1877,14 @@ fn Sheet(open: Signal<bool>, close: Callback<()>, children: Children) -> impl In
     });
     on_cleanup(move || keys.remove());
     view! {
+        <leptos::portal::Portal>
         <div class="c6-scrim c6-presence fixed inset-0 z-40 bg-black/30" data-open=move || open.get().to_string() inert=move || !open.get()
             on:click=move |_| close.run(())></div>
         <div node_ref=node class="c6-sheet c6-presence phone-sheet fixed inset-x-0 bottom-0 z-50 flex max-h-[85dvh] flex-col overflow-hidden rounded-t-xl border-t border-zinc-200 bg-white shadow-2xl dark:border-zinc-700 dark:bg-zinc-900"
             data-open=move || open.get().to_string() inert=move || !open.get()>
             {children()}
         </div>
+        </leptos::portal::Portal>
     }
 }
 

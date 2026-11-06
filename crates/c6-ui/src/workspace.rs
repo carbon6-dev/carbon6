@@ -2442,6 +2442,7 @@ pub fn Popover(at: RwSignal<Option<(f64, f64)>>, #[prop(into)] class: String, ch
     move || {
         at.get().map(|(x, y)| {
             view! {
+                <leptos::portal::Portal>
                 <div class="fixed inset-0 z-40" on:click=move |ev| { ev.stop_propagation(); at.set(None) }></div>
                 <div data-pop=pop.get_value()
                     class=format!("c6-pop phone-popover fixed z-50 max-h-[75vh] overflow-y-auto rounded-lg border border-zinc-200 bg-white p-2 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900 {}", class.get_value())
@@ -2449,6 +2450,7 @@ pub fn Popover(at: RwSignal<Option<(f64, f64)>>, #[prop(into)] class: String, ch
                 >
                     {children.with_value(|c| c())}
                 </div>
+                </leptos::portal::Portal>
             }
         })
     }

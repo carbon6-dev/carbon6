@@ -498,7 +498,7 @@ fn Sheet(
     open: RwSignal<bool>,
     #[prop(into)] title: String,
     #[prop(optional)] reset: Option<Callback<()>>,
-    children: Children,
+    children: ChildrenFn,
 ) -> impl IntoView {
     let close = move || {
         open.try_set(false);
@@ -506,11 +506,12 @@ fn Sheet(
     let pop = escapable(move || open.get(), close);
     let label = title.clone();
     view! {
+        <leptos::portal::Portal>
         <div class="fixed inset-0 z-40 bg-black/30" on:click=move |_| close()></div>
-        <div data-pop=pop role="dialog" aria-label=label
+        <div data-pop=pop.clone() role="dialog" aria-label=label.clone()
             class="fixed inset-x-0 bottom-0 z-50 flex max-h-[85dvh] flex-col rounded-t-xl border-t border-zinc-200 bg-white text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900">
             <div class="flex shrink-0 items-center gap-2 border-b border-zinc-200 py-1 pl-4 pr-2 dark:border-zinc-800">
-                <h2 class="flex-1 py-2 font-medium">{title}</h2>
+                <h2 class="flex-1 py-2 font-medium">{title.clone()}</h2>
                 {reset.map(|r| view! { <button class="rounded-md px-3 py-2 text-sky-700 dark:text-sky-400" on:click=move |_| r.run(())>"Reset"</button> })}
             </div>
             <div class="min-h-0 flex-1 overflow-y-auto px-4 py-4">{children()}</div>
@@ -518,6 +519,7 @@ fn Sheet(
                 <button class=format!("{BUTTON} w-full py-2") on:click=move |_| close()>"Done"</button>
             </div>
         </div>
+        </leptos::portal::Portal>
     }
 }
 
@@ -1150,19 +1152,20 @@ fn RailCard(s: Session, hover: Hover, like_this: RwSignal<Option<SessionSeed>>, 
         let fallback = s.clone();
         move |_| live.sessions.with(|ss| ss.iter().find(|s| s.id == id.get_value()).cloned()).unwrap_or_else(|| fallback.clone())
     });
-    let (open_id, tile_id) = (s.id.clone(), s.id.clone());
-    let place = match (&s.ssh, s.cwd.is_empty()) {
-        (Some(t), _) => relationship_label(String::new(), format!("{t}:{}", s.cwd)).into_any(),
+    let place_session = s.clone();
+    let place = move || match (&place_session.ssh, place_session.cwd.is_empty()) {
+        (Some(t), _) => relationship_label(String::new(), format!("{t}:{}", place_session.cwd)).into_any(),
         (None, true) => "scratch workspace".into_any(),
-        (None, false) => c6_api::labels::display_labels(&s.auto_labels)
+        (None, false) => c6_api::labels::display_labels(&place_session.auto_labels)
             .iter()
             .find_map(|l| l.strip_prefix("folder:").map(str::to_owned))
-            .unwrap_or_else(|| s.cwd.clone())
+            .unwrap_or_else(|| place_session.cwd.clone())
             .into_any(),
     };
     let act = "rounded-md border border-zinc-200 px-2 py-1 text-xs hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800";
     view! {
-        <div node_ref=card data-session-preview data-pop=pop class="fixed z-40 w-72 space-y-2 overflow-y-auto rounded-lg border border-zinc-200 bg-white p-3 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
+        <leptos::portal::Portal>
+        <div node_ref=card data-session-preview data-pop=pop.clone() class="fixed z-40 w-72 space-y-2 overflow-y-auto rounded-lg border border-zinc-200 bg-white p-3 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
             style=move || {
                 let (_, x, y) = hover.shown.get().unwrap_or_default();
                 format!("left:clamp(8px,{x}px,max(8px,calc(100vw - 18rem - 8px)));top:min({y}px,8px + max(0px,100dvh - 340px));max-width:calc(100vw - 16px);max-height:calc(100dvh - min({y}px,8px + max(0px,100dvh - 340px)) - 8px)")
@@ -1178,8 +1181,8 @@ fn RailCard(s: Session, hover: Hover, like_this: RwSignal<Option<SessionSeed>>, 
             </div>
             {s.awaiting_approval.then(|| view! { <p class="text-xs font-medium text-amber-600">"A tool call waits for your approval"</p> })}
             <div class="space-y-0.5 text-xs text-muted">
-                <div class="truncate"><span title=s.on_head.then_some(api::HEAD_TITLE)>{worker}</span> " · " {move || current.get().model}</div>
-                <div class="break-all font-mono">{place}</div>
+                <div class="truncate"><span title=s.on_head.then_some(api::HEAD_TITLE)>{worker.clone()}</span> " · " {move || current.get().model}</div>
+                <div class="break-all font-mono">{place()}</div>
                 <div>{move || format!("active {}", ago(now.get() - current.get().updated_at))}</div>
             </div>
             {(!s.labels.is_empty() || !crate::labels::shown_auto(&s.auto_labels).is_empty()).then(|| view! {
@@ -1191,14 +1194,15 @@ fn RailCard(s: Session, hover: Hover, like_this: RwSignal<Option<SessionSeed>>, 
             <crate::aspects::AspectChips s=s.clone() />
             <crate::marks::SessionSwatch session=s.clone() />
             <div class="flex flex-wrap gap-1.5 pt-1">
-                <button class=act on:click=move |_| { hover.hide_now(); ws.open(None, View::session(open_id.clone()), How::Beside) }>"Open"</button>
-                <button class=act on:click=move |_| { hover.hide_now(); ws.open(None, View::session(tile_id.clone()), How::OwnTile) }>"New tile"</button>
+                <button class=act on:click=move |_| { hover.hide_now(); ws.open(None, View::session(id.get_value()), How::Beside) }>"Open"</button>
+                <button class=act on:click=move |_| { hover.hide_now(); ws.open(None, View::session(id.get_value()), How::OwnTile) }>"New tile"</button>
                 {(!s.observed && s.instance.is_empty()).then(|| view! {
                     <button class=act title="Start a new, empty session with this one's worker, folder, model and labels (you can change them first)"
                         on:click=move |_| { let seed = SessionSeed::from_session(&current.get_untracked()); hover.hide_now(); like_this.set(Some(seed)) }>"New like this"</button>
                 })}
             </div>
         </div>
+        </leptos::portal::Portal>
     }
 }
 

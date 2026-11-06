@@ -384,7 +384,8 @@ fn AddWorker() -> impl IntoView {
             "Add worker"
         </button>
         <Show when=move || open.get()>
-            <div class="fixed inset-0 z-10 flex items-center justify-center bg-black/40 px-4" on:click=close>
+            <leptos::portal::Portal>
+            <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4 text-sm text-zinc-900 dark:text-zinc-100" on:click=close>
                 <div
                     class="w-full max-w-xl space-y-4 rounded-lg bg-white p-5 shadow-xl dark:bg-zinc-900"
                     on:click=|ev| ev.stop_propagation()
@@ -423,6 +424,7 @@ fn AddWorker() -> impl IntoView {
                     }}
                 </div>
             </div>
+            </leptos::portal::Portal>
         </Show>
     }
 }

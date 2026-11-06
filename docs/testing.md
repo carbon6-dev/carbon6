@@ -388,6 +388,87 @@ A line that must break a rule says why: `// test-lint: allow (<reason>)`. Today 
 
 The suite is also run with every CPU core kept busy by other processes, to surface timing assumptions a lint can't see (rule 2). A failure there is a bug in the test or the product, never "just load".
 
+## Production image-preview browser regression
+
+`crates/c6-ui/tests/image-preview.cjs` runs the actual production WASM, not
+recreated markup. It reuses `motion.cjs`'s private, port-0 loopback HTTP/WS
+fixture and browser launcher. It never starts a head/worker or changes a live
+account. All API replies, transcript attachment bytes, pending upload bytes,
+and the document's SVG drawing are local fixtures. Each case gets private
+browser storage and a fresh browser process.
+
+Build in the worktree being tested, then run with Node 24 and Playwright Core
+1.50.1 (or a compatible installation). No npm install or UI rebuild occurs in
+the harness. The build requires Trunk, the WASM Rust target, Tailwind and
+`brotli` on PATH. Do not pipe `make ui` through `tail` without `pipefail`: a
+failed build must not silently test an older `dist`.
+
+```sh
+set -euo pipefail
+env -u NO_COLOR make ui
+ENGINE=both node crates/c6-ui/tests/image-preview.cjs
+```
+
+On thalassa, Node 24 is at
+`/home/zheilbron/.nvm/versions/node/v24.16.0/bin/node`. Browser/library defaults
+come from `motion.cjs`; other machines can set `PLAYWRIGHT_CORE`, `CHROMIUM`,
+`CHROMIUM_LIBS`, and `WEBKIT_EXECUTABLE`. `ROOT` selects an existing production
+dist, `ENGINE=chromium|webkit|both` selects the browser (default Chromium),
+`VIEWPORT=desktop-wide,desktop-narrow,phone,phone-narrow` filters cases, and
+`THEME=light,dark` filters themes. The desktop cases use a 1440×1000 window
+with one or three real workspace tiles; phones use 390×844 and 320×568.
+
+The three real entry points are exercised in every case:
+
+- a received transcript image (`TranscriptImage` → `FullImage`);
+- a file added through the composer's real file input, then its thumbnail;
+- a document `diagram` block (`Expandable`, with `fill=true` → `FullImage`).
+
+Checks cover full-window scrim bounds and four-corner hit testing, absence of
+tile ancestors, image fit, explicit 14px captions/12px actions, image/caption
+clicks staying open, Escape/Close/outside dismissal, opener focus return, and
+attachment removal's composer-focus fallback. Drawing preview must not enter
+document editing and also opens with Enter/Space. Geometry, decoded-image
+readiness and DOM state are the completion conditions; there are no fixed
+sleeps or external requests.
+
+Screenshots and JSON ancestry/geometry measurements go to
+`/tmp/q2-screenshots/` (`SCREENSHOTS` overrides it), named
+`after-<engine>-<viewport>-<theme>-<caller>.png`. For baseline diagnosis:
+
+```sh
+ROOT=/tmp/q2-baseline-dist BEFORE=1 ENGINE=both \
+  node crates/c6-ui/tests/image-preview.cjs
+```
+
+`BEFORE=1` records `before-*` screenshots and proves the baseline transcript
+preview is row-constrained. It temporarily resets one ancestor CSS property
+at a time, waits for rendering, records the geometry change and restores the
+original styles. Against `8d0079b9`, removing only the transcript row's
+`content-visibility:auto` makes Chromium's fixed preview fill the window;
+WebKit changes its origin but retains the measured row size in this live-style
+experiment. Both reproduce row-constrained previews in wide tiles too.
+Composer and document previews fill the window at rest in the tested
+browsers, but all three previously remained under tile/pane ancestors, which
+can also contain fixed children during transforms. The fix portals the
+complete shared preview, not just its image or an individual caller, without
+removing transcript virtualization or tile clipping.
+
+The accompanying source guard retains the model picker's typography checks
+and additionally guards the image portal, all three callers, explicit image
+action sizing and the audited viewport-overlay boundaries. The same escape
+is applied to the shared workspace/session popovers, session overview/catch-up
+phone sheets, document/session-list sheets, session-preview cards, row menus,
+person cards, session details, file/folder pickers and Add Worker dialog.
+Existing task/decision/archive/Ask/needs-you dialogs already escape via a
+component or caller Portal. Absolute document comment popovers and anchored
+composer menus remain tile-local. The responsive new-session fields panel
+(static on desktop) and stop confirmation (absolute dialog with a fixed click
+catcher) are mixed anchored layouts, not blindly moved to `body` as a pair.
+The browser harness also opens tile Actions, Session details and phone document
+Comments as representative audited surfaces and checks their viewport ancestry
+and bounds.
+
 Use `NEXTEST=1 make test-under-load RUNS=5` for repeated workspace runs. Do not rebuild test binaries in the same target directory while nextest is running: Cargo can remove binaries nextest has listed but not yet started.
 
 SQLite contention regressions use a real temporary WAL database and simultaneous operations on its connection pool, not just an in-memory database or serial calls. A transaction that reads before writing must take the writer with `BEGIN IMMEDIATE` before its first read: `busy_timeout` cannot repair a stale read snapshot's upgrade to a write. Related rows must commit together too (for example, a claim and all its evidence); fault injection should verify that a failed insert leaves none of a partial operation behind. Neither a longer timeout nor a retry is a fix for these atomicity bugs.

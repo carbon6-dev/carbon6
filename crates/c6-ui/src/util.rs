@@ -824,12 +824,12 @@ pub fn Menu(items: Vec<(&'static str, Callback<()>)>, #[prop(optional)] row: boo
             let _ = first.focus();
         }
     });
-    let pop = dismissable(
+    let pop = StoredValue::new(dismissable(
         move || open.get().is_some(),
         move || {
             open.try_set(None);
         },
-    );
+    ));
     let items = StoredValue::new(items);
     let trigger = if row {
         "row-action flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-muted hover:bg-zinc-200 dark:hover:bg-zinc-800"
@@ -839,7 +839,7 @@ pub fn Menu(items: Vec<(&'static str, Callback<()>)>, #[prop(optional)] row: boo
     let label = if label.is_empty() { "More".to_owned() } else { label };
     view! {
         <button class=trigger title=label.clone() aria-label=label aria-haspopup="menu" aria-expanded=move || open.get().is_some().to_string()
-            data-pop=pop.clone() on:click=move |ev| {
+            data-pop=pop.get_value() on:click=move |ev| {
                 ev.prevent_default();
                 ev.stop_propagation();
                 if open.get_untracked().is_some() {
@@ -854,7 +854,8 @@ pub fn Menu(items: Vec<(&'static str, Callback<()>)>, #[prop(optional)] row: boo
                 open.set(at.or(Some((0.0, 0.0))));
             }>{crate::icons::ellipsis()}</button>
         {move || open.get().map(|(top, right)| view! {
-            <div node_ref=menu role="menu" data-pop=pop.clone() on:keydown=menu_keys class="c6-pop fixed z-50 min-w-40 rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900"
+            <leptos::portal::Portal>
+            <div node_ref=menu role="menu" data-pop=pop.get_value() on:keydown=menu_keys class="c6-pop fixed z-50 min-w-40 rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900"
                 style=format!("top: {}px; right: {}px", top + 4.0, right.max(8.0))>
                 {items.get_value().into_iter().map(|(name, run)| view! {
                     <button role="menuitem" class="flex min-h-11 w-full items-center px-4 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
@@ -866,6 +867,7 @@ pub fn Menu(items: Vec<(&'static str, Callback<()>)>, #[prop(optional)] row: boo
                         }>{name}</button>
                 }).collect_view()}
             </div>
+            </leptos::portal::Portal>
         })}
     }
 }

@@ -411,7 +411,8 @@ pub fn SessionDetails(session: String, usage: Memo<UsageStats>, #[prop(into)] on
         }
     });
     view! {
-        <div class="fixed inset-0 z-30 flex items-start justify-center overflow-y-auto bg-black/40 px-4 py-16" on:click=move |_| on_close.run(())
+        <leptos::portal::Portal>
+        <div class="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 px-4 py-16 text-sm text-zinc-900 dark:text-zinc-100" on:click=move |_| on_close.run(())
             on:keydown=move |ev| {
                 if ev.key() == "Escape" {
                     ev.stop_propagation();
@@ -428,9 +429,10 @@ pub fn SessionDetails(session: String, usage: Memo<UsageStats>, #[prop(into)] on
                     <h3 class="text-sm font-medium">"Usage"</h3>
                     <Usage usage />
                 </section>
-                <crate::labels::SessionConfig session />
+                <crate::labels::SessionConfig session=session.clone() />
             </div>
         </div>
+        </leptos::portal::Portal>
     }
 }
 

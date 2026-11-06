@@ -300,7 +300,8 @@ pub fn FolderPicker(
     };
 
     view! {
-        <div class="fixed inset-0 z-30 flex items-center justify-center bg-black/40 px-4" on:click=move |_| on_cancel.run(())>
+        <leptos::portal::Portal>
+        <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4 text-sm text-zinc-900 dark:text-zinc-100" on:click=move |_| on_cancel.run(())>
             <div class="flex max-h-[85vh] w-full max-w-2xl flex-col gap-3 rounded-lg bg-white p-4 shadow-xl dark:bg-zinc-900" on:click=|ev| ev.stop_propagation()>
                 <h2 class="font-medium">"Choose a working directory"</h2>
                 // Breadcrumbs: each segment is clickable.
@@ -375,6 +376,7 @@ pub fn FolderPicker(
                 </div>
             </div>
         </div>
+        </leptos::portal::Portal>
     }
 }
 
@@ -486,10 +488,11 @@ pub fn FilePicker(
             }
         });
     };
-    let accept = extensions.join(",");
+    let accept = StoredValue::new(extensions.join(","));
     let tab = "rounded-md px-2.5 py-1 text-sm";
     view! {
-        <div class="fixed inset-0 z-30 flex items-center justify-center bg-black/40 px-4" on:click=move |_| on_cancel.run(())>
+        <leptos::portal::Portal>
+        <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4 text-sm text-zinc-900 dark:text-zinc-100" on:click=move |_| on_cancel.run(())>
             <div class="flex max-h-[85vh] w-full max-w-2xl flex-col gap-3 rounded-lg bg-white p-4 shadow-xl dark:bg-zinc-900" on:click=|ev| ev.stop_propagation()>
                 <h2 class="font-medium">{title}</h2>
                 <div class="flex flex-wrap gap-1">
@@ -510,7 +513,7 @@ pub fn FilePicker(
                         <div class="flex min-h-48 flex-col items-center justify-center gap-2 rounded-md border border-dashed border-zinc-300 p-6 text-sm text-muted dark:border-zinc-700">
                             <p>"A file on the device you are using now."</p>
                             <button class=crate::util::BUTTON on:click=move |_| if let Some(i) = device_input.get_untracked() { i.click(); }>"Choose a file…"</button>
-                            <input node_ref=device_input type="file" accept=accept.clone() class="hidden" on:change=from_device />
+                            <input node_ref=device_input type="file" accept=accept.get_value() class="hidden" on:change=from_device />
                         </div>
                     }.into_any()
                 } else {
@@ -580,5 +583,6 @@ pub fn FilePicker(
                 </div>
             </div>
         </div>
+        </leptos::portal::Portal>
     }
 }

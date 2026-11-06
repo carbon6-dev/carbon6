@@ -1102,7 +1102,9 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             <SessionOverview chrome on_done=move |()| glance_at.set(None) />
         </SessionPopover>
         <Show when=move || sheet_present.get()>
-            <BottomSheet open=sheet><SessionOverview chrome on_done=move |()| sheet.set(false) /></BottomSheet>
+            <leptos::portal::Portal>
+                <BottomSheet open=sheet><SessionOverview chrome on_done=move |()| sheet.set(false) /></BottomSheet>
+            </leptos::portal::Portal>
         </Show>
         <SessionPopover at=catch_at class="w-[min(24rem,calc(100vw-1rem))] p-3">
             <div node_ref=catch_pop_size>
@@ -1110,11 +1112,13 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             </div>
         </SessionPopover>
         <Show when=move || catch_present.get()>
+            <leptos::portal::Portal>
             <BottomSheet open=catch_sheet label="Catch up">
                 <div node_ref=catch_sheet_size>
                     <crate::catchup::CatchupBody session=id_stored.get_value() jump on_done=move |()| catch_sheet.set(false) />
                 </div>
             </BottomSheet>
+            </leptos::portal::Portal>
         </Show>
         </div>
     }
@@ -1827,6 +1831,7 @@ fn SessionPopover(at: RwSignal<Option<(f64, f64)>>, #[prop(into)] class: String,
         },
     ));
     view! {
+        <leptos::portal::Portal>
         <Show when=move || present.get()>
             <div class="c6-presence fixed inset-0 z-40" data-open=move || open.get().to_string() inert=move || !open.get()
                 on:click=move |ev| { ev.stop_propagation(); at.set(None); }></div>
@@ -1839,12 +1844,14 @@ fn SessionPopover(at: RwSignal<Option<(f64, f64)>>, #[prop(into)] class: String,
                 {children.with_value(|c| c())}
             </div>
         </Show>
+        </leptos::portal::Portal>
     }
 }
 
 /// A sheet from the bottom on a phone (the glance, what runs in the
 /// background), about half the screen, closed by a tap outside it, its ✕,
 /// or pulling its handle down.
+/// Callers portal the complete sheet, keeping its retained body mounted.
 #[component]
 fn BottomSheet(
     open: RwSignal<bool>,
@@ -3659,7 +3666,7 @@ fn subject_of(text: &str) -> (String, Option<String>) {
 
 /// A button on the dark backdrop behind a full-size image.
 const FULL_BUTTON: &str =
-    "shrink-0 whitespace-nowrap rounded-md bg-zinc-800 px-3 py-1.5 text-zinc-100 ring-1 ring-zinc-600 hover:bg-zinc-700";
+    "shrink-0 whitespace-nowrap rounded-md bg-zinc-800 px-3 py-1.5 text-xs text-zinc-100 ring-1 ring-zinc-600 hover:bg-zinc-700";
 
 /// An image full size over the page, focused so Esc closes it, as Close or
 /// a click outside it does. `info` (its size, say) shows by its name, and
@@ -3672,32 +3679,54 @@ pub(crate) fn FullImage(
     #[prop(optional, into)] info: String,
     #[prop(optional)] fill: bool,
     #[prop(into)] close: Callback<()>,
-    #[prop(optional)] children: Option<Children>,
+    #[prop(optional)] children: Option<ChildrenFn>,
 ) -> impl IntoView {
     let el = NodeRef::<leptos::html::Div>::new();
     Effect::new(move || {
         if let Some(el) = el.get() {
+            use wasm_bindgen::JsCast;
+            let previous = document().active_element().and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok());
+            // Removing an attachment can remove its opener too. Keep its own
+            // composer's input as the fallback, not another tile's input.
+            let input = previous
+                .as_ref()
+                .and_then(|el| el.closest("[data-pane-motion]").ok().flatten())
+                .and_then(|pane| pane.query_selector("textarea").ok().flatten())
+                .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok());
+            let return_to = send_wrapper::SendWrapper::new((previous, input));
+            on_cleanup(move || {
+                if let Some(target) =
+                    return_to.0.as_ref().filter(|el| el.is_connected()).or_else(|| return_to.1.as_ref().filter(|el| el.is_connected()))
+                {
+                    let _ = target.focus();
+                }
+            });
             let _ = el.focus();
         }
     });
     view! {
-        <div node_ref=el tabindex="-1" class="fixed inset-0 z-50 flex flex-col items-center justify-center gap-3 bg-black/90 p-4 outline-none backdrop-blur-sm"
-            on:click=move |_| close.run(())
+        // content-visibility on transcript rows contains fixed descendants;
+        // tile/pane transforms during motion do too. All three callers escape
+        // those ancestors here, rather than depending on their current layout.
+        <leptos::portal::Portal>
+        <div node_ref=el role="dialog" aria-modal="true" aria-label=name.clone() tabindex="-1" class="fixed inset-0 z-50 flex flex-col items-center justify-center gap-3 bg-black/90 p-4 text-sm text-zinc-100 outline-none backdrop-blur-sm"
+            on:click=move |ev| { ev.stop_propagation(); close.run(()); }
             on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); close.run(()) }>
-            <img class=if fill { "h-[80dvh] w-[92vw] rounded-md bg-white object-contain shadow-2xl" } else { "max-h-[80dvh] max-w-[92vw] rounded-md object-contain shadow-2xl" } src=src alt=name.clone() on:click=|ev| ev.stop_propagation() />
+            <img class=if fill { "h-[80dvh] w-[92vw] rounded-md bg-white object-contain shadow-2xl" } else { "max-h-[80dvh] max-w-[92vw] rounded-md object-contain shadow-2xl" } src=src.clone() alt=name.clone() on:click=|ev| ev.stop_propagation() />
             // The name gets its own line (cut short), so the buttons never wrap
             // or run into it on a phone.
             <div class="flex w-full max-w-[92vw] flex-col items-center gap-2 text-sm text-zinc-100" on:click=|ev| ev.stop_propagation()>
                 <div class="flex min-w-0 max-w-full items-baseline gap-2">
-                    <span class="truncate">{name}</span>
-                    {(!info.is_empty()).then(|| view! { <span class="shrink-0 text-zinc-400">{info}</span> })}
+                    <span class="truncate">{name.clone()}</span>
+                    {(!info.is_empty()).then(|| view! { <span class="shrink-0 text-zinc-400">{info.clone()}</span> })}
                 </div>
                 <div class="flex items-center gap-2">
-                {children.map(|c| c())}
+                {children.as_ref().map(|c| c())}
                 <button class=FULL_BUTTON title="Close (Esc)" on:click=move |_| close.run(())>"Close"</button>
                 </div>
             </div>
         </div>
+        </leptos::portal::Portal>
     }
 }
 
@@ -3722,7 +3751,7 @@ fn TranscriptImage(src: String, name: String) -> impl IntoView {
             let href = full.clone();
             view! {
                 <FullImage src=full.clone() name=title.clone() close=move |_| open.set(false)>
-                    <a class=FULL_BUTTON href=href target="_blank" on:click=move |_| open.set(false)>"Open in new tab"</a>
+                    <a class=FULL_BUTTON href=href.clone() target="_blank" on:click=move |_| open.set(false)>"Open in new tab"</a>
                 </FullImage>
             }
         })}
@@ -6331,7 +6360,7 @@ mod tests {
     }
 
     #[test]
-    fn composer_model_portals_keep_their_own_typography() {
+    fn viewport_portals_escape_tiles_and_keep_their_own_typography() {
         let source = include_str!("session.rs");
         let picker = source
             .split("// The desktop tile clips its transcript, not")
@@ -6346,6 +6375,68 @@ mod tests {
         }
         let sheet = source.split("fn BottomSheet(").nth(1).unwrap().split("/// Where a subagent sits").next().unwrap();
         assert!(sheet.contains("bg-white text-sm shadow-xl"), "the phone sheet keeps its independent, larger text size");
+
+        // The shared preview must escape once for *all* callers, not merely
+        // for the composer path which happens to work at rest. Transcript
+        // rows use content-visibility and tile motion creates containing blocks.
+        let image = source.split("pub(crate) fn FullImage(").nth(1).unwrap().split("/// An image sent in the transcript").next().unwrap();
+        let portal = image.find("<leptos::portal::Portal>").expect("FullImage owns the viewport escape");
+        let fixed = image.find("class=\"fixed inset-0").unwrap();
+        assert!(portal < fixed && image[fixed..].contains("</leptos::portal::Portal>"), "the complete scrim and content share one portal");
+        assert!(image.contains("p-4 text-sm text-zinc-100"), "a portal cannot inherit the tile's typography");
+        let actions = source.split("const FULL_BUTTON: &str =").nth(1).unwrap().split(';').next().unwrap();
+        assert!(actions.split_whitespace().any(|c| c == "text-xs"), "image actions keep their own compact size");
+        assert!(image.contains("role=\"dialog\" aria-modal=\"true\""));
+        assert!(image.contains("return_to") && image.contains("is_connected()"), "dismissal restores a surviving opener or composer input");
+        let product = source.split("#[cfg(test)]").next().unwrap();
+        assert_eq!(product.matches("<FullImage ").count(), 2, "transcript and composer use the shared escaped preview");
+        assert_eq!(
+            include_str!("docs.rs").split("#[cfg(test)]").next().unwrap().matches("<crate::session::FullImage ").count(),
+            1,
+            "document images/drawings use that same preview"
+        );
+
+        // Audited viewport overlays: the escape belongs to the primitive,
+        // so new tile callers cannot silently reintroduce clipping. Absolute
+        // tile-local menus and responsive inline panels are not viewport modals.
+        for (file, name) in [
+            (source, "SessionPopover"),
+            (source, "PhoneStatusDetails"),
+            (include_str!("workspace.rs"), "Popover"),
+            (include_str!("docs.rs"), "Sheet"),
+            (include_str!("sessions.rs"), "Sheet"),
+            (include_str!("sessions.rs"), "RailCard"),
+            (include_str!("util.rs"), "Menu"),
+            (include_str!("people.rs"), "Person"),
+            (include_str!("details.rs"), "SessionDetails"),
+            (include_str!("files.rs"), "FolderPicker"),
+            (include_str!("files.rs"), "FilePicker"),
+            (include_str!("fleet.rs"), "AddWorker"),
+        ] {
+            let signature = format!("fn {name}(");
+            let body = file.split(&signature).nth(1).unwrap().split("\n#[component]").next().unwrap();
+            let start = body.find("<leptos::portal::Portal>").unwrap_or_else(|| panic!("{name} needs a viewport portal"));
+            let end = body.rfind("</leptos::portal::Portal>").unwrap();
+            let mut fixed_layers = 0;
+            for (at, _) in body.match_indices("class=") {
+                let class = body[at..].split('"').nth(1).unwrap();
+                if class.split_whitespace().any(|token| token == "fixed") {
+                    fixed_layers += 1;
+                    assert!(start < at && at < end, "{name}'s fixed layers must stay inside its portal");
+                }
+            }
+            assert!(fixed_layers > 0, "the {name} guard must inspect actual viewport-fixed markup");
+        }
+        // BottomSheet deliberately leaves portal ownership at its retained
+        // callsites (including Model); keep the SSR state/markup test below.
+        let mut before = product;
+        while let Some((prefix, rest)) = before.split_once("<BottomSheet ") {
+            assert!(
+                prefix.rsplit_once("<leptos::portal::Portal>").is_some_and(|(_, tail)| !tail.contains("</leptos::portal::Portal>")),
+                "every BottomSheet callsite escapes the tile"
+            );
+            before = rest;
+        }
     }
 
     #[test]
