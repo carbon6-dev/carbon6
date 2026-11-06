@@ -45,6 +45,26 @@ pub enum TranscriptTimes {
     Off,
 }
 
+/// Session identity colour in tile bars; aspect marks keep their colours.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SessionBarColour {
+    #[default]
+    Tinted,
+    DotOnly,
+}
+
+/// Display only, for this head's user across realms and devices.
+/// `GET/PUT /api/v1/settings/session_bar`; does not change marks or interactions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SessionBarSettings {
+    /// Preserve the current coloured stripe unless the user opts into dot-only colour.
+    #[serde(default)]
+    pub colour: SessionBarColour,
+}
+
 /// Non-destructive inspection of a background shell command, subagent or observed Claude Code task.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -483,6 +503,30 @@ impl Session {
 mod session_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn session_bar_settings_default_and_wire_round_trip() {
+        let default = SessionBarSettings::default();
+        assert_eq!(default.colour, SessionBarColour::Tinted);
+        assert_eq!(serde_json::from_value::<SessionBarSettings>(json!({})).unwrap(), default);
+        for (colour, wire) in [(SessionBarColour::Tinted, "tinted"), (SessionBarColour::DotOnly, "dot_only")] {
+            let settings = SessionBarSettings { colour };
+            let value = serde_json::to_value(settings).unwrap();
+            assert_eq!(value, json!({"colour": wire}));
+            assert_eq!(serde_json::from_value::<SessionBarSettings>(value).unwrap(), settings);
+        }
+        for invalid in [json!({"colour": "none"}), json!({"colour": true}), json!({"colour": null})] {
+            assert!(serde_json::from_value::<SessionBarSettings>(invalid).is_err());
+        }
+    }
+
+    #[cfg(feature = "schema")]
+    #[test]
+    fn session_bar_settings_schema_keeps_tinted_default() {
+        let schema = serde_json::to_value(schemars::schema_for!(SessionBarSettings)).unwrap();
+        assert_eq!(schema["properties"]["colour"]["default"], "tinted");
+        assert_eq!(schema["$defs"]["SessionBarColour"]["enum"], json!(["tinted", "dot_only"]));
+    }
 
     fn session() -> Session {
         // Older servers did not send activity counts or the other optional

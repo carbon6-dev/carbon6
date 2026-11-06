@@ -373,3 +373,51 @@ async fn transcript_display_preference_round_trips_across_realms_and_restart() {
     assert!(!saved.show_thinking);
     head.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn session_bar_preference_round_trips_across_realms_and_restart() {
+    use c6_api::{SessionBarColour, SessionBarSettings};
+    let head_dir = tempfile::tempdir().unwrap();
+    let config = || HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    };
+    let head = c6_head::start(config()).await.unwrap();
+    let url = format!("http://127.0.0.1:{}/api/v1/settings/session_bar", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let get = async |realm| {
+        let r = http.get(&url).header("X-C6-Realm", realm).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        r.json::<SessionBarSettings>().await.unwrap()
+    };
+    assert_eq!(get("home").await.colour, SessionBarColour::Tinted, "existing heads keep their coloured stripes");
+    for colour in [SessionBarColour::DotOnly, SessionBarColour::Tinted, SessionBarColour::DotOnly] {
+        let r = http.put(&url).header("X-C6-Realm", "home").json(&SessionBarSettings { colour }).send().await.unwrap();
+        assert_eq!(r.status(), 204);
+        assert_eq!(get("home").await.colour, colour);
+        assert_eq!(get("admin").await.colour, colour, "the user's preference is shared across realms");
+    }
+    for invalid in [json!({"colour": "none"}), json!({"colour": false}), json!({"colour": null})] {
+        let r = http.put(&url).json(&invalid).send().await.unwrap();
+        let status = r.status();
+        let body = r.text().await.unwrap();
+        assert!(matches!(status.as_u16(), 400 | 422), "{invalid}: {status}: {body}");
+        assert_eq!(get("home").await.colour, SessionBarColour::DotOnly, "invalid writes leave the preference alone");
+    }
+    head.shutdown().await.unwrap();
+
+    let head = c6_head::start(config()).await.unwrap();
+    let url = format!("http://127.0.0.1:{}/api/v1/settings/session_bar", head.ui_addrs[0].port());
+    let other_device = reqwest::Client::new();
+    let saved = other_device.get(&url).send().await.unwrap().json::<SessionBarSettings>().await.unwrap();
+    assert_eq!(saved.colour, SessionBarColour::DotOnly, "a new client after restart reads the saved preference");
+    let r = other_device.put(&url).json(&json!({})).send().await.unwrap();
+    assert_eq!(r.status(), 204, "an omitted colour restores the default");
+    let saved = other_device.get(&url).send().await.unwrap().json::<SessionBarSettings>().await.unwrap();
+    assert_eq!(saved.colour, SessionBarColour::Tinted);
+    head.shutdown().await.unwrap();
+}

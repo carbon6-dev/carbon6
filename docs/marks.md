@@ -37,9 +37,19 @@ Marks you or the head picked live in the head (`marks` table) and reach every br
 
 Which aspects show in these rows and cards is a per-realm setting (`session_facets`, Settings → Appearance): worker, work, project and realm by default. It does not add aspects to the tile bar or phone header. A realm aspect shows only when it isn't home and the UI is not scoped to a realm.
 
+### Session bar colour
+
+**Settings → Appearance → Session bar colour** chooses how much of a session's tile bar carries its identity colour:
+
+- **Coloured stripe** (default) keeps the session's colour along the bar's top edge.
+- **Dot only** opts into a neutral bar: only the session's identity dot carries its colour, not the bar's background or edge.
+
+This changes session identity styling only; it does not add aspect marks or hover-dimming to tile bars. Existing aspect marks keep their own colours and patterns, and existing hover behaviour (including dimming where present) and every click action remain unchanged. It does not recolour state dots, rail/dock/list marks, or the marks stored in the head. Like transcript display, this is one preference for the head's user across realms and devices, not a per-realm facet choice. It is loaded when the UI opens; another device sees a saved change on reload. Existing heads with no saved preference keep coloured stripes, with no migration.
+
 ## 4. API
 
 - `GET /api/v1/marks`: every mark given, by key (`marks.list`). A realm's caller sees its own work's.
 - `PUT /api/v1/marks` `{key, mark}`: gives a value its mark, `mark: ""` takes it away (`marks.set`).
 - `PUT /api/v1/sessions/{id}/colour` `{colour}`: a session's mark (`sessions.colour.set`).
 - `GET/PUT /api/v1/settings/session_facets` `{shown: [...]}` (`sessions.facets.get`/`put`).
+- `GET/PUT /api/v1/settings/session_bar` `{colour: "tinted" | "dot_only"}` (`settings.session_bar.get`/`put`): user-wide display preference, stored in the existing settings table as `session_bar_display`. An omitted `colour` defaults to `tinted`; unsupported values are rejected without changing the saved preference.

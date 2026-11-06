@@ -712,6 +712,14 @@ pub async fn put_transcript_settings(settings: c6_api::TranscriptSettings) -> Re
     empty(Request::put("/api/v1/settings/transcript").json(&settings).map_err(|e| e.to_string())?.send().await).await
 }
 
+pub async fn session_bar_settings() -> Result<c6_api::SessionBarSettings, String> {
+    json(Request::get("/api/v1/settings/session_bar").send().await).await
+}
+
+pub async fn put_session_bar_settings(settings: c6_api::SessionBarSettings) -> Result<(), String> {
+    empty(Request::put("/api/v1/settings/session_bar").json(&settings).map_err(|e| e.to_string())?.send().await).await
+}
+
 /// A settings list's own entries in `realm` (the console, choosing which
 /// realm's rules it edits; "root": the defaults every realm inherits).
 pub async fn get_setting_in(name: &'static str, realm: String) -> Result<serde_json::Value, String> {

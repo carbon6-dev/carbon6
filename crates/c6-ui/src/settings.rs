@@ -190,6 +190,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                 {move || match current.get().as_str() {
                     "appearance" => view! {
                         <AppearanceSetting />
+                        <SessionBarSetting />
                         <TranscriptSetting />
                         <crate::aspects::FacetsSetting />
                     }.into_any(),
@@ -476,6 +477,79 @@ fn AppearanceSetting() -> impl IntoView {
                 {option("dark", "Dark", "Always dark")}
             </div>
             <p class="text-xs text-muted">"Kept in this browser, so each device can have its own."</p>
+        </section>
+    }
+}
+
+/// The user's identity colour preference, shared by every mounted session bar.
+#[derive(Clone, Copy)]
+pub struct SessionBarDisplay {
+    pub colour: RwSignal<c6_api::SessionBarColour>,
+    loaded: RwSignal<bool>,
+    error: RwSignal<Option<String>>,
+}
+
+impl SessionBarDisplay {
+    /// Load once in Main and provide as context before rendering bars or Appearance.
+    pub fn load() -> Self {
+        let display = Self {
+            colour: RwSignal::new(c6_api::SessionBarSettings::default().colour),
+            loaded: RwSignal::new(false),
+            error: RwSignal::new(None),
+        };
+        spawn_local(async move {
+            match api::session_bar_settings().await {
+                Ok(settings) => {
+                    display.colour.set(settings.colour);
+                    display.loaded.set(true);
+                }
+                Err(e) => display.error.set(Some(e)),
+            }
+        });
+        display
+    }
+}
+
+#[component]
+fn SessionBarSetting() -> impl IntoView {
+    use c6_api::SessionBarColour;
+    let display = expect_context::<SessionBarDisplay>();
+    let busy = RwSignal::new(false);
+    let option = move |colour: SessionBarColour, label: &'static str, what: &'static str| {
+        let save = move |_| {
+            let previous = display.colour.get_untracked();
+            display.colour.set(colour);
+            busy.set(true);
+            display.error.set(None);
+            spawn_local(async move {
+                if let Err(e) = api::put_session_bar_settings(c6_api::SessionBarSettings { colour }).await {
+                    display.colour.set(previous);
+                    display.error.set(Some(e));
+                }
+                busy.set(false);
+            });
+        };
+        view! {
+            <label class="flex cursor-pointer items-start gap-3 rounded-md border border-zinc-200 px-3 py-2 has-checked:border-blue-500 has-checked:bg-blue-50 dark:border-zinc-800 dark:has-checked:border-blue-400 dark:has-checked:bg-blue-950">
+                <input type="radio" name="session-bar-colour" class="mt-1"
+                    prop:checked=move || display.colour.get() == colour
+                    disabled=move || !display.loaded.get() || busy.get() on:change=save />
+                <span>
+                    <span class="block text-sm font-medium">{label}</span>
+                    <span class="block text-xs text-muted">{what}</span>
+                </span>
+            </label>
+        }
+    };
+    view! {
+        <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+            <h2 class="font-medium">"Session bar colour"</h2>
+            <div class="grid gap-2 sm:grid-cols-2">
+                {option(SessionBarColour::Tinted, "Coloured stripe", "Keep the session's colour along the bar's top edge (default)")}
+                {option(SessionBarColour::DotOnly, "Dot only", "Keep the bar neutral; show the session's colour only on its dot")}
+            </div>
+            <p class="text-xs text-muted">"Aspect marks keep their colours. Existing hover behaviour and click actions stay the same. Kept in carbon6 across realms and devices."</p>
+            {move || display.error.get().map(|e| view! { <ErrorBox message=e /> })}
         </section>
     }
 }
@@ -4721,5 +4795,37 @@ fn MemorySetting() -> impl IntoView {
                 <button class=BUTTON on:click=save>{move || if editing.get().is_some() { "Save note" } else { "Add note" }}</button>
             </div>
         </section>
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod session_bar_tests {
+    use super::*;
+
+    #[test]
+    fn session_bar_appearance_uses_shared_context_and_reports_loading_errors() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let display = SessionBarDisplay {
+                colour: RwSignal::new(c6_api::SessionBarSettings::default().colour),
+                loaded: RwSignal::new(false),
+                error: RwSignal::new(None),
+            };
+            provide_context(display);
+            let render = || untrack(|| view! { <SessionBarSetting /> }.to_html());
+            let html = render();
+            for text in ["Session bar colour", "Coloured stripe", "Dot only", "Aspect marks keep their colours", "Existing hover behaviour"]
+            {
+                assert!(html.contains(text), "{text} missing: {html}");
+            }
+            assert_eq!(html.matches(" disabled").count(), 2, "don't overwrite a preference before loading it");
+            display.loaded.set(true);
+            assert!(!render().contains(" disabled"));
+            display.colour.set(c6_api::SessionBarColour::DotOnly);
+            assert_eq!(expect_context::<SessionBarDisplay>().colour.get_untracked(), c6_api::SessionBarColour::DotOnly);
+            display.error.set(Some("Could not save session bar colour".to_owned()));
+            assert!(render().contains("Could not save session bar colour"));
+        });
     }
 }

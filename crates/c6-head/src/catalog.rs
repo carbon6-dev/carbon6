@@ -62,6 +62,8 @@ pub fn scope(name: &str) -> Option<Scope> {
         "sessions.locate",
         "settings.transcript.get",
         "settings.transcript.put",
+        "settings.session_bar.get",
+        "settings.session_bar.put",
     ];
     const SHARED: &[&str] =
         &["workers.list", "connections.list", "connections.models", "connections.quotas", "commands.list", "realms.list", "hosts.list"];
@@ -446,6 +448,8 @@ fn build() -> Vec<Op> {
         op!("sessions.facets.put", "sessions", "PUT" "/api/v1/settings/session_facets", Write, Input::Body(schema::<api::marks::SessionFacets>), "Sets which aspects of a session its header shows: any of worker, work, project, realm, repo, model."),
         op!("settings.transcript.get", "settings", "GET" "/api/v1/settings/transcript", Read, Input::None, "The user's transcript display preference across realms and devices: show_thinking defaults to false (hidden); true shows thinking expanded. Display only, with no effect on stored events or model input."),
         op!("settings.transcript.put", "settings", "PUT" "/api/v1/settings/transcript", Write, Input::Body(schema::<api::TranscriptSettings>), "Saves the user's transcript display preference across realms and devices: show_thinking false hides thinking, true shows it expanded. Does not change stored events or model input."),
+        op!("settings.session_bar.get", "settings", "GET" "/api/v1/settings/session_bar", Read, Input::None, "The user's session bar colour preference across realms and devices: tinted by default, or dot_only for session identity colour on its dot alone. Aspect colours and hover/click behaviour are unchanged."),
+        op!("settings.session_bar.put", "settings", "PUT" "/api/v1/settings/session_bar", Write, Input::Body(schema::<api::SessionBarSettings>), "Saves session bar colour: tinted (default) or dot_only. Display only, across realms and devices; aspect colours and hover/click behaviour are unchanged."),
         op!("marks.list", "sessions", "GET" "/api/v1/marks", Read, Input::None, "The marks given to the values of sessions' aspects, by key (worker:<id>, work:<id>, project:<id>, realm:<id>, repo:<name>, model:<name>): a value without one wears a colour worked out from its name."),
         op!("marks.set", "sessions", "PUT" "/api/v1/marks", Write, Input::Body(schema::<api::marks::SetMark>), "Gives a worker, piece of work, project, realm, repo or model its mark (a colour, or <colour>/<pattern>: hstripes, vstripes, diagonal, dots), the same everywhere it shows; an empty mark takes it away."),
         op!("settings.own.get", "settings", "GET" "/api/v1/settings/own/{name}", Read, Input::None, "Whether this realm sets a setting itself (suggestions, web-search, assistant, subagent-limits) or follows root's."),
@@ -1385,6 +1389,17 @@ pub fn openapi(urls: &[String]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_bar_preference_is_available_from_any_realm() {
+        for (method, name) in [("GET", "settings.session_bar.get"), ("PUT", "settings.session_bar.put")] {
+            assert_eq!(scope(name), Some(Scope::Device));
+            assert_eq!(route_scope(method, "/api/v1/settings/session_bar"), Scope::Device);
+        }
+        let put = ops().iter().find(|o| o.name == "settings.session_bar.put").unwrap();
+        let schema = input_schema(put);
+        assert_eq!(schema["properties"]["body"]["properties"]["colour"]["default"], "tinted");
+    }
 
     /// Every route is an operation or a known exception, and every
     /// operation is a route; every memex method the UI calls is an
