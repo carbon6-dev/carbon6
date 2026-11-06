@@ -36,6 +36,29 @@ workspace scrollbar. Calendar's seven-column month and the Workers table
 still have their existing dense/data-table designs; don't mistake overflow
 containment for a redesigned narrow version of those views.
 
+## Browser-local themes
+
+`crates/c6-ui/tests/theme.cjs` checks System, Light, unchanged Dark and Soft:
+
+```sh
+node --test crates/c6-ui/tests/theme.cjs
+SCREENSHOTS=/tmp/p3-screenshots node crates/c6-ui/tests/theme.cjs --browser
+ENGINE=webkit THEME_DELAY_MS=1000 node crates/c6-ui/tests/theme.cjs --browser
+```
+
+Use Node 24 and the same browser overrides as the motion harness. The browser
+test delays the real theme bootstrap fetch, holds WASM, and checks the first
+body frames before the application renders. It also tests four usable radio
+cards at 240/320/400/480/640px tile and phone widths, persistence, OS changes,
+and real cross-tab palette and selected-card updates.
+
+Soft keeps the requested greys and existing accents, not a blanket contrast
+guarantee. The sample document's red `#f87171` on chip `#33343a` is 4.484:1:
+it rounds to 4.5 but is below the unrounded AA threshold. Current Tailwind 4
+red-400 resolves to sRGB8 `#ff6467`, measuring 4.294:1 on that chip. The test
+prints both the sample swatches and the actual built tokens rather than
+silently changing accents or treating rounded figures as a pass.
+
 ## Motion: production browser regression
 
 `ONLY=sessionsPicker` checks the phone Sessions header's visual alignment,

@@ -457,10 +457,17 @@ extern "C" {
     fn motion_set(choice: &str);
 }
 
-/// Light, dark, or as the system is: kept in this browser.
+/// Light, dark, soft, or as the system is: kept in this browser.
 #[component]
 fn AppearanceSetting() -> impl IntoView {
     let choice = RwSignal::new(theme_get());
+    let theme = window_event_listener(leptos::ev::Custom::new("c6-theme"), move |_: web_sys::Event| {
+        let next = theme_get();
+        if choice.get_untracked() != next {
+            choice.set(next);
+        }
+    });
+    on_cleanup(move || theme.remove());
     let motion = RwSignal::new(motion_get());
     let option = move |value: &'static str, label: &'static str, what: &'static str| {
         view! {
@@ -486,10 +493,11 @@ fn AppearanceSetting() -> impl IntoView {
     view! {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <h2 class="font-medium">"Theme"</h2>
-            <div class="grid gap-2 @xl/settings:grid-cols-3">
+            <div class="grid gap-2 @lg/settings:grid-cols-2 @4xl/settings:grid-cols-4">
                 {option("system", "System", "Follows your device's setting")}
                 {option("light", "Light", "Always light")}
                 {option("dark", "Dark", "Always dark")}
+                {option("soft", "Soft", "Dark with softer greys")}
             </div>
             <h2 class="font-medium">"Motion"</h2>
             <div class="grid gap-2 @lg/settings:grid-cols-2">

@@ -6,6 +6,9 @@
          message box stays above it and the header in view. -->
     <meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content" />
     <meta name="theme-color" content="#141417" />
+    <!-- Resolve the browser-local theme before CSS can paint. Keep this
+         parser-blocking: defer permits a light flash while the script loads. -->
+    <script src="/js/theme.js"></script>
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <meta name="apple-mobile-web-app-title" content="carbon6" />
@@ -20,7 +23,6 @@
     <link data-trunk rel="copy-dir" href="vendor" />
     <link data-trunk rel="copy-dir" href="js" />
     <script defer src="/js/crash.js"></script>
-    <script defer src="/js/theme.js"></script>
     <script defer src="/js/motion.js"></script>
     <script defer src="/js/terminal.js"></script>
     <script defer src="/js/passkey.js"></script>
