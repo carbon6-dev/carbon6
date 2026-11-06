@@ -104,19 +104,23 @@ The hidden signed-in `/dev/components` page (also `/r/<realm>/dev/components`) i
 
 The UI's release build uses the separate `ui-release` Cargo profile (size
 optimisation, fat LTO, one codegen unit and aborting panics), selected by Trunk's
-HTML entry point. The wasm target also erases Leptos component view types to keep
-download and browser compilation small. `make ui`, direct `trunk build --release`,
-Docker and package builds all use these settings; native `c6h`/`c6w` release
-optimisation, unwinding and build settings are unchanged. The browser panic hook
-still reports the panic to the head and shows its plain-JavaScript reload banner
-before wasm traps.
+HTML entry point. Do not enable `--cfg erase_components` for this build: the
+locked renderer's erased-attribute rebuild clears and recreates attributes and
+SVG inner HTML on routine live updates, substantially increasing main-thread
+work. Keep the typed renderer even though its download is larger (see
+[the responsiveness investigation](docs/ui-responsiveness.md)). `make ui`, direct
+`trunk build --release`, Docker and package builds all use these settings; native
+`c6h`/`c6w` release optimisation, unwinding and build settings are unchanged. The
+browser panic hook still reports the panic to the head and shows its
+plain-JavaScript reload banner before wasm traps.
 
 After `make ui`, `make check` also checks the wasm size ratchet in
 `scripts/ui-size.sh`: both raw and Brotli bytes must stay within 3% of the last
 accepted production build. Lower its accepted byte counts when the UI shrinks;
 explain any increase in the commit message. The targets are at most 8 MB raw and
-2 MB Brotli (decimal bytes). A checkout without built wasm skips this check;
-a built wasm without its Brotli sidecar fails it.
+2 MB Brotli (decimal bytes); the responsiveness fix explicitly exceeds those
+targets rather than trade input responsiveness for size. A checkout without
+built wasm skips this check; a built wasm without its Brotli sidecar fails it.
 
 ## Run
 

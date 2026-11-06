@@ -4,8 +4,11 @@
 # in the commit message. Allow 3% for ordinary compiler/build variation.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-accepted_raw=7582584
-accepted_br=1834487
+# Retain typed views: erase_components made ordinary live snapshots clear and
+# rebuild attributes/SVG innerHTML. Accept the measured runtime/size tradeoff;
+# the 8 MB / 2 MB targets below remain goals, not a reason to regress input.
+accepted_raw=10412407
+accepted_br=2589638
 dist=${UI_DIST:-crates/c6-ui/dist}
 shopt -s nullglob
 wasm=("$dist"/*_bg.wasm)
