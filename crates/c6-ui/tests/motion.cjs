@@ -622,6 +622,42 @@ async function sheet(f) {
   } finally { await page.clock.resume(); }
 }
 
+async function sessionsPicker(f) {
+  if (!phoneViewport(f.viewport)) return;
+  const { page } = f;
+  const opener = page.getByRole('button', { name: /^Switch sessions and pages/ });
+  const dialog = page.getByRole('dialog', { name: 'Sessions', exact: true });
+  const open = async () => { await opener.click(); await dialog.waitFor(); await settle(page); };
+  const closed = async () => { await page.waitForFunction(() => !document.querySelector('[role="dialog"][aria-label="Sessions"][data-open="true"]')); await settle(page); };
+  await open();
+  const header = await dialog.evaluate(el => {
+    const h = el.querySelector('h2').parentElement;
+    const [ask, bell] = h.querySelectorAll('button');
+    const rowX = el.querySelector('button[aria-label="Close this session or page"]');
+    const box = e => { const r = e.getBoundingClientRect(); return { right: r.right, cy: r.y + r.height / 2, height: r.height }; };
+    return { buttons: h.querySelectorAll('button').length, title: box(h.querySelector('h2')),
+      ask: box(ask), askPill: box(ask.querySelector('span')), bell: box(bell), bellPill: box(bell.querySelector('span')), rowX: box(rowX),
+      icons: h.querySelectorAll('svg').length, handle: el.querySelector('button[aria-label="Close Sessions"]')?.tagName };
+  });
+  assert.equal(header.buttons, 2, 'header has Ask and bell, not an extra X');
+  assert.equal(header.icons, 2, 'Ask and bell keep their drawn SVG icons');
+  assert.equal(header.handle, 'BUTTON', 'screen readers can activate the named close handle');
+  assert.equal(header.askPill.height, header.bellPill.height, JSON.stringify(header));
+  assert(Math.abs(header.title.cy - header.ask.cy) < 1 && Math.abs(header.ask.cy - header.bell.cy) < 1, JSON.stringify(header));
+  assert(Math.abs(header.bell.right - header.rowX.right) < 1, `header ends at the row close column: ${JSON.stringify(header)}`);
+  await page.screenshot({ path: path.join(SHOTS, `${f.label}-sessions-picker.png`) });
+  await dialog.getByRole('button', { name: 'Close Sessions', exact: true }).click(); await closed();
+  await open(); await page.keyboard.press('Escape'); await closed();
+  await open(); await page.locator('.c6-scrim[data-open="true"]').click({ position: { x: 2, y: 2 } }); await closed();
+  await open();
+  await dialog.getByRole('button', { name: 'Close Sessions', exact: true }).evaluate(el => {
+    el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, clientY: 10, pointerId: 1 }));
+    el.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, clientY: 60, pointerId: 1 }));
+    el.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, clientY: 60, pointerId: 1 }));
+  });
+  await closed();
+}
+
 async function assertFollowing(page, reason) {
   await settle(page);
   // A fit queued by an effect can run on the frame *after* the row's RO
@@ -1063,7 +1099,7 @@ async function main() {
       'CHROMIUM_LIBS=/path/to/shared-libraries (local /tmp/c7-browser-libs default when present)\n' +
       'ENGINE=chromium|webkit|both (default chromium; WEBKIT=1 also supported)\n' +
       'ISOLATE_BROWSER=1 owns a fresh browser process per case (useful for the local old WPE WebKit)\n' +
-      'ONLY=policy,menu,sheet,phone,tool,tiles,sendStop THEME=light,dark VIEWPORT=desktop,phone,narrow,landscape (default desktop,phone) MOTION_CASE=system,system-reduce,full,full-reduce,reduced,off\n' +
+      'ONLY=policy,menu,sheet,sessionsPicker,phone,tool,tiles,sendStop THEME=light,dark VIEWPORT=desktop,phone,narrow,landscape (default desktop,phone) MOTION_CASE=system,system-reduce,full,full-reduce,reduced,off\n' +
       'narrow=320x568; landscape=900x480; both opt-in views use the phone/short-height checks\n' +
       '--helpers tests real-DOM production list cleanup in Full/Reduced/Off (ENGINE=both selects all six)\n' +
       '--unit runs node:test VM checks of the production motion.js without a browser/build\n' +
@@ -1074,7 +1110,7 @@ async function main() {
   const playwright = require(process.env.PLAYWRIGHT_CORE || '/home/zheilbron/.bun/install/cache/playwright-core@1.50.1@@@1');
   const engine = process.env.ENGINE || (process.env.WEBKIT ? 'webkit' : 'chromium');
   assert(['chromium', 'webkit', 'both'].includes(engine), `Unknown ENGINE=${engine}`);
-  for (const [env, allowed] of Object.entries({ ONLY: ['policy', 'menu', 'sheet', 'phone', 'tool', 'tiles', 'sendStop'],
+  for (const [env, allowed] of Object.entries({ ONLY: ['policy', 'menu', 'sheet', 'sessionsPicker', 'phone', 'tool', 'tiles', 'sendStop'],
     VIEWPORT: VIEWPORTS.map(([name]) => name), THEME: ['light', 'dark'], MOTION_CASE: CASES.map(motion => motion.name) })) {
     if (process.env[env]) assert(process.env[env].split(',').every(value => allowed.includes(value)), `Unknown ${env}=${process.env[env]}`);
   }
@@ -1099,7 +1135,7 @@ async function main() {
                 browser ||= await launch();
                 f = await within(`${label}/fixture`, () => fixture(browser, origin, viewport, theme, motion, partial => { f = partial; }));
                 f.label = label;
-                for (const [test, check] of Object.entries({ policy, menu, ...(phoneViewport(viewport) ? { sheet, phone } : { tiles }), tool, sendStop })) {
+                for (const [test, check] of Object.entries({ policy, menu, ...(phoneViewport(viewport) ? { sheet, sessionsPicker, phone } : { tiles }), tool, sendStop })) {
                   if (!selected('ONLY', test)) continue;
                   f.phase = test;
                   console.log(`  ${test}`); await within(`${label}/${test}`, () => Promise.race([check(f), f.crash]));

@@ -4,6 +4,11 @@ Status: rules in force (2026-10-19); `make check` enforces what a pattern can ca
 
 ## Motion: production browser regression
 
+`ONLY=sessionsPicker` checks the phone Sessions header's visual alignment,
+retained SVG icons, accessible close handle, and tap-outside/handle/swipe/Escape
+dismissal. Include `VIEWPORT=narrow,phone,landscape THEME=light,dark` for the
+320px, 390px and short-height phone layouts.
+
 `crates/c6-ui/tests/motion.cjs` serves the built production UI on an owned
 loopback port, with fake HTTP and WebSocket head responses. It does not connect
 to your head, use your browser profile, or require an npm install. Build first

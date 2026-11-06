@@ -634,8 +634,9 @@ fn SessionsSheet(close: Callback<()>, open: RwSignal<bool>) -> impl IntoView {
         <div class="c6-presence c6-scrim fixed inset-0 z-40 bg-black/30" data-open=move || open.get().to_string() inert=move || !open.get() on:click=move |_| close.run(())></div>
         <div role="dialog" aria-modal="true" aria-label="Sessions" data-pop=pop data-open=move || open.get().to_string() inert=move || !open.get()
             class="c6-presence c6-sheet phone-sheet fixed inset-x-0 bottom-0 z-50 flex max-h-[80dvh] flex-col rounded-t-xl border border-zinc-200 bg-white text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
-            // Its handle: swiped down, the sheet goes.
-            <div class="flex shrink-0 touch-none justify-center pb-1 pt-2"
+            // A named native button also gives screen readers a close action.
+            <button type="button" aria-label="Close Sessions" class=format!("{} min-h-11 w-full shrink-0 touch-none rounded-none", crate::components::BTN_QUIET)
+                on:click=move |_| close.run(())
                 on:pointerdown=move |ev: web_sys::PointerEvent| {
                     swipe.set_value(Some(f64::from(ev.client_y())));
                     if let Some(el) = ev.current_target().and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok()) {
@@ -651,13 +652,12 @@ fn SessionsSheet(close: Callback<()>, open: RwSignal<bool>) -> impl IntoView {
                 on:pointerup=move |_| swipe.set_value(None)
                 on:pointercancel=move |_| swipe.set_value(None)>
                 <span class="h-1 w-10 rounded-full bg-zinc-300 dark:bg-zinc-600"></span>
-            </div>
+            </button>
             <div class="min-h-0 overflow-y-auto p-1 pb-4">
-                <div class="flex min-h-11 items-center gap-2 px-2">
+                <div class="flex min-h-11 items-center gap-2 pl-2">
                     <h2 class="flex-1 font-semibold">"Sessions"</h2>
                     <crate::assistant::AskButton touch=true />
                     <crate::needs::NeedsYou touch=true />
-                    <button class="flex h-11 w-11 items-center justify-center" aria-label="Close Sessions" on:click=move |_| close.run(())>{crate::icons::x()}</button>
                 </div>
                 {move || tiles.get().into_iter().map(row).collect_view()}
                 {move || {

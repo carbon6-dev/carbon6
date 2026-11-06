@@ -36,8 +36,10 @@ pub fn AskHost() -> impl IntoView {
 pub fn AskButton(#[prop(optional)] touch: bool) -> impl IntoView {
     let open = expect_context::<AskState>().0;
     view! {
-        <button class=if touch { "inline-flex min-h-11 min-w-11 items-center justify-center gap-1 rounded-md border border-zinc-300 px-2 text-xs text-zinc-700 hover:bg-zinc-200/60 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800" } else { "inline-flex items-center gap-1 rounded-md border border-zinc-300 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-200/60 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800" }
-            title="Ask carbon6 to do or explain anything (⌘J)" on:click=move |_| open.set(true)>{crate::icons::sparkles()}" Ask"</button>
+        <button class=if touch { format!("{} min-h-11 min-w-11 px-1 text-xs text-zinc-700 dark:text-zinc-300", crate::components::BTN_QUIET) } else { "inline-flex items-center gap-1 rounded-md border border-zinc-300 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-200/60 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800".to_owned() }
+            title="Ask carbon6 to do or explain anything (⌘J)" on:click=move |_| open.set(true)>
+            <span class=if touch { "inline-flex h-5 items-center justify-center gap-1 rounded-full border border-zinc-300 px-1.5 dark:border-zinc-700" } else { "inline-flex items-center gap-1" }>{crate::icons::sparkles()}" Ask"</span>
+        </button>
     }
 }
 
