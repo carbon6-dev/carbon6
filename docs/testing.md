@@ -386,9 +386,26 @@ The native `session::tests::tool_output_keeps_one_bounded_area_before_and_after_
 In a browser, repeat at 320px, 390px and desktop widths:
 
 1. Start a shell call that emits several lines before finishing. Its summary appears immediately; it stays collapsed throughout. Open it while running: the output scrolls within a fixed-height area, which remains the same height when the result replaces the live text. An error must behave the same way. Plans start open and retain that choice.
-2. Retain DOM handles for the card, its `details`, and its output `pre`. Deliver output chunks, its result, and another assistant event: all three handles must remain connected and refer to the same nodes. A user-opened card stays open; a user-closed card stays closed.
+2. Before first opening, the collapsed card has no output `pre` or detail body. Open it and retain DOM handles for the card, its `details`, and its output `pre`. Deliver output chunks, its result, and another assistant event: all three handles must remain connected and refer to the same nodes. A user-opened card stays open; a user-closed card stays closed. Closing unmounts the body; reopening shows the latest result immediately in the same bounded area, not a growing fill-in box.
 3. Create a session and a document with long titles. Their pending link areas must already occupy the completed card's height, with the input title when known. The result activates the destination without adding a row or horizontal overflow. Keep all status, document/deck and navigation icons.
 4. With a long transcript following the bottom, repeat through completion: it stays at the bottom without a transient expansion/collapse. Scroll up deliberately before a result arrives: the viewport stays at that position. Repeat on a touch viewport and with reduced motion.
+
+### Off-screen transcript rows and lazy bodies
+
+`collapsed_tool_body_does_not_read_or_render_output` checks that closed bodies
+neither render nor read their output; the bounded-output regression above still
+covers pending, live, completed and error states. Thinking starts expanded when
+enabled, but collapsing it removes its Markdown body until reopened.
+
+In Chromium and WebKit, use a transcript spanning several screens (include tool
+results and thinking). Inspect `.c6-transcript-row`: browsers supporting
+`content-visibility: auto` skip off-screen layout and remember measured sizes.
+Scroll slowly and fling in both directions; Latest must still glide/follow to
+the real end as rows materialize. Open Find and jump to a hit in an off-screen
+tool body, a folded turn, and an event outside the loaded window. Each unfolds,
+mounts the body before highlighting/measuring, and centers the actual hit.
+Repeat while streaming, with following off and reduced motion enabled. No
+result-arrival fill-in jump, missing icons, or empty first jump is acceptable.
 
 ### Observer lifetime regression
 
@@ -397,6 +414,15 @@ callbacks alongside the observer, disconnect before dropping either on replaceme
 or unmount, and never `forget()` the closure. The message box uses the same
 ownership pattern. The transcript's on-sight IntersectionObserver retains its
 callback until cleanup too (as the glance outline already does).
+
+Transcript-follow resize delivery must not measure or scroll synchronously:
+deliver its callback twice in one task and assert that only one animation frame
+is queued. Scroll away before that frame runs: it must recheck following and
+leave the reading position alone. Queue another frame and close the tile in the
+same task: cleanup must disconnect the observer and cancel the queued frame, with
+no late reads or dropped-closure errors. With normal-motion WebKit and many tall
+contained rows, stream and resize at phone and desktop widths; no ResizeObserver
+loop warning is acceptable (also repeat with reduced motion and in Chromium).
 
 In browser automation, wrap the native observers before loading the app and
 record each callback and its observed elements. Open and close session tiles

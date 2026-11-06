@@ -230,6 +230,14 @@ html.dark {
 }
 .c6-arrive { animation: c6-arrive var(--dur-arrive) var(--ease-out); }
 
+/* Keep off-screen event rows in the DOM (anchors/search/selection still
+   work), but let the browser skip their layout and paint. Remember measured
+   heights so revisiting a tool result doesn't fill in a new output area. */
+.c6-transcript-row {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 6rem;
+}
+
 /* Chart series (the dataviz reference palette's first slots, stepped
    separately for light and dark surfaces). */
 .viz {

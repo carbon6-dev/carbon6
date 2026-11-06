@@ -1975,22 +1975,39 @@ pub fn ScrollBox(
         });
         type ResizeWatch = (web_sys::ResizeObserver, wasm_bindgen::closure::Closure<dyn Fn(js_sys::Array)>);
         let observer = StoredValue::new_local(None::<ResizeWatch>);
+        let frame = StoredValue::new(None::<leptos::leptos_dom::helpers::AnimationFrameRequestHandle>);
+        let stop = move || {
+            observer.try_update_value(|o| {
+                if let Some(watch) = o.take() {
+                    watch.0.disconnect();
+                }
+            });
+            if let Some(frame) = frame.try_update_value(Option::take).flatten() {
+                frame.cancel();
+            }
+        };
         Effect::new(move || {
             let Some(el) = node.get() else { return };
             // One at a time: a box drawn anew isn't watched twice.
-            observer.update_value(|o| {
-                if let Some((ro, _)) = o.take() {
-                    ro.disconnect();
-                }
-            });
+            stop();
             let to_end = wasm_bindgen::closure::Closure::<dyn Fn(js_sys::Array)>::new(move |_: js_sys::Array| {
-                // A last resize may come after the box has gone.
-                if let Some(el) = node.try_get_untracked().flatten()
-                    && follow.try_get_untracked() == Some(true)
-                    && el.client_height() > 0
-                {
-                    glide_to_end(&el);
-                }
+                // Scrolling can materialize contained rows and resize again. Do
+                // not measure or scroll inside resize delivery; coalesce a frame.
+                let Some(None) = frame.try_get_value() else { return };
+                let next = leptos::leptos_dom::helpers::request_animation_frame_with_handle(move || {
+                    if frame.try_update_value(|f| *f = None).is_none() {
+                        return;
+                    }
+                    // Input or unmount may have stopped following since delivery.
+                    if let Some(el) = node.try_get_untracked().flatten()
+                        && follow.try_get_untracked() == Some(true)
+                        && el.client_height() > 0
+                    {
+                        glide_to_end(&el);
+                    }
+                })
+                .ok();
+                frame.set_value(next);
             });
             if let Ok(obs) = web_sys::ResizeObserver::new(to_end.as_ref().unchecked_ref()) {
                 obs.observe(&el);
@@ -2004,13 +2021,7 @@ pub fn ScrollBox(
                 observer.set_value(Some((obs, to_end)));
             }
         });
-        on_cleanup(move || {
-            observer.update_value(|o| {
-                if let Some((ro, _)) = o.take() {
-                    ro.disconnect();
-                }
-            });
-        });
+        on_cleanup(stop);
     }
     let yours = move |direction: ScrollIntent| {
         let (Some(f), Some(el)) = (follow, node.get_untracked()) else { return };

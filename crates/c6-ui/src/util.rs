@@ -91,7 +91,12 @@ pub fn flip_list(node: NodeRef<leptos::html::Div>, next: &[String]) {
 pub fn reveal_tool(ev: web_sys::Event) {
     use wasm_bindgen::JsCast;
     if let Some(el) = ev.current_target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
-        tool_reveal(&el);
+        // Let the open signal mount its lazy body before measuring the reveal.
+        request_animation_frame(move || {
+            if el.is_connected() {
+                tool_reveal(&el);
+            }
+        });
     }
 }
 

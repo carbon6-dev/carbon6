@@ -2305,7 +2305,7 @@ fn Transcript(
                             {divider}
                             <div
                                 id=format!("{}-e{seq}", id.get_value())
-                                class=move || format!("group relative {arrive} {} {} {}",
+                                class=move || format!("c6-transcript-row group relative {arrive} {} {} {}",
                                     if anchorable { "pb-7" } else { "" },
                                     if hidden() || (only_thinking && !show_thinking.get()) { "hidden" } else { "" },
                                     if by().is_some() { "opacity-50" } else { "" })
@@ -3944,14 +3944,21 @@ fn thinking_only(kind: &EventKind) -> bool {
 
 #[component]
 fn Thinking(#[prop(into)] text: Signal<String>, #[prop(into)] show: Signal<bool>) -> impl IntoView {
+    thinking_view(text, show, RwSignal::new(true))
+}
+
+fn thinking_view(text: Signal<String>, show: Signal<bool>, open: RwSignal<bool>) -> impl IntoView {
     // Its Markdown as the agent's text renders it; links open like theirs
     // where there's a workspace to open them in.
     let (col, ws) = (crate::workspace::use_column(), use_context::<crate::workspace::Workspace>());
     view! {
         <Show when=move || show.get()>
-            <details class="border-l-2 border-zinc-300 pl-3 text-sm text-muted dark:border-zinc-700" open=true>
+            <details class="border-l-2 border-zinc-300 pl-3 text-sm text-muted dark:border-zinc-700" open=move || open.get()
+                on:toggle=move |ev| open.set(event_target::<web_sys::HtmlDetailsElement>(&ev).open())>
                 <summary class="cursor-pointer select-none text-xs">"Thinking"</summary>
-                <div class="md mt-1 text-xs" on:click=move |ev| if let Some(ws) = ws { crate::mentions::follow_link(&ev, col, ws); } inner_html=move || markdown::to_html(&text.get())></div>
+                <Show when=move || open.get()>
+                    <div class="md mt-1 text-xs" on:click=move |ev| if let Some(ws) = ws { crate::mentions::follow_link(&ev, col, ws); } inner_html=move || text.with(|t| markdown::to_html(t))></div>
+                </Show>
             </details>
         </Show>
     }
@@ -4615,18 +4622,10 @@ fn ToolOutput(result: Signal<Option<ToolResultView>>, live_output: Signal<Option
     }
 }
 
-#[component]
-fn ToolCard(
-    name: String,
-    input_json: String,
-    call_id: String,
-    result: Signal<Option<ToolResultView>>,
-    live_output: Signal<Option<String>>,
-) -> impl IntoView {
-    let input: serde_json::Value = serde_json::from_str(&input_json).unwrap_or(serde_json::Value::Null);
-    let summary = summarize(&name, &input);
-    let kind = tool_kind(&name).to_owned();
-    let detail_input = match kind.as_str() {
+/// Formatting potentially large inputs belongs to the lazy body, not the
+/// summary: a collapsed tool mustn't pretty-print a whole file or JSON value.
+fn tool_detail(kind: &str, input: &serde_json::Value) -> Option<String> {
+    match kind {
         "write" => input.get("content").and_then(|v| v.as_str()).map(str::to_owned),
         "edit" => Some(format!(
             "- {}\n+ {}",
@@ -4634,7 +4633,7 @@ fn ToolCard(
             input.get("new_string").and_then(|v| v.as_str()).unwrap_or("").replace('\n', "\n+ ")
         )),
         "bash" => {
-            let s = summarize(&name, &input);
+            let s = summarize(kind, input);
             let full = match input.get("command") {
                 Some(serde_json::Value::String(c)) => c.clone(),
                 Some(serde_json::Value::Array(a)) => a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" "),
@@ -4646,8 +4645,21 @@ fn ToolCard(
         "task" => input.get("prompt").and_then(|v| v.as_str()).map(str::to_owned),
         "send_message" | "message_session" => input.get("message").and_then(|v| v.as_str()).map(str::to_owned),
         "read" | "glob" | "grep" | "plan" | "web_fetch" | "bash_output" | "kill_shell" | "load_skill" | "list_sessions" => None,
-        _ => serde_json::to_string_pretty(&input).ok(),
-    };
+        _ => serde_json::to_string_pretty(input).ok(),
+    }
+}
+
+#[component]
+fn ToolCard(
+    name: String,
+    input_json: String,
+    call_id: String,
+    result: Signal<Option<ToolResultView>>,
+    live_output: Signal<Option<String>>,
+) -> impl IntoView {
+    let input: serde_json::Value = serde_json::from_str(&input_json).unwrap_or(serde_json::Value::Null);
+    let summary = summarize(&name, &input);
+    let kind = tool_kind(&name).to_owned();
     let plan = (kind == "plan").then(|| plan_items(&input));
     // A Task call's subagent, shown as a thread under the card; the one a
     // SendMessage call continues.
@@ -4704,9 +4716,13 @@ fn ToolCard(
     // Where a search hit in this call's output scrolls to.
     let dom_id = format!("call-{call_id}");
     let started_open = plan.is_some();
+    let open = RwSignal::new(started_open);
     view! {
         <div id=dom_id class=format!("rounded-md border border-zinc-200 text-sm dark:border-zinc-800 {}", Arrived::class())>
-        <details class="c6-tool-details group" open=started_open on:toggle=crate::util::reveal_tool>
+        <details class="c6-tool-details group" open=started_open on:toggle=move |ev| {
+            open.set(event_target::<web_sys::HtmlDetailsElement>(&ev).open());
+            crate::util::reveal_tool(ev);
+        }>
             // A session it made shows on a line of its own below.
             <summary class=if made_session.is_some() {
                 "flex cursor-pointer select-none flex-wrap items-center gap-x-2 px-3 py-1.5"
@@ -4771,22 +4787,7 @@ fn ToolCard(
                     </div>
                 })}
             </summary>
-            <div class="space-y-2 border-t border-zinc-200 px-3 py-2 dark:border-zinc-800">
-                {plan.map(|items| view! {
-                    <ul class="space-y-1 text-sm">
-                        {items.into_iter().map(|(text, status)| {
-                            let (mark, cls) = match status.as_str() {
-                                "completed" => (crate::icons::check_box(true).into_any(), "text-muted line-through"),
-                                "in_progress" => (crate::icons::play().into_any(), "font-medium"),
-                                _ => (crate::icons::check_box(false).into_any(), ""),
-                            };
-                            view! { <li class=format!("flex gap-2 {cls}")><span>{mark}</span><span>{text}</span></li> }
-                        }).collect_view()}
-                    </ul>
-                })}
-                {detail_input.map(|d| view! { <pre class="max-h-64 overflow-auto whitespace-pre-wrap font-mono text-xs text-zinc-600 dark:text-zinc-400">{d}</pre> })}
-                <ToolOutput result live_output />
-            </div>
+            <ToolBody open plan kind input result live_output />
         </details>
         {doc_card.map(|doc| view! {
             <div class="mx-3 mb-2 h-8 min-w-0">
@@ -4812,6 +4813,42 @@ fn ToolCard(
             move || child.get().map(|cid| view! { <div class="px-3 pb-2">{subagent_thread(cid, s, waiting)}</div> })
         })}
         </div>
+    }
+}
+
+/// Mount only while open, never on result arrival: ToolOutput retains D2's
+/// one bounded pre through streaming/completion in an open card.
+#[component]
+fn ToolBody(
+    open: RwSignal<bool>,
+    plan: Option<Vec<(String, String)>>,
+    kind: String,
+    input: serde_json::Value,
+    result: Signal<Option<ToolResultView>>,
+    live_output: Signal<Option<String>>,
+) -> impl IntoView {
+    let plan = StoredValue::new(plan);
+    let input = StoredValue::new(input);
+    let kind = StoredValue::new(kind);
+    view! {
+        <Show when=move || open.get()>
+            <div class="space-y-2 border-t border-zinc-200 px-3 py-2 dark:border-zinc-800">
+                {plan.get_value().map(|items| view! {
+                    <ul class="space-y-1 text-sm">
+                        {items.into_iter().map(|(text, status)| {
+                            let (mark, cls) = match status.as_str() {
+                                "completed" => (crate::icons::check_box(true).into_any(), "text-muted line-through"),
+                                "in_progress" => (crate::icons::play().into_any(), "font-medium"),
+                                _ => (crate::icons::check_box(false).into_any(), ""),
+                            };
+                            view! { <li class=format!("flex gap-2 {cls}")><span>{mark}</span><span>{text}</span></li> }
+                        }).collect_view()}
+                    </ul>
+                })}
+                {input.with_value(|input| kind.with_value(|kind| tool_detail(kind, input))).map(|d| view! { <pre class="max-h-64 overflow-auto whitespace-pre-wrap font-mono text-xs text-zinc-600 dark:text-zinc-400">{d}</pre> })}
+                <ToolOutput result live_output />
+            </div>
+        </Show>
     }
 }
 
@@ -6337,6 +6374,71 @@ mod tests {
         let html = subagent_name(&s).unwrap().to_html();
         assert!(html.contains("<svg"), "template lost its icon: {html}");
         assert!(html.contains("review"), "{html}");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn thinking_preference_remount_preserves_matching_details_and_body_state() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let show = RwSignal::new(true);
+            let open = RwSignal::new(true);
+            let render = || thinking_view(Signal::derive(|| "private reasoning".to_owned()), show.into(), open).to_html();
+            assert!(render().contains("private reasoning"));
+            open.set(false);
+            let collapsed = render();
+            assert!(!collapsed.contains("private reasoning"));
+            show.set(false);
+            assert!(!render().contains("<details"));
+            show.set(true);
+            let remounted = render();
+            assert!(remounted.contains("<details"), "the preference shows its summary again: {remounted}");
+            assert!(
+                !remounted.split('>').find(|s| s.contains("<details")).unwrap().contains(" open"),
+                "a collapsed box remounts collapsed: {remounted}"
+            );
+            assert!(!remounted.contains("private reasoning"), "its closed body remains lazy");
+            open.set(true);
+            assert!(render().contains("private reasoning"), "opening restores the body");
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn collapsed_tool_body_does_not_read_or_render_output() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let open = RwSignal::new(false);
+            let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let output_reads = reads.clone();
+            let result = Signal::derive(move || {
+                output_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Some(ToolResultView {
+                    output: "private output".into(),
+                    is_error: false,
+                    truncated: false,
+                    duration_ms: 10,
+                    images: Vec::new(),
+                })
+            });
+            let render = || {
+                view! {
+                <ToolBody open plan=None kind="write".into() input=serde_json::json!({"content": "private input"}) result live_output=Signal::derive(|| None) />
+                }
+                .to_html()
+            };
+            let closed = render();
+            assert!(!closed.contains("private") && !closed.contains("<pre"), "closed bodies are absent: {closed}");
+            assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 0, "closed bodies must not even read output");
+            open.set(true);
+            let expanded = render();
+            assert!(expanded.contains("private input") && expanded.contains("private output"), "opening mounts the body: {expanded}");
+            assert!(expanded.contains("h-48 overflow-auto"), "the output is bounded on its first visible frame: {expanded}");
+            open.set(false);
+            let before = reads.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(!render().contains("<pre"));
+            assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), before, "closing suspends output work again");
+        });
     }
 
     #[cfg(not(target_arch = "wasm32"))]
