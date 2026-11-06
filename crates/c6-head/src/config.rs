@@ -379,7 +379,8 @@ mod tests {
     #[test]
     fn homebrew_symlinks_find_the_service_database() {
         let dir = tempfile::tempdir().unwrap();
-        let prefix = dir.path();
+        // Resolved like the path it's compared with: macOS's temp folder is a symlink.
+        let prefix = dir.path().canonicalize().unwrap();
         let exe = prefix.join("Cellar/c6h/0.3.10/bin/c6h");
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
         std::fs::write(&exe, "").unwrap();
