@@ -1855,7 +1855,10 @@ fn BottomSheet(open: RwSignal<bool>, #[prop(default = "Session details")] label:
                     }
                     pulled_from.set_value(None);
                 }>
-                <span class="h-1 w-10 rounded-full bg-zinc-300 dark:bg-zinc-600"></span>
+                <button type="button" class=format!("{} h-full w-full rounded-none", crate::components::BTN_QUIET)
+                    aria-label=format!("Close {label}") on:click=move |_| close()>
+                    <span class="h-1 w-10 rounded-full bg-zinc-300 dark:bg-zinc-600"></span>
+                </button>
                 <button class=format!("{} absolute right-1 top-1", crate::icons::BAR_BUTTON) title="Close" aria-label="Close" on:click=move |_| close()>{crate::icons::x()}</button>
             </div>
             <div class="min-h-0 flex-1 overflow-y-auto px-2 pb-4">
@@ -3076,7 +3079,14 @@ pub(crate) fn ModelPicker(
     #[prop(optional)]
     claude_off: Option<Signal<Option<String>>>,
     #[prop(optional, into)] auto: Option<Signal<bool>>,
+    /// Inside a scrolling sheet, keep the offered models in that same scroll.
+    #[prop(optional)]
+    inline_list: bool,
 ) -> impl IntoView {
+    // The new-session sheet and Ask's inline form also scroll on phones.
+    // An absolutely positioned offered list can be clipped by those scrollports.
+    #[cfg(target_arch = "wasm32")]
+    let inline_list = inline_list || crate::util::phone();
     let connections = crate::resources::connections();
     // Effort only where the connection passes it on to the model.
     let supports_effort =
@@ -3108,8 +3118,8 @@ pub(crate) fn ModelPicker(
             }).collect_view()}
         </select>
         <crate::quota::QuotaNote connection />
-        <div class="w-56 max-w-full" class:hidden=move || auto.is_some() && connection.with(String::is_empty)><ModelInput connection=connection value=model on_set=move |v| model.set(v) class=SMALL_INPUT.to_owned() placeholder="model id" /></div>
-        <select class=SMALL_INPUT class:hidden=move || !supports_effort(&connection.get()) title="Reasoning effort" on:change=move |ev| effort.set(event_target_value(&ev))>
+        <div class="w-56 max-w-full" class:hidden=move || auto.is_some() && connection.with(String::is_empty)><ModelInput connection=connection value=model on_set=move |v| model.set(v) class=SMALL_INPUT.to_owned() placeholder="model id" inline_list /></div>
+        <select class=SMALL_INPUT class:hidden=move || !supports_effort(&connection.get()) aria-label="Reasoning effort" title="Reasoning effort" on:change=move |ev| effort.set(event_target_value(&ev))>
             {EFFORTS.iter().map(|&(value, label)| view! {
                 <option value=value selected=move || effort.get() == value>{label}</option>
             }).collect_view()}
@@ -5194,7 +5204,14 @@ fn Composer(
     // The model row, on phones (always shown on wider screens).
     // Whether the model chip's menu (the model and its subagents') is open.
     let picking = RwSignal::new(false);
-    let toggle = move || picking.update(|p| *p = !*p);
+    let picking_phone = RwSignal::new(false);
+    let picking_present = crate::util::presence(move || picking.get());
+    let toggle = move || {
+        if !picking.get_untracked() {
+            picking_phone.set(crate::util::phone());
+        }
+        picking.update(|p| *p = !*p);
+    };
     let picking_pop = StoredValue::new(crate::util::dismissable(
         move || picking.get(),
         move || {
@@ -5829,13 +5846,14 @@ fn Composer(
                                 </button>
                             } }}
                         })}
-                        {move || picking.get().then(|| view! {
-                            <div data-pop=picking_pop.get_value() class="absolute bottom-full left-0 z-40 mb-1 w-max max-w-[90vw] sm:max-w-xl space-y-2 rounded-lg border border-zinc-200 bg-white p-3 text-zinc-700 shadow-lg dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200">
+                        <Show when=move || picking.get() || (picking_phone.get() && picking_present.get())>
+                            {move || {
+                            let contents = move || view! {
                                 // The plan's windows first, when it has one.
                                 {model.map(|m| view! { <crate::quota::PlanMenu connection=Signal::derive(move || m.current.get().0) /> })}
                                 {model.map(|m| view! {
                                     <div class="font-medium">"Model"</div>
-                                    <div class="flex flex-wrap items-center gap-2"><ModelPicker connection=m.connection model=m.model effort=m.effort no_claude_code claude_off=claude_off /></div>
+                                    <div class="flex flex-wrap items-center gap-2"><ModelPicker connection=m.connection model=m.model effort=m.effort no_claude_code claude_off=claude_off inline_list=picking_phone.get_untracked() /></div>
                                     {move || switch_note(m, kinds.get().and_then(Result::ok).unwrap_or_default()).map(|(text, title)| view! {
                                         <p class="text-amber-700 dark:text-amber-400">{text}{(!title.is_empty()).then(|| view! { <span class="block text-muted">{title}</span> })}</p>
                                     })}
@@ -5868,7 +5886,7 @@ fn Composer(
                                             <Switch on=same on_change=flip label="Same as the session" title="Run them on the session's own model, or turn off to choose theirs" />
                                             {move || (!same.get()).then(|| view! {
                                                 <div class="flex flex-wrap items-center gap-2">
-                                                    <ModelPicker connection=s.connection model=s.model effort=s.effort no_claude_code=no_claude_code />
+                                                    <ModelPicker connection=s.connection model=s.model effort=s.effort no_claude_code=no_claude_code inline_list=picking_phone.get_untracked() />
                                                     {move || s.change().map(|req| view! {
                                                         <button class="rounded-md bg-violet-600 px-2 py-1 text-white hover:bg-violet-700" on:click=move |_| set(req.clone())>"Set"</button>
                                                     })}
@@ -5877,8 +5895,24 @@ fn Composer(
                                         </div>
                                     }
                                 })}
-                            </div>
-                        })}
+                            }.into_any();
+                            if picking_phone.get_untracked() {
+                                view! {
+                                    <leptos::portal::Portal>
+                                        <div data-pop=picking_pop.get_value()>
+                                            <BottomSheet open=picking label="Model">
+                                                <div class="space-y-2 py-1 text-zinc-700 dark:text-zinc-200">{contents()}</div>
+                                            </BottomSheet>
+                                        </div>
+                                    </leptos::portal::Portal>
+                                }.into_any()
+                            } else {
+                                view! {
+                                    <div data-pop=picking_pop.get_value() class="absolute bottom-full left-0 z-40 mb-1 w-max max-w-[90vw] sm:max-w-xl space-y-2 rounded-lg border border-zinc-200 bg-white p-3 text-zinc-700 shadow-lg dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200">{contents()}</div>
+                                }.into_any()
+                            }
+                            }}
+                        </Show>
                     </div>
                 })}
                         <div class="relative ml-auto flex shrink-0 items-center gap-0.5">

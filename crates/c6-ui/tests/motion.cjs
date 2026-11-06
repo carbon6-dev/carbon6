@@ -195,7 +195,8 @@ async function fixture(browser, origin, viewport, theme, motion, started) {
     else if (p.endsWith('/elsewhere')) json = [{ id: 'home', name: 'Home', waiting: 0 }, { id: 'other', name: 'Other', waiting: 0 }];
     else if (p.endsWith('/version')) json = { version: 'motion-test' };
     else if (p.endsWith('/connections')) json = [{ id: 'test', name: 'Test', kind: 'openai_compat',
-      base_url: 'http://127.0.0.1', default_model: 'test', context_window: null, has_api_key: true, created_at: 1 }];
+      base_url: 'http://127.0.0.1', default_model: 'test', context_window: null, supports_effort: true, has_api_key: true, created_at: 1 }];
+    else if (p.endsWith('/connections/test/models')) json = ['test', ...Array.from({ length: 32 }, (_, i) => `fixture-model-${i + 1}`)];
     else if (p.endsWith('/settings/transcript')) json = { show_thinking: false };
     else if (p.endsWith('/settings/session_bar')) json = { colour: 'tinted' };
     else if (p.endsWith('/settings/facets')) json = {};
@@ -658,6 +659,156 @@ async function sessionsPicker(f) {
   await closed();
 }
 
+async function modelPicker(f) {
+  const { page } = f;
+  const phone = phoneViewport(f.viewport);
+  const chip = page.getByRole('button', { name: /^Model: .*change it/ }).first();
+  const dialog = page.getByRole('dialog', { name: 'Model', exact: true });
+  const input = page.getByPlaceholder('model id', { exact: true });
+  const modelsAsked = () => f.requests.filter(r => r.endsWith('/connections/test/models')).length;
+  await page.waitForFunction(() => document.querySelector('button[aria-label^="Model:"]'));
+  // The policy check deliberately reloads the document. Every such page owns
+  // a new cache; the picker must not add requests to its current page's warm list.
+  const prefetched = modelsAsked();
+  assert(prefetched > 0, 'composer prefetched its shared model list');
+  await chip.click();
+  await input.waitFor(); await settle(page);
+  assert.equal(await dialog.count(), phone ? 1 : 0, 'only phones use the existing bottom sheet');
+  await input.fill('custom-model-id');
+  assert.equal(await input.inputValue(), 'custom-model-id', 'free-form model selection is unchanged');
+  const last = page.getByRole('button', { name: 'fixture-model-32', exact: true });
+  await last.waitFor();
+  assert.equal(modelsAsked(), prefetched, 'opening/searching uses the prefetched model list');
+  if (phone) {
+    await page.evaluate(() => __keyboard(Math.min(innerHeight, 300), 12));
+    await settle(page);
+    await visibleBounds(dialog);
+    assert(await dialog.evaluate(el => {
+      const input = el.querySelector('input');
+      return getComputedStyle(input.parentElement.nextElementSibling).position === 'static';
+    }), 'model choices share the keyboard-bounded sheet scroll, not a clipped popover');
+    await page.screenshot({ path: path.join(SHOTS, `${f.label}-model-picker-keyboard.png`) });
+  }
+  await last.click();
+  assert.equal(await input.inputValue(), 'fixture-model-32');
+  const effort = page.getByRole('combobox', { name: 'Reasoning effort', exact: true });
+  await effort.scrollIntoViewIfNeeded();
+  await effort.selectOption('high');
+  assert.equal(await effort.inputValue(), 'high', 'effort selection stays usable after choosing a model');
+  assert(!f.requests.some(r => r.startsWith('POST ') && r.endsWith('/messages')), 'choosing a model does not send a message');
+  await page.screenshot({ path: path.join(SHOTS, `${f.label}-model-picker.png`) });
+  if (phone && f.motion.effective !== 'off') {
+    const retained = await dialog.evaluate(async (el, opener) => {
+      el.querySelector('button[aria-label="Close Model"]').click();
+      await Promise.resolve(); await Promise.resolve();
+      const closed = el.inert && el.dataset.open === 'false';
+      const transition = el.getAnimations().find(a => a.transitionProperty === 'translate');
+      if (transition) {
+        transition.pause();
+        transition.currentTime = Number(transition.effect.getTiming().duration) / 2;
+      }
+      const before = getComputedStyle(el).translate;
+      opener.click();
+      await Promise.resolve(); await Promise.resolve();
+      return { closed, same: document.querySelector('[role="dialog"][aria-label="Model"]') === el,
+        open: !el.inert && el.dataset.open === 'true', before, after: getComputedStyle(el).translate };
+    }, await chip.elementHandle());
+    assert(retained.closed && retained.same && retained.open && retained.before === retained.after,
+      `interrupted model-sheet exit keeps the live body at its displayed position: ${JSON.stringify(retained)}`);
+    await settle(page);
+  }
+  await page.keyboard.press('Escape');
+  await settle(page);
+  await input.waitFor({ state: 'hidden' });
+  if (!phone) return;
+  await page.evaluate(() => __keyboard(innerHeight));
+  const open = async () => { await chip.click(); await dialog.waitFor(); await settle(page); };
+  const closed = async () => { await page.waitForFunction(() => !document.querySelector('[role="dialog"][aria-label="Model"][data-open="true"]')); await settle(page); };
+  await open();
+  await dialog.getByRole('button', { name: 'Close Model', exact: true }).click(); await closed();
+  await open();
+  await page.locator('.c6-scrim[data-open="true"]').click({ position: { x: 2, y: 2 } }); await closed();
+  await open();
+  await dialog.getByRole('button', { name: 'Close Model', exact: true }).evaluate(el => {
+    el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, clientY: 10, pointerId: 1 }));
+    el.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, clientY: 60, pointerId: 1 }));
+  });
+  await closed();
+  assert.equal(modelsAsked(), prefetched, 'all picker openings share the latency build cache');
+}
+
+async function modelForms(f) {
+  const { page } = f;
+  const step = phase => { f.phase = `modelForms: ${phase}`; if (process.env.DEBUG_FIXTURE) console.log(`  ${f.phase}`); };
+  for (const [pathname, name, cold] of [
+    ['/ask', 'ask', false], ['/sessions', 'new-session', false],
+    ['/ask', 'ask', true], ['/sessions', 'new-session', true],
+  ]) {
+    const route = `${name}-${cold ? 'cold' : 'warm'}`;
+    step(`${route} navigation`);
+    // Real same-page navigation also proves these forms can reuse the
+    // composer's prefetch; direct loads separately cover a cold page cache.
+    if (cold) {
+      await page.evaluate(next => localStorage.setItem('c6.home.workspace.v2', JSON.stringify(next)), {
+        ...layout, tiles: [{ ...layout.tiles[0], columns: [{ key: 3, view: { view: name === 'ask' ? 'chats' : 'sessions' } }] }],
+      });
+      await page.goto(new URL(`/r/home${pathname}`, page.url()).href, { waitUntil: 'domcontentloaded' });
+    } else if (pathname === '/ask') {
+      await page.keyboard.press('Control+j');
+      await page.getByRole('dialog', { name: 'Ask carbon6', exact: true }).getByRole('button', { name: /^Your conversations/ }).click();
+    } else {
+      if (phoneViewport(f.viewport)) await page.getByRole('button', { name: /^Menu,/ }).first().click();
+      await page.getByRole('link', { name: 'Sessions', exact: true }).first().click();
+    }
+    // Desktop keeps the previous tile visible beside the new one. Scope the
+    // fields to their page so a still-open Ask form cannot stand in for Sessions.
+    const formPage = page.locator('main').filter({ has: page.locator('h1').filter({ hasText: name === 'ask' ? /^Ask$/ : /^Sessions$/ }) }).last();
+    const input = formPage.getByPlaceholder('model id', { exact: true });
+    step(`${route} fields`);
+    if (name === 'new-session') {
+      await formPage.getByTitle(phoneViewport(f.viewport) ? 'Where and how it runs' : 'Change where and how it runs', { exact: true }).click();
+    }
+    await input.waitFor(); await settle(page);
+    assert.equal(await page.getByRole('dialog', { name: 'Model', exact: true }).count(), 0, 'form fields remain inline, not nested sheets');
+    const controls = input.locator('..').locator('..').locator('..').locator('..');
+    step(`${route} connection`);
+    const prefetched = f.requests.filter(r => r.endsWith('/connections/test/models')).length;
+    await controls.locator('select').first().selectOption('test');
+    // Connection changes reset the form's default model in a reactive effect.
+    // Finish that update before exercising a subsequent user edit.
+    await settle(page);
+    await input.evaluate(el => { window.__formModelInput = el; });
+    await input.fill('custom-form-model');
+    await settle(page);
+    assert.equal(await input.inputValue(), 'custom-form-model');
+    assert(await input.evaluate(el => el === window.__formModelInput && el === document.activeElement), `${route} retains its input and focus while models load`);
+    if (phoneViewport(f.viewport)) {
+      await page.evaluate(() => __keyboard(Math.min(innerHeight, 300), 12));
+      await settle(page);
+      await input.evaluate(el => el.scrollIntoView({ block: 'center' })); await visibleBounds(input);
+    }
+    const offered = formPage.getByRole('button', { name: 'fixture-model-32', exact: true });
+    step(`${route} model`);
+    await offered.evaluate(el => el.scrollIntoView({ block: 'center' })); await visibleBounds(offered);
+    await offered.click();
+    if (!cold) assert.equal(f.requests.filter(r => r.endsWith('/connections/test/models')).length, prefetched, `${route} shares the composer's prefetched list`);
+    assert.equal(await input.inputValue(), 'fixture-model-32', `${name} still selects offered models`);
+    const effort = controls.getByRole('combobox', { name: 'Reasoning effort', exact: true });
+    step(`${route} effort`);
+    await effort.evaluate(el => el.scrollIntoView({ block: 'center' }));
+    await visibleBounds(effort);
+    await effort.selectOption('high');
+    assert.equal(await effort.inputValue(), 'high');
+    const asked = f.requests.filter(r => r.endsWith('/connections/test/models')).length;
+    await controls.getByTitle('Every model the connection offers', { exact: true }).click();
+    await offered.waitFor();
+    assert.equal(f.requests.filter(r => r.endsWith('/connections/test/models')).length, asked, `${name} reuses its shared model list`);
+    await page.keyboard.press('Escape');
+    await page.screenshot({ path: path.join(SHOTS, `${f.label}-${route}-models.png`) });
+    await page.evaluate(() => __keyboard(innerHeight));
+  }
+}
+
 async function assertFollowing(page, reason) {
   await settle(page);
   // A fit queued by an effect can run on the frame *after* the row's RO
@@ -1099,7 +1250,7 @@ async function main() {
       'CHROMIUM_LIBS=/path/to/shared-libraries (local /tmp/c7-browser-libs default when present)\n' +
       'ENGINE=chromium|webkit|both (default chromium; WEBKIT=1 also supported)\n' +
       'ISOLATE_BROWSER=1 owns a fresh browser process per case (useful for the local old WPE WebKit)\n' +
-      'ONLY=policy,menu,sheet,sessionsPicker,phone,tool,tiles,sendStop THEME=light,dark VIEWPORT=desktop,phone,narrow,landscape (default desktop,phone) MOTION_CASE=system,system-reduce,full,full-reduce,reduced,off\n' +
+      'ONLY=policy,menu,sheet,sessionsPicker,modelPicker,modelForms,phone,tool,tiles,sendStop THEME=light,dark VIEWPORT=desktop,phone,narrow,landscape (default desktop,phone) MOTION_CASE=system,system-reduce,full,full-reduce,reduced,off\n' +
       'narrow=320x568; landscape=900x480; both opt-in views use the phone/short-height checks\n' +
       '--helpers tests real-DOM production list cleanup in Full/Reduced/Off (ENGINE=both selects all six)\n' +
       '--unit runs node:test VM checks of the production motion.js without a browser/build\n' +
@@ -1110,7 +1261,7 @@ async function main() {
   const playwright = require(process.env.PLAYWRIGHT_CORE || '/home/zheilbron/.bun/install/cache/playwright-core@1.50.1@@@1');
   const engine = process.env.ENGINE || (process.env.WEBKIT ? 'webkit' : 'chromium');
   assert(['chromium', 'webkit', 'both'].includes(engine), `Unknown ENGINE=${engine}`);
-  for (const [env, allowed] of Object.entries({ ONLY: ['policy', 'menu', 'sheet', 'sessionsPicker', 'phone', 'tool', 'tiles', 'sendStop'],
+  for (const [env, allowed] of Object.entries({ ONLY: ['policy', 'menu', 'sheet', 'sessionsPicker', 'modelPicker', 'modelForms', 'phone', 'tool', 'tiles', 'sendStop'],
     VIEWPORT: VIEWPORTS.map(([name]) => name), THEME: ['light', 'dark'], MOTION_CASE: CASES.map(motion => motion.name) })) {
     if (process.env[env]) assert(process.env[env].split(',').every(value => allowed.includes(value)), `Unknown ${env}=${process.env[env]}`);
   }
@@ -1135,7 +1286,7 @@ async function main() {
                 browser ||= await launch();
                 f = await within(`${label}/fixture`, () => fixture(browser, origin, viewport, theme, motion, partial => { f = partial; }));
                 f.label = label;
-                for (const [test, check] of Object.entries({ policy, menu, ...(phoneViewport(viewport) ? { sheet, sessionsPicker, phone } : { tiles }), tool, sendStop })) {
+                for (const [test, check] of Object.entries({ policy, menu, modelPicker, ...(phoneViewport(viewport) ? { sheet, sessionsPicker, phone } : { tiles }), tool, sendStop, modelForms })) {
                   if (!selected('ONLY', test)) continue;
                   f.phase = test;
                   console.log(`  ${test}`); await within(`${label}/${test}`, () => Promise.race([check(f), f.crash]));

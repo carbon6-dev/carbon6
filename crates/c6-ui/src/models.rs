@@ -35,6 +35,7 @@ pub fn ModelInput(
     #[prop(optional, into)] class: String,
     #[prop(optional, into)] disabled: Signal<bool>,
     #[prop(optional)] list: Option<Listed>,
+    #[prop(optional)] inline_list: bool,
 ) -> impl IntoView {
     let shown = RwSignal::new(false);
     // Opened by ▾ (the box keeping no focus), a press outside or Escape
@@ -103,9 +104,9 @@ pub fn ModelInput(
                     on:mousedown=move |ev| { ev.prevent_default(); shown.update(|s| *s = !*s); }>{crate::icons::chevron_down()}</button>
             </div>
             {move || (shown.get() && !disabled.get()).then(|| view! {
-                <div class=move || format!("absolute z-30 w-full min-w-56 overflow-auto rounded-md border border-zinc-200 bg-white py-1 text-xs shadow-lg dark:border-zinc-700 dark:bg-zinc-900 {}",
-                        if room.get().0 { "bottom-full mb-1" } else { "mt-1" })
-                    style=move || format!("max-height: {}px", room.get().1)
+                <div class=move || format!("w-full overflow-auto rounded-md border border-zinc-200 bg-white py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900 {}",
+                        if inline_list { "mt-1" } else if room.get().0 { "absolute z-30 min-w-56 shadow-lg bottom-full mb-1" } else { "absolute z-30 min-w-56 shadow-lg mt-1" })
+                    style=move || if inline_list { String::new() } else { format!("max-height: {}px", room.get().1) }
                     on:mousedown=|ev| ev.prevent_default()>
                     {move || match groups() {
                         None => view! { <p class="px-2 py-1 text-muted">{if list.is_some() { "Test the connection to list its models." } else { "Asking for the models…" }}</p> }.into_any(),

@@ -242,7 +242,9 @@ pub fn SessionsPage() -> impl IntoView {
                     })}
                 </button>
             </div>
-            <Suspense fallback=|| ()>
+            // Later model-list loads must not detach the new-session form
+            // and interrupt an edit in its focused model input.
+            <Transition fallback=|| ()>
                 {move || connections.get().map(|r| match r {
                     Ok(conns) if conns.is_empty() => view! {
                         <div class="rounded-lg border border-dashed border-zinc-300 p-6 text-center text-sm text-soft dark:border-zinc-700">
@@ -252,7 +254,7 @@ pub fn SessionsPage() -> impl IntoView {
                     Ok(conns) => view! { <SessionForm connections=conns /> }.into_any(),
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
                 })}
-            </Suspense>
+            </Transition>
 
             <div class="divide-y divide-zinc-200 overflow-hidden rounded-lg border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
                 {move || {
@@ -2101,7 +2103,7 @@ fn SessionForm(
             <div class:hidden=move || !changing.get()>
                 <div class="fixed inset-0 z-40 bg-black/30 md:hidden" on:click=move |_| changing.set(false)></div>
                 <div data-pop=fields_pop
-                    class="fixed inset-x-0 bottom-0 z-50 flex max-h-[85dvh] flex-col rounded-t-xl border-t border-zinc-200 bg-white text-sm shadow-xl md:static md:z-auto md:max-h-none md:rounded-t-none md:rounded-b-xl md:shadow-none dark:border-zinc-800 dark:bg-zinc-900">
+                    class="phone-sheet fixed inset-x-0 bottom-0 z-50 flex max-h-[85dvh] flex-col rounded-t-xl border-t border-zinc-200 bg-white text-sm shadow-xl md:static md:z-auto md:max-h-none md:rounded-t-none md:rounded-b-xl md:shadow-none dark:border-zinc-800 dark:bg-zinc-900">
                     <h2 class="shrink-0 border-b border-zinc-200 px-4 py-3 font-medium md:hidden dark:border-zinc-800">"New session: where and how it runs"</h2>
                     <div class="min-h-0 flex-1 space-y-3 overflow-y-auto px-4 py-4 md:overflow-visible md:px-3 md:py-3">
                         {move || template.with(Option::is_some).then(|| view! {

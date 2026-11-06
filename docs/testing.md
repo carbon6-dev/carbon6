@@ -9,6 +9,16 @@ retained SVG icons, accessible close handle, and tap-outside/handle/swipe/Escape
 dismissal. Include `VIEWPORT=narrow,phone,landscape THEME=light,dark` for the
 320px, 390px and short-height phone layouts.
 
+`ONLY=modelPicker` checks the composer chip's bottom sheet on those phone
+layouts and its unchanged desktop popover: arbitrary model ids, the last item
+in a long offered list with an overlay keyboard, effort, all dismissal paths,
+and one prefetched model-list request across repeated openings. Phone model
+screenshots end in `-model-picker.png` and `-model-picker-keyboard.png`.
+`ONLY=modelForms` checks the other inline `ModelPicker` users in Ask and the
+new-session form on both warm navigation and cold page loads, including
+arbitrary text, retained input/focus during list loading, offered-model/effort
+selection and cache reuse.
+
 `crates/c6-ui/tests/motion.cjs` serves the built production UI on an owned
 loopback port, with fake HTTP and WebSocket head responses. It does not connect
 to your head, use your browser profile, or require an npm install. Build first
