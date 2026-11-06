@@ -21,6 +21,7 @@ The main agent stays free to talk while its work runs in the background. A backg
 
 - **The process stays up between turns.** Closing stdin makes it exit 0.
 - **Each turn runs from `system/init` to `result`.**
+- **Narration before tools is reply text.** Claude Code 2.1.311 sends some visible updates as `thinking` blocks, identified by zero-based `narration_block_indexes` on the assistant frame. The worker maps only those indexed blocks to Text, for both the parent and mirrored subagents; genuine reasoning remains Thinking. Indexes refer to the original content array, before empty or unsupported blocks are removed. Historical logs keep their original classification because the old mapper discarded this metadata.
 - **It wakes itself.** A background task that ends while the process is idle gets a `task_notification`, and the CLI starts a turn of its own on it. That turn has no echoed user message.
 - **A message written mid-turn joins the running turn** at its next model call. With `--replay-user-messages` it is echoed back when the CLI takes it, not when it was written.
 - **`{"type":"control_request","request_id":…,"request":{"subtype":"interrupt"}}` stops the running turn.** The CLI answers `control_response` success, then sends `result` with `error_during_execution`. Background commands keep running and still wake the agent later. A queued message becomes the next turn.

@@ -2037,8 +2037,7 @@ impl Mapper {
             "assistant" => {
                 self.note_usage(Some(call), &v["message"], sink).await?;
                 self.note_calls(&v["message"]["content"], Some(&id));
-                let blocks: Vec<ContentBlock> =
-                    v["message"]["content"].as_array().map(|a| a.iter().filter_map(assistant_block).collect()).unwrap_or_default();
+                let blocks = assistant_blocks(v);
                 if !blocks.is_empty() {
                     let stop_reason = v["message"]["stop_reason"].as_str().unwrap_or("").to_owned();
                     log.append(session_event::Kind::Assistant(AssistantMessage { turn: 1, blocks, stop_reason })).await?;
@@ -2114,8 +2113,7 @@ impl Mapper {
             "assistant" => {
                 self.note_usage(None, &v["message"], sink).await?;
                 self.note_calls(&v["message"]["content"], None);
-                let blocks: Vec<ContentBlock> =
-                    v["message"]["content"].as_array().map(|a| a.iter().filter_map(assistant_block).collect()).unwrap_or_default();
+                let blocks = assistant_blocks(v);
                 if !blocks.is_empty() {
                     let stop_reason = v["message"]["stop_reason"].as_str().unwrap_or("").to_owned();
                     sink.append(session_event::Kind::Assistant(AssistantMessage { turn: self.turn, blocks, stop_reason })).await?;
@@ -2216,9 +2214,26 @@ fn tool_result(b: &Value) -> ToolResult {
     }
 }
 
-fn assistant_block(b: &Value) -> Option<ContentBlock> {
+/// Narration indexes name visible updates encoded as thinking, not reasoning.
+/// Use original content positions before filtering empty or unsupported blocks.
+fn assistant_blocks(v: &Value) -> Vec<ContentBlock> {
+    v["message"]["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(i, b)| {
+            let narration =
+                v["narration_block_indexes"].as_array().is_some_and(|indexes| indexes.iter().any(|n| n.as_u64() == Some(i as u64)));
+            assistant_block(b, narration)
+        })
+        .collect()
+}
+
+fn assistant_block(b: &Value, narration: bool) -> Option<ContentBlock> {
     let block = match b["type"].as_str()? {
         "text" => content_block::Block::Text(b["text"].as_str()?.to_owned()),
+        "thinking" if narration => content_block::Block::Text(b["thinking"].as_str().filter(|t| !t.is_empty())?.to_owned()),
         "thinking" => content_block::Block::Thinking(b["thinking"].as_str().filter(|t| !t.is_empty())?.to_owned()),
         "tool_use" => content_block::Block::ToolUse(ToolUse {
             id: b["id"].as_str()?.to_owned(),
@@ -2256,6 +2271,88 @@ mod tests {
             Ok(v.len() as u64)
         }
         fn ephemeral(&self, _: ephemeral_event::Kind) {}
+    }
+
+    #[tokio::test]
+    async fn narration_and_text_survive_interleaved_tools_in_parent_and_child() {
+        for child in [false, true] {
+            let recorded = Arc::new(VecSink::default());
+            let sink: Arc<dyn EventSink> = if child { Arc::new(VecSink::default()) } else { recorded.clone() };
+            let mut mapper = Mapper {
+                turn: 436,
+                scope: "conversation".into(),
+                output_root: None,
+                saw_output: false,
+                result: None,
+                interrupted: false,
+                observer: None,
+                calls: HashMap::new(),
+                mcp_calls: HashSet::new(),
+                children: HashMap::new(),
+                backgrounded: HashSet::new(),
+                task_calls: HashMap::new(),
+                call_usage: HashMap::new(),
+                per_call: false,
+            };
+            if child {
+                mapper.children.insert("task".into(), Child { id: "child".into(), log: recorded.clone(), depth: 1, open: true });
+            }
+            // Recorded Claude Code 2.1.311 shape: narration indexes refer to
+            // the original content array, including empty/unsupported blocks.
+            let frames = [
+                serde_json::json!({"type": "assistant", "narration_block_indexes": [3], "message": {"content": [
+                    {"type": "thinking", "thinking": ""},
+                    {"type": "thinking", "thinking": "Private reasoning"},
+                    {"type": "future_block"},
+                    {"type": "thinking", "thinking": "The loop limit protects against cycles."},
+                    {"type": "text", "text": "Checking the setting now."},
+                    {"type": "tool_use", "id": "bash", "name": "Bash", "input": {"command": "true"}}
+                ], "stop_reason": "tool_use"}}),
+                serde_json::json!({"type": "user", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "bash", "content": "ok"}
+                ]}}),
+                serde_json::json!({"type": "assistant", "message": {"content": [
+                    {"type": "text", "text": "Cleanup is under way."}
+                ], "stop_reason": "end_turn"}}),
+            ];
+            for mut frame in frames {
+                if child {
+                    frame["parent_tool_use_id"] = "task".into();
+                }
+                mapper.handle(&frame, &sink).await.unwrap();
+            }
+            let events = recorded.0.lock().unwrap();
+            assert_eq!(events.len(), 3);
+            let blocks: Vec<_> = events
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    Some(session_event::Kind::Assistant(a)) => Some(&a.blocks),
+                    _ => None,
+                })
+                .flatten()
+                .map(|b| b.block.as_ref().unwrap())
+                .collect();
+            use content_block::Block;
+            assert!(
+                matches!(blocks.as_slice(), [Block::Thinking(t), Block::Text(n), Block::Text(before), Block::ToolUse(_), Block::Text(after)]
+                if t == "Private reasoning" && n == "The loop limit protects against cycles."
+                    && before == "Checking the setting now." && after == "Cleanup is under way.")
+            );
+        }
+    }
+
+    #[test]
+    fn narration_metadata_is_optional_and_only_changes_indexed_thinking() {
+        for indexes in
+            [Value::Null, serde_json::json!([]), serde_json::json!([1]), serde_json::json!(["0", -1, 99]), serde_json::json!("invalid")]
+        {
+            let frame = serde_json::json!({"narration_block_indexes": indexes, "message": {"content": [
+                {"type": "thinking", "thinking": "Reasoning"}, {"type": "text", "text": "Reply"}
+            ]}});
+            let blocks = assistant_blocks(&frame);
+            assert!(matches!(&blocks[0].block, Some(content_block::Block::Thinking(t)) if t == "Reasoning"));
+            assert!(matches!(&blocks[1].block, Some(content_block::Block::Text(t)) if t == "Reply"));
+        }
     }
 
     #[tokio::test]
