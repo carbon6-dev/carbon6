@@ -2,6 +2,40 @@
 
 Status: rules in force (2026-10-19); `make check` enforces what a pattern can catch (`scripts/test-lint.sh`).
 
+## Narrow desktop tiles
+
+`crates/c6-ui/tests/narrow-tiles.cjs` reuses the loopback production-browser
+fixture below. It keeps the desktop window at 1600×1000 and resizes the actual
+tile to 240, 320, 400, 480 and 640px, in both themes. It records screenshots
+and element geometry in `/tmp/p3-screenshots/`, checks radio/text overlap and
+elements escaping the tile, and checks 320px, 390px and landscape phones.
+Run after building, with the same browser overrides as `motion.cjs`:
+
+```sh
+/home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/narrow-tiles.cjs
+```
+
+`BEFORE=1 ROOT=/path/to/pinned/dist` records baseline screenshots without
+enforcing the new layout invariants; `VIEWS` selects comma-separated view
+paths. This deliberately tests pane width independently of window width.
+`ISOLATE_BROWSER=1` uses a fresh browser process for each desktop, split,
+phone or coarse-pointer fixture group. As with the motion harness, report
+shared-process failures alongside isolated results; isolation is not a retry.
+The workspace gives each pane a named `@container/view`; view layout uses
+named container breakpoints, while global phone navigation still follows the
+viewport and pointer. Settings adds `@container/settings` to its content
+column, so cards also adapt when its wide-screen side menu is present.
+The populated fixtures cover list and detail views, cleanup decisions,
+comments and open forms. Real two-pane layouts check each pane independently
+and the retained single-pane/back navigation below 40rem. Coarse-pointer bars
+are also checked down to 132px; natural four-column layouts verify there is
+no horizontal canvas scroll at 1600, 1024 and 768px window widths.
+
+Tables, code and other deliberately scrollable data regions are not a
+workspace scrollbar. Calendar's seven-column month and the Workers table
+still have their existing dense/data-table designs; don't mistake overflow
+containment for a redesigned narrow version of those views.
+
 ## Motion: production browser regression
 
 `ONLY=sessionsPicker` checks the phone Sessions header's visual alignment,

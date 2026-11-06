@@ -134,11 +134,11 @@ function instrumentation() {
   };
 }
 
-async function fixture(browser, origin, viewport, theme, motion, started) {
+async function fixture(browser, origin, viewport, theme, motion, started, contextOptions = {}) {
   const debug = phase => { if (process.env.DEBUG_FIXTURE) console.log(`  FIXTURE ${phase}`); };
   debug('new context');
   const context = await browser.newContext({ viewport, hasTouch: phoneViewport(viewport),
-    isMobile: phoneViewport(viewport), reducedMotion: motion.os, colorScheme: theme, serviceWorkers: 'block' });
+    isMobile: phoneViewport(viewport), reducedMotion: motion.os, colorScheme: theme, serviceWorkers: 'block', ...contextOptions });
   debug('new page');
   const page = await context.newPage();
   debug('configure');
@@ -1620,4 +1620,5 @@ function bundleSizes() {
   console.log(JSON.stringify({ root: ROOT, compression: 'per-file gzip level 9 estimate; not head transfer measurements', totals, files }, null, 2));
 }
 
-main().catch(error => { console.error(error.stack || error); process.exitCode = 1; });
+module.exports = { serve, fixture, settle, within, launchBrowser };
+if (require.main === module) main().catch(error => { console.error(error.stack || error); process.exitCode = 1; });
