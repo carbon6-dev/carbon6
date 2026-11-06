@@ -20,6 +20,8 @@ pub const BTN_MD: &str = "min-h-8 px-3 text-sm";
 pub const BTN_SM: &str = "min-h-7 px-2.5 text-xs";
 
 pub const BAR_BUTTON: &str = "flex size-7 shrink-0 items-center justify-center rounded text-zinc-600 outline-none focus-visible:ring-2 focus-visible:ring-sky-500/60 disabled:opacity-30 pointer-fine:hover:bg-black/10 pointer-fine:hover:text-zinc-900 pointer-fine:disabled:hover:bg-transparent pointer-coarse:size-10 dark:text-zinc-400 dark:pointer-fine:hover:bg-white/10 dark:pointer-fine:hover:text-zinc-100";
+/// Phone/coarse targets stay 44px; a desktop mouse only needs a 28px slot.
+pub const SESSION_BAR_BUTTON: &str = "flex size-11 shrink-0 items-center justify-center gap-0.5 rounded-md text-soft outline-none hover:bg-zinc-200/70 focus-visible:ring-2 focus-visible:ring-sky-500/60 disabled:opacity-40 md:pointer-fine:size-7 dark:hover:bg-zinc-800";
 
 pub const INPUT: &str = "w-full rounded-md border border-zinc-300 bg-white px-2 py-1.5 text-sm outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/30 pointer-coarse:min-h-10 pointer-coarse:text-base dark:border-zinc-700 dark:bg-zinc-900";
 // The background is the same Lucide chevron-down, encoded as a CSS image.

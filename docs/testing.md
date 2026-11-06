@@ -423,12 +423,12 @@ Hold a draft and focused composer element across these transitions: it must
 stay mounted and at the same bottom position; the transcript loses/gains 44px.
 Following remains at the bottom, while a scrolled-up reader stays put.
 
-At desktop height, exercise real columns of 360/400/440/480px tiles before
-applying the chosen floor (temporarily override the canvas floor, not just the
-bar width). The transcript and bar must share the same actual tile width.
-All seven controls must remain 44px, with identity separate;
-record title room and overflow rather than shrinking targets. Verify the
-480px floor and horizontally scrolling canvas. Inspect all four rim states,
+At desktop height, exercise actual 240/320/400/480/640px tiles, not just the
+bar width. The transcript and bar must share the same actual tile width.
+Fine-pointer controls use 28px slots; coarse pointers keep 44px targets.
+Verify narrow bars move secondary controls into Actions with their icons,
+truncate the title, and never require a horizontally scrolling workspace.
+Also test a list and item in a split tile. Inspect all four rim states,
 neutral context arc, dashed waiting, failed cross, positive-only badge, worded
 accessible name/tooltip, and stripe-default/Dot-only Appearance preference.
 Keep screenshots for both themes; validate new arbitrary utilities in built

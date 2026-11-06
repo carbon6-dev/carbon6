@@ -1469,6 +1469,10 @@ pub fn SessionMenu(chrome: SessionChrome, #[prop(into)] on_rename: Callback<()>,
                 on_done.run(());
             }>"Find in session"<span class="ml-auto"><crate::components::Kbd text="⌘F" /></span></button>
             <div class=MENU_RULE></div>
+            <div class="hidden flex-col md:flex md:@min-[30rem]/tile:hidden">
+                <button class=MENU_ITEM disabled=move || chrome.ssh() on:click=move |ev| { chrome.toggle_pane(Pane::Changes, &ev); on_done.run(()); }>{crate::icons::file_diff()}"Changes"</button>
+                <button class=MENU_ITEM on:click=move |ev| { chrome.toggle_pane(Pane::Terminal, &ev); on_done.run(()); }>{crate::icons::square_terminal()}"Terminal"</button>
+            </div>
             <div class="hidden md:contents">
             <Show when=move || !chrome.ssh()>
                 <button class=MENU_ITEM title="Its folder, beside the transcript (⌘-click: a new tile)"
@@ -1586,7 +1590,7 @@ pub fn SessionControls(chrome: SessionChrome, #[prop(optional)] strip: bool) -> 
         None => "Context: known after the first model call · Session sheet (⌘I)".to_owned(),
     };
     view! {
-        <button id=chrome.ring_id() class="flex h-11 w-11 shrink-0 items-center justify-center rounded-md text-soft outline-none hover:bg-zinc-200/70 focus-visible:ring-2 focus-visible:ring-sky-500/60 dark:hover:bg-zinc-800"
+        <button id=chrome.ring_id() class=SESSION_SLOT
             aria-label=move || format!("{} Open session sheet", chrome.ring_description())
             title=move || format!("{} Open session sheet (⌘I)", chrome.ring_description())
             aria-haspopup="dialog" aria-expanded=move || glance_open().to_string()
@@ -1597,8 +1601,8 @@ pub fn SessionControls(chrome: SessionChrome, #[prop(optional)] strip: bool) -> 
                     context=Signal::derive(move || chrome.context_percent()) background=Signal::derive(move || phone_background_count(chrome)) />
             </span>
         </button>
-        <div class="hidden shrink-0 items-center md:flex">
-            <button class=move || format!("{} {}", SESSION_SLOT, if chrome.pane_open(Pane::Changes) { "bg-zinc-200 dark:bg-zinc-700" } else { "" })
+        <div class="hidden shrink-0 items-center md:@min-[30rem]/tile:flex">
+            <button class=move || format!("{} md:pointer-fine:min-w-7 md:pointer-fine:w-auto md:pointer-fine:px-1 {}", SESSION_SLOT, if chrome.pane_open(Pane::Changes) { "bg-zinc-200 dark:bg-zinc-700" } else { "" })
                 aria-label="Changes" disabled=move || chrome.ssh() aria-pressed=move || chrome.pane_open(Pane::Changes).to_string()
                 title=move || changed().map_or_else(|| "Changes (⌘-click: a new tile)".to_owned(), |n| format!("Changes: {n} files (⌘-click: a new tile)"))
                 on:click=move |ev| chrome.toggle_pane(Pane::Changes, &ev)>
@@ -1614,8 +1618,7 @@ pub fn SessionControls(chrome: SessionChrome, #[prop(optional)] strip: bool) -> 
     }
 }
 
-/// Fixed controls never take the title's remaining room (even on a narrow tile).
-pub(crate) const SESSION_SLOT: &str = "flex h-11 w-11 shrink-0 items-center justify-center gap-0.5 rounded-md text-soft outline-none hover:bg-zinc-200/70 focus-visible:ring-2 focus-visible:ring-sky-500/60 disabled:opacity-40 dark:hover:bg-zinc-800";
+pub(crate) const SESSION_SLOT: &str = crate::components::SESSION_BAR_BUTTON;
 
 /// The context ring's one destination: panes, what runs, and the unchanged glance.
 #[component]

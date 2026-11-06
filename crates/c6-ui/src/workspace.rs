@@ -2489,7 +2489,7 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
         >
         <section
             class=move || format!(
-                "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-white data-[aspect-dim=true]:opacity-30 dark:bg-zinc-950 md:rounded-lg md:border md:shadow-sm {}",
+                "@container/tile relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-white data-[aspect-dim=true]:opacity-30 dark:bg-zinc-950 md:rounded-lg md:border md:shadow-sm {}",
                 if focused.get() && many.get() { "md:border-blue-400 md:ring-1 md:ring-blue-400/40 dark:md:border-blue-500" } else { "md:border-zinc-200 dark:md:border-zinc-800" },
             )
             on:pointerdown=move |_| ws.focus_tile_key(key)
@@ -2503,9 +2503,8 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
             // and what you can do to the whole tile.
             // Dragged by its bar to another place or column. Always the
             // panel's own colours, so it reads whatever the mark; the mark
-            // is an optional stripe along its top. Seven fixed 44px slots
-            // leave the rest to identity and title; secondary tile actions
-            // are in ⋯, retaining their icons and shortcuts.
+            // is an optional stripe along its top. Fine pointers use 28px
+            // controls; below 30rem secondary controls move into ⋯.
             <div class="relative flex h-11 shrink-0 cursor-grab items-center border-b border-zinc-200 bg-zinc-50 text-xs active:cursor-grabbing md:@container md:px-1 dark:border-zinc-800 dark:bg-zinc-900"
                 draggable=move || if many.get() { "true" } else { "false" }
                 title="Drag to move this tile: onto another tile's top or bottom half, or its left or right edge for a new column"
@@ -2532,14 +2531,14 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                 // A session of your own is renamed by double-clicking its name
                 // (or from ⋯).
                 <div class="flex min-w-0 flex-1 items-center overflow-hidden">
-                    <span node_ref=title_el class="min-w-0 flex-1 truncate px-1 font-medium text-zinc-800 dark:text-zinc-100"
+                    <span node_ref=title_el class="min-w-0 flex-1 truncate font-medium text-zinc-800 @min-[14rem]/tile:px-1 dark:text-zinc-100"
                         title=move || if renamable() { format!("{} · Double-click to rename", title.get()) } else { title.get() }
                         on:dblclick=move |ev| if renamable() { ev.stop_propagation(); rename_under_title() }>{title}</span>
-                    <span data-tile-aspects=key class="flex shrink-0 items-center"></span>
+                    <span data-tile-aspects=key class="hidden shrink-0 items-center md:@min-[40rem]/tile:flex"></span>
                 </div>
                 {move || chrome().map(|c| view! { <crate::session::SessionControls chrome=c /> })}
                 <Show when=move || shown.get().is_some()>
-                    <button class=format!("{btn} hidden md:flex")
+                    <button class=format!("{btn} hidden md:@min-[30rem]/tile:flex")
                         disabled=move || pinnable().is_none()
                         title=move || if pinnable().is_some_and(|id| ws.pinned.with(|p| p.contains(&id))) { "Unpin" } else { "Pin to the dock" }
                         aria-label=move || if pinnable().is_some_and(|id| ws.pinned.with(|p| p.contains(&id))) { "Unpin" } else { "Pin" }
@@ -2547,14 +2546,14 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                         {move || crate::icons::star(pinnable().is_some_and(|id| ws.pinned.with(|p| p.contains(&id))))}
                     </button>
                 </Show>
-                <button class=format!("{btn} hidden md:flex") title=move || if full.get() { "Defocus: back to the tiles" } else { "Focus: this tile fills the screen" }
+                <button class=format!("{btn} hidden md:@min-[30rem]/tile:flex") title=move || if full.get() { "Defocus: back to the tiles" } else { "Focus: this tile fills the screen" }
                     aria-label=move || if full.get() { "Defocus" } else { "Focus" }
                     on:click=move |ev| { ev.stop_propagation(); ws.set_full(if full.get_untracked() { None } else { Some(key) }) }>
                     {move || if full.get() { crate::icons::minimize().into_any() } else { crate::icons::maximize().into_any() }}
                 </button>
                 <button class=btn title="Actions: session actions, history and tile controls" aria-label="Actions"
                     on:click=move |ev| menu_at.set(if menu_at.get_untracked().is_some() { None } else { Some(below(&ev, 240.0)) })>{crate::icons::ellipsis()}</button>
-                <button class=format!("{btn} hidden md:flex") title="Close this tile" aria-label="Close this tile" on:click=move |_| ws.close_tile(key)>{crate::icons::x()}</button>
+                <button class=format!("{btn} hidden md:@min-[14rem]/tile:flex") title="Close this tile" aria-label="Close this tile" on:click=move |_| ws.close_tile(key)>{crate::icons::x()}</button>
                 <crate::activity::SessionsPicker />
             </div>
             {move || shown.get().map(|(_, id)| view! { <crate::session::ArchivedSession id /> })}
@@ -2572,6 +2571,19 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                 {move || chrome().map(|c| view! {
                     <crate::session::SessionMenu chrome=c on_rename=move |()| rename_under_title() on_done=move |()| menu_at.set(None) />
                 })}
+                <div class="hidden flex-col md:flex md:@min-[30rem]/tile:hidden">
+                    <Show when=move || shown.get().is_some()>
+                        <button class=crate::session::MENU_ITEM disabled=move || pinnable().is_none() on:click=move |_| { if let Some(id) = pinnable() { ws.toggle_pin(&id); } menu_at.set(None); }>
+                            {move || crate::icons::star(pinnable().is_some_and(|id| ws.pinned.with(|p| p.contains(&id))))}
+                            {move || if pinnable().is_some_and(|id| ws.pinned.with(|p| p.contains(&id))) { "Unpin" } else { "Pin" }}
+                        </button>
+                    </Show>
+                    <button class=crate::session::MENU_ITEM on:click=move |_| { ws.set_full(if full.get_untracked() { None } else { Some(key) }); menu_at.set(None); }>
+                        {move || if full.get() { crate::icons::minimize().into_any() } else { crate::icons::maximize().into_any() }}
+                        {move || if full.get() { "Defocus" } else { "Focus" }}
+                    </button>
+                </div>
+                <button class=format!("{} hidden md:flex md:@min-[14rem]/tile:hidden", crate::session::MENU_ITEM) on:click=move |_| { menu_at.set(None); ws.close_tile(key); }>{crate::icons::x()}"Close this tile"</button>
                 <div class="flex flex-col border-t border-zinc-200 pt-1 text-xs dark:border-zinc-700">
                     <button class=crate::session::MENU_ITEM disabled=move || !can_back() on:click=move |_| { ws.step(-1); menu_at.set(None); }>{crate::icons::chevron_left()}"Back"</button>
                     <button class=crate::session::MENU_ITEM disabled=move || !can_forward() on:click=move |_| { ws.step(1); menu_at.set(None); }>{crate::icons::chevron_right()}"Forward"</button>
