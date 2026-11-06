@@ -1012,6 +1012,10 @@ pub async fn effective_config(st: &HeadState, session_id: &str) -> anyhow::Resul
     })
 }
 
+/// Kept distinct so a non-blocking question can still be answered when
+/// only its delivery is refused because the asking session was archived.
+pub(crate) const ARCHIVED_INPUT_MESSAGE: &str = "this session is archived; unarchive it before sending a message";
+
 pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage) -> anyhow::Result<api::QueuedInput> {
     send_input_as(st, session_id, req, Uuid::now_v7().to_string(), "", None).await
 }
@@ -1080,7 +1084,7 @@ async fn send_input_with(
     }
     let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
     if session.archived != 0 {
-        return Err(bad_request("this session is archived; unarchive it before sending a message"));
+        return Err(bad_request(ARCHIVED_INPUT_MESSAGE));
     }
     if session.observed {
         return Err(bad_request("this is Claude Code's own subagent: it is shown here, and Claude Code runs it"));

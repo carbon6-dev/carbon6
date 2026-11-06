@@ -219,6 +219,23 @@ async fn a_template_runs_a_subagent_on_another_worker() {
     });
     assert!(delegated.is_some_and(|d| !d.is_empty()), "the head says which call sent it");
 
+    // An archived remote child refuses the message immediately. The
+    // parent hears a tool error, rather than waiting for a report from a
+    // child that never received input, and the head retires its delegation.
+    let child_events = env.events(&child_id).await;
+    let r = env.http.patch(format!("{}/sessions/{child_id}", env.api)).json(&json!({"archived": true})).send().await.unwrap();
+    assert!(r.status().is_success());
+    let seq = last_seq(&env.events(&id).await);
+    env.mock.push(Reply::ToolCalls(vec![("send_message".into(), json!({"to": child_id, "message": "Do not enqueue this."}).to_string())]));
+    env.mock.push(Reply::Text("That child is archived; I cannot message it.".into()));
+    env.message(&id, "try the archived child", false).await;
+    assert_eq!(env.turn_ended_after(&id, seq).await, TurnEndReason::Completed);
+    let (out, is_error) = result_of(&env.events(&id).await, "send_message").unwrap();
+    assert!(is_error && out.contains("archived") && out.contains("unarchive"), "{out}");
+    assert!(env.head.state.store.waiting_delegations(&child_id).await.unwrap().is_empty());
+    assert!(env.head.state.store.queued_inputs(&child_id).await.unwrap().is_empty());
+    assert_eq!(env.events(&child_id).await, child_events, "the refused input never reaches the child");
+
     // A template agents may not start is refused.
     let seq = last_seq(&env.events(&id).await);
     env.mock

@@ -406,7 +406,17 @@ async fn act(
             if !note.trim().is_empty() {
                 text.push_str(&format!("\nNote: {}", note.trim()));
             }
-            crate::sessions::send_input(st, session, &api::SendMessage { text, ..Default::default() }).await?;
+            if let Err(e) = crate::sessions::send_input(st, session, &api::SendMessage { text, ..Default::default() }).await {
+                // The answer still belongs on the card if its agent has
+                // since been archived. All other delivery failures keep
+                // the decision open, as before.
+                if matches!(e.downcast_ref::<crate::UserError>(), Some(crate::UserError::BadRequest(m)) if m == crate::sessions::ARCHIVED_INPUT_MESSAGE)
+                {
+                    warn!(decision = d.id, %session, "telling the archived session: {e:#}");
+                } else {
+                    return Err(e);
+                }
+            }
         }
         _ => {}
     }
@@ -928,6 +938,105 @@ async fn start_task(st: &HeadState, d: &api::Decision) -> anyhow::Result<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn question_head() -> (tempfile::TempDir, crate::Head) {
+        let dir = tempfile::tempdir().unwrap();
+        let head = crate::start(crate::HeadConfig {
+            data_dir: dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            auth: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, realm) \
+             VALUES ('session', ?, 'Asking agent', '', 'c', 'm', 'idle', 0, 0, ?)",
+        )
+        .bind(c6_core::WorkerId::new().to_string())
+        .bind(crate::realms::HOME)
+        .execute(&head.state.store.pool)
+        .await
+        .unwrap();
+        (dir, head)
+    }
+
+    #[tokio::test]
+    async fn archived_question_answers_are_recorded_but_other_delivery_failures_stay_open() {
+        let (_dir, head) = question_head().await;
+        let st = &head.state;
+        let http = reqwest::Client::new();
+        let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+        let card = from_session(
+            st,
+            "session",
+            "decision",
+            &json!({"title": "Which region?", "options": [{"label": "Keep"}],
+                "form": [{"name": "region", "label": "Region", "required": true}]}),
+        )
+        .await
+        .unwrap();
+        let id = card["id"].as_i64().unwrap();
+        assert!(st.store.set_archived("session", true).await.unwrap());
+        let response = http
+            .post(format!("{api}/decisions/{id}/answer"))
+            .json(&json!({"option": "Keep", "values": {"region": "us-east"}, "note": "Leave staging here"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let answered: api::Decision = response.json().await.unwrap();
+        assert_eq!(answered.state, "answered");
+        assert_eq!(answered.answer, Some(json!({"option": "Keep", "values": {"region": "us-east"}})));
+        assert_eq!(answered.note, "Leave staging here");
+        assert_eq!(answered.answered_via, "carbon6");
+        assert!(answered.answered_at.is_some());
+        assert_eq!(get(st, id).await.unwrap().unwrap(), answered);
+        assert_eq!(st.store.session("session").await.unwrap().unwrap().archived, 1);
+        let commands: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM commands WHERE session_id = 'session'").fetch_one(&st.store.pool).await.unwrap();
+        assert_eq!(commands, 0, "recording an answer must not enqueue input or unarchive its session");
+
+        // A different bad request and a missing session must still fail,
+        // rather than turning all question-delivery errors into warnings.
+        st.store.set_archived("session", false).await.unwrap();
+        sqlx::query("UPDATE sessions SET observed = 1 WHERE id = 'session'").execute(&st.store.pool).await.unwrap();
+        for (session, status) in [("session", reqwest::StatusCode::BAD_REQUEST), ("missing", reqwest::StatusCode::NOT_FOUND)] {
+            let card = from_session(st, session, "decision", &json!({"title": format!("Question from {session}")})).await.unwrap();
+            let id = card["id"].as_i64().unwrap();
+            let response = http.post(format!("{api}/decisions/{id}/answer")).json(&json!({"note": "An answer"})).send().await.unwrap();
+            assert_eq!(response.status(), status);
+            let pending = get(st, id).await.unwrap().unwrap();
+            assert_eq!(pending.state, "open");
+            assert!(pending.answer.is_none() && pending.answered_at.is_none());
+        }
+        head.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_archived_task_refuses_do_it_here_but_can_still_be_put_away() {
+        let (_dir, head) = question_head().await;
+        let st = &head.state;
+        let card = task_card(st, "session", "task_propose", &json!({"title": "Clean up", "prompt": "Remove dead code"})).await.unwrap();
+        let id = card["id"].as_i64().unwrap();
+        st.store.set_archived("session", true).await.unwrap();
+        let http = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{}/api/v1/decisions/{id}/answer", head.ui_addrs[0].port());
+        let response = http.post(&url).json(&json!({"option": TASK_HERE})).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        let error: api::ApiError = response.json().await.unwrap();
+        assert_eq!(error.error, crate::sessions::ARCHIVED_INPUT_MESSAGE);
+        assert_eq!(get(st, id).await.unwrap().unwrap().state, "open");
+        let response = http.post(&url).json(&json!({"option": "Not now"})).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let answered: api::Decision = response.json().await.unwrap();
+        assert_eq!(answered.state, "answered");
+        assert_eq!(answered.answer.unwrap()["option"], "Not now");
+        assert!(st.store.queued_inputs("session").await.unwrap().is_empty());
+        head.shutdown().await.unwrap();
+    }
 
     #[test]
     fn a_card_drops_automatic_labels_its_agent_copied() {
