@@ -1590,6 +1590,14 @@ impl Workspace {
     /// flag once they are.
     pub fn watch(&self, live: LiveFeed) {
         let ws = *self;
+        // Header resolution follows the same initial-load budget as panes.
+        // It still resolves omitted/archived rows after the focused paint.
+        let loading = TileLoading {
+            released: RwSignal::new(false),
+            drawn: RwSignal::new(HashSet::new()),
+            one_pane: RwSignal::new(crate::util::phone()),
+        };
+        provide_context(loading);
         // Open views own their metadata, not their membership in a recent,
         // non-archived list. This also covers restored layouts, direct links,
         // minimized tiles and standalone session panes. Keep the last good
@@ -1604,6 +1612,7 @@ impl Workspace {
         Effect::new(move || {
             retry.track();
             let ids = open.get();
+            let eligible = ws.layout.with(|l| initial_metadata_ids(l, loading.one_pane.get(), loading.released.get()));
             let sessions = live.sessions.get();
             let mut cached = live.resolved_sessions.get_untracked();
             cached.retain(|id, _| ids.contains(id));
@@ -1613,14 +1622,20 @@ impl Workspace {
             if live.resolved_sessions.with_untracked(|old| *old != cached) {
                 live.resolved_sessions.set(cached);
             }
-            for id in ids.into_iter().filter(|id| !sessions.iter().any(|s| s.id == *id)) {
+            for id in ids.into_iter().filter(|id| eligible.contains(id) && !sessions.iter().any(|s| s.id == *id)) {
                 // A slow by-id request must get to finish even if newer
                 // live snapshots arrive; never pile up or starve requests.
                 if fetching.try_update_value(|pending| pending.insert(id.clone())) != Some(true) {
                     continue;
                 }
+                // Capture the owned future while its arena handle is live.
+                // A completed cached value must not suppress a fresh check.
+                let pending = crate::resources::pending_session(&id).map(|data| std::future::IntoFuture::into_future(data.detail));
                 leptos::task::spawn_local(async move {
-                    let result = api::session(id.clone()).await;
+                    let result = match pending {
+                        Some(pending) => pending.await,
+                        None => api::session(id.clone()).await,
+                    };
                     let failed = result.is_err();
                     fetching.try_update_value(|pending| pending.remove(&id));
                     if let Ok(detail) = result
@@ -2191,9 +2206,7 @@ pub fn arrange(tiles: &[(usize, u64)]) -> Vec<Rect> {
 #[component]
 pub fn Tiles() -> impl IntoView {
     let ws = use_workspace();
-    let loading =
-        TileLoading { released: RwSignal::new(false), drawn: RwSignal::new(HashSet::new()), one_pane: RwSignal::new(crate::util::phone()) };
-    provide_context(loading);
+    let loading = expect_context::<TileLoading>();
     let resize = window_event_listener(leptos::ev::resize, move |_| {
         loading.one_pane.set(crate::util::phone());
     });
@@ -2280,6 +2293,21 @@ struct TileLoading {
 
 fn initial_mount(mounted: bool, shown: bool, focused: bool, released: bool) -> bool {
     mounted || (shown && (focused || released))
+}
+
+fn initial_metadata_ids(layout: &Layout, one_pane: bool, released: bool) -> HashSet<String> {
+    layout
+        .tiles
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| released || *i == layout.focus)
+        .flat_map(|(_, tile)| {
+            tile.columns
+                .iter()
+                .filter(move |col| released || layout.pane_shown(tile.key, col.key, one_pane))
+                .filter_map(|col| col.view.session_id().map(str::to_owned))
+        })
+        .collect()
 }
 
 fn focused_drawn(layout: &Layout, one_pane: bool, drawn: &HashSet<u64>) -> Option<Vec<u64>> {
@@ -2739,6 +2767,30 @@ mod tests {
         assert_eq!(focused_drawn(&l, false, &drawn), None);
         l.tiles[0].minimized = false;
         assert!(l.pane_shown(tile, list, false));
+    }
+
+    #[test]
+    fn header_metadata_waits_with_hidden_panes_then_resolves_every_open_session() {
+        let mut l = Layout::new(View::session("first"));
+        l.open_tile(View::session("focus"));
+        let side = l.key();
+        l.tiles[1].columns.push(Column { key: side, view: View::session("side") });
+        l.tiles[1].settle();
+        l.open_tile(View::session("minimized"));
+        l.tiles[2].minimized = true;
+        l.focus = 1;
+        let ids = |ss: &[&str]| ss.iter().map(|s| s.to_string()).collect::<HashSet<_>>();
+        assert_eq!(initial_metadata_ids(&l, false, false), ids(&["focus", "side"]));
+        assert_eq!(initial_metadata_ids(&l, true, false), ids(&["side"]), "a hidden phone pane does not start a header read");
+        for phone in [false, true] {
+            assert_eq!(
+                initial_metadata_ids(&l, phone, true),
+                ids(&["first", "focus", "side", "minimized"]),
+                "after the focused paint, omitted/archived headers resolve even for minimized tiles"
+            );
+        }
+        l.focus = 0;
+        assert_eq!(initial_metadata_ids(&l, true, false), ids(&["first"]), "changing focus immediately changes eligibility");
     }
 
     #[test]

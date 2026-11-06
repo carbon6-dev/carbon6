@@ -58,6 +58,13 @@ pub fn connections() -> Connections {
     expect_context::<Page>().connections
 }
 
+/// A header can join an initial pane read, without accepting an old answer
+/// instead of the fresh by-id check needed when a session leaves the live list.
+pub fn pending_session(id: &str) -> Option<SessionData> {
+    let page = expect_context::<Page>();
+    page.sessions.with_value(|all| all.get(id).copied()).filter(|data| data.detail.get_untracked().is_none())
+}
+
 /// Shared completed and pending lists. Returning an Arc resource lets an
 /// open picker keep using its list even when the bounded page cache evicts
 /// that entry. No signal used by a mounted picker is disposed on eviction.
@@ -129,6 +136,12 @@ mod tests {
                 assert_eq!(first.to_any_source(), connections().to_any_source(), "a picker must not create another connections resource");
                 session("s1".into())
             });
+            assert!(pending_session("unopened").is_none(), "a header must not start a hidden pane read");
+            assert_eq!(
+                pending_session("s1").unwrap().detail.to_any_source(),
+                data.detail.to_any_source(),
+                "headers join pending pane reads"
+            );
             tile.cleanup();
             let other = session("s1".into());
             assert_eq!(data.detail.to_any_source(), other.detail.to_any_source(), "panes share the transcript's session request");
@@ -136,6 +149,8 @@ mod tests {
             assert_eq!(data.folder.get_untracked().as_deref(), Some("/actual/worktree"));
             assert_ne!(data.detail.to_any_source(), session("s2".into()).detail.to_any_source(), "different sessions are separate");
             assert_eq!(first.to_any_source(), connections().to_any_source());
+            data.detail.set(Some(Err("previous failure".into())));
+            assert!(pending_session("s1").is_none(), "an old result must not suppress a fresh metadata check or retry");
         });
     }
 

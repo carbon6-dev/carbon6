@@ -296,6 +296,10 @@ Non-session panes use their mounted shell as readiness, not completion of all
 their background requests. Minimized tiles, tiles hidden by focus mode, and
 phone tabs/panes not currently shown wait for their first reveal. Once a pane
 has mounted, hiding it keeps its DOM, stream, draft and scroll state alive.
+Restored headers share this initial budget and join a pending pane detail read.
+After the focused paint, headers missing from the live list (including archived
+or minimized sessions) may resolve by id without mounting their hidden panes;
+an old cached answer must not suppress a fresh omission check or failed-read retry.
 
 A failed detail response releases loading after drawing the error. A stream
 that closes or fails to open before `Synced` draws a reconnecting notice and
