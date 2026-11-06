@@ -3571,7 +3571,8 @@ pub struct Policy {
     /// Bash or Edit, work with every model); empty: every tool.
     #[serde(default)]
     pub tools: String,
-    /// A regular expression over the call's input (as JSON); empty: any.
+    /// A regular expression over the call's input, as JSON and each string in
+    /// it as plain text; empty: any.
     #[serde(default)]
     pub pattern: String,
     /// "ask" (wait for your approval) or "deny".
