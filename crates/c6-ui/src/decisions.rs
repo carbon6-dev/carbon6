@@ -343,11 +343,11 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
         .flatten();
     let cleanup = archive_docs.is_some();
     view! {
-        <section id=card_id(id) class=format!("space-y-2 rounded-lg border p-3 {tone}")>
+        <section id=card_id(id) class=format!("min-w-0 space-y-2 rounded-lg border p-3 [overflow-wrap:anywhere] {tone}")>
             <div class="flex flex-wrap items-center gap-2">
                 <span class="rounded bg-zinc-100 px-1.5 text-[11px] dark:bg-zinc-800">{d.kind.clone()}</span>
                 {(d.waiting && open).then(|| view! { <span class="rounded bg-sky-100 px-1.5 text-[11px] text-sky-800 dark:bg-sky-950 dark:text-sky-300">"waiting"</span> })}
-                <h2 class="min-w-0 flex-1 font-medium">{d.title.clone()}</h2>
+                <h2 class="min-w-0 flex-1 basis-full font-medium @sm/view:basis-0">{d.title.clone()}</h2>
                 {(d.count > 1).then(|| view! { <span class="text-xs text-muted">{format!("raised {}×", d.count)}</span> })}
                 <span class="text-xs text-muted">{ago(now_ms() - d.updated_at)}</span>
             </div>
@@ -425,7 +425,7 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
 /// scrollable so the question and the answer buttons remain reachable.
 fn archive_cleanup_body(docs: Vec<c6_api::docs_archive::ArchiveDocCandidate>, reason: String, realm: String) -> impl IntoView {
     view! {
-        <div class="space-y-2 text-sm">
+        <div class="min-w-0 space-y-2 text-sm [overflow-wrap:anywhere]">
             <p>{format!("{} documents. {}", docs.len(), reason)}</p>
             <div class="max-h-64 overflow-y-auto rounded-md border border-zinc-200 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-sky-500 dark:border-zinc-800"
                 role="region" aria-label="Documents to archive" tabindex="0">
@@ -463,7 +463,7 @@ fn archive_cleanup_outcome(context: serde_json::Value, realm: String) -> impl In
             let rows = result.archived.into_iter().map(|id| (id, "Archived".to_owned()))
                 .chain(result.skipped.into_iter().map(|doc| (doc.id, doc.reason)));
             view! {
-                <div class="mt-3 space-y-2 text-sm" role="status">
+                <div class="mt-3 min-w-0 space-y-2 text-sm [overflow-wrap:anywhere]" role="status">
                     <p class="font-medium">{summary}</p>
                     <ul class="max-h-64 space-y-1 overflow-y-auto rounded-md outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-sky-500" aria-label="Document cleanup results" tabindex="0">
                         {rows.map(|(id, outcome)| {
@@ -758,6 +758,7 @@ mod tests {
         });
         assert!(html.contains("2 documents. Finished drafts"));
         assert!(html.contains("max-h-64 overflow-y-auto"));
+        assert!(html.contains("[overflow-wrap:anywhere]"), "long document titles must wrap within a narrow tile");
         assert!(html.contains("aria-label=\"Documents to archive\""));
         assert!(html.contains("tabindex=\"0\""), "the list remains keyboard-scrollable: {html}");
         assert!(html.contains("outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-sky-500"));
@@ -791,6 +792,7 @@ mod tests {
         });
         assert!(html.contains("Cleanup result: 1 archived; 2 not archived."));
         assert!(html.contains("aria-label=\"Document cleanup results\""));
+        assert!(html.contains("[overflow-wrap:anywhere]"), "long result titles and errors must wrap within a narrow tile");
         assert!(html.contains("href=\"/r/home/docs/first\""));
         assert!(html.contains("Draft &lt;one&gt;"));
         assert!(html.contains(": Archived"));
