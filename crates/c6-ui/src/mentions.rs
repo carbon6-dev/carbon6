@@ -387,21 +387,25 @@ fn by_whom(by: &str) -> String {
 #[component]
 fn DocPeek(id: String) -> impl IntoView {
     let title = crate::docs::title_of(&id).unwrap_or_else(|| Kind::Doc.short(&id));
+    let changed = api::live().doc;
     let doc = {
         let id = id.clone();
-        LocalResource::new(move || api::doc_get(id.clone()))
+        LocalResource::new(move || {
+            changed.track();
+            api::doc_get(id.clone())
+        })
     };
     move || {
-        let (title, line) = match doc.get() {
-            None => (title.clone(), "…".to_owned()),
+        let (title, line, archived) = match doc.get() {
+            None => (title.clone(), "…".to_owned(), false),
             Some(Ok(d)) => {
                 let s = d.summary;
-                (s.title, format!("changed {} by {}", ago(now_ms() - s.updated_at), by_whom(&s.updated_by)))
+                (s.title, format!("changed {} by {}", ago(now_ms() - s.updated_at), by_whom(&s.updated_by)), s.archived_at.is_some())
             }
-            Some(Err(e)) => (title.clone(), e),
+            Some(Err(e)) => (title.clone(), e, false),
         };
         view! {
-            {title_row(None, icon(Icon::FileText, Size::S16).into_any(), title, None)}
+            {title_row(None, icon(Icon::FileText, Size::S16).into_any(), title, archived.then(|| ("Archived".to_owned(), STATE_QUIET)))}
             <div class="truncate text-xs text-muted">{line}</div>
         }
     }
@@ -413,14 +417,19 @@ fn ItemPeek(kind: Kind, id: String) -> impl IntoView {
     let reference = format!("{}:{id}", kind.name());
     let title = known(kind, &id).title.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| kind.short(&id));
     let mark = live_mark_of(&reference);
+    let changed = api::live().doc;
     let now = {
         let reference = reference.clone();
-        LocalResource::new(move || api::doc_refs(vec![reference.clone()]))
+        LocalResource::new(move || {
+            changed.track();
+            api::doc_refs(vec![reference.clone()])
+        })
     };
     move || {
         let l = now.get().and_then(Result::ok).and_then(|v| v.into_iter().next());
         let (title, state, at) = match l {
             Some(l) if l.state == "gone" => (title.clone(), Some(("gone".to_owned(), STATE_QUIET)), 0),
+            Some(l) if l.state == "archived" => (l.title, Some(("Archived".to_owned(), STATE_QUIET)), l.at),
             Some(l) => (l.title, Some((l.state.replace('_', " "), state_look(&l.state))), l.at),
             None => (title.clone(), None, 0),
         };

@@ -169,6 +169,9 @@ const MAKE: &[&str] = &[
     "docs.comment",
     "docs.reply",
     "docs.export",
+    // The batch-specific gate checks every selected id and asks once;
+    // there is no single path target for the generic Change gate.
+    "docs.archive_many",
     "decks.bring_in",
     "collections.create",
     "records.create",
@@ -569,7 +572,7 @@ async fn project_id(st: &HeadState, realm: &str, project: &str) -> anyhow::Resul
 }
 
 /// Runs `op` for a session family after the rule says it may.
-async fn call(st: &HeadState, op: &'static Op, args: Value, realm: &str, root: &str, session: &str) -> anyhow::Result<Value> {
+async fn call(st: &HeadState, op: &'static Op, mut args: Value, realm: &str, root: &str, session: &str) -> anyhow::Result<Value> {
     let mut class = class_of(op, &args);
     if class == Class::Never {
         return Err(crate::forbidden(format!("{} is the user's alone; tell them what you'd like done", op.name)));
@@ -608,6 +611,54 @@ async fn call(st: &HeadState, op: &'static Op, args: Value, realm: &str, root: &
     {
         return Err(crate::forbidden(format!("this session works in realm {realm}, not {r}")));
     }
+    let pure_archive = op.name == "docs.rename"
+        && args["body"]["archived"].is_boolean()
+        && args["body"]["title"].is_null()
+        && args["body"]["labels"].is_null();
+    if op.effect != Effect::Read
+        && op.name != "docs.delete"
+        && !pure_archive
+        && let Some(thing) = thing(op, &args)
+        && let Some(id) = thing.strip_prefix("doc:")
+    {
+        // Read-only is a state refusal, not an invitation to ask for
+        // permission. The core rechecks under its write lock as well.
+        crate::docs::ensure_writable(st, realm, id).await?;
+    }
+    // Cleanup is one fixed, per-call selection, never a persistent grant.
+    // In a mixed list even its own documents wait for that one answer.
+    if op.name == "docs.archive_many" {
+        let mut input: c6_api::docs_archive::ArchiveDocsIn = serde_json::from_value(args["body"].clone())
+            .map_err(|e| crate::bad_request(format!("archive_many takes ids and reason under body: {e}")))?;
+        input.ids = crate::docs::archive::selection(&input.ids)?;
+        input.reason = input.reason.trim().to_owned();
+        if input.reason.is_empty() {
+            return Err(crate::bad_request("archive_many takes a reason for the user"));
+        }
+        args = json!({"body": input});
+        let mut others = Vec::new();
+        // Check every selected id, not just today's live candidates: an
+        // archived document can be unarchived while this call is running.
+        // A stale entry must not become an unapproved change in that race.
+        for id in &input.ids {
+            let thing = format!("doc:{id}");
+            if !own(st, realm, root, &thing).await {
+                others.push(thing);
+            }
+        }
+        if !others.is_empty() {
+            let d = ask(st, op, &args, realm, root, session, &others, true).await?;
+            return Ok(json!({"asked": d, "text": format!(
+                "Not yet: the user is asked to archive this exact document selection (decision {d}). Nothing changed. \
+                 Allow archives it once; Not now does nothing. No future permission is granted. You'll hear the result when they answer."
+            )}));
+        }
+        return run(st, op, args, realm, root).await;
+    }
+    // Archive/unarchive changes another person's document even when it
+    // belongs to this session's work/project. Only ownership or explicit
+    // per-document consent exempts it, not may_write's work/realm policy.
+    let archiving = op.name == "docs.rename" && args["body"]["archived"].is_boolean();
     let mut needs: Vec<String> = Vec::new();
     if matches!(class, Class::Change | Class::Delete) && op.name != "projects.work" {
         match thing(op, &args) {
@@ -633,9 +684,21 @@ async fn call(st: &HeadState, op: &'static Op, args: Value, realm: &str, root: &
         }
         if let Some(doc) = t.strip_prefix("doc:")
             && class != Class::Delete
+            && !archiving
             && crate::docs::session::may_write(st, realm, doc, root).await?.is_ok()
         {
             continue;
+        }
+        if archiving && let Some(doc) = t.strip_prefix("doc:") {
+            let pool = crate::docs::pool(st, realm).await?;
+            let granted: i64 = sqlx::query_scalar("SELECT count(*) FROM doc_writers WHERE doc_id = ? AND writer = ?")
+                .bind(doc)
+                .bind(format!("session:{root}"))
+                .fetch_one(&pool)
+                .await?;
+            if granted > 0 {
+                continue;
+            }
         }
         if class != Class::Delete && allowed(st, realm, root, &t).await {
             continue;
@@ -710,7 +773,49 @@ async fn ask(
 ) -> anyhow::Result<i64> {
     let who = st.store.session(root).await?.map(|s| s.title).filter(|t| !t.trim().is_empty()).unwrap_or_else(|| "A session".into());
     let what = label(st, realm, &things[0]).await;
-    let (title, document) = if things[0].starts_with("account:") {
+    let archive_docs = if op.name == "docs.archive_many" {
+        let ids: Vec<String> = serde_json::from_value(args["body"]["ids"].clone())?;
+        let family = crate::docs::archive::family(st, root).await?;
+        let live = crate::docs::archive::candidates(st, realm, &ids, &family).await?;
+        let mut shown = Vec::new();
+        for id in ids {
+            if let Some(doc) = live.iter().find(|d| d.id == id) {
+                shown.push(doc.clone());
+            } else {
+                // Show every frozen id, even one that went stale while
+                // preparing the card. Nothing unseen can later be run.
+                let (title, kind, _) = crate::docs::title_of(st, realm, &id).await.unwrap_or((id.clone(), "doc".into(), 0));
+                shown.push(c6_api::docs_archive::ArchiveDocCandidate {
+                    id,
+                    title,
+                    kind,
+                    reasons: vec!["Gone or already archived; will be skipped if still unavailable".into()],
+                });
+            }
+        }
+        shown
+    } else {
+        Vec::new()
+    };
+    let (title, document) = if op.name == "docs.archive_many" {
+        let mut document = format!(
+            "The session wants to archive **{} documents**.\n\n{}\n\n",
+            archive_docs.len(),
+            args["body"]["reason"].as_str().unwrap_or("")
+        );
+        for doc in &archive_docs {
+            document.push_str(&format!("- [{}](doc:{})", doc.title.replace(['[', ']'], ""), doc.id));
+            if !doc.reasons.is_empty() {
+                document.push_str(&format!(" — {}", doc.reasons.join("; ")));
+            }
+            document.push('\n');
+        }
+        document.push_str(
+            "\nAllow archives only the listed ids once. Gone or already archived documents are skipped and reported. \
+                           Not now changes nothing. No ongoing permission is granted; no other document is included.",
+        );
+        (format!("Let {who} archive {} documents?", archive_docs.len()), document)
+    } else if things[0].starts_with("account:") {
         (
             format!("Let {who} {}?", lower_first(op.summary.trim_end_matches('.'))),
             format!(
@@ -748,7 +853,7 @@ async fn ask(
             ),
         )
     };
-    let d = c6_api::DecisionIn {
+    let mut d = c6_api::DecisionIn {
         kind: "approve".into(),
         title,
         document,
@@ -760,6 +865,11 @@ async fn ask(
         ],
         ..Default::default()
     };
+    if op.name == "docs.archive_many" {
+        d.context["archive_docs"] = json!(archive_docs);
+        d.context["reason"] = args["body"]["reason"].clone();
+        d.options[1].label = "Not now".into();
+    }
     let reference =
         if once { format!("agentop:{realm}:{}", uuid::Uuid::now_v7()) } else { format!("agentop:{realm}:{root}/{}", things.join(",")) };
     Ok(crate::decisions::open(st, &d, realm, &reference).await?.id)
@@ -777,13 +887,62 @@ pub async fn decided(st: &HeadState, d: &c6_api::Decision, option: Option<&str>)
         (c["realm"].as_str().unwrap_or_default(), c["root"].as_str().unwrap_or_default(), c["session"].as_str().unwrap_or_default());
     let allow = option == Some("Allow");
     let op_name = c["op"].as_str().unwrap_or_default();
+    if op_name == "docs.archive_many" {
+        if allow {
+            let ids: Vec<String> = serde_json::from_value(c["input"]["body"]["ids"].clone())?;
+            let shown: Vec<&str> = c["archive_docs"].as_array().into_iter().flatten().filter_map(|d| d["id"].as_str()).collect();
+            if crate::docs::archive::selection(&ids)? != ids || shown != ids.iter().map(String::as_str).collect::<Vec<_>>() {
+                return Err(crate::bad_request(
+                    "this cleanup approval's ids are not canonical or do not match its preview; ask for a new exact selection",
+                ));
+            }
+        }
+        // One answer consumes this exact selection, including Not now.
+        // A conditional write also prevents two concurrent answers from
+        // replaying it after both readers saw the decision still open.
+        let claimed = sqlx::query(
+            "UPDATE decisions SET context = json_set(context, '$.archive_consumed', json('true')) \
+             WHERE id = ? AND json_extract(context, '$.archive_consumed') IS NULL",
+        )
+        .bind(d.id)
+        .execute(&st.store.pool)
+        .await?;
+        if claimed.rows_affected() == 0 {
+            return Err(crate::bad_request("this document cleanup approval was already used; ask for a new exact selection"));
+        }
+    }
     let mut text = format!("The user {} decision #{} ({}).", if allow { "allowed" } else { "denied" }, d.id, d.title);
     if allow {
         if c["once"].as_bool() == Some(true) {
             let op = catalog::find(op_name).ok_or_else(|| crate::bad_request("that operation is gone"))?;
             match run(st, op, c["input"].clone(), realm, root).await {
-                Ok(v) => text.push_str(&format!(" {op_name} ran: {}", crate::util_clip(&v.to_string(), 1500))),
-                Err(e) => text.push_str(&format!(" {op_name} failed: {e:#}")),
+                Ok(v) => {
+                    if op_name == "docs.archive_many" {
+                        // Keep the complete skipped-id report on the card
+                        // as well as in the session notification.
+                        // The approved input and candidate list never change.
+                        sqlx::query("UPDATE decisions SET context = json_set(context, '$.archive_result', json(?)) WHERE id = ?")
+                            .bind(v.to_string())
+                            .bind(d.id)
+                            .execute(&st.store.pool)
+                            .await?;
+                    }
+                    let result = if op_name == "docs.archive_many" { v.to_string() } else { crate::util_clip(&v.to_string(), 1500) };
+                    text.push_str(&format!(" {op_name} ran: {result}"));
+                }
+                Err(e) => {
+                    let error = format!("{e:#}");
+                    if op_name == "docs.archive_many" {
+                        // An archived requester cannot receive the notice;
+                        // keep failures readable on its decision as well.
+                        sqlx::query("UPDATE decisions SET context = json_set(context, '$.archive_error', ?) WHERE id = ?")
+                            .bind(&error)
+                            .bind(d.id)
+                            .execute(&st.store.pool)
+                            .await?;
+                    }
+                    text.push_str(&format!(" {op_name} failed: {error}"));
+                }
             }
         } else {
             for t in c["things"].as_array().into_iter().flatten().filter_map(Value::as_str) {
@@ -871,6 +1030,7 @@ mod tests {
         assert_eq!(c("work.add"), Class::Make);
         assert_eq!(c("projects.add"), Class::Make);
         assert_eq!(c("projects.work"), Class::Change);
+        assert_eq!(c("docs.archive_many"), Class::Make);
         assert_eq!(c("work.edit"), Class::Change);
         assert_eq!(c("work.todos.remove"), Class::Delete);
         assert_eq!(c("work.list"), Class::Read);

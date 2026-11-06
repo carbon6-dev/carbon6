@@ -291,6 +291,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/answers/{call_id}", post(answer_question))
         .merge(crate::auth::routes())
         .merge(crate::docs::http::routes())
+        .merge(crate::docs::archive::routes())
         .merge(crate::projects::routes())
         .merge(crate::quotas::routes())
         .merge(crate::decks::routes())
@@ -1300,9 +1301,52 @@ const MAX_TITLE: usize = 120;
 pub(crate) struct UpdateSession {
     title: Option<String>,
     archived: Option<bool>,
+    /// The user's explicit selection from archive-docs. Agents archive
+    /// documents separately, through their document permission gate.
+    #[serde(default)]
+    archive_docs: Vec<String>,
 }
 
-async fn update_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>, Json(req): Json<UpdateSession>) -> ApiResult<StatusCode> {
+async fn update_session(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateSession>,
+) -> ApiResult<StatusCode> {
+    let selected = if req.archive_docs.is_empty() {
+        Vec::new()
+    } else {
+        if crate::agent_ops::actor().is_some() {
+            return Err(crate::forbidden(
+                "archiving a session leaves its documents alone; use docs.archive_many to ask for a document cleanup",
+            )
+            .into());
+        }
+        if req.archived != Some(true) {
+            return Err(crate::bad_request("archive_docs is only a selection for archiving a session").into());
+        }
+        let session = st.store.session(&id).await?.ok_or_else(|| crate::not_found("no such session"))?;
+        if !caller.sees(&session.realm) {
+            return Err(crate::not_found("no such session").into());
+        }
+        let selected = crate::docs::archive::selection(&req.archive_docs)?;
+        let family = crate::docs::archive::family(&st, &id).await?;
+        let pool = crate::docs::pool(&st, &session.realm).await?;
+        // Validate every id before changing either the session or any doc.
+        // Soft-deleted/already archived docs may have changed since the
+        // dialog opened: archive_many skips those without widening it.
+        for doc in &selected {
+            let maker: Option<String> = sqlx::query_scalar("SELECT created_by FROM docs WHERE id = ?")
+                .bind(doc)
+                .fetch_optional(&pool)
+                .await
+                .map_err(anyhow::Error::from)?;
+            if !maker.is_some_and(|by| family.contains(&crate::agent_ops::made_by(&by))) {
+                return Err(crate::bad_request(format!("document {doc} wasn't made by this session or its subagents")).into());
+            }
+        }
+        selected
+    };
     let mut found = true;
     if let Some(t) = req.title.as_deref().map(str::trim) {
         if t.is_empty() {
@@ -1316,7 +1360,42 @@ async fn update_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>
         crate::naming::forget(&st, &id).await?;
     }
     if let Some(a) = req.archived {
-        found &= st.store.set_archived(&id, a).await?;
+        let cleanup = if a && !selected.is_empty() {
+            let realm = crate::realms::of_session(&st, &id).await?.ok_or_else(|| crate::not_found("no such session"))?;
+            let result = crate::docs::archive::archive_many(&st, &realm, &selected, &crate::docs::by_of(&caller)).await?;
+            let failures: Vec<_> = result.skipped.iter().filter(|s| !matches!(s.reason.as_str(), "gone" | "already archived")).collect();
+            if !failures.is_empty() {
+                // Stale selections are harmless, but do not announce that
+                // cleanup succeeded when a document could not be changed.
+                // Earlier successes remain archived and are reported too.
+                return Err(ApiErr(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "Session kept open: some documents could not be archived. Archived ids: {}. Failures: {}",
+                        result.archived.join(", "),
+                        failures.iter().map(|s| format!("{}: {}", s.id, s.reason)).collect::<Vec<_>>().join("; ")
+                    ),
+                ));
+            }
+            Some(result)
+        } else {
+            None
+        };
+        let updated = st.store.set_archived(&id, a).await;
+        if let Some(cleanup) = cleanup {
+            let failure = match &updated {
+                Err(e) => Some(format!("{e:#}")),
+                Ok(false) => Some("no such session".into()),
+                Ok(true) => None,
+            };
+            if let Some(failure) = failure {
+                return Err(ApiErr(
+                    StatusCode::CONFLICT,
+                    format!("Session kept open: could not archive the session: {failure}. Archived ids: {}.", cleanup.archived.join(", ")),
+                ));
+            }
+        }
+        found &= updated?;
         if a && found {
             crate::starts::session_archived(&st, &id).await;
             crate::watchers::session_ended(&st, &id).await;

@@ -206,6 +206,9 @@ pub struct LiveDoc {
     pub kind: String,
     #[serde(default)]
     pub updated_at: UnixMs,
+    /// Still linked, but read-only and hidden from the Docs list by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<UnixMs>,
     /// Comment threads an agent answered that wait for you.
     #[serde(default)]
     pub answered: u32,

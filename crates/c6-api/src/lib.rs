@@ -3,6 +3,7 @@
 
 pub mod citations;
 pub mod docs;
+pub mod docs_archive;
 pub mod labels;
 pub mod marks;
 pub mod projects;

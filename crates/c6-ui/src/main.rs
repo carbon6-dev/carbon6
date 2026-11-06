@@ -47,6 +47,7 @@ mod push;
 mod quota;
 mod search;
 mod session;
+mod session_archive;
 mod session_ring;
 mod sessions;
 mod settings;
@@ -144,6 +145,7 @@ fn Main() -> impl IntoView {
     let ws = workspace::Workspace::restore();
     provide_context(ws);
     util::Notice::provide();
+    session_archive::SessionArchive::provide();
     ws.watch(live);
     notify::watch_sessions(live, ws, labels::use_filter());
     // Needing attention, as the label filter shows it.
@@ -169,6 +171,7 @@ fn Main() -> impl IntoView {
         <div class="c6-app flex h-dvh flex-col overflow-hidden">
             <util::NoticeHost />
             <assistant::AskHost />
+            <session_archive::ArchiveHost />
             <mentions::Peek />
             <header class="hidden h-11 shrink-0 items-center gap-2 border-b border-zinc-200 bg-zinc-50 px-3 md:flex dark:border-zinc-800 dark:bg-zinc-950">
                 <Brand />

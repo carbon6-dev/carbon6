@@ -612,6 +612,30 @@ pub async fn send_queued_now(id: String, command_id: String) -> Result<(), Strin
     empty(Request::post(&format!("/api/v1/sessions/{id}/queue/{command_id}/now")).send().await).await
 }
 
+/// Docs made by this session or its subagents, with reasons to keep each.
+pub use c6_api::docs_archive::ArchiveDocCandidate as SessionArchiveDoc;
+
+pub async fn session_archive_docs(id: String) -> Result<Vec<SessionArchiveDoc>, String> {
+    json(Request::get(&format!("/api/v1/sessions/{id}/archive-docs")).send().await).await
+}
+
+/// One request archives the session and exactly these docs; others stay as they are.
+pub async fn archive_with_docs(id: String, archive_docs: Vec<String>) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct Body {
+        archived: bool,
+        archive_docs: Vec<String>,
+    }
+    empty(
+        Request::patch(&format!("/api/v1/sessions/{id}"))
+            .json(&Body { archived: true, archive_docs })
+            .map_err(|e| e.to_string())?
+            .send()
+            .await,
+    )
+    .await
+}
+
 pub async fn archive(id: String) -> Result<(), String> {
     set_archived(id, true).await
 }
@@ -1650,6 +1674,9 @@ pub async fn work_todo_start(id: String, todo: String) -> Result<c6_api::work::T
 
 pub async fn docs_list(q: &c6_api::docs::DocQuery) -> Result<Vec<c6_api::docs::DocSummary>, String> {
     let mut params = Vec::new();
+    if q.archived {
+        params.push("archived=true".to_owned());
+    }
     for (k, v) in [("kind", &q.kind), ("q", &q.q), ("label", &q.label), ("by", &q.by)] {
         if let Some(v) = v {
             params.push(format!("{k}={}", enc(v)));

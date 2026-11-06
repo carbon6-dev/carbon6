@@ -814,30 +814,14 @@ pub fn GroupBar(grouping: Grouping) -> impl IntoView {
 }
 
 /// A session's menu in a list (its row, a card, the dock): archive it
-/// without opening it, with Undo rather than a question; and what the list
-/// adds (`dismiss`).
+/// without opening it (offering its docs if any, otherwise with Undo);
+/// and what the list adds (`dismiss`).
 #[component]
 pub(crate) fn SessionMenu(id: String, #[prop(optional)] dismiss: Option<Callback<()>>) -> impl IntoView {
-    let notice = crate::util::Notice::get();
+    let archiver = crate::session_archive::SessionArchive::get();
     let id = StoredValue::new(id);
     let archive = Callback::new(move |()| {
-        spawn_local(async move {
-            let sid = id.get_value();
-            match api::set_archived(sid.clone(), true).await {
-                Ok(()) => notice.show(
-                    "Archived",
-                    Some(Callback::new(move |()| {
-                        let sid = sid.clone();
-                        spawn_local(async move {
-                            if let Err(e) = api::set_archived(sid, false).await {
-                                notice.show(format!("Couldn't bring it back: {e}"), None);
-                            }
-                        });
-                    })),
-                ),
-                Err(e) => notice.show(format!("Couldn't archive it: {e}"), None),
-            }
-        });
+        archiver.start(id.get_value());
     });
     let mut items = Vec::new();
     if let Some(d) = dismiss {

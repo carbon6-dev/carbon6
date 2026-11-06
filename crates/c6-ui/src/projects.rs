@@ -900,6 +900,9 @@ fn Documents(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> im
                         <Go to=View::Docs { id: d.doc.clone() } class="min-w-0 flex-1 truncate text-sky-700 hover:underline dark:text-sky-400">
                             {mark}" "{title}
                         </Go>
+                        {d.archived_at.is_some().then(|| view! {
+                            <span class="shrink-0 rounded-full bg-zinc-100 px-2 py-0.5 text-xs text-muted dark:bg-zinc-800">"Archived"</span>
+                        })}
                         <span class="shrink-0 text-xs text-muted">{(d.updated_at > 0).then(|| since(d.updated_at))}</span>
                         <select class="shrink-0 cursor-pointer rounded bg-transparent px-1 text-xs text-muted hover:bg-zinc-200/60 dark:hover:bg-zinc-800"
                             title="Its role in the project" on:change=move |ev| set_role(doc.clone(), event_target_value(&ev))>

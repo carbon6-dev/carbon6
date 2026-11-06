@@ -72,6 +72,9 @@ pub(crate) fn reload_quietly(tick: RwSignal<u32>) {
     let due = StoredValue::new(false);
     Effect::new(move |seen: Option<()>| {
         live.sessions.track();
+        // Work/project references and their attention state also change
+        // when a linked doc is archived or unarchived in another tile.
+        live.doc.track();
         if seen.is_some() {
             later(due, tick);
         }
@@ -335,6 +338,10 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
         }
         format!("{} {}", parts.join(" · "), if d.answered_via.is_empty() { String::new() } else { format!("(via {})", d.answered_via) })
     });
+    let archive_docs = (d.context["op"] == "docs.archive_many")
+        .then(|| serde_json::from_value::<Vec<c6_api::docs_archive::ArchiveDocCandidate>>(d.context["archive_docs"].clone()).ok())
+        .flatten();
+    let cleanup = archive_docs.is_some();
     view! {
         <section id=card_id(id) class=format!("space-y-2 rounded-lg border p-3 {tone}")>
             <div class="flex flex-wrap items-center gap-2">
@@ -344,7 +351,13 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
                 {(d.count > 1).then(|| view! { <span class="text-xs text-muted">{format!("raised {}×", d.count)}</span> })}
                 <span class="text-xs text-muted">{ago(now_ms() - d.updated_at)}</span>
             </div>
-            {(!d.document.is_empty()).then(|| view! { <div class="md text-sm text-zinc-700 dark:text-zinc-300" on:click=crate::mentions::link_clicks() inner_html=crate::markdown::to_html(&d.document)></div> })}
+            {archive_docs.map(|docs| view! {
+                <div on:click=crate::mentions::link_clicks()>
+                    {archive_cleanup_body(docs, d.context["reason"].as_str().unwrap_or("").to_owned(), d.realm.clone())}
+                    {archive_cleanup_outcome(d.context.clone(), d.realm.clone())}
+                </div>
+            })}
+            {(!cleanup && !d.document.is_empty()).then(|| view! { <div class="md text-sm text-zinc-700 dark:text-zinc-300" on:click=crate::mentions::link_clicks() inner_html=crate::markdown::to_html(&d.document)></div> })}
             // A task card: exactly what the new session would be told.
             {(d.kind == "task").then(|| d.context["prompt"].as_str().map(str::to_owned)).flatten().map(|p| view! {
                 <details class="text-xs">
@@ -389,13 +402,14 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
                     {d.options.iter().map(|o| {
                         let label = o.label.clone();
                         view! {
-                            <button class=BUTTON title=o.does.clone() disabled=move || busy.get() on:click=move |_| answer(Some(label.clone()))>{o.label.clone()}</button>
+                            <button class=if cleanup { format!("{BUTTON} min-h-11") } else { BUTTON.to_owned() }
+                                title=o.does.clone() disabled=move || busy.get() on:click=move |_| answer(Some(label.clone()))>{o.label.clone()}</button>
                         }
                     }).collect_view()}
                     {(d.options.is_empty()).then(|| view! {
                         <button class=BUTTON disabled=move || busy.get() on:click=move |_| answer(None)>{if has_form { "Send" } else { "Settled" }}</button>
                     })}
-                    {(!d.waiting && d.kind != "task").then(|| view! {
+                    {(!cleanup && !d.waiting && d.kind != "task").then(|| view! {
                         <button class=BUTTON_QUIET disabled=move || busy.get() on:click=start title="A session that helps you settle it, with its context">"Work on it"</button>
                         <button class=BUTTON_QUIET on:click=move |_| set(json!({"state": "snoozed", "snooze_until": now_ms() + 86_400_000}))>"Tomorrow"</button>
                         <button class=format!("{BUTTON_QUIET} text-muted") on:click=move |_| set(json!({"state": "dismissed"}))>"Dismiss"</button>
@@ -404,6 +418,68 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
             }.into_any() })}
             {(!open && d.state == "dismissed").then(|| view! { <button class=BUTTON_QUIET on:click=move |_| set(json!({"state": "open"}))>"Reopen"</button> })}
         </section>
+    }
+}
+
+/// The approval's frozen selection, not a fresh query. Keep only the list
+/// scrollable so the question and the answer buttons remain reachable.
+fn archive_cleanup_body(docs: Vec<c6_api::docs_archive::ArchiveDocCandidate>, reason: String, realm: String) -> impl IntoView {
+    view! {
+        <div class="space-y-2 text-sm">
+            <p>{format!("{} documents. {}", docs.len(), reason)}</p>
+            <div class="max-h-64 overflow-y-auto rounded-md border border-zinc-200 dark:border-zinc-800"
+                role="region" aria-label="Documents to archive" tabindex="0">
+                <ul class="divide-y divide-zinc-200 dark:divide-zinc-800">
+                    {docs.into_iter().map(|doc| {
+                        let href = format!("/r/{realm}/docs/{}", doc.id);
+                        view! {
+                            <li class="min-h-11 space-y-1 px-3 py-2">
+                                <a href=href class="block break-words font-medium text-sky-700 hover:underline dark:text-sky-400">{doc.title}</a>
+                                {if doc.reasons.is_empty() {
+                                    view! { <p class="text-xs text-muted">"Not used anywhere else"</p> }.into_any()
+                                } else {
+                                    view! { <p class="break-words text-xs text-amber-700 dark:text-amber-400">{doc.reasons.join("; ")}</p> }.into_any()
+                                }}
+                            </li>
+                        }
+                    }).collect_view()}
+                </ul>
+            </div>
+            <p class="text-xs text-muted">"Allow archives only these documents, once. Gone or already archived docs are skipped and reported. Not now archives nothing. No ongoing permission is granted."</p>
+        </div>
+    }
+}
+
+/// Keep the execution report on the saved card, even when the asking session
+/// was archived and correctly refuses the usual result notification.
+fn archive_cleanup_outcome(context: serde_json::Value, realm: String) -> impl IntoView {
+    let result = serde_json::from_value::<c6_api::docs_archive::ArchiveDocsResult>(context["archive_result"].clone()).ok();
+    let error = context["archive_error"].as_str().map(str::to_owned);
+    let docs =
+        serde_json::from_value::<Vec<c6_api::docs_archive::ArchiveDocCandidate>>(context["archive_docs"].clone()).unwrap_or_default();
+    view! {
+        {result.map(|result| {
+            let summary = format!("Cleanup result: {} archived; {} not archived.", result.archived.len(), result.skipped.len());
+            let rows = result.archived.into_iter().map(|id| (id, "Archived".to_owned()))
+                .chain(result.skipped.into_iter().map(|doc| (doc.id, doc.reason)));
+            view! {
+                <div class="mt-3 space-y-2 text-sm" role="status">
+                    <p class="font-medium">{summary}</p>
+                    <ul class="max-h-64 space-y-1 overflow-y-auto" aria-label="Document cleanup results" tabindex="0">
+                        {rows.map(|(id, outcome)| {
+                            let title = docs.iter().find(|doc| doc.id == id).map(|doc| doc.title.clone()).unwrap_or_else(|| id.clone());
+                            view! {
+                                <li class="break-words">
+                                    <a href=format!("/r/{realm}/docs/{id}") class="text-sky-700 hover:underline dark:text-sky-400">{title}</a>
+                                    {format!(": {outcome}")}
+                                </li>
+                            }
+                        }).collect_view()}
+                    </ul>
+                </div>
+            }
+        })}
+        {error.map(|message| view! { <div class="mt-3"><ErrorBox message=format!("Document cleanup failed: {message}") /></div> })}
     }
 }
 
@@ -654,6 +730,82 @@ pub fn FactRow(f: c6_api::Fact, on_change: Callback<()>) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_approval_keeps_the_exact_linked_selection_scrollable_and_explains_its_limits() {
+        let owner = Owner::new();
+        let html = owner.with(|| {
+            untrack(|| {
+                archive_cleanup_body(
+                    vec![
+                        c6_api::docs_archive::ArchiveDocCandidate {
+                            id: "first".into(),
+                            title: "A draft <not markup>".into(),
+                            ..Default::default()
+                        },
+                        c6_api::docs_archive::ArchiveDocCandidate {
+                            id: "second".into(),
+                            title: "The plan".into(),
+                            reasons: vec!["Open work refers to it".into(), "You wrote in it".into()],
+                            ..Default::default()
+                        },
+                    ],
+                    "Finished drafts".into(),
+                    "home".into(),
+                )
+                .to_html()
+            })
+        });
+        assert!(html.contains("2 documents. Finished drafts"));
+        assert!(html.contains("max-h-64 overflow-y-auto"));
+        assert!(html.contains("aria-label=\"Documents to archive\""));
+        assert_eq!(html.matches("<li ").count(), 2);
+        assert!(html.contains("href=\"/r/home/docs/first\""));
+        assert!(html.contains("href=\"/r/home/docs/second\""));
+        assert!(html.contains("A draft &lt;not markup&gt;"));
+        assert!(html.contains("Open work refers to it; You wrote in it"));
+        assert!(html.contains("Not used anywhere else"));
+        assert!(html.contains("Not now archives nothing"));
+        assert!(html.contains("No ongoing permission is granted"));
+        assert!(!html.contains("checkbox"));
+    }
+
+    #[test]
+    fn cleanup_outcome_keeps_successes_skips_and_failures_visible_on_the_saved_card() {
+        let owner = Owner::new();
+        let html = owner.with(|| {
+            archive_cleanup_outcome(
+                json!({
+                    "archive_docs": [{"id": "first", "title": "Draft <one>", "kind": "doc", "reasons": []}],
+                    "archive_result": {
+                        "archived": ["first"],
+                        "skipped": [{"id": "gone", "reason": "gone"}, {"id": "broken", "reason": "database write failed <details>"}]
+                    }
+                }),
+                "home".into(),
+            )
+            .to_html()
+        });
+        assert!(html.contains("Cleanup result: 1 archived; 2 not archived."));
+        assert!(html.contains("aria-label=\"Document cleanup results\""));
+        assert!(html.contains("href=\"/r/home/docs/first\""));
+        assert!(html.contains("Draft &lt;one&gt;"));
+        assert!(html.contains(": Archived"));
+        assert!(html.contains(": gone"));
+        assert!(html.contains("database write failed &lt;details&gt;"));
+    }
+
+    #[test]
+    fn cleanup_outcome_renders_top_level_errors_but_no_report_before_execution() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let html = archive_cleanup_outcome(json!({"archive_error": "Realm unavailable <home>"}), "home".into()).to_html();
+            assert!(html.contains("Document cleanup failed: Realm unavailable &lt;home&gt;"));
+            let pending = archive_cleanup_outcome(json!({}), "home".into()).to_html();
+            assert!(!pending.contains("Cleanup result:"));
+            assert!(!pending.contains("Document cleanup failed:"));
+        });
+    }
 
     #[test]
     fn waiting_heading_requires_a_non_task_decision_in_the_session() {

@@ -222,6 +222,12 @@ pub async fn open_count(st: &HeadState, caller: &Caller) -> anyhow::Result<i64> 
 pub async fn edit(st: &HeadState, id: i64, e: &api::DecisionEdit) -> anyhow::Result<api::Decision> {
     let mut d = get(st, id).await?.ok_or_else(|| not_found("no such decision"))?;
     if let Some(s) = &e.state {
+        if matches!(s.as_str(), "open" | "snoozed")
+            && d.context["op"] == "docs.archive_many"
+            && (d.state == "answered" || !d.context["archive_consumed"].is_null())
+        {
+            return Err(bad_request("a document cleanup approval is one-use and cannot be reopened; ask for a new exact selection"));
+        }
         if !matches!(s.as_str(), "open" | "snoozed" | "dismissed") {
             return Err(bad_request("a decision is opened, snoozed or dismissed here; answer it with …/answer"));
         }

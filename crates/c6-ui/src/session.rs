@@ -1371,6 +1371,7 @@ pub fn SessionMenu(chrome: SessionChrome, #[prop(into)] on_rename: Callback<()>,
     let live = api::live();
     let session = move || live.session(&id.get_value()).or_else(|| detail.get().and_then(Result::ok).map(|d| d.session));
     let archive_error = RwSignal::new(None::<String>);
+    let archiver = crate::session_archive::SessionArchive::get();
     // Its catch-up card and folding its finished turns, on or off (kept on
     // the head). The switch moves once the head has it.
     let cards = crate::catchup::cards();
@@ -1446,8 +1447,13 @@ pub fn SessionMenu(chrome: SessionChrome, #[prop(into)] on_rename: Callback<()>,
             <button class=format!("{MENU_ITEM} text-red-600 dark:text-red-400") title="Archive or unarchive the session without closing this tile" on:click=move |_| {
                 let archived = session().is_some_and(|s| s.archived);
                 let sid = id.get_value();
+                if !archived {
+                    archiver.start(sid);
+                    on_done.run(());
+                    return;
+                }
                 spawn_local(async move {
-                    match api::set_archived(sid.clone(), !archived).await {
+                    match api::set_archived(sid.clone(), false).await {
                         Ok(()) => {
                             if let Ok(d) = api::session(sid).await { live.remember_session(d.session); }
                             on_done.try_run(());

@@ -83,21 +83,23 @@ fn FromSession(id: String) -> impl IntoView {
     }
 }
 
-/// A session's title for `session:<id>`, from the live feed.
-fn author_named(by: &str) -> String {
-    if let Some(id) = by.strip_prefix("session:") {
-        // Untracked: called while the document draws, it must not make
-        // the whole document redraw (dropping an open comment box and
-        // what's typed in it) whenever any session changes.
-        let live = api::live();
-        let title = live.sessions.with_untracked(|ss| ss.iter().find(|s| s.id == id).map(|s| s.title.clone()));
-        return match title.filter(|t| !t.trim().is_empty()) {
-            Some(t) if t.chars().count() > 32 => format!("session {}…", t.chars().take(30).collect::<String>().trim_end()),
-            Some(t) => format!("session {t}"),
-            None => "a session".into(),
-        };
+/// Capture the live feed when the component is made, not while its async
+/// list or history renders: delayed rendering needn't have a context owner.
+fn author_names() -> impl Fn(&str) -> String + Copy {
+    let live = use_context::<api::LiveFeed>();
+    move |by| {
+        if let Some(id) = by.strip_prefix("session:") {
+            // Untracked: a session update mustn't redraw an open editor.
+            let title =
+                live.and_then(|l| l.sessions.try_with_untracked(|ss| ss.iter().find(|s| s.id == id).map(|s| s.title.clone())).flatten());
+            return match title.filter(|t| !t.trim().is_empty()) {
+                Some(t) if t.chars().count() > 32 => format!("session {}…", t.chars().take(30).collect::<String>().trim_end()),
+                Some(t) => format!("session {t}"),
+                None => "a session".into(),
+            };
+        }
+        author(by)
     }
-    author(by)
 }
 
 fn kind_mark(kind: &str) -> AnyView {
@@ -132,6 +134,7 @@ struct ChipCtx {
     refs: RwSignal<std::collections::HashMap<String, c6_api::work::LiveAttached>>,
     editing: RwSignal<Option<(String, String, Value)>>,
     send: StoredValue<Box<dyn Fn(Vec<DocOp>) + Send + Sync>>,
+    archived: Memo<bool>,
 }
 
 fn esc(s: &str) -> String {
@@ -141,7 +144,7 @@ fn esc(s: &str) -> String {
 /// A block's Markdown as HTML with its chips as small widgets (docs/docs.md
 /// §3): a date and a dropdown you click to change, a mention, and a ref
 /// with the thing's title and state as they are now.
-fn chips_html(text: &str, attrs: &Value, refs: &std::collections::HashMap<String, c6_api::work::LiveAttached>) -> String {
+fn chips_html(text: &str, attrs: &Value, refs: &std::collections::HashMap<String, c6_api::work::LiveAttached>, archived: bool) -> String {
     let chips = attrs.get("chips").and_then(Value::as_object);
     let mut md = String::with_capacity(text.len());
     let mut shown = Vec::new();
@@ -154,9 +157,10 @@ fn chips_html(text: &str, attrs: &Value, refs: &std::collections::HashMap<String
         let v = chips.and_then(|c| c.get(key)).cloned().unwrap_or(Value::Null);
         let s = |k: &str| v[k].as_str().unwrap_or("").to_owned();
         const CHIP: &str = "mx-0.5 rounded px-1 py-px text-[0.92em]";
+        let disabled = if archived { " disabled aria-disabled=\"true\"" } else { "" };
         let html = match v["type"].as_str().unwrap_or("") {
             "date" => format!(
-                "<button type=\"button\" data-chip=\"{}\" title=\"A date: click to change it\" class=\"{CHIP} bg-sky-50 text-sky-800 hover:bg-sky-100 dark:bg-sky-950/40 dark:text-sky-300\">{} {}</button>",
+                "<button type=\"button\"{disabled} data-chip=\"{}\" title=\"A date\" class=\"{CHIP} bg-sky-50 text-sky-800 enabled:hover:bg-sky-100 dark:bg-sky-950/40 dark:text-sky-300\">{} {}</button>",
                 esc(key),
                 crate::icons::html::calendar(),
                 esc(&s("value"))
@@ -166,7 +170,7 @@ fn chips_html(text: &str, attrs: &Value, refs: &std::collections::HashMap<String
                 esc(&if s("name").is_empty() { s("user") } else { s("name") })
             ),
             "dropdown" => format!(
-                "<button type=\"button\" data-chip=\"{}\" title=\"Pick another\" class=\"{CHIP} bg-zinc-100 text-zinc-800 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-200\">{} {}</button>",
+                "<button type=\"button\"{disabled} data-chip=\"{}\" title=\"Pick another\" class=\"{CHIP} bg-zinc-100 text-zinc-800 enabled:hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-200\">{} {}</button>",
                 esc(key),
                 esc(&s("value")),
                 crate::icons::html::chevron_down()
@@ -188,7 +192,10 @@ fn chips_html(text: &str, attrs: &Value, refs: &std::collections::HashMap<String
                     if state.is_empty() {
                         String::new()
                     } else {
-                        format!(" <span class=\"text-[10px] uppercase tracking-wide opacity-70\">{}</span>", esc(&state.replace('_', " ")))
+                        format!(
+                            " <span class=\"text-[10px] uppercase tracking-wide opacity-70\">{}</span>",
+                            esc(&if state == "archived" { "Archived".into() } else { state.replace('_', " ") })
+                        )
                     }
                 )
             }
@@ -275,6 +282,9 @@ fn chip_clicked(
                 None => ws.open(None, to, how),
             }
         }
+        return true;
+    }
+    if ctx.archived.get_untracked() {
         return true;
     }
     let key = el.get_attribute("data-chip").unwrap_or_default();
@@ -560,24 +570,67 @@ fn EmbedView(name: String) -> impl IntoView {
 
 // --- The list ---------------------------------------------------------------
 
+/// Kept local until the shared base has a switch. The label stays at the
+/// left edge of the row, including on a phone.
+#[component]
+fn ArchiveSwitch(checked: RwSignal<bool>) -> impl IntoView {
+    view! {
+        <button type="button" role="switch" aria-label="Show archived" aria-checked=move || checked.get().to_string()
+            class="flex min-h-11 w-full items-center justify-between gap-3 text-left text-sm text-soft"
+            on:click=move |_| checked.update(|on| *on = !*on)>
+            <span>"Show archived"</span>
+            <span aria-hidden="true"
+                class=move || format!("relative h-6 w-10 shrink-0 rounded-full transition-colors {}", if checked.get() { "bg-sky-600" } else { "bg-zinc-300 dark:bg-zinc-700" })
+            >
+                <span class=move || format!("absolute top-1 size-4 rounded-full bg-white transition-transform {}", if checked.get() { "left-1 translate-x-4" } else { "left-1" })></span>
+            </span>
+        </button>
+    }
+}
+
+#[component]
+fn ArchivedPill(archived: bool) -> impl IntoView {
+    archived.then(|| {
+        view! {
+            <span class="shrink-0 rounded-full bg-zinc-100 px-2 py-0.5 text-[11px] text-muted dark:bg-zinc-800">"Archived"</span>
+        }
+    })
+}
+
+#[component]
+fn DocListTitle(summary: DocSummary) -> impl IntoView {
+    view! {
+        <span class="shrink-0 text-muted" title=summary.kind.clone()>{kind_mark(&summary.kind)}</span>
+        <span class="min-w-0 flex-1 truncate font-medium">{summary.title}</span>
+        <ArchivedPill archived=summary.archived_at.is_some() />
+    }
+}
+
+fn list_query(kind: String, q: String, label: String, by: String, archived: bool) -> DocQuery {
+    DocQuery {
+        kind: Some(kind).filter(|s| !s.is_empty()),
+        q: Some(q).filter(|s| !s.trim().is_empty()),
+        label: Some(label).filter(|s| !s.trim().is_empty()),
+        by: Some(by).filter(|s| !s.is_empty()),
+        archived,
+        ..Default::default()
+    }
+}
+
 #[component]
 pub fn DocsPage() -> impl IntoView {
+    let author_named = author_names();
     let tick = RwSignal::new(0u32);
     reload_on_change(tick, None);
     let kind = RwSignal::new(String::new());
     let q = RwSignal::new(String::new());
     let label = RwSignal::new(String::new());
     let by = RwSignal::new(String::new());
+    let archived = RwSignal::new(false);
     let list = LocalResource::new(move || {
         tick.track();
         api::realm().track();
-        let query = DocQuery {
-            kind: Some(kind.get()).filter(|k| !k.is_empty()),
-            q: Some(q.get()).filter(|k| !k.trim().is_empty()),
-            label: Some(label.get()).filter(|k| !k.trim().is_empty()),
-            by: Some(by.get()).filter(|k| !k.is_empty()),
-            ..Default::default()
-        };
+        let query = list_query(kind.get(), q.get(), label.get(), by.get(), archived.get());
         async move { api::docs_list(&query).await }
     });
     let shown = RwSignal::new(None::<Result<Vec<DocSummary>, String>>);
@@ -679,6 +732,7 @@ pub fn DocsPage() -> impl IntoView {
                     <option value="assistant">"The assistant"</option>
                 </select>
             </div>
+            <ArchiveSwitch checked=archived />
             {move || match shown.get() {
                 None => view! { <p class="text-sm text-muted">"Loading…"</p> }.into_any(),
                 Some(Err(e)) => view! { <ErrorBox message=e /> }.into_any(),
@@ -697,9 +751,8 @@ pub fn DocsPage() -> impl IntoView {
                                         ev.prevent_default();
                                         open_doc.with_value(|f| f(id.clone(), How::from_mouse(&ev)));
                                     }>
-                                    <span class="shrink-0 text-muted" title=d.kind.clone()>{kind_mark(&d.kind)}</span>
-                                    <span class="min-w-0 flex-1 truncate font-medium">{d.title.clone()}</span>
-                                    {(d.pending > 0).then(|| view! {
+                                    <DocListTitle summary=d.clone() />
+                                    {(d.archived_at.is_none() && d.pending > 0).then(|| view! {
                                         <span class="shrink-0 rounded bg-violet-100 px-1.5 text-[11px] text-violet-800 dark:bg-violet-900/40 dark:text-violet-300"
                                             title=format!("Still being written by {}", d.writers.iter().map(|w| author_named(w)).collect::<Vec<_>>().join(", "))>
                                             {crate::icons::icon(crate::icons::Icon::PenLine, crate::icons::Size::S14)}" "{format!("{} to write", d.pending)}
@@ -738,6 +791,69 @@ const DOCKED_FROM: f64 = 1120.0;
 
 /// A button in the doc's bar.
 const BAR: &str = "shrink-0 rounded-md px-2 py-1 text-sm text-soft hover:bg-zinc-100 dark:hover:bg-zinc-800";
+
+#[derive(Clone, Copy)]
+struct ReadOnly(Memo<bool>);
+
+fn read_only() -> Memo<bool> {
+    use_context::<ReadOnly>().map(|r| r.0).unwrap_or_else(|| Memo::new(|_| false))
+}
+
+#[component]
+fn ArchivedBanner(unarchive: Callback<()>, busy: RwSignal<bool>) -> impl IntoView {
+    view! {
+        <div role="status" class="flex min-h-11 items-center gap-2 rounded-lg bg-zinc-100 px-3 py-2 text-sm text-muted dark:bg-zinc-900">
+            {crate::icons::icon(crate::icons::Icon::Archive, crate::icons::Size::S16)}
+            <span class="flex-1">"Archived. Read-only."</span>
+            <button class=BUTTON_QUIET disabled=move || busy.get() on:click=move |_| unarchive.run(())>"Unarchive"</button>
+        </div>
+    }
+}
+
+#[component]
+fn ArchiveMenuItem(archived: bool, run: Callback<()>, busy: RwSignal<bool>) -> impl IntoView {
+    view! {
+        <button role="menuitem" class="flex min-h-11 w-full items-center gap-2 px-4 text-left hover:bg-zinc-100 disabled:opacity-50 dark:hover:bg-zinc-800"
+            disabled=move || busy.get() on:click=move |_| run.run(())>
+            {if archived { crate::icons::icon(crate::icons::Icon::ArchiveRestore, crate::icons::Size::S16).into_any() } else { crate::icons::icon(crate::icons::Icon::Archive, crate::icons::Size::S16).into_any() }}
+            {if archived { "Unarchive" } else { "Archive" }}
+        </button>
+    }
+}
+
+/// The shared text-only menu cannot carry the Archive/Unarchive SVGs.
+#[component]
+fn DocMenu(
+    archived: Memo<bool>,
+    busy: RwSignal<bool>,
+    archive: Callback<()>,
+    export: Callback<()>,
+    history: Callback<()>,
+) -> impl IntoView {
+    let open = RwSignal::new(false);
+    let pop = crate::util::dismissable(
+        move || open.get(),
+        move || {
+            open.set(false);
+        },
+    );
+    view! {
+        <div class="relative shrink-0">
+            <button class="flex h-11 w-11 items-center justify-center rounded-md text-muted hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                title="Document actions" aria-label="Document actions" aria-haspopup="menu" aria-expanded=move || open.get().to_string()
+                data-pop=pop.clone() on:click=move |_| open.update(|o| *o = !*o)>{crate::icons::ellipsis()}</button>
+            {move || open.get().then(|| view! {
+                <div role="menu" data-pop=pop.clone() class="absolute right-0 z-50 min-w-40 rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
+                    <button role="menuitem" class="flex min-h-11 w-full items-center px-4 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                        on:click=move |_| { open.set(false); export.run(()); }>"Export…"</button>
+                    <button role="menuitem" class="flex min-h-11 w-full items-center px-4 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                        on:click=move |_| { open.set(false); history.run(()); }>"History"</button>
+                    {move || view! { <ArchiveMenuItem archived=archived.get() busy run=Callback::new(move |()| { open.set(false); archive.run(()); }) /> }}
+                </div>
+            })}
+        </div>
+    }
+}
 
 /// A doc's comments, shared by its bar, its blocks (each marks its own),
 /// the popover by a block and the panel: the threads as last loaded, and
@@ -1005,6 +1121,7 @@ fn dismiss(node: NodeRef<leptos::html::Div>, keep: &'static str, close: impl Fn(
 /// popover by each block's 💬.
 #[component]
 pub fn DocPage(id: String) -> impl IntoView {
+    let author_named = author_names();
     let id = StoredValue::new(id);
     let tick = RwSignal::new(0u32);
     reload_on_change(tick, Some(id.get_value()));
@@ -1039,6 +1156,8 @@ pub fn DocPage(id: String) -> impl IntoView {
     });
     let shown_doc = Memo::new(move |_| doc.with(|d| d.as_ref().and_then(|r| r.as_ref().ok()).cloned()));
     let summary = Memo::new(move |_| shown_doc.with(|d| d.as_ref().map(|d| d.summary.clone()).unwrap_or_default()));
+    let archived = Memo::new(move |_| summary.with(|s| s.archived_at.is_some()));
+    provide_context(ReadOnly(archived));
     let tabs = Memo::new(move |_| shown_doc.with(|d| d.as_ref().map(|d| d.tabs.clone()).unwrap_or_default()));
     let tab_names = Memo::new(move |_| tabs.with(|ts| ts.iter().map(|t| (t.id.clone(), t.title.clone())).collect::<Vec<_>>()));
     let tab = RwSignal::new(String::new());
@@ -1066,6 +1185,9 @@ pub fn DocPage(id: String) -> impl IntoView {
     let reload = move || tick.update(|t| *t += 1);
     let reload_cb = Callback::new(move |()| reload());
     let send = move |ops: Vec<DocOp>| {
+        if archived.get_untracked() {
+            return;
+        }
         spawn_local(async move {
             match api::doc_ops(id.get_value(), &DocBatch { ops, answering: String::new() }).await {
                 Ok(_) => reload(),
@@ -1084,9 +1206,12 @@ pub fn DocPage(id: String) -> impl IntoView {
         refs: RwSignal::new(Default::default()),
         editing: RwSignal::new(None),
         send: StoredValue::new(Box::new(move |ops: Vec<DocOp>| send.with_value(|f| f(ops)))),
+        archived,
     };
     provide_context(chip_ctx);
+    let doc_changes = api::live().doc;
     Effect::new(move || {
+        doc_changes.track();
         let Some(d) = shown_doc.get() else { return };
         let refs = ref_chips(&d);
         if refs.is_empty() {
@@ -1127,6 +1252,9 @@ pub fn DocPage(id: String) -> impl IntoView {
     let open_n = Memo::new(move |_| shown_threads.with(|ts| ts.iter().filter(|t| t.state == "open").count()));
     let sending = RwSignal::new(false);
     let send_all = Callback::new(move |()| {
+        if archived.get_untracked() {
+            return;
+        }
         sending.set(true);
         spawn_local(async move {
             match api::doc_threads_send(id.get_value(), Vec::new()).await {
@@ -1153,6 +1281,17 @@ pub fn DocPage(id: String) -> impl IntoView {
         send_all,
     };
     provide_context(threads);
+    // Archiving elsewhere must close editors without blur-saving a late write.
+    Effect::new(move || {
+        if archived.get() {
+            edit.set(None);
+            edit_all.set(false);
+            renaming.set(false);
+            adding_open.set(false);
+            chip_ctx.editing.set(None);
+            threads.commenting.set(None);
+        }
+    });
     let loaded_threads = LocalResource::new(move || {
         tick.track();
         api::doc_threads(id.get_value())
@@ -1250,6 +1389,9 @@ pub fn DocPage(id: String) -> impl IntoView {
 
     let attaching = RwSignal::new(false);
     let attach_file = move |ev: leptos::ev::Event| {
+        if archived.get_untracked() {
+            return;
+        }
         use wasm_bindgen::JsCast;
         let Some(input) = ev.target().and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok()) else { return };
         let Some(file) = input.files().and_then(|f| f.get(0)) else { return };
@@ -1324,19 +1466,25 @@ pub fn DocPage(id: String) -> impl IntoView {
         out
     });
     let rename = move || {
+        if archived.get_untracked() {
+            return;
+        }
         let t = title.get_untracked();
         renaming.set(false);
         if t.trim().is_empty() {
             return;
         }
         spawn_local(async move {
-            match api::doc_patch(id.get_value(), &DocPatch { title: Some(t), labels: None }).await {
+            match api::doc_patch(id.get_value(), &DocPatch { title: Some(t), ..Default::default() }).await {
                 Ok(d) => doc.set(Some(Ok(d))),
                 Err(e) => error.set(Some(e)),
             }
         });
     };
     let add_block = move || {
+        if archived.get_untracked() {
+            return;
+        }
         let md = adding.get_untracked();
         if md.trim().is_empty() {
             return;
@@ -1369,10 +1517,13 @@ pub fn DocPage(id: String) -> impl IntoView {
         }
     });
     let toggle_edit = move |_| {
+        if archived.get_untracked() {
+            return;
+        }
         if edit_all.get_untracked() {
             edit_all.set(false);
             adding_open.set(false);
-            save(id.get_value(), edit, draft, false, error, reload);
+            save(id.get_value(), edit, draft, false, error, archived, reload);
         } else {
             edit_all.set(true);
         }
@@ -1391,14 +1542,29 @@ pub fn DocPage(id: String) -> impl IntoView {
         bs
     });
     let empty = Memo::new(move |_| blocks.with(Vec::is_empty));
-    let show_add = Memo::new(move |_| !is_deck.get() && (edit_all.get() || empty.get()));
+    let show_add = Memo::new(move |_| !archived.get() && !is_deck.get() && (edit_all.get() || empty.get()));
+    let archive_busy = RwSignal::new(false);
+    let archive = Callback::new(move |()| {
+        if archive_busy.get_untracked() {
+            return;
+        }
+        let next = !archived.get_untracked();
+        archive_busy.set(true);
+        spawn_local(async move {
+            match api::doc_patch(id.get_value(), &DocPatch { archived: Some(next), ..Default::default() }).await {
+                Ok(d) => doc.set(Some(Ok(d))),
+                Err(e) => error.set(Some(e)),
+            }
+            archive_busy.set(false);
+        });
+    });
 
     let bar = move || {
         view! {
             <div class="sticky top-0 z-20 border-b border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950">
                 <div class="mx-auto flex max-w-3xl flex-wrap items-center gap-1 px-4 py-1">
                     <span class="shrink-0 text-muted" title=move || summary.with(|s| s.kind.clone())>{move || summary.with(|s| kind_mark(&s.kind))}</span>
-                    {move || if renaming.get() {
+                    {move || if renaming.get() && !archived.get() {
                         view! {
                             <input node_ref=rename_ref class=format!("{INPUT} min-w-0 flex-1 basis-40 font-semibold") prop:value=move || title.get()
                                 on:input=move |ev| title.set(event_target_value(&ev))
@@ -1407,8 +1573,8 @@ pub fn DocPage(id: String) -> impl IntoView {
                         }.into_any()
                     } else {
                         view! {
-                            <h1 class="min-w-0 flex-1 basis-40 cursor-text truncate text-lg font-semibold" title="Click to rename"
-                                on:click=move |_| { title.set(summary.with_untracked(|s| s.title.clone())); renaming.set(true); }>
+                            <h1 class="min-w-0 flex-1 basis-40 truncate text-lg font-semibold" title=move || if archived.get() { "Archived document" } else { "Click to rename" }
+                                on:click=move |_| { if !archived.get_untracked() { title.set(summary.with_untracked(|s| s.title.clone())); renaming.set(true); } }>
                                 {move || summary.with(|s| s.title.clone())}
                             </h1>
                         }.into_any()
@@ -1419,10 +1585,11 @@ pub fn DocPage(id: String) -> impl IntoView {
                         {crate::icons::icon(crate::icons::Icon::MessageSquare, crate::icons::Size::S14)}" "{move || match open_n.get() { 0 => "Comments".to_owned(), n => format!("{n} open") }}
                     </button>
                     // A comment on the whole doc, wherever you've scrolled to.
-                    <button data-opens="comments" class=BAR title="Comment on the whole doc"
+                    <Show when=move || !archived.get()><button data-opens="comments" class=BAR title="Comment on the whole doc"
                         on:click=move |_| { panel.set(true); threads.focus.set(Some(String::new())); threads.commenting.set(Some(String::new())); }>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" Comment"</button>
-                    {move || (unsent.get() > 0).then(|| send_all_button(threads, true))}
-                    {move || (!is_deck.get()).then(|| view! {
+                    </Show>
+                    {move || (!archived.get() && unsent.get() > 0).then(|| send_all_button(threads, true))}
+                    {move || (!archived.get() && !is_deck.get()).then(|| view! {
                         <button class=move || format!("{BAR} {}", if edit_all.get() { "bg-zinc-100 font-medium dark:bg-zinc-800" } else { "" })
                             title=move || if edit_all.get() { "Back to reading" } else { "Edit the doc: a click on a block opens it in Markdown" }
                             on:click=toggle_edit>
@@ -1430,10 +1597,9 @@ pub fn DocPage(id: String) -> impl IntoView {
                         </button>
                     })}
                     <UsedIn items=used />
-                    <crate::util::Menu label="Export and history" items=vec![
-                        ("Export…", Callback::new(move |()| exporting.update(|x| *x = !*x))),
-                        ("History", Callback::new(move |()| history.update(|x| *x = !*x))),
-                    ] />
+                    <DocMenu archived busy=archive_busy archive
+                        export=Callback::new(move |()| exporting.update(|x| *x = !*x))
+                        history=Callback::new(move |()| history.update(|x| *x = !*x)) />
                 </div>
                 {move || floating.get().then(|| view! { <FloatingPanel /> })}
             </div>
@@ -1441,6 +1607,7 @@ pub fn DocPage(id: String) -> impl IntoView {
     };
     let content = move || {
         view! {
+            <Show when=move || archived.get()><ArchivedBanner unarchive=archive busy=archive_busy /></Show>
             <header class="space-y-1">
                 <p class="flex flex-wrap items-center gap-x-1 text-xs text-muted">
                     {move || summary.with(|s| view! {
@@ -1449,7 +1616,7 @@ pub fn DocPage(id: String) -> impl IntoView {
                         {(!s.labels.is_empty()).then(|| format!(" · {}", s.labels.iter().map(|l| format!("#{l}")).collect::<Vec<_>>().join(" ")))}
                     })}
                 </p>
-                {move || summary.with(|s| (s.pending > 0).then(|| view! {
+                {move || summary.with(|s| (s.archived_at.is_none() && s.pending > 0).then(|| view! {
                     <p class="text-sm text-violet-700 dark:text-violet-300">
                         {crate::icons::icon(crate::icons::Icon::PenLine, crate::icons::Size::S14)}" "{format!("Being written by {}: {} {} to go", s.writers.iter().map(|w| author_named(w)).collect::<Vec<_>>().join(", "), s.pending, if s.pending == 1 { "part" } else { "parts" })}
                     </p>
@@ -1471,15 +1638,18 @@ pub fn DocPage(id: String) -> impl IntoView {
             })}
             {move || exporting.get().then(|| view! { <Exports id=id.get_value() kind=summary.with_untracked(|s| s.kind.clone()) /> })}
             {move || history.get().then(|| view! { <History id=id.get_value() reload=reload_cb /> })}
-            {move || is_deck.get().then(|| shown_doc.get().map(|d| view! {
+            {move || (is_deck.get() && !archived.get()).then(|| shown_doc.get().map(|d| view! {
                 <crate::deck::DeckView doc=d send=Callback::new(move |ops: Vec<DocOp>| send.with_value(|f| f(ops))) error picked=deck_pick commenting=threads.commenting />
+            }))}
+            {move || (is_deck.get() && archived.get()).then(|| shown_doc.get().map(|d| view! {
+                <ArchivedDeck doc=d width=Signal::derive(move || (tile_w.get() - 32.0).clamp(160.0, 704.0)) />
             }))}
             {move || (!is_deck.get()).then(|| view! {
                 <article class="space-y-1">
                     <For each=move || drawn.get() key=|b: &DocBlock| (b.id.clone(), b.hash.clone(), b.rev) children=move |b: DocBlock| view! {
                         <BlockView doc_id=id b kind=summary.with_untracked(|s| s.kind.clone()) doc_rev edit draft error reload=reload_cb edit_all />
                     } />
-                    {move || empty.get().then(|| view! { <p class="text-sm text-muted">"Empty: add a block below to start it."</p> })}
+                    {move || empty.get().then(|| view! { <p class="text-sm text-muted">{if archived.get() { "Empty document." } else { "Empty: add a block below to start it." }}</p> })}
                 </article>
             })}
             // The end, in edit mode (or an empty doc): a line that opens
@@ -1668,13 +1838,14 @@ fn Sheet(close: Callback<()>, children: Children) -> impl IntoView {
 #[component]
 fn CommentsPanel() -> impl IntoView {
     let ctx = expect_context::<ThreadsCtx>();
+    let archived = read_only();
     let resolved = RwSignal::new(false);
     let ids = Memo::new(move |_| {
         let resolved = resolved.get();
         ctx.shown.with(|ts| ts.iter().filter(|t| (t.state != "open") == resolved).map(|t| t.id.clone()).collect::<Vec<_>>())
     });
     // A new comment on the tab, or on what has no popover (a slide).
-    let new_on = Memo::new(move |_| ctx.commenting.get().filter(|b| ctx.pop.with(|p| p.as_ref() != Some(b))));
+    let new_on = Memo::new(move |_| ctx.commenting.get().filter(|b| !archived.get() && ctx.pop.with(|p| p.as_ref() != Some(b))));
     let seg = move |on: bool| {
         format!(
             "rounded px-2 py-0.5 {}",
@@ -1692,15 +1863,17 @@ fn CommentsPanel() -> impl IntoView {
                 title="Close" aria-label="Close the comments" on:click=move |_| ctx.panel.set(false)>{crate::icons::icon(crate::icons::Icon::X, crate::icons::Size::S14)}</button>
         </div>
         <div class="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain p-3 text-sm">
+            <Show when=move || !archived.get()>
             <button class="text-xs text-muted hover:text-zinc-900 hover:underline dark:hover:text-zinc-100"
                 on:click=move |_| { ctx.focus.set(Some(String::new())); ctx.commenting.set(Some(String::new())) }>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" On the whole tab"</button>
+            </Show>
             {move || new_on.get().map(|b| view! { <NewComment block=b done=Callback::new(move |()| ctx.commenting.set(None)) /> })}
             <For each=move || ids.get() key=|id| id.clone() children=move |id| view! { <Thread id about=true /> } />
             {move || ids.with(Vec::is_empty).then(|| view! {
                 <p class="text-muted">{if resolved.get() { view! { "No resolved comments." }.into_any() } else { view! { "No open comments. Press "{crate::icons::icon(crate::icons::Icon::MessageSquare, crate::icons::Size::S14)}" by a block to start one." }.into_any() }}</p>
             })}
         </div>
-        {move || (ctx.unsent.get() > 0).then(|| view! {
+        {move || (!archived.get() && ctx.unsent.get() > 0).then(|| view! {
             <div class="flex shrink-0 items-center gap-2 border-t border-zinc-200 px-3 py-2 dark:border-zinc-800">
                 <span class="flex-1 text-xs text-muted">{move || format!("{} not sent yet", ctx.unsent.get())}</span>
                 {send_all_button(ctx, false)}
@@ -1738,6 +1911,7 @@ fn BlockPop(block: String) -> impl IntoView {
 #[component]
 fn PopBody(block: String) -> impl IntoView {
     let ctx = expect_context::<ThreadsCtx>();
+    let archived = read_only();
     let bid = StoredValue::new(block);
     let ids = Memo::new(move |_| {
         ctx.shown.with(|ts| {
@@ -1754,7 +1928,9 @@ fn PopBody(block: String) -> impl IntoView {
                 title="Close" aria-label="Close" on:click=move |_| close.run(())>{crate::icons::icon(crate::icons::Icon::X, crate::icons::Size::S14)}</button>
         </div>
         <For each=move || ids.get() key=|id| id.clone() children=move |id| view! { <Thread id about=false /> } />
-        {move || if writing.get() {
+        {move || if archived.get() {
+            ().into_any()
+        } else if writing.get() {
             view! { <NewComment block=bid.get_value() done=close /> }.into_any()
         } else {
             view! {
@@ -1807,8 +1983,12 @@ fn save(
     draft: Draft,
     keep: bool,
     error: RwSignal<Option<String>>,
+    archived: Memo<bool>,
     reload: impl Fn() + 'static,
 ) {
+    if archived.try_get_untracked() != Some(false) {
+        return;
+    }
     let Some(e) = edit.get_untracked() else { return };
     if !keep {
         edit.set(None);
@@ -1880,6 +2060,8 @@ fn BlockView(
     reload: Callback<()>,
     edit_all: RwSignal<bool>,
 ) -> impl IntoView {
+    let author_named = author_names();
+    let archived = read_only();
     let bid = StoredValue::new(b.id.clone());
     let block = StoredValue::new(b.clone());
     // Its open comment threads: a marker with their count.
@@ -1892,6 +2074,9 @@ fn BlockView(
     let (col, ws) = (use_column(), use_workspace());
     let is_open = Memo::new(move |_| edit.with(|e| e.as_ref().is_some_and(|e| e.id == bid.get_value())));
     let begin = move |text: String| {
+        if archived.get_untracked() {
+            return;
+        }
         let b = block.get_value();
         edit.set(Some(Editing {
             id: b.id.clone(),
@@ -1905,12 +2090,12 @@ fn BlockView(
     };
     let start = move || {
         let b = block.get_value();
-        if b.kind == "pending" || is_open.get_untracked() {
+        if archived.get_untracked() || b.kind == "pending" || is_open.get_untracked() {
             return;
         }
         // Another block being edited is saved first.
         if edit.get_untracked().is_some() {
-            save(doc_id.get_value(), edit, draft, false, error, move || reload.run(()));
+            save(doc_id.get_value(), edit, draft, false, error, archived, move || reload.run(()));
         }
         if b.kind == "slide" || b.kind == "embed" {
             // Its Markdown comes from the head (a slide's header and regions).
@@ -1925,7 +2110,7 @@ fn BlockView(
     };
     let finish = move |keep: bool| {
         if is_open.get_untracked() {
-            save(doc_id.get_value(), edit, draft, keep, error, move || reload.run(()));
+            save(doc_id.get_value(), edit, draft, keep, error, archived, move || reload.run(()));
         }
     };
     let typed = move || {
@@ -1939,7 +2124,7 @@ fn BlockView(
                 if draft.typed.try_get_untracked() == Some(n)
                     && edit.try_with_untracked(|e| e.as_ref().is_some_and(|e| e.id == id)) == Some(true)
                 {
-                    save(doc, edit, draft, true, error, move || {
+                    save(doc, edit, draft, true, error, archived, move || {
                         reload.try_run(());
                     });
                 }
@@ -1955,7 +2140,7 @@ fn BlockView(
     };
     view! {
         <div class="group relative rounded py-0.5 pl-2 pr-14 hover:bg-zinc-50 dark:hover:bg-zinc-900/60" title=hover data-block=b.id.clone()>
-            {move || if is_open.get() {
+            {move || if is_open.get() && !archived.get() {
                 let area = NodeRef::<leptos::html::Textarea>::new();
                 crate::util::autosize(area, move || draft.text.track());
                 Effect::new(move || {
@@ -2009,6 +2194,7 @@ fn BlockView(
             // block is edited by a double-click, or Edit in the doc's bar.
             <div data-marks="" class="absolute right-0.5 top-0.5 flex items-center">
                 {move || match open_n.get() {
+                    0 if archived.get() => ().into_any(),
                     0 => view! {
                         <button class="invisible rounded px-1 text-xs text-muted hover:bg-zinc-100 group-hover:visible pointer-coarse:visible dark:hover:bg-zinc-800"
                             title="Comment on this" aria-label="Comment on this block" on:click=move |ev| marker(ev, true)>{crate::icons::icon(crate::icons::Icon::MessageSquare, crate::icons::Size::S14)}</button>
@@ -2023,9 +2209,44 @@ fn BlockView(
     }
 }
 
+/// Archived decks use the same slide renderer without the sorter's write
+/// controls. All slides and notes remain readable, including hidden slides.
+#[component]
+fn ArchivedDeck(doc: Doc, width: Signal<f64>) -> impl IntoView {
+    use c6_api::slides::{BASE_CSS, default_themes, scoped_theme, slide_html};
+    let id = doc.summary.id.clone();
+    let themes = LocalResource::new(api::deck_themes);
+    let theme = doc.summary.theme.clone();
+    let css = move || {
+        let themes = themes.get().and_then(Result::ok).unwrap_or_else(default_themes);
+        let css = themes.iter().find(|t| t.name.eq_ignore_ascii_case(&theme)).or(themes.first()).map(|t| t.css.as_str()).unwrap_or("");
+        format!("{}{BASE_CSS}", scoped_theme(css, &format!(".c6deck[data-deck=\"{id}\"]")))
+    };
+    let slides: Vec<_> = doc.tabs.into_iter().flat_map(|t| t.blocks).collect();
+    let total = slides.len();
+    view! {
+        <div class="c6deck space-y-4" data-deck=doc.summary.id on:click=crate::mentions::link_clicks()>
+            <style>{css}</style>
+            {slides.into_iter().enumerate().map(|(i, slide)| {
+                let html = slide_html(&slide, i + 1, total, &doc.summary.title, &crate::markdown::to_html);
+                let notes = slide.attrs["notes"].as_str().unwrap_or("").to_owned();
+                view! {
+                    <section data-block=slide.id>
+                        <crate::deck::SlideBox html width />
+                        {(slide.attrs["hidden"] == true).then(|| view! { <p class="text-xs text-muted">"Hidden slide"</p> })}
+                        {(!notes.is_empty()).then(|| view! { <p class="mt-1 whitespace-pre-wrap text-xs text-muted">{format!("Notes: {notes}")}</p> })}
+                    </section>
+                }
+            }).collect_view()}
+        </div>
+    }
+}
+
 /// A block as it reads.
 #[component]
 fn Shown(b: DocBlock, kind: String) -> impl IntoView {
+    let author_named = author_names();
+    let archived = read_only();
     match b.kind.as_str() {
         "pending" => {
             let who = b.attrs["by"].as_str().map(author_named).unwrap_or_else(|| "an agent".into());
@@ -2050,7 +2271,7 @@ fn Shown(b: DocBlock, kind: String) -> impl IntoView {
                         if c.kind == "embed" {
                             view! { <Embed v=c.attrs.clone() /> }.into_any()
                         } else {
-                            view! { <div class="md" inner_html=move || chips_html(&c.text, &c.attrs, &refs.map(|r| r.get()).unwrap_or_default())></div> }.into_any()
+                            view! { <div class="md" inner_html=move || chips_html(&c.text, &c.attrs, &refs.map(|r| r.get()).unwrap_or_default(), archived.get())></div> }.into_any()
                         }
                     }).collect_view()}
                     {(!notes.is_empty()).then(|| view! { <p class="mt-2 border-t border-zinc-100 pt-1 text-xs text-muted dark:border-zinc-900">{format!("Notes: {notes}")}</p> })}
@@ -2062,7 +2283,7 @@ fn Shown(b: DocBlock, kind: String) -> impl IntoView {
         _ => {
             let _ = kind;
             let refs = use_context::<ChipCtx>().map(|c| c.refs);
-            view! { <div class="md" inner_html=move || chips_html(&b.text, &b.attrs, &refs.map(|r| r.get()).unwrap_or_default())></div> }
+            view! { <div class="md" inner_html=move || chips_html(&b.text, &b.attrs, &refs.map(|r| r.get()).unwrap_or_default(), archived.get())></div> }
                 .into_any()
         }
     }
@@ -2265,6 +2486,7 @@ fn About(t: Memo<DocThread>) -> impl IntoView {
 #[component]
 fn NewComment(block: String, done: Callback<()>) -> impl IntoView {
     let ctx = expect_context::<ThreadsCtx>();
+    let archived = read_only();
     let doc = ctx.doc;
     let error = RwSignal::new(None::<String>);
     // Kept as drafts: the box goes when its popover does, and may be
@@ -2295,6 +2517,9 @@ fn NewComment(block: String, done: Callback<()>) -> impl IntoView {
     });
     crate::util::autosize(writing, move || text.track());
     let post = move || {
+        if archived.get_untracked() {
+            return;
+        }
         let (said, quoted) = (text.get_untracked(), quote.get_untracked());
         let t = c6_api::docs::ThreadNew {
             anchor: c6_api::docs::Anchor { block: block.get_value(), quote: quoted.clone(), tab: String::new() },
@@ -2449,6 +2674,7 @@ const COMMENT_TOOL: &str = "rounded px-1.5 leading-none text-muted opacity-60 po
 #[component]
 fn MyComment(c: c6_api::docs::DocComment, thread: String) -> impl IntoView {
     let ctx = expect_context::<ThreadsCtx>();
+    let archived = read_only();
     let (doc, tick) = (ctx.doc, ctx.tick);
     let ids = StoredValue::new((thread, c.id));
     let when = since(c.at).trim_end_matches(" ago").to_owned();
@@ -2481,7 +2707,7 @@ fn MyComment(c: c6_api::docs::DocComment, thread: String) -> impl IntoView {
     };
     let save = move || {
         let said = text.get_untracked();
-        if busy.get_untracked() || said.trim().is_empty() {
+        if archived.get_untracked() || busy.get_untracked() || said.trim().is_empty() {
             return;
         }
         if said.trim() == shown.with_untracked(|s| s.trim().to_owned()) {
@@ -2508,7 +2734,7 @@ fn MyComment(c: c6_api::docs::DocComment, thread: String) -> impl IntoView {
         });
     };
     let delete = move |_| {
-        if busy.get_untracked() {
+        if archived.get_untracked() || busy.get_untracked() {
             return;
         }
         busy.set(true);
@@ -2530,14 +2756,14 @@ fn MyComment(c: c6_api::docs::DocComment, thread: String) -> impl IntoView {
     view! {
         <div class="group/said flex flex-col items-end">
             <div class="mb-0.5 flex items-center gap-0.5 text-xs text-muted">
-                {move || (!editing.get() && !deleting.get()).then(|| view! {
+                {move || (!archived.get() && !editing.get() && !deleting.get()).then(|| view! {
                     <button class=COMMENT_TOOL title="Edit or delete your comment (no agent has it yet)" aria-label="Edit or delete your comment"
                         aria-expanded=move || menu.get().to_string() data-pop=pop.get_value()
                         on:click=move |ev| { ev.stop_propagation(); menu.update(|o| *o = !*o) }>{crate::icons::ellipsis()}</button>
                 })}
                 <span class="ml-1">{format!("You · {when}")}</span>
             </div>
-            {move || if editing.get() {
+            {move || if editing.get() && !archived.get() {
                 view! {
                     <div class="w-full space-y-1">
                         <textarea node_ref=area rows="1" class=format!("{INPUT} {COMMENT_GROWS}") prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev))
@@ -2557,14 +2783,14 @@ fn MyComment(c: c6_api::docs::DocComment, thread: String) -> impl IntoView {
             }}
             // Edit and Delete under the comment, in the thread's own flow: a
             // menu floating over it was cut off by the list's scrolling.
-            {move || (menu.get() && !editing.get() && !deleting.get()).then(|| view! {
+            {move || (!archived.get() && menu.get() && !editing.get() && !deleting.get()).then(|| view! {
                 <div data-pop=pop.get_value() class="mt-1.5 flex gap-3">
                     <button class=SMALL_BUTTON on:click=move |ev| { menu.set(false); edit(ev) }>"Edit"</button>
                     <button class=format!("{SMALL_BUTTON} text-red-700 dark:text-red-400")
                         on:click=move |_| { menu.set(false); error.set(None); deleting.set(true) }>"Delete"</button>
                 </div>
             })}
-            {move || deleting.get().then(|| view! {
+            {move || (!archived.get() && deleting.get()).then(|| view! {
                 <div class="mt-1.5 flex flex-col items-end gap-2">
                     <span class="text-xs text-soft">"Delete this comment?"</span>
                     <div class="flex gap-3">
@@ -2614,6 +2840,7 @@ fn changed_the_doc(ctx: ThreadsCtx, t: &DocThread) -> AnyView {
 #[component]
 fn Thread(id: String, about: bool) -> impl IntoView {
     let ctx = expect_context::<ThreadsCtx>();
+    let archived = read_only();
     let (doc, tick) = (ctx.doc, ctx.tick);
     let tid = StoredValue::new(id);
     let t = Memo::new(move |_| ctx.shown.with(|ts| ts.iter().find(|t| t.id == tid.get_value()).cloned().unwrap_or_default()));
@@ -2634,6 +2861,9 @@ fn Thread(id: String, about: bool) -> impl IntoView {
     };
     // The draft goes as it's sent, and comes back if sending fails.
     let send = move || {
+        if archived.get_untracked() {
+            return;
+        }
         let c = c6_api::docs::CommentNew {
             text: reply.get_untracked(),
             to: if to_agent.get_untracked() { "agent".into() } else { String::new() },
@@ -2654,6 +2884,9 @@ fn Thread(id: String, about: bool) -> impl IntoView {
     };
     // Its last word, yours, hasn't gone to an agent: send it now.
     let send_unsent = move |_| {
+        if archived.get_untracked() {
+            return;
+        }
         spawn_local(async move {
             match api::doc_threads_send(doc.get_value(), vec![tid.get_value()]).await {
                 Ok(_) => {
@@ -2691,7 +2924,7 @@ fn Thread(id: String, about: bool) -> impl IntoView {
                     <div class="flex flex-wrap items-center gap-2 text-xs text-muted">
                         {t.detached.then(|| view! { <span class="rounded bg-zinc-100 px-1 dark:bg-zinc-800" title="What it was about is gone or changed">"detached"</span> })}
                         {waiting.then(|| view! { <AgentOnIt session=t.agent.clone() /> })}
-                        {t.unsent.then(|| view! {
+                        {(!archived.get() && t.unsent).then(|| view! {
                             <button class="rounded-md border border-sky-600 px-2 py-0.5 font-medium text-sky-700 hover:bg-sky-50 pointer-coarse:py-1.5 dark:border-sky-500 dark:text-sky-300 dark:hover:bg-sky-950"
                                 title="Your last comment here hasn't gone to an agent: send the thread now" on:click=send_unsent>"Send now"</button>
                         })}
@@ -2735,6 +2968,7 @@ fn Thread(id: String, about: bool) -> impl IntoView {
                 {changed_after}
             </div>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+            <Show when=move || !archived.get()>
             <div class="relative">
                 <textarea node_ref=area rows="1" class=format!("{INPUT} {COMMENT_GROWS} pr-9") placeholder="Reply…" prop:value=move || reply.get() on:input=move |ev| reply.set(event_target_value(&ev))
                     on:keydown=move |ev| if crate::util::sends(&ev) { ev.prevent_default(); send() }></textarea>
@@ -2750,6 +2984,7 @@ fn Thread(id: String, about: bool) -> impl IntoView {
                     <button class="text-xs text-muted hover:underline" on:click=move |_| spawn_local(async move { done(api::doc_thread_resolve(doc.get_value(), tid.get_value()).await) })>"Resolve"</button>
                 })}
             </div>
+            </Show>
         </div>
     }
 }
@@ -2765,6 +3000,7 @@ thread_local! {
 /// (each with the version it was made from), to download again.
 #[component]
 fn Exports(id: String, kind: String) -> impl IntoView {
+    let archived = read_only();
     let id = StoredValue::new(id);
     let tick = RwSignal::new(0u32);
     // The page draws this box again whenever the document changes (an agent
@@ -2791,6 +3027,9 @@ fn Exports(id: String, kind: String) -> impl IntoView {
         &[("pdf", "PDF"), ("docx", "Word"), ("odt", "OpenDocument"), ("html", "HTML"), ("md", "Markdown")]
     };
     let go = move |f: &'static str| {
+        if archived.get_untracked() {
+            return;
+        }
         busy.set(Some(f));
         error.set(None);
         spawn_local(async move {
@@ -2807,6 +3046,8 @@ fn Exports(id: String, kind: String) -> impl IntoView {
     view! {
         <section class="space-y-2 rounded-lg border border-zinc-200 p-3 text-sm dark:border-zinc-800">
             <h2 class="text-xs font-medium uppercase tracking-wide text-muted">"Export"</h2>
+            <Show when=move || archived.get()><p class="text-xs text-muted">"Unarchive to make a new export. Previous exports can still be downloaded below."</p></Show>
+            <Show when=move || !archived.get()>
             <div class="flex flex-wrap gap-2">
                 {formats.iter().map(|(f, label)| {
                     let f = *f;
@@ -2818,6 +3059,7 @@ fn Exports(id: String, kind: String) -> impl IntoView {
                     }
                 }).collect_view()}
             </div>
+            </Show>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             <ToGoogle id=id.get_value() />
             {move || past.get().filter(|p| !p.is_empty()).map(|p| view! {
@@ -2840,6 +3082,7 @@ fn Exports(id: String, kind: String) -> impl IntoView {
 /// make a new one; a Google file edited in Google since is said first.
 #[component]
 fn ToGoogle(id: String) -> impl IntoView {
+    let archived = read_only();
     let id = StoredValue::new(id);
     let tick = RwSignal::new(0u32);
     // As in the box around it: what it loaded last, then fresh.
@@ -2860,6 +3103,9 @@ fn ToGoogle(id: String) -> impl IntoView {
     let error = RwSignal::new(None::<String>);
     let changed = RwSignal::new(false);
     let go = move |new: bool, anyway: bool| {
+        if archived.get_untracked() {
+            return;
+        }
         busy.set(true);
         error.set(None);
         changed.set(false);
@@ -2873,6 +3119,9 @@ fn ToGoogle(id: String) -> impl IntoView {
         });
     };
     let connect = move |_| {
+        if archived.get_untracked() {
+            return;
+        }
         spawn_local(async move {
             let back = window().location().pathname().unwrap_or_default();
             match api::docs_google_connect(back, false).await {
@@ -2885,6 +3134,9 @@ fn ToGoogle(id: String) -> impl IntoView {
     };
     view! {
         {move || google.get().map(|g| {
+            if archived.get() {
+                return view! { <GoogleReadOnly state=g /> }.into_any();
+            }
             let app = g.app.clone();
             view! {
                 <div class="space-y-1 border-t border-zinc-200 pt-2 dark:border-zinc-800">
@@ -2927,19 +3179,41 @@ fn ToGoogle(id: String) -> impl IntoView {
                     }}
                     {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
                 </div>
-            }
+            }.into_any()
         })}
     }
+}
+
+/// Archiving never removes or updates the remembered Google file, even
+/// when its account has since been disconnected from carbon6.
+#[component]
+fn GoogleReadOnly(state: c6_api::docs::DocGoogle) -> impl IntoView {
+    state.file.map(|file| view! {
+        <div class="space-y-1 border-t border-zinc-200 pt-2 dark:border-zinc-800">
+            <div class="text-xs text-muted">{state.app.clone()}</div>
+            <div class="flex items-center gap-2">
+                <a href=file.url target="_blank" rel="noopener" class="min-w-0 flex-1 truncate text-sky-700 hover:underline dark:text-sky-400">
+                    {format!("Open in {}", state.app)}
+                </a>
+                <span class="shrink-0 text-xs text-muted">{format!("v{} · {}", file.rev, file.account)}</span>
+            </div>
+        </div>
+    })
 }
 
 /// History: changes by author run, each version openable and restorable.
 #[component]
 fn History(id: String, reload: Callback<()>) -> impl IntoView {
+    let author_named = author_names();
+    let archived = read_only();
     let id = StoredValue::new(id);
     let versions = LocalResource::new(move || api::doc_history(id.get_value()));
     let open = RwSignal::new(None::<i64>);
     let error = RwSignal::new(None::<String>);
     let restore = move |rev: i64, block: Option<String>| {
+        if archived.get_untracked() {
+            return;
+        }
         spawn_local(async move {
             match api::doc_restore(id.get_value(), &DocRestore { rev, block }).await {
                 Ok(_) => {
@@ -2971,8 +3245,9 @@ fn History(id: String, reload: Callback<()>) -> impl IntoView {
                                         <span class="w-10 shrink-0 text-xs text-muted">{format!("v{rev}")}</span>
                                         <span class="min-w-0 flex-1 truncate">{v.summary.clone()}</span>
                                         <button class="text-xs text-sky-700 hover:underline dark:text-sky-400" on:click=move |_| open.set(if open.get_untracked() == Some(rev) { None } else { Some(rev) })>"Open"</button>
-                                        <button class="text-xs text-sky-700 hover:underline dark:text-sky-400" title="Bring this version back as a new change"
+                                        <Show when=move || !archived.get()><button class="text-xs text-sky-700 hover:underline dark:text-sky-400" title="Bring this version back as a new change"
                                             on:click=move |_| restore(rev, None)>"Restore"</button>
+                                        </Show>
                                     </div>
                                 }
                             }).collect_view()}
@@ -3005,6 +3280,7 @@ fn when_hm(ms: i64) -> String {
 /// An earlier version, read only, with a Restore per block.
 #[component]
 fn Version(id: String, rev: i64, restore: Callback<(i64, Option<String>)>) -> impl IntoView {
+    let archived = read_only();
     let id = StoredValue::new(id);
     let old = LocalResource::new(move || async move { api::doc_read(&id.get_value(), &format!("view=full&at={rev}")).await });
     view! {
@@ -3015,12 +3291,13 @@ fn Version(id: String, rev: i64, restore: Callback<(i64, Option<String>)>) -> im
                 Ok(v) => {
                     let d: Option<Doc> = serde_json::from_value(v).ok();
                     view! { <div>{d.map(|d| d.tabs.into_iter().flat_map(|t| t.blocks).map(|b| {
-                        let bid = b.id.clone();
+                        let bid = StoredValue::new(b.id.clone());
                         view! {
                             <div class="group flex items-start gap-2">
                                 <div class="min-w-0 flex-1"><Shown b=b kind=String::new() /></div>
-                                <button class="invisible shrink-0 text-xs text-sky-700 group-hover:visible dark:text-sky-400" title="Bring back just this block"
-                                    on:click=move |_| restore.run((rev, Some(bid.clone())))>"Restore block"</button>
+                                <Show when=move || !archived.get()><button class="invisible shrink-0 text-xs text-sky-700 group-hover:visible dark:text-sky-400" title="Bring back just this block"
+                                    on:click=move |_| restore.run((rev, Some(bid.get_value())))>"Restore block"</button>
+                                </Show>
                             </div>
                         }
                     }).collect_view())}</div> }.into_any()
@@ -3046,6 +3323,166 @@ fn base64_of(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_authors_use_the_captured_feed_during_delayed_rendering() {
+        use super::*;
+        let owner = Owner::new();
+        let named = owner.with(|| {
+            let session = serde_json::from_value(serde_json::json!({
+                "id": "s1", "worker_id": "00000000-0000-0000-0000-000000000001", "title": "Archive regression",
+                "cwd": "", "connection_id": "", "model": "", "status": "idle", "created_at": 0, "updated_at": 0, "last_seq": 0
+            }))
+            .unwrap();
+            let (workers, _) = signal(Vec::new());
+            let (sessions, _) = signal(vec![session]);
+            let (connected, _) = signal(false);
+            let (doc, _) = signal(None);
+            let (marks, _) = signal(Default::default());
+            let (attention, _) = signal(0);
+            let resolved_sessions = RwSignal::new(Default::default());
+            provide_context(api::LiveFeed { workers, sessions, resolved_sessions, connected, doc, marks, attention });
+            author_names()
+        });
+        // The list's async render can run under a different root, with no
+        // LiveFeed context. Its captured formatter must still name sessions.
+        Owner::new_root(None).with(|| {
+            assert!(use_context::<api::LiveFeed>().is_none());
+            assert_eq!(named("session:s1"), "session Archive regression");
+            assert_eq!(named("session:missing"), "a session");
+            assert_eq!(named("you"), "you");
+        });
+    }
+
+    #[test]
+    fn archive_list_search_preserves_filters_and_includes_archived_only_when_on() {
+        use super::*;
+        let query = |archived| list_query("deck".into(), "The plan".into(), "design".into(), "you".into(), archived);
+        assert!(!query(false).archived);
+        let q = query(true);
+        assert!(q.archived);
+        assert_eq!(q.kind.as_deref(), Some("deck"));
+        assert_eq!(q.q.as_deref(), Some("The plan"));
+        assert_eq!(q.label.as_deref(), Some("design"));
+        assert_eq!(q.by.as_deref(), Some("you"));
+        assert_eq!(list_query(String::new(), "  ".into(), String::new(), String::new(), false).q, None);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn archive_switch_list_banner_and_menu_are_labelled_and_use_drawn_icons() {
+        use super::*;
+        Owner::new().with(|| {
+            let checked = RwSignal::new(false);
+            let html = view! { <ArchiveSwitch checked /> }.to_html();
+            assert!(html.contains("role=\"switch\"") && html.contains("aria-checked=\"false\""), "{html}");
+            assert!(html.find(">Show archived").unwrap() < html.find("h-6 w-10").unwrap(), "label must stay left: {html}");
+            assert!(
+                html.matches("<button").count() == 1 && html.contains("min-h-11 w-full"),
+                "the entire 44px row must be clickable: {html}"
+            );
+            checked.set(true);
+            let html = view! { <ArchiveSwitch checked /> }.to_html();
+            assert!(html.contains("aria-checked=\"true\""), "{html}");
+
+            for archived in [false, true] {
+                let summary = DocSummary {
+                    title: "The readable plan".into(),
+                    kind: "doc".into(),
+                    archived_at: archived.then_some(42),
+                    ..Default::default()
+                };
+                let html = view! { <DocListTitle summary /> }.to_html();
+                assert!(html.contains("The readable plan") && html.contains("<svg"), "{html}");
+                assert_eq!(html.contains("Archived"), archived, "{html}");
+                let busy = RwSignal::new(false);
+                let html = view! { <ArchiveMenuItem archived busy run=Callback::new(|()| {}) /> }.to_html();
+                assert!(html.contains("role=\"menuitem\"") && html.contains("<svg"), "{html}");
+                assert!(html.contains(if archived { "Unarchive" } else { "Archive" }), "{html}");
+                crate::icons::tests::assert_no_icon_glyphs(&html);
+            }
+            let busy = RwSignal::new(false);
+            let html = view! { <ArchivedBanner busy unarchive=Callback::new(|()| {}) /> }.to_html();
+            assert!(html.contains("Archived. Read-only.") && html.contains("Unarchive") && html.contains("<svg"), "{html}");
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn archived_google_export_keeps_the_remembered_link_without_write_controls() {
+        use super::*;
+        Owner::new().with(|| {
+            // A remembered file remains openable after disconnecting its account.
+            let state = c6_api::docs::DocGoogle {
+                app: "Google Docs".into(),
+                accounts: vec![],
+                file: Some(c6_api::docs::GoogleFile {
+                    url: "https://docs.google.com/document/d/remembered".into(),
+                    rev: 7,
+                    ..Default::default()
+                }),
+            };
+            let html = view! { <GoogleReadOnly state /> }.to_html();
+            assert!(html.contains("https://docs.google.com/document/d/remembered") && html.contains("Open in Google Docs"), "{html}");
+            assert!(
+                !html.contains("<button")
+                    && !html.contains("Connect Google")
+                    && !html.contains("Update the Google file")
+                    && !html.contains("Make a new one"),
+                "{html}"
+            );
+            let html = view! { <GoogleReadOnly state=c6_api::docs::DocGoogle::default() /> }.to_html();
+            assert!(!html.contains("<button") && !html.contains("<a "), "no remembered link means no controls: {html}");
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn archived_chips_disable_edits_but_keep_archived_refs_readable() {
+        use super::*;
+        use serde_json::json;
+        Owner::new().with(|| {
+            let attrs = json!({"chips": {
+                "date": {"type": "date", "value": "2026-11-06"},
+                "choice": {"type": "dropdown", "value": "Ready"},
+                "ref": {"type": "ref", "ref": "doc:d1", "title": "The plan"}
+            }});
+            let refs = std::collections::HashMap::from([(
+                "doc:d1".into(),
+                c6_api::work::LiveAttached {
+                    reference: "doc:d1".into(),
+                    title: "The archived plan".into(),
+                    state: "archived".into(),
+                    ..Default::default()
+                },
+            )]);
+            let text = "<?c6 block date?> <?c6 block choice?> <?c6 block ref?>";
+            let html = chips_html(text, &attrs, &refs, true);
+            assert_eq!(html.matches(" disabled ").count(), 2, "only date/dropdown edits are disabled: {html}");
+            assert!(html.contains("data-ref=\"doc:d1\"") && html.contains("The archived plan") && html.contains("Archived"), "{html}");
+            assert!(!chips_html(text, &attrs, &refs, false).contains(" disabled "));
+        });
+    }
+
+    #[test]
+    fn archived_autosave_does_not_send_or_consume_a_draft() {
+        use super::*;
+        Owner::new().with(|| {
+            let archived = Memo::new(|_| true);
+            let edit = RwSignal::new(Some(Editing {
+                id: "b1".into(),
+                rev: 1,
+                hash: "hash".into(),
+                original: "Before".into(),
+                chips: Map::new(),
+                block: DocBlock::default(),
+            }));
+            let draft = Draft { text: RwSignal::new("After".into()), typed: RwSignal::new(1) };
+            save("d1".into(), edit, draft, false, RwSignal::new(None), archived, || panic!("must not reload or send"));
+            assert!(edit.get_untracked().is_some());
+            assert_eq!(draft.text.get_untracked(), "After");
+        });
+    }
+
     #[test]
     fn comment_popover_flips_clamps_and_shrinks_to_the_visible_tile() {
         use super::{Rect, popover_at};
@@ -3178,7 +3615,7 @@ mod tests {
                 ("dropdown", json!({"type": "dropdown", "value": "Ready"}), "Ready", false),
                 ("ref", json!({"type": "ref", "ref": "work:w1", "title": "The plan"}), "The plan", false),
             ] {
-                let html = chips_html("<?c6 block chip?>", &json!({"chips": {"chip": attrs}}), &Default::default());
+                let html = chips_html("<?c6 block chip?>", &json!({"chips": {"chip": attrs}}), &Default::default(), false);
                 let svg = html.find("<svg").unwrap_or_else(|| panic!("{kind} lost its icon: {html}"));
                 let text = html.rfind(label).unwrap_or_else(|| panic!("{kind} lost its text: {html}"));
                 assert_eq!(svg < text, icon_first, "{kind} moved its icon: {html}");

@@ -24,6 +24,7 @@ mod context_window;
 mod decisions;
 mod delivery;
 mod dev_starts;
+mod docs_archive;
 mod documents;
 mod examples;
 mod explorer;

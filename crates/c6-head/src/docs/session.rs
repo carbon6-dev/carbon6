@@ -186,6 +186,7 @@ pub async fn for_session(st: &HeadState, session: &str, p: &Value) -> anyhow::Re
         }
         "list" => {
             let q = DocQuery {
+                archived: p["archived"].as_bool().unwrap_or(false),
                 kind: p["kind"].as_str().map(str::to_owned),
                 q: p["q"].as_str().map(str::to_owned),
                 limit: Some(50),
@@ -202,7 +203,7 @@ pub async fn for_session(st: &HeadState, session: &str, p: &Value) -> anyhow::Re
                 }
             }
             let (ours, rest): (Vec<_>, Vec<_>) = all.into_iter().partition(|d| mine.contains(&d.id) || d.created_by == by);
-            let line = |d: &c6_api::docs::DocSummary| json!({"id": d.id, "kind": d.kind, "title": d.title, "rev": d.rev, "updated_by": d.updated_by, "pending": d.pending});
+            let line = |d: &c6_api::docs::DocSummary| json!({"id": d.id, "kind": d.kind, "title": d.title, "rev": d.rev, "updated_by": d.updated_by, "pending": d.pending, "archived_at": d.archived_at});
             Ok(json!({"yours": ours.iter().map(line).collect::<Vec<_>>(), "others": rest.iter().map(line).collect::<Vec<_>>()}))
         }
         "create" => {
@@ -250,6 +251,7 @@ pub async fn for_session(st: &HeadState, session: &str, p: &Value) -> anyhow::Re
         }
         "edit" => {
             need_id()?;
+            super::ensure_writable(st, &realm, &id).await?;
             let b: DocBatch = serde_json::from_value(json!({"ops": p["ops"], "answering": p["answering"].as_str().unwrap_or("")}))
                 .map_err(|e| {
                     bad_request(format!(
@@ -279,6 +281,7 @@ pub async fn for_session(st: &HeadState, session: &str, p: &Value) -> anyhow::Re
         }
         "restore" => {
             need_id()?;
+            super::ensure_writable(st, &realm, &id).await?;
             let r = c6_api::docs::DocRestore {
                 rev: p["rev"].as_i64().ok_or_else(|| bad_request("restore takes rev (the version), and block to bring back one block"))?,
                 block: p["block"].as_str().map(str::to_owned),
