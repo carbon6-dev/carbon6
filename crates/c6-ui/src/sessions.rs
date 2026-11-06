@@ -220,15 +220,15 @@ pub fn SessionsPage() -> impl IntoView {
     let search = move |ev: web_sys::Event| query.set(event_target_value(&ev));
 
     view! {
-        <main class="mx-auto max-w-6xl space-y-4 px-3 py-4 md:space-y-5 md:px-4 md:py-6">
-            <div class="hidden flex-wrap items-center gap-2 md:flex">
+        <main class="mx-auto max-w-6xl space-y-4 px-3 py-4 @min-[40rem]/view:space-y-5 @min-[40rem]/view:px-4 @min-[40rem]/view:py-6">
+            <div class="hidden flex-wrap items-center gap-2 @min-[40rem]/view:flex">
                 <h1 class="mr-2 text-lg font-semibold">"Sessions"</h1>
                 <input type="search" class=format!("{INPUT} {PLACEHOLDER} min-w-48 max-w-sm flex-1") placeholder="Search titles, labels, workers, folders"
                     prop:value=move || query.get() on:input=search />
                 <span class="flex-1"></span>
                 <ListMenus choices />
             </div>
-            <div class="flex items-center gap-2 md:hidden">
+            <div class="flex items-center gap-2 @min-[40rem]/view:hidden">
                 <label class="relative min-w-0 flex-1">
                     <span class="pointer-events-none absolute left-2.5 top-1/2 flex -translate-y-1/2 text-muted">{icons::search()}</span>
                     <input type="search" class=format!("{INPUT} {PLACEHOLDER} pl-8") placeholder="Search" aria-label="Search sessions"
@@ -883,7 +883,7 @@ fn SessionRow(s: Session, now: RwSignal<i64>, hover: Hover) -> impl IntoView {
     let line = where_line(&worker, &s);
     let chips = s.clone();
     view! {
-        <div class="group flex items-center gap-1 pr-1 hover:bg-zinc-100 md:pr-2 dark:hover:bg-zinc-900"
+        <div class="group flex items-center gap-1 pr-1 hover:bg-zinc-100 @min-[40rem]/view:pr-2 dark:hover:bg-zinc-900"
             on:mouseenter=move |ev| {
                 use wasm_bindgen::JsCast;
                 if !window().match_media("(hover: hover)").ok().flatten().is_some_and(|m| m.matches()) { return; }
@@ -892,7 +892,7 @@ fn SessionRow(s: Session, now: RwSignal<i64>, hover: Hover) -> impl IntoView {
                 }
             }
             on:mouseleave=move |_| hover.hide_soon()>
-        <Go to=View::session(s.id.clone()) class="flex min-w-0 flex-1 items-center gap-3 py-2.5 pl-3 md:pl-4" title="Open beside this list (⌘-click: new tile)">
+        <Go to=View::session(s.id.clone()) class="flex min-w-0 flex-1 items-center gap-3 py-2.5 pl-3 @min-[40rem]/view:pl-4" title="Open beside this list (⌘-click: new tile)">
             <span class="mt-1.5 h-2.5 w-2.5 shrink-0 self-start rounded-full" style=mark title="Its mark"></span>
             <div class="min-w-0 flex-1">
                 <div class="truncate font-medium">{s.title.clone()}</div>
@@ -904,9 +904,9 @@ fn SessionRow(s: Session, now: RwSignal<i64>, hover: Hover) -> impl IntoView {
                     </div>
                 })}
             </div>
-            <div class="flex shrink-0 flex-col items-end gap-0.5 text-xs md:flex-row md:items-center md:gap-0">
+            <div class="flex shrink-0 flex-col items-end gap-0.5 text-xs @min-[40rem]/view:flex-row @min-[40rem]/view:items-center @min-[40rem]/view:gap-0">
                 <span class=state_colour(word)>{word}</span>
-                <span class="text-muted md:w-20 md:text-right">{move || ago(now.get() - updated)}</span>
+                <span class="text-muted @min-[40rem]/view:w-20 @min-[40rem]/view:text-right">{move || ago(now.get() - updated)}</span>
             </div>
         </Go>
         <PreviewButton id=s.id.clone() hover />
@@ -1996,7 +1996,7 @@ fn SessionForm(
                     if crate::util::sends(&ev) { ev.prevent_default(); submit(); }
                 }
             ></textarea>
-            <div class="flex min-w-0 items-center gap-1.5 px-2 pb-2">
+            <div class="flex min-w-0 flex-wrap items-center gap-1.5 px-2 pb-2">
                 {move || fixed().is_none().then(|| view! {
                     <button type="button" class="flex size-6.5 shrink-0 items-center justify-center rounded-md text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
                         title="Attach images or files (or paste / drop them)" aria-label="Attach images or files"
@@ -2110,7 +2110,7 @@ fn SessionForm(
                             <p class="text-xs text-muted">"The template sets where and how its sessions run."</p>
                         })}
                         <div class="space-y-3" class:hidden=move || template.with(Option::is_some)>
-                            <div class="grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]">
+                            <div class="grid grid-cols-1 gap-3 @min-[40rem]/view:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]">
                                 <label class="block min-w-0 text-xs text-muted">
                                     "Worker"
                                     <select class=format!("mt-1 {INPUT}") on:change=move |ev| { chosen_by_hand.set(true); worker.set(event_target_value(&ev)) } prop:value=move || worker.get()>
@@ -2163,7 +2163,7 @@ fn SessionForm(
                                     <p class="mt-1">"The connection, model and effort come from the first rule in Settings → Model routing that matches this session's labels."</p>
                                 })}
                             </div>
-                            <div class="grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
+                            <div class="grid grid-cols-1 gap-3 @min-[40rem]/view:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
                                 <label class="block min-w-0 text-xs text-muted">
                                     "Labels"
                                     <input class=format!("mt-1 font-mono {INPUT} {PLACEHOLDER}") placeholder="optional, e.g. client:acme, spike"
