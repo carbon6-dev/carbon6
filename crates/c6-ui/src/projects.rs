@@ -138,7 +138,7 @@ pub fn ProjectsPage() -> impl IntoView {
                                     on:click=move |ev| open_project.with_value(|f| f(id.clone(), How::from_mouse(&ev)))>
                                     <div class="flex items-center gap-2">
                                         <crate::marks::ValueGlyph key=format!("project:{}", p.id) />
-                                        <span class="min-w-[6rem] flex-1 truncate font-medium">{p.fields.title.clone()}</span>
+                                        <span class="min-w-0 flex-1 truncate font-medium">{p.fields.title.clone()}</span>
                                         <StatePill state=p.state.clone() />
                                         <span class="shrink-0 text-xs text-muted">{since(p.fields.moved_at.max(p.updated_at))}</span>
                                     </div>
@@ -322,7 +322,7 @@ pub fn ProjectPage(id: String) -> impl IntoView {
                                 view! {
                                     <div class="flex items-start gap-2">
                                         <span class="mt-2"><crate::marks::MarkButton key=mark_key.clone() shape=crate::marks::Shape::Hexagon size=14 /></span>
-                                        <h1 class="min-w-0 flex-1 text-xl font-semibold">{t.clone()}</h1>
+                                        <h1 class="min-w-0 flex-1 text-xl font-semibold [overflow-wrap:anywhere]">{t.clone()}</h1>
                                         <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| { title.set(t2.clone()); purpose.set(p2.clone()); editing.set(true); }>"Edit"</button>
                                     </div>
                                     <p class="whitespace-pre-wrap text-sm text-zinc-600 dark:text-zinc-400">{if pu.is_empty() { "Purpose: not said yet".to_owned() } else { pu.clone() }}</p>
@@ -393,9 +393,9 @@ pub fn ProjectPage(id: String) -> impl IntoView {
                         {move || merging.get().then(|| {
                             let me = mine.clone();
                             view! {
-                                <div class="flex items-center gap-2 text-sm">
+                                <div class="flex flex-wrap items-center gap-2 text-sm">
                                     <span class="text-muted">"Merge into this:"</span>
-                                    <select class=format!("{INPUT} w-auto!") on:change=move |ev| {
+                                    <select class=format!("{INPUT} min-w-0 max-w-full w-auto!") on:change=move |ev| {
                                         let from = event_target_value(&ev);
                                         if from.is_empty() { return; }
                                         merging.set(false);
@@ -439,12 +439,12 @@ pub fn ProjectPage(id: String) -> impl IntoView {
                                     })
                                 }).collect_view().into_any()
                             }}
-                            <div class="flex items-center gap-2 pt-1 text-sm">
+                            <div class="flex min-w-0 flex-wrap items-center gap-2 pt-1 text-sm">
                                 {active.then(|| view! {
                                     <button class=format!("{BUTTON_QUIET} text-xs") title="A new work item in this project; its sessions start as the project says"
                                         on:click=move |_| new_work.update(|n| *n = !*n)>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" New work"</button>
                                 })}
-                                <AdoptPick placeholder="+ Bring in open work…" class=format!("{INPUT} w-auto! max-w-full")
+                                <AdoptPick placeholder="+ Bring in open work…" class=format!("{INPUT} min-w-0 w-auto! max-w-full")
                                     title="Open work: what's in no project first, then work in other projects (choosing it moves it here)"
                                     items=Signal::derive(move || {
                                         all_work.get().and_then(Result::ok).unwrap_or_default().into_iter()
@@ -548,12 +548,12 @@ fn QuickSessions(
         .collect_view();
     view! {
         <section class="space-y-1">
-            <div class="flex items-center gap-2">
-                <h2 class="flex-1 text-xs font-medium uppercase tracking-wide text-muted">{format!("Sessions ({n})")}</h2>
+            <div class="flex min-w-0 flex-wrap items-center gap-2">
+                <h2 class="min-w-0 flex-1 text-xs font-medium uppercase tracking-wide text-muted">{format!("Sessions ({n})")}</h2>
                 {active.then(|| view! {
                     <button class=format!("{BUTTON_QUIET} text-xs") title="A quick task in this project with no work item, such as drafting a doc"
                         on:click=move |_| start.run(())>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" Session"</button>
-                    <AdoptPick placeholder="Attach a session…" class="max-w-56 cursor-pointer rounded bg-transparent px-1 text-xs text-muted hover:bg-zinc-200/60 dark:hover:bg-zinc-800"
+                    <AdoptPick placeholder="Attach a session…" class="min-w-0 max-w-full cursor-pointer rounded bg-transparent px-1 text-xs text-muted hover:bg-zinc-200/60 @sm/view:max-w-56 dark:hover:bg-zinc-800"
                         title="A running session as a quick session here: free ones first, then ones serving work or in another project (choosing it moves it here)"
                         items=adoptable on_pick=adopt />
                 })}
@@ -792,7 +792,7 @@ fn Proposed(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> imp
                 let (a, b) = (x.id.clone(), x.id.clone());
                 view! {
                     <div class="flex flex-wrap items-center gap-2 text-sm">
-                        <span class="min-w-[10rem] flex-1">
+                        <span class="min-w-0 flex-1 basis-full break-words @sm/view:basis-0">
                             <span class="font-medium">{x.title.clone()}</span>
                             {(!x.done_when.is_empty()).then(|| view! { <span class="ml-2 text-xs text-muted">{format!("done when {}", x.done_when)}</span> })}
                             {phase_title(&x.phase).map(|t| view! { <span class="ml-2 text-xs text-violet-700 dark:text-violet-400">{t}</span> })}
@@ -818,18 +818,18 @@ fn WorkRow(
     let (moving, moving_project) = (w.id.clone(), project.clone());
     let current = w.phase.clone();
     view! {
-        <div class="flex items-center gap-2 rounded px-2 py-1 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900">
+        <div class="flex flex-wrap items-center gap-2 rounded px-2 py-1 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900">
             <span class=format!("shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium {}", state_class(if w.state == "needs_you" { "needs_you" } else if w.state == "moving" { "moving" } else { "" }))>
                 {c6_api::work::state_label(&w.state)}
             </span>
             <crate::marks::ValueGlyph key=format!("work:{}", w.id) />
-            <span class="min-w-[8rem] flex-1 truncate">
+            <span class="min-w-0 flex-1 truncate">
                 <Go to=View::Work { id: w.id.clone() } class="text-violet-700 hover:underline dark:text-violet-400" title=w.why.clone()>{w.title.clone()}</Go>
                 {(!w.why.is_empty()).then(|| view! { <span class="ml-2 text-xs text-muted">{w.why.clone()}</span> })}
             </span>
             <span class="shrink-0 text-xs text-muted">{(w.moved_at > 0).then(|| since(w.moved_at))}</span>
             {(!phases.is_empty()).then(|| view! {
-                <select class="shrink-0 rounded border-none bg-transparent text-xs text-muted" title="Its phase"
+                <select class="max-w-full rounded border-none bg-transparent text-xs text-muted" title="Its phase"
                     on:change=move |ev| {
                         let (p, w) = (moving_project.clone(), moving.clone());
                         let phase = event_target_value(&ev);
@@ -919,7 +919,7 @@ fn Documents(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> im
                 }
             }).collect_view()}
             <div class="flex flex-wrap items-center gap-2 pt-1 text-sm">
-                <select class=format!("{INPUT} w-auto! max-w-64") on:change=move |ev| {
+                <select class=format!("{INPUT} min-w-0 w-auto! max-w-full @sm/view:max-w-64") on:change=move |ev| {
                     let doc = event_target_value(&ev);
                     if doc.is_empty() { return; }
                     set_role(doc, role.get_untracked());
@@ -958,10 +958,10 @@ fn Documents(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> im
                     </div>
                 }
             }).collect_view()}
-            <div class="flex gap-2">
+            <div class="flex flex-col gap-2 @sm/view:flex-row">
                 <input class=format!("{INPUT} min-w-0 flex-1") placeholder="A link: URL, record:<collection>:<id>, decision:<id>" prop:value=move || link.get()
                     on:input=move |ev| link.set(event_target_value(&ev)) on:keydown=move |ev| if ev.key() == "Enter" { add_link() } />
-                <input class=format!("{INPUT} w-40!") placeholder="Its name" prop:value=move || link_title.get()
+                <input class=format!("{INPUT} min-w-0 @sm/view:w-40!") placeholder="Its name" prop:value=move || link_title.get()
                     on:input=move |ev| link_title.set(event_target_value(&ev)) on:keydown=move |ev| if ev.key() == "Enter" { add_link() } />
                 <button class=BUTTON_QUIET on:click=move |_| add_link()>"Link"</button>
             </div>
@@ -977,9 +977,9 @@ pub fn StartWith(current: String, realm: String, none: &'static str, #[prop(into
     let realm = StoredValue::new(realm);
     let current = StoredValue::new(current);
     view! {
-        <label class="inline-flex items-center gap-1 text-xs text-muted" title="The template its work's sessions start with: worker, folder, worktree and branch, model">
+        <label class="inline-flex min-w-0 max-w-full flex-wrap items-center gap-1 text-xs text-muted" title="The template its work's sessions start with: worker, folder, worktree and branch, model">
             "Start with"
-            <select class=format!("{INPUT} w-auto! py-0.5 text-xs") data-start-with="" prop:value=move || current.get_value()
+            <select class=format!("{INPUT} min-w-0 max-w-full w-auto! py-0.5 text-xs") data-start-with="" prop:value=move || current.get_value()
                 on:change=move |ev| on_pick.run(event_target_value(&ev))>
                 <option value="">{none}</option>
                 {move || {
