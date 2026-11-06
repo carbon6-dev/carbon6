@@ -75,6 +75,16 @@ Not goals:
 
 ### Inputs
 
+**Phone display (November 6, 2026):** the quiet task line described below is
+desktop-only. Phones integrate running tasks, subagent waits and held notices
+into the conditional status/Show experience above the still-mounted composer,
+and the context-ring session sheet. **Background N** appears only for positive
+distinct running jobs, independently of the main agent's Working state. Linked
+child/task records count once; foreground native tasks and mirrors do not add
+another job. Show and the session sheet retain Inspect/Stop, errors, completed
+history and held notices; an otherwise idle session has no status row. Task
+inspection is portal-backed so moving it into a sheet does not clip it.
+
 - The actor writes each input to stdin as soon as it has expanded it: commands, mentions and `UserPromptSubmit` hooks run as today. It no longer waits for the turn to end.
 - **Inputs that start a turn** are logged with `TurnStarted` when they are written, as before.
 - **Inputs written during a turn** wait in an `unconfirmed` list. Each is written with a `uuid`; its echo, or the `result` listing it, confirms it. On confirmation the turn appends that input's `UserMessage`, so the log holds what the model saw, in the order it saw it. The head's command row becomes done then, as now.

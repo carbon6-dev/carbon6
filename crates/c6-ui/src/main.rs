@@ -46,6 +46,7 @@ mod push;
 mod quota;
 mod search;
 mod session;
+mod session_ring;
 mod sessions;
 mod settings;
 mod tasks;
@@ -112,10 +113,13 @@ fn App() -> impl IntoView {
 fn Main() -> impl IntoView {
     let live = api::LiveFeed::connect();
     provide_context(live);
+    util::watch_visible_viewport();
     provide_context(labels::LabelFilter::restored());
     provide_context(sessions::Grouping::load());
     provide_context(aspects::Facets::load());
     provide_context(settings::TranscriptDisplay::load());
+    provide_context(settings::SessionBarDisplay::load());
+    provide_context(assistant::AskState(RwSignal::new(false)));
     // Plan limits per connection, beside every connection picker.
     quota::provide();
     // A signed-in browser opening a login link (to sign in again).
@@ -144,15 +148,27 @@ fn Main() -> impl IntoView {
     let attention = move || counts.get().0;
     let tiles = move || ws.layout.with(|l| l.tiles.len());
     let console = place::is_console();
+    let tick = decisions::ticking();
+    let places = LocalResource::new(move || {
+        api::realms_changed().track();
+        live.attention.track();
+        live.sessions.track();
+        tick.track();
+        api::elsewhere()
+    });
+    provide_context(PhoneWaiting(Signal::derive(move || {
+        places.get().and_then(Result::ok).map_or(0, |ps| ps.iter().map(|p| p.waiting).sum())
+    })));
     view! {
         // The page itself never scrolls: its parts do (a phone panned the
         // whole page, header gone and the right edge cut off).
-        <div class="flex h-dvh flex-col overflow-hidden">
+        <div class="c6-app flex h-dvh flex-col overflow-hidden">
             <util::NoticeHost />
+            <assistant::AskHost />
             <mentions::Peek />
-            <header class="flex h-11 shrink-0 items-center gap-2 border-b border-zinc-200 bg-zinc-50 px-3 dark:border-zinc-800 dark:bg-zinc-950">
+            <header class="hidden h-11 shrink-0 items-center gap-2 border-b border-zinc-200 bg-zinc-50 px-3 md:flex dark:border-zinc-800 dark:bg-zinc-950">
                 <Brand />
-                <MobileMenu attention=Signal::derive(attention) />
+                <MobileMenu desktop_attention=Signal::derive(attention) />
                 <PlaceMenu />
                 {if console {
                     view! {
@@ -212,7 +228,6 @@ fn Main() -> impl IntoView {
                 {(!console).then(|| view! { <div class=move || if ws.is_full() { "contents md:hidden" } else { "contents" }><activity::Dock /></div> })}
                 <workspace::Tiles />
             </div>
-            {(!console).then(|| view! { <activity::MobileBar /> })}
         </div>
     }
     .into_any()
@@ -263,9 +278,16 @@ fn AppsMenu() -> impl IntoView {
     }
 }
 
+/// Waiting across every realm and the console, independent of list filters.
+#[derive(Clone, Copy)]
+struct PhoneWaiting(Signal<u64>);
+
 /// Phones and narrower windows: the nav, views and search in a menu.
 #[component]
-fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
+fn MobileMenu(#[prop(optional, into)] desktop_attention: Option<Signal<usize>>) -> impl IntoView {
+    let attention = expect_context::<PhoneWaiting>().0;
+    let connected = api::live().connected;
+    let version = versions();
     let menu = NodeRef::<leptos::html::Details>::new();
     let (pop, toggled) = util::details_pop(menu);
     let feeds = feeds();
@@ -280,12 +302,18 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
         }
     };
     view! {
-        <details node_ref=menu data-pop=pop on:toggle=toggled class="relative xl:hidden">
-            <summary class="cursor-pointer list-none rounded-md px-2 py-1 text-sm text-zinc-600 dark:text-zinc-400" aria-label="Menu">
+        <details node_ref=menu data-pop=pop on:toggle=toggled class="relative shrink-0 md:shrink xl:hidden">
+            <summary class="relative flex h-11 w-11 cursor-pointer list-none items-center justify-center rounded-md text-sm text-zinc-600 md:block md:h-auto md:w-auto md:px-2 md:py-1 dark:text-zinc-400"
+                aria-label=move || format!("Menu, {} waiting across the app{}", attention.get(), if connected.get() { "" } else { ", reconnecting" })>
                 {crate::icons::menu()}
-                {move || (attention.get() > 0).then(|| view! { <span class="ml-1 rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white">{attention.get()}</span> })}
+                {move || (attention.get() > 0).then(|| view! { <span data-phone-waiting="true" class="absolute right-1 top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-amber-500 px-1 text-[10px] font-semibold leading-none text-white md:hidden">{attention.get()}</span> })}
+                {move || desktop_attention.map(|n| n.get()).filter(|n| *n > 0).map(|n| view! { <span class="ml-1 hidden rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white md:inline">{n}</span> })}
+                <Show when=move || !connected.get()>
+                    <span class="absolute bottom-1 right-1 size-2 rounded-full bg-amber-500 md:hidden" title="Reconnecting"></span>
+                </Show>
             </summary>
-            <div class="fixed inset-x-2 top-12 z-40 max-h-[80dvh] space-y-1 overflow-y-auto rounded-lg border border-zinc-200 bg-white p-2 shadow-lg sm:absolute sm:inset-x-auto sm:left-0 sm:top-9 sm:w-64 dark:border-zinc-700 dark:bg-zinc-900" on:click=close>
+            <div class="phone-drawer fixed left-0 z-40 w-72 max-w-full space-y-1 overflow-y-auto rounded-r-lg border border-zinc-200 bg-white p-2 shadow-lg md:absolute md:top-11 dark:border-zinc-700 dark:bg-zinc-900" on:click=close>
+                <PlaceMenu drawer=true />
                 {place::is_console().then(|| view! {
                     <div class="flex flex-col text-sm">
                         <Go to=View::Realms class=MENU>"Realms"</Go>
@@ -306,10 +334,8 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
                     <projects::ProjectsLink class=MENU />
                     <work::WorkLink class=MENU />
                     <docs::DocsLink class=MENU />
-                    <Go to=View::Mission class=MENU>"Mission control"</Go>
-                    <Go to=View::Workers class=MENU>"Workers"</Go>
-                    <Go to=View::Collections { name: String::new() } class=MENU>"Collections"</Go>
-                    <views::ViewsMenu class=MENU />
+                    <div class="my-1 border-t border-zinc-200 dark:border-zinc-800"></div>
+                    <span class="px-2 pt-1 text-xs font-medium text-muted">"Apps"</span>
                     // Only what an app feeds in this realm (or it holds).
                     {move || feeds.get().and_then(Result::ok).map(|f| view! {
                         {(f["mail"] == true).then(|| view! { <Go to=View::Mail class=MENU>"Mail"</Go> })}
@@ -320,11 +346,22 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
                     })}
                     <Go to=View::Photos class=MENU>"Photos"</Go>
                     <Go to=View::Memex class=MENU>"Memex"</Go>
+                    <div class="my-1 border-t border-zinc-200 dark:border-zinc-800"></div>
+                    <Go to=View::Mission class=MENU>"Mission control"</Go>
+                    <Go to=View::Workers class=MENU>"Workers"</Go>
+                    <Go to=View::Collections { name: String::new() } class=MENU>"Collections"</Go>
+                    <views::ViewsMenu class=MENU />
+                    <div class="flex items-center"><Go to=View::Activity class=MENU>"Activity"</Go><monitor::ActivityBadge /></div>
                     <Go to=View::Analytics class=MENU>"Analytics"</Go>
                     <Go to=View::Usage class=MENU>"Usage and budgets"</Go>
                     <Go to=View::Settings { note: None, section: String::new() } class=MENU>"Settings"</Go>
                 </div>
-                <PlaceLinks />
+                <div class="space-y-2 border-t border-zinc-200 px-2 pt-2 text-xs text-muted dark:border-zinc-800">
+                    <div on:click=|ev| ev.stop_propagation()><needs::NeedsYou labelled=true /></div>
+                    <div on:click=|ev| ev.stop_propagation()><notify::NotifyToggle /></div>
+                    <ConnBadge connected />
+                    <span class="block font-mono">{move || version.now.get().map(|v| format!("carbon6 {v}"))}</span>
+                </div>
             </div>
         </details>
     }
@@ -346,7 +383,7 @@ fn ConnBadge(connected: ReadSignal<bool>) -> impl IntoView {
             <span class=move || {
                 if connected.get() { "h-2 w-2 rounded-full bg-emerald-500" } else { "h-2 w-2 animate-pulse rounded-full bg-amber-500" }
             }></span>
-            <span class="hidden sm:inline">{move || if connected.get() { "live" } else { "reconnecting…" }}</span>
+            <span>{move || if connected.get() { "live" } else { "reconnecting…" }}</span>
         </span>
     }
 }
@@ -364,7 +401,7 @@ fn RealmGlyph(#[prop(into)] id: String) -> impl IntoView {
 /// tab. Links to a place are `rel="external"`: a place is fixed when the
 /// page loads, so the router must not handle them in the page.
 #[component]
-fn PlaceMenu() -> impl IntoView {
+fn PlaceMenu(#[prop(optional)] drawer: bool) -> impl IntoView {
     // Loaded again as things change, like the Decisions count: an update
     // offer, say, waits in the console while you're in a realm.
     let (live, tick) = (api::live(), decisions::ticking());
@@ -402,7 +439,7 @@ fn PlaceMenu() -> impl IntoView {
     };
     view! {
         <details node_ref=menu data-pop=pop on:toggle=toggled class="relative">
-            <summary class="flex cursor-pointer list-none items-center gap-1.5 rounded-md border border-zinc-300 px-2 py-0.5 text-sm dark:border-zinc-700"
+            <summary class=if drawer { "flex min-h-9 cursor-pointer list-none items-center gap-1.5 rounded-md bg-zinc-100 px-2 text-sm dark:bg-zinc-800" } else { "flex cursor-pointer list-none items-center gap-1.5 rounded-md border border-zinc-300 px-2 py-0.5 text-sm dark:border-zinc-700" }
                 title="Where you are: a realm, or the console">
                 {match here.clone() {
                     Some(r) => view! { <RealmGlyph id=r /> }.into_any(),
@@ -416,17 +453,17 @@ fn PlaceMenu() -> impl IntoView {
             </summary>
             // On a phone, the width of the screen (anchored at the chip, it
             // would run off its edge).
-            <div class="fixed inset-x-2 top-12 z-40 rounded-lg border border-zinc-200 bg-white p-1 text-sm shadow-lg sm:absolute sm:inset-x-auto sm:left-0 sm:top-9 sm:w-64 dark:border-zinc-700 dark:bg-zinc-900">
+            <div class=if drawer { "mt-1 rounded-lg border border-zinc-200 bg-white p-1 text-sm dark:border-zinc-700 dark:bg-zinc-900" } else { "absolute left-0 top-9 z-40 w-64 rounded-lg border border-zinc-200 bg-white p-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900" }>
                 <div class="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-muted">"Realms"</div>
                 {move || places.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|p| p.id != "root").map(|p| {
                     let current = here.as_deref() == Some(p.id.as_str());
                     view! {
                         <a rel="external" href=place::url_of(&place::Place::Realm(p.id.clone()))
-                            class=format!("flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 {}", if current { "font-medium" } else { "" })>
+                            class=format!("flex min-h-9 items-center gap-2 rounded-md px-2 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 {}", if current { "bg-zinc-100 font-medium dark:bg-zinc-800" } else { "" })>
                             <RealmGlyph id=p.id.clone() />
                             <span class="min-w-0 flex-1 truncate">{p.name.clone()}</span>
                             {(p.waiting > 0).then(|| view! { <span class="rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white" title="Waiting on you">{p.waiting}</span> })}
-                            {current.then(|| view! { <span class="text-muted">{crate::icons::check()}</span> })}
+                            {(current && !drawer).then(|| view! { <span class="text-muted">{crate::icons::check()}</span> })}
                         </a>
                     }
                 }).collect_view()}

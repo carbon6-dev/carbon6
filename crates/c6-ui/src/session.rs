@@ -750,8 +750,6 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     });
     let details = RwSignal::new(false);
     // What runs in its background (◌ N): a popover, a sheet on a phone.
-    let background_at = RwSignal::new(None::<(f64, f64)>);
-    let background_sheet = RwSignal::new(false);
     // To a place in the transcript: loaded back to there, and its turn open
     // if finished turns fold.
     let reach_to = Callback::new(move |seq: u64| {
@@ -789,6 +787,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         col,
         events,
         from: feed.from,
+        latest: Signal::derive(move || feed.to.get().is_none()),
         usage,
         started,
         model_label,
@@ -803,8 +802,6 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         glance_at,
         sheet,
         details,
-        background_at,
-        background_sheet,
         view_settings,
         timeline,
         reach_to,
@@ -838,7 +835,6 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             "Escape" if guard.confirm.get_untracked() => guard.confirm.set(false),
             "Escape" if details.get_untracked() => details.set(false),
             "Escape" if !in_field && (glance_at.get_untracked().is_some() || sheet.get_untracked()) => chrome.close_glance(),
-            "Escape" if !in_field && background_sheet.get_untracked() => background_sheet.set(false),
             // Taken already: a menu, a mention list or a suggestion put away.
             "Escape" if running() && !ev.default_prevented() => {
                 let now = now_ms();
@@ -999,7 +995,8 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             }
         })}
         </ScrollBox>
-            <SubagentWaiting chrome />
+            <div class="hidden md:contents"><SubagentWaiting chrome /></div>
+            <PhoneStatus chrome scroller follow=stick latest=Signal::derive(move || feed.to.get().is_none()) />
             {move || {
                 // Claude Code's own subagents take no messages.
                 if detail.get().and_then(|d| d.ok()).is_some_and(|d| d.session.observed) {
@@ -1033,17 +1030,11 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                 }
             }}
         </div>
-        <Popover at=glance_at class="w-72">
-            <crate::details::Glance chrome on_done=move |()| glance_at.set(None) />
+        <Popover at=glance_at class="w-80">
+            <SessionOverview chrome on_done=move |()| glance_at.set(None) />
         </Popover>
         {move || sheet.get().then(|| view! {
-            <BottomSheet open=sheet><crate::details::Glance chrome on_done=move |()| sheet.set(false) /></BottomSheet>
-        })}
-        <Popover at=background_at class="w-96 max-w-[calc(100vw-1rem)]">
-            <BackgroundWork chrome on_done=move |()| background_at.set(None) />
-        </Popover>
-        {move || background_sheet.get().then(|| view! {
-            <BottomSheet open=background_sheet><BackgroundWork chrome on_done=move |()| background_sheet.set(false) /></BottomSheet>
+            <BottomSheet open=sheet><SessionOverview chrome on_done=move |()| sheet.set(false) /></BottomSheet>
         })}
         <Popover at=catch_at class="w-[min(24rem,calc(100vw-1rem))] p-3">
             <crate::catchup::CatchupBody session=id_stored.get_value() jump on_done=move |()| catch_at.set(None) />
@@ -1144,6 +1135,8 @@ pub struct SessionChrome {
     pub(crate) events: RwSignal<Vec<Event>>,
     /// The first event its transcript shows (see [`Feed::from`]).
     from: RwSignal<u64>,
+    /// Whether this event window includes the latest turn.
+    latest: Signal<bool>,
     pub(crate) usage: Memo<UsageStats>,
     pub(crate) started: Memo<Option<Started>>,
     pub(crate) model_label: Memo<String>,
@@ -1167,10 +1160,6 @@ pub struct SessionChrome {
     sheet: RwSignal<bool>,
     /// The session's details dialog is open.
     details: RwSignal<bool>,
-    /// What runs in its background (◌ N), as a popover, while open.
-    background_at: RwSignal<Option<(f64, f64)>>,
-    /// The same as a phone's bottom sheet, while open.
-    background_sheet: RwSignal<bool>,
     /// Whether it shows a catch-up card and folds its finished turns (None
     /// until read).
     view_settings: RwSignal<Option<c6_api::SessionViewSettings>>,
@@ -1220,9 +1209,6 @@ impl SessionChrome {
     /// (by default the context ring), its right edge with the anchor's, or
     /// on a phone as a sheet from the bottom.
     fn toggle_glance(&self, anchor: Option<web_sys::Element>) {
-        if self.wide.get_untracked() {
-            return;
-        }
         if self.glance_at.get_untracked().is_some() || self.sheet.get_untracked() {
             return self.close_glance();
         }
@@ -1298,45 +1284,6 @@ impl SessionChrome {
             },
             0,
         );
-    }
-
-    /// What a click on its state in the tile's bar does: to what waits on
-    /// you, else what runs in its background, else the glance (where it
-    /// isn't a column).
-    pub(crate) fn status_title(&self) -> &'static str {
-        if !self.waiting.with(Vec::is_empty) {
-            "Go to what waits on you"
-        } else if !self.busy.with(Vec::is_empty) {
-            "What runs in the background"
-        } else if self.wide.get() {
-            "Its own turn's state"
-        } else {
-            "The glance (⌘I)"
-        }
-    }
-
-    /// A click on its state in the tile's bar (see [`Self::status_title`]).
-    pub(crate) fn status_click(&self, ev: &web_sys::MouseEvent) {
-        if let Some(w) = self.waiting.with_untracked(|w| w.first().cloned()) {
-            self.go_waiting(w);
-        } else if !self.busy.with_untracked(Vec::is_empty) {
-            self.toggle_background(ev);
-        } else {
-            self.toggle_glance(ev.current_target().and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok()));
-        }
-    }
-
-    /// Opens or closes what runs in its background (◌ N): under what was
-    /// clicked, or on a phone as a sheet from the bottom.
-    fn toggle_background(&self, ev: &web_sys::MouseEvent) {
-        if self.background_at.get_untracked().is_some() || self.background_sheet.get_untracked() {
-            self.background_at.set(None);
-            self.background_sheet.set(false);
-        } else if crate::util::phone() {
-            self.background_sheet.set(true);
-        } else {
-            self.background_at.set(Some(below(ev, 384.0)));
-        }
     }
 }
 
@@ -1448,6 +1395,7 @@ pub fn SessionMenu(chrome: SessionChrome, #[prop(into)] on_rename: Callback<()>,
                 on_done.run(());
             }>"Find in session"<span class=MENU_HINT>"⌘F"</span></button>
             <div class=MENU_RULE></div>
+            <div class="hidden md:contents">
             <Show when=move || !chrome.ssh()>
                 <button class=MENU_ITEM title="Its folder, beside the transcript (⌘-click: a new tile)"
                     on:click=move |ev| { chrome.show_pane(Pane::Files, &ev); on_done.run(()) }>
@@ -1458,6 +1406,7 @@ pub fn SessionMenu(chrome: SessionChrome, #[prop(into)] on_rename: Callback<()>,
                 on:click=move |ev| { chrome.show_pane(Pane::Outputs, &ev); on_done.run(()) }>
                 {crate::icons::package()}"Outputs"
             </button>
+            </div>
             <button class=MENU_ITEM on:click=move |_| { details.set(true); on_done.run(()) }>
                 "Session details…"<span class=MENU_HINT>"usage, config"</span>
             </button>
@@ -1510,103 +1459,119 @@ fn MenuSwitch(
     }
 }
 
-/// An icon button of a session's: 28px square round a 16px icon (40px on
-/// a touch screen), filled only while what it opens is on screen. Hover
-/// only with a mouse (a tapped button on a phone keeps no look), and a ring
-/// for the keyboard's focus alone.
-fn icon_class(open: bool) -> &'static str {
-    if open {
-        "flex h-7 min-w-7 shrink-0 items-center justify-center gap-0.5 rounded px-1.5 outline-none focus-visible:ring-2 focus-visible:ring-sky-500/60 pointer-coarse:h-10 pointer-coarse:min-w-10 bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100"
-    } else {
-        "flex h-7 min-w-7 shrink-0 items-center justify-center gap-0.5 rounded px-1.5 outline-none focus-visible:ring-2 focus-visible:ring-sky-500/60 pointer-coarse:h-10 pointer-coarse:min-w-10 text-muted pointer-fine:hover:bg-zinc-200/70 pointer-fine:hover:text-zinc-900 dark:pointer-fine:hover:bg-zinc-800 dark:pointer-fine:hover:text-zinc-100"
-    }
-}
-
 /// How full the context is, as a 16px ring (amber from 80%).
 fn context_ring(pct: Option<u64>) -> impl IntoView {
     // The circle's length: 2π × 6.
     const ROUND: f64 = 37.7;
     let p = pct.unwrap_or(0).min(100) as f64;
-    let tone = if p >= 80.0 { "stroke-amber-500" } else { "stroke-blue-500" };
     view! {
         <svg viewBox="0 0 16 16" class="size-4 shrink-0" fill="none" stroke-width="2" aria-hidden="true">
             <circle cx="8" cy="8" r="6" class="stroke-zinc-300 dark:stroke-zinc-600" />
-            <circle cx="8" cy="8" r="6" class=tone
+            <circle cx="8" cy="8" r="6" class="stroke-zinc-600 dark:stroke-zinc-300"
                 stroke-dasharray=format!("{:.2} {ROUND}", ROUND * p / 100.0) transform="rotate(-90 8 8)" />
         </svg>
     }
 }
 
-/// What runs in a session's background and its panes, for its tile's bar
-/// (or its own strip): ◌ N while a task or subagent runs (each named on
-/// hover, listed with Inspect and Stop on a click), then
-/// Changes (with how many files changed), Terminal, and the context ring
-/// while the glance isn't a column.
+/// Context and state are independent inputs to the desktop experiment. The
+/// phone deliberately keeps its plain context ring and its prompt status row.
+impl SessionChrome {
+    fn ring_state(&self) -> crate::session_ring::AgentState {
+        use crate::session_ring::AgentState;
+        let live = api::live();
+        let session = live
+            .sessions
+            .with(|ss| ss.iter().find(|s| s.id == self.id.get_value()).cloned())
+            .or_else(|| self.detail.get().and_then(Result::ok).map(|d| d.session));
+        if !self.waiting.with(Vec::is_empty) || session.as_ref().is_some_and(|s| s.awaiting_approval) {
+            AgentState::Waiting
+        } else if !self.running.get()
+            && (session.as_ref().is_some_and(|s| s.status == SessionStatus::Failed)
+                || self
+                    .events
+                    .with(|evs| last_turn_failure(if self.latest.get() { evs } else { &[] }, session.as_ref().and_then(|s| s.end_reason)))
+                    .is_some())
+        {
+            AgentState::Failed
+        } else if self.running.get() || session.as_ref().is_some_and(|s| s.status == SessionStatus::Starting) {
+            AgentState::Working
+        } else {
+            AgentState::Idle
+        }
+    }
+
+    fn context_percent(&self) -> Option<u64> {
+        self.usage.with(|u| u.context.and_then(|used| used.saturating_mul(100).checked_div(u.context_window)))
+    }
+
+    fn ring_description(&self) -> String {
+        crate::session_ring::description(self.ring_state(), self.context_percent(), phone_background_count(*self))
+    }
+}
+
+/// One ring route to the session sheet, followed by fixed desktop pane slots.
 #[component]
-pub fn SessionControls(chrome: SessionChrome) -> impl IntoView {
+pub fn SessionControls(chrome: SessionChrome, #[prop(optional)] strip: bool) -> impl IntoView {
     let changed = move || chrome.git.get().flatten().map(|g| g.0).filter(|n| *n > 0);
     let glance_open = move || chrome.glance_at.get().is_some() || chrome.sheet.get();
-    let pct = move || chrome.usage.with(|u| u.context.and_then(|used| (used * 100).checked_div(u.context_window)));
-    let ring_title = move || {
-        chrome.usage.with(|u| match u.context {
-            Some(used) => match (used * 100).checked_div(u.context_window) {
-                Some(p) => format!("Context: {p}% used ({} of {} tokens) · the glance (⌘I)", tokens(used), tokens(u.context_window)),
-                None => format!("Context: {} tokens · the glance (⌘I)", tokens(used)),
-            },
-            None => "Context: known after the first model call · the glance (⌘I)".to_owned(),
-        })
+    let ring_title = move || match chrome.context_percent() {
+        Some(p) => format!("Context: {p}% used · Session sheet (⌘I)"),
+        None => "Context: known after the first model call · Session sheet (⌘I)".to_owned(),
     };
     view! {
-        {move || {
-            let lines = chrome.busy.get();
-            let n = lines.len();
-            // A spinner and the count: what they are on hover, and in full
-            // (with Inspect and Stop) on a click.
-            let what = format!("{n} running in the background:");
-            let open = move || chrome.background_at.get().is_some() || chrome.background_sheet.get();
-            (n > 0).then(|| view! {
-                <button class=move || format!("flex h-7 shrink-0 items-center gap-1 rounded px-1.5 text-xs text-blue-600 outline-none focus-visible:ring-2 focus-visible:ring-sky-500/60 pointer-coarse:h-10 pointer-coarse:px-2 dark:text-blue-400 {}",
-                        if open() { "bg-zinc-200 dark:bg-zinc-700" } else { "pointer-fine:hover:bg-zinc-200/70 dark:pointer-fine:hover:bg-zinc-800" })
-                    title=format!("{what}\n{}", lines.join("\n")) aria-label=format!("{what} {}", lines.join("; "))
-                    aria-haspopup="dialog" aria-expanded=move || open().to_string()
-                    on:click=move |ev| chrome.toggle_background(&ev)>
-                    <svg viewBox="0 0 16 16" class="size-3.5 shrink-0 animate-spin" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
-                        <circle cx="8" cy="8" r="6" stroke-opacity="0.3" />
-                        <path d="M14 8a6 6 0 0 0-6-6" />
-                    </svg>
-                    <span class="tabular-nums">{n}</span>
-                </button>
-            })
-        }}
-        <div class="flex shrink-0 items-center gap-0.5">
-            <Show when=move || !chrome.ssh()>
-                <button class=move || icon_class(chrome.pane_open(Pane::Changes)) aria-label="Changes"
-                    aria-pressed=move || chrome.pane_open(Pane::Changes).to_string()
-                    title=move || match changed() {
-                        Some(1) => "Changes: 1 file (⌘-click: a new tile)".to_owned(),
-                        Some(n) => format!("Changes: {n} files (⌘-click: a new tile)"),
-                        None => "Changes (⌘-click: a new tile)".to_owned(),
-                    }
-                    on:click=move |ev| chrome.toggle_pane(Pane::Changes, &ev)>
-                    {crate::icons::file_diff()}
-                    {move || changed().map(|n| view! { <span class="text-[10px] leading-none tabular-nums">{n}</span> })}
-                </button>
-            </Show>
-            <button class=move || icon_class(chrome.pane_open(Pane::Terminal)) aria-label="Terminal" title="Terminal (⌘-click: a new tile)"
-                aria-pressed=move || chrome.pane_open(Pane::Terminal).to_string()
-                on:click=move |ev| chrome.toggle_pane(Pane::Terminal, &ev)>
-                {crate::icons::square_terminal()}
+        <button id=chrome.ring_id() class="flex h-11 w-11 shrink-0 items-center justify-center rounded-md text-soft outline-none hover:bg-zinc-200/70 focus-visible:ring-2 focus-visible:ring-sky-500/60 dark:hover:bg-zinc-800"
+            aria-label=move || format!("{} Open session sheet", chrome.ring_description())
+            title=move || format!("{} Open session sheet (⌘I)", chrome.ring_description())
+            aria-haspopup="dialog" aria-expanded=move || glance_open().to_string()
+            on:click=move |ev| chrome.toggle_glance(ev.current_target().and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok()))>
+            <span class=if strip { "flex" } else { "md:hidden" } title=ring_title>{move || context_ring(chrome.context_percent())}</span>
+            <span class=if strip { "hidden" } else { "hidden md:flex" }>
+                <crate::session_ring::SessionRing state=Signal::derive(move || chrome.ring_state())
+                    context=Signal::derive(move || chrome.context_percent()) background=Signal::derive(move || phone_background_count(chrome)) />
+            </span>
+        </button>
+        <div class="hidden shrink-0 items-center md:flex">
+            <button class=move || format!("{} {}", SESSION_SLOT, if chrome.pane_open(Pane::Changes) { "bg-zinc-200 dark:bg-zinc-700" } else { "" })
+                aria-label="Changes" disabled=move || chrome.ssh() aria-pressed=move || chrome.pane_open(Pane::Changes).to_string()
+                title=move || changed().map_or_else(|| "Changes (⌘-click: a new tile)".to_owned(), |n| format!("Changes: {n} files (⌘-click: a new tile)"))
+                on:click=move |ev| chrome.toggle_pane(Pane::Changes, &ev)>
+                {crate::icons::file_diff()}
+                {move || changed().map(|n| view! { <span class="text-[10px] leading-none tabular-nums">{n}</span> })}
             </button>
-            <Show when=move || !chrome.wide.get()>
-                <button id=chrome.ring_id() class=move || icon_class(glance_open()) aria-label="Glance" title=ring_title
-                    aria-expanded=move || glance_open().to_string()
-                    on:click=move |ev| {
-                        let el = ev.current_target().and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok());
-                        chrome.toggle_glance(el);
-                    }>
-                    {move || context_ring(pct())}
-                </button>
-            </Show>
+            <button class=move || format!("{} {}", SESSION_SLOT, if chrome.pane_open(Pane::Terminal) { "bg-zinc-200 dark:bg-zinc-700" } else { "" })
+                aria-label="Terminal" title="Terminal (⌘-click: a new tile)" aria-pressed=move || chrome.pane_open(Pane::Terminal).to_string()
+                on:click=move |ev| chrome.toggle_pane(Pane::Terminal, &ev)>{crate::icons::square_terminal()}</button>
+        </div>
+    }
+}
+
+/// Fixed controls never take the title's remaining room (even on a narrow tile).
+pub(crate) const SESSION_SLOT: &str = "flex h-11 w-11 shrink-0 items-center justify-center gap-0.5 rounded-md text-soft outline-none hover:bg-zinc-200/70 focus-visible:ring-2 focus-visible:ring-sky-500/60 disabled:opacity-40 dark:hover:bg-zinc-800";
+
+/// The context ring's one destination: panes, what runs, and the unchanged glance.
+#[component]
+fn SessionOverview(chrome: SessionChrome, #[prop(into)] on_done: Callback<()>) -> impl IntoView {
+    view! {
+        <div class="space-y-3">
+            <h2 class="font-semibold">"Session"</h2>
+            <p class="text-xs text-muted">{move || chrome.ring_description()}</p>
+            <div class="grid grid-cols-2 gap-2">
+                {[Pane::Changes, Pane::Terminal, Pane::Files, Pane::Outputs].into_iter().map(|pane| view! {
+                    <button class="flex min-h-11 items-center gap-2 rounded-md border border-zinc-200 px-3 text-left disabled:opacity-40 dark:border-zinc-700"
+                        disabled=move || matches!(pane, Pane::Changes | Pane::Files) && chrome.ssh()
+                        on:click=move |ev| { chrome.show_pane(pane, &ev); on_done.run(()); }>
+                        {match pane {
+                            Pane::Changes => crate::icons::file_diff().into_any(),
+                            Pane::Terminal => crate::icons::square_terminal().into_any(),
+                            Pane::Files => crate::icons::folder().into_any(),
+                            Pane::Outputs => crate::icons::package().into_any(),
+                        }}
+                        {pane.name()}
+                    </button>
+                }).collect_view()}
+            </div>
+            <BackgroundWork chrome on_done />
+            <crate::details::Glance chrome on_done />
         </div>
     }
 }
@@ -1622,8 +1587,8 @@ fn SessionStrip(chrome: SessionChrome) -> impl IntoView {
     // view's).
     let rename_from = StoredValue::new((8.0, 48.0));
     view! {
-        <div class="flex h-9 shrink-0 items-center justify-end gap-0.5 border-b border-zinc-200 bg-zinc-50 px-2 text-xs pointer-coarse:h-11 pointer-coarse:gap-0 dark:border-zinc-800 dark:bg-zinc-900/60">
-            <SessionControls chrome />
+        <div class="flex h-11 shrink-0 items-center justify-end gap-0.5 border-b border-zinc-200 bg-zinc-50 px-2 text-xs pointer-coarse:gap-0 dark:border-zinc-800 dark:bg-zinc-900/60">
+            <SessionControls chrome strip=true />
             <span class="mx-1 h-4 w-px shrink-0 bg-zinc-200 dark:bg-zinc-700"></span>
             <button class=crate::icons::BAR_BUTTON aria-label="Actions"
                 title="Actions: rename, find, files, outputs, details, new like this, save as template, catch-up, fold finished turns, archive"
@@ -1650,7 +1615,7 @@ fn SessionStrip(chrome: SessionChrome) -> impl IntoView {
     }
 }
 
-/// What runs in a session's background, from its bar's ◌ N: its subagents
+/// What runs in a session's background, from its overview or status Show: subagents
 /// and tasks running, then the last few that failed or were stopped, each
 /// with its state, name and time; a task with Inspect and (while it runs)
 /// Stop, a subagent going to its thread. Show all lists every one.
@@ -1672,10 +1637,13 @@ fn BackgroundWork(chrome: SessionChrome, #[prop(into)] on_done: Callback<()>) ->
     let heading = "text-[10px] font-medium uppercase tracking-wide text-muted";
     view! {
         <div class="space-y-2 p-1 text-xs">
-            <p class="text-muted">{move || match chrome.busy.with(Vec::len) {
+            <p class="text-muted" title=move || chrome.busy.get().join("\n")>{move || match phone_background_count(chrome) {
                 0 => "Nothing runs in the background now.".to_owned(),
                 n => format!("{n} running in the background"),
             }}</p>
+            <Show when=move || !chrome.running.get()>
+                <WaitingNotices events=chrome.events now session_id=chrome.id.get_value() />
+            </Show>
             {move || {
                 let (rows, _) = subagents.get();
                 (!rows.is_empty()).then(|| view! {
@@ -1737,7 +1705,7 @@ fn BottomSheet(open: RwSignal<bool>, children: Children) -> impl IntoView {
     let pulled_from = StoredValue::new(None::<i32>);
     view! {
         <div class="fixed inset-0 z-40 bg-black/30" on:click=move |ev| { ev.stop_propagation(); close() }></div>
-        <div class="fixed inset-x-0 bottom-0 z-50 flex max-h-[50dvh] flex-col rounded-t-xl border-t border-zinc-200 bg-white text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
+        <div role="dialog" aria-modal="true" aria-label="Session details" class="phone-sheet fixed inset-x-0 bottom-0 z-50 flex max-h-[80dvh] flex-col rounded-t-xl border-t border-zinc-200 bg-white text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
             on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); close() }>
             <div class="relative flex h-9 shrink-0 touch-none items-center justify-center pointer-coarse:h-12"
                 on:pointerdown=move |ev: web_sys::PointerEvent| pulled_from.set_value(Some(ev.client_y()))
@@ -2318,7 +2286,7 @@ fn Transcript(
             // Through the whole turn, so the end of the page doesn't come and
             // go as text starts and stops streaming.
             {move || running.get().then(|| view! {
-                <div class="flex items-center gap-2 text-sm text-muted">
+                <div class="hidden items-center gap-2 text-sm text-muted md:flex">
                     <span class="h-2 w-2 animate-pulse rounded-full bg-blue-500"></span>
                     {move || stream_status.with(|s| if s.is_empty() { "Working…".to_owned() } else { s.clone() })}
                 </div>
@@ -2328,10 +2296,191 @@ fn Transcript(
             })}
             {move || edit_open.get().then(|| view! { <QueueEditBox rows=edit_rows session_id=id.get_value() on_close=Callback::new(move |_| { edit_open.set(false); edit_rows.update(Vec::clear); }) /> })}
             {move || queued.get().into_iter().map(|q| view! { <Queued q session_id=id.get_value() worker_id=worker_id pull=pull /> }).collect_view()}
-            {move || (!running.get()).then(|| view! { <WaitingNotices events now session_id=id.get_value() /> })}
-            // What still runs in the background, while or after it works.
-            <crate::tasks::RunningTasks session=id.get_value() events />
+            // Phones combine these outside scrolling, directly above the prompt.
+            <div class="hidden md:block">
+                {move || (!running.get()).then(|| view! { <WaitingNotices events now session_id=id.get_value() /> })}
+                <crate::tasks::RunningTasks session=id.get_value() events />
+            </div>
         </div>
+    }
+}
+
+/// Only truthful, local information belongs in the phone's conditional row.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct PhoneStatusState {
+    working: bool,
+    waiting: usize,
+    background: usize,
+    failed: bool,
+}
+
+impl PhoneStatusState {
+    fn visible(self) -> bool {
+        self.working || self.waiting > 0 || self.background > 0 || self.failed
+    }
+}
+
+/// Kept independent of browser hooks so all eight B layouts can be SSR-tested.
+fn phone_status_row(state: PhoneStatusState, show: Callback<()>) -> AnyView {
+    if !state.visible() {
+        return ().into_any();
+    }
+    let primary = if state.waiting > 0 {
+        Some((format!("Waiting on you {}", state.waiting), "text-amber-700 dark:text-amber-300", crate::icons::triangle_alert().into_any()))
+    } else if state.working {
+        Some(("Working…".into(), "text-sky-700 dark:text-sky-400", crate::icons::loader_circle().into_any()))
+    } else if state.failed {
+        Some(("Last turn failed".into(), "text-red-600 dark:text-red-400", crate::icons::circle_x().into_any()))
+    } else {
+        None
+    };
+    view! {
+        <div class="flex h-11 items-center gap-2 border-t border-zinc-200 bg-zinc-50 px-3 text-[11px] min-[360px]:text-xs dark:border-zinc-800 dark:bg-zinc-900" data-phone-status="true">
+            <div role="status" class="flex min-w-0 flex-1 items-center gap-2 overflow-hidden whitespace-nowrap">
+                {primary.map(|(label, tone, icon)| view! { <span class=format!("flex items-center gap-1 {tone}")>{icon}{label}</span> })}
+                {(state.background > 0).then(|| view! {
+                    <span class="flex items-center gap-1 text-sky-700 dark:text-sky-400">
+                        {crate::icons::hourglass()}{format!("Background {}", state.background)}
+                    </span>
+                })}
+            </div>
+            <button type="button" class="group flex h-11 min-w-11 shrink-0 items-center justify-center outline-none" aria-label="Show session status details" on:click=move |_| show.run(())>
+                <span class="flex h-8 items-center rounded-md border border-zinc-300 px-2 group-focus-visible:ring-2 group-focus-visible:ring-inset group-focus-visible:ring-sky-500 dark:border-zinc-700">"Show"</span>
+            </button>
+        </div>
+    }.into_any()
+}
+
+fn phone_background_count(chrome: SessionChrome) -> usize {
+    let rows = chrome.subagents.rows().into_iter().map(|(s, _)| s).collect::<Vec<_>>();
+    chrome.events.with(|evs| crate::tasks::background_count(evs, &rows))
+}
+
+/// The most recent turn, not the most recent error anywhere in the transcript.
+/// A new turn or successful/interrupted finish clears the old failure. The
+/// session row supplies the result when viewing an older window of events.
+fn last_turn_failure(evs: &[Event], fallback: Option<TurnEndReason>) -> Option<String> {
+    let last = evs.iter().rposition(|e| matches!(e.kind, EventKind::TurnStarted { .. } | EventKind::TurnEnded { .. }));
+    let reason = match last.map(|i| &evs[i].kind) {
+        Some(EventKind::TurnStarted { .. }) => return None,
+        Some(EventKind::TurnEnded { reason, .. }) => Some(*reason),
+        _ => fallback,
+    };
+    let default = match reason? {
+        TurnEndReason::Error => "The last turn ended with an error.",
+        TurnEndReason::WorkerRestarted => "The worker restarted during the last turn.",
+        TurnEndReason::Unknown => "The last turn ended without a recorded result.",
+        TurnEndReason::Completed | TurnEndReason::Interrupted => return None,
+    };
+    Some(
+        last.and_then(|at| {
+            evs[..at].iter().rev().take_while(|e| !matches!(e.kind, EventKind::TurnStarted { .. })).find_map(|e| match &e.kind {
+                EventKind::Error { message } => Some(message.clone()),
+                _ => None,
+            })
+        })
+        .unwrap_or_else(|| default.into()),
+    )
+}
+
+/// The row is a sibling of ScrollBox and Composer, never an overlay. Its
+/// appearance only shrinks the transcript. ResizeObserver runs before paint:
+/// following snaps to the same bottom without a glide; scrolled-up content
+/// keeps its scrollTop (no content above its message anchor has changed).
+#[component]
+fn PhoneStatus(chrome: SessionChrome, scroller: NodeRef<leptos::html::Div>, follow: RwSignal<bool>, latest: Signal<bool>) -> impl IntoView {
+    let row = NodeRef::<leptos::html::Div>::new();
+    let open = RwSignal::new(false);
+    let live = api::live();
+    let failure = Memo::new(move |_| {
+        if chrome.running.get() {
+            return None;
+        }
+        let end = live
+            .sessions
+            .with(|ss| ss.iter().find(|s| s.id == chrome.id.get_value()).and_then(|s| s.end_reason))
+            .or_else(|| chrome.detail.get().and_then(Result::ok).and_then(|d| d.session.end_reason));
+        chrome.events.with(|evs| last_turn_failure(if latest.get() { evs } else { &[] }, end))
+    });
+    let state = Memo::new(move |_| PhoneStatusState {
+        working: chrome.running.get(),
+        waiting: chrome.waiting.with(Vec::len),
+        background: phone_background_count(chrome),
+        failed: failure.with(Option::is_some),
+    });
+    Effect::new(move || {
+        let Some(el) = row.get() else { return };
+        let mut height = el.client_height();
+        let callback = wasm_bindgen::closure::Closure::<dyn FnMut(js_sys::Array)>::new(move |_: js_sys::Array| {
+            let Some(row) = row.try_get_untracked().flatten() else { return };
+            let next = row.client_height();
+            if next != height {
+                height = next;
+                if follow.try_get_untracked() == Some(true)
+                    && let Some(el) = scroller.try_get_untracked().flatten()
+                {
+                    el.set_scroll_top(el.scroll_height());
+                }
+            }
+        });
+        if let Ok(observer) = web_sys::ResizeObserver::new(wasm_bindgen::JsCast::unchecked_ref(callback.as_ref())) {
+            observer.observe(&el);
+            let kept = send_wrapper::SendWrapper::new((observer, callback));
+            on_cleanup(move || kept.0.disconnect());
+        }
+    });
+    view! {
+        <div node_ref=row class="shrink-0 md:hidden">
+            {move || phone_status_row(state.get(), Callback::new(move |_| open.set(true)))}
+        </div>
+        <Show when=move || open.get()>
+            <PhoneStatusDetails chrome open failure />
+        </Show>
+    }
+}
+
+/// A portal avoids the tile's transform/overflow clipping. The same complete
+/// waiting list drives this and the header; each Show uses the existing jump
+/// (including folded/off-window cards and children). Held notices and the
+/// existing task inspector live here, not in a second pinned waiting row.
+#[component]
+fn PhoneStatusDetails(chrome: SessionChrome, open: RwSignal<bool>, failure: Memo<Option<String>>) -> impl IntoView {
+    let dialog = NodeRef::<leptos::html::Div>::new();
+    let pop = crate::util::escapable(
+        move || open.get(),
+        move || {
+            open.try_set(false);
+        },
+    );
+    Effect::new(move || {
+        if let Some(el) = dialog.get() {
+            let _ = el.focus();
+        }
+    });
+    view! {
+        <leptos::portal::Portal>
+            <div class="phone-dialog fixed inset-0 z-50 flex items-end justify-center bg-black/30 p-2 md:items-center" on:click=move |_| open.set(false)>
+                <div node_ref=dialog data-pop=pop.clone() role="dialog" aria-modal="true" aria-label="Session status" tabindex="-1"
+                    class="max-h-[80dvh] w-full max-w-lg space-y-3 overflow-y-auto rounded-lg bg-white p-4 text-sm shadow-xl dark:bg-zinc-900"
+                    on:click=|ev| ev.stop_propagation()>
+                    <div class="flex items-center justify-between">
+                        <h2 class="font-medium">"Session status"</h2>
+                        <button class=format!("{BUTTON_QUIET} min-h-11") on:click=move |_| open.set(false)>{crate::icons::x()}"Close"</button>
+                    </div>
+                    {move || chrome.waiting.get().into_iter().map(|w| view! {
+                        <div class="flex items-center gap-3 rounded-md bg-amber-50 p-2 dark:bg-amber-950">
+                            <span class="min-w-0 flex-1 break-words text-amber-800 dark:text-amber-300">{w.what.clone()}</span>
+                            <button class=format!("{BUTTON} min-h-11") on:click=move |_| { open.set(false); chrome.go_waiting(w.clone()); }>"Show"</button>
+                        </div>
+                    }).collect_view()}
+                    {move || failure.get().map(|message| view! { <ErrorBox message /> })}
+                    <Show when=move || chrome.running.get() && chrome.waiting.with(Vec::is_empty)>
+                        <p class="text-muted">"The agent is working on this turn."</p>
+                    </Show>
+                    <BackgroundWork chrome on_done=Callback::new(move |_| open.set(false)) />
+                </div>
+            </div>
+        </leptos::portal::Portal>
     }
 }
 
@@ -2945,7 +3094,8 @@ fn stop_icon() -> impl IntoView {
 
 /// The tile bar's ⋯ menu: an item, the hint after it, and the line
 /// between groups.
-const MENU_ITEM: &str = "flex w-full items-center gap-3 rounded px-2 py-1 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800";
+pub(crate) const MENU_ITEM: &str =
+    "flex min-h-9 w-full items-center gap-3 rounded px-2 py-1 text-left hover:bg-zinc-100 disabled:opacity-40 dark:hover:bg-zinc-800";
 const MENU_HINT: &str = "ml-auto text-[11px] text-muted";
 const MENU_RULE: &str = "my-1 border-t border-zinc-200 dark:border-zinc-700";
 
@@ -5801,6 +5951,116 @@ mod tests {
     }
 
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn phone_status_renders_all_eight_b_states_without_false_or_zero_parts() {
+        let owner = Owner::new();
+        owner.with(|| {
+            // Quiet, working, background only, working + background,
+            // waiting, waiting + background, failure, failure + background.
+            for (state, expected) in [
+                (PhoneStatusState::default(), vec![]),
+                (PhoneStatusState { working: true, ..Default::default() }, vec!["Working…"]),
+                (PhoneStatusState { background: 2, ..Default::default() }, vec!["Background 2"]),
+                (PhoneStatusState { working: true, background: 2, ..Default::default() }, vec!["Working…", "Background 2"]),
+                (PhoneStatusState { working: true, waiting: 1, ..Default::default() }, vec!["Waiting on you 1"]),
+                (
+                    PhoneStatusState { working: true, waiting: 1, background: 2, ..Default::default() },
+                    vec!["Waiting on you 1", "Background 2"],
+                ),
+                (PhoneStatusState { failed: true, ..Default::default() }, vec!["Last turn failed"]),
+                (PhoneStatusState { failed: true, background: 2, ..Default::default() }, vec!["Last turn failed", "Background 2"]),
+            ] {
+                let html = phone_status_row(state, Callback::new(|_| {})).to_html();
+                if expected.is_empty() {
+                    assert!(
+                        !html.contains("data-phone-status") && !html.contains("Show") && !html.contains("h-11"),
+                        "no reserved quiet row: {html}"
+                    );
+                } else {
+                    assert!(html.contains("h-11") && html.contains("<button") && html.contains("Show session status details"), "{html}");
+                }
+                for label in ["Working…", "Background 2", "Waiting on you 1", "Last turn failed"] {
+                    assert_eq!(html.contains(label), expected.contains(&label), "{state:?}: {html}");
+                }
+                assert!(!html.contains("Background 0") && !html.contains("Idle") && !html.contains("idle"), "{html}");
+                assert_eq!(
+                    html.matches("<svg").count(),
+                    usize::from(state.working || state.waiting > 0 || state.failed) + usize::from(state.background > 0),
+                    "every visible state keeps its drawn icon: {html}"
+                );
+                if state.waiting > 0 {
+                    assert!(html.contains("text-amber-700"), "waiting is amber: {html}");
+                }
+                if state.background > 0 {
+                    assert!(html.contains("text-sky-700") && html.contains("<svg"), "keep the real job icon: {html}");
+                }
+            }
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn phone_context_arc_is_neutral_at_every_usage_level() {
+        for used in [None, Some(0), Some(25), Some(90), Some(137)] {
+            let html = context_ring(used).to_html();
+            assert!(html.contains("stroke-zinc-600 dark:stroke-zinc-300"), "{html}");
+            assert!(!html.contains("blue") && !html.contains("amber") && !html.contains("animate"), "context is not agent state: {html}");
+        }
+    }
+
+    #[test]
+    fn held_notices_stay_in_details_without_creating_a_quiet_status_row() {
+        let source = include_str!("session.rs");
+        let details = source.split("fn BackgroundWork(").nth(1).unwrap().split("/// A session's subagents for").next().unwrap();
+        assert!(details.contains("<WaitingNotices events=chrome.events now session_id=chrome.id.get_value() />"));
+        assert!(!PhoneStatusState::default().visible(), "held notices are for the agent, not attention from you");
+    }
+
+    #[test]
+    fn phone_status_is_outside_scrollbox_and_does_not_condition_the_composer() {
+        let source = include_str!("session.rs");
+        let view = source.split("// Measured: the glance").nth(1).unwrap().split("/// The transcript's reading column").next().unwrap();
+        let scroll_end = view.find("</ScrollBox>").unwrap();
+        let row = view.find("<PhoneStatus chrome").unwrap();
+        let composer = view.find("<Composer id=").unwrap();
+        assert!(scroll_end < row && row < composer);
+        assert!(view[scroll_end..row].contains("hidden md:contents"), "no duplicate pinned child waiting row on phone");
+        let conditional = source.split("fn phone_status_row").nth(1).unwrap().split("/// The most recent turn").next().unwrap();
+        assert!(!conditional.contains("<Composer") && !conditional.contains("<Transcript"));
+        assert!(source.contains("node_ref=row class=\"shrink-0 md:hidden\""));
+        assert!(
+            source.contains("if follow.try_get_untracked() == Some(true)"),
+            "row compensation must not force a scrolled-up reader to the end"
+        );
+    }
+
+    #[test]
+    fn last_turn_failure_clears_on_a_new_turn_or_success_and_keeps_details() {
+        let started = |seq, turn| Event { seq, ts: 0, kind: EventKind::TurnStarted { turn, context_window: 0 } };
+        let ended = |seq, turn, reason| Event { seq, ts: 0, kind: EventKind::TurnEnded { turn, reason } };
+        let mut events = vec![
+            started(1, 1),
+            Event { seq: 2, ts: 0, kind: EventKind::Error { message: "Model unavailable".into() } },
+            ended(3, 1, TurnEndReason::Error),
+        ];
+        assert_eq!(last_turn_failure(&events, None).as_deref(), Some("Model unavailable"));
+        events.push(started(4, 2));
+        assert_eq!(last_turn_failure(&events, Some(TurnEndReason::Error)), None);
+        events.push(ended(5, 2, TurnEndReason::Completed));
+        assert_eq!(last_turn_failure(&events, Some(TurnEndReason::Error)), None);
+        events.push(started(6, 3));
+        events.push(ended(7, 3, TurnEndReason::Error));
+        assert_eq!(last_turn_failure(&events, None).as_deref(), Some("The last turn ended with an error."));
+        events.push(ended(8, 3, TurnEndReason::Interrupted));
+        assert_eq!(last_turn_failure(&events, None), None);
+        assert_eq!(
+            last_turn_failure(&[], Some(TurnEndReason::WorkerRestarted)).as_deref(),
+            Some("The worker restarted during the last turn.")
+        );
+        assert_eq!(last_turn_failure(&[], Some(TurnEndReason::Completed)), None);
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]

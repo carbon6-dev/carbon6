@@ -17,8 +17,8 @@ impl AgentState {
         match self {
             Self::Idle => "Idle",
             Self::Working => "Working",
-            Self::Waiting => "Waiting",
-            Self::Failed => "Failed",
+            Self::Waiting => "Waiting on you",
+            Self::Failed => "Last turn failed",
         }
     }
 
@@ -104,9 +104,12 @@ mod tests {
 
     #[test]
     fn descriptions_keep_state_context_and_background_separate() {
-        for (state, label) in
-            [(AgentState::Idle, "Idle"), (AgentState::Working, "Working"), (AgentState::Waiting, "Waiting"), (AgentState::Failed, "Failed")]
-        {
+        for (state, label) in [
+            (AgentState::Idle, "Idle"),
+            (AgentState::Working, "Working"),
+            (AgentState::Waiting, "Waiting on you"),
+            (AgentState::Failed, "Last turn failed"),
+        ] {
             assert_eq!(description(state, Some(137), 2), format!("{label}. Context 137 percent used. 2 background tasks running."));
         }
         assert_eq!(description(AgentState::Idle, None, 0), "Idle. Context usage unavailable. No background tasks running.");

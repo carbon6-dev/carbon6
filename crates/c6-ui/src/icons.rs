@@ -86,6 +86,19 @@ pub fn info() -> impl IntoView {
     icon(view! { <circle cx="12" cy="12" r="9" /><path d="M12 11v6m0-10h.01" /> })
 }
 
+pub fn triangle_alert() -> impl IntoView {
+    icon(view! { <path d="m10.3 3.9-8.1 14a2 2 0 0 0 1.7 3h16.2a2 2 0 0 0 1.7-3l-8.1-14a2 2 0 0 0-3.4 0ZM12 9v4m0 4h.01" /> })
+}
+
+pub fn circle_x() -> impl IntoView {
+    icon(view! { <circle cx="12" cy="12" r="9" /><path d="m9 9 6 6m0-6-6 6" /> })
+}
+
+/// Static until a separate motion design is approved.
+pub fn loader_circle() -> impl IntoView {
+    icon(view! { <path d="M21 12a9 9 0 1 1-9-9" /> })
+}
+
 pub fn help() -> impl IntoView {
     icon(view! { <circle cx="12" cy="12" r="9" /><path d="M9 9a3 3 0 0 1 6 0c0 2-3 2-3 4m0 4h.01" /> })
 }

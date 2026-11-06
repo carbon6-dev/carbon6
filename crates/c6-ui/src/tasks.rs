@@ -1,6 +1,6 @@
 //! Background task lifecycle history and read-only stream inspection.
 
-use c6_api::{Event, EventKind};
+use c6_api::{Event, EventKind, Session, SessionStatus};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
@@ -143,6 +143,27 @@ pub fn running_counts(events: &[Event]) -> (usize, usize) {
         .iter()
         .filter(|t| t.running())
         .fold((0, 0), |(tasks, servers), t| if t.notify || t.kind == "claude_code" { (tasks + 1, servers) } else { (tasks, servers + 1) })
+}
+
+/// Distinct jobs actually running in the background, including servers.
+/// A carbon6 background subagent also has a task record: count it once.
+/// Claude's read-only mirrors are represented by its native task records,
+/// whose foreground flag tells us whether they really run in the background.
+pub(crate) fn background_count(events: &[Event], subagents: &[Session]) -> usize {
+    let children = subagents.iter().filter(|s| s.status == SessionStatus::Running && !s.observed).collect::<Vec<_>>();
+    let tasks = lifecycle(events)
+        .into_iter()
+        .filter(|t| t.running() && !t.foreground)
+        .filter(|t| {
+            !events.iter().any(|e| match &e.kind {
+                EventKind::SubagentSpawned { child_session_id, background_task_id, .. } => {
+                    background_task_id == &t.id && children.iter().any(|s| &s.id == child_session_id)
+                }
+                _ => false,
+            })
+        })
+        .count();
+    children.len() + tasks
 }
 
 /// The words beside the hourglass at the bottom of a transcript.
@@ -295,7 +316,11 @@ fn inspector(session: StoredValue<String>, list: Memo<Vec<Task>>, selected: RwSi
     move || {
         selected.get().map(|id| {
             let task = Memo::new(move |_| list.with(|tasks| tasks.iter().find(|t| t.id == id).cloned()));
-            view! { <TaskInspector session=session.get_value() task on_close=Callback::new(move |_| selected.set(None)) /> }
+            view! {
+                <leptos::portal::Portal>
+                    <TaskInspector session=session.get_value() task on_close=Callback::new(move |_| selected.set(None)) />
+                </leptos::portal::Portal>
+            }
         })
     }
 }
@@ -305,6 +330,7 @@ fn inspector(session: StoredValue<String>, list: Memo<Vec<Task>>, selected: RwSi
 #[component]
 fn TaskInspector(session: String, task: Memo<Option<Task>>, on_close: Callback<()>) -> impl IntoView {
     let dialog = NodeRef::<leptos::html::Div>::new();
+    let pop = crate::util::escapable(|| true, move || on_close.run(()));
     Effect::new(move || {
         if let Some(el) = dialog.get() {
             let _ = el.focus();
@@ -319,13 +345,9 @@ fn TaskInspector(session: String, task: Memo<Option<Task>>, on_close: Callback<(
         }
     });
     view! {
-        <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-2 sm:p-4"
-            on:click=move |_| on_close.run(()) on:keydown=move |ev| if ev.key() == "Escape" {
-                ev.prevent_default();
-                ev.stop_propagation();
-                on_close.run(());
-            }>
-            <div node_ref=dialog role="dialog" aria-modal="true" aria-label="Background task inspector" tabindex="-1"
+        <div class="phone-dialog fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-2 sm:p-4"
+            on:click=move |_| on_close.run(())>
+            <div node_ref=dialog role="dialog" aria-modal="true" aria-label="Background task inspector" data-pop=pop tabindex="-1"
                 class="flex max-h-[90vh] w-full max-w-4xl flex-col gap-3 overflow-auto rounded-lg bg-white p-3 text-sm shadow-xl sm:p-4 dark:bg-zinc-900"
                 on:click=|ev| ev.stop_propagation()>
                 <div class="flex flex-wrap items-center gap-2">
@@ -490,6 +512,40 @@ mod tests {
         assert_eq!(background_agents(&moved), 2);
         let task = lifecycle(&moved).into_iter().find(|t| t.id == "fg-agent").unwrap();
         assert_eq!(task.since, 2000);
+    }
+
+    #[test]
+    fn phone_background_count_is_positive_only_for_current_distinct_background_jobs() {
+        let mut events = vec![
+            native(1, "foreground", "started", "local_agent", true),
+            native(2, "native", "started", "local_agent", false),
+            event(3, "server", "started"),
+            event(4, "done", "started"),
+            event(5, "done", "finished"),
+        ];
+        assert_eq!(background_count(&[], &[]), 0);
+        assert_eq!(background_count(&events, &[]), 2, "neither foreground nor completed tasks count");
+        let child = |id: &str, status: &str, observed: bool| {
+            serde_json::from_value::<Session>(serde_json::json!({
+                "id": id, "worker_id": "00000000-0000-0000-0000-000000000001", "title": id, "cwd": "/src",
+                "connection_id": "anthropic", "model": "m", "status": status, "error": null, "effort": null,
+                "created_at": 0, "updated_at": 0, "last_seq": 0, "observed": observed
+            }))
+            .unwrap()
+        };
+        let children = [child("child", "running", false), child("mirror", "running", true), child("ended", "idle", false)];
+        assert_eq!(background_count(&events, &children), 3, "a running ordinary subagent counts; its native mirror does not count twice");
+        let spawn: Event = serde_json::from_value(serde_json::json!({
+            "seq": 6, "ts": 6000, "type": "subagent_spawned", "call_id": "call", "child_session_id": "child",
+            "background_task_id": "child-task", "description": "Child"
+        }))
+        .unwrap();
+        events.extend([spawn, event(7, "child-task", "started")]);
+        assert_eq!(background_count(&events, &children), 3, "a child and its background task are one job");
+        events.extend([event(8, "server", "finished"), native(9, "native", "finished", "local_agent", false)]);
+        assert_eq!(background_count(&events, &children), 1);
+        events.push(event(10, "child-task", "finished"));
+        assert_eq!(background_count(&events, &[]), 0, "a stale foreground task cannot leave Background 0/1 behind");
     }
 
     #[test]

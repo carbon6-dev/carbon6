@@ -127,7 +127,7 @@ fn elsewhere_line(e: &AttentionElsewhere) -> impl IntoView {
 }
 
 #[component]
-pub fn NeedsYou() -> impl IntoView {
+pub fn NeedsYou(#[prop(optional)] labelled: bool, #[prop(optional)] touch: bool) -> impl IntoView {
     let live = api::live();
     let tick = RwSignal::new(0u32);
     let list = LocalResource::new(move || {
@@ -218,7 +218,7 @@ pub fn NeedsYou() -> impl IntoView {
     };
     view! {
         <div class="relative shrink-0">
-            <button class="flex items-center rounded-md px-1 py-1 hover:bg-zinc-200/60 dark:hover:bg-zinc-800"
+            <button class=if touch { "flex min-h-11 min-w-11 items-center justify-center rounded-md px-1 py-1 hover:bg-zinc-200/60 dark:hover:bg-zinc-800" } else if labelled { "flex min-h-9 items-center gap-2 rounded-md px-1 py-1 hover:bg-zinc-200/60 dark:hover:bg-zinc-800" } else { "flex items-center rounded-md px-1 py-1 hover:bg-zinc-200/60 dark:hover:bg-zinc-800" }
                 aria-haspopup="dialog" aria-expanded=move || open.get().to_string() aria-label=title title=title data-pop=pop.get_value()
                 on:click=move |_| {
                     // Opened after a failed load, it tries again.
@@ -235,12 +235,13 @@ pub fn NeedsYou() -> impl IntoView {
                     </svg>
                     {number}
                 </span>
+                {labelled.then_some("Needs you")}
             </button>
             <Show when=move || open.get()>
                 // A click outside closes it (on a phone the page dims).
                 <div class="fixed inset-0 z-40 bg-black/30 md:bg-transparent" on:click=move |_| open.set(false)></div>
                 <div role="dialog" aria-label="What needs you" data-pop=pop.get_value()
-                    class="fixed inset-x-0 bottom-0 z-50 flex max-h-[80dvh] flex-col rounded-t-xl border border-zinc-200 bg-white text-sm shadow-lg md:absolute md:inset-x-auto md:bottom-auto md:right-0 md:top-9 md:max-h-[70vh] md:w-[420px] md:rounded-lg dark:border-zinc-700 dark:bg-zinc-900">
+                    class="phone-sheet fixed inset-x-0 bottom-0 z-50 flex max-h-[80dvh] flex-col rounded-t-xl border border-zinc-200 bg-white text-sm shadow-lg md:absolute md:inset-x-auto md:bottom-auto md:right-0 md:top-9 md:max-h-[70vh] md:w-[420px] md:rounded-lg dark:border-zinc-700 dark:bg-zinc-900">
                     <div class="flex items-center gap-2 border-b border-zinc-200 px-3 py-2 dark:border-zinc-800">
                         <span class="flex-1 font-semibold">"Needs you"</span>
                         {move || (counts().1 > 0).then(|| view! {

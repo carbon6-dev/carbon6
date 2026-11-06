@@ -650,23 +650,6 @@ impl Layout {
         }
     }
 
-    /// Moves tile `key` one place earlier (`by` < 0) or later in reading
-    /// order among the tiles shown, trading places with that neighbour (its
-    /// column and its place in it); the focus stays on its tile.
-    fn step_tile(&mut self, key: u64, by: isize) {
-        let order: Vec<usize> = self.reading_order().into_iter().filter(|&i| !self.tiles[i].minimized).collect();
-        let Some(at) = order.iter().position(|&i| self.tiles[i].key == key) else { return };
-        let Some(&j) = at.checked_add_signed(by.signum()).and_then(|n| order.get(n)) else { return };
-        let (i, focused) = (order[at], self.tiles.get(self.focus).map(|t| t.key));
-        self.tiles.swap(i, j);
-        let stack = self.tiles[i].stack;
-        self.tiles[i].stack = self.tiles[j].stack;
-        self.tiles[j].stack = stack;
-        if let Some(f) = focused.and_then(|k| self.tiles.iter().position(|t| t.key == k)) {
-            self.focus = f;
-        }
-    }
-
     fn touch(&mut self, ti: usize) {
         let k = self.key();
         if let Some(t) = self.tiles.get_mut(ti) {
@@ -1209,16 +1192,6 @@ impl Workspace {
     /// Moves a dragged tile to where it was dropped.
     pub fn move_tile(&self, key: u64, to: Drop) {
         self.layout.update(|l| l.move_tile(key, to));
-    }
-
-    /// Moves a tile `by` places left (< 0) or right among the tiles shown,
-    /// in reading order (a phone's tab dropped).
-    pub fn step_tile(&self, key: u64, by: isize) {
-        let _ = self.layout.try_update(|l| {
-            for _ in 0..by.unsigned_abs() {
-                l.step_tile(key, by.signum());
-            }
-        });
     }
 
     pub fn new_tile(&self) {
@@ -1850,12 +1823,13 @@ pub fn Tiles() -> impl IntoView {
     // In focus mode the focused tile takes the whole workspace (the others
     // keep their places, hidden).
     let rects = Memo::new(move |_| ws.layout.with(Layout::rects));
+    let floor = move || rects.with(|rs| desktop_canvas_min(rs, ws.is_full()));
     // Tiles are cards with room between them, placed by `arrange` (so one
     // moving to another column keeps what it shows); on a phone, one fills
     // the screen.
     view! {
-        <div class="flex min-h-0 min-w-0 flex-1 bg-zinc-100 dark:bg-black md:p-1">
-            <div class="relative flex min-h-0 min-w-0 flex-1">
+        <div class="flex min-h-0 min-w-0 flex-1 bg-zinc-100 dark:bg-black md:overflow-x-auto md:p-1">
+            <div class="relative flex min-h-0 min-w-0 flex-1 md:min-w-(--tile-floor)" style=move || format!("--tile-floor:{}px", floor())>
                 <For each=move || keys.get() key=|k| *k let:key>
                     <TileView key rect=Signal::derive(move || rects.with(|r| r.get(&key).copied().unwrap_or_default())) />
                 </For>
@@ -1864,18 +1838,14 @@ pub fn Tiles() -> impl IntoView {
     }
 }
 
-/// A session's own turn, as its tile's bar shows it: (its dot, its word).
-/// What runs in its background (subagents, side chats, tasks) doesn't
-/// count: the bar says that apart.
-fn status_dot(s: &Session) -> (&'static str, &'static str) {
-    if s.awaiting_approval {
-        return ("bg-amber-500", "needs you");
-    }
-    match s.status {
-        SessionStatus::Running => ("animate-pulse bg-blue-500", "running"),
-        SessionStatus::Idle => ("bg-zinc-400 dark:bg-zinc-500", "idle"),
-        SessionStatus::Starting => ("bg-amber-400", "starting"),
-        SessionStatus::Failed => ("bg-red-500", "failed"),
+/// 480px of tile, plus its two 4px gutters. Preserve that useful title room
+/// with horizontal workspace scrolling instead of shrinking control targets.
+fn desktop_canvas_min(rects: &HashMap<u64, Rect>, full: bool) -> usize {
+    const TILE_WITH_GUTTERS: usize = 488;
+    if full {
+        TILE_WITH_GUTTERS
+    } else {
+        rects.values().map(|r| (TILE_WITH_GUTTERS as f64 / r.width).ceil() as usize).max().unwrap_or(TILE_WITH_GUTTERS)
     }
 }
 
@@ -1913,8 +1883,8 @@ pub fn Popover(at: RwSignal<Option<(f64, f64)>>, #[prop(into)] class: String, ch
             view! {
                 <div class="fixed inset-0 z-40" on:click=move |ev| { ev.stop_propagation(); at.set(None) }></div>
                 <div data-pop=pop.get_value()
-                    class=format!("fixed z-50 max-h-[75vh] overflow-y-auto rounded-lg border border-zinc-200 bg-white p-2 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900 {}", class.get_value())
-                    style=format!("left:{x}px;top:{y}px")
+                    class=format!("phone-popover fixed z-50 max-h-[75vh] overflow-y-auto rounded-lg border border-zinc-200 bg-white p-2 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900 {}", class.get_value())
+                    style=format!("left:{x}px;top:{y}px;--c6-pop-y:{y}px")
                 >
                     {children.with_value(|c| c())}
                 </div>
@@ -1926,6 +1896,7 @@ pub fn Popover(at: RwSignal<Option<(f64, f64)>>, #[prop(into)] class: String, ch
 #[component]
 fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
     let ws = use_workspace();
+    let bar_colour = expect_context::<crate::settings::SessionBarDisplay>().colour;
     let live = api::live();
     let focused = Memo::new(move |_| ws.layout.with(|l| l.tiles.get(l.focus).map(|t| t.key) == Some(key)));
     // Focus mode: this tile alone, or hidden behind the one that is.
@@ -1974,7 +1945,7 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
         let el: Option<web_sys::Element> = title_el.get_untracked().map(Into::into);
         rename_at.set(Some(below_element(el.as_ref(), 320.0)));
     };
-    let btn = crate::icons::BAR_BUTTON;
+    let btn = crate::session::SESSION_SLOT;
     // Another tile dragged over this one: where it would go, by where the
     // pointer is (the outer fifths make a new column beside this one's).
     // Include the padding between tiles: it belongs to this drop target too.
@@ -2047,9 +2018,10 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
             // and what you can do to the whole tile.
             // Dragged by its bar to another place or column. Always the
             // panel's own colours, so it reads whatever the mark; the mark
-            // is a stripe along its top. Taller on a touch screen, for its
-            // buttons' 40px.
-            <div class="@container relative flex h-9 shrink-0 cursor-grab items-center gap-0.5 pointer-coarse:h-11 pointer-coarse:gap-0 border-b border-zinc-200 bg-zinc-50 px-2 text-xs active:cursor-grabbing dark:border-zinc-800 dark:bg-zinc-900"
+            // is an optional stripe along its top. Seven fixed 44px slots
+            // leave the rest to identity and title; secondary tile actions
+            // are in ⋯, retaining their icons and shortcuts.
+            <div class="relative flex h-11 shrink-0 cursor-grab items-center border-b border-zinc-200 bg-zinc-50 text-xs active:cursor-grabbing md:@container md:px-1 dark:border-zinc-800 dark:bg-zinc-900"
                 draggable=move || if many.get() { "true" } else { "false" }
                 title="Drag to move this tile: onto another tile's top or bottom half, or its left or right edge for a new column"
                 on:dragstart=move |ev: web_sys::DragEvent| {
@@ -2065,70 +2037,37 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                     ws.drop_at.set(None);
                 }
             >
-                {move || colour.get().map(|c| view! { <div class="pointer-events-none absolute inset-x-0 top-0 h-1" style=crate::marks::fill(&c)></div> })}
-                <button class=btn title="Back (⌘[)" aria-label="Back" prop:disabled=move || !can_back() on:click=move |_| { ws.focus_tile_key(key); ws.step(-1) }>{crate::icons::chevron_left()}</button>
-                <button class=btn title="Forward (⌘])" aria-label="Forward" prop:disabled=move || !can_forward() on:click=move |_| { ws.focus_tile_key(key); ws.step(1) }>{crate::icons::chevron_right()}</button>
-                {move || colour.get().map(|c| view! {
-                    <button class=format!("{btn} hover:[&>*]:scale-125") title="This session's mark: change it" aria-label="Its mark" on:click=move |ev| palette_at.set(Some(below(&ev, 380.0)))>
-                        <crate::marks::Glyph mark=Signal::stored(c) shape=crate::marks::Shape::Circle size=12 />
+                <span class="md:hidden"><crate::MobileMenu /></span>
+                {move || colour.get().filter(|_| bar_colour.get() != c6_api::SessionBarColour::DotOnly).map(|c| view! { <div class="pointer-events-none absolute inset-x-0 top-0 hidden h-1 md:block" style=crate::marks::fill(&c)></div> })}
+                <Show when=move || colour.get().is_some()>
+                    <button class="hidden h-11 w-5 shrink-0 items-center justify-center md:flex" title="This session's mark: change it" aria-label="Its mark" on:click=move |ev| palette_at.set(Some(below(&ev, 380.0)))>
+                        <crate::marks::Glyph mark=Signal::derive(move || colour.get().unwrap_or_default()) shape=crate::marks::Shape::Circle size=10 />
                     </button>
-                })}
+                </Show>
                 // A session of your own is renamed by double-clicking its name
                 // (or from ⋯).
                 <span node_ref=title_el class="min-w-0 flex-1 truncate px-1 font-medium text-zinc-800 dark:text-zinc-100"
                     title=move || if renamable() { format!("{} · Double-click to rename", title.get()) } else { title.get() }
                     on:dblclick=move |ev| if renamable() { ev.stop_propagation(); rename_under_title() }>{title}</span>
-                {move || session.get().map(|s| {
-                    let (dot, label) = status_dot(&s);
-                    // A click goes to what waits on you, else what runs in
-                    // the background, else the glance. On a phone, the dot
-                    // alone (the word for screen readers).
-                    view! {
-                        <button class="flex h-7 shrink-0 items-center gap-1 rounded px-1 text-[11px] text-soft outline-none focus-visible:ring-2 focus-visible:ring-sky-500/60 pointer-coarse:h-10 pointer-coarse:min-w-10 pointer-coarse:justify-center pointer-fine:hover:bg-black/10 dark:pointer-fine:hover:bg-white/10"
-                            title=move || match chrome() {
-                                Some(c) => format!("{label} · {}", c.status_title()),
-                                None => label.to_owned(),
-                            }
-                            on:click=move |ev| if let Some(c) = chrome() { c.status_click(&ev) }>
-                            <span class=format!("size-1.5 rounded-full {dot}")></span>
-                            <span class="max-sm:sr-only">{label}</span>
-                        </button>
-                    }
-                })}
-                // What runs in it, its panes, then its actions.
-                {move || chrome().map(|c| view! {
-                    <crate::session::SessionControls chrome=c />
-                    <span class="mx-1 h-4 w-px shrink-0 bg-zinc-200 dark:bg-zinc-700"></span>
-                    <button class=btn title="Actions: rename, find, files, outputs, details, new like this, save as template, catch-up, fold finished turns, archive" aria-label="Actions"
-                        on:click=move |ev| menu_at.set(if menu_at.get_untracked().is_some() { None } else { Some(below(&ev, 240.0)) })>{crate::icons::ellipsis()}</button>
-                })}
-                {move || pinnable().map(|id| {
-                    let (a, b) = (StoredValue::new(id.clone()), id.clone());
-                    let on = move || ws.pinned.with(|p| p.contains(&a.get_value()));
-                    view! {
-                        <button class=btn title=move || if on() { "Unpin" } else { "Pin to the dock" } aria-label=move || if on() { "Unpin" } else { "Pin" }
-                            on:click=move |_| ws.toggle_pin(&b)>
-                            {move || crate::icons::star(on())}
-                        </button>
-                    }
-                })}
-                {move || two().then(|| view! {
-                    <button class=format!("{btn} hidden md:flex") title="Move the open item to a tile of its own (or ⌘-click a link)" aria-label="Into a tile of its own"
-                        on:click=move |_| ws.detach(key)>{crate::icons::square_arrow_out()}</button>
-                })}
-                {move || many.get().then(|| view! {
-                    <button class=format!("{btn} hidden md:flex") title="Minimize: hide this tile; bring it back from the sidebar (or ⌘ and its number)"
-                        aria-label="Minimize" on:click=move |ev| { ev.stop_propagation(); ws.minimize(key) }>
-                        {crate::icons::minus()}
+                {move || chrome().map(|c| view! { <crate::session::SessionControls chrome=c /> })}
+                <Show when=move || shown.get().is_some()>
+                    <button class=format!("{btn} hidden md:flex")
+                        disabled=move || pinnable().is_none()
+                        title=move || if pinnable().is_some_and(|id| ws.pinned.with(|p| p.contains(&id))) { "Unpin" } else { "Pin to the dock" }
+                        aria-label=move || if pinnable().is_some_and(|id| ws.pinned.with(|p| p.contains(&id))) { "Unpin" } else { "Pin" }
+                        on:click=move |_| if let Some(id) = pinnable() { ws.toggle_pin(&id) }>
+                        {move || crate::icons::star(pinnable().is_some_and(|id| ws.pinned.with(|p| p.contains(&id))))}
                     </button>
-                })}
+                </Show>
                 <button class=format!("{btn} hidden md:flex") title=move || if full.get() { "Defocus: back to the tiles" } else { "Focus: this tile fills the screen" }
                     aria-label=move || if full.get() { "Defocus" } else { "Focus" }
                     on:click=move |ev| { ev.stop_propagation(); ws.set_full(if full.get_untracked() { None } else { Some(key) }) }>
-                    // Corners pointing out (focus) or in (back to the tiles).
                     {move || if full.get() { crate::icons::minimize().into_any() } else { crate::icons::maximize().into_any() }}
                 </button>
-                <button class=btn title="Close this tile" aria-label="Close this tile" on:click=move |_| ws.close_tile(key)>{crate::icons::x()}</button>
+                <button class=btn title="Actions: session actions, history and tile controls" aria-label="Actions"
+                    on:click=move |ev| menu_at.set(if menu_at.get_untracked().is_some() { None } else { Some(below(&ev, 240.0)) })>{crate::icons::ellipsis()}</button>
+                <button class=format!("{btn} hidden md:flex") title="Close this tile" aria-label="Close this tile" on:click=move |_| ws.close_tile(key)>{crate::icons::x()}</button>
+                <crate::activity::SessionsPicker />
             </div>
             <Popover at=palette_at class="w-auto">
                 {move || shown.get().map(|(_, id)| view! { <crate::marks::SessionPalette session=id on_pick=move |()| palette_at.set(None) /> })}
@@ -2144,6 +2083,19 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                 {move || chrome().map(|c| view! {
                     <crate::session::SessionMenu chrome=c on_rename=move |()| rename_under_title() on_done=move |()| menu_at.set(None) />
                 })}
+                <div class="flex flex-col border-t border-zinc-200 pt-1 text-xs dark:border-zinc-700">
+                    <button class=crate::session::MENU_ITEM disabled=move || !can_back() on:click=move |_| { ws.step(-1); menu_at.set(None); }>{crate::icons::chevron_left()}"Back"</button>
+                    <button class=crate::session::MENU_ITEM disabled=move || !can_forward() on:click=move |_| { ws.step(1); menu_at.set(None); }>{crate::icons::chevron_right()}"Forward"</button>
+                    <Show when=two>
+                        <button class=crate::session::MENU_ITEM on:click=move |_| { ws.detach(key); menu_at.set(None); }>{crate::icons::square_arrow_out()}"Into its own tile"</button>
+                    </Show>
+                    <Show when=move || many.get()>
+                        <button class=crate::session::MENU_ITEM on:click=move |_| { ws.minimize(key); menu_at.set(None); }>{crate::icons::minus()}"Minimize"</button>
+                    </Show>
+                    <Show when=move || colour.get().is_some()>
+                        <button class=crate::session::MENU_ITEM on:click=move |ev| { palette_at.set(Some(below(&ev, 380.0))); menu_at.set(None); }>{crate::icons::circle()}"Session mark"</button>
+                    </Show>
+                </div>
             </Popover>
             <div class="flex min-h-0 flex-1">
                 <For each=move || cols.get() key=|k| *k let:col>
@@ -2158,6 +2110,19 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_tiles_keep_480px_without_squeezing_their_controls() {
+        for columns in 1..=4 {
+            let rects = arrange(&(0..columns).map(|c| (c, 0)).collect::<Vec<_>>());
+            let rects = rects.into_iter().enumerate().map(|(i, r)| (i as u64, r)).collect::<HashMap<_, _>>();
+            let width = desktop_canvas_min(&rects, false);
+            for r in rects.values() {
+                assert!(width as f64 * r.width - 8.0 >= 480.0);
+            }
+            assert_eq!(desktop_canvas_min(&rects, true), 488, "focus mode needs just one tile");
+        }
+    }
 
     #[test]
     fn upward_input_stops_following_before_any_scroll_and_even_one_pixel_from_end() {
@@ -2225,29 +2190,6 @@ mod tests {
         assert_eq!(ScrollIntent::from_key(" ", true), Some(ScrollIntent::Away));
         assert_eq!(ScrollIntent::from_key("a", false), None);
         assert_eq!(ScrollIntent::from_key("Tab", false), None);
-    }
-
-    #[test]
-    fn tile_status_is_the_sessions_own_turn_not_what_runs_beside_it() {
-        let mut session: Session = serde_json::from_value(serde_json::json!({
-            "id": "main", "worker_id": "00000000-0000-0000-0000-000000000000",
-            "title": "Main", "cwd": "", "connection_id": "", "model": "",
-            "status": "idle", "created_at": 0, "updated_at": 0, "last_seq": 0,
-            "side_chats_running": 1
-        }))
-        .unwrap();
-        assert_eq!(status_dot(&session).1, "idle", "a side chat runs, not its turn");
-        session.subagents_running = 2;
-        session.tasks_running = 1;
-        assert_eq!(status_dot(&session).1, "idle", "subagents and tasks are its background");
-        session.status = SessionStatus::Running;
-        assert_eq!(status_dot(&session).1, "running");
-        session.status = SessionStatus::Idle;
-        session.awaiting_approval = true;
-        assert_eq!(status_dot(&session).1, "needs you");
-        session.awaiting_approval = false;
-        session.side_chats_running = 0;
-        assert_eq!(status_dot(&session).1, "idle");
     }
 
     #[test]
@@ -2485,28 +2427,6 @@ mod tests {
         assert_eq!(l.reading_order(), [1, 0, 2], "left column first, then top to bottom");
         l.minimize(0);
         assert_eq!(l.reading_order(), [1, 0, 2], "a minimized tile keeps its number");
-    }
-
-    #[test]
-    fn a_tile_steps_left_and_right_among_those_shown() {
-        let mut l = opened(5); // the fifth stacks under the first
-        let keys: Vec<u64> = l.tiles.iter().map(|t| t.key).collect();
-        let order = |l: &Layout| l.reading_order().into_iter().map(|i| l.tiles[i].key).collect::<Vec<_>>();
-        assert_eq!(order(&l), [keys[0], keys[4], keys[1], keys[2], keys[3]]);
-        l.focus = 2;
-        l.step_tile(keys[1], -1);
-        assert_eq!(order(&l), [keys[0], keys[1], keys[4], keys[2], keys[3]], "it trades places with the one before");
-        assert_eq!(l.tile(keys[1]).unwrap().stack, Some(0), "into that one's column");
-        assert_eq!(l.tile(keys[4]).unwrap().stack, Some(1));
-        assert_eq!(l.tiles[l.focus].key, keys[2], "the focus stays on its tile");
-        l.step_tile(keys[0], -1);
-        l.step_tile(keys[3], 1);
-        assert_eq!(order(&l), [keys[0], keys[1], keys[4], keys[2], keys[3]], "the ends stay");
-        // A minimized tile is stepped over.
-        let i = l.tiles.iter().position(|t| t.key == keys[4]).unwrap();
-        l.minimize(i);
-        l.step_tile(keys[2], -1);
-        assert_eq!(order(&l), [keys[0], keys[2], keys[4], keys[1], keys[3]]);
     }
 
     #[test]

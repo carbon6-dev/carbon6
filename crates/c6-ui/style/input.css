@@ -1,4 +1,34 @@
 @import "tailwindcss";
+
+/* One phone bar, no footer. Keyboard visibility changes the transcript's
+   viewport, never swaps or recreates the composer. No motion. */
+@media (width < 48rem), (height < 32rem) {
+  .c6-app {
+    position: fixed;
+    inset-inline: 0;
+    top: var(--c6-visible-top, 0px);
+    height: var(--c6-visible-height, 100dvh);
+  }
+  .phone-sheet {
+    bottom: var(--c6-keyboard-inset, 0px);
+    max-height: calc(var(--c6-visible-height, 100dvh) * .8);
+  }
+  .phone-drawer {
+    top: calc(var(--c6-visible-top, 0px) + 44px);
+    max-height: calc(var(--c6-visible-height, 100dvh) - 44px);
+  }
+  .phone-dialog {
+    top: var(--c6-visible-top, 0px);
+    bottom: var(--c6-keyboard-inset, 0px);
+    padding-top: 8px;
+    padding-bottom: 8px;
+  }
+  .phone-dialog > [role="dialog"] { max-height: 100%; }
+  .phone-popover {
+    top: clamp(calc(var(--c6-visible-top, 0px) + 48px), var(--c6-pop-y), calc(var(--c6-visible-top, 0px) + var(--c6-visible-height, 100dvh) - 56px)) !important;
+    max-height: calc(var(--c6-visible-height, 100dvh) - 60px);
+  }
+}
 @source "../src/**/*.rs";
 
 /* Dark mode follows the html element's class (js/theme.js: the OS, or
@@ -24,7 +54,7 @@
 
 /* The desktop layout (tiles side by side, the header's nav, the sidebar)
    needs height as well as width: a phone on its side is wide but short,
-   so it keeps the phone's layout (one tile, the bottom bar, the ☰ menu).
+   so it keeps the phone's layout (one tile, the Sessions picker, the ☰ menu).
    sm stays width-only: it sets spacing and type, not the layout. */
 @custom-variant md (@media (width >= 48rem) and (height >= 32rem));
 @custom-variant lg (@media (width >= 64rem) and (height >= 32rem));

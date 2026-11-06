@@ -6,6 +6,43 @@ use leptos::prelude::*;
 mod drafts;
 pub use drafts::attachments as draft_attachments;
 
+/// Keep the app and its phone sheets in the *visible* viewport. Safari can
+/// overlay its keyboard without resizing 100dvh; Chromium may resize both.
+/// CSS applies these measurements only to phone layouts, not desktop tiles.
+pub fn watch_visible_viewport() {
+    use wasm_bindgen::{JsCast, closure::Closure};
+    let measure = || {
+        let w = window();
+        let height = w.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let (top, visible) = w.visual_viewport().map_or((0.0, height), |v| (v.offset_top(), v.height()));
+        if let Some(root) = document().document_element().and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok()) {
+            let style = root.style();
+            let _ = style.set_property("--c6-visible-top", &format!("{top}px"));
+            let _ = style.set_property("--c6-visible-height", &format!("{visible}px"));
+            let _ = style.set_property("--c6-keyboard-inset", &format!("{}px", (height - top - visible).max(0.0)));
+        }
+    };
+    measure();
+    let on = Closure::<dyn Fn()>::new(measure);
+    let callback = on.as_ref().unchecked_ref();
+    let _ = window().add_event_listener_with_callback("resize", callback);
+    let viewport = window().visual_viewport();
+    if let Some(v) = &viewport {
+        let _ = v.add_event_listener_with_callback("resize", callback);
+        let _ = v.add_event_listener_with_callback("scroll", callback);
+    }
+    let hooks = send_wrapper::SendWrapper::new((viewport, on));
+    on_cleanup(move || {
+        let (viewport, on) = &*hooks;
+        let callback = on.as_ref().unchecked_ref();
+        let _ = window().remove_event_listener_with_callback("resize", callback);
+        if let Some(v) = viewport {
+            let _ = v.remove_event_listener_with_callback("resize", callback);
+            let _ = v.remove_event_listener_with_callback("scroll", callback);
+        }
+    });
+}
+
 pub fn now_ms() -> i64 {
     js_sys::Date::now() as i64
 }

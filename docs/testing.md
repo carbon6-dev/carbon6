@@ -147,10 +147,40 @@ In a desktop browser (also check touch-capable desktop/tablet native dragging):
    must follow the same rules. Dropping a tile over a message box still moves
    the tile; dropping a file still attaches it, not moves a tile. End/cancel a
    drag and check that all feedback disappears.
-6. On a phone, long-press a bottom tab and drag it across several tabs (also
-   with minimized tiles present). The insertion line and final reading order
-   must agree. This uses `step_tile`/the switcher's pointer handlers, not the
-   desktop `Drop` zones; a long press without movement still opens its menu.
+6. On a phone there is no reorder footer. Open **Sessions**, check one flat
+   reading-order list including hidden tiles, switch and close each kind of
+   page, and check its current highlight and positive count. Desktop dragging
+   above remains the reordering route.
+
+## Phone session header and desktop ring: browser check
+
+Use Chromium and WebKit, light and dark. Test 320px and 390px portraits and a
+short landscape viewport, with the keyboard closed, a resized viewport and an
+overlay/offset visual viewport. Check one 44px top bar and no footer. Open
+the app menu (realm, search, Activity, notifications, connection/version),
+Sessions (Ask, bell, close/switch/new), Actions (Find/details/history), and the
+plain context ring (the only phone route to Changes/Terminal/Files/Outputs).
+Sheets and dialogs must stay within the visible viewport and scroll.
+
+Drive idle, main-working, waiting, last-turn failure and background-only
+states. No idle row or Background 0; working must not follow aggregate child
+status. Deduplicate linked task/subagent records and exclude foreground native
+work and mirrors. Show must expose cards, errors, Inspect/Stop and history.
+Hold a draft and focused composer element across these transitions: it must
+stay mounted and at the same bottom position; the transcript loses/gains 44px.
+Following remains at the bottom, while a scrolled-up reader stays put.
+
+At desktop height, exercise real columns of 360/400/440/480px tiles before
+applying the chosen floor (temporarily override the canvas floor, not just the
+bar width). The transcript and bar must share the same actual tile width.
+All seven controls must remain 44px, with identity separate;
+record title room and overflow rather than shrinking targets. Verify the
+480px floor and horizontally scrolling canvas. Inspect all four rim states,
+neutral context arc, dashed waiting, failed cross, positive-only badge, worded
+accessible name/tooltip, and stripe-default/Dot-only Appearance preference.
+Keep screenshots for both themes; validate new arbitrary utilities in built
+CSS as well as geometry. Emulated keyboard tests do not replace a physical
+phone keyboard/accessibility review.
 
 ## Transcript follow: manual browser check
 
