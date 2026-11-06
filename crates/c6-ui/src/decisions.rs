@@ -427,7 +427,7 @@ fn archive_cleanup_body(docs: Vec<c6_api::docs_archive::ArchiveDocCandidate>, re
     view! {
         <div class="space-y-2 text-sm">
             <p>{format!("{} documents. {}", docs.len(), reason)}</p>
-            <div class="max-h-64 overflow-y-auto rounded-md border border-zinc-200 dark:border-zinc-800"
+            <div class="max-h-64 overflow-y-auto rounded-md border border-zinc-200 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-sky-500 dark:border-zinc-800"
                 role="region" aria-label="Documents to archive" tabindex="0">
                 <ul class="divide-y divide-zinc-200 dark:divide-zinc-800">
                     {docs.into_iter().map(|doc| {
@@ -465,7 +465,7 @@ fn archive_cleanup_outcome(context: serde_json::Value, realm: String) -> impl In
             view! {
                 <div class="mt-3 space-y-2 text-sm" role="status">
                     <p class="font-medium">{summary}</p>
-                    <ul class="max-h-64 space-y-1 overflow-y-auto" aria-label="Document cleanup results" tabindex="0">
+                    <ul class="max-h-64 space-y-1 overflow-y-auto rounded-md outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-sky-500" aria-label="Document cleanup results" tabindex="0">
                         {rows.map(|(id, outcome)| {
                             let title = docs.iter().find(|doc| doc.id == id).map(|doc| doc.title.clone()).unwrap_or_else(|| id.clone());
                             view! {
@@ -759,6 +759,9 @@ mod tests {
         assert!(html.contains("2 documents. Finished drafts"));
         assert!(html.contains("max-h-64 overflow-y-auto"));
         assert!(html.contains("aria-label=\"Documents to archive\""));
+        assert!(html.contains("tabindex=\"0\""), "the list remains keyboard-scrollable: {html}");
+        assert!(html.contains("outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-sky-500"));
+        assert!(!html.contains("autofocus"), "appearing must not take focus: {html}");
         assert_eq!(html.matches("<li ").count(), 2);
         assert!(html.contains("href=\"/r/home/docs/first\""));
         assert!(html.contains("href=\"/r/home/docs/second\""));

@@ -2139,7 +2139,11 @@ fn BlockView(
         }
     };
     view! {
-        <div class="group relative rounded py-0.5 pl-2 pr-14 hover:bg-zinc-50 dark:hover:bg-zinc-900/60" title=hover data-block=b.id.clone()>
+        <div class=move || if archived.get() {
+            "group relative rounded py-0.5 pl-2 pr-14"
+        } else {
+            "group relative rounded py-0.5 pl-2 pr-14 hover:bg-zinc-50 dark:hover:bg-zinc-900/60"
+        } title=hover data-block=b.id.clone()>
             {move || if is_open.get() && !archived.get() {
                 let area = NodeRef::<leptos::html::Textarea>::new();
                 crate::util::autosize(area, move || draft.text.track());
@@ -2166,7 +2170,7 @@ fn BlockView(
             } else {
                 let b = block.get_value();
                 view! {
-                    <div class=move || if edit_all.get() { "cursor-text" } else { "" }
+                    <div class=move || if !archived.get() && edit_all.get() { "cursor-text" } else { "" }
                         on:click=move |ev| {
                             if let Some(c) = chip_ctx && chip_clicked(&ev, &block.get_value(), c, col, ws) { return; }
                             if crate::mentions::follow_link(&ev, col, ws) { return; }
