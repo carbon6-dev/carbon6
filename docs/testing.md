@@ -70,6 +70,19 @@ body frames before the application renders. It also tests four usable radio
 cards at 240/320/400/480/640px tile and phone widths, persistence, OS changes,
 and real cross-tab palette and selected-card updates.
 
+`theme.cjs --browser --workspace-radios` additionally checks one/five/six-tile
+workspaces and duplicate retained Appearance views: actual native `.checked`
+properties, selected-card paint, Soft/System persistence through maximizing
+another tile, restore and reload, and same-document/cross-tab motion-choice
+synchronization. Native group names are per mounted instance; hidden views
+still participate in document-wide groups. Inert cloned radios participate
+too, which is another reason tile motion must not clone outgoing content.
+The same run exercises both custom `Choices` callers (session questions and
+decision forms), optional clearing, and the actual session aspect palette
+through that lifecycle. `--workspace-choices` runs just the custom-control audit.
+Unsent forms reconstruct their existing defaults after reload; saved aspect
+marks persist. These checks do not add persistence to unsent forms.
+
 Soft keeps the requested greys and existing accents, not a blanket contrast
 guarantee. The sample document's red `#f87171` on chip `#33343a` is 4.484:1:
 it rounds to 4.5 but is below the unrounded AA threshold. Current Tailwind 4

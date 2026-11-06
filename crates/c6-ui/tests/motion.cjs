@@ -134,7 +134,7 @@ function instrumentation() {
   };
 }
 
-async function fixture(browser, origin, viewport, theme, motion, started, contextOptions = {}) {
+async function fixture(browser, origin, viewport, theme, motion, started, contextOptions = {}, seed = {}) {
   const debug = phase => { if (process.env.DEBUG_FIXTURE) console.log(`  FIXTURE ${phase}`); };
   debug('new context');
   const context = await browser.newContext({ viewport, hasTouch: phoneViewport(viewport),
@@ -150,7 +150,7 @@ async function fixture(browser, origin, viewport, theme, motion, started, contex
   crash.catch(() => {}); // The fixture may still be wiring its awaited signals.
   const progress = { page, context, errors, requests, consoleMessages, motion, theme, viewport, crash, phase: 'configure' };
   started(progress);
-  let state = 'idle', sequence = 100, suggestion = null;
+  let state = 'idle', sequence = 100, suggestion = null, marks = seed.marks || {};
   let sessionView = { catchup: true, fold: false }, deferredView;
   page.on('pageerror', error => {
     errors.push(String(error.stack || error)); console.error('PAGEERROR', error.stack || error);
@@ -179,9 +179,10 @@ async function fixture(browser, origin, viewport, theme, motion, started, contex
       socket.onClose(() => lives.delete(socket));
       socket.send(JSON.stringify({ type: 'sessions', sessions: [session('parent', state)] }));
       socket.send(JSON.stringify({ type: 'workers', workers: [worker] }));
+      socket.send(JSON.stringify({ type: 'marks', marks }));
     } else if (url.pathname.endsWith('/stream')) {
       streams.add(socket);
-      for (const event of initialEvents()) socket.send(JSON.stringify({ type: 'event', event }));
+      for (const event of [...initialEvents(), ...(seed.events || [])]) socket.send(JSON.stringify({ type: 'event', event }));
       socket.send(JSON.stringify({ type: 'synced' }));
       socket.onClose(() => streams.delete(socket));
     } else { errors.push(`Unmocked WebSocket: ${url}`); socket.close(); }
@@ -252,6 +253,7 @@ async function fixture(browser, origin, viewport, theme, motion, started, contex
   await Promise.race([settle(page), crash]);
   const send = message => { for (const socket of streams) socket.send(JSON.stringify(message)); };
   return Object.assign(progress, {
+    setMarks: given => { marks = given; for (const live of lives) live.send(JSON.stringify({ type: 'marks', marks })); },
     setSuggestion: text => { suggestion = text === null ? null : { text, for_seq: 65 }; },
     deferViewWrite: () => {
       let received, release;
@@ -350,7 +352,7 @@ async function policy(f) {
   await tab.goto(new URL('/r/other/settings/appearance', page.url()).href, { waitUntil: 'domcontentloaded' });
   assert.equal(await tab.evaluate(() => c6Motion.get()), 'full', 'motion is not realm-scoped');
   await tab.getByRole('heading', { name: 'Motion', exact: true }).waitFor();
-  const choices = tab.locator('input[name="motion"]');
+  const choices = tab.locator('input[name|="motion"]');
   assert.equal(await choices.count(), 4, 'Appearance exposes all four real motion choices');
   for (const [index, choice] of ['system', 'full', 'reduced', 'off'].entries()) {
     f.phase = `policy/appearance-${choice}`;
@@ -1479,7 +1481,7 @@ function unitTests() {
     const storage = new Map(choice === undefined ? [] : [['c6.motion', choice]]);
     const events = new Map(), mediaEvents = new Map();
     const media = { matches: reduced, addEventListener: (name, callback) => mediaEvents.set(name, callback) };
-    let canceled = 0, cssCanceled = 0, transitionCanceled = 0, changed = 0;
+    let canceled = 0, cssCanceled = 0, transitionCanceled = 0, changed = 0, choiceChanged = 0;
     class CSSAnimation { cancel() { cssCanceled++; } }
     class CSSTransition { cancel() { transitionCanceled++; } }
     const animations = [{ cancel() { canceled++; } }];
@@ -1490,7 +1492,11 @@ function unitTests() {
       matchMedia: query => { assert.equal(query, '(prefers-reduced-motion: reduce)'); return media; },
       document: { documentElement: { dataset: {} }, getAnimations: () => animations },
       addEventListener: (name, callback) => events.set(name, callback),
-      dispatchEvent: event => { if (event.type === 'c6-motion') changed++; events.get(event.type)?.(event); }, Event,
+      dispatchEvent: event => {
+        if (event.type === 'c6-motion') changed++;
+        if (event.type === 'c6-motion-choice') choiceChanged++;
+        events.get(event.type)?.(event);
+      }, Event,
     };
     if (cssAnimations) Object.assign(context, { CSSAnimation, CSSTransition });
     context.window = context;
@@ -1498,7 +1504,8 @@ function unitTests() {
     return { api: context.c6Motion, window: context, storage, root: context.document.documentElement,
       os: value => { media.matches = value; mediaEvents.get('change')(); },
       external: value => { storage.set('c6.motion', value); events.get('storage')({ key: 'c6.motion' }); },
-      canceled: () => canceled, cssCanceled: () => cssCanceled, transitionCanceled: () => transitionCanceled, changed: () => changed };
+      canceled: () => canceled, cssCanceled: () => cssCanceled, transitionCanceled: () => transitionCanceled,
+      changed: () => changed, choiceChanged: () => choiceChanged };
   };
   test('motion.js resolves default/invalid System and follows OS changes', () => {
     for (const choice of [undefined, 'bogus', 'system']) {
@@ -1530,6 +1537,16 @@ function unitTests() {
     const quota = load({ choice: 'full', reduced: true, failWrite: true });
     assert.doesNotThrow(() => quota.api.set('reduced'));
     assert.equal(quota.root.dataset.motion, 'full', 'failed persistence retains the stored preference');
+  });
+  test('motion choices notify mounted pickers even when the effective policy stays Full', () => {
+    const f = load({ choice: 'system' });
+    const changes = f.changed(), canceled = f.canceled();
+    f.api.set('full');
+    f.api.set('system');
+    f.external('full');
+    assert.equal(f.choiceChanged(), 3, 'same-document and cross-tab choices notify pickers');
+    assert.equal(f.changed(), changes, 'preference-only changes do not signal an effective-policy change');
+    assert.equal(f.canceled(), canceled, 'System/Full switches do not interrupt motion');
   });
   test('motion.js non-Full cancels JavaScript/captured transitions but preserves variable-driven CSS keyframes', () => {
     const f = load({ choice: 'full', cssAnimations: true });

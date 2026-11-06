@@ -143,7 +143,8 @@ function data(now) {
     }),
     decision(7103, 'Confirm the release reviewer and include any remaining phone landscape observations', {
       kind: 'provide', document: 'Record who will sign off the browser evidence and any remaining concerns.',
-      form: [{ name: 'reviewer', label: 'Release reviewer with a deliberately long descriptive field label', kind: 'text', required: true }, { name: 'observations', label: 'Phone landscape observations', kind: 'long' }],
+      form: [{ name: 'reviewer', label: 'Release reviewer with a deliberately long descriptive field label', kind: 'text', required: true }, { name: 'observations', label: 'Phone landscape observations', kind: 'long' },
+        { name: 'strategy', label: 'Review strategy', kind: 'choice', choices: ['Prioritise narrow tiles', 'Review every layout'] }],
     }),
   ];
   const mailThreads = [

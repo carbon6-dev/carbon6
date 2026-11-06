@@ -457,9 +457,18 @@ extern "C" {
     fn motion_set(choice: &str);
 }
 
+// Native radio groups span the document, including hidden retained tiles.
+// Each mounted setting needs its own group, not just its own checked signal.
+fn radio_name(group: &str) -> String {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    format!("{group}-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Light, dark, soft, or as the system is: kept in this browser.
 #[component]
 fn AppearanceSetting() -> impl IntoView {
+    let theme_name = radio_name("theme");
+    let motion_name = radio_name("motion");
     let choice = RwSignal::new(theme_get());
     let theme = window_event_listener(leptos::ev::Custom::new("c6-theme"), move |_: web_sys::Event| {
         let next = theme_get();
@@ -469,10 +478,17 @@ fn AppearanceSetting() -> impl IntoView {
     });
     on_cleanup(move || theme.remove());
     let motion = RwSignal::new(motion_get());
+    let motion_choice = window_event_listener(leptos::ev::Custom::new("c6-motion-choice"), move |_: web_sys::Event| {
+        let next = motion_get();
+        if motion.get_untracked() != next {
+            motion.set(next);
+        }
+    });
+    on_cleanup(move || motion_choice.remove());
     let option = move |value: &'static str, label: &'static str, what: &'static str| {
         view! {
             <label class="flex cursor-pointer items-start gap-3 rounded-md border border-zinc-200 px-3 py-2 has-checked:border-blue-500 has-checked:bg-blue-50 dark:border-zinc-800 dark:has-checked:border-blue-400 dark:has-checked:bg-blue-950">
-                <input type="radio" name="theme" class="mt-1 shrink-0" prop:checked=move || choice.get() == value
+                <input type="radio" name=theme_name.clone() class="mt-1 shrink-0" prop:checked=move || choice.get() == value
                     on:change=move |_| { theme_set(value); choice.set(value.to_owned()); } />
                 <span class="min-w-0">
                     <span class="block text-sm font-medium">{label}</span>
@@ -484,7 +500,7 @@ fn AppearanceSetting() -> impl IntoView {
     let motion_option = move |value: &'static str, label: &'static str, what: &'static str| {
         view! {
             <label class="flex cursor-pointer items-start gap-3 rounded-md border border-zinc-200 px-3 py-2 has-checked:border-blue-500 has-checked:bg-blue-50 dark:border-zinc-800 dark:has-checked:border-blue-400 dark:has-checked:bg-blue-950">
-                <input type="radio" name="motion" class="mt-1 shrink-0" prop:checked=move || motion.get() == value
+                <input type="radio" name=motion_name.clone() class="mt-1 shrink-0" prop:checked=move || motion.get() == value
                     on:change=move |_| { motion_set(value); motion.set(value.to_owned()); } />
                 <span class="min-w-0"><span class="block text-sm font-medium">{label}</span><span class="block text-xs text-muted">{what}</span></span>
             </label>
@@ -1503,6 +1519,7 @@ fn SuggestionsSetting() -> impl IntoView {
 /// write without asking.
 #[component]
 fn DocsSetting() -> impl IntoView {
+    let write_name = radio_name("docs-write");
     let shown = RwSignal::new(None::<c6_api::docs::DocsSettings>);
     let loaded = LocalResource::new(move || {
         api::realm().track();
@@ -1524,7 +1541,7 @@ fn DocsSetting() -> impl IntoView {
     let choice = move |value: &'static str, text: &'static str| {
         view! {
             <label class="flex items-start gap-2 text-sm">
-                <input type="radio" name="docs-write" class="mt-1" prop:checked=move || shown.get().is_some_and(|s| s.write == value)
+                <input type="radio" name=write_name.clone() class="mt-1" prop:checked=move || shown.get().is_some_and(|s| s.write == value)
                     on:change=move |_| set(value) />
                 <span>{text}</span>
             </label>
@@ -4001,6 +4018,8 @@ fn SubagentLimitsSetting() -> impl IntoView {
 /// MCP server (docs/background.md §4).
 #[component]
 fn ClaudeCodeToolsSetting() -> impl IntoView {
+    let native_name = radio_name("cc-native");
+    let tools_name = radio_name("cc-tools");
     let setting = RwSignal::new(None::<c6_api::ClaudeCodeTools>);
     // The extra Claude Code settings, as typed (JSON).
     let extra = RwSignal::new(String::new());
@@ -4079,11 +4098,11 @@ fn ClaudeCodeToolsSetting() -> impl IntoView {
                     <h3 class="text-sm font-medium">"Claude Code's own tools"</h3>
                     <div class="flex flex-wrap gap-4 text-sm">
                         <label class="flex items-center gap-2">
-                            <input type="radio" name="cc-native" prop:checked=!all on:change=move |_| native_all(false) />
+                            <input type="radio" name=native_name.clone() prop:checked=!all on:change=move |_| native_all(false) />
                             "Coding tools only: Bash, Read, Write, Edit and its tool search"
                         </label>
                         <label class="flex items-center gap-2">
-                            <input type="radio" name="cc-native" prop:checked=all on:change=move |_| native_all(true) />
+                            <input type="radio" name=native_name.clone() prop:checked=all on:change=move |_| native_all(true) />
                             "All, as without carbon6"
                         </label>
                     </div>
@@ -4102,11 +4121,11 @@ fn ClaudeCodeToolsSetting() -> impl IntoView {
                     <h3 class="text-sm font-medium">"carbon6's tools"</h3>
                     <div class="flex flex-wrap gap-4 text-sm">
                         <label class="flex items-center gap-2">
-                            <input type="radio" name="cc-tools" prop:checked=auto on:change=move |_| automatic(true) />
+                            <input type="radio" name=tools_name.clone() prop:checked=auto on:change=move |_| automatic(true) />
                             "Automatic: every carbon6 tool the session has"
                         </label>
                         <label class="flex items-center gap-2">
-                            <input type="radio" name="cc-tools" prop:checked=!auto on:change=move |_| automatic(false) />
+                            <input type="radio" name=tools_name.clone() prop:checked=!auto on:change=move |_| automatic(false) />
                             "Chosen by hand"
                         </label>
                     </div>
@@ -4796,6 +4815,16 @@ fn MemorySetting() -> impl IntoView {
 #[cfg(not(target_arch = "wasm32"))]
 mod session_bar_tests {
     use super::*;
+
+    #[test]
+    fn radio_groups_are_unique_across_mounted_settings() {
+        for group in ["theme", "motion", "docs-write", "cc-native", "cc-tools"] {
+            let first = radio_name(group);
+            let second = radio_name(group);
+            assert!(first.starts_with(&format!("{group}-")));
+            assert_ne!(first, second);
+        }
+    }
 
     #[test]
     fn session_bar_appearance_uses_shared_context_and_reports_loading_errors() {

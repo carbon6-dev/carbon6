@@ -30,13 +30,20 @@ window.c6Motion = (() => {
     dispatchEvent(new Event("c6-motion"));
   };
   media.addEventListener("change", apply);
-  addEventListener("storage", event => { if (event.key === KEY) apply(); });
+  addEventListener("storage", event => {
+    if (event.key !== KEY && event.key !== null) return;
+    apply();
+    dispatchEvent(new Event("c6-motion-choice"));
+  });
   apply();
   return {
     get,
     set(choice) {
       try { localStorage.setItem(KEY, choice); } catch (_) {}
       apply();
+      // System and Full can resolve identically. Notify radio pickers even
+      // then, without interrupting animations via the effective-policy event.
+      dispatchEvent(new Event("c6-motion-choice"));
     },
     reduced: () => document.documentElement.dataset.motion !== "full",
     off: () => document.documentElement.dataset.motion === "off",

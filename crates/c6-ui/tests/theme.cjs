@@ -3,6 +3,7 @@
 
 // Unit/contrast/source guards (no build): node --test crates/c6-ui/tests/theme.cjs
 // Production browser: node crates/c6-ui/tests/theme.cjs --browser
+// Retained-tile radio regression only: add --workspace-radios.
 // First-paint only, no WASM needed: add --paint-only. Both modes use ROOT=dist.
 // Browser options match motion.cjs: ENGINE, PLAYWRIGHT_CORE, CHROMIUM, etc.
 // WIDTHS=240,320,400,480,640 THEMES=light,dark,soft,system LAYOUTS=tile,phone
@@ -180,6 +181,15 @@ function unitTests() {
     assert(appearance.includes('@lg/settings:grid-cols-2 @4xl/settings:grid-cols-4'));
     assert(appearance.includes('Custom::new("c6-theme")'));
     assert(appearance.includes('on_cleanup(move || theme.remove())'));
+    assert(appearance.includes('Custom::new("c6-motion-choice")'));
+    assert(appearance.includes('on_cleanup(move || motion_choice.remove())'));
+  });
+  test('native Settings radio names are instance-local, including Docs and Claude Code', () => {
+    const rust = fs.readFileSync(path.join(UI, 'src/settings.rs'), 'utf8');
+    assert(!/type="radio" name="/.test(rust), 'static native radio names collide across retained Settings views');
+    for (const group of ['theme', 'motion', 'docs-write', 'cc-native', 'cc-tools']) {
+      assert(rust.includes(`radio_name("${group}")`), `${group} needs its own instance-local radio group`);
+    }
   });
   test('exact sRGB contrast: muted passes; specified chip red rounds up but is below 4.5', t => {
     const colours = { muted: '#a1a1aa', red: '#f87171', white: '#ffffff',
@@ -273,7 +283,7 @@ async function assertTheme(page, choice, os = false) {
 }
 
 async function cardBounds(page) {
-  const result = await page.locator('input[name=theme]').evaluateAll(radios => {
+  const result = await page.locator('input[name|=theme]').evaluateAll(radios => {
     const grid = radios[0].closest('label').parentElement;
     const bounds = grid.getBoundingClientRect();
     return radios.map(radio => {
@@ -307,8 +317,8 @@ async function switching(browser, origin, layout, fixture, settle) {
     if (process.env.SCREENSHOTS) await f.page.screenshot({ path: path.join(process.env.SCREENSHOTS, `soft-theme-session-${layout}.png`) });
     await f.page.evaluate(() => localStorage.removeItem('c6.home.workspace.v2'));
     await f.page.goto(`${origin}/r/home/settings/appearance`, { waitUntil: 'domcontentloaded' });
-    await f.page.locator('input[name=theme]').first().waitFor();
-    const radios = f.page.locator('input[name=theme]');
+    await f.page.locator('input[name|=theme]').first().waitFor();
+    const radios = f.page.locator('input[name|=theme]');
     assert.equal(await radios.count(), 4);
     const themes = (process.env.THEMES || 'light,dark,soft,system').split(',');
     for (const width of (process.env.WIDTHS || '240,320,400,480,640').split(',').map(Number)) {
@@ -333,11 +343,11 @@ async function switching(browser, origin, layout, fixture, settle) {
     // events, not synthetic dispatches, must update palette AND selected card.
     const peer = await f.context.newPage();
     await peer.goto(`${origin}/r/home/settings/appearance`, { waitUntil: 'domcontentloaded' });
-    await peer.locator('input[name=theme]').first().waitFor();
+    await peer.locator('input[name|=theme]').first().waitFor();
     for (const [choice, index] of [['soft', 3], ['dark', 2], ['light', 1], ['system', 0]]) {
       await radios.nth(index).check();
       await peer.waitForFunction(choice => c6Theme.get() === choice &&
-        document.querySelectorAll('input[name=theme]')[['system', 'light', 'dark', 'soft'].indexOf(choice)].checked, choice);
+        document.querySelectorAll('input[name|=theme]')[['system', 'light', 'dark', 'soft'].indexOf(choice)].checked, choice);
       await assertTheme(peer, choice, true);
     }
     await f.page.emulateMedia({ colorScheme: 'light' });
@@ -349,11 +359,192 @@ async function switching(browser, origin, layout, fixture, settle) {
     await f.page.emulateMedia({ colorScheme: 'light' });
     await assertTheme(f.page, 'soft');
     await f.page.reload({ waitUntil: 'domcontentloaded' });
-    await f.page.locator('input[name=theme]').nth(3).waitFor();
-    assert(await f.page.locator('input[name=theme]').nth(3).isChecked(), 'Soft survives reload');
+    await f.page.locator('input[name|=theme]').nth(3).waitFor();
+    assert(await f.page.locator('input[name|=theme]').nth(3).isChecked(), 'Soft survives reload');
     await assertTheme(f.page, 'soft');
     assert.deepEqual(f.errors, [], 'no production UI errors');
     console.log(`PASS ${layout}: cross-tab selected card, OS changes, Soft reload`);
+  } finally { await f.context.close(); }
+}
+
+// Use real retained tiles, not CSS-resized copies of a single settings page.
+// A second Appearance tile exercises document-wide native radio grouping too.
+async function workspaceRadios(browser, origin, fixture, settle) {
+  const f = await fixture(browser, origin, { width: 1600, height: 1000 }, 'dark',
+    { choice: 'system', effective: 'full', os: 'no-preference' }, () => {});
+  const { page } = f;
+  try {
+    for (const [layout, count, repeated] of [['single', 1], ['grid', 5], ['stack', 6], ['grid-retained', 5, true], ['stack-retained', 6, true]]) {
+      await page.evaluate(({ count, repeated }) => {
+        const views = [{ view: 'settings', section: 'appearance' }, { view: 'session', id: 'parent' },
+          { view: 'workers' }, { view: 'sessions' }, repeated ? { view: 'settings', section: 'appearance' } : { view: 'workers' }, { view: 'docs', id: '' }];
+        const tiles = views.slice(0, count).map((view, i) => ({ key: 10 + i,
+          columns: [{ key: 20 + i, view }], cursor: 0, active: 20 + i, used: 20 + i,
+          back: [], forward: [], stack: i % 4, minimized: false }));
+        localStorage.setItem('c6.home.workspace.v2', JSON.stringify({ tiles, focus: 0, next: 40, full: false }));
+        localStorage.setItem('c6.theme', 'soft');
+        localStorage.setItem('c6.motion', 'system');
+      }, { count, repeated: !!repeated });
+      await page.goto(`${origin}/r/home/settings/appearance`, { waitUntil: 'domcontentloaded' });
+      await page.getByRole('heading', { name: 'Theme', exact: true }).first().waitFor();
+      if (repeated) await page.locator('[data-tile-motion="14"]').getByRole('heading', { name: 'Theme', exact: true }).waitFor();
+      const appearance = page.locator('[data-tile-motion="10"]');
+      const check = async (phase, motion = 'system') => {
+        await settle(page);
+        const state = await page.evaluate(() => ({ theme: c6Theme.get(), motion: c6Motion.get(),
+          soft: document.documentElement.classList.contains('soft'), effectiveMotion: document.documentElement.dataset.motion,
+          panels: [...document.querySelectorAll('[data-tile-motion]')].flatMap(tile => {
+            const radios = [...tile.querySelectorAll('input[name|=theme], input[name|=motion]')];
+            return radios.length ? [{ key: tile.dataset.tileMotion,
+              checked: radios.filter(r => r.checked).map(r => r.nextElementSibling.firstElementChild.textContent),
+              selectedCards: radios.filter(r => r.closest('label').matches(':has(:checked)')).length,
+              styled: radios.filter(r => r.checked).every(r =>
+                getComputedStyle(r.closest('label')).borderColor !== getComputedStyle(radios.find(r => !r.checked).closest('label')).borderColor) }] : [];
+          }) }));
+        assert.equal(state.theme, 'soft', `${layout}/${phase}: applied palette`);
+        assert.equal(state.motion, motion, `${layout}/${phase}: applied motion choice`);
+        assert.equal(state.soft, true, `${layout}/${phase}: Soft palette remains applied`);
+        assert.equal(state.effectiveMotion, motion === 'system' ? 'full' : motion, `${layout}/${phase}: effective motion`);
+        assert.equal(state.panels.length, repeated ? 2 : 1, `${layout}/${phase}: Appearance views stay mounted`);
+        for (const panel of state.panels) {
+          assert.deepEqual(panel.checked, ['Soft', motion[0].toUpperCase() + motion.slice(1)], `${layout}/${phase}: actual checked properties ${JSON.stringify(state)}`);
+          assert.equal(panel.selectedCards, 2, `${layout}/${phase}: selected card CSS`);
+          assert(panel.styled, `${layout}/${phase}: selected border painted`);
+        }
+        console.log(`PASS radios ${layout}/${phase}: ${JSON.stringify(state)}`);
+      };
+      await check('initial');
+      await appearance.getByRole('radio', { name: /^Light/ }).check();
+      await appearance.getByRole('radio', { name: /^Soft/ }).check();
+      await appearance.getByRole('radio', { name: /^Off/ }).check();
+      await check('motion-off', 'off');
+      await appearance.getByRole('radio', { name: /^Full/ }).check();
+      await check('motion-full', 'full');
+      await appearance.getByRole('radio', { name: /^System/ }).last().check();
+      await check('selected');
+      if (repeated) {
+        const peer = await f.context.newPage();
+        try {
+          await peer.goto(`${origin}/r/home/settings/appearance`, { waitUntil: 'domcontentloaded' });
+          const peerAppearance = peer.locator('[data-tile-motion="10"]');
+          await peerAppearance.getByRole('radio', { name: /^Full/ }).check();
+          await page.waitForFunction(() => c6Motion.get() === 'full');
+          await check('peer-motion-full', 'full');
+          await peerAppearance.getByRole('radio', { name: /^System/ }).last().check();
+          await page.waitForFunction(() => c6Motion.get() === 'system');
+          await check('peer-motion-system');
+        } finally { await peer.close(); }
+      }
+      if (count > 1) {
+        const other = page.locator('[data-tile-motion="11"]');
+        await other.getByRole('button', { name: 'Focus', exact: true }).click();
+        await check('other-maximized');
+        await other.getByRole('button', { name: 'Defocus', exact: true }).click();
+        await check('restored');
+      }
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await page.getByRole('heading', { name: 'Theme', exact: true }).first().waitFor();
+      if (repeated) await page.locator('[data-tile-motion="14"]').getByRole('heading', { name: 'Theme', exact: true }).waitFor();
+      await check('reload');
+    }
+    assert.deepEqual(f.errors, [], 'no production UI errors');
+  } finally { await f.context.close(); }
+}
+
+// Both custom Choices callers and the session aspect palette use their real
+// production cards. Keep fixture data here, sharing motion's transport/head.
+async function workspaceChoices(browser, origin, fixture, settle) {
+  const question = { seq: 66, ts: 66, type: 'question', call_id: 'retained-choice', state: 'asked',
+    title: 'Choose a workspace verification approach', fields: [{ name: 'approach', label: 'Question approach',
+      type: 'choice', required: true, choices: [{ value: 'first', label: 'Question first answer' }, { value: 'second', label: 'Question second answer' }] }] };
+  const f = await fixture(browser, origin, { width: 1600, height: 1000 }, 'dark',
+    { choice: 'system', effective: 'full', os: 'no-preference' }, () => {}, {}, { events: [question] });
+  const { page } = f;
+  try {
+    await require('./narrow-fixtures.cjs').install(f.context);
+    let marks = {};
+    await f.context.route('**/api/**', async route => {
+      const p = new URL(route.request().url()).pathname;
+      if (p.endsWith('/settings/session_facets')) return route.fulfill({ json: { shown: ['worker', 'model'], tile_bars: true } });
+      if (!p.endsWith('/marks')) return route.fallback();
+      if (route.request().method() === 'PUT') {
+        const { key, mark } = route.request().postDataJSON();
+        marks = { ...marks, [key]: mark };
+        f.setMarks(marks);
+      }
+      return route.fulfill({ json: marks });
+    });
+    await page.evaluate(() => {
+      const views = [{ view: 'session', id: 'parent' }, { view: 'decisions' }, { view: 'workers' },
+        { view: 'docs', id: '' }, { view: 'settings', section: 'appearance' }, { view: 'sessions' }];
+      const tiles = views.map((view, i) => ({ key: 10 + i, columns: [{ key: 20 + i, view }],
+        cursor: 0, active: 20 + i, used: 20 + i, back: [], forward: [], stack: i % 4, minimized: false }));
+      localStorage.setItem('c6.home.workspace.v2', JSON.stringify({ tiles, focus: 0, next: 40, full: false }));
+      localStorage.setItem('c6.theme', 'soft');
+    });
+    await page.goto(`${origin}/r/home/sessions/parent`, { waitUntil: 'domcontentloaded' });
+    const session = page.locator('[data-tile-motion="10"]');
+    const questionGroup = session.getByRole('radiogroup', { includeHidden: true });
+    const decisionGroup = page.locator('#decision-7103').getByRole('radiogroup', { includeHidden: true });
+    const checked = group => group.getByRole('radio', { includeHidden: true }).evaluateAll(rows => rows.filter(r => r.getAttribute('aria-checked') === 'true').map(r => r.textContent));
+    const check = async phase => {
+      await settle(page);
+      assert.deepEqual(await checked(questionGroup), ['Question second answer'], `${phase}: session QuestionCard Choices`);
+      assert.deepEqual(await checked(decisionGroup), ['Review every layout'], `${phase}: decision-form Choices`);
+      console.log(`PASS custom Choices/${phase}: both real cards retain their independent selection`);
+    };
+    await questionGroup.waitFor();
+    await decisionGroup.waitFor();
+    assert.deepEqual(await checked(questionGroup), ['Question first answer'], 'required question defaults to its first choice');
+    assert.deepEqual(await checked(decisionGroup), [], 'decision choice starts empty');
+    await questionGroup.getByRole('radio', { name: 'Question second answer', exact: true }).click();
+    const decisionPick = decisionGroup.getByRole('radio', { name: 'Review every layout', exact: true });
+    await decisionPick.click(); await decisionPick.click();
+    assert.deepEqual(await checked(decisionGroup), [], 'optional Choices supports clearing the chosen row');
+    await decisionPick.click();
+    await check('selected');
+    const other = page.locator('[data-tile-motion="12"]');
+    await other.getByRole('button', { name: 'Focus', exact: true }).click();
+    await check('other-maximized');
+    await other.getByRole('button', { name: 'Defocus', exact: true }).click();
+    await check('restored');
+    // Aspect strips intentionally yield in narrow tiles; use the real maximize
+    // control to expose the session's bar, rather than forcing CSS visibility.
+    await session.getByRole('button', { name: 'Focus', exact: true }).click();
+    const worker = session.getByRole('button', { name: 'Worker: Motion fixture', exact: true });
+    const card = page.locator('.c6-pop').filter({ hasText: 'Its mark, wherever it shows' });
+    await worker.click();
+    const save = page.waitForResponse(r => new URL(r.url()).pathname.endsWith('/marks') && r.request().method() === 'PUT');
+    await card.getByRole('button', { name: 'rose', exact: true }).click();
+    await save;
+    await card.waitFor({ state: 'detached' });
+    const aspect = async phase => {
+      await worker.click();
+      await card.waitFor();
+      assert.match(await card.getByRole('button', { name: 'rose', exact: true }).getAttribute('class'), /ring-2/, `${phase}: aspect palette selected mark`);
+      assert.match(await card.innerText(), /No other session has it/);
+      await page.keyboard.press('Escape');
+      await card.waitFor({ state: 'detached' });
+      console.log(`PASS session aspect card/${phase}: saved mark remains selected`);
+    };
+    await aspect('selected');
+    await session.getByRole('button', { name: 'Defocus', exact: true }).click();
+    await other.getByRole('button', { name: 'Focus', exact: true }).click();
+    await check('aspect-other-maximized');
+    await other.getByRole('button', { name: 'Defocus', exact: true }).click();
+    await session.getByRole('button', { name: 'Focus', exact: true }).click();
+    await aspect('restored');
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await questionGroup.waitFor();
+    assert.deepEqual(await checked(questionGroup), ['Question first answer'], 'reload reconstructs required question defaults, not an unsaved answer');
+    await aspect('reload');
+    await session.getByRole('button', { name: 'Defocus', exact: true }).click();
+    await decisionGroup.waitFor();
+    assert.deepEqual(await checked(decisionGroup), [], 'reload reconstructs the unanswered decision; unsent choices are not persisted');
+    await questionGroup.getByRole('radio', { name: 'Question second answer', exact: true }).click();
+    await decisionPick.click();
+    await check('reload-reselected');
+    assert.deepEqual(f.errors, [], 'no production UI errors');
   } finally { await f.context.close(); }
 }
 
@@ -365,6 +556,15 @@ async function browserTests() {
   let browser;
   try {
     browser = await launchBrowser(playwright, process.env.ENGINE || 'chromium');
+    if (process.argv.includes('--workspace-choices')) {
+      await within('retained workspace Choices and aspects', () => workspaceChoices(browser, origin, fixture, settle));
+      return;
+    }
+    if (process.argv.includes('--workspace-radios')) {
+      await within('retained workspace radios', () => workspaceRadios(browser, origin, fixture, settle));
+      await within('retained workspace Choices and aspects', () => workspaceChoices(browser, origin, fixture, settle));
+      return;
+    }
     await within('theme first-paint and switching', async () => {
       for (const choice of ['system', 'light', 'dark', 'soft']) for (const os of ['light', 'dark']) {
         await firstPaint(browser, origin, choice, os);
@@ -373,6 +573,8 @@ async function browserTests() {
         assert(['tile', 'phone'].includes(layout), `unknown LAYOUTS choice ${layout}`);
         await switching(browser, origin, layout, fixture, settle);
       }
+      if (!process.argv.includes('--paint-only')) await workspaceRadios(browser, origin, fixture, settle);
+      if (!process.argv.includes('--paint-only')) await workspaceChoices(browser, origin, fixture, settle);
     });
   } finally { await browser?.close(); await new Promise(resolve => server.close(resolve)); }
 }

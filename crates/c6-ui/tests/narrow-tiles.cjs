@@ -208,7 +208,7 @@ async function main() {
           await f.page.goto(`${origin}/r/home/${view === 'session' ? 'sessions/parent' : view}`, { waitUntil: 'domcontentloaded' });
           await f.page.locator('[data-tile-motion] section').first().waitFor();
           assert.equal(await f.page.locator('[data-tile-motion]').count(), 1, `${view}: isolated tile`);
-          if (view === 'settings/appearance') await f.page.locator('input[name=theme]').first().waitFor();
+          if (view === 'settings/appearance') await f.page.locator('input[name|=theme]').first().waitFor();
           if (view === 'session') await f.page.locator('textarea').first().waitFor();
           await f.page.waitForFunction(() => {
             const pane = document.querySelector('[data-pane-motion]');
