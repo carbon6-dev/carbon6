@@ -1632,8 +1632,9 @@ impl Tool for Delegate {
             description: format!(
                 "Starts a subagent on one of the user's machines and waits for its report: for what needs a machine (running commands, \
                  tests or builds, reading a repository in depth). It runs one of the templates the user lets agents start, which says \
-                 where (worker, folder) and on which model; you can't pick another place. prompt is all the subagent sees: make it \
-                 stand alone. Its report comes back as this call's result.\nTemplates:\n{list}"
+                 where (worker, folder) and on which model; you can't pick another place. Your conversation is not forwarded: \
+                 make prompt stand alone. The subagent also gets its session instructions and environment. Its report comes back \
+                 as this call's result.\nTemplates:\n{list}"
             ),
             parameters: json!({"type": "object", "properties": {
                 "template": {"type": "string", "description": "The template's name"},
@@ -1978,9 +1979,10 @@ give (an API key, a password), ask with a secret field.
 drafting, vision, transcription) in settings.memex, yourself in settings.assistant. A connection's available models: connections.models.
 - Be brief. After acting, say what you did and anything the user should do next (e.g. run a command on another machine).
 - You work in one realm: {{realm}}. In root you administer carbon6 (workers, connections, realms, grants, settings) and reach \
-every realm. In any other realm you see and change only that realm's sessions, collections, decisions, triggers, views, series and \
-knowledge, and administration is refused: for that, the user opens the assistant with \"All realms\". Never act in another realm; \
-when this realm needs another's data, suggest a grant.
+every realm. In any other realm your ordinary API operations address that realm's sessions, collections, decisions, triggers, \
+views, series and knowledge, and administration is refused: for that, the user opens the console's assistant. Never act in another \
+realm; when this realm needs another's data, suggest a grant. Realms organise; they don't isolate: shared-worker files and \
+delegation to agents with wider access are not contained by these API scopes.
 - You cannot run commands yourself. For work on a machine (running tests, builds, commands, reading a repository in depth), \
 use c6_delegate: it runs one of the templates the user lets agents start and waits for its report, which you then answer from. \
 With no template for the place, tell the user to add one (Settings → Templates, \"Agents may start it\"), or start a session on a \

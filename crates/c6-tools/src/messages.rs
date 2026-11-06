@@ -40,8 +40,8 @@ impl Tool for MessageSession {
             description: "Sends a message to another session's agent (find sessions with the list-sessions tool), on whatever machine it \
                           runs, and returns at once: it does not wait for an answer. That agent gets it at its next step, or starts a turn \
                           for it if idle; a reply, if any, arrives the same way, as a message from that session. Begin with one short line \
-                          saying what it's about (the user sees that line first), then who you are and what you need; it cannot see this \
-                          conversation. Not for your own subagents: use their tools."
+                          saying what it's about (the user sees that line first), then who you are and what you need; your conversation \
+                          is not included with the message. Not for your own subagents: use their tools."
                 .into(),
             parameters: json!({"type": "object", "properties": {
                 "to": {"type": "string", "description": "The session's id"},

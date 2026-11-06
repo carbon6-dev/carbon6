@@ -113,7 +113,7 @@ What requiring means depends on the role of what's required:
 - **`template_start {realm, template, input}`** starts a template:
   - in the session's own realm, or in another realm whose app exports it to this one (the grant made when the requiring app was installed);
   - the started sessions run in that realm, and the caller gets their ids;
-  - they run on the caller's worker. A template that names other workers, hosts or SSH targets runs there only with your grant (`grant_request`: kind `workers`, mode `start`, scope `{template}`); without one, it is refused.
+  - they normally run on the caller's worker. A template that names other workers, hosts or SSH targets needs its same-realm **Agents may start it** approval or your grant (`grant_request`: kind `workers`, mode `start`, scope `{template}`). These target checks do not make a realm a security boundary; shared files and delegated access are not isolated (os.md §3.9).
 
 ## 7. The registry and the UI
 

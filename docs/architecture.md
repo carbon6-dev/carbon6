@@ -31,6 +31,7 @@ Status: draft v0.1 (2026-10-09). Implements [requirements.md](requirements.md) v
 - The head (c6h) is the system of record. It serves two ports: a UI/API port and a worker port. Both bind only to private interfaces.
 - Workers (c6w) dial the head and keep one long-lived HTTP/2 connection open. Every head→worker request travels back over a stream the worker opened, because the head never dials a worker.
 - Workers call LLM providers directly, using short-lived credentials issued by the head.
+- **Realms organise; they don't isolate.** The head enforces realm-scoped API requests, but commands run as the worker's OS user. Shared-worker sessions can reach each other's files, and delegation can borrow an agent's wider access even from a worker limited to one realm. See [realms-ux.md §8](realms-ux.md#8-what-realms-provide-and-dont).
 
 ## 2. Cargo workspace
 

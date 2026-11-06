@@ -21,8 +21,8 @@ pub use turn::{
 };
 
 /// What a subagent is told (docs/os.md §4.6: an editable prompt).
-pub const SUBAGENT_NOTE: &str = "You are a subagent working for another agent, which cannot see this conversation. \
-Work autonomously. When you are done, reply with a concise but complete report of what you found or did; that report is all the other agent receives.";
+pub const SUBAGENT_NOTE: &str = "You are a subagent working for another agent, which does not receive this conversation automatically. \
+Work autonomously. When you are done, reply with a concise but complete report of what you found or did; your report is returned to the other agent.";
 
 /// What an agent is told after the digest of a subagent that did not
 /// finish (docs/subagents.md §10: an editable prompt).
@@ -51,8 +51,9 @@ then continue the task and finish with your report.";
 /// Introduces, in Task's description, the templates an agent may start as
 /// remote subagents (docs/remote-subagents.md §6: an editable prompt).
 pub const SUBAGENT_TEMPLATES: &str = "Templates (set template, and on when it lists several places): each starts the subagent as a \
-session of its own somewhere else, set up by the user: another worker, folder, repository or model, with its own tools. It cannot \
-see this conversation or your files; give it a complete prompt, and expect files it changes to stay where it runs.";
+session of its own in a place set up by the user: another worker, folder, repository or model, with its own tools. It does not \
+receive this conversation or copies of your files automatically; give it a complete prompt. File access depends on where it runs \
+and the tools and OS permissions available there; changes happen there. This is delegation, not isolation.";
 
 /// The result of a remote subagent's call after this worker restarted
 /// while the call waited (an editable prompt).

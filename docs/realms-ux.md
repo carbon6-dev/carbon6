@@ -6,20 +6,22 @@ Status: built (2026-10-24). Decided:
 - a realm page shows only a count of what waits in other realms;
 - the app opens on the last realm you used.
 
+**Realms organise; they don't isolate.** The head enforces the API scopes described here, not a security boundary around an agent. See §8 for what this does and doesn't provide.
+
 ## 1. Why realms don't work today
 
-docs/os.md §3 makes realms a boundary, and the head enforces it for realm tokens and the assistant. The UI doesn't use that boundary:
+docs/os.md §3 gives realms their own data and settings, and the head enforces API scopes for realm tokens and the assistant. The UI didn't consistently use those scopes:
 
 - **Your browser is root.** A signed-in browser sees every realm. The realm picker only adds `?realm=` to some requests: 34 of the UI's ~179 API calls.
 - **So the picker is a filter that many pages ignore.** The live session list, the activity dock, the inbox, mission control, search, usage, analytics and the memex show all realms, or mix them.
 - **Your browser's state is shared across realms.** Tiles, history, pinned sessions, finished-unseen sessions and the label filter stay the same when you switch. Pages change partly.
 - **"All realms" mixes administration into everything.** Workers, connections and sign-in sit next to one realm's skills and secrets in the same Settings.
 
-Fixing each call site doesn't last: every new page is another place to forget the realm. The boundary has to be the default, enforced where the data is.
+Fixing each call site doesn't last: every new page is another place to forget the realm. Realm-scoped API requests have to be the default, enforced by the head.
 
 ## 2. The model: two places
 
-**A realm** (`/r/<realm>/…`): everything you do in one realm. That covers its sessions, inbox, decisions, mission control, analytics, collections, views, memex, mail, assistant and its own settings. You can't reach another realm's data from there. You can switch realm, or go to the console.
+**A realm** (`/r/<realm>/…`): everything you do in one realm. That covers its sessions, inbox, decisions, mission control, analytics, collections, views, memex, mail, assistant and its own settings. Its API requests are realm-scoped; grants allow specific cross-realm access. This does not limit what a session can reach through files or delegation (§8). You can switch realm, or go to the console.
 
 **The console** (`/admin/…`): carbon6 itself. It manages realms, grants, workers, connections and routing, the defaults every realm inherits, spending across realms, apps and packages, sign-in and tokens, updates, upgrades and backups, and the administration assistant. It shows no realm's sessions or knowledge, only counts and totals.
 
@@ -99,17 +101,21 @@ The same shell, with its own nav:
 
 `GET /api/v1/elsewhere` (scope: device) returns, for each other realm, how many things wait on you there: approvals, open questions and decisions. It returns no titles or content. The header shows the total, and its menu lists the realms with a count each, each linking to that realm's inbox. Browser notifications are per realm already (their links carry the realm).
 
-## 7. Tests (they fail iff the boundary breaks)
+## 7. Tests of API scoping
 
 1. **Every operation has a scope:** the catalog test fails on an op without one.
-2. **Realm isolation over every list:** a head with two realms gets objects of each kind in both. For every realm-scoped list op, a realm-A browser caller gets none of B's objects. Asked for one of B's by id, it gets "not found".
+2. **Realm scoping over every list:** a head with two realms gets objects of each kind in both. For every realm-scoped list op, a realm-A browser caller gets none of B's objects. Asked for one of B's by id, it gets "not found".
 3. **Admin stays admin:** every admin op, called as a realm browser caller, returns 403. A browser request with no `X-C6-Realm` is refused.
 4. **The live feed and usage are narrowed:** a realm-A live connection never carries a B session; analytics for A count only A's turns.
 5. **Old links redirect** to the object's realm.
 
-## 8. Limits
+## 8. What realms provide and don't
 
-- **A shared worker shares its disk.** Two realms that may use the same worker can both browse its files and open terminals on it. To keep a realm's files apart, dedicate a worker to it (os §3.2).
+**Realms organise your work. They aren't a security boundary.**
+
+- **What they provide:** realm-scoped lists of sessions, work, decisions and data; each realm's own settings, with root's defaults; and per-realm secret lookup (a session gets its realm's value, falling back to root's). Browser state such as tiles and history is kept per realm. Realm-scoped API tokens and session tools have enforced scopes, with grants for specific cross-realm API access. These are API and organisation rules, not agent isolation.
+- **Shared workers share access.** Commands run as the worker's OS user, not as a realm-specific user or in a realm sandbox. On a worker serving several realms, a session's shell can read other realms' files that user can read: journals and transcripts, worktrees, credentials and config. A worker's empty `realms: []` list means it serves every realm; a non-empty list limits availability, not OS permissions.
+- **A one-realm worker isn't enough.** An agent can message another session or delegate through subagents, task cards, templates or the head-run assistant. If the receiving agent has wider worker or tool access, it can use that access on the caller's behalf. Same-realm messaging checks, template worker grants and assistant approvals still apply; they do not make delegation a security boundary. Do not rely on realm membership or a dedicated worker to contain an untrusted agent or package.
 - **Imports' realm rules are administration.** They decide which realm a Claude Code or Codex session lands in.
 
 ## 9. As built

@@ -26,7 +26,7 @@ See [docs/requirements.md](docs/requirements.md) and [docs/architecture.md](docs
 - **Offline-tolerant.** Workers journal every event before sending it. Sessions keep running when the head is unreachable and sync back exactly when it returns. A worker that loses its journal has its sessions restored from the head.
 - **IDE-like access to workers:** browse files, review git changes, and open terminals in the browser.
 - **Observability:** the head exports OpenTelemetry GenAI traces over OTLP.
-- **An operating system for agents.** Realms isolate apps from each other, and apps are built from general primitives (collections, decisions, triggers, series, views) with configuration only, then installed as packages. See [docs/os.md](docs/os.md) and the examples in [examples/apps](examples/apps).
+- **An operating system for agents.** Realms organise your work; they don't isolate apps. Apps are built from general primitives (collections, decisions, triggers, series, views) with configuration only, then installed as packages. See [docs/os.md](docs/os.md) and the examples in [examples/apps](examples/apps).
 
 ## Status
 
@@ -39,6 +39,8 @@ carbon6 is version 0.1: a working system its author uses every day, not a finish
 ## Security
 
 carbon6 runs agents that execute shell commands as the worker's user, so the head is as sensitive as a shell on every worker.
+
+**Realms organise; they don't isolate.** Realm-scoped API tokens and tools have enforced scopes, but sessions run as the worker's OS user. Sessions on a shared worker can reach each other's files, including journals, transcripts, worktrees, credentials and config. A worker limited to one realm is not isolation either: an agent can delegate to another session or assistant with wider access. See [what realms provide and don't](docs/realms-ux.md#8-what-realms-provide-and-dont).
 
 - **The network:** by default the head binds only loopback, private (RFC 1918, IPv6 ULA) and tailnet addresses, and refuses public ones unless `allow_public_bind = true`. It answers only to its own names (against DNS rebinding) and refuses requests from other sites' pages.
 - **Sign-in** is on by default: passkeys, one-time login links made on the head, and API tokens. Outside a tailnet or `localhost`, turn on HTTPS (`ui_tls_head_ca = true`); the head warns at start when it serves plain HTTP on a LAN address.
@@ -539,9 +541,9 @@ Not every task belongs in a repository. Leave the folder empty when starting a s
 
 Keep API keys, tokens and passwords under **Settings → Secrets**. Each one is an environment variable (`$GITHUB_TOKEN`) for the agent's shell commands, background commands included, in the sessions it applies to (an "Applies to" label list, like other settings).
 
-- **The agent never sees a value.** The system prompt lists only names and descriptions, and a value that appears in command output is replaced by `[secret:NAME]` before the model or the UI sees it.
+- **Names in prompts, redacted output.** The system prompt lists only names and descriptions. Command output uses best-effort literal-value redaction (`[secret:NAME]`), not a guarantee that a value can never reach the model or UI. Redaction is not isolation from an agent that can use those credentials.
 - **Storage.** Values are encrypted on the head and can only be replaced, never read back.
-- **Delivery.** Workers fetch values when a turn starts, keep them in memory for a few minutes, and never write them to their journal. A secret scoped to a `worker:` label is only handed to that worker.
+- **Delivery.** Workers fetch values when a turn starts, keep them in memory for a few minutes, and never write them to their journal. Session credential requests enforce a secret's `worker:` labels; this is a delivery check, not a filesystem boundary.
 - **Per realm.** A secret belongs to a realm, and the same name can hold a different value in each (work's `GITHUB_TOKEN` and home's). A session gets its realm's, else root's: root's secrets are every realm's that has none of its own by that name. A realm's Settings → Secrets shows its own; the console's are root's.
 
 ### Background tasks
@@ -652,7 +654,7 @@ The UI is a workspace of **tiles**: framed cards, each with its own bar (‹ ›
 
   **Inbox** lists the same for triage; **Mission** shows them as live cards you can reply from.
 - **A session's glance:** a line each for where it runs (worker, model, runtime), its worktree or folder, branch and changes, its work and labels, and its context, then its newest outputs; first, while there is any, what waits on you (an approval or a question, going to its card). A line acts where you would: Changes and the folder open their panes, Work and Labels their editors, Context its breakdown (with **Compact now**) and usage. A wide session shows it as a column beside the transcript; otherwise the context ring (or ⌘I; Esc closes it) opens it, as a sheet from the bottom on a phone.
-- **Realms and the console:** each realm is its own app at `/r/<realm>/`: its sessions, inbox, decisions, analytics and its own settings, nothing of any other realm. The menu by the logo switches realm (⌘-click opens one in a new tab) and shows how many things wait on you in each. **Console** (`/admin/`) is carbon6's administration: realms, workers, connections, the defaults realms inherit, spending, sign-in and updates. The head enforces this, not the page. The app opens where you were last. Design: [docs/realms-ux.md](docs/realms-ux.md).
+- **Realms and the console:** each realm is its own app at `/r/<realm>/`: its sessions, inbox, decisions, analytics and its own settings, with realm-scoped API requests. This organises the UI; it does not isolate sessions or their files. The menu by the logo switches realm (⌘-click opens one in a new tab) and shows how many things wait on you in each. **Console** (`/admin/`) is carbon6's administration: realms, workers, connections, the defaults realms inherit, spending, sign-in and updates. The head enforces API scopes, not the page. The app opens where you were last. Design: [docs/realms-ux.md](docs/realms-ux.md).
 - **Light or dark:** Settings → Appearance: follow the system, or always light or dark (kept in each browser).
 - **Thinking:** Settings → Appearance → Session transcripts → **Show thinking**, off by default. Off hides reasoning entirely; on shows it expanded under **Thinking**, in sessions and inline threads on desktop and phone. Kept in carbon6 across realms and devices, without changing stored events or model input ([display preference and API](docs/session-header.md#4-defaults)).
 - **Phones:** one tile at a time with a switcher, **+** and **▸ N** at the bottom; the current tab's **×** closes its tile, and a long press lifts a tab: drag it and a line shows where it will land, or let go where it is for **Close** and **Minimize**. **▸ N** opens a sheet of every tile (to show or close each, the minimized too), the sessions you viewed lately that no tile holds, **All sessions** and **+ New tile**; Inbox is in ☰. One pane fills the screen (‹ in the item's header goes back to the list), and the nav is in ☰. A phone on its side keeps this layout: the desktop one needs 512px of height as well as width. On a touch screen Return is a new line in a message box; ⌘/Ctrl+Enter sends everywhere.

@@ -135,11 +135,13 @@ The tool waits for the submitted values, the same way an approval waits. Cancell
 
 ### Realms (OS step 8)
 
+Realms organise; they don't isolate. The following API admission and approval checks remain enforced, but neither shared-worker files nor delegation to agents with wider access is contained by realm membership (docs/realms-ux.md §8).
+
 - **A conversation works in one realm:** the realm whose page you open it from. From the console it is root, which administers carbon6 and reaches every realm.
 - **Its operations are admitted like that realm's API token.** It reaches the realm's sessions, collections, decisions, triggers, views, series and knowledge. Administration (workers, connections, realms, grants, settings) answers 403, and the assistant is told to send you to the console for it.
 - **Its instructions** are the `assistant.base` prompt as the realm has it (a realm can override it), with `{{realm}}` naming the realm.
 - **Commons** is not a place to work in.
-- **From root it starts sessions in a realm, with your approval each time.** Sessions never run in root (or commons), so for work on a machine the assistant in root calls `sessions.create` naming the realm. Before anything starts you get an approval (also a decision and a notification) that names the realm, the worker and, when given, the folder, model, title and labels, with the first message in full. The first message is the one way root's knowledge reaches the realm, so the call carries nothing else: no attachments, work item, to-do or references, and no secret you gave the assistant. The first message is at most 4,000 characters, so the approval always shows all of it.
+- **From root it starts sessions in a realm, with your approval each time.** Sessions never run in root (or commons), so for work on a machine the assistant in root calls `sessions.create` naming the realm. Before anything starts you get an approval (also a decision and a notification) that names the realm, the worker and, when given, the folder, model, title and labels, with the first message in full. For this start call, the first message is the approved input from root: no attachments, work item, to-do or references, and no secret you gave the assistant. The first message is at most 4,000 characters, so the approval always shows all of it.
   - **Allow:** the session starts in that realm as that realm's API token would start it, under the realm's policies, routes, connections and workers and none of root's. It is labelled `started-by:console`. The assistant gets the session back, with its id, and can follow it, since root reads every realm.
   - **Deny** (or no answer): nothing starts, and the assistant is told not to try another way.
   - In any other realm nothing changes: the assistant starts sessions only in its own realm, without asking.

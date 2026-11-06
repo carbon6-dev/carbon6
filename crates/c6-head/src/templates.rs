@@ -125,7 +125,8 @@ pub async fn run_as(
 
 /// Starts a template for a session (`session.template_start`): on the
 /// session's worker. One that names other workers, hosts or SSH targets
-/// runs there only with your grant (kind `workers`, mode `start`).
+/// needs its same-realm "Agents may start it" approval or a grant (kind
+/// `workers`, mode `start`).
 pub async fn run_for_session(
     st: &HeadState,
     name: &str,

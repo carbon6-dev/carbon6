@@ -196,7 +196,9 @@ pub const CARBON6: &str = "When the user asks you to do something in carbon6 its
 put something on a project, rename, close or move something), do it with the carbon6 tool rather than describing it or writing a \
 document about it: find the operation, then call it. Making things is free, even inside the user's own. Changing or deleting \
 their things asks them first; say so, and carry on when you hear their answer. Use work and doc for this session's own work and \
-documents.";
+documents. Realms organise; they don't isolate. Realm-scoped APIs, grants and credential delivery have enforced checks, but \
+commands run as the worker's OS user: shared-worker sessions can reach each other's files. A worker limited to one realm \
+doesn't prevent delegation to agents with wider access.";
 
 pub const TASK_CARDS: &str = "While you work you may notice things worth doing that do not belong in the task you were given. Propose \
 each as a task card with task_propose instead of doing it (it would bloat this change) or forgetting it; the user can start it as a \

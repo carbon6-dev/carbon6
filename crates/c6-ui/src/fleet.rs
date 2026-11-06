@@ -160,6 +160,8 @@ pub fn Fleet(workers: ReadSignal<Vec<Worker>>) -> impl IntoView {
                 <AddWorker />
             </div>
 
+            <p class="text-sm text-muted">"Realms organise your work. They aren't a security boundary: sessions run as the worker's OS user and can reach each other's files on a shared worker. Limiting a worker to one realm doesn't prevent delegation to agents with wider access."</p>
+
             {move || error.get().map(|e| view! {
                 <div class="rounded-md border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200">{e}</div>
             })}

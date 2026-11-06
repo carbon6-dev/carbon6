@@ -20,7 +20,7 @@ The current session carries on undisturbed, never waiting on a card.
 ## 2. Raising one (the agent)
 
 - **A tool:** `task_propose {title, why, prompt, worktree?, labels?}`.
-  - `prompt` must stand alone, including file paths and enough context to act without this conversation. The new session sees only that.
+  - `prompt` must stand alone, including file paths and enough context to act without this conversation, which is not forwarded automatically. The new session also gets its session instructions and environment; this is context delivery, not file or realm isolation.
   - `worktree: true` starts the task in a fresh git worktree, so it doesn't touch the current one. That's the default when this session uses one.
   - Returns the card's id.
 - **And its pair,** `task_withdraw {id, why}`: the agent withdraws a card that went stale, for example because it fixed the thing after all or the user asked for it in this session.

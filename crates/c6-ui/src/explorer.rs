@@ -123,7 +123,7 @@ pub fn RealmsMap() -> impl IntoView {
         <main class="mx-auto max-w-6xl space-y-4 px-4 py-6">
             <div>
                 <h1 class="text-lg font-semibold">"Realms"</h1>
-                <p class="text-sm text-muted">"Each realm keeps an app or a project apart. Open one to explore what it holds; the arrows are grants, the only way data crosses."</p>
+                <p class="text-sm text-muted">"Realms organise apps and projects; they aren't a security boundary. Open one to explore what it holds; the arrows are grants for cross-realm API access, not every way data can move."</p>
             </div>
             {move || map.get().map(|r| match r {
                 Err(e) => view! { <ErrorBox message=e /> }.into_any(),

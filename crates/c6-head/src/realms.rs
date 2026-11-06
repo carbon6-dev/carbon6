@@ -1,7 +1,7 @@
-//! Realms (docs/os.md §3): every object belongs to exactly one. You, signed
-//! in (or with a root API token), reach every realm; an API token scoped to
-//! a realm reaches only that realm's data, and none of carbon6's
-//! administration. The head is where this is decided.
+//! Realms (docs/os.md §3) organise data and settings; they don't isolate
+//! agents. Signed-in users and root API tokens reach every realm. The head
+//! enforces realm-scoped API requests and refuses administrative operations
+//! to realm tokens. Those checks do not isolate worker files or delegation.
 
 use axum::http::{Method, StatusCode};
 use c6_api as api;

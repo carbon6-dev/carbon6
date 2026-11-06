@@ -25,7 +25,7 @@ Nothing in carbon6's core is about Slack. It's written as packages on the primit
 | `slack` (kit) | A Rust binary in its image that talks to Slack and keeps nothing. Network: `hosts` slack.com and files.slack.com only. |
 | `slack` (app) | Owns the `chat` items, the channel and Slack-user things, and their claims. It holds the internal `slack_sync` collection, a schedule trigger that runs the kit with no agent, and kit operations. |
 
-- **Per realm:** one app instance per realm, with that realm's workspaces as its accounts. A work workspace in its business's realm and a community in home stay apart unless you grant otherwise.
+- **Per realm:** one app instance per realm, with that realm's workspaces as its accounts. A work workspace in its business's realm and a community in home have distinct lists and realm-scoped API access, with grants for cross-realm reads. This does not isolate agents or worker files (os.md §3.9).
 - **The source:** `crates/c6-slack`, part of carbon6, like `crates/c6-google`. Its packages are listed under Packages and installed, with your approval, only in the realms you choose.
 
 ## 3. Signing in: your own internal Slack app
@@ -121,7 +121,7 @@ They fail only when what they check is broken (docs/testing.md):
   - a file read into an item and linked;
   - people linked by email to an existing contact;
   - an agent's `post` held for approval, then sent; and a post from the Chat page with undo;
-  - realm isolation: a workspace in one realm is invisible in another.
+  - realm API scoping: another realm's ordinary workspace list does not include this workspace.
 - **The image builds,** and reaches slack.com over TLS through the egress allow-list (like Google's).
 
 ## 9. Steps

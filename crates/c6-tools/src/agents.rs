@@ -200,7 +200,7 @@ impl Tool for Task {
         let mut description = "Launches a subagent with its own context to handle a self-contained task: broad searches, \
                           investigations, or independent pieces of work. It has the same tools (except launching \
                           further subagents) and returns a single final report. Give it a complete, standalone prompt; \
-                          it cannot see this conversation. Launch several in one message to run them in parallel."
+                          it does not receive this conversation automatically. Launch several in one message to run them in parallel."
             .to_owned();
         let mut properties = json!({
             "description": {"type": "string", "description": "A short (3-5 word) description of the task"},

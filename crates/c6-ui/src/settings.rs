@@ -687,7 +687,7 @@ fn Inherited(name: &'static str, #[prop(optional_no_strip)] realm: Option<RwSign
 
 /// Which realm's own routing rules the console edits: root's (every
 /// realm's defaults) or one realm's, which it uses before root's and no
-/// other realm sees.
+/// other realm uses.
 #[component]
 fn RulesFor(realm: RwSignal<String>) -> impl IntoView {
     let realms = LocalResource::new(move || {
@@ -710,7 +710,7 @@ fn RulesFor(realm: RwSignal<String>) -> impl IntoView {
             </select>
             {move || (realm.get() != "root").then(|| view! {
                 <p class="w-full rounded-md bg-sky-50 px-3 py-2 text-sky-900 dark:bg-sky-950 dark:text-sky-200">
-                    {format!("Rules here are realm {}'s own: its sessions use them before root's, and no other realm sees them.", realm.get())}
+                    {format!("Rules here are realm {}'s own: its sessions use them before root's, and no other realm uses them.", realm.get())}
                 </p>
             })}
         </div>
@@ -765,7 +765,8 @@ fn Realms() -> impl IntoView {
     view! {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <h2 class="font-medium">"Realms"</h2>
-            <p class="text-sm text-muted">"A realm keeps an app or a project apart: its own sessions, collections, decisions, secrets, memory and settings. Root is carbon6's administration, home is yours; create more for apps. A realm inherits root's settings. Commons holds what every realm may read: realms publish into it, and you review each item (Decisions) before it is there."</p>
+            <p class="text-sm text-muted">"A realm organises an app or a project: its own sessions, collections, decisions, secrets, memory and settings. Root is carbon6's administration, home is yours; create more as needed. A realm inherits root's settings. Realms read commons by default; each can turn reads off. Realms publish into it, and you review each item (Decisions) before it is there."</p>
+            <p class="text-sm text-muted">"Realms organise your work. They aren't a security boundary: sessions on a shared worker can reach each other's files. A worker limited to one realm doesn't prevent delegation to agents with wider access."</p>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             {move || realms.get().and_then(Result::ok).map(|rs| rs.into_iter().map(|r| {
                 let rid = r.id.clone();
@@ -806,7 +807,7 @@ fn Realms() -> impl IntoView {
                 <button class=BUTTON on:click=create>"Create a realm"</button>
             </div>
             <h3 class="pt-2 text-sm font-medium">"Which realms each worker and connection serves"</h3>
-            <p class="text-xs text-muted">"Empty: every realm. One realm: dedicated to it (a realm whose files must stay apart needs a worker of its own)."</p>
+            <p class="text-xs text-muted">"Empty: every realm. A list limits which realms may use that worker or connection; it does not isolate their files or delegated work."</p>
             <div class="space-y-1 text-sm">
                 {move || live.workers.get().into_iter().filter(|w| w.role != "memex" && w.role != "head").map(|w| {
                     let text = RwSignal::new(w.realms.join(", "));
@@ -3760,7 +3761,7 @@ fn SecretsSetting() -> impl IntoView {
             <div>
                 <h2 class="font-medium">"Secrets"</h2>
                 <p class="text-sm text-muted">
-                    "API keys, tokens and passwords for the agent's shell commands. Each is an environment variable (e.g. $GITHUB_TOKEN) in the sessions it applies to. The agent sees only its name and description: the value is never shown to it, is replaced by [secret:NAME] in command output, and stays encrypted on the head. Values can't be read back here, only replaced."
+                    "API keys, tokens and passwords for the agent's shell commands. Each is an environment variable (e.g. $GITHUB_TOKEN) in the sessions it applies to. Prompts list names and descriptions; command output uses best-effort literal-value redaction ([secret:NAME]). This is not isolation from an agent that can use the credentials. Values stay encrypted on the head and can't be read back here, only replaced."
                 </p>
                 <p class="text-sm text-muted">{move || {
                     let r = api::realm().get();

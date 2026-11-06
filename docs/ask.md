@@ -23,7 +23,7 @@ An Ask conversation is a session the head runs (label `assistant`), in the realm
 
 ## 2. Work on a machine: delegation that waits
 
-Ask can't run commands itself: it runs in the head, which works on no files. When a question needs a machine, it starts a **remote subagent** (docs/remote-subagents.md) and **waits for its report**, as a worker session's `Task` does:
+Ask exposes no shell or filesystem tools of its own. When a question needs a machine, it starts a **remote subagent** (docs/remote-subagents.md) and **waits for its report**, as a worker session's `Task` does. This restricts the exposed tools, not the OS permissions of the head's process or the delegated agent; realms organise, not isolate (docs/realms-ux.md §8):
 
 - **Where it may go is decided by you, beforehand: your templates that agents may start** (Settings → Templates, "Agents may start it"). Each names the worker, folder, worktree, connection and model. The assistant can't make up a worker or folder. That's the same rule remote subagents follow, so one list of approved places serves both.
 - Its tool, `c6_delegate` (template, `on` for a template with several places, prompt, description), lists those templates with where they run. With none, it says so and the assistant tells you where to add one.
@@ -37,7 +37,7 @@ New chat takes a connection and model; the reply box's picker switches it later 
 **Claude Code.** On a Claude Code connection the conversation runs the Claude Code CLI **on the head's machine**, with the worker's Claude Code runtime (`c6_worker::claude_code`, through `c6_worker::hosted`):
 - **Only Ask's tools.** Claude Code starts with `--tools ""` (none of its own: no shell, no files, no web), `--strict-mcp-config` (no MCP server but carbon6's) and `--disable-slash-commands`, in an empty folder of its own (`<data_dir>/assistant/<id>`). Ask's tools (`c6_discover`, `c6_describe`, `c6_call`, `c6_ask`, `c6_delegate`) are served to it over carbon6's MCP bridge, all loaded up front (with its own tools off there is no tool search).
 - **Ask's instructions** (`assistant.base`) go in as its appended system prompt (`--append-system-prompt-file`).
-- **Ask's rules hold:** the tools are the same code as in Ask's own loop, so destructive operations still ask first, secrets still go only to you, and operations are admitted as the conversation's realm. Claude Code itself can't reach anything else.
+- **Ask's rules hold:** the tools are the same code as in Ask's own loop, so destructive operations still ask first, secret results still go only to you, and operations are admitted as the conversation's realm. Claude Code is given no other tools here; that is not an OS sandbox or a limit on a delegated worker's access.
 - **When it's there:** `claude` on the head's PATH (or the usual install places, as a worker looks). `GET /api/v1/assistant/claude` says whether; without it the pickers show Claude Code switched off with the reason, and starting or switching a conversation to it is refused. The plan-limit hints show as for any connection.
 - **Its process** stays up between turns and closes after 15 idle minutes; the next turn resumes the conversation. A conversation that moves onto Claude Code from another model gives it the conversation so far as context.
 

@@ -201,8 +201,9 @@ simple_tool!(
     "task_propose",
     "TaskPropose",
     "Proposes a task for a separate session, as a card the user can start with one click: work worth doing that does not belong \
-     in what you are doing now. You carry on without it. prompt is all the new session sees: make it stand alone (what to do, \
-     where, file paths, why, how to check it). Returns the card's id.",
+     in what you are doing now. You carry on without it. Your conversation is not forwarded automatically: make prompt stand \
+     alone (what to do, where, file paths, why, how to check it). The new session also gets its session instructions and environment. \
+     Returns the card's id.",
     json!({"type": "object", "properties": {
         "title": {"type": "string", "description": "The task, as an imperative (e.g. \"Remove the dead retry module\")"},
         "why": {"type": "string", "description": "One or two sentences: what you noticed, and why it is worth doing"},
@@ -282,7 +283,8 @@ simple_tool!(
      records) or snapshot (a copy once); kind memex with mode read (its knowledge; scope {kinds?}); kind operations with mode \
      call (scope {methods: [\"memex.mail.draft\", …]}); kind workers with mode start (scope {template}; from_realm: the \
      template's, this realm's too) to start a template on the other workers, hosts or SSH targets it names, where \
-     template_start otherwise runs only on this session's worker. Once allowed, give realm on records_* calls to reach the \
+     template_start otherwise runs only on this session's worker unless its same-realm Agents may start it approval allows more. \
+     Once allowed, give realm on records_* calls to reach the \
      collection; memex searches include the granted knowledge, and granted operations run in the realm that owns them.",
     json!({"type": "object", "properties": {
         "from_realm": {"type": "string", "description": "The realm whose data you need"},
@@ -307,7 +309,7 @@ simple_tool!(
     CommonsPublish,
     "commons_publish",
     "CommonsPublish",
-    "Proposes something for commons, the knowledge every realm reads: a fact of this realm's knowledge (its id), or a record \
+    "Proposes something for commons, shared knowledge realms read by default (each realm can turn reads off): a fact of this realm's knowledge (its id), or a record \
      for one of commons' collections (collection and fields, matching its schema). The user reviews each proposal before it is \
      published; this realm needs their append grant to commons. Read commons with records_query (realm commons); its facts \
      come up in searches and briefs.",

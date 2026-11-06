@@ -1,4 +1,5 @@
-//! Grants (docs/os.md §3.7): the only way data crosses realms. A grant says
+//! Grants (docs/os.md §3.7) authorise specific cross-realm API access, not
+//! all file access or data passed through delegation. A grant says
 //! "realm A's data may flow into realm B" — B may read A's collection (or
 //! some of its records), add to it, or take a copy once; read A's
 //! knowledge of some kinds; or call some of A's operations (drafting mail

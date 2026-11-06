@@ -218,7 +218,7 @@ fn NewChat(like: Signal<Option<(String, String)>>, on_started: Callback<Session>
 
             </div>
             <div class="flex flex-wrap items-center gap-3">
-                <label class="flex items-center gap-1 text-xs text-zinc-600 dark:text-zinc-400" title="Off: it can't read your mail, chat or calendar. You can still @-mention one item in a message.">
+                <label class="flex items-center gap-1 text-xs text-zinc-600 dark:text-zinc-400" title="Off: this switch does not add mail, chat or calendar to this conversation's knowledge scope. You can still @-mention one item in a message.">
                     <input type="checkbox" prop:checked=move || personal.get() on:change=move |ev| personal.set(event_target_checked(&ev)) />
                     "Include my mail, chat and calendar"
                 </label>
