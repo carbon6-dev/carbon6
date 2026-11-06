@@ -3422,17 +3422,18 @@ fn ColumnView(tile: u64, col: u64) -> impl IntoView {
     provide_context(ctx);
     let label = Signal::derive(move || view.get().map(|v| v.label(&live)).unwrap_or_default());
     view! {
-        // The list beside an item is narrower; a phone shows one pane.
+        // The list beside an item is narrower. A narrow tile reuses the
+        // phone's cursor/back navigation instead of squeezing two panes.
         <div
             id=ctx.root_id()
             data-pane-motion=col
             class=move || match pos.get() {
                 Some(p) if p.len == 2 && p.index == 0 => format!(
-                    "min-w-0 flex-col border-r border-zinc-200 dark:border-zinc-800 md:flex md:shrink-0 {} {}",
-                    if p.even { "md:basis-1/2" } else { "md:basis-[40%]" },
+                    "min-w-0 flex-col border-r border-zinc-200 dark:border-zinc-800 md:@min-[40rem]/tile:flex md:@min-[40rem]/tile:grow-0 md:@min-[40rem]/tile:shrink-0 {} {}",
+                    if p.even { "md:@min-[40rem]/tile:basis-1/2" } else { "md:@min-[40rem]/tile:basis-[40%]" },
                     if p.cursor == 0 { "flex flex-1" } else { "hidden" },
                 ),
-                Some(p) => format!("min-w-0 flex-1 flex-col md:flex {}", if p.cursor == p.index { "flex" } else { "hidden" }),
+                Some(p) => format!("min-w-0 flex-1 flex-col md:@min-[40rem]/tile:flex {}", if p.cursor == p.index { "flex" } else { "hidden" }),
                 None => "hidden".to_owned(),
             }
             on:pointerdown=move |_| ws.set_active(tile, col)
@@ -3472,7 +3473,7 @@ fn ColumnHeader(label: Signal<String>, pos: Signal<Option<Pos>>, view: Signal<Op
             if ctx.active.get() { "text-zinc-700 dark:text-zinc-300" } else { "text-muted" },
         )>
             <Show when=move || pos.get().is_some_and(|p| p.index == 1)>
-                <button class=format!("{btn} md:hidden") title="Back to the list" aria-label="Back to the list" on:click=move |_| ws.show_list(ctx.tile)>{crate::icons::chevron_left()}</button>
+                <button class=format!("{btn} md:@min-[40rem]/tile:hidden") title="Back to the list" aria-label="Back to the list" on:click=move |_| ws.show_list(ctx.tile)>{crate::icons::chevron_left()}</button>
             </Show>
             <span class="min-w-0 flex-1 truncate">{label}</span>
             {move || session().map(|id| view! {

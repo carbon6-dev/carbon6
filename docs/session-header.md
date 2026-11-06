@@ -10,6 +10,12 @@ With a fine pointer desktop slots are 28px; phones and coarse pointers keep 44px
 
 Optional aspect shapes yield first: below 40rem of tile content width they are hidden, before secondary controls collapse below 30rem. The title and core controls keep their room; the aspect preference and phone behaviour are unchanged.
 
+A two-pane tile below 40rem uses the existing phone navigation: one pane at
+a time, with **Back to the list** in the item's slim header. Both panes stay
+mounted, preserving drafts and scroll. Above that width, both appear beside
+each other and each view responds to its own pane's content container—not
+the window width or even the whole tile's width.
+
 - **Combined ring:** a standalone 24px SVG with a neutral context-used arc inside a complete state rim: grey idle, blue working, amber waiting, red failed. Waiting is dashed and failure has a cross, so colour is not the only cue. A badge appears only for a positive count of distinct background jobs. Its accessible name and tooltip spell out state, context and jobs. The own main-agent state does not become working just because background work runs. Clicking opens the session overview, even with a glance column visible.
 - **Identity colour:** Settings → Appearance → **Session bar colour** uses the shared immediate-setting **Coloured stripe** switch: on (default) keeps the stripe; off is **Dot only**. The identity dot remains in either case. Saving disables the switch, and a failed save restores the previous choice and reports the error. This is independent of aspect marks.
 - **Optional aspects:** Settings → Appearance → **Session aspects → Show on tile bars**, using the shared Switch, is **off by default** so the default bar remains as in PR29. On desktop only, the chosen aspects appear after the title as shapes in their own colours/patterns, never named chips. They share the title's flexible room, not the ring or fixed control slots. Resting on a value for 400ms dims tiles without it; leaving cancels it, clicking opens its card (related sessions, destination and palette). The choice is `session_facets.tile_bars`, stored per realm alongside `shown`; missing fields from old saved settings/heads mean off, with no migration. One workspace-level gate unmounts the entire feature off/on phone: no per-tile mark signals, scans, listeners or timers when off. Enabling/disabling does not remount the bar's controls or the transcript.
