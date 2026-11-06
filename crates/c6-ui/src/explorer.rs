@@ -133,7 +133,7 @@ pub fn RealmsMap() -> impl IntoView {
                     let grants = m["grants"].as_array().cloned().unwrap_or_default();
                     view! {
                         <GrantGraph realms=realms.clone() grants=grants.clone() />
-                        <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                        <div class="grid gap-3 @md/view:grid-cols-2 @min-[64rem]/view:grid-cols-3">
                             {realms.into_iter().map(|c| {
                                 let id = c["realm"]["id"].as_str().unwrap_or("").to_owned();
                                 let n = |k: &str| c["counts"][k].as_i64().unwrap_or(0);
@@ -142,7 +142,7 @@ pub fn RealmsMap() -> impl IntoView {
                                 let health = c["health"].as_i64().unwrap_or(0);
                                 view! {
                                     <Ex to=explore(&id, "", "", "") class="block space-y-2 rounded-lg border border-zinc-200 p-3 hover:border-zinc-400 dark:border-zinc-800 dark:hover:border-zinc-600">
-                                        <div class="flex items-baseline gap-2">
+                                        <div class="flex flex-wrap items-baseline gap-2 [overflow-wrap:anywhere]">
                                             <span class="font-medium">{c["realm"]["name"].as_str().unwrap_or("").to_owned()}</span>
                                             <span class="font-mono text-xs text-muted">{id.clone()}</span>
                                             <span class="flex-1"></span>
@@ -247,14 +247,14 @@ pub fn ExplorePage(realm: String, section: String, kind: String, id: String) -> 
     let has_object = !kind.is_empty();
     let (rr, sec) = (realm.clone(), section.clone());
     view! {
-        <main class="flex h-full min-h-0 flex-col gap-3 px-3 py-3 lg:flex-row">
-            <aside class=format!("shrink-0 space-y-3 overflow-y-auto lg:w-64 {}", if has_object || !section.is_empty() { "hidden lg:block" } else { "" })>
+        <main class="flex h-full min-h-0 flex-col gap-3 px-3 py-3 @min-[64rem]/view:flex-row">
+            <aside class=format!("shrink-0 space-y-3 overflow-y-auto @min-[64rem]/view:w-64 {}", if has_object || !section.is_empty() { "hidden @min-[64rem]/view:block" } else { "" })>
                 {move || summary.get().map(|r| match r {
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
                     Ok(s) => view! { <Inventory summary=s realm=rr.clone() section=sec.clone() /> }.into_any(),
                 })}
             </aside>
-            <section class=format!("min-w-0 flex-1 overflow-y-auto {}", if has_object { "hidden lg:block" } else { "" })>
+            <section class=format!("min-w-0 flex-1 overflow-y-auto {}", if has_object { "hidden @min-[64rem]/view:block" } else { "" })>
                 {if section.is_empty() {
                     let r2 = realm.clone();
                     view! { {move || summary.get().map(|r| match r {
@@ -266,7 +266,7 @@ pub fn ExplorePage(realm: String, section: String, kind: String, id: String) -> 
                 }}
             </section>
             {has_object.then(|| view! {
-                <section class="min-w-0 overflow-y-auto rounded-lg border border-zinc-200 p-3 lg:w-[30rem] lg:shrink-0 dark:border-zinc-800">
+                <section class="min-w-0 overflow-y-auto rounded-lg border border-zinc-200 p-3 @min-[64rem]/view:w-[30rem] @min-[64rem]/view:shrink-0 dark:border-zinc-800">
                     <ObjectPane realm=realm.clone() section=section.clone() kind=kind.clone() id=id.clone() />
                 </section>
             })}
@@ -532,8 +532,8 @@ fn SearchResults(realm: String, q: String, selected: String) -> impl IntoView {
     let section = format!("search:{q}");
     view! {
         <div class="space-y-3">
-            <div class="flex items-center gap-2">
-                <Ex to=explore(&realm, "", "", "") class="text-sm text-muted hover:underline lg:hidden">{crate::icons::arrow_left()}" Overview"</Ex>
+            <div class="flex flex-wrap items-center gap-2 [overflow-wrap:anywhere]">
+                <Ex to=explore(&realm, "", "", "") class="text-sm text-muted hover:underline @min-[64rem]/view:hidden">{crate::icons::arrow_left()}" Overview"</Ex>
                 <h2 class="font-medium">{format!("“{q}”")}</h2>
             </div>
             {move || found.get().map(|r| match r {
@@ -571,11 +571,11 @@ fn SectionList(realm: String, section: String, selected: String) -> impl IntoVie
     view! {
         <div class="space-y-2">
             <div class="flex flex-wrap items-center gap-2">
-                <Ex to=explore(&realm, "", "", "") class="text-sm text-muted hover:underline lg:hidden">{crate::icons::arrow_left()}" Overview"</Ex>
-                <h2 class="font-medium">{title}</h2>
+                <Ex to=explore(&realm, "", "", "") class="text-sm text-muted hover:underline @min-[64rem]/view:hidden">{crate::icons::arrow_left()}" Overview"</Ex>
+                <h2 class="min-w-0 max-w-full font-medium [overflow-wrap:anywhere]">{title}</h2>
                 {(what == "collection").then(|| view! { <Ex to=explore(&realm, &section, "collection", &arg) class="text-xs text-muted underline">"about this collection"</Ex> })}
                 <span class="flex-1"></span>
-                <input class=format!("{INPUT} w-48 py-1 text-sm") placeholder="Filter" prop:value=move || q.get() on:input=move |ev| q.set(event_target_value(&ev)) />
+                <input class=format!("{INPUT} min-w-0 max-w-full w-48 py-1 text-sm") placeholder="Filter" prop:value=move || q.get() on:input=move |ev| q.set(event_target_value(&ev)) />
             </div>
             {move || list.get().map(|r| match r {
                 Err(e) => view! { <ErrorBox message=e /> }.into_any(),
@@ -612,16 +612,16 @@ fn ObjectPane(realm: String, section: String, kind: String, id: String) -> impl 
                 view! {
                     <div class="space-y-3">
                         <div class="flex items-start gap-2">
-                            <Ex to=back.clone() class="text-sm text-muted hover:underline lg:hidden" title="Back to the overview">{crate::icons::chevron_left()}</Ex>
+                            <Ex to=back.clone() class="text-sm text-muted hover:underline @min-[64rem]/view:hidden" title="Back to the overview">{crate::icons::chevron_left()}</Ex>
                             <span class=format!("text-lg {color}")>{mark}</span>
-                            <div class="min-w-0 flex-1">
+                            <div class="min-w-0 flex-1 [overflow-wrap:anywhere]">
                                 <h2 class="break-words font-medium">{o.title.clone()}</h2>
                                 <p class="text-xs text-muted">{format!("{} · {}", o.kind, o.sub)}</p>
                             </div>
                             {o.open.clone().map(|p| view! { <Go to=View::from_path(&p) class="shrink-0 text-xs text-muted underline" title="Edit it where it lives">"Open "{icon(Icon::ArrowUpRight, Size::S14)}</Go> })}
                         </div>
                         {(!o.fields.is_empty()).then(|| view! {
-                            <dl class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-sm">
+                            <dl class="grid grid-cols-1 gap-x-3 gap-y-0.5 text-sm [overflow-wrap:anywhere] @sm/view:grid-cols-[auto_minmax(0,1fr)]">
                                 {o.fields.iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| view! { <dt class="text-muted">{k.clone()}</dt><dd class="whitespace-pre-wrap break-words">{v.clone()}</dd> }).collect_view()}
                             </dl>
                         })}
