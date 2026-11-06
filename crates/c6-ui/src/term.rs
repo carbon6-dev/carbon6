@@ -229,8 +229,8 @@ pub fn Terminals(
                 <button class="flex h-6 items-center rounded-md px-1 text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100 pointer-coarse:h-9"
                     title="New terminal in another folder" aria-label="New terminal in another folder" on:click=move |_| picking.update(|p| *p = !*p)>{crate::icons::icon(crate::icons::Icon::Ellipsis, crate::icons::Size::S14)}</button>
                 {move || picking.get().then(|| view! {
-                    <form class="flex items-center gap-1" on:submit=move |ev| { ev.prevent_default(); picking.set(false); open(); }>
-                        <input class=format!("{} w-64 font-mono text-xs", crate::util::INPUT) placeholder="folder (empty: home)" autofocus=true
+                    <form class="flex min-w-0 max-w-full items-center gap-1" on:submit=move |ev| { ev.prevent_default(); picking.set(false); open(); }>
+                        <input class=format!("{} min-w-0 w-64 font-mono text-xs", crate::util::INPUT) placeholder="folder (empty: home)" autofocus=true
                             prop:value=move || cwd.get() on:input=move |ev| cwd.set(event_target_value(&ev))
                             on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); picking.set(false) } />
                         <button type="submit" class=crate::util::BUTTON_QUIET>"Open"</button>

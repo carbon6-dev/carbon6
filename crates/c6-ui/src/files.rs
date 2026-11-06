@@ -25,8 +25,8 @@ pub fn FileBrowser(worker_id: String, #[prop(optional)] root: Option<String>) ->
     });
 
     view! {
-        <div class="grid gap-3 lg:grid-cols-[minmax(16rem,1fr)_2fr]">
-            <div class="space-y-2">
+        <div class="grid gap-3 @min-[40rem]/view:grid-cols-[minmax(16rem,1fr)_2fr]">
+            <div class="min-w-0 space-y-2">
                 <div class="flex gap-2">
                     <button class="rounded-md border border-zinc-300 px-2 text-sm dark:border-zinc-700" title="Up"
                         on:click=move |_| {
@@ -34,7 +34,7 @@ pub fn FileBrowser(worker_id: String, #[prop(optional)] root: Option<String>) ->
                             let parent = cur.rsplit_once('/').map(|(p, _)| if p.is_empty() { "/".to_owned() } else { p.to_owned() }).unwrap_or(cur);
                             dir.set(parent);
                         }>{crate::icons::arrow_up()}</button>
-                    <input class=format!("{INPUT} font-mono text-xs") prop:value=move || path_input.get()
+                    <input class=format!("{INPUT} min-w-0 font-mono text-xs") prop:value=move || path_input.get()
                         on:input=move |ev| path_input.set(event_target_value(&ev))
                         on:keydown=move |ev| if ev.key() == "Enter" { dir.set(path_input.get_untracked()) } />
                 </div>
@@ -60,7 +60,7 @@ pub fn FileBrowser(worker_id: String, #[prop(optional)] root: Option<String>) ->
                                                     <button class="flex w-full items-center gap-2 px-2 py-1 text-left hover:bg-zinc-100 dark:hover:bg-zinc-900"
                                                         on:click=move |_| if is_dir { dir.set(full.clone()) } else { open_file.set(Some(full.clone())) }>
                                                         <span class="w-4 text-muted">{if is_dir { crate::icons::chevron_right().into_any() } else { ().into_any() }}</span>
-                                                        <span class=if is_dir { "flex-1 truncate font-medium" } else { "flex-1 truncate" }>{name}</span>
+                                                        <span class=if is_dir { "min-w-0 flex-1 truncate font-medium" } else { "min-w-0 flex-1 truncate" }>{name}</span>
                                                         <span class="shrink-0 text-[11px] text-muted">{mtime.map(|t| ago(now - t)).unwrap_or_default()}</span>
                                                     </button>
                                                 </li>
@@ -190,7 +190,7 @@ fn StatusSummary(s: Value) -> impl IntoView {
                 {s["upstream"].as_str().map(|u| view! { <span class="text-xs text-muted">{crate::icons::arrow_right()}" "{format!("Upstream {u} · {ahead} ahead, {behind} behind")}</span> })}
                 <span class="text-xs text-muted">{format!("{} changed file{}", files.len(), if files.len() == 1 { "" } else { "s" })}</span>
             </div>
-            <ul class="mt-2 grid gap-x-4 font-mono text-xs sm:grid-cols-2">
+            <ul class="mt-2 grid gap-x-4 font-mono text-xs @sm/view:grid-cols-2">
                 {files.into_iter().map(|f| {
                     let code = format!("{}{}", f["index"].as_str().unwrap_or(" "), f["worktree"].as_str().unwrap_or(" "));
                     let cls = match code.as_str() { "??" => "text-emerald-600", c if c.contains('D') => "text-red-600", _ => "text-amber-600" };

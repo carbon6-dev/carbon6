@@ -98,9 +98,9 @@ pub fn WorkerPage(id: String) -> impl IntoView {
     let worker = move || live.workers.with(|ws| ws.iter().find(|w| w.id.to_string() == id.get()).cloned());
     view! {
         <main class="mx-auto max-w-6xl space-y-4 px-4 py-6">
-            <div class="flex items-center gap-3">
+            <div class="flex flex-wrap items-center gap-3">
                 {move || view! { <crate::marks::MarkButton key=format!("worker:{}", id.get()) shape=crate::marks::Shape::Square size=14 /> }}
-                <h1 class="text-lg font-semibold">{move || worker().map(|w| w.name).unwrap_or_default()}</h1>
+                <h1 class="min-w-0 break-words text-lg font-semibold [overflow-wrap:anywhere]">{move || worker().map(|w| w.name).unwrap_or_default()}</h1>
                 {move || worker().map(|w| {
                     let online = w.status == WorkerStatus::Online;
                     view! { <span class=if online { "text-xs text-emerald-600" } else { "text-xs text-muted" }>{if online { "online" } else { "offline" }}</span> }
@@ -152,7 +152,7 @@ pub fn Fleet(workers: ReadSignal<Vec<Worker>>) -> impl IntoView {
 
     view! {
         <section class="space-y-4">
-            <div class="flex items-end justify-between gap-4">
+            <div class="flex flex-wrap items-end justify-between gap-4">
                 <div>
                     <h1 class="text-lg font-semibold">"Workers"</h1>
                     <p class="text-sm text-muted">{move || format!("{} online · {} enrolled", online(), active())}</p>
@@ -240,9 +240,9 @@ fn CodexLimitsSettings(workers: ReadSignal<Vec<Worker>>) -> impl IntoView {
                                     pending.set(false);
                                 });
                             } label=w.name />
-                    <label class="flex items-center gap-2">
+                    <label class="flex min-w-0 max-w-full flex-wrap items-center gap-2">
                         <span class="text-muted">"Codex command"</span>
-                        <input type="text" class="rounded border border-zinc-300 bg-transparent px-2 py-1 dark:border-zinc-700"
+                        <input type="text" class="min-w-0 max-w-full rounded border border-zinc-300 bg-transparent px-2 py-1 dark:border-zinc-700"
                             placeholder="auto-discover Codex"
                             title="Optional absolute executable path, without arguments or ~ expansion. Its folder is added to PATH for Codex only."
                             disabled=move || pending.get() || !matches!(settings.get(), Some(Ok(_)))
