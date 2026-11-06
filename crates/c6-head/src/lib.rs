@@ -5,6 +5,7 @@ pub mod agent_ops;
 pub mod analytics;
 pub mod api;
 pub mod apps;
+mod assets;
 pub mod assistant;
 pub mod attention;
 pub mod auth;

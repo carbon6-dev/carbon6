@@ -11,7 +11,6 @@ use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router};
 use c6_api as api;
 use c6_core::{WorkerId, now_ms};
-use rust_embed::RustEmbed;
 
 use crate::HeadState;
 use crate::realms::Caller;
@@ -298,6 +297,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .fallback(static_asset)
         .layer(axum::middleware::from_fn_with_state(state.clone(), settings_realm))
         .layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::require))
+        .layer(crate::assets::json_compression())
         .with_state(state)
 }
 
@@ -742,16 +742,9 @@ async fn chatgpt_callback(State(st): State<Arc<HeadState>>, uri: Uri) -> Respons
     }
 }
 
-/// Trunk's outputs: `name-<16 hex>.ext`, and the wasm, `name-<16 hex>_bg.wasm`.
 /// A body that may carry attachments: up to 20 MB of them (sessions.rs),
 /// as base64 (a third more) in JSON. The default 2 MB refused a screenshot.
 const ATTACHED_BODY: usize = 32 * 1024 * 1024;
-
-fn is_fingerprinted(path: &str) -> bool {
-    let stem = path.rsplit('/').next().unwrap_or(path).split('.').next().unwrap_or("");
-    let stem = stem.strip_suffix("_bg").unwrap_or(stem);
-    stem.rsplit_once('-').is_some_and(|(_, h)| h.len() == 16 && h.chars().all(|c| c.is_ascii_hexdigit()))
-}
 
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
@@ -3419,29 +3412,11 @@ async fn terminal_socket(st: Arc<HeadState>, worker_id: WorkerId, tid: String, m
     }
 }
 
-#[derive(RustEmbed)]
-#[folder = "../c6-ui/dist"]
-#[allow_missing = true]
-struct UiAssets;
-
-async fn static_asset(uri: Uri) -> Response {
-    let path = uri.path().trim_start_matches('/');
-    if path.starts_with("api/") {
+async fn static_asset(uri: Uri, headers: HeaderMap) -> Response {
+    if uri.path().trim_start_matches('/').starts_with("api/") {
         return ApiErr(StatusCode::NOT_FOUND, "not found".into()).into_response();
     }
-    // SPA: unknown paths serve index.html and the client router takes over.
-    let (path, file) = match UiAssets::get(path).filter(|_| !path.is_empty()) {
-        Some(f) => (path, f),
-        None => match UiAssets::get("index.html") {
-            Some(f) => ("index.html", f),
-            None => return (StatusCode::NOT_FOUND, "web UI not built; run `make ui`").into_response(),
-        },
-    };
-    let mime = mime_guess::from_path(path).first_or_octet_stream();
-    // Trunk fingerprints its outputs (`name-<16 hex>.ext`); those never
-    // change. Everything else (index.html, vendored scripts) is revalidated.
-    let cache = if is_fingerprinted(path) { "public, max-age=31536000, immutable" } else { "no-cache" };
-    ([(header::CONTENT_TYPE, mime.as_ref().to_owned()), (header::CACHE_CONTROL, cache.to_owned())], file.data).into_response()
+    crate::assets::static_asset(uri, headers).await
 }
 
 // --- The assistant and the operation catalog ----------------------------------
@@ -4633,21 +4608,4 @@ async fn answer_decision(
 /// Starts a session that helps you settle the decision.
 async fn decision_session(State(st): State<Arc<HeadState>>, Path(id): Path<i64>) -> ApiResult<Json<api::Session>> {
     Ok(Json(crate::decisions::start_session(&st, id).await?))
-}
-
-#[cfg(test)]
-mod fingerprint_tests {
-    use super::is_fingerprinted;
-
-    #[test]
-    fn trunk_outputs_are_fingerprinted_and_the_rest_not() {
-        // The wasm too: without it, 15 MB went again on every page load.
-        assert!(is_fingerprinted("c6-ui-789d462898aabf89_bg.wasm"));
-        assert!(is_fingerprinted("c6-ui-1de8bb420f162f4a.js"));
-        assert!(is_fingerprinted("input-d3c90d3631cf98b5.css"));
-        assert!(!is_fingerprinted("index.html"));
-        assert!(!is_fingerprinted("vendor/xterm.js"));
-        assert!(!is_fingerprinted("js/terminal.js"));
-        assert!(!is_fingerprinted("c6-ui-notahexhashxxxxx_bg.wasm"));
-    }
 }

@@ -18,6 +18,10 @@ runs:
       if: inputs.trunk == 'true'
       shell: bash
       run: |
+        case $RUNNER_OS in
+          macOS) brew install brotli ;;
+          *) sudo apt-get update && sudo apt-get install -y --no-install-recommends brotli ;;
+        esac
         trunk=$(sed -n 's/^ARG TRUNK_VERSION=//p' docker/Dockerfile)
         arch=$(uname -m | sed 's/^arm64$/aarch64/')
         case $RUNNER_OS in macOS) os=apple-darwin ;; *) os=unknown-linux-gnu ;; esac

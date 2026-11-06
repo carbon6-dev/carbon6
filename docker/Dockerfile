@@ -20,6 +20,7 @@ ARG UBUNTU=22.04
 FROM rust:${RUST_VERSION}-bookworm AS toolchain
 ARG TRUNK_VERSION
 RUN rustup target add wasm32-unknown-unknown \
+ && apt-get update && apt-get install -y --no-install-recommends brotli && rm -rf /var/lib/apt/lists/* \
  && curl -fsSL "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-$(uname -m)-unknown-linux-gnu.tar.gz" \
     | tar -xz -C /usr/local/bin trunk \
  && trunk --version
@@ -77,7 +78,7 @@ FROM ubuntu:${UBUNTU} AS deb-toolchain
 ARG RUST_VERSION
 ARG TRUNK_VERSION
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential ca-certificates curl \
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential ca-certificates curl brotli \
  && rm -rf /var/lib/apt/lists/* \
  && curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal \
       --default-toolchain "${RUST_VERSION}" --target wasm32-unknown-unknown \

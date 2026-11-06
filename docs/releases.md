@@ -21,6 +21,24 @@ Status: built (2026-10-15); reworked 2026-10-23 so packages are built once per c
 
 **Toolchain:** the Rust version is set in one place, `rust-toolchain.toml`: rustup uses it for local builds, CI installs it through `.github/actions/rust`, and the Makefile passes it to the Docker builds (`RUST_VERSION`). Trunk's version comes from `docker/Dockerfile` (`TRUNK_VERSION`). So local, CI and Docker builds match.
 
+**UI transfer size:** Trunk's `post_build` hook runs `scripts/precompress-ui.sh`
+against `TRUNK_STAGING_DIR` before publishing `dist`. It writes Brotli quality-11
+`.br` sidecars for WASM, JS, CSS and HTML, leaving originals intact. Thus direct
+`trunk build` / `trunk serve`, `make ui`, `make build`, native deb/brew packaging
+(both depend on `build`), and both Docker build stages share the same step.
+CI's Trunk setup and both Docker toolchains install the Brotli CLI; local builds
+need it too. A missing compressor fails the build rather than shipping an
+uncompressed release. `sh scripts/precompress-ui.sh [dist-directory]` can also be
+used by size checks; an absent dist directory is a no-op. Test with
+`sh scripts/test-precompress-ui.sh`.
+
+The head embeds originals and sidecars. It negotiates `Accept-Encoding` qvalues,
+explicit exclusions, wildcards and identity, serves Brotli only when acceptable,
+and sends `Vary: Accept-Encoding` even for the original representation. MIME and
+fingerprinted immutable caching are based on the original path. API JSON uses
+tower-http's streaming Brotli/gzip compression; event streams, WebSockets and UI
+assets are not dynamically compressed. Native executable settings are unchanged.
+
 ## 3. Versions
 
 - **Semver.** `make release BUMP=patch|minor|major` (default `patch`), or `VERSION=x.y.z`. The first release is `0.2.0` (`make release BUMP=minor`): `0.1.0` has been the unreleased development version.
