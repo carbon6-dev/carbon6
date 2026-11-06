@@ -12,7 +12,9 @@ dismissal. Include `VIEWPORT=narrow,phone,landscape THEME=light,dark` for the
 `ONLY=modelPicker` checks the composer chip's bottom sheet on those phone
 layouts and its unchanged desktop popover: arbitrary model ids, the last item
 in a long offered list with an overlay keyboard, effort, all dismissal paths,
-and one prefetched model-list request across repeated openings. Phone model
+and one prefetched model-list request across repeated openings. It also checks
+that the phone label, field and list span the sheet's normal padding, with a
+close handle but no redundant top X. Phone model
 screenshots end in `-model-picker.png` and `-model-picker-keyboard.png`.
 `ONLY=modelForms` checks the other inline `ModelPicker` users in Ask and the
 new-session form on both warm navigation and cold page loads, including

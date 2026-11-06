@@ -1838,7 +1838,12 @@ fn SessionPopover(at: RwSignal<Option<(f64, f64)>>, #[prop(into)] class: String,
 /// background), about half the screen, closed by a tap outside it, its ✕,
 /// or pulling its handle down.
 #[component]
-fn BottomSheet(open: RwSignal<bool>, #[prop(default = "Session details")] label: &'static str, children: Children) -> impl IntoView {
+fn BottomSheet(
+    open: RwSignal<bool>,
+    #[prop(default = "Session details")] label: &'static str,
+    #[prop(default = true)] close_icon: bool,
+    children: Children,
+) -> impl IntoView {
     let close = move || open.set(false);
     let pulled_from = StoredValue::new(None::<i32>);
     view! {
@@ -1859,7 +1864,9 @@ fn BottomSheet(open: RwSignal<bool>, #[prop(default = "Session details")] label:
                     aria-label=format!("Close {label}") on:click=move |_| close()>
                     <span class="h-1 w-10 rounded-full bg-zinc-300 dark:bg-zinc-600"></span>
                 </button>
-                <button class=format!("{} absolute right-1 top-1", crate::icons::BAR_BUTTON) title="Close" aria-label="Close" on:click=move |_| close()>{crate::icons::x()}</button>
+                {close_icon.then(|| view! {
+                    <button class=format!("{} absolute right-1 top-1", crate::icons::BAR_BUTTON) title="Close" aria-label="Close" on:click=move |_| close()>{crate::icons::x()}</button>
+                })}
             </div>
             <div class="min-h-0 flex-1 overflow-y-auto px-2 pb-4">
                 {children()}
@@ -3082,6 +3089,9 @@ pub(crate) fn ModelPicker(
     /// Inside a scrolling sheet, keep the offered models in that same scroll.
     #[prop(optional)]
     inline_list: bool,
+    /// The phone composer sheet gives the labelled model field its own full row.
+    #[prop(optional)]
+    stacked: bool,
 ) -> impl IntoView {
     // The new-session sheet and Ask's inline form also scroll on phones.
     // An absolutely positioned offered list can be clipped by those scrollports.
@@ -3092,7 +3102,7 @@ pub(crate) fn ModelPicker(
     let supports_effort =
         move |id: &str| connections.get().and_then(Result::ok).is_some_and(|cs| cs.iter().any(|c| c.id == id && c.supports_effort));
     view! {
-        <select class=format!("{SMALL_INPUT} max-w-48") on:change=move |ev| {
+        <select class=format!("{SMALL_INPUT} {}", if stacked { "w-full" } else { "max-w-48" }) on:change=move |ev| {
             let c = event_target_value(&ev);
             let chosen = connections.get().and_then(Result::ok).and_then(|cs| cs.into_iter().find(|x| x.id == c));
             let default = chosen.map(|x| picker_model(&x.kind, x.default_model)).unwrap_or_default();
@@ -3118,8 +3128,12 @@ pub(crate) fn ModelPicker(
             }).collect_view()}
         </select>
         <crate::quota::QuotaNote connection />
-        <div class="w-56 max-w-full" class:hidden=move || auto.is_some() && connection.with(String::is_empty)><ModelInput connection=connection value=model on_set=move |v| model.set(v) class=SMALL_INPUT.to_owned() placeholder="model id" inline_list /></div>
-        <select class=SMALL_INPUT class:hidden=move || !supports_effort(&connection.get()) aria-label="Reasoning effort" title="Reasoning effort" on:change=move |ev| effort.set(event_target_value(&ev))>
+        <div class=if stacked { "w-full space-y-2" } else { "w-56 max-w-full" } class:hidden=move || auto.is_some() && connection.with(String::is_empty)>
+            {stacked.then(|| view! { <div class="font-medium">"Model"</div> })}
+            <ModelInput connection=connection value=model on_set=move |v| model.set(v)
+                class=if stacked { format!("{SMALL_INPUT} min-w-0 flex-1") } else { SMALL_INPUT.to_owned() } placeholder="model id" inline_list />
+        </div>
+        <select class=format!("{SMALL_INPUT} {}", if stacked { "w-full" } else { "" }) class:hidden=move || !supports_effort(&connection.get()) aria-label="Reasoning effort" title="Reasoning effort" on:change=move |ev| effort.set(event_target_value(&ev))>
             {EFFORTS.iter().map(|&(value, label)| view! {
                 <option value=value selected=move || effort.get() == value>{label}</option>
             }).collect_view()}
@@ -5852,8 +5866,10 @@ fn Composer(
                                 // The plan's windows first, when it has one.
                                 {model.map(|m| view! { <crate::quota::PlanMenu connection=Signal::derive(move || m.current.get().0) /> })}
                                 {model.map(|m| view! {
-                                    <div class="font-medium">"Model"</div>
-                                    <div class="flex flex-wrap items-center gap-2"><ModelPicker connection=m.connection model=m.model effort=m.effort no_claude_code claude_off=claude_off inline_list=picking_phone.get_untracked() /></div>
+                                    {(!picking_phone.get_untracked()).then(|| view! { <div class="font-medium">"Model"</div> })}
+                                    <div class=if picking_phone.get_untracked() { "flex flex-col items-stretch gap-2" } else { "flex flex-wrap items-center gap-2" }>
+                                        <ModelPicker connection=m.connection model=m.model effort=m.effort no_claude_code claude_off=claude_off inline_list=picking_phone.get_untracked() stacked=picking_phone.get_untracked() />
+                                    </div>
                                     {move || switch_note(m, kinds.get().and_then(Result::ok).unwrap_or_default()).map(|(text, title)| view! {
                                         <p class="text-amber-700 dark:text-amber-400">{text}{(!title.is_empty()).then(|| view! { <span class="block text-muted">{title}</span> })}</p>
                                     })}
@@ -5885,8 +5901,8 @@ fn Composer(
                                             <p class="max-w-md text-muted">{SUBAGENTS_HELP}</p>
                                             <Switch on=same on_change=flip label="Same as the session" title="Run them on the session's own model, or turn off to choose theirs" />
                                             {move || (!same.get()).then(|| view! {
-                                                <div class="flex flex-wrap items-center gap-2">
-                                                    <ModelPicker connection=s.connection model=s.model effort=s.effort no_claude_code=no_claude_code inline_list=picking_phone.get_untracked() />
+                                                <div class=if picking_phone.get_untracked() { "flex flex-col items-stretch gap-2" } else { "flex flex-wrap items-center gap-2" }>
+                                                    <ModelPicker connection=s.connection model=s.model effort=s.effort no_claude_code=no_claude_code inline_list=picking_phone.get_untracked() stacked=picking_phone.get_untracked() />
                                                     {move || s.change().map(|req| view! {
                                                         <button class="rounded-md bg-violet-600 px-2 py-1 text-white hover:bg-violet-700" on:click=move |_| set(req.clone())>"Set"</button>
                                                     })}
@@ -5900,7 +5916,7 @@ fn Composer(
                                 view! {
                                     <leptos::portal::Portal>
                                         <div data-pop=picking_pop.get_value()>
-                                            <BottomSheet open=picking label="Model">
+                                            <BottomSheet open=picking label="Model" close_icon=false>
                                                 <div class="space-y-2 py-1 text-zinc-700 dark:text-zinc-200">{contents()}</div>
                                             </BottomSheet>
                                         </div>
@@ -6345,11 +6361,15 @@ mod tests {
             assert_eq!(html.matches(" inert").count(), 2, "scrim and body immediately stop taking input: {html}");
             assert!(html.contains("c6-sheet c6-presence phone-sheet"), "retain keyboard viewport bounds: {html}");
             assert!(html.contains("aria-label=\"Catch up\""));
+            assert!(html.contains("aria-label=\"Close\""), "other shared sheets retain their close icon: {html}");
             assert!(html.contains("Body"), "the exiting body remains mounted");
             open.set(true);
             let html = view! { <BottomSheet open><button>"Body"</button></BottomSheet> }.to_html();
             assert_eq!(html.matches("data-open=\"true\"").count(), 2);
             assert!(!html.contains(" inert"), "opening must not delay input: {html}");
+            let html = view! { <BottomSheet open label="Model" close_icon=false><button>"Body"</button></BottomSheet> }.to_html();
+            assert!(html.contains("aria-label=\"Close Model\""), "the native handle remains a named close action: {html}");
+            assert!(!html.contains("aria-label=\"Close\""), "the model sheet has no redundant top X: {html}");
         });
     }
 

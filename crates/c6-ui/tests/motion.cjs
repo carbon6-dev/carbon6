@@ -687,6 +687,25 @@ async function modelPicker(f) {
       const input = el.querySelector('input');
       return getComputedStyle(input.parentElement.nextElementSibling).position === 'static';
     }), 'model choices share the keyboard-bounded sheet scroll, not a clipped popover');
+    const layout = await dialog.evaluate(el => {
+      const box = node => { const r = node.getBoundingClientRect(); return { left: r.left, right: r.right, top: r.top, bottom: r.bottom }; };
+      const row = el.querySelector('input').parentElement;
+      const content = el.lastElementChild;
+      const style = getComputedStyle(content);
+      return { row: box(row), list: box(row.nextElementSibling), label: box(row.parentElement.previousElementSibling),
+        labelText: row.parentElement.previousElementSibling.textContent,
+        left: content.getBoundingClientRect().left + parseFloat(style.paddingLeft),
+        right: content.getBoundingClientRect().right - parseFloat(style.paddingRight),
+        headerButtons: el.firstElementChild.querySelectorAll('button').length };
+    });
+    assert.equal(layout.labelText, 'Model');
+    assert.equal(layout.headerButtons, 1, 'the named close handle is the only model-sheet header button, with no top X');
+    for (const part of ['label', 'row', 'list']) {
+      assert(Math.abs(layout[part].left - layout.left) < 1, `${part} starts at the sheet padding: ${JSON.stringify(layout)}`);
+      assert(Math.abs(layout[part].right - layout.right) < 1, `${part} uses the full sheet width: ${JSON.stringify(layout)}`);
+    }
+    assert(layout.row.top >= layout.label.bottom && layout.row.top - layout.label.bottom <= 12,
+      `Model sits directly above its field: ${JSON.stringify(layout)}`);
     await page.screenshot({ path: path.join(SHOTS, `${f.label}-model-picker-keyboard.png`) });
   }
   await last.click();
