@@ -236,7 +236,7 @@ pub fn CatchupBody(
                         </div>
                     }}
                     {if !c.summary.is_empty() {
-                        view! { <p class="leading-snug">{c.summary.clone()}</p> }.into_any()
+                        view! { <p class="leading-snug">{c6_api::citations::clean(&c.summary).into_owned()}</p> }.into_any()
                     } else if card.pending {
                         view! { <p class="animate-pulse text-xs text-muted">"Summing up…"</p> }.into_any()
                     } else {
@@ -255,7 +255,7 @@ pub fn CatchupBody(
                                         aria-expanded={let o = is_open.clone(); move || o().to_string()} on:click=toggle>
                                         <span class=format!("size-1.5 shrink-0 rounded-full {}", tone(&kind))></span>
                                         <span class=format!("min-w-0 flex-1 {strong}")>{r.text.clone()}</span>
-                                        <span class="shrink-0 text-muted">{let o = is_open.clone(); move || if o() { "▾" } else { "▸" }}</span>
+                                        <span class="shrink-0 text-muted">{let o = is_open.clone(); move || if o() { crate::icons::chevron_down().into_any() } else { crate::icons::chevron_right().into_any() }}</span>
                                     </button>
                                     <Show when=is_open.clone()>
                                         <ul class="mb-1 ml-5 space-y-px">
@@ -289,7 +289,7 @@ pub fn CatchupBody(
                             }>"Jump to it"</button>
                         <span class="flex-1"></span>
                         <button class=crate::util::BUTTON title="Mark it all seen and put the card away"
-                            on:click=move |_| { caught_up(ws, id.get_value()); done() }>"Caught up ✓"</button>
+                            on:click=move |_| { caught_up(ws, id.get_value()); done() }>"Caught up "{crate::icons::check()}</button>
                     </div>
                 </div>
             }

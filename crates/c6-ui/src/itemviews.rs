@@ -166,9 +166,9 @@ pub fn CalendarView(view: ViewDef) -> impl IntoView {
     let v = StoredValue::new(view);
     view! {
         <div class="flex items-center gap-2">
-            <button class=BUTTON_QUIET on:click=move |_| start.update(|s| *s -= 7.0 * DAY)>"←"</button>
+            <button class=BUTTON_QUIET title="Previous week" on:click=move |_| start.update(|s| *s -= 7.0 * DAY)>{crate::icons::chevron_left()}</button>
             <button class=BUTTON_QUIET on:click=move |_| start.set(monday(js_sys::Date::now()))>"This week"</button>
-            <button class=BUTTON_QUIET on:click=move |_| start.update(|s| *s += 7.0 * DAY)>"→"</button>
+            <button class=BUTTON_QUIET title="Next week" on:click=move |_| start.update(|s| *s += 7.0 * DAY)>{crate::icons::chevron_right()}</button>
             <span class="text-sm text-muted">{move || format!("{} – {}", day_label(start.get()), day_label(start.get() + 6.0 * DAY))}</span>
         </div>
         {move || error.get().map(|e| view! { <ErrorBox message=e /> })}

@@ -3,7 +3,8 @@
 //! hand (in any profile's naming), some loaded up front, with carbon6's
 //! guidance for them in Claude Code's system prompt. A running session
 //! takes a change up at its next quiet turn: its process starts again,
-//! resuming the conversation, never while a background task runs.
+//! resuming the conversation, never while a background task runs. Claude
+//! Code keeps only its coding tools unless the setting says all.
 //! A binary of its own: it sets C6_CLAUDE_BIN.
 
 use std::path::Path;
@@ -104,6 +105,17 @@ async fn claude_code_gets_carbon6s_tools_and_takes_up_changes() {
     // Automatic by default, with the defaults up front, and what may be chosen.
     let setting: Value = http.get(format!("{api}/settings/claude-code-tools")).send().await.unwrap().json().await.unwrap();
     assert_eq!(setting["automatic"], true);
+    assert_eq!(setting["native_all"], false, "Claude Code keeps only its coding tools by default");
+    assert_eq!(setting["settings"], json!({"includeCoAuthoredBy": false, "gitAttribution": false}), "no co-author lines by default");
+    // Extra settings must be an object, without the keys carbon6 sets.
+    for (bad, says) in [
+        (json!({"automatic": true, "tools": [], "settings": [1]}), "JSON object"),
+        (json!({"automatic": true, "tools": [], "settings": {"hooks": {}, "env": {}}}), "hooks, env"),
+    ] {
+        let r = http.put(format!("{api}/settings/claude-code-tools")).json(&bad).send().await.unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(r.text().await.unwrap().contains(says));
+    }
     assert_eq!(
         setting["core"],
         json!(["Task", "SendMessage", "doc", "Work", "Carbon6", "Remember", "Forget", "TaskPropose", "TaskWithdraw"])
@@ -176,6 +188,12 @@ async fn claude_code_gets_carbon6s_tools_and_takes_up_changes() {
         "the guidance is in its system prompt: {system}"
     );
     assert_eq!(spawns(), 1, "{}", file("spawns.txt"));
+    let first = file("spawns.txt").lines().next().unwrap().to_owned();
+    for flag in ["--tools Bash,Read,Write,Edit,ToolSearch ", "--strict-mcp-config", "--setting-sources ", "--disable-slash-commands"] {
+        assert!(first.contains(flag), "only its coding tools: {flag} in {first}");
+    }
+    assert!(first.contains("claude-guard Bash Read Write Edit ToolSearch"), "the guard hook: {first}");
+    assert!(first.contains(r#""gitAttribution":false"#) && first.contains(r#""includeCoAuthoredBy":false"#), "the default extras: {first}");
 
     // Nothing changed: the same process.
     send("again").await;
@@ -210,6 +228,18 @@ async fn claude_code_gets_carbon6s_tools_and_takes_up_changes() {
     assert!(names.len() > 4 && names.contains(&"TaskPropose".to_owned()) && names.contains(&"Work".to_owned()), "{names:?}");
     assert!(offered().iter().any(|(n, up)| n == "TaskPropose" && *up), "the defaults up front");
     assert_eq!(restarts().await, 2);
+
+    // The escape hatch: all of Claude Code's own tools, as without carbon6.
+    // The extra settings apply there too.
+    choose(json!({"automatic": true, "tools": [], "native_all": true, "settings": {"effortLevel": "high"}})).await;
+    send("all").await;
+    turns_ended(8).await;
+    assert_eq!(spawns(), 4);
+    let last = file("spawns.txt").lines().last().unwrap().to_owned();
+    for flag in ["--tools", "--strict-mcp-config", "--setting-sources", "claude-guard", "includeCoAuthoredBy"] {
+        assert!(!last.contains(flag), "{flag} in {last}");
+    }
+    assert!(last.contains(r#"--settings {"effortLevel":"high"}"#), "{last}");
     stop.cancel();
     head.shutdown().await.unwrap();
 }

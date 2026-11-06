@@ -26,6 +26,10 @@ const COALESCE: Duration = Duration::from_millis(25);
 pub trait LocalHead: Send + Sync {
     async fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String>;
     async fn credential(&self, connection_id: &str) -> CredentialGrant;
+    /// Records ChatGPT reply headers on calls made in the head's process.
+    fn chatgpt_limits_hook(&self, _connection_id: &str) -> Option<c6_llm::openai_responses::ChatGptLimitsHook> {
+        None
+    }
     /// The pool a connection is, if it is one: the head spreads its calls
     /// over the pool's members.
     async fn pool(&self, _connection_id: &str) -> Option<Arc<c6_llm::pool::Pool>> {
@@ -38,6 +42,7 @@ pub struct HeadLink {
     /// Set when the head is in this process.
     local: std::sync::OnceLock<Arc<dyn LocalHead>>,
     outbound: Mutex<Option<mpsc::Sender<WorkerMsg>>>,
+    attached: tokio::sync::Notify,
     /// Deltas waiting for the next flush; `Some` while a flush is scheduled.
     ephemeral_buf: Arc<Mutex<Option<Vec<EphemeralEvent>>>>,
     waiters: Mutex<HashMap<u64, oneshot::Sender<CredentialGrant>>>,
@@ -60,6 +65,7 @@ impl HeadLink {
 
     pub(crate) fn connected(&self, tx: mpsc::Sender<WorkerMsg>) {
         *self.outbound.lock().unwrap() = Some(tx);
+        self.attached.notify_waiters();
     }
 
     pub(crate) fn disconnected(&self) {
@@ -103,6 +109,20 @@ impl HeadLink {
 
     pub fn is_connected(&self) -> bool {
         self.local.get().is_some() || self.outbound.lock().unwrap().is_some()
+    }
+
+    /// Automatic notice delivery waits for the head, particularly on
+    /// startup when no model credentials have been cached yet.
+    pub(crate) async fn wait_connected(&self) {
+        loop {
+            let attached = self.attached.notified();
+            tokio::pin!(attached);
+            attached.as_mut().enable();
+            if self.is_connected() {
+                return;
+            }
+            attached.await;
+        }
     }
 
     /// Best effort: dropped when disconnected or backed up. Consecutive
@@ -179,6 +199,11 @@ impl HeadLink {
     /// one (pools are only for what runs in the head).
     pub async fn pool(&self, connection_id: &str) -> Option<Arc<c6_llm::pool::Pool>> {
         self.local.get()?.pool(connection_id).await
+    }
+
+    /// The head's quota recorder, only when it is in this process.
+    pub fn chatgpt_limits_hook(&self, connection_id: &str) -> Option<c6_llm::openai_responses::ChatGptLimitsHook> {
+        self.local.get()?.chatgpt_limits_hook(connection_id)
     }
 
     /// New credentials, after the provider refused the ones it had (HTTP

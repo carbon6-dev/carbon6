@@ -18,6 +18,11 @@ struct Local {
 
 #[async_trait::async_trait]
 impl c6_worker::link::LocalHead for Local {
+    fn chatgpt_limits_hook(&self, connection_id: &str) -> Option<c6_llm::openai_responses::ChatGptLimitsHook> {
+        let st = self.st.upgrade()?;
+        crate::quotas::chatgpt_hook(&st, connection_id)
+    }
+
     async fn call(&self, method: &str, params: Value) -> Result<Value, String> {
         let st = self.st.upgrade().ok_or("the head stopped")?;
         crate::fabric::memex_call(&st, method, params).await.map_err(|e| format!("{e:#}"))

@@ -83,7 +83,14 @@ fn dot(kind: &str) -> &'static str {
 /// the Brief.
 fn target(i: &AttentionItem) -> View {
     match (i.kind.as_str(), &i.session_id, &i.doc_id) {
-        ("approval" | "question" | "turn_ended" | "failed", Some(s), _) => View::session(s.clone()),
+        ("approval" | "question", Some(s), _) => View::Session {
+            id: s.clone(),
+            target: i
+                .call_id
+                .as_ref()
+                .map(|call| crate::workspace::Target { anchor: Some(crate::session::waiting_card_id(s, call)), ..Default::default() }),
+        },
+        ("turn_ended" | "failed", Some(s), _) => View::session(s.clone()),
         ("comment_answer", _, Some(d)) => View::Docs { id: d.clone() },
         ("brief", ..) => View::Brief,
         _ => View::Decisions,
@@ -112,7 +119,11 @@ fn load_error(e: &str) -> String {
 /// Another realm's row.
 fn elsewhere_text(e: &AttentionElsewhere) -> String {
     let name = if e.id == "root" { "the console" } else { e.name.as_str() };
-    format!("{} waiting in {name} →", e.waiting)
+    format!("{} waiting in {name}", e.waiting)
+}
+
+fn elsewhere_line(e: &AttentionElsewhere) -> impl IntoView {
+    view! { {elsewhere_text(e)}" "{crate::icons::arrow_right()} }
 }
 
 #[component]
@@ -289,7 +300,7 @@ pub fn NeedsYou() -> impl IntoView {
                                         let to = if e.id == "root" { Place::Console } else { Place::Realm(e.id.clone()) };
                                         view! {
                                             <a rel="external" href=place::url_of(&to) class="block rounded-md px-2 py-1.5 text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800">
-                                                {elsewhere_text(e)}
+                                                {elsewhere_line(e)}
                                             </a>
                                         }
                                     }).collect_view()}
@@ -372,6 +383,21 @@ mod tests {
     }
 
     #[test]
+    fn approvals_and_questions_open_at_the_answerable_card_not_the_session_tail() {
+        for kind in ["approval", "question"] {
+            let i = AttentionItem { session_id: Some("child".into()), call_id: Some("call-1".into()), ..item(kind) };
+            assert_eq!(
+                target(&i),
+                View::Session {
+                    id: "child".into(),
+                    target: Some(crate::workspace::Target { anchor: Some("waiting-child-call-1".into()), ..Default::default() }),
+                }
+            );
+        }
+        assert_eq!(target(&item("decision")), View::Decisions);
+    }
+
+    #[test]
     fn times_are_short() {
         assert_eq!(
             (short_ago(5_000), short_ago(120_000), short_ago(3 * 3_600_000), short_ago(2 * 86_400_000)),
@@ -390,8 +416,18 @@ mod tests {
     #[test]
     fn other_realms_say_only_how_many() {
         let e = AttentionElsewhere { id: "lab".into(), name: "Lab".into(), waiting: 2 };
-        assert_eq!(elsewhere_text(&e), "2 waiting in Lab →");
-        assert_eq!(elsewhere_text(&AttentionElsewhere { id: "root".into(), ..e }), "2 waiting in the console →");
+        assert_eq!(elsewhere_text(&e), "2 waiting in Lab");
+        assert_eq!(elsewhere_text(&AttentionElsewhere { id: "root".into(), ..e }), "2 waiting in the console");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn other_realm_rows_keep_their_trailing_action_arrow() {
+        let e = AttentionElsewhere { id: "lab".into(), name: "Lab".into(), waiting: 2 };
+        let html = elsewhere_line(&e).to_html();
+        assert!(html.contains("2 waiting in Lab"), "{html}");
+        assert!(html.find("2 waiting in Lab").unwrap() < html.find("<svg").expect("keep the trailing SVG arrow"), "{html}");
+        crate::icons::tests::assert_no_icon_glyphs(&html);
     }
 
     #[test]

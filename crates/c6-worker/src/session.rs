@@ -221,6 +221,7 @@ pub(crate) enum ActorMsg {
         text: String,
         wake: bool,
     },
+    /// Context for the next input, never a reason to start a turn.
     /// How a remote subagent's turn ended (from the head, as a command).
     RemoteReport(String, Box<c6_proto::DelegationEnded>),
     /// Deliver the held notices now, whatever the hourly limit (you asked).
@@ -240,6 +241,9 @@ pub(crate) enum ActorMsg {
 /// the hour allows, or for your next message.
 const AUTO_TURNS_PER_HOUR: usize = c6_api::DEFAULT_AUTO_TURNS_PER_HOUR as usize;
 const HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
+/// Only recently active sessions re-arm held notices at worker startup:
+/// don't scan dormant logs or wake days-old conversations on upgrade.
+const NOTICE_RECOVERY_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// Why a rewind may not go back past a handoff (the head says the same).
 const HANDOFF_REWIND: &str = "can only rewind to a message after the last switch between Claude Code and carbon6's agent: \
@@ -390,6 +394,18 @@ impl SessionManager {
                 warn!(session = %session_id, "resuming for lost background tasks: {e:#}");
             }
         }
+        // An idle session with only held notices has no open task to load
+        // it above. Restore its actor too, so its hourly timer is armed
+        // without waiting for another command from the head. Only scan
+        // recently active sessions; dormant notices wait for explicit use.
+        for session_id in self.journal.recent_session_ids(c6_core::now_ms() - NOTICE_RECOVERY_WINDOW_MS).await? {
+            let events = self.journal.events_after(&session_id, 0, u32::MAX).await?;
+            if notices_of(&events).2.iter().any(|(_, wake)| *wake)
+                && let Err(e) = self.actor(&session_id).await
+            {
+                warn!(session = %session_id, "resuming for held notices: {e:#}");
+            }
+        }
         Ok(())
     }
 
@@ -468,6 +484,7 @@ impl SessionManager {
                     from_session_id: input.from_session_id,
                     from_title: input.from_title,
                     hops: input.hops,
+                    api_origin: input.api_origin,
                     send_now: input.send_now,
                     ..Default::default()
                 };
@@ -1441,7 +1458,7 @@ struct Actor {
     inbox: Arc<Mutex<Inbox>>,
     checkpoints: Arc<Checkpoints>,
     /// When background-task notices started turns (for the hourly limit).
-    auto_turns: VecDeque<std::time::Instant>,
+    auto_turns: VecDeque<tokio::time::Instant>,
     /// Notices held for your next message, and whether each would start a
     /// turn (those held by the hourly limit go once the hour allows).
     deferred: Vec<(PendingInput, bool)>,
@@ -1460,7 +1477,7 @@ struct Actor {
     /// Shared with the manager: a turn is running.
     running_flag: Arc<std::sync::atomic::AtomicBool>,
     /// A subagent's inputs since its last report that no call waits on
-    /// (yours, notices, messages joining a turn): what they said, and
+    /// (yours, notices, messages joining a turn): who said what, and
     /// whether the report should wake the parent.
     report: Option<(Vec<String>, bool)>,
     /// Shared with the manager: it runs Claude Code now.
@@ -1529,8 +1546,8 @@ impl Actor {
             // start a turn for them by itself.
             let wake_at = self.claude.as_ref().filter(|_| running.is_none()).and_then(|p| p.wake_due());
             // Notices the hourly limit held: once the hour allows.
-            let retry_at = (running.is_none() && self.deferred.iter().any(|(_, wake)| *wake))
-                .then(|| self.auto_turns.front().map_or_else(std::time::Instant::now, |t| *t + HOUR));
+            let waiting_to_wake = running.is_none() && self.deferred.iter().any(|(_, wake)| *wake);
+            let retry_at = (waiting_to_wake && self.link.is_connected()).then(|| self.next_auto_turn());
             tokio::select! {
                 msg = rx.recv() => match msg {
                     None => return,
@@ -1604,7 +1621,9 @@ impl Actor {
                         }
                         if self.spec.delegation.is_some() && !input.is_compact() {
                             let r = self.report.get_or_insert_with(Default::default);
-                            r.0.push(input.text.clone());
+                            r.0.push(crate::subagent::report_input(
+                                &self.writer.session_id, &input.command, &input.text, &input.from_session_id, &input.from_title, input.api_origin.as_ref(),
+                            ));
                             r.1 |= input.wake;
                         }
                         let held = std::mem::take(&mut self.deferred);
@@ -1691,7 +1710,7 @@ impl Actor {
                         }
                     }
                     Some(ActorMsg::Reloaded { auto_turns_ms, noticed, pending }) => {
-                        let (now, now_ms) = (std::time::Instant::now(), c6_core::now_ms());
+                        let (now, now_ms) = (tokio::time::Instant::now(), c6_core::now_ms());
                         self.auto_turns = auto_turns_ms
                             .into_iter()
                             .filter_map(|t| now.checked_sub(std::time::Duration::from_millis(now_ms.saturating_sub(t).max(0) as u64)))
@@ -1869,9 +1888,10 @@ impl Actor {
                         }
                     }
                 }
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(retry_at.unwrap_or_else(std::time::Instant::now))), if retry_at.is_some() => {
+                _ = tokio::time::sleep_until(retry_at.unwrap_or_else(tokio::time::Instant::now)), if retry_at.is_some() => {
                     self.release_held();
                 }
+                _ = self.link.wait_connected(), if waiting_to_wake && retry_at.is_none() => {}
                 // Idle long enough, with no background tasks: close it.
                 _ = tokio::time::sleep_until(idle_until.unwrap_or_else(tokio::time::Instant::now)), if running.is_none() && idle_until.is_some() => {
                     info!(session = %self.writer.session_id, "closing an idle Claude Code process");
@@ -2023,8 +2043,8 @@ impl Actor {
 
     /// Takes a turn for notices if the hour allows one.
     fn take_auto_turn(&mut self) -> bool {
-        let now = std::time::Instant::now();
-        while self.auto_turns.front().is_some_and(|t| now.duration_since(*t) > HOUR) {
+        let now = tokio::time::Instant::now();
+        while self.auto_turns.front().is_some_and(|t| now.duration_since(*t) >= HOUR) {
             self.auto_turns.pop_front();
         }
         if self.auto_turns.len() >= self.auto_turn_limit() {
@@ -2034,15 +2054,36 @@ impl Actor {
         true
     }
 
+    /// The first slot with fewer than N turns in the preceding hour. A
+    /// manual Deliver now can leave more than N counted turns after load.
+    fn next_auto_turn(&self) -> tokio::time::Instant {
+        let now = tokio::time::Instant::now();
+        self.auto_turns.len().checked_sub(self.auto_turn_limit()).map_or(now, |i| (self.auto_turns[i] + HOUR).max(now))
+    }
+
+    fn report_notice(&mut self, input: &PendingInput) {
+        if self.spec.delegation.is_some() && input.command == "session-message" {
+            let r = self.report.get_or_insert_with(Default::default);
+            r.0.push(crate::subagent::report_input(
+                &self.writer.session_id,
+                &input.command,
+                &input.text,
+                &input.from_session_id,
+                &input.from_title,
+                input.api_origin.as_ref(),
+            ));
+            r.1 = true;
+        }
+    }
+
     /// The hour allows another automatic turn: the held notices start one
     /// together.
     fn release_held(&mut self) {
-        if self.deferred.is_empty() || !self.take_auto_turn() {
+        if !self.link.is_connected() || !self.deferred.iter().any(|(_, wake)| *wake) || !self.take_auto_turn() {
             return;
         }
-        let mut inbox = self.inbox.lock().unwrap();
         for (n, _) in std::mem::take(&mut self.deferred) {
-            inbox.push(n, None);
+            self.inbox.lock().unwrap().push(n, None);
         }
     }
 
@@ -2062,6 +2103,12 @@ impl Actor {
             from_session_id: input.from_session_id.clone(),
             from_title: input.from_title.clone(),
             hops: input.hops,
+            deliver_at_ms: if wake && !busy && self.inbox.lock().unwrap().queue.is_empty() {
+                let delay = self.next_auto_turn().saturating_duration_since(tokio::time::Instant::now());
+                if delay.is_zero() { 0 } else { c6_core::now_ms() + delay.as_millis() as i64 }
+            } else {
+                0
+            },
         };
         self.writer.append(session_event::Kind::NoticeQueued(queued)).await?;
         self.deliver_notice(input, busy, wake, true).await
@@ -2072,20 +2119,33 @@ impl Actor {
     /// beyond it, once the hour allows), else it waits for the next input.
     /// `announce`: say so in the log when the limit holds it.
     async fn deliver_notice(&mut self, input: PendingInput, busy: bool, wake: bool, announce: bool) -> anyhow::Result<()> {
+        self.report_notice(&input);
         // What the agent does next follows from this message's chain.
         if input.hops > 0 {
             self.session_tools.set_message_hops(input.hops);
         }
         if busy || !self.inbox.lock().unwrap().queue.is_empty() {
-            self.inbox.lock().unwrap().push(input, None);
+            let mut inbox = self.inbox.lock().unwrap();
+            for (held, _) in std::mem::take(&mut self.deferred) {
+                inbox.push(held, None);
+            }
+            inbox.push(input, None);
             return Ok(());
         }
         if !wake {
             self.deferred.push((input, false));
             return Ok(());
         }
+        if !self.link.is_connected() {
+            self.deferred.push((input, true));
+            return Ok(());
+        }
         if self.take_auto_turn() {
-            self.inbox.lock().unwrap().push(input, None);
+            let mut inbox = self.inbox.lock().unwrap();
+            for (held, _) in std::mem::take(&mut self.deferred) {
+                inbox.push(held, None);
+            }
+            inbox.push(input, None);
             return Ok(());
         }
         warn!(session = %self.writer.session_id, notice = %input.command_id, "notice held: too many automatic turns this hour");
@@ -2387,7 +2447,10 @@ impl Actor {
             );
             applicable_secrets(&self.spec, &labels).into_iter().map(|(n, _)| n).collect()
         };
-        let claude_settings = self.hooks.as_ref().filter(|_| claude_code).map(|h| h.claude_settings());
+        let claude_settings =
+            claude_code.then(|| claude_code_settings(&self.spec, self.hooks.as_ref().map(|h| h.claude_settings()).as_deref()));
+        // Claude Code's own tools it keeps (none of its others).
+        let claude_native = claude_code_native(&self.spec);
         // carbon6's subagents, offered to Claude Code over MCP.
         let bridge_tools = if claude_code { self.claude_code_subagent_tools() } else { Vec::new() };
         let bridge_core = claude_code_core(&self.spec);
@@ -2485,6 +2548,7 @@ impl Actor {
                     tools: bridge_names,
                     worker: c6_core::build().to_owned(),
                     extra_args: Vec::new(),
+                    native: claude_native,
                 };
                 let process = claude.take();
                 let result = claude_turn(
@@ -3097,6 +3161,48 @@ fn claude_code_choice(spec: &CreateSession) -> Option<Vec<String>> {
     }
 }
 
+/// Claude Code's own tools a session keeps unless Settings → Agents says
+/// all (docs/background.md §4, Claude Code's own tools): its coding tools,
+/// and its tool search for carbon6's tools not loaded up front. The rest
+/// (its subagents, web, schedules, artifacts…) are off; carbon6's come
+/// over MCP instead.
+pub const CLAUDE_CODE_NATIVE_TOOLS: &[&str] = &["Bash", "Read", "Write", "Edit", "ToolSearch"];
+
+/// The Claude Code tools the session's process gets: `None` for all of
+/// them (the escape hatch), else the coding tools a routing rule's tool
+/// list allows (its tool search always: it only finds carbon6's tools).
+pub(crate) fn claude_code_native(spec: &CreateSession) -> Option<Vec<String>> {
+    if spec.claude_code.as_ref().is_some_and(|c| c.native_all) {
+        return None;
+    }
+    Some(
+        CLAUDE_CODE_NATIVE_TOOLS
+            .iter()
+            .filter(|t| **t == "ToolSearch" || c6_tools::tool_allowed(&spec.tools, t))
+            .map(|t| (*t).to_owned())
+            .collect(),
+    )
+}
+
+/// The settings carbon6 passes to Claude Code (`--settings`): the extra
+/// settings of Settings → Agents (by default no Claude co-author lines),
+/// without the keys carbon6 sets itself, then the head's hooks (`hooks`,
+/// settings JSON). The lockdown adds its guard and plugin switches.
+pub(crate) fn claude_code_settings(spec: &CreateSession, hooks: Option<&str>) -> String {
+    let raw = spec.claude_code.as_ref().map(|c| c.settings_json.as_str()).filter(|s| !s.trim().is_empty());
+    let mut v: serde_json::Value = serde_json::from_str(raw.unwrap_or(c6_api::CLAUDE_CODE_SETTINGS_DEFAULT))
+        .ok()
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::from_str(c6_api::CLAUDE_CODE_SETTINGS_DEFAULT).unwrap_or_default());
+    if let Some(obj) = v.as_object_mut() {
+        obj.retain(|k, _| !c6_api::CLAUDE_CODE_SETTINGS_PROTECTED.contains(&k.as_str()));
+        if let Some(h) = hooks.and_then(|h| serde_json::from_str::<serde_json::Value>(h).ok()).and_then(|h| h.get("hooks").cloned()) {
+            obj.insert("hooks".into(), h);
+        }
+    }
+    v.to_string()
+}
+
 /// Those of them loaded up front (`_meta` anthropic/alwaysLoad).
 fn claude_code_core(spec: &CreateSession) -> Vec<String> {
     match &spec.claude_code {
@@ -3111,17 +3217,26 @@ fn is_chosen(chosen: &[String], name: &str) -> bool {
 }
 
 /// carbon6's tools that may be offered to Claude Code beyond its subagents
-/// and documents: carbon6's own, without those Claude Code has equivalents
-/// of (files, shell, web, plan, skills, its own background tasks), in
-/// Claude Code's naming.
+/// and documents: carbon6's own, without those Claude Code keeps its own
+/// of (files, shell, plan, skills, its own background tasks), in Claude
+/// Code's naming. Its own web tools are off unless it keeps all its tools,
+/// so carbon6's `WebFetch` comes instead, and `WebSearch` where a search
+/// provider is set up whose key (Brave, Tavily) the session has.
 fn claude_code_extras(spec: &CreateSession, labels: &[String], chrome: Option<PathBuf>) -> Vec<Arc<dyn Tool>> {
     let own: HashSet<String> = c6_tools::tools_for(ToolProfile::Claude).iter().map(|t| t.spec().name).collect();
+    let web = claude_code_native(spec).is_some();
+    let search = || {
+        let cfg: c6_tools::SearchConfig = serde_json::from_str(&spec.web_search_json).unwrap_or_default();
+        !matches!(cfg.provider.as_str(), "brave" | "tavily") || applicable_secrets(spec, labels).iter().any(|(n, _)| *n == cfg.secret)
+    };
     let (tools, _) = builtin_tools(spec, ToolProfile::Claude, labels, chrome);
     tools
         .into_iter()
-        .filter(|t| {
-            let name = t.spec().name;
-            !own.contains(&name) && !matches!(name.as_str(), "WebSearch" | "Skill" | "Doc")
+        .filter(|t| match t.spec().name.as_str() {
+            "WebFetch" => web,
+            "WebSearch" => web && search(),
+            "Skill" | "Doc" => false,
+            name => !own.contains(name),
         })
         .collect()
 }
@@ -3567,12 +3682,46 @@ mod route_tool_tests {
     #[tokio::test]
     async fn tool_lists_filter_generic_claude_and_codex_tools() {
         let dir = tempfile::tempdir().unwrap();
-        let spec =
-            CreateSession { tools: ["Read", "Bash", "Edit", "TodoWrite", "Skill", "MemexSearch"].map(str::to_owned).to_vec(), ..spec() };
+        let spec = CreateSession {
+            tools: ["Read", "Bash", "Edit", "TodoWrite", "Skill", "MemexSearch", "Task", "SendMessage", "BashOutput", "KillShell"]
+                .map(str::to_owned)
+                .to_vec(),
+            ..spec()
+        };
         for (profile, expected) in [
-            (ToolProfile::Generic, vec!["bash", "edit", "load_skill", "memex_search", "read", "update_plan"]),
-            (ToolProfile::Claude, vec!["Bash", "Edit", "MemexSearch", "Read", "Skill", "TodoWrite"]),
-            (ToolProfile::Codex, vec!["apply_patch", "load_skill", "memex_search", "shell", "update_plan"]),
+            (
+                ToolProfile::Generic,
+                vec![
+                    "bash",
+                    "bash_output",
+                    "edit",
+                    "kill_shell",
+                    "load_skill",
+                    "memex_search",
+                    "read",
+                    "send_message",
+                    "task",
+                    "update_plan",
+                ],
+            ),
+            (
+                ToolProfile::Claude,
+                vec!["Bash", "BashOutput", "Edit", "KillShell", "MemexSearch", "Read", "SendMessage", "Skill", "Task", "TodoWrite"],
+            ),
+            (
+                ToolProfile::Codex,
+                vec![
+                    "apply_patch",
+                    "bash_output",
+                    "kill_shell",
+                    "load_skill",
+                    "memex_search",
+                    "send_message",
+                    "shell",
+                    "task",
+                    "update_plan",
+                ],
+            ),
         ] {
             let built = build_tools(&spec, dir.path(), profile, &[], &[]).await;
             let mut names: Vec<String> = built.tools.iter().map(|t| t.spec().name).collect();
@@ -3584,6 +3733,54 @@ mod route_tool_tests {
         let unavailable = CreateSession { tools: vec!["mcp__missing__tool".into()], ..spec };
         let built = build_tools(&unavailable, dir.path(), ToolProfile::Generic, &[], &[]).await;
         assert!(built.tools.is_empty() && built.skills.is_empty(), "an unavailable list must not fall back to all tools");
+    }
+
+    #[tokio::test]
+    async fn codex_subagents_offer_agents_connections_and_templates_and_obey_depth_and_tool_limits() {
+        use serde_json::json;
+
+        let dir = tempfile::tempdir().unwrap();
+        let spec = CreateSession {
+            model: Some(ModelSpec { connection_kind: "chatgpt".into(), model: "gpt-6.1-sol".into(), ..Default::default() }),
+            agents_json: json!([{"name": "finder", "description": "Find code", "prompt": "Look around."}]).to_string(),
+            subagent_connections_json: json!([{"id": "gpt", "name": "GPT", "kind": "chatgpt", "default_model": "gpt-6.1-sol"}]).to_string(),
+            subagent_templates_json: json!([{"name": "review", "place": "other-worker:/repo", "targets": ["other-worker"]}]).to_string(),
+            prompts_json: json!({"session.subagent_templates": "Available remote reviewers:"}).to_string(),
+            max_subagent_depth: 2,
+            ..Default::default()
+        };
+        for depth in [0, 1, 2] {
+            let spec = CreateSession { depth, ..spec.clone() };
+            let built = own_runtime(&HeadLink::default(), "s", &spec, dir.path(), &[], String::new(), "startup").await;
+            assert_eq!(built.profile, ToolProfile::Codex);
+            assert!(built.errors.is_empty(), "{:?}", built.errors);
+            let task = built.tools.iter().find(|t| c6_tools::Task::is_task(&t.spec().name));
+            assert_eq!(task.is_some(), depth < 2);
+            assert_eq!(built.tools.iter().any(|t| c6_tools::SendMessage::is_send(&t.spec().name)), depth < 2);
+            for name in ["bash_output", "kill_shell"] {
+                assert!(built.tools.iter().any(|t| t.spec().name == name), "{name} stays available at depth {depth}");
+            }
+            if let Some(task) = task {
+                let task = task.spec();
+                assert_eq!(task.name, "task");
+                let props = &task.parameters["properties"];
+                assert_eq!(props["subagent_type"]["enum"], json!(["general-purpose", "finder"]));
+                assert_eq!(props["connection"]["enum"], json!(["GPT"]));
+                assert_eq!(props["template"]["enum"], json!(["review"]));
+                assert_eq!(props["on"]["type"], "string");
+                assert_eq!(props["run_in_background"]["type"], "boolean");
+                assert!(props["run_in_background"]["description"].as_str().unwrap().contains("kill_shell"));
+                for text in ["gpt-6.1-sol", "Available remote reviewers:", "other-worker:/repo"] {
+                    assert!(task.description.contains(text), "{text}: {}", task.description);
+                }
+            }
+        }
+        let limited = CreateSession { delegation: Some(c6_proto::Delegation { depth: 2, ..Default::default() }), ..spec.clone() };
+        let built = build_tools(&limited, dir.path(), ToolProfile::Codex, &[], &[]).await;
+        assert!(!built.tools.iter().any(|t| c6_tools::Task::is_task(&t.spec().name) || c6_tools::SendMessage::is_send(&t.spec().name)));
+        let restricted = CreateSession { tools: vec!["BashOutput".into(), "KillShell".into()], ..spec };
+        let built = build_tools(&restricted, dir.path(), ToolProfile::Codex, &[], &[]).await;
+        assert_eq!(built.tools.iter().map(|t| t.spec().name).collect::<Vec<_>>(), ["bash_output", "kill_shell"]);
     }
 
     #[tokio::test]
@@ -3866,24 +4063,27 @@ mod label_tests {
         assert_eq!(repo_slug(d).await, "github.com/acme/app", "origin wins");
     }
 
-    #[test]
-    fn stops_orphaned_background_commands() {
+    #[tokio::test]
+    async fn stops_orphaned_background_commands() {
         use std::os::unix::process::CommandExt;
-        let spawn = |cmd: &str| std::process::Command::new("/bin/sh").args(["-c", cmd]).process_group(0).spawn().unwrap();
+        struct Group(std::process::Child);
+        impl Drop for Group {
+            fn drop(&mut self) {
+                // Killing only the shell leaves its sleep child holding the
+                // test's stdout/stderr open. Clean up even on assertion failure.
+                let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(self.0.id() as i32), nix::sys::signal::Signal::SIGKILL);
+                let _ = self.0.wait();
+            }
+        }
+        let spawn = |cmd: &str| Group(std::process::Command::new("/bin/sh").args(["-c", cmd]).process_group(0).spawn().unwrap());
         let mut orphan = spawn("sleep 77; echo orphan-test");
         let mut other = spawn("sleep 78; echo other-test");
-        let pid = |c: &std::process::Child| c.id() as i32;
+        let pid = |c: &Group| c.0.id() as i32;
         // A different command under that pid is left alone.
         stop_orphan(pid(&other), "sleep 77; echo orphan-test");
         stop_orphan(pid(&orphan), "sleep 77; echo orphan-test");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while orphan.try_wait().unwrap().is_none() {
-            assert!(std::time::Instant::now() < deadline, "the orphan was not stopped");
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        assert!(other.try_wait().unwrap().is_none(), "another command was stopped");
-        other.kill().unwrap();
-        let _ = other.wait();
+        c6_testkit::eventually("the orphan to stop", async || orphan.0.try_wait().unwrap()).await;
+        assert!(other.0.try_wait().unwrap().is_none(), "another command was stopped");
     }
 }
 
@@ -3943,8 +4143,8 @@ mod claude_code_tools_tests {
         assert!(default.starts_with(c6_agent::CLAUDE_CODE_NOTE));
     }
 
-    /// Claude Code is offered carbon6's own tools, not copies of its own,
-    /// with the defaults first.
+    /// Claude Code is offered carbon6's own tools, not copies of those it
+    /// keeps, with the defaults first; carbon6's web fetch, as its own is off.
     #[test]
     fn claude_code_is_offered_carbon6s_own_tools() {
         let names: Vec<String> = claude_code_tool_names().into_iter().map(|(n, _)| n).collect();
@@ -3952,26 +4152,82 @@ mod claude_code_tools_tests {
             &names[..CLAUDE_CODE_DEFAULT_TOOLS.len()],
             ["Task", "SendMessage", "TaskOutput", "TaskStop", "doc", "MessageSession", "ListSessions"]
         );
-        for offered in ["PublishFile", "Remember", "Forget", "TodoAdd", "TaskPropose", "TaskWithdraw", "MemexSearch", "MailSend"] {
+        for offered in
+            ["PublishFile", "Remember", "Forget", "TodoAdd", "TaskPropose", "TaskWithdraw", "MemexSearch", "MailSend", "WebFetch"]
+        {
             assert!(names.iter().any(|n| n == offered), "{offered} in {names:?}");
         }
-        for own in [
-            "Bash",
-            "Read",
-            "Write",
-            "Edit",
-            "Grep",
-            "Glob",
-            "WebFetch",
-            "WebSearch",
-            "TodoWrite",
-            "Skill",
-            "BashOutput",
-            "KillShell",
-            "Doc",
-        ] {
+        for own in ["Bash", "Read", "Write", "Edit", "Grep", "Glob", "TodoWrite", "Skill", "BashOutput", "KillShell", "Doc"] {
             assert!(!names.iter().any(|n| n == own), "{own} is Claude Code's own");
         }
+    }
+
+    /// carbon6's settings for Claude Code: the extra settings (by default,
+    /// no co-author lines), never the keys carbon6 sets, then the head's hooks.
+    #[test]
+    fn claude_code_settings_take_the_extras_but_not_carbon6s_keys() {
+        let settings = |extra: &str, hooks: Option<&str>| -> serde_json::Value {
+            let spec = CreateSession {
+                claude_code: Some(c6_proto::ClaudeCodeToolChoice { settings_json: extra.into(), ..Default::default() }),
+                ..Default::default()
+            };
+            serde_json::from_str(&claude_code_settings(&spec, hooks)).unwrap()
+        };
+        let default = serde_json::json!({"includeCoAuthoredBy": false, "gitAttribution": false});
+        assert_eq!(settings("", None), default);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&claude_code_settings(&CreateSession::default(), None)).unwrap(), default);
+        assert_eq!(settings("not json", None), default, "unreadable: the default");
+        assert_eq!(settings("{}", None), serde_json::json!({}), "set to nothing: nothing");
+        let hooks = r#"{"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"head"}]}]}}"#;
+        let v = settings(
+            r#"{"effortLevel":"high","hooks":{"PreToolUse":[]},"env":{"ENABLE_CLAUDEAI_MCP_SERVERS":"true"},"enabledPlugins":{"x@y":true},"disableAllHooks":true}"#,
+            Some(hooks),
+        );
+        assert_eq!(v["effortLevel"], "high", "passes through");
+        assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"], "head", "the head's hooks, not the setting's");
+        assert!(v["hooks"].get("PreToolUse").is_none() && v.get("env").is_none() && v.get("enabledPlugins").is_none(), "{v}");
+        assert!(v.get("disableAllHooks").is_none(), "{v}");
+    }
+
+    /// Claude Code keeps only its coding tools, those a routing rule's
+    /// list allows (its tool search always), unless Settings says all.
+    #[test]
+    fn claude_code_keeps_its_coding_tools_as_the_route_allows() {
+        let native = |tools: &[&str], all: bool| {
+            claude_code_native(&CreateSession {
+                tools: tools.iter().map(|t| (*t).to_owned()).collect(),
+                claude_code: Some(c6_proto::ClaudeCodeToolChoice { automatic: true, native_all: all, ..Default::default() }),
+                ..Default::default()
+            })
+        };
+        assert_eq!(native(&[], false).unwrap(), CLAUDE_CODE_NATIVE_TOOLS);
+        assert_eq!(claude_code_native(&CreateSession::default()).unwrap(), CLAUDE_CODE_NATIVE_TOOLS, "an older head: locked down");
+        assert_eq!(native(&["read_file", "web_fetch"], false).unwrap(), ["Read", "ToolSearch"], "no shell: no Bash");
+        assert_eq!(native(&["shell", "apply_patch"], false).unwrap(), ["Bash", "Edit", "ToolSearch"]);
+        assert_eq!(native(&[], true), None);
+        assert_eq!(native(&["read_file"], true), None, "all is all");
+    }
+
+    /// With Claude Code's web tools off, carbon6's come over MCP: fetch
+    /// always, search where a provider is set up and the session has its
+    /// key; with all its tools, neither.
+    #[test]
+    fn carbon6s_web_tools_replace_claude_codes() {
+        let names = |spec: &CreateSession| -> Vec<String> {
+            claude_code_extras(spec, &[], None).iter().map(|t| t.spec().name).filter(|n| n.starts_with("Web")).collect()
+        };
+        let brave = r#"{"provider":"brave","secret":"BRAVE_KEY"}"#;
+        let spec = |search: &str, secrets: &str, all: bool| CreateSession {
+            web_search_json: search.into(),
+            secrets_json: secrets.into(),
+            claude_code: Some(c6_proto::ClaudeCodeToolChoice { automatic: true, native_all: all, ..Default::default() }),
+            ..Default::default()
+        };
+        assert_eq!(names(&spec("", "", false)), ["WebFetch"]);
+        assert_eq!(names(&spec(brave, "", false)), ["WebFetch"], "no key: no search");
+        assert_eq!(names(&spec(brave, r#"[{"name":"BRAVE_KEY"}]"#, false)), ["WebFetch", "WebSearch"]);
+        assert_eq!(names(&spec(r#"{"provider":"searxng","url":"http://s"}"#, "", false)), ["WebFetch", "WebSearch"], "no key needed");
+        assert!(names(&spec(brave, r#"[{"name":"BRAVE_KEY"}]"#, true)).is_empty(), "Claude Code has its own");
     }
 
     /// The guidance carbon6's loop gives in its system prompt goes with the
@@ -4001,6 +4257,24 @@ mod claude_code_tools_tests {
 #[cfg(test)]
 mod notice_tests {
     use super::*;
+
+    struct Head(String);
+
+    #[async_trait]
+    impl crate::link::LocalHead for Head {
+        async fn call(&self, _method: &str, _params: serde_json::Value) -> Result<serde_json::Value, String> {
+            Err("not needed by this test".into())
+        }
+
+        async fn credential(&self, connection_id: &str) -> c6_proto::CredentialGrant {
+            c6_proto::CredentialGrant {
+                connection_id: connection_id.into(),
+                kind: "openai_compat".into(),
+                base_url: self.0.clone(),
+                ..Default::default()
+            }
+        }
+    }
 
     fn ev(seq: u64, ts_ms: i64, kind: session_event::Kind) -> SessionEvent {
         SessionEvent { seq, ts_ms, kind: Some(kind) }
@@ -4044,6 +4318,243 @@ mod notice_tests {
         let pending: Vec<(&str, &str, bool)> = pending.iter().map(|(i, w)| (i.command_id.as_str(), i.text.as_str(), *w)).collect();
         assert_eq!(pending, [("subagent:s", "about subagent:s", false), ("task:bg2:finished", "about task:bg2:finished", true)]);
     }
+
+    /// A log at the default limit, with no open task or turn: the case
+    /// startup recovery used to leave without an actor (and thus a timer).
+    async fn at_limit() -> (tempfile::TempDir, SessionManager, c6_testkit::MockLlm) {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = c6_testkit::MockLlm::start().await;
+        let journal = Arc::new(Journal::open(&dir.path().join("journal.db")).await.unwrap());
+        let model =
+            ModelSpec { connection_id: "mock".into(), connection_kind: "openai_compat".into(), model: "m".into(), ..Default::default() };
+        let spec = CreateSession { model: Some(model.clone()), cwd: dir.path().display().to_string(), ..Default::default() };
+        let now = c6_core::now_ms();
+        let mut events = vec![ev(
+            1,
+            now,
+            session_event::Kind::Started(SessionStarted {
+                model: Some(model),
+                cwd: spec.cwd.clone(),
+                tool_profile: "generic".into(),
+                ..Default::default()
+            }),
+        )];
+        for i in 0..AUTO_TURNS_PER_HOUR {
+            for kind in [
+                queued(&format!("n{i}"), true),
+                user(&format!("n{i}")),
+                turn(),
+                session_event::Kind::TurnEnded(TurnEnded { turn: i as u64 + 1, reason: TurnEndReason::Completed as i32 }),
+            ] {
+                events.push(ev(events.len() as u64 + 1, now, kind));
+            }
+        }
+        journal.import("held", &spec, &events).await.unwrap();
+        let manager =
+            SessionManager::new(journal, Arc::new(HeadLink::local(Arc::new(Head(mock.base_url())))), dir.path().join("worktrees"));
+        (dir, manager, mock)
+    }
+
+    // External I/O (SQLite and the mock server) must progress without
+    // Tokio automatically jumping to the hourly timer while we await it.
+    fn pause_clock() -> tokio_util::task::AbortOnDropHandle<()> {
+        tokio::time::pause();
+        tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        }))
+    }
+
+    async fn logged(manager: &SessionManager, predicate: impl Fn(&[SessionEvent]) -> bool) -> Vec<SessionEvent> {
+        c6_testkit::within("the notice actor to record its work", async {
+            loop {
+                let events = manager.journal.events_after("held", 0, u32::MAX).await.unwrap();
+                if predicate(&events) {
+                    return events;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+    }
+
+    async fn hold(manager: &SessionManager) -> mpsc::UnboundedSender<ActorMsg> {
+        let tx = manager.actor("held").await.unwrap().unwrap();
+        for text in ["report 21", "report 22"] {
+            tx.send(ActorMsg::ChildReport { text: text.into(), wake: true }).unwrap();
+        }
+        let events =
+            logged(manager, |events| events.iter().filter(|e| matches!(e.kind, Some(session_event::Kind::Error(_)))).count() == 2).await;
+        let held: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Some(session_event::Kind::NoticeQueued(n)) if n.text.starts_with("report ") => Some(n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(held.len(), 2);
+        assert!(held.iter().all(|n| n.deliver_at_ms > c6_core::now_ms()), "the UI gets the next free slot");
+        tx
+    }
+
+    async fn delivered(manager: &SessionManager, mock: &c6_testkit::MockLlm) {
+        // Only the hourly wait is simulated. The mock streams chunks on
+        // short timers, and the model's I/O must run on a live clock.
+        tokio::time::resume();
+        let events =
+            logged(manager, |events| events.iter().filter(|e| matches!(e.kind, Some(session_event::Kind::TurnEnded(_)))).count() == 21)
+                .await;
+        assert_eq!(mock.requests().len(), 1, "one turn takes the whole held batch");
+        let request = mock.requests()[0].to_string();
+        assert!(request.contains("report 21") && request.contains("report 22"), "{request}");
+        assert!(notices_of(&events).2.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_twenty_first_notice_delivers_itself_when_the_hour_frees_up() {
+        let (_dir, manager, mock) = at_limit().await;
+        let _clock = pause_clock();
+        let _tx = hold(&manager).await;
+        assert!(mock.requests().is_empty(), "the 21st notice is held");
+        tokio::time::advance(HOUR - std::time::Duration::from_secs(1)).await;
+        assert!(mock.requests().is_empty(), "not before a counted turn expires");
+        mock.push(c6_testkit::Reply::Text("Saw the batch.".into()));
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        delivered(&manager, &mock).await;
+    }
+
+    #[tokio::test]
+    async fn deliver_now_bypasses_the_hourly_timer() {
+        let (_dir, manager, mock) = at_limit().await;
+        let _clock = pause_clock();
+        let tx = hold(&manager).await;
+        mock.push(c6_testkit::Reply::Text("Saw them now.".into()));
+        tx.send(ActorMsg::ReleaseNotices).unwrap();
+        delivered(&manager, &mock).await;
+        tokio::time::pause();
+        tokio::time::advance(HOUR).await;
+        barrier(&manager, "after-old-timer").await;
+        assert_eq!(mock.requests().len(), 1, "the old timer doesn't deliver them twice");
+    }
+
+    #[tokio::test]
+    async fn non_waking_notices_still_wait_for_explicit_input() {
+        let (_dir, manager, mock) = at_limit().await;
+        let _clock = pause_clock();
+        let tx = manager.actor("held").await.unwrap().unwrap();
+        for text in ["report 21", "report 22"] {
+            tx.send(ActorMsg::ChildReport { text: text.into(), wake: false }).unwrap();
+        }
+        barrier(&manager, "held-without-wake").await;
+        tokio::time::advance(HOUR).await;
+        barrier(&manager, "hour-free").await;
+        let events = manager.journal.events_after("held", 0, u32::MAX).await.unwrap();
+        assert_eq!(notices_of(&events).2.len(), 2);
+        assert!(mock.requests().is_empty(), "a free slot doesn't grant permission to wake");
+        mock.push(c6_testkit::Reply::Text("Saw them when asked.".into()));
+        tx.send(ActorMsg::ReleaseNotices).unwrap();
+        delivered(&manager, &mock).await;
+    }
+
+    #[tokio::test]
+    async fn recovery_reschedules_pending_notices_without_an_open_task() {
+        let (_dir, manager, mock) = at_limit().await;
+        seed_held(&manager).await;
+        assert!(manager.journal.sessions_with_open_tasks().await.unwrap().is_empty());
+        let _clock = pause_clock();
+        manager.recover().await.unwrap();
+        assert_eq!(manager.active(), ["held"], "startup, not a new command, restores its actor");
+        barrier(&manager, "reloaded").await;
+        assert!(mock.requests().is_empty(), "restart must not reset the limit");
+        mock.push(c6_testkit::Reply::Text("Saw them after restart.".into()));
+        tokio::time::advance(HOUR).await;
+        delivered(&manager, &mock).await;
+    }
+
+    #[tokio::test]
+    async fn recovery_leaves_old_held_notices_for_explicit_input() {
+        let (dir, manager, mock) = at_limit().await;
+        seed_held(&manager).await;
+        // The log's events are recent: it is last_activity, not event
+        // timestamps, that bounds the SQL scan at startup.
+        let db = sqlx::SqlitePool::connect(&format!("sqlite:{}", dir.path().join("journal.db").display())).await.unwrap();
+        sqlx::query("UPDATE sessions SET last_activity = ? WHERE id = 'held'")
+            .bind(c6_core::now_ms() - NOTICE_RECOVERY_WINDOW_MS - 1000)
+            .execute(&db)
+            .await
+            .unwrap();
+        db.close().await;
+        let _clock = pause_clock();
+        manager.recover().await.unwrap();
+        assert!(manager.active().is_empty(), "startup must not restore an old session's actor");
+        tokio::time::advance(HOUR).await;
+        let events = manager.journal.events_after("held", 0, u32::MAX).await.unwrap();
+        assert_eq!(notices_of(&events).2.len(), 2, "old held notices remain pending");
+        assert!(mock.requests().is_empty(), "old notices must not cause an upgrade burst");
+
+        // Deliver now still loads the actor and delivers the batch.
+        mock.push(c6_testkit::Reply::Text("Saw the old notices when asked.".into()));
+        manager.actor("held").await.unwrap().unwrap().send(ActorMsg::ReleaseNotices).unwrap();
+        delivered(&manager, &mock).await;
+    }
+
+    async fn seed_held(manager: &SessionManager) {
+        // Seed held notices without starting an actor, exactly as a fresh
+        // worker finds them on disk after its predecessor exited.
+        for (i, text) in ["report 21", "report 22"].into_iter().enumerate() {
+            let notice = c6_proto::NoticeQueued {
+                command_id: format!("held{i}"),
+                text: text.into(),
+                wake: true,
+                command: "task-notification".into(),
+                ..Default::default()
+            };
+            manager.journal.append("held", &ev(82 + i as u64, c6_core::now_ms(), session_event::Kind::NoticeQueued(notice))).await.unwrap();
+        }
+    }
+
+    async fn barrier(manager: &SessionManager, id: &str) {
+        // A recorded message after Reloaded is a barrier: the actor has
+        // reconstructed its counted turns and armed its timer.
+        let tx = manager.actor("held").await.unwrap().unwrap();
+        tx.send(ActorMsg::SetSubagentModel { command_id: id.into(), model: None }).unwrap();
+        logged(manager, |events| {
+            events.iter().any(|e| matches!(&e.kind, Some(session_event::Kind::SubagentModelSet(m)) if m.command_id == id))
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn overdue_notices_wait_for_the_head_after_restart() {
+        let (_dir, mut manager, mock) = at_limit().await;
+        seed_held(&manager).await;
+        let head = manager.link.clone();
+        manager.link = Arc::new(HeadLink::default());
+        let _clock = pause_clock();
+        manager.recover().await.unwrap();
+        barrier(&manager, "reloaded").await;
+        tokio::time::advance(HOUR).await;
+        barrier(&manager, "still-offline").await;
+        let events = manager.journal.events_after("held", 0, u32::MAX).await.unwrap();
+        assert_eq!(notices_of(&events).2.len(), 2, "offline delivery must not consume the held batch");
+        assert!(mock.requests().is_empty());
+
+        mock.push(c6_testkit::Reply::Text("Saw them once connected.".into()));
+        let (tx, mut rx) = mpsc::channel::<c6_proto::WorkerMsg>(32);
+        let link = manager.link.clone();
+        link.connected(tx);
+        let _head = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                if let Some(c6_proto::worker_msg::Msg::CredentialRequest(req)) = msg.msg {
+                    let mut grant = head.session_credential("held", &req.connection_id).await.unwrap();
+                    grant.request_id = req.request_id;
+                    link.on_grant(grant);
+                }
+            }
+        }));
+        delivered(&manager, &mock).await;
+    }
 }
 
 #[cfg(test)]
@@ -4062,7 +4573,7 @@ mod handoff_tests {
         ev(seq, session_event::Kind::User(UserMessage { text: t.into(), ..Default::default() }))
     }
     fn assistant(seq: u64, blocks: Vec<content_block::Block>) -> SessionEvent {
-        let blocks = blocks.into_iter().map(|b| ContentBlock { block: Some(b) }).collect();
+        let blocks = blocks.into_iter().map(|b| ContentBlock { block: Some(b), ..Default::default() }).collect();
         ev(seq, session_event::Kind::Assistant(AssistantMessage { turn: 1, blocks, stop_reason: String::new() }))
     }
     fn switched(seq: u64, m: ModelSpec, handoff: Option<Handoff>) -> SessionEvent {

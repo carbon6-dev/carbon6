@@ -1004,7 +1004,25 @@ pub async fn effective_config(st: &HeadState, session_id: &str) -> anyhow::Resul
 }
 
 pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage) -> anyhow::Result<api::QueuedInput> {
-    send_input_as(st, session_id, req, Uuid::now_v7().to_string(), "").await
+    send_input_as(st, session_id, req, Uuid::now_v7().to_string(), "", None).await
+}
+
+/// A button sends your message as typed, marked so Watchers do not mistake
+/// the card's title for a correction. A closed proposer need not hear it.
+pub async fn card_answer(st: &HeadState, session_id: &str, text: String) -> anyhow::Result<()> {
+    let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    if session.archived != 0 || session.status == "stopped" {
+        return Err(bad_request("the proposing session is archived or stopped"));
+    }
+    send_input_with(
+        st,
+        session_id,
+        &api::SendMessage { text, ..Default::default() },
+        Uuid::now_v7().to_string(),
+        UserInput { command: "card-answer".into(), ..Default::default() },
+    )
+    .await?;
+    Ok(())
 }
 
 /// Queues an input as command `id`; `delegated_by`: a remote subagent's
@@ -1015,6 +1033,17 @@ pub async fn send_input_as(
     req: &api::SendMessage,
     id: String,
     delegated_by: &str,
+    api_origin: Option<c6_proto::ApiMessageOrigin>,
+) -> anyhow::Result<api::QueuedInput> {
+    send_input_with(st, session_id, req, id, UserInput { delegated_by: delegated_by.to_owned(), api_origin, ..Default::default() }).await
+}
+
+async fn send_input_with(
+    st: &HeadState,
+    session_id: &str,
+    req: &api::SendMessage,
+    id: String,
+    input: UserInput,
 ) -> anyhow::Result<api::QueuedInput> {
     let text = req.text.trim();
     let files = attachments(&req.attachments)?;
@@ -1045,15 +1074,7 @@ pub async fn send_input_as(
         st,
         &session.realm,
         session.head_labels(),
-        UserInput {
-            text: text.to_owned(),
-            model,
-            attachments: files,
-            wake,
-            delegated_by: delegated_by.to_owned(),
-            send_now: req.send_now,
-            ..Default::default()
-        },
+        UserInput { text: text.to_owned(), model, attachments: files, wake, send_now: req.send_now, ..input },
     )
     .await?;
     // Send now to a connected worker that doesn't know it (an older one):
@@ -1447,6 +1468,8 @@ pub async fn claude_code_tools(st: &HeadState, realm: Option<&str>) -> anyhow::R
         automatic: true,
         tools: Vec::new(),
         core: None,
+        native_all: false,
+        settings: None,
         available: Vec::new(),
     });
     if t.automatic {
@@ -1463,6 +1486,8 @@ pub async fn claude_code_choice(st: &HeadState, realm: &str) -> anyhow::Result<c
         tools: if t.automatic { Vec::new() } else { t.tools },
         core_chosen: t.core.is_some(),
         core: t.core.unwrap_or_default(),
+        native_all: t.native_all,
+        settings_json: t.settings.map(|v| v.to_string()).unwrap_or_default(),
     })
 }
 
@@ -1481,7 +1506,12 @@ pub async fn subagent_limits(st: &HeadState, realm: Option<&str>) -> anyhow::Res
 
 /// Continues a subagent whose last turn did not finish, with the realm's
 /// resume prompt.
-pub async fn resume(st: &HeadState, session_id: &str, req: &api::ResumeRequest) -> anyhow::Result<api::QueuedInput> {
+pub async fn resume(
+    st: &HeadState,
+    session_id: &str,
+    req: &api::ResumeRequest,
+    api_origin: Option<c6_proto::ApiMessageOrigin>,
+) -> anyhow::Result<api::QueuedInput> {
     let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
     if session.parent_call_id.is_none() {
         return Err(bad_request("only subagents are resumed; send the session a message instead"));
@@ -1498,8 +1528,14 @@ pub async fn resume(st: &HeadState, session_id: &str, req: &api::ResumeRequest) 
     let text = crate::prompts::get(st, "session.subagent_resume", &session.realm).await;
     let worker_id: WorkerId = session.worker_id.parse()?;
     let id = Uuid::now_v7().to_string();
-    let input =
-        UserInput { text: text.clone(), command: "resume".into(), wake: req.wake, labels: session.head_labels(), ..Default::default() };
+    let input = UserInput {
+        text: text.clone(),
+        command: "resume".into(),
+        wake: req.wake,
+        labels: session.head_labels(),
+        api_origin,
+        ..Default::default()
+    };
     let data = input_command(&id, session_id, input);
     st.store.enqueue_command(&NewCommand { id: &id, session_id, worker_id, data, text: Some(&text) }).await?;
     publish_queue(st, session_id).await;
@@ -2212,11 +2248,12 @@ async fn restore(st: &HeadState, worker_id: WorkerId, session_id: &str, command_
         kind: Some(session_command::Kind::Restore(c6_proto::Restore { spec: Some(spec), events })),
     };
     let input_id = Uuid::now_v7().to_string();
+    let data = input_command(&input_id, session_id, input);
     st.store
         .replace_with_restore(
             command_id,
             &NewCommand { id: &restore_id, session_id, worker_id, data: cmd.encode_to_vec(), text: None },
-            &NewCommand { id: &input_id, session_id, worker_id, data: input_command(&input_id, session_id, input), text: Some(&text) },
+            &NewCommand { id: &input_id, session_id, worker_id, data, text: Some(&text) },
         )
         .await?;
     // A parent's call waiting on that input waits on its copy.

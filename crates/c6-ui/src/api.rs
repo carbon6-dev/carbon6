@@ -249,6 +249,14 @@ pub async fn session_imports() -> Result<c6_api::SessionImports, String> {
     json(Request::get("/api/v1/settings/session_imports").send().await).await
 }
 
+pub async fn codex_limits() -> Result<c6_api::CodexLimitsSettings, String> {
+    json(Request::get("/api/v1/settings/codex_limits").send().await).await
+}
+
+pub async fn set_codex_limits(s: c6_api::CodexLimitsSettings) -> Result<(), String> {
+    empty(Request::put("/api/v1/settings/codex_limits").json(&s).map_err(|e| e.to_string())?.send().await).await
+}
+
 pub async fn set_session_imports(s: c6_api::SessionImports) -> Result<(), String> {
     empty(Request::put("/api/v1/settings/session_imports").json(&s).map_err(|e| e.to_string())?.send().await).await
 }
@@ -694,6 +702,14 @@ pub async fn descendants(id: String) -> Result<Vec<Session>, String> {
 
 pub async fn get_setting(name: &'static str) -> Result<serde_json::Value, String> {
     json(Request::get(&format!("/api/v1/settings/{name}{}", in_realm('?'))).send().await).await
+}
+
+pub async fn transcript_settings() -> Result<c6_api::TranscriptSettings, String> {
+    json(Request::get("/api/v1/settings/transcript").send().await).await
+}
+
+pub async fn put_transcript_settings(settings: c6_api::TranscriptSettings) -> Result<(), String> {
+    empty(Request::put("/api/v1/settings/transcript").json(&settings).map_err(|e| e.to_string())?.send().await).await
 }
 
 /// A settings list's own entries in `realm` (the console, choosing which
@@ -1413,6 +1429,10 @@ pub async fn session_decisions(id: String) -> Result<Vec<c6_api::Decision>, Stri
     json(Request::get(&format!("/api/v1/sessions/{id}/decisions")).send().await).await
 }
 
+pub async fn session_waiting(id: String) -> Result<Vec<c6_api::AttentionItem>, String> {
+    json(Request::get(&format!("/api/v1/sessions/{id}/waiting")).send().await).await
+}
+
 pub async fn decision_count() -> Result<i64, String> {
     let v: serde_json::Value = json(Request::get("/api/v1/decisions/count").send().await).await?;
     Ok(v["open"].as_i64().unwrap_or(0))
@@ -1523,6 +1543,11 @@ pub async fn set_mark(key: String, mark: String) -> Result<c6_api::marks::Marks,
 
 pub async fn work_list(closed: bool) -> Result<Vec<WorkItem>, String> {
     json(Request::get(&format!("/api/v1/work{}", if closed { "?closed=true" } else { "" })).send().await).await
+}
+
+/// A task card's destinations, even when viewed from the all-realms console.
+pub async fn task_work_list(realm: String) -> Result<Vec<WorkItem>, String> {
+    json(Request::get(&format!("/api/v1/work?realm={}", enc(&realm))).send().await).await
 }
 
 pub async fn work_get(id: String) -> Result<WorkItem, String> {

@@ -268,7 +268,7 @@ fn CallDetail(id: u64, live: bool) -> impl IntoView {
         move |k: &'static str| move || call.with(|c| c.as_ref().and_then(|r| r.as_ref().ok()).map(|v| s(&v[k])).unwrap_or_default());
     // Each part stays put as its text grows, so what you opened stays open.
     let block = move |title: &'static str, k: &'static str| {
-        let text = field(k);
+        let text = move || c6_api::citations::clean(&field(k)()).into_owned();
         let shown = field(k);
         let size = field(k);
         view! {

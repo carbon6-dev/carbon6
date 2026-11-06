@@ -22,8 +22,8 @@ pub fn AskButton() -> impl IntoView {
     });
     on_cleanup(move || hotkey.remove());
     view! {
-        <button class="rounded-md border border-zinc-300 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-200/60 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
-            title="Ask carbon6 to do or explain anything (⌘J)" on:click=move |_| open.set(true)>"✦ Ask"</button>
+        <button class="inline-flex items-center gap-1 rounded-md border border-zinc-300 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-200/60 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
+            title="Ask carbon6 to do or explain anything (⌘J)" on:click=move |_| open.set(true)>{crate::icons::sparkles()}" Ask"</button>
         <Show when=move || open.get()>
             <AskBox on_close=Callback::new(move |()| open.set(false)) />
         </Show>
@@ -74,7 +74,7 @@ fn AskBox(on_close: Callback<()>) -> impl IntoView {
                     <h2 class="font-medium">"Ask carbon6"</h2>
                     <span class="flex-1 text-xs text-muted">"anything you can do in the UI, or about your setup"</span>
                     <button class=format!("{BUTTON_QUIET} text-xs") title="Your Ask conversations: come back to one, or start one with a model of your choice"
-                        on:click=move |_| { on_close.run(()); ws.open(None, View::Chats, How::OwnTile); }>"Your conversations →"</button>
+                        on:click=move |_| { on_close.run(()); ws.open(None, View::Chats, How::OwnTile); }>"Your conversations "{crate::icons::arrow_right()}</button>
                 </div>
                 <textarea node_ref=area class=format!("{INPUT} {} min-h-24", crate::util::GROWS)
                     placeholder="e.g. What can I do in carbon6? · Which models are set up for vision? · Create an enrollment token for a new worker"
@@ -120,7 +120,7 @@ pub fn AssistantSettings() -> impl IntoView {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <div>
                 <h2 class="font-medium">"Assistant"</h2>
-                <p class="text-sm text-muted">"Ask carbon6 (✦ Ask, ⌘J) to do anything you can do here, or to explain your setup. It runs in the head, needs no worker, asks you for missing details with a form, shows tokens only to you, and asks before anything destructive. Its conversations have the label assistant, so routes, policies and budgets for that label apply."</p>
+                <p class="text-sm text-muted">"Ask carbon6 ("<span class="inline-flex items-center">{crate::icons::sparkles()}" Ask"</span>", ⌘J) to do anything you can do here, or to explain your setup. It runs in the head, needs no worker, asks you for missing details with a form, shows tokens only to you, and asks before anything destructive. Its conversations have the label assistant, so routes, policies and budgets for that label apply."</p>
             </div>
             <div class="grid gap-2 sm:grid-cols-3">
                 <label class="space-y-0.5">

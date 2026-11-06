@@ -189,6 +189,13 @@ impl Journal {
         Ok(rows.iter().map(|r| r.get("id")).collect())
     }
 
+    /// Cached sessions active since the cutoff, whose notice logs may
+    /// need recovery. Filter here so older sessions' logs aren't read.
+    pub async fn recent_session_ids(&self, since_ms: i64) -> anyhow::Result<Vec<String>> {
+        let rows = sqlx::query("SELECT id FROM sessions WHERE last_activity >= ?").bind(since_ms).fetch_all(&self.pool).await?;
+        Ok(rows.iter().map(|r| r.get("id")).collect())
+    }
+
     pub async fn open_turns(&self) -> anyhow::Result<Vec<(String, u64, u64)>> {
         let rows = sqlx::query("SELECT id, last_seq, open_turn FROM sessions WHERE open_turn IS NOT NULL").fetch_all(&self.pool).await?;
         Ok(rows.iter().map(|r| (r.get("id"), r.get::<i64, _>("last_seq") as u64, r.get::<i64, _>("open_turn") as u64)).collect())

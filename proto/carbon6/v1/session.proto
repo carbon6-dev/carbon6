@@ -77,6 +77,9 @@ message NoticeQueued {
   string from_session_id = 6;
   string from_title = 7;
   uint32 hops = 8;
+  // When the hourly limit next permits this notice's automatic delivery
+  // (Unix milliseconds); zero if it is not held by the limit.
+  int64 deliver_at_ms = 9;
 }
 
 // The session's default for its subagents changed (you picked one in the
@@ -308,6 +311,13 @@ message UserMessage {
   string from_session_id = 9;
   string from_title = 10;
   uint32 hops = 11;
+  // Present for HTTP API input; only the token's display name, never its secret.
+  ApiMessageOrigin api_origin = 12;
+}
+
+message ApiMessageOrigin {
+  // Empty when the API caller has no known token name (e.g. sign-in off).
+  string token_name = 1;
 }
 
 message Attachment {
@@ -342,6 +352,9 @@ message ContentBlock {
     Reasoning reasoning = 6;            // OpenAI Responses
     Opaque opaque = 7;                  // provider-run tools (web search …)
   }
+  // Display-only annotations on text (Responses url_citation, including
+  // title, URL and character offsets). Absent in older events.
+  string annotations_json = 8;
 }
 
 // A provider-specific block kept verbatim (e.g. Anthropic server_tool_use
@@ -528,8 +541,8 @@ message DelegationEnded {
   // What it did (a <subagent …> digest), when the turn did not complete
   // with a report.
   string digest = 5;
-  // For a turn no call waited on: what you said to it, and whether its
-  // report should wake the parent.
+  // For a turn no call waited on: its inputs with sender attribution
+  // (older heads send plain text), and whether its report wakes the parent.
   repeated string said = 6;
   bool wake = 7;
 }
@@ -706,6 +719,16 @@ message ClaudeCodeToolChoice {
   repeated string core = 3;
   // `core` is the choice (an empty one: none); unset: the defaults.
   bool core_chosen = 4;
+  // Claude Code's own tools as they are without carbon6 (today's
+  // behaviour, an escape hatch for now). Unset: only its coding tools
+  // (Bash, Read, Write, Edit, ToolSearch), narrowed by a routing rule's
+  // tool list, with nothing else from settings files, MCP servers, skills
+  // or plugins (docs/background.md §4, Claude Code's own tools).
+  bool native_all = 5;
+  // Extra Claude Code settings (a JSON object) merged into the --settings
+  // carbon6 passes, without the keys carbon6 sets itself. Empty: the
+  // default, no Claude co-author or attribution lines.
+  string settings_json = 6;
 }
 
 // What makes a session a subagent: who started it, and as which agent.
@@ -775,6 +798,8 @@ message UserInput {
   // stops the turn and this starts the next. Older workers treat it as an
   // ordinary message (the head interrupts first for them).
   bool send_now = 14;
+  // Present for HTTP API input, retained in UserMessage for remote reports.
+  ApiMessageOrigin api_origin = 15;
 }
 
 message Interrupt {

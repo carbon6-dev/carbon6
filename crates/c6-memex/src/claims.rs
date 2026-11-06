@@ -67,6 +67,9 @@ pub async fn add(m: &Memex, p: &Value) -> anyhow::Result<Value> {
     };
     let confidence = p["confidence"].as_f64().unwrap_or(1.0).clamp(0.0, 1.0);
     let basis = if confidence < 1.0 || p["basis"] == "inferred" { "inferred" } else { "observed" };
+    // Publish the claim with all its evidence, never an edge that readers
+    // can see before its supporting items have been attached.
+    let mut tx = m.store.pool.begin_with("BEGIN IMMEDIATE").await?;
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO links (src_thing, src_item, rel, dst_thing, dst_item, basis, confidence, made_by, owner, created_at, realm) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
@@ -82,12 +85,13 @@ pub async fn add(m: &Memex, p: &Value) -> anyhow::Result<Value> {
     .bind(&owner)
     .bind(c6_core::now_ms())
     .bind(&m.realm)
-    .fetch_one(&m.store.pool)
+    .fetch_one(&mut *tx)
     .await?;
     for e in p["evidence"].as_array().into_iter().flatten().filter_map(Value::as_str) {
         let item = e.strip_prefix("item:").unwrap_or(e);
-        sqlx::query("INSERT INTO evidence (link_id, item_id) VALUES (?, ?)").bind(id).bind(item).execute(&m.store.pool).await?;
+        sqlx::query("INSERT INTO evidence (link_id, item_id) VALUES (?, ?)").bind(id).bind(item).execute(&mut *tx).await?;
     }
+    tx.commit().await?;
     Ok(json!(one(m, id).await?))
 }
 
@@ -302,6 +306,31 @@ pub async fn list(m: &Memex, p: &Value) -> anyhow::Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_claim_and_all_its_evidence_commit_together() {
+        c6_llm::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memex::open(dir.path(), Default::default()).await.unwrap();
+        create_thing(&m, &json!({"key": "person:pat", "name": "Pat"})).await.unwrap();
+        create_thing(&m, &json!({"key": "topic:plan", "name": "Plan"})).await.unwrap();
+        // Fail after the first evidence row, not before the claim is made.
+        sqlx::raw_sql(
+            "CREATE TRIGGER reject_evidence BEFORE INSERT ON evidence WHEN NEW.item_id = 'reject' \
+             BEGIN SELECT RAISE(ABORT, 'rejected evidence'); END",
+        )
+        .execute(&m.store.pool)
+        .await
+        .unwrap();
+        let p = json!({"from": "thing:person:pat", "label": "about", "to": "thing:topic:plan", "evidence": ["first", "reject"]});
+        assert!(add(&m, &p).await.unwrap_err().to_string().contains("rejected evidence"));
+        let links: i64 = sqlx::query_scalar("SELECT count(*) FROM links").fetch_one(&m.store.pool).await.unwrap();
+        let evidence: i64 = sqlx::query_scalar("SELECT count(*) FROM evidence").fetch_one(&m.store.pool).await.unwrap();
+        assert_eq!((links, evidence), (0, 0), "no reader may see a half-written claim");
+        let mut p = p;
+        p["evidence"] = json!(["first", "item:second"]);
+        assert_eq!(add(&m, &p).await.unwrap()["evidence"], json!(["first", "second"]));
+    }
 
     fn c(id: i64, from: &str, label: &str, owner: &str) -> api::Claim {
         api::Claim { id, from: from.into(), label: label.into(), owner: owner.into(), ..Default::default() }

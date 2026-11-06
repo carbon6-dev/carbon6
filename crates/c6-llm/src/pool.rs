@@ -77,6 +77,11 @@ pub struct Endpoint {
 #[async_trait]
 pub trait Dial: Send + Sync {
     async fn endpoint(&self, member: &str) -> Result<Endpoint, LlmError>;
+
+    /// Attribute ChatGPT plan headers to the member that answered, not the pool.
+    fn chatgpt_limits_hook(&self, _member: &str) -> Option<crate::openai_responses::ChatGptLimitsHook> {
+        None
+    }
 }
 
 struct Seat {
@@ -468,6 +473,11 @@ impl ModelClient for PoolClient {
             };
             let origin = crate::activity::Origin { connection: slot.member.clone(), via: self.pool.id.clone(), ..self.origin.clone() };
             let mut client = crate::client_once(&e.kind, &e.base_url, &e.bearer, e.headers)?;
+            if e.kind == "chatgpt"
+                && let Some(hook) = self.pool.dial.chatgpt_limits_hook(&slot.member)
+            {
+                client.set_chatgpt_limits_hook(hook);
+            }
             if let Some(l) = self.limits {
                 client = crate::limit::limited(client, l);
             }

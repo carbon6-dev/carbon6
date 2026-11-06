@@ -370,7 +370,7 @@ pub fn ProjectPage(id: String) -> impl IntoView {
                                 <button class="text-xs text-muted hover:underline" title="Write it again now"
                                     on:click=move |_| spawn_local(async move {
                                         if let Err(e) = api::project_refresh(id.get_value()).await { error.set(Some(e)); }
-                                    })>"↻"</button>
+                                    })>{crate::icons::rotate()}</button>
                             </div>
                             <p class="whitespace-pre-wrap text-sm">{match &p.fields.note {
                                 Some(n) => n.text.clone(),
@@ -625,7 +625,7 @@ fn PhaseStrip(p: ProjectItem, change: Callback<c6_api::projects::PhaseIn>) -> im
                         <button class=format!("min-w-[7rem] flex-1 rounded-md border px-2 py-1 text-left text-xs {class}") title=ph.done_when.clone()
                             on:click=move |_| open_editor(Some(one.clone()))>
                             <div class="flex items-center gap-1 font-medium">
-                                {(ph.state == "done").then_some("✓ ")}
+                                {(ph.state == "done").then(crate::icons::check)}
                                 <span class="truncate">{ph.title.clone()}</span>
                             </div>
                             <div class="flex gap-1 text-[11px] opacity-80">
@@ -658,10 +658,10 @@ fn PhaseStrip(p: ProjectItem, change: Callback<c6_api::projects::PhaseIn>) -> im
                                     <button class=BUTTON_QUIET title="Make it the current phase" on:click=move |_| { editing.set(None); change.run(PhaseIn { action: "start".into(), phase: w1.clone(), ..Default::default() }); }>"Make current"</button>
                                 })}
                                 {(i > 0).then(|| view! {
-                                    <button class=BUTTON_QUIET title="Earlier" on:click=move |_| { editing.set(None); change.run(PhaseIn { action: "move".into(), phase: w2.clone(), to: Some(i - 1), ..Default::default() }); }>"←"</button>
+                                    <button class=BUTTON_QUIET title="Earlier" on:click=move |_| { editing.set(None); change.run(PhaseIn { action: "move".into(), phase: w2.clone(), to: Some(i - 1), ..Default::default() }); }>{crate::icons::chevron_left()}</button>
                                 })}
                                 {(i + 1 < n).then(|| view! {
-                                    <button class=BUTTON_QUIET title="Later" on:click=move |_| { editing.set(None); change.run(PhaseIn { action: "move".into(), phase: w3.clone(), to: Some(i + 1), ..Default::default() }); }>"→"</button>
+                                    <button class=BUTTON_QUIET title="Later" on:click=move |_| { editing.set(None); change.run(PhaseIn { action: "move".into(), phase: w3.clone(), to: Some(i + 1), ..Default::default() }); }>{crate::icons::chevron_right()}</button>
                                 })}
                                 <button class=format!("{BUTTON_QUIET} text-red-600") title="Its work stays in the project, in no phase"
                                     on:click=move |_| { editing.set(None); change.run(PhaseIn { action: "remove".into(), phase: w4.clone(), ..Default::default() }); }>"Remove"</button>
@@ -846,7 +846,7 @@ fn WorkRow(
                 on:click=move |_| {
                     let (p, d) = (project.clone(), ProjectDetach { work: Some(wid.clone()), ..Default::default() });
                     spawn_local(async move { apply.run(api::project_detach(p, &d).await) });
-                }>"✕"</button>
+                }>{crate::icons::x()}</button>
         </div>
     }
 }
@@ -896,10 +896,12 @@ fn Documents(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> im
                 let doc = d.doc.clone();
                 let doc2 = d.doc.clone();
                 let current = d.role.clone();
+                let mark = if d.kind == "deck" { crate::icons::chart().into_any() } else { crate::icons::file().into_any() };
+                let title = d.title.clone();
                 view! {
                     <div class="flex items-center gap-2 rounded px-2 py-1 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900">
                         <Go to=View::Docs { id: d.doc.clone() } class="min-w-0 flex-1 truncate text-sky-700 hover:underline dark:text-sky-400">
-                            {format!("{} {}", if d.kind == "deck" { "▦" } else { "▤" }, d.title)}
+                            {mark}" "{title}
                         </Go>
                         <span class="shrink-0 text-xs text-muted">{(d.updated_at > 0).then(|| since(d.updated_at))}</span>
                         <select class="shrink-0 cursor-pointer rounded bg-transparent px-1 text-xs text-muted hover:bg-zinc-200/60 dark:hover:bg-zinc-800"
@@ -912,7 +914,7 @@ fn Documents(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> im
                             on:click=move |_| {
                                 let d = ProjectDetach { doc: Some(doc2.clone()), ..Default::default() };
                                 spawn_local(async move { apply.run(api::project_detach(id.get_value(), &d).await) });
-                            }>"✕"</button>
+                            }>{crate::icons::x()}</button>
                     </div>
                 }
             }).collect_view()}
@@ -947,12 +949,12 @@ fn Documents(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> im
                         {if href.is_empty() {
                             view! { <span class="min-w-0 flex-1 truncate">{text}</span> }.into_any()
                         } else {
-                            view! { <a href=href target="_blank" rel="noopener noreferrer" class="min-w-0 flex-1 truncate text-sky-700 hover:underline dark:text-sky-400">{format!("↗ {text}")}</a> }.into_any()
+                            view! { <a href=href target="_blank" rel="noopener noreferrer" class="min-w-0 flex-1 truncate text-sky-700 hover:underline dark:text-sky-400">{crate::icons::arrow_up_right()}" "{text}</a> }.into_any()
                         }}
-                        <button class="shrink-0 text-xs text-muted hover:text-red-600" on:click=move |_| {
+                        <button class="shrink-0 text-xs text-muted hover:text-red-600" title="Remove link" on:click=move |_| {
                             let d = ProjectDetach { link: Some(r.clone()), ..Default::default() };
                             spawn_local(async move { apply.run(api::project_detach(id.get_value(), &d).await) });
-                        }>"✕"</button>
+                        }>{crate::icons::x()}</button>
                     </div>
                 }
             }).collect_view()}

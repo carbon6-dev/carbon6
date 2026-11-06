@@ -90,7 +90,12 @@ pub async fn ask(
                 context_window: grant.context_window,
             };
             let window = c6_llm::window::known(&task.connection_id, &task.model, &endpoint).await;
-            let client = c6_llm::client_for(&endpoint.kind, &endpoint.base_url, &endpoint.bearer, endpoint.headers)?;
+            let mut client = c6_llm::client_for(&endpoint.kind, &endpoint.base_url, &endpoint.bearer, endpoint.headers)?;
+            if endpoint.kind == "chatgpt"
+                && let Some(hook) = m.link.chatgpt_limits_hook(&task.connection_id)
+            {
+                client.set_chatgpt_limits_hook(hook);
+            }
             (c6_llm::activity::track(c6_llm::limit::limited(client, limits), origin), window)
         }
     };
@@ -161,7 +166,7 @@ async fn answer(client: &dyn c6_llm::ModelClient, req: &ModelRequest) -> anyhow:
         acc.push(&ev?);
     }
     let msg = acc.finish(true);
-    Ok(msg.blocks.iter().filter_map(|b| if let Block::Text(t) = b { Some(t.as_str()) } else { None }).collect())
+    Ok(msg.blocks.iter().filter_map(Block::text).collect())
 }
 
 /// Resolves once this call's task is no longer current.

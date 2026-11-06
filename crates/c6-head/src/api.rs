@@ -42,6 +42,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/google/connect", post(google_connect))
         .route("/api/v1/google/install", post(google_install))
         .route("/api/v1/settings/session_imports", get(get_session_imports).put(put_session_imports))
+        .route("/api/v1/settings/codex_limits", get(get_codex_limits).put(put_codex_limits))
         .route("/api/v1/imports", get(list_imports))
         .route("/api/v1/google/accounts", get(google_accounts))
         .route("/api/v1/google/accounts/{id}", delete(google_remove))
@@ -168,6 +169,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/search", get(search))
         .route("/api/v1/sessions/{id}/matches", get(session_matches))
         .route("/api/v1/sessions/{id}/decisions", get(session_decisions))
+        .route("/api/v1/sessions/{id}/waiting", get(session_waiting))
         .route("/api/v1/sessions/{id}/suggestion", get(session_suggestion))
         .route("/api/v1/sessions/{id}/suggestion/seen", post(suggestion_seen))
         .route("/api/v1/sessions/{id}/name/suggestion", get(session_name_suggestion))
@@ -177,6 +179,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/settings/suggestions", get(get_suggestion_settings).put(put_suggestion_settings))
         .route("/api/v1/settings/session_grouping", get(get_session_grouping).put(put_session_grouping))
         .route("/api/v1/settings/session_facets", get(get_session_facets).put(put_session_facets))
+        .route("/api/v1/settings/transcript", get(get_transcript_settings).put(put_transcript_settings))
         .route("/api/v1/marks", get(get_marks).put(put_mark))
         .route("/api/v1/settings/own/{name}", get(get_own_setting).delete(drop_own_setting))
         .route("/api/v1/work", get(list_work).post(add_work))
@@ -1008,6 +1011,15 @@ async fn session_decisions(
     Ok(Json(crate::decisions::of_session(&st, &id, &caller).await?))
 }
 
+/// What waits on you here and in this session's subagents.
+async fn session_waiting(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<api::AttentionItem>>> {
+    Ok(Json(crate::attention::of_session(&st, &id, &caller).await?))
+}
+
 /// What you'd likely type next (docs/suggestions.md): 204 when there's none.
 async fn session_suggestion(
     State(st): State<Arc<HeadState>>,
@@ -1183,6 +1195,17 @@ async fn put_session_grouping(
 }
 
 const SESSION_FACETS: &str = "session_facets";
+
+/// One user per head: this preference is global, not realm-scoped.
+async fn get_transcript_settings(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::TranscriptSettings>> {
+    let raw = st.store.setting("transcript_display").await?;
+    Ok(Json(raw.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default()))
+}
+
+async fn put_transcript_settings(State(st): State<Arc<HeadState>>, Json(settings): Json<api::TranscriptSettings>) -> ApiResult<StatusCode> {
+    st.store.set_setting("transcript_display", &serde_json::to_string(&settings).map_err(anyhow::Error::from)?).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
 
 fn facets_key(caller: &Caller) -> String {
     match &caller.realm {
@@ -1555,6 +1578,7 @@ async fn get_claude_code_tools(State(st): State<Arc<HeadState>>) -> ApiResult<Js
         c6_worker::session::claude_code_tool_names().into_iter().map(|(name, description)| api::ToolChoice { name, description }).collect();
     let mut t = crate::sessions::claude_code_tools(&st, None).await?;
     t.core.get_or_insert_with(|| c6_worker::session::CLAUDE_CODE_CORE_TOOLS.iter().map(|n| (*n).to_owned()).collect());
+    t.settings.get_or_insert_with(|| serde_json::from_str(api::CLAUDE_CODE_SETTINGS_DEFAULT).unwrap_or_default());
     t.available = available;
     Ok(Json(t))
 }
@@ -1575,7 +1599,17 @@ async fn put_claude_code_tools(State(st): State<Arc<HeadState>>, Json(t): Json<a
             ),
         ));
     }
-    let v = api::ClaudeCodeTools { automatic: t.automatic, tools: named, core: t.core, available: Vec::new() };
+    if let Some(e) = t.settings.as_ref().and_then(api::claude_code_settings_error) {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, e));
+    }
+    let v = api::ClaudeCodeTools {
+        automatic: t.automatic,
+        tools: named,
+        core: t.core,
+        native_all: t.native_all,
+        settings: t.settings,
+        available: Vec::new(),
+    };
     st.store.set_setting(crate::sessions::CLAUDE_CODE_TOOLS, &serde_json::to_string(&v).map_err(anyhow::Error::from)?).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1804,13 +1838,14 @@ async fn put_hooks(State(st): State<Arc<HeadState>>, Json(hooks): Json<Vec<api::
 
 async fn send_message(
     State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<crate::realms::Caller>,
     Path(id): Path<String>,
     Json(req): Json<api::SendMessage>,
 ) -> ApiResult<Json<api::QueuedInput>> {
     // You answered: you'd seen how it stood (docs/work.md §3), not the
     // turn this starts.
     let at = now_ms();
-    let queued = crate::sessions::send_input(&st, &id, &req).await?;
+    let queued = crate::sessions::send_input_as(&st, &id, &req, uuid::Uuid::now_v7().to_string(), "", caller.api_origin()).await?;
     // The message is queued: failing to note this mustn't make the send
     // look failed (and get it sent twice).
     if let Err(e) = crate::work::seen_session(&st, &id, at).await {
@@ -2323,6 +2358,28 @@ async fn slack_remove(
 /// Importing sessions from Claude Code and Codex (docs/imports.md).
 async fn get_session_imports(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::SessionImports>> {
     Ok(Json(crate::imports::settings(&st).await?))
+}
+
+async fn get_codex_limits(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::CodexLimitsSettings>> {
+    Ok(Json(crate::quotas::codex_settings(&st).await?))
+}
+
+async fn put_codex_limits(State(st): State<Arc<HeadState>>, Json(s): Json<api::CodexLimitsSettings>) -> ApiResult<StatusCode> {
+    for id in s.workers.iter().chain(s.commands.keys()) {
+        let id = parse_worker_id(id)?;
+        if st.store.worker(id).await?.is_none() {
+            return Err(crate::bad_request("worker not found").into());
+        }
+    }
+    for command in s.commands.values() {
+        if !command.trim().is_empty() && !std::path::Path::new(command).is_absolute() {
+            return Err(
+                crate::bad_request("Codex command must be an absolute path to an executable, without arguments or ~ expansion").into()
+            );
+        }
+    }
+    st.store.set_setting(crate::quotas::CODEX_SETTINGS, &serde_json::to_string(&s).map_err(anyhow::Error::from)?).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn put_session_imports(State(st): State<Arc<HeadState>>, Json(s): Json<api::SessionImports>) -> ApiResult<StatusCode> {
@@ -2954,10 +3011,11 @@ async fn put_policies(State(st): State<Arc<HeadState>>, Json(p): Json<Vec<api::P
 
 async fn resume_session(
     State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<crate::realms::Caller>,
     Path(id): Path<String>,
     Json(req): Json<api::ResumeRequest>,
 ) -> ApiResult<Json<api::QueuedInput>> {
-    Ok(Json(crate::sessions::resume(&st, &id, &req).await?))
+    Ok(Json(crate::sessions::resume(&st, &id, &req, caller.api_origin()).await?))
 }
 
 async fn interrupt_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<StatusCode> {

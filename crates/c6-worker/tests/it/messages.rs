@@ -54,6 +54,11 @@ async fn a_session_messages_another_on_another_worker() {
         .json()
         .await
         .unwrap();
+    let defaults: c6_api::SubagentLimits = http.get(format!("{api}/settings/subagent-limits")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(defaults.max_message_hops, 4);
+    assert_eq!(c6_api::SubagentLimits::default().max_message_hops, 4);
+    let missing_fields: c6_api::SubagentLimits = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(missing_fields.max_message_hops, 4, "older settings keep the same default");
     // A chain of one: a reply to a session message is refused.
     let limits = json!({"max_depth": 3, "max_running": 16, "auto_turns_per_hour": 20, "claude_code_idle_minutes": 15, "max_message_hops": 1, "messages_per_hour": 30});
     assert!(http.put(format!("{api}/settings/subagent-limits")).json(&limits).send().await.unwrap().status().is_success());
@@ -154,6 +159,28 @@ async fn a_session_messages_another_on_another_worker() {
     // B's transcript attributes it to A, not to you.
     let md = http.get(format!("{api}/sessions/{b}/export")).send().await.unwrap().text().await.unwrap();
     assert!(md.contains(r#"## ✉ From "Alice""#) && !md.contains("## You\n\nWhat is your status?"), "{md}");
+
+    // Your direct message resets B's count: its next send is hop 1,
+    // rather than a refused hop 2 in the previous chain.
+    mock.push_about(
+        "try again from me",
+        Reply::ToolCalls(vec![("message_session".into(), json!({"to": a, "message": "A fresh chain."}).to_string())]),
+    );
+    mock.push_about("Sent to", Reply::Text("Sent this time.".into()));
+    mock.push_about("<session-message", Reply::Text("Received the fresh chain.".into()));
+    let r = http.post(format!("{api}/sessions/{b}/messages")).json(&json!({"text": "try again from me"})).send().await.unwrap();
+    assert!(r.status().is_success());
+    idle(&b, 3).await;
+    idle(&a, 2).await;
+    assert!(
+        head.state
+            .store
+            .events_after(&a, 0, 1_000)
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| { matches!(&e.kind, Some(c6_proto::session_event::Kind::User(u)) if u.text == "A fresh chain." && u.hops == 1) })
+    );
     stop_a.cancel();
     stop_b.cancel();
 }

@@ -1189,11 +1189,19 @@ pub async fn on_new_session(st: &HeadState, s: &api::Session, work: Option<&str>
 
 /// A task card kept as a to-do (docs/task-cards.md §4.1): added to the
 /// work its session belongs to (`into_session_work`), else to new work
-/// named after it. Returns the work item's id.
-pub async fn keep_todo(st: &HeadState, d: &api::Decision, into_session_work: bool) -> anyhow::Result<String> {
+/// named after it. An explicit target must be open and in the card's realm
+/// (the answer endpoint already checks the caller can see that realm).
+/// Returns the work item's id.
+pub async fn keep_todo(st: &HeadState, d: &api::Decision, into_session_work: bool, destination: Option<&str>) -> anyhow::Result<String> {
     let origin = d.context["session"].as_str().unwrap_or("").to_owned();
-    let mut target = None;
-    if into_session_work && !origin.is_empty() {
+    let mut target = match destination {
+        Some(id) => {
+            load(st, id).await?.filter(|w| w.realm == d.realm).ok_or_else(|| not_found("no such work item in this realm"))?;
+            Some(id.to_owned())
+        }
+        None => None,
+    };
+    if target.is_none() && into_session_work && !origin.is_empty() {
         let root = match st.store.session(&origin).await? {
             Some(s) => s.root_id.clone().or(s.parent_id.clone()).unwrap_or(s.id),
             None => origin.clone(),
@@ -1210,7 +1218,15 @@ pub async fn keep_todo(st: &HeadState, d: &api::Decision, into_session_work: boo
     todo.origin = origin;
     let id = match target {
         Some(id) => {
-            modify(st, &id, &crate::agent_ops::by("you"), None, |f| add_todo_to(f, todo)).await?;
+            modify(st, &id, &crate::agent_ops::by("you"), None, |f| {
+                // Recheck under the writer lock: it may have been closed
+                // since the chooser loaded (or this target was resolved).
+                if f.status != "open" {
+                    return Err(bad_request("choose an open work item"));
+                }
+                add_todo_to(f, todo)
+            })
+            .await?;
             id
         }
         None => {
@@ -1294,7 +1310,15 @@ pub(crate) async fn model_for_route(
         serde_json::from_str(&st.store.setting_for(crate::sessions::ROUTES, realm).await?.unwrap_or_default()).unwrap_or_default();
     let usable = |c: &crate::store::ConnectionRow| realm == crate::realms::ROOT || crate::realms::available(&c.realms, realm);
     for route in routes.iter().filter(|x| x.enabled && x.applies_to.iter().any(|l| l == route_label)) {
-        if !api::labels::applies(&route.applies_to, &labels) {
+        // The new suggestion fallback has suggestions' any-task semantics;
+        // leave the existing work/project selectors unchanged.
+        let selectors: Vec<String> = route
+            .applies_to
+            .iter()
+            .filter(|l| route_label != crate::suggestions::ROUTE_LABEL || !l.trim().starts_with("task:"))
+            .cloned()
+            .collect();
+        if !api::labels::applies(&selectors, &labels) {
             continue;
         }
         let want = route.connection.trim();
@@ -1320,6 +1344,38 @@ pub(crate) async fn model_for_route(
         return Ok(None);
     }
     Ok(Some((c, m)))
+}
+
+/// Notes retain their existing rules and session choice before trying the
+/// small model configured for suggestions. Claude Code remains askable
+/// wherever the head has `claude`.
+pub(crate) async fn model_for_note(
+    st: &HeadState,
+    realm: &str,
+    label: &str,
+    fallback: Option<(String, String)>,
+) -> anyhow::Result<(String, String)> {
+    if label != ROUTE_LABEL
+        && let Some(model) = model_for_route(st, realm, label, None).await?
+    {
+        return Ok(model);
+    }
+    if let Some(model) = model_for_route(st, realm, ROUTE_LABEL, fallback.clone()).await? {
+        return Ok(model);
+    }
+    if let Some(model) = model_for_route(st, realm, crate::suggestions::ROUTE_LABEL, None).await? {
+        return Ok(model);
+    }
+    let why = match fallback {
+        Some((connection, _)) => crate::pools::cannot_answer(st, &connection).await,
+        None => None,
+    }
+    .unwrap_or_else(|| "no attached session supplies a model the head can ask".into());
+    let rules = if label == ROUTE_LABEL { "task:work or task:suggest" } else { "task:projects, task:work or task:suggest" };
+    anyhow::bail!(
+        "no note was written: {why}; no askable {rules} rule; \
+         add a task:suggest rule with an API connection in Settings → Model routing, or install claude on the head"
+    )
 }
 
 /// Asks the model, for JSON. Its tokens count in the realm's usage, as
@@ -1383,7 +1439,7 @@ pub(crate) async fn ask_as(
     .bind(realm)
     .execute(&st.store.pool)
     .await?;
-    let text: String = msg.blocks.iter().filter_map(|b| if let Block::Text(t) = b { Some(t.as_str()) } else { None }).collect();
+    let text: String = msg.blocks.iter().filter_map(Block::text).collect();
     json_of(&text).ok_or_else(|| anyhow::anyhow!("{model} gave no JSON: {}", text.chars().take(200).collect::<String>()))
 }
 
@@ -1577,7 +1633,7 @@ async fn note(st: &HeadState, id: &str) -> anyhow::Result<()> {
         }
     }
     let fallback = fallback.or_else(|| sessions.first().map(|s| (s.connection_id.clone(), s.model.clone())));
-    let Some(model) = model_for(st, &r.realm, fallback).await? else { return Ok(()) };
+    let model = model_for_note(st, &r.realm, ROUTE_LABEL, fallback).await?;
     let item = view(st, vec![r]).await?.remove(0);
     let attached = described(st, &item).await?;
     let previous = match &item.fields.note {
@@ -2015,8 +2071,181 @@ pub async fn for_session(st: &HeadState, session_id: &str, p: &Value) -> anyhow:
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// No worker is needed: these are one-off calls made by the head.
+    pub(crate) async fn routing_fixture() -> (tempfile::TempDir, crate::Head, c6_testkit::MockLlm, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let head = crate::start(crate::HeadConfig {
+            claude_bin: Some(dir.path().join("no-claude-here")),
+            data_dir: dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            auth: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let mock = c6_testkit::MockLlm::start().await;
+        for (id, kind) in [("cc", "claude_code"), ("api", "openai_compat")] {
+            sqlx::query("INSERT INTO connections (id, name, kind, base_url, created_at) VALUES (?, ?, ?, ?, 0)")
+                .bind(id)
+                .bind(id)
+                .bind(kind)
+                .bind(mock.base_url())
+                .execute(&head.state.store.pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, realm, labels) \
+             VALUES ('session', '', 'Fix the pager', '', 'cc', 'opus', 'idle', 1, 1, ?, '[\"repo:notes\"]')",
+        )
+        .bind(crate::realms::HOME)
+        .execute(&head.state.store.pool)
+        .await
+        .unwrap();
+        let fields = WorkFields {
+            title: "Fix the pager".into(),
+            status: "open".into(),
+            attached: vec![Attached { reference: "session:session".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let id = insert(&head.state, crate::realms::HOME, &fields, &[], "you").await.unwrap();
+        (dir, head, mock, id)
+    }
+
+    pub(crate) async fn note_routes(st: &HeadState, routes: &[(&str, &str)]) {
+        let routes: Vec<Value> = routes
+            .iter()
+            .map(|(label, model)| json!({"name": model, "applies_to": [label], "connection": "api", "model": model, "enabled": true}))
+            .collect();
+        st.store.set_setting(crate::sessions::ROUTES, &serde_json::to_string(&routes).unwrap()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn note_suggest_fallback_accepts_shared_task_rules_and_skips_unaskable_choices() {
+        let (_dir, head, mock, _id) = routing_fixture().await;
+        let st = &head.state;
+        let routes = json!([
+            {"name": "no claude", "applies_to": ["task:suggest", "task:name"], "connection": "cc", "model": "opus", "enabled": true},
+            {"name": "other context", "applies_to": ["task:suggest", "repo:elsewhere"], "connection": "api", "model": "wrong", "enabled": true},
+            {"name": "shared", "applies_to": ["task:suggest", "task:name"], "connection": "api", "model": "small", "enabled": true}
+        ]);
+        st.store.set_setting(crate::sessions::ROUTES, &routes.to_string()).await.unwrap();
+        let model = model_for_note(st, crate::realms::HOME, ROUTE_LABEL, Some(("cc".into(), "opus".into()))).await.unwrap();
+        assert_eq!(model, ("api".into(), "small".into()));
+        assert!(mock.requests().is_empty());
+        head.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn work_note_uses_suggest_only_after_upstream_choices_and_explains_no_model() {
+        let (_dir, head, mock, id) = routing_fixture().await;
+        let st = &head.state;
+        assert!(st.claude_bin().is_none());
+        let suggest = (crate::suggestions::ROUTE_LABEL, "suggest");
+        note_routes(st, &[suggest]).await;
+        mock.push(c6_testkit::Reply::Text(json!({"done": "Read logs", "left": "fix", "next": "suggest", "finished": false}).to_string()));
+        note(st, &id).await.unwrap();
+        assert_eq!(mock.requests().last().unwrap()["model"], "suggest");
+        assert_eq!(load(st, &id).await.unwrap().unwrap().fields.note.unwrap().next, "suggest");
+
+        note_routes(st, &[]).await;
+        let before = mock.requests().len();
+        let error = note(st, &id).await.unwrap_err().to_string();
+        assert!(error.contains("no note was written"), "{error}");
+        assert!(error.contains("Claude Code (`claude`) is not on the head machine's PATH"), "{error}");
+        assert!(error.contains("task:suggest rule with an API connection in Settings → Model routing"), "{error}");
+        assert_eq!(mock.requests().len(), before);
+        assert_eq!(load(st, &id).await.unwrap().unwrap().fields.note.unwrap().next, "suggest");
+
+        // Even with a suggest rule, the older askable session still wins.
+        sqlx::query(
+            "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, realm) \
+             VALUES ('older', '', 'API session', '', 'api', 'session', 'idle', 0, 0, ?)",
+        )
+        .bind(crate::realms::HOME)
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+        modify(st, &id, "test", None, |f| {
+            f.attached.push(Attached { reference: "session:older".into(), ..Default::default() });
+            Ok(true)
+        })
+        .await
+        .unwrap();
+        for (routes, expected) in [(vec![suggest], "session"), (vec![suggest, (ROUTE_LABEL, "work")], "work")] {
+            note_routes(st, &routes).await;
+            mock.push(c6_testkit::Reply::Text(json!({"next": expected, "finished": false}).to_string()));
+            note(st, &id).await.unwrap();
+            assert_eq!(mock.requests().last().unwrap()["model"], expected);
+            assert_eq!(load(st, &id).await.unwrap().unwrap().fields.note.unwrap().next, expected);
+        }
+        head.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn task_card_saves_elsewhere_only_to_open_work_in_its_realm() {
+        let (_dir, head, _mock, original) = routing_fixture().await;
+        let st = &head.state;
+        let realm = crate::realms::HOME;
+        crate::realms::create(st, &api::RealmIn { id: "elsewhere".into(), ..Default::default() }, "you").await.unwrap();
+        let mut destinations = Vec::new();
+        for (realm, status) in [(realm, "open"), (realm, "done"), ("elsewhere", "open")] {
+            let fields = WorkFields { title: "Another work item".into(), status: status.into(), ..Default::default() };
+            destinations.push(insert(st, realm, &fields, &[], "you").await.unwrap());
+        }
+        let card = crate::decisions::task_card(
+            st,
+            "session",
+            "task_propose",
+            &json!({
+                "title": "Split the config", "prompt": "Split src/config.rs into load.rs and check.rs."
+            }),
+        )
+        .await
+        .unwrap();
+        let id = card["id"].as_i64().unwrap();
+        // This card has only the original options, like a card saved before
+        // the chooser existed. An arbitrary destination still works.
+        let url = format!("http://127.0.0.1:{}/api/v1/decisions/{id}/answer", head.ui_addrs[0].port());
+        let http = reqwest::Client::new();
+        for target in ["", "missing", &destinations[1], &destinations[2]] {
+            let response = http.post(&url).json(&json!({"option": format!("Add to work:{target}")})).send().await.unwrap();
+            assert!(response.status().is_client_error(), "{}", response.text().await.unwrap());
+            assert_eq!(crate::decisions::get(st, id).await.unwrap().unwrap().state, "open");
+        }
+        let response = http.post(&url).json(&json!({"option": format!("Add to work:{}", destinations[0])})).send().await.unwrap();
+        assert!(response.status().is_success(), "{}", response.text().await.unwrap());
+        let saved = load(st, &destinations[0]).await.unwrap().unwrap();
+        let todo = &saved.fields.todos[0];
+        assert_eq!(saved.fields.todos.len(), 1);
+        assert_eq!(todo.text, "Split the config");
+        assert_eq!(todo.prompt, "Split src/config.rs into load.rs and check.rs.");
+        assert_eq!(todo.origin, "session");
+        assert_eq!(todo.from, format!("decision:{id}"));
+        assert!(todo.done_at.is_none());
+        assert!(load(st, &original).await.unwrap().unwrap().fields.todos.is_empty());
+        for id in &destinations[1..] {
+            assert!(load(st, id).await.unwrap().unwrap().fields.todos.is_empty());
+        }
+        assert_eq!(crate::decisions::get(st, id).await.unwrap().unwrap().state, "answered");
+        // Other kinds of decision cannot use the task-only dynamic option.
+        let question =
+            crate::decisions::open(st, &api::DecisionIn { title: "A question".into(), ..Default::default() }, realm, "").await.unwrap();
+        let result = crate::decisions::answer(
+            st,
+            question.id,
+            &api::DecisionAnswer { option: Some(format!("Add to work:{}", destinations[0])), ..Default::default() },
+            "test",
+        )
+        .await;
+        assert!(result.is_err());
+        head.shutdown().await.unwrap();
+    }
 
     fn live(reference: &str, state: &str, at: i64) -> LiveAttached {
         LiveAttached { reference: reference.into(), title: reference.into(), state: state.into(), at, ..Default::default() }

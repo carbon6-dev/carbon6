@@ -151,7 +151,7 @@ pub(crate) fn worth_a_card(steps: u64, waiting: usize) -> bool {
 /// document's comments or the agent's that started it.
 fn yours(kind: &EventKind) -> bool {
     matches!(kind, EventKind::User { text, command, from_session_id, delegated_by, .. }
-        if from_session_id.is_empty() && delegated_by.is_empty() && command != "task-notification" && command != "stop-hook" && doc_comment(text).is_none())
+        if from_session_id.is_empty() && delegated_by.is_empty() && !matches!(command.as_str(), "task-notification" | "stop-hook") && doc_comment(text).is_none())
 }
 
 /// Where a catch-up starts, and when: after `seen`, the last event before
@@ -286,6 +286,7 @@ pub(crate) fn target(name: &str, input: &serde_json::Value) -> String {
 
 /// The first `n` characters of a text, on one line, with … if cut.
 pub(crate) fn clip(text: &str, n: usize) -> String {
+    let text = api::citations::clean(text);
     let one: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if one.chars().count() <= n {
         return one;
@@ -366,8 +367,8 @@ pub(crate) fn rows(events: &[Event], waiting: Vec<CatchupItem>) -> Vec<CatchupRo
     }
     let shell: HashSet<&str> = calls.iter().filter(|c| command_of(c.name, &c.input).is_some()).map(|c| c.id).collect();
     for e in events {
-        // One that ran in the foreground ends with its call's result (a
-        // command of Claude Code's is mirrored as a subagent too: not one).
+        // One that ran in the foreground ends with its call's result. Older
+        // workers also mirrored Claude Code shell commands: not subagents.
         if let EventKind::SubagentSpawned { call_id, description, background_task_id, .. } = &e.kind
             && background_task_id.is_empty()
             && !shell.contains(call_id.as_str())
@@ -483,7 +484,7 @@ pub(crate) fn condensed(events: &[Event]) -> String {
     let mut finals: HashMap<u64, u64> = HashMap::new();
     for e in events {
         if let EventKind::Assistant { turn, blocks, .. } = &e.kind
-            && blocks.iter().any(|b| matches!(b, ContentBlock::Text { text } if !text.trim().is_empty()))
+            && blocks.iter().any(|b| matches!(b, ContentBlock::Text { text, .. } if !text.trim().is_empty()))
         {
             finals.insert(*turn, e.seq);
         }
@@ -514,7 +515,7 @@ pub(crate) fn condensed(events: &[Event]) -> String {
                     let text: String = blocks
                         .iter()
                         .filter_map(|b| match b {
-                            ContentBlock::Text { text } => Some(text.as_str()),
+                            ContentBlock::Text { text, .. } => Some(text.as_str()),
                             _ => None,
                         })
                         .collect::<Vec<_>>()
@@ -676,14 +677,19 @@ pub(crate) async fn ask(st: &HeadState, row: &SessionRow, label: &str, what: &st
     .bind(&row.realm)
     .execute(&st.store.pool)
     .await?;
-    let text: String = msg.blocks.iter().filter_map(|b| if let Block::Text(t) = b { Some(t.as_str()) } else { None }).collect();
+    let text: String = msg.blocks.iter().filter_map(Block::text).collect();
     anyhow::ensure!(!text.trim().is_empty(), "{model} gave no answer");
-    Ok(text.trim().to_owned())
+    Ok(api::citations::clean(text.trim()).into_owned())
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn catchup_previews_remove_citations_before_clipping() {
+        assert_eq!(clip("Fact \u{e200}cite\u{e202}turn347046search1\u{e201}. More", 6), "Fact.…");
+    }
 
     pub(crate) fn ev(seq: u64, ts: i64, kind: EventKind) -> Event {
         Event { seq, ts, kind }
@@ -720,10 +726,18 @@ pub(crate) mod tests {
         k
     }
 
+    pub(crate) fn card_answer() -> EventKind {
+        let mut k = user("Not now: task card #185 \"Cleanup\".");
+        if let EventKind::User { command, .. } = &mut k {
+            *command = "card-answer".into();
+        }
+        k
+    }
+
     pub(crate) fn reply(turn: u64, text: &str, tools: &[(&str, &str, serde_json::Value)]) -> EventKind {
         let mut blocks = Vec::new();
         if !text.is_empty() {
-            blocks.push(ContentBlock::Text { text: text.into() });
+            blocks.push(ContentBlock::Text { text: text.into(), citations: vec![] });
         }
         for (id, name, input) in tools {
             blocks.push(ContentBlock::ToolUse { id: (*id).into(), name: (*name).into(), input_json: input.to_string() });
@@ -848,6 +862,7 @@ pub(crate) mod tests {
             ev(32, 3002, user("A comment on the document \"Plan\" (doc:d1) is for you. Thread t1")),
         ];
         assert_eq!(since(&others, 29, 2900), (29, 2900));
+        assert_eq!(since(&[ev(33, 3003, card_answer())], 29, 2900), (33, 3003), "a card button is your message");
     }
 
     #[test]
@@ -877,14 +892,14 @@ pub(crate) mod tests {
     }
 
     /// Claude Code's own tasks: a command in the foreground is a command
-    /// (not finished work, though the worker mirrors it as a subagent too),
+    /// (not finished work, even if an older worker mirrored it as a subagent),
     /// each task counts once, as it ended, and only agents are subagents.
     #[test]
     fn finished_is_background_work_each_once() {
         use serde_json::json;
         let bash = json!({"command": "cd /home/me/.local/state/c6w/worktrees/x && cargo test", "description": "Run the tests"});
         let evs = vec![
-            // A command in the foreground: started, mirrored, ended.
+            // An older worker's foreground command: started, mirrored, ended.
             ev(1, 1, reply(1, "", &[("c1", "Bash", bash)])),
             ev(2, 2, native("claude:fg", "local_bash", "Run the tests", "started", true)),
             ev(3, 3, spawned("c1", "Run the tests")),

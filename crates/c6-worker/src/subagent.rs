@@ -633,14 +633,39 @@ pub(crate) fn report_body(spec: &CreateSession, sid: &str, reason: TurnEndReason
     }
 }
 
-/// The notice of a subagent's turn that no call waited on: what you said
-/// to it, if you did.
+/// Attribute an unasked input before its source is lost in `said` (also
+/// used by the head for remote subagents). A resume is not a user message.
+pub fn report_input(
+    sid: &str,
+    command: &str,
+    text: &str,
+    from_id: &str,
+    from_title: &str,
+    api_origin: Option<&c6_proto::ApiMessageOrigin>,
+) -> String {
+    let sender = if from_title.is_empty() { from_id } else { from_title };
+    if from_id == sid {
+        format!("Subagent {sid} ({sender}) resumed itself: \"{text}\"")
+    } else if !from_id.is_empty() {
+        format!("Session \"{sender}\" ({from_id}) messaged subagent {sid}: \"{text}\"")
+    } else if let Some(origin) = api_origin {
+        let token = if origin.token_name.is_empty() { String::new() } else { format!(" (token {:?})", origin.token_name) };
+        format!("Sent to subagent {sid} via the API{token}: \"{text}\"")
+    } else if command == "resume" {
+        format!("Subagent {sid} resumed: \"{text}\"")
+    } else {
+        format!("The user messaged subagent {sid} directly: \"{text}\"")
+    }
+}
+
+/// The notice of a subagent's turn that no call waited on, retaining the
+/// input's attribution. Older workers' plain `said` text stays neutral.
 pub(crate) fn unasked_report(sid: &str, said: &[String], body: &str) -> String {
     let said: Vec<&str> = said.iter().map(String::as_str).filter(|s| !s.trim().is_empty()).collect();
     if said.is_empty() {
         format!("Subagent {sid} worked on its own (no call of yours waited on it):\n{body}")
     } else {
-        format!("The user messaged subagent {sid} directly: \"{}\"\n{body}", said.join("\" / \""))
+        format!("{}\n{body}", said.join("\n"))
     }
 }
 
@@ -879,6 +904,36 @@ impl c6_tools::Hooks for SubagentHooks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unasked_reports_name_the_input_source() {
+        let own = report_input("ops", "session-message", "Continue after restart.", "ops", "Deploy head", None);
+        let text = unasked_report("ops", &[own], "Deployed.");
+        assert!(text.starts_with("Subagent ops (Deploy head) resumed itself:"), "{text}");
+        assert!(!text.contains("The user"));
+        let resume = unasked_report("ops", &[report_input("ops", "resume", "Continue.", "", "", None)], "Done.");
+        assert!(resume.starts_with("Subagent ops resumed:"), "{resume}");
+        assert!(!resume.contains("The user"));
+        let other = report_input("ops", "session-message", "Deploy.", "coordinator", "Coordinator", None);
+        assert!(other.starts_with("Session \"Coordinator\" (coordinator) messaged subagent ops:"));
+        let user = report_input("ops", "", "Status?", "", "", None);
+        assert!(user.starts_with("The user messaged subagent ops directly:"));
+        assert!(!unasked_report("ops", &["an older worker's input".into()], "Done.").contains("The user"));
+    }
+
+    #[test]
+    fn api_inputs_name_only_the_token_display_name() {
+        for command in ["", "resume"] {
+            let origin = c6_proto::ApiMessageOrigin { token_name: "ops-controller".into() };
+            let text = report_input("ops", command, "Continue.", "", "", Some(&origin));
+            assert_eq!(text, "Sent to subagent ops via the API (token \"ops-controller\"): \"Continue.\"");
+            let unnamed = report_input("ops", command, "Continue.", "", "", Some(&Default::default()));
+            assert_eq!(unnamed, "Sent to subagent ops via the API: \"Continue.\"");
+        }
+        let origin = c6_proto::ApiMessageOrigin { token_name: "name\n\"quoted\"".into() };
+        let text = report_input("ops", "", "Continue.", "", "", Some(&origin));
+        assert!(text.contains(r#"name\n\"quoted\""#), "{text}");
+    }
 
     fn conn(id: &str, name: &str, kind: &str, default_model: &str) -> SubagentConnection {
         SubagentConnection { id: id.into(), name: name.into(), kind: kind.into(), default_model: default_model.into() }

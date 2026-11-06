@@ -205,12 +205,14 @@ fn NewCollection(done: Callback<()>) -> impl IntoView {
 /// A field's value in a table: a `doc:<id>` opens the document.
 fn cell_view(v: Option<&Value>) -> leptos::prelude::AnyView {
     match v.and_then(Value::as_str).and_then(|s| s.strip_prefix("doc:")) {
-        Some(id) if !id.is_empty() => view! {
-            <crate::workspace::Go to=crate::workspace::View::Docs { id: id.to_owned() } class="text-sky-700 hover:underline dark:text-sky-400" stop=true>
-                {format!("▤ doc:{}", id.chars().take(8).collect::<String>())}
-            </crate::workspace::Go>
+        Some(id) if !id.is_empty() => {
+            let title = format!("doc:{}", id.chars().take(8).collect::<String>());
+            view! {
+                <crate::workspace::Go to=crate::workspace::View::Docs { id: id.to_owned() } class="text-sky-700 hover:underline dark:text-sky-400" stop=true>
+                    {crate::icons::file()}" "{title}
+                </crate::workspace::Go>
+            }.into_any()
         }
-        .into_any(),
         _ => cell(v).into_any(),
     }
 }
@@ -259,7 +261,7 @@ fn CollectionView(name: String) -> impl IntoView {
                     let columns = StoredValue::new(columns);
                     view! {
                         <div class="flex flex-wrap items-center gap-2">
-                            <Go to=View::Collections { name: String::new() } class=format!("{BUTTON_QUIET} text-sm")>"← Collections"</Go>
+                            <Go to=View::Collections { name: String::new() } class=format!("{BUTTON_QUIET} text-sm")>{crate::icons::arrow_left()}" Collections"</Go>
                             <h1 class="text-lg font-semibold">{c.with_value(|c| c.name.clone())}</h1>
                             <span class="flex-1 text-sm text-muted">{c.with_value(|c| c.description.clone())}</span>
                             <input class=format!("{INPUT} w-48 py-1 text-sm") placeholder="Search" prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev)) />

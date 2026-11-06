@@ -105,7 +105,7 @@ fn messages(msgs: &[crate::Message]) -> Vec<Value> {
                 .blocks
                 .iter()
                 .filter_map(|b| match b {
-                    Block::Text(t) if !t.is_empty() => Some(json!({"type": "text", "text": t})),
+                    Block::Text(t) | Block::AnnotatedText { text: t, .. } if !t.is_empty() => Some(json!({"type": "text", "text": t})),
                     Block::Image { media_type, data } if m.role == Role::User => {
                         use base64::Engine;
                         let data = base64::engine::general_purpose::STANDARD.encode(data);

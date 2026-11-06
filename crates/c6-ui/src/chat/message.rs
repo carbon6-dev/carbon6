@@ -228,7 +228,7 @@ pub(crate) fn MessageList(place: Place, at: Option<String>) -> impl IntoView {
                 }}
                 {move || jumped.get().is_some().then(|| view! {
                     <div class="sticky bottom-0 flex justify-center p-2">
-                        <button class="rounded-full bg-sky-700 px-3 py-1 text-xs text-white shadow" on:click=move |_| { jumped.set(None); older_done.set(false); }>"Jump to the newest ↓"</button>
+                        <button class="rounded-full bg-sky-700 px-3 py-1 text-xs text-white shadow" on:click=move |_| { jumped.set(None); older_done.set(false); }>"Jump to the newest "{crate::icons::arrow_down()}</button>
                     </div>
                 })}
             </div>
@@ -344,27 +344,27 @@ pub(crate) fn Message(
             view! {
                 <div class="absolute -top-3 right-3 z-20 hidden items-center gap-0.5 rounded-md border border-zinc-200 bg-white px-1 py-0.5 text-xs shadow-sm group-hover:flex dark:border-zinc-700 dark:bg-zinc-900">
                     {QUICK.iter().map(|n| { let react = react.clone(); view! { <button class=btn title=format!(":{n}:") on:click=move |_| react(n.to_string(), false)>{text::face(n)}</button> } }).collect_view()}
-                    <button class=btn title="Add a reaction" data-pop=pop.get_value() on:click=move |_| picker.update(|p| *p = !*p)>"☺+"</button>
-                    {(!in_thread).then(|| view! { <button class=btn title="Reply in a thread" on:click=move |_| open_thread()>"💬"</button> })}
-                    <button class=btn title="Save for later" on:click=move |_| chat.act("memex.chat.save", json!({"id": id1}))>"🔖"</button>
-                    <button class=btn title="Copy link" on:click=move |_| { let _ = window().navigator().clipboard().write_text(&url1); }>"🔗"</button>
+                    <button class=btn title="Add a reaction" data-pop=pop.get_value() on:click=move |_| picker.update(|p| *p = !*p)>{crate::icons::reaction()}</button>
+                    {(!in_thread).then(|| view! { <button class=btn title="Reply in a thread" on:click=move |_| open_thread()>{crate::icons::message()}</button> })}
+                    <button class=btn title="Save for later" on:click=move |_| chat.act("memex.chat.save", json!({"id": id1}))>{crate::icons::bookmark()}</button>
+                    <button class=btn title="Copy link" on:click=move |_| { let _ = window().navigator().clipboard().write_text(&url1); }>{crate::icons::link()}</button>
                     {(!in_thread && ctl.is_some()).then(|| view! {
                         <button class=btn title="Mark unread from here" on:click=move |_| {
                             if let Some(c) = ctl { c.auto_read.set(false); }
                             chat.act("memex.chat.unread", json!({"workspace": p1.workspace, "channel": p1.channel, "ts": ts1}));
-                        }>"◉"</button>
+                        }>{crate::icons::circle()}</button>
                     })}
                     {mine.then(|| view! {
-                        <button class=btn title="Edit" on:click=move |_| chat.editing.set(Some(id2.clone()))>"✎"</button>
+                        <button class=btn title="Edit" on:click=move |_| chat.editing.set(Some(id2.clone()))>{crate::icons::pencil()}</button>
                         <button class=format!("{btn} text-red-600") title="Delete" on:click=move |_| {
                             if window().confirm_with_message("Delete this message? This can't be undone.").unwrap_or(false) {
                                 let mut params = json!({"workspace": p2.workspace, "channel": p2.channel, "ts": ts2});
                                 if let Some(t) = tt.clone() { params["thread_ts"] = json!(t); }
                                 chat.act("memex.chat.delete", params);
                             }
-                        }>"🗑"</button>
+                        }>{crate::icons::trash()}</button>
                     })}
-                    <a class=btn href=url2 target="_blank" rel="noopener" title="Open in Slack">"↗"</a>
+                    <a class=btn href=url2 target="_blank" rel="noopener" title="Open in Slack">{crate::icons::square_arrow_out()}</a>
                 </div>
             }
         }
@@ -426,7 +426,7 @@ pub(crate) fn Message(
                                 }
                             }).collect_view()}
                             <button class="rounded-full border border-zinc-200 px-1.5 text-xs text-muted hover:border-zinc-400 dark:border-zinc-700" title="Add a reaction"
-                                data-pop=pop.get_value() on:click=move |_| picker.update(|p| *p = !*p)>"☺+"</button>
+                                data-pop=pop.get_value() on:click=move |_| picker.update(|p| *p = !*p)>{crate::icons::reaction()}</button>
                         </div>
                     }
                 })}

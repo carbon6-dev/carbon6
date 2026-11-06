@@ -4,14 +4,65 @@
 //! "Sign in with ChatGPT".
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Once};
 
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{Value, json};
+use tracing::info;
 
 use crate::http;
 use crate::sse::SseDecoder;
 use crate::{Block, EventStream, LlmError, ModelClient, ModelEvent, ModelRequest, Role, Usage};
+
+/// ChatGPT's default Codex plan windows, as reported on a model response.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ChatGptLimits {
+    pub primary: Option<ChatGptWindow>,
+    pub secondary: Option<ChatGptWindow>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChatGptWindow {
+    pub used_percent: f64,
+    pub window_minutes: Option<i64>,
+    /// Unix seconds (not milliseconds or seconds from now).
+    pub resets_at: Option<i64>,
+}
+
+/// Called once response headers arrive, before the stream is consumed.
+pub type ChatGptLimitsHook = Arc<dyn Fn(ChatGptLimits) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+
+/// The legacy/default `x-codex` family, as in Codex's
+/// `codex-rs/codex-api/src/rate_limits.rs`. A window needs a finite usage
+/// percentage; malformed optional fields do not discard its usage.
+pub fn parse_chatgpt_limits(headers: &reqwest::header::HeaderMap) -> Option<ChatGptLimits> {
+    let window = |which: &str| {
+        let prefix = format!("x-codex-{which}");
+        let value = |suffix: &str| headers.get(format!("{prefix}-{suffix}")).and_then(|v| v.to_str().ok());
+        let used_percent = value("used-percent")?.parse::<f64>().ok().filter(|v| v.is_finite())?;
+        let window_minutes = value("window-minutes").and_then(|v| v.parse::<i64>().ok()).filter(|m| *m > 0);
+        let resets_at = value("reset-at").and_then(|v| v.parse::<i64>().ok()).filter(|s| *s > 0);
+        // Codex ignores an empty all-zero window too.
+        if used_percent == 0.0 && window_minutes.is_none() && resets_at.is_none() {
+            return None;
+        }
+        Some(ChatGptWindow { used_percent, window_minutes, resets_at })
+    };
+    let limits = ChatGptLimits { primary: window("primary"), secondary: window("secondary") };
+    (limits.primary.is_some() || limits.secondary.is_some()).then_some(limits)
+}
+
+/// Diagnostic names only: never retain or log response header values.
+fn usage_header_names(headers: &reqwest::header::HeaderMap) -> Vec<&str> {
+    let mut names: Vec<_> = headers
+        .keys()
+        .map(|name| name.as_str())
+        .filter(|name| name.starts_with("x-") || ["codex", "rate", "limit", "usage", "quota"].iter().any(|part| name.contains(part)))
+        .collect();
+    names.sort_unstable();
+    names
+}
 
 pub struct OpenAiResponses {
     http: reqwest::Client,
@@ -23,6 +74,7 @@ pub struct OpenAiResponses {
     official: bool,
     /// Attempts at each request (`http::post_json`).
     attempts: u32,
+    limits_hook: Option<ChatGptLimitsHook>,
 }
 
 impl OpenAiResponses {
@@ -33,7 +85,7 @@ impl OpenAiResponses {
         }
         let official = url::Url::parse(base_url).ok().and_then(|u| u.host_str().map(|h| h == "api.openai.com")).unwrap_or(false);
         let base_url = base_url.trim_end_matches('/').to_owned();
-        Ok(Self { http: http::client()?, base_url, headers, plan, official, attempts: http::MAX_ATTEMPTS })
+        Ok(Self { http: http::client()?, base_url, headers, plan, official, attempts: http::MAX_ATTEMPTS, limits_hook: None })
     }
 
     /// Gives up after the first failed attempt.
@@ -109,7 +161,9 @@ fn input_items(msgs: &[crate::Message]) -> Vec<Value> {
                             flush(&mut parts, &mut items);
                             items.push(json!({"type": "function_call_output", "call_id": id, "output": content}))
                         }
-                        Block::Text(t) if !t.is_empty() => parts.push(json!({"type": "input_text", "text": t})),
+                        Block::Text(t) | Block::AnnotatedText { text: t, .. } if !t.is_empty() => {
+                            parts.push(json!({"type": "input_text", "text": t}));
+                        }
                         Block::Image { media_type, data } => {
                             parts.push(json!({"type": "input_image", "image_url": crate::data_url(media_type, data)}))
                         }
@@ -126,7 +180,7 @@ fn input_items(msgs: &[crate::Message]) -> Vec<Value> {
                                 if summary.is_empty() { vec![] } else { vec![json!({"type": "summary_text", "text": summary})] };
                             items.push(json!({"type": "reasoning", "id": id, "encrypted_content": encrypted, "summary": summary}));
                         }
-                        Block::Text(t) if !t.is_empty() => {
+                        Block::Text(t) | Block::AnnotatedText { text: t, .. } if !t.is_empty() => {
                             items.push(json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": t}]}))
                         }
                         Block::ToolUse { id, name, input_json } => {
@@ -134,7 +188,7 @@ fn input_items(msgs: &[crate::Message]) -> Vec<Value> {
                         }
                         Block::Opaque { provider, json, .. } if provider == "openai" => {
                             if let Ok(v) = serde_json::from_str::<Value>(json) {
-                                items.push(v);
+                                items.push(replayable(v));
                             }
                         }
                         // Other providers' reasoning is not replayable here.
@@ -149,10 +203,35 @@ fn input_items(msgs: &[crate::Message]) -> Vec<Value> {
 
 #[async_trait]
 impl ModelClient for OpenAiResponses {
+    fn set_chatgpt_limits_hook(&mut self, hook: ChatGptLimitsHook) {
+        self.limits_hook = Some(hook);
+    }
+
     async fn stream(&self, req: &ModelRequest) -> Result<EventStream, LlmError> {
         let body = self.request_body(req);
         let headers = self.request_headers(req);
         let resp = http::post_json(&self.http, &format!("{}/responses", self.base_url), &headers, &body, self.attempts).await?;
+        if self.plan {
+            match parse_chatgpt_limits(resp.headers()) {
+                Some(limits) => {
+                    if let Some(hook) = &self.limits_hook {
+                        hook(limits).await;
+                    }
+                }
+                None => {
+                    // Clients are rebuilt for head calls; this must be
+                    // process-wide, not once per client or connection.
+                    static MISSING_LIMITS: Once = Once::new();
+                    MISSING_LIMITS.call_once(|| {
+                        info!(
+                            header_names = ?usage_header_names(resp.headers()),
+                            limits_hook_installed = self.limits_hook.is_some(),
+                            "ChatGPT reply has no usable x-codex usage headers"
+                        );
+                    });
+                }
+            }
+        }
         let state = State::new(resp.bytes_stream().boxed());
         Ok(futures::stream::unfold(state, |mut st| async move {
             loop {
@@ -188,13 +267,21 @@ struct State {
     bytes: futures::stream::BoxStream<'static, reqwest::Result<bytes::Bytes>>,
     decoder: SseDecoder,
     pending: VecDeque<Result<ModelEvent, LlmError>>,
+    annotations: HashMap<(u32, usize), Vec<Value>>,
     saw_tool_call: bool,
     finished: bool,
 }
 
 impl State {
     fn new(bytes: futures::stream::BoxStream<'static, reqwest::Result<bytes::Bytes>>) -> Self {
-        Self { bytes, decoder: SseDecoder::default(), pending: VecDeque::new(), saw_tool_call: false, finished: false }
+        Self {
+            bytes,
+            decoder: SseDecoder::default(),
+            pending: VecDeque::new(),
+            annotations: HashMap::new(),
+            saw_tool_call: false,
+            finished: false,
+        }
     }
 
     fn handle(&mut self, data: &str) {
@@ -216,10 +303,27 @@ impl State {
                     self.pending.push_back(Ok(ModelEvent::ThinkingDelta(d.to_owned())));
                 }
             }
+            "response.output_text.annotation.added" => {
+                if let Some(annotation) = v.get("annotation").filter(|a| a.is_object()) {
+                    let index = v["output_index"].as_u64().unwrap_or(0) as u32;
+                    let part = v["content_index"].as_u64().unwrap_or(0) as usize;
+                    self.annotations.entry((index, part)).or_default().push(annotation.clone());
+                }
+            }
             // Finished items define the message; deltas above are display only.
             "response.output_item.done" => {
                 let index = v["output_index"].as_u64().unwrap_or(0) as u32;
-                if let Some(block) = item_block(&v["item"]) {
+                let mut item = v["item"].clone();
+                if let Some(parts) = item["content"].as_array_mut() {
+                    for (part, content) in parts.iter_mut().enumerate() {
+                        if let Some(annotations) = self.annotations.remove(&(index, part))
+                            && content["annotations"].as_array().is_none_or(Vec::is_empty)
+                        {
+                            content["annotations"] = json!(annotations);
+                        }
+                    }
+                }
+                if let Some(block) = item_block(&item) {
                     self.saw_tool_call |= matches!(block, Block::ToolUse { .. });
                     self.pending.push_back(Ok(ModelEvent::Block { index, block }));
                 }
@@ -268,19 +372,44 @@ fn classify(msg: &str) -> LlmError {
     if http::is_context_overflow(msg) { LlmError::ContextOverflow(msg.to_owned()) } else { LlmError::Protocol(msg.to_owned()) }
 }
 
+/// A kept built-in item as the API takes it back. Replies can carry `content`
+/// on items whose input form refuses it (HTTP 400 "Unknown parameter"), which
+/// would fail every later turn of the session.
+fn replayable(mut item: Value) -> Value {
+    if let Some(fields) = item.as_object_mut() {
+        fields.remove("content");
+    }
+    item
+}
+
 fn item_block(item: &Value) -> Option<Block> {
     match item["type"].as_str()? {
         "message" => {
-            let text: String = item["content"]
-                .as_array()?
-                .iter()
-                .filter_map(|c| match c["type"].as_str() {
-                    Some("output_text") => c["text"].as_str(),
-                    Some("refusal") => c["refusal"].as_str(),
+            let mut text = String::new();
+            let mut annotations = Vec::new();
+            for part in item["content"].as_array()? {
+                let t = match part["type"].as_str() {
+                    Some("output_text") => part["text"].as_str(),
+                    Some("refusal") => part["refusal"].as_str(),
                     _ => None,
-                })
-                .collect();
-            Some(Block::Text(text))
+                };
+                let Some(t) = t else { continue };
+                let offset = text.chars().count() as u64;
+                for mut annotation in part["annotations"].as_array().into_iter().flatten().cloned() {
+                    for key in ["start_index", "end_index"] {
+                        if let Some(n) = annotation[key].as_u64() {
+                            annotation[key] = json!(n + offset);
+                        }
+                    }
+                    annotations.push(annotation);
+                }
+                text.push_str(t);
+            }
+            Some(if annotations.is_empty() {
+                Block::Text(text)
+            } else {
+                Block::AnnotatedText { text, annotations_json: serde_json::to_string(&annotations).unwrap() }
+            })
         }
         "function_call" => Some(Block::ToolUse {
             id: item["call_id"].as_str()?.to_owned(),
@@ -311,6 +440,173 @@ fn item_block(item: &Value) -> Option<Block> {
 mod tests {
     use super::*;
     use crate::{Accumulator, Message, ToolSpec};
+
+    #[test]
+    fn streamed_citations_survive_finished_items_without_changing_model_replay() {
+        let text = "A fact. \u{e200}cite\u{e202}turn347046search1\u{e201}";
+        let annotation = json!({"type": "url_citation", "url": "https://source.test/fact", "title": "The source", "start_index": 8, "end_index": text.chars().count()});
+        let mut st = State::new(futures::stream::empty().boxed());
+        for event in [
+            json!({"type": "response.output_text.delta", "delta": text}),
+            json!({"type": "response.output_text.annotation.added", "annotation": annotation}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {"type": "message", "content": [{"type": "output_text", "text": text, "annotations": [annotation]}]}}),
+        ] {
+            st.handle(&event.to_string());
+        }
+        let mut acc = Accumulator::default();
+        for event in st.pending {
+            acc.push(&event.unwrap());
+        }
+        // Finished annotations are authoritative, including after interruption.
+        let message = acc.finish(false);
+        let [Block::AnnotatedText { text: kept, annotations_json }] = message.blocks.as_slice() else { panic!("missing annotations") };
+        assert_eq!(kept, text);
+        assert_eq!(serde_json::from_str::<Value>(annotations_json).unwrap(), json!([annotation]));
+        assert_eq!(input_items(&[message]), input_items(&[Message { role: Role::Assistant, blocks: vec![Block::Text(text.into())] }]));
+    }
+
+    #[test]
+    fn annotation_events_are_kept_when_the_finished_item_omits_them() {
+        let annotation = json!({"type": "url_citation", "url": "https://source.test", "title": "Source", "start_index": 0, "end_index": 4});
+        let mut st = State::new(futures::stream::empty().boxed());
+        st.handle(
+            &json!({"type": "response.output_text.annotation.added", "output_index": 3, "content_index": 1, "annotation": annotation})
+                .to_string(),
+        );
+        st.handle(
+            &json!({"type": "response.output_item.done", "output_index": 3, "item": {"type": "message", "content": [
+                {"type": "output_text", "text": "Été. "},
+                {"type": "output_text", "text": "Fact."}
+            ]}})
+            .to_string(),
+        );
+        let mut acc = Accumulator::default();
+        for event in st.pending {
+            acc.push(&event.unwrap());
+        }
+        let message = acc.finish(true);
+        let [Block::AnnotatedText { text, annotations_json }] = message.blocks.as_slice() else { panic!("missing streamed annotation") };
+        assert_eq!(text, "Été. Fact.");
+        let annotations: Value = serde_json::from_str(annotations_json).unwrap();
+        assert_eq!(annotations[0]["url"], annotation["url"]);
+        assert_eq!(annotations[0]["start_index"], 5);
+        assert_eq!(annotations[0]["end_index"], 9);
+    }
+
+    #[test]
+    fn kept_built_in_items_replay_without_content_the_api_refuses() {
+        let msgs = [crate::Message {
+            role: Role::Assistant,
+            blocks: vec![Block::Opaque {
+                provider: "openai".into(),
+                json: json!({"type": "web_search_call", "id": "ws_1", "status": "completed", "action": {"type": "search", "query": "q"}, "content": [{"type": "output_text", "text": "x"}]}).to_string(),
+                label: "web_search: q".into(),
+            }],
+        }];
+        let items = input_items(&msgs);
+        assert_eq!(
+            items,
+            [json!({"type": "web_search_call", "id": "ws_1", "status": "completed", "action": {"type": "search", "query": "q"}})]
+        );
+    }
+
+    #[test]
+    fn annotations_follow_concatenated_text_offsets_and_plain_messages_stay_plain() {
+        let block = item_block(&json!({"type": "message", "content": [
+            {"type": "output_text", "text": "Été. "},
+            {"type": "output_text", "text": "Fact.", "annotations": [{"type": "url_citation", "url": "https://source.test", "title": "Source", "start_index": 0, "end_index": 4}]}
+        ]})).unwrap();
+        let Block::AnnotatedText { text, annotations_json } = block else { panic!("missing annotations") };
+        assert_eq!(text, "Été. Fact.");
+        let annotations: Value = serde_json::from_str(&annotations_json).unwrap();
+        assert_eq!(annotations[0]["start_index"], 5);
+        assert_eq!(annotations[0]["end_index"], 9);
+        assert_eq!(
+            item_block(&json!({"type": "message", "content": [{"type": "output_text", "text": "Plain."}]})),
+            Some(Block::Text("Plain.".into()))
+        );
+    }
+
+    #[test]
+    fn usage_diagnostic_filters_and_sorts_only_header_names() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        for name in [
+            "x-request-id",
+            "codex-status",
+            "ratelimit-remaining",
+            "request-limit",
+            "server-usage",
+            "quota-window",
+            "content-type",
+            "authorization",
+            "set-cookie",
+            "chatgpt-account-id",
+        ] {
+            headers.insert(name, "sensitive-header-value".parse().unwrap());
+        }
+        assert_eq!(
+            usage_header_names(&headers),
+            ["codex-status", "quota-window", "ratelimit-remaining", "request-limit", "server-usage", "x-request-id"]
+        );
+        assert!(usage_header_names(&reqwest::header::HeaderMap::new()).is_empty());
+    }
+
+    #[test]
+    fn chatgpt_limit_headers_and_units() {
+        let headers = reqwest::header::HeaderMap::from_iter([
+            ("x-codex-primary-used-percent".parse().unwrap(), "34.5".parse().unwrap()),
+            ("x-codex-primary-window-minutes".parse().unwrap(), "300".parse().unwrap()),
+            ("x-codex-primary-reset-at".parse().unwrap(), "1793750400".parse().unwrap()),
+            ("x-codex-secondary-used-percent".parse().unwrap(), "0".parse().unwrap()),
+            ("x-codex-secondary-window-minutes".parse().unwrap(), "10080".parse().unwrap()),
+            ("x-codex-secondary-reset-at".parse().unwrap(), "1794355200".parse().unwrap()),
+        ]);
+        assert_eq!(
+            parse_chatgpt_limits(&headers),
+            Some(ChatGptLimits {
+                primary: Some(ChatGptWindow { used_percent: 34.5, window_minutes: Some(300), resets_at: Some(1_793_750_400) }),
+                secondary: Some(ChatGptWindow { used_percent: 0.0, window_minutes: Some(10080), resets_at: Some(1_794_355_200) }),
+            })
+        );
+    }
+
+    #[test]
+    fn chatgpt_missing_and_malformed_limit_headers() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let mut headers = HeaderMap::new();
+        assert_eq!(parse_chatgpt_limits(&headers), None);
+        // Length and reset alone must not invent zero usage.
+        headers.insert("x-codex-primary-window-minutes", HeaderValue::from_static("300"));
+        headers.insert("x-codex-primary-reset-at", HeaderValue::from_static("1793750400"));
+        assert_eq!(parse_chatgpt_limits(&headers), None);
+        for bad in ["bad", "NaN", "inf", "-inf", ""] {
+            headers.insert("x-codex-primary-used-percent", HeaderValue::from_str(bad).unwrap());
+            assert_eq!(parse_chatgpt_limits(&headers), None, "{bad}");
+        }
+        headers.insert("x-codex-primary-used-percent", HeaderValue::from_bytes(b"\xff").unwrap());
+        assert_eq!(parse_chatgpt_limits(&headers), None);
+        headers.insert("x-codex-primary-used-percent", HeaderValue::from_static("101.5"));
+        for bad in ["bad", "-1", "0", "1.5", "999999999999999999999999"] {
+            headers.insert("x-codex-primary-window-minutes", HeaderValue::from_str(bad).unwrap());
+            headers.insert("x-codex-primary-reset-at", HeaderValue::from_str(bad).unwrap());
+            assert_eq!(
+                parse_chatgpt_limits(&headers),
+                Some(ChatGptLimits {
+                    primary: Some(ChatGptWindow { used_percent: 101.5, window_minutes: None, resets_at: None }),
+                    secondary: None,
+                }),
+                "{bad}"
+            );
+        }
+        headers.clear();
+        headers.insert("x-codex-primary-used-percent", HeaderValue::from_static("bad"));
+        headers.insert("x-codex-secondary-used-percent", HeaderValue::from_static("12"));
+        let limits = parse_chatgpt_limits(&headers).unwrap();
+        assert!(limits.primary.is_none());
+        assert_eq!(limits.secondary.unwrap().used_percent, 12.0, "a malformed primary doesn't discard the secondary");
+        headers.insert("x-codex-secondary-used-percent", HeaderValue::from_static("0"));
+        assert_eq!(parse_chatgpt_limits(&headers), None, "Codex ignores an all-zero window");
+    }
 
     #[test]
     fn incomplete_output_limit_is_normalized() {

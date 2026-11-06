@@ -321,7 +321,7 @@ fn watch_clicks() {
 }
 
 /// The title row: its mark (or glyph), the title, and how it stands.
-fn title_row(mark: Option<String>, glyph: &'static str, title: String, state: Option<(String, &'static str)>) -> impl IntoView {
+fn title_row(mark: Option<String>, glyph: AnyView, title: String, state: Option<(String, &'static str)>) -> impl IntoView {
     view! {
         <div class="flex items-start gap-2">
             {match mark {
@@ -351,7 +351,7 @@ fn SessionPeek(id: String) -> impl IntoView {
             let title = if s.title.trim().is_empty() { "Untitled session".to_owned() } else { s.title.clone() };
             let worker = live.session_worker(&s);
             view! {
-                {title_row(Some(crate::marks::of(&s)), "", title, Some((word.to_owned(), cls)))}
+                {title_row(Some(crate::marks::of(&s)), ().into_any(), title, Some((word.to_owned(), cls)))}
                 <div class="truncate text-xs text-muted">
                     <span title=s.on_head.then_some(api::HEAD_TITLE)>{worker}</span>
                     {format!(" · active {}", ago(now_ms() - s.updated_at))}
@@ -360,7 +360,7 @@ fn SessionPeek(id: String) -> impl IntoView {
             .into_any()
         }
         None => view! {
-            {title_row(None, "○", short.clone(), None)}
+            {title_row(None, crate::icons::circle().into_any(), short.clone(), None)}
             <div class="text-xs text-muted">"Not among this realm's sessions"</div>
         }
         .into_any(),
@@ -400,7 +400,7 @@ fn DocPeek(id: String) -> impl IntoView {
             Some(Err(e)) => (title.clone(), e),
         };
         view! {
-            {title_row(None, "▤", title, None)}
+            {title_row(None, crate::icons::file().into_any(), title, None)}
             <div class="truncate text-xs text-muted">{line}</div>
         }
     }
@@ -424,7 +424,7 @@ fn ItemPeek(kind: Kind, id: String) -> impl IntoView {
             None => (title.clone(), None, 0),
         };
         view! {
-            {title_row(Some(mark.clone()), "", title, state)}
+            {title_row(Some(mark.clone()), ().into_any(), title, state)}
             <div class="text-xs text-muted">{format!("{}{}", kind.word(), if at > 0 { format!(" · moved {}", ago(now_ms() - at)) } else { String::new() })}</div>
         }
     }

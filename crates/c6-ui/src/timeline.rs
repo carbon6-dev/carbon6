@@ -373,7 +373,7 @@ pub fn TurnRow(session: String, span: Span, timeline: Timeline) -> impl IntoView
         <div id=format!("{session}-t{start}") class="c6-fold">
             <button class=ROW aria-expanded=move || open().to_string() title=crate::when::full(span.at)
                 on:click=move |_| tl.toggle(start, end)>
-                <span class="w-3 shrink-0 text-xs text-muted">{move || if open() { "▾" } else { "▸" }}</span>
+                <span class="w-3 shrink-0 text-xs text-muted">{move || if open() { crate::icons::chevron_down().into_any() } else { crate::icons::chevron_right().into_any() }}</span>
                 <span class="min-w-0 flex-1">
                     <span class="block truncate font-medium">{by}</span>
                     {move || Some(said()).filter(|s| !s.is_empty()).map(|s| view! { <span class="block truncate text-xs text-soft">{s}</span> })}
@@ -486,7 +486,7 @@ pub fn Outline(timeline: Timeline, #[prop(into)] on_go: Callback<TimelineTurn>) 
                         <div>
                             <button class=format!("{LINE} font-medium") aria-expanded=move || is_open().to_string()
                                 on:click=move |_| open.update(|o| if !o.remove(&start) { o.insert(start); })>
-                                <span class="w-3 shrink-0 text-muted">{move || if is_open() { "▾" } else { "▸" }}</span>
+                                <span class="w-3 shrink-0 text-muted">{move || if is_open() { crate::icons::chevron_down().into_any() } else { crate::icons::chevron_right().into_any() }}</span>
                                 <span class="tabular-nums">{label}</span>
                                 {h.running.then(|| view! { <span class="size-1.5 shrink-0 self-center animate-pulse rounded-full bg-blue-500"></span> })}
                             </button>
@@ -607,7 +607,7 @@ mod tests {
         let mut blocks: Vec<ContentBlock> =
             (0..calls).map(|i| ContentBlock::ToolUse { id: format!("c{seq}{i}"), name: "Bash".into(), input_json: "{}".into() }).collect();
         if calls == 0 {
-            blocks.push(ContentBlock::Text { text: "Done.".into() });
+            blocks.push(ContentBlock::Text { text: "Done.".into(), citations: vec![] });
         }
         ev(seq, EventKind::Assistant { turn, blocks, stop_reason: String::new() })
     }
@@ -666,6 +666,18 @@ mod tests {
         // next one's message is in none.
         let got: Vec<(u64, u64)> = spans(&evs[3..]).into_iter().map(|(s, _)| (s.turn, s.start)).collect();
         assert_eq!(got, [(2, 8), (3, 12), (4, 14)]);
+    }
+
+    #[test]
+    fn card_answers_are_inputs_to_the_next_turn() {
+        let mut card = user(1, "Not now: task card #185 \"Cleanup\".");
+        if let EventKind::User { command, .. } = &mut card.kind {
+            *command = "card-answer".into();
+        }
+        let evs = [card, started(2, 1), ended(3, 1)];
+        assert!(spans(&evs[..1]).is_empty(), "the turn has not started yet");
+        assert_eq!(spans(&evs)[0].0.start, 1, "the card answer starts the turn like any user input");
+        assert_eq!(keys(&fold(&evs, false, |_| Some(false))), [(1, true)], "folding includes the real user input in its turn");
     }
 
     #[test]

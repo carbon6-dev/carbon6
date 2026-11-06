@@ -84,24 +84,56 @@ pub struct Here<'a> {
 pub const DOC_COLOUR: &str = "#0ea5e9";
 
 pub fn to_html(src: &str) -> String {
+    with_citations(src, &[])
+}
+
+/// Plain text with carbon6 references as the usual mentions, not Markdown.
+/// Card-button messages can name a new session without interpreting the
+/// task's title as formatting or HTML.
+pub fn text_with_mentions(src: &str) -> String {
+    let here = Here { origin: String::new(), realm: crate::place::realm(), base: crate::place::base(), known: &crate::mentions::known };
+    let mut out = String::new();
+    html::push_html(&mut out, bare_mentions(src, &here).into_iter());
+    out
+}
+
+pub fn with_citations(src: &str, citations: &[c6_api::citations::UrlCitation]) -> String {
     // Titles and marks as the message renders, untracked: a message isn't
     // drawn again for every change to a session (its hover card shows
     // those). Outside the app (no live feed) nothing is known.
     let live = leptos::prelude::use_context::<crate::api::LiveFeed>();
     let origin = live.and_then(|_| leptos::prelude::window().location().origin().ok()).unwrap_or_default();
     let here = Here { origin, realm: crate::place::realm(), base: crate::place::base(), known: &crate::mentions::known };
-    render(src, &here)
+    if citations.is_empty() { render(src, &here) } else { render_citations(src, citations, &here) }
 }
 
 /// Markdown as HTML, with its links to carbon6 things (`session:<id>`,
 /// `/docs/<id>`, a bare `work:<uuid>`…) as mentions. None in code or in
 /// another link.
 pub fn render(src: &str, here: &Here) -> String {
+    render_citations(src, &[], here)
+}
+
+fn render_citations(src: &str, citations: &[c6_api::citations::UrlCitation], here: &Here) -> String {
+    let src = c6_api::citations::markdown(src, citations);
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     // Raw HTML first, as text: the mentions are the only HTML let through.
-    let events = Parser::new_ext(src, opts).map(|ev| match ev {
+    let events = Parser::new_ext(&src, opts).map(|ev| match ev {
         Event::Html(h) | Event::InlineHtml(h) => Event::Text(h),
         other => other,
+    });
+    // String markup only: Leptos views cannot be rendered to strings in wasm.
+    // Reference links we just generated get a small superscript, not raw HTML
+    // from the model. All URLs still pass through the normal sanitizer.
+    let mut links = Vec::new();
+    let events = events.flat_map(|ev| match &ev {
+        Event::Start(Tag::Link { id, .. }) => {
+            let citation = !citations.is_empty() && c6_api::citations::reference(id);
+            links.push(citation);
+            if citation { vec![Event::InlineHtml("<sup>".into()), ev] } else { vec![ev] }
+        }
+        Event::End(TagEnd::Link) if links.pop().unwrap_or(false) => vec![ev, Event::InlineHtml("</sup>".into())],
+        _ => vec![ev],
     });
     let mut out: Vec<Event> = Vec::new();
     // Inside a code block, an image or a web link: no mentions there.
@@ -265,14 +297,14 @@ fn given_text(inner: &[Event], bare: &[&str]) -> Option<String> {
     Some(out)
 }
 
-/// A mention: the thing's mark (a document's ▤), then the text given or
+/// A mention: the thing's mark (a document's drawn file icon), then the text given or
 /// its title, on a tint of its colour. `data-ref` says what it is, for the
 /// click that opens it and the card hovering shows (`mentions.rs`).
 fn mention(kind: Kind, id: &str, rest: &str, given: Option<String>, here: &Here) -> String {
     let known = (here.known)(kind, id);
     let label = given.unwrap_or_else(|| esc(&known.title.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| kind.short(id))));
     let (colour, glyph) = match kind {
-        Kind::Doc => (DOC_COLOUR, "<span class=\"c6-mention-doc\">▤</span>".to_owned()),
+        Kind::Doc => (DOC_COLOUR, format!("<span class=\"c6-mention-doc\">{}</span>", crate::icons::html::file())),
         _ => {
             let mark = known.mark.unwrap_or_else(|| c6_api::marks::hashed(id).to_owned());
             let shape = crate::marks::Shape::of(kind.name()).css(7);
@@ -323,6 +355,66 @@ mod tests {
         Known::default()
     }
 
+    #[test]
+    fn single_and_grouped_citations_render_as_numbered_superscript_links() {
+        for marker in
+            ["\u{e200}cite\u{e202}turn347046search1\u{e201}", "\u{e200}cite\u{e202}turn919800search4\u{e202}turn919800search5\u{e201}"]
+        {
+            let text = format!("Fact{marker}.");
+            let mut citations = vec![c6_api::citations::UrlCitation {
+                url: "https://source.test/one".into(),
+                title: "One & <two>".into(),
+                start_index: 4,
+                end_index: text.chars().count() - 1,
+            }];
+            if marker.contains("search5") {
+                citations.push(c6_api::citations::UrlCitation {
+                    url: "https://source.test/two".into(),
+                    title: "Second".into(),
+                    ..citations[0].clone()
+                });
+            }
+            let html = render_citations(&text, &citations, &here(&nothing));
+            assert!(html.contains("<sup><a href=\"https://source.test/one\" title=\"One &amp; &lt;two&gt;\">[1]</a></sup>"), "{html}");
+            assert_eq!(html.matches("<sup>").count(), citations.len(), "{html}");
+            assert!(html.ends_with("</sup>.</p>\n"), "{html}");
+            assert!(!html.contains(['\u{e200}', '\u{e201}', '\u{e202}']));
+        }
+    }
+
+    #[test]
+    fn unresolved_citations_disappear_without_spaces_before_punctuation() {
+        let marker = "\u{e200}cite\u{e202}turn347046search1\u{e201}";
+        assert_eq!(render(&format!("Fact {marker}."), &here(&nothing)), "<p>Fact.</p>\n");
+        assert_eq!(render(&format!("Fact. {marker}"), &here(&nothing)), "<p>Fact.</p>\n");
+        assert_eq!(render(&format!("`{marker}`"), &here(&nothing)), format!("<p><code>{marker}</code></p>\n"));
+        assert_eq!(render("An **ordinary** sentence.", &here(&nothing)), "<p>An <strong>ordinary</strong> sentence.</p>\n");
+    }
+
+    #[test]
+    fn citation_titles_cannot_inject_html_and_only_web_urls_become_links() {
+        let marker = "\u{e200}cite\u{e202}turn1search1\u{e201}";
+        let mut citation = c6_api::citations::UrlCitation {
+            url: "https://source.test/?q=\"<tag>".into(),
+            title: "\" onmouseover=\"alert(1)".into(),
+            start_index: 0,
+            end_index: marker.chars().count(),
+        };
+        let html = render_citations(marker, &[citation.clone()], &here(&nothing));
+        assert!(html.contains("title=\"&quot; onmouseover=&quot;alert(1)\""), "{html}");
+        assert!(!html.contains("<tag>"), "{html}");
+        citation.url = "javascript:alert(1)".into();
+        assert_eq!(render_citations(marker, &[citation], &here(&nothing)), "");
+    }
+
+    #[test]
+    fn document_mentions_keep_a_drawn_file_before_the_given_label() {
+        let html = render(&format!("[the plan](doc:{ID})"), &here(&nothing));
+        assert!(html.find("<svg").expect("keep the document icon") < html.find("the plan").unwrap(), "{html}");
+        assert!(!html.contains(">Doc "), "don't replace the icon with a word: {html}");
+        crate::icons::tests::assert_no_icon_glyphs(&html);
+    }
+
     fn here(known: &dyn Fn(Kind, &str) -> Known) -> Here<'_> {
         Here { origin: "https://head.example".into(), realm: Some("home".into()), base: "/r/home".into(), known }
     }
@@ -371,7 +463,7 @@ mod tests {
                 format!("https://head.example/{segment}/{ID}"),
             ] {
                 let out = render(&format!("See [the plan]({href}) now."), &h);
-                let text = if kind == "doc" { "▤the plan" } else { "the plan" };
+                let text = "the plan";
                 assert_eq!(
                     mentions(&out),
                     vec![(format!("{kind}:{ID}"), format!("/r/home/{segment}/{ID}"), text.to_owned())],
@@ -417,7 +509,7 @@ mod tests {
         assert!(out.contains(&format!("--m:{}", crate::marks::colour_hex("rose"))), "its mark's colour: {out}");
         // Nothing known: its kind and the id's start.
         let out = render(&format!("work:{ID} [`doc:{ID}`](doc:{ID})"), &here(&nothing));
-        assert_eq!(mentions(&out).iter().map(|m| m.2.as_str()).collect::<Vec<_>>(), ["work 01a18f50", "▤document 01a18f50"], "{out}");
+        assert_eq!(mentions(&out).iter().map(|m| m.2.as_str()).collect::<Vec<_>>(), ["work 01a18f50", "document 01a18f50"], "{out}");
     }
 
     #[test]

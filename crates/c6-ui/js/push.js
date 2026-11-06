@@ -8,9 +8,15 @@
     // iPad, only for the app added to the Home Screen), "denied",
     // "default" (not asked yet) or "granted".
     state() {
-      if (!window.isSecureContext || !("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window))
+      try {
+        if (!window.isSecureContext || !navigator.serviceWorker || typeof window.PushManager !== "function" ||
+            typeof window.Notification !== "function" || typeof window.Notification.requestPermission !== "function")
+          return "unsupported";
+        const permission = window.Notification.permission;
+        return ["default", "denied", "granted"].includes(permission) ? permission : "unsupported";
+      } catch (_) {
         return "unsupported";
-      return Notification.permission;
+      }
     },
     // This device's subscription as JSON, or "" if it has none.
     async current() {
@@ -22,15 +28,17 @@
     // Asks for permission and subscribes with the head's key; the
     // subscription as JSON.
     async enable(key) {
+      if (this.state() === "unsupported") throw new Error("notifications are not available in this browser");
       const reg = await navigator.serviceWorker.register("/sw.js", { scope: "/" });
       await navigator.serviceWorker.ready;
-      if ((await Notification.requestPermission()) !== "granted") throw new Error("notifications are not allowed for this site");
+      if ((await window.Notification.requestPermission()) !== "granted") throw new Error("notifications are not allowed for this site");
       let sub = await reg.pushManager.getSubscription();
       if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: dec(key) });
       return JSON.stringify(sub.toJSON());
     },
     // Unsubscribes this device; its endpoint ("" if none).
     async disable() {
+      if (this.state() === "unsupported") return "";
       const reg = await navigator.serviceWorker.getRegistration("/");
       const sub = reg && (await reg.pushManager.getSubscription());
       if (!sub) return "";

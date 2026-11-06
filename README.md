@@ -73,7 +73,7 @@ make docker-token      # an enrollment token from that head
 
 **Homebrew (macOS).** `make brew` builds bottles and formulas of `c6h`, `c6w` and `c6` for this Mac's architecture into `dist/brew/` (with the local toolchain) and adds them to a local tap, `carbon6/local`. `make brew-install` installs or upgrades them from it and restarts their running services. Bottles need neither Xcode nor the Command Line Tools to install, and work on macOS 11 and later. The services run as you, under launchd:
 
-- **`c6h`:** `brew services start c6h`. Its config is `$(brew --prefix)/etc/c6h/c6h.toml` (kept across upgrades), its data `$(brew --prefix)/var/c6h`. Sign in with `c6h --config $(brew --prefix)/etc/c6h/c6h.toml login-link`.
+- **`c6h`:** `brew services start c6h`. Its config is `$(brew --prefix)/etc/c6h/c6h.toml` (kept across upgrades), its data `$(brew --prefix)/var/c6h`. Sign in with `c6h login-link`: a Homebrew binary finds this config automatically, including for other admin commands. An explicit `--config <path>` overrides it.
 - **`c6w`:** `c6w enroll <token>`, then `brew services start c6w`. It starts through a login shell, so sessions get your `PATH`.
 - Logs are in `$(brew --prefix)/var/log/c6h.log` (and `c6w.log`). The worker keeps the standard state folder (`~/Library/Application Support/c6w`), the same one `make dev-worker` uses.
 - `make brew-test` installs the bottles from a scratch tap and runs them, as CI does, then removes them.
@@ -82,13 +82,15 @@ make docker-token      # an enrollment token from that head
 
 **Website.** [carbon6.dev](https://carbon6.dev) is a static site generated with Leptos from `site/`, with the docs, this README's guide and the changelog rendered from the repository. `make site-serve` builds it and serves it locally; the Site workflow publishes it to GitHub Pages. See [docs/site.md](docs/site.md).
 
-**With a local toolchain.** You need Rust with the `wasm32-unknown-unknown` target, plus [Trunk](https://trunkrs.dev), which downloads Tailwind and wasm-bindgen on first use. protoc is vendored.
+**With a local toolchain.** You need Rust with the `wasm32-unknown-unknown` target, plus [Trunk](https://trunkrs.dev), which downloads Tailwind and wasm-bindgen on first use. The version is pinned in `rust-toolchain.toml`: with rustup, `cargo` and `make` in the repo install and use it on their own. protoc is vendored.
 
 ```bash
 make build             # web UI, then release c6h and c6w into target/release
 make test              # every test at once with cargo nextest (brew install cargo-nextest), else cargo test
 make check             # the code must be formatted (cargo fmt), and every target, and the web UI for wasm, must build and pass clippy without warnings (CI runs it too)
 ```
+
+`cargo build -p c6-head` also works before the web UI is built (UI requests then say to run `make ui`). Incremental head builds watch `crates/c6-ui/dist` when it exists, or its existing parent until it is created: an unchanged build is a no-op in either case, and building the UI later picks it up automatically.
 
 ## Run
 
@@ -99,6 +101,7 @@ c6h               # binds private/tailnet addresses only; prints the web UI URL
 ```
 
 1. Sign in: run `c6h login-link` on the head and open the link it prints (it works once, for 15 minutes). Then add a passkey under **Settings → Sign-in**, and sign in with Touch ID, Face ID or a security key from then on. A new link always gets you back in.
+   - If the head uses a non-default config, use the command printed at startup (for example, `c6h --config /etc/c6h/c6h.toml login-link`) so the link comes from the running head's database. Invalid-link errors name that same config. Run it as the service user, as above for .deb installs.
    - To sign in another device (a phone), create a one-time code under **Settings → Sign-in → Sign in another device** and type it into that device's sign-in page. Codes work once, for 10 minutes; five wrong codes cancel all outstanding ones.
 2. In the UI, add an LLM connection under **Settings**. For a local Ollama, use `http://127.0.0.1:11434/v1` with no key. carbon6 finds a local server's context window automatically (vLLM, llama.cpp, Ollama's loaded model); you can set it with the connection's [**Context window**](docs/connections.md).
 3. On the **Workers** page, click **Add worker**, then run the printed command on the worker machine (or create a token with `c6h enroll-token` on the head):
@@ -168,6 +171,7 @@ Collections are typed tables of records in a realm, for anything apps and agents
   Answer with an option, a form or a note, or start a session that helps you settle one. Answering one answers what waits on it, and answering in the session settles the decision. With options, a notification carries a link that answers it from your phone. With a deadline, an unanswered decision takes its default answer.
 - **Task cards:** while working, an agent proposes things worth doing that don't belong in the current change (dead code, a stale doc, a missing test, a bug noticed in passing) as cards: a title, why, and the prompt a new session would get. **Start it** runs that session where the first one worked (in a fresh worktree if it used one), and **Not now** dismisses it. Cards show in their session and in Decisions under "Suggested tasks", without notifications. When to propose is an editable prompt (`session.task_cards`). Design: [docs/task-cards.md](docs/task-cards.md).
 - **In the session, too:** a session shows its own open decisions under its transcript, as **Waiting for you**, to answer right there. These are the questions its agent asked without stopping, the grants it asked for, and what it was started to work on. Its tool approvals and questions show in the transcript itself, as before.
+- **Waiting on you:** the session header's list includes its open decisions and task cards, its tool approvals and questions, and approvals/questions in its subagents at any depth. Each opens the answerable card. Subagent approvals/questions also stay visible just above the message box in the same amber style as held notices; **Show** opens the card in its thread, or its own session if the thread isn't drawn. Subagent approvals count in **What needs you** and use the same approval notifications and signed Allow/Deny links as a top-level session. Offered task cards still don't count in What needs you or send notifications.
 - **The design:** see [docs/os.md](docs/os.md) §4.2 and [docs/follow-through.md](docs/follow-through.md) §6.
 
 ### Configuration
@@ -188,6 +192,7 @@ Collections are typed tables of records in a realm, for anything apps and agents
   - MCP servers, slash commands, agents, skills and hooks are configured in the UI (Settings) and stored on the head. Settings is grouped (General, Models, Agents and tools, Automation, Memory and memex, System), with one page per setting.
 - **Worker:** its identity lives in `~/.local/state/c6w` (Linux) or `~/Library/Application Support/c6w` (macOS).
   - For Claude Code sessions, install `claude` on the worker and sign in there; set `C6_CLAUDE_BIN` if it is not on the worker's PATH.
+  - Optional ChatGPT plan limits: on the **Workers** page, under **ChatGPT plan limits**, check the worker to read limits from its installed, signed-in `codex`. Off by default; discovers Codex through the service user's login shell (`$SHELL -lic 'command -v codex'`, or `/bin/sh -lc` if unset), with a timeout and cached result. The UI shows the selected path and that it came from the user's shell. Optional **Codex command** is an absolute-path override, without arguments or `~` expansion. The executable's own folder is prepended to `PATH` for that command only, so a sibling `node` is found; the worker environment, `HOME` and `CODEX_HOME` are unchanged. It never reads Codex credentials or starts a model turn. Exact account ids take priority; otherwise exactly one case-insensitive email match updates a connection. Ambiguous/unmatched snapshots get their own row in the LLM connections list, with the reason. **One Codex install reports one account; other ChatGPT accounts get no numbers this way.** All plan-window text and bars show what's **left** (the API still reports `used_percent`). See [Plan limits](docs/analytics.md#4-plan-limits) for settings and protocol details.
 
 ### Updates
 
@@ -381,6 +386,7 @@ Channels (**Settings → Notifications**) tell you about your sessions while you
 - **Approvals from your phone:** an approval notification links to a page showing the held call with **Allow** / **Deny**. The link is signed, works without signing in, and expires after an hour; answering takes a button press, so chat link previews can't answer for you. Links use the address under the channel list (taken from your browser the first time you save a channel).
 - **The agent's `notify` tool:** agents can send you a notice (a title, a few lines, a priority), for example from an automation that finds a problem.
 - **Testing:** **Send a test** sends a message on a channel and shows any error.
+- **Browser support:** browser notifications are optional. If their APIs are unavailable (as in some mobile browser tabs), the local notification toggle is disabled and sessions still open normally; push settings show that notifications are unavailable there.
 
 **Web push (no third party):** on each device, **Settings → Notifications → Turn on here**, then add a channel of kind `push`. The head encrypts each message for each device and sends it to the browser's own push service, signed with its own key. Tapping a notification opens the session, or for an approval its Allow / Deny page.
 
@@ -549,6 +555,8 @@ The agent can start work in the background and carry on: long builds, test suite
 - **Limit.** Notices start at most 20 turns per hour in an idle session. Beyond that they're held until your next message, and the session says so.
 - **Worker restarts.** Tasks die with the worker; the agent is told they were lost, and a command left running by the old worker process is stopped.
 
+Agents can also message other sessions in their realm with `message_session`. Each send adds one to the last session message's hop count. The default `max_message_hops` is **4**: chains of up to four messages are allowed; a fifth is refused. Your next direct message resets that session's count to **0**. Settings → Agents → Limits also caps sends per session per hour (default **30**); that allowance survives head restarts. See [Session messages](docs/background.md#6-session-messages).
+
 ### Subagents
 
 The agent can hand work to a subagent with the Task tool. A subagent is a session of its own, shown as a thread under the call that started it (docs/subagents.md).
@@ -572,6 +580,17 @@ Hover one of your messages: **↶ Rewind** takes the conversation back to before
 ### Attachments and @-mentions
 
 Paste, drop or pick (📎) images and text files into the message box; they go with the message (images as images, for models that see them; text files inline). Type `@` to mention a file or folder in the session's folder: a fuzzy finder completes the path, and the worker attaches the file (or a folder's listing) when the message arrives, so the model has it without a tool call. Files over 256 KB are mentioned but not inlined. Limits: 10 MB per upload, 20 MB per message. The Claude Code backend gets text only.
+
+**Drafts survive a reload**, including attachments in session and Ask reply boxes
+and the ordinary new-session form. Text stays in this browser's localStorage;
+attachment names, types, data and order stay in IndexedDB, scoped to the same
+realm and draft. Sending or removing the attachments clears their saved copy.
+The browser keeps at most 20 MB of attachment draft payloads (including base64
+and metadata), evicting the oldest modified drafts' attachments first, not their
+text. A quiet note reports attachments that couldn't be kept or restored. Storage
+is local to this browser and origin, not a backup or a cross-device sync; clearing
+site data clears drafts too. Seeded start forms without a saved text draft remain
+temporary.
 
 ### Slash commands
 
@@ -612,6 +631,8 @@ Hooks are shell commands that run on the worker at set points in every session. 
 The UI is a workspace of **tiles**: framed cards, each with its own bar (‹ › back and forward, its name, ⧉, minimize, ⛶ focus, ✕). Up to four sit side by side; more stack in those four columns in turn: the fifth halves the first column (the other three stay full height), the sixth the second, and so on, until the ninth makes the first column three high. In a column of three or more, the tile you last used there takes half the height and the others share the rest (it grows when your click finishes, so what you clicked doesn't move away).
 
 - **Inside a tile:** at most two panes, a list and the item opened from it. Clicking anything inside a tile opens it in that tile's right pane, beside the list, replacing what was there. ‹ and › (⌘[ / ⌘]) step through the tile's own history.
+- **The first click acts:** clicking a control or link in an unfocused tile focuses that tile and performs the action in the same click; it doesn't take a separate click to focus it first.
+- **Drag a tile's bar** onto another tile's top or bottom half to stack it there, or its left or right edge to make a column. Blue highlights mark moves that can happen, including the gaps between tiles. With four columns already open, a tile sharing its column cannot make a fifth: the edge shows no highlight, and dropping there does nothing; drop above or below a tile to stack it. A tile alone in its column can still move that column. Dropping where a tile already sits does nothing and shows no highlight.
 - **A new tile only when you ask:** ⌘/Ctrl-click a link, ⧉ in a tile's bar (moves the open item into a tile of its own), or **+ Tile**. ⌘1–9 focus a tile, numbered in reading order (the columns left to right, each top to bottom); a session open in a tile shows that number on its rows in the dock. A session that is already open is shown where it is instead of opening twice.
 - **Minimize** (the bar's — beside ⛶) hides a tile, still loaded, keeping its column, its place in it, its history and where it was scrolled; the others take its room. The dock's **Minimized** group brings it back, as does opening its session from anywhere or its ⌘ number. The last tile shown can't be minimized.
 - **A session's tile** has the session's mark as a stripe along the top of its bar (the bar keeps the panel's own colours, so it reads whatever the mark), with its state as a dot and a word (idle, running, starting, failed, needs you). Double-click its name in the bar to rename it. Each session gets a colour when it starts (the one its realm's recent sessions use least; side chats and subagents take their parent's); click the dot in the bar (or the palette in the rail's card) to change it. `PUT /api/v1/sessions/{id}/colour`.
@@ -633,8 +654,10 @@ The UI is a workspace of **tiles**: framed cards, each with its own bar (‹ ›
 - **A session's glance:** a line each for where it runs (worker, model, runtime), its worktree or folder, branch and changes, its work and labels, and its context, then its newest outputs; first, while there is any, what waits on you (an approval or a question, going to its card). A line acts where you would: Changes and the folder open their panes, Work and Labels their editors, Context its breakdown (with **Compact now**) and usage. A wide session shows it as a column beside the transcript; otherwise the context ring (or ⌘I; Esc closes it) opens it, as a sheet from the bottom on a phone.
 - **Realms and the console:** each realm is its own app at `/r/<realm>/`: its sessions, inbox, decisions, analytics and its own settings, nothing of any other realm. The menu by the logo switches realm (⌘-click opens one in a new tab) and shows how many things wait on you in each. **Console** (`/admin/`) is carbon6's administration: realms, workers, connections, the defaults realms inherit, spending, sign-in and updates. The head enforces this, not the page. The app opens where you were last. Design: [docs/realms-ux.md](docs/realms-ux.md).
 - **Light or dark:** Settings → Appearance: follow the system, or always light or dark (kept in each browser).
+- **Thinking:** Settings → Appearance → Session transcripts → **Show thinking**, off by default. Off hides reasoning entirely; on shows it expanded under **Thinking**, in sessions and inline threads on desktop and phone. Kept in carbon6 across realms and devices, without changing stored events or model input ([display preference and API](docs/session-header.md#4-defaults)).
 - **Phones:** one tile at a time with a switcher, **+** and **▸ N** at the bottom; the current tab's **×** closes its tile, and a long press lifts a tab: drag it and a line shows where it will land, or let go where it is for **Close** and **Minimize**. **▸ N** opens a sheet of every tile (to show or close each, the minimized too), the sessions you viewed lately that no tile holds, **All sessions** and **+ New tile**; Inbox is in ☰. One pane fills the screen (‹ in the item's header goes back to the list), and the nav is in ☰. A phone on its side keeps this layout: the desktop one needs 512px of height as well as width. On a touch screen Return is a new line in a message box; ⌘/Ctrl+Enter sends everywhere.
 - **The message box** grows with what you type, up to 40% of the window, then scrolls. An image pasted, dropped or attached opens full size when you click it, before you send. The session's model and its subagents' model are chips under the box, each opening its pickers; a change waiting for Send shows beside them.
+- **Tool calls** show their summary straight away and start collapsed (plans start open). Open one to watch its live output; live and final output, including images, share the same fixed-height scrolling area. Finishing a call doesn't open or close it. Calls that make a session or write a document reserve their link's space from the start, including on a phone.
 - **Recently viewed** heads the Sessions page: the last 8 sessions you looked at, newest first, with each one's state and when, the same on every device (the head keeps each realm's last 20: `POST /api/v1/sessions/{id}/viewed`, `GET /api/v1/sessions/recent`). Hidden while you search.
 - **Start session** (the Sessions page) opens the new session in place of the form's tile (‹ goes back to it); one started from a popup (New like this, or from work or mail) gets a tile of its own. The session opens at once: the memex's brief for it is fetched afterwards, before its worker gets it.
 - The workspace is saved in the browser; the address bar shows the focused pane, so links and reloads land in the right place.

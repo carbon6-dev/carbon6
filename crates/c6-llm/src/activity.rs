@@ -92,7 +92,7 @@ fn push_capped(s: &mut String, more: &str, cap: usize) {
 fn prompt_of(req: &ModelRequest) -> String {
     let mut parts = vec![format!("[system]\n{}", req.system)];
     for m in &req.messages {
-        let text: Vec<&str> = m.blocks.iter().filter_map(|b| if let Block::Text(t) = b { Some(t.as_str()) } else { None }).collect();
+        let text: Vec<&str> = m.blocks.iter().filter_map(Block::text).collect();
         let images = m.blocks.iter().filter(|b| matches!(b, Block::Image { .. })).count();
         let role = if m.role == crate::Role::User { "user" } else { "assistant" };
         let mut part = format!("[{role}]\n{}", text.join("\n"));
@@ -201,7 +201,7 @@ impl ModelClient for Tracked {
                         c.state = "answering";
                         push_capped(&mut c.text, &format!("\n[tool call: {name}]"), OUTPUT_CHARS);
                     }),
-                    Ok(ModelEvent::Block { block: Block::Text(t), .. }) => update(id, |c| {
+                    Ok(ModelEvent::Block { block: Block::Text(t) | Block::AnnotatedText { text: t, .. }, .. }) => update(id, |c| {
                         // Providers that send whole blocks may send no deltas.
                         if c.text.is_empty() {
                             c.first_at.get_or_insert_with(now_ms);

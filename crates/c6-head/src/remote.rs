@@ -51,7 +51,7 @@ pub async fn for_session(st: &HeadState, parent: &SessionRow, what: &str, params
             if !running {
                 st.store.add_remote_delegation(&id, &child.id, &parent.id, &call_id).await?;
             }
-            if let Err(e) = crate::sessions::send_input_as(st, &child.id, &req, id.clone(), &call_id).await {
+            if let Err(e) = crate::sessions::send_input_as(st, &child.id, &req, id.clone(), &call_id, None).await {
                 st.store.delegation_reported(&id).await?;
                 return Err(e);
             }
@@ -136,9 +136,14 @@ async fn relay(st: &HeadState, child_id: &str, end_seq: u64, reason: i32) -> any
                 if u.delegated_by.is_empty() && u.command != "task-notification" {
                     yours = true;
                     wake |= u.wake;
-                    if u.command != "resume" {
-                        said.push(u.text.clone());
-                    }
+                    said.push(c6_worker::report_input(
+                        child_id,
+                        &u.command,
+                        &u.text,
+                        &u.from_session_id,
+                        &u.from_title,
+                        u.api_origin.as_ref(),
+                    ));
                 }
             }
             Some(session_event::Kind::Assistant(a)) => {

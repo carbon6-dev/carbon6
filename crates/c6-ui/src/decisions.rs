@@ -11,7 +11,7 @@ use serde_json::json;
 
 use crate::api;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT, ago, now_ms};
-use crate::workspace::{Go, How, View, use_workspace};
+use crate::workspace::{Go, How, View, use_column, use_workspace};
 
 /// The header link, with how many are open.
 #[component]
@@ -136,7 +136,7 @@ fn Cards(list: LocalResource<Result<Vec<Decision>, String>>, refresh: Callback<(
             2 if !in_session => view! { <p class="text-sm text-muted">"Nothing here."</p> }.into_any(),
             3 => view! {
                 <div class=if in_session { "space-y-2" } else { "space-y-4" } data-decisions="">
-                {in_session.then(|| view! { <p class="text-xs font-medium uppercase tracking-wide text-muted">"Waiting for you"</p> })}
+                {waiting_heading(in_session, groups)}
                 <For each=move || groups.get() key=|(g, _)| g.clone() let:group>
                     <div class="space-y-2">
                         {(!group.0.is_empty()).then(|| {
@@ -161,6 +161,15 @@ fn Cards(list: LocalResource<Result<Vec<Decision>, String>>, refresh: Callback<(
             .into_any(),
             _ => ().into_any(),
         }
+    }
+}
+
+/// Task offers have their own heading; they are not waiting for an answer.
+fn waiting_heading(in_session: bool, groups: Memo<Vec<(String, Vec<Decision>)>>) -> impl IntoView {
+    view! {
+        <Show when=move || in_session && groups.with(|gs| gs.iter().any(|(_, ds)| ds.iter().any(|d| d.kind != "task")))>
+            <p class="text-xs font-medium uppercase tracking-wide text-muted">"Waiting for you"</p>
+        </Show>
     }
 }
 
@@ -216,6 +225,15 @@ pub fn SessionDecisions(session: String) -> impl IntoView {
         }
     });
     let session = StoredValue::new(session);
+    let live = api::live();
+    let due = StoredValue::new(false);
+    Effect::new(move |seen: Option<()>| {
+        live.attention.track();
+        live.connected.track();
+        if seen.is_some() {
+            tick_quietly(tick, due);
+        }
+    });
     let list = LocalResource::new(move || {
         tick.track();
         api::session_decisions(session.get_value())
@@ -225,9 +243,15 @@ pub fn SessionDecisions(session: String) -> impl IntoView {
     view! { <Cards list refresh in_session=true /> }
 }
 
+pub(crate) fn card_id(id: i64) -> String {
+    format!("decision-{id}")
+}
+
 #[component]
 fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session: bool) -> impl IntoView {
     let ws = use_workspace();
+    let col = use_column();
+    let task = d.kind == "task";
     let id = d.id;
     let note = RwSignal::new(String::new());
     let error = RwSignal::new(None::<String>);
@@ -243,6 +267,7 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
         });
     };
     let answer = move |option: Option<String>| {
+        let start_task = task && option.as_deref() == Some(TaskAction::Start.option());
         let mut fields = serde_json::Map::new();
         for (f, v) in values.get_value() {
             let text = v.get_untracked();
@@ -254,7 +279,18 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
         busy.set(true);
         spawn_local(async move {
             match api::answer_decision(id, a).await {
-                Ok(_) => refresh.run(()),
+                Ok(d) => {
+                    // The head appends the created session after the proposing
+                    // sessions. Other answers must not open those older ones.
+                    if start_task && let Some(id) = d.sessions.last() {
+                        let view = View::session(id.clone());
+                        match col {
+                            Some(c) => ws.open_after(c.tile, c.col, view),
+                            None => ws.open(None, view, How::OwnTile),
+                        }
+                    }
+                    refresh.run(());
+                }
                 Err(e) => error.set(Some(e)),
             }
             busy.set(false);
@@ -278,6 +314,7 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
     let things: Vec<String> =
         d.context["things"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default();
     let session = d.context["session"].as_str().map(str::to_owned);
+    let task_session = StoredValue::new(session.clone());
     let open = matches!(d.state.as_str(), "open" | "snoozed");
     let tone = match (d.waiting && open, d.priority.as_str()) {
         (true, _) => "border-sky-300 dark:border-sky-900",
@@ -298,7 +335,7 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
         format!("{} {}", parts.join(" · "), if d.answered_via.is_empty() { String::new() } else { format!("(via {})", d.answered_via) })
     });
     view! {
-        <section class=format!("space-y-2 rounded-lg border p-3 {tone}")>
+        <section id=card_id(id) class=format!("space-y-2 rounded-lg border p-3 {tone}")>
             <div class="flex flex-wrap items-center gap-2">
                 <span class="rounded bg-zinc-100 px-1.5 text-[11px] dark:bg-zinc-800">{d.kind.clone()}</span>
                 {(d.waiting && open).then(|| view! { <span class="rounded bg-sky-100 px-1.5 text-[11px] text-sky-800 dark:bg-sky-950 dark:text-sky-300">"waiting"</span> })}
@@ -316,16 +353,23 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
             })}
             <div class="flex flex-wrap items-center gap-2 text-xs text-muted">
                 {(!in_session).then(|| view! { <span>{format!("from {}", d.source)}</span> })}
-                {session.filter(|_| !in_session).map(|s| view! { <Go to=View::session(s) class="text-sky-700 hover:underline dark:text-sky-400">"the session ↗"</Go> })}
+                {session.filter(|_| !in_session).map(|s| view! { <Go to=View::session(s) class="text-sky-700 hover:underline dark:text-sky-400">"the session "{crate::icons::arrow_up_right()}</Go> })}
                 {things.into_iter().map(|k| view! { <span class="rounded bg-violet-100 px-1 font-mono text-violet-800 dark:bg-violet-950 dark:text-violet-300">{k}</span> }).collect_view()}
-                {d.sessions.iter().map(|s| view! { <Go to=View::session(s.clone()) class="text-sky-700 hover:underline dark:text-sky-400">"working session ↗"</Go> }).collect_view()}
+                {d.sessions.iter().map(|s| view! { <Go to=View::session(s.clone()) class="text-sky-700 hover:underline dark:text-sky-400">"working session "{crate::icons::arrow_up_right()}</Go> }).collect_view()}
                 {deadline.map(|t| view! { <span class="text-amber-700 dark:text-amber-400">{t}</span> })}
             </div>
             {(!facts.is_empty()).then(|| view! { <FactList ids=facts on_change=refresh /> })}
             {answered.map(|a| view! { <p class="text-sm text-emerald-700 dark:text-emerald-400">{format!("Answered: {a}")}</p> })}
             {(!d.note.is_empty()).then(|| view! { <p class="text-sm text-zinc-600 dark:text-zinc-400">{format!("Note: {}", d.note)}</p> })}
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
-            {open.then(|| view! {
+            {open.then(|| if d.kind == "task" {
+                let live = api::live();
+                let proposing = Memo::new(move |_| live.sessions.with(|ss| ss.iter().find(|s| Some(&s.id) == task_session.read_value().as_ref()).cloned()));
+                let session_title = Signal::derive(move || proposing.get().map(|s| s.title).filter(|t| !t.is_empty())
+                    .or_else(|| task_session.get_value()).unwrap_or_else(|| "the proposing session".into()));
+                let work_title = Signal::derive(move || proposing.get().and_then(|s| s.work).map(|w| w.title));
+                view! { <TaskActions busy session_title work_title realm=d.realm.clone() answer=Callback::new(move |o| answer(Some(o))) /> }.into_any()
+            } else { view! {
                 {values.get_value().into_iter().map(|(f, v)| {
                     let label = format!("{}{}", if f.label.is_empty() { f.name.clone() } else { f.label.clone() }, if f.required { " *" } else { "" });
                     let input = if !f.choices.is_empty() {
@@ -356,9 +400,159 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
                         <button class=format!("{BUTTON_QUIET} text-muted") on:click=move |_| set(json!({"state": "dismissed"}))>"Dismiss"</button>
                     })}
                 </div>
-            })}
+            }.into_any() })}
             {(!open && d.state == "dismissed").then(|| view! { <button class=BUTTON_QUIET on:click=move |_| set(json!({"state": "open"}))>"Reopen"</button> })}
         </section>
+    }
+}
+
+/// Task labels are presentation only: keep the existing answers understood by
+/// the head, including cards raised before the controls were restyled.
+#[derive(Clone, Copy)]
+enum TaskAction {
+    Start,
+    Here,
+    Save,
+    SaveNew,
+    NotNow,
+}
+
+impl TaskAction {
+    fn option(self) -> &'static str {
+        match self {
+            Self::Start => "Start it",
+            Self::Here => "Do it here",
+            Self::Save => "Add to this work",
+            Self::SaveNew => "Add as new work",
+            Self::NotNow => "Not now",
+        }
+    }
+}
+
+// An inset outline keeps secondary buttons exactly as tall as the primary.
+const TASK_SECONDARY: &str = "ring-1 ring-inset ring-zinc-300 disabled:opacity-50 dark:ring-zinc-600";
+
+/// One wrapping action row in the transcript and Decisions. The uncommon
+/// destination picker lives in a portal, outside the tile and composer.
+#[component]
+fn TaskActions(
+    busy: RwSignal<bool>,
+    session_title: Signal<String>,
+    work_title: Signal<Option<String>>,
+    realm: String,
+    answer: Callback<String>,
+) -> impl IntoView {
+    let chooser = RwSignal::new(false);
+    let realm = StoredValue::new(realm);
+    let trigger = NodeRef::<leptos::html::Button>::new();
+    let close = Callback::new(move |()| {
+        chooser.set(false);
+        if let Some(button) = trigger.get() {
+            let _ = button.focus();
+        }
+    });
+    view! {
+        {task_actions(busy, session_title, work_title, answer, chooser, trigger)}
+        <Show when=move || chooser.get()>
+            <TaskWorkChooser busy realm=realm.get_value() answer=Callback::new(move |option| {
+                close.run(());
+                answer.run(option);
+            }) close />
+        </Show>
+    }
+}
+
+fn task_actions(
+    busy: RwSignal<bool>,
+    session_title: Signal<String>,
+    work_title: Signal<Option<String>>,
+    answer: Callback<String>,
+    chooser: RwSignal<bool>,
+    trigger: NodeRef<leptos::html::Button>,
+) -> impl IntoView {
+    let act = move |action: TaskAction| answer.run(action.option().into());
+    let save_title = move || {
+        work_title
+            .get()
+            .map(|w| format!("A to-do in “{w}”, to start later"))
+            .unwrap_or_else(|| "A to-do in the session's work, to start later (new work if it belongs to none)".into())
+    };
+    view! {
+        <div class="flex flex-wrap items-center gap-2">
+            <button class=format!("{BUTTON} pointer-coarse:min-h-11") disabled=move || busy.get()
+                title="A new session does it, with the prompt shown above"
+                on:click=move |_| act(TaskAction::Start)>"Start session"</button>
+            <button class=format!("{BUTTON_QUIET} {TASK_SECONDARY} pointer-coarse:min-h-11") disabled=move || busy.get()
+                title=move || format!("The session that proposed it, {}, does it after what it's doing now", session_title.get())
+                on:click=move |_| act(TaskAction::Here)>"Do it here"</button>
+            <button class=format!("{BUTTON_QUIET} {TASK_SECONDARY} pointer-coarse:min-h-11") disabled=move || busy.get()
+                title=save_title on:click=move |_| act(TaskAction::Save)>"Save for later"</button>
+            <button class=format!("{BUTTON_QUIET} text-muted pointer-coarse:min-h-11") disabled=move || busy.get()
+                title="Put this card away" on:click=move |_| act(TaskAction::NotNow)>"Not now"</button>
+            <button node_ref=trigger class="rounded-md px-1 py-1.5 text-xs text-muted hover:underline disabled:opacity-50 pointer-coarse:min-h-11"
+                disabled=move || busy.get() aria-haspopup="dialog" aria-expanded=move || chooser.get().to_string()
+                on:click=move |_| chooser.set(true)>"Save elsewhere…"</button>
+        </div>
+    }
+}
+
+#[component]
+fn TaskWorkChooser(busy: RwSignal<bool>, realm: String, answer: Callback<String>, close: Callback<()>) -> impl IntoView {
+    let realm = StoredValue::new(realm);
+    let works = LocalResource::new(move || api::task_work_list(realm.get_value()));
+    let query = RwSignal::new(String::new());
+    let search = NodeRef::<leptos::html::Input>::new();
+    Effect::new(move || {
+        if let Some(input) = search.get() {
+            let _ = input.focus();
+        }
+    });
+    let rows =
+        Signal::derive(move || task_work_options(&works.get().and_then(Result::ok).unwrap_or_default(), &realm.get_value(), &query.get()));
+    view! {
+        <leptos::portal::Portal>
+            <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" on:click=move |_| close.run(())
+                on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); close.run(()); }>
+                <div role="dialog" aria-modal="true" aria-label="Save elsewhere"
+                    class="flex max-h-[80dvh] w-full max-w-lg flex-col gap-3 overflow-hidden rounded-lg bg-white p-4 text-left shadow-xl dark:bg-zinc-900"
+                    on:click=|ev| ev.stop_propagation()>
+                    <div class="flex shrink-0 items-center gap-2">
+                        <h2 class="flex-1 font-medium">"Save elsewhere"</h2>
+                        <button class=format!("{BUTTON_QUIET} pointer-coarse:min-h-11") aria-label="Close" on:click=move |_| close.run(())>{crate::icons::x()}</button>
+                    </div>
+                    <input node_ref=search class=format!("{INPUT} shrink-0") type="search" aria-label="Search open work" placeholder="Search open work…"
+                        prop:value=move || query.get() on:input=move |ev| query.set(event_target_value(&ev)) />
+                    <div class="min-h-0 overflow-y-auto">
+                        {task_work_choices(busy, rows, answer)}
+                        <Suspense fallback=|| view! { <p class="p-2 text-sm text-muted">"Loading work…"</p> }>
+                            {move || works.get().map(|r| match r {
+                                Err(e) => view! { <ErrorBox message=e /> }.into_any(),
+                                Ok(_) => view! { <Show when=move || rows.get().is_empty()><p class="p-2 text-sm text-muted">"No matching open work."</p></Show> }.into_any(),
+                            })}
+                        </Suspense>
+                    </div>
+                </div>
+            </div>
+        </leptos::portal::Portal>
+    }
+}
+
+fn task_work_options(works: &[c6_api::work::WorkItem], realm: &str, query: &str) -> Vec<(String, String)> {
+    let query = query.trim().to_lowercase();
+    works
+        .iter()
+        .filter(|w| w.realm == realm && w.fields.status == "open" && w.fields.title.to_lowercase().contains(&query))
+        .map(|w| (format!("Add to work:{}", w.id), w.fields.title.clone()))
+        .collect()
+}
+
+fn task_work_choices(busy: RwSignal<bool>, rows: Signal<Vec<(String, String)>>, answer: Callback<String>) -> impl IntoView {
+    let class = "block w-full break-words rounded-md px-3 py-2 text-left text-sm hover:bg-zinc-100 disabled:opacity-50 pointer-coarse:min-h-11 dark:hover:bg-zinc-800";
+    view! {
+        <button class=class disabled=move || busy.get() on:click=move |_| answer.run(TaskAction::SaveNew.option().into())>"New work"</button>
+        <For each=move || rows.get() key=|(option, _)| option.clone() let:row>
+            <button class=class disabled=move || busy.get() on:click=move |_| answer.run(row.0.clone())>{row.1}</button>
+        </For>
     }
 }
 
@@ -453,5 +647,127 @@ pub fn FactRow(f: c6_api::Fact, on_change: Callback<()>) -> impl IntoView {
                 </div>
             })}
         </li>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn waiting_heading_requires_a_non_task_decision_in_the_session() {
+        let html = |in_session: bool, kinds: &[&str]| {
+            let owner = Owner::new();
+            owner.with(|| {
+                untrack(|| {
+                    let decisions: Vec<Decision> = kinds.iter().map(|k| Decision { kind: (*k).into(), ..Default::default() }).collect();
+                    let groups = Memo::new(move |_| vec![("Suggested tasks".into(), decisions.clone())]);
+                    waiting_heading(in_session, groups).to_html()
+                })
+            })
+        };
+        for kinds in [vec![], vec!["task"], vec!["task", "task"]] {
+            assert!(!html(true, &kinds).contains("Waiting for you"));
+        }
+        for kinds in [vec!["question"], vec!["task", "approve"], vec!["confirm", "task"]] {
+            assert!(html(true, &kinds).contains("Waiting for you"));
+            assert!(!html(false, &kinds).contains("Waiting for you"));
+        }
+    }
+
+    #[test]
+    fn task_actions_keep_the_existing_head_answers() {
+        for (action, expected) in [
+            (TaskAction::Start, "Start it"),
+            (TaskAction::Here, "Do it here"),
+            (TaskAction::Save, "Add to this work"),
+            (TaskAction::SaveNew, "Add as new work"),
+            (TaskAction::NotNow, "Not now"),
+        ] {
+            assert_eq!(action.option(), expected);
+        }
+    }
+
+    fn actions_html(busy: bool, work: Option<&str>) -> String {
+        let owner = Owner::new();
+        owner.with(|| {
+            untrack(|| {
+                let busy = RwSignal::new(busy);
+                let session_title = Signal::stored("The proposing session".to_owned());
+                let work_title = Signal::stored(work.map(str::to_owned));
+                task_actions(busy, session_title, work_title, Callback::new(|_| ()), RwSignal::new(false), NodeRef::new()).to_html()
+            })
+        })
+    }
+
+    #[test]
+    fn task_actions_have_one_primary_and_no_general_decision_controls() {
+        let html = actions_html(false, Some("Improve C6"));
+        for label in ["Start session", "Do it here", "Save for later", "Not now", "Save elsewhere…"] {
+            assert!(html.contains(label), "missing {label}: {html}");
+        }
+        for removed in [
+            "Start it",
+            "Add to this work",
+            "Add as new work",
+            "Work on it",
+            "Tomorrow",
+            "Dismiss",
+            "<input",
+            "<textarea",
+            "▾",
+            "<svg",
+            "absolute",
+            "role=\"menu\"",
+        ] {
+            assert!(!html.contains(removed), "unexpected {removed}: {html}");
+        }
+        assert_eq!(html.matches(BUTTON).count(), 1);
+        assert_eq!(html.matches(TASK_SECONDARY).count(), 2);
+        assert_eq!(html.matches("<button").count(), 5);
+        assert_eq!(html.matches("pointer-coarse:min-h-11").count(), 5);
+        assert_eq!(html.matches("flex flex-wrap items-center gap-2").count(), 1);
+        assert!(html.contains("The session that proposed it, The proposing session, does it after"));
+        assert!(html.contains("A to-do in “Improve C6”, to start later"));
+        assert!(html.contains("aria-haspopup=\"dialog\""));
+        assert!(html.contains("aria-expanded=\"false\""));
+        assert!(!html.contains("role=\"menu\""));
+    }
+
+    #[test]
+    fn task_actions_are_disabled_together_while_answering_and_explain_no_work_fallback() {
+        let html = actions_html(true, None);
+        assert_eq!(html.matches("<button").count(), 5);
+        for button in html.split("<button").skip(1) {
+            let opening = button.split('>').next().unwrap();
+            assert!(opening.split_whitespace().any(|a| matches!(a, "disabled" | "disabled=\"\"" | "disabled=\"true\"")), "{opening}");
+        }
+        assert!(html.contains("new work if it belongs to none"));
+    }
+
+    #[test]
+    fn task_work_chooser_offers_new_work_and_searchable_open_work_in_its_realm() {
+        let work = |id: &str, realm: &str, title: &str, status: &str| c6_api::work::WorkItem {
+            id: id.into(),
+            realm: realm.into(),
+            fields: c6_api::work::WorkFields { title: title.into(), status: status.into(), ..Default::default() },
+            ..Default::default()
+        };
+        let works = vec![
+            work("one", "home", "Improve C6", "open"),
+            work("two", "home", "Fix the pager", "open"),
+            work("closed", "home", "Old C6", "done"),
+            work("private", "other", "Other C6", "open"),
+        ];
+        let all = task_work_options(&works, "home", "");
+        assert_eq!(all, [("Add to work:one".into(), "Improve C6".into()), ("Add to work:two".into(), "Fix the pager".into())]);
+        assert_eq!(task_work_options(&works, "home", " C6 "), all[..1]);
+        assert!(task_work_options(&works, "home", "missing").is_empty());
+        let owner = Owner::new();
+        let html = owner.with(|| untrack(|| task_work_choices(RwSignal::new(false), Signal::stored(all), Callback::new(|_| ())).to_html()));
+        assert_eq!(html.matches("New work").count(), 1);
+        assert!(html.contains("Improve C6") && html.contains("Fix the pager"));
+        assert_eq!(html.matches("<button").count(), 3);
+        assert!(!html.contains("Save for later"));
     }
 }

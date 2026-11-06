@@ -4,6 +4,12 @@ Status: rules in force (2026-10-19); `make check` enforces what a pattern can ca
 
 A test is a claim: *this invariant holds*. It must fail **if and only if** the invariant is broken. A slow machine, a busy CI runner, another test running beside it, or the order tests run in must never fail it. The test suite runs on GitHub's runners (`ubuntu-24.04`, `macos-15`), which are shared, small and sometimes slow, and it must hold there.
 
+## Failure diagnostics
+
+`make test` enables panic backtraces (`RUST_BACKTRACE=1` unless already set, for both nextest and its `cargo test` fallback). Use `RUST_BACKTRACE=full make test` for every stack frame.
+
+`.config/nextest.toml` shows each failure's complete captured stdout and stderr both immediately and at the end of the run (`failure-output = "immediate-final"`, `final-status-level = "fail"`). The final status list alone does not include that output: nextest's default only prints it immediately, where a long parallel run can bury it. Keep capture enabled so concurrent tests' diagnostics stay together.
+
 ## Rules
 
 1. **Wait for a condition, never for a time.**
@@ -12,9 +18,11 @@ A test is a claim: *this invariant holds*. It must fail **if and only if** the i
    - No `tokio::time::timeout(Duration::…)`, no local deadline loops, and no copies of `eventually` with their own 10, 20 or 30 seconds.
 2. **Assert once the thing is finished.**
    - Count events, read files or compare states after an explicit sign that the work is done, never during it. Signs: the turn ended (`turn_ended`), the session is idle, the state is `done`, the mock got its request, the text streamed.
+   - A session is also briefly idle after `started`, before its queued prompt starts. For a first turn, require `turn_ended` (or idle **and** `end_reason`), not idle or a quick project's `ended` alone.
    - Example: the imports test counted a turn's events when its reply appeared, before the turn's usage and end arrived (0.3.5).
 3. **Act on a signal, not after a pause.**
    - To interrupt a stream, interrupt once its first text has arrived, not 300 ms after starting.
+   - To restart a head during a turn, gate a mock response and wait for its request before stopping the head. Release it while the head is down and check offline progress in the worker's journal, then restart and wait for the new attachment. This places the restart inside the turn even when setup or reconnect is slow, without losing offline-progress coverage.
    - A pause that a slow machine could outlast is a race.
 4. **"Nothing happens" checks may sleep.**
    - A pause before asserting that something did *not* happen can't fail falsely. A slow machine only makes it a weaker check.
@@ -24,6 +32,7 @@ A test is a claim: *this invariant holds*. It must fail **if and only if** the i
    - **Ports:** bind port 0. A server that must come back on the same port (a head restarting while its workers keep its address) takes `c6_testkit::port()`. Those ports come from a range below every OS's ephemeral range, so no test binding port 0 is ever handed one, and each is held by a file lock for the life of its test process, so tests in other processes (nextest runs each test as its own) never share one. Never pick a free port, release it, and bind it later: another test can take it in between.
    - **Files:** each test works in its own temporary folders, never `$HOME` or the repository.
    - **Programs it writes:** a script a test writes and then runs can fail with "Text file busy" while a process another test just started still holds it open for writing. Wait with `c6_testkit::runnable(path, args)` before using it.
+   - **Child processes:** own and clean up the whole process group, including on a panic. Killing just a shell leaves its children holding nextest's output handles open (`LEAK`), even after the test returns.
 6. **What a test needs from the machine, CI has.**
    - A test that needs Chrome, git or a shell says so with `c6_testkit::need(what, present)` or `have(tool)`. On a laptop without it, the test skips. In CI (`GITHUB_ACTIONS`) a missing tool fails, so coverage never disappears quietly.
    - Tests that build container images (`C6_TEST_KITS`) are opt-in and don't run in CI.
@@ -46,3 +55,149 @@ A line that must break a rule says why: `// test-lint: allow (<reason>)`. Today 
 ## Checked under load
 
 The suite is also run with every CPU core kept busy by other processes, to surface timing assumptions a lint can't see (rule 2). A failure there is a bug in the test or the product, never "just load".
+
+Use `NEXTEST=1 make test-under-load RUNS=5` for repeated workspace runs. Do not rebuild test binaries in the same target directory while nextest is running: Cargo can remove binaries nextest has listed but not yet started.
+
+SQLite contention regressions use a real temporary WAL database and simultaneous operations on its connection pool, not just an in-memory database or serial calls. A transaction that reads before writing must take the writer with `BEGIN IMMEDIATE` before its first read: `busy_timeout` cannot repair a stale read snapshot's upgrade to a write. Related rows must commit together too (for example, a claim and all its evidence); fault injection should verify that a failed insert leaves none of a partial operation behind. Neither a longer timeout nor a retry is a fix for these atomicity bugs.
+
+## App-owned icons: native UI regression
+
+`cargo test -p c6-ui` renders representative session notices, memory events,
+published outputs, file attachments, approvals, questions and secret cards, plus
+task/subagent states, document chips and mentions, and explorer diagram labels. Their
+fixture content is plain text, so emoji or symbol-icons in the resulting markup
+are a regression in the app, not a restriction on user content. A source guard
+also scans app-owned Rust, HTML and JS (excluding test modules and comments).
+Use drawn SVG icons instead of emoji; don't drop icons or replace them with
+words alone. Rendered-markup regressions assert that restored icons produce
+`<svg>` elements, not just that glyphs are absent. Keep trailing action arrows
+as drawn SVGs too, in their original position beside the original label.
+Intentional typography and keyboard/prose directions are allowed. Slack's emoji table and vendored terminal
+Unicode data remain content, not app icons.
+
+After building with `env -u NO_COLOR make ui`, check arbitrary Tailwind utilities
+used by changed markup against the generated CSS, not merely the source class
+strings. The shared SVGs use ordinary size/alignment utilities.
+
+## Doc comments: placement browser check
+
+`cargo test -p c6-ui` checks the pure popover placement with offset tile bounds,
+above/below anchors, oversized threads and 320px/390px/desktop widths. In a
+browser, repeat at those widths (with touch on phones):
+
+1. Open a long doc, also with its comments panel beside it on a wide desktop
+   tile. Start a comment on a block near the bottom of the visible tile. The
+   popover flips above; the text box, Cancel and Comment remain reachable.
+2. Type a long draft, scroll the doc, resize the tile/window and open an existing
+   long thread. The box stays inside the visible tile, scrolling its contents
+   when necessary, without losing the draft or focus. Cancel, posting, outside
+   press and Escape still work.
+3. On phones, open the keyboard in a block's sheet and in the comments panel
+   (also on a deck). The sheet and its scrolling contents remain above the
+   keyboard, including when only `visualViewport` shrinks or pans. Close the
+   keyboard and check that the sheet returns to the screen bottom.
+4. Check the floating comments panel in a short desktop tile too. Chip editors
+   and comment ellipsis actions remain in normal flow, not clipped floating
+   menus; ref chips still open their destination.
+
+## Tile focus and first click: manual browser check
+
+Focus and active-pane selection run on pointerdown. The pane header and its conditional buttons must stay mounted when only focus/active changes: detaching the original target between pointerdown and click loses its click. Use cached boolean conditions (`Show`) for their presence, not a closure that rebuilds them on every position change. Growing a tile still waits until click bubbles, after the action. The native `c6-ui` tests don't exercise browser event dispatch, so check this in a browser:
+
+1. Open two session tiles side by side, with the left focused. Click **×** in the right tile's bar: it closes on the first click. Reopen it and refocus the left tile before each check below.
+2. In the unfocused right tile, click **⋯**, **Changes**, **Terminal**, **Minimize**, and **Focus** (maximize). Each acts immediately; actions that leave the tile open focus it too. Bring it back or defocus as needed. Check any view tabs in its content the same way.
+3. Open a second pane inside the right tile (a list and item, or a session and Changes). With the left tile focused, click **×** in either of the right tile's *pane* headers. It closes that pane on the first click. Also try its pin button and clicking a control in the inactive pane of an already-focused tile.
+4. Click a transcript link in an unfocused tile: its destination opens on the first click. Type a draft in that tile, refocus the other tile, and click **Send**: it sends once and clears the draft. Try keyboard activation (Tab, then Enter/Space) and a touch tap as well.
+5. Repeat with enough tiles for three to share a column (nine tiles): the clicked tile may grow only after its action, never move the target between press and release. Clicking plain transcript content should focus its tile, and shortcuts should then act there. A press canceled by dragging or scrolling should not activate a control.
+6. Run the transcript-follow checks below too: focusing by clicking content must not interfere with wheel/touch/keyboard scroll intent or the transcript's tabindex.
+
+For a browser-automation regression, keep the target element's DOM handle, send pointerdown, allow an animation frame, then send pointerup. Assert that the target stays connected through pointerdown and the action happens after one click. In particular, a split tile's pane-header close reproduces the old replacement reliably; an atomic synthetic `click()` can hide the interval where rendering occurs.
+
+## Tile drops: layout regressions and browser check
+
+The `workspace` unit tests exercise the same `check_drop` rules used by the
+preview and the move, including all source/target/direction combinations for
+2–16 tiles, minimized tiles, missing endpoints, and unchanged positions. There
+is a four-column limit, not a per-column tile limit. A rejected drop must leave
+the entire layout unchanged; every blue preview must change the visible layout.
+
+In a desktop browser (also check touch-capable desktop/tablet native dragging):
+
+1. Open sixteen tiles (four columns, four tiles each). Drag a tile from a shared
+   column over another tile's left and right fifths. Neither edge turns blue
+   and no text covers the tile's bar. Releasing leaves the layout unchanged.
+2. Drop the same tile in the middle of another tile's top or bottom half. It
+   joins that column at the highlighted position, even with many tiles there.
+   Repeat in the padding between stacked tiles; the gap accepts the drop too.
+3. Move over a valid destination, then back over the source or out of the grid.
+   No old highlight remains. Moving between child elements inside a destination
+   must keep the preview. Dropping onto the source, immediately before/after its
+   current position, or beside its singleton column shows no highlight and does nothing.
+4. With fewer than four occupied columns, move a tile into a new column. With
+   four columns, a tile alone in its column can still move that column to a
+   different place. Minimize/close a different tile during a drag: the drop uses
+   stable tile keys, not stale indices. A source/destination hidden or closed
+   during the drag must no longer advertise an accepted drop; hiding/closing
+   the source cancels its drag state even if its bar never receives dragend.
+   Also minimize every tile in the leftmost column, then drag a tile from a
+   shared column beside another: it makes the promised fourth visible column,
+   rather than merging with the rightmost one. A minimized-only slot is free
+   for reuse, not a fifth saved column that squeezes two visible ones together.
+5. Start a drag on a tile-bar button as well as its title; both native drags
+   must follow the same rules. Dropping a tile over a message box still moves
+   the tile; dropping a file still attaches it, not moves a tile. End/cancel a
+   drag and check that all feedback disappears.
+6. On a phone, long-press a bottom tab and drag it across several tabs (also
+   with minimized tiles present). The insertion line and final reading order
+   must agree. This uses `step_tile`/the switcher's pointer handlers, not the
+   desktop `Drop` zones; a long press without movement still opens its menu.
+
+## Transcript follow: manual browser check
+
+The `c6-ui` workspace unit tests cover input direction and stop/resume decisions. In a browser, use a long session with a streaming reply:
+
+1. Open it normally: it starts at the bottom and follows new text. While there, roll the wheel up one notch (also try a tiny trackpad movement). It must stay up as tokens arrive or the window resizes, even if less than 120px from the end. Repeat during a smooth glide.
+2. Focus the transcript and try Up, Page Up, Home and Shift+Space. Each stops following immediately. Down/Page Down/End and scrolling down resume only at the very bottom (less than 4px); being merely near the bottom does not resume. Check the scrollbar too.
+3. Scroll more than a screen away, click **Latest** with its drawn down-arrow (or its new-event count), and confirm that streaming follows again. Fold/show the tile while following, and while just a few pixels above the bottom with following off; each keeps its prior choice and position.
+4. Open a search hit near the end. Its anchor must stay put through streaming and resize, not start following because it is near the end. Click Latest to resume.
+5. On a phone, tap without dragging: following stays on. Drag toward older content by a small distance: it stops immediately and stays off through touch inertia. Drag back to the bottom or use Latest: it resumes. Try reversing direction within one gesture.
+6. Check that horizontal scrolling and typing/navigation in text fields do not change transcript following. With reduced motion enabled, repeat the small upward scroll and Latest checks.
+
+### Tool-card arrival regression
+
+The native `session::tests::tool_output_keeps_one_bounded_area_before_and_after_the_result` renders the production output area before output, during streaming, and after success or an error (including truncation and images). Its height and single output box must be the same in every state. Native tests deliberately render this small component, not the recursive session/subagent transcript.
+
+In a browser, repeat at 320px, 390px and desktop widths:
+
+1. Start a shell call that emits several lines before finishing. Its summary appears immediately; it stays collapsed throughout. Open it while running: the output scrolls within a fixed-height area, which remains the same height when the result replaces the live text. An error must behave the same way. Plans start open and retain that choice.
+2. Retain DOM handles for the card, its `details`, and its output `pre`. Deliver output chunks, its result, and another assistant event: all three handles must remain connected and refer to the same nodes. A user-opened card stays open; a user-closed card stays closed.
+3. Create a session and a document with long titles. Their pending link areas must already occupy the completed card's height, with the input title when known. The result activates the destination without adding a row or horizontal overflow. Keep all status, document/deck and navigation icons.
+4. With a long transcript following the bottom, repeat through completion: it stays at the bottom without a transient expansion/collapse. Scroll up deliberately before a result arrives: the viewport stays at that position. Repeat on a touch viewport and with reduced motion.
+
+### Observer lifetime regression
+
+The transcript-follow and glance-width ResizeObservers retain their Rust
+callbacks alongside the observer, disconnect before dropping either on replacement
+or unmount, and never `forget()` the closure. The message box uses the same
+ownership pattern. The transcript's on-sight IntersectionObserver retains its
+callback until cleanup too (as the glance outline already does).
+
+In browser automation, wrap the native observers before loading the app and
+record each callback and its observed elements. Open and close session tiles
+repeatedly. Every observer attached to a removed textarea, transcript, glance or
+on-sight marker must disconnect. Retaining a JS reference to its callback and
+invoking it after unmount should throw the wasm-bindgen dropped-closure error,
+not call a leaked Rust closure. While mounted, resize the tile, append a streamed
+reply and scroll: width measurement, transcript following and visibility still
+work, without callbacks or reactive reads after disposal.
+
+## Task card actions: manual phone check
+
+Check both a session transcript and Decisions, with a coarse pointer at 320px and 390px widths, and on desktop. Use a realm with several open work items and a closed one.
+
+1. The actions read **Start session**, **Do it here**, **Save for later**, **Not now** in that order. Only Start session is filled; the next two have identical visible outlines and heights. They share one wrapping row, with no split arrow or stray divider. Coarse-pointer targets are at least 44px tall; desktop buttons remain compact.
+2. Save for later's tooltip names the proposing session's work. Clicking it sends `Add to this work`, without a picker. With no work, it creates new work. Do it here's tooltip names the proposing session.
+3. **Save elsewhere…** opens over the workspace, not inside the card. Scroll the transcript so the card is directly above the message box, then open it again: the whole dialog remains visible, with a scrolling list rather than content clipped by the composer. Try light/dark mode and the phone keyboard.
+4. The chooser offers **New work** once and open work only in the card's realm. Search is case-insensitive. A nonmatching search shows an empty-state message but keeps New work available. The New work choice sends `Add as new work`; an existing work item sends `Add to work:<id>` and receives the card's title, prompt and origin as a to-do.
+5. Close, outside click and Escape dismiss the chooser; Escape must not stop the session. Focus returns to Save elsewhere. A failed save leaves the card open with an error; all action buttons disable while a save is pending. Check the chooser with a long list and a long work title.
+6. With only task cards open, the transcript shows **Suggested tasks (N)** without an empty **Waiting for you** heading. Add a question or approval: Waiting for you returns. Answer the last non-task decision: its heading disappears while Suggested tasks stays.

@@ -68,7 +68,9 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
                 .iter()
                 .filter_map(|b| {
                     Some(match b.block.as_ref()? {
-                        content_block::Block::Text(t) => api::ContentBlock::Text { text: t.clone() },
+                        content_block::Block::Text(t) => {
+                            api::ContentBlock::Text { text: t.clone(), citations: api::citations::annotations(&b.annotations_json) }
+                        }
                         content_block::Block::Thinking(t) => api::ContentBlock::Thinking { text: t.clone() },
                         content_block::Block::ToolUse(u) => {
                             api::ContentBlock::ToolUse { id: u.id.clone(), name: u.name.clone(), input_json: u.input_json.clone() }
@@ -81,6 +83,7 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
                         content_block::Block::Reasoning(r) if !r.summary.is_empty() => {
                             api::ContentBlock::Thinking { text: r.summary.clone() }
                         }
+                        content_block::Block::Opaque(o) => api::ContentBlock::ServerTool { label: o.label.clone() },
                         _ => return None,
                     })
                 })
@@ -133,7 +136,11 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
             state: q.state.clone(),
             answer: serde_json::from_str(&q.answer_json).unwrap_or_default(),
         },
-        Kind::Notice(n) => api::EventKind::Notice { title: n.title.clone(), message: n.message.clone(), priority: n.priority.clone() },
+        Kind::Notice(n) => api::EventKind::Notice {
+            title: api::citations::clean(&n.title).into_owned(),
+            message: api::citations::clean(&n.message).into_owned(),
+            priority: n.priority.clone(),
+        },
         Kind::Memory(m) => api::EventKind::Memory { op: m.op.clone(), id: m.id.clone(), scope: m.scope.clone(), text: m.text.clone() },
         Kind::Output(o) => {
             api::EventKind::Output { name: o.name.clone(), title: o.title.clone(), mime: o.mime.clone(), size: o.data.len() as u64 }
@@ -172,12 +179,12 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
         }
         // Shown in the queue (as with the agent), not the transcript.
         Kind::InputDelivered(_) => return None,
-        // Shown when a turn takes it; until then, it waits.
         Kind::NoticeQueued(n) => api::EventKind::NoticeQueued {
             command_id: n.command_id.clone(),
             text: n.text.clone(),
             command: n.command.clone(),
             from_title: n.from_title.clone(),
+            deliver_at_ms: n.deliver_at_ms,
         },
     };
     Some(api::Event { seq: ev.seq, ts: ev.ts_ms, kind })
@@ -270,5 +277,65 @@ pub fn queued(c: &CommandRow) -> api::QueuedInput {
         created_at: c.created_at,
         rejected: (c.state == "rejected").then(|| c.error.clone().unwrap_or_default()),
         with_agent: c.with_agent != 0 && c.state == "pending",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_card_answer_is_an_ordinary_user_event() {
+        let id = "test";
+        let text = "Not now: task card #185 \"Cleanup\".";
+        let input = SessionEvent {
+            seq: 17,
+            ts_ms: 1234,
+            kind: Some(session_event::Kind::User(c6_proto::UserMessage {
+                command_id: id.into(),
+                text: text.into(),
+                command: "card-answer".into(),
+                ..Default::default()
+            })),
+        };
+        let shown = event(&input).unwrap();
+        assert_eq!((shown.seq, shown.ts), (17, 1234));
+        assert!(matches!(shown.kind, api::EventKind::User { command_id, text: s, command, prompt, wake: false, .. }
+            if command_id == id && s == text && command == "card-answer" && prompt.is_empty()));
+    }
+
+    #[test]
+    fn text_annotations_reach_the_browser_while_raw_text_and_server_tool_icons_are_kept() {
+        let text = "Fact. \u{e200}cite\u{e202}turn1search1\u{e201}";
+        let saved = SessionEvent {
+            kind: Some(session_event::Kind::Assistant(c6_proto::AssistantMessage {
+                blocks: vec![
+                    c6_proto::ContentBlock {
+                        block: Some(content_block::Block::Opaque(c6_proto::Opaque {
+                            provider: "openai".into(),
+                            json: "{}".into(),
+                            label: "web_search: a query".into(),
+                        })),
+                        ..Default::default()
+                    },
+                    c6_proto::ContentBlock {
+                        block: Some(content_block::Block::Text(text.into())),
+                        annotations_json:
+                            r#"[{"type":"url_citation","url":"https://source.test","title":"Source","start_index":6,"end_index":33}]"#
+                                .into(),
+                    },
+                ],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let event = event(&saved).unwrap();
+        let api::EventKind::Assistant { blocks, .. } = event.kind else { panic!("not an assistant event") };
+        assert!(matches!(&blocks[0], api::ContentBlock::ServerTool { label } if label == "web_search: a query"));
+        let api::ContentBlock::Text { text: shown, citations } = &blocks[1] else { panic!("missing text") };
+        assert_eq!(shown, text);
+        assert_eq!(citations.len(), 1);
+        assert_eq!(citations[0].url, "https://source.test");
+        assert_eq!(citations[0].title, "Source");
     }
 }

@@ -45,6 +45,7 @@ pub struct Tls;
 
 pub struct Auth {
     pub required: bool,
+    pub login_link_command: String,
     challenges: Mutex<HashMap<String, Pending>>,
     /// Wrong one-time codes since the last cancellation.
     code_failures: Mutex<u32>,
@@ -58,8 +59,13 @@ struct Pending {
 }
 
 impl Auth {
-    pub fn new(required: bool) -> Self {
-        Self { required, challenges: Mutex::default(), code_failures: Mutex::default() }
+    pub fn new(cfg: &crate::HeadConfig) -> Self {
+        Self {
+            required: cfg.auth,
+            login_link_command: cfg.login_link_command(),
+            challenges: Mutex::default(),
+            code_failures: Mutex::default(),
+        }
     }
 
     fn issue(&self, register: bool, here: &Here) -> String {
@@ -250,15 +256,17 @@ impl Store {
     async fn check_api_token(&self, token: &str) -> anyhow::Result<Option<crate::realms::Caller>> {
         let hash = sha256_hex(token);
         let now = now_ms();
-        let Some(row) =
-            sqlx::query("SELECT last_used_at, realm FROM api_tokens WHERE token_hash = ?").bind(&hash).fetch_optional(&self.pool).await?
+        let Some(row) = sqlx::query("SELECT last_used_at, realm, name FROM api_tokens WHERE token_hash = ?")
+            .bind(&hash)
+            .fetch_optional(&self.pool)
+            .await?
         else {
             return Ok(None);
         };
         if now - row.get::<Option<i64>, _>("last_used_at").unwrap_or(0) > TOUCH_MS {
             sqlx::query("UPDATE api_tokens SET last_used_at = ? WHERE token_hash = ?").bind(now).bind(&hash).execute(&self.pool).await?;
         }
-        Ok(Some(crate::realms::Caller { realm: row.get("realm"), browser: false, console: false }))
+        Ok(Some(crate::realms::Caller { realm: row.get("realm"), api_token_name: Some(row.get("name")), ..Default::default() }))
     }
 
     async fn api_tokens(&self) -> anyhow::Result<Vec<api::ApiToken>> {
@@ -399,7 +407,10 @@ pub async fn require(State(st): State<Arc<HeadState>>, mut req: Request, next: N
             None if st.auth.required => {
                 return (StatusCode::UNAUTHORIZED, Json(api::ApiError { error: "invalid API token".into() })).into_response();
             }
-            None => return next.run(req).await,
+            None => {
+                req.extensions_mut().insert(Caller { api_token_name: Some(String::new()), ..Caller::root() });
+                return next.run(req).await;
+            }
         }
     }
     let place = browser_place(&req);
@@ -526,7 +537,11 @@ async fn redeem_link(
     Json(req): Json<api::RedeemLink>,
 ) -> Res<Response> {
     if !st.store.redeem_login_link(req.token.trim()).await? {
-        return Err(bad_request("this login link is invalid, expired or already used; run `c6h login-link` for a new one").into());
+        return Err(bad_request(format!(
+            "this login link is invalid, expired or already used; run `{}` for a new one",
+            st.auth.login_link_command
+        ))
+        .into());
     }
     sign_in(&st, "link", &headers, is_tls(tls)).await
 }
@@ -799,6 +814,33 @@ mod tests {
     fn cookie(r: &reqwest::Response) -> String {
         let c = r.headers().get("set-cookie").expect("sets a cookie").to_str().unwrap();
         c.split(';').next().unwrap().to_owned()
+    }
+
+    #[tokio::test]
+    async fn invalid_link_hints_target_the_running_heads_config() {
+        for path in [None, Some("/etc/c6h/c6h.toml"), Some("/custom/head config.toml")] {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = crate::HeadConfig {
+                config_path: path.map(Into::into),
+                data_dir: dir.path().to_owned(),
+                bind: vec!["127.0.0.1".parse().unwrap()],
+                ui_port: 0,
+                worker_port: 0,
+                ..Default::default()
+            };
+            let command = cfg.login_link_command();
+            let head = crate::start(cfg).await.unwrap();
+            let r = reqwest::Client::new()
+                .post(format!("http://{}/api/v1/auth/link", head.ui_addrs[0]))
+                .json(&json!({"token": "invalid"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+            assert!(r.text().await.unwrap().contains(&format!("run `{command}` for a new one")));
+            assert_eq!(head.state.auth.login_link_command, command);
+            head.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]

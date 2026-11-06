@@ -330,6 +330,7 @@ fn claude_code_log(turns: u64) -> Vec<c6_proto::SessionEvent> {
                         name: "Bash".into(),
                         input_json: r#"{"command":"git status"}"#.into(),
                     })),
+                    ..Default::default()
                 })
                 .collect();
             push(Kind::Assistant(AssistantMessage { turn, blocks, ..Default::default() }));
@@ -341,7 +342,7 @@ fn claude_code_log(turns: u64) -> Vec<c6_proto::SessionEvent> {
                 push(Kind::InputDelivered(InputDelivered { command_id: id.clone() }));
             }
         }
-        let reply = ContentBlock { block: Some(Block::Text(format!("Done with turn {turn}. Nothing else to do."))) };
+        let reply = ContentBlock { block: Some(Block::Text(format!("Done with turn {turn}. Nothing else to do."))), ..Default::default() };
         push(Kind::Assistant(AssistantMessage { turn, blocks: vec![reply], ..Default::default() }));
         push(usage());
         if turn < turns {

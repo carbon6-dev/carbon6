@@ -28,7 +28,7 @@ fn where_of(m: &Value) -> Place {
     }
 }
 
-fn empty(what: &'static str) -> AnyView {
+fn empty(what: impl IntoView + 'static) -> AnyView {
     view! { <p class="p-6 text-center text-muted">{what}</p> }.into_any()
 }
 
@@ -187,7 +187,11 @@ pub(crate) fn Saved() -> impl IntoView {
         <div class="min-h-0 flex-1 overflow-y-auto py-2">
             {move || list.get().map(|r| match r {
                 Err(e) => view! { <ErrorBox message=e /> }.into_any(),
-                Ok(v) if v.as_array().is_none_or(Vec::is_empty) => empty(if done.get_untracked() { "Nothing completed yet." } else { "Save a message (🔖 on hover) to come back to it." }),
+                Ok(v) if v.as_array().is_none_or(Vec::is_empty) => if done.get_untracked() {
+                    empty("Nothing completed yet.")
+                } else {
+                    empty(view! { "Save a message ("{crate::icons::bookmark()}" on hover) to come back to it." })
+                },
                 Ok(v) => v.as_array().cloned().unwrap_or_default().into_iter().map(|m| {
                     let (id1, id2) = (m["id"].clone(), m["id"].clone());
                     let finished = m["done_at"].is_number();
@@ -299,7 +303,7 @@ pub(crate) fn Details(place: Place) -> impl IntoView {
     view! {
         <header class="flex items-center gap-2 border-b border-zinc-200 px-4 py-2 dark:border-zinc-800">
             <span class="flex-1 truncate font-semibold">{place.name.clone()}</span>
-            <button class="text-xs text-muted hover:text-zinc-900 dark:hover:text-zinc-100" on:click=move |_| chat.details.set(false)>"✕"</button>
+                    <button class="text-xs text-muted hover:text-zinc-900 dark:hover:text-zinc-100" title="Close details" on:click=move |_| chat.details.set(false)>{crate::icons::x()}</button>
         </header>
         <div class="flex gap-1 border-b border-zinc-200 px-2 dark:border-zinc-800">{t("about", "About")}{t("people", "People")}{t("files", "Files")}{t("links", "Links")}</div>
         <div class="space-y-3 p-4 text-sm">
@@ -320,9 +324,9 @@ pub(crate) fn Details(place: Place) -> impl IntoView {
                         {row("Workspace", c["workspace_name"].as_str().unwrap_or("").to_owned())}
                         <div class="flex flex-wrap gap-2 pt-1">
                             <button class="rounded-md border border-zinc-300 px-2 py-1 text-xs hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
-                                on:click=move |_| chat.act("memex.chat.prefs", json!({"workspace": w, "channel": ch, "starred": !starred}))>{if starred { "★ Starred" } else { "☆ Star" }}</button>
+                                on:click=move |_| chat.act("memex.chat.prefs", json!({"workspace": w, "channel": ch, "starred": !starred}))><span class="inline-flex items-center gap-1">{crate::icons::star(starred)}{if starred { "Starred" } else { "Star" }}</span></button>
                             <button class="rounded-md border border-zinc-300 px-2 py-1 text-xs hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
-                                on:click=move |_| chat.act("memex.chat.prefs", json!({"workspace": w2, "channel": ch2, "muted": !muted}))>{if muted { "🔕 Muted" } else { "🔔 Mute" }}</button>
+                                on:click=move |_| chat.act("memex.chat.prefs", json!({"workspace": w2, "channel": ch2, "muted": !muted}))>{if muted { crate::icons::bell_off().into_any() } else { crate::icons::bell().into_any() }}" "{if muted { "Muted" } else { "Mute" }}</button>
                         </div>
                     }.into_any()
                 }).unwrap_or_else(|| ().into_any()),
@@ -389,7 +393,7 @@ fn shared(r: Result<Value, String>, files: bool) -> AnyView {
         .map(|(name, href, who)| {
             view! {
                 <a href=href target="_blank" rel="noopener" class="block rounded-md px-2 py-1 hover:bg-zinc-100 dark:hover:bg-zinc-800">
-                    <div class="truncate text-xs font-medium">{format!("{} {name}", if files { "📄" } else { "🔗" })}</div>
+                    <div class="truncate text-xs font-medium">{if files { crate::icons::file().into_any() } else { crate::icons::link().into_any() }}" "{name}</div>
                     <div class="text-[11px] text-muted">{who}</div>
                 </a>
             }

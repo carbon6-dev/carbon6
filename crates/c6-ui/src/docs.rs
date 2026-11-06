@@ -13,7 +13,7 @@ use serde_json::{Map, Value};
 
 use crate::api;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT, ago, now_ms};
-use crate::workspace::{Go, How, View, use_column, use_workspace};
+use crate::workspace::{Go, How, Rect, View, use_column, use_workspace};
 
 fn since(at: i64) -> String {
     ago(now_ms() - at)
@@ -100,8 +100,8 @@ fn author_named(by: &str) -> String {
     author(by)
 }
 
-fn kind_mark(kind: &str) -> &'static str {
-    if kind == "deck" { "▦" } else { "▤" }
+fn kind_mark(kind: &str) -> AnyView {
+    if kind == "deck" { crate::icons::chart().into_any() } else { crate::icons::file().into_any() }
 }
 
 /// Reloads `tick` whenever a document changes over the live feed (`id`:
@@ -156,8 +156,9 @@ fn chips_html(text: &str, attrs: &Value, refs: &std::collections::HashMap<String
         const CHIP: &str = "mx-0.5 rounded px-1 py-px text-[0.92em]";
         let html = match v["type"].as_str().unwrap_or("") {
             "date" => format!(
-                "<button type=\"button\" data-chip=\"{}\" title=\"A date: click to change it\" class=\"{CHIP} bg-sky-50 text-sky-800 hover:bg-sky-100 dark:bg-sky-950/40 dark:text-sky-300\">📅 {}</button>",
+                "<button type=\"button\" data-chip=\"{}\" title=\"A date: click to change it\" class=\"{CHIP} bg-sky-50 text-sky-800 hover:bg-sky-100 dark:bg-sky-950/40 dark:text-sky-300\">{} {}</button>",
                 esc(key),
+                crate::icons::html::calendar(),
                 esc(&s("value"))
             ),
             "mention" => format!(
@@ -165,9 +166,10 @@ fn chips_html(text: &str, attrs: &Value, refs: &std::collections::HashMap<String
                 esc(&if s("name").is_empty() { s("user") } else { s("name") })
             ),
             "dropdown" => format!(
-                "<button type=\"button\" data-chip=\"{}\" title=\"Pick another\" class=\"{CHIP} bg-zinc-100 text-zinc-800 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-200\">{} ▾</button>",
+                "<button type=\"button\" data-chip=\"{}\" title=\"Pick another\" class=\"{CHIP} bg-zinc-100 text-zinc-800 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-200\">{} {}</button>",
                 esc(key),
-                esc(&s("value"))
+                esc(&s("value")),
+                crate::icons::html::chevron_down()
             ),
             "ref" => {
                 let r = s("ref");
@@ -178,9 +180,10 @@ fn chips_html(text: &str, attrs: &Value, refs: &std::collections::HashMap<String
                     .unwrap_or_else(|| if s("title").is_empty() { r.clone() } else { s("title") });
                 let state = live.map(|l| l.state.clone()).unwrap_or_default();
                 format!(
-                    "<button type=\"button\" data-ref=\"{}\" title=\"{}\" class=\"{CHIP} bg-emerald-50 text-emerald-800 hover:underline dark:bg-emerald-950/40 dark:text-emerald-300\">↗ {}{}</button>",
+                    "<button type=\"button\" data-ref=\"{}\" title=\"{}\" class=\"{CHIP} bg-emerald-50 text-emerald-800 hover:underline dark:bg-emerald-950/40 dark:text-emerald-300\">{} {}{}</button>",
                     esc(&r),
                     esc(&r),
+                    crate::icons::html::arrow_up_right(),
                     esc(&title),
                     if state.is_empty() {
                         String::new()
@@ -368,6 +371,17 @@ fn Expandable(src: String, name: String, fill: bool, new_tab: Option<String>, ch
     }
 }
 
+/// A file embed's drawn paperclip, original name and size.
+fn file_embed(href: String, name: String, size: Option<u64>) -> impl IntoView {
+    view! {
+        <a href=href class="my-1 inline-flex items-center gap-2 rounded border border-zinc-200 px-2 py-1 text-sm text-sky-700 hover:bg-zinc-50 dark:border-zinc-800 dark:text-sky-400 dark:hover:bg-zinc-900"
+            on:click=|ev| ev.stop_propagation()>
+            {crate::icons::paperclip()} {name}
+            <span class="text-xs text-muted">{size.map(|n| format!("{} KB", n.div_ceil(1024))).unwrap_or_default()}</span>
+        </a>
+    }
+}
+
 /// An embed (docs/docs.md §3): a picture, a file, a diagram, a chart drawn
 /// from its rows, or a live view of the realm.
 #[component]
@@ -388,13 +402,7 @@ fn Embed(v: Value) -> impl IntoView {
                 </figure>
             }.into_any()
         }
-        "file" => view! {
-            <a href=file_url(&s("blob")) class="my-1 inline-flex items-center gap-2 rounded border border-zinc-200 px-2 py-1 text-sm text-sky-700 hover:bg-zinc-50 dark:border-zinc-800 dark:text-sky-400 dark:hover:bg-zinc-900"
-                on:click=|ev| ev.stop_propagation()>
-                "📎 " {s("name")}
-                <span class="text-xs text-muted">{v["size"].as_u64().map(|n| format!("{} KB", n.div_ceil(1024))).unwrap_or_default()}</span>
-            </a>
-        }.into_any(),
+        "file" => file_embed(file_url(&s("blob")), s("name"), v["size"].as_u64()).into_any(),
         // An agent's SVG, drawn as a picture: it can't run or restyle the page.
         "diagram" => {
             let svg = s("svg");
@@ -694,7 +702,7 @@ pub fn DocsPage() -> impl IntoView {
                                     {(d.pending > 0).then(|| view! {
                                         <span class="shrink-0 rounded bg-violet-100 px-1.5 text-[11px] text-violet-800 dark:bg-violet-900/40 dark:text-violet-300"
                                             title=format!("Still being written by {}", d.writers.iter().map(|w| author_named(w)).collect::<Vec<_>>().join(", "))>
-                                            {format!("✎ {} to write", d.pending)}
+                                            {crate::icons::pencil()}" "{format!("{} to write", d.pending)}
                                         </span>
                                     })}
                                     {d.labels.iter().map(|l| view! { <span class="shrink-0 text-[11px] text-muted">{format!("#{l}")}</span> }).collect_view()}
@@ -747,12 +755,10 @@ struct ThreadsCtx {
     commenting: RwSignal<Option<String>>,
     /// The comments panel is open.
     panel: RwSignal<bool>,
-    /// The block whose comments show in a popover by its 💬, and where it
-    /// hangs in the page (top and right, in pixels).
+    /// The block whose comments show in a popover by its 💬.
     pop: RwSignal<Option<String>>,
-    pop_at: RwSignal<(f64, f64)>,
+    pop_node: NodeRef<leptos::html::Div>,
     tabs: Memo<Vec<DocTab>>,
-    deck: Memo<bool>,
     /// The page: what the popover hangs in, and blocks are found in.
     root: NodeRef<leptos::html::Div>,
     /// Scrolls to blocks and flashes them (on their tab).
@@ -764,7 +770,7 @@ struct ThreadsCtx {
 }
 
 impl ThreadsCtx {
-    /// A block's 💬 (`marker`) pressed: its popover opens under it (with a
+    /// A block's 💬 (`marker`) pressed: its popover opens by it (with a
     /// new comment box, `new`), or closes if it was open.
     fn toggle_pop(self, block: String, marker: &web_sys::Element, new: bool) {
         if !new && self.pop.get_untracked().as_deref() == Some(block.as_str()) {
@@ -779,11 +785,10 @@ impl ThreadsCtx {
         }
     }
 
-    /// The popover hangs under `marker`, its right edge on the marker's.
+    /// Prefer below the marker, but keep the whole box in the visible tile.
     fn place_pop(self, marker: &web_sys::Element) {
-        let Some(root) = self.root.try_get_untracked().flatten() else { return };
-        let (r, m) = (root.get_bounding_client_rect(), marker.get_bounding_client_rect());
-        let _ = self.pop_at.try_set((m.bottom() - r.top() + 4.0, (r.right() - m.right()).max(8.0)));
+        let Some(node) = self.pop_node.try_get_untracked().flatten() else { return };
+        place_popover(&node, marker, self.root);
     }
 
     /// The popover goes, and the new comment in it (its draft stays).
@@ -795,6 +800,129 @@ impl ThreadsCtx {
             let _ = self.pop.try_set(None);
         }
     }
+}
+
+fn rect(r: web_sys::DomRect) -> Rect {
+    Rect { left: r.left(), top: r.top(), width: r.width(), height: r.height() }
+}
+
+/// The part of the layout viewport not covered by a phone's keyboard.
+fn visible_viewport() -> Rect {
+    let w = window();
+    match w.visual_viewport() {
+        Some(v) => Rect { left: v.offset_left(), top: v.offset_top(), width: v.width(), height: v.height() },
+        None => Rect {
+            width: w.inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(0.0),
+            height: w.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(0.0),
+            ..Rect::default()
+        },
+    }
+}
+
+/// Prefer below, then above; if neither fits, clamp and scroll the box.
+/// `area` is the intersection of the scrolling tile and visual viewport.
+fn popover_at(anchor: Rect, area: Rect, size: (f64, f64)) -> Rect {
+    let (left, top) = (area.left + 8.0, area.top + 8.0);
+    let (width, height) = (size.0.min((area.width - 16.0).max(0.0)), size.1.min((area.height - 16.0).max(0.0)));
+    let below = anchor.top + anchor.height + 4.0;
+    let y = if below + height <= area.top + area.height - 8.0 { below } else { anchor.top - height - 4.0 };
+    Rect {
+        left: (anchor.left + anchor.width - width).clamp(left, (area.left + area.width - 8.0 - width).max(left)),
+        top: y.clamp(top, (area.top + area.height - 8.0 - height).max(top)),
+        width,
+        height,
+    }
+}
+
+fn place_popover(node: &web_sys::HtmlElement, anchor: &web_sys::Element, root: NodeRef<leptos::html::Div>) {
+    let Some(area) = root.try_get_untracked().flatten().and_then(|r| r.parent_element()) else { return };
+    let Some(parent) = node.offset_parent() else { return };
+    let (mut a, v) = (rect(area.get_bounding_client_rect()), visible_viewport());
+    // The scrollport excludes borders and the reserved scrollbar gutter.
+    a.left += f64::from(area.client_left());
+    a.top += f64::from(area.client_top());
+    a.width = f64::from(area.client_width());
+    a.height = f64::from(area.client_height());
+    let (left, top) = (a.left.max(v.left), a.top.max(v.top));
+    let visible = Rect {
+        left,
+        top,
+        width: ((a.left + a.width).min(v.left + v.width) - left).max(0.0),
+        height: ((a.top + a.height).min(v.top + v.height) - top).max(0.0),
+    };
+    let style = node.style();
+    // Constrain before measuring: wrapping and a growing draft change height.
+    let _ = style.set_property("max-width", &format!("{}px", (visible.width - 16.0).max(0.0)));
+    let _ = style.set_property("max-height", &format!("{}px", (visible.height - 16.0).max(0.0)));
+    let r = node.get_bounding_client_rect();
+    let at = popover_at(rect(anchor.get_bounding_client_rect()), visible, (r.width(), r.height()));
+    let p = parent.get_bounding_client_rect();
+    let _ = style.set_property("left", &format!("{}px", at.left - p.left() - f64::from(parent.client_left())));
+    let _ = style.set_property("top", &format!("{}px", at.top - p.top() - f64::from(parent.client_top())));
+}
+
+/// Follow the tile, content, scrolling and keyboard without remounting a draft.
+fn follow_popover(node: NodeRef<leptos::html::Div>, place: impl Fn() + Clone + 'static) {
+    use wasm_bindgen::{JsCast, closure::Closure};
+    let root = expect_context::<ThreadsCtx>().root;
+    Effect::new(move || {
+        let (Some(node), Some(root)) = (node.get(), root.get()) else { return };
+        let place = place.clone();
+        place();
+        let alive = std::rc::Rc::new(std::cell::Cell::new(true));
+        let on = Closure::<dyn Fn()>::new({
+            let (place, alive) = (place.clone(), alive.clone());
+            move || {
+                let (place, alive) = (place.clone(), alive.clone());
+                // Resizing the observed box during delivery makes an observer
+                // loop. Measure on the next frame, only while it still exists.
+                request_animation_frame(move || {
+                    if alive.get() {
+                        place();
+                    }
+                });
+            }
+        });
+        let callback = on.as_ref().unchecked_ref();
+        let observer = web_sys::ResizeObserver::new(callback).ok();
+        if let Some(ro) = observer.clone() {
+            let alive = alive.clone();
+            // A panel can mount during the tile's observer delivery (docked
+            // becomes floating). Register its ancestors outside that delivery.
+            request_animation_frame(move || {
+                if alive.get() {
+                    ro.observe(&node);
+                    ro.observe(&root);
+                    if let Some(area) = root.parent_element() {
+                        ro.observe(&area);
+                    }
+                }
+            });
+        }
+        // Capture catches nested scroll areas too; repositioning never closes it.
+        let _ = document().add_event_listener_with_callback_and_bool("scroll", callback, true);
+        let _ = window().add_event_listener_with_callback("resize", callback);
+        let viewport = window().visual_viewport();
+        if let Some(v) = &viewport {
+            let _ = v.add_event_listener_with_callback("resize", callback);
+            let _ = v.add_event_listener_with_callback("scroll", callback);
+        }
+        let hooks = send_wrapper::SendWrapper::new((observer, viewport, on, alive));
+        on_cleanup(move || {
+            let (observer, viewport, on, alive) = &*hooks;
+            alive.set(false);
+            if let Some(ro) = observer {
+                ro.disconnect();
+            }
+            let callback = on.as_ref().unchecked_ref();
+            let _ = document().remove_event_listener_with_callback_and_bool("scroll", callback, true);
+            let _ = window().remove_event_listener_with_callback("resize", callback);
+            if let Some(v) = viewport {
+                let _ = v.remove_event_listener_with_callback("resize", callback);
+                let _ = v.remove_event_listener_with_callback("scroll", callback);
+            }
+        });
+    });
 }
 
 /// Where a block is drawn in the page.
@@ -831,6 +959,19 @@ fn flash_blocks(root: NodeRef<leptos::html::Div>, ids: &[String]) {
         let _ = el.dyn_ref::<web_sys::HtmlElement>().map(web_sys::HtmlElement::offset_width);
         let _ = classes.add_1("c6-flash");
     }
+}
+
+/// Blocks as drawn (a slide for its children), on the first matching tab.
+fn reveal_targets(tabs: &[DocTab], ids: &[String]) -> Option<(String, Vec<String>)> {
+    tabs.iter().find_map(|t| {
+        let blocks: Vec<String> = t
+            .blocks
+            .iter()
+            .filter(|b| ids.iter().any(|i| *i == b.id || b.children.iter().any(|c| c.id == *i)))
+            .map(|b| b.id.clone())
+            .collect();
+        (!blocks.is_empty()).then(|| (t.id.clone(), blocks))
+    })
 }
 
 /// Closes a popover (`close`) on a press outside it (`node`), but not on
@@ -966,24 +1107,14 @@ pub fn DocPage(id: String) -> impl IntoView {
     let pop = RwSignal::new(None::<String>);
     let shown_threads = RwSignal::new(Vec::<DocThread>::new());
     let reveal = Callback::new(move |ids: Vec<String>| {
-        // Each as the block drawn for it (a slide, for a block on one), on
-        // the tab of the first.
-        let mut on = None::<String>;
-        let mut els = Vec::new();
-        tabs.with_untracked(|ts| {
-            for t in ts {
-                for b in &t.blocks {
-                    if ids.iter().any(|i| *i == b.id || b.children.iter().any(|c| c.id == *i))
-                        && *on.get_or_insert_with(|| t.id.clone()) == t.id
-                    {
-                        els.push(b.id.clone());
-                    }
-                }
-            }
-        });
-        let Some(on) = on else { return };
+        let Some((on, mut els)) = tabs.with_untracked(|ts| reveal_targets(ts, &ids)) else { return };
         if on != current.get_untracked() {
             tab.set(on);
+        }
+        if is_deck.get_untracked() {
+            // Only one slide is drawn at a time. Select it before flashing.
+            els.truncate(1);
+            deck_pick.set(els.first().cloned());
         }
         // A sheet covers the doc.
         if fit.get_untracked() == Fit::Sheet {
@@ -1013,9 +1144,8 @@ pub fn DocPage(id: String) -> impl IntoView {
         commenting: RwSignal::new(None),
         panel,
         pop,
-        pop_at: RwSignal::new((0.0, 0.0)),
+        pop_node: NodeRef::new(),
         tabs,
-        deck: is_deck,
         root,
         reveal,
         unsent,
@@ -1286,7 +1416,7 @@ pub fn DocPage(id: String) -> impl IntoView {
                     <button data-opens="comments" class=move || format!("{BAR} {}", if panel.get() { "bg-zinc-100 dark:bg-zinc-800" } else { "" })
                         title=move || if panel.get() { "Hide the comments" } else { "Show the comments" }
                         on:click=move |_| panel.update(|p| *p = !*p)>
-                        {move || match open_n.get() { 0 => "💬".to_owned(), n => format!("💬 {n} open") }}
+                        {crate::icons::message()}" "{move || match open_n.get() { 0 => "Comments".to_owned(), n => format!("{n} open") }}
                     </button>
                     // A comment on the whole doc, wherever you've scrolled to.
                     <button data-opens="comments" class=BAR title="Comment on the whole doc"
@@ -1296,7 +1426,7 @@ pub fn DocPage(id: String) -> impl IntoView {
                         <button class=move || format!("{BAR} {}", if edit_all.get() { "bg-zinc-100 font-medium dark:bg-zinc-800" } else { "" })
                             title=move || if edit_all.get() { "Back to reading" } else { "Edit the doc: a click on a block opens it in Markdown" }
                             on:click=toggle_edit>
-                            {move || if edit_all.get() { "Done" } else { "✎ Edit" }}
+                            {move || if edit_all.get() { view! { "Done" }.into_any() } else { view! { {crate::icons::pencil()}" Edit" }.into_any() }}
                         </button>
                     })}
                     <UsedIn items=used />
@@ -1305,7 +1435,7 @@ pub fn DocPage(id: String) -> impl IntoView {
                         ("History", Callback::new(move |()| history.update(|x| *x = !*x))),
                     ] />
                 </div>
-                {move || floating.get().then(|| view! { <FloatingPanel tile_h /> })}
+                {move || floating.get().then(|| view! { <FloatingPanel /> })}
             </div>
         }
     };
@@ -1321,7 +1451,7 @@ pub fn DocPage(id: String) -> impl IntoView {
                 </p>
                 {move || summary.with(|s| (s.pending > 0).then(|| view! {
                     <p class="text-sm text-violet-700 dark:text-violet-300">
-                        {format!("✎ Being written by {}: {} {} to go", s.writers.iter().map(|w| author_named(w)).collect::<Vec<_>>().join(", "), s.pending, if s.pending == 1 { "part" } else { "parts" })}
+                        {crate::icons::pencil()}" "{format!("Being written by {}: {} {} to go", s.writers.iter().map(|w| author_named(w)).collect::<Vec<_>>().join(", "), s.pending, if s.pending == 1 { "part" } else { "parts" })}
                     </p>
                 }))}
             </header>
@@ -1400,7 +1530,7 @@ pub fn DocPage(id: String) -> impl IntoView {
                         {move || error.get().map(|e| view! {
                             <div class="flex items-start gap-2">
                                 <div class="flex-1"><ErrorBox message=e /></div>
-                                <button class="text-xs text-muted" on:click=move |_| error.set(None)>"✕"</button>
+                                <button class="text-xs text-muted" title="Dismiss error" on:click=move |_| error.set(None)>{crate::icons::x()}</button>
                             </div>
                         })}
                         {move || match state.get() {
@@ -1441,7 +1571,7 @@ fn send_all_button(ctx: ThreadsCtx, arrow: bool) -> impl IntoView {
         <button class="shrink-0 rounded-md bg-sky-600 px-2 py-1 text-xs font-medium text-white hover:bg-sky-700 disabled:opacity-50"
             title="Your open comments that haven't gone to an agent: each thread goes to its session, which answers in it"
             disabled=move || ctx.sending.get() on:click=move |_| ctx.send_all.run(())>
-            {move || format!("Send {} to agent{}", ctx.unsent.get(), if arrow { " ↑" } else { "" })}
+            {move || format!("Send {} to agent", ctx.unsent.get())}{arrow.then(|| view! { " "{crate::icons::arrow_up()} })}
         </button>
     }
 }
@@ -1464,7 +1594,8 @@ fn UsedIn(items: Signal<Vec<(View, String)>>) -> impl IntoView {
                 <div class="relative shrink-0">
                     <button class=BAR data-pop=pop.get_value() aria-haspopup="menu" aria-expanded=move || open.get().to_string()
                         title="What refers to this doc" on:click=move |_| open.update(|o| *o = !*o)>
-                        {move || format!("Used in {} ▾", n.get())}
+                        {move || format!("Used in {}", n.get())}
+                        {crate::icons::chevron_down()}
                     </button>
                     {move || open.get().then(|| view! {
                         <div role="menu" data-pop=pop.get_value() on:click=move |_| open.set(false)
@@ -1483,15 +1614,21 @@ fn UsedIn(items: Signal<Vec<(View, String)>>) -> impl IntoView {
 /// The comments panel over the doc's right side, hanging from the bar; a
 /// press outside it (or Escape) closes it.
 #[component]
-fn FloatingPanel(tile_h: RwSignal<f64>) -> impl IntoView {
+fn FloatingPanel() -> impl IntoView {
     let ctx = expect_context::<ThreadsCtx>();
     let node = NodeRef::<leptos::html::Div>::new();
     dismiss(node, "[data-opens=comments]", move || {
         let _ = ctx.panel.try_set(false);
     });
+    follow_popover(node, move || {
+        if let Some(el) = node.try_get_untracked().flatten()
+            && let Some(bar) = el.parent_element()
+        {
+            place_popover(&el, &bar, ctx.root);
+        }
+    });
     view! {
-        <div node_ref=node class="absolute right-2 top-full z-10 mt-1 flex w-[26rem] max-w-[calc(100%-1rem)] flex-col overflow-hidden rounded-lg border border-zinc-200 bg-white shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
-            style=move || format!("max-height: {}px", (tile_h.get() - 72.0).max(240.0))>
+        <div node_ref=node class="absolute z-10 flex w-[26rem] max-w-[calc(100%-1rem)] flex-col overflow-hidden rounded-lg border border-zinc-200 bg-white shadow-xl dark:border-zinc-700 dark:bg-zinc-900">
             <CommentsPanel />
         </div>
     }
@@ -1501,6 +1638,16 @@ fn FloatingPanel(tile_h: RwSignal<f64>) -> impl IntoView {
 /// a tap above it or Escape closes it.
 #[component]
 fn Sheet(close: Callback<()>, children: Children) -> impl IntoView {
+    let node = NodeRef::<leptos::html::Div>::new();
+    follow_popover(node, move || {
+        if let Some(el) = node.try_get_untracked().flatten() {
+            let v = visible_viewport();
+            let height = window().inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(v.top + v.height);
+            let style = web_sys::HtmlElement::style(&el);
+            let _ = style.set_property("bottom", &format!("{}px", (height - v.top - v.height).max(0.0)));
+            let _ = style.set_property("max-height", &format!("{}px", v.height * 0.85));
+        }
+    });
     let keys = window_event_listener(leptos::ev::keydown, move |ev| {
         if ev.key() == "Escape" && !ev.default_prevented() {
             close.run(());
@@ -1509,7 +1656,7 @@ fn Sheet(close: Callback<()>, children: Children) -> impl IntoView {
     on_cleanup(move || keys.remove());
     view! {
         <div class="fixed inset-0 z-40 bg-black/30" on:click=move |_| close.run(())></div>
-        <div class="fixed inset-x-0 bottom-0 z-50 flex max-h-[85dvh] flex-col overflow-hidden rounded-t-xl border-t border-zinc-200 bg-white shadow-2xl dark:border-zinc-700 dark:bg-zinc-900">
+        <div node_ref=node class="fixed inset-x-0 bottom-0 z-50 flex max-h-[85dvh] flex-col overflow-hidden rounded-t-xl border-t border-zinc-200 bg-white shadow-2xl dark:border-zinc-700 dark:bg-zinc-900">
             {children()}
         </div>
     }
@@ -1550,7 +1697,7 @@ fn CommentsPanel() -> impl IntoView {
             {move || new_on.get().map(|b| view! { <NewComment block=b done=Callback::new(move |()| ctx.commenting.set(None)) /> })}
             <For each=move || ids.get() key=|id| id.clone() children=move |id| view! { <Thread id about=true /> } />
             {move || ids.with(Vec::is_empty).then(|| view! {
-                <p class="text-muted">{if resolved.get() { "No resolved comments." } else { "No open comments. Press 💬 by a block to start one." }}</p>
+                <p class="text-muted">{if resolved.get() { view! { "No resolved comments." }.into_any() } else { view! { "No open comments. Press "{crate::icons::message()}" by a block to start one." }.into_any() }}</p>
             })}
         </div>
         {move || (ctx.unsent.get() > 0).then(|| view! {
@@ -1562,16 +1709,26 @@ fn CommentsPanel() -> impl IntoView {
     }
 }
 
-/// A block's comments, in a popover under its 💬 over the doc: a press
+/// A block's comments, in a popover by its 💬 over the doc: a press
 /// outside it or Escape closes it.
 #[component]
 fn BlockPop(block: String) -> impl IntoView {
     let ctx = expect_context::<ThreadsCtx>();
-    let node = NodeRef::<leptos::html::Div>::new();
+    let node = ctx.pop_node;
+    let bid = StoredValue::new(block.clone());
+    follow_popover(node, move || {
+        let marker = ctx
+            .root
+            .try_get_untracked()
+            .flatten()
+            .and_then(|r| r.query_selector(&format!("{} > [data-marks]", block_sel(&bid.get_value()))).ok().flatten());
+        if let Some(m) = marker {
+            ctx.place_pop(&m);
+        }
+    });
     dismiss(node, "[data-marks]", move || ctx.close_pop());
     view! {
-        <div node_ref=node class="absolute z-30 max-h-[70vh] w-96 max-w-[calc(100%-1rem)] space-y-2 overflow-y-auto overscroll-contain rounded-lg border border-zinc-200 bg-white p-2 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
-            style=move || ctx.pop_at.with(|(top, right)| format!("top: {top}px; right: {right}px"))>
+        <div node_ref=node class="absolute z-30 w-96 space-y-2 overflow-y-auto overscroll-contain rounded-lg border border-zinc-200 bg-white p-2 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900">
             <PopBody block />
         </div>
     }
@@ -1854,11 +2011,11 @@ fn BlockView(
                 {move || match open_n.get() {
                     0 => view! {
                         <button class="invisible rounded px-1 text-xs text-muted hover:bg-zinc-100 group-hover:visible pointer-coarse:visible dark:hover:bg-zinc-800"
-                            title="Comment on this" aria-label="Comment on this block" on:click=move |ev| marker(ev, true)>"💬"</button>
+                            title="Comment on this" aria-label="Comment on this block" on:click=move |ev| marker(ev, true)>{crate::icons::message()}</button>
                     }.into_any(),
                     n => view! {
                         <button class=move || format!("rounded px-1 text-xs font-medium text-soft hover:bg-zinc-100 dark:hover:bg-zinc-800 {}", if popped.get() { "bg-zinc-100 dark:bg-zinc-800" } else { "" })
-                            title="Its comments" on:click=move |ev| marker(ev, false)>{format!("💬 {n}")}</button>
+                            title="Its comments" on:click=move |ev| marker(ev, false)>{crate::icons::message()}" "{n}</button>
                     }.into_any(),
                 }}
             </div>
@@ -1874,7 +2031,7 @@ fn Shown(b: DocBlock, kind: String) -> impl IntoView {
             let who = b.attrs["by"].as_str().map(author_named).unwrap_or_else(|| "an agent".into());
             view! {
                 <div class="rounded border border-dashed border-violet-300 px-3 py-2 text-sm text-violet-800 dark:border-violet-800 dark:text-violet-300">
-                    <span class="animate-pulse">"✎ "</span>{b.attrs["intent"].as_str().unwrap_or("").to_owned()}
+                    <span class="animate-pulse">{crate::icons::pencil()}" "</span>{b.attrs["intent"].as_str().unwrap_or("").to_owned()}
                     <span class="text-xs text-violet-500">{format!(" — {who} is writing this")}</span>
                 </div>
             }
@@ -1917,6 +2074,7 @@ fn Shown(b: DocBlock, kind: String) -> impl IntoView {
 struct Subject {
     thumb: Option<String>,
     text: String,
+    file: bool,
     /// It's in the doc, to go to.
     here: bool,
 }
@@ -1925,14 +2083,14 @@ struct Subject {
 /// or diagram with its caption, "Whole tab"; once gone, what it said
 /// (`about`).
 fn subject(tabs: &[DocTab], block: &str, about: &str, doc: &str) -> Subject {
-    let words = |text: String| Subject { thumb: None, text, here: true };
+    let words = |text: String| Subject { thumb: None, text, file: false, here: true };
     if block.is_empty() {
-        return Subject { thumb: None, text: "Whole tab".into(), here: false };
+        return Subject { thumb: None, text: "Whole tab".into(), file: false, here: false };
     }
     let found =
         tabs.iter().flat_map(|t| &t.blocks).find_map(|b| if b.id == block { Some(b) } else { b.children.iter().find(|c| c.id == block) });
     let Some(b) = found else {
-        return Subject { thumb: None, text: first_line(about, &Value::Null), here: false };
+        return Subject { thumb: None, text: first_line(about, &Value::Null), file: false, here: false };
     };
     let v = &b.attrs;
     let s = |k: &str| v[k].as_str().unwrap_or("").to_owned();
@@ -1944,15 +2102,17 @@ fn subject(tabs: &[DocTab], block: &str, about: &str, doc: &str) -> Subject {
                 if s("caption").is_empty() { if s("alt").is_empty() { s("name") } else { s("alt") } } else { s("caption") },
                 "A picture",
             ),
+            file: false,
             here: true,
         },
         ("embed", "diagram") => Subject {
             thumb: Some(format!("data:image/svg+xml;base64,{}", base64_of(s("svg").as_bytes()))),
             text: either(s("title"), "A diagram"),
+            file: false,
             here: true,
         },
         ("embed", "chart") => words(either(s("title"), "A chart")),
-        ("embed", "file") => words(format!("📎 {}", s("name"))),
+        ("embed", "file") => Subject { file: true, ..words(s("name")) },
         ("embed", "view") => words(format!("View · {}", s("view"))),
         ("slide", _) => {
             words(either(b.children.iter().map(|c| first_line(&c.text, &c.attrs)).find(|l| !l.is_empty()).unwrap_or_default(), "A slide"))
@@ -2050,7 +2210,12 @@ fn first_line(md: &str, attrs: &Value) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ").replace("· ·", "·")
 }
 
-/// A thread's quote box: what it's about, and ↗ to go to it in the doc.
+/// A thread's anchor, or none when its block or quoted words are gone.
+fn comment_target(t: &DocThread, here: bool) -> Option<String> {
+    (here && !t.detached && !t.anchor.block.is_empty()).then(|| t.anchor.block.clone())
+}
+
+/// A thread's quote box: what it's about, and locate it in the doc.
 #[component]
 fn About(t: Memo<DocThread>) -> impl IntoView {
     let ctx = expect_context::<ThreadsCtx>();
@@ -2058,23 +2223,39 @@ fn About(t: Memo<DocThread>) -> impl IntoView {
         let (block, about) = t.with(|t| (t.anchor.block.clone(), t.about.clone()));
         ctx.tabs.with(|ts| subject(ts, &block, &about, &ctx.doc.get_value()))
     });
+    let target = Memo::new(move |_| t.with(|t| comment_target(t, what.with(|w| w.here))));
+    let gone = RwSignal::new(false);
+    let show = Callback::new(move |()| {
+        if let Some(block) = target.get_untracked() {
+            gone.set(false);
+            ctx.reveal.run(vec![block]);
+        } else {
+            gone.set(true);
+        }
+    });
     view! {
+        <>
         <div class="flex items-start gap-2 border-l-2 border-zinc-300 pl-2 dark:border-zinc-600">
             {move || what.with(|w| w.thumb.clone()).map(|src| view! {
                 <img src=src alt="" class="h-8 w-8 shrink-0 rounded border border-zinc-200 bg-white object-contain dark:border-zinc-700" />
             })}
-            <div class="min-w-0 flex-1">
-                <p class="line-clamp-2 break-words">{move || what.with(|w| w.text.clone())}</p>
+            <button type="button" class="min-w-0 flex-1 cursor-pointer select-text rounded text-left hover:bg-zinc-100 disabled:cursor-default dark:hover:bg-zinc-800"
+                title="Show it in the doc" aria-label="Show it in the doc"
+                disabled=move || t.with(|t| t.anchor.block.is_empty()) on:click=move |_| show.run(())>
+                <span class="line-clamp-2 break-words">{move || what.with(|w| w.file).then(crate::icons::paperclip)}" "{move || what.with(|w| w.text.clone())}</span>
                 {move || t.with(|t| t.anchor.quote.clone()).chars().next().is_some().then(|| view! {
-                    <p class="truncate text-xs text-muted">{move || format!("“{}”", t.with(|t| t.anchor.quote.clone()))}</p>
+                    <span class="block truncate text-xs text-muted">{move || format!("“{}”", t.with(|t| t.anchor.quote.clone()))}</span>
                 })}
-            </div>
-            {move || (what.with(|w| w.here) && !ctx.deck.get()).then(|| view! {
-                <button class="shrink-0 rounded px-1 text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+            </button>
+            {move || t.with(|t| !t.anchor.block.is_empty()).then(|| view! {
+                <button type="button" class="shrink-0 rounded px-1 text-muted enabled:hover:bg-zinc-100 enabled:hover:text-zinc-900 disabled:opacity-40 dark:enabled:hover:bg-zinc-800 dark:enabled:hover:text-zinc-100"
                     title="Show it in the doc" aria-label="Show it in the doc"
-                    on:click=move |_| ctx.reveal.run(vec![t.with_untracked(|t| t.anchor.block.clone())])>"↗"</button>
+                    disabled=move || target.with(Option::is_none)
+                    on:click=move |_| show.run(())>{crate::icons::locate_fixed()}</button>
             })}
         </div>
+        {move || gone.get().then(|| view! { <p class="mt-1 text-xs text-muted" role="status">"That part of the doc is gone"</p> })}
+        </>
     }
 }
 
@@ -2165,7 +2346,7 @@ fn NewComment(block: String, done: Callback<()>) -> impl IntoView {
 
 /// A comment box: one line, growing with its text to about eight, then
 /// scrolling.
-const COMMENT_GROWS: &str = "block max-h-44 resize-none overflow-y-auto";
+const COMMENT_GROWS: &str = "grows block max-h-44 resize-none overflow-y-auto";
 
 /// "Send to agent", as a switch: what you write goes on to an agent.
 #[component]
@@ -2225,6 +2406,17 @@ fn AgentName(id: String) -> impl IntoView {
     }
 }
 
+/// An agent's comment: agents write Markdown, so it renders as in the
+/// transcript, its links opening in the workspace where there is one.
+fn agent_text(text: &str) -> impl IntoView {
+    let (col, ws) = (crate::workspace::use_column(), use_context::<crate::workspace::Workspace>());
+    view! {
+        <div class="md max-w-[85%] break-words rounded-xl bg-zinc-100 px-3 py-1.5 dark:bg-zinc-800"
+            on:click=move |ev| if let Some(ws) = ws { crate::mentions::follow_link(&ev, col, ws); }
+            inner_html=crate::markdown::to_html(text)></div>
+    }
+}
+
 /// One comment: yours on the right, a quiet grey-blue; anyone else's on
 /// the left, grey, an agent's named by its session (its colour on the dot
 /// by the name). `under`: what goes beneath it (that it changed the doc).
@@ -2250,7 +2442,7 @@ fn said(c: &c6_api::docs::DocComment, under: Option<AnyView>) -> AnyView {
             <div class="mb-0.5 flex max-w-full items-center gap-1 text-xs text-muted">
                 {who}<span class="shrink-0">{format!("· {when}")}</span>
             </div>
-            <p class="max-w-[85%] whitespace-pre-wrap break-words rounded-xl bg-zinc-100 px-3 py-1.5 dark:bg-zinc-800">{text}</p>
+            {agent_text(&text)}
             {under}
         </div>
     }
@@ -2355,7 +2547,7 @@ fn MyComment(c: c6_api::docs::DocComment, thread: String) -> impl IntoView {
                 {move || (!editing.get() && !deleting.get()).then(|| view! {
                     <button class=COMMENT_TOOL title="Edit or delete your comment (no agent has it yet)" aria-label="Edit or delete your comment"
                         aria-expanded=move || menu.get().to_string() data-pop=pop.get_value()
-                        on:click=move |ev| { ev.stop_propagation(); menu.update(|o| *o = !*o) }>"⋯"</button>
+                        on:click=move |ev| { ev.stop_propagation(); menu.update(|o| *o = !*o) }>{crate::icons::ellipsis()}</button>
                 })}
                 <span class="ml-1">{format!("You · {when}")}</span>
             </div>
@@ -2870,6 +3062,152 @@ fn base64_of(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn comment_popover_flips_clamps_and_shrinks_to_the_visible_tile() {
+        use super::{Rect, popover_at};
+        let area = Rect { left: 100.0, top: 60.0, width: 600.0, height: 400.0 };
+        let mut anchor = Rect { left: 650.0, top: 100.0, width: 20.0, height: 20.0 };
+        let below = popover_at(anchor, area, (384.0, 160.0));
+        assert_eq!((below.left, below.top), (286.0, 124.0));
+        anchor.top = 420.0;
+        let above = popover_at(anchor, area, (384.0, 160.0));
+        assert_eq!((above.left, above.top), (286.0, 256.0));
+        // A long thread or a keyboard-shortened viewport: the box scrolls.
+        for width in [320.0, 390.0, 1400.0] {
+            let area = Rect { left: 30.0, top: 120.0, width, height: 220.0 };
+            for (x, y) in [(-100.0, -100.0), (300.0, 200.0), (2000.0, 2000.0)] {
+                let at = popover_at(Rect { left: x, top: y, ..anchor }, area, (384.0, 600.0));
+                assert!(at.left >= area.left + 8.0 && at.top >= area.top + 8.0);
+                assert!(at.left + at.width <= area.left + area.width - 8.0);
+                assert!(at.top + at.height <= area.top + area.height - 8.0);
+                assert_eq!(at.height, 204.0);
+                assert_eq!(at.width, 384.0_f64.min(width - 16.0));
+            }
+        }
+        // A hidden tile has no room, not an inverted clamp range or panic.
+        let hidden = popover_at(anchor, Rect::default(), (384.0, 160.0));
+        assert_eq!((hidden.width, hidden.height), (0.0, 0.0));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn agents_comments_render_their_markdown() {
+        use super::*;
+        let owner = Owner::new();
+        owner.with(|| {
+            let html = agent_text("1. **Work the target back.** Then *check*.").to_html();
+            assert!(html.contains("<strong>Work the target back.</strong>") && !html.contains("**"), "{html}");
+            assert!(html.contains("<ol>") || html.contains("<ol "), "{html}");
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn comment_quotes_are_labelled_buttons_and_gone_anchors_keep_an_inactive_icon() {
+        use super::*;
+        let owner = Owner::new();
+        owner.with(|| {
+            let tabs = RwSignal::new(vec![DocTab {
+                blocks: vec![DocBlock { id: "block.1".into(), text: "The release plan".into(), ..Default::default() }],
+                ..Default::default()
+            }]);
+            let thread = RwSignal::new(DocThread {
+                anchor: c6_api::docs::Anchor { block: "block.1".into(), quote: "release plan".into(), ..Default::default() },
+                about: "The release plan".into(),
+                ..Default::default()
+            });
+            provide_context(ThreadsCtx {
+                doc: StoredValue::new("doc.1".into()),
+                shown: RwSignal::new(vec![]),
+                tick: RwSignal::new(0),
+                focus: RwSignal::new(None),
+                commenting: RwSignal::new(None),
+                panel: RwSignal::new(false),
+                pop: RwSignal::new(None),
+                pop_node: NodeRef::new(),
+                tabs: Memo::new(move |_| tabs.get()),
+                root: NodeRef::new(),
+                reveal: Callback::new(|_| {}),
+                unsent: Memo::new(|_| 0),
+                sending: RwSignal::new(false),
+                send_all: Callback::new(|_| {}),
+            });
+            let t = Memo::new(move |_| thread.get());
+            for (deleted, rewritten) in [(false, false), (false, true), (true, false)] {
+                thread.update(|t| t.detached = rewritten);
+                if deleted {
+                    tabs.set(vec![]);
+                }
+                let html = view! { <About t /> }.to_html();
+                let buttons: Vec<_> = html.split("<button").skip(1).map(|b| b.split("</button>").next().unwrap()).collect();
+                assert_eq!(buttons.len(), 2, "keep both the quote and locate button: {html}");
+                for button in &buttons {
+                    assert!(button.contains("type=\"button\""), "{button}");
+                    assert!(button.contains("title=\"Show it in the doc\""), "{button}");
+                    assert!(button.contains("aria-label=\"Show it in the doc\""), "{button}");
+                }
+                assert!(buttons[0].contains("The release plan"), "{html}");
+                assert!(buttons[0].contains("“release plan”"), "both lines are in the button: {html}");
+                let disabled = |button: &str| button.split('>').next().unwrap().split_whitespace().any(|a| a == "disabled");
+                assert!(!disabled(buttons[0]), "gone quotes still explain themselves: {html}");
+                assert!(buttons[1].contains("<svg"), "keep the locate icon: {html}");
+                assert!(buttons[1].contains("r=\"3\""), "use the crosshair, not the opening arrow: {html}");
+                assert_eq!(disabled(buttons[1]), deleted || rewritten, "{html}");
+                assert_eq!(comment_target(&thread.get_untracked(), !deleted), (!deleted && !rewritten).then(|| "block.1".into()));
+            }
+        });
+    }
+
+    #[test]
+    fn comment_reveal_finds_the_tab_and_slide_holding_a_block() {
+        use super::*;
+        let tabs = vec![DocTab {
+            id: "deck-tab".into(),
+            blocks: vec![
+                DocBlock { id: "slide.1".into(), kind: "slide".into(), ..Default::default() },
+                DocBlock {
+                    id: "slide.2".into(),
+                    kind: "slide".into(),
+                    children: vec![DocBlock { id: "words.1".into(), ..Default::default() }],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }];
+        let expected = Some(("deck-tab".into(), vec!["slide.2".into()]));
+        assert_eq!(reveal_targets(&tabs, &["words.1".into()]), expected);
+        assert_eq!(reveal_targets(&tabs, &["slide.2".into()]), expected);
+        assert_eq!(reveal_targets(&tabs, &["deleted.1".into()]), None);
+        assert_eq!(reveal_targets(&tabs, &[]), None);
+        assert_eq!(comment_target(&DocThread::default(), false), None, "whole-tab threads have no jump target");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn document_chips_and_file_embeds_keep_their_drawn_icons() {
+        use super::*;
+        use serde_json::json;
+        let owner = Owner::new();
+        owner.with(|| {
+            for (kind, attrs, label, icon_first) in [
+                ("date", json!({"type": "date", "value": "2026-11-05"}), "2026-11-05", true),
+                ("dropdown", json!({"type": "dropdown", "value": "Ready"}), "Ready", false),
+                ("ref", json!({"type": "ref", "ref": "work:w1", "title": "The plan"}), "The plan", true),
+            ] {
+                let html = chips_html("<?c6 block chip?>", &json!({"chips": {"chip": attrs}}), &Default::default());
+                let svg = html.find("<svg").unwrap_or_else(|| panic!("{kind} lost its icon: {html}"));
+                let text = html.rfind(label).unwrap_or_else(|| panic!("{kind} lost its text: {html}"));
+                assert_eq!(svg < text, icon_first, "{kind} moved its icon: {html}");
+                crate::icons::tests::assert_no_icon_glyphs(&html);
+            }
+            let html = file_embed("/file".into(), "notes.txt".into(), Some(42)).to_html();
+            assert!(html.contains("href=\"/file\""), "keep the download link: {html}");
+            assert!(html.contains("<svg"), "file lost its paperclip: {html}");
+            assert!(html.contains("notes.txt"), "{html}");
+            crate::icons::tests::assert_no_icon_glyphs(&html);
+        });
+    }
+
     #[test]
     fn base64_as_the_head_reads_it() {
         assert_eq!(super::base64_of(b"Man"), "TWFu");

@@ -466,6 +466,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn card_answers_are_searchable_as_user_messages() {
+        let text = "Not now: task card #185 \"Cleanup\".";
+        let input = SessionEvent {
+            seq: 17,
+            kind: Some(session_event::Kind::User(c6_proto::UserMessage {
+                command_id: "test".into(),
+                text: text.into(),
+                command: "card-answer".into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(entries(&input), [(0, "user", text.into())]);
+        assert_eq!(crate::convert::event(&input).unwrap().seq, 17, "search points to the user message");
+    }
+
+    #[test]
     fn query_syntax() {
         assert_eq!(fts_query("foo_bar src/").unwrap().0, r#""foo_bar" AND "src/""#);
         assert_eq!(fts_query(r#""out of memory" -oom2 x"#).unwrap().0, r#"("out of memory") NOT "oom2""#);

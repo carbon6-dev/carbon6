@@ -194,6 +194,85 @@ pub fn Fleet(workers: ReadSignal<Vec<Worker>>) -> impl IntoView {
                     </tbody>
                 </table>
             </div>
+            {crate::place::is_console().then(|| view! { <CodexLimitsSettings workers /> })}
+        </section>
+    }
+}
+
+#[component]
+fn CodexLimitsSettings(workers: ReadSignal<Vec<Worker>>) -> impl IntoView {
+    let settings = LocalResource::new(api::codex_limits);
+    let pending = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    view! {
+        <section class="space-y-2 text-sm">
+            <h2 class="font-medium">"ChatGPT plan limits"</h2>
+            <p class="text-muted">"Read ChatGPT plan limits from this machine's Codex. Uses its existing sign-in, never a model turn. Finds Codex through the user's login shell; an optional absolute command path overrides discovery. Matches by account id or a unique email. One Codex install reports one account, not every ChatGPT account."</p>
+            {move || error.get().map(|e| view! { <p class="text-muted">{e}</p> })}
+            <For each=move || workers.get().into_iter().filter(|w| w.role != "memex" && w.status != WorkerStatus::Revoked)
+                key=|w| (w.id, w.name.clone()) children=move |w| {
+                let id = w.id.to_string();
+                let checked_id = id.clone();
+                let value_id = id.clone();
+                let command_id = id.clone();
+                let quota_id = format!("codex-cli:{id}");
+                let found_id = id.clone();
+                view! {
+                    <div class="space-y-1">
+                    <div class="flex flex-wrap items-center gap-2">
+                    <label class="flex items-center gap-2">
+                        <input type="checkbox"
+                            disabled=move || pending.get() || !matches!(settings.get(), Some(Ok(_)))
+                            prop:checked=move || settings.get().and_then(Result::ok).is_some_and(|s| s.workers.contains(&checked_id))
+                            on:change=move |ev| {
+                                let enabled = event_target_checked(&ev);
+                                let id = id.clone();
+                                pending.set(true);
+                                spawn_local(async move {
+                                    let result = async {
+                                        let mut s = api::codex_limits().await?;
+                                        s.workers.retain(|w| w != &id);
+                                        if enabled { s.workers.push(id); }
+                                        api::set_codex_limits(s).await
+                                    }.await;
+                                    error.set(result.err());
+                                    settings.refetch();
+                                    pending.set(false);
+                                });
+                            } />
+                        {w.name}
+                    </label>
+                    <label class="flex items-center gap-2">
+                        <span class="text-muted">"Codex command"</span>
+                        <input type="text" class="rounded border border-zinc-300 bg-transparent px-2 py-1 dark:border-zinc-700"
+                            placeholder="auto-discover Codex"
+                            title="Optional absolute executable path, without arguments or ~ expansion. Its folder is added to PATH for Codex only."
+                            disabled=move || pending.get() || !matches!(settings.get(), Some(Ok(_)))
+                            prop:value=move || settings.get().and_then(Result::ok).and_then(|s| s.commands.get(&value_id).cloned()).unwrap_or_default()
+                            on:change=move |ev| {
+                                let command = event_target_value(&ev).trim().to_owned();
+                                let id = command_id.clone();
+                                pending.set(true);
+                                spawn_local(async move {
+                                    let result = async {
+                                        let mut s = api::codex_limits().await?;
+                                        if command.is_empty() { s.commands.remove(&id); }
+                                        else { s.commands.insert(id, command); }
+                                        api::set_codex_limits(s).await
+                                    }.await;
+                                    error.set(result.err());
+                                    settings.refetch();
+                                    pending.set(false);
+                                });
+                            } />
+                    </label>
+                    </div>
+                    {move || crate::quota::codex_command(&found_id).map(|(p, shell)| view! { <p class="break-all text-xs text-muted">"Codex command used: "{p}{if shell { " (from user's shell)" } else { " (manual override)" }}</p> })}
+                    {move || crate::quota::all().into_iter().find(|q| q.connection_id == quota_id && !q.error.is_empty())
+                        .map(|q| view! { <p class="text-muted">{q.error}</p> })}
+                    </div>
+                }
+            } />
         </section>
     }
 }

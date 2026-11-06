@@ -33,6 +33,12 @@ pub enum Role {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Block {
     Text(String),
+    /// Display metadata from a Responses message. Only `text` is replayed,
+    /// exactly as received; annotations never become model input.
+    AnnotatedText {
+        text: String,
+        annotations_json: String,
+    },
     /// Unsigned reasoning text (Chat Completions servers). Display only.
     Thinking(String),
     /// Anthropic thinking. Must go back unchanged, even with empty text.
@@ -76,6 +82,15 @@ pub enum Block {
 pub struct Message {
     pub role: Role,
     pub blocks: Vec<Block>,
+}
+
+impl Block {
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) | Self::AnnotatedText { text, .. } => Some(text),
+            _ => None,
+        }
+    }
 }
 
 impl Message {
@@ -203,6 +218,10 @@ pub type EventStream = BoxStream<'static, Result<ModelEvent, LlmError>>;
 
 #[async_trait]
 pub trait ModelClient: Send + Sync {
+    /// ChatGPT response headers only; other providers ignore this hook.
+    /// Set before wrapping a client with activity tracking or time limits.
+    fn set_chatgpt_limits_hook(&mut self, _hook: openai_responses::ChatGptLimitsHook) {}
+
     /// Starts a streaming completion. Dropping the stream cancels the request.
     async fn stream(&self, req: &ModelRequest) -> Result<EventStream, LlmError>;
 }

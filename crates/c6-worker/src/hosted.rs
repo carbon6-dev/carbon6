@@ -83,6 +83,8 @@ impl HostedClaude {
             tools: names.clone(),
             worker: c6_core::build().to_owned(),
             extra_args: LOCKED_DOWN.iter().map(|a| (*a).to_owned()).collect(),
+            // Locked down by its own flags: none of Claude Code's tools.
+            native: None,
         };
         if let Some(p) = self.process.take_if(|p| p.launch() != &launch && p.idle_until(std::time::Duration::ZERO).is_some()) {
             p.close().await;
@@ -192,9 +194,7 @@ impl ClaudeOnce {
 /// The conversation as one prompt: a single message as it is, more as a
 /// transcript.
 fn once_prompt(req: &c6_llm::ModelRequest) -> String {
-    let text = |m: &c6_llm::Message| -> String {
-        m.blocks.iter().filter_map(|b| if let c6_llm::Block::Text(t) = b { Some(t.as_str()) } else { None }).collect::<Vec<_>>().join("\n")
-    };
+    let text = |m: &c6_llm::Message| -> String { m.blocks.iter().filter_map(c6_llm::Block::text).collect::<Vec<_>>().join("\n") };
     if let [only] = req.messages.as_slice() {
         return text(only);
     }

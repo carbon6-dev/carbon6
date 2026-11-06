@@ -35,6 +35,11 @@ struct Dial {
 
 #[async_trait::async_trait]
 impl c6_llm::pool::Dial for Dial {
+    fn chatgpt_limits_hook(&self, member: &str) -> Option<c6_llm::openai_responses::ChatGptLimitsHook> {
+        let st = self.head.upgrade()?;
+        crate::quotas::chatgpt_hook(&st, member)
+    }
+
     async fn endpoint(&self, member: &str) -> Result<Endpoint, LlmError> {
         let st = self.head.upgrade().ok_or_else(|| LlmError::Unavailable("the head stopped".into()))?;
         let req = CredentialRequest { connection_id: member.to_owned(), ..Default::default() };
@@ -92,7 +97,13 @@ pub async fn client(
     let req = CredentialRequest { connection_id: connection_id.to_owned(), ..Default::default() };
     let g = crate::sessions::credential_for(st, None, "head", req).await;
     anyhow::ensure!(g.error.is_empty(), "{}", g.error);
-    Ok(c6_llm::activity::track(c6_llm::client_for(&g.kind, &g.base_url, &g.bearer, g.headers)?, origin))
+    let mut client = c6_llm::client_for(&g.kind, &g.base_url, &g.bearer, g.headers)?;
+    if g.kind == "chatgpt"
+        && let Some(hook) = crate::quotas::chatgpt_hook(st, connection_id)
+    {
+        client.set_chatgpt_limits_hook(hook);
+    }
+    Ok(c6_llm::activity::track(client, origin))
 }
 
 const NO_CLAUDE: &str = "Claude Code (`claude`) is not on the head machine's PATH";

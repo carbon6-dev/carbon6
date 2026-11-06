@@ -191,8 +191,8 @@ pub struct HeadState {
     pub docs: docs::Docs,
     /// Pings the live feed when what needs you may have changed.
     pub attention: attention::Pings,
-    /// When each session sent other sessions messages in the last hour
-    /// (docs/background.md §6).
+    /// When each session sent other sessions messages in the last hour,
+    /// rebuilt from durable commands at startup (docs/background.md §6).
     pub(crate) messages_sent: std::sync::Mutex<std::collections::HashMap<String, std::collections::VecDeque<i64>>>,
     /// Catch-ups' paragraphs and timelines' turns and lines, made when
     /// looked at.
@@ -302,6 +302,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     let secrets = secrets::Secrets::load_or_create(&cfg.data_dir.join("master.key"))?;
     c6_llm::install_crypto_provider();
     let http = reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?;
+    let messages_sent = std::sync::Mutex::new(store.recent_session_messages(c6_core::now_ms() - 3_600_000).await?);
     let state = Arc::new(HeadState {
         store,
         pki,
@@ -310,7 +311,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         hub: Default::default(),
         oauth: Default::default(),
         terminals: Default::default(),
-        auth: auth::Auth::new(cfg.auth),
+        auth: auth::Auth::new(&cfg),
         ui_ca: ui_tls.as_ref().and_then(|t| t.ca.clone()),
         otlp: telemetry::Otlp::from_config(cfg.otlp_endpoint.as_deref(), cfg.otlp_headers.clone()),
         http,
@@ -332,7 +333,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         quotas: Default::default(),
         docs: Default::default(),
         attention: Default::default(),
-        messages_sent: Default::default(),
+        messages_sent,
         catchup: Default::default(),
         backups: Default::default(),
         watchers: Default::default(),

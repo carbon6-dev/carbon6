@@ -593,8 +593,7 @@ impl Turn<'_> {
             return Ok(Err(NoSummary::Answered("the summary hit the output token limit before finishing".into())));
         }
         let blocks = resp.message.map(|m| m.blocks).unwrap_or_default();
-        let summary =
-            blocks.iter().filter_map(|b| if let Block::Text(t) = b { Some(t.as_str()) } else { None }).collect::<Vec<_>>().join("\n");
+        let summary = blocks.iter().filter_map(Block::text).collect::<Vec<_>>().join("\n");
         if !summary.trim().is_empty() {
             let tokens = self
                 .estimate_request(&[Message::user_text(summary.clone())], &[])

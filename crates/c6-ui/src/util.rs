@@ -3,6 +3,9 @@
 use c6_api::SessionStatus;
 use leptos::prelude::*;
 
+mod drafts;
+pub use drafts::attachments as draft_attachments;
+
 pub fn now_ms() -> i64 {
     js_sys::Date::now() as i64
 }
@@ -51,6 +54,9 @@ pub fn StatusPill(status: SessionStatus) -> impl IntoView {
 /// its placeholder) is sized to show all of it: measured as if typed, then
 /// emptied again. Without one, as `fit`.
 pub fn fit_hint(el: &web_sys::HtmlTextAreaElement, hint: Option<&str>) {
+    if el.client_width() == 0 {
+        return;
+    }
     match hint.filter(|h| !h.is_empty()) {
         Some(h) if el.value().is_empty() => {
             el.set_value(h);
@@ -64,6 +70,11 @@ pub fn fit_hint(el: &web_sys::HtmlTextAreaElement, hint: Option<&str>) {
 }
 
 pub fn fit(el: &web_sys::HtmlTextAreaElement) {
+    // Hidden tiles have no layout: scrollHeight would turn a restored draft
+    // into a zero-height box. Leave even its existing inline style alone.
+    if el.client_width() == 0 {
+        return;
+    }
     // Empty, it keeps its own rows: a long hint doesn't size it.
     if el.value().is_empty() {
         let _ = el.set_attribute("style", "overflow-y:hidden");
@@ -82,10 +93,18 @@ pub fn fit(el: &web_sys::HtmlTextAreaElement) {
 /// Keeps a message box sized to its text as `track` changes it (typed, sent,
 /// put back to edit).
 pub fn autosize(node: NodeRef<leptos::html::Textarea>, track: impl Fn() + 'static) {
+    autosize_hint(node, track, || None);
+}
+
+/// Like `autosize`, preserving the placeholder's size on reveal and resize.
+pub fn autosize_hint(node: NodeRef<leptos::html::Textarea>, track: impl Fn() + 'static, hint: impl Fn() -> Option<String> + 'static) {
+    use wasm_bindgen::JsCast;
+    let hint = StoredValue::new_local(hint);
     let refit = move || {
         request_animation_frame(move || {
             if let Some(el) = node.try_get_untracked().flatten() {
-                fit(&el);
+                let hint = hint.try_with_value(|h| untrack(h)).flatten();
+                fit_hint(&el, hint.as_deref());
             }
         })
     };
@@ -95,12 +114,49 @@ pub fn autosize(node: NodeRef<leptos::html::Textarea>, track: impl Fn() + 'stati
     });
     // Narrower (a phone turned, a tile resized), its text takes more lines.
     let resized = window_event_listener(leptos::ev::resize, move |_| refit());
-    on_cleanup(move || resized.remove());
+    let visible = window_event_listener_untyped("visibilitychange", move |_| refit());
+    on_cleanup(move || {
+        resized.remove();
+        visible.remove();
+    });
+    // Observe width and hidden -> visible transitions, not our own height
+    // writes. Queue writes outside the observer's layout delivery loop.
+    type ResizeWatch = (web_sys::ResizeObserver, wasm_bindgen::closure::Closure<dyn FnMut(js_sys::Array)>);
+    let observer = StoredValue::new_local(None::<ResizeWatch>);
+    Effect::new(move || {
+        let Some(el) = node.get() else { return };
+        observer.update_value(|o| {
+            if let Some((ro, _)) = o.take() {
+                ro.disconnect();
+            }
+        });
+        let mut width = -1;
+        let callback = wasm_bindgen::closure::Closure::<dyn FnMut(js_sys::Array)>::new(move |_| {
+            if let Some(el) = node.try_get_untracked().flatten() {
+                let next = el.client_width();
+                if next != width {
+                    width = next;
+                    refit();
+                }
+            }
+        });
+        if let Ok(ro) = web_sys::ResizeObserver::new(callback.as_ref().unchecked_ref()) {
+            ro.observe(&el);
+            observer.set_value(Some((ro, callback)));
+        }
+    });
+    on_cleanup(move || {
+        observer.update_value(|o| {
+            if let Some((ro, _)) = o.take() {
+                ro.disconnect();
+            }
+        });
+    });
 }
 
 /// The class of a message box that grows with its text up to 40% of the
 /// window, then scrolls.
-pub const GROWS: &str = "max-h-[40dvh] resize-none overflow-y-auto";
+pub const GROWS: &str = "grows max-h-[40dvh] resize-none overflow-y-auto";
 
 /// A touch screen is the main way in (a phone or tablet): there, Return
 /// in a message box is a new line, as on a phone's keyboard.
@@ -159,10 +215,15 @@ pub fn draft(key: &str) -> RwSignal<String> {
 /// Drops a draft that was sent, from code that may outlive its box.
 pub fn forget_draft(key: &str) {
     storage_remove(&format!("c6.draft.{key}"));
+    drafts::forget(key);
 }
 
 fn placed_key(key: &str) -> String {
-    match (crate::place::header(), key.strip_prefix("c6.")) {
+    placed_key_in(crate::place::header().as_deref(), key)
+}
+
+fn placed_key_in(place: Option<&str>, key: &str) -> String {
+    match (place, key.strip_prefix("c6.")) {
         (Some(p), Some(rest)) => format!("c6.{p}.{rest}"),
         _ => key.to_owned(),
     }
@@ -176,6 +237,12 @@ pub fn storage_get_global(key: &str) -> Option<String> {
 pub fn storage_set_global(key: &str, value: &str) {
     if let Ok(Some(s)) = window().local_storage() {
         let _ = s.set_item(key, value);
+    }
+}
+
+fn storage_remove_global(key: &str) {
+    if let Ok(Some(s)) = window().local_storage() {
+        let _ = s.remove_item(key);
     }
 }
 
@@ -464,7 +531,7 @@ pub fn details_pop(menu: NodeRef<leptos::html::Details>) -> (String, impl Fn(web
     (pop, toggled)
 }
 
-/// A "⋯" button and its menu. With `row`, it's a row's: on touch screens
+/// An ellipsis button and its menu. With `row`, it's a row's: on touch screens
 /// always there, elsewhere on hover or keyboard focus (style/input.css).
 /// The menu is fixed to the screen, so a scrolling list doesn't clip it,
 /// and goes away as `dismissable` says.
@@ -499,7 +566,7 @@ pub fn Menu(items: Vec<(&'static str, Callback<()>)>, #[prop(optional)] row: boo
                     (r.bottom(), window().inner_width().ok().and_then(|w| w.as_f64()).unwrap_or(0.0) - r.right())
                 });
                 open.set(at.or(Some((0.0, 0.0))));
-            }>"⋯"</button>
+            }>{crate::icons::ellipsis()}</button>
         {move || open.get().map(|(top, right)| view! {
             <div role="menu" data-pop=pop.clone() class="fixed z-50 min-w-40 rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900"
                 style=format!("top: {}px; right: {}px", top + 4.0, right.max(8.0))>
@@ -522,7 +589,7 @@ pub fn Menu(items: Vec<(&'static str, Callback<()>)>, #[prop(optional)] row: boo
 pub fn OpenIn(link: c6_api::Link) -> impl IntoView {
     view! {
         <a class="inline-flex items-center rounded-md px-3 py-1.5 text-sm text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800"
-            href=link.url target="_blank" rel="noopener noreferrer">{format!("Open in {} ↗", link.service)}</a>
+            href=link.url target="_blank" rel="noopener noreferrer">{format!("Open in {}", link.service)}" "{crate::icons::arrow_up_right()}</a>
     }
 }
 
@@ -612,6 +679,16 @@ pub fn steady<T: Clone + PartialEq + Send + Sync + 'static>(r: LocalResource<T>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attachment_drafts_use_the_text_drafts_place_and_key() {
+        for key in ["new", "ask", "session-123"] {
+            let key = format!("c6.draft.{key}");
+            assert_eq!(placed_key_in(None, &key), key);
+            assert_eq!(placed_key_in(Some("home"), &key), key.replacen("c6.", "c6.home.", 1));
+            assert_ne!(placed_key_in(Some("admin"), &key), placed_key_in(Some("work"), &key));
+        }
+    }
 
     #[test]
     fn what_pops_up_within_another_keeps_it_open() {

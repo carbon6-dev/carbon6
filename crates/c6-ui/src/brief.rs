@@ -50,14 +50,17 @@ pub(crate) async fn settle(id: i64, how: Settle) -> Result<Value, String> {
     api::rpc("memex.requests.set", json!({"id": id, "status": status, "until": until})).await
 }
 
-/// Where a request came from, as icons: ✉ mail, 💬 chat.
-fn channels(r: &Request) -> String {
+/// Where a request came from: mail, chat, or both, as drawn icons.
+fn channels(r: &Request) -> AnyView {
     let mail = r.sources.iter().any(|s| s.kind == "mail");
     let chat = r.sources.iter().any(|s| s.kind == "chat");
     match (mail, chat) {
-        (true, true) => "✉ 💬".into(),
-        (true, false) => "✉".into(),
-        _ => "💬".into(),
+        (true, true) => {
+            view! { <span role="img" title="Mail and chat" aria-label="Mail and chat">{crate::icons::mail()}" "{crate::icons::message()}</span> }
+                .into_any()
+        }
+        (true, false) => view! { <span role="img" title="Mail" aria-label="Mail">{crate::icons::mail()}</span> }.into_any(),
+        _ => view! { <span role="img" title="Chat" aria-label="Chat">{crate::icons::message()}</span> }.into_any(),
     }
 }
 
@@ -383,7 +386,7 @@ fn Row(r: Request, i: usize, picked: RwSignal<usize>, b: Brief) -> impl IntoView
     view! {
         <div class=move || format!("flex cursor-pointer flex-wrap items-baseline gap-x-2 px-3 py-2 text-sm sm:flex-nowrap {}", if picked.get() == i { "bg-zinc-100 dark:bg-zinc-900" } else { "hover:bg-zinc-50 dark:hover:bg-zinc-900/50" })
             on:click=move |_| { picked.set(i); b.show(Some(selected.clone())); }>
-            <span class="shrink-0 text-amber-500">"●"</span>
+            <span class="shrink-0 text-amber-500">{crate::icons::circle()}</span>
             <span class="min-w-0 flex-1 truncate font-medium sm:w-36 sm:flex-none">{if r.person_name.is_empty() { r.person.clone() } else { r.person_name.clone() }}</span>
             <span class="order-last w-full truncate pl-4 sm:order-none sm:w-auto sm:min-w-0 sm:flex-1 sm:pl-0" title=r.reason.clone()>{r.title.clone()}</span>
             {maybe.map(|other| view! {
@@ -453,7 +456,7 @@ fn Fyi(t: Triage, b: Brief) -> impl IntoView {
             head=ViewFn::from({
                 let t = t.clone();
                 move || view! {
-                    <span class="shrink-0 text-xs">{if t.kind == "mail" { "✉" } else { "💬" }}</span>
+                    <span class="shrink-0 text-xs" role="img" title=if t.kind == "mail" { "Mail" } else { "Chat" } aria-label=if t.kind == "mail" { "Mail" } else { "Chat" }>{if t.kind == "mail" { crate::icons::mail().into_any() } else { crate::icons::message().into_any() }}</span>
                     <span class="min-w-0 flex-1 truncate"><b class="font-medium">{t.sender_name.clone()}</b>" · "{t.title.clone()}</span>
                     <span class="hidden shrink-0 truncate text-xs text-muted sm:inline sm:max-w-[40%]">{t.reason.clone()}</span>
                 }.into_any()
@@ -488,7 +491,7 @@ fn RequestView(r: Request, b: Brief) -> impl IntoView {
                 {r.sources.iter().rev().map(|s| view! { <Source target=s.target.clone() kind=s.kind.clone() title=s.title.clone() refresh /> }).collect_view()}
             </div>
             <aside class="w-full shrink-0 space-y-3 lg:sticky lg:top-0 lg:w-80">
-                <button class=BUTTON_QUIET on:click=move |_| b.show(None)>"← Brief (Esc)"</button>
+                <button class=BUTTON_QUIET on:click=move |_| b.show(None)>{crate::icons::arrow_left()}" Brief (Esc)"</button>
                 <div class="space-y-1 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
                     <p class="text-xs uppercase tracking-wide text-muted">{if r.category == "first_contact" { "First contact" } else { "Needs you" }}</p>
                     <h1 class="font-semibold">{r.title.clone()}</h1>
@@ -668,11 +671,11 @@ fn DraftCard(r: Request, b: Brief) -> impl IntoView {
                     <p class="text-xs text-muted">{move || {
                         let v = to.get().and_then(Result::ok).unwrap_or_default();
                         if v["kind"] == "mail" {
-                            format!("✉ To {} <{}> · {}", v["to_name"].as_str().unwrap_or(""), v["to"][0].as_str().unwrap_or(""), v["subject"].as_str().unwrap_or(""))
+                            view! { {crate::icons::mail()}" "{format!("To {} <{}> · {}", v["to_name"].as_str().unwrap_or(""), v["to"][0].as_str().unwrap_or(""), v["subject"].as_str().unwrap_or(""))} }.into_any()
                         } else if v["kind"] == "chat" {
-                            format!("💬 In {}", if v["thread_ts"].is_string() { "the thread" } else { "the conversation" })
+                            view! { {crate::icons::message()}" "{format!("In {}", if v["thread_ts"].is_string() { "the thread" } else { "the conversation" })} }.into_any()
                         } else {
-                            String::new()
+                            ().into_any()
                         }
                     }}</p>
                     {(!d.note.is_empty()).then(|| view! { <p class="text-xs text-amber-700 dark:text-amber-400">{format!("Check: {}", d.note)}</p> })}
@@ -802,6 +805,23 @@ fn Source(target: String, kind: String, title: String, refresh: RwSignal<u32>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn request_sources_keep_one_icon_for_each_channel() {
+        for kinds in [vec!["mail"], vec!["chat"], vec!["mail", "chat"]] {
+            let request = Request {
+                sources: kinds.iter().map(|kind| c6_api::RequestSource { kind: (*kind).into(), ..Default::default() }).collect(),
+                ..Default::default()
+            };
+            let html = channels(&request).to_html();
+            assert_eq!(html.matches("<svg").count(), kinds.len(), "{html}");
+            for kind in kinds {
+                assert!(html.to_lowercase().contains(kind), "keep the accessible channel label: {html}");
+            }
+            crate::icons::tests::assert_no_icon_glyphs(&html);
+        }
+    }
 
     #[test]
     fn request_links_carry_a_positive_id() {

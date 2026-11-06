@@ -566,19 +566,53 @@ impl Layout {
         }
     }
 
+    /// Whether a drop changes the visible layout. The preview and the move
+    /// use the same rules, including when tiles disappear during a drag.
+    fn check_drop(&self, key: u64, to: Drop) -> Result<(), &'static str> {
+        let shown = |key| self.tile(key).filter(|t| !t.minimized && t.stack.is_some());
+        let from = shown(key).ok_or("The dragged tile is no longer shown")?;
+        let target = shown(to.target()).ok_or("The destination tile is no longer shown")?;
+        if key == target.key {
+            return Err("Already here");
+        }
+        let column: Vec<u64> = self.tiles.iter().filter(|t| !t.minimized && t.stack == from.stack).map(|t| t.key).collect();
+        match to {
+            Drop::Above(_) | Drop::Below(_) if from.stack == target.stack => {
+                let i = column.iter().position(|&k| k == key).unwrap();
+                let j = column.iter().position(|&k| k == target.key).unwrap();
+                if (matches!(to, Drop::Above(_)) && i + 1 == j) || (matches!(to, Drop::Below(_)) && j + 1 == i) {
+                    return Err("Already here");
+                }
+            }
+            Drop::LeftOf(_) | Drop::RightOf(_) => {
+                let mut columns: Vec<usize> = self.tiles.iter().filter(|t| !t.minimized).filter_map(|t| t.stack).collect();
+                columns.sort_unstable();
+                columns.dedup();
+                if column.len() > 1 && columns.len() >= COLUMNS {
+                    return Err("Four columns are already open; drop above or below a tile");
+                }
+                if column.len() == 1 {
+                    let i = columns.iter().position(|c| Some(*c) == from.stack).unwrap();
+                    let j = columns.iter().position(|c| Some(*c) == target.stack).unwrap();
+                    if (matches!(to, Drop::LeftOf(_)) && i + 1 == j) || (matches!(to, Drop::RightOf(_)) && j + 1 == i) {
+                        return Err("Already here");
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Moves tile `key` to where it was dropped, keeping focus where it was.
     fn move_tile(&mut self, key: u64, to: Drop) {
-        let focused = self.tiles.get(self.focus).map(|t| t.key);
-        let Some(from) = self.tiles.iter().position(|t| t.key == key) else { return };
-        let target = match to {
-            Drop::Above(k) | Drop::Below(k) | Drop::LeftOf(k) | Drop::RightOf(k) => k,
-        };
-        if target == key {
+        if self.check_drop(key, to).is_err() {
             return;
         }
-        let Some(target_stack) = self.tile(target).and_then(|t| t.stack) else { return };
-        let columns = self.tiles.iter().filter(|t| !t.minimized).filter_map(|t| t.stack).collect::<HashSet<_>>().len();
-        let alone = self.tiles.iter().filter(|t| !t.minimized && t.stack == self.tiles[from].stack).count() == 1;
+        let focused = self.tiles.get(self.focus).map(|t| t.key);
+        let from = self.tiles.iter().position(|t| t.key == key).unwrap();
+        let target = to.target();
+        let target_stack = self.tile(target).unwrap().stack.unwrap();
         let mut tile = self.tiles.remove(from);
         match to {
             Drop::Above(_) | Drop::Below(_) => {
@@ -590,16 +624,23 @@ impl Layout {
             Drop::LeftOf(_) | Drop::RightOf(_) => {
                 // A new column, while there's room for one (a tile alone
                 // in its column just moves its column).
-                if columns >= COLUMNS && !alone {
-                    self.tiles.insert(from, tile);
-                    return;
-                }
+                let shown: HashSet<usize> = self.tiles.iter().filter(|t| !t.minimized).filter_map(|t| t.stack).collect();
+                let columns: HashSet<usize> = self.tiles.iter().filter_map(|t| t.stack).collect();
+                // Reuse a vacant saved column if adding this one would
+                // exceed the limit, or take the source's hidden neighbours
+                // along when moving its column. Otherwise place() would
+                // cap five saved columns to four, merging visible ones.
+                let spare = tile
+                    .stack
+                    .filter(|c| !shown.contains(c))
+                    .or_else(|| if columns.len() >= COLUMNS { columns.difference(&shown).copied().min() } else { None });
+                let stack = if matches!(to, Drop::LeftOf(_)) { 2 * target_stack } else { 2 * target_stack + 2 };
                 // Spread the columns out (c to 2c + 1), to make room on
                 // either side of each.
                 for t in &mut self.tiles {
-                    t.stack = t.stack.map(|c| 2 * c + 1);
+                    t.stack = t.stack.map(|c| if Some(c) == spare { stack } else { 2 * c + 1 });
                 }
-                tile.stack = Some(if matches!(to, Drop::LeftOf(_)) { 2 * target_stack } else { 2 * target_stack + 2 });
+                tile.stack = Some(stack);
                 self.tiles.push(tile);
             }
         }
@@ -856,6 +897,24 @@ pub enum Drop {
     RightOf(u64),
 }
 
+impl Drop {
+    fn target(self) -> u64 {
+        match self {
+            Self::Above(k) | Self::Below(k) | Self::LeftOf(k) | Self::RightOf(k) => k,
+        }
+    }
+
+    /// The outer fifths make a new column; the middle stacks tiles.
+    fn at(key: u64, x: f64, y: f64) -> Self {
+        match () {
+            _ if x < 0.2 => Self::LeftOf(key),
+            _ if x > 0.8 => Self::RightOf(key),
+            _ if y < 0.5 => Self::Above(key),
+            _ => Self::Below(key),
+        }
+    }
+}
+
 impl How {
     pub fn from_mouse(ev: &web_sys::MouseEvent) -> Self {
         if ev.meta_key() || ev.ctrl_key() { How::NewTile } else { How::Beside }
@@ -942,6 +1001,15 @@ impl Workspace {
         });
         Effect::new(move || storage_set(ATTENTION_KEY, &serde_json::to_string(&ws.attention.get()).unwrap_or_default()));
         Effect::new(move || storage_set(PINNED_KEY, &serde_json::to_string(&ws.pinned.get()).unwrap_or_default()));
+        // Hiding/removing the source can prevent its bar receiving dragend.
+        Effect::new(move || {
+            if let Some(key) = ws.dragging.get()
+                && !ws.layout.with(|l| l.tile(key).is_some_and(|t| !t.minimized))
+            {
+                ws.dragging.set(None);
+                ws.drop_at.set(None);
+            }
+        });
         ws
     }
 
@@ -1480,6 +1548,45 @@ pub fn Go(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScrollIntent {
+    Away,
+    Toward,
+    Scrollbar,
+}
+
+impl ScrollIntent {
+    fn from_delta(delta: f64) -> Option<Self> {
+        if delta < 0.0 {
+            Some(Self::Away)
+        } else if delta > 0.0 {
+            Some(Self::Toward)
+        } else {
+            None
+        }
+    }
+
+    fn from_key(key: &str, shift: bool) -> Option<Self> {
+        match key {
+            "ArrowUp" | "PageUp" | "Home" => Some(Self::Away),
+            "ArrowDown" | "PageDown" | "End" => Some(Self::Toward),
+            " " => Some(if shift { Self::Away } else { Self::Toward }),
+            _ => None,
+        }
+    }
+}
+
+/// Input decides whether to stop; only a user return to the very end resumes.
+/// Upward input stops before the browser's default scroll, without needing a gap.
+fn scroll_follow(following: bool, intent: Option<ScrollIntent>, gap: Option<i32>) -> bool {
+    match (intent, gap) {
+        (Some(ScrollIntent::Away), None) => false,
+        (Some(ScrollIntent::Toward), Some(gap)) if gap < 4 => true,
+        (Some(ScrollIntent::Scrollbar), Some(gap)) => gap < 4,
+        _ => following,
+    }
+}
+
 /// A scrolling area that remembers its position while its column is folded
 /// away: where it was, or the end if it was at the end.
 ///
@@ -1503,7 +1610,7 @@ pub fn ScrollBox(
                 let (top, end) = c.scroll.get_value();
                 request_animation_frame(move || {
                     if let Some(el) = node.try_get_untracked().flatten() {
-                        if end || follow.is_some_and(|f| f.try_get_untracked() == Some(true)) {
+                        if follow.map_or(end, |f| f.try_get_untracked() == Some(true)) {
                             el.set_scroll_top(el.scroll_height());
                         } else if top > 0 {
                             el.set_scroll_top(top);
@@ -1513,16 +1620,28 @@ pub fn ScrollBox(
             }
         });
     }
-    // You moved it (rather than content arriving, or it being hidden).
-    let by_you = StoredValue::new(false);
+    // Direction comes from input, never from scrollTop changes: those can be
+    // caused by rendering, restoring a hidden tile, or our own smooth glide.
+    let intent = StoredValue::new(None::<ScrollIntent>);
+    let touch = StoredValue::new(None::<(i32, i32)>);
     if let Some(follow) = follow {
-        let observer = StoredValue::new_local(None::<web_sys::ResizeObserver>);
+        Effect::new(move || {
+            if follow.get() || intent.get_value() == Some(ScrollIntent::Toward) {
+                // Opening / Latest explicitly follows; an anchor jump explicitly
+                // stops. Neither should inherit a pending user return to the end.
+                intent.set_value(None);
+            }
+        });
+        type ResizeWatch = (web_sys::ResizeObserver, wasm_bindgen::closure::Closure<dyn Fn(js_sys::Array)>);
+        let observer = StoredValue::new_local(None::<ResizeWatch>);
         Effect::new(move || {
             let Some(el) = node.get() else { return };
             // One at a time: a box drawn anew isn't watched twice.
-            if let Some(o) = observer.try_get_value().flatten() {
-                o.disconnect();
-            }
+            observer.update_value(|o| {
+                if let Some((ro, _)) = o.take() {
+                    ro.disconnect();
+                }
+            });
             let to_end = wasm_bindgen::closure::Closure::<dyn Fn(js_sys::Array)>::new(move |_: js_sys::Array| {
                 // A last resize may come after the box has gone.
                 if let Some(el) = node.try_get_untracked().flatten()
@@ -1541,37 +1660,85 @@ pub fn ScrollBox(
                         obs.observe(&child);
                     }
                 }
-                observer.set_value(Some(obs));
+                observer.set_value(Some((obs, to_end)));
             }
-            to_end.forget();
         });
         on_cleanup(move || {
-            if let Some(o) = observer.try_get_value().flatten() {
-                o.disconnect();
-            }
+            observer.update_value(|o| {
+                if let Some((ro, _)) = o.take() {
+                    ro.disconnect();
+                }
+            });
         });
     }
-    let yours = move || by_you.set_value(true);
+    let yours = move |direction: ScrollIntent| {
+        let (Some(f), Some(el)) = (follow, node.get_untracked()) else { return };
+        if direction != ScrollIntent::Toward && el.scroll_height() <= el.client_height() {
+            return;
+        }
+        intent.set_value(Some(direction));
+        let now = f.get_untracked();
+        // A downward input while already at the end need not emit a scroll
+        // event (e.g. the prior upward trackpad movement rounded to zero px).
+        let gap = (direction == ScrollIntent::Toward).then(|| el.scroll_height() - el.scroll_top() - el.client_height());
+        let next = scroll_follow(now, Some(direction), gap);
+        if now != next {
+            f.set(next);
+        }
+        if matches!(direction, ScrollIntent::Away | ScrollIntent::Scrollbar) {
+            // Cancel an already-running smooth glide without moving the box or
+            // preventing the browser's wheel, touch or keyboard default action.
+            let opts = web_sys::ScrollToOptions::new();
+            opts.set_top(el.scroll_top() as f64);
+            opts.set_behavior(web_sys::ScrollBehavior::Instant);
+            el.scroll_to_with_scroll_to_options(&opts);
+        }
+    };
     view! {
         <div node_ref=node class=format!("min-h-0 flex-1 overflow-y-auto {class}")
-            // Up: stop following now, not when the scroll event says so: a small
-            // roll stays within `at_end`'s reach, and content arriving first
-            // would take you back down.
-            on:wheel=move |ev: web_sys::WheelEvent| if ev.delta_y() < 0.0 {
-                yours();
-                if let (Some(f), Some(el)) = (follow, node.get_untracked())
-                    && el.scroll_height() > el.client_height()
-                {
-                    f.set(false);
+            tabindex=follow.map(|_| 0)
+            on:wheel=move |ev: web_sys::WheelEvent| {
+                if let Some(direction) = ScrollIntent::from_delta(ev.delta_y()) {
+                    yours(direction);
                 }
             }
-            on:touchstart=move |_| yours()
-            on:keydown=move |ev: web_sys::KeyboardEvent| if matches!(ev.key().as_str(), "ArrowUp" | "PageUp" | "Home" | " ") { yours() }
+            on:touchstart=move |ev: web_sys::TouchEvent| {
+                touch.set_value(ev.touches().item(0).map(|t| (t.identifier(), t.client_y())));
+            }
+            on:touchmove=move |ev: web_sys::TouchEvent| {
+                let Some((id, y)) = touch.get_value() else { return };
+                let touches = ev.touches();
+                if let Some(t) = (0..touches.length()).filter_map(|i| touches.item(i)).find(|t| t.identifier() == id) {
+                    touch.set_value(Some((id, t.client_y())));
+                    // Finger down means the transcript moves up.
+                    if let Some(direction) = ScrollIntent::from_delta((y - t.client_y()) as f64) {
+                        yours(direction);
+                    }
+                }
+            }
+            on:touchend=move |_| touch.set_value(None)
+            on:touchcancel=move |_| touch.set_value(None)
+            on:keydown=move |ev: web_sys::KeyboardEvent| {
+                let in_field = ev.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                    .is_some_and(|el| el.closest("input, textarea, select, [contenteditable]:not([contenteditable=false])").ok().flatten().is_some());
+                if !ev.default_prevented() && !in_field
+                    && let Some(direction) = ScrollIntent::from_key(&ev.key(), ev.shift_key())
+                {
+                    yours(direction);
+                }
+            }
             // The scroll bar: a press on the box itself, not its content.
             on:pointerdown=move |ev: web_sys::PointerEvent| {
-                if ev.target().is_some_and(|t| node.get_untracked().is_some_and(|el| AsRef::<web_sys::EventTarget>::as_ref(&el) == &t)) {
-                    yours();
+                if ev.pointer_type() == "mouse"
+                    && ev.target().is_some_and(|t| node.get_untracked().is_some_and(|el| AsRef::<web_sys::EventTarget>::as_ref(&el) == &t))
+                {
+                    yours(ScrollIntent::Scrollbar);
                 }
+            }
+            on:scrollend=move |_| {
+                // Keep permission through touch/trackpad inertia, not through a
+                // later unrelated resize or programmatic scroll to the bottom.
+                intent.set_value(None);
             }
             on:scroll=move |_| {
             let Some(el) = node.get_untracked() else { return };
@@ -1586,16 +1753,11 @@ pub fn ScrollBox(
                 c.scroll.set_value((el.scroll_top(), end));
             }
             if let Some(f) = follow {
-                if by_you.get_value() {
-                    // You moved it: it follows again only once you are back at the
-                    // very end, not merely near it (a small step up is still near).
-                    let back = el.scroll_height() - el.scroll_top() - el.client_height() < 4;
-                    f.set(back);
-                    if back {
-                        by_you.set_value(false);
-                    }
-                } else if end {
-                    f.set(true);
+                let now = f.get_untracked();
+                let gap = el.scroll_height() - el.scroll_top() - el.client_height();
+                let next = scroll_follow(now, intent.get_value(), Some(gap));
+                if now != next {
+                    f.set(next);
                 }
             }
             if let Some(f) = on_scroll {
@@ -1605,7 +1767,6 @@ pub fn ScrollBox(
     }
 }
 
-/// Whether a scrolling area is at (or within a line or two of) its end.
 /// Follows the end of a scroll box: a short glide down to what just arrived
 /// (rather than a jump for each line), straight there when it is more than
 /// a screen away (as when it opens) or motion is reduced.
@@ -1621,8 +1782,9 @@ pub fn glide_to_end(el: &web_sys::Element) {
     el.scroll_to_with_scroll_to_options(&opts);
 }
 
+/// Whether a scrolling area is at its end (allowing a few pixels of rounding).
 pub fn at_end(el: &web_sys::Element) -> bool {
-    el.scroll_height() - el.scroll_top() - el.client_height() < 120
+    el.scroll_height() - el.scroll_top() - el.client_height() < 4
 }
 
 /// Where a tile goes, as fractions of the workspace.
@@ -1815,20 +1977,20 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
     let btn = crate::icons::BAR_BUTTON;
     // Another tile dragged over this one: where it would go, by where the
     // pointer is (the outer fifths make a new column beside this one's).
-    let section = NodeRef::<leptos::html::Section>::new();
+    // Include the padding between tiles: it belongs to this drop target too.
+    let drop_area = NodeRef::<Div>::new();
     let zone = move |ev: &web_sys::DragEvent| -> Option<Drop> {
-        let r = section.get_untracked()?.get_bounding_client_rect();
+        let r = drop_area.get_untracked()?.get_bounding_client_rect();
         let x = (f64::from(ev.client_x()) - r.left()) / r.width().max(1.0);
         let y = (f64::from(ev.client_y()) - r.top()) / r.height().max(1.0);
-        Some(match () {
-            _ if x < 0.2 => Drop::LeftOf(key),
-            _ if x > 0.8 => Drop::RightOf(key),
-            _ if y < 0.5 => Drop::Above(key),
-            _ => Drop::Below(key),
-        })
+        Some(Drop::at(key, x, y))
     };
-    let other = move || ws.dragging.get_untracked().filter(|&k| k != key);
-    let hint = move || match ws.drop_at.get() {
+    let feedback = Memo::new(move |_| {
+        let from = ws.dragging.get()?;
+        let to = ws.drop_at.get().filter(|to| to.target() == key)?;
+        Some(ws.layout.with(|l| l.check_drop(from, to)))
+    });
+    let hint = move || match ws.drop_at.get().filter(|_| feedback.get() == Some(Ok(()))) {
         Some(Drop::Above(k)) if k == key => Some("inset-x-0 top-0 h-1/2"),
         Some(Drop::Below(k)) if k == key => Some("inset-x-0 bottom-0 h-1/2"),
         Some(Drop::LeftOf(k)) if k == key => Some("inset-y-0 left-0 w-1/5"),
@@ -1843,17 +2005,9 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                 if minimized.get() || (full.get() && !focused.get()) { "md:hidden" } else { "md:flex" },
             )
             style=move || { let r = rect.get(); format!("--l:{:.4}%;--t:{:.4}%;--w:{:.4}%;--h:{:.4}%", r.left * 100.0, r.top * 100.0, r.width * 100.0, r.height * 100.0) }
-        >
-        <section
-            class=move || format!(
-                "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-white dark:bg-zinc-950 md:rounded-lg md:border md:shadow-sm {}",
-                if focused.get() && many.get() { "md:border-blue-400 md:ring-1 md:ring-blue-400/40 dark:md:border-blue-500" } else { "md:border-zinc-200 dark:md:border-zinc-800" },
-            )
-            node_ref=section
-            on:pointerdown=move |_| ws.focus_tile_key(key)
-            on:click=move |_| ws.grow(key)
+            node_ref=drop_area
             on:dragover=move |ev: web_sys::DragEvent| {
-                if other().is_some() {
+                if ws.dragging.get_untracked().is_some() {
                     ev.prevent_default();
                     let z = zone(&ev);
                     if ws.drop_at.get_untracked() != z {
@@ -1861,14 +2015,29 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                     }
                 }
             }
+            on:dragleave=move |ev: web_sys::DragEvent| {
+                let inside = ev.related_target().and_then(|t| t.dyn_into::<web_sys::Node>().ok())
+                    .is_some_and(|t| drop_area.get_untracked().is_some_and(|el| el.contains(Some(&t))));
+                if !inside && ws.drop_at.get_untracked().is_some_and(|to| to.target() == key) {
+                    ws.drop_at.set(None);
+                }
+            }
             on:drop=move |ev: web_sys::DragEvent| {
-                if let (Some(k), Some(z)) = (other(), zone(&ev)) {
+                if let (Some(k), Some(z)) = (ws.dragging.get_untracked(), zone(&ev)) {
                     ev.prevent_default();
                     ws.move_tile(k, z);
                 }
                 ws.dragging.set(None);
                 ws.drop_at.set(None);
             }
+        >
+        <section
+            class=move || format!(
+                "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-white dark:bg-zinc-950 md:rounded-lg md:border md:shadow-sm {}",
+                if focused.get() && many.get() { "md:border-blue-400 md:ring-1 md:ring-blue-400/40 dark:md:border-blue-500" } else { "md:border-zinc-200 dark:md:border-zinc-800" },
+            )
+            on:pointerdown=move |_| ws.focus_tile_key(key)
+            on:click=move |_| ws.grow(key)
         >
             {move || hint().map(|at| view! {
                 <div class=format!("pointer-events-none absolute z-20 rounded-md border-2 border-blue-500 bg-blue-500/15 {at}")></div>
@@ -1888,6 +2057,7 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                         let _ = dt.set_data("text/plain", &format!("tile {key}"));
                         dt.set_effect_allowed("move");
                     }
+                    ws.drop_at.set(None);
                     ws.dragging.set(Some(key));
                 }
                 on:dragend=move |_| {
@@ -1990,6 +2160,74 @@ mod tests {
     use super::*;
 
     #[test]
+    fn upward_input_stops_following_before_any_scroll_and_even_one_pixel_from_end() {
+        assert!(!scroll_follow(true, Some(ScrollIntent::Away), None));
+        for gap in [120, 40, 4, 3, 1, 0, -1] {
+            assert!(!scroll_follow(false, Some(ScrollIntent::Away), Some(gap)), "gap {gap}");
+        }
+    }
+
+    #[test]
+    fn programmatic_scrolls_never_change_following() {
+        for following in [false, true] {
+            for gap in [400, 119, 3, 0, -1] {
+                assert_eq!(scroll_follow(following, None, Some(gap)), following, "gap {gap}");
+            }
+        }
+    }
+
+    #[test]
+    fn latest_can_resume_before_the_old_upward_intent_is_cleared() {
+        assert!(!scroll_follow(true, Some(ScrollIntent::Away), None));
+        // Latest explicitly sets following. Its own scroll event must not
+        // replay the earlier upward input while the reactive effect is pending.
+        assert!(scroll_follow(true, Some(ScrollIntent::Away), Some(0)));
+    }
+
+    #[test]
+    fn downward_input_resumes_only_after_reaching_the_very_end() {
+        assert!(!scroll_follow(false, Some(ScrollIntent::Toward), None));
+        for gap in [120, 40, 4] {
+            assert!(!scroll_follow(false, Some(ScrollIntent::Toward), Some(gap)), "gap {gap}");
+        }
+        for gap in [3, 1, 0, -1] {
+            assert!(scroll_follow(false, Some(ScrollIntent::Toward), Some(gap)), "gap {gap}");
+        }
+        // Content growth while following is not a reason to stop.
+        assert!(scroll_follow(true, Some(ScrollIntent::Toward), Some(400)));
+    }
+
+    #[test]
+    fn scrollbar_follows_only_at_the_very_end() {
+        assert!(scroll_follow(true, Some(ScrollIntent::Scrollbar), None));
+        assert!(!scroll_follow(true, Some(ScrollIntent::Scrollbar), Some(4)));
+        assert!(scroll_follow(false, Some(ScrollIntent::Scrollbar), Some(3)));
+    }
+
+    #[test]
+    fn wheel_and_touch_direction_ignore_zero_movement() {
+        assert_eq!(ScrollIntent::from_delta(-0.5), Some(ScrollIntent::Away));
+        assert_eq!(ScrollIntent::from_delta(0.5), Some(ScrollIntent::Toward));
+        assert_eq!(ScrollIntent::from_delta(0.0), None);
+        // Finger down scrolls up; finger up scrolls down.
+        assert_eq!(ScrollIntent::from_delta(100.0 - 101.0), Some(ScrollIntent::Away));
+        assert_eq!(ScrollIntent::from_delta(100.0 - 99.0), Some(ScrollIntent::Toward));
+    }
+
+    #[test]
+    fn scroll_keys_have_direction_and_shift_space_scrolls_up() {
+        for key in ["ArrowUp", "PageUp", "Home"] {
+            assert_eq!(ScrollIntent::from_key(key, false), Some(ScrollIntent::Away), "{key}");
+        }
+        for key in ["ArrowDown", "PageDown", "End", " "] {
+            assert_eq!(ScrollIntent::from_key(key, false), Some(ScrollIntent::Toward), "{key}");
+        }
+        assert_eq!(ScrollIntent::from_key(" ", true), Some(ScrollIntent::Away));
+        assert_eq!(ScrollIntent::from_key("a", false), None);
+        assert_eq!(ScrollIntent::from_key("Tab", false), None);
+    }
+
+    #[test]
     fn tile_status_is_the_sessions_own_turn_not_what_runs_beside_it() {
         let mut session: Session = serde_json::from_value(serde_json::json!({
             "id": "main", "worker_id": "00000000-0000-0000-0000-000000000000",
@@ -2058,6 +2296,32 @@ mod tests {
         let v: View = serde_json::from_str(r#"{"view":"session_outputs","id":"s1"}"#).unwrap();
         assert_eq!(v, View::SessionOutputs { id: "s1".into(), output: String::new() });
         assert_eq!(View::session("s1").session_pane(), None);
+    }
+
+    #[test]
+    fn a_started_session_opens_beside_the_card_and_is_shown_on_a_phone() {
+        for source in [View::session("proposer"), View::Decisions] {
+            // The card can be in the item beside a list, not the first pane.
+            let mut l = Layout::new(View::Sessions);
+            let tile = l.tiles[0].key;
+            let card = l.key();
+            l.tiles[0].columns.push(Column { key: card, view: source.clone() });
+            l.tiles[0].settle();
+            // Async completion must open beside the card, even if focus moved.
+            l.open_tile(View::Calendar);
+            l.open_after(tile, card, View::session("started"));
+            let t = l.tile(tile).unwrap();
+            assert_eq!(t.columns.len(), 2);
+            assert_eq!(t.columns[0].key, card, "keep the card's mounted pane");
+            assert_eq!(t.columns[0].view, source);
+            assert_eq!(t.columns[1].view, View::session("started"));
+            assert_eq!(t.back.last().unwrap()[0].view, View::Sessions, "the old list stays in history");
+            let started = t.columns[1].key;
+            assert_eq!(t.active, started, "keyboard actions target the new session");
+            assert!(l.pane_shown(tile, started, true), "a phone navigates to the new session");
+            assert!(!l.pane_shown(tile, card, true), "the phone does not stay on the card");
+            assert!(l.pane_shown(tile, card, false), "desktop keeps the card alongside");
+        }
     }
 
     #[test]
@@ -2326,6 +2590,185 @@ mod tests {
         l.place();
         assert_eq!(stacks(&l), [0, 1, 2, 0]);
     }
+
+    #[test]
+    fn full_columns_reject_only_new_columns_not_more_tiles() {
+        let mut l = opened(16);
+        let (from, target) = (l.tiles[7].key, l.tiles[0].key);
+        let before = l.clone();
+        for to in [Drop::at(target, 0.1, 0.25), Drop::at(target, 0.9, 0.75)] {
+            assert_eq!(l.check_drop(from, to), Err("Four columns are already open; drop above or below a tile"));
+            l.move_tile(from, to);
+            assert_eq!(l, before, "no room for a fifth column; it must not be highlighted");
+        }
+        for to in [Drop::at(target, 0.5, 0.25), Drop::at(target, 0.5, 0.75)] {
+            let mut l = before.clone();
+            assert_eq!(l.check_drop(from, to), Ok(()), "there is no per-column tile limit");
+            l.move_tile(from, to);
+            assert_eq!(l.tile(from).unwrap().stack, l.tile(target).unwrap().stack);
+            assert_eq!(l.tiles.iter().filter(|t| t.stack == Some(0)).count(), 5);
+            assert_eq!(l.tiles[l.focus].key, before.tiles[before.focus].key);
+        }
+    }
+
+    #[test]
+    fn drops_that_are_already_in_place_are_not_advertised() {
+        let mut l = opened(9);
+        let (first, second, third) = (l.tiles[0].key, l.tiles[4].key, l.tiles[8].key);
+        l.minimize(4);
+        l.minimize(5);
+        l.minimize(6);
+        for (from, to) in [
+            (first, Drop::Above(first)),
+            (first, Drop::Below(first)),
+            (first, Drop::LeftOf(first)),
+            (first, Drop::RightOf(first)),
+            (first, Drop::Above(third)),
+            (third, Drop::Below(first)),
+            (l.tiles[1].key, Drop::LeftOf(l.tiles[2].key)),
+            (l.tiles[2].key, Drop::RightOf(l.tiles[1].key)),
+        ] {
+            let before = l.clone();
+            assert_eq!(l.check_drop(from, to), Err("Already here"));
+            l.move_tile(from, to);
+            assert_eq!(l, before);
+        }
+        assert!(l.tile(second).unwrap().minimized);
+        assert_eq!(l.check_drop(first, Drop::Below(third)), Ok(()), "reordering within one's column still works");
+        l.move_tile(first, Drop::Below(third));
+        let column: Vec<_> = l.tiles.iter().filter(|t| !t.minimized && t.stack == Some(0)).map(|t| t.key).collect();
+        assert_eq!(column, [third, first]);
+    }
+
+    #[test]
+    fn drop_keys_survive_closed_or_minimized_tiles_but_not_a_missing_endpoint() {
+        let mut l = opened(12);
+        let (from, target) = (l.tiles[7].key, l.tiles[8].key);
+        l.remove_tile(0);
+        l.minimize(0);
+        assert_eq!(l.check_drop(from, Drop::Above(target)), Ok(()));
+        l.move_tile(from, Drop::Above(target));
+        let i = l.tiles.iter().position(|t| t.key == from).unwrap();
+        assert_eq!(l.tiles[i + 1].key, target, "keys, not pre-drag indices, locate the tiles");
+        for source in [true, false] {
+            for close in [true, false] {
+                let mut l = l.clone();
+                let key = if source { from } else { target };
+                let i = l.tiles.iter().position(|t| t.key == key).unwrap();
+                if close {
+                    l.remove_tile(i);
+                } else {
+                    l.minimize(i);
+                }
+                let before = l.clone();
+                assert!(l.check_drop(from, Drop::Below(target)).is_err());
+                l.move_tile(from, Drop::Below(target));
+                assert_eq!(l, before, "a stale drag must not move hidden tiles or unrelated neighbours");
+            }
+        }
+    }
+
+    #[test]
+    fn every_allowed_drop_changes_the_visible_layout_and_every_rejection_keeps_it() {
+        let visible = |l: &Layout| {
+            // Canonicalize column numbers: a column held only by minimized
+            // tiles takes no room, even though it keeps its saved number.
+            let mut columns: Vec<_> = l.tiles.iter().filter(|t| !t.minimized).filter_map(|t| t.stack).collect();
+            columns.sort_unstable();
+            columns.dedup();
+            l.reading_order()
+                .into_iter()
+                .filter(|&i| !l.tiles[i].minimized)
+                .map(|i| (l.tiles[i].key, columns.iter().position(|c| Some(*c) == l.tiles[i].stack).unwrap()))
+                .collect::<Vec<_>>()
+        };
+        for n in 2..=16 {
+            for hidden in [false, true] {
+                let mut l = opened(n);
+                if hidden {
+                    l.minimize(0);
+                }
+                let before = visible(&l);
+                for from in &l.tiles {
+                    for target in &l.tiles {
+                        for to in [Drop::Above(target.key), Drop::Below(target.key), Drop::LeftOf(target.key), Drop::RightOf(target.key)] {
+                            let mut moved = l.clone();
+                            moved.move_tile(from.key, to);
+                            if l.check_drop(from.key, to).is_ok() {
+                                let after = visible(&moved);
+                                assert_ne!(after, before, "{n} tiles, hidden {hidden}, {} to {to:?}", from.key);
+                                let i = after.iter().position(|t| t.0 == from.key).unwrap();
+                                let j = after.iter().position(|t| t.0 == target.key).unwrap();
+                                match to {
+                                    Drop::Above(_) => {
+                                        assert_eq!(i + 1, j);
+                                        assert_eq!(after[i].1, after[j].1);
+                                    }
+                                    Drop::Below(_) => {
+                                        assert_eq!(i, j + 1);
+                                        assert_eq!(after[i].1, after[j].1);
+                                    }
+                                    Drop::LeftOf(_) | Drop::RightOf(_) => {
+                                        let columns = before.iter().map(|t| t.1).collect::<HashSet<_>>().len();
+                                        let alone = l.tiles.iter().filter(|t| !t.minimized && t.stack == from.stack).count() == 1;
+                                        assert_eq!(after.iter().map(|t| t.1).collect::<HashSet<_>>().len(), columns + usize::from(!alone));
+                                        assert_eq!(after.iter().filter(|t| t.1 == after[i].1).count(), 1, "a new column, not a stack");
+                                        if matches!(to, Drop::LeftOf(_)) {
+                                            assert_eq!(after[i].1 + 1, after[j].1);
+                                        } else {
+                                            assert_eq!(after[i].1, after[j].1 + 1);
+                                        }
+                                    }
+                                }
+                                assert_eq!(moved.tiles[moved.focus].key, l.tiles[l.focus].key);
+                            } else {
+                                assert_eq!(moved, l);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_free_column_or_a_singleton_can_still_move_sideways() {
+        let mut l = opened(5);
+        let (from, target) = (l.tiles[4].key, l.tiles[2].key);
+        l.minimize(3);
+        assert_eq!(l.check_drop(from, Drop::RightOf(target)), Ok(()), "a minimized-only column is free");
+        l.move_tile(from, Drop::RightOf(target));
+        assert!(l.tile(from).unwrap().stack > l.tile(target).unwrap().stack);
+
+        let mut l = opened(5);
+        let (from, target) = (l.tiles[3].key, l.tiles[0].key);
+        assert_eq!(l.check_drop(from, Drop::LeftOf(target)), Ok(()), "a singleton moves its column, not adds one");
+        l.move_tile(from, Drop::LeftOf(target));
+        assert_eq!(l.tile(from).unwrap().stack, Some(0));
+        assert_eq!(l.tile(target).unwrap().stack, Some(1));
+    }
+
+    #[test]
+    fn a_new_column_reuses_a_minimized_only_slot_without_merging_visible_columns() {
+        let mut l = opened(9);
+        let keys: Vec<_> = l.tiles.iter().map(|t| t.key).collect();
+        for i in [0, 4, 8] {
+            l.minimize(i);
+        }
+        // Three columns are shown; column zero is held only by minimized
+        // tiles. Keeping that spare as well as the new column used to make
+        // five saved columns: place() capped the last two to column three,
+        // silently stacking the dropped tile with the rightmost column.
+        let to = Drop::RightOf(keys[2]);
+        assert_eq!(l.check_drop(keys[5], to), Ok(()));
+        l.move_tile(keys[5], to);
+        let shown: HashSet<_> = l.tiles.iter().filter(|t| !t.minimized).map(|t| t.stack).collect();
+        assert_eq!(shown.len(), COLUMNS, "the edge promised a new column");
+        assert_eq!(l.tiles.iter().filter(|t| !t.minimized && t.stack == l.tile(keys[5]).unwrap().stack).count(), 1);
+        assert!(l.tile(keys[2]).unwrap().stack < l.tile(keys[5]).unwrap().stack);
+        assert!(l.tile(keys[5]).unwrap().stack < l.tile(keys[3]).unwrap().stack);
+        assert_eq!(l.tiles[l.focus].key, keys[7], "focus stays on the last shown focused tile");
+    }
 }
 
 /// Where a pane is in its tile.
@@ -2382,9 +2825,11 @@ fn ColumnView(tile: u64, col: u64) -> impl IntoView {
             on:pointerdown=move |_| ws.set_active(tile, col)
         >
             // A pane has its own header only beside another; alone, the tile's bar names it.
-            {move || pos.get().is_some_and(|p| p.len == 2).then(|| view! {
+            // Keep it mounted when only focus/active changes on pointerdown,
+            // or its controls disappear before their click can arrive.
+            <Show when=move || pos.get().is_some_and(|p| p.len == 2)>
                 <ColumnHeader label pos=Signal::derive(move || pos.get()) view=Signal::derive(move || view.get()) />
-            })}
+            </Show>
             <div class="relative flex min-h-0 flex-1 flex-col">
                 {move || view.get().map(render_view)}
             </div>
@@ -2411,9 +2856,9 @@ fn ColumnHeader(label: Signal<String>, pos: Signal<Option<Pos>>, view: Signal<Op
             "flex h-7 shrink-0 items-center gap-1 border-b border-zinc-100 px-2 text-[11px] pointer-coarse:h-11 pointer-coarse:gap-0 dark:border-zinc-900 {}",
             if ctx.active.get() { "text-zinc-700 dark:text-zinc-300" } else { "text-muted" },
         )>
-            {move || pos.get().filter(|p| p.index == 1).map(|_| view! {
+            <Show when=move || pos.get().is_some_and(|p| p.index == 1)>
                 <button class=format!("{btn} md:hidden") title="Back to the list" aria-label="Back to the list" on:click=move |_| ws.show_list(ctx.tile)>{crate::icons::chevron_left()}</button>
-            })}
+            </Show>
             <span class="min-w-0 flex-1 truncate">{label}</span>
             {move || session().map(|id| view! {
                 <button class=btn title=move || if pinned() { "Unpin" } else { "Pin to the dock" } aria-label=move || if pinned() { "Unpin" } else { "Pin" }
@@ -2421,9 +2866,9 @@ fn ColumnHeader(label: Signal<String>, pos: Signal<Option<Pos>>, view: Signal<Op
                     {move || crate::icons::star(pinned())}
                 </button>
             })}
-            {move || pos.get().filter(|p| p.len == 2).map(|_| view! {
+            <Show when=move || pos.get().is_some_and(|p| p.len == 2)>
                 <button class=btn title="Close this pane" aria-label="Close this pane" on:click=move |_| ctx.close()>{crate::icons::x()}</button>
-            })}
+            </Show>
         </div>
     }
 }

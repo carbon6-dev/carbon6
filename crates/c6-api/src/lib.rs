@@ -1,6 +1,7 @@
 //! JSON types for the head's `/api/v1`, shared by `c6h` and the web UI.
 //! Must stay wasm-compatible: no tokio, no std-only dependencies.
 
+pub mod citations;
 pub mod docs;
 pub mod labels;
 pub mod marks;
@@ -15,6 +16,16 @@ pub use uuid::Uuid;
 
 /// Timestamps are Unix milliseconds.
 pub type UnixMs = i64;
+
+/// Display only, for this head's user across realms and devices.
+/// `GET/PUT /api/v1/settings/transcript`; never sent to models.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TranscriptSettings {
+    /// Hidden by default; when shown, thinking starts expanded.
+    #[serde(default)]
+    pub show_thinking: bool,
+}
 
 /// Non-destructive inspection of a background shell command, subagent or observed Claude Code task.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -175,16 +186,85 @@ pub struct QuotaWindow {
     /// the provider said; empty when it didn't.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub status: String,
+    /// Observation time and provenance; absent in older saved snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<QuotaOrigin>,
+}
+
+/// Where a plan snapshot was observed. Worker identity is supplied by the head.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct QuotaOrigin {
+    pub source: String,
+    pub observed_at: UnixMs,
+    #[serde(default)]
+    pub worker_id: String,
+    #[serde(default)]
+    pub worker_name: String,
+    #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default)]
+    pub plan_type: Option<String>,
+    /// Transient identity for conservative merging; never copied into the
+    /// quota API or persisted quota history.
+    #[serde(skip)]
+    #[cfg_attr(feature = "schema", schemars(skip))]
+    pub email: Option<String>,
+    /// Executable selected on the worker (manual override or discovered).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub command_from_shell: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub unmatched_reason: String,
+}
+
+/// Opt-in workers, by id (like session imports, but no session files are read).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct CodexLimitsSettings {
+    #[serde(default)]
+    pub workers: Vec<String>,
+    /// Optional absolute executable paths, by worker id. No arguments or
+    /// shell expansion; absent/empty discovers Codex through the user's shell.
+    #[serde(default)]
+    pub commands: std::collections::BTreeMap<String, String>,
+}
+
+/// `quotas.codex.report`, carried by the existing JSON HeadCall protocol.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CodexLimitsReport {
+    pub observed_at: UnixMs,
+    pub account_id: Option<String>,
+    pub plan_type: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub command_from_shell: bool,
+    pub windows: Vec<CodexPlanWindow>,
+    /// A bounded diagnostic, never stderr or credentials.
+    #[serde(default)]
+    pub error: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CodexPlanWindow {
+    pub used_percent: f64,
+    pub window_minutes: i64,
+    /// Unix seconds.
+    pub resets_at: Option<i64>,
 }
 
 /// A connection's plan limits, as last seen (docs/analytics.md, "Plan
 /// limits"): from Claude Code's own reports as its sessions run, or read
-/// from ChatGPT's usage endpoint every few minutes.
+/// from ChatGPT reply headers or an opted-in worker's local Codex.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ConnectionQuota {
     pub connection_id: String,
-    /// "claude_code" or "chatgpt".
+    /// "claude_code", "chatgpt" (headers/legacy endpoint), or "codex-cli".
     pub source: String,
     pub windows: Vec<QuotaWindow>,
     /// When they were last seen.
@@ -192,6 +272,8 @@ pub struct ConnectionQuota {
     /// Why the last read failed (the windows are the last good ones).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<QuotaOrigin>,
 }
 
 impl ConnectionQuota {
@@ -1852,8 +1934,9 @@ pub struct SubagentLimits {
     /// up, in minutes.
     #[serde(default = "default_claude_code_idle_minutes")]
     pub claude_code_idle_minutes: u32,
-    /// How long a chain of messages between sessions may get: a message sent
-    /// from a turn a session message started is one more.
+    /// Longest chain of messages between sessions (default 4). A send adds
+    /// one to the last session message delivered; direct UI or HTTP API
+    /// input resets the session's count to 0. Sends beyond this limit are refused.
     #[serde(default = "default_max_message_hops")]
     pub max_message_hops: u32,
     /// How many messages one session may send other sessions per hour.
@@ -1905,6 +1988,33 @@ impl Default for SubagentLimits {
     }
 }
 
+/// Extra Claude Code settings when none are set: no Claude co-author or
+/// attribution lines in commits and pull requests.
+pub const CLAUDE_CODE_SETTINGS_DEFAULT: &str = r#"{"includeCoAuthoredBy":false,"gitAttribution":false}"#;
+
+/// Claude Code settings carbon6 sets itself or that would undo its
+/// lockdown (hooks, plugins, MCP servers, environment), so extra settings
+/// may not name them.
+pub const CLAUDE_CODE_SETTINGS_PROTECTED: &[&str] = &[
+    "hooks",
+    "disableAllHooks",
+    "allowManagedHooksOnly",
+    "enabledPlugins",
+    "extraKnownMarketplaces",
+    "env",
+    "mcpServers",
+    "enableAllProjectMcpServers",
+    "enabledMcpjsonServers",
+    "disabledMcpjsonServers",
+];
+
+/// What's wrong with `v` as extra Claude Code settings, if anything.
+pub fn claude_code_settings_error(v: &serde_json::Value) -> Option<String> {
+    let Some(obj) = v.as_object() else { return Some("extra Claude Code settings must be a JSON object".into()) };
+    let taken: Vec<&str> = CLAUDE_CODE_SETTINGS_PROTECTED.iter().copied().filter(|k| obj.contains_key(*k)).collect();
+    (!taken.is_empty()).then(|| format!("carbon6 sets these Claude Code settings itself: {}", taken.join(", ")))
+}
+
 /// `GET`/`PUT /api/v1/settings/claude-code-tools`: carbon6's tools that
 /// Claude Code sessions get over carbon6's MCP server (docs/background.md
 /// §4). A routing rule's tool list narrows them further.
@@ -1924,6 +2034,19 @@ pub struct ClaudeCodeTools {
     /// (subagents, documents, work, memory and task cards).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub core: Option<Vec<String>>,
+    /// Claude Code's own tools as they are without carbon6: all of them,
+    /// with its settings files, MCP servers, skills and plugins (today's
+    /// behaviour, an escape hatch for now). Off (the default): only its
+    /// coding tools (Bash, Read, Write, Edit, ToolSearch), narrowed by a
+    /// routing rule's tool list, and carbon6's over MCP for the rest.
+    #[serde(default)]
+    pub native_all: bool,
+    /// Extra Claude Code settings: a JSON object merged into the settings
+    /// carbon6 passes to Claude Code (`--settings`), in either mode. None:
+    /// [`CLAUDE_CODE_SETTINGS_DEFAULT`]. The keys carbon6 sets itself
+    /// ([`CLAUDE_CODE_SETTINGS_PROTECTED`]) are refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<serde_json::Value>,
     /// Every tool that may be chosen, with what it does (ignored when set).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub available: Vec<ToolChoice>,
@@ -2270,6 +2393,8 @@ pub enum EventKind {
         command: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         from_title: String,
+        #[serde(default)]
+        deliver_at_ms: i64,
     },
 }
 
@@ -2282,7 +2407,7 @@ impl EventKind {
         if calls > 0 {
             return calls;
         }
-        blocks.iter().any(|b| matches!(b, ContentBlock::Text { text } if !text.trim().is_empty())) as u64
+        blocks.iter().any(|b| matches!(b, ContentBlock::Text { text, .. } if !text.trim().is_empty())) as u64
     }
 
     /// What a window's summary needs from before it (usage, the model,
@@ -2314,6 +2439,8 @@ pub enum ContentBlock {
     },
     Text {
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        citations: Vec<citations::UrlCitation>,
     },
     Thinking {
         text: String,
@@ -2538,7 +2665,8 @@ pub struct DecisionEdit {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DecisionAnswer {
-    /// One of its options (when it has options).
+    /// One of its options (when it has options). Task cards also accept
+    /// `Add to work:<id>` for an open work item in the card's realm.
     #[serde(default)]
     pub option: Option<String>,
     /// Its form's fields.
@@ -5125,7 +5253,7 @@ pub struct Attention {
     pub elsewhere: Vec<AttentionElsewhere>,
 }
 
-/// One thing that needs you.
+/// One thing that needs you (or an offered task in a session's waiting list).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AttentionItem {
@@ -5133,7 +5261,8 @@ pub struct AttentionItem {
     /// answers) or `brief`.
     pub key: String,
     /// Waiting: `approval`, `question` or `decision`. Worth a look:
-    /// `turn_ended`, `failed`, `comment_answer` or `brief`.
+    /// `turn_ended`, `failed`, `comment_answer` or `brief`. The session-scoped
+    /// waiting list also includes `task` (never in Attention.waiting).
     pub kind: String,
     pub title: String,
     /// Where it is: the session's title for an approval or a turn. For a

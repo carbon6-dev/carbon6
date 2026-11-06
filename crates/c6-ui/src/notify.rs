@@ -10,8 +10,36 @@ use web_sys::{Notification, NotificationOptions, NotificationPermission};
 use crate::api::LiveFeed;
 use crate::util::{storage_get, storage_set};
 
+/// Some mobile browsers have no Notification global at all. Reflective
+/// reads also catch permission getters that are unavailable or throw.
+fn notification_api() -> Option<wasm_bindgen::JsValue> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let window = web_sys::window()?;
+        js_sys::Reflect::get(&window, &"Notification".into()).ok().filter(wasm_bindgen::JsValue::is_function)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    None
+}
+
+fn permission() -> Option<NotificationPermission> {
+    let api = notification_api()?;
+    match js_sys::Reflect::get(&api, &"permission".into()).ok()?.as_string()?.as_str() {
+        "granted" => Some(NotificationPermission::Granted),
+        "denied" => Some(NotificationPermission::Denied),
+        "default" => Some(NotificationPermission::Default),
+        _ => None,
+    }
+}
+
+fn request_permission() -> Option<js_sys::Promise> {
+    let api = notification_api()?;
+    js_sys::Reflect::get(&api, &"requestPermission".into()).ok().filter(wasm_bindgen::JsValue::is_function)?;
+    Notification::request_permission().ok()
+}
+
 fn enabled() -> bool {
-    Notification::permission() == NotificationPermission::Granted && storage_get("c6.notify").as_deref() != Some("0")
+    permission() == Some(NotificationPermission::Granted) && storage_get("c6.notify").as_deref() != Some("0")
 }
 
 fn finished(previous: &mut HashMap<String, SessionStatus>, session: &Session) -> bool {
@@ -71,9 +99,13 @@ pub fn watch_sessions(live: LiveFeed, ws: crate::workspace::Workspace, filter: c
 
 #[component]
 pub fn NotifyToggle() -> impl IntoView {
+    let available = permission().is_some();
     let state = RwSignal::new(enabled());
     let filter = crate::labels::use_filter().0;
     let title = move || {
+        if !available {
+            return "Browser notifications are not available here".to_owned();
+        }
         let base = "Notify me when a session finishes while this tab is in the background";
         filter.with(|f| {
             if f.is_empty() { base.to_owned() } else { format!("{base} (only sessions with labels {}, as filtered)", f.join(", ")) }
@@ -83,24 +115,25 @@ pub fn NotifyToggle() -> impl IntoView {
         if state.get_untracked() {
             storage_set("c6.notify", "0");
             state.set(false);
-        } else if Notification::permission() == NotificationPermission::Granted {
+        } else if permission() == Some(NotificationPermission::Granted) {
             storage_set("c6.notify", "1");
             state.set(true);
-        } else if let Ok(p) = Notification::request_permission() {
-            let done = wasm_bindgen::closure::Closure::<dyn FnMut(wasm_bindgen::JsValue)>::new(move |_| {
-                storage_set("c6.notify", "1");
-                state.set(enabled());
+        } else if let Some(p) = request_permission() {
+            leptos::task::spawn_local(async move {
+                if wasm_bindgen_futures::JsFuture::from(p).await.is_ok() {
+                    storage_set("c6.notify", "1");
+                    let _ = state.try_set(enabled());
+                }
             });
-            let _ = p.then(&done);
-            done.forget();
         }
     };
     view! {
-        <button class="hidden text-xs text-muted hover:text-zinc-900 md:inline dark:hover:text-zinc-100" title=title on:click=click>
+        <button class="hidden text-xs text-muted hover:text-zinc-900 md:inline dark:hover:text-zinc-100" title=title disabled=!available on:click=click>
+            {move || if state.get() { crate::icons::bell().into_any() } else { crate::icons::bell_off().into_any() }}" "
             {move || match (state.get(), filter.with(Vec::is_empty)) {
-                (true, true) => "🔔 on",
-                (true, false) => "🔔 filtered",
-                _ => "🔕 off",
+                (true, true) => "Notifications on",
+                (true, false) => "Notifications filtered",
+                _ => "Notifications off",
             }}
         </button>
     }
@@ -117,6 +150,23 @@ mod tests {
             "created_at": 0, "updated_at": 0, "last_seq": 0
         }))
         .unwrap()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn missing_browser_notifications_leave_the_toggle_renderable_and_off() {
+        assert!(permission().is_none());
+        assert!(request_permission().is_none());
+        assert!(!enabled());
+        let owner = Owner::new();
+        owner.with(|| {
+            provide_context(crate::labels::LabelFilter(RwSignal::new(Vec::new())));
+            let html = view! { <NotifyToggle /> }.to_html();
+            assert!(html.contains("Notifications off"), "{html}");
+            assert!(html.contains("<svg"), "keep the notification bell: {html}");
+            assert!(html.contains("disabled"), "{html}");
+            assert!(html.contains("Browser notifications are not available here"), "{html}");
+        });
     }
 
     #[test]

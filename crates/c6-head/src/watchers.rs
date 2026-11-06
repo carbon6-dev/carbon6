@@ -425,7 +425,14 @@ fn reasons(events: &[SessionEvent]) -> Vec<&'static str> {
                     add("correction");
                 }
             }
-            Some(Kind::User(u)) if u.from_session_id.is_empty() && u.delegated_by.is_empty() && corrects(&u.text) => add("correction"),
+            Some(Kind::User(u))
+                if u.from_session_id.is_empty()
+                    && u.delegated_by.is_empty()
+                    && !matches!(u.command.as_str(), "task-notification" | "card-answer")
+                    && corrects(&u.text) =>
+            {
+                add("correction")
+            }
             Some(Kind::Rewound(_)) => add("correction"),
             Some(Kind::Approval(a)) if a.state == "denied" => add("correction"),
             Some(Kind::ToolResult(r)) => {
@@ -468,12 +475,15 @@ fn digest(events: &[SessionEvent]) -> String {
             Some(Kind::User(u)) if !u.from_session_id.is_empty() => {
                 lines.push(format!("[{}] message from \"{}\": {}", e.seq, u.from_title, clip(&u.text, 600)))
             }
+            Some(Kind::User(u)) if u.command == "task-notification" => {
+                lines.push(format!("[{}] agent notice: {}", e.seq, clip(&u.text, 800)))
+            }
             Some(Kind::User(u)) => lines.push(format!("[{}] user: {}", e.seq, clip(&u.text, 800))),
             Some(Kind::Assistant(a)) => {
                 for b in &a.blocks {
                     match &b.block {
                         Some(content_block::Block::Text(t)) if !t.trim().is_empty() => {
-                            lines.push(format!("[{}] agent: {}", e.seq, clip(t, 600)))
+                            lines.push(format!("[{}] agent: {}", e.seq, clip(&api::citations::clean(t), 600)))
                         }
                         Some(content_block::Block::ToolUse(t)) => {
                             lines.push(format!("[{}] agent calls {} {}", e.seq, t.name, clip(&t.input_json, 400)))
@@ -801,7 +811,7 @@ async fn wake(st: &HeadState, name: &str, key: &str, forced: &[String], message:
         vec![
             Kind::Assistant(c6_proto::AssistantMessage {
                 turn,
-                blocks: vec![c6_proto::ContentBlock { block: Some(content_block::Block::Text(said)) }],
+                blocks: vec![c6_proto::ContentBlock { block: Some(content_block::Block::Text(said)), ..Default::default() }],
                 stop_reason: "end_turn".into(),
             }),
             Kind::Usage(c6_proto::Usage {
@@ -1573,7 +1583,7 @@ pub async fn guard(st: &HeadState, session: &SessionRow, tool: &str, input: &str
         vec![
             Kind::Assistant(c6_proto::AssistantMessage {
                 turn,
-                blocks: vec![c6_proto::ContentBlock { block: Some(content_block::Block::Text(said)) }],
+                blocks: vec![c6_proto::ContentBlock { block: Some(content_block::Block::Text(said)), ..Default::default() }],
                 stop_reason: "end_turn".into(),
             }),
             Kind::Usage(c6_proto::Usage {
@@ -1827,5 +1837,69 @@ mod tests {
         assert!(corrects("Don't do that"));
         assert!(corrects("please make sure memory is accounted for"));
         assert!(!corrects("thanks, looks good"));
+    }
+
+    #[test]
+    fn digest_cleans_citations_without_changing_annotated_events() {
+        let text = "Use the documented flag.\u{e200}cite\u{e202}turn0search0\u{e201}";
+        let event = SessionEvent {
+            seq: 2,
+            kind: Some(Kind::Assistant(c6_proto::AssistantMessage {
+                blocks: vec![c6_proto::ContentBlock {
+                    block: Some(content_block::Block::Text(text.into())),
+                    annotations_json:
+                        r#"[{"type":"url_citation","url":"https://example.com/flag","title":"Flag","start_index":24,"end_index":49}]"#
+                            .into(),
+                }],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let original = event.clone();
+        assert_eq!(digest(std::slice::from_ref(&event)), "[2] agent: Use the documented flag.\n");
+        assert_eq!(event, original);
+    }
+
+    #[test]
+    fn notices_and_card_buttons_are_not_corrections() {
+        let events = [
+            SessionEvent {
+                kind: Some(Kind::NoticeQueued(c6_proto::NoticeQueued {
+                    text: "Don't do that; the task card was declined".into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            SessionEvent {
+                kind: Some(Kind::Notice(c6_proto::Notice {
+                    message: "Don't do that; the task card was declined".into(),
+                    quiet: true,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        ];
+        assert!(reasons(&events).is_empty());
+        assert!(digest(&events).is_empty());
+
+        // A task notification is agent context, not a human correction.
+        let mut consumed = SessionEvent {
+            seq: 3,
+            kind: Some(Kind::User(c6_proto::UserMessage {
+                text: "Don't do that; the task card was declined".into(),
+                command: "task-notification".into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(reasons(std::slice::from_ref(&consumed)).is_empty());
+        assert_eq!(digest(std::slice::from_ref(&consumed)), "[3] agent notice: Don't do that; the task card was declined\n");
+        let Some(Kind::User(u)) = &mut consumed.kind else { unreachable!() };
+        u.command = "card-answer".into();
+        assert!(reasons(std::slice::from_ref(&consumed)).is_empty());
+        assert_eq!(digest(std::slice::from_ref(&consumed)), "[3] user: Don't do that; the task card was declined\n");
+        let Some(Kind::User(u)) = &mut consumed.kind else { unreachable!() };
+        u.command.clear();
+        assert!(reasons(&[consumed]).contains(&"correction"));
     }
 }

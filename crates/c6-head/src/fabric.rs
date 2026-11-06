@@ -116,6 +116,11 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
     }
     // Sessions this worker imports from Claude Code and Codex (docs/imports.md).
     match method {
+        "quotas.codex.config" => return crate::quotas::codex_config(st, from).await,
+        "quotas.codex.report" => {
+            crate::quotas::from_codex(st, from, serde_json::from_value(params)?).await?;
+            return Ok(json!({}));
+        }
         "imports.config" => return crate::imports::config(st, from).await,
         // How its update goes (docs/updates.md §5).
         "update.status" => return crate::updates::worker_status(st, from, &params).await,

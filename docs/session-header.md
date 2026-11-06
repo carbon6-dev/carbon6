@@ -16,6 +16,32 @@ Left to right: back and forward, the session's mark, its title (double-click to 
 - With another view beside the session in its tile (a doc), the bar speaks for that view; the session's icons and ⋯ are in a slim strip at the top of the session. A pane of its own beside it leaves the bar the session's.
 - **Gone:** the second bar and its tabs, the drawer, ⚙, the ◆ pill, the aspect marks (and the dimming of other tiles when pointing at one).
 
+## Icons throughout the app
+
+App-owned chrome uses drawn SVG icons instead of emoji or Unicode pictograms
+(including checkmarks, crosses, stars and disclosure triangles). Don't drop
+icons or replace them with words alone: keep each icon in its original position
+and keep its accompanying text. This includes trailing action arrows and icons
+mentioned in help text. Use `crates/c6-ui/src/icons.rs`; new icons use its shared
+helper and follow the same 24-unit viewBox, rounded
+`currentColor` strokes and 16px size; compact wrappers constrain them to the
+surrounding text. Decorative SVGs are hidden from accessibility APIs; icon-only
+controls retain a title or accessible label.
+
+Notices use a drawn bell, files a drawn page, secrets a drawn key, and published
+outputs the existing package icon. Memory events keep their brain, task and
+subagent states keep their status marks, and labelled actions keep their icons. Mail
+attachments share a file icon; the filename and type distinguish formats.
+Chat actions and document comments use drawn message, bookmark, link and
+reaction icons, not emoji. The same rule applies to explorer badges and menus.
+
+Keep intentional typography (`› ‹ … · ×`, quotes, dashes and list bullets),
+keyboard symbols and directions within prose (action arrows are drawn SVGs), and
+the worker/SSH relationship separator. Imported/user-authored emoji in messages, reactions, status text,
+documents and terminal output remain content, including Slack's emoji picker
+and the terminal vendor's Unicode-width data. The native UI tests render
+representative session cards and scan app-owned Rust/HTML/JS to guard this rule.
+
 ## 2. Panes
 
 Changes, Terminal, Files and Outputs are views of their own (`/sessions/{id}/changes`, `/terminal`, `/files`, `/outputs`), each with its name and the session's title. Clicking an icon opens its pane, or closes it if open; ⌘/Ctrl-click opens it in a new tile. Opened beside the session, the session stays and a list beside it goes back in the tile's history; the two share the tile evenly.
@@ -26,11 +52,14 @@ One line each, read-only: **Runs on** (worker, online dot, model and effort, run
 
 ## 4. Defaults
 
+- **Thinking:** Settings → Appearance → Session transcripts → **Show thinking**, off by default. The explanation is “Show model reasoning expanded, labelled Thinking; otherwise hide it from transcripts.” Off removes reasoning blocks entirely, including their label; a thinking-only reply leaves no empty event or branching controls. Text, tool calls, results and interruption notices are unchanged. On shows both streamed and saved reasoning expanded, under the existing **Thinking** label (you can still fold an individual block). This applies to every transcript: sessions, inline subagent threads, side chats, expanded timeline turns and the phone layout. Catch-up/timeline summaries already omit reasoning. Model-call diagnostics and explicit thinking search results are not transcripts and are unchanged.
+- **Thinking preference storage and API:** one user per head, one preference across realms and devices, saved in the existing `settings` table as `transcript_display`; no migration. It is loaded when the app opens and updates all mounted transcripts when changed in Settings. Other open devices pick it up on reload; it is not a live cross-device broadcast. `GET /api/v1/settings/transcript` (`settings.transcript.get`) returns `{"show_thinking": false}` until saved; `PUT` on that path (`settings.transcript.put`) accepts the same object and returns 204. A missing field defaults to false. Available from either a realm or the console. This is display only: recorded events, streamed data, search indexing and model input are unchanged. The generated Settings API reference includes the request schema and default.
 - Icons: Lucide (ISC), inline, 16px; hit targets 28px with a mouse (24px in a pane's bar), 40px on a touch screen.
 - A pane opens beside the session when its tile is at least ~1100px wide, else in a tile of its own; on a phone beside (it fills the screen, ‹ goes back).
 - The glance is a column 24px to the right of the transcript, 288px wide where it starts and growing with the room to 380px (`clamp(18rem, 100% − 59.5rem, 23.75rem)`), its values wrapping rather than cut short, which keeps its reading width (56rem); the two are centred together in the session's column, the glance stays in sight as the transcript scrolls, and the message box and the find bar line up with the transcript. That needs the session's column to be at least 1240px wide (896 + 24 + 288 and 16px either side); narrower, the glance is behind the context ring: a popover, a sheet from the bottom on a phone. ⌘I opens and closes it there; Esc closes it.
 - The bar's only count is *◌ N*; the state word is the session's own turn.
 - The branch has no "based on" yet.
+- **Transcript scrolling:** opening a session follows the latest reply; opening a search hit stays at its anchor. Any upward wheel/trackpad movement, vertical touch drag toward older content, or Up/Page Up/Home (Shift+Space too) immediately stops following, even a pixel from the bottom, and cancels a running glide. New text and resizes do not re-enable it. Scrolling down to the very bottom (less than 4px away), or clicking **↓ Latest**, resumes following. Folding and showing the tile preserves that choice and position. Touching without dragging and editing a text field do not stop following.
 
 ## 5. Not yet
 

@@ -131,7 +131,7 @@ fn text_of(blocks: &[ContentBlock]) -> String {
     blocks
         .iter()
         .filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Text { text, .. } => Some(api::citations::clean(text)),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -188,7 +188,7 @@ fn known_lines(st: &HeadState, session: &str, list: &mut [TimelineTurn]) -> Vec<
     let mut missing = Vec::new();
     for (i, t) in list.iter_mut().enumerate() {
         match lines.get(&key(session, t)) {
-            Some(l) => t.summary = l.clone(),
+            Some(l) => t.summary = api::citations::clean(l).into_owned(),
             None if t.end_seq > 0 => missing.push(i),
             None => {}
         }
@@ -304,8 +304,24 @@ pub(crate) fn parse_lines(text: &str) -> HashMap<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catchup::tests::{ev, from_session, notice, reply, result, user};
+    use crate::catchup::tests::{card_answer, ev, from_session, notice, reply, result, user};
     use serde_json::json;
+
+    #[test]
+    fn card_answers_start_and_attribute_turns_as_user_messages() {
+        let mut t = Turns::default();
+        for e in [ev(1, 0, card_answer()), ev(2, 20, EventKind::TurnStarted { turn: 1, context_window: 0 })] {
+            t.feed(&e);
+        }
+        assert_eq!(
+            (t.list[0].start_seq, t.list[0].by.as_str(), t.list[0].words.as_str()),
+            (1, "you", "Not now: task card #185 \"Cleanup\".")
+        );
+        let mut t = Turns::default();
+        t.feed(&ev(1, 0, EventKind::TurnStarted { turn: 1, context_window: 0 }));
+        t.feed(&ev(2, 10, card_answer()));
+        assert_eq!(t.list[0].by, "you", "a card answer can join the running turn");
+    }
 
     #[test]
     fn turns_say_who_started_them_and_how_many_steps() {

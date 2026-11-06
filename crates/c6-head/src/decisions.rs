@@ -256,8 +256,12 @@ pub async fn answer(st: &HeadState, id: i64, a: &api::DecisionAnswer, via: &str)
         return Err(bad_request(format!("decision {id} is already {}", d.state)));
     }
     let option = a.option.as_deref().map(str::trim).filter(|o| !o.is_empty());
+    let reference: String = sqlx::query_scalar("SELECT ref FROM decisions WHERE id = ?").bind(id).fetch_one(&st.store.pool).await?;
+    // Destinations are chosen at answer time, including for older cards.
+    // The work writer checks that the target is open and in this realm.
+    let task_destination = d.kind == "task" && reference.starts_with("task:") && option.is_some_and(|o| o.starts_with(TASK_TO_WORK_PREFIX));
     match option {
-        Some(o) if !d.options.iter().any(|x| x.label == o) => {
+        Some(o) if !task_destination && !d.options.iter().any(|x| x.label == o) => {
             return Err(bad_request(format!("{o:?} is not one of its options")));
         }
         None if !d.options.is_empty() => return Err(bad_request("choose one of its options")),
@@ -279,7 +283,6 @@ pub async fn answer(st: &HeadState, id: i64, a: &api::DecisionAnswer, via: &str)
         return Err(bad_request("answer only the fields it asks for"));
     }
     let answer = json!({"option": option, "values": a.values});
-    let reference: String = sqlx::query_scalar("SELECT ref FROM decisions WHERE id = ?").bind(id).fetch_one(&st.store.pool).await?;
     // What waits on it first: if that fails, the decision stays open.
     act(st, &d, &reference, option, &a.values, &a.note).await?;
     record(st, id, "answered", &answer, &a.note, via).await?;
@@ -367,13 +370,23 @@ async fn act(
             crate::updates::answer(st, version, option).await?;
         }
         (Some("task"), Some(_), Some(_)) => match option {
-            Some(TASK_START) => start_task(st, d).await?,
-            Some(TASK_HERE) => do_task_here(st, d).await?,
-            Some(TASK_TO_WORK) => {
-                crate::work::keep_todo(st, d, true).await?;
+            Some(TASK_START) => {
+                let session = start_task(st, d).await?;
+                task_answer_message(st, d, format!("Start session: task card #{} {:?}. session:{session}", d.id, d.title)).await;
             }
-            Some(TASK_TO_NEW_WORK) => {
-                crate::work::keep_todo(st, d, false).await?;
+            Some(TASK_HERE) => do_task_here(st, d).await?,
+            Some(o) if matches!(o, TASK_TO_WORK | TASK_TO_NEW_WORK) || o.starts_with(TASK_TO_WORK_PREFIX) => {
+                let id = crate::work::keep_todo(st, d, o == TASK_TO_WORK, o.strip_prefix(TASK_TO_WORK_PREFIX)).await?;
+                let work = crate::work::get(st, &id, &Caller::root()).await?;
+                task_answer_message(
+                    st,
+                    d,
+                    format!("Save for later: task card #{} {:?} (to-do on {:?}).", d.id, d.title, work.fields.title),
+                )
+                .await;
+            }
+            Some("Not now") => {
+                task_answer_message(st, d, format!("Not now: task card #{} {:?}.", d.id, d.title)).await;
             }
             _ => {}
         },
@@ -720,6 +733,7 @@ pub const TASK_START: &str = "Start it";
 pub const TASK_HERE: &str = "Do it here";
 pub const TASK_TO_WORK: &str = "Add to this work";
 pub const TASK_TO_NEW_WORK: &str = "Add as new work";
+pub const TASK_TO_WORK_PREFIX: &str = "Add to work:";
 
 /// An agent proposes a task for a separate session, or withdraws one
 /// (docs/task-cards.md): a card in its session and in Decisions.
@@ -728,12 +742,18 @@ pub async fn task_card(st: &HeadState, session_id: &str, what: &str, params: &Va
     let prefix = format!("task:{session_id}:");
     if what == "task_withdraw" {
         let id = params["id"].as_i64().ok_or_else(|| bad_request("id is required"))?;
-        let reference: Option<String> = sqlx::query_scalar("SELECT ref FROM decisions WHERE id = ? AND state IN ('open', 'snoozed')")
-            .bind(id)
-            .fetch_optional(&st.store.pool)
-            .await?;
+        let reference: Option<String> =
+            sqlx::query_scalar("SELECT ref FROM decisions WHERE id = ?").bind(id).fetch_optional(&st.store.pool).await?;
         let reference =
             reference.filter(|r| r.starts_with(&prefix)).ok_or_else(|| not_found("no open task card of this session by that id"))?;
+        let d = get(st, id).await?.ok_or_else(|| not_found("no such task card"))?;
+        if d.state == "answered" {
+            let option = d.answer.as_ref().and_then(|a| a["option"].as_str()).unwrap_or("(no option)");
+            return Err(bad_request(format!("Task card #{id} was already answered: {option}.")));
+        }
+        if !matches!(d.state.as_str(), "open" | "snoozed") {
+            return Err(bad_request(format!("Task card #{id} was already {}.", d.state)));
+        }
         let why = params["why"].as_str().unwrap_or("").trim().to_owned();
         settle_ref(st, &reference, "withdrawn", json!({"why": why}), &format!("session:{session_id}")).await;
         return Ok(json!({"id": id}));
@@ -801,6 +821,16 @@ pub async fn task_card(st: &HeadState, session_id: &str, what: &str, params: &Va
     Ok(json!({"id": decision.id, "count": decision.count}))
 }
 
+/// The button sends your answer as a message; a closed proposer cannot
+/// prevent the card's action from succeeding.
+async fn task_answer_message(st: &HeadState, d: &api::Decision, text: String) {
+    if let Some(session) = d.context["session"].as_str()
+        && let Err(e) = crate::sessions::card_answer(st, session, text).await
+    {
+        warn!(decision = d.id, %session, "telling the session about its task card: {e:#}");
+    }
+}
+
 /// "Do it here": the card's task, as a message to the session that
 /// proposed it (queued behind its current turn).
 async fn do_task_here(st: &HeadState, d: &api::Decision) -> anyhow::Result<()> {
@@ -817,7 +847,20 @@ async fn do_task_here(st: &HeadState, d: &api::Decision) -> anyhow::Result<()> {
 }
 
 /// "Start it": a session that does the card's task, where its session worked.
-async fn start_task(st: &HeadState, d: &api::Decision) -> anyhow::Result<()> {
+/// A task card's labels a new session can take. An agent may copy automatic
+/// ones (`folder:`, `worker:`…) from its own session, and the session sets those itself.
+fn card_labels(labels: &Value) -> Vec<String> {
+    labels
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|l| l.as_str())
+        .filter(|l| c6_api::labels::check_user_label(l).is_ok())
+        .map(str::to_owned)
+        .collect()
+}
+
+async fn start_task(st: &HeadState, d: &api::Decision) -> anyhow::Result<String> {
     let c = &d.context;
     let s = |k: &str| c[k].as_str().unwrap_or("").to_owned();
     let workers = st.store.workers().await?;
@@ -830,7 +873,7 @@ async fn start_task(st: &HeadState, d: &api::Decision) -> anyhow::Result<()> {
         .find(|w| w.id == s("worker"))
         .or_else(|| workers.iter().find(online))
         .ok_or_else(|| bad_request("no worker is online to start it"))?;
-    let mut labels: Vec<String> = c["labels"].as_array().into_iter().flatten().filter_map(|l| l.as_str().map(str::to_owned)).collect();
+    let mut labels = card_labels(&c["labels"]);
     labels.extend(["task-card".to_owned(), format!("from:{}", s("session"))]);
     let mut req: api::CreateSession = serde_json::from_value(json!({
         "worker_id": worker.id, "cwd": s("cwd"), "connection_id": "", "model": "", "realm": d.realm,
@@ -879,5 +922,17 @@ async fn start_task(st: &HeadState, d: &api::Decision) -> anyhow::Result<()> {
         .execute(&st.store.pool)
         .await?;
     info!(decision = d.id, session = %session.id, "task card started");
-    Ok(())
+    Ok(session.id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_card_drops_automatic_labels_its_agent_copied() {
+        let labels = json!(["vpn", "folder:~/projects/mainland-vpn", "worker:zmbp", "client:acme", 7]);
+        assert_eq!(card_labels(&labels), ["vpn", "client:acme"]);
+        assert!(card_labels(&Value::Null).is_empty());
+    }
 }

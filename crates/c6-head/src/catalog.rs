@@ -43,7 +43,7 @@ pub enum Scope {
     Shared,
     /// carbon6's administration: the console (root) only.
     Admin,
-    /// This browser's own business, from anywhere.
+    /// The user's display preferences and this browser's own business, from anywhere.
     Device,
 }
 
@@ -60,6 +60,8 @@ pub fn scope(name: &str) -> Option<Scope> {
         "push.devices",
         "realms.elsewhere",
         "sessions.locate",
+        "settings.transcript.get",
+        "settings.transcript.put",
     ];
     const SHARED: &[&str] =
         &["workers.list", "connections.list", "connections.models", "connections.quotas", "commands.list", "realms.list", "hosts.list"];
@@ -430,6 +432,7 @@ fn build() -> Vec<Op> {
         op!("sessions.queue.now", "sessions", "POST" "/api/v1/sessions/{id}/queue/{command_id}/now", Write, Input::None, "Send now for a message already with the agent: it gets it at once rather than at its next step (Claude Code moves what holds its turn to the background, or stops only that turn, sparing its background agents; carbon6's own loop stops the turn and the message starts the next). 409 when the worker is not connected.", choices = &[("id", "sessions.list")]),
         op!("sessions.queue.pull", "sessions", "POST" "/api/v1/sessions/{id}/queue/{command_id}/pull", Write, Input::None, "Pulls a queued message and every message queued after it out of the queue, to be re-sent edited, reordered or dropped (each is canceled and returned, oldest first); 409 once the message is on its way to the agent.", choices = &[("id", "sessions.list")]),
         op!("sessions.decisions", "sessions", "GET" "/api/v1/sessions/{id}/decisions", Read, Input::None, "A session's open decisions: what its agent raised or asked without stopping, grants it asked for, and what it was started to work on (its tool approvals and questions are in its log).", choices = &[("id", "sessions.list")]),
+        op!("sessions.waiting", "sessions", "GET" "/api/v1/sessions/{id}/waiting", Read, Input::None, "What waits on the user in this session: its open decisions and task cards, and tool approvals and questions in it and its subagents at any depth. Returns AttentionItem rows; offered task cards have kind task. Snoozed decisions appear once due; side chats are independent.", choices = &[("id", "sessions.list")]),
         op!("sessions.suggestion", "sessions", "GET" "/api/v1/sessions/{id}/suggestion", Read, Input::None, "The message the user would likely send next, once a session's turn finished (made by a cheap model, at most once per turn; 204 when there is none).", choices = &[("id", "sessions.list")]),
         op!("sessions.name.suggest", "sessions", "GET" "/api/v1/sessions/{id}/name/suggestion", Read, Input::None, "A short name for a session from how it started (its first message and reply), made now by a cheap model (a task:name routing rule's, else task:suggest's, else the session's own). It isn't applied: sessions.update renames.", choices = &[("id", "sessions.list")]),
         op!("sessions.suggestion.seen", "sessions", "POST" "/api/v1/sessions/{id}/suggestion/seen", Write, Input::Body(schema::<api::SuggestionSeen>), "Records that a suggestion was shown, and whether it was taken.", choices = &[("id", "sessions.list")]),
@@ -441,6 +444,8 @@ fn build() -> Vec<Op> {
         op!("sessions.grouping.put", "sessions", "PUT" "/api/v1/settings/session_grouping", Write, Input::Body(schema::<api::SessionGrouping>), "Sets how the session list is grouped: label keys such as repo, host or client, outermost first."),
         op!("sessions.facets.get", "sessions", "GET" "/api/v1/settings/session_facets", Read, Input::None, "Which aspects of a session (worker, work, project, realm, repo, model) its header shows, each as a shape in its mark."),
         op!("sessions.facets.put", "sessions", "PUT" "/api/v1/settings/session_facets", Write, Input::Body(schema::<api::marks::SessionFacets>), "Sets which aspects of a session its header shows: any of worker, work, project, realm, repo, model."),
+        op!("settings.transcript.get", "settings", "GET" "/api/v1/settings/transcript", Read, Input::None, "The user's transcript display preference across realms and devices: show_thinking defaults to false (hidden); true shows thinking expanded. Display only, with no effect on stored events or model input."),
+        op!("settings.transcript.put", "settings", "PUT" "/api/v1/settings/transcript", Write, Input::Body(schema::<api::TranscriptSettings>), "Saves the user's transcript display preference across realms and devices: show_thinking false hides thinking, true shows it expanded. Does not change stored events or model input."),
         op!("marks.list", "sessions", "GET" "/api/v1/marks", Read, Input::None, "The marks given to the values of sessions' aspects, by key (worker:<id>, work:<id>, project:<id>, realm:<id>, repo:<name>, model:<name>): a value without one wears a colour worked out from its name."),
         op!("marks.set", "sessions", "PUT" "/api/v1/marks", Write, Input::Body(schema::<api::marks::SetMark>), "Gives a worker, piece of work, project, realm, repo or model its mark (a colour, or <colour>/<pattern>: hstripes, vstripes, diagonal, dots), the same everywhere it shows; an empty mark takes it away."),
         op!("settings.own.get", "settings", "GET" "/api/v1/settings/own/{name}", Read, Input::None, "Whether this realm sets a setting itself (suggestions, web-search, assistant, subagent-limits) or follows root's."),
@@ -518,10 +523,10 @@ fn build() -> Vec<Op> {
         op!("settings.brief.put", "settings", "PUT" "/api/v1/settings/brief", Write, Input::Body(schema::<api::BriefSetting>), "Sets when the brief comes and what may interrupt you."),
         op!("settings.web_search.get", "settings", "GET" "/api/v1/settings/web-search", Read, Input::None, "The web search provider sessions use."),
         op!("settings.web_search.put", "settings", "PUT" "/api/v1/settings/web-search", Write, Input::Body(schema::<api::WebSearchSetting>), "Sets the web search provider."),
-        op!("settings.claude_code_tools.get", "settings", "GET" "/api/v1/settings/claude-code-tools", Read, Input::None, "carbon6's tools Claude Code sessions get over carbon6's MCP server, and every tool that may be chosen."),
-        op!("settings.claude_code_tools.put", "settings", "PUT" "/api/v1/settings/claude-code-tools", Write, Input::Body(schema::<api::ClaudeCodeTools>), "Sets which of carbon6's tools Claude Code sessions get (a routing rule's tool list narrows them further)."),
-        op!("settings.subagent_limits.get", "settings", "GET" "/api/v1/settings/subagent-limits", Read, Input::None, "How deep subagents nest, how many may run at once in one session's tree, how many turns notices may start per hour, and how long an idle Claude Code process stays up."),
-        op!("settings.subagent_limits.put", "settings", "PUT" "/api/v1/settings/subagent-limits", Write, Input::Body(schema::<api::SubagentLimits>), "Sets how deep subagents nest, how many may run at once, how many turns notices may start per hour, and how long an idle Claude Code process stays up."),
+        op!("settings.claude_code_tools.get", "settings", "GET" "/api/v1/settings/claude-code-tools", Read, Input::None, "carbon6's tools Claude Code sessions get over carbon6's MCP server, every tool that may be chosen, and whether they keep all of Claude Code's own tools."),
+        op!("settings.claude_code_tools.put", "settings", "PUT" "/api/v1/settings/claude-code-tools", Write, Input::Body(schema::<api::ClaudeCodeTools>), "Sets which of carbon6's tools Claude Code sessions get (a routing rule's tool list narrows them further), and whether they keep all of Claude Code's own tools (native_all) or only its coding tools."),
+        op!("settings.subagent_limits.get", "settings", "GET" "/api/v1/settings/subagent-limits", Read, Input::None, "Subagent depth and running limits, notice turns per hour, Claude Code idle minutes, and session-message limits: max_message_hops (default 4; each send adds one to the last received session message's count, your next direct message resets it to 0; longer chains are refused) and messages_per_hour (default 30)."),
+        op!("settings.subagent_limits.put", "settings", "PUT" "/api/v1/settings/subagent-limits", Write, Input::Body(schema::<api::SubagentLimits>), "Sets subagent depth and running limits, notice turns per hour, Claude Code idle minutes, and session-message limits: max_message_hops (default 4; each send adds one to the last received session message's count, your next direct message resets it to 0; longer chains are refused) and messages_per_hour (default 30)."),
         op!("settings.public_url.get", "notifications", "GET" "/api/v1/settings/public_url", Read, Input::None, "The address links in notifications point to."),
         op!("settings.public_url.put", "notifications", "PUT" "/api/v1/settings/public_url", Write, Input::Body(schema::<api::PublicUrl>), "Sets the address links in notifications point to."),
         op!("settings.assistant.get", "assistant", "GET" "/api/v1/settings/assistant", Read, Input::None, "Which model the assistant uses (none: routes for the label assistant, else the default)."),
@@ -665,6 +670,8 @@ fn build() -> Vec<Op> {
         op!("google.client.put", "mail", "PUT" "/api/v1/google/client", Write, Input::Body(schema::<api::GoogleClientIn>), "Sets a realm's Google OAuth client (from your Google Cloud project); root's (from the console) is every realm's that has none. Ask for the secret with c6_ask (secret field)."),
         op!("google.connect", "mail", "POST" "/api/v1/google/connect", Write, Input::Query(schema::<api::InRealm>), "Starts adding a Google account to a realm's Gmail, Calendar and Contacts apps: returns the address for you to open and sign in."),
         op!("imports.settings.get", "sessions", "GET" "/api/v1/settings/session_imports", Read, Input::None, "Importing sessions from Claude Code and Codex: which workers import, from which tools, and which realm a folder's sessions go to."),
+        op!("workers.codex_limits.get", "workers", "GET" "/api/v1/settings/codex_limits", Read, Input::None, "Workers opted in to read ChatGPT plan windows from their local Codex app server, and optional per-worker executable paths; off by default."),
+        op!("workers.codex_limits.put", "workers", "PUT" "/api/v1/settings/codex_limits", Write, Input::Body(schema::<api::CodexLimitsSettings>), "Sets worker ids allowed to read plan windows with Codex's own sign-in and optional absolute executable paths in commands; never reads credentials or starts a model turn."),
         op!("imports.settings.put", "sessions", "PUT" "/api/v1/settings/session_imports", Write, Input::Body(schema::<api::SessionImports>), "Sets which workers import their Claude Code and Codex sessions, and the folder → realm rules."),
         op!("imports.list", "sessions", "GET" "/api/v1/imports", Read, Input::None, "Sessions imported from Claude Code and Codex, by source and realm."),
         op!("google.install", "mail", "POST" "/api/v1/google/install", Write, Input::Query(schema::<api::InRealm>), "Asks to install the Gmail, Calendar and Contacts apps in a realm (default home) (a decision each; they run on a worker with Docker or Podman)."),
@@ -887,7 +894,7 @@ pub fn list_schema(key: &str) -> Option<Value> {
 /// these).
 pub const NOT_OPERATIONS: &[(&str, &str, &str, Scope)] = &[
     ("GET", "/api/v1/live", "a live WebSocket for the UI", Scope::Realm),
-    ("POST", "/api/v1/ui/error", "the web UI reporting that it broke, for the head's log", Scope::Realm),
+    ("POST", "/api/v1/ui/error", "the web UI reporting that it broke, for the head's log", Scope::Device),
     ("GET", "/api/v1/docs/{id}/exports/{export}/file", "an export's file, to download (docs.exports gives its address)", Scope::Realm),
     ("GET", "/api/v1/docs/{id}/files/{blob}", "a document's picture or file (an image or file embed names it)", Scope::Realm),
     ("GET", "/api/v1/head/fs/list", "the head's own files, for the UI's file picker only", Scope::Admin),

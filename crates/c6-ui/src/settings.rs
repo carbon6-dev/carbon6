@@ -190,6 +190,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                 {move || match current.get().as_str() {
                     "appearance" => view! {
                         <AppearanceSetting />
+                        <TranscriptSetting />
                         <crate::aspects::FacetsSetting />
                     }.into_any(),
                     "account" => view! {
@@ -475,6 +476,73 @@ fn AppearanceSetting() -> impl IntoView {
                 {option("dark", "Dark", "Always dark")}
             </div>
             <p class="text-xs text-muted">"Kept in this browser, so each device can have its own."</p>
+        </section>
+    }
+}
+
+/// The user's display preference, shared by every mounted transcript.
+#[derive(Clone, Copy)]
+pub struct TranscriptDisplay {
+    pub show_thinking: RwSignal<bool>,
+    loaded: RwSignal<bool>,
+    error: RwSignal<Option<String>>,
+}
+
+impl TranscriptDisplay {
+    pub fn load() -> Self {
+        let display = Self {
+            show_thinking: RwSignal::new(c6_api::TranscriptSettings::default().show_thinking),
+            loaded: RwSignal::new(false),
+            error: RwSignal::new(None),
+        };
+        spawn_local(async move {
+            match api::transcript_settings().await {
+                Ok(settings) => {
+                    display.show_thinking.set(settings.show_thinking);
+                    display.loaded.set(true);
+                }
+                Err(e) => display.error.set(Some(e)),
+            }
+        });
+        display
+    }
+}
+
+pub fn show_thinking() -> RwSignal<bool> {
+    expect_context::<TranscriptDisplay>().show_thinking
+}
+
+#[component]
+fn TranscriptSetting() -> impl IntoView {
+    let display = expect_context::<TranscriptDisplay>();
+    let busy = RwSignal::new(false);
+    let toggle = move |ev| {
+        let show_thinking = event_target_checked(&ev);
+        let previous = display.show_thinking.get_untracked();
+        display.show_thinking.set(show_thinking);
+        busy.set(true);
+        display.error.set(None);
+        spawn_local(async move {
+            if let Err(e) = api::put_transcript_settings(c6_api::TranscriptSettings { show_thinking }).await {
+                display.show_thinking.set(previous);
+                display.error.set(Some(e));
+            }
+            busy.set(false);
+        });
+    };
+    view! {
+        <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+            <h2 class="font-medium">"Session transcripts"</h2>
+            <label class="flex cursor-pointer items-start gap-3">
+                <input type="checkbox" class="mt-1" prop:checked=move || display.show_thinking.get()
+                    disabled=move || !display.loaded.get() || busy.get() on:change=toggle />
+                <span>
+                    <span class="block text-sm font-medium">"Show thinking"</span>
+                    <span class="block text-xs text-muted">"Show model reasoning expanded, labelled Thinking; otherwise hide it from transcripts."</span>
+                </span>
+            </label>
+            <p class="text-xs text-muted">"Off by default. Kept in carbon6 across realms and devices; does not change what models receive."</p>
+            {move || display.error.get().map(|e| view! { <ErrorBox message=e /> })}
         </section>
     }
 }
@@ -835,7 +903,7 @@ fn Apps() -> impl IntoView {
                             // Waiting on your answer: in the console's Decisions.
                             {matches!(i.state.as_str(), "installing" | "upgrading" | "removing").then(|| view! {
                                 <a rel="external" href="/admin/decisions" class="rounded bg-amber-100 px-1.5 text-xs text-amber-900 hover:underline dark:bg-amber-950 dark:text-amber-200">
-                                    {format!("Waiting for your answer{} →", i.decision.map(|d| format!(" (#{d})")).unwrap_or_default())}
+                                    {format!("Waiting for your answer{}", i.decision.map(|d| format!(" (#{d})")).unwrap_or_default())}" "{crate::icons::arrow_right()}
                                 </a>
                             })}
                             {(!i.problems.is_empty()).then(|| view! { <span class="w-full text-xs text-red-600">{i.problems.join("; ")}</span> })}
@@ -1242,7 +1310,7 @@ fn SessionImportsSetting() -> impl IntoView {
                     <div class="flex items-center gap-2">
                         <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="~/work" prop:value=r.folder.clone()
                             on:change=move |ev| { let f = event_target_value(&ev); s.update(|v| v.rules[i].folder = f); } />
-                        <span class="text-xs text-muted">"→"</span>
+                        <span class="text-xs text-muted">{crate::icons::chevron_right()}</span>
                         <input class=format!("{INPUT} w-32 py-1 font-mono text-xs") placeholder="work" prop:value=r.realm.clone()
                             on:change=move |ev| { let x = event_target_value(&ev); s.update(|v| v.rules[i].realm = x); } />
                         <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| s.update(|v| { v.rules.remove(i); })>"Remove"</button>
@@ -1304,7 +1372,7 @@ fn SuggestionsSetting() -> impl IntoView {
                 "Name sessions"<span class="text-muted">"a short name after the first turn"</span>
             </label>
             <h3 class="pt-2 text-sm font-medium">"New sessions start with"</h3>
-            <p class="text-sm text-muted">"Each session has its own switches in its ⋯ menu; these are what a new one starts with. Catch-up: when you come back to a session that did 5 steps or more (or waits on you), a card says what happened since you looked, counted, and in a paragraph from a small model (a routing rule with the label task:catchup picks it, else task:suggest's, else the session's own; the prompt is session.catchup). Fold finished turns: the transcript shows each finished turn as one row (who started it, what it did, its steps), opened in place by a click; what it did is written when you open its hour in the glance's timeline (task:timeline, else task:suggest; session.timeline)."</p>
+            <p class="text-sm text-muted">"Each session has its own switches in its "{crate::icons::ellipsis()}" menu; these are what a new one starts with. Catch-up: when you come back to a session that did 5 steps or more (or waits on you), a card says what happened since you looked, counted, and in a paragraph from a small model (a routing rule with the label task:catchup picks it, else task:suggest's, else the session's own; the prompt is session.catchup). Fold finished turns: the transcript shows each finished turn as one row (who started it, what it did, its steps), opened in place by a click; what it did is written when you open its hour in the glance's timeline (task:timeline, else task:suggest; session.timeline)."</p>
             <label class="flex items-center gap-2 text-sm">
                 <input type="checkbox" prop:checked=move || shown.with(|s| s.catchup)
                     on:change=move |ev| set(|s, on| s.catchup = on, event_target_checked(&ev)) />
@@ -1717,6 +1785,7 @@ fn Connections(signed_in: bool) -> impl IntoView {
                             Err(e) => view! { <div class="p-3"><ErrorBox message=e /></div> }.into_any(),
                         })}
                     </Suspense>
+                    <crate::quota::UnmatchedCodexLimits list_rows=true />
                 </div>
             </section>
             {move || signed_in().then(|| view! {
@@ -1896,8 +1965,8 @@ fn ConnectionRow(
             <div class="min-w-0 flex-1">
                 <div class="font-medium">{c.name.clone()}</div>
                 {move || check.get().map(|r| match r {
-                    Ok(m) => view! { <div class="text-xs text-emerald-700 dark:text-emerald-400">{format!("✓ Connected · {} models", m.len())}</div> }.into_any(),
-                    Err(e) => view! { <div class="text-xs text-red-600">{format!("✕ {e}")}</div> }.into_any(),
+                    Ok(m) => view! { <div class="text-xs text-emerald-700 dark:text-emerald-400">{crate::icons::check()}" "{format!("Connected · {} models", m.len())}</div> }.into_any(),
+                    Err(e) => view! { <div class="text-xs text-red-600">{crate::icons::x()}" "{e}</div> }.into_any(),
                 })}
                 <div class="truncate font-mono text-xs text-muted">
                     {kind_label(&c.kind)} {(!matches!(c.kind.as_str(), "claude_code" | "pool")).then(|| format!(" · {}", c.base_url))}
@@ -2063,11 +2132,11 @@ fn AddConnection(all: Signal<Vec<Connection>>, on_added: impl Fn() + Copy + Send
             {move || tested.get().map(|r| match r {
                 Ok(models) => view! {
                     <p class="text-sm text-emerald-700 dark:text-emerald-400">
-                        {format!("✓ Connected · {} model{} available", models.len(), if models.len() == 1 { "" } else { "s" })}
+                        {crate::icons::check()}" "{format!("Connected · {} model{} available", models.len(), if models.len() == 1 { "" } else { "s" })}
                         {(!models.is_empty()).then(|| view! { <span class="text-muted">" (listed in the model field)"</span> })}
                     </p>
                 }.into_any(),
-                Err(e) => view! { <p class="text-sm text-red-600">{format!("✕ {e}")}</p> }.into_any(),
+                Err(e) => view! { <p class="text-sm text-red-600">{crate::icons::x()}" "{e}</p> }.into_any(),
             })}
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             <div class="flex justify-end gap-2">
@@ -2319,7 +2388,7 @@ fn WorkflowRunsPanel() -> impl IntoView {
                                                 title=tip>
                                                 {format!("{} · {}", s.id, s.status)}
                                                 {sessions.into_iter().map(|sid| view! {
-                                                    <button class="underline" title="Open the session" on:click=move |_| ws.open(None, crate::workspace::View::session(sid.clone()), crate::workspace::How::Beside)>"↗"</button>
+                                                    <button class="underline" title="Open the session" on:click=move |_| ws.open(None, crate::workspace::View::session(sid.clone()), crate::workspace::How::Beside)>{crate::icons::square_arrow_out()}</button>
                                                 }).collect_view()}
                                             </span>
                                             {waiting.then(|| view! {
@@ -3788,7 +3857,7 @@ fn SubagentLimitsSetting() -> impl IntoView {
                 </label>
             </div>
             <p class="text-sm text-muted">
-                "An agent can message another session of its realm. A reply to a message, and a reply to that, make a chain: one longer than this is refused, so two agents can't keep waking each other. A session sends at most this many messages an hour."
+                "An agent can message another session of its realm. Each send adds one to the last session message it received. The default chain limit is 4; a chain longer than the configured limit is refused, so two agents can't keep waking each other. Your next message resets the count to 0. A session sends at most this many messages an hour."
             </p>
             <div class="grid gap-2 sm:grid-cols-2">
                 <label class="space-y-0.5">
@@ -3818,10 +3887,14 @@ fn SubagentLimitsSetting() -> impl IntoView {
 #[component]
 fn ClaudeCodeToolsSetting() -> impl IntoView {
     let setting = RwSignal::new(None::<c6_api::ClaudeCodeTools>);
+    // The extra Claude Code settings, as typed (JSON).
+    let extra = RwSignal::new(String::new());
     let loaded = LocalResource::new(move || api::get_setting("claude-code-tools"));
     Effect::new(move || {
         if let Some(Ok(v)) = loaded.get() {
-            setting.set(serde_json::from_value(v).ok());
+            let s: Option<c6_api::ClaudeCodeTools> = serde_json::from_value(v).ok();
+            extra.set(s.as_ref().and_then(|s| s.settings.as_ref()).and_then(|v| serde_json::to_string_pretty(v).ok()).unwrap_or_default());
+            setting.set(s);
         }
     });
     let status = RwSignal::new(None::<Result<&'static str, String>>);
@@ -3830,6 +3903,20 @@ fn ClaudeCodeToolsSetting() -> impl IntoView {
         v.available.clear();
         if v.automatic {
             v.tools.clear();
+        }
+        let text = extra.get_untracked();
+        let parsed = if text.trim().is_empty() { Ok(serde_json::json!({})) } else { serde_json::from_str::<serde_json::Value>(&text) };
+        match parsed.map_err(|e| format!("Extra Claude Code settings: not JSON ({e})")).and_then(|x| {
+            match c6_api::claude_code_settings_error(&x) {
+                Some(e) => Err(format!("Extra Claude Code settings: {e}")),
+                None => Ok(x),
+            }
+        }) {
+            Ok(x) => v.settings = Some(x),
+            Err(e) => {
+                status.set(Some(Err(e)));
+                return;
+            }
         }
         let v = serde_json::to_value(v).unwrap_or_default();
         spawn_local(async move {
@@ -3848,6 +3935,7 @@ fn ClaudeCodeToolsSetting() -> impl IntoView {
             }
         })
     };
+    let native_all = move |on: bool| setting.update(|s| s.iter_mut().for_each(|s| s.native_all = on));
     let automatic = move |on: bool| {
         setting.update(|s| {
             if let Some(s) = s {
@@ -3862,16 +3950,41 @@ fn ClaudeCodeToolsSetting() -> impl IntoView {
     view! {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <div>
-                <h2 class="font-medium">"carbon6 tools in Claude Code sessions"</h2>
+                <h2 class="font-medium">"Tools in Claude Code sessions"</h2>
                 <p class="text-sm text-muted">
-                    "Claude Code brings its own tools for files, the shell and the web. These are carbon6's, offered to it as mcp__carbon6__…; carbon6's policies apply to them, and its guidance for them goes into Claude Code's system prompt. A routing rule's tool list narrows them further. Running sessions take changes up with their next message (Claude Code starts again, resuming its conversation, once it has nothing running)."
+                    "Claude Code keeps its own tools for files and the shell. The rest are carbon6's, offered to it as mcp__carbon6__…; carbon6's policies apply to them, and its guidance for them goes into Claude Code's system prompt. A routing rule's tool list narrows both. Running sessions take changes up with their next message (Claude Code starts again, resuming its conversation, once it has nothing running)."
                 </p>
             </div>
             {move || setting.get().map(|s| {
                 let auto = s.automatic;
+                let all = s.native_all;
                 let offered = s.tools.clone();
                 let core = s.core.clone().unwrap_or_default();
                 view! {
+                    <h3 class="text-sm font-medium">"Claude Code's own tools"</h3>
+                    <div class="flex flex-wrap gap-4 text-sm">
+                        <label class="flex items-center gap-2">
+                            <input type="radio" name="cc-native" prop:checked=!all on:change=move |_| native_all(false) />
+                            "Coding tools only: Bash, Read, Write, Edit and its tool search"
+                        </label>
+                        <label class="flex items-center gap-2">
+                            <input type="radio" name="cc-native" prop:checked=all on:change=move |_| native_all(true) />
+                            "All, as without carbon6"
+                        </label>
+                    </div>
+                    <p class="text-xs text-muted">
+                        "Coding tools only: nothing else of Claude Code's (its subagents, web, schedules, artifacts), no MCP server but carbon6's, no settings files, skills or plugins, and a hook refuses any other tool. All: its own tools, settings, MCP servers, skills and plugins, out of carbon6's reach; for now, while coding tools only is new."
+                    </p>
+                    <h3 class="text-sm font-medium">"Extra Claude Code settings"</h3>
+                    <p class="text-xs text-muted">
+                        {format!(
+                            "A JSON object merged into the settings carbon6 passes to Claude Code, in either mode (Claude Code reads no settings files of its own with coding tools only). The default turns off Claude's co-author and attribution lines in commits and pull requests; empty means none. carbon6 sets these itself, so they are refused: {}.",
+                            c6_api::CLAUDE_CODE_SETTINGS_PROTECTED.join(", ")
+                        )}
+                    </p>
+                    <textarea class=format!("{INPUT} h-24 font-mono text-xs") aria-label="Extra Claude Code settings" spellcheck="false"
+                        prop:value=move || extra.get() on:input=move |ev| extra.set(event_target_value(&ev))></textarea>
+                    <h3 class="text-sm font-medium">"carbon6's tools"</h3>
                     <div class="flex flex-wrap gap-4 text-sm">
                         <label class="flex items-center gap-2">
                             <input type="radio" name="cc-tools" prop:checked=auto on:change=move |_| automatic(true) />

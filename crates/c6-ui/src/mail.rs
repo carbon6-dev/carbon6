@@ -185,8 +185,8 @@ pub fn MailPage() -> impl IntoView {
                                                             let (label, class) = sorted_as(&x.category);
                                                             view! { <span class=format!("shrink-0 rounded px-1.5 text-[10px] font-medium {class}") title=x.reason.clone()>{label}</span> }
                                                         })}
-                                                        {t.starred.then(|| view! { <span class="text-amber-500">"★"</span> })}
-                                                        {t.attachments.then(|| view! { <span class="text-muted">"📎"</span> })}
+                                                        {t.starred.then(|| view! { <span class="text-amber-500">{crate::icons::star(true)}</span> })}
+                                                        {t.attachments.then(|| view! { <span class="text-muted">{crate::icons::paperclip()}</span> })}
                                                         <span class="shrink-0 text-xs font-normal text-muted">{crate::when::compact(t.date)}</span>
                                                     </div>
                                                     <div class="truncate text-sm">{t.subject.clone()}</div>
@@ -442,7 +442,7 @@ pub(crate) fn Thread(
     view! {
         <section class="space-y-3">
             <div class="flex flex-wrap items-center gap-1 text-sm">
-                {(!embedded).then(|| view! { <button class=BUTTON_QUIET on:click=move |_| open.set(None)>"← Back"</button> })}
+                {(!embedded).then(|| view! { <button class=BUTTON_QUIET on:click=move |_| open.set(None)>{crate::icons::arrow_left()}" Back"</button> })}
                 <span class="flex-1"></span>
                 <button class=BUTTON_QUIET on:click=move |_| modify(vec![], vec!["INBOX"], true)>"Archive"</button>
                 <button class=BUTTON_QUIET on:click=move |_| modify(vec!["INBOX"], vec![], false)>"Move to inbox"</button>
@@ -656,19 +656,27 @@ pub(crate) fn FileChip(name: String, mime: String, size: u64, href: String) -> i
     }
 }
 
-/// An icon and a short name for a file's kind.
-pub(crate) fn file_kind(mime: &str, name: &str) -> (&'static str, String) {
+/// A file icon and a short name for a file's kind. The name and type,
+/// rather than a pictogram, distinguish its format.
+pub(crate) fn file_kind(mime: &str, name: &str) -> (AnyView, String) {
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_uppercase()).unwrap_or_default();
-    match mime {
-        "application/pdf" => ("📕", "PDF".into()),
-        m if m.starts_with("image/") => ("🖼", ext),
-        m if m.starts_with("video/") => ("🎞", ext),
-        m if m.starts_with("audio/") => ("🎵", ext),
-        m if m.contains("spreadsheet") || m.contains("excel") || m == "text/csv" => ("📊", ext),
-        m if m.contains("presentation") || m.contains("powerpoint") => ("📽", ext),
-        m if m.contains("zip") || m.contains("compressed") || m.contains("tar") => ("🗜", ext),
-        _ => ("📄", if ext.is_empty() { "File".into() } else { ext }),
-    }
+    let kind = if mime == "application/pdf" {
+        "PDF".into()
+    } else if ext.is_empty() {
+        match mime {
+            m if m.starts_with("image/") => "Image",
+            m if m.starts_with("video/") => "Video",
+            m if m.starts_with("audio/") => "Audio",
+            m if m.contains("spreadsheet") || m.contains("excel") || m == "text/csv" => "Spreadsheet",
+            m if m.contains("presentation") || m.contains("powerpoint") => "Slides",
+            m if m.contains("zip") || m.contains("compressed") || m.contains("tar") => "Archive",
+            _ => "File",
+        }
+        .into()
+    } else {
+        ext
+    };
+    (crate::icons::file().into_any(), kind)
 }
 
 /// "230 KB", "1.4 MB".
@@ -873,5 +881,35 @@ pub fn GoogleSettings() -> impl IntoView {
                 }
             })}
         </section>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn file_chips_draw_one_icon_and_keep_the_formats_in_words() {
+        let owner = Owner::new();
+        owner.with(|| {
+            for (mime, name, kind) in [
+                ("application/pdf", "report", "PDF"),
+                ("image/png", "picture", "Image"),
+                ("video/mp4", "movie", "Video"),
+                ("audio/mpeg", "recording", "Audio"),
+                ("text/csv", "table", "Spreadsheet"),
+                ("application/vnd.ms-powerpoint", "deck", "Slides"),
+                ("application/zip", "archive", "Archive"),
+                ("text/plain", "notes", "File"),
+                ("image/png", "picture.png", "PNG"),
+            ] {
+                assert_eq!(file_kind(mime, name).1, kind);
+                let html = view! { <FileChip name=name.into() mime=mime.into() size=42 href="/file".into() /> }.to_html();
+                assert!(html.contains("<svg"), "{html}");
+                assert!(html.contains(kind), "{html}");
+                crate::icons::tests::assert_no_icon_glyphs(&html);
+            }
+        });
     }
 }
