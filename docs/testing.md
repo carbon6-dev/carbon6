@@ -286,6 +286,52 @@ send the draft; sending afterward works normally. Check an Unarchive failure
 is visible and leaves the session archived. New sends from a stale client are
 also rejected clearly by the head, without queueing input.
 
+## Initial tile loading: manual browser check
+
+On a restored workspace, only the focused tile starts its pane loads first.
+Other visible tiles start after the focused panes have drawn (for a session,
+after its detail response and either the feed's initial `Synced` or a stream's
+reconnecting notice, then a paint).
+Non-session panes use their mounted shell as readiness, not completion of all
+their background requests. Minimized tiles, tiles hidden by focus mode, and
+phone tabs/panes not currently shown wait for their first reveal. Once a pane
+has mounted, hiding it keeps its DOM, stream, draft and scroll state alive.
+
+A failed detail response releases loading after drawing the error. A stream
+that closes or fails to open before `Synced` draws a reconnecting notice and
+also releases loading, while continuing its normal retries. A successful
+replay clears the notice. There is no timer that declares an undrawn transcript
+ready: a connection that remains open but never sends `Synced` still waits
+until it syncs, disconnects, or the user changes focus/closes its tile.
+
+The workspace native regressions cover mount eligibility, sticky mounts,
+split-pane readiness and changes of focus while loading. In a browser, use
+request gates rather than sleeps:
+
+1. Restore several session tiles with a non-first tile focused. Hold that
+   session's detail response and feed replay independently. Neither releasing
+   detail alone nor replay alone may start another session tile's requests.
+   Release both: confirm the focused transcript is in the DOM before another
+   tile's first request (observe animation frames and the request log).
+2. Restore a split focused tile with a list beside a session. Drawing the list
+   must not release other tiles before the session's replay. Repeat with an
+   empty session and a failed detail response (the error also releases loading).
+3. Minimize a never-loaded tile or restore in focus mode: it makes no pane
+   requests until revealed. On a phone, repeat for inactive tabs and a hidden
+   list pane; resize to desktop and check newly visible panes load.
+4. Hide an already-loaded session, stream a reply, and show it again. Keep DOM
+   handles for its transcript and draft textarea: both remain connected and
+   retain their contents/scroll choices. Switching away while the initial feed
+   is gated, or closing its tile, must let the newly focused tile load and draw.
+5. Run the first-click checks below, including a nonfocused split-pane close.
+   Keep all icons; this scheduling must not recreate header controls on focus.
+6. Resolve the focused session's detail, but close its stream before `Synced`.
+   Confirm its reconnecting notice is drawn before other visible tiles start
+   loading. Observe a new stream connection without switching focus; finish
+   that retry's replay and check the notice clears and its transcript appears.
+   Repeat with detail still gated when the stream closes: other tiles must
+   wait for detail too, rather than treating failure as an unconditional bypass.
+
 ## Tile focus and first click: manual browser check
 
 Focus and active-pane selection run on pointerdown. The pane header and its conditional buttons must stay mounted when only focus/active changes: detaching the original target between pointerdown and click loses its click. Use cached boolean conditions (`Show`) for their presence, not a closure that rebuilds them on every position change. Growing a tile still waits until click bubbles, after the action. The native `c6-ui` tests don't exercise browser event dispatch, so check this in a browser:

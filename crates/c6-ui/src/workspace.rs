@@ -471,8 +471,8 @@ pub struct Tile {
     /// when it opens and moved by dragging its bar.
     #[serde(default)]
     pub stack: Option<usize>,
-    /// Minimized: hidden (still loaded), keeping its column and its place
-    /// in it for when it comes back.
+    /// Minimized: hidden (keeping already-loaded state), keeping its column
+    /// and its place in it for when it comes back.
     #[serde(default)]
     pub minimized: bool,
 }
@@ -2191,6 +2191,31 @@ pub fn arrange(tiles: &[(usize, u64)]) -> Vec<Rect> {
 #[component]
 pub fn Tiles() -> impl IntoView {
     let ws = use_workspace();
+    let loading =
+        TileLoading { released: RwSignal::new(false), drawn: RwSignal::new(HashSet::new()), one_pane: RwSignal::new(crate::util::phone()) };
+    provide_context(loading);
+    let resize = window_event_listener(leptos::ev::resize, move |_| {
+        loading.one_pane.set(crate::util::phone());
+    });
+    on_cleanup(move || resize.remove());
+    let drawn_focus = Memo::new(move |_| {
+        if loading.released.get() {
+            return None;
+        }
+        ws.layout.with(|l| loading.drawn.with(|drawn| focused_drawn(l, loading.one_pane.get(), drawn)))
+    });
+    Effect::new(move || {
+        let Some(cols) = drawn_focus.get() else { return };
+        // One frame lets the focused DOM and scroll restoration settle;
+        // the next yields a paint before other tiles start their requests.
+        request_animation_frame(move || {
+            request_animation_frame(move || {
+                if drawn_focus.try_get_untracked() == Some(Some(cols)) {
+                    loading.released.try_set(true);
+                }
+            });
+        });
+    });
     let keys = window_event_listener(leptos::ev::keydown, move |ev| {
         if !(ev.meta_key() || ev.ctrl_key()) || ev.alt_key() {
             return;
@@ -2242,6 +2267,50 @@ fn desktop_canvas_min(rects: &HashMap<u64, Rect>, full: bool) -> usize {
     } else {
         rects.values().map(|r| (TILE_WITH_GUTTERS as f64 / r.width).ceil() as usize).max().unwrap_or(TILE_WITH_GUTTERS)
     }
+}
+
+/// Only initial loading is staged. Once mounted, a pane keeps its DOM,
+/// subscriptions, drafts and scroll state even while hidden.
+#[derive(Clone, Copy)]
+struct TileLoading {
+    released: RwSignal<bool>,
+    drawn: RwSignal<HashSet<u64>>,
+    one_pane: RwSignal<bool>,
+}
+
+fn initial_mount(mounted: bool, shown: bool, focused: bool, released: bool) -> bool {
+    mounted || (shown && (focused || released))
+}
+
+fn focused_drawn(layout: &Layout, one_pane: bool, drawn: &HashSet<u64>) -> Option<Vec<u64>> {
+    let tile = layout.tiles.get(layout.focus)?;
+    let cols: Vec<_> = tile.columns.iter().filter(|c| layout.pane_shown(tile.key, c.key, one_pane)).map(|c| c.key).collect();
+    (!cols.is_empty() && cols.iter().all(|c| drawn.contains(c))).then_some(cols)
+}
+
+/// A session supplies readiness after its detail and initial log replay (or
+/// a disconnect notice), not its empty, still-loading shell.
+#[derive(Clone, Copy)]
+pub(crate) struct InitialDraw(pub RwSignal<bool>);
+
+#[component]
+fn InitialView(view: View, col: u64) -> impl IntoView {
+    let loading = expect_context::<TileLoading>();
+    let ready = RwSignal::new(!matches!(view, View::Session { .. }));
+    provide_context(InitialDraw(ready));
+    Effect::new(move || {
+        if ready.get() && !loading.released.get_untracked() {
+            loading.drawn.update(|drawn| {
+                drawn.insert(col);
+            });
+        }
+    });
+    on_cleanup(move || {
+        loading.drawn.try_update(|drawn| {
+            drawn.remove(&col);
+        });
+    });
+    render_view(view)
 }
 
 /// Where a popover opens: below the element clicked, kept on screen.
@@ -2601,6 +2670,18 @@ mod tests {
     }
 
     #[test]
+    fn initial_loading_prioritizes_focus_without_mounting_hidden_panes() {
+        for shown in [false, true] {
+            for focused in [false, true] {
+                for released in [false, true] {
+                    assert_eq!(initial_mount(false, shown, focused, released), shown && (focused || released));
+                    assert!(initial_mount(true, shown, focused, released), "hiding must never dispose a mounted pane");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn open_session_titles_status_and_marks_do_not_depend_on_the_live_list() {
         Owner::new().with(|| {
             let archived: Session = serde_json::from_value(serde_json::json!({
@@ -2638,6 +2719,43 @@ mod tests {
             }
             assert_eq!(View::Sessions.session_id(), None);
         });
+    }
+
+    #[test]
+    fn background_loading_waits_for_every_shown_focused_pane() {
+        let mut l = Layout::new(View::Sessions);
+        let tile = l.tiles[0].key;
+        let list = l.tiles[0].columns[0].key;
+        let session = l.key();
+        l.tiles[0].columns.push(Column { key: session, view: View::session("s1") });
+        l.tiles[0].settle();
+        let mut drawn = HashSet::from([list]);
+        assert_eq!(focused_drawn(&l, false, &drawn), None, "a list shell cannot release its loading session");
+        assert_eq!(focused_drawn(&l, true, &drawn), None, "the phone shows the session, not the list");
+        drawn.insert(session);
+        assert_eq!(focused_drawn(&l, false, &drawn), Some(vec![list, session]));
+        assert_eq!(focused_drawn(&l, true, &HashSet::from([session])), Some(vec![session]));
+        l.tiles[0].minimized = true;
+        assert_eq!(focused_drawn(&l, false, &drawn), None);
+        l.tiles[0].minimized = false;
+        assert!(l.pane_shown(tile, list, false));
+    }
+
+    #[test]
+    fn changing_focus_or_closing_the_loading_tile_cannot_release_stale_readiness() {
+        let mut l = Layout::new(View::session("s1"));
+        let first = l.tiles[0].columns[0].key;
+        let second = l.new_tile(View::session("s2"));
+        let other = second.columns[0].key;
+        l.tiles.push(second);
+        let drawn = HashSet::from([first]);
+        assert_eq!(focused_drawn(&l, false, &drawn), Some(vec![first]));
+        l.focus = 1;
+        assert_eq!(focused_drawn(&l, false, &drawn), None, "focus must draw before the barrier opens");
+        assert_eq!(focused_drawn(&l, false, &HashSet::from([other])), Some(vec![other]));
+        l.tiles.remove(0);
+        l.focus = 0;
+        assert_eq!(focused_drawn(&l, false, &drawn), None, "a closed tile's replay is irrelevant");
     }
 
     #[test]
@@ -3224,6 +3342,18 @@ struct Pos {
 fn ColumnView(tile: u64, col: u64) -> impl IntoView {
     let ws = use_workspace();
     let live = api::live();
+    let loading = expect_context::<TileLoading>();
+    let mounted = Memo::new(move |was: Option<&bool>| {
+        initial_mount(
+            was.copied().unwrap_or(false),
+            ws.layout.with(|l| {
+                let one_pane = loading.one_pane.get();
+                l.pane_shown(tile, col, one_pane) && (!one_pane || l.tiles.get(l.focus).is_some_and(|t| t.key == tile))
+            }),
+            ws.layout.with(|l| l.tiles.get(l.focus).is_some_and(|t| t.key == tile)),
+            loading.released.get(),
+        )
+    });
     let pos = Memo::new(move |_| {
         ws.layout.with(|l| {
             let ti = l.tiles.iter().position(|t| t.key == tile)?;
@@ -3268,7 +3398,9 @@ fn ColumnView(tile: u64, col: u64) -> impl IntoView {
                 <ColumnHeader label pos=Signal::derive(move || pos.get()) view=Signal::derive(move || view.get()) />
             </Show>
             <div class="relative flex min-h-0 flex-1 flex-col">
-                {move || view.get().map(render_view)}
+                <Show when=move || mounted.get()>
+                    {move || view.get().map(|view| view! { <InitialView view col /> })}
+                </Show>
             </div>
         </div>
     }

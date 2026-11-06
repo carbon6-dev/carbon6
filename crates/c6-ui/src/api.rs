@@ -112,7 +112,13 @@ pub fn live() -> LiveFeed {
 /// Streams a session's events and live deltas, resuming from the last seen
 /// seq after reconnects. Returns a handle that stops it.
 /// `query`: where to (re)start, as the stream's query (`after=…`).
-pub fn stream_session(session_id: String, on_msg: impl Fn(StreamMsg) + 'static, query: impl Fn() -> String + 'static) -> AbortHandle {
+/// `on_disconnect`: the connection closed or failed to open; retry follows.
+pub fn stream_session(
+    session_id: String,
+    on_msg: impl Fn(StreamMsg) + 'static,
+    query: impl Fn() -> String + 'static,
+    on_disconnect: impl Fn() + 'static,
+) -> AbortHandle {
     let (fut, handle) = abortable(async move {
         let mut backoff = 500;
         loop {
@@ -130,6 +136,7 @@ pub fn stream_session(session_id: String, on_msg: impl Fn(StreamMsg) + 'static, 
                     }
                 }
             }
+            on_disconnect();
             gloo_timers::future::sleep(Duration::from_millis(backoff)).await;
             backoff = (backoff * 2).min(10_000);
         }

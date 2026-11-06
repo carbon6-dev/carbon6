@@ -199,6 +199,8 @@ pub(crate) struct Feed {
     secrets: RwSignal<Vec<SecretCard>>,
     /// The log has been replayed up to where the session was when opened.
     pub(crate) synced: RwSignal<bool>,
+    /// The stream disconnected; cleared once its retry finishes replaying.
+    stream_failed: RwSignal<bool>,
     /// The first event shown: before it, `events` has only the summary's
     /// (`EventKind::summary`). 1 (or 0): all of it.
     pub(crate) from: RwSignal<u64>,
@@ -312,12 +314,13 @@ impl Feed {
             activity: RwSignal::new(None),
             secrets: RwSignal::new(Vec::new()),
             synced: RwSignal::new(false),
+            stream_failed: RwSignal::new(false),
             from: RwSignal::new(0),
             to: RwSignal::new(None),
             loading: RwSignal::new(false),
             id: StoredValue::new(id.clone()),
         };
-        let Feed { events, streaming, queued, activity, secrets, synced, from, to, .. } = feed;
+        let Feed { events, streaming, queued, activity, secrets, synced, stream_failed, from, to, .. } = feed;
         // The replay arrives all at once (not an event at a time, each
         // drawn and scrolled to).
         let replay = StoredValue::new(Vec::<Event>::new());
@@ -390,6 +393,7 @@ impl Feed {
                     }
                     again.set_value(false);
                     synced.set(true);
+                    stream_failed.set(false);
                 }
                 StreamMsg::Secret { call_id, title, value, note } => secrets.update(|s| s.push(SecretCard { call_id, title, value, note })),
             },
@@ -407,6 +411,9 @@ impl Feed {
                     (None, Window::Tail) => format!("after=0&tail={TAIL}"),
                     (None, Window::At(at)) => format!("after=0&tail={TAIL}&at={at}"),
                 }
+            },
+            move || {
+                stream_failed.try_set(true);
             },
         );
         on_cleanup(move || handle.abort());
@@ -546,6 +553,13 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         None => Window::Tail,
     };
     let feed = Feed::open(id.clone(), window);
+    if let Some(crate::workspace::InitialDraw(ready)) = use_context() {
+        Effect::new(move || {
+            if detail.get().is_some_and(|d| d.is_err() || feed.synced.get() || feed.stream_failed.get()) {
+                ready.set(true);
+            }
+        });
+    }
     let Feed { events, streaming, queued, activity, .. } = feed;
     let error = RwSignal::new(None::<String>);
 
@@ -950,6 +964,9 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         // in sight as the transcript scrolls.
         <div class=format!("relative {READING_ROW} items-start")>
         <div class=format!("{READING} px-4 pb-8 pt-4")>
+            <Show when=move || feed.stream_failed.get()>
+                <p class="mb-3 text-sm text-muted" role="status">"Session stream disconnected. Reconnecting…"</p>
+            </Show>
             // Its catch-up, where the glance isn't a column: a pill that
             // stays at the top as the transcript scrolls.
             {move || card_open.get().filter(|_| !wide.get()).map(|steps| view! {
