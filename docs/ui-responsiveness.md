@@ -306,3 +306,170 @@ are not filmstrip presentation or field INP. Remaining broad positional rail
 updates should eventually be presentation-gated or keyed with reactive row data;
 keying a row by ID alone would leave its plain Session props stale. That larger
 refactor is deliberately not mixed into this demonstrated settings regression.
+
+## Q3: fixed-arc working ring and new transcript items — November 6, 2026
+
+Branch `c6/q3-ring-render`, explicitly based on `c6/next` at `8d0079b9`, not
+upstream/main. This follow-up changes only the shared desktop SessionRing and
+its CSS, plus tests/documentation. No transcript algorithm, icons, header,
+image preview, settings, dependencies, size budgets or migrations change.
+
+### Change and hypothesis results
+
+- **Fixed arc, whole-SVG rotation.** The 24px outer-rim SVG rotates as one
+  composited piece at the existing 1.4s period. Its arc is fixed at `20 46`;
+  `c6-ring-arc` and its per-frame dash morph are removed. The independently
+  named context SVG, failed cross, badge and all state colors remain. Reduced
+  and Off retain the original stationary full working rim and release the
+  working layer's `will-change` hint. The browser checks an active accelerated
+  transform layer on this exact SVG, not merely a transform in its stylesheet.
+- **A was only partly supported.** Baseline rotation already continues during
+  a blocked main thread in both installed Chromium versions. The baseline's
+  dash morph does repeatedly require Paint. The demonstrated improvement is
+  removal of this paint-bound animation, **not newly enabling baseline angular
+  motion, eliminating all frame drops, or a measured global FPS increase**.
+- **B did not reproduce.** The original rim/context nodes and running spin
+  animation survive new items, changing session snapshots, and
+  Starting-to-Running updates. The new implementation retains them too. There
+  is no speculative remount fix.
+- **C remains a measured no-fix.** Large items miss frame budgets, but no
+  specific small transcript change is justified by the profile below. Other
+  `.animate-spin` sites already rotate HTML boxes around their icons; they do
+  not share this inner-SVG/dash-morph structure and are unchanged.
+
+`SessionRing` is shared by the workspace session controls; the separate plain
+phone context ring is unchanged. All states are captured in light/dark, narrow
+tile controls are checked down to 240px, and phone Full/Reduced/Off controls are
+exercised without changing their design.
+
+### Production measurement
+
+The standalone `tests/ring-render.cjs` serves the real `make ui` WASM/CSS behind
+an owned loopback fake head: three populated tiles, 93 historical replies, eight
+short streamed chunks before each of twelve new assistant Markdown items.
+Ordinary items have twelve paragraphs (about 1.7KB); the stress variant has
+180 (about 23KB). Both include formatting, links, code and a table. Browser:
+Chromium 158.0.8127.18 on shared Linux x86-64, 1600×1000, 4× CPU throttle, both
+themes. Chromium 133.0.6943.16 independently checks compositor/retention
+behavior. Neither is a physical Mac/Chrome measurement.
+
+Each canonical case has one traced/profiled run and two unprofiled timing runs.
+The following DOM medians pool 24 item arrivals from the two **unprofiled**
+runs; frame gaps/estimated missed 60Hz rAF slots remain per-run observations,
+not pass/fail limits or ring-specific compositor FPS:
+
+| Workload / theme | DOM median before → after | Largest rAF gap before → after | Missed rAF slots before → after |
+|---|---:|---:|---:|
+| Ordinary / light | 4.75 → 4.50 ms | 16.8 → 16.8 ms | 0, 0 → 0, 0 |
+| Ordinary / dark | 4.55 → 4.00 ms | 16.8 → 16.8 ms | 0, 0 → 0, 0 |
+| Large item / light | 11.35 → 11.10 ms | 33.5 → 33.4 ms | 5, 11 → 7, 5 |
+| Large item / dark | 11.35 → 11.35 ms | 33.4 → 33.4 ms | 12, 9 → 10, 8 |
+
+There are **zero >50ms long tasks** in these natural-workload cases, before or
+after. This does not mean all items fit a 16.7ms frame: main-thread rendering
+can miss that budget without qualifying as a Long Task. Small timing movements
+on this shared machine are not evidence of a transcript speedup.
+
+In each traced natural window, ring-span Paint records fall from **217 to 0**
+for ordinary items (each theme), and **228/230 to 0** for large items
+(light/dark). Large-item partial-update `DroppedFrame` trace records are
+12/12 before versus 17/16 after, while compositor DrawFrames continue in all
+cases. These records must not be presented as an FPS win or as proof that the
+ring stopped moving. A separate 600ms deliberately blocked-main-thread
+screencast has distinct moving blue-ring pixels in every captured frame before
+and after (34–36 frames); this challenge is outside all natural timing windows.
+
+### What one new item costs
+
+Single **traced** trials, median receipt-to-completed-main-thread-paint time:
+
+| Workload | Light before → after | Dark before → after |
+|---|---:|---:|
+| Ordinary | 17.49 → 19.33 ms | 20.13 → 17.88 ms |
+| Large item | 39.33 → 39.77 ms | 40.93 → 39.99 ms |
+
+Receipt is the harness marker after its JSON parse, not network/provider
+latency. Completed paint is main-thread paint recording, not physical display
+presentation. The earlier next-rAF marker (about 14ms for large items) misses
+most subsequent rendering work and must not be called render completion.
+
+Downstream presentation timing is unresolved, not omitted: the canonical traced
+large-item feedback medians are 43.47/45.39ms before versus 53.54/56.64ms after
+(light/dark), despite nearly unchanged main-thread paint and activated-draw
+times. Three additional adjacent light-theme pairs under greater host load
+reverse that direction: feedback medians 74.86/75.07/61.18ms before versus
+58.70/65.41/53.74ms after. Those later traced runs also record 2/2/2 natural
+long tasks before and 3/1/0 after; they are not the unprofiled trials above.
+The analysis cross-checks activated surface IDs through Viz aggregation and
+buffer-swap completion: feedback tracks a downstream display wait, not merely
+late callback delivery. Its scheduling cause and physical-pixel relevance are
+not established. Ordered pairs on a shared host are not randomized causal
+evidence; **neither a presentation-latency improvement nor a confirmed
+regression is claimed**. Preserve these adverse and opposite-direction results
+in `paired-summary.json`/`.md` for a controlled device follow-up.
+
+For a large baseline item, mean work through completed paint is approximately
+9.6–9.8ms exclusive FunctionCall work, 2.3–2.4ms ParseHTML, 9.3–9.9ms style,
+8.6–8.7ms layout, 3.5–4.0ms prepaint, and 3.6ms paint. Nested durations are
+interval-unioned rather than double-counted. After numbers are very similar.
+The largest Layout records dirty 2,206 objects and take about 8ms. The main
+increment is browser style/layout of the large new Markdown subtree, not an
+attributed expensive Rust function.
+
+Committed Markdown insertion is `session.rs:3827–3835`; complete Markdown and
+mention serialization is `markdown.rs:117–180`. Existing keyed event rows are
+retained, with per-row `content-visibility:auto`. Anonymous production WASM
+indices are not assigned names from an unrelated diagnostic build. Consequently
+this profile does not establish event/result cloning or Markdown parsing as the
+dominant scripting cause, and does not justify an incremental-log/cache rewrite.
+
+There is a concrete, smaller forced-layout edge: scroll dispatch calls a
+wasm-bindgen `clientHeight` import, matching ScrollBox's entry visibility read
+at `workspace.rs:2187–2193`, followed by follow/end/far bookkeeping. Forced
+layout inside each item's receipt-to-paint interval averages only 0.62–1.09ms;
+it is not the dominant large-item cost. Deferring that first visibility read or
+changing follow scheduling has user-intent/scroll-restoration risks. A separate
+one-factor experiment with retained follow/selection/anchor tests is the next
+option, not an unmeasured fix here.
+
+The inherited motion harness calls `document.getAnimations()` on every rAF;
+its own forced rendering is attributed separately. Trace/profile overhead and
+headless presentation feedback are not field INP. Trace counts are bounded by
+`q3-start`/`q3-end`, excluding stale initial layer-tree events and the later
+deliberate block. rAF intervals spanning the start boundary are excluded too.
+
+### Size, verification and evidence
+
+| Production WASM | Before | After | Delta |
+|---|---:|---:|---:|
+| Raw | 10,513,126 | 10,514,419 | +1,293 bytes |
+| Brotli | 2,613,011 | 2,613,554 | +543 bytes |
+
+The accepted size ceilings are unchanged; both builds pass `scripts/ui-size.sh`.
+The fixed-arc and motion overrides are verified through computed production CSS,
+and the animating SVG has a 24×24 compositor layer with the active-transform
+reason. All eight native ring tests and eleven motion JS unit tests pass.
+`env -u NO_COLOR make ui`, `make check`, and `make test` pass: **1,113 workspace
+tests pass, two intentionally skipped**. The two slow tests finish successfully
+(132s fixture upgrade and 339s Slack integration); no failed native-test rerun
+is needed. Logs are in `/tmp/q3-ring/`, with the file limit raised to 16,384.
+
+The dedicated ring regression passes both themes in Chromium 133 and 158,
+including startup state changes, streamed text visibility, all state looks,
+node/animation identity and Reduced/Off. Narrow tile-marks checks pass in both
+themes. The existing sheet/sendStop matrix passes all twelve Chromium contexts.
+Shared-process WebKit passes five desktop contexts before an out-of-bounds
+hydration crash on desktop/dark/Off; that case passes alone and all twelve
+WebKit contexts pass with isolated browser processes. The shared-process failure
+is retained, not silently replaced by isolated results.
+
+An extra `ONLY=tool` check fails because its saved `__pre` is null. It fails
+again alone and identically against the pinned baseline distribution. This
+pre-existing tool-output harness failure is not fixed or weakened in this change.
+
+Evidence is under `/tmp/q3-ring/`: pinned `before-dist`/`after-dist`, build and
+size logs, SHA-256 manifests, `comparison.json`, `comparison-attribution.json`
+and its Markdown/analysis script, raw traces/CPU profiles, screenshots and
+`blocked-ring-pixels.json` with cropped-ring hashes/blue-arc angles. A separate
+set of adjacent traced pairs investigates presentation-feedback uncertainty;
+these must not be mixed into the unprofiled comparison above.

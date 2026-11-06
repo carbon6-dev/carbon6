@@ -263,11 +263,12 @@ async function fixture(browser, origin, viewport, theme, motion, started, contex
       return { request, release };
     },
     send: event => send({ type: 'event', event: { seq: sequence++, ts: Date.now(), ...event } }),
+    stream: send,
     output: text => send({ type: 'tool_output', call_id: 'motion-tool', text }),
-    setState: async next => {
+    setState: async (next, patch = {}) => {
       assert(lives.size, 'live fixture connected'); state = next;
       for (const live of lives) {
-        live.send(JSON.stringify({ type: 'sessions', sessions: [session('parent', state)] }));
+        live.send(JSON.stringify({ type: 'sessions', sessions: [{ ...session('parent', state), ...patch }] }));
         live.send(JSON.stringify({ type: 'attention' }));
       }
     },

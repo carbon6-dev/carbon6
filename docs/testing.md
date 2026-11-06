@@ -2,6 +2,40 @@
 
 Status: rules in force (2026-10-19); `make check` enforces what a pattern can catch (`scripts/test-lint.sh`).
 
+## Working ring and transcript rendering
+
+After `env -u NO_COLOR make ui`, run the production Chromium regression with
+the same Node/Playwright/browser overrides as `motion.cjs`:
+
+```sh
+/home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/ring-render.cjs
+PARAGRAPHS=180 LABEL=after-heavy /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/ring-render.cjs
+```
+
+The private loopback fixture has three tiles and 93 historical replies. At 4×
+CPU throttling it streams eight chunks before each of twelve new Markdown
+items, in both themes. It checks retained rim/context nodes and the same running
+spin animation across item arrivals and changing session snapshots. The spinning
+element must be the outer SVG, with an active-transform compositor layer, one
+1.4s animation, and no motion on the independently drawn context. All four states
+and the unchanged static Reduced/Off working rim are checked too.
+
+Evidence goes to `/tmp/q3-ring/` (`EVIDENCE` overrides it): JSON timing and
+main-thread rAF gaps, long tasks, screenshots, and a trace/CPU profile on the
+first of three runs. Runs 1 and 2 are unprofiled. Timings and frame counts have
+**no pass/fail budget**. A separate 600ms deliberately blocked-main-thread
+screencast follows the first run's natural workload; its frames allow checking
+whether the ring's pixels keep changing, unlike rAF, which itself stops on a
+busy main thread. This challenge is not a measured transcript long task.
+
+`BASELINE=1 ROOT=/path/to/pinned/dist` records the old implementation without
+enforcing the new compositor/retention invariants. `LABEL`, `THEME`, `RUNS`,
+`CPU`, and `PARAGRAPHS` select evidence names/workloads. Compare identical
+workloads and separate traced from untraced runs. The recorded DOM-update and
+next-rAF latencies are **not presentation times**; use the trace's layout,
+paint and compositor events for attribution. See the Q3 section of
+`docs/ui-responsiveness.md` for measured findings and limitations.
+
 ## Narrow desktop tiles
 
 Tile-bar mouse slots follow the tile's content width: 36px at 40rem and

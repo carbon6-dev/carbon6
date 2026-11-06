@@ -417,10 +417,11 @@ html.soft {
 }
 [data-open="false"] > .c6-ring-badge { opacity: 0; scale: calc(1 - .1 * var(--travel)); transition-duration: var(--dur-quick); }
 
-/* Ring-only motion stays with the optional combined ring. The context arc
-   never spins. loader-circle uses the same calmer period without morphing. */
-.c6-ring-working { transform-origin: 12px 12px; animation: spin 1.4s linear infinite, c6-ring-arc 2.8s ease-in-out infinite; }
-@keyframes c6-ring-arc { 0%, 100% { stroke-dasharray: 8 58; } 50% { stroke-dasharray: 30 36; } }
+/* Rotate the outer rim's whole SVG as one composited piece, with a fixed arc:
+   no inner-SVG transform or paint-bound dash morph when the transcript is busy.
+   The separately drawn context arc never spins. loader-circle keeps this period. */
+.c6-ring-working { transform-origin: center; will-change: transform; animation: spin 1.4s linear infinite; }
+.c6-ring-working > circle { stroke-dasharray: 20 46; }
 
 /* Native details keep keyboard/search semantics. Only their bounded tool
    body reveals: output updates don't restart it or change its final height.
@@ -443,6 +444,10 @@ html.soft {
 :root[data-motion="reduced"] .animate-spin,
 :root[data-motion="reduced"] .animate-pulse,
 :root[data-motion="reduced"] .c6-ring-working { animation: none; }
+:root[data-motion="reduced"] .c6-ring-working,
+:root[data-motion="off"] .c6-ring-working { will-change: auto; }
+:root[data-motion="reduced"] .c6-ring-working > circle,
+:root[data-motion="off"] .c6-ring-working > circle { stroke-dasharray: none; }
 :root[data-motion="reduced"] .c6-sidebar { translate: 0; }
 :root[data-motion="reduced"] .transition-transform,
 :root[data-motion="reduced"] .transition-\[width\] { transition: none; }

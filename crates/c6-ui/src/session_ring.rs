@@ -69,13 +69,18 @@ pub fn SessionRing(
     let count = Memo::new(move |last: Option<&usize>| if background.get() > 0 { background.get() } else { last.copied().unwrap_or(0) });
     view! {
         <span class="relative inline-flex size-6 shrink-0 align-middle">
+            // Rotate the whole SVG on its own layer, never an SVG child or
+            // the context arc. Retain both drawings across state updates.
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" aria-hidden="true"
+                class=move || if state.get() == AgentState::Working { "absolute inset-0 size-6 c6-ring-working" } else { "absolute inset-0 size-6" }>
+                // A full outer rim; waiting is dashed, failed has a drawn cross.
+                <circle cx="12" cy="12" r="10.5" stroke-width="1.5"
+                    class=move || state.get().rim_class()
+                    stroke-dasharray=move || if state.get() == AgentState::Waiting { "2 2" } else { "none" } />
+            </svg>
             <svg width="24" height="24" viewBox="0 0 24 24" class="size-6 shrink-0" fill="none"
                 role="img" aria-label=label>
                 <title>{label}</title>
-                // A full outer rim; waiting is dashed, failed has a drawn cross.
-                <circle cx="12" cy="12" r="10.5" stroke-width="1.5"
-                    class=move || format!("{} {}", state.get().rim_class(), if state.get() == AgentState::Working { "c6-ring-working" } else { "" })
-                    stroke-dasharray=move || if state.get() == AgentState::Waiting { "2 2" } else { "none" } />
                 <circle cx="12" cy="12" r="7" stroke-width="2"
                     class="stroke-zinc-200 dark:stroke-zinc-700" />
                 {move || context.get().map(|percent| view! {
@@ -193,6 +198,23 @@ mod tests {
             assert!(html.contains("stroke-dasharray=\"42 100\""));
             assert!(html.contains("stroke-zinc-600 dark:stroke-zinc-300"));
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn only_the_outer_svg_spins_and_the_context_keeps_its_accessible_name() {
+        let html = render(AgentState::Working, Some(42), 0);
+        let rim_svg = html.split("<svg").nth(1).unwrap().split("</svg>").next().unwrap();
+        let context_svg = html.split("<svg").nth(2).unwrap().split("</svg>").next().unwrap();
+        assert!(rim_svg.contains("aria-hidden=\"true\""));
+        assert!(rim_svg.split('>').next().unwrap().contains("c6-ring-working"));
+        assert!(!rim_svg.contains("r=\"7\""));
+        assert!(!context_svg.contains("c6-ring-working"));
+        assert!(context_svg.contains("role=\"img\""));
+        assert!(context_svg.contains("stroke-dasharray=\"42 100\""));
+        let css = include_str!("../style/input.css");
+        assert!(!css.contains("c6-ring-arc"));
+        assert!(css.contains(".c6-ring-working > circle { stroke-dasharray: 20 46; }"));
     }
 
     #[cfg(not(target_arch = "wasm32"))]
