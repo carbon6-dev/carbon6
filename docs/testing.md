@@ -45,6 +45,15 @@ workspace scrollbar. Calendar's seven-column month and the Workers table
 still have their existing dense/data-table designs; don't mistake overflow
 containment for a redesigned narrow version of those views.
 
+## Same-tile session panes
+
+`node crates/c6-ui/tests/session-panes.cjs` uses the same production fixture
+and browser overrides as `motion.cjs`. It clicks Changes, Terminal, Files
+and Outputs at 1200, 800, 640, 480, 320 and 240px tile widths, plus 320/390px
+phones, in both themes. It asserts unchanged tile count, retained transcript,
+single-pane Back/reopening, the phone sheet route and explicit ⌘-click to
+a separate tile. Screenshots default to `/tmp/q1-screenshots/panes/`.
+
 ## Browser-local themes
 
 `crates/c6-ui/tests/theme.cjs` checks System, Light, unchanged Dark and Soft:
