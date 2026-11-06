@@ -59,6 +59,16 @@ Key dependencies: tokio, tonic/prost, axum, sqlx (sqlite), reqwest (rustls), ser
 
 Why a CSR SPA rather than Leptos SSR/server functions: requirement R-HEAD-4 calls for an API that automations and scripts can also use. With a SPA, the UI uses the same versioned `/api/v1` that those clients will, so there is no second, UI-only API surface. The built assets are embedded in `c6h`, which keeps it a single binary.
 
+The head's attention list reads decision-session titles in one batch,
+derives ended-turn state from a single session/decision query, and groups
+elsewhere counts in one query rather than querying each session or realm.
+The candidate limit, seen markers, waiting exclusions and failure precedence
+stay the same. Brief positive-only
+authentication and realm-existence caches avoid repeated request lookups
+(invalidation and access-check boundaries: docs/realms-ux.md §3). SQLite
+remains in WAL mode with `synchronous=FULL`; these read optimizations do not
+relax durability.
+
 ## 3. Identity, enrollment and transport
 
 **Head PKI.** On first start, c6h creates a private CA (rcgen) and a server certificate in its data directory.

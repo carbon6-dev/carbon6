@@ -10,6 +10,7 @@ pub mod assistant;
 pub mod attention;
 pub mod auth;
 pub mod backups;
+mod brief_cache;
 pub mod catalog;
 pub mod catchup;
 pub mod claims;

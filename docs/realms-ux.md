@@ -46,6 +46,21 @@ Fixing each call site doesn't last: every new page is another place to forget th
 - **Realm tokens and the assistant don't change.** They already use this caller; they just get the fuller list.
 - **`?realm=` stays for root tokens and the CLI,** which can address any realm. The UI stops using it.
 
+The head reuses successful browser-session, API-token and realm-existence
+checks for at most two seconds (bounded in-memory caches, shared by the
+head's store clones). Session expiry is still checked on every cache hit;
+credentials are keyed by their hashes, not their secrets. Logout, browser
+session/token revocation and realm deletion invalidate the affected caches
+before returning success, preventing cache fills from reads already in flight.
+The durable revocation and invalidation finish in an owned task even if the
+requesting HTTP stream is cancelled while SQLite is writing.
+Realm deletion records its memex cleanup in the same transaction.
+Invalid credentials and missing realms are not cached. Object ownership, worker
+availability, operation scopes and grants are **not** cached: every request
+still checks its realm's access against current state. Direct database edits
+outside the head are not an invalidation interface; restart the head after
+such maintenance rather than relying on the two-second expiry.
+
 ### 3.1 Operations by scope
 
 | Area | Realm | Shared (read, narrowed) | Admin |

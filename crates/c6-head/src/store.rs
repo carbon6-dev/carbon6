@@ -10,6 +10,8 @@ use sqlx::{FromRow, Row};
 #[derive(Clone)]
 pub struct Store {
     pub(crate) pool: SqlitePool,
+    pub(crate) auth_cache: std::sync::Arc<crate::brief_cache::BriefCache<crate::auth::CachedAuth>>,
+    pub(crate) realm_cache: std::sync::Arc<crate::brief_cache::BriefCache<bool>>,
 }
 
 #[derive(Clone, Debug, FromRow)]
@@ -315,7 +317,7 @@ impl Store {
         crate::prompts::seed(&pool).await?;
         crate::claims::seed(&pool).await?;
         crate::packages::fix_legacy(&pool).await?;
-        Ok((Self { pool }, report))
+        Ok((Self { pool, auth_cache: Default::default(), realm_cache: Default::default() }, report))
     }
 
     /// Earlier upgrades of this database, newest first.

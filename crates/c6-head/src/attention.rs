@@ -162,7 +162,6 @@ pub async fn of_session(st: &HeadState, id: &str, caller: &Caller) -> anyhow::Re
 }
 
 async fn waiting_items(st: &HeadState, rows: Vec<sqlx::sqlite::SqliteRow>) -> anyhow::Result<Vec<api::AttentionItem>> {
-    let mut titles = HashMap::<String, String>::new();
     let mut out = Vec::new();
     for r in rows {
         let id: i64 = r.get("id");
@@ -178,15 +177,10 @@ async fn waiting_items(st: &HeadState, rows: Vec<sqlx::sqlite::SqliteRow>) -> an
                 None,
             ),
         };
-        let detail = match &session {
-            Some(s) => session_title(st, &mut titles, s).await,
-            None => String::new(),
-        };
         out.push(api::AttentionItem {
             key: format!("decision:{id}"),
             kind: kind.into(),
             title: r.get("title"),
-            detail,
             at: r.get("updated_at"),
             session_id: session,
             call_id: call,
@@ -195,32 +189,52 @@ async fn waiting_items(st: &HeadState, rows: Vec<sqlx::sqlite::SqliteRow>) -> an
             ..Default::default()
         });
     }
+    // One title read for the whole list, not one full session read per
+    // decision. A malformed reference must not disclose another realm's title.
+    let ids: Vec<&str> = out.iter().filter_map(|i| i.session_id.as_deref()).collect();
+    if !ids.is_empty() {
+        let rows = sqlx::query("SELECT id, realm, title FROM sessions WHERE id IN (SELECT value FROM json_each(?))")
+            .bind(serde_json::to_string(&ids)?)
+            .fetch_all(&st.store.pool)
+            .await
+            .unwrap_or_else(|e| {
+                warn!("reading attention session titles: {e:#}");
+                Vec::new()
+            });
+        let titles: HashMap<(String, String), String> =
+            rows.into_iter().map(|r| ((r.get("realm"), r.get("id")), display_title(r.get("title")))).collect();
+        for item in &mut out {
+            if let (Some(realm), Some(session)) = (&item.realm, &item.session_id) {
+                item.detail = titles.get(&(realm.clone(), session.clone())).cloned().unwrap_or_default();
+            }
+        }
+    }
     Ok(out)
 }
 
-async fn session_title(st: &HeadState, titles: &mut HashMap<String, String>, id: &str) -> String {
-    if let Some(t) = titles.get(id) {
-        return t.clone();
-    }
-    let t = match st.store.session(id).await {
-        Ok(Some(s)) if !s.title.trim().is_empty() => s.title,
-        Ok(Some(_)) => "Untitled session".into(),
-        _ => String::new(),
-    };
-    titles.insert(id.to_owned(), t.clone());
-    t
+fn display_title(title: String) -> String {
+    if title.trim().is_empty() { "Untitled session".into() } else { title }
 }
 
 /// Sessions whose last turn ended (or that failed) since you saw them, as
 /// work tells them (docs/work.md §3): not archived, not running, nothing
 /// in them waiting on you.
 async fn turns(st: &HeadState, realm: Option<&str>, waiting: &[api::AttentionItem]) -> anyhow::Result<Vec<api::AttentionItem>> {
-    // The few that might be: their turn ended after you last saw them.
+    // Keep the candidate limit before state filtering, as in the live work
+    // derivation. Read its session/seen/state and outstanding asks together,
+    // rather than session_live's three database reads per candidate.
     let rows = sqlx::query(
-        "SELECT id, realm, turn_ended_at FROM sessions WHERE archived = 0 AND parent_id IS NULL AND (? IS NULL OR realm = ?) \
-         AND turn_ended_at > seen_at ORDER BY turn_ended_at DESC LIMIT ?",
+        "WITH candidates AS (\
+             SELECT id, realm, title, status, end_reason, awaiting, turn_ended_at FROM sessions \
+             WHERE archived = 0 AND parent_id IS NULL AND (?1 IS NULL OR realm = ?1) \
+             AND turn_ended_at > seen_at ORDER BY turn_ended_at DESC LIMIT ?2\
+         ), asked(id) AS (\
+             SELECT json_extract(context, '$.session') FROM decisions WHERE state = 'open' AND kind != 'task' \
+             UNION SELECT j.value FROM decisions d, json_each(d.sessions) j WHERE d.state = 'open' AND d.kind != 'task'\
+         ) SELECT * FROM candidates s WHERE awaiting <= 0 AND status NOT IN ('running', 'starting') \
+         AND id NOT IN (SELECT id FROM asked WHERE typeof(id) = 'text') \
+         ORDER BY turn_ended_at DESC",
     )
-    .bind(realm)
     .bind(realm)
     .bind(LIMIT)
     .fetch_all(&st.store.pool)
@@ -231,15 +245,13 @@ async fn turns(st: &HeadState, realm: Option<&str>, waiting: &[api::AttentionIte
         if waiting.iter().any(|w| w.session_id.as_deref() == Some(id.as_str())) {
             continue;
         }
-        let l = crate::work::session_live(st, &realm, &id).await?;
-        if l.seen || !matches!(l.state.as_str(), "idle" | "failed") {
-            continue;
-        }
+        let failed = r.get::<String, _>("status") == "failed" || r.get::<String, _>("end_reason") == "error";
+        let title = display_title(r.get("title"));
         out.push(api::AttentionItem {
             key: format!("session:{id}"),
-            kind: if l.state == "failed" { "failed" } else { "turn_ended" }.into(),
-            detail: l.title.clone(),
-            title: l.title,
+            kind: if failed { "failed" } else { "turn_ended" }.into(),
+            detail: title.clone(),
+            title,
             at: r.get("turn_ended_at"),
             session_id: Some(id),
             realm: Some(realm),
@@ -365,13 +377,18 @@ pub async fn waiting_count(st: &HeadState, realm: &str) -> anyhow::Result<i64> {
 /// for the realm switcher (`GET /api/v1/elsewhere`). A realm's token
 /// learns only about its own; the console's (root's) is your browser's.
 pub async fn places(st: &HeadState, caller: &Caller) -> anyhow::Result<Vec<api::RealmWaiting>> {
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT realm, COUNT(*) AS n FROM decisions WHERE {WAITING} GROUP BY realm")))
+        .bind(now_ms())
+        .fetch_all(&st.store.pool)
+        .await?;
+    let counts: HashMap<String, i64> = rows.into_iter().map(|r| (r.get("realm"), r.get("n"))).collect();
     let mut out = Vec::new();
     for r in crate::realms::list(st, &Caller::root()).await? {
         let console = r.id == crate::realms::ROOT;
         if (console && !caller.browser) || !(caller.sees_others() || caller.sees(&r.id)) {
             continue;
         }
-        let waiting = waiting_count(st, &r.id).await?;
+        let waiting = counts.get(&r.id).copied().unwrap_or(0);
         out.push(api::RealmWaiting { id: r.id, name: r.name, waiting: waiting.max(0) as u64 });
     }
     Ok(out)
@@ -428,6 +445,220 @@ pub async fn seen(st: &HeadState, caller: &Caller, keys: &[String]) -> anyhow::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn test_head() -> (tempfile::TempDir, crate::Head) {
+        let dir = tempfile::tempdir().unwrap();
+        let head = crate::start(crate::HeadConfig {
+            data_dir: dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            auth: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        (dir, head)
+    }
+
+    async fn attention_session(st: &HeadState, id: &str, title: &str, realm: &str) {
+        sqlx::query(
+            "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, realm, turn_ended_at) \
+             VALUES (?, 'w', ?, '', 'c', 'm', 'idle', 0, 0, ?, 1)",
+        )
+        .bind(id)
+        .bind(title)
+        .bind(realm)
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn batched_waiting_titles_handle_duplicates_missing_blank_and_cross_realm_references() {
+        let (_dir, head) = test_head().await;
+        let st = &head.state;
+        attention_session(st, "named", "A session", "home").await;
+        attention_session(st, "blank", "  ", "home").await;
+        attention_session(st, "private", "Another realm's title", "commons").await;
+        for (title, session, reference) in [
+            ("First", "named", "approval:named:one"),
+            ("Second", "named", "question:named:two"),
+            ("Blank", "blank", ""),
+            ("Missing", "missing", ""),
+            ("Cross realm", "private", ""),
+        ] {
+            crate::decisions::open(
+                st,
+                &api::DecisionIn { title: title.into(), context: serde_json::json!({"session": session}), ..Default::default() },
+                "home",
+                reference,
+            )
+            .await
+            .unwrap();
+        }
+        for realm in [None, Some("home")] {
+            let items = waiting(st, realm).await.unwrap();
+            let details: HashMap<_, _> = items.iter().map(|i| (i.title.as_str(), i.detail.as_str())).collect();
+            assert_eq!(details.len(), 5);
+            assert_eq!(details["First"], "A session");
+            assert_eq!(details["Second"], "A session");
+            assert_eq!(details["Blank"], "Untitled session");
+            assert_eq!(details["Missing"], "");
+            assert_eq!(details["Cross realm"], "");
+        }
+        for (realm, kind, state, until) in [
+            ("commons", "question", "open", None),
+            ("commons", "task", "open", None),
+            ("commons", "question", "snoozed", Some(0)),
+            ("commons", "question", "snoozed", Some(i64::MAX)),
+            ("root", "question", "open", None),
+        ] {
+            let d = crate::decisions::open(
+                st,
+                &api::DecisionIn { title: "Other realm".into(), kind: kind.into(), ..Default::default() },
+                realm,
+                "",
+            )
+            .await
+            .unwrap();
+            sqlx::query("UPDATE decisions SET state = ?, snooze_until = ? WHERE id = ?")
+                .bind(state)
+                .bind(until)
+                .bind(d.id)
+                .execute(&st.store.pool)
+                .await
+                .unwrap();
+        }
+        let scoped = places(st, &Caller::in_realm("home")).await.unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!((scoped[0].id.as_str(), scoped[0].waiting), ("home", 5));
+        assert!(places(st, &Caller::root()).await.unwrap().iter().all(|r| r.id != "root"));
+        let browser = Caller { browser: true, ..Caller::in_realm("home") };
+        let all = places(st, &browser).await.unwrap();
+        for realm in &all {
+            assert_eq!(realm.waiting, waiting_count(st, &realm.id).await.unwrap() as u64);
+        }
+        let counts: HashMap<_, _> = all.iter().map(|r| (r.id.as_str(), r.waiting)).collect();
+        assert_eq!(counts["commons"], 2);
+        assert_eq!(counts["root"], 1);
+        head.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn batched_turns_match_live_work_state_and_keep_the_candidate_limit() {
+        let (_dir, head) = test_head().await;
+        let st = &head.state;
+        let ids = [
+            "idle",
+            "failed",
+            "end_error",
+            "running",
+            "starting",
+            "awaiting",
+            "seen",
+            "archived",
+            "child",
+            "context",
+            "linked",
+            "task",
+            "snoozed",
+            "due",
+            "answered",
+            "123",
+        ];
+        for id in ids {
+            attention_session(st, id, if id == "idle" { "  " } else { id }, "home").await;
+        }
+        attention_session(st, "other", "Other realm", "commons").await;
+        for sql in [
+            "UPDATE sessions SET status = 'failed' WHERE id = 'failed'",
+            "UPDATE sessions SET end_reason = 'error' WHERE id = 'end_error'",
+            "UPDATE sessions SET status = id, end_reason = 'error' WHERE id IN ('running', 'starting')",
+            "UPDATE sessions SET awaiting = 1 WHERE id = 'awaiting'",
+            "UPDATE sessions SET seen_at = turn_ended_at WHERE id = 'seen'",
+            "UPDATE sessions SET archived = 1 WHERE id = 'archived'",
+            "UPDATE sessions SET parent_id = 'idle' WHERE id = 'child'",
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&st.store.pool).await.unwrap();
+        }
+        for (session, kind, state, context, linked, until) in [
+            ("context", "question", "open", true, false, None),
+            ("linked", "question", "open", false, true, None),
+            ("task", "task", "open", true, false, None),
+            ("snoozed", "question", "snoozed", true, false, Some(i64::MAX)),
+            ("due", "question", "snoozed", true, false, Some(0)),
+            ("answered", "question", "answered", true, false, None),
+        ] {
+            let d = crate::decisions::open(
+                st,
+                &api::DecisionIn {
+                    title: session.into(),
+                    kind: kind.into(),
+                    context: if context { serde_json::json!({"session": session}) } else { serde_json::json!({}) },
+                    ..Default::default()
+                },
+                "home",
+                "",
+            )
+            .await
+            .unwrap();
+            sqlx::query("UPDATE decisions SET state = ?, sessions = ?, snooze_until = ? WHERE id = ?")
+                .bind(state)
+                .bind(if linked { serde_json::json!([session]) } else { serde_json::json!([]) }.to_string())
+                .bind(until)
+                .bind(d.id)
+                .execute(&st.store.pool)
+                .await
+                .unwrap();
+        }
+        // The live derivation binds a text session id. JSON numbers are
+        // not session references, even if their printed form matches an id.
+        let numeric = crate::decisions::open(
+            st,
+            &api::DecisionIn {
+                title: "Numeric, not a session reference".into(),
+                context: serde_json::json!({"session": 123}),
+                ..Default::default()
+            },
+            "home",
+            "",
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE decisions SET sessions = '[123]' WHERE id = ?").bind(numeric.id).execute(&st.store.pool).await.unwrap();
+        let waiting = waiting(st, Some("home")).await.unwrap();
+        let items = turns(st, Some("home"), &waiting).await.unwrap();
+        let actual: std::collections::BTreeSet<_> = items.iter().filter_map(|i| i.session_id.as_deref()).collect();
+        assert_eq!(actual, ["idle", "failed", "end_error", "task", "snoozed", "answered", "123"].into_iter().collect());
+        assert_eq!(items.iter().find(|i| i.session_id.as_deref() == Some("idle")).unwrap().title, "Untitled session");
+        for item in &items {
+            let live = crate::work::session_live(st, "home", item.session_id.as_deref().unwrap()).await.unwrap();
+            assert_eq!(item.title, live.title);
+            assert_eq!(item.kind, if live.state == "failed" { "failed" } else { "turn_ended" });
+            assert!(!live.seen);
+        }
+        assert!(turns(st, None, &waiting).await.unwrap().iter().any(|i| i.session_id.as_deref() == Some("other")));
+
+        // Newer running sessions still occupy candidate slots. Filtering
+        // before LIMIT would surface older idle sessions the old list hid.
+        for n in 0..55 {
+            let id = format!("bulk-{n}");
+            attention_session(st, &id, &id, "home").await;
+            sqlx::query("UPDATE sessions SET turn_ended_at = ?, status = ? WHERE id = ?")
+                .bind(100 + n)
+                .bind(if n >= 30 { "running" } else { "idle" })
+                .bind(id)
+                .execute(&st.store.pool)
+                .await
+                .unwrap();
+        }
+        let items = turns(st, Some("home"), &waiting).await.unwrap();
+        assert_eq!(items.len(), 25);
+        assert_eq!(items.first().unwrap().session_id.as_deref(), Some("bulk-29"));
+        assert_eq!(items.last().unwrap().session_id.as_deref(), Some("bulk-5"));
+        head.shutdown().await.unwrap();
+    }
 
     /// Exercise real head ingestion, including the worker-created child
     /// rows: neither the live-list filter nor nested ancestry may hide a
