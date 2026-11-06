@@ -7,7 +7,8 @@
 //! the item opened from it. One rule: a click inside a tile opens in that
 //! tile's right pane; the header's navigation opens a tile of its own (the
 //! one already showing it, else a new one). An existing destination is
-//! focused in either pane; only ⌘/Ctrl-click makes another copy.
+//! focused in either pane, even on ⌘/Ctrl-click. Only sessions and their
+//! companion panes allow explicit live copies.
 //! Each tile keeps its own
 //! back and forward history (⌘[ and ⌘]).
 //!
@@ -463,6 +464,12 @@ impl View {
         }
     }
 
+    /// Sessions and their companion panes retain explicit-copy behavior.
+    /// Other destinations always reveal their existing live pane.
+    fn single_copy(&self) -> bool {
+        !matches!(self, Self::Session { .. }) && self.session_pane().is_none()
+    }
+
     /// An untargeted link focuses without resetting where you were reading.
     fn navigates_existing(&self) -> bool {
         !matches!(self, Self::Session { target: None, .. } | Self::Docs { target: None, .. })
@@ -755,29 +762,29 @@ impl Layout {
         }
     }
 
-    /// Saved document copies collapse to the focused copy, else the first.
-    /// Only current doc panes are removed, not sessions or history entries.
-    fn restore_documents(&mut self) {
+    /// Saved single-copy pages collapse to the focused copy, else the first.
+    /// Explicit Home tiles, session copies and history entries are retained.
+    fn restore_single_copies(&mut self) {
         let focused = self.tiles[self.focus].key;
-        let mut docs = HashMap::<String, (u64, u64)>::new();
+        let mut owners = Vec::<(View, (u64, u64))>::new();
+        // Home's New tile action deliberately creates independent launchers.
+        let unique = |view: &View| view.single_copy() && !matches!(view, View::Sessions | View::Realms);
         for ti in [self.focus].into_iter().chain(0..self.tiles.len()) {
             let t = &self.tiles[ti];
             for c in t.columns.iter().filter(|c| ti == self.focus && c.key == t.active).chain(t.columns.iter()) {
-                if let View::Docs { id, .. } = &c.view
-                    && !id.is_empty()
-                {
-                    docs.entry(id.clone()).or_insert((t.key, c.key));
+                if unique(&c.view) && !owners.iter().any(|(view, _)| view.same_destination(&c.view)) {
+                    owners.push((c.view.clone(), (t.key, c.key)));
                 }
             }
         }
-        let keep = |c: &Column, tile: u64, docs: &HashMap<String, (u64, u64)>| match &c.view {
-            View::Docs { id, .. } if !id.is_empty() => docs.get(id).is_none_or(|&owner| owner == (tile, c.key)),
-            _ => true,
+        let keep = |c: &Column, tile: u64, owners: &Vec<(View, (u64, u64))>| {
+            !unique(&c.view)
+                || owners.iter().find(|(view, _)| view.same_destination(&c.view)).is_none_or(|(_, owner)| *owner == (tile, c.key))
         };
         for t in &mut self.tiles {
             let original = t.columns.clone();
             let cursor = t.columns[t.cursor].key;
-            t.columns.retain(|c| keep(c, t.key, &docs));
+            t.columns.retain(|c| keep(c, t.key, &owners));
             if t.columns.len() == original.len() {
                 continue;
             }
@@ -785,7 +792,7 @@ impl Layout {
                 // A duplicate-only tile still owns independent navigation.
                 // Walk to its nearest useful page rather than deleting that
                 // history or grafting it onto the surviving document tile.
-                let useful = |cs: &Vec<Column>| cs.iter().any(|c| keep(c, t.key, &docs));
+                let useful = |cs: &Vec<Column>| cs.iter().any(|c| keep(c, t.key, &owners));
                 let destination = t
                     .back
                     .iter()
@@ -800,18 +807,16 @@ impl Layout {
                         let now = std::mem::replace(&mut t.columns, next);
                         if back { t.forward.push(now) } else { t.back.push(now) }
                     }
-                    // A revived, previously history-only doc now has a live
+                    // A revived, previously history-only page now has a live
                     // owner too: later revivals must not duplicate it.
                     t.columns.retain(|c| {
-                        if let View::Docs { id, .. } = &c.view
-                            && !id.is_empty()
-                        {
-                            docs.entry(id.clone()).or_insert((t.key, c.key));
+                        if unique(&c.view) && !owners.iter().any(|(view, _)| view.same_destination(&c.view)) {
+                            owners.push((c.view.clone(), (t.key, c.key)));
                         }
-                        keep(c, t.key, &docs)
+                        keep(c, t.key, &owners)
                     });
                 } else {
-                    // All its history is duplicate docs. Keep a Home shell
+                    // All its history is duplicate pages. Keep a Home shell
                     // with both stacks and the outgoing page still reachable.
                     t.forward.push(std::mem::take(&mut t.columns));
                     self.next += 1;
@@ -883,11 +888,11 @@ impl Layout {
     }
 
     /// One open path for links, mentions, navigation and created documents.
-    /// Explicit copies win over dedupe, even for sessions. Only a new target
+    /// Only sessions and their companions allow explicit copies. A new target
     /// changes the reused pane's history; merely focusing it does not.
     fn open(&mut self, from: Option<(u64, u64)>, view: View, how: How) {
         let origin = from.and_then(|(t, _)| self.tiles.iter().position(|x| x.key == t)).unwrap_or(self.focus);
-        if how != How::NewTile && self.reuse(origin, &view) {
+        if (how != How::NewTile || view.single_copy()) && self.reuse(origin, &view) {
             return;
         }
         if how == How::Instead {
@@ -916,16 +921,14 @@ impl Layout {
     }
 
     fn step(&mut self, delta: isize) {
-        // A retained history entry must not silently recreate a document
+        // A retained history entry must not silently recreate a single-copy
         // copy. Reveal its live destination instead; the source's entire
         // snapshot and both stacks remain available, including other panes.
         let source = &self.tiles[self.focus];
         let next = if delta < 0 { source.back.last() } else { source.forward.last() };
         let existing = next.and_then(|cs| {
             cs.iter().find_map(|c| {
-                if !matches!(&c.view, View::Docs { id, .. } if !id.is_empty())
-                    || source.columns.iter().any(|now| now.view.same_destination(&c.view))
-                {
+                if !c.view.single_copy() || source.columns.iter().any(|now| now.view.same_destination(&c.view)) {
                     return None;
                 }
                 self.tiles
@@ -955,10 +958,16 @@ impl Layout {
         }
         // Old snapshots can themselves contain two copies in one tile.
         // Normalize only the newly current panes, never stored snapshots.
-        let mut docs = HashSet::new();
-        t.columns.retain(|c| match &c.view {
-            View::Docs { id, .. } if !id.is_empty() => docs.insert(id.clone()),
-            _ => true,
+        let mut pages = Vec::<View>::new();
+        t.columns.retain(|c| {
+            if !c.view.single_copy() {
+                return true;
+            }
+            if pages.iter().any(|view| view.same_destination(&c.view)) {
+                return false;
+            }
+            pages.push(c.view.clone());
+            true
         });
         if t.cursor >= t.columns.len() || !t.columns.iter().any(|c| c.key == t.active) {
             t.settle();
@@ -1074,6 +1083,18 @@ impl Layout {
         self.focus = ti;
         self.touch(ti);
     }
+
+    /// In-place browsing (explorer links, search filters, Settings) cannot
+    /// replace a pane with a single-copy destination already live elsewhere.
+    fn replace(&mut self, tile: u64, col: u64, view: View) {
+        let Some(ti) = self.tiles.iter().position(|t| t.key == tile) else { return };
+        let Some(ci) = self.tiles[ti].columns.iter().position(|c| c.key == col) else { return };
+        if view.single_copy() && self.find_view(ti, &view).is_some_and(|owner| owner != (ti, ci)) && self.reuse(ti, &view) {
+            return;
+        }
+        // Editing this pane's own route retains its key and existing history.
+        self.tiles[ti].columns[ci].view = view;
+    }
 }
 
 /// How a link opens.
@@ -1082,7 +1103,8 @@ pub enum How {
     /// In this tile: its right pane (from inside it), or in place of it
     /// (from the header's navigation).
     Beside,
-    /// In a new tile (⌘/Ctrl-click).
+    /// In a new tile (Mac ⌘-click, Ctrl-click elsewhere), unless a single-copy
+    /// destination is already open. Sessions and their panes allow copies.
     NewTile,
     /// In a tile of its own: the one already showing it, or a new one (the
     /// Apps menu).
@@ -1373,7 +1395,7 @@ impl Workspace {
         let layout = match load::<Layout>(LAYOUT_KEY).filter(Layout::valid) {
             None => Layout::new(here.clone()),
             Some(mut l) => {
-                l.restore_documents();
+                l.restore_single_copies();
                 l
             }
         };
@@ -1422,12 +1444,12 @@ impl Workspace {
     /// Opens `view` from pane `from` (tile key, pane key), or from outside
     /// the tiles (the header, a notification).
     ///
-    /// One rule: ⌘/Ctrl-click (`NewTile`) makes a new tile; anything else
+    /// One rule: ⌘/Ctrl-click (`NewTile`) requests a new tile; anything else
     /// stays in its tile. From a pane, it opens in the tile's right pane
     /// (beside a list, or in place of the item there). From outside, it
     /// replaces the focused tile (an item goes beside the list it shows).
-    /// An already-open destination is focused in either pane; `NewTile`
-    /// explicitly makes a second copy, including sessions and documents.
+    /// An already-open destination is focused in either pane, even with
+    /// `NewTile`; only sessions and their companions allow explicit copies.
     pub fn open(&self, from: Option<(u64, u64)>, view: View, how: How) {
         let targeted = matches!(&view, View::Docs { target: Some(_), .. } | View::Session { target: Some(_), .. });
         self.update_layout(|l| l.open(from, view, how));
@@ -1502,11 +1524,7 @@ impl Workspace {
 
     /// Changes what a column shows in place (e.g. a search's query).
     pub fn replace(&self, tile: u64, col: u64, view: View) {
-        self.update_layout(|l| {
-            if let Some(c) = l.tile_mut(tile).and_then(|t| t.columns.iter_mut().find(|c| c.key == col)) {
-                c.view = view;
-            }
-        });
+        self.update_layout(|l| l.replace(tile, col, view));
     }
 
     /// Closes a pane: the item (the list stays), or the list (the item
@@ -1581,7 +1599,7 @@ impl Workspace {
     }
 
     pub fn new_tile(&self) {
-        self.open(None, View::home(), How::NewTile);
+        self.update_layout(|l| l.open_tile(View::home()));
     }
 
     /// Focus mode on (for the tile `key`) or off: in it, the focused tile
@@ -1934,7 +1952,8 @@ pub fn use_column() -> Option<ColumnCtx> {
 
 /// Opens a view: from inside a column, beside it (or with `own`, in a tile
 /// of its own); from elsewhere (the header's menus), in a tile of its own. ⌘/Ctrl-click opens
-/// a new tile; middle-click and "copy link" use the plain URL.
+/// a new tile for a destination not already open (sessions allow copies);
+/// middle-click and "copy link" use the plain URL.
 #[component]
 pub fn Go(
     to: View,
@@ -3029,7 +3048,10 @@ mod tests {
     fn opening_any_existing_destination_reveals_its_exact_pane_without_history_or_key_churn() {
         for view in destinations() {
             for pane in 0..2 {
-                for how in [How::Beside, How::OwnTile, How::Instead] {
+                for how in [How::Beside, How::OwnTile, How::Instead, How::NewTile] {
+                    if how == How::NewTile && !view.single_copy() {
+                        continue;
+                    }
                     let mut l = Layout::new(view.clone());
                     let extra = Column { key: l.key(), view: View::Worker { id: "different".into() } };
                     l.tiles[0].columns.insert(1 - pane, extra);
@@ -3058,18 +3080,110 @@ mod tests {
     }
 
     #[test]
-    fn explicit_new_tile_allows_every_destination_including_sessions_and_docs() {
+    fn explicit_new_tile_reuses_single_copy_pages_but_keeps_session_and_companion_copies() {
         for view in destinations() {
             let mut l = Layout::new(view.clone());
             l.place();
             let original = l.tiles[0].clone();
             l.open(Some((original.key, original.columns[0].key)), view.clone(), How::NewTile);
-            assert_eq!(l.tiles.len(), 2, "{view:?}");
-            assert_eq!(l.focus, 1);
-            assert_eq!(l.tiles[0], original);
+            if view.single_copy() {
+                assert_eq!(l.tiles.len(), 1, "{view:?}");
+                assert_eq!(l.focus, 0);
+                assert_eq!(l.tiles[0].columns, original.columns);
+                assert_eq!(l.tiles[0].back, original.back);
+                assert_eq!(l.tiles[0].forward, original.forward);
+            } else {
+                assert_eq!(l.tiles.len(), 2, "{view:?}");
+                assert_eq!(l.focus, 1);
+                assert_eq!(l.tiles[0], original);
+                assert_ne!(l.tiles[0].columns[0].key, l.tiles[1].columns[0].key);
+            }
             assert_eq!(l.focused_view(), Some(&view));
-            assert_ne!(l.tiles[0].columns[0].key, l.tiles[1].columns[0].key);
         }
+    }
+
+    #[test]
+    fn restore_single_copy_pages_keeps_home_launchers_sessions_and_companions() {
+        for view in destinations() {
+            let mut l = Layout::new(view.clone());
+            l.open_tile(view.clone()); // Legacy saved duplicate, not a new open.
+            l.focus = 0;
+            let before = l.clone();
+            l.restore_single_copies();
+            if view.single_copy() && !matches!(view, View::Sessions | View::Realms) {
+                assert_eq!(l.tiles, [before.tiles[0].clone()], "{view:?}");
+            } else {
+                assert_eq!(l, before, "{view:?}: deliberate copies survive restoration");
+            }
+        }
+    }
+
+    #[test]
+    fn back_and_forward_reveal_every_live_single_copy_page_without_consuming_source_history() {
+        for view in destinations().into_iter().filter(View::single_copy) {
+            for delta in [-1, 1] {
+                let mut l = Layout::new(View::session("source"));
+                let snapshot = vec![Column { key: l.key(), view: View::session("companion") }, Column { key: l.key(), view: view.clone() }];
+                if delta < 0 {
+                    l.tiles[0].back.push(snapshot)
+                } else {
+                    l.tiles[0].forward.push(snapshot)
+                }
+                l.open_tile(view.clone());
+                l.tiles[1].minimized = true;
+                l.focus = 0;
+                l.full = true;
+                let source = l.tiles[0].clone();
+                l.step(delta);
+                assert_eq!(l.tiles[0], source, "{view:?}: mixed snapshot and both stacks survive");
+                assert_eq!(l.focus, 1);
+                assert!(!l.tiles[1].minimized);
+                assert_eq!(l.focused_view(), Some(&view));
+                assert_eq!(l.tiles.len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn history_snapshots_cannot_recreate_two_panes_of_a_single_copy_page() {
+        for view in destinations().into_iter().filter(View::single_copy) {
+            let mut l = Layout::new(View::session("source"));
+            let snapshot = vec![Column { key: l.key(), view: view.clone() }, Column { key: l.key(), view }];
+            l.tiles[0].back.push(snapshot.clone());
+            l.step(-1);
+            assert_eq!(l.tiles[0].columns, [snapshot[0].clone()]);
+            assert!(l.valid());
+        }
+    }
+
+    #[test]
+    fn in_place_routes_reveal_existing_single_copy_pages_but_keep_session_copy_behavior() {
+        for view in destinations() {
+            let mut l = Layout::new(View::session("source"));
+            l.place();
+            let source = l.tiles[0].clone();
+            l.open_tile(view.clone());
+            let target = l.tiles[1].columns.clone();
+            l.focus = 0;
+            l.tiles[1].minimized = true;
+            l.replace(source.key, source.columns[0].key, view.clone());
+            assert_eq!(l.tiles[1].columns, target);
+            if view.single_copy() {
+                assert_eq!(l.tiles[0], source, "{view:?}: in-place navigation leaves the source intact");
+                assert_eq!(l.focus, 1);
+                assert!(!l.tiles[1].minimized);
+            } else {
+                assert_eq!(l.tiles[0].columns[0].view, view, "sessions and companion selection still replace in place");
+                assert_eq!(l.focus, 0);
+            }
+        }
+        let mut l = Layout::new(View::Settings { note: None, section: String::new() });
+        let source = l.tiles[0].clone();
+        let next = View::Settings { note: None, section: "appearance".into() };
+        l.replace(source.key, source.columns[0].key, next.clone());
+        assert_eq!(l.tiles[0].columns, [Column { key: source.columns[0].key, view: next }]);
+        assert_eq!(l.tiles[0].back, source.back);
+        assert_eq!(l.tiles[0].forward, source.forward);
     }
 
     #[test]
@@ -3154,7 +3268,7 @@ mod tests {
         saved.open(None, view.clone(), How::NewTile);
         saved.open(None, View::Inbox, How::NewTile);
         let mut l: Layout = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
-        l.restore_documents();
+        l.restore_single_copies();
         assert_eq!(l, saved, "restoration keeps intentional and old duplicates");
         let keys: Vec<_> = l.tiles.iter().map(|t| t.key).collect();
         let from = (l.tiles[1].key, l.tiles[1].columns[0].key);
@@ -3179,7 +3293,8 @@ mod tests {
             saved.tiles[0].settle();
             saved.tiles[0].back.push(vec![Column { key: 100, view: View::Decisions }]);
             saved.tiles[0].forward.push(vec![Column { key: 101, view: View::Workers }]);
-            saved.open(None, second.clone(), How::NewTile);
+            // Legacy saved copies predate the single-copy open policy.
+            saved.open_tile(second.clone());
             saved.open_tile(View::session("s"));
             saved.focus = focus;
             saved.full = true;
@@ -3188,7 +3303,7 @@ mod tests {
             let focused = saved.tiles[focus].key;
             let histories = (saved.tiles[0].back.clone(), saved.tiles[0].forward.clone());
             let mut l: Layout = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
-            l.restore_documents();
+            l.restore_single_copies();
             let docs: Vec<_> =
                 l.tiles.iter().flat_map(|t| &t.columns).filter(|c| matches!(&c.view, View::Docs { id, .. } if id == "d")).collect();
             assert_eq!(docs, [&winner_column]);
@@ -3200,13 +3315,13 @@ mod tests {
             assert_eq!(mixed.active, inbox.key, "a surviving companion keeps focus");
             assert!(l.valid());
             let normalized = l.clone();
-            l.restore_documents();
+            l.restore_single_copies();
             assert_eq!(l, normalized, "normalization is idempotent");
         }
     }
 
     #[test]
-    fn restore_prefers_active_document_within_focused_tile_but_leaves_doc_lists_and_sessions() {
+    fn restore_prefers_active_document_and_collapses_doc_lists_but_keeps_sessions() {
         for active in 0..2 {
             let mut l = Layout::new(View::from_path("/docs/d#first"));
             let copy = Column { key: l.key(), view: View::from_path("/docs/d#second") };
@@ -3219,10 +3334,11 @@ mod tests {
                 l.open_tile(v);
             }
             l.focus = 0;
-            let rest = l.tiles[1..].to_vec();
-            l.restore_documents();
+            let mut rest = l.tiles[1..].to_vec();
+            rest.remove(1); // The second legacy Docs list is also a duplicate.
+            l.restore_single_copies();
             assert_eq!(l.tiles[0].columns, [winner]);
-            assert_eq!(l.tiles[1..], rest);
+            assert_eq!(l.tiles[1..].iter().map(|t| &t.columns).collect::<Vec<_>>(), rest.iter().map(|t| &t.columns).collect::<Vec<_>>());
             assert!(l.valid());
         }
     }
@@ -3247,7 +3363,7 @@ mod tests {
                 l.tiles[1].forward = vec![opposite.clone()];
             }
             l.focus = 0;
-            l.restore_documents();
+            l.restore_single_copies();
             assert_eq!(l.tiles[1].columns, useful);
             let (visited, returned) = if back { (&l.tiles[1].back, &l.tiles[1].forward) } else { (&l.tiles[1].forward, &l.tiles[1].back) };
             assert!(visited.is_empty());
@@ -3275,14 +3391,14 @@ mod tests {
         let next = l.next;
         let source = l.tiles[1].clone();
         l.focus = 0;
-        l.restore_documents();
+        l.restore_single_copies();
         assert_eq!(l.tiles[1].columns[0].view, View::home());
         assert_eq!(l.tiles[1].back, [previous]);
         assert_eq!(l.tiles[1].forward, [future, source.columns]);
         assert_eq!(l.tiles[1].columns[0].key, next + 1, "the Home shell allocates exactly one fresh pane key");
         assert_eq!(l.next, next + 1);
         let normalized = l.clone();
-        l.restore_documents();
+        l.restore_single_copies();
         assert_eq!(l, normalized);
         l.focus = 1;
         let source = l.tiles[1].clone();
@@ -3299,11 +3415,11 @@ mod tests {
         let second = Column { key: l.key(), view: View::from_path("/docs/x#second") };
         l.tiles[1].back.push(vec![first.clone(), second]);
         l.focus = 0;
-        l.restore_documents();
+        l.restore_single_copies();
         assert_eq!(l.tiles[1].columns, [first]);
         assert!(l.valid());
         let normalized = l.clone();
-        l.restore_documents();
+        l.restore_single_copies();
         assert_eq!(l, normalized, "revived document copies must collapse in the first pass");
     }
 

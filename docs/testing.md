@@ -908,27 +908,31 @@ Check both a session transcript and Decisions, with a coarse pointer at 320px an
 
 ## Workspace destination reuse and explicit copies
 
-Ordinary opens (`Beside`, `OwnTile`, `Instead`) first look for a live matching
+All opens (`Beside`, `OwnTile`, `Instead`, `NewTile`) first look for a live matching
 destination in either pane, including minimized tiles. They focus that exact
 pane, restore its tile, and reveal it even if another tile fills the workspace.
 If explicit live copies exist, the origin tile wins, then the focused tile,
-then the first matching tile in saved order. `NewTile` (⌘/Ctrl-click) always
-makes another live copy, including sessions and documents. Ordinary “New tile”
-menu actions use `OwnTile`, so they focus an existing destination. Opening a
+then the first matching tile in saved order. `NewTile` (⌘-click on Mac,
+Ctrl-click elsewhere) creates a new tile only for a destination not already
+open, except sessions and their companion panes, which retain explicit copies.
+Ordinary “New tile” link actions use `OwnTile`; the pane's “Into its own tile”
+action detaches its existing pane, without copying it. The blank Home command
+still makes an independent launcher. Opening a
 destination found only in history does not steal or rewrite that history entry.
 
-Saved-layout restore now collapses current document copies (not session copies
-or Docs indexes), retaining the focused copy/active pane or the first in saved
-order, with its exact block target and key. Only duplicate document panes are
+Saved-layout restore collapses current single-copy page duplicates (including
+Docs indexes, but not session/companion copies or explicit Home launchers),
+retaining the focused copy/active pane or the first in saved order, with its
+exact reading target and key. Only duplicate single-copy panes are
 removed; their companion panes and history stacks stay. A duplicate-only tile
 without history disappears. One with history traverses Back, then Forward, to
 its nearest useful page, preserving skipped snapshots and the opposite stack.
-If all its history is already-open docs, a fresh Home pane retains both stacks
+If all its history is already-open pages, a fresh Home pane retains both stacks
 and the outgoing page in Forward. This may retain an extra navigation tile:
 deleting it or grafting its independent history onto the winner would lose or
 change navigation. Restore is idempotent and makes no rendering-to-HTML calls.
 
-Back/Forward collisions also reveal/navigate the existing document (including
+Back/Forward collisions also reveal/navigate the existing single-copy page (including
 minimized tiles) rather than recreating a copy. The source panes and both
 stacks remain untouched, so even a mixed historical snapshot remains available
 instead of being destructively rewritten. Its other panes are not restored on
@@ -943,7 +947,9 @@ lists remain separate destinations from their items. Settings is one page:
 opening a different section navigates that same pane. Session Outputs likewise
 navigates output selection in its existing pane. Searches match the complete
 query/kind/worker, and explorer/app routes match their section/object/record,
-so different investigations can stay side by side. Selected-parent detail
+so different investigations can stay side by side. In-place `replace` also
+reveals an existing single-copy destination rather than duplicating it.
+Selected-parent detail
 opens (`open_after`, including Glance's worker and started sessions) also reuse
 existing destinations; new details keep the selected parent rather than its
 list. Session companion actions (Changes/Files/Terminal/Outputs) retain their
@@ -976,11 +982,15 @@ The standalone harness reuses motion.cjs's private loopback server, Playwright
 launcher, session/live fixtures and bounded condition waits. It checks desktop
 and 320×568: actual doc links/mentions, links inside a document, query-targeted
 tab selection, incoming session-created documents, pane key/DOM/editor identity,
-target Back/Forward, minimized docs under a maximized session, explicit doc and
-session copies, focused/first document-copy collapse on restore, retained
-companion panes and history-only navigation shells, and Back routing without
-recreating copies. Set
-`VIEWPORT=desktop` or `VIEWPORT=narrow` to focus one case. The draft-retention
+target Back/Forward, minimized docs under a maximized session, modifier reuse
+of open docs/pages and new tiles for unopened destinations, unchanged explicit
+session copies, focused/first duplicate collapse on restore, retained companion
+panes and history-only navigation shells, pane detaching, Back/Forward and
+in-place route collisions, Home's New tile, and real drag/drop without copying
+panes. Both `MacIntel` (⌘-click) and `Linux x86_64` (Ctrl-click) browser platform
+identities are tested; native Mac Ctrl-click remains a context click.
+Set `VIEWPORT=desktop|narrow` or `PLATFORM=MacIntel|Linux x86_64` to focus a case.
+The draft-retention
 case dispatches a real link click without pointer blur, since normal editor
 blur intentionally saves/closes it; it does not call workspace internals or
 replace production navigation helpers.

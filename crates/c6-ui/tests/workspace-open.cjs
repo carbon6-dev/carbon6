@@ -9,6 +9,7 @@ const { serve, fixture, settle, within, launchBrowser } = require('./motion.cjs'
 const playwright = require(process.env.PLAYWRIGHT_CORE || '/home/zheilbron/.bun/install/cache/playwright-core@1.50.1@@@1');
 const KEY = 'c6.home.workspace.v2';
 const DOC = '00000000-0000-0000-0000-000000000042';
+const OTHER_DOC = '00000000-0000-0000-0000-000000000043';
 const worker = { id: '00000000-0000-0000-0000-000000000000', name: 'Workspace fixture', hostname: 'fixture',
   os: 'linux', arch: 'x86_64', version: 'test', status: 'online', enrolled_at: 1, last_seen: 1 };
 const session = { id: 'parent', realm: 'home', worker_id: worker.id, title: 'Workspace parent', cwd: '/tmp',
@@ -46,12 +47,21 @@ async function waitView(page, view, target, count) {
   }
   await settle(page);
 }
-async function check(browser, origin, viewport, label) {
+async function check(browser, origin, viewport, label, platform) {
   console.log(`RUN workspace-open ${label}`);
   let f;
   try {
     f = await fixture(browser, origin, viewport, 'light', { choice: 'off', os: 'no-preference', effective: 'off' }, value => { f = value; });
     const { page, context } = f, lives = new Set(), liveWaiters = new Set();
+    const command = platform.startsWith('Mac') ? 'Meta' : 'Control';
+    const press = key => page.keyboard.press(`${command}+${key}`);
+    // Subsequent seed navigations install this before WASM starts, so the
+    // real platform check, not just synthetic modifier flags, is covered.
+    await context.addInitScript(platform => Object.defineProperty(navigator, 'platform', { get: () => platform }), platform);
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.locator('textarea').first().waitFor();
+    await settle(page);
+    assert.equal(await page.evaluate(() => navigator.platform), platform);
     const phase = name => { f.phase = name; console.log(`  ${label}: ${name}`); };
     page.on('pageerror', error => console.error(`  ERROR during ${f.phase}: ${error.message}`));
     page.on('console', message => {
@@ -71,7 +81,9 @@ async function check(browser, origin, viewport, label) {
       if (p.endsWith('/sessions/secondary/suggestion') || p.endsWith('/sessions/secondary/catchup')) return route.fulfill({ status: 204 });
       if (p.endsWith('/sessions/secondary/view')) return route.fulfill({ json: {} });
       if (p.endsWith(`/docs/${DOC}`)) return route.fulfill({ json: doc });
+      if (p.endsWith(`/docs/${OTHER_DOC}`)) return route.fulfill({ json: { ...doc, id: OTHER_DOC, title: 'Other workspace document' } });
       if (p.endsWith('/docs')) return route.fulfill({ json: [{ ...doc, tabs: undefined }] });
+      if (p.endsWith('/search')) return route.fulfill({ json: { results: [], ignored: [], truncated: false } });
       if (p.endsWith(`/docs/${DOC}/ops`)) return route.fulfill({ json: { id: DOC, rev: 1, ids: [], keys: {}, hashes: {} } });
       return route.fallback();
     });
@@ -90,12 +102,13 @@ async function check(browser, origin, viewport, label) {
     const parent = () => page.locator('#col-3');
     const documentPane = () => page.locator('#col-6');
     const links = async () => {
-      await page.keyboard.press('Control+1');
+      await press('1');
       await parent().locator('textarea').waitFor();
       await parent().locator('[id="parent-e20"]').waitFor({ state: 'attached' });
       f.send({ type: 'assistant', turn: 80, blocks: [{ type: 'text', text:
         `[Document block](/docs/${DOC}#block.2) [Other tab](doc:${DOC}?block=block.3) ` +
-        `doc:${DOC} [Session turn](/sessions/parent#e20) [Inbox](/inbox) [Sessions](/)` }], stop_reason: 'end_turn' });
+        `doc:${DOC} [Other document](/docs/${OTHER_DOC}) [Workers](/workers) ` +
+        `[Session turn](/sessions/parent#e20) [Inbox](/inbox) [Sessions](/)` }], stop_reason: 'end_turn' });
       await parent().locator('a[href$="#block.2"]').last().waitFor({ state: 'attached' });
     };
     const clickBlock = () => parent().locator('a[href$="#block.2"]').last().click();
@@ -107,9 +120,9 @@ async function check(browser, origin, viewport, label) {
       await seed(writers, '/sessions/parent');
       await parent().locator('[id="parent-e20"]').waitFor({ state: 'attached' });
       // Mount both sessions even on phones, whose other tiles load lazily.
-      await page.keyboard.press('Control+2');
+      await press('2');
       await page.locator('#col-9 [id="secondary-e20"]').waitFor({ state: 'attached' });
-      await page.keyboard.press('Control+1');
+      await press('1');
       await parent().locator('[id="parent-e20"]').waitFor({ state: 'attached' });
       await within('live socket ready', () => lives.size ? Promise.resolve() : new Promise(resolve => liveWaiters.add(resolve)));
       let rev = 1;
@@ -137,7 +150,7 @@ async function check(browser, origin, viewport, label) {
       await draft.press('Escape');
       await autoDoc.locator('[data-block="block.1"]').evaluate(el => { window.__autoDocNode = el; });
       for (const by of ['parent', 'parent', 'secondary', 'secondary']) {
-        await page.keyboard.press(by === 'parent' ? 'Control+1' : 'Control+2');
+        await press(by === 'parent' ? '1' : '2');
         const before = await snapshot(page);
         await write(by, 'changed');
         assert.deepEqual(await snapshot(page), before, `${by}'s streaming edit must refresh, not open/refocus or rewrite history`);
@@ -146,7 +159,7 @@ async function check(browser, origin, viewport, label) {
       // Repeated creation notifications use OwnTile and find the existing
       // pane, even when the notification comes from the other session.
       for (const by of ['parent', 'secondary', 'parent']) {
-        await page.keyboard.press('Control+1');
+        await press('1');
         await write(by, 'created');
         await waitView(page, 'docs', undefined, 3);
         const after = await snapshot(page);
@@ -177,10 +190,10 @@ async function check(browser, origin, viewport, label) {
     await waitView(page, 'session', sessionTarget, 1);
     assert.deepEqual(f.errors, [], 'session-only target must replace its old reactive owner without a panic');
     phase('session target Back and Forward');
-    await page.keyboard.press('Control+[');
+    await press('[');
     await waitView(page, 'session', undefined, 1);
     assert.equal((await snapshot(page)).tiles[0].columns[0].view.target, null);
-    await page.keyboard.press('Control+]');
+    await press(']');
     await waitView(page, 'session', sessionTarget, 1);
     phase('repeat identical session target');
     await addSessionTarget();
@@ -233,10 +246,10 @@ async function check(browser, origin, viewport, label) {
     await waitView(page, 'docs', 'block.2', 2);
     assert.deepEqual((await snapshot(page)).tiles[1].back, beforePlain.tiles[1].back, 'plain mention only focuses; no history churn');
     phase('doc target back and forward');
-    await page.keyboard.press('Control+[');
+    await press('[');
     await waitView(page, 'docs', undefined, 2);
     assert.equal((await snapshot(page)).tiles[1].columns[1].view.target, undefined);
-    await page.keyboard.press('Control+]');
+    await press(']');
     await waitView(page, 'docs', 'block.2', 2);
     phase('targeted link inside doc');
     await documentPane().locator('[data-block="block.2"] a').click();
@@ -254,9 +267,15 @@ async function check(browser, origin, viewport, label) {
     await waitView(page, 'docs', 'block.2', 2);
     assert(await editor.evaluate(el => el === window.__docEditor), 'target must not remount DocPage/editor');
     assert.equal(await editor.inputValue(), 'An unsaved retained block draft.');
-    await page.keyboard.press('Control+[');
+    const editorHistory = (await snapshot(page)).tiles[1].back;
+    await parent().locator('a[href$="#block.2"]').last().dispatchEvent('click', { metaKey: command === 'Meta', ctrlKey: command === 'Control' });
+    await waitView(page, 'docs', 'block.2', 2);
+    assert(await editor.evaluate(el => el === window.__docEditor), 'modifier reveal must retain the mounted editor too');
+    assert.equal(await editor.inputValue(), 'An unsaved retained block draft.');
+    assert.deepEqual((await snapshot(page)).tiles[1].back, editorHistory);
+    await press('[');
     await waitView(page, 'docs', 'block.1', 2);
-    await page.keyboard.press('Control+]');
+    await press(']');
     await waitView(page, 'docs', 'block.2', 2);
     assert(await editor.evaluate(el => el === window.__docEditor), 'target history retains editor identity');
     phase('save block editor and navigate another tab');
@@ -293,20 +312,72 @@ async function check(browser, origin, viewport, label) {
     await documentPane().locator('[data-block="block.2"]').waitFor();
     assert.equal((await snapshot(page)).focus, 1);
 
-    // Modifier-click makes a live copy. Restore now collapses doc copies,
-    // but keeps session copies and a duplicate doc's companion pane.
-    phase('explicit document copy');
+    phase('modifier reveals existing document without key or history churn');
     await links();
-    await parent().locator('a[href$="#block.2"]').last().click({ modifiers: ['Control'] });
-    await waitView(page, 'docs', 'block.2', 3);
+    const beforeModifier = await snapshot(page);
+    await parent().locator('a[href$="#block.2"]').last().click({ modifiers: [command] });
+    await waitView(page, 'docs', 'block.2', 2);
+    const afterModifier = await snapshot(page);
+    assert.deepEqual(afterModifier.tiles.map(t => t.columns.map(c => c.key)), beforeModifier.tiles.map(t => t.columns.map(c => c.key)));
+    assert.deepEqual(afterModifier.tiles.map(t => [t.back, t.forward]), beforeModifier.tiles.map(t => [t.back, t.forward]));
+    assert.equal(afterModifier.tiles[afterModifier.focus].active, 6);
+    assert.equal(afterModifier.tiles.flatMap(t => t.columns).filter(c => c.view.view === 'docs' && c.view.id === DOC).length, 1);
+    if (command === 'Meta') {
+      phase('Mac Control context-click cannot duplicate document');
+      await links();
+      const link = parent().locator('a[href$="#block.2"]').last();
+      const beforeContext = await snapshot(page);
+      await link.dispatchEvent('contextmenu', { button: 2, ctrlKey: true });
+      await settle(page);
+      assert.deepEqual(await snapshot(page), beforeContext, 'context menu is not an app open');
+      await link.dispatchEvent('click', { button: 0, ctrlKey: true });
+      await waitView(page, 'docs', 'block.2', 2);
+    }
+
+    phase('modifier opens not-yet-open document in new tile, then reuses it');
+    await links();
+    const sourceBeforeNew = (await snapshot(page)).tiles[0];
+    await parent().locator(`a[href$="/docs/${OTHER_DOC}"]`).last().click({ modifiers: [command] });
+    await waitView(page, 'docs', undefined, 3);
+    const newDoc = await snapshot(page), newDocTile = newDoc.tiles[newDoc.focus];
+    assert.equal(newDocTile.columns[0].view.id, OTHER_DOC);
+    assert.deepEqual(newDoc.tiles[0].columns, sourceBeforeNew.columns, 'new destination does not replace source panes');
+    assert.deepEqual(newDoc.tiles[0].back, sourceBeforeNew.back);
+    await links();
+    await parent().locator(`a[href$="/docs/${OTHER_DOC}"]`).last().click({ modifiers: [command] });
+    await waitView(page, 'docs', undefined, 3);
+    const newDocAgain = await snapshot(page);
+    assert.equal(newDocAgain.tiles[newDocAgain.focus].key, newDocTile.key);
+
+    phase('modifier opens a new single-copy page, then reuses it');
+    await links();
+    await parent().locator('a[href$="/workers"]').last().click({ modifiers: [command] });
+    await waitView(page, 'workers', undefined, 4);
+    const workers = await snapshot(page), workersTile = workers.tiles[workers.focus];
+    await links();
+    await parent().locator('a[href$="/workers"]').last().click({ modifiers: [command] });
+    await waitView(page, 'workers', undefined, 4);
+    const workersAgain = await snapshot(page);
+    assert.equal(workersAgain.tiles[workersAgain.focus].key, workersTile.key);
+    assert.deepEqual(workersAgain.tiles[workersAgain.focus].columns, workersTile.columns);
+    assert.deepEqual(workersAgain.tiles[workersAgain.focus].back, workersTile.back);
+
+    // Sessions still deliberately allow modifier-created live copies.
     phase('explicit session copy');
+    await seed(layout(), '/sessions/parent');
     await links();
-    await parent().locator('a[href$="#e20"]').last().click({ modifiers: ['Control'] });
-    await waitView(page, 'session', { q: '', anchor: 'e20', open: [], at: null }, 4);
+    await parent().locator('a[href$="#e20"]').last().click({ modifiers: [command] });
+    await waitView(page, 'session', { q: '', anchor: 'e20', open: [], at: null }, 3);
     await page.locator('[id="parent-e20"]').last().waitFor();
-    const copies = await snapshot(page), keys = copies.tiles.map(t => t.key);
+    const sessionCopies = await snapshot(page);
+    // Seed a legacy document copy; new clicks can no longer create one.
+    const copies = structuredClone(sessionCopies);
+    copies.tiles.splice(2, 0, tile(20, [{ key: 21, view: { view: 'docs', id: DOC, target: 'block.2' } }]));
+    copies.next = 22;
+    copies.focus = 0;
+    const keys = copies.tiles.map(t => t.key);
     phase('restore copies with document deep link');
-    await page.goto(origin + `/r/home/docs/${DOC}#block.1`, { waitUntil: 'domcontentloaded' });
+    await seed(copies, `/docs/${DOC}#block.1`);
     await waitView(page, 'docs', 'block.1', 3);
     const restored = await snapshot(page);
     assert.deepEqual(restored.tiles.map(t => t.key), keys.filter((_, i) => i !== 2), 'first doc copy survives; empty-history duplicate-only tile disappears');
@@ -328,16 +399,102 @@ async function check(browser, origin, viewport, label) {
     history.tiles.push(loser); history.next = 12;
     await seed(history, `/docs/${DOC}`);
     await waitView(page, 'docs', undefined, 3);
-    await page.keyboard.press('Control+3');
+    await press('3');
     const shell = (await snapshot(page)).tiles[2];
     assert.notEqual(shell.columns[0].view.view, 'docs');
     assert.deepEqual(shell.back, loser.back);
     assert.deepEqual(shell.forward, [...loser.forward, loser.columns]);
-    await page.keyboard.press('Control+[');
+    await press('[');
     await waitView(page, 'docs', 'block.1', 3);
     const revisited = await snapshot(page);
     assert.deepEqual(revisited.tiles[2], shell, 'Back reuses the existing doc and leaves its source history intact');
     assert.equal(revisited.tiles.flatMap(t => t.columns).filter(c => c.view.view === 'docs' && c.view.id === DOC).length, 1);
+
+    phase('tile Actions detaches a document instead of copying it; Back reveals the moved pane');
+    await seed(layout(), `/docs/${DOC}`);
+    await documentPane().locator('[data-block="block.1"]').waitFor();
+    await page.locator('[data-tile-motion="4"]').getByRole('button', { name: 'Actions', exact: true }).click();
+    await page.getByRole('button', { name: 'Into its own tile', exact: true }).click();
+    await waitView(page, 'docs', undefined, 3);
+    const detached = await snapshot(page), detachedKey = detached.tiles[detached.focus].key;
+    assert.equal(detached.tiles.flatMap(t => t.columns).filter(c => c.view.view === 'docs' && c.view.id === DOC).length, 1);
+    assert.deepEqual(detached.tiles[1].columns.map(c => c.key), [5]);
+    await press('2');
+    await waitView(page, 'docs', undefined, 3);
+    const detachedSource = (await snapshot(page)).tiles[1];
+    await press('[');
+    await page.waitForFunction(({ key, tile }) => {
+      const l = JSON.parse(localStorage.getItem(key));
+      return l?.tiles[l.focus]?.key === tile;
+    }, { key: KEY, tile: detachedKey });
+    await waitView(page, 'docs', undefined, 3);
+    const afterDetachBack = await snapshot(page);
+    assert.equal(afterDetachBack.tiles[afterDetachBack.focus].key, detachedKey);
+    assert.deepEqual(afterDetachBack.tiles[1], detachedSource, 'the detached source history remains available');
+
+    phase('Back and Forward reuse an already-open ordinary page');
+    for (const direction of ['[', ']']) {
+      const saved = { tiles: [tile(2, [{ key: 3, view: { view: 'session', id: 'parent' } }]),
+        tile(4, [{ key: 5, view: { view: 'workers' } }])], focus: 0, next: 10, full: false };
+      saved.tiles[0][direction === '[' ? 'back' : 'forward'] = [[{ key: 9, view: { view: 'workers' } }]];
+      await seed(saved, '/sessions/parent');
+      const source = (await snapshot(page)).tiles[0];
+      await press(direction);
+      await waitView(page, 'workers', undefined, 2);
+      const after = await snapshot(page);
+      assert.deepEqual(after.tiles[0], source, 'history collision must not consume either stack or replace the source');
+      assert.equal(after.tiles.flatMap(t => t.columns).filter(c => c.view.view === 'workers').length, 1);
+    }
+
+    phase('in-place search route reveals an existing destination instead of duplicating it');
+    const searches = { tiles: [tile(2, [{ key: 3, view: { view: 'search', q: 'alpha' } }]),
+      tile(4, [{ key: 5, view: { view: 'search', q: 'beta' } }])], focus: 0, next: 6, full: false };
+    await seed(searches, '/search?q=alpha');
+    const originalSearch = (await snapshot(page)).tiles[0];
+    const query = page.locator('#col-3 input[type="search"]');
+    await query.fill('beta');
+    await query.press('Enter');
+    await page.waitForFunction(key => JSON.parse(localStorage.getItem(key))?.focus === 1, KEY);
+    await waitView(page, 'search', undefined, 2);
+    const replaced = await snapshot(page);
+    assert.equal(replaced.focus, 1);
+    assert.equal(replaced.tiles[1].columns[0].view.q, 'beta');
+    assert.deepEqual(replaced.tiles[0].columns, originalSearch.columns);
+    assert.deepEqual(replaced.tiles[0].back, originalSearch.back);
+    assert.deepEqual(replaced.tiles[0].forward, originalSearch.forward);
+
+    if (viewport.width >= 1280) {
+      phase('Home New tile still creates independent launchers');
+      await seed(layout(), `/docs/${DOC}`);
+      for (const count of [3, 4]) {
+        await page.getByRole('button', { name: 'Tile', exact: true }).click();
+        await waitView(page, 'sessions', undefined, count);
+      }
+      const homes = await snapshot(page);
+      assert.equal(homes.tiles.filter(t => t.columns[0].view.view === 'sessions').length, 2);
+      await seed(homes, '/');
+      await waitView(page, 'sessions', undefined, 4);
+
+      phase('drag/drop moves tile identities without copying any panes');
+      await seed(layout(), `/docs/${DOC}`);
+      const before = await snapshot(page);
+      const source = page.locator('[data-tile-motion="4"] [draggable="true"]');
+      const target = page.locator('[data-tile-motion="2"]');
+      // Drive the real HTML drag handlers with a real DataTransfer. Native
+      // pointer DnD support differs by engine; identity is the invariant.
+      const transfer = await page.evaluateHandle(() => new DataTransfer());
+      await source.dispatchEvent('dragstart', { dataTransfer: transfer });
+      const rect = await target.boundingBox();
+      const drop = { dataTransfer: transfer, clientX: rect.x + rect.width * .5, clientY: rect.y + rect.height * .9 };
+      await target.dispatchEvent('dragover', drop);
+      await target.dispatchEvent('drop', drop);
+      await source.dispatchEvent('dragend', { dataTransfer: transfer });
+      await settle(page);
+      const after = await snapshot(page);
+      assert.deepEqual(after.tiles.map(t => [t.key, t.columns, t.back, t.forward]), before.tiles.map(t => [t.key, t.columns, t.back, t.forward]));
+      assert.notDeepEqual(after.tiles.map(t => t.stack), before.tiles.map(t => t.stack), 'drop must actually move the document tile');
+      await transfer.dispose();
+    }
     assert.deepEqual(f.errors, [], `${label}: browser errors`);
     console.log(`PASS workspace-open ${label}`);
   } finally { await f?.context?.close(); }
@@ -352,7 +509,11 @@ async function main() {
       try {
         for (const [name, viewport] of [['desktop', { width: 1900, height: 1000 }], ['narrow', { width: 320, height: 568 }]]) {
           if (process.env.VIEWPORT && process.env.VIEWPORT !== name) continue;
-          await within(`workspace-open ${engine}/${name}`, () => check(browser, origin, viewport, `${engine}/${name}`));
+          for (const platform of ['Linux x86_64', 'MacIntel']) {
+            if (process.env.PLATFORM && process.env.PLATFORM !== platform) continue;
+            const label = `${engine}/${name}/${platform}`;
+            await within(`workspace-open ${label}`, () => check(browser, origin, viewport, label, platform));
+          }
         }
       } finally { await browser.close(); }
     }
