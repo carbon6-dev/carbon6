@@ -28,7 +28,7 @@ pub fn DecisionLink(class: &'static str) -> impl IntoView {
         <Go to=View::Decisions class=class>
             "Decisions"
             {move || count.get().and_then(Result::ok).filter(|n| *n > 0).map(|n| view! {
-                <span class="ml-1 rounded-full bg-sky-600 px-1.5 text-[10px] font-semibold text-white">{n}</span>
+                <span data-header-count class="ml-1 rounded-full bg-sky-600 px-1.5 text-[10px] font-semibold text-white">{n}</span>
             })}
         </Go>
     }

@@ -67,7 +67,7 @@ pub fn WorkLink(class: &'static str) -> impl IntoView {
         <Go to=View::Work { id: String::new() } class=class title="What you've left open: what needs you, what went quiet">
             "Work"
             {move || list.get().and_then(Result::ok).map(|l| waiting(&l)).filter(|n| *n > 0).map(|n| view! {
-                <span class="ml-1 rounded-full bg-violet-600 px-1.5 text-[10px] font-semibold text-white">{n}</span>
+                <span data-header-count class="ml-1 rounded-full bg-violet-600 px-1.5 text-[10px] font-semibold text-white">{n}</span>
             })}
         </Go>
     }

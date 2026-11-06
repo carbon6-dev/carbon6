@@ -1,5 +1,27 @@
 @import "tailwindcss";
 
+/* Fit before the first visible frame. Removed navigation stays measurable:
+   display:none would make resizing depend on its own previous decisions. */
+.c6-header:not([data-header-ready]) { visibility: hidden; }
+.c6-header [data-header-overflow],
+.c6-header [data-header-empty],
+.c6-header [data-header-menu-hidden] {
+  position: fixed;
+  top: -10000px;
+  left: 0;
+  width: max-content;
+  visibility: hidden;
+  pointer-events: none;
+}
+.c6-header-overflow-badge { display: none; }
+[data-header-counted] .c6-header-overflow-badge { display: block; }
+/* Reserve search's resting width, including while focused. Its global focus
+   expansion is useful in pages, but mustn't push neighboring header actions. */
+.c6-header input[type="search"], .c6-header input[type="search"]:focus {
+  width: 11rem;
+  transition: none;
+}
+
 /* Motion is resolved before paint by js/motion.js. Full intentionally wins
    over an OS request; System follows changes without a page reload. */
 @theme {

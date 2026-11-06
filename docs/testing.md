@@ -47,6 +47,49 @@ next-rAF latencies are **not presentation times**; use the trace's layout,
 paint and compositor events for attribution. See the Q3 section of
 `docs/ui-responsiveness.md` for measured findings and limitations.
 
+## Content-fitted desktop header
+
+The desktop header uses measured item widths, not an `xl` navigation cutoff.
+Sessions/Inbox, search, Decisions, Work and Docs take precedence over Projects,
+analytics, apps/collections/workers, saved views, tile creation, administration,
+connection text and the build tag. The realm and quick attention/Ask controls
+have reserved space. Exceptionally long realm names are bounded to 36vw/28rem,
+with their full name on hover, rather than being squeezed by navigation.
+Overflowed links remain inert and measurable offscreen; the existing menu
+contains their live links and badges. An amber dot on the menu, with a numeric
+screen-reader description, reports counts on overflowed links. Notifications
+remain icon-only, with state in matching title and aria-label.
+
+`header-fit.cjs` uses the production browser fixture below, both engines and
+themes, short labels/zero counts and a long realm/build tag with five-digit
+Decisions and three-digit Projects/Work counts. It resizes **the same mounted
+header** through 768, 1024, 1200, 1280, 1600 and 2000px, asserts pairwise control
+rectangles never intersect or escape the header, and repeats with focused
+search. It also checks readable realm space, menu badge preservation, its
+accessible count indication, ample-space restoration, and no settled attribute
+feedback loop. ResizeObserver watches intrinsic widths; MutationObserver only
+watches content (including equal-width count changes), not its own attribute
+outputs. There is no polling, per-frame loop, DOM reparenting or duplicate
+measurement tree. Initial fitting runs before the header is made visible.
+
+```sh
+set -euo pipefail
+env -u NO_COLOR make ui
+ENGINE=both SCREENSHOTS=/tmp/q2-screenshots \
+  /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/header-fit.cjs
+```
+
+`BEFORE=1 ROOT=/path/to/pinned/dist` captures the baseline without enforcing the
+new invariants. PNGs and per-case geometry JSON go to `SCREENSHOTS` (default
+`/tmp/q2-screenshots`). `THEME=light,dark` and `COUNTS=short|large` select a
+diagnostic subset; browser paths and `ROOT` use the motion harness overrides.
+Every scenario owns a fresh browser process. Missing browsers fail explicitly.
+
+For the full parallel Rust suite, raise a low per-shell descriptor limit first
+(`ulimit -n 65536` on this Linux worker; the inherited soft limit is 1024), then
+run `make check` and `make test` with `set -euo pipefail`. This affects only the
+verification shell, not services or persisted machine settings.
+
 ## Narrow desktop tiles
 
 Tile-bar mouse slots follow the tile's content width: 36px at 40rem and

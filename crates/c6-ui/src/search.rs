@@ -59,6 +59,7 @@ pub fn SearchBox() -> impl IntoView {
         if ev.key().eq_ignore_ascii_case("k")
             && crate::util::app_shortcut(&ev)
             && let Some(el) = input.try_get_untracked().flatten()
+            && el.closest("[inert]").ok().flatten().is_none()
             && el.get_bounding_client_rect().width() > 0.0
         {
             ev.prevent_default();

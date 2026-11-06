@@ -226,6 +226,9 @@ async function fixture(browser, origin, viewport, theme, motion, started, contex
     await route.fulfill({ json });
   });
   await page.route('**/__seed', route => route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>fixture seed</title>' }));
+  // Standalone production harnesses can start on their real page/layout and
+  // install API fixtures before WASM mounts; no reload of a live app needed.
+  await seed.setup?.({ page, context });
   progress.phase = 'seed';
   debug(progress.phase);
   await page.goto(origin + '/__seed');
@@ -233,15 +236,15 @@ async function fixture(browser, origin, viewport, theme, motion, started, contex
     localStorage.setItem('c6.home.workspace.v2', JSON.stringify(layout));
     localStorage.setItem('c6.theme', theme);
     if (choice !== null) localStorage.setItem('c6.motion', choice);
-  }, { layout, theme, choice: motion.choice });
+  }, { layout: seed.layout || layout, theme, choice: motion.choice });
   progress.phase = 'application document';
   debug(progress.phase);
-  await page.goto(origin + '/r/home/sessions/parent', { waitUntil: 'domcontentloaded' });
+  await page.goto(origin + '/r/home' + (seed.path || '/sessions/parent'), { waitUntil: 'domcontentloaded' });
   // This checks pre-hydration policy, not a late correction after WASM starts.
   assert.equal(await page.locator('html').getAttribute('data-motion'), motion.effective, 'motion must resolve in the head script');
   progress.phase = 'WASM hydration';
   debug(progress.phase);
-  await Promise.race([page.locator('textarea').first().waitFor(), crash]);
+  await Promise.race([page.locator(seed.ready || 'textarea').first().waitFor(), crash]);
   progress.phase = 'initial animation completion';
   debug(progress.phase);
   if (process.env.DEBUG_FIXTURE) console.log('  INITIAL EFFECTS', await page.evaluate(() => document.getAnimations().map(a => ({

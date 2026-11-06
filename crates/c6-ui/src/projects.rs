@@ -49,7 +49,7 @@ pub fn ProjectsLink(class: &'static str) -> impl IntoView {
         <Go to=View::Projects { id: String::new() } class=class title="Long-running efforts made of work">
             "Projects"
             {move || list.get().and_then(Result::ok).map(|l| l.iter().filter(|p| matches!(p.state.as_str(), "needs_you" | "stalled")).count()).filter(|n| *n > 0).map(|n| view! {
-                <span class="ml-1 rounded-full bg-violet-600 px-1.5 text-[10px] font-semibold text-white">{n}</span>
+                <span data-header-count class="ml-1 rounded-full bg-violet-600 px-1.5 text-[10px] font-semibold text-white">{n}</span>
             })}
         </Go>
     }
