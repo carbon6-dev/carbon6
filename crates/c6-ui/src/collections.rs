@@ -208,7 +208,7 @@ fn cell_view(v: Option<&Value>) -> leptos::prelude::AnyView {
         Some(id) if !id.is_empty() => {
             let title = format!("doc:{}", id.chars().take(8).collect::<String>());
             view! {
-                <crate::workspace::Go to=crate::workspace::View::Docs { id: id.to_owned() } class="text-sky-700 hover:underline dark:text-sky-400" stop=true>
+                <crate::workspace::Go to=crate::workspace::View::Docs { id: id.to_owned(), target: None } class="text-sky-700 hover:underline dark:text-sky-400" stop=true>
                     {crate::icons::file()}" "{title}
                 </crate::workspace::Go>
             }.into_any()

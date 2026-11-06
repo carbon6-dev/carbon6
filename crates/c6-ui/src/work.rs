@@ -129,7 +129,7 @@ fn last_session(w: &WorkItem) -> Option<String> {
 fn resume(w: &WorkItem) -> bool {
     match last_session(w) {
         Some(id) => {
-            use_workspace().open(None, View::session(id), How::NewTile);
+            use_workspace().open(None, View::session(id), How::OwnTile);
             true
         }
         None => false,
@@ -536,7 +536,7 @@ fn attached_view(reference: &str) -> Option<View> {
     } else if reference.starts_with("decision:") {
         Some(View::Decisions)
     } else {
-        reference.strip_prefix("doc:").map(|id| View::Docs { id: id.to_owned() })
+        reference.strip_prefix("doc:").map(|id| View::Docs { id: id.to_owned(), target: None })
     }
 }
 

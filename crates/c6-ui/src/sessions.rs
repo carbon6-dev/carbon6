@@ -1192,7 +1192,7 @@ fn RailCard(s: Session, hover: Hover, like_this: RwSignal<Option<SessionSeed>>, 
             <crate::marks::SessionSwatch session=s.clone() />
             <div class="flex flex-wrap gap-1.5 pt-1">
                 <button class=act on:click=move |_| { hover.hide_now(); ws.open(None, View::session(open_id.clone()), How::Beside) }>"Open"</button>
-                <button class=act on:click=move |_| { hover.hide_now(); ws.open(None, View::session(tile_id.clone()), How::NewTile) }>"New tile"</button>
+                <button class=act on:click=move |_| { hover.hide_now(); ws.open(None, View::session(tile_id.clone()), How::OwnTile) }>"New tile"</button>
                 {(!s.observed && s.instance.is_empty()).then(|| view! {
                     <button class=act title="Start a new, empty session with this one's worker, folder, model and labels (you can change them first)"
                         on:click=move |_| { let seed = SessionSeed::from_session(&current.get_untracked()); hover.hide_now(); like_this.set(Some(seed)) }>"New like this"</button>
@@ -1833,7 +1833,7 @@ fn SessionForm(
                     if let Some(f) = on_session {
                         f.run(s.clone());
                     }
-                    let how = if on_cancel.is_some() { How::NewTile } else { How::Instead };
+                    let how = if on_cancel.is_some() { How::OwnTile } else { How::Instead };
                     match col {
                         Some(c) => c.open(View::session(s.id), how),
                         None => ws.open(None, View::session(s.id), how),

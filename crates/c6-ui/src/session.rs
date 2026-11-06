@@ -511,6 +511,12 @@ impl Feed {
     }
 }
 
+/// A session-authored creation brings its document forward. Edits only
+/// refresh already-open views: streaming block writes must not steal focus.
+fn opens_document(change: &c6_api::docs::DocChange, by: &str) -> bool {
+    change.what == "created" && change.by == by
+}
+
 /// A session in a workspace column. `target`: a place to reveal once it
 /// loads (from search).
 #[component]
@@ -520,19 +526,18 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     // Keyboard shortcuts only act in the active column.
     let active = move || col.is_none_or(|c| c.active.try_get_untracked() == Some(true));
     let root = col.map(|c| c.root_id()).unwrap_or_default();
-    // A document this session starts opens in a tile of its own (the
-    // session stays), so you watch it being written (docs/docs.md §6).
+    // A document this session creates opens in its existing pane
+    // or a tile of its own (the session stays), so you watch it being written.
     {
         let by = format!("session:{id}");
         let seen = live.doc.get_untracked();
         Effect::new(move |_| {
             let Some(c) = live.doc.get() else { return };
-            if c.what == "created"
-                && c.by == by
+            if opens_document(&c, &by)
                 && Some(&c) != seen.as_ref()
                 && let Some(col) = col
             {
-                col.open(View::Docs { id: c.id.clone() }, crate::workspace::How::OwnTile);
+                col.open(View::Docs { id: c.id.clone(), target: None }, crate::workspace::How::OwnTile);
             }
         });
     }
@@ -4843,7 +4848,7 @@ fn ToolCard(
             <div class="mx-3 mb-2 h-8 min-w-0">
                 {move || match doc.get() {
                     Some((id, title, kind, what)) => view! {
-                        <crate::workspace::Go to=crate::workspace::View::Docs { id } class="inline-flex h-full max-w-full items-center gap-2 rounded-md border border-zinc-200 px-2 text-sm hover:bg-zinc-50 dark:border-zinc-700 dark:hover:bg-zinc-900">
+                        <crate::workspace::Go to=crate::workspace::View::Docs { id, target: None } class="inline-flex h-full max-w-full items-center gap-2 rounded-md border border-zinc-200 px-2 text-sm hover:bg-zinc-50 dark:border-zinc-700 dark:hover:bg-zinc-900">
                             <span class="shrink-0 text-muted">{if kind == "deck" { crate::icons::chart().into_any() } else { crate::icons::file().into_any() }}</span>
                             <span class="min-w-0 truncate font-medium">{title}</span>
                             <span class="shrink-0 text-xs text-muted">{what}</span>
@@ -6232,6 +6237,18 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn only_session_authored_creation_brings_documents_forward_not_streaming_edits() {
+        for by in ["session:one", "session:two"] {
+            for what in ["created", "changed", "deleted", "commented", "exported"] {
+                let change = c6_api::docs::DocChange { id: "shared".into(), by: by.into(), what: what.into(), ..Default::default() };
+                assert_eq!(opens_document(&change, by), what == "created");
+                assert!(!opens_document(&change, "session:someone-else"));
+                assert!(!opens_document(&change, "you"));
+            }
+        }
+    }
 
     #[test]
     fn child_lists_invalidate_on_spawn_not_tool_results_or_task_reports() {

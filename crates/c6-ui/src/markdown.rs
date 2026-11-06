@@ -202,7 +202,8 @@ fn sanitize(ev: Event) -> Event {
 pub fn thing_of(href: &str, here: &Here) -> Option<(Kind, String, String)> {
     let href = href.trim();
     if href.split_once(':').is_some_and(|(k, _)| Kind::parse(k).is_some()) {
-        return reference(href).map(|(kind, id)| (kind, id, String::new()));
+        let (reference_path, rest) = href.split_at(href.find(['?', '#']).unwrap_or(href.len()));
+        return reference(reference_path).map(|(kind, id)| (kind, id, rest.to_owned()));
     }
     let mut path = href;
     if !here.origin.is_empty()
@@ -536,6 +537,17 @@ mod tests {
     fn a_session_link_keeps_its_place() {
         let out = render(&format!("[there](/r/home/sessions/{ID}?q=error#ev-12)"), &here(&nothing));
         assert_eq!(mentions(&out)[0].1, format!("/r/home/sessions/{ID}?q=error#ev-12"), "{out}");
+    }
+
+    #[test]
+    fn document_links_and_reference_mentions_keep_block_targets() {
+        for href in [format!("/docs/{ID}#block.2"), format!("doc:{ID}#block.2"), format!("doc:{ID}?block=block.2")] {
+            let out = render(&format!("[there]({href})"), &here(&nothing));
+            let found = mentions(&out);
+            let suffix = if href.contains('?') { "?block=block.2" } else { "#block.2" };
+            assert_eq!(found[0].1, format!("/r/home/docs/{ID}{suffix}"), "{out}");
+            assert_eq!(thing_of(&href, &here(&nothing)), Some((Kind::Doc, ID.into(), suffix.into())));
+        }
     }
 
     #[test]

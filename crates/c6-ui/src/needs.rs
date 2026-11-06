@@ -91,7 +91,7 @@ fn target(i: &AttentionItem) -> View {
                 .map(|call| crate::workspace::Target { anchor: Some(crate::session::waiting_card_id(s, call)), ..Default::default() }),
         },
         ("turn_ended" | "failed", Some(s), _) => View::session(s.clone()),
-        ("comment_answer", _, Some(d)) => View::Docs { id: d.clone() },
+        ("comment_answer", _, Some(d)) => View::Docs { id: d.clone(), target: None },
         ("brief", ..) => View::Brief,
         _ => View::Decisions,
     }
@@ -447,7 +447,10 @@ mod tests {
         assert_eq!(target(&AttentionItem { session_id: s.clone(), ..item("approval") }), View::session("s1"));
         assert_eq!(target(&AttentionItem { session_id: s.clone(), ..item("failed") }), View::session("s1"));
         assert_eq!(target(&AttentionItem { session_id: s, ..item("decision") }), View::Decisions);
-        assert_eq!(target(&AttentionItem { doc_id: Some("d1".into()), ..item("comment_answer") }), View::Docs { id: "d1".into() });
+        assert_eq!(
+            target(&AttentionItem { doc_id: Some("d1".into()), ..item("comment_answer") }),
+            View::Docs { id: "d1".into(), target: None }
+        );
         assert_eq!(target(&item("brief")), View::Brief);
         assert!(["turn_ended", "failed", "comment_answer", "brief"].into_iter().all(seen_by_opening));
         assert!(!["approval", "question", "decision"].into_iter().any(seen_by_opening));

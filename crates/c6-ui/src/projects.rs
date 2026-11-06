@@ -869,8 +869,8 @@ fn Documents(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> im
                     let did = d.summary.id.clone();
                     apply.run(api::project_doc(id.get_value(), did.clone(), String::new()).await);
                     match col {
-                        Some(c) => c.open(View::Docs { id: did }, How::Beside),
-                        None => ws.open(None, View::Docs { id: did }, How::Beside),
+                        Some(c) => c.open(View::Docs { id: did, target: None }, How::Beside),
+                        None => ws.open(None, View::Docs { id: did, target: None }, How::Beside),
                     }
                 }
                 Err(e) => apply.run(Err(e)),
@@ -897,7 +897,7 @@ fn Documents(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> im
                 let title = d.title.clone();
                 view! {
                     <div class="flex items-center gap-2 rounded px-2 py-1 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900">
-                        <Go to=View::Docs { id: d.doc.clone() } class="min-w-0 flex-1 truncate text-sky-700 hover:underline dark:text-sky-400">
+                        <Go to=View::Docs { id: d.doc.clone(), target: None } class="min-w-0 flex-1 truncate text-sky-700 hover:underline dark:text-sky-400">
                             {mark}" "{title}
                         </Go>
                         {d.archived_at.is_some().then(|| view! {

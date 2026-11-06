@@ -333,7 +333,7 @@ fn Hit(h: MemexHit, open: RwSignal<Option<String>>) -> impl IntoView {
                 {h.matched.iter().map(|m| view! { <span class="text-[10px] uppercase tracking-wide text-muted">{m.clone()}</span> }).collect_view()}
                 <span class="flex-1"></span>
                 {session.map(|sid| view! { <Go to=View::session(sid) class="text-xs text-sky-700 hover:underline dark:text-sky-400">"open session "{icon(Icon::ArrowUpRight, Size::S14)}</Go> })}
-                {doc.map(|d| view! { <Go to=View::Docs { id: d } class="text-xs text-sky-700 hover:underline dark:text-sky-400">"open document "{icon(Icon::ArrowUpRight, Size::S14)}</Go> })}
+                {doc.map(|d| view! { <Go to=View::Docs { id: d, target: None } class="text-xs text-sky-700 hover:underline dark:text-sky-400">"open document "{icon(Icon::ArrowUpRight, Size::S14)}</Go> })}
                 {h.url.clone().map(|u| view! { <a href=crate::markdown::safe_href(&u) target="_blank" rel="noopener noreferrer" class="text-xs text-sky-700 hover:underline dark:text-sky-400">"page "{icon(Icon::ExternalLink, Size::S14)}</a> })}
             </div>
             <p class="text-sm text-zinc-600 dark:text-zinc-400">{h.snippet.clone()}</p>

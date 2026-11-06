@@ -707,3 +707,110 @@ Check both a session transcript and Decisions, with a coarse pointer at 320px an
 4. The chooser offers **New work** once and open work only in the card's realm. Search is case-insensitive. A nonmatching search shows an empty-state message but keeps New work available. The New work choice sends `Add as new work`; an existing work item sends `Add to work:<id>` and receives the card's title, prompt and origin as a to-do.
 5. Close, outside click and Escape dismiss the chooser; Escape must not stop the session. Focus returns to Save elsewhere. A failed save leaves the card open with an error; all action buttons disable while a save is pending. Check the chooser with a long list and a long work title.
 6. With only task cards open, the transcript shows **Suggested tasks (N)** without an empty **Waiting for you** heading. Add a question or approval: Waiting for you returns. Answer the last non-task decision: its heading disappears while Suggested tasks stays.
+
+## Workspace destination reuse and explicit copies
+
+Ordinary opens (`Beside`, `OwnTile`, `Instead`) first look for a live matching
+destination in either pane, including minimized tiles. They focus that exact
+pane, restore its tile, and reveal it even if another tile fills the workspace.
+If explicit live copies exist, the origin tile wins, then the focused tile,
+then the first matching tile in saved order. `NewTile` (⌘/Ctrl-click) always
+makes another live copy, including sessions and documents. Ordinary “New tile”
+menu actions use `OwnTile`, so they focus an existing destination. Opening a
+destination found only in history does not steal or rewrite that history entry.
+
+Saved-layout restore now collapses current document copies (not session copies
+or Docs indexes), retaining the focused copy/active pane or the first in saved
+order, with its exact block target and key. Only duplicate document panes are
+removed; their companion panes and history stacks stay. A duplicate-only tile
+without history disappears. One with history traverses Back, then Forward, to
+its nearest useful page, preserving skipped snapshots and the opposite stack.
+If all its history is already-open docs, a fresh Home pane retains both stacks
+and the outgoing page in Forward. This may retain an extra navigation tile:
+deleting it or grafting its independent history onto the winner would lose or
+change navigation. Restore is idempotent and makes no rendering-to-HTML calls.
+
+Back/Forward collisions also reveal/navigate the existing document (including
+minimized tiles) rather than recreating a copy. The source panes and both
+stacks remain untouched, so even a mixed historical snapshot remains available
+instead of being destructively rewritten. Its other panes are not restored on
+that collision click. Old same-tile copies in a history snapshot collapse only
+when that snapshot becomes current; stored history is not pruned.
+
+Fixed pages (Inbox, Decisions, Sessions, Docs list, Work list, Projects list,
+Ask, workers list, Brief, Usage, Activity, Memex, Mail, Chat, Calendar, Contacts,
+Photos, Analytics, Mission, Realms) reuse one matching live view. Documents,
+sessions, workers, work, projects and collections match by their identifier;
+lists remain separate destinations from their items. Settings is one page:
+opening a different section navigates that same pane. Session Outputs likewise
+navigates output selection in its existing pane. Searches match the complete
+query/kind/worker, and explorer/app routes match their section/object/record,
+so different investigations can stay side by side. Selected-parent detail
+opens (`open_after`, including Glance's worker and started sessions) also reuse
+existing destinations; new details keep the selected parent rather than its
+list. Session companion actions (Changes/Files/Terminal/Outputs) retain their
+deliberate same-tile placement contract rather than searching globally for a
+companion elsewhere in `open_after`.
+
+Session turn targets and document block targets reuse the destination and
+record target changes in the destination tile's Back/Forward history, keeping
+pane keys. Untargeted links only focus: they do not reset the reading target,
+add history, or discard Forward. Documents accept `/docs/<id>#<block>` and
+`/docs/<id>?block=<block>` (a nonempty hash wins); the address bar uses the hash.
+The same targets work on `doc:<id>` Markdown links. In-app links retain their
+query and hash, including inside document blocks. A document block jump uses
+the existing comment-reveal callback to select its tab/slide and flash/scroll
+to it without remounting DocPage or losing its block/comment drafts. Clicking
+the same target again explicitly revisits it; focus alone does not.
+
+Run `cargo test -p c6-ui workspace::tests` for the real pure `Layout::open`
+path (every view and opening mode, either pane, minimize/maximize, duplicates,
+targets, history and legacy saved Docs). `cargo test -p c6-ui` also covers
+Markdown target preservation and document tab/slide reveal selection.
+
+After building the final combined UI **once**, run:
+
+```sh
+ROOT=/path/to/dist ENGINE=chromium,webkit node crates/c6-ui/tests/workspace-open.cjs
+```
+
+The standalone harness reuses motion.cjs's private loopback server, Playwright
+launcher, session/live fixtures and bounded condition waits. It checks desktop
+and 320×568: actual doc links/mentions, links inside a document, query-targeted
+tab selection, incoming session-created documents, pane key/DOM/editor identity,
+target Back/Forward, minimized docs under a maximized session, explicit doc and
+session copies, focused/first document-copy collapse on restore, retained
+companion panes and history-only navigation shells, and Back routing without
+recreating copies. Set
+`VIEWPORT=desktop` or `VIEWPORT=narrow` to focus one case. The draft-retention
+case dispatches a real link click without pointer blur, since normal editor
+blur intentionally saves/closes it; it does not call workspace internals or
+replace production navigation helpers.
+
+`ONLY=autoDocs` isolates two real mounted session fixtures and one shared doc.
+Session-authored `created` events use `OwnTile`, including repeated notifications
+from either writer. Real `changed` events (head edits emit this value) refresh
+the existing document, retaining DOM/editor drafts without opening or focusing
+it, changing pane/tile keys, or adding/clearing history. Repeated edits by both
+sessions are checked while focus stays on the chosen session. This deliberately
+preserves the existing creation-only auto-open policy: streaming block edits
+must not steal focus. Comments/deletes/other authors do not auto-open either.
+
+Opener audit: `Go` (`own`/outside-column included), Markdown/mentions, doc chips,
+Search, and attention all reach the shared destination policy. “Used in” opens
+the referring Work/Project through `Go`, not another doc. The sessions hover
+“New tile”, new-session dialog, and work resume now use `OwnTile`; genuine
+modifier clicks and session companion modifiers retain `NewTile`. The workspace
+blank-tile command intentionally creates a fresh Home. Workspace drag/drop only
+moves existing tiles; there is no document `text/uri-list` drop opener to patch.
+
+`ONLY=sessionTarget` isolates session query/turn targets, target Back/Forward,
+and an identical repeated target (also with the tile Actions menu open) before
+any Docs are mounted. These operations
+must be panic-free: session targets need a keyed content replacement with a
+fresh owner and DOM, not an unkeyed rebuild against disposed reactive attributes.
+Doc targets deliberately keep the same content key to retain editors. The full
+test prints each phase and checks browser errors both before and after the
+session/doc boundary; its live fixture accepts the live socket's query string
+and waits for readiness rather than depending on connection timing.
+

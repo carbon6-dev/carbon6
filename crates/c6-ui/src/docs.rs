@@ -122,7 +122,7 @@ fn reload_on_change(tick: RwSignal<u32>, id: Option<String>) {
 /// The header link.
 #[component]
 pub fn DocsLink(class: &'static str) -> impl IntoView {
-    view! { <Go to=View::Docs { id: String::new() } class=class title="Docs and decks: what people and agents write together">"Docs"</Go> }
+    view! { <Go to=View::Docs { id: String::new(), target: None } class=class title="Docs and decks: what people and agents write together">"Docs"</Go> }
 }
 
 /// What chips and embeds in a document panel share: the document, the
@@ -267,6 +267,12 @@ fn chip_clicked(
     };
     // A mention (a link) middle- or shift-clicked: the browser's.
     if el.tag_name() == "A" && (ev.button() != 0 || ev.shift_key() || ev.alt_key()) {
+        return true;
+    }
+    // Markdown mentions retain their query/hash in href, but data-ref is
+    // only the thing's identity. Follow the full link before the ref-chip
+    // fallback, or a document/session block jump loses its target here.
+    if el.tag_name() == "A" && crate::mentions::follow_link(ev, col, ws) {
         return true;
     }
     ev.prevent_default();
@@ -634,8 +640,8 @@ pub fn DocsPage() -> impl IntoView {
     let title = RwSignal::new(String::new());
     let (col, ws) = (use_column(), use_workspace());
     let open_doc = move |id: String, how: How| match &col {
-        Some(c) => c.open(View::Docs { id }, how),
-        None => ws.open(None, View::Docs { id }, how),
+        Some(c) => c.open(View::Docs { id, target: None }, how),
+        None => ws.open(None, View::Docs { id, target: None }, how),
     };
     let open_doc = StoredValue::new(open_doc);
     let make = move || {
@@ -735,7 +741,7 @@ pub fn DocsPage() -> impl IntoView {
                         {l.into_iter().map(|d| {
                             let id = d.id.clone();
                             view! {
-                                <a href=View::Docs { id: d.id.clone() }.href() class="flex flex-wrap items-center gap-2 px-2 py-2 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900"
+                                <a href=View::Docs { id: d.id.clone(), target: None }.href() class="flex flex-wrap items-center gap-2 px-2 py-2 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900"
                                     on:click=move |ev: web_sys::MouseEvent| {
                                         if ev.button() != 0 { return }
                                         ev.prevent_default();
@@ -1241,6 +1247,36 @@ pub fn DocPage(id: String) -> impl IntoView {
             pop.set(None);
         }
         request_animation_frame(move || flash_blocks(root, &els));
+    });
+    // Observe the retained pane, not the document's mount-time View. Wait
+    // for its tabs to load, then use the same tab/slide reveal as comments.
+    let column = use_column();
+    let target = Memo::new(move |_| {
+        column.and_then(|c| {
+            c.ws.layout.with(|l| match &l.tile(c.tile)?.columns.iter().find(|col| col.key == c.col)?.view {
+                View::Docs { target, .. } => target.clone(),
+                _ => None,
+            })
+        })
+    });
+    let visits = column.map(|c| c.ws.navigation_for(c.col));
+    let revealed = StoredValue::new(None::<(String, u64)>);
+    Effect::new(move || {
+        let target = target.get();
+        let visit = visits.map(|v| v.get()).unwrap_or_default();
+        tabs.track();
+        root.track();
+        let Some(block) = target else {
+            revealed.set_value(None);
+            return;
+        };
+        if revealed.get_value().as_ref() != Some(&(block.clone(), visit))
+            && root.get_untracked().is_some()
+            && tabs.with_untracked(|ts| reveal_targets(ts, std::slice::from_ref(&block))).is_some()
+        {
+            revealed.set_value(Some((block.clone(), visit)));
+            reveal.run(vec![block]);
+        }
     });
     let unsent = Memo::new(move |_| shown_threads.with(|ts| ts.iter().filter(|t| t.state == "open" && t.unsent).count()));
     let open_n = Memo::new(move |_| shown_threads.with(|ts| ts.iter().filter(|t| t.state == "open").count()));

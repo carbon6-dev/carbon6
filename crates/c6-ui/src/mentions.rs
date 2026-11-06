@@ -53,20 +53,18 @@ fn in_app(href: &str) -> Option<View> {
     let origin = window().location().origin().unwrap_or_default();
     let here = crate::markdown::Here { origin: origin.clone(), realm: crate::place::realm(), base: crate::place::base(), known: &nothing };
     if let Some((kind, id, rest)) = crate::markdown::thing_of(href, &here) {
-        let query = rest.split('#').next().unwrap_or_default();
-        return Some(View::from_path(&format!("{}{query}", kind.path(&id))));
+        return Some(View::from_path(&format!("{}{rest}", kind.path(&id))));
     }
     let path = href.strip_prefix(origin.as_str()).filter(|_| !origin.is_empty()).unwrap_or(href);
     if !path.starts_with('/') || path.starts_with("//") {
         return None;
     }
     let path = crate::place::strip(path);
-    let path = path.split('#').next().unwrap_or_default();
     // Another place's (a realm's, the console's) loads that place.
     if path.starts_with("/r/") || path.starts_with(&format!("/{}", crate::place::CONSOLE)) {
         return None;
     }
-    let to = View::from_path(path);
+    let to = View::from_path(&path);
     (to != View::home() || path == "/").then_some(to)
 }
 
