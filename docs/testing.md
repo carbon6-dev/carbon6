@@ -100,6 +100,20 @@ browser, repeat at those widths (with touch on phones):
    and comment ellipsis actions remain in normal flow, not clipped floating
    menus; ref chips still open their destination.
 
+## Session preview marks: manual browser check
+
+On desktop, hover a sidebar session or activate its drawn **Session details**
+button with Tab and Enter/Space. On a touch phone, open **Sessions** and tap
+the row's **Session details** button (the list uses the same preview card).
+The card initially has one swatch, not the palette. Open it and pick a plain
+colour and a pattern; the card must stay open and the saved mark must update.
+Repeat with a session whose own colour is empty: its id-derived swatch must
+still show. Move the pointer away with keyboard focus inside the card; it must
+remain usable. Escape and the close button dismiss it. Open near the bottom
+and right viewport edges, also at 320px and 390px phone widths: expanding the
+palette must not push the card or its controls off screen, or require horizontal
+scrolling. Tall cards scroll within the viewport.
+
 ## Tile focus and first click: manual browser check
 
 Focus and active-pane selection run on pointerdown. The pane header and its conditional buttons must stay mounted when only focus/active changes: detaching the original target between pointerdown and click loses its click. Use cached boolean conditions (`Show`) for their presence, not a closure that rebuilds them on every position change. Growing a tile still waits until click bubbles, after the action. The native `c6-ui` tests don't exercise browser event dispatch, so check this in a browser:

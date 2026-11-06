@@ -179,6 +179,8 @@ impl ListChoices {
 
 #[component]
 pub fn SessionsPage() -> impl IntoView {
+    let hover = Hover::new();
+    let like_this = RwSignal::new(None);
     let live = api::live();
     let now = clock();
     let connections = LocalResource::new(api::connections);
@@ -257,11 +259,13 @@ pub fn SessionsPage() -> impl IntoView {
                         view! { <p class="px-4 py-8 text-center text-sm text-muted">{msg}</p> }.into_any()
                     } else {
                         let sessions = sorted(sessions, choices.sort.get(), &viewed);
-                        grouped(sessions, &choices.grouping.levels.get(), String::new(), folded, &|s| view! { <SessionRow s now /> }.into_any(), false)
+                        grouped(sessions, &choices.grouping.levels.get(), String::new(), folded, &|s| view! { <SessionRow s now hover /> }.into_any(), false)
                     }
                 }}
             </div>
         </main>
+        <SessionPreview hover like_this />
+        {move || like_this.get().map(|seed| view! { <NewSessionDialog seed on_close=move |()| like_this.set(None) /> })}
         <Show when=move || sheet.get()>
             <Sheet open=sheet title="Filter, sort and group" reset=Callback::new(move |()| choices.reset())>
                 <div class="space-y-5">
@@ -847,7 +851,8 @@ fn where_line(worker: &str, s: &Session) -> String {
 /// active; under the title where it runs (all of it on hover) and, if you
 /// gave it any, its labels (with the aspects Settings → Appearance shows).
 #[component]
-fn SessionRow(s: Session, now: RwSignal<i64>) -> impl IntoView {
+fn SessionRow(s: Session, now: RwSignal<i64>, hover: Hover) -> impl IntoView {
+    let id = s.id.clone();
     let live = api::live();
     let worker = live.session_worker(&s);
     let updated = s.updated_at;
@@ -864,7 +869,15 @@ fn SessionRow(s: Session, now: RwSignal<i64>) -> impl IntoView {
     let line = where_line(&worker, &s);
     let chips = s.clone();
     view! {
-        <div class="group flex items-center gap-1 pr-1 hover:bg-zinc-100 md:pr-2 dark:hover:bg-zinc-900">
+        <div class="group flex items-center gap-1 pr-1 hover:bg-zinc-100 md:pr-2 dark:hover:bg-zinc-900"
+            on:mouseenter=move |ev| {
+                use wasm_bindgen::JsCast;
+                if !window().match_media("(hover: hover)").ok().flatten().is_some_and(|m| m.matches()) { return; }
+                if let Some(el) = ev.current_target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
+                    hover.show(id.clone(), &el);
+                }
+            }
+            on:mouseleave=move |_| hover.hide_soon()>
         <Go to=View::session(s.id.clone()) class="flex min-w-0 flex-1 items-center gap-3 py-2.5 pl-3 md:pl-4" title="Open beside this list (⌘-click: new tile)">
             <span class="mt-1.5 h-2.5 w-2.5 shrink-0 self-start rounded-full" style=mark title="Its mark"></span>
             <div class="min-w-0 flex-1">
@@ -882,6 +895,7 @@ fn SessionRow(s: Session, now: RwSignal<i64>) -> impl IntoView {
                 <span class="text-muted md:w-20 md:text-right">{move || ago(now.get() - updated)}</span>
             </div>
         </Go>
+        <PreviewButton id=s.id.clone() hover />
         <SessionMenu id=s.id.clone() />
         </div>
     }
@@ -951,9 +965,7 @@ pub fn SessionsRail(open: RwSignal<bool>) -> impl IntoView {
             }}
         </div>
         </Show>
-        {move || hover.shown.get().and_then(|(id, x, y)| live.sessions.with(|ss| ss.iter().find(|s| s.id == id).cloned()).map(|s| view! {
-            <RailCard s x y hover like_this />
-        }))}
+        <SessionPreview hover like_this />
         {move || like_this.get().map(|seed| view! { <NewSessionDialog seed on_close=move |()| like_this.set(None) /> })}
     }
 }
@@ -964,34 +976,43 @@ pub fn SessionsRail(open: RwSignal<bool>) -> impl IntoView {
 struct Hover {
     shown: RwSignal<Option<(String, f64, f64)>>,
     generation: StoredValue<u64>,
+    pinned: RwSignal<bool>,
 }
 
 impl Hover {
     fn new() -> Self {
-        Hover { shown: RwSignal::new(None), generation: StoredValue::new(0) }
+        Hover { shown: RwSignal::new(None), generation: StoredValue::new(0), pinned: RwSignal::new(false) }
     }
 
     fn show(&self, id: String, row: &web_sys::Element) {
+        if self.pinned.get_untracked() {
+            return;
+        }
         self.keep();
         let r = row.get_bounding_client_rect();
         let vh = window().inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(800.0);
-        // Beside the rail, level with the row, kept on screen.
-        let y = r.top().min(vh - 340.0).max(8.0);
-        let rail = row.closest("aside").ok().flatten().map(|a| a.get_bounding_client_rect().right()).unwrap_or(r.right());
-        self.shown.set(Some((id, rail + 6.0, y)));
+        // Beside the rail, or below a list row/button. Clamping a card to
+        // the right edge of a wide list mustn't cover its own opener.
+        let (x, y) = match row.closest("aside").ok().flatten() {
+            Some(rail) => (rail.get_bounding_client_rect().right() + 6.0, r.top()),
+            None => (r.left(), r.bottom() + 6.0),
+        };
+        self.shown.set(Some((id, x, y.min(vh - 340.0).max(8.0))));
     }
 
     /// The pointer came back: don't hide.
     fn keep(&self) {
-        self.generation.update_value(|g| *g += 1);
+        self.generation.try_update_value(|g| *g += 1);
     }
 
     fn hide_soon(&self) {
-        self.generation.update_value(|g| *g += 1);
-        let (me, this) = (self.generation.get_value(), *self);
+        self.keep();
+        let Some(me) = self.generation.try_get_value() else { return };
+        let this = *self;
         set_timeout(
             move || {
-                if this.generation.try_get_value() == Some(me) {
+                let focused = document().active_element().is_some_and(|el| el.closest("[data-session-preview]").ok().flatten().is_some());
+                if this.generation.try_get_value() == Some(me) && this.pinned.try_get() == Some(false) && !focused {
                     this.shown.set(None);
                 }
             },
@@ -1001,9 +1022,44 @@ impl Hover {
 
     fn hide_now(&self) {
         self.keep();
-        if self.shown.with_untracked(Option::is_some) {
+        self.pinned.set(false);
+        if self.shown.try_with_untracked(Option::is_some) == Some(true) {
             self.shown.set(None);
         }
+    }
+}
+
+/// Touch and keyboard entry to the same card as the rail's hover.
+#[component]
+fn PreviewButton(id: String, hover: Hover) -> impl IntoView {
+    view! {
+        <button class=icons::BAR_BUTTON title="Session details" aria-label="Session details"
+            on:click=move |ev| {
+                use wasm_bindgen::JsCast;
+                hover.hide_now();
+                if let Some(el) = ev.current_target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
+                    hover.show(id.clone(), &el);
+                    hover.pinned.set(true);
+                }
+            }>{icons::info()}</button>
+    }
+}
+
+#[component]
+fn SessionPreview(hover: Hover, like_this: RwSignal<Option<SessionSeed>>) -> impl IntoView {
+    let live = api::live();
+    let pop = StoredValue::new(escapable(move || hover.shown.with(Option::is_some), move || hover.hide_now()));
+    // A heartbeat may change the row, not the identity of this preview.
+    // In particular it mustn't recreate its picker or discard focus.
+    let shown = move || {
+        hover.shown.get().filter(|(id, _, _)| live.sessions.with(|ss| ss.iter().any(|s| s.id == *id))).into_iter().collect::<Vec<_>>()
+    };
+    view! {
+        <For each=shown
+            key=|(id, _, _)| id.clone() children=move |(id, _, _)| {
+                let s = live.sessions.with_untracked(|ss| ss.iter().find(|s| s.id == id).cloned()).expect("previewed row");
+                view! { <RailCard s hover like_this pop=pop.get_value() /> }
+            } />
     }
 }
 
@@ -1029,19 +1085,23 @@ fn RailRow(s: Session, hover: Hover) -> impl IntoView {
     view! {
         <div
             on:mouseenter=move |ev| {
+                if !window().match_media("(hover: hover)").ok().flatten().is_some_and(|m| m.matches()) { return; }
                 if let Some(el) = ev.current_target().and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok()) {
                     hover.show(id.clone(), &el);
                 }
             }
             on:mouseleave=move |_| hover.hide_soon()
         >
-            <Go to=View::session(s.id.clone()) class="flex items-center gap-1.5 rounded px-1 py-0.5 text-[13px] hover:bg-zinc-200/60 dark:hover:bg-zinc-800/60">
+            <div class="flex items-center">
+            <Go to=View::session(s.id.clone()) class="flex min-w-0 flex-1 items-center gap-1.5 rounded px-1 py-0.5 text-[13px] hover:bg-zinc-200/60 dark:hover:bg-zinc-800/60">
                 <span class="h-2.5 w-1 shrink-0 rounded-sm" style=crate::marks::fill(&colour)></span>
                 <span class="min-w-0 flex-1 truncate">{s.title.clone()}</span>
                 <span class="flex shrink-0 items-center gap-0.5"><crate::aspects::AspectGlyphs s=glyphs /></span>
                 <span class=state></span>
                 {move || number.get().map(crate::activity::tile_badge)}
             </Go>
+            <PreviewButton id=s.id.clone() hover />
+            </div>
         </div>
     }
 }
@@ -1049,14 +1109,34 @@ fn RailRow(s: Session, hover: Hover) -> impl IntoView {
 /// A rail row's details: all of its title, its state, where it runs, its
 /// labels and colour, and what you can do with it.
 #[component]
-fn RailCard(s: Session, x: f64, y: f64, hover: Hover, like_this: RwSignal<Option<SessionSeed>>) -> impl IntoView {
+fn RailCard(s: Session, hover: Hover, like_this: RwSignal<Option<SessionSeed>>, pop: String) -> impl IntoView {
     let ws = use_workspace();
     let live = api::live();
     let now = clock();
     let worker = live.session_worker(&s);
-    let updated = s.updated_at;
+    let card = NodeRef::<leptos::html::Div>::new();
+    Effect::new(move || {
+        if !hover.pinned.get() || card.get().is_none() {
+            return;
+        }
+        request_animation_frame(move || {
+            use wasm_bindgen::JsCast;
+            if let Some(el) = card
+                .try_get_untracked()
+                .flatten()
+                .and_then(|el| el.query_selector("[aria-label=\"Change session mark\"]").ok().flatten())
+                .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok())
+            {
+                let _ = el.focus();
+            }
+        });
+    });
+    let id = StoredValue::new(s.id.clone());
+    let current = Memo::new({
+        let fallback = s.clone();
+        move |_| live.sessions.with(|ss| ss.iter().find(|s| s.id == id.get_value()).cloned()).unwrap_or_else(|| fallback.clone())
+    });
     let (open_id, tile_id) = (s.id.clone(), s.id.clone());
-    let seed = SessionSeed::from_session(&s);
     let place = match (&s.ssh, s.cwd.is_empty()) {
         (Some(t), _) => format!("⇄ {t}:{}", s.cwd),
         (None, true) => "scratch workspace".to_owned(),
@@ -1067,19 +1147,25 @@ fn RailCard(s: Session, x: f64, y: f64, hover: Hover, like_this: RwSignal<Option
     };
     let act = "rounded-md border border-zinc-200 px-2 py-1 text-xs hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800";
     view! {
-        <div class="fixed z-40 w-72 space-y-2 rounded-lg border border-zinc-200 bg-white p-3 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
-            style=format!("left:{x}px;top:{y}px")
+        <div node_ref=card data-session-preview data-pop=pop class="fixed z-40 w-72 space-y-2 overflow-y-auto rounded-lg border border-zinc-200 bg-white p-3 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
+            style=move || {
+                let (_, x, y) = hover.shown.get().unwrap_or_default();
+                format!("left:clamp(8px,{x}px,max(8px,calc(100vw - 18rem - 8px)));top:min({y}px,8px + max(0px,100dvh - 340px));max-width:calc(100vw - 16px);max-height:calc(100dvh - min({y}px,8px + max(0px,100dvh - 340px)) - 8px)")
+            }
             on:mouseenter=move |_| hover.keep()
+            on:focusin=move |_| hover.keep()
+            on:focusout=move |_| hover.hide_soon()
             on:mouseleave=move |_| hover.hide_soon()>
             <div class="flex items-start gap-2">
-                <div class="min-w-0 flex-1 break-words font-medium">{s.title.clone()}</div>
-                <StatusPill status=s.display_status() />
+                <div class="min-w-0 flex-1 break-words font-medium">{move || current.get().title}</div>
+                {move || view! { <StatusPill status=current.get().display_status() /> }}
+                <button class=icons::BAR_BUTTON title="Close session details" aria-label="Close session details" on:click=move |_| hover.hide_now()>{icons::x()}</button>
             </div>
             {s.awaiting_approval.then(|| view! { <p class="text-xs font-medium text-amber-600">"A tool call waits for your approval"</p> })}
             <div class="space-y-0.5 text-xs text-muted">
-                <div class="truncate"><span title=s.on_head.then_some(api::HEAD_TITLE)>{worker}</span> " · " {s.model.clone()}</div>
+                <div class="truncate"><span title=s.on_head.then_some(api::HEAD_TITLE)>{worker}</span> " · " {move || current.get().model}</div>
                 <div class="break-all font-mono">{place.clone()}</div>
-                <div>{move || format!("active {}", ago(now.get() - updated))}</div>
+                <div>{move || format!("active {}", ago(now.get() - current.get().updated_at))}</div>
             </div>
             {(!s.labels.is_empty() || !crate::labels::shown_auto(&s.auto_labels).is_empty()).then(|| view! {
                 <div class="flex flex-wrap gap-1">
@@ -1088,13 +1174,13 @@ fn RailCard(s: Session, x: f64, y: f64, hover: Hover, like_this: RwSignal<Option
                 </div>
             })}
             <crate::aspects::AspectChips s=s.clone() />
-            <crate::marks::SessionPalette session=s.id.clone() />
+            <crate::marks::SessionSwatch session=s.clone() />
             <div class="flex flex-wrap gap-1.5 pt-1">
                 <button class=act on:click=move |_| { hover.hide_now(); ws.open(None, View::session(open_id.clone()), How::Beside) }>"Open"</button>
                 <button class=act on:click=move |_| { hover.hide_now(); ws.open(None, View::session(tile_id.clone()), How::NewTile) }>"New tile"</button>
                 {(!s.observed && s.instance.is_empty()).then(|| view! {
                     <button class=act title="Start a new, empty session with this one's worker, folder, model and labels (you can change them first)"
-                        on:click=move |_| { hover.hide_now(); like_this.set(Some(seed.clone())) }>"New like this"</button>
+                        on:click=move |_| { let seed = SessionSeed::from_session(&current.get_untracked()); hover.hide_now(); like_this.set(Some(seed)) }>"New like this"</button>
                 })}
             </div>
         </div>

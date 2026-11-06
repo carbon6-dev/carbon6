@@ -183,7 +183,7 @@ pub fn Palette(
     let rows = std::iter::once("").chain(m::PATTERNS).map(|p| {
         let marks: Vec<String> = m::COLOURS.into_iter().map(|c| if p.is_empty() { c.to_owned() } else { format!("{c}/{p}") }).collect();
         view! {
-            <div class="flex gap-[3px]">
+            <div class="flex flex-wrap gap-[3px]">
                 {marks.into_iter().map(|mk| {
                     let (a, b, c) = (mk.clone(), mk.clone(), mk.clone());
                     view! {
@@ -231,6 +231,28 @@ pub fn SessionPalette(session: String, #[prop(optional, into)] on_pick: Option<C
     }
 }
 
+/// A looking card starts with just its current mark, not a hundred swatches.
+/// Keep the picker in the card's flow so it remains part of the hover target.
+#[component]
+pub fn SessionSwatch(session: Session) -> impl IntoView {
+    let open = RwSignal::new(false);
+    let id = StoredValue::new(session.id.clone());
+    let fallback = of(&session);
+    let current = Signal::derive(move || of_id(&id.get_value()).unwrap_or_else(|| fallback.clone()));
+    view! {
+        <div class="space-y-2">
+            <button class=crate::icons::BAR_BUTTON title="This session's mark: change it" aria-label="Change session mark"
+                aria-expanded=move || open.get().to_string()
+                on:click=move |ev| { ev.stop_propagation(); open.update(|o| *o = !*o) }>
+                <Glyph mark=current shape=Shape::Circle size=16 />
+            </button>
+            <Show when=move || open.get()>
+                <SessionPalette session=id.get_value() />
+            </Show>
+        </div>
+    }
+}
+
 /// The palette for an aspect's value (`worker:<id>`, `work:<id>`…).
 #[component]
 pub fn ValuePalette(#[prop(into)] key: String, #[prop(optional, into)] on_pick: Option<Callback<()>>) -> impl IntoView {
@@ -263,6 +285,35 @@ pub fn ValuePalette(#[prop(into)] key: String, #[prop(optional, into)] on_pick: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_session_card_starts_with_just_its_current_swatch() {
+        let owner = Owner::new();
+        owner.with(|| {
+            provide_context(api::LiveFeed {
+                workers: signal(Vec::new()).0,
+                sessions: signal(Vec::new()).0,
+                connected: signal(false).0,
+                doc: signal(None).0,
+                marks: signal(Default::default()).0,
+                attention: signal(0).0,
+            });
+            for mark in ["navy/dots", "rose/diagonal", "sky", ""] {
+                let session: Session = serde_json::from_value(serde_json::json!({
+                    "id": "older-session", "worker_id": "00000000-0000-0000-0000-000000000001",
+                    "title": "A session", "cwd": "", "connection_id": "c", "model": "m", "status": "idle",
+                    "error": null, "created_at": 0, "updated_at": 0, "last_seq": 0, "colour": mark
+                }))
+                .unwrap();
+                let expected = fill(&of(&session));
+                let html = view! { <SessionSwatch session /> }.to_html();
+                assert_eq!(html.matches("<button").count(), 1, "collapsed: {html}");
+                assert!(html.contains("aria-expanded=\"false\""), "{html}");
+                assert!(html.contains(&expected), "keep the pattern or id fallback: {html}");
+            }
+        });
+    }
 
     #[test]
     fn every_mark_fills_in_its_own_colour() {
