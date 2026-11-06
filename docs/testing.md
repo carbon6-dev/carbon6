@@ -4,6 +4,15 @@ Status: rules in force (2026-10-19); `make check` enforces what a pattern can ca
 
 ## Narrow desktop tiles
 
+Tile-bar mouse slots follow the tile's content width: 36px at 40rem and
+above, 32px at 30–40rem, and 28px below 30rem. Phone/coarse-pointer slots
+remain 44px. Optional marks yield below 40rem, before Changes, Terminal and
+Pin move into Actions below 30rem. Icons and the trailing Actions, Maximize,
+Close order are unchanged. `tests/tile-marks.cjs` checks resize boundaries,
+retained controls, title room and both themes at 240–960px; `BEFORE=1` uses
+the old fixed 28px assertions against a pinned baseline `ROOT`.
+`SCREENSHOTS=/tmp/q1-screenshots/after` selects its screenshot directory.
+
 `crates/c6-ui/tests/narrow-tiles.cjs` reuses the loopback production-browser
 fixture below. It keeps the desktop window at 1600×1000 and resizes the actual
 tile to 240, 320, 400, 480 and 640px, in both themes. It records screenshots

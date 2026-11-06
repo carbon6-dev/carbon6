@@ -2503,8 +2503,9 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
             // and what you can do to the whole tile.
             // Dragged by its bar to another place or column. Always the
             // panel's own colours, so it reads whatever the mark; the mark
-            // is an optional stripe along its top. Fine pointers use 28px
-            // controls; below 30rem secondary controls move into ⋯.
+            // is an optional stripe along its top. Mouse slots relax from
+            // 28 to 32 to 36px with tile width; below 30rem secondary
+            // controls move into ⋯, after optional marks yield below 40rem.
             <div class="relative flex h-11 shrink-0 cursor-grab items-center border-b border-zinc-200 bg-zinc-50 text-xs active:cursor-grabbing md:@container md:px-1 dark:border-zinc-800 dark:bg-zinc-900"
                 draggable=move || if many.get() { "true" } else { "false" }
                 title="Drag to move this tile: onto another tile's top or bottom half, or its left or right edge for a new column"

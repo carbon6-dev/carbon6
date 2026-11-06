@@ -113,6 +113,17 @@
 @custom-variant lg (@media (width >= 64rem) and (height >= 32rem));
 @custom-variant xl (@media (width >= 80rem) and (height >= 32rem));
 
+/* Mouse targets relax as the tile (not the window) gains room. These only
+   feed the fine-pointer utility: phone/coarse targets remain 44px. The Changes
+   count can grow beyond the same minimum without squeezing its icon. */
+.c6-session-slot { --tile-bar-slot: 1.75rem; }
+@container tile (width >= 30rem) {
+  .c6-session-slot { --tile-bar-slot: 2rem; }
+}
+@container tile (width >= 40rem) {
+  .c6-session-slot { --tile-bar-slot: 2.25rem; }
+}
+
 /* Optional marks yield before the bar's secondary controls. Keep an explicit
    narrow rule: Blink can retain the wide display value on this portal mount
    after crossing the container breakpoint with only a min-width utility. */

@@ -1602,7 +1602,7 @@ pub fn SessionControls(chrome: SessionChrome, #[prop(optional)] strip: bool) -> 
             </span>
         </button>
         <div class="hidden shrink-0 items-center md:@min-[30rem]/tile:flex">
-            <button class=move || format!("{} md:pointer-fine:min-w-7 md:pointer-fine:w-auto md:pointer-fine:px-1 {}", SESSION_SLOT, if chrome.pane_open(Pane::Changes) { "bg-zinc-200 dark:bg-zinc-700" } else { "" })
+            <button class=move || format!("{} md:pointer-fine:min-w-(--tile-bar-slot) md:pointer-fine:w-auto md:pointer-fine:px-1 {}", SESSION_SLOT, if chrome.pane_open(Pane::Changes) { "bg-zinc-200 dark:bg-zinc-700" } else { "" })
                 aria-label="Changes" disabled=move || chrome.ssh() aria-pressed=move || chrome.pane_open(Pane::Changes).to_string()
                 title=move || changed().map_or_else(|| "Changes (⌘-click: a new tile)".to_owned(), |n| format!("Changes: {n} files (⌘-click: a new tile)"))
                 on:click=move |ev| chrome.toggle_pane(Pane::Changes, &ev)>

@@ -128,7 +128,10 @@ async function check(browser, origin, label) {
     const composer = await first.locator('textarea').elementHandle(), close = await control.elementHandle();
     const titleNode = await title.elementHandle();
     const fixedControls = await bar.locator('button').elementHandles();
-    const slotSize = await page.evaluate(() => matchMedia('(min-width: 768px) and (pointer: fine)').matches ? 28 : 44);
+    const fine = await page.evaluate(() => matchMedia('(min-width: 768px) and (pointer: fine)').matches);
+    const expectedSlot = width => !fine ? 44 : process.env.BEFORE === '1' ? 28 : width >= 640 ? 36 : width >= 480 ? 32 : 28;
+    const initialWidth = await first.evaluate(el => el.clientWidth);
+    const slotSize = expectedSlot(initialWidth);
     const scrollHome = () => page.locator('[data-workspace-motion]').evaluate(el => { el.parentElement.scrollLeft = 0; });
     const shot = async name => { await scrollHome(); await page.screenshot({ path: path.join(SHOTS, `${label}-${name}.png`) }); };
     await scrollHome();
@@ -199,7 +202,7 @@ async function check(browser, origin, label) {
       return { bar: rect(bar), title: rect(el), controls };
     });
     let wideGeometry;
-    for (const width of [720, 640, 639, 480, 479, 320, 240, 720]) {
+    for (const width of [960, 800, 720, 640, 639, 560, 480, 479, 400, 320, 240, 720]) {
       await resizeTile(width);
       assert.equal(await first.locator('[data-aspect-strip]').isVisible(), width >= 640, `marks yield below 40rem at ${width}`);
       for (const name of ['Changes', 'Terminal', 'Pin']) {
@@ -207,13 +210,14 @@ async function check(browser, origin, label) {
           `${name} yields only below 30rem at ${width}`);
       }
       const geometry = await barGeometry();
+      await bar.screenshot({ path: path.join(SHOTS, `${label}-bar-${width}.png`) });
       const core = geometry.controls.filter(c => /Open session sheet/.test(c.label) || ['Actions', 'Focus', 'Close this tile'].includes(c.label));
       assert.deepEqual(core.map(c => /Open session sheet/.test(c.label) ? 'Session sheet' : c.label),
         ['Session sheet', 'Actions', 'Focus', 'Close this tile'], `core order at ${width}`);
       assert.deepEqual(geometry.controls.slice(-3).map(c => c.label), ['Actions', 'Focus', 'Close this tile'],
         `Maximize immediately precedes Close at ${width}`);
       for (const c of core) {
-        assert.equal(c.box.width, slotSize); assert.equal(c.box.height, slotSize);
+        assert.equal(c.box.width, expectedSlot(width)); assert.equal(c.box.height, expectedSlot(width));
         assert(c.icon, `${c.label} keeps its icon at ${width}`);
       }
       assert(geometry.title.width > 0, `title retains room at ${width}`);
