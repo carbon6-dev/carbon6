@@ -374,6 +374,132 @@ async function policy(f) {
   await page.evaluate(() => { __motionTest.effects.length = 0; });
 }
 
+// CDP emits native Chromium emulated touch, including pointer cancellation,
+// scrolling and compatibility clicks. Synthetic dispatched pointer events
+// alone cannot prove that nested scrolling remains native.
+async function drawer(f) {
+  if (!f.label.startsWith('chromium-')) { console.log('    drawer: Chromium touch emulation only'); return; }
+  const { page, context, motion } = f;
+  const opener = page.getByRole('button', { name: /^Menu,/ }).first();
+  const panel = opener.locator('..').locator('.phone-drawer');
+  const cdp = await context.newCDPSession(page);
+  const touch = (type, x, y) => cdp.send('Input.dispatchTouchEvent', {
+    type, touchPoints: type === 'touchEnd' || type === 'touchCancel' ? [] : [{ x, y, id: 1 }],
+  });
+  const point = async () => panel.evaluate(el => {
+    const box = el.getBoundingClientRect();
+    return { x: box.left + box.width - 40, y: box.top + Math.min(130, box.height / 2), width: box.width };
+  });
+  const open = async () => {
+    await opener.tap();
+    // Wait for this one native tap's result; no retries or JS substitution.
+    await page.waitForFunction(el => el.dataset.open === 'true', await panel.elementHandle());
+    await settle(page);
+    assert.equal(await panel.getAttribute('data-open'), 'true');
+  };
+  const picture = () => panel.evaluate(el => {
+    const css = getComputedStyle(el);
+    return { left: el.getBoundingClientRect().left, dragging: el.hasAttribute('data-dragging'), inert: el.inert,
+      duration: css.transitionDuration.split(',').map(value => parseFloat(value) * 1000),
+      travel: Number(css.getPropertyValue('--travel')), enter: css.getPropertyValue('--dur-large').trim(),
+      exit: css.getPropertyValue('--dur-sheet-exit').trim() };
+  });
+  try {
+    await open();
+    await panel.evaluate(el => { window.__swipeDrawer = el; });
+    const tokens = await picture();
+    assert.equal(tokens.travel, motion.effective === 'full' ? 1 : 0);
+    assert.equal(tokens.enter, motion.effective === 'full' ? '280ms' : motion.effective === 'off' ? '0ms' : '80ms');
+    assert.equal(tokens.exit, motion.effective === 'full' ? '200ms' : motion.effective === 'off' ? '0ms' : '80ms');
+    assert(await panel.evaluate(el => getComputedStyle(el).touchAction.includes('pan-y')), 'native vertical pan remains enabled');
+
+    // A normal tap still opens the live, nested realm menu, not the drawer's
+    // close handler. Keep it shut afterward so fixture height stays stable.
+    const summary = panel.locator('summary').first();
+    const wasOpen = await summary.evaluate(el => el.parentElement.open);
+    await summary.tap();
+    assert.equal(await summary.evaluate(el => el.parentElement.open), !wasOpen);
+    assert.equal(await panel.getAttribute('data-open'), 'true', 'tap is not stolen');
+    await summary.tap();
+    await settle(page);
+
+    // Start well inside the drawer, cross the close threshold, then reverse
+    // before release. Net travel, not the furthest point or velocity, decides.
+    let p = await point();
+    await touch('touchStart', p.x, p.y);
+    await touch('touchMove', p.x - 35, p.y + 1);
+    const following = await picture();
+    assert(following.dragging && !following.inert);
+    assert(Math.abs(following.left - (motion.effective === 'full' ? -35 : 0)) < 2,
+      `finger drives Full only: ${JSON.stringify(following)}`);
+    await touch('touchMove', p.x - 125, p.y + 2);
+    await touch('touchMove', p.x - 28, p.y);
+    assert.equal(await panel.getAttribute('data-open'), 'true', 'crossing threshold alone does not close');
+    await touch('touchEnd');
+    const returning = await picture();
+    assert(!returning.dragging && returning.duration.includes(motion.effective === 'full' ? 280 : motion.effective === 'off' ? 0 : 80),
+      `snap-back reuses enter tokens: ${JSON.stringify(returning)}`);
+    await settle(page);
+    assert.equal(await panel.getAttribute('data-open'), 'true', 'short reversal snaps back without a compatibility click closing it');
+    assert(Math.abs((await picture()).left) < 1);
+    assert(await panel.evaluate(el => el === __swipeDrawer), 'no remount during reversal');
+
+    // Nested overflow fixture uses native DOM only, not rendered app HTML.
+    // Real touch must scroll it; checking only that the drawer stays open
+    // would miss a preventDefault that silently breaks nested scrolling.
+    await panel.evaluate(el => {
+      const scroll = document.createElement('div');
+      scroll.id = 'drawer-scroll-fixture';
+      Object.assign(scroll.style, { height: '180px', overflowY: 'auto', touchAction: 'pan-y', flexShrink: '0' });
+      scroll.addEventListener('scrollend', () => { scroll.dataset.ended = 'true'; }, { once: true });
+      const content = document.createElement('div');
+      Object.assign(content.style, { height: '1000px', background: 'linear-gradient(#aaa, #ddd)' });
+      scroll.append(content); el.prepend(scroll); el.scrollTop = 0;
+    });
+    const nested = page.locator('#drawer-scroll-fixture');
+    const box = await nested.boundingBox();
+    const x = box.x + box.width / 2, y = box.y + 145;
+    await touch('touchStart', x, y);
+    for (const dy of [15, 40, 70, 100]) await touch('touchMove', x - dy / 10, y - dy);
+    await touch('touchEnd');
+    await page.waitForFunction(() => document.querySelector('#drawer-scroll-fixture').scrollTop > 20);
+    // Native scrolling outlives touchEnd. Keep its target attached until the
+    // browser reports completion, rather than tearing it out during a fling.
+    await page.waitForFunction(() => document.querySelector('#drawer-scroll-fixture').dataset.ended === 'true');
+    assert.equal(await panel.getAttribute('data-open'), 'true', 'nested vertical scroll does not close');
+    assert(!(await picture()).dragging);
+    await nested.evaluate(el => el.remove());
+
+    // Long pull stays open until release, then exits inert on the same node.
+    p = await point();
+    await touch('touchStart', p.x, p.y);
+    await touch('touchMove', p.x - 30, p.y);
+    assert((await picture()).dragging, 'the next native gesture reaches and is claimed by the drawer');
+    // Test a deliberate distance-based pull/release, not a 115px one-step
+    // flick. Fast-release diagnostics delivered the next tap's down/up with
+    // no click; report that separately rather than retrying the missed tap.
+    for (const dx of [60, 90, 120, 130, 138, 142, 144, 145]) await touch('touchMove', p.x - dx, p.y + 2);
+    assert.equal(await panel.getAttribute('data-open'), 'true');
+    await touch('touchEnd');
+    await page.waitForFunction(() => __swipeDrawer.dataset.open === 'false' && __swipeDrawer.inert);
+    const closing = await picture();
+    assert(closing.duration.includes(motion.effective === 'full' ? 200 : motion.effective === 'off' ? 0 : 80),
+      `close reuses exit tokens: ${JSON.stringify(closing)}`);
+    await settle(page);
+    assert.equal(await panel.getAttribute('data-open'), 'false', 'compatibility click must not reopen/select anything');
+
+    await open();
+    const bounds = await panel.boundingBox();
+    await page.touchscreen.tap(Math.min(f.viewport.width - 8, bounds.x + bounds.width + 24), bounds.y + 80);
+    await page.waitForFunction(() => __swipeDrawer.dataset.open === 'false');
+    await settle(page);
+    await open();
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => __swipeDrawer.dataset.open === 'false' && __swipeDrawer.inert);
+    await settle(page);
+  } finally { await cdp.detach(); }
+}
+
 async function menu(f) {
   const { page } = f;
   if (phoneViewport(f.viewport)) {
@@ -1274,7 +1400,7 @@ async function main() {
       'CHROMIUM_LIBS=/path/to/shared-libraries (local /tmp/c7-browser-libs default when present)\n' +
       'ENGINE=chromium|webkit|both (default chromium; WEBKIT=1 also supported)\n' +
       'ISOLATE_BROWSER=1 owns a fresh browser process per case (useful for the local old WPE WebKit)\n' +
-      'ONLY=policy,menu,sheet,sessionsPicker,modelPicker,modelForms,phone,tool,tiles,sendStop THEME=light,dark VIEWPORT=desktop,phone,narrow,landscape (default desktop,phone) MOTION_CASE=system,system-reduce,full,full-reduce,reduced,off\n' +
+      'ONLY=policy,menu,drawer,sheet,sessionsPicker,modelPicker,modelForms,phone,tool,tiles,sendStop THEME=light,dark VIEWPORT=desktop,phone,narrow,landscape (default desktop,phone) MOTION_CASE=system,system-reduce,full,full-reduce,reduced,off\n' +
       'narrow=320x568; landscape=900x480; both opt-in views use the phone/short-height checks\n' +
       '--helpers tests real-DOM production list cleanup in Full/Reduced/Off (ENGINE=both selects all six)\n' +
       '--unit runs node:test VM checks of the production motion.js without a browser/build\n' +
@@ -1285,7 +1411,7 @@ async function main() {
   const playwright = require(process.env.PLAYWRIGHT_CORE || '/home/zheilbron/.bun/install/cache/playwright-core@1.50.1@@@1');
   const engine = process.env.ENGINE || (process.env.WEBKIT ? 'webkit' : 'chromium');
   assert(['chromium', 'webkit', 'both'].includes(engine), `Unknown ENGINE=${engine}`);
-  for (const [env, allowed] of Object.entries({ ONLY: ['policy', 'menu', 'sheet', 'sessionsPicker', 'modelPicker', 'modelForms', 'phone', 'tool', 'tiles', 'sendStop'],
+  for (const [env, allowed] of Object.entries({ ONLY: ['policy', 'menu', 'drawer', 'sheet', 'sessionsPicker', 'modelPicker', 'modelForms', 'phone', 'tool', 'tiles', 'sendStop'],
     VIEWPORT: VIEWPORTS.map(([name]) => name), THEME: ['light', 'dark'], MOTION_CASE: CASES.map(motion => motion.name) })) {
     if (process.env[env]) assert(process.env[env].split(',').every(value => allowed.includes(value)), `Unknown ${env}=${process.env[env]}`);
   }
@@ -1310,7 +1436,7 @@ async function main() {
                 browser ||= await launch();
                 f = await within(`${label}/fixture`, () => fixture(browser, origin, viewport, theme, motion, partial => { f = partial; }));
                 f.label = label;
-                for (const [test, check] of Object.entries({ policy, menu, modelPicker, ...(phoneViewport(viewport) ? { sheet, sessionsPicker, phone } : { tiles }), tool, sendStop, modelForms })) {
+                for (const [test, check] of Object.entries({ policy, menu, modelPicker, ...(phoneViewport(viewport) ? { drawer, sheet, sessionsPicker, phone } : { tiles }), tool, sendStop, modelForms })) {
                   if (!selected('ONLY', test)) continue;
                   f.phase = test;
                   console.log(`  ${test}`); await within(`${label}/${test}`, () => Promise.race([check(f), f.crash]));
@@ -1408,6 +1534,88 @@ function unitTests() {
     assert.equal(f.canceled(), 0);
     f.api.set('reduced'); assert.equal(f.canceled(), 1); assert.equal(f.cssCanceled(), 0); assert.equal(f.transitionCanceled(), 1);
     f.api.set('off'); assert.equal(f.canceled(), 2); assert.equal(f.cssCanceled(), 0); assert.equal(f.transitionCanceled(), 2);
+  });
+  test('production drawer swipe claims only clear left touch drags and releases through shared CSS', () => {
+    const setup = (choice = 'full') => {
+      const f = load({ choice }), listeners = new Map(), global = new Map(), mediaListeners = new Map();
+      const attributes = new Map(), styles = new Map(), captured = new Set();
+      let closed = 0, reads = 0, prevented = 0;
+      const media = { matches: true, addEventListener: (type, fn) => mediaListeners.set(type, fn),
+        removeEventListener: type => mediaListeners.delete(type) };
+      f.window.matchMedia = query => { assert.equal(query, '(width < 48rem), (height < 32rem)'); return media; };
+      f.window.addEventListener = (type, fn) => global.set(type, fn);
+      f.window.removeEventListener = type => global.delete(type);
+      f.window.getComputedStyle = () => { reads++; return { translate: '0px' }; };
+      const element = { dataset: { open: 'true' },
+        getBoundingClientRect: () => { reads++; return { width: 288, left: 0 }; },
+        style: { setProperty: (key, value) => styles.set(key, value), removeProperty: key => styles.delete(key) },
+        setAttribute: (key, value) => attributes.set(key, value), removeAttribute: key => attributes.delete(key),
+        setPointerCapture: id => captured.add(id), hasPointerCapture: id => captured.has(id),
+        releasePointerCapture: id => captured.delete(id),
+        addEventListener: (type, fn) => listeners.set(type, fn), removeEventListener: type => listeners.delete(type) };
+      const dispose = f.window.c6DrawerSwipe(element, () => { closed++; element.dataset.open = 'false'; });
+      const send = (type, x = 200, y = 100, extra = {}) => listeners.get(type)?.({ pointerType: 'touch', isPrimary: true,
+        pointerId: 1, clientX: x, clientY: y, target: element, preventDefault: () => { prevented++; }, ...extra });
+      return { send, element, attributes, styles, captured, global, media, mediaListeners, dispose,
+        closed: () => closed, reads: () => reads, prevented: () => prevented, listeners };
+    };
+    for (const choice of ['full', 'reduced', 'off']) {
+      const f = setup(choice);
+      f.send('pointerdown'); f.send('pointermove', 195, 102);
+      assert.equal(f.captured.size, 0, 'tap slop does not capture'); assert.equal(f.prevented(), 0);
+      f.send('pointerup'); assert.equal(f.closed(), 0);
+      f.send('pointerdown'); f.send('pointermove', 160, 103);
+      assert(f.attributes.has('data-dragging')); assert(f.captured.has(1));
+      f.send('lostpointercapture', 160, 103, { target: {} });
+      assert(f.attributes.has('data-dragging'), 'implicit capture transferring from a child does not cancel the drawer drag');
+      assert.equal(f.styles.get('--drawer-pull'), '-40px');
+      const reads = f.reads();
+      f.send('pointermove', 60, 103); f.send('pointermove', 175, 101);
+      assert.equal(f.reads(), reads, 'moves never measure layout');
+      assert.equal(f.styles.get('--drawer-pull'), '-25px');
+      assert.equal(f.closed(), 0, 'crossing close threshold waits for release');
+      f.send('pointerup'); assert.equal(f.closed(), 0, 'short reversal returns to open');
+      assert.equal(f.captured.size, 0); assert.equal(f.styles.size, 0); assert.equal(f.attributes.size, 0);
+      let stopped = 0;
+      f.send('click', 0, 0, { detail: 1, stopImmediatePropagation: () => { stopped++; } });
+      assert.equal(stopped, 1, 'compatibility click cannot activate a link or close after snap-back');
+      f.send('pointerdown'); f.send('pointermove', 50, 100); f.send('pointerup');
+      assert.equal(f.closed(), 1, `${choice} retains gesture semantics; CSS alone scales motion`);
+      f.dispose(); assert.equal(f.listeners.size, 0); assert.equal(f.global.size, 0); assert.equal(f.mediaListeners.size, 0);
+    }
+    for (const [dx, dy] of [[-5, 40], [-25, 25], [30, 0]]) {
+      const f = setup(); f.send('pointerdown'); f.send('pointermove', 200 + dx, 100 + dy);
+      f.send('pointermove', 20, 100); f.send('pointerup');
+      assert.equal(f.prevented(), 0, 'vertical, diagonal and rightward starts stay native for the entire gesture');
+      assert.equal(f.closed(), 0); assert.equal(f.captured.size, 0); f.dispose();
+    }
+    for (const end of ['pointercancel', 'lostpointercapture', 'policy', 'escape', 'resize', 'dispose']) {
+      const f = setup(); f.send('pointerdown'); f.send('pointermove', 40, 100);
+      if (end === 'policy') f.global.get('c6-motion')();
+      else if (end === 'escape') f.global.get('keydown')({ key: 'Escape' });
+      else if (end === 'resize') f.mediaListeners.get('change')();
+      else if (end === 'dispose') f.dispose();
+      else f.send(end);
+      f.send('pointerup'); assert.equal(f.closed(), 0, `${end} must cancel, not dismiss`);
+      assert.equal(f.captured.size, 0); assert.equal(f.attributes.size, 0); assert.equal(f.styles.size, 0);
+      f.dispose();
+    }
+    for (const mode of ['mouse', 'pen', 'secondary', 'desktop', 'closed']) {
+      const f = setup();
+      if (mode === 'desktop') f.media.matches = false;
+      if (mode === 'closed') f.element.dataset.open = 'false';
+      f.send('pointerdown', 200, 100, mode === 'secondary' ? { isPrimary: false } :
+        ['mouse', 'pen'].includes(mode) ? { pointerType: mode } : {});
+      f.send('pointermove', 20, 100); f.send('pointerup');
+      assert.equal(f.closed(), 0); assert.equal(f.prevented(), 0); f.dispose();
+    }
+    const f = setup(); f.send('pointerdown'); f.send('pointerup');
+    let stopped = false;
+    f.send('click', 0, 0, { detail: 1, stopImmediatePropagation: () => { stopped = true; } });
+    assert(!stopped, 'ordinary taps keep their normal click'); f.dispose();
+    const css = fs.readFileSync(path.join(__dirname, '../style/input.css'), 'utf8');
+    assert.match(css, /\.phone-drawer\s*\{[^}]*touch-action:\s*pan-y pinch-zoom/);
+    assert.match(css, /\.phone-drawer\[data-open="true"\]\[data-dragging\]\s*\{[^}]*var\(--drawer-pull, 0px\)\s*\*\s*var\(--travel\)[^}]*transition:\s*none/);
   });
   test('Off hides outgoing count and notice decoration instead of exposing animation base styles', () => {
     const css = fs.readFileSync(path.join(__dirname, '../style/input.css'), 'utf8');

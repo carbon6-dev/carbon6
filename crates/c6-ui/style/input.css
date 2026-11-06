@@ -67,6 +67,7 @@
   .phone-drawer {
     --sheet-x: -100%;
     --sheet-y: 0px;
+    touch-action: pan-y pinch-zoom;
     top: calc(var(--c6-visible-top, 0px) + 44px);
     max-height: calc(var(--c6-visible-height, 100dvh) - 44px);
   }
@@ -348,6 +349,12 @@ html.soft {
   translate: calc(var(--sheet-x, 0px) * var(--travel)) calc(var(--sheet-y, 100%) * var(--travel));
   opacity: 0;
   transition: translate var(--dur-sheet-exit) var(--ease-in), opacity var(--dur-sheet-exit) var(--ease-in), visibility 0s var(--dur-sheet-exit);
+}
+@media (width < 48rem), (height < 32rem) {
+  .phone-drawer[data-open="true"][data-dragging] {
+    translate: calc(var(--drawer-pull, 0px) * var(--travel)) 0px;
+    transition: none;
+  }
 }
 .c6-scrim {
   transition: opacity var(--dur-medium) var(--ease-out), visibility 0s;

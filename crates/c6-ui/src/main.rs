@@ -291,6 +291,12 @@ fn AppsMenu() -> impl IntoView {
 #[derive(Clone, Copy)]
 struct PhoneWaiting(Signal<u64>);
 
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_name = c6DrawerSwipe)]
+    fn drawer_swipe(element: &web_sys::Element, close: &js_sys::Function) -> js_sys::Function;
+}
+
 /// Phones and narrower windows: the nav, views and search in a menu.
 #[component]
 fn MobileMenu(#[prop(optional, into)] desktop_attention: Option<Signal<usize>>) -> impl IntoView {
@@ -298,6 +304,23 @@ fn MobileMenu(#[prop(optional, into)] desktop_attention: Option<Signal<usize>>) 
     let connected = api::live().connected;
     let version = versions();
     let open = RwSignal::new(false);
+    let drawer = NodeRef::<leptos::html::Div>::new();
+    #[cfg(target_arch = "wasm32")]
+    Effect::new(move || {
+        use wasm_bindgen::JsCast;
+
+        if let Some(el) = drawer.get() {
+            let close = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                open.try_set(false);
+            });
+            let dispose = send_wrapper::SendWrapper::new(drawer_swipe(&el, close.as_ref().unchecked_ref()));
+            let close = send_wrapper::SendWrapper::new(close);
+            on_cleanup(move || {
+                let _ = dispose.call0(&wasm_bindgen::JsValue::NULL);
+                drop(close);
+            });
+        }
+    });
     let pop = util::dismissable(
         move || open.get(),
         move || {
@@ -326,7 +349,7 @@ fn MobileMenu(#[prop(optional, into)] desktop_attention: Option<Signal<usize>>) 
                 </Show>
             </button>
             <div class="c6-presence c6-scrim fixed inset-0 z-30 bg-black/30 md:hidden" data-open=move || open.get().to_string() inert=move || !open.get() on:click=move |_| open.set(false)></div>
-            <div class="c6-sheet c6-pane c6-presence phone-drawer fixed left-0 z-40 w-72 max-w-full space-y-1 overflow-y-auto rounded-r-lg border border-zinc-200 bg-white p-2 shadow-lg md:absolute md:top-11 dark:border-zinc-700 dark:bg-zinc-900"
+            <div node_ref=drawer class="c6-sheet c6-pane c6-presence phone-drawer fixed left-0 z-40 w-72 max-w-full space-y-1 overflow-y-auto rounded-r-lg border border-zinc-200 bg-white p-2 shadow-lg md:absolute md:top-11 dark:border-zinc-700 dark:bg-zinc-900"
                 data-open=move || open.get().to_string() inert=move || !open.get() on:click=close>
                 <PlaceMenu drawer=true />
                 {place::is_console().then(|| view! {

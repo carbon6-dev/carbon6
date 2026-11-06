@@ -43,6 +43,93 @@ window.c6Motion = (() => {
   };
 })();
 
+// Start anywhere *inside* the phone drawer, not at Android's Back edge.
+// Leave native vertical scrolling and taps alone until a clear left drag.
+// Release returns control to the sheet's shared CSS tokens/presence state.
+window.c6DrawerSwipe = (element, close) => {
+  const phone = matchMedia("(width < 48rem), (height < 32rem)");
+  let drag, suppressClick = false;
+  const reset = () => {
+    const previous = drag;
+    drag = undefined;
+    element.removeAttribute("data-dragging");
+    element.style.removeProperty("--drawer-pull");
+    if (previous && element.hasPointerCapture(previous.id)) element.releasePointerCapture(previous.id);
+  };
+  const down = event => {
+    reset();
+    suppressClick = false;
+    if (event.pointerType !== "touch" || !event.isPrimary || !phone.matches || element.dataset.open !== "true") return;
+    const box = element.getBoundingClientRect();
+    drag = { id: event.pointerId, x: event.clientX, y: event.clientY, width: box.width, from: box.left, distance: 0, claimed: false };
+  };
+  const move = event => {
+    if (!drag || drag.id !== event.pointerId) return;
+    if (element.dataset.open !== "true" || !phone.matches) { reset(); return; }
+    const dx = event.clientX - drag.x, dy = event.clientY - drag.y;
+    if (!drag.claimed) {
+      if (Math.max(Math.abs(dx), Math.abs(dy)) < 10) return;
+      // Lock the *whole* gesture to scrolling/rightward motion, even if it
+      // turns left later. A diagonal must not steal a nested vertical scroll.
+      if (dx >= 0 || -dx <= Math.abs(dy) * 1.5) { reset(); return; }
+      drag.claimed = true;
+      suppressClick = true;
+      element.setPointerCapture(event.pointerId);
+      element.setAttribute("data-dragging", "");
+    }
+    event.preventDefault();
+    drag.distance = Math.max(0, -dx);
+    element.style.setProperty("--drawer-pull", `${Math.max(-drag.width, Math.min(0, drag.from + dx))}px`);
+  };
+  const up = event => {
+    if (!drag || drag.id !== event.pointerId) return;
+    const dismiss = drag.claimed && drag.distance >= drag.width * .35 && element.dataset.open === "true";
+    // Capture the last finger position before removing the direct-manipulation
+    // rule. Both close and snap-back then transition from that displayed frame.
+    if (drag.claimed) getComputedStyle(element).translate;
+    reset();
+    if (dismiss) close();
+  };
+  const cancel = event => { if (drag?.id === event.pointerId) reset(); };
+  // Touch starts with implicit capture on the tapped child. Transferring it
+  // to the drawer emits a bubbling loss on that child, not a cancellation.
+  const lost = event => { if (event.target === element) cancel(event); };
+  const click = event => {
+    if (!suppressClick || event.detail === 0) return;
+    suppressClick = false;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  };
+  const escape = event => { if (event.key === "Escape") reset(); };
+  const policy = () => {
+    // Resolve the new --travel while direct manipulation still disables
+    // transitions, so switching to Reduced cannot animate the old offset.
+    if (drag?.claimed) getComputedStyle(element).translate;
+    reset();
+  };
+  element.addEventListener("pointerdown", down);
+  element.addEventListener("pointermove", move, { passive: false });
+  element.addEventListener("pointerup", up);
+  element.addEventListener("pointercancel", cancel);
+  element.addEventListener("lostpointercapture", lost);
+  element.addEventListener("click", click, true);
+  addEventListener("keydown", escape);
+  addEventListener("c6-motion", policy);
+  phone.addEventListener("change", reset);
+  return () => {
+    reset();
+    element.removeEventListener("pointerdown", down);
+    element.removeEventListener("pointermove", move);
+    element.removeEventListener("pointerup", up);
+    element.removeEventListener("pointercancel", cancel);
+    element.removeEventListener("lostpointercapture", lost);
+    element.removeEventListener("click", click, true);
+    removeEventListener("keydown", escape);
+    removeEventListener("c6-motion", policy);
+    phone.removeEventListener("change", reset);
+  };
+};
+
 // Observe only a small, explicitly opted-in card, never a transcript. Read
 // layout only on resize, not once per animation frame. The layout is already
 // final; only its picture catches up. Cancelling starts at the displayed rect.

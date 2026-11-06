@@ -845,3 +845,46 @@ events actually bubble to the production window listeners. After leaving the
 terminal, shortcuts must work again. Normal Search and message inputs still
 allow these explicit app commands. Retained but hidden Search inputs must not
 claim K before the visible header input; the fixture checks actual visible focus.
+
+### Phone app drawer: left swipe from inside (fix6)
+
+`node crates/c6-ui/tests/motion.cjs --unit` exercises the production
+`c6DrawerSwipe` helper without a UI build: touch-only direction locking,
+tap slop and click preservation/suppression, short reversal after crossing
+the threshold, long release, cancellation, motion/viewport changes and
+listener cleanup. No app views are rendered to HTML.
+
+After the coordinator's **combined** `make ui` (do not build each worktree),
+run against that production dist:
+
+```sh
+ROOT=/path/to/coordinator/crates/c6-ui/dist ENGINE=chromium \
+  ONLY=drawer THEME=light VIEWPORT=phone,narrow,landscape \
+  MOTION_CASE=full,full-reduce,reduced,off \
+  node crates/c6-ui/tests/motion.cjs
+```
+
+The existing fake-head fixture uses Chromium CDP **emulated touch**, not a
+physical Android device. It checks actual native touch/pointer cancellation
+and compatibility clicks: a normal nested-menu tap; a drag starting well
+inside the drawer (no Android Back-edge dependency); finger tracking; a long
+pull reversed to a short release with snap-back; long release with inert
+retained exit; and real nested vertical scrolling without dismissal. Outside
+tap and Escape still close. It checks the shared 280/200ms Full tokens,
+80/80ms Reduced tokens, 0/0ms Off tokens and zero travel outside Full, including
+explicit Full overriding an OS reduced-motion preference. Gesture recognition
+is identical in each setting; only Full translates during the finger drag.
+Physical Android Back-edge interaction remains a manual follow-up.
+
+The drawer opener still uses **one** native Playwright tap, then waits for
+the retained panel's `data-open="true"`, settles animations and asserts it
+remains open. No sleeps, retries or JS clicks: a missed tap must time out and
+an unintended subsequent close must fail. The nested scroll test registers
+`scrollend` before its gesture and awaits native completion before removing
+the fixture. The long-close gesture ends with slowing native touch moves,
+testing a deliberate distance-based pull/release rather than a 115px
+one-step flick. Fast-release diagnostic traces showed native opener down/up
+with no subsequent click; native scroll completion and a one-frame trusted
+press did not cure it. Those failures must remain reported separately, not
+be described as an app-side dismissal or as solved by the state wait.
+
