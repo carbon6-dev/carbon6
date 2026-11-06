@@ -34,6 +34,14 @@ pub struct LiveFeed {
     pub attention: ReadSignal<u32>,
 }
 
+// Reconnection is an invalidation source for session resources. An ordinary
+// live frame must not look like another reconnect (same-value sets notify).
+fn connection_state(connected: ReadSignal<bool>, set_connected: WriteSignal<bool>, next: bool) {
+    if connected.get_untracked() != next {
+        set_connected.set(next);
+    }
+}
+
 impl LiveFeed {
     pub fn connect() -> Self {
         let (workers, set_workers) = signal(Vec::new());
@@ -51,7 +59,7 @@ impl LiveFeed {
                         let Message::Text(text) = msg else { continue };
                         match serde_json::from_str::<LiveEvent>(&text) {
                             Ok(ev) => {
-                                set_connected.set(true);
+                                connection_state(connected, set_connected, true);
                                 backoff = 500;
                                 match ev {
                                     LiveEvent::Workers { workers } => set_workers.set(workers),
@@ -70,7 +78,7 @@ impl LiveFeed {
                         }
                     }
                 }
-                set_connected.set(false);
+                connection_state(connected, set_connected, false);
                 gloo_timers::future::sleep(Duration::from_millis(backoff)).await;
                 backoff = (backoff * 2).min(10_000);
             }
@@ -1927,4 +1935,38 @@ pub async fn doc_threads_send(id: String, threads: Vec<String>) -> Result<Vec<c6
 
 pub async fn doc_thread_resolve(id: String, thread: String) -> Result<c6_api::docs::DocThread, String> {
     json(Request::post(&format!("/api/v1/docs/{}/threads/{}/resolve", enc(&id), enc(&thread))).send().await).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_live_frames_do_not_invalidate_reconnect_subscribers() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let (connected, set_connected) = signal(false);
+            let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let fetched = {
+                let reads = reads.clone();
+                Memo::new(move |_| {
+                    connected.track();
+                    reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                })
+            };
+            assert_eq!(fetched.get_untracked(), 0);
+            connection_state(connected, set_connected, true);
+            assert_eq!(fetched.get_untracked(), 1, "the first connection reloads its resources");
+            for _ in 0..100 {
+                connection_state(connected, set_connected, true);
+                assert_eq!(fetched.get_untracked(), 1, "workers, sessions, marks and attention are not reconnects");
+            }
+            connection_state(connected, set_connected, false);
+            assert_eq!(fetched.get_untracked(), 2, "disconnection is still observable");
+            connection_state(connected, set_connected, false);
+            assert_eq!(fetched.get_untracked(), 2, "failed retries do not pretend the connection changed");
+            connection_state(connected, set_connected, true);
+            assert_eq!(fetched.get_untracked(), 3, "a real reconnect still reloads its resources");
+        });
+    }
 }
