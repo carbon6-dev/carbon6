@@ -5,6 +5,7 @@ use leptos::prelude::*;
 use serde_json::{Value, json};
 
 use crate::api;
+use crate::icons::{Icon, Size, icon};
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT};
 use crate::when::full as day;
 use crate::workspace::{Go, View};
@@ -183,7 +184,7 @@ fn PhotoView(id: String, open: RwSignal<Option<String>>, about: RwSignal<Option<
     view! {
         <section class="space-y-2 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
             <div class="flex justify-end gap-2">
-                <a href=crate::api::url(&format!("/api/v1/memex/items/{id}/content")) target="_blank" rel="noopener" class="text-xs text-sky-700 hover:underline dark:text-sky-400">"Open original "{crate::icons::arrow_up_right()}</a>
+                <a href=crate::api::url(&format!("/api/v1/memex/items/{id}/content")) target="_blank" rel="noopener" class="text-xs text-sky-700 hover:underline dark:text-sky-400">"Open original "{icon(Icon::ExternalLink, Size::S14)}</a>
                 <button class=BUTTON_QUIET on:click=move |_| open.set(None)>"Close"</button>
             </div>
             {move || data.get().map(|r| match r {
@@ -234,7 +235,7 @@ fn detail(v: Value, about: RwSignal<Option<(String, String)>>) -> impl IntoView 
                 <p class="text-xs text-muted">
                     {when}
                     {(!v["camera"].as_str().unwrap_or_default().is_empty()).then(|| format!(" · {}", v["camera"].as_str().unwrap_or_default()))}
-                    {map.map(|u| view! { " · " <a href=u target="_blank" rel="noopener noreferrer" class="text-sky-700 hover:underline dark:text-sky-400">"map "{crate::icons::arrow_up_right()}</a> })}
+                    {map.map(|u| view! { " · " <a href=u target="_blank" rel="noopener noreferrer" class="text-sky-700 hover:underline dark:text-sky-400">"map "{icon(Icon::ExternalLink, Size::S14)}</a> })}
                 </p>
                 <div class="flex flex-wrap gap-1">
                     {things.into_iter().map(|t| {

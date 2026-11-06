@@ -8,6 +8,7 @@ use leptos::task::spawn_local;
 use serde_json::json;
 
 use crate::api;
+use crate::icons::{Icon, Size, icon};
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT};
 
 const VIEWS: [(&str, &str); 12] = [
@@ -656,10 +657,29 @@ pub(crate) fn FileChip(name: String, mime: String, size: u64, href: String) -> i
     }
 }
 
-/// A file icon and a short name for a file's kind. The name and type,
-/// rather than a pictogram, distinguish its format.
+/// A format-specific icon and a short name for a file's kind. Prefer its
+/// MIME type, falling back to the extension for generic/unknown types.
 pub(crate) fn file_kind(mime: &str, name: &str) -> (AnyView, String) {
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_uppercase()).unwrap_or_default();
+    let mark = match mime {
+        "application/pdf" => Icon::FileText,
+        m if m.starts_with("image/") => Icon::Image,
+        m if m.starts_with("video/") => Icon::Film,
+        m if m.starts_with("audio/") => Icon::Music,
+        m if m.contains("spreadsheet") || m.contains("excel") || m == "text/csv" => Icon::Sheet,
+        m if m.contains("presentation") || m.contains("powerpoint") => Icon::Presentation,
+        m if m.contains("zip") || m.contains("compressed") || m.contains("tar") => Icon::FileArchive,
+        _ => match ext.as_str() {
+            "PDF" => Icon::FileText,
+            "PNG" | "JPG" | "JPEG" | "GIF" | "WEBP" | "SVG" | "HEIC" | "AVIF" => Icon::Image,
+            "MP4" | "MOV" | "WEBM" | "MKV" | "AVI" => Icon::Film,
+            "MP3" | "WAV" | "M4A" | "OGG" | "FLAC" | "AAC" => Icon::Music,
+            "CSV" | "TSV" | "XLS" | "XLSX" | "ODS" => Icon::Sheet,
+            "PPT" | "PPTX" | "ODP" => Icon::Presentation,
+            "ZIP" | "TAR" | "GZ" | "TGZ" | "BZ2" | "XZ" | "7Z" | "RAR" | "ZST" => Icon::FileArchive,
+            _ => Icon::File,
+        },
+    };
     let kind = if mime == "application/pdf" {
         "PDF".into()
     } else if ext.is_empty() {
@@ -676,7 +696,7 @@ pub(crate) fn file_kind(mime: &str, name: &str) -> (AnyView, String) {
     } else {
         ext
     };
-    (crate::icons::file().into_any(), kind)
+    (icon(mark, Size::S16).into_any(), kind)
 }
 
 /// "230 KB", "1.4 MB".
@@ -890,23 +910,33 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn file_chips_draw_one_icon_and_keep_the_formats_in_words() {
+    fn file_chips_draw_their_type_icon_and_keep_the_formats_in_words() {
         let owner = Owner::new();
         owner.with(|| {
-            for (mime, name, kind) in [
-                ("application/pdf", "report", "PDF"),
-                ("image/png", "picture", "Image"),
-                ("video/mp4", "movie", "Video"),
-                ("audio/mpeg", "recording", "Audio"),
-                ("text/csv", "table", "Spreadsheet"),
-                ("application/vnd.ms-powerpoint", "deck", "Slides"),
-                ("application/zip", "archive", "Archive"),
-                ("text/plain", "notes", "File"),
-                ("image/png", "picture.png", "PNG"),
+            for (mime, name, kind, expected) in [
+                ("application/pdf", "report", "PDF", Icon::FileText),
+                ("image/png", "picture", "Image", Icon::Image),
+                ("video/mp4", "movie", "Video", Icon::Film),
+                ("audio/mpeg", "recording", "Audio", Icon::Music),
+                ("text/csv", "table", "Spreadsheet", Icon::Sheet),
+                ("application/vnd.ms-powerpoint", "deck", "Slides", Icon::Presentation),
+                ("application/zip", "archive", "Archive", Icon::FileArchive),
+                ("text/plain", "notes", "File", Icon::File),
+                ("image/png", "picture.png", "PNG", Icon::Image),
+                ("application/octet-stream", "picture.jpg", "JPG", Icon::Image),
+                ("application/octet-stream", "report.PDF", "PDF", Icon::FileText),
+                ("application/octet-stream", "movie.mp4", "MP4", Icon::Film),
+                ("application/octet-stream", "recording.mp3", "MP3", Icon::Music),
+                ("application/octet-stream", "table.xlsx", "XLSX", Icon::Sheet),
+                ("application/octet-stream", "deck.pptx", "PPTX", Icon::Presentation),
+                ("application/octet-stream", "archive.tar.gz", "GZ", Icon::FileArchive),
+                ("application/octet-stream", "unknown.bin", "BIN", Icon::File),
+                ("image/png", "odd-name.pdf", "PDF", Icon::Image),
             ] {
                 assert_eq!(file_kind(mime, name).1, kind);
+                assert_eq!(file_kind(mime, name).0.to_html(), icon(expected, Size::S16).to_html(), "{mime}/{name}");
                 let html = view! { <FileChip name=name.into() mime=mime.into() size=42 href="/file".into() /> }.to_html();
-                assert!(html.contains("<svg"), "{html}");
+                assert_eq!(html.matches("<svg").count(), 1, "keep the type icon: {html}");
                 assert!(html.contains(kind), "{html}");
                 crate::icons::tests::assert_no_icon_glyphs(&html);
             }

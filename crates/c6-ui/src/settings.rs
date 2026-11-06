@@ -1016,7 +1016,7 @@ fn Apps() -> impl IntoView {
                             // Waiting on your answer: in the console's Decisions.
                             {matches!(i.state.as_str(), "installing" | "upgrading" | "removing").then(|| view! {
                                 <a rel="external" href="/admin/decisions" class="rounded bg-amber-100 px-1.5 text-xs text-amber-900 hover:underline dark:bg-amber-950 dark:text-amber-200">
-                                    {format!("Waiting for your answer{}", i.decision.map(|d| format!(" (#{d})")).unwrap_or_default())}" "{crate::icons::arrow_right()}
+                                    {format!("Waiting for your answer{}", i.decision.map(|d| format!(" (#{d})")).unwrap_or_default())}" "{crate::icons::icon(crate::icons::Icon::ArrowUpRight, crate::icons::Size::S14)}
                                 </a>
                             })}
                             {(!i.problems.is_empty()).then(|| view! { <span class="w-full text-xs text-red-600">{i.problems.join("; ")}</span> })}
@@ -2085,7 +2085,7 @@ fn ConnectionRow(
                 <div class="font-medium">{c.name.clone()}</div>
                 {move || check.get().map(|r| match r {
                     Ok(m) => view! { <div class="text-xs text-emerald-700 dark:text-emerald-400">{crate::icons::check()}" "{format!("Connected · {} models", m.len())}</div> }.into_any(),
-                    Err(e) => view! { <div class="text-xs text-red-600">{crate::icons::x()}" "{e}</div> }.into_any(),
+                    Err(e) => view! { <div class="text-xs text-red-600">{crate::icons::icon(crate::icons::Icon::CircleX, crate::icons::Size::S14)}" "{e}</div> }.into_any(),
                 })}
                 <div class="truncate font-mono text-xs text-muted">
                     {kind_label(&c.kind)} {(!matches!(c.kind.as_str(), "claude_code" | "pool")).then(|| format!(" · {}", c.base_url))}
@@ -2255,7 +2255,7 @@ fn AddConnection(all: Signal<Vec<Connection>>, on_added: impl Fn() + Copy + Send
                         {(!models.is_empty()).then(|| view! { <span class="text-muted">" (listed in the model field)"</span> })}
                     </p>
                 }.into_any(),
-                Err(e) => view! { <p class="text-sm text-red-600">{crate::icons::x()}" "{e}</p> }.into_any(),
+                Err(e) => view! { <p class="text-sm text-red-600">{crate::icons::icon(crate::icons::Icon::CircleX, crate::icons::Size::S14)}" "{e}</p> }.into_any(),
             })}
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             <div class="flex justify-end gap-2">
@@ -2349,7 +2349,7 @@ fn ChatGptSignIn(
                 Some(u) => view! {
                     <div class="space-y-2 text-sm">
                         <p class="text-zinc-600 dark:text-zinc-400">
-                            "Approve access in the tab that opened (or " <a class="underline" href=u target="_blank">"open it again"</a> "). "
+                            "Approve access in the tab that opened (or " <a class="underline" href=u target="_blank">"open it again "{crate::icons::icon(crate::icons::Icon::ExternalLink, crate::icons::Size::S14)}</a> "). "
                             "If this browser runs on the head's machine, you'll come straight back here. Otherwise the tab ends on a page that "
                             "fails to load: copy its full address and paste it below."
                         </p>
@@ -2507,7 +2507,7 @@ fn WorkflowRunsPanel() -> impl IntoView {
                                                 title=tip>
                                                 {format!("{} · {}", s.id, s.status)}
                                                 {sessions.into_iter().map(|sid| view! {
-                                                    <button class="underline" title="Open the session" on:click=move |_| ws.open(None, crate::workspace::View::session(sid.clone()), crate::workspace::How::Beside)>{crate::icons::square_arrow_out()}</button>
+                                                    <button class="underline" title="Open the session" on:click=move |_| ws.open(None, crate::workspace::View::session(sid.clone()), crate::workspace::How::Beside)>{crate::icons::icon(crate::icons::Icon::ArrowUpRight, crate::icons::Size::S14)}</button>
                                                 }).collect_view()}
                                             </span>
                                             {waiting.then(|| view! {

@@ -123,7 +123,7 @@ fn elsewhere_text(e: &AttentionElsewhere) -> String {
 }
 
 fn elsewhere_line(e: &AttentionElsewhere) -> impl IntoView {
-    view! { {elsewhere_text(e)}" "{crate::icons::arrow_right()} }
+    view! { {elsewhere_text(e)}" "{crate::icons::arrow_up_right()} }
 }
 
 #[component]
@@ -229,10 +229,7 @@ pub fn NeedsYou(#[prop(optional)] labelled: bool, #[prop(optional)] touch: bool)
                 }>
                 // A small bell, tight against its number.
                 <span class=pill_class>
-                    <svg viewBox="0 0 12 12" class="h-2.5 w-2.5 shrink-0" fill="currentColor" aria-hidden="true">
-                        <path d="M2 9h8l-1.4-2V5a2.6 2.6 0 0 0-5.2 0v2z" />
-                        <circle cx="6" cy="10.4" r="1.1" />
-                    </svg>
+                    {crate::icons::icon(crate::icons::Icon::Bell, crate::icons::Size::S14)}
                     {number}
                 </span>
                 {labelled.then_some("Needs you")}

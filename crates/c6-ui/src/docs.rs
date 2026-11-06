@@ -183,8 +183,8 @@ fn chips_html(text: &str, attrs: &Value, refs: &std::collections::HashMap<String
                     "<button type=\"button\" data-ref=\"{}\" title=\"{}\" class=\"{CHIP} bg-emerald-50 text-emerald-800 hover:underline dark:bg-emerald-950/40 dark:text-emerald-300\">{} {}{}</button>",
                     esc(&r),
                     esc(&r),
-                    crate::icons::html::arrow_up_right(),
                     esc(&title),
+                    crate::icons::html::arrow_up_right(),
                     if state.is_empty() {
                         String::new()
                     } else {
@@ -650,8 +650,8 @@ pub fn DocsPage() -> impl IntoView {
             </header>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             <div class="flex flex-wrap items-center gap-2">
-                <button class=BUTTON on:click=move |_| making.set(Some("doc"))>"+ New doc"</button>
-                <button class=BUTTON_QUIET on:click=move |_| making.set(Some("deck"))>"+ New deck"</button>
+                <button class=BUTTON on:click=move |_| making.set(Some("doc"))>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" New doc"</button>
+                <button class=BUTTON_QUIET on:click=move |_| making.set(Some("deck"))>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" New deck"</button>
                 <label class=format!("{BUTTON_QUIET} cursor-pointer") title="A Word, OpenDocument, PowerPoint, HTML or Markdown file becomes a doc or a deck">
                     {move || if importing.get() { "Importing…" } else { "Import…" }}
                     <input type="file" class="hidden" accept=".docx,.odt,.pptx,.html,.htm,.md,.markdown,.txt" on:change=import_file />
@@ -702,7 +702,7 @@ pub fn DocsPage() -> impl IntoView {
                                     {(d.pending > 0).then(|| view! {
                                         <span class="shrink-0 rounded bg-violet-100 px-1.5 text-[11px] text-violet-800 dark:bg-violet-900/40 dark:text-violet-300"
                                             title=format!("Still being written by {}", d.writers.iter().map(|w| author_named(w)).collect::<Vec<_>>().join(", "))>
-                                            {crate::icons::pencil()}" "{format!("{} to write", d.pending)}
+                                            {crate::icons::icon(crate::icons::Icon::PenLine, crate::icons::Size::S14)}" "{format!("{} to write", d.pending)}
                                         </span>
                                     })}
                                     {d.labels.iter().map(|l| view! { <span class="shrink-0 text-[11px] text-muted">{format!("#{l}")}</span> }).collect_view()}
@@ -1416,11 +1416,11 @@ pub fn DocPage(id: String) -> impl IntoView {
                     <button data-opens="comments" class=move || format!("{BAR} {}", if panel.get() { "bg-zinc-100 dark:bg-zinc-800" } else { "" })
                         title=move || if panel.get() { "Hide the comments" } else { "Show the comments" }
                         on:click=move |_| panel.update(|p| *p = !*p)>
-                        {crate::icons::message()}" "{move || match open_n.get() { 0 => "Comments".to_owned(), n => format!("{n} open") }}
+                        {crate::icons::icon(crate::icons::Icon::MessageSquare, crate::icons::Size::S14)}" "{move || match open_n.get() { 0 => "Comments".to_owned(), n => format!("{n} open") }}
                     </button>
                     // A comment on the whole doc, wherever you've scrolled to.
                     <button data-opens="comments" class=BAR title="Comment on the whole doc"
-                        on:click=move |_| { panel.set(true); threads.focus.set(Some(String::new())); threads.commenting.set(Some(String::new())); }>"+ Comment"</button>
+                        on:click=move |_| { panel.set(true); threads.focus.set(Some(String::new())); threads.commenting.set(Some(String::new())); }>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" Comment"</button>
                     {move || (unsent.get() > 0).then(|| send_all_button(threads, true))}
                     {move || (!is_deck.get()).then(|| view! {
                         <button class=move || format!("{BAR} {}", if edit_all.get() { "bg-zinc-100 font-medium dark:bg-zinc-800" } else { "" })
@@ -1451,7 +1451,7 @@ pub fn DocPage(id: String) -> impl IntoView {
                 </p>
                 {move || summary.with(|s| (s.pending > 0).then(|| view! {
                     <p class="text-sm text-violet-700 dark:text-violet-300">
-                        {crate::icons::pencil()}" "{format!("Being written by {}: {} {} to go", s.writers.iter().map(|w| author_named(w)).collect::<Vec<_>>().join(", "), s.pending, if s.pending == 1 { "part" } else { "parts" })}
+                        {crate::icons::icon(crate::icons::Icon::PenLine, crate::icons::Size::S14)}" "{format!("Being written by {}: {} {} to go", s.writers.iter().map(|w| author_named(w)).collect::<Vec<_>>().join(", "), s.pending, if s.pending == 1 { "part" } else { "parts" })}
                     </p>
                 }))}
             </header>
@@ -1494,7 +1494,7 @@ pub fn DocPage(id: String) -> impl IntoView {
                                     on:keydown=move |ev| if ev.key() == "Enter" && (ev.meta_key() || ev.ctrl_key()) { add_block() } else if ev.key() == "Escape" { ev.prevent_default(); adding_open.set(false) } />
                                 <div class="flex items-center justify-end gap-2">
                                     <label class=format!("{BUTTON_QUIET} cursor-pointer text-xs") title="A picture shows in the doc; any other file is a link to download">
-                                        {move || if attaching.get() { "Adding…" } else { "+ Picture or file" }}
+                                        {move || if attaching.get() { "Adding…".into_any() } else { view! { {crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" Picture or file" }.into_any() }}
                                         <input type="file" class="hidden" on:change=attach_file />
                                     </label>
                                     <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| adding_open.set(false)>"Cancel"</button>
@@ -1505,10 +1505,10 @@ pub fn DocPage(id: String) -> impl IntoView {
                     } else {
                         view! {
                             <div class="flex flex-wrap items-center gap-x-2 rounded-md border border-dashed border-zinc-300 px-3 py-2 text-sm text-muted dark:border-zinc-700">
-                                <button class="hover:text-zinc-900 dark:hover:text-zinc-100" on:click=move |_| adding_open.set(true)>"+ Add a block at the end"</button>
+                                <button class="hover:text-zinc-900 dark:hover:text-zinc-100" on:click=move |_| adding_open.set(true)>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" Add a block at the end"</button>
                                 <span aria-hidden="true">"·"</span>
                                 <label class="cursor-pointer hover:text-zinc-900 dark:hover:text-zinc-100" title="A picture shows in the doc; any other file is a link to download">
-                                    {move || if attaching.get() { "Adding…" } else { "+ Picture or file" }}
+                                    {move || if attaching.get() { "Adding…".into_any() } else { view! { {crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" Picture or file" }.into_any() }}
                                     <input type="file" class="hidden" on:change=attach_file />
                                 </label>
                             </div>
@@ -1689,15 +1689,15 @@ fn CommentsPanel() -> impl IntoView {
                 <button class=move || seg(resolved.get()) aria-pressed=move || resolved.get().to_string() on:click=move |_| resolved.set(true)>"Resolved"</button>
             </div>
             <button class="rounded px-1.5 text-lg leading-none text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
-                title="Close" aria-label="Close the comments" on:click=move |_| ctx.panel.set(false)>"×"</button>
+                title="Close" aria-label="Close the comments" on:click=move |_| ctx.panel.set(false)>{crate::icons::icon(crate::icons::Icon::X, crate::icons::Size::S14)}</button>
         </div>
         <div class="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain p-3 text-sm">
             <button class="text-xs text-muted hover:text-zinc-900 hover:underline dark:hover:text-zinc-100"
-                on:click=move |_| { ctx.focus.set(Some(String::new())); ctx.commenting.set(Some(String::new())) }>"+ On the whole tab"</button>
+                on:click=move |_| { ctx.focus.set(Some(String::new())); ctx.commenting.set(Some(String::new())) }>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" On the whole tab"</button>
             {move || new_on.get().map(|b| view! { <NewComment block=b done=Callback::new(move |()| ctx.commenting.set(None)) /> })}
             <For each=move || ids.get() key=|id| id.clone() children=move |id| view! { <Thread id about=true /> } />
             {move || ids.with(Vec::is_empty).then(|| view! {
-                <p class="text-muted">{if resolved.get() { view! { "No resolved comments." }.into_any() } else { view! { "No open comments. Press "{crate::icons::message()}" by a block to start one." }.into_any() }}</p>
+                <p class="text-muted">{if resolved.get() { view! { "No resolved comments." }.into_any() } else { view! { "No open comments. Press "{crate::icons::icon(crate::icons::Icon::MessageSquare, crate::icons::Size::S14)}" by a block to start one." }.into_any() }}</p>
             })}
         </div>
         {move || (ctx.unsent.get() > 0).then(|| view! {
@@ -1749,9 +1749,9 @@ fn PopBody(block: String) -> impl IntoView {
     view! {
         <div class="flex items-center justify-end gap-2 text-xs">
             <button class="text-muted hover:text-zinc-900 hover:underline dark:hover:text-zinc-100"
-                on:click=move |_| { ctx.close_pop(); ctx.panel.set(true); }>"All comments ›"</button>
+                on:click=move |_| { ctx.close_pop(); ctx.panel.set(true); }>"All comments "{crate::icons::icon(crate::icons::Icon::ArrowUpRight, crate::icons::Size::S14)}</button>
             <button class="rounded px-1 text-base leading-none text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
-                title="Close" aria-label="Close" on:click=move |_| close.run(())>"×"</button>
+                title="Close" aria-label="Close" on:click=move |_| close.run(())>{crate::icons::icon(crate::icons::Icon::X, crate::icons::Size::S14)}</button>
         </div>
         <For each=move || ids.get() key=|id| id.clone() children=move |id| view! { <Thread id about=false /> } />
         {move || if writing.get() {
@@ -1759,7 +1759,7 @@ fn PopBody(block: String) -> impl IntoView {
         } else {
             view! {
                 <button class="text-xs text-muted hover:text-zinc-900 hover:underline dark:hover:text-zinc-100"
-                    on:click=move |_| { ctx.focus.set(Some(bid.get_value())); ctx.commenting.set(Some(bid.get_value())) }>"+ New thread on this block"</button>
+                    on:click=move |_| { ctx.focus.set(Some(bid.get_value())); ctx.commenting.set(Some(bid.get_value())) }>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" New thread on this block"</button>
             }.into_any()
         }}
     }
@@ -2011,11 +2011,11 @@ fn BlockView(
                 {move || match open_n.get() {
                     0 => view! {
                         <button class="invisible rounded px-1 text-xs text-muted hover:bg-zinc-100 group-hover:visible pointer-coarse:visible dark:hover:bg-zinc-800"
-                            title="Comment on this" aria-label="Comment on this block" on:click=move |ev| marker(ev, true)>{crate::icons::message()}</button>
+                            title="Comment on this" aria-label="Comment on this block" on:click=move |ev| marker(ev, true)>{crate::icons::icon(crate::icons::Icon::MessageSquare, crate::icons::Size::S14)}</button>
                     }.into_any(),
                     n => view! {
                         <button class=move || format!("rounded px-1 text-xs font-medium text-soft hover:bg-zinc-100 dark:hover:bg-zinc-800 {}", if popped.get() { "bg-zinc-100 dark:bg-zinc-800" } else { "" })
-                            title="Its comments" on:click=move |ev| marker(ev, false)>{crate::icons::message()}" "{n}</button>
+                            title="Its comments" on:click=move |ev| marker(ev, false)>{crate::icons::icon(crate::icons::Icon::MessageSquare, crate::icons::Size::S14)}" "{n}</button>
                     }.into_any(),
                 }}
             </div>
@@ -2031,7 +2031,7 @@ fn Shown(b: DocBlock, kind: String) -> impl IntoView {
             let who = b.attrs["by"].as_str().map(author_named).unwrap_or_else(|| "an agent".into());
             view! {
                 <div class="rounded border border-dashed border-violet-300 px-3 py-2 text-sm text-violet-800 dark:border-violet-800 dark:text-violet-300">
-                    <span class="animate-pulse">{crate::icons::pencil()}" "</span>{b.attrs["intent"].as_str().unwrap_or("").to_owned()}
+                    <span class="animate-pulse">{crate::icons::icon(crate::icons::Icon::PenLine, crate::icons::Size::S14)}" "</span>{b.attrs["intent"].as_str().unwrap_or("").to_owned()}
                     <span class="text-xs text-violet-500">{format!(" — {who} is writing this")}</span>
                 </div>
             }
@@ -2755,9 +2755,7 @@ fn Thread(id: String, about: bool) -> impl IntoView {
                 // Send, as the message box's: a soft square, sky once there's text.
                 <button class=move || format!("absolute bottom-1.5 right-1.5 flex h-[22px] w-[22px] items-center justify-center rounded-md {}", if reply.with(|r| r.trim().is_empty()) { "bg-zinc-600 text-zinc-200" } else { "bg-sky-600 text-white" })
                     title="Send the reply (Enter)" aria-label="Send the reply" on:click=move |_| send()>
-                    <svg viewBox="0 0 16 16" class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                        <path d="M8 13V3M3.5 7.5 8 3l4.5 4.5" />
-                    </svg>
+                    {crate::session::send_icon()}
                 </button>
             </div>
             <div class="flex items-center gap-2">

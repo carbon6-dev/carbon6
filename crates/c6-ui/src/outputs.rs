@@ -4,6 +4,7 @@
 use c6_api::{Event, EventKind};
 use leptos::prelude::*;
 
+use crate::icons::{Icon, Size, icon};
 use crate::util::BUTTON_QUIET;
 
 #[derive(Clone, PartialEq)]
@@ -101,7 +102,7 @@ pub fn Outputs(session: String, events: RwSignal<Vec<Event>>, chosen: RwSignal<O
                                     {versions.iter().enumerate().rev().map(|(i, x)| view! { <option value=x.seq.to_string()>{format!("v{}{}", i + 1, if i + 1 == n { " (latest)" } else { "" })}</option> }).collect_view()}
                                 </select>
                             })}
-                            <a class=format!("{BUTTON_QUIET} text-xs") href=u.clone() target="_blank" rel="noopener">"Open "{crate::icons::arrow_up_right()}</a>
+                            <a class=format!("{BUTTON_QUIET} text-xs") href=u.clone() target="_blank" rel="noopener">"Open "{icon(Icon::ExternalLink, Size::S14)}</a>
                             <a class=format!("{BUTTON_QUIET} text-xs") href=format!("{u}?download=1")>"Download"</a>
                         </div>
                         <Preview url=u mime=v.mime.clone() />
@@ -186,7 +187,7 @@ pub fn published_line(session: &str, seq: u64, name: &str, title: &str, mime: &s
                 <span>"Published"</span>
                 <span class="font-medium text-zinc-700 dark:text-zinc-300">{title.to_owned()}</span>
                 <span class="font-mono">{format!("{name} · {}", size(size_bytes))}</span>
-                <a class="underline" href=u.clone() target="_blank" rel="noopener">"open"</a>
+                <a class="underline" href=u.clone() target="_blank" rel="noopener">"open "{icon(Icon::ExternalLink, Size::S14)}</a>
                 <span>"· see Outputs ("{crate::icons::ellipsis()}")"</span>
             </p>
             {image.then(|| view! {
@@ -197,4 +198,25 @@ pub fn published_line(session: &str, seq: u64, name: &str, title: &str, mime: &s
         </div>
     }
     .into_any()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn published_output_links_keep_the_external_arrow_and_existing_icons() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let html = published_line("s1", 1, "report.txt", "Report", "text/plain", 42).to_html();
+            let arrow = icon(Icon::ExternalLink, Size::S14).to_html();
+            let link = html.split("<a ").nth(1).unwrap().split("</a>").next().unwrap();
+            assert!(link.contains("target=\"_blank\""), "{html}");
+            assert!(link.contains(&arrow), "the link keeps its 14px external arrow: {html}");
+            assert!(html.contains(&crate::icons::package().to_html()), "keep the published icon: {html}");
+            assert!(html.contains(&crate::icons::ellipsis().to_html()), "keep the Outputs menu icon: {html}");
+            assert_eq!(html.matches("<svg").count(), 3, "{html}");
+        });
+    }
 }

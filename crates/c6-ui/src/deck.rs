@@ -11,6 +11,7 @@ use leptos::task::spawn_local;
 use serde_json::Map;
 
 use crate::api;
+use crate::icons::{Icon, Size, icon};
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT};
 
 /// Markdown for a slide's blocks (raw HTML shown as text; html slides are
@@ -271,7 +272,7 @@ pub fn DeckView(
                             </div>
                         }
                     }).collect_view()}
-                    <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| add_after()>"+ Slide"</button>
+                    <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| add_after()>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" Slide"</button>
                 </div>
                 // The slide being edited.
                 <div class="min-w-0 flex-1 space-y-2" node_ref=main_ref>
@@ -289,7 +290,7 @@ pub fn DeckView(
                             </div>
                             <div class="flex flex-wrap items-center gap-2 text-sm">
                                 <span class="text-muted">{format!("Slide {} of {total}", i + 1)}</span>
-                                {let c = s.id.clone(); view! { <button class=BUTTON_QUIET title="Comment on this slide" on:click=move |_| commenting.set(Some(c.clone()))>{crate::icons::message()}</button> }}
+                                {let c = s.id.clone(); view! { <button class=BUTTON_QUIET title="Comment on this slide" on:click=move |_| commenting.set(Some(c.clone()))>{icon(Icon::MessageSquare, Size::S16)}</button> }}
                                 {(!pending).then(|| view! {
                                     <select class=format!("{INPUT} w-auto!") title="Its layout" on:change=move |ev| {
                                         send.run(vec![replace_slide(&sid, Some(event_target_value(&ev)), None, None)]);
@@ -302,7 +303,7 @@ pub fn DeckView(
                                     </label>
                                     <button class=BUTTON_QUIET on:click=move |_| edit_slide()>"Edit slide"</button>
                                 })}
-                                {pending.then(|| view! { <span class="text-violet-700 dark:text-violet-300">{crate::icons::pencil()}" "{format!("being written by {}", crate::docs::author(s.attrs["by"].as_str().unwrap_or("")))}</span> })}
+                                {pending.then(|| view! { <span class="text-violet-700 dark:text-violet-300">{icon(Icon::PenLine, Size::S14)}" "{format!("being written by {}", crate::docs::author(s.attrs["by"].as_str().unwrap_or("")))}</span> })}
                                 <span class="flex-1"></span>
                                 <button class="text-xs text-muted hover:text-red-600" title="Delete this slide"
                                     on:click=move |_| send.run(vec![DocOp::Delete { id: sid3.clone(), if_rev: Some(rev), if_hash: Some(hash.clone()) }])>"Delete slide"</button>
@@ -518,7 +519,7 @@ pub fn ThemesSetting() -> impl IntoView {
                 <button class=BUTTON_QUIET on:click=move |_| list.update(|l| {
                     let base = l.first().cloned().unwrap_or_default();
                     l.push(DeckTheme { name: format!("Theme {}", l.len() + 1), mood: String::new(), css: base.css });
-                })>"+ Theme"</button>
+                })>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" Theme"</button>
                 <button class=BUTTON on:click=move |_| save()>"Save themes"</button>
                 {move || saved.get().then(|| view! { <span class="self-center text-sm text-emerald-700">"Saved"</span> })}
             </div>

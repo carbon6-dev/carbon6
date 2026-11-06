@@ -7,6 +7,7 @@ use leptos::task::spawn_local;
 
 use crate::api;
 use crate::icons;
+use crate::icons::{Icon, Size, icon};
 use crate::session::{ModelPicker, SEND, SEND_EMPTY, SEND_READY, SEND_SHAPE, send_icon};
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, GROWS, INPUT, StatusPill, ago, clock, escapable, storage_get, storage_set};
 use crate::workspace::{Go, How, Popover, View, below, use_column, use_workspace};
@@ -115,7 +116,7 @@ fn home_form(path: &str) -> String {
     }
 }
 
-/// Where and how a new session runs, in one line: "on thalassa ·
+/// Native title text for where and how a new session runs: "on thalassa ·
 /// ~/projects/carbon6 · opus · high"; `short` (a phone's chip):
 /// "thalassa · carbon6 · opus".
 fn summary(worker: &str, ssh: Option<&str>, folder: &str, model: &str, effort: &str, short: bool) -> String {
@@ -131,6 +132,27 @@ fn summary(worker: &str, ssh: Option<&str>, folder: &str, model: &str, effort: &
     parts.extend([model, if short { "" } else { effort }].into_iter().filter(|x| !x.is_empty()).map(str::to_owned));
     let line = parts.join(" · ");
     if short { line } else { format!("on {line}") }
+}
+
+/// A visible relationship, without interpreting symbols inside either name.
+pub(crate) fn relationship_label(before: String, after: String) -> impl IntoView {
+    view! { {before}" "{icon(Icon::ArrowLeftRight, Size::S14)}" "{after} }
+}
+
+/// The visible counterpart of `summary`; native titles remain plain text.
+fn summary_label(worker: &str, ssh: Option<&str>, folder: &str, model: &str, effort: &str, short: bool) -> AnyView {
+    let Some(target) = ssh else { return summary(worker, None, folder, model, effort, short).into_any() };
+    let target = if folder.is_empty() {
+        target.to_owned()
+    } else if short {
+        format!("{target}:{}", last_part(folder))
+    } else {
+        format!("{target}:{folder}")
+    };
+    let before = if short { worker.to_owned() } else { format!("on {worker}") };
+    let rest = [model, if short { "" } else { effort }].into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" · ");
+    let rest = if rest.is_empty() { rest } else { format!(" · {rest}") };
+    view! { {relationship_label(before, target)}{rest} }.into_any()
 }
 
 /// The list's choices: Show (and its labels: the shared label filter), Sort
@@ -751,21 +773,21 @@ pub fn GroupBar(grouping: Grouping) -> impl IntoView {
                 levels.iter().enumerate().map(|(i, k)| {
                     let (outer, gone) = (levels.clone(), levels.clone());
                     view! {
-                        {(i > 0).then(|| view! { <span class="text-muted">"›"</span> })}
+                        {(i > 0).then(|| view! { <span class="text-muted">{icon(Icon::ChevronRight, Size::S14)}</span> })}
                         <span class="inline-flex items-center gap-1 rounded bg-violet-100 px-1.5 py-0.5 font-mono text-[11px] text-violet-800 dark:bg-violet-950 dark:text-violet-300">
                             {(i > 0).then(|| view! {
-                                <button title="Group by this one level further out" on:click=move |_| {
+                                <button title="Group by this one level further out" aria-label="Group by this one level further out" on:click=move |_| {
                                     let mut l = outer.clone();
                                     l.swap(i - 1, i);
                                     save(l);
-                                }>"‹"</button>
+                                }>{icon(Icon::ChevronLeft, Size::S14)}</button>
                             })}
                             {k.clone()}
                             <button title="Stop grouping by this" on:click=move |_| {
                                 let mut l = gone.clone();
                                 l.remove(i);
                                 save(l);
-                            }>"×"</button>
+                            }>{crate::icons::icon(crate::icons::Icon::X, crate::icons::Size::S14)}</button>
                         </span>
                     }
                 }).collect_view()
@@ -837,14 +859,19 @@ fn state_colour(word: &str) -> &'static str {
 
 /// A row's line of where it runs: its worker, its folder's last part and
 /// its model.
-fn where_line(worker: &str, s: &Session) -> String {
+fn where_line(worker: &str, s: &Session) -> AnyView {
     let place = match (&s.ssh, s.cwd.is_empty()) {
-        (Some(t), true) => format!("⇄ {t}"),
-        (Some(t), false) => format!("⇄ {t}:{}", last_part(&s.cwd)),
-        (None, true) => "scratch folder".to_owned(),
-        (None, false) => last_part(&s.cwd),
+        (Some(t), empty) => {
+            let target = if empty { t.clone() } else { format!("{t}:{}", last_part(&s.cwd)) };
+            relationship_label(worker.to_owned(), target).into_any()
+        }
+        (None, empty) => {
+            let folder = if empty { "scratch folder".to_owned() } else { last_part(&s.cwd) };
+            [worker, folder.as_str()].into_iter().filter(|x| !x.is_empty()).collect::<Vec<_>>().join(" · ").into_any()
+        }
     };
-    [worker, place.as_str(), s.model.as_str()].into_iter().filter(|x| !x.is_empty()).collect::<Vec<_>>().join(" · ")
+    let model = if s.model.is_empty() { String::new() } else { format!(" · {}", s.model) };
+    view! { {place}{model} }.into_any()
 }
 
 /// A session in the list: its mark, title, state and when it was last
@@ -858,6 +885,7 @@ fn SessionRow(s: Session, now: RwSignal<i64>, hover: Hover) -> impl IntoView {
     let updated = s.updated_at;
     let word = recent_state(&s).1;
     let mark = crate::marks::fill(&crate::marks::of(&s));
+    // Native hover text stays plain; `where_line` draws the visible relationship.
     let place = match (&s.ssh, s.cwd.is_empty()) {
         (Some(t), _) => format!("{worker} ⇄ {t}:{}", s.cwd),
         (None, true) => format!("{worker}: a scratch folder"),
@@ -1138,12 +1166,13 @@ fn RailCard(s: Session, hover: Hover, like_this: RwSignal<Option<SessionSeed>>, 
     });
     let (open_id, tile_id) = (s.id.clone(), s.id.clone());
     let place = match (&s.ssh, s.cwd.is_empty()) {
-        (Some(t), _) => format!("⇄ {t}:{}", s.cwd),
-        (None, true) => "scratch workspace".to_owned(),
+        (Some(t), _) => relationship_label(String::new(), format!("{t}:{}", s.cwd)).into_any(),
+        (None, true) => "scratch workspace".into_any(),
         (None, false) => c6_api::labels::display_labels(&s.auto_labels)
             .iter()
             .find_map(|l| l.strip_prefix("folder:").map(str::to_owned))
-            .unwrap_or_else(|| s.cwd.clone()),
+            .unwrap_or_else(|| s.cwd.clone())
+            .into_any(),
     };
     let act = "rounded-md border border-zinc-200 px-2 py-1 text-xs hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800";
     view! {
@@ -1164,7 +1193,7 @@ fn RailCard(s: Session, hover: Hover, like_this: RwSignal<Option<SessionSeed>>, 
             {s.awaiting_approval.then(|| view! { <p class="text-xs font-medium text-amber-600">"A tool call waits for your approval"</p> })}
             <div class="space-y-0.5 text-xs text-muted">
                 <div class="truncate"><span title=s.on_head.then_some(api::HEAD_TITLE)>{worker}</span> " · " {move || current.get().model}</div>
-                <div class="break-all font-mono">{place.clone()}</div>
+                <div class="break-all font-mono">{place}</div>
                 <div>{move || format!("active {}", ago(now.get() - current.get().updated_at))}</div>
             </div>
             {(!s.labels.is_empty() || !crate::labels::shown_auto(&s.auto_labels).is_empty()).then(|| view! {
@@ -1281,10 +1310,11 @@ pub fn SaveTemplateDialog(seed: SessionSeed, #[prop(into)] on_close: Callback<()
     let agents = RwSignal::new(true);
     let worktree = RwSignal::new(seed.worktree);
     let status = RwSignal::new(None::<Result<String, String>>);
-    let place = match &seed.ssh {
-        Some(t) => format!("{worker} ⇄ {t}:{}", seed.cwd),
-        None if seed.cwd.is_empty() => format!("{worker}: a scratch folder"),
-        None => format!("{worker}:{}", seed.cwd),
+    let (place_worker, place_target, place_folder) = (worker.clone(), seed.ssh.clone(), seed.cwd.clone());
+    let place = move || match &place_target {
+        Some(t) => relationship_label(place_worker.clone(), format!("{t}:{place_folder}")).into_any(),
+        None if place_folder.is_empty() => format!("{place_worker}: a scratch folder").into_any(),
+        None => format!("{place_worker}:{place_folder}").into_any(),
     };
     let model = if seed.model.is_empty() { "by routing rules".to_owned() } else { seed.model.clone() };
     let seed = StoredValue::new(seed);
@@ -1890,7 +1920,10 @@ fn SessionForm(
         let folder = if on_ssh { remote_dir.get().trim().to_owned() } else { cwd.get() };
         let effort = if effort_supported() { effort.get() } else { String::new() };
         let target = if target.is_empty() { "an SSH host".to_owned() } else { target };
-        summary(&worker_label(), on_ssh.then_some(target.as_str()), &folder, &model_label(), &effort, short)
+        let worker = worker_label();
+        let model = model_label();
+        let target = on_ssh.then_some(target.as_str());
+        (summary(&worker, target, &folder, &model, &effort, short), summary_label(&worker, target, &folder, &model, &effort, short))
     };
     let template_label = |t: &c6_api::RealmTemplate| {
         if t.realm == "home" { t.template.name.clone() } else { format!("{} ({})", t.template.name, t.realm) }
@@ -1945,7 +1978,7 @@ fn SessionForm(
                                 {if image {
                                     view! { <img class="h-10 w-10 rounded object-cover" src=format!("data:{};base64,{}", a.mime, a.data) /> }.into_any()
                                 } else {
-                                    view! { <span class="px-1">{crate::icons::file()}</span> }.into_any()
+                                    view! { <span class="px-1">{crate::icons::icon(crate::icons::Icon::File, crate::icons::Size::S14)}</span> }.into_any()
                                 }}
                                 <span class="max-w-40 truncate">{a.name.clone()}</span>
                                 <button type="button" class="text-muted hover:text-zinc-900 dark:hover:text-zinc-100" title="Remove"
@@ -1982,9 +2015,7 @@ fn SessionForm(
                     <button type="button" class="flex size-6.5 shrink-0 items-center justify-center rounded-md text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
                         title="Attach images or files (or paste / drop them)" aria-label="Attach images or files"
                         on:click=move |_| { if let Some(i) = picker.get_untracked() { i.click(); } }>
-                        <svg viewBox="0 0 16 16" class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
-                            <path d="M8 2.5v11M2.5 8h11" />
-                        </svg>
+                        {crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}
                     </button>
                 })}
                 <input node_ref=picker type="file" multiple class="hidden"
@@ -2000,14 +2031,17 @@ fn SessionForm(
                             on:click=move |_| pick_template(None)>{icons::x()}</button>
                     }.into_any(),
                     None => view! {
-                        <span class="hidden min-w-0 truncate text-xs text-muted md:inline" title=move || line(false)>{move || line(false)}</span>
+                        <span class="hidden min-w-0 truncate text-xs text-muted md:inline" title=move || line(false).0>{move || line(false).1}</span>
                     }.into_any(),
                 }}
                 // A phone's one chip, opening every field in a sheet.
                 <button data-pop=fields_pop.clone() aria-haspopup="dialog" aria-expanded=move || changing.get().to_string()
                     class="inline-flex h-8 min-w-0 items-center gap-1 rounded-md border border-zinc-200 px-2 text-xs text-soft md:hidden dark:border-zinc-700"
                     title="Where and how it runs" on:click=move |_| changing.update(|c| *c = !*c)>
-                    <span class="min-w-0 truncate">{move || template.with(|t| t.as_ref().map(template_label)).unwrap_or_else(|| line(true))}</span>
+                    <span class="min-w-0 truncate">{move || match template.with(|t| t.as_ref().map(template_label)) {
+                        Some(label) => label.into_any(),
+                        None => line(true).1,
+                    }}</span>
                     <span class="text-muted">{crate::icons::chevron_down()}</span>
                 </button>
                 <button type="button" role="switch" aria-checked=move || worktree.get().to_string()
@@ -2327,6 +2361,32 @@ mod tests {
         assert_eq!(home_form("/root"), "~");
         assert_eq!(home_form("/srv/app"), "/srv/app");
         assert_eq!(last_part("/srv/app/"), "app");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn visible_remote_labels_draw_the_relation_while_native_titles_stay_text() {
+        let arrow = icon(Icon::ArrowLeftRight, Size::S14).to_html();
+        for short in [true, false] {
+            let html = summary_label("worker", Some("admin@web1"), "/srv/app", "model", "high", short).to_html();
+            assert_eq!(html.matches("<svg").count(), 1, "keep the relationship icon: {html}");
+            assert!(html.contains(&arrow), "{html}");
+            assert!(!html.contains('⇄'), "the visible label is drawn: {html}");
+            assert!(html.find("worker").unwrap() < html.find("<svg").unwrap(), "{html}");
+            assert!(html.find("<svg").unwrap() < html.find("admin@web1").unwrap(), "{html}");
+            assert!(html.contains(if short { "admin@web1:app" } else { "admin@web1:/srv/app" }), "{html}");
+            assert!(summary("worker", Some("admin@web1"), "/srv/app", "model", "high", short).contains('⇄'));
+        }
+        let local = summary_label("worker", None, "/srv/app", "model", "high", false).to_html();
+        assert_eq!(local, summary("worker", None, "/srv/app", "model", "high", false));
+
+        let mut s = session("s1", "Remote session", 0);
+        s.ssh = Some("admin@web1".into());
+        s.cwd = "/srv/app".into();
+        let row = where_line("worker", &s).to_html();
+        assert!(row.contains(&arrow), "{row}");
+        assert!(row.contains("admin@web1:app"), "{row}");
+        assert!(!row.contains('⇄'), "{row}");
     }
 
     #[test]

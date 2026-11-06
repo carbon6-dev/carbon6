@@ -8,6 +8,7 @@ use leptos::task::spawn_local;
 use serde_json::json;
 
 use crate::api;
+use crate::icons::{Icon, Size, icon};
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT};
 
 pub(crate) const DAY: f64 = 86_400_000.0;
@@ -91,8 +92,8 @@ pub fn CalendarPage() -> impl IntoView {
         <main class="mx-auto max-w-6xl space-y-3 px-3 py-3">
             <div class="flex flex-wrap items-center gap-2">
                 <button class=BUTTON_QUIET on:click=move |_| anchor.set(midnight(js_sys::Date::now()))>"Today"</button>
-                <button class=BUTTON_QUIET on:click=move |_| step(-1.0)>"‹"</button>
-                <button class=BUTTON_QUIET on:click=move |_| step(1.0)>"›"</button>
+                <button class=BUTTON_QUIET title="Previous period" aria-label="Previous period" on:click=move |_| step(-1.0)>{icon(Icon::ChevronLeft, Size::S16)}</button>
+                <button class=BUTTON_QUIET title="Next period" aria-label="Next period" on:click=move |_| step(1.0)>{icon(Icon::ChevronRight, Size::S16)}</button>
                 <span class="font-medium">{move || {
                     let d = date_of(anchor.get());
                     String::from(d.to_locale_date_string("default", &js_sys::Object::from(js_sys::JSON::parse(r#"{"month":"long","year":"numeric"}"#).unwrap())))
@@ -233,7 +234,7 @@ fn Detail(e: CalendarEvent, open: RwSignal<Option<CalendarEvent>>, refresh: RwSi
                 <button class=BUTTON_QUIET on:click=move |_| open.set(None)>"Close"</button>
             </div>
             {move || error.get().map(|x| view! { <ErrorBox message=x /> })}
-            {(!e.conference.is_empty()).then(|| view! { <a class="text-sm text-sky-700 hover:underline dark:text-sky-400" href=crate::markdown::safe_href(&e.conference) target="_blank" rel="noopener">"Join the call "{crate::icons::arrow_up_right()}</a> })}
+            {(!e.conference.is_empty()).then(|| view! { <a class="text-sm text-sky-700 hover:underline dark:text-sky-400" href=crate::markdown::safe_href(&e.conference) target="_blank" rel="noopener">"Join the call "{icon(Icon::ExternalLink, Size::S14)}</a> })}
             {(!e.description.is_empty()).then(|| view! { <pre class="max-h-48 overflow-auto whitespace-pre-wrap font-sans text-sm">{e.description.clone()}</pre> })}
             {(!e.attendees.is_empty()).then(|| view! {
                 <ul class="text-sm">
@@ -258,7 +259,7 @@ fn Detail(e: CalendarEvent, open: RwSignal<Option<CalendarEvent>>, refresh: RwSi
                     </select>
                 })}
                 <button class="text-xs text-red-600 hover:underline" on:click=delete>"Delete"</button>
-                {(!e.html_link.is_empty()).then(|| view! { <a class="text-xs text-sky-700 hover:underline dark:text-sky-400" href=crate::markdown::safe_href(&e.html_link) target="_blank" rel="noopener">"Open in Google "{crate::icons::arrow_up_right()}</a> })}
+                {(!e.html_link.is_empty()).then(|| view! { <a class="text-xs text-sky-700 hover:underline dark:text-sky-400" href=crate::markdown::safe_href(&e.html_link) target="_blank" rel="noopener">"Open in Google "{icon(Icon::ExternalLink, Size::S14)}</a> })}
             </div>
         </section>
     }

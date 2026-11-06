@@ -393,7 +393,7 @@ fn shared(r: Result<Value, String>, files: bool) -> AnyView {
         .map(|(name, href, who)| {
             view! {
                 <a href=href target="_blank" rel="noopener" class="block rounded-md px-2 py-1 hover:bg-zinc-100 dark:hover:bg-zinc-800">
-                    <div class="truncate text-xs font-medium">{if files { crate::icons::file().into_any() } else { crate::icons::link().into_any() }}" "{name}</div>
+                    <div class="truncate text-xs font-medium">{if files { crate::icons::icon(crate::icons::Icon::File, crate::icons::Size::S14).into_any() } else { crate::icons::link().into_any() }}" "{name}</div>
                     <div class="text-[11px] text-muted">{who}</div>
                 </a>
             }

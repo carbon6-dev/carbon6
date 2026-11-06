@@ -9,6 +9,7 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 use crate::api;
+use crate::icons::{Icon, Size, icon};
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT, ago, now_ms};
 use crate::workspace::{Go, How, View, use_column, use_workspace};
 
@@ -95,12 +96,12 @@ fn moved(w: &WorkItem) -> i64 {
 /// The kind of thing a ref points at, as a drawn icon.
 fn kind_mark(reference: &str) -> AnyView {
     match reference.split(':').next().unwrap_or("") {
-        "session" => crate::icons::diamond().into_any(),
+        "session" => icon(Icon::Bot, Size::S14).into_any(),
         "request" | "thread" => crate::icons::mail().into_any(),
         "chat" => crate::icons::message().into_any(),
         "decision" => crate::icons::help().into_any(),
-        "doc" => crate::icons::file().into_any(),
-        _ => crate::icons::arrow_up_right().into_any(),
+        "doc" => icon(Icon::FileText, Size::S14).into_any(),
+        _ => icon(Icon::ArrowUpRight, Size::S14).into_any(),
     }
 }
 
@@ -281,7 +282,7 @@ pub fn WorkPage() -> impl IntoView {
             </header>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             <div class="flex flex-wrap gap-2">
-                <button class=BUTTON on:click=move |_| adding.update(|a| *a = !*a)>"+ Add"</button>
+                <button class=BUTTON on:click=move |_| adding.update(|a| *a = !*a)>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" Add"</button>
                 {move || (!projects.get().is_empty()).then(|| view! {
                     <select class=format!("{INPUT} w-auto!") title="Only the work of a project"
                         on:change=move |ev| in_project.set(event_target_value(&ev))>
@@ -549,9 +550,10 @@ fn AttachedLink(l: LiveAttached) -> impl IntoView {
     let r = l.reference.clone();
     let text = view! { {kind_mark(&r)}" "{l.title} };
     if let Some(to) = attached_view(&r) {
-        view! { <Go to class=class>{text}</Go> }.into_any()
+        view! { <Go to class=class>{text}" "{icon(Icon::ArrowUpRight, Size::S14)}</Go> }.into_any()
     } else {
-        view! { <a href=r target="_blank" rel="noopener noreferrer" class=class>{text}</a> }.into_any()
+        view! { <a href=r target="_blank" rel="noopener noreferrer" class=class>{text}" "{icon(Icon::ExternalLink, Size::S14)}</a> }
+            .into_any()
     }
 }
 
@@ -793,7 +795,7 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
                                             Ok(()) => { let _ = set_timeout_with_handle(reload, std::time::Duration::from_secs(5)); }
                                             Err(e) => error.set(Some(e)),
                                         }
-                                    })>{crate::icons::rotate()}</button>
+                                    })>{icon(Icon::RefreshCw, Size::S14)}</button>
                             </div>
                             {match w.fields.note.clone() {
                                 Some(n) => view! {
@@ -838,7 +840,7 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
                                         })}
                                         {ticked_by.map(|why| view! { <span class="shrink-0 text-[11px] text-emerald-700 dark:text-emerald-400" title=why>{crate::icons::check()}" agent"</span> })}
                                         {(!t.session.is_empty()).then(|| view! {
-                                            <Go to=View::session(t.session.clone()) class="shrink-0 text-xs text-sky-700 hover:underline dark:text-sky-400">"session "{crate::icons::arrow_up_right()}</Go>
+                                            <Go to=View::session(t.session.clone()) class="shrink-0 text-xs text-sky-700 hover:underline dark:text-sky-400">"session "{icon(Icon::ArrowUpRight, Size::S14)}</Go>
                                         })}
                                         {(!done && open).then(|| view! {
                                             <button class=format!("{BUTTON_QUIET} shrink-0 text-xs") title="Start a session that does it"
@@ -1013,7 +1015,7 @@ pub fn SessionWork(session_id: String, title: Signal<String>) -> impl IntoView {
                     <Go to=View::Projects { id: w.fields.project.clone() } class="max-w-40 truncate text-violet-700 hover:underline dark:text-violet-400" title="Its project">
                         {w.project_title.clone()}
                     </Go>
-                    <span class="text-muted">"›"</span>
+                    <span class="text-muted">{icon(Icon::ChevronRight, Size::S14)}</span>
                 })}
                 <WorkGlyph id=w.id.clone() />
                 <Go to=View::Work { id: w.id.clone() } class="max-w-56 truncate text-violet-700 hover:underline dark:text-violet-400" title=w.why.clone()>

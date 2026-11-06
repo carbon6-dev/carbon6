@@ -8,6 +8,7 @@ use leptos::prelude::*;
 use serde_json::Value;
 
 use crate::api;
+use crate::icons::{Icon, Size, icon};
 use crate::util::{ErrorBox, INPUT, ago, now_ms};
 use crate::workspace::{Go, View};
 
@@ -22,23 +23,23 @@ fn when(at: Option<i64>) -> String {
 /// A kind's mark and color.
 fn badge(kind: &str) -> (AnyView, &'static str) {
     match kind {
-        "collection" => (crate::icons::folder().into_any(), "text-sky-600"),
-        "record" => (crate::icons::file().into_any(), "text-sky-500"),
-        "series" => (crate::icons::chart().into_any(), "text-cyan-600"),
-        "thing" => (crate::icons::diamond().into_any(), "text-violet-600"),
-        "item" => (crate::icons::mail().into_any(), "text-violet-500"),
-        "fact" => (crate::icons::check().into_any(), "text-emerald-600"),
-        "session" => (crate::icons::play().into_any(), "text-amber-600"),
+        "collection" => (icon(Icon::Layers, Size::S16).into_any(), "text-sky-600"),
+        "record" => (icon(Icon::FileText, Size::S16).into_any(), "text-sky-500"),
+        "series" => (icon(Icon::ChartLine, Size::S16).into_any(), "text-cyan-600"),
+        "thing" => (icon(Icon::Box, Size::S16).into_any(), "text-violet-600"),
+        "item" => (icon(Icon::Mail, Size::S16).into_any(), "text-violet-500"),
+        "fact" => (icon(Icon::Check, Size::S16).into_any(), "text-emerald-600"),
+        "session" => (icon(Icon::Bot, Size::S16).into_any(), "text-amber-600"),
         "decision" => (crate::icons::help().into_any(), "text-rose-600"),
-        "trigger" => (crate::icons::zap().into_any(), "text-orange-600"),
-        "grant" => (crate::icons::arrows_left_right().into_any(), "text-teal-600"),
-        "view" => (crate::icons::maximize().into_any(), "text-indigo-600"),
-        "entry" => (crate::icons::square_terminal().into_any(), "text-muted"),
-        "secret" => (crate::icons::lock().into_any(), "text-muted"),
-        "realm" => (crate::icons::circle().into_any(), "text-zinc-700"),
-        "template" => (crate::icons::pencil().into_any(), "text-amber-700"),
-        "event" => (crate::icons::diamond().into_any(), "text-muted"),
-        _ => (crate::icons::circle().into_any(), "text-muted"),
+        "trigger" => (icon(Icon::Zap, Size::S16).into_any(), "text-orange-600"),
+        "grant" => (icon(Icon::ShieldCheck, Size::S16).into_any(), "text-teal-600"),
+        "view" => (icon(Icon::LayoutPanelLeft, Size::S16).into_any(), "text-indigo-600"),
+        "entry" => (icon(Icon::Settings, Size::S16).into_any(), "text-muted"),
+        "secret" => (icon(Icon::Lock, Size::S16).into_any(), "text-muted"),
+        "realm" => (icon(Icon::Globe, Size::S16).into_any(), "text-zinc-700"),
+        "template" => (icon(Icon::LayoutTemplate, Size::S16).into_any(), "text-amber-700"),
+        "event" => (icon(Icon::CalendarClock, Size::S16).into_any(), "text-muted"),
+        _ => (icon(Icon::Dot, Size::S16).into_any(), "text-muted"),
     }
 }
 
@@ -159,7 +160,7 @@ pub fn RealmsMap() -> impl IntoView {
                                                             } else {
                                                                 let _ = window().location().set_href(&to);
                                                             }
-                                                        }>"Open "{crate::icons::arrow_up_right()}</span>
+                                                        }>"Open "{icon(Icon::ArrowUpRight, Size::S14)}</span>
                                                 }
                                             })}
                                         </div>
@@ -303,7 +304,7 @@ fn Inventory(summary: RealmSummary, realm: String, section: String) -> impl Into
                             <span class="text-xs text-muted" title=tip>{count}</span>
                         };
                         match &e.link {
-                            Some(l) => view! { <Go to=View::from_path(l) class=class>{inner}<span class="text-xs text-muted">{crate::icons::square_arrow_out()}</span></Go> }.into_any(),
+                            Some(l) => view! { <Go to=View::from_path(l) class=class>{inner}<span class="text-xs text-muted">{icon(Icon::ArrowUpRight, Size::S14)}</span></Go> }.into_any(),
                             None => view! { <Ex to=explore(&realm, &e.section, "", "") class=class>{inner}</Ex> }.into_any(),
                         }
                     }).collect_view()}
@@ -617,7 +618,7 @@ fn ObjectPane(realm: String, section: String, kind: String, id: String) -> impl 
                                 <h2 class="break-words font-medium">{o.title.clone()}</h2>
                                 <p class="text-xs text-muted">{format!("{} · {}", o.kind, o.sub)}</p>
                             </div>
-                            {o.open.clone().map(|p| view! { <Go to=View::from_path(&p) class="shrink-0 text-xs text-muted underline" title="Edit it where it lives">"Open "{crate::icons::arrow_up_right()}</Go> })}
+                            {o.open.clone().map(|p| view! { <Go to=View::from_path(&p) class="shrink-0 text-xs text-muted underline" title="Edit it where it lives">"Open "{icon(Icon::ArrowUpRight, Size::S14)}</Go> })}
                         </div>
                         {(!o.fields.is_empty()).then(|| view! {
                             <dl class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-sm">
@@ -726,6 +727,36 @@ fn Neighborhood(realm: String, section: String, object: ExObject) -> impl IntoVi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn explorer_kinds_use_the_approved_icons_and_keep_their_colours() {
+        for (kind, expected, colour) in [
+            ("collection", Icon::Layers, "text-sky-600"),
+            ("record", Icon::FileText, "text-sky-500"),
+            ("series", Icon::ChartLine, "text-cyan-600"),
+            ("thing", Icon::Box, "text-violet-600"),
+            ("item", Icon::Mail, "text-violet-500"),
+            ("fact", Icon::Check, "text-emerald-600"),
+            ("session", Icon::Bot, "text-amber-600"),
+            ("trigger", Icon::Zap, "text-orange-600"),
+            ("grant", Icon::ShieldCheck, "text-teal-600"),
+            ("view", Icon::LayoutPanelLeft, "text-indigo-600"),
+            ("entry", Icon::Settings, "text-muted"),
+            ("secret", Icon::Lock, "text-muted"),
+            ("realm", Icon::Globe, "text-zinc-700"),
+            ("template", Icon::LayoutTemplate, "text-amber-700"),
+            ("event", Icon::CalendarClock, "text-muted"),
+            ("other", Icon::Dot, "text-muted"),
+        ] {
+            let (mark, actual_colour) = badge(kind);
+            assert_eq!(actual_colour, colour, "{kind}");
+            assert_eq!(mark.to_html(), icon(expected, Size::S16).to_html(), "{kind}");
+        }
+        let (decision, colour) = badge("decision");
+        assert_eq!(colour, "text-rose-600");
+        assert_eq!(decision.to_html(), crate::icons::help().to_html());
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]

@@ -86,7 +86,7 @@ fn AskBox(on_close: Callback<()>) -> impl IntoView {
                     <h2 class="font-medium">"Ask carbon6"</h2>
                     <span class="flex-1 text-xs text-muted">"anything you can do in the UI, or about your setup"</span>
                     <button class=format!("{BUTTON_QUIET} text-xs") title="Your Ask conversations: come back to one, or start one with a model of your choice"
-                        on:click=move |_| { on_close.run(()); ws.open(None, View::Chats, How::OwnTile); }>"Your conversations "{crate::icons::arrow_right()}</button>
+                        on:click=move |_| { on_close.run(()); ws.open(None, View::Chats, How::OwnTile); }>"Your conversations "{crate::icons::arrow_up_right()}</button>
                 </div>
                 <textarea node_ref=area class=format!("{INPUT} {} min-h-24", crate::util::GROWS)
                     placeholder="e.g. What can I do in carbon6? · Which models are set up for vision? · Create an enrollment token for a new worker"

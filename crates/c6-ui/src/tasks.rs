@@ -5,6 +5,7 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 use crate::api;
+use crate::icons::{Icon, Size, icon};
 use crate::util::{BUTTON_QUIET, clock};
 use crate::workspace::{Popover, below};
 
@@ -166,7 +167,7 @@ pub(crate) fn background_count(events: &[Event], subagents: &[Session]) -> usize
     children.len() + tasks
 }
 
-/// The words beside the hourglass at the bottom of a transcript.
+/// The words beside the running-task spinner at the bottom of a transcript.
 pub fn running_line(tasks: usize, servers: usize) -> String {
     let plural = |n: usize, one: &str, many: &str| if n == 1 { format!("1 {one}") } else { format!("{n} {many}") };
     match (tasks, servers) {
@@ -246,7 +247,7 @@ pub fn RunningTasks(session: String, events: RwSignal<Vec<Event>>) -> impl IntoV
                         ev.stop_propagation();
                         at.set(if at.get_untracked().is_some() { None } else { Some(below(&ev, 384.0)) });
                     }>
-                    {crate::icons::hourglass()}" "{move || counts.with(|(t, s)| running_line(*t, *s))}" "{crate::icons::chevron_right()}
+                    <span class="inline-flex animate-spin">{icon(Icon::LoaderCircle, Size::S14)}</span>" "{move || counts.with(|(t, s)| running_line(*t, *s))}" "{crate::icons::chevron_right()}
                 </button>
                 <Popover at class="w-96 max-w-[calc(100vw-1rem)] space-y-2 text-xs">
                     <p class="text-muted">"Task history remains available when the worker is offline. Inspect streams with Refresh."</p>
@@ -403,7 +404,7 @@ pub fn ended_line(task_id: &str, kind: &str, description: &str, state: &str, exi
     let native = kind == "claude_code";
     let status_icon = match state {
         "finished" if native || exit_code == 0 => crate::icons::check().into_any(),
-        "finished" | "failed" => crate::icons::x().into_any(),
+        "finished" | "failed" => icon(Icon::CircleX, Size::S14).into_any(),
         "stopped" | "stopped_by_user" => crate::icons::stop().into_any(),
         "lost" => crate::icons::warning().into_any(),
         _ => crate::icons::circle().into_any(),
@@ -460,6 +461,9 @@ mod tests {
             let html = ended_line("t1", kind, "Build", state, exit_code, 1000).unwrap().to_html();
             assert_eq!(html.matches("<svg").count(), 2, "keep both icons for {kind}/{state}: {html}");
             assert!(html.contains(text), "{html}");
+            if state == "failed" || (state == "finished" && kind != "claude_code" && exit_code != 0) {
+                assert!(html.contains(&icon(Icon::CircleX, Size::S14).to_html()), "failed tasks keep the error icon: {html}");
+            }
             crate::icons::tests::assert_no_icon_glyphs(&html);
         }
         assert!(ended_line("t1", "shell", "Build", "started", 0, 0).is_none());

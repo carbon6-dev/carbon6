@@ -177,7 +177,7 @@ pub fn Terminals(
                             <button class="px-2 py-1 font-mono text-xs" title=t.cwd.clone() on:click=move |_| active.set(Some(id2.clone()))>
                                 {label}{t.exited.map(|c| format!(" (exited {c})"))}
                             </button>
-                            <button class="px-1.5 text-muted hover:text-red-600" title="Close" on:click={let id = t.id.clone(); move |_| close(id.clone())}>"×"</button>
+                            <button class="px-1.5 text-muted hover:text-red-600" title="Close" aria-label="Close terminal" on:click={let id = t.id.clone(); move |_| close(id.clone())}>{crate::icons::icon(crate::icons::Icon::X, crate::icons::Size::S14)}</button>
                         </span>
                     }
                 }).collect_view()}
@@ -185,10 +185,10 @@ pub fn Terminals(
                 <button class="flex size-6 items-center justify-center rounded-md text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100 pointer-coarse:size-9"
                     title="New terminal in the session's folder" aria-label="New terminal"
                     on:click=move |_| { cwd.set(home.get_value()); picking.set(false); open(); }>
-                    <svg viewBox="0 0 16 16" class="size-3.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
+                    {crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}
                 </button>
                 <button class="flex h-6 items-center rounded-md px-1 text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100 pointer-coarse:h-9"
-                    title="New terminal in another folder" aria-label="New terminal in another folder" on:click=move |_| picking.update(|p| *p = !*p)>"…"</button>
+                    title="New terminal in another folder" aria-label="New terminal in another folder" on:click=move |_| picking.update(|p| *p = !*p)>{crate::icons::icon(crate::icons::Icon::Ellipsis, crate::icons::Size::S14)}</button>
                 {move || picking.get().then(|| view! {
                     <form class="flex items-center gap-1" on:submit=move |ev| { ev.prevent_default(); picking.set(false); open(); }>
                         <input class=format!("{} w-64 font-mono text-xs", crate::util::INPUT) placeholder="folder (empty: home)" autofocus=true

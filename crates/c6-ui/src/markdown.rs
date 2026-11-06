@@ -348,6 +348,7 @@ fn safe_url(url: CowStr<'_>) -> CowStr<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::icons::{Icon, Size};
 
     const ID: &str = "01a18f50-9f48-7567-8070-43e1f17ba642";
 
@@ -410,6 +411,7 @@ mod tests {
     #[test]
     fn document_mentions_keep_a_drawn_file_before_the_given_label() {
         let html = render(&format!("[the plan](doc:{ID})"), &here(&nothing));
+        assert!(html.contains(&crate::icons::html::icon(Icon::FileText, Size::S14)), "{html}");
         assert!(html.find("<svg").expect("keep the document icon") < html.find("the plan").unwrap(), "{html}");
         assert!(!html.contains(">Doc "), "don't replace the icon with a word: {html}");
         crate::icons::tests::assert_no_icon_glyphs(&html);

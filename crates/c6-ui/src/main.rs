@@ -221,7 +221,7 @@ fn Main() -> impl IntoView {
                 }}
                 <button class="hidden rounded-md px-2 py-1 text-xs text-muted hover:bg-zinc-200/60 hover:text-zinc-900 xl:inline dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
                     title=move || format!("New tile (or ⌘-click any link): {} open · ⌘1–9 switch tiles · ⌘[ ⌘] back and forward", tiles())
-                    on:click=move |_| ws.new_tile()>"+ Tile"</button>
+                    on:click=move |_| ws.new_tile()>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" Tile"</button>
                 {(!console).then(|| view! { <notify::NotifyToggle /> })}
                 <ConnBadge connected=live.connected />
             </header>

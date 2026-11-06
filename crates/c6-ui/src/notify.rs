@@ -8,6 +8,7 @@ use leptos::prelude::*;
 use web_sys::{Notification, NotificationOptions, NotificationPermission};
 
 use crate::api::LiveFeed;
+use crate::icons::{Icon, Size, icon};
 use crate::util::{storage_get, storage_set};
 
 /// Some mobile browsers have no Notification global at all. Reflective
@@ -97,20 +98,33 @@ pub fn watch_sessions(live: LiveFeed, ws: crate::workspace::Workspace, filter: c
     });
 }
 
+fn toggle_state(on: bool, filtered: bool) -> (Icon, &'static str) {
+    match (on, filtered) {
+        (true, false) => (Icon::Bell, "Notifications on"),
+        (true, true) => (Icon::BellDot, "Notifications filtered"),
+        _ => (Icon::BellOff, "Notifications off"),
+    }
+}
+
+fn toggle_title(on: bool, labels: &[String], available: bool) -> String {
+    let (_, label) = toggle_state(on, !labels.is_empty());
+    if !available {
+        return format!("{label}. Browser notifications are not available here");
+    }
+    let base = "Notify me when a session finishes while this tab is in the background";
+    if labels.is_empty() {
+        format!("{label}. {base}")
+    } else {
+        format!("{label}. {base} (only sessions with labels {}, as filtered)", labels.join(", "))
+    }
+}
+
 #[component]
 pub fn NotifyToggle() -> impl IntoView {
     let available = permission().is_some();
     let state = RwSignal::new(enabled());
     let filter = crate::labels::use_filter().0;
-    let title = move || {
-        if !available {
-            return "Browser notifications are not available here".to_owned();
-        }
-        let base = "Notify me when a session finishes while this tab is in the background";
-        filter.with(|f| {
-            if f.is_empty() { base.to_owned() } else { format!("{base} (only sessions with labels {}, as filtered)", f.join(", ")) }
-        })
-    };
+    let title = move || filter.with(|f| toggle_title(state.get(), f, available));
     let click = move |_| {
         if state.get_untracked() {
             storage_set("c6.notify", "0");
@@ -128,13 +142,8 @@ pub fn NotifyToggle() -> impl IntoView {
         }
     };
     view! {
-        <button class="hidden text-xs text-muted hover:text-zinc-900 md:inline dark:hover:text-zinc-100" title=title disabled=!available on:click=click>
-            {move || if state.get() { crate::icons::bell().into_any() } else { crate::icons::bell_off().into_any() }}" "
-            {move || match (state.get(), filter.with(Vec::is_empty)) {
-                (true, true) => "Notifications on",
-                (true, false) => "Notifications filtered",
-                _ => "Notifications off",
-            }}
+        <button class="hidden text-xs text-muted hover:text-zinc-900 md:inline dark:hover:text-zinc-100" title=title aria-label=title disabled=!available on:click=click>
+            {move || icon(toggle_state(state.get(), !filter.with(Vec::is_empty)).0, Size::S16)}
         </button>
     }
 }
@@ -162,11 +171,33 @@ mod tests {
         owner.with(|| {
             provide_context(crate::labels::LabelFilter(RwSignal::new(Vec::new())));
             let html = view! { <NotifyToggle /> }.to_html();
-            assert!(html.contains("Notifications off"), "{html}");
-            assert!(html.contains("<svg"), "keep the notification bell: {html}");
+            let label = "Notifications off. Browser notifications are not available here";
+            assert!(html.contains(&format!("title=\"{label}\"")), "{html}");
+            assert!(html.contains(&format!("aria-label=\"{label}\"")), "{html}");
+            assert!(!html.split_once('>').unwrap().1.contains("Notifications off"), "the bell stands alone: {html}");
+            assert_eq!(html.matches("<svg").count(), 1, "keep the notification bell: {html}");
             assert!(html.contains("disabled"), "{html}");
             assert!(html.contains("Browser notifications are not available here"), "{html}");
         });
+    }
+
+    #[test]
+    fn notification_states_keep_distinct_icons_and_accessible_details() {
+        assert_eq!(toggle_state(true, false), (Icon::Bell, "Notifications on"));
+        assert_eq!(toggle_state(true, true), (Icon::BellDot, "Notifications filtered"));
+        for filtered in [true, false] {
+            assert_eq!(toggle_state(false, filtered), (Icon::BellOff, "Notifications off"));
+        }
+        for on in [true, false] {
+            for labels in [vec![], vec!["repo:carbon6".to_owned(), "worker:home".to_owned()]] {
+                let title = toggle_title(on, &labels, true);
+                assert!(title.starts_with(toggle_state(on, !labels.is_empty()).1), "{title}");
+                assert!(title.contains("while this tab is in the background"), "{title}");
+                if !labels.is_empty() {
+                    assert!(title.contains("only sessions with labels repo:carbon6, worker:home, as filtered"), "{title}");
+                }
+            }
+        }
     }
 
     #[test]

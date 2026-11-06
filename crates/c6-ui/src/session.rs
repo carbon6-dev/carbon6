@@ -7,6 +7,7 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 use crate::details::GLANCE_WIDTH;
+use crate::icons::{Icon, Size, icon};
 use crate::models::ModelInput;
 use crate::panes::Pane;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT, now_ms, storage_get, storage_set};
@@ -994,7 +995,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                                 el.set_scroll_top(el.scroll_height());
                             }
                         }>
-                        {crate::icons::arrow_down()}" "{if fresh > 0 { format!("{fresh} new") } else { "Latest".to_owned() }}
+                        {if fresh > 0 { format!("{fresh} new") } else { "Latest".to_owned() }}" "{icon(Icon::ArrowDownToLine, Size::S14)}
                     </button>
                     </div>
                     {glance_room(wide)}
@@ -1404,7 +1405,7 @@ pub fn SessionMenu(chrome: SessionChrome, #[prop(into)] on_rename: Callback<()>,
             <button class=MENU_ITEM on:click=move |_| {
                 find_open.set(true);
                 on_done.run(());
-            }>"Find in session"<span class=MENU_HINT>"⌘F"</span></button>
+            }>"Find in session"<span class="ml-auto"><crate::components::Kbd text="⌘F" /></span></button>
             <div class=MENU_RULE></div>
             <div class="hidden md:contents">
             <Show when=move || !chrome.ssh()>
@@ -1663,7 +1664,7 @@ pub(crate) fn ArchivedSession(id: String) -> impl IntoView {
                         }
                         saving.set(false);
                     });
-                }>{crate::icons::undo()}</button>
+                }>{icon(Icon::ArchiveRestore, Size::S16)}</button>
             </div>
             {move || error.get().map(|e| view! { <p role="alert" class="px-3 py-1 text-xs text-red-600">{e}</p> })}
         </Show>
@@ -1814,7 +1815,7 @@ fn Lineage(session: Session) -> impl IntoView {
                 let target = crate::workspace::Target { q: String::new(), anchor: Some(format!("call-{call}")), open: Vec::new(), at: None };
                 view! {
                     <Go to=View::Session { id, target: Some(target) } class="max-w-60 truncate underline">{title}</Go>
-                    <span>"›"</span>
+                    <span>{icon(Icon::ChevronRight, Size::S14)}</span>
                 }
             }).collect_view()}
             <span class="max-w-60 truncate text-zinc-700 dark:text-zinc-300">{session.title.clone()}</span>
@@ -2325,7 +2326,7 @@ fn Transcript(
                     <button class="text-xs text-muted underline" on:click=move |_| {
                         feed.latest();
                         if let Some(Follow(f)) = follow { f.set(true) }
-                    }>"Latest "{crate::icons::arrow_down()}</button>
+                    }>"Latest "{icon(Icon::ArrowDownToLine, Size::S14)}</button>
                 </div>
             })}
             <crate::decisions::SessionDecisions session=id.get_value() />
@@ -3128,29 +3129,17 @@ fn stop_question(n: usize) -> String {
 /// Stop: a thin ring, a small square in it.
 const STOP: &str = "flex size-5 shrink-0 items-center justify-center rounded-full border-[1.2px] border-zinc-400 text-muted hover:border-zinc-500 hover:text-zinc-500 disabled:opacity-50";
 
-/// Send's icon, an arrow up: its one path, to change it.
-const SEND_ICON: &str = "M8 13V3M3.5 7.5 8 3l4.5 4.5";
-
 pub(crate) fn send_icon() -> impl IntoView {
-    view! {
-        <svg viewBox="0 0 16 16" class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d=SEND_ICON />
-        </svg>
-    }
+    icon(Icon::ArrowUp, Size::S14)
 }
 
 fn stop_icon() -> impl IntoView {
-    view! {
-        <svg viewBox="0 0 16 16" class="h-2 w-2" fill="currentColor" aria-hidden="true">
-            <rect x="1" y="1" width="14" height="14" rx="2.5" />
-        </svg>
-    }
+    crate::icons::stop()
 }
 
 /// The tile bar's ⋯ menu: an item, the hint after it, and the line
 /// between groups.
-pub(crate) const MENU_ITEM: &str =
-    "flex min-h-9 w-full items-center gap-3 rounded px-2 py-1 text-left hover:bg-zinc-100 disabled:opacity-40 dark:hover:bg-zinc-800";
+pub(crate) const MENU_ITEM: &str = "flex min-h-9 w-full items-center gap-3 rounded px-2 py-1 text-left hover:bg-zinc-100 disabled:opacity-40 pointer-coarse:min-h-11 dark:hover:bg-zinc-800";
 const MENU_HINT: &str = "ml-auto text-[11px] text-muted";
 const MENU_RULE: &str = "my-1 border-t border-zinc-200 dark:border-zinc-700";
 
@@ -3346,8 +3335,8 @@ fn FindBar(session: String, initial: String, open: RwSignal<bool>, force_open: F
                     (None, None) => String::new(),
                 }}
             </span>
-            <button class=format!("{BUTTON_QUIET} px-2 py-1 text-xs") title="Previous match (Shift+Enter, ⇧⌘G)" on:click=move |_| step(-1)>{crate::icons::arrow_up()}</button>
-            <button class=format!("{BUTTON_QUIET} px-2 py-1 text-xs") title="Next match (Enter, ⌘G)" on:click=move |_| step(1)>{crate::icons::arrow_down()}</button>
+            <button class=format!("{BUTTON_QUIET} px-2 py-1 text-xs") title="Previous match (Shift+Enter, ⇧⌘G)" on:click=move |_| step(-1)>{icon(Icon::ChevronUp, Size::S14)}</button>
+            <button class=format!("{BUTTON_QUIET} px-2 py-1 text-xs") title="Next match (Enter, ⌘G)" on:click=move |_| step(1)>{icon(Icon::ChevronDown, Size::S14)}</button>
             <button class=format!("{BUTTON_QUIET} px-2 py-1 text-xs text-muted") title="Close (Esc)" on:click=move |_| close()>{crate::icons::x()}</button>
         </div>
     }
@@ -3509,7 +3498,7 @@ fn SessionMessage(from: String, title: String, text: String, prompt: String) -> 
         <div class="flex flex-col items-start">
             <div class="max-w-[85%] space-y-1.5 rounded-r-md border-l-4 bg-zinc-50 px-3 py-2 text-sm dark:bg-zinc-900/60"
                 style=move || format!("border-left-color:{}", mark.get().map_or("#a1a1aa", |m| crate::marks::colour_hex(&m)))>
-                <p class="text-[11px] font-medium uppercase tracking-wide text-sky-700 dark:text-sky-400">{crate::icons::arrow_down_right()}" Message from another session"</p>
+                <p class="text-[11px] font-medium uppercase tracking-wide text-sky-700 dark:text-sky-400">{icon(Icon::CornerDownRight, Size::S14)}" Message from another session"</p>
                 <Go to=View::session(from.clone()) stop=true
                     class="inline-flex max-w-full items-center gap-1.5 rounded-md border border-sky-300 px-2 py-0.5 text-xs text-sky-800 hover:bg-sky-50 dark:border-sky-800 dark:text-sky-300 dark:hover:bg-sky-950"
                     title="Open the session that sent it">
@@ -3630,7 +3619,7 @@ fn transcript_file(src: String, name: String, size: u64) -> AnyView {
     view! {
         <a href=src target="_blank" title=format!("{size} bytes")
             class="flex items-center gap-1 rounded-md border border-zinc-300 bg-white px-2 py-1 font-mono text-xs text-zinc-600 hover:text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100">
-            {crate::icons::file()}{name}
+            {icon(Icon::File, Size::S14)}{name}
         </a>
     }.into_any()
 }
@@ -3673,7 +3662,7 @@ fn user_message(session: &str, e: &Event) -> AnyView {
     let url = |i: usize| crate::api::url(&format!("/api/v1/sessions/{session}/attachments/{}/{i}", e.seq));
     // In a subagent: who sent it.
     let from = if !delegated_by.is_empty() {
-        Some((crate::icons::arrow_down_right().into_any(), "from the agent that started it"))
+        Some((icon(Icon::CornerDownRight, Size::S14).into_any(), "from the agent that started it"))
     } else if command == "resume" {
         Some((crate::icons::rotate().into_any(), "resumed by you"))
     } else {
@@ -3750,7 +3739,7 @@ fn render_event(
             s => {
                 let (icon, what, tone) = match s {
                     "allowed" => (crate::icons::check().into_any(), "Approved", "text-emerald-700 dark:text-emerald-400"),
-                    "denied" => (crate::icons::x().into_any(), "Denied", "text-red-600 dark:text-red-400"),
+                    "denied" => (icon(Icon::CircleX, Size::S14).into_any(), "Denied", "text-red-600 dark:text-red-400"),
                     _ => (crate::icons::hourglass().into_any(), "No answer: not run", "text-muted"),
                 };
                 view! { <p class=format!("flex items-center gap-2 text-xs {tone}")><span>{icon}</span><span>{what}</span></p> }.into_any()
@@ -3777,9 +3766,9 @@ fn render_event(
                         Some(format!("{}: {text}", if f.label.is_empty() { &f.name } else { &f.label }))
                     })
                     .collect();
-                view! { <p class="flex items-start gap-2 text-xs text-muted"><span>{crate::icons::pencil()}</span><span>{format!("Answered “{title}” · {}", shown.join(" · "))}</span></p> }.into_any()
+                view! { <p class="flex items-start gap-2 text-xs text-muted"><span>{icon(Icon::PenLine, Size::S14)}</span><span>{format!("Answered “{title}” · {}", shown.join(" · "))}</span></p> }.into_any()
             }
-            _ => view! { <p class="flex items-center gap-2 text-xs text-muted"><span>{crate::icons::x()}</span><span>{format!("Not answered: {title}")}</span></p> }.into_any(),
+            _ => view! { <p class="flex items-center gap-2 text-xs text-muted"><span>{icon(Icon::CircleX, Size::S14)}</span><span>{format!("Not answered: {title}")}</span></p> }.into_any(),
         },
         EventKind::Notice { title, message, priority } => notice_line(title, message, priority),
         EventKind::Memory { op, id, scope, text } => memory_line(op, id, scope, text),
@@ -3973,25 +3962,30 @@ pub(crate) fn subagent_failed(s: &Session) -> bool {
 /// How a subagent stands: (pill, its colors).
 fn subagent_state(running: bool, end: Option<TurnEndReason>) -> (AnyView, &'static str) {
     match (running, end) {
-        (true, _) => (view! { {crate::icons::circle()}" running" }.into_any(), "text-blue-600 dark:text-blue-400"),
+        (true, _) => (
+            view! { <span class="inline-flex animate-spin">{icon(Icon::LoaderCircle, Size::S14)}</span>" running" }.into_any(),
+            "text-blue-600 dark:text-blue-400",
+        ),
         (false, Some(TurnEndReason::Completed)) => {
             (view! { {crate::icons::check()}" done" }.into_any(), "text-emerald-700 dark:text-emerald-400")
         }
-        (false, Some(TurnEndReason::Interrupted)) => (view! { "interrupted" }.into_any(), "text-amber-700 dark:text-amber-400"),
+        (false, Some(TurnEndReason::Interrupted)) => {
+            (view! { {icon(Icon::Pause, Size::S14)}" interrupted" }.into_any(), "text-amber-700 dark:text-amber-400")
+        }
         (false, Some(TurnEndReason::WorkerRestarted)) => {
             (view! { {crate::icons::warning()}" lost" }.into_any(), "text-amber-700 dark:text-amber-400")
         }
-        (false, Some(_)) => (view! { {crate::icons::x()}" failed" }.into_any(), "text-red-600 dark:text-red-400"),
-        (false, None) => (view! { {crate::icons::circle()}" starting" }.into_any(), "text-muted"),
+        (false, Some(_)) => (view! { {icon(Icon::CircleX, Size::S14)}" failed" }.into_any(), "text-red-600 dark:text-red-400"),
+        (false, None) => (view! { {icon(Icon::CircleDashed, Size::S14)}" starting" }.into_any(), "text-muted"),
     }
 }
 
 /// Where a subagent runs: "connection · model · effort" (a subagent may
 /// run on another connection than its parent's).
-fn runs_on(row: Memo<Option<Session>>, connections: LocalResource<Result<Vec<c6_api::Connection>, String>>) -> String {
+fn runs_on(row: Memo<Option<Session>>, connections: LocalResource<Result<Vec<c6_api::Connection>, String>>) -> (String, AnyView) {
     let live = api::live();
     row.with(|r| {
-        let Some(r) = r else { return String::new() };
+        let Some(r) = r else { return (String::new(), ().into_any()) };
         let model = model_label(&r.model, r.effort.as_deref().unwrap_or_default());
         let name = connections.get().and_then(Result::ok).and_then(|cs| cs.into_iter().find(|c| c.id == r.connection_id).map(|c| c.name));
         let model = match name {
@@ -4000,15 +3994,19 @@ fn runs_on(row: Memo<Option<Session>>, connections: LocalResource<Result<Vec<c6_
         };
         // A remote subagent: where it runs, too (docs/remote-subagents.md).
         if r.remote_template.is_empty() {
-            return model;
+            return (model.clone(), model.into_any());
         }
         let worker = live.worker_name(&r.worker_id.to_string());
         let place = match (&r.ssh, r.cwd.is_empty()) {
             (Some(t), _) => format!("{worker} ⇄ {t}:{}", r.cwd),
-            (None, true) => worker,
+            (None, true) => worker.clone(),
             (None, false) => format!("{worker}:{}", r.cwd),
         };
-        format!("{place} · {model}")
+        let label = match &r.ssh {
+            Some(target) => crate::sessions::relationship_label(worker, format!("{target}:{}", r.cwd)).into_any(),
+            None => place.clone().into_any(),
+        };
+        (format!("{place} · {model}"), view! { {label}" · "{model} }.into_any())
     })
 }
 
@@ -4082,8 +4080,7 @@ fn subagent_thread(id: String, subagents: Subagents, waiting: Signal<bool>) -> A
                         // short, whole on hover): squeezed, the name went a
                         // letter a line.
                         {move || {
-                            let on = runs_on(row, connections);
-                            let title = on.clone();
+                            let (title, on) = runs_on(row, connections);
                             view! { <span class="ml-auto min-w-0 truncate font-mono" title=title>{on}</span> }
                         }}
                     </button>
@@ -4164,8 +4161,7 @@ fn SubagentLive(id: String, row: Memo<Option<Session>>, open: RwSignal<bool>, to
                 parts.join(" · ")
             }}</span>
             {move || {
-                let on = runs_on(row, connections);
-                let title = on.clone();
+                let (title, on) = runs_on(row, connections);
                 view! { <span class="ml-auto min-w-0 truncate font-mono" title=title>{on}</span> }
             }}
             <Go to=View::session(id.clone()) class="shrink-0 text-violet-700 hover:underline dark:text-violet-400" title="Open subagent session" stop=true>{crate::icons::square_arrow_out()}</Go>
@@ -4248,10 +4244,10 @@ fn SubagentPeek(events: RwSignal<Vec<Event>>, streaming: RwSignal<Streaming>) ->
         <div class="space-y-0.5 pb-1 text-xs text-muted">
             {move || lines.get().into_iter().map(|(mark, text)| view! {
                 <p class="flex gap-2 truncate"><span class="w-3 shrink-0">{match mark {
-                    "message" | "delegated" => crate::icons::message().into_any(),
-                    "edit" => crate::icons::pencil().into_any(),
+                    "message" | "delegated" => icon(Icon::CornerDownRight, Size::S14).into_any(),
+                    "edit" => crate::icons::user().into_any(),
                     "tool" => crate::icons::chevron_right().into_any(),
-                    "error" => crate::icons::x().into_any(),
+                    "error" => icon(Icon::CircleX, Size::S14).into_any(),
                     _ => ().into_any(),
                 }}</span><span class="truncate font-mono">{text}</span></p>
             }).collect_view()}
@@ -4659,8 +4655,8 @@ fn ToolCard(
             }>
                 {move || {
                     let (icon, cls) = match result.get() {
-                        None => (crate::icons::circle().into_any(), "animate-pulse text-blue-500"),
-                        Some(r) if r.is_error => (crate::icons::x().into_any(), "text-red-500"),
+                        None => (icon(Icon::LoaderCircle, Size::S14).into_any(), "animate-spin text-blue-500"),
+                        Some(r) if r.is_error => (icon(Icon::CircleX, Size::S14).into_any(), "text-red-500"),
                         Some(_) => (crate::icons::check().into_any(), "text-emerald-600"),
                     };
                     view! { <span class=format!("shrink-0 text-xs {cls}")>{icon}</span> }
@@ -5613,9 +5609,7 @@ fn Composer(
                             // Keep the box's focus (and a phone's keyboard) as it's tapped.
                             on:mousedown=|ev| ev.prevent_default()
                             on:click=move |_| accept_next()>
-                            <svg viewBox="0 0 16 16" class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                                <path d="M2 8h9M8 4.5 11.5 8 8 11.5M13.5 3.5v9" />
-                            </svg>
+                            {icon(Icon::ArrowRightToLine, Size::S14)}
                         </button>
                     })}
                     </div>
@@ -5626,9 +5620,7 @@ fn Composer(
                         // Drawn, not an emoji, so it matches the other icons.
                         <button class="flex size-6.5 shrink-0 items-center justify-center rounded-md text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
                             title="Attach images or files (or paste / drop them)" aria-label="Attach images or files" on:click=move |_| { if let Some(i) = picker.get_untracked() { i.click(); } }>
-                            <svg viewBox="0 0 16 16" class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
-                                <path d="M8 2.5v11M2.5 8h11" />
-                            </svg>
+                            {icon(Icon::Plus, Size::S14)}
                         </button>
                         <input node_ref=picker type="file" multiple class="hidden" on:change=add_files />
                 {(model.is_some() || subagents.is_some()).then(|| view! {
@@ -5740,14 +5732,14 @@ fn Composer(
                                         title="More ways to send" aria-label="More ways to send"
                                         aria-haspopup="menu" prop:aria-expanded=move || send_menu.get().to_string() data-pop=send_pop.get_value()
                                         on:click=move |ev| { ev.stop_propagation(); send_menu.update(|o| *o = !*o); }>
-                                        <svg viewBox="0 0 10 10" class="h-2.5 w-2.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 4 5 6.5 7.5 4" /></svg>
+                                        {icon(Icon::ChevronDown, Size::S14)}
                                     </button>
                                     {move || send_menu.get().then(|| view! {
                                         <div role="menu" data-pop=send_pop.get_value() class="absolute bottom-full right-0 z-40 mb-1 w-max rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
                                             <button role="menuitem" class="flex w-full items-center gap-4 px-3 py-1.5 text-left hover:bg-zinc-100 pointer-coarse:py-3 dark:hover:bg-zinc-800"
                                                 title="The agent gets it now, not at its next step (Claude Code moves what it waits on to the background; its background agents go on)" on:click=move |_| send_now()>
                                                 <span>"Send now"</span>
-                                                <span class="text-xs text-muted">"⌘/Ctrl ⇧ ↵"</span>
+                                                <crate::components::Kbd text="⌘/Ctrl ⇧ ↵" />
                                             </button>
                                         </div>
                                     })}
@@ -5918,7 +5910,7 @@ fn QuestionCard(session: String, call_id: String, title: String, fields: Vec<c6_
     };
     view! {
         <div id=waiting_card_id(&sid.get_value(), &call.get_value()) class="space-y-3 rounded-lg border border-sky-300 bg-sky-50 p-3 text-sm dark:border-sky-900 dark:bg-sky-950/40">
-            <p class="flex items-center gap-2 font-medium"><span>{crate::icons::pencil()}</span><span>{title}</span></p>
+            <p class="flex items-center gap-2 font-medium"><span>{icon(Icon::PenLine, Size::S14)}</span><span>{title}</span></p>
             {move || open.get().then(|| view! {
                 <div class="space-y-2">
                     {values.get_value().into_iter().map(|(f, v)| {
@@ -6232,6 +6224,7 @@ mod tests {
         for (running, end, text) in [
             (true, None, "running"),
             (false, Some(TurnEndReason::Completed), "done"),
+            (false, Some(TurnEndReason::Interrupted), "interrupted"),
             (false, Some(TurnEndReason::WorkerRestarted), "lost"),
             (false, Some(TurnEndReason::Error), "failed"),
             (false, None, "starting"),
@@ -6246,8 +6239,6 @@ mod tests {
         let html = subagent_name(&s).unwrap().to_html();
         assert!(html.contains("<svg"), "template lost its icon: {html}");
         assert!(html.contains("review"), "{html}");
-        // This state never had a symbol; don't invent one during restoration.
-        assert!(!subagent_state(false, Some(TurnEndReason::Interrupted)).0.to_html().contains("<svg"));
     }
 
     #[cfg(not(target_arch = "wasm32"))]

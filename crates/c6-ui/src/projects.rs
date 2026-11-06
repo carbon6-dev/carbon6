@@ -107,7 +107,7 @@ pub fn ProjectsPage() -> impl IntoView {
             </header>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             <div class="flex flex-wrap gap-2">
-                <button class=BUTTON on:click=move |_| adding.update(|a| *a = !*a)>"+ New project"</button>
+                <button class=BUTTON on:click=move |_| adding.update(|a| *a = !*a)>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" New project"</button>
             </div>
             {move || adding.get().then(|| view! {
                 <div class="space-y-2 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
@@ -370,7 +370,7 @@ pub fn ProjectPage(id: String) -> impl IntoView {
                                 <button class="text-xs text-muted hover:underline" title="Write it again now"
                                     on:click=move |_| spawn_local(async move {
                                         if let Err(e) = api::project_refresh(id.get_value()).await { error.set(Some(e)); }
-                                    })>{crate::icons::rotate()}</button>
+                                    })>{crate::icons::icon(crate::icons::Icon::RefreshCw, crate::icons::Size::S14)}</button>
                             </div>
                             <p class="whitespace-pre-wrap text-sm">{match &p.fields.note {
                                 Some(n) => n.text.clone(),
@@ -445,7 +445,7 @@ pub fn ProjectPage(id: String) -> impl IntoView {
                             <div class="flex items-center gap-2 pt-1 text-sm">
                                 {active.then(|| view! {
                                     <button class=format!("{BUTTON_QUIET} text-xs") title="A new work item in this project; its sessions start as the project says"
-                                        on:click=move |_| new_work.update(|n| *n = !*n)>"+ New work"</button>
+                                        on:click=move |_| new_work.update(|n| *n = !*n)>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" New work"</button>
                                 })}
                                 <AdoptPick placeholder="+ Bring in open work…" class=format!("{INPUT} w-auto! max-w-full")
                                     title="Open work: what's in no project first, then work in other projects (choosing it moves it here)"
@@ -555,7 +555,7 @@ fn QuickSessions(
                 <h2 class="flex-1 text-xs font-medium uppercase tracking-wide text-muted">{format!("Sessions ({n})")}</h2>
                 {active.then(|| view! {
                     <button class=format!("{BUTTON_QUIET} text-xs") title="A quick task in this project with no work item, such as drafting a doc"
-                        on:click=move |_| start.run(())>"+ Session"</button>
+                        on:click=move |_| start.run(())>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" Session"</button>
                     <AdoptPick placeholder="Attach a session…" class="max-w-56 cursor-pointer rounded bg-transparent px-1 text-xs text-muted hover:bg-zinc-200/60 dark:hover:bg-zinc-800"
                         title="A running session as a quick session here: free ones first, then ones serving work or in another project (choosing it moves it here)"
                         items=adoptable on_pick=adopt />
@@ -638,7 +638,7 @@ fn PhaseStrip(p: ProjectItem, change: Callback<c6_api::projects::PhaseIn>) -> im
                 }).collect_view()}
                 <button class="rounded-md border border-dashed border-zinc-300 px-2 py-1 text-xs text-muted hover:bg-zinc-50 dark:border-zinc-700 dark:hover:bg-zinc-900"
                     title="Phases are optional: an ordered list, each with what done means" on:click=move |_| open_editor(None)>
-                    {if n == 0 { "+ Phases" } else { "+ Phase" }}
+                    {crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}{if n == 0 { " Phases" } else { " Phase" }}
                 </button>
             </div>
             {move || editing.get().map(|which| {
@@ -711,7 +711,7 @@ fn PhaseGroup(
             {real.then(|| view! { <span>{count}</span> })}
             <span class="flex-1"></span>
             {(active && real).then(|| view! {
-                <button class="hover:underline" on:click=move |_| adding.update(|a| *a = !*a)>"+ Work"</button>
+                <button class="hover:underline" on:click=move |_| adding.update(|a| *a = !*a)>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" Work"</button>
                 {(state != "done").then(|| view! {
                     <button class="hover:underline" title="A session that proposes this phase's work and updates the plan"
                         on:click=move |_| plan.run(c6_api::projects::ProjectPlanIn { phase: phase.get_value(), ..Default::default() })>"Plan it"</button>
@@ -936,8 +936,8 @@ fn Documents(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> im
                     <option value="notes">"notes"</option>
                     <option value="review">"review"</option>
                 </select>
-                <button class=BUTTON_QUIET on:click=move |_| new_doc("doc")>"+ New doc"</button>
-                <button class=BUTTON_QUIET on:click=move |_| new_doc("deck")>"+ New deck"</button>
+                <button class=BUTTON_QUIET on:click=move |_| new_doc("doc")>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" New doc"</button>
+                <button class=BUTTON_QUIET on:click=move |_| new_doc("deck")>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" New deck"</button>
             </div>
             <h2 class="pt-2 text-xs font-medium uppercase tracking-wide text-muted">"Links"</h2>
             {p.fields.links.iter().map(|l| {
@@ -949,7 +949,7 @@ fn Documents(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> im
                         {if href.is_empty() {
                             view! { <span class="min-w-0 flex-1 truncate">{text}</span> }.into_any()
                         } else {
-                            view! { <a href=href target="_blank" rel="noopener noreferrer" class="min-w-0 flex-1 truncate text-sky-700 hover:underline dark:text-sky-400">{crate::icons::arrow_up_right()}" "{text}</a> }.into_any()
+                            view! { <a href=href target="_blank" rel="noopener noreferrer" class="min-w-0 flex-1 truncate text-sky-700 hover:underline dark:text-sky-400">{text}" "{crate::icons::icon(crate::icons::Icon::ExternalLink, crate::icons::Size::S14)}</a> }.into_any()
                         }}
                         <button class="shrink-0 text-xs text-muted hover:text-red-600" title="Remove link" on:click=move |_| {
                             let d = ProjectDetach { link: Some(r.clone()), ..Default::default() };

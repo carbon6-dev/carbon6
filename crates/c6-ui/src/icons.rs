@@ -39,6 +39,7 @@ impl Size {
 pub enum Icon {
     Archive,
     ArchiveRestore,
+    PanelsTopLeft,
     FileDiff,
     SquareTerminal,
     Bell,
@@ -150,6 +151,7 @@ impl Icon {
     pub const ALL: &[Self] = &[
         Self::Archive,
         Self::ArchiveRestore,
+        Self::PanelsTopLeft,
         Self::FileDiff,
         Self::SquareTerminal,
         Self::Bell,
@@ -261,6 +263,7 @@ impl Icon {
         match self {
             Self::Archive => "archive",
             Self::ArchiveRestore => "archive-restore",
+            Self::PanelsTopLeft => "panels-top-left",
             Self::FileDiff => "file-diff",
             Self::SquareTerminal => "square-terminal",
             Self::Bell => "bell",
@@ -371,6 +374,7 @@ impl Icon {
 
     fn paths(self) -> &'static str {
         match self {
+            Self::PanelsTopLeft => r#"<rect width="18" height="18" x="3" y="3" rx="2" /><path d="M3 9h18" /><path d="M9 21V9" />"#,
             Self::Archive => {
                 r#"<rect width="20" height="5" x="2" y="3" rx="1" /><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8" /><path d="M10 12h4" />"#
             }
@@ -667,7 +671,7 @@ legacy_icons! {
     grid_plus => LayoutGrid, S16;
     info => Info, S16;
     help => CircleHelp, S16;
-    user => User, S16;
+    user => User, S14;
     plus => Plus, S16;
     quote => Quote, S16;
     list => List, S16;

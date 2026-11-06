@@ -9,6 +9,7 @@ use serde_json::Value;
 use wasm_bindgen::prelude::*;
 
 use crate::api;
+use crate::icons::{Icon, Size, icon};
 use crate::models::ModelInput;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT, ago, now_ms};
 use crate::when::compact as when;
@@ -331,9 +332,9 @@ fn Hit(h: MemexHit, open: RwSignal<Option<String>>) -> impl IntoView {
                 <span class="text-xs text-muted">{when(h.created_at)}</span>
                 {h.matched.iter().map(|m| view! { <span class="text-[10px] uppercase tracking-wide text-muted">{m.clone()}</span> }).collect_view()}
                 <span class="flex-1"></span>
-                {session.map(|sid| view! { <Go to=View::session(sid) class="text-xs text-sky-700 hover:underline dark:text-sky-400">"open session "{crate::icons::arrow_up_right()}</Go> })}
-                {doc.map(|d| view! { <Go to=View::Docs { id: d } class="text-xs text-sky-700 hover:underline dark:text-sky-400">"open document "{crate::icons::arrow_up_right()}</Go> })}
-                {h.url.clone().map(|u| view! { <a href=crate::markdown::safe_href(&u) target="_blank" rel="noopener noreferrer" class="text-xs text-sky-700 hover:underline dark:text-sky-400">"page "{crate::icons::arrow_up_right()}</a> })}
+                {session.map(|sid| view! { <Go to=View::session(sid) class="text-xs text-sky-700 hover:underline dark:text-sky-400">"open session "{icon(Icon::ArrowUpRight, Size::S14)}</Go> })}
+                {doc.map(|d| view! { <Go to=View::Docs { id: d } class="text-xs text-sky-700 hover:underline dark:text-sky-400">"open document "{icon(Icon::ArrowUpRight, Size::S14)}</Go> })}
+                {h.url.clone().map(|u| view! { <a href=crate::markdown::safe_href(&u) target="_blank" rel="noopener noreferrer" class="text-xs text-sky-700 hover:underline dark:text-sky-400">"page "{icon(Icon::ExternalLink, Size::S14)}</a> })}
             </div>
             <p class="text-sm text-zinc-600 dark:text-zinc-400">{h.snippet.clone()}</p>
         </div>
@@ -394,7 +395,7 @@ fn item_view(it: Value, open: RwSignal<Option<String>>, error: RwSignal<Option<S
             <h2 class="font-medium">{s("title")}</h2>
             <span class="text-xs text-muted">{format!("{} · from {}", when(it["created_at"].as_i64().unwrap_or(0)), s("source"))}</span>
             <span class="flex-1"></span>
-            {has_original.then(|| view! { <a href=original.clone() target="_blank" rel="noopener" class="text-xs text-sky-700 hover:underline dark:text-sky-400">"Open original "{crate::icons::arrow_up_right()}</a> })}
+            {has_original.then(|| view! { <a href=original.clone() target="_blank" rel="noopener" class="text-xs text-sky-700 hover:underline dark:text-sky-400">"Open original "{icon(Icon::ExternalLink, Size::S14)}</a> })}
             <button class="text-xs text-red-600 hover:underline" on:click=remove>"Delete"</button>
         </div>
         <div class="flex flex-wrap gap-1">{chips(about, open)}</div>

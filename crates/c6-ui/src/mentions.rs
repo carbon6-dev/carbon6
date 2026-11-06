@@ -8,6 +8,7 @@ use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
 use crate::api;
+use crate::icons::{Icon, Size, icon};
 use crate::markdown::{Kind, Known};
 use crate::util::{ago, now_ms, status_look};
 use crate::workspace::{ColumnCtx, How, View, Workspace, use_column, use_workspace};
@@ -360,7 +361,7 @@ fn SessionPeek(id: String) -> impl IntoView {
             .into_any()
         }
         None => view! {
-            {title_row(None, crate::icons::circle().into_any(), short.clone(), None)}
+            {title_row(None, icon(Icon::CircleDashed, Size::S16).into_any(), short.clone(), None)}
             <div class="text-xs text-muted">"Not among this realm's sessions"</div>
         }
         .into_any(),
@@ -400,7 +401,7 @@ fn DocPeek(id: String) -> impl IntoView {
             Some(Err(e)) => (title.clone(), e),
         };
         view! {
-            {title_row(None, crate::icons::file().into_any(), title, None)}
+            {title_row(None, icon(Icon::FileText, Size::S16).into_any(), title, None)}
             <div class="truncate text-xs text-muted">{line}</div>
         }
     }

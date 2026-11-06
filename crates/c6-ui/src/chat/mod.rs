@@ -545,7 +545,7 @@ fn Sidebar() -> impl IntoView {
                         names.push(n.trim().to_owned());
                         chat.act("memex.chat.sections", json!({"workspace": w, "names": names}));
                     }
-                }>"+ New section"</button>
+                }>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" New section"</button>
             </div>
         </nav>
     }
@@ -773,7 +773,7 @@ fn ConversationPane(place: Place, at: Option<String>) -> impl IntoView {
                     </button>
                     {(c["muted"] == true).then(|| view! { <span class="rounded bg-zinc-200 px-1 text-[10px] text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400">"muted"</span> })}
                     <span class="min-w-0 flex-1 truncate text-xs text-muted" title=c["topic"].as_str().unwrap_or("").to_owned()>{c["topic"].as_str().unwrap_or("").to_owned()}</span>
-                    {c["members"].as_i64().map(|n| view! { <span class="text-xs text-muted" title="Members">{crate::icons::user()}" "{n}</span> })}
+                    {c["members"].as_i64().map(|n| view! { <span class="text-xs text-muted" title="Members">{crate::icons::icon(crate::icons::Icon::Users, crate::icons::Size::S14)}" "{n}</span> })}
                     {c["user_status"].as_str().filter(|s| !s.is_empty()).map(|s| view! { <span class="text-xs text-muted">{text::status(s)}</span> })}
                 }
             })}

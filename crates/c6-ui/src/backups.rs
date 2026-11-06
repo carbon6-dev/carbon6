@@ -199,8 +199,8 @@ pub fn BackupsSetting() -> impl IntoView {
                                 }
                             }).collect_view()}
                             <div class="flex gap-2">
-                                <button class=BUTTON_QUIET on:click=move |_| edit(Box::new(|s| { let n = s.destinations.len() + 1; s.destinations.push(new_destination("folder", n)) }))>"+ Folder"</button>
-                                <button class=BUTTON_QUIET on:click=move |_| edit(Box::new(|s| { let n = s.destinations.len() + 1; s.destinations.push(new_destination("s3", n)) }))>"+ S3"</button>
+                                <button class=BUTTON_QUIET on:click=move |_| edit(Box::new(|s| { let n = s.destinations.len() + 1; s.destinations.push(new_destination("folder", n)) }))>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" Folder"</button>
+                                <button class=BUTTON_QUIET on:click=move |_| edit(Box::new(|s| { let n = s.destinations.len() + 1; s.destinations.push(new_destination("s3", n)) }))>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" S3"</button>
                             </div>
                         </div>
                         <div class="flex flex-wrap gap-3 text-sm">

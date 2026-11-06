@@ -10,6 +10,7 @@ use wasm_bindgen::JsCast;
 
 use super::{Chat, Place, text};
 use crate::api;
+use crate::icons::{Icon, Size, icon};
 use crate::util::ErrorBox;
 use crate::when::{full, heading as day, time};
 
@@ -364,7 +365,7 @@ pub(crate) fn Message(
                             }
                         }>{crate::icons::trash()}</button>
                     })}
-                    <a class=btn href=url2 target="_blank" rel="noopener" title="Open in Slack">{crate::icons::square_arrow_out()}</a>
+                    <a class=btn href=url2 target="_blank" rel="noopener" title="Open in Slack">{icon(Icon::ExternalLink, Size::S14)}</a>
                 </div>
             }
         }

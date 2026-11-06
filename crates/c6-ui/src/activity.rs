@@ -144,7 +144,7 @@ fn DockActivity(open: RwSignal<bool>, fold: &'static str, kept: RwSignal<bool>, 
                     <button class="font-normal normal-case tracking-normal hover:text-zinc-900 dark:hover:text-zinc-100"
                         title=move || if kept.get() { "Hide the sidebar: it slides out when you point at the left edge (⌘\\)" } else { "Keep the sidebar open (⌘\\)" }
                         on:click=move |_| toggle.run(())>
-                        {move || if kept.get() { "«" } else { "»" }}
+                        {move || crate::icons::icon(if kept.get() { crate::icons::Icon::PanelLeftClose } else { crate::icons::Icon::PanelLeftOpen }, crate::icons::Size::S16)}
                     </button>
                 </span>
             </div>
@@ -552,10 +552,7 @@ pub fn SessionsPicker() -> impl IntoView {
         <button node_ref=button class="relative flex h-11 w-11 shrink-0 items-center justify-center rounded-md text-zinc-600 hover:bg-zinc-200/60 md:hidden dark:text-zinc-300 dark:hover:bg-zinc-800"
             title="Sessions" aria-label=move || picker_label(count()) aria-haspopup="dialog" aria-expanded=move || open.get().to_string()
             on:click=move |_| open.update(|o| *o = !*o)>
-            <svg viewBox="0 0 24 24" class="size-4" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <rect x="3" y="3" width="18" height="18" rx="2" />
-                <path d="M3 9h18M9 9v12" />
-            </svg>
+            {crate::icons::icon(crate::icons::Icon::PanelsTopLeft, crate::icons::Size::S16)}
             <span data-phone-pages="true" class="absolute right-1 top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-zinc-200 px-1 text-[10px] leading-none tabular-nums dark:bg-zinc-700">{count}</span>
         </button>
         <Show when=move || open.get()>
@@ -670,7 +667,7 @@ fn SessionsSheet(close: Callback<()>) -> impl IntoView {
                     })
                 }}
                 <div class="my-1 border-t border-zinc-200 dark:border-zinc-800"></div>
-                <button class=link on:click=move |_| { ws.open(None, View::Sessions, How::OwnTile); close.run(()) }>"All sessions "{crate::icons::arrow_right()}</button>
+                <button class=link on:click=move |_| { ws.open(None, View::Sessions, How::OwnTile); close.run(()) }>"All sessions "{crate::icons::arrow_up_right()}</button>
                 <button class=link on:click=move |_| { ws.new_tile(); close.run(()) }>{crate::icons::plus()}" New session or page"</button>
             </div>
         </div>

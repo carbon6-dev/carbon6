@@ -115,14 +115,19 @@ pub fn Glance(chrome: SessionChrome, #[prop(optional, into)] on_done: Option<Cal
         } else {
             let worker =
                 detail.get().and_then(Result::ok).map(|d| d.worker_name).unwrap_or_else(|| live.worker_name(&s.worker_id.to_string()));
-            let worker = match &s.ssh {
+            // Native title text stays plain; the visible label draws the relationship.
+            let worker_title = match &s.ssh {
                 Some(t) => format!("{worker} ⇄ {t}"),
-                None => worker,
+                None => worker.clone(),
             };
-            let title = format!("{worker}{} · {rest}", if online { "" } else { " (offline)" });
+            let title = format!("{worker_title}{} · {rest}", if online { "" } else { " (offline)" });
+            let worker = match &s.ssh {
+                Some(t) => crate::sessions::relationship_label(worker, t.clone()).into_any(),
+                None => worker.into_any(),
+            };
             view! {
                 <span class=format!("mr-1 inline-block size-1.5 rounded-full align-middle {}", if online { "bg-emerald-500" } else { "bg-zinc-400" })></span>
-                <span title=title>{format!("{worker} · {rest}")}</span>
+                <span title=title>{worker}" · "{rest}</span>
             }
             .into_any()
         };
