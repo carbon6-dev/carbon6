@@ -178,7 +178,7 @@ test: ## Run the test suite: every test at once with cargo nextest when it's ins
 test-under-load: ## Run the test suite with every CPU core kept busy (RUNS=1; NEXTEST=1 for cargo nextest); it must pass as it does otherwise (docs/testing.md)
 	NEXTEST=$(NEXTEST) scripts/test-under-load.sh $(or $(RUNS),1)
 
-check: ## Check formatting (cargo fmt), clippy every target (libraries, binaries, tests, examples; the web UI for wasm), fail on any warning, and lint the tests (docs/testing.md)
+check: ## Check formatting, clippy every target (including wasm), lint tests and ratchet built UI size (docs/testing.md)
 	@cargo fmt --all --check || { echo "check: unformatted code; run cargo fmt --all" >&2; exit 1; }
 	@for args in "--workspace --all-targets" "-p c6-ui --target wasm32-unknown-unknown"; do \
 		if cargo clippy --locked $$args --message-format short 2>&1 | tee /dev/stderr | grep -vE '^warning: spurious network' | grep -qE '^(warning|error)'; then \
@@ -186,6 +186,7 @@ check: ## Check formatting (cargo fmt), clippy every target (libraries, binaries
 		fi; \
 	done; echo "check: no warnings"
 	@scripts/test-lint.sh
+	@scripts/ui-size.sh
 
 dev-head: ui ## Run the dev head on all interfaces (dev/c6h.toml; state in the standard data directory)
 	cargo run -p c6h -- --config dev/c6h.toml

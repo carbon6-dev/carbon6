@@ -111,6 +111,13 @@ optimisation, unwinding and build settings are unchanged. The browser panic hook
 still reports the panic to the head and shows its plain-JavaScript reload banner
 before wasm traps.
 
+After `make ui`, `make check` also checks the wasm size ratchet in
+`scripts/ui-size.sh`: both raw and Brotli bytes must stay within 3% of the last
+accepted production build. Lower its accepted byte counts when the UI shrinks;
+explain any increase in the commit message. The targets are at most 8 MB raw and
+2 MB Brotli (decimal bytes). A checkout without built wasm skips this check;
+a built wasm without its Brotli sidecar fails it.
+
 ## Run
 
 On the head machine:
