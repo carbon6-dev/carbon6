@@ -1,0 +1,4 @@
+# Erase Leptos component view types only in the browser build. Native head,
+# worker and UI unit-test builds retain their existing compiler settings.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", "erase_components"]

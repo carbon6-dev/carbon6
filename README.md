@@ -102,6 +102,15 @@ Chrome uses `crates/c6-ui/src/icons.rs`: `icon(Icon::Bell, Size::S16)`, with Luc
 
 The hidden signed-in `/dev/components` page (also `/r/<realm>/dev/components`) is a small live specimen: inspect it in both themes and pointer modes. The first-stage migration provides the foundations, icons and switches; existing button-tier, pill/badge and overlay call-site migrations wait for visual review. See [docs/testing.md](docs/testing.md#icons-and-components-browser-check).
 
+The UI's release build uses the separate `ui-release` Cargo profile (size
+optimisation, fat LTO, one codegen unit and aborting panics), selected by Trunk's
+HTML entry point. The wasm target also erases Leptos component view types to keep
+download and browser compilation small. `make ui`, direct `trunk build --release`,
+Docker and package builds all use these settings; native `c6h`/`c6w` release
+optimisation, unwinding and build settings are unchanged. The browser panic hook
+still reports the panic to the head and shows its plain-JavaScript reload banner
+before wasm traps.
+
 ## Run
 
 On the head machine:
