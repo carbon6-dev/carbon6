@@ -74,8 +74,13 @@ async function sessionOverlays(page, theme, width) {
   if (await model.count()) {
     console.log(`  overlays ${theme} ${width}: model`);
     await model.click();
+    assert.equal(await page.getByRole('dialog', { name: 'Model', exact: true }).count(), 0, 'narrow desktop tiles keep the viewport portal, not the phone sheet');
     const pop = page.locator('[data-pop]').filter({ has: page.getByText('Model', { exact: true }) }).last();
     await overlayBounds(pop);
+    const input = pop.getByPlaceholder('model id', { exact: true });
+    await input.fill('custom-model-id');
+    await pop.getByRole('button', { name: 'fixture-model-32', exact: true }).click();
+    assert.equal(await input.inputValue(), 'fixture-model-32', 'narrow desktop picker keeps its last model choice reachable');
     await page.keyboard.press('Escape');
   }
 }

@@ -503,11 +503,15 @@ ENGINE=both SCREENSHOTS=/tmp/z2-screenshots \
 
 Like `motion.cjs`, it uses the local Playwright/browser paths (or their environment
 overrides), an owned ephemeral port, fake HTTP/WebSockets and fresh contexts.
-Check both themes with several actual 480px tiles: old-head/default off,
+Check both themes with several wide tiles: old-head/default off,
 opt-in on, the selected shapes, 400ms resting spotlight and cancellation,
 clicking a card and its palette, setting save/reload, and live off/on changes
-without replacing controls or composers. Fixed controls must stay 44px and at
-the same coordinates; only the title loses room. Resize to 320/390px and short
+without replacing controls or composers. Fixed controls keep their 28px
+fine-pointer or 44px coarse-pointer slots and coordinates; only the title loses
+room. Resize actual tile content through 720/640/639/480/479/320/240px: marks
+yield below 640px, before secondary controls move into Actions below 480px;
+the ring, Actions, Focus and Close stay ordered and reachable. Widening restores
+the same nodes and geometry. Resize the viewport to 320/390px and short
 landscape: no strips, pending dimming or popovers, even with the setting on.
 Keep off/on/card/phone screenshots and reject console/crash-reporter errors.
 

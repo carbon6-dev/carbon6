@@ -113,6 +113,13 @@
 @custom-variant lg (@media (width >= 64rem) and (height >= 32rem));
 @custom-variant xl (@media (width >= 80rem) and (height >= 32rem));
 
+/* Optional marks yield before the bar's secondary controls. Keep an explicit
+   narrow rule: Blink can retain the wide display value on this portal mount
+   after crossing the container breakpoint with only a min-width utility. */
+@container tile (width < 40rem) {
+  [data-tile-aspects] { display: none; }
+}
+
 /* Dark mode's three background greys, page, panels and chips, a step
    softer than Tailwind's zinc-950/900/800 (the near-black read as too
    dark); text and accents are unchanged and keep 4.5:1 or more on them.

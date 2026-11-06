@@ -7,6 +7,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
+const { settle } = require('./motion.cjs');
 const playwright = require(process.env.PLAYWRIGHT_CORE || '/home/zheilbron/.bun/install/cache/playwright-core@1.50.1@@@1');
 const ROOT = path.resolve(process.env.ROOT || path.join(__dirname, '../dist'));
 const SHOTS = process.env.SCREENSHOTS || '/tmp/z2-screenshots';
@@ -122,8 +123,12 @@ async function check(browser, origin, label) {
     assert.equal(await page.locator('[data-aspect-dim]').count(), 0, 'no per-tile spotlight work off');
     const panel = key => page.locator(`[data-tile-motion="${key}"] > section`);
     const first = panel(2), title = first.locator('span[title*="Double-click"]');
+    const bar = first.locator(':scope > div[draggable]');
     const control = first.getByRole('button', { name: 'Close this tile', exact: true });
     const composer = await first.locator('textarea').elementHandle(), close = await control.elementHandle();
+    const titleNode = await title.elementHandle();
+    const fixedControls = await bar.locator('button').elementHandles();
+    const slotSize = await page.evaluate(() => matchMedia('(min-width: 768px) and (pointer: fine)').matches ? 28 : 44);
     const scrollHome = () => page.locator('[data-workspace-motion]').evaluate(el => { el.parentElement.scrollLeft = 0; });
     const shot = async name => { await scrollHome(); await page.screenshot({ path: path.join(SHOTS, `${label}-${name}.png`) }); };
     await scrollHome();
@@ -137,21 +142,120 @@ async function check(browser, origin, label) {
     assert.equal(saved.tile_bars, true);
     assert.deepEqual(saved.shown, facets);
     const after = { title: await title.boundingBox(), close: await control.boundingBox() };
-    assert.equal(after.close.width, 44); assert.equal(after.close.height, 44);
+    assert.equal(after.close.width, slotSize); assert.equal(after.close.height, slotSize);
     assert.deepEqual(after.close, before.close, 'marks must not move or squeeze controls');
     assert.equal(before.title.width - after.title.width, 80, 'five 16px shapes take only title room');
     for (const key of [2, 4, 6]) {
-      assert((await panel(key).boundingBox()).width >= 480, 'the canvas retains its 480px floor');
       const labels = await panel(key).locator('[data-aspect-strip] button').evaluateAll(els => els.map(e => e.getAttribute('aria-label').split(':')[0]));
       assert.deepEqual(labels, ['Worker', 'Work', 'Project', 'Repo', 'Model'], 'chosen aspects, with the home realm omitted');
       for (const name of ['Changes', 'Terminal', 'Pin', 'Focus', 'Actions', 'Close this tile']) {
         const box = await panel(key).getByRole('button', { name, exact: true }).boundingBox();
-        assert.equal(box.width, 44); assert.equal(box.height, 44);
+        assert.equal(box.width, slotSize); assert.equal(box.height, slotSize);
       }
       const ring = await panel(key).getByRole('button', { name: /Open session sheet/ }).boundingBox();
-      assert.equal(ring.width, 44); assert.equal(ring.height, 44);
+      assert.equal(ring.width, slotSize); assert.equal(ring.height, slotSize);
     }
     await shot('on');
+    phase('marks yield before secondary controls in narrow desktop tiles');
+    const strip = await first.locator('[data-aspect-strip]').elementHandle();
+    const tileRoot = page.locator('[data-tile-motion="2"]');
+    // Saving the setting focused its tile. Focus the session before applying
+    // fixture widths: clicking Actions must not trigger a workspace layout
+    // update that restores the tile's normal width during the assertions.
+    await bar.getByRole('button', { name: 'Actions', exact: true }).click();
+    await first.locator(':scope > .phone-popover').waitFor();
+    await page.keyboard.press('Escape');
+    await first.locator(':scope > .phone-popover').waitFor({ state: 'detached' });
+    await settle(page);
+    const originalWidth = await tileRoot.evaluate(el => el.style.width);
+    // Resize the real tile, not the window: phone mode must remain off. The
+    // named /tile container queries use the section's content-box width.
+    const resizeTile = async width => {
+      await tileRoot.evaluate((el, width) => {
+        const panel = el.querySelector(':scope > section');
+        const style = getComputedStyle(panel);
+        const inset = ['paddingLeft', 'paddingRight', 'borderLeftWidth', 'borderRightWidth'].reduce((sum, key) => sum + parseFloat(style[key]), 0);
+        const contentWidth = panel.getBoundingClientRect().width - inset;
+        el.style.width = `${width + el.getBoundingClientRect().width - contentWidth}px`;
+      }, width);
+      await page.waitForFunction(width => {
+        const panel = document.querySelector('[data-tile-motion="2"] > section');
+        const style = getComputedStyle(panel);
+        return Math.abs(panel.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight) - width) < 0.5;
+      }, width);
+      // Container-query styles settle on the rendering opportunity after
+      // the geometry read; do not sample the preceding width's visibility.
+      await settle(page);
+    };
+    const barGeometry = () => title.evaluate(el => {
+      const bar = el.closest('[draggable]');
+      const rect = node => {
+        const r = node.getBoundingClientRect();
+        return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height };
+      };
+      const controls = [...bar.querySelectorAll('button')].filter(button => button.getClientRects().length).map(button => ({
+        label: button.getAttribute('aria-label'), box: rect(button), icon: !!button.querySelector('svg'),
+      }));
+      return { bar: rect(bar), title: rect(el), controls };
+    });
+    let wideGeometry;
+    for (const width of [720, 640, 639, 480, 479, 320, 240, 720]) {
+      await resizeTile(width);
+      assert.equal(await first.locator('[data-aspect-strip]').isVisible(), width >= 640, `marks yield below 40rem at ${width}`);
+      for (const name of ['Changes', 'Terminal', 'Pin']) {
+        assert.equal(await bar.getByRole('button', { name, exact: true, includeHidden: true }).isVisible(), width >= 480,
+          `${name} yields only below 30rem at ${width}`);
+      }
+      const geometry = await barGeometry();
+      const core = geometry.controls.filter(c => /Open session sheet/.test(c.label) || ['Actions', 'Focus', 'Close this tile'].includes(c.label));
+      assert.deepEqual(core.map(c => /Open session sheet/.test(c.label) ? 'Session sheet' : c.label),
+        ['Session sheet', 'Actions', 'Focus', 'Close this tile'], `core order at ${width}`);
+      assert.deepEqual(geometry.controls.slice(-3).map(c => c.label), ['Actions', 'Focus', 'Close this tile'],
+        `Maximize immediately precedes Close at ${width}`);
+      for (const c of core) {
+        assert.equal(c.box.width, slotSize); assert.equal(c.box.height, slotSize);
+        assert(c.icon, `${c.label} keeps its icon at ${width}`);
+      }
+      assert(geometry.title.width > 0, `title retains room at ${width}`);
+      const boxes = [{ label: 'Title', box: geometry.title }, ...geometry.controls];
+      for (const [i, a] of boxes.entries()) {
+        assert(a.box.left >= geometry.bar.left - 0.5 && a.box.right <= geometry.bar.right + 0.5 &&
+          a.box.top >= geometry.bar.top - 0.5 && a.box.bottom <= geometry.bar.bottom + 0.5,
+        `${a.label} fits the bar at ${width}`);
+        for (const b of boxes.slice(i + 1)) {
+          assert(Math.min(a.box.right, b.box.right) - Math.max(a.box.left, b.box.left) <= 0.5,
+            `${a.label} and ${b.label} do not overlap at ${width}`);
+        }
+      }
+      const canvasFits = await page.locator('[data-workspace-motion]').evaluate(el =>
+        el.getBoundingClientRect().width <= el.parentElement.clientWidth + 1 && el.parentElement.scrollWidth <= el.parentElement.clientWidth + 1);
+      assert(canvasFits, `no horizontal canvas overflow at ${width}`);
+      assert(await strip.evaluate(el => el.isConnected && el === el.closest('section').querySelector('[data-aspect-strip]')), 'resize retains the existing strip');
+      assert(await titleNode.evaluate(el => el.isConnected), 'resize retains the title');
+      assert(await composer.evaluate(el => el.isConnected), 'resize retains the composer');
+      for (const handle of fixedControls) assert(await handle.evaluate(el => el.isConnected), 'resize retains fixed controls');
+      if (width < 480) {
+        await bar.getByRole('button', { name: 'Actions', exact: true }).click();
+        // Scope to this tile's Actions popover, not unrelated realm menus
+        // elsewhere in the wall (including menus inside closed details).
+        const menu = first.locator(':scope > .phone-popover');
+        await menu.waitFor();
+        for (const name of ['Changes', 'Terminal', 'Pin']) {
+          const action = menu.getByRole('button', { name, exact: true });
+          assert(await action.isVisible(), `${name} remains available in Actions at ${width}`);
+          assert(await action.locator('svg').count(), `${name} keeps its menu icon at ${width}`);
+        }
+        await page.keyboard.press('Escape');
+        await menu.waitFor({ state: 'detached' });
+      }
+      if (width === 720) {
+        if (wideGeometry) assert.deepEqual(geometry, wideGeometry, 'widening restores title and control positions');
+        else wideGeometry = geometry;
+      }
+    }
+    await tileRoot.evaluate((el, width) => { el.style.width = width; }, originalWidth);
+    await first.locator('[data-aspect-strip] button').first().waitFor();
+    assert.deepEqual({ title: await title.boundingBox(), close: await control.boundingBox() }, after, 'restoring the tile restores the original bar geometry');
     const worker = first.getByRole('button', { name: 'Worker: Shared worker', exact: true });
     phase('resting spotlight');
     await worker.hover(); await page.mouse.move(0, 0);
@@ -190,6 +294,8 @@ async function check(browser, origin, label) {
     assert.equal(saved.tile_bars, false);
     assert.equal(await page.locator('[data-aspect-dim]').count(), 0, 'off removes spotlight attributes');
     assert(await close.evaluate(el => el.isConnected), 'toggle retains fixed controls');
+    for (const handle of fixedControls) assert(await handle.evaluate(el => el.isConnected), 'toggle retains every bar control');
+    assert(await titleNode.evaluate(el => el.isConnected), 'toggle retains the title');
     assert(await composer.evaluate(el => el.isConnected), 'toggle retains composers');
     phase('re-enable and reload');
     await change(toggle);

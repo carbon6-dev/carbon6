@@ -674,6 +674,8 @@ async function modelPicker(f) {
   await chip.click();
   await input.waitFor(); await settle(page);
   assert.equal(await dialog.count(), phone ? 1 : 0, 'only phones use the existing bottom sheet');
+  const originalModel = await input.inputValue();
+  const originalEffort = await page.getByRole('combobox', { name: 'Reasoning effort', exact: true }).inputValue();
   await input.fill('custom-model-id');
   assert.equal(await input.inputValue(), 'custom-model-id', 'free-form model selection is unchanged');
   const last = page.getByRole('button', { name: 'fixture-model-32', exact: true });
@@ -736,6 +738,9 @@ async function modelPicker(f) {
       `interrupted model-sheet exit keeps the live body at its displayed position: ${JSON.stringify(retained)}`);
     await settle(page);
   }
+  // Leave no pending-change badge to wrap the toolbar in later composer checks.
+  await input.fill(originalModel);
+  await effort.selectOption(originalEffort);
   await page.keyboard.press('Escape');
   await settle(page);
   await input.waitFor({ state: 'hidden' });
