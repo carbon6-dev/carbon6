@@ -14,23 +14,34 @@ PARAGRAPHS=180 LABEL=after-heavy /home/zheilbron/.nvm/versions/node/v24.16.0/bin
 
 The private loopback fixture has three tiles and 93 historical replies. At 4×
 CPU throttling it streams eight chunks before each of twelve new Markdown
-items, in both themes. It checks retained rim/context nodes and the same running
-spin animation across item arrivals and changing session snapshots. The spinning
-element must be the outer SVG, with an active-transform compositor layer, one
-1.4s animation, and no motion on the independently drawn context. All four states
-and the unchanged static Reduced/Off working rim are checked too.
+items, in both themes. It checks retained rim/context nodes and both running
+animation identities across item arrivals and changing session snapshots. The
+1.4s spin belongs to the HTML wrapper; a clipped outer SVG sweeps over 2.8s to
+grow/shrink the arc from 8 to 30 units. Both must have their own active-transform
+compositor layers, transform-only keyframes, and no motion on the independently
+drawn context. All four states and the unchanged static Reduced/Off working rim
+are checked too. Run with `SCALE=2 LABEL=after-retina` for Retina-sized output;
+the default scale is 1. Use distinct labels to preserve both sets of evidence.
+The first run also saves a paused nine-phase full-cycle comparison against the
+original dashed circle: 16/20/24px, integer/quarter/half-pixel placement, both
+growth and shrink, and the cycle boundary. It checks arc length/easing, weighted
+blue ink and angular continuity, and saves all-state Full/Reduced/Off galleries.
+DSF-2 gallery PNGs have twice the physical resolution. CDP screencasts can
+instead return CSS-pixel images; their own viewport metadata determines crops.
 
 Evidence goes to `/tmp/q3-ring/` (`EVIDENCE` overrides it): JSON timing and
 main-thread rAF gaps, long tasks, screenshots, and a trace/CPU profile on the
 first of three runs. Runs 1 and 2 are unprofiled. Timings and frame counts have
 **no pass/fail budget**. A separate 600ms deliberately blocked-main-thread
-screencast follows the first run's natural workload; its frames allow checking
-whether the ring's pixels keep changing, unlike rAF, which itself stops on a
-busy main thread. This challenge is not a measured transcript long task.
+screencast follows the first run's natural workload. Its blue-pixel area checks
+arc-length change independently of the centroid's angular movement: spinning a
+fixed arc alone cannot satisfy the breathing check. The natural trace window
+must contain zero ring-specific Paint records. The separate blocked-main-thread
+challenge is not a measured transcript long task or a global FPS benchmark.
 
 `BASELINE=1 ROOT=/path/to/pinned/dist` records the old implementation without
 enforcing the new compositor/retention invariants. `LABEL`, `THEME`, `RUNS`,
-`CPU`, and `PARAGRAPHS` select evidence names/workloads. Compare identical
+`CPU`, `SCALE`, and `PARAGRAPHS` select evidence names/workloads. Compare identical
 workloads and separate traced from untraced runs. The recorded DOM-update and
 next-rAF latencies are **not presentation times**; use the trace's layout,
 paint and compositor events for attribution. See the Q3 section of

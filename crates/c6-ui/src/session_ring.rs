@@ -69,10 +69,20 @@ pub fn SessionRing(
     let count = Memo::new(move |last: Option<&usize>| if background.get() > 0 { background.get() } else { last.copied().unwrap_or(0) });
     view! {
         <span class="relative inline-flex size-6 shrink-0 align-middle">
-            // Rotate the whole SVG on its own layer, never an SVG child or
-            // the context arc. Retain both drawings across state updates.
+            // The arc stays below a semicircle: one static lower-half clip
+            // reveals a rotating half-ring, with no join between two pieces.
+            // Both moving boxes composite; the context and state rim stay put.
+            <span aria-hidden="true"
+                class=move || if state.get() == AgentState::Working { "c6-ring-motion c6-ring-working" } else { "c6-ring-motion" }>
+                <span class="c6-ring-clip">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" class="c6-ring-sweep">
+                        <path d="M22.5 12a10.5 10.5 0 0 1-21 0" stroke-width="1.5"
+                            class="stroke-blue-500 dark:stroke-blue-400" />
+                    </svg>
+                </span>
+            </span>
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" aria-hidden="true"
-                class=move || if state.get() == AgentState::Working { "absolute inset-0 size-6 c6-ring-working" } else { "absolute inset-0 size-6" }>
+                class="absolute inset-0 size-6 c6-ring-rim">
                 // A full outer rim; waiting is dashed, failed has a drawn cross.
                 <circle cx="12" cy="12" r="10.5" stroke-width="1.5"
                     class=move || state.get().rim_class()
@@ -190,7 +200,8 @@ mod tests {
             assert!(rim.contains("r=\"10.5\""));
             assert!(rim.contains(color));
             assert!(rim.contains(if state == AgentState::Waiting { "stroke-dasharray=\"2 2\"" } else { "stroke-dasharray=\"none\"" }));
-            assert_eq!(html.contains("<path"), state == AgentState::Failed);
+            assert_eq!(html.matches("<path").count(), 1 + usize::from(state == AgentState::Failed));
+            assert_eq!(html.contains("d=\"m10 10 4 4m0-4-4 4\""), state == AgentState::Failed);
             if state == AgentState::Failed {
                 assert!(html.contains("d=\"m10 10 4 4m0-4-4 4\""));
             }
@@ -202,19 +213,23 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn only_the_outer_svg_spins_and_the_context_keeps_its_accessible_name() {
+    fn working_arc_moves_whole_boxes_and_context_keeps_its_accessible_name() {
         let html = render(AgentState::Working, Some(42), 0);
-        let rim_svg = html.split("<svg").nth(1).unwrap().split("</svg>").next().unwrap();
-        let context_svg = html.split("<svg").nth(2).unwrap().split("</svg>").next().unwrap();
-        assert!(rim_svg.contains("aria-hidden=\"true\""));
-        assert!(rim_svg.split('>').next().unwrap().contains("c6-ring-working"));
-        assert!(!rim_svg.contains("r=\"7\""));
+        let sweep_svg = html.split("<svg").nth(1).unwrap().split("</svg>").next().unwrap();
+        let context_svg = html.split("<svg").nth(3).unwrap().split("</svg>").next().unwrap();
+        assert!(html.contains("aria-hidden=\"true\" class=\"c6-ring-motion c6-ring-working\""));
+        assert!(sweep_svg.split('>').next().unwrap().contains("c6-ring-sweep"));
+        assert!(sweep_svg.contains("d=\"M22.5 12a10.5 10.5 0 0 1-21 0\""));
+        assert!(!sweep_svg.contains("r=\"7\""));
         assert!(!context_svg.contains("c6-ring-working"));
         assert!(context_svg.contains("role=\"img\""));
         assert!(context_svg.contains("stroke-dasharray=\"42 100\""));
         let css = include_str!("../style/input.css");
         assert!(!css.contains("c6-ring-arc"));
-        assert!(css.contains(".c6-ring-working > circle { stroke-dasharray: 20 46; }"));
+        let sweep = css.split("@keyframes c6-ring-sweep").nth(1).unwrap().split("/*").next().unwrap();
+        assert!(sweep.contains("rotate(-136.35deg)"));
+        assert!(sweep.contains("rotate(-16.3deg)"));
+        assert!(!sweep.contains("stroke-dasharray"));
     }
 
     #[cfg(not(target_arch = "wasm32"))]

@@ -417,11 +417,20 @@ html.soft {
 }
 [data-open="false"] > .c6-ring-badge { opacity: 0; scale: calc(1 - .1 * var(--travel)); transition-duration: var(--dur-quick); }
 
-/* Rotate the outer rim's whole SVG as one composited piece, with a fixed arc:
-   no inner-SVG transform or paint-bound dash morph when the transcript is busy.
-   The separately drawn context arc never spins. loader-circle keeps this period. */
-.c6-ring-working { transform-origin: center; will-change: transform; animation: spin 1.4s linear infinite; }
-.c6-ring-working > circle { stroke-dasharray: 20 46; }
+/* The 8..30-unit arc never reaches 180deg. One lower-half clip over a rotating
+   semicircle gives the old breathing shape without a seam between two pieces.
+   Only whole-box transforms animate: spin the wrapper, sweep the outer SVG.
+   The separate context/state drawings never move; static motion keeps the rim. */
+.c6-ring-motion { display: none; position: absolute; inset: 0; }
+.c6-ring-working { display: block; transform-origin: center; will-change: transform; animation: spin 1.4s linear infinite; }
+.c6-ring-clip { position: absolute; top: 50%; right: 0; bottom: 0; left: 0; overflow: hidden; }
+.c6-ring-sweep { position: absolute; bottom: 0; left: 0; width: 100%; height: 200%; transform-origin: center; }
+.c6-ring-working .c6-ring-sweep { will-change: transform; animation: c6-ring-sweep 2.8s ease-in-out infinite; }
+.c6-ring-working + .c6-ring-rim { visibility: hidden; }
+@keyframes c6-ring-sweep {
+  0%, 100% { transform: rotate(-136.35deg); }
+  50% { transform: rotate(-16.3deg); }
+}
 
 /* Native details keep keyboard/search semantics. Only their bounded tool
    body reveals: output updates don't restart it or change its final height.
@@ -446,8 +455,12 @@ html.soft {
 :root[data-motion="reduced"] .c6-ring-working { animation: none; }
 :root[data-motion="reduced"] .c6-ring-working,
 :root[data-motion="off"] .c6-ring-working { will-change: auto; }
-:root[data-motion="reduced"] .c6-ring-working > circle,
-:root[data-motion="off"] .c6-ring-working > circle { stroke-dasharray: none; }
+:root[data-motion="reduced"] .c6-ring-sweep,
+:root[data-motion="off"] .c6-ring-sweep { animation: none; will-change: auto; }
+:root[data-motion="reduced"] .c6-ring-motion,
+:root[data-motion="off"] .c6-ring-motion { display: none; }
+:root[data-motion="reduced"] .c6-ring-rim,
+:root[data-motion="off"] .c6-ring-rim { visibility: visible; }
 :root[data-motion="reduced"] .c6-sidebar { translate: 0; }
 :root[data-motion="reduced"] .transition-transform,
 :root[data-motion="reduced"] .transition-\[width\] { transition: none; }

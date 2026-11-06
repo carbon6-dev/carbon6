@@ -473,3 +473,113 @@ and its Markdown/analysis script, raw traces/CPU profiles, screenshots and
 `blocked-ring-pixels.json` with cropped-ring hashes/blue-arc angles. A separate
 set of adjacent traced pairs investigates presentation-feedback uncertainty;
 these must not be mixed into the unprofiled comparison above.
+
+## Q3 follow-up: restore breathing with transforms — November 6, 2026
+
+The fixed arc above removed paint work, but those measurements did **not**
+establish that the old breathing arc slowed the application. This follow-up
+preserves its appearance instead of treating repainting alone as a reason to
+remove it. The baseline for this change is the fixed-arc commit `348fd67b` on
+`c6/q3-ring-render`; the original dash morph at `8d0079b9` remains a separate
+visual reference and positive Paint control. No transcript code changes.
+
+### Small transform-only construction
+
+The radius is 10.5, so 8–30 SVG units span approximately 43.65–163.70 degrees,
+always less than a semicircle. A single lower semicircle rotates from
+−136.35 to −16.3 degrees behind a lower-half clip fixed within the spin wrapper.
+Their intersection is exactly the desired clockwise arc starting at three o'clock. An outer HTML
+wrapper supplies the original 1.4s linear spin; the **whole outer SVG**, not its
+path, supplies the original 2.8s, per-half-cycle `ease-in-out` sweep. Both
+animations change only `transform`, with independently verified active-transform
+compositor layers. There are no joined half-rings, extra caps, masks, animated
+dash attributes, JavaScript animation loops, or new dependencies.
+
+This adds four decorative DOM nodes (two spans, one SVG, one path). The existing
+rim remains for Idle/Waiting/Failed and the stationary full Working rim under
+Reduced/Off. Context, accessible descriptions, failed cross and background badge
+stay independent. Reduced/Off hide the new overlay, stop both animations and
+release both layer hints. Ordinary live snapshots, new items and
+Starting-to-Running updates retain both moving nodes and both CSS Animation
+objects. The separate plain phone context ring is still unchanged.
+
+### Verification and limits
+
+`tests/ring-render.cjs` now checks both layers, transform-only keyframes, exact
+periods/easing/offsets, clip/SVG geometry, stationary context, retained animation
+identities, state cues and Full/Reduced/Off restoration. Paint attribution
+includes the exact 24px ring parent and its subtree: the original dash morph
+paints that parent span. Broader document/tile/button paints are not counted as
+ring-specific paints. A fresh original-implementation positive control records
+**260 ring Paints**, so a zero result is not merely an empty attribution filter.
+
+The same production fixture uses three tiles, 93 historical replies, eight
+streamed chunks before each of twelve ordinary or large new Markdown items,
+4× CPU throttle, both themes, and DSF 1/2. Chromium 158.0.8127.18 checks ordinary
+and 180-paragraph workloads; Chromium 133.0.6943.16 independently checks ordinary
+workloads at both scales. The saved three-run series still separates traced
+run 0 from unprofiled runs 1/2. Additional final single-run cases exercise the
+completed regression, including its stricter ring-parent attribution.
+
+Final Chromium 158 results (each paired value is **light / dark**):
+
+| Workload / scale | Natural ring Paints | Interior blocked frames | Blue area, last third / first third |
+|---|---:|---:|---:|
+| Ordinary / DSF 1 | 0 / 0 | 29 / 30 | 1.635× / 1.665× |
+| Ordinary / DSF 2 | 0 / 0 | 30 / 30 | 1.667× / 1.696× |
+| Large items / DSF 1 | 0 / 0 | 30 / 30 | 1.640× / 1.689× |
+| Large items / DSF 2 | 0 / 0 | 30 / 30 | 1.640× / 1.689× |
+
+The fixed-arc before cases also have **zero** ring Paints at both scales/themes,
+but blue area stays approximately constant (0.969–0.975×) during the block.
+Chromium 133's four theme/scale cases likewise have **zero** ring Paints and
+30 interior frames each, with 1.633–1.668× blue-area growth. Both moving boxes
+have active-transform compositor layers, all retained-node/animation checks
+pass, and candidate centroid displacement is 138.0–143.8 degrees. The original
+dash-morph control has 0.972× blue area during the block: its rotation already
+continues, but its breathing does not.
+
+The separate 600ms blocked-main-thread diagnostic seeks the sweep early in its
+growth phase, then commits that phase before blocking. It saves interior
+compositor frames, rather than relying on rAF, and measures blue area separately
+from centroid movement. A spinning fixed arc cannot pass the breathing check.
+Centroid displacement includes half the arc-angle change and is **not** reported
+as a measurement of pure spin. CDP can output CSS-pixel screencasts even at
+DSF 2; cropping uses its own captured-viewport metadata, not layout height or an
+assumed device-pixel ratio. The separate DSF-2 visual PNGs are truly 3200×2000
+for a 1600×1000 viewport.
+
+Paused comparisons use the actual production drawing beside an independently
+animated reproduction of the original dashed circle, at nine times from 0 to
+2800ms, including growth, shrink and cycle wrap. Each theme/scale has 81 working
+comparisons: 16/20/24px at whole, quarter and half-pixel placement. Arc lengths
+match the original easing to under 0.001 SVG unit. Weighted blue-ink checks avoid
+treating a barely antialiased endpoint pixel as a whole pixel at 16px. Angular
+occupancy checks find no detached piece or interior gap at their two-physical-
+pixel endpoint tolerance. All-state galleries also cover each size under Full,
+Reduced and Off. There is no internal join at which two separately rasterized
+pieces could open a seam.
+
+This establishes the requested paint/compositor and bounded raster invariants,
+not a global FPS or transcript-latency improvement. Shared-host timing remains
+variable: one saved heavy unprofiled run has an 849.9ms main-thread rAF gap and
+34 long tasks. It is retained, not silently discarded or called a ring-induced
+slowdown. The original rotation already continued during a blocked main thread;
+the new result is that **arc length changes there too**, without ring paints.
+No physical Retina Mac, Android device, thermal/battery test or field INP was
+validated. Native Chromium headless evidence is not a substitute for those.
+
+`env -u NO_COLOR make ui`, `make check`, and `make test` pass. The native suite
+reports **1,113 passed, two intentionally skipped**; the eight native ring tests
+pass. The production WASM is **10,515,173 raw / 2,614,072 Brotli bytes**, a delta
+of **+754 / +518 bytes** from the fixed-arc baseline. The size ratchet and
+8MB/2MB goals are unchanged. SHA-256:
+`ec22ef43850575d387e4427743d806159336f8619b294f7a7a2b5fb69b5e9299`.
+
+Follow-up evidence stays under `/tmp/q3-ring/breath/`: pinned `fixed-dist` and
+`breath-dist`, build/check/test logs, JSON, traces/profiles, before/after blocked
+frames, original positive-control frames, nine-phase reference comparisons and
+all-state galleries. `frames.html` is a self-contained before/after frame viewer;
+`final-summary.json` and `final-summary.md` contain the complete per-case results.
+Historical measurements above are not rewritten to imply
+that the fixed arc proved an overall speedup.
