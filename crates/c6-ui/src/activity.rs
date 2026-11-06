@@ -356,7 +356,7 @@ fn InboxRow(s: Session, t: Tracked) -> impl IntoView {
                 <div class="truncate font-medium">{s.title.clone()}</div>
                 <div title=s.on_head.then_some(api::HEAD_TITLE) class="truncate text-xs text-muted">{format!("{} · {} · {}", what(s.display_status(), t), worker, ago(now_ms() - s.updated_at))}</div>
                 {(!s.labels.is_empty() || !crate::labels::shown_auto(&s.auto_labels).is_empty()).then(|| view! {
-                    <div class="mt-1 flex flex-wrap gap-1">
+                    <div class="mt-1 flex flex-wrap gap-1 [overflow-wrap:anywhere]">
                         {crate::labels::shown_auto(&s.auto_labels).into_iter().map(|l| view! { <crate::labels::LabelChip label=l auto=true stay=true /> }).collect_view()}
                         {s.labels.iter().cloned().map(|l| view! { <crate::labels::LabelChip label=l stay=true /> }).collect_view()}
                     </div>
@@ -394,7 +394,7 @@ pub fn MissionPage() -> impl IntoView {
             <p class="text-xs text-muted">"Running, finished-unseen and pinned sessions (or your most recent), live. Reply from a card, or open it beside this view."</p>
             <crate::labels::LabelFilterBar />
             {move || ids.with(Vec::is_empty).then(|| view! { <p class="text-sm text-muted">"No sessions with these labels."</p> })}
-            <div class="grid gap-3 [grid-template-columns:repeat(auto-fill,minmax(20rem,1fr))]">
+            <div class="grid gap-3 [grid-template-columns:repeat(auto-fill,minmax(min(20rem,100%),1fr))]">
                 <For each=move || ids.get() key=|id| id.clone() let:id>
                     <MissionCard id />
                 </For>
@@ -499,13 +499,13 @@ fn MissionCard(id: String) -> impl IntoView {
     };
     let open_id = id.clone();
     view! {
-        <div class="flex h-48 flex-col rounded-lg border sm:h-64 border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
-            <div class="group flex items-center gap-2 border-b border-zinc-100 px-3 py-2 dark:border-zinc-800">
+        <div class="flex h-48 min-w-0 flex-col rounded-lg border @sm/view:h-64 border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
+            <div class="group flex flex-wrap items-center gap-2 border-b border-zinc-100 px-3 py-2 dark:border-zinc-800">
                 {move || session.get().map(|s| view! { <span class=dot(s.display_status(), tracked())></span> })}
-                <Go to=View::session(open_id.clone()) class="min-w-0 flex-1 truncate text-sm font-medium hover:underline" title="Open (⌘-click: new tile)">
+                <Go to=View::session(open_id.clone()) class="min-w-0 flex-1 basis-1/2 truncate text-sm font-medium hover:underline" title="Open (⌘-click: new tile)">
                     {move || session.get().map(|s| s.title).unwrap_or_else(|| "Session".into())}
                 </Go>
-                <span class="shrink-0 text-[11px] text-muted">
+                <span class="max-w-full truncate text-[11px] text-muted">
                     {move || session.get().map(|s| format!("{} · {}", live.session_worker(&s), ago(now_ms() - s.updated_at)))}
                 </span>
                 <crate::sessions::SessionMenu id=open_id.clone() />
@@ -687,7 +687,7 @@ fn MailNeedsReply() -> impl IntoView {
                 <h2 class="text-sm font-semibold text-muted">"Mail that needs a reply"</h2>
                 <div class="divide-y divide-zinc-200 rounded-lg border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
                     {t.into_iter().map(|x| view! {
-                        <crate::workspace::Go to=crate::workspace::View::Mail class="block px-3 py-2 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900">
+                        <crate::workspace::Go to=crate::workspace::View::Mail class="block px-3 py-2 text-sm [overflow-wrap:anywhere] hover:bg-zinc-50 dark:hover:bg-zinc-900">
                             <span class="font-medium">{x.people.join(", ")}</span>
                             <span class="ml-2 text-zinc-600 dark:text-zinc-400">{x.subject.clone()}</span>
                         </crate::workspace::Go>
