@@ -5,6 +5,7 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 use crate::api;
+use crate::components::SELECT;
 use crate::models::ModelInput;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT};
 use crate::when::compact as when;
@@ -1212,7 +1213,6 @@ fn Grants() -> impl IntoView {
         "memex" => vec!["read"],
         _ => vec!["call"],
     };
-    const SELECT: &str = "rounded-md border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-700 dark:bg-zinc-900";
     view! {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <h2 class="font-medium">"Grants"</h2>
@@ -1713,7 +1713,6 @@ fn UpdatesSetting() -> impl IntoView {
             }
         });
     };
-    const SELECT: &str = "rounded-md border border-zinc-300 bg-white px-2 py-1 text-sm dark:border-zinc-700 dark:bg-zinc-900";
     view! {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <div class="flex items-start justify-between gap-3">

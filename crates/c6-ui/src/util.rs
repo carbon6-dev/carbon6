@@ -283,9 +283,8 @@ fn storage_remove_global(key: &str) {
     }
 }
 
-pub const INPUT: &str = "w-full rounded-md border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-700 dark:bg-zinc-900";
-pub const BUTTON: &str = "rounded-md bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300";
-pub const BUTTON_QUIET: &str = "rounded-md px-3 py-1.5 text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800";
+pub use crate::components::INPUT;
+pub use crate::components::{BTN_PRIMARY as BUTTON, BTN_QUIET as BUTTON_QUIET};
 
 /// A short notice at the bottom of the screen, with Undo for what can be
 /// undone (archiving), instead of asking first.

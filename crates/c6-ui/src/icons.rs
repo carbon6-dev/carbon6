@@ -746,8 +746,8 @@ pub fn check_box(on: bool) -> impl IntoView {
     icon(if on { Icon::SquareCheck } else { Icon::Square }, Size::S14)
 }
 
-/// Compatibility class; moved into the component standard in the next step.
-pub const BAR_BUTTON: &str = "flex size-7 shrink-0 items-center justify-center rounded text-zinc-600 outline-none focus-visible:ring-2 focus-visible:ring-sky-500/60 disabled:opacity-30 pointer-fine:hover:bg-black/10 pointer-fine:hover:text-zinc-900 pointer-fine:disabled:hover:bg-transparent pointer-coarse:size-10 dark:text-zinc-400 dark:pointer-fine:hover:bg-white/10 dark:pointer-fine:hover:text-zinc-100";
+/// Compatibility import for bars; the component standard owns the class.
+pub use crate::components::BAR_BUTTON;
 
 #[cfg(test)]
 pub(crate) mod tests {

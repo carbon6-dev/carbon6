@@ -7,7 +7,7 @@ use crate::api;
 use crate::util::{ErrorBox, INPUT, ago, now_ms};
 use crate::workspace::{Go, How, Target, View, use_column, use_workspace};
 
-const SELECT: &str = "rounded-md border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-700 dark:bg-zinc-900";
+use crate::components::SELECT;
 
 /// Entry kinds, with labels, for the filter and the hit badges.
 const KINDS: [(&str, &str); 8] = [

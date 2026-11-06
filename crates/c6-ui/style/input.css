@@ -77,6 +77,18 @@ html.dark {
 }
 
 @layer components {
+  .btn {
+    @apply inline-flex min-h-8 items-center justify-center gap-1.5 rounded-md px-3 py-1 text-sm font-medium outline-none focus-visible:ring-2 focus-visible:ring-sky-500/60 disabled:opacity-50;
+  }
+  /* Minimum touch target wins even when a caller adds BTN_SM utilities. */
+  @media (pointer: coarse) { .btn { min-height: 2.5rem !important; } }
+  .c6-select {
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2371717b' stroke-width='2.25' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-position: right .5rem center;
+    background-repeat: no-repeat;
+    background-size: 1rem;
+  }
   /* At least one line plus padding/borders, even after a bad measurement.
      Components, not utilities: a box's explicit larger min-height still wins. */
   .grows { min-height: calc(1lh + 1.25rem); }
