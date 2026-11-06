@@ -2007,13 +2007,9 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
             style=move || { let r = rect.get(); format!("--l:{:.4}%;--t:{:.4}%;--w:{:.4}%;--h:{:.4}%", r.left * 100.0, r.top * 100.0, r.width * 100.0, r.height * 100.0) }
             node_ref=drop_area
             on:dragover=move |ev: web_sys::DragEvent| {
-                if let Some(from) = ws.dragging.get_untracked() {
+                if ws.dragging.get_untracked().is_some() {
                     ev.prevent_default();
                     let z = zone(&ev);
-                    let allowed = z.is_some_and(|to| ws.layout.with_untracked(|l| l.check_drop(from, to).is_ok()));
-                    if let Some(dt) = ev.data_transfer() {
-                        dt.set_drop_effect(if allowed { "move" } else { "none" });
-                    }
                     if ws.drop_at.get_untracked() != z {
                         ws.drop_at.set(z);
                     }

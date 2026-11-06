@@ -124,9 +124,8 @@ the entire layout unchanged; every blue preview must change the visible layout.
 In a desktop browser (also check touch-capable desktop/tablet native dragging):
 
 1. Open sixteen tiles (four columns, four tiles each). Drag a tile from a shared
-   column over another tile's left and right fifths. Neither edge turns blue,
-   no text covers the tile's bar, and the cursor forbids the drop. Releasing
-   leaves the layout unchanged.
+   column over another tile's left and right fifths. Neither edge turns blue
+   and no text covers the tile's bar. Releasing leaves the layout unchanged.
 2. Drop the same tile in the middle of another tile's top or bottom half. It
    joins that column at the highlighted position, even with many tiles there.
    Repeat in the padding between stacked tiles; the gap accepts the drop too.
