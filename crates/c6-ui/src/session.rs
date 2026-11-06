@@ -5221,6 +5221,7 @@ fn Composer(
     // The model row, on phones (always shown on wider screens).
     // Whether the model chip's menu (the model and its subagents') is open.
     let picking = RwSignal::new(false);
+    let model_anchor = NodeRef::<leptos::html::Div>::new();
     let picking_phone = RwSignal::new(false);
     let picking_present = crate::util::presence(move || picking.get());
     let toggle = move || {
@@ -5828,7 +5829,7 @@ fn Composer(
                         </button>
                         <input node_ref=picker type="file" multiple class="hidden" on:change=add_files />
                 {(model.is_some() || subagents.is_some()).then(|| view! {
-                    <div class="relative flex min-w-0 flex-1 flex-wrap items-center gap-1 text-xs">
+                    <div node_ref=model_anchor class="relative flex min-w-0 flex-1 flex-wrap items-center gap-1 text-xs">
                         {model.map(|m| view! {
                             {move || {
                                 let (_, mm, e) = m.current.get();
@@ -5927,7 +5928,19 @@ fn Composer(
                                 }.into_any()
                             } else {
                                 view! {
-                                    <div data-pop=picking_pop.get_value() class="absolute bottom-full left-0 z-40 mb-1 w-max max-w-[90vw] sm:max-w-xl space-y-2 rounded-lg border border-zinc-200 bg-white p-3 text-zinc-700 shadow-lg dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200">{contents()}</div>
+                                    // The desktop tile clips its transcript, not
+                                    // the picker. Phones keep their bottom sheet.
+                                    <leptos::portal::Portal>
+                                        <div data-pop=picking_pop.get_value() class="fixed z-50 w-max max-w-[min(36rem,calc(100vw-1rem))] space-y-2 overflow-y-auto rounded-lg border border-zinc-200 bg-white p-3 text-zinc-700 shadow-lg dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+                                            style=move || {
+                                                let width = window().inner_width().ok().and_then(|w| w.as_f64()).unwrap_or(800.0);
+                                                let height = window().inner_height().ok().and_then(|h| h.as_f64()).unwrap_or(600.0);
+                                                let rect = model_anchor.get_untracked().map(|el| el.get_bounding_client_rect());
+                                                let left = rect.as_ref().map_or(8.0, |r| r.left()).clamp(8.0, (width - 584.0).max(8.0));
+                                                let top = rect.as_ref().map_or(height - 48.0, |r| r.top());
+                                                format!("left:{left}px;bottom:{}px;max-height:{}px", (height - top + 4.0).max(8.0), (top - 12.0).max(40.0).min(height * 0.75))
+                                            }>{contents()}</div>
+                                    </leptos::portal::Portal>
                                 }.into_any()
                             }
                             }}
