@@ -2257,13 +2257,12 @@ pub fn Tiles() -> impl IntoView {
     // In focus mode the focused tile takes the whole workspace (the others
     // keep their places, hidden).
     let rects = Memo::new(move |_| ws.layout.with(Layout::rects));
-    let floor = move || rects.with(|rs| desktop_canvas_min(rs, ws.is_full()));
     // Tiles are cards with room between them, placed by `arrange` (so one
     // moving to another column keeps what it shows); on a phone, one fills
     // the screen.
     view! {
-        <div class="flex min-h-0 min-w-0 flex-1 bg-zinc-100 dark:bg-black md:overflow-x-auto md:p-1">
-            <div data-workspace-motion class="relative flex min-h-0 min-w-0 flex-1 md:min-w-(--tile-floor)" style=move || format!("--tile-floor:{}px", floor())>
+        <div class="flex min-h-0 min-w-0 flex-1 bg-zinc-100 dark:bg-black md:p-1">
+            <div data-workspace-motion class="relative flex min-h-0 min-w-0 flex-1">
                 <For each=move || keys.get() key=|k| *k let:key>
                     <TileView key rect=Signal::derive(move || rects.with(|r| r.get(&key).copied().unwrap_or_default())) />
                 </For>
@@ -2272,17 +2271,6 @@ pub fn Tiles() -> impl IntoView {
                 </Show>
             </div>
         </div>
-    }
-}
-
-/// 480px of tile, plus its two 4px gutters. Preserve that useful title room
-/// with horizontal workspace scrolling instead of shrinking control targets.
-fn desktop_canvas_min(rects: &HashMap<u64, Rect>, full: bool) -> usize {
-    const TILE_WITH_GUTTERS: usize = 488;
-    if full {
-        TILE_WITH_GUTTERS
-    } else {
-        rects.values().map(|r| (TILE_WITH_GUTTERS as f64 / r.width).ceil() as usize).max().unwrap_or(TILE_WITH_GUTTERS)
     }
 }
 
@@ -2689,19 +2677,6 @@ mod tests {
         assert_eq!(layout.tiles[0].stack, Some(0));
         assert!(!layout.full);
         assert!(layout.valid());
-    }
-
-    #[test]
-    fn desktop_tiles_keep_480px_without_squeezing_their_controls() {
-        for columns in 1..=4 {
-            let rects = arrange(&(0..columns).map(|c| (c, 0)).collect::<Vec<_>>());
-            let rects = rects.into_iter().enumerate().map(|(i, r)| (i as u64, r)).collect::<HashMap<_, _>>();
-            let width = desktop_canvas_min(&rects, false);
-            for r in rects.values() {
-                assert!(width as f64 * r.width - 8.0 >= 480.0);
-            }
-            assert_eq!(desktop_canvas_min(&rects, true), 488, "focus mode needs just one tile");
-        }
     }
 
     #[test]
