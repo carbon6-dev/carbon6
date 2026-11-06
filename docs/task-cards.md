@@ -61,7 +61,7 @@ The card is answered with "Start it" and names the new session ("working session
 
 The new session is on its own from there: nothing it does is reported back to the session that proposed the card. You see its result in the new session (linked from the card), and the `from:<session>` label ties the two together.
 
-The click sends your message to the proposing session: `Start session: task card #177 "Remove the dead retry module".` It shows in that session's transcript immediately when the worker records it, and reaches the agent with its next input. This does not report the new session's progress or result.
+The click sends your message to the proposing session: `Start session: task card #177 "Remove the dead retry module". session:<new-session-id>` It starts a turn or joins the current one and shows in the transcript when taken, like a typed message. The new session opens beside it (on a phone, you go to the new session). This does not report the new session's progress or result.
 
 ### 4.1 The other answers
 
@@ -73,21 +73,21 @@ The click sends your message to the proposing session: `Start session: task card
 
 Start session, the Save answers (including Save for later's new-work fallback), and Not now send text in your voice. What you see as your own right-aligned transcript message is exactly what the proposing agent gets:
 
-- `Start session: task card #177 "Remove the dead retry module".`
+- `Start session: task card #177 "Remove the dead retry module". session:<new-session-id>`
 - `Save for later: task card #177 "Remove the dead retry module" (to-do on "Cleanup").`
 - `Not now: task card #177 "Remove the dead retry module".`
 
 The Save text names the actual destination work, including Save elsewhere's destinations. Titles are quoted and newlines escaped, so the message stays one line. There is no separate system-note label or style. Do it here already sends the task as your message and gets no extra message. A failed answer sends no message.
 
-These messages never start or interrupt a turn, change the session's status, or add a queued-input count or held-notice pill. Even during a busy turn, they wait for the next input rather than joining that turn. Delivery still uses the head's durable command queue (`SessionCommand.quiet_note`) and the worker's journaled `NoticeQueued` / deferred-notice machinery, marked `quiet` and non-waking. The command survives a head restart while the worker is offline; the journaled message survives a worker reload and is delivered once with the next input.
+Every button sends a real message: it starts a turn if the proposing session is idle and joins a running turn at its next step, exactly as if you typed it. Delivery uses the ordinary durable `SessionCommand.input` queue and worker command-id deduplication. The message appears once in the transcript when taken, and reaches the agent once, including after a head restart, worker reload or restoration of a trimmed session. Until taken it appears in the ordinary input queue, not as a held notice.
 
-New card-answer commands have a `card-answer:` id prefix, preserved when restoring a trimmed session. The head converts their quiet `NoticeQueued` arrival into an API `User` event (`command: "card-answer"`), at the arrival's original sequence and timestamp. This same conversion serves live view and journal reload, for local and remote workers, without running a turn. The later journaled `User` event is still the worker's consumption receipt for model history and recovery, but the head omits it from the API: it cannot create a second transcript line. The existing command-id deduplication prevents redelivery from creating another arrival or agent copy. Older, unmarked quiet notes retain their existing behavior.
+The `command: "card-answer"` marker distinguishes these user messages from typed corrections for Watchers; their quoted task titles must not trigger a correction finding. Otherwise they are ordinary user events, including in search, catch-up and the turn outline, with the usual message controls and icons.
 
-The arrival is searchable at its visible position, but does not reset unread catch-up activity or become a turn's starting message in the outline. It has no edit, rewind or side-chat controls: those require a model-history input, not a display-only arrival. Other user messages keep their existing controls and icons.
+Start session includes the new session's id as a clickable `session:<id>` mention in the answer message. After success, the UI opens it beside the current tile; on a phone it goes to the new session. Only card-answer messages gain mention rendering; ordinary user messages remain plain text. A failed answer keeps its error on the card.
 
-No schema migration or new wire field is needed. Only workers advertising `quiet_notes` receive the optional command; their existing machinery preserves the id prefix without any worker update. An older worker without that capability silently skips the message (the head logs at debug), including one queued while it was offline; there is no waking fallback. `queue_ops` alone only promises queued-input editing/cancellation, not quiet-note support.
+No schema migration or new wire field is needed. Older preview workers already understand ordinary `UserInput` messages and the command marker, so they receive and run these messages normally, without a capability gate. The unused quiet-note command, quiet queued-notice field, capability and synthetic transcript-arrival conversion have been removed.
 
-If the worker has trimmed the session, restoration preserves the quiet command instead of turning it into an ordinary message. A worker that rejects a note leaves it pending for reconnection, without marking the session failed or immediately retrying in a loop.
+An archived or stopped proposer cannot prevent the card's action: the save, dismissal or new session still succeeds, and the head logs why the proposing session could not receive the message.
 
 ## 5. Not doing
 

@@ -48,9 +48,6 @@ pub(crate) struct Who {
 /// Who sent a message that starts a turn.
 pub(crate) fn who(kind: &EventKind) -> Option<Who> {
     let EventKind::User { text, command, from_session_id, from_title, delegated_by, .. } = kind else { return None };
-    if command == "card-answer" {
-        return None; // Displayed at arrival, not input to this turn.
-    }
     let words = |t: &str| clip(t.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or(""), 60);
     let (by, from, words) = if !from_session_id.is_empty() {
         ("session", from_title.clone(), words(text))
@@ -311,16 +308,19 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn card_arrivals_never_start_or_attribute_a_turn() {
+    fn card_answers_start_and_attribute_turns_as_user_messages() {
         let mut t = Turns::default();
-        for e in [ev(1, 0, card_answer()), ev(2, 10, user("continue")), ev(3, 20, EventKind::TurnStarted { turn: 1, context_window: 0 })] {
+        for e in [ev(1, 0, card_answer()), ev(2, 20, EventKind::TurnStarted { turn: 1, context_window: 0 })] {
             t.feed(&e);
         }
-        assert_eq!((t.list[0].start_seq, t.list[0].words.as_str()), (2, "continue"));
+        assert_eq!(
+            (t.list[0].start_seq, t.list[0].by.as_str(), t.list[0].words.as_str()),
+            (1, "you", "Not now: task card #185 \"Cleanup\".")
+        );
         let mut t = Turns::default();
         t.feed(&ev(1, 0, EventKind::TurnStarted { turn: 1, context_window: 0 }));
         t.feed(&ev(2, 10, card_answer()));
-        assert!(t.list[0].by.is_empty(), "the card answer was not delivered into the running turn");
+        assert_eq!(t.list[0].by, "you", "a card answer can join the running turn");
     }
 
     #[test]

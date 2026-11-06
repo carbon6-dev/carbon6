@@ -30,11 +30,6 @@ fn entries(ev: &SessionEvent) -> Vec<(u32, &'static str, String)> {
     use session_event::Kind;
     let mut out = Vec::new();
     match &ev.kind {
-        Some(Kind::NoticeQueued(n)) if n.quiet && n.command_id.starts_with(crate::sessions::CARD_ANSWER_PREFIX) => {
-            out.push((0, "user", n.text.clone()));
-        }
-        // Search must anchor the visible arrival, not its hidden receipt.
-        Some(Kind::User(u)) if u.command_id.starts_with(crate::sessions::CARD_ANSWER_PREFIX) => {}
         Some(Kind::User(u)) => {
             // Text attachments (pasted logs, mentioned files) are searchable too.
             let mut text = u.text.clone();
@@ -471,26 +466,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn card_answers_are_searchable_at_arrival_not_at_consumption() {
-        let id = format!("{}test", crate::sessions::CARD_ANSWER_PREFIX);
+    fn card_answers_are_searchable_as_user_messages() {
         let text = "Not now: task card #185 \"Cleanup\".";
-        let arrival = SessionEvent {
+        let input = SessionEvent {
             seq: 17,
-            kind: Some(session_event::Kind::NoticeQueued(c6_proto::NoticeQueued {
-                command_id: id.clone(),
+            kind: Some(session_event::Kind::User(c6_proto::UserMessage {
+                command_id: "test".into(),
                 text: text.into(),
-                quiet: true,
+                command: "card-answer".into(),
                 ..Default::default()
             })),
             ..Default::default()
         };
-        assert_eq!(entries(&arrival), [(0, "user", text.into())]);
-        assert_eq!(crate::convert::event(&arrival).unwrap().seq, 17, "search points to the visible message");
-        let receipt = SessionEvent {
-            kind: Some(session_event::Kind::User(c6_proto::UserMessage { command_id: id, text: text.into(), ..Default::default() })),
-            ..Default::default()
-        };
-        assert!(entries(&receipt).is_empty(), "no duplicate or hidden search hit");
+        assert_eq!(entries(&input), [(0, "user", text.into())]);
+        assert_eq!(crate::convert::event(&input).unwrap().seq, 17, "search points to the user message");
     }
 
     #[test]

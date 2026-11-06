@@ -426,7 +426,10 @@ fn reasons(events: &[SessionEvent]) -> Vec<&'static str> {
                 }
             }
             Some(Kind::User(u))
-                if u.from_session_id.is_empty() && u.delegated_by.is_empty() && u.command != "task-notification" && corrects(&u.text) =>
+                if u.from_session_id.is_empty()
+                    && u.delegated_by.is_empty()
+                    && !matches!(u.command.as_str(), "task-notification" | "card-answer")
+                    && corrects(&u.text) =>
             {
                 add("correction")
             }
@@ -1858,12 +1861,11 @@ mod tests {
     }
 
     #[test]
-    fn quiet_notices_are_not_user_messages_or_corrections() {
+    fn notices_and_card_buttons_are_not_corrections() {
         let events = [
             SessionEvent {
                 kind: Some(Kind::NoticeQueued(c6_proto::NoticeQueued {
                     text: "Don't do that; the task card was declined".into(),
-                    quiet: true,
                     ..Default::default()
                 })),
                 ..Default::default()
@@ -1880,8 +1882,7 @@ mod tests {
         assert!(reasons(&events).is_empty());
         assert!(digest(&events).is_empty());
 
-        // Once the next input takes it, the worker records the context as
-        // a task-notification User event, without the queued quiet bit.
+        // A task notification is agent context, not a human correction.
         let mut consumed = SessionEvent {
             seq: 3,
             kind: Some(Kind::User(c6_proto::UserMessage {
@@ -1893,6 +1894,10 @@ mod tests {
         };
         assert!(reasons(std::slice::from_ref(&consumed)).is_empty());
         assert_eq!(digest(std::slice::from_ref(&consumed)), "[3] agent notice: Don't do that; the task card was declined\n");
+        let Some(Kind::User(u)) = &mut consumed.kind else { unreachable!() };
+        u.command = "card-answer".into();
+        assert!(reasons(std::slice::from_ref(&consumed)).is_empty());
+        assert_eq!(digest(std::slice::from_ref(&consumed)), "[3] user: Don't do that; the task card was declined\n");
         let Some(Kind::User(u)) = &mut consumed.kind else { unreachable!() };
         u.command.clear();
         assert!(reasons(&[consumed]).contains(&"correction"));

@@ -371,18 +371,22 @@ async fn act(
         }
         (Some("task"), Some(_), Some(_)) => match option {
             Some(TASK_START) => {
-                start_task(st, d).await?;
-                task_answer_note(st, d, format!("Start session: task card #{} {:?}.", d.id, d.title)).await;
+                let session = start_task(st, d).await?;
+                task_answer_message(st, d, format!("Start session: task card #{} {:?}. session:{session}", d.id, d.title)).await;
             }
             Some(TASK_HERE) => do_task_here(st, d).await?,
             Some(o) if matches!(o, TASK_TO_WORK | TASK_TO_NEW_WORK) || o.starts_with(TASK_TO_WORK_PREFIX) => {
                 let id = crate::work::keep_todo(st, d, o == TASK_TO_WORK, o.strip_prefix(TASK_TO_WORK_PREFIX)).await?;
                 let work = crate::work::get(st, &id, &Caller::root()).await?;
-                task_answer_note(st, d, format!("Save for later: task card #{} {:?} (to-do on {:?}).", d.id, d.title, work.fields.title))
-                    .await;
+                task_answer_message(
+                    st,
+                    d,
+                    format!("Save for later: task card #{} {:?} (to-do on {:?}).", d.id, d.title, work.fields.title),
+                )
+                .await;
             }
             Some("Not now") => {
-                task_answer_note(st, d, format!("Not now: task card #{} {:?}.", d.id, d.title)).await;
+                task_answer_message(st, d, format!("Not now: task card #{} {:?}.", d.id, d.title)).await;
             }
             _ => {}
         },
@@ -817,12 +821,13 @@ pub async fn task_card(st: &HeadState, session_id: &str, what: &str, params: &Va
     Ok(json!({"id": decision.id, "count": decision.count}))
 }
 
-/// The proposer hears an answer without being asked to act on it.
-async fn task_answer_note(st: &HeadState, d: &api::Decision, text: String) {
+/// The button sends your answer as a message; a closed proposer cannot
+/// prevent the card's action from succeeding.
+async fn task_answer_message(st: &HeadState, d: &api::Decision, text: String) {
     if let Some(session) = d.context["session"].as_str()
-        && let Err(e) = crate::sessions::quiet_note(st, session, text).await
+        && let Err(e) = crate::sessions::card_answer(st, session, text).await
     {
-        warn!(decision = d.id, "telling the session quietly: {e:#}");
+        warn!(decision = d.id, %session, "telling the session about its task card: {e:#}");
     }
 }
 
@@ -855,7 +860,7 @@ fn card_labels(labels: &Value) -> Vec<String> {
         .collect()
 }
 
-async fn start_task(st: &HeadState, d: &api::Decision) -> anyhow::Result<()> {
+async fn start_task(st: &HeadState, d: &api::Decision) -> anyhow::Result<String> {
     let c = &d.context;
     let s = |k: &str| c[k].as_str().unwrap_or("").to_owned();
     let workers = st.store.workers().await?;
@@ -917,7 +922,7 @@ async fn start_task(st: &HeadState, d: &api::Decision) -> anyhow::Result<()> {
         .execute(&st.store.pool)
         .await?;
     info!(decision = d.id, session = %session.id, "task card started");
-    Ok(())
+    Ok(session.id)
 }
 
 #[cfg(test)]

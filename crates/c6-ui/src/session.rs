@@ -3371,10 +3371,8 @@ fn memory_line(op: &str, id: &str, scope: &str, text: &str) -> AnyView {
     view! { <p class="flex items-start gap-2 text-xs text-muted"><span>{crate::icons::brain()}</span><span class="whitespace-pre-wrap">{what}</span></p> }.into_any()
 }
 
-// A card answer is visible before its model input exists. It cannot anchor
-// a rewind, edit or side chat: those use model history, not display arrivals.
 fn can_anchor(kind: &EventKind) -> bool {
-    matches!(kind, EventKind::Assistant { .. }) || matches!(kind, EventKind::User { command, .. } if command != "card-answer")
+    matches!(kind, EventKind::Assistant { .. } | EventKind::User { .. })
 }
 
 /// Your transcript message, including card-button answers. Kept separate so
@@ -3393,6 +3391,17 @@ fn user_message(session: &str, e: &Event) -> AnyView {
         None
     };
     let delegated = !delegated_by.is_empty();
+    let has_text = !text.is_empty();
+    let text = if command == "card-answer" {
+        let (col, ws) = (use_column(), use_context::<crate::workspace::Workspace>());
+        view! {
+            <span on:click=move |ev| if let Some(ws) = ws { crate::mentions::follow_link(&ev, col, ws); }
+                inner_html=markdown::text_with_mentions(text)></span>
+        }
+        .into_any()
+    } else {
+        text.clone().into_any()
+    };
     let shown = attachments
         .iter()
         .enumerate()
@@ -3408,8 +3417,8 @@ fn user_message(session: &str, e: &Event) -> AnyView {
         <div class="flex flex-col items-end gap-1.5">
             {from.map(|(icon, text)| view! { <p class="text-[11px] text-violet-700 dark:text-violet-400">{icon}" "{text}</p> })}
             {(!attachments.is_empty()).then(|| view! { <div class="flex max-w-[85%] flex-wrap justify-end gap-1.5">{shown}</div> })}
-            {(!text.is_empty()).then(|| view! {
-                <div class=format!("max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm bg-zinc-200 px-4 py-2 text-sm dark:bg-zinc-800 {}", if blocked.is_empty() { "" } else { "line-through opacity-60" })>{text.clone()}</div>
+            {has_text.then(|| view! {
+                <div class=format!("max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm bg-zinc-200 px-4 py-2 text-sm dark:bg-zinc-800 {}", if blocked.is_empty() { "" } else { "line-through opacity-60" })>{text}</div>
             })}
             {(!blocked.is_empty()).then(|| view! {
                 <p class="max-w-[85%] text-right text-xs text-red-600 dark:text-red-400">{format!("Not sent: a UserPromptSubmit hook blocked it. {blocked}")}</p>
@@ -5673,7 +5682,7 @@ mod tests {
         let owner = Owner::new();
         owner.with(|| {
             let e: Event = serde_json::from_value(serde_json::json!({
-                "seq": 17, "ts": 1234, "type": "user", "command_id": "card-answer:test",
+                "seq": 17, "ts": 1234, "type": "user", "command_id": "answer-17",
                 "command": "card-answer", "text": "Not now: task card #185 \"Cleanup\"."
             }))
             .unwrap();
@@ -5685,8 +5694,38 @@ mod tests {
                 !html.contains("<details") && !html.contains("the agent was told") && !html.contains("system note"),
                 "no separate note label: {html}"
             );
-            assert!(!can_anchor(&e.kind), "arrival is not a model-history edit, rewind or side-chat target");
+            assert!(can_anchor(&e.kind), "a card answer is real user input in model history");
             assert!(waiting_notices(&[e], 1234 + NOTICE_GRACE_MS).is_empty(), "not a held-notice pill");
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn card_answer_links_its_session_but_ordinary_user_text_stays_plain() {
+        const ID: &str = "01a18f50-326a-7e26-9348-8ee7c41bb3bd";
+        let owner = Owner::new();
+        owner.with(|| {
+            let text = format!("Start session: **Cleanup** <script>alert(1)</script>\nStarted session:{ID}.");
+            for command in ["card-answer", ""] {
+                let e: Event = serde_json::from_value(serde_json::json!({
+                    "seq": 17, "ts": 1234, "type": "user", "command_id": "answer-17",
+                    "command": command, "text": text
+                }))
+                .unwrap();
+                let html = user_message("s1", &e).to_html();
+                assert!(html.contains("items-end") && html.contains("rounded-br-sm"), "the user bubble: {html}");
+                assert!(html.contains("**Cleanup**"), "no Markdown interpretation: {html}");
+                assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"), "HTML stays escaped: {html}");
+                if command == "card-answer" {
+                    assert!(html.contains(&format!("href=\"/sessions/{ID}\"")), "a real session link: {html}");
+                    assert!(html.contains(&format!("data-ref=\"session:{ID}\"")), "the usual clickable/hoverable mention: {html}");
+                    assert!(html.contains("class=\"c6-mention\""), "the usual mention styling: {html}");
+                    assert!(html.contains("c6-mention-dot"), "keep the session's mark: {html}");
+                } else {
+                    assert!(html.contains(&format!("session:{ID}")), "ordinary user text is unchanged: {html}");
+                    assert!(!html.contains("<a ") && !html.contains("data-ref="), "no links in ordinary user text: {html}");
+                }
+            }
         });
     }
 

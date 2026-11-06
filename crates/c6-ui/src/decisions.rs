@@ -11,7 +11,7 @@ use serde_json::json;
 
 use crate::api;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT, ago, now_ms};
-use crate::workspace::{Go, How, View, use_workspace};
+use crate::workspace::{Go, How, View, use_column, use_workspace};
 
 /// The header link, with how many are open.
 #[component]
@@ -250,6 +250,8 @@ pub(crate) fn card_id(id: i64) -> String {
 #[component]
 fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session: bool) -> impl IntoView {
     let ws = use_workspace();
+    let col = use_column();
+    let task = d.kind == "task";
     let id = d.id;
     let note = RwSignal::new(String::new());
     let error = RwSignal::new(None::<String>);
@@ -265,6 +267,7 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
         });
     };
     let answer = move |option: Option<String>| {
+        let start_task = task && option.as_deref() == Some(TaskAction::Start.option());
         let mut fields = serde_json::Map::new();
         for (f, v) in values.get_value() {
             let text = v.get_untracked();
@@ -276,7 +279,18 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
         busy.set(true);
         spawn_local(async move {
             match api::answer_decision(id, a).await {
-                Ok(_) => refresh.run(()),
+                Ok(d) => {
+                    // The head appends the created session after the proposing
+                    // sessions. Other answers must not open those older ones.
+                    if start_task && let Some(id) = d.sessions.last() {
+                        let view = View::session(id.clone());
+                        match col {
+                            Some(c) => ws.open_after(c.tile, c.col, view),
+                            None => ws.open(None, view, How::OwnTile),
+                        }
+                    }
+                    refresh.run(());
+                }
                 Err(e) => error.set(Some(e)),
             }
             busy.set(false);

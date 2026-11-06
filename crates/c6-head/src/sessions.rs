@@ -1007,32 +1007,21 @@ pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage
     send_input_as(st, session_id, req, Uuid::now_v7().to_string(), "", None).await
 }
 
-// Identifies both the journaled arrival and its later consumption, including
-// on workers that already support quiet_notes. No new worker protocol needed.
-pub(crate) const CARD_ANSWER_PREFIX: &str = "card-answer:";
-
-fn quiet_note_id() -> String {
-    format!("{CARD_ANSWER_PREFIX}{}", Uuid::now_v7())
-}
-
-/// A card answer from you, held for the agent's next input, through the durable command queue.
-/// Older workers must never receive it as an ordinary, waking input.
-pub async fn quiet_note(st: &HeadState, session_id: &str, text: String) -> anyhow::Result<()> {
+/// A button sends your message as typed, marked so Watchers do not mistake
+/// the card's title for a correction. A closed proposer need not hear it.
+pub async fn card_answer(st: &HeadState, session_id: &str, text: String) -> anyhow::Result<()> {
     let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
-    let worker_id: WorkerId = session.worker_id.parse()?;
-    if st.registry.get(worker_id).is_some_and(|w| !w.capabilities.iter().any(|c| c == "quiet_notes")) {
-        tracing::debug!(%session_id, "skipping quiet context: the worker does not support it");
-        return Ok(());
+    if session.archived != 0 || session.status == "stopped" {
+        return Err(bad_request("the proposing session is archived or stopped"));
     }
-    let id = quiet_note_id();
-    let data = SessionCommand {
-        command_id: id.clone(),
-        session_id: session_id.to_owned(),
-        kind: Some(session_command::Kind::QuietNote(c6_proto::QuietNote { text })),
-    }
-    .encode_to_vec();
-    st.store.enqueue_command(&NewCommand { id: &id, session_id, worker_id, data, text: None }).await?;
-    st.registry.deliver(worker_id);
+    send_input_with(
+        st,
+        session_id,
+        &api::SendMessage { text, ..Default::default() },
+        Uuid::now_v7().to_string(),
+        UserInput { command: "card-answer".into(), ..Default::default() },
+    )
+    .await?;
     Ok(())
 }
 
@@ -1045,6 +1034,16 @@ pub async fn send_input_as(
     id: String,
     delegated_by: &str,
     api_origin: Option<c6_proto::ApiMessageOrigin>,
+) -> anyhow::Result<api::QueuedInput> {
+    send_input_with(st, session_id, req, id, UserInput { delegated_by: delegated_by.to_owned(), api_origin, ..Default::default() }).await
+}
+
+async fn send_input_with(
+    st: &HeadState,
+    session_id: &str,
+    req: &api::SendMessage,
+    id: String,
+    input: UserInput,
 ) -> anyhow::Result<api::QueuedInput> {
     let text = req.text.trim();
     let files = attachments(&req.attachments)?;
@@ -1075,16 +1074,7 @@ pub async fn send_input_as(
         st,
         &session.realm,
         session.head_labels(),
-        UserInput {
-            text: text.to_owned(),
-            model,
-            attachments: files,
-            wake,
-            delegated_by: delegated_by.to_owned(),
-            send_now: req.send_now,
-            api_origin,
-            ..Default::default()
-        },
+        UserInput { text: text.to_owned(), model, attachments: files, wake, send_now: req.send_now, ..input },
     )
     .await?;
     // Send now to a connected worker that doesn't know it (an older one):
@@ -2174,12 +2164,6 @@ pub async fn on_ephemeral(st: &HeadState, worker_id: WorkerId, ev: EphemeralEven
 }
 
 pub async fn on_rejected(st: &HeadState, worker_id: WorkerId, r: CommandRejected) -> anyhow::Result<()> {
-    let quiet = st.store.pending_input(&r.command_id).await?.is_some_and(|(_, _, data)| {
-        matches!(SessionCommand::decode(data.as_slice()).ok(), Some(SessionCommand {
-            session_id, kind: Some(session_command::Kind::QuietNote(_)), ..
-        }) if session_id == r.session_id)
-    });
-    let quiet = quiet && st.store.session(&r.session_id).await?.is_some_and(|s| s.worker_id == worker_id.to_string());
     // The worker lost (or trimmed) this session: send it the log, then the
     // input again. At most once a minute per session, so a worker that
     // cannot restore does not loop.
@@ -2189,12 +2173,6 @@ pub async fn on_rejected(st: &HeadState, worker_id: WorkerId, r: CommandRejected
             Ok(false) => {}
             Err(e) => warn!(session = %r.session_id, "restoring session: {e:#}"),
         }
-    }
-    if quiet {
-        // Leave it pending for the next connection, without a failed
-        // session, user input, or an immediate rejection/retry loop.
-        debug!(session = %r.session_id, reason = %r.reason, "holding rejected quiet context until the worker reconnects");
-        return Ok(());
     }
     if let Some(session_id) = st.store.reject_command(worker_id, &r.command_id, &r.reason).await? {
         warn!(session = %session_id, reason = %r.reason, "worker rejected command");
@@ -2217,10 +2195,9 @@ async fn restore(st: &HeadState, worker_id: WorkerId, session_id: &str, command_
     }
     let Some((text, _created_at, data)) = st.store.pending_input(command_id).await? else { return Ok(false) };
     // The same input (model switch, attachments and all), under a new id.
-    let (input, quiet_note) = match SessionCommand::decode(data.as_slice()).ok().and_then(|c| c.kind) {
-        Some(session_command::Kind::Input(i)) => (i, None),
-        Some(session_command::Kind::QuietNote(n)) => (UserInput::default(), Some(n)),
-        _ => (UserInput { text: text.clone(), ..Default::default() }, None),
+    let input = match SessionCommand::decode(data.as_slice()).ok().and_then(|c| c.kind) {
+        Some(session_command::Kind::Input(i)) => i,
+        _ => UserInput { text: text.clone(), ..Default::default() },
     };
     let events = st.store.events_after(session_id, 0, i64::MAX).await?;
     if events.is_empty() {
@@ -2270,25 +2247,13 @@ async fn restore(st: &HeadState, worker_id: WorkerId, session_id: &str, command_
         session_id: session_id.to_owned(),
         kind: Some(session_command::Kind::Restore(c6_proto::Restore { spec: Some(spec), events })),
     };
-    let input_id =
-        if quiet_note.is_some() && command_id.starts_with(CARD_ANSWER_PREFIX) { quiet_note_id() } else { Uuid::now_v7().to_string() };
-    let (data, shown) = match quiet_note {
-        Some(note) => (
-            SessionCommand {
-                command_id: input_id.clone(),
-                session_id: session_id.to_owned(),
-                kind: Some(session_command::Kind::QuietNote(note)),
-            }
-            .encode_to_vec(),
-            None,
-        ),
-        None => (input_command(&input_id, session_id, input), Some(text.as_str())),
-    };
+    let input_id = Uuid::now_v7().to_string();
+    let data = input_command(&input_id, session_id, input);
     st.store
         .replace_with_restore(
             command_id,
             &NewCommand { id: &restore_id, session_id, worker_id, data: cmd.encode_to_vec(), text: None },
-            &NewCommand { id: &input_id, session_id, worker_id, data, text: shown },
+            &NewCommand { id: &input_id, session_id, worker_id, data, text: Some(&text) },
         )
         .await?;
     // A parent's call waiting on that input waits on its copy.
