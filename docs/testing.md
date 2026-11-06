@@ -491,6 +491,37 @@ SSH sessions still refuse local Changes/Files and open remote terminals.
 Close the transcript while keeping a pane open, then reopen it: the pane
 must keep working and the transcript must refresh its detail.
 
+### Shared model lists
+
+`cargo test -p c6-head --lib models::tests` checks one cold request per
+connection, ten-minute freshness, stale-while-refresh, refresh failures,
+bounded eviction, and invalidation racing a provider reply or an old
+connection-row read. Time is supplied to cache lookups; tests do not wait
+ten minutes. The loopback HTTP test checks that connection edits and deletion
+invalidate lists, while **Test connection** (including the saved connection's
+`GET /models?fresh=true` and pool members) always contacts the provider and
+does not populate the cache. Pools share their members' cached lists and
+compute the union directly, avoiding a second ten-minute freshness window.
+Editing any connection clears cached member lists too.
+The head keeps at most 128 entries; failed refreshes retain the last successful
+list and back off for 30 seconds. It never caches a cold failure.
+
+`resources::tests` also checks the UI's shared pending model resources,
+refresh coalescing and 128-entry bound. An evicted or invalidated entry cannot
+dispose a list still used by an open picker. A confirmed connections reload
+clears the page cache; late replies cannot reinsert old entries.
+
+In Network, open several message boxes before opening any model dropdown:
+their mount should warm each connection's list only once per page. Open the
+all-connections picker: requests run in parallel, grouped in the same order
+as before, with per-connection errors and free-text model entry unchanged.
+Open a second picker or close/reopen a box: it shares both pending and ready
+lists. Save a connection edit and repeat; lists must refresh only after the
+save succeeds. Test a saved connection while its list is cached: the provider
+must still be contacted. Repeat with an unavailable provider after the head's
+ten-minute freshness window: the previous successful list remains usable
+while one refresh runs. All pickers retain native controls and drawn icons.
+
 ## Task card actions: manual phone check
 
 Check both a session transcript and Decisions, with a coarse pointer at 320px and 390px widths, and on desktop. Use a realm with several open work items and a closed one.

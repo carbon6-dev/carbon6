@@ -2065,7 +2065,7 @@ fn ConnectionRow(
     let test = move |_| {
         let id = test_id.clone();
         check.set(None);
-        spawn_local(async move { check.set(Some(api::models(id).await)) });
+        spawn_local(async move { check.set(Some(api::check_models(id).await)) });
     };
     view! {
         <div class="flex items-center gap-3 px-4 py-3">

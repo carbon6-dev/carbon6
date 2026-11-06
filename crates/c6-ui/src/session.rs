@@ -5141,6 +5141,9 @@ fn Composer(
     let claude_off = Signal::derive(move || claude_check.get().flatten().and_then(|c| (!c.available).then_some(c.reason)));
     // Connection kinds: a switch into or out of Claude Code is a handoff.
     let kinds = crate::resources::connections();
+    if model.is_some() || subagents.is_some() {
+        crate::models::prefetch();
+    }
     let text = crate::util::draft(&id);
     let (attachments, draft_note, draft_ready) = crate::util::draft_attachments(Some(&id));
     // What you'd likely type next (docs/suggestions.md): fetched when a turn

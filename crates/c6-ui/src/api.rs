@@ -546,6 +546,12 @@ pub async fn models(connection_id: String) -> Result<Vec<String>, String> {
     json(Request::get(&format!("/api/v1/connections/{connection_id}/models")).send().await).await
 }
 
+/// The saved connection's Test button must contact the provider even when
+/// a picker already has a successful list cached.
+pub async fn check_models(connection_id: String) -> Result<Vec<String>, String> {
+    json(Request::get(&format!("/api/v1/connections/{connection_id}/models?fresh=true")).send().await).await
+}
+
 pub async fn create_session(req: CreateSession) -> Result<Session, String> {
     send_json(Request::post("/api/v1/sessions"), &req).await
 }

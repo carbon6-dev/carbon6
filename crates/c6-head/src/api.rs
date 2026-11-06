@@ -544,6 +544,7 @@ async fn create_connection(State(st): State<Arc<HeadState>>, Json(req): Json<api
         compact_at: None,
     };
     st.store.insert_connection(&row).await?;
+    st.models.clear();
     Ok(Json(connection_view(row)))
 }
 
@@ -583,6 +584,7 @@ async fn create_pool(st: &HeadState, req: &api::CreateConnection) -> anyhow::Res
         compact_at: None,
     };
     st.store.insert_connection(&row).await?;
+    st.models.clear();
     Ok(connection_view(row))
 }
 
@@ -629,6 +631,7 @@ async fn update_connection(
     };
     let row = crate::store::ConnectionRow { name, members, context_window, subagent_model, compact_at, ..c };
     st.store.update_connection(&row).await?;
+    st.models.clear();
     if let Some(link) = st.local_link.get() {
         link.forget_connection(&id);
     }
@@ -695,6 +698,7 @@ async fn finish_chatgpt(st: &HeadState, callback: &str) -> anyhow::Result<api::C
     }
     if let Some(id) = existing {
         st.store.set_connection_secret(&id, &secret).await?;
+        st.models.clear();
         let row = st.store.connection(&id).await?.ok_or_else(|| anyhow::anyhow!("the connection went away"))?;
         return Ok(connection_view(row));
     }
@@ -715,6 +719,7 @@ async fn finish_chatgpt(st: &HeadState, callback: &str) -> anyhow::Result<api::C
         compact_at: None,
     };
     st.store.insert_connection(&row).await?;
+    st.models.clear();
     Ok(connection_view(row))
 }
 
@@ -754,6 +759,7 @@ async fn delete_connection(State(st): State<Arc<HeadState>>, Path(id): Path<Stri
     if !st.store.delete_connection(&id).await? {
         return Err(ApiErr(StatusCode::NOT_FOUND, "no such connection".into()));
     }
+    st.models.clear();
     if let Some(link) = st.local_link.get() {
         link.forget_connection(&id);
     }
@@ -762,16 +768,43 @@ async fn delete_connection(State(st): State<Arc<HeadState>>, Path(id): Path<Stri
 
 /// Lists models from the provider. The head calls the provider directly here;
 /// all model calls for sessions happen on workers.
-async fn connection_models(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Json<Vec<String>>> {
+#[derive(Default, serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct ModelQuery {
+    /// Test the saved connection without reading or populating the cache.
+    #[serde(default)]
+    fresh: bool,
+}
+
+async fn connection_models(
+    State(st): State<Arc<HeadState>>,
+    Path(id): Path<String>,
+    Query(q): Query<ModelQuery>,
+) -> ApiResult<Json<Vec<String>>> {
+    let generation = st.models.generation();
     let c = st.store.connection(&id).await?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "no such connection".into()))?;
     if c.kind == crate::pools::KIND {
-        return Ok(Json(crate::pools::models(&st, &c).await?));
+        // The cheap union uses each member's cache. Caching it again
+        // would make a stale member list fresh for another ten minutes.
+        return Ok(Json(crate::pools::models(&st, &c, q.fresh).await?));
     }
-    connection_models_of(&st, &c).await.map(Json)
+    if q.fresh {
+        return list_connection_models(&st, &c).await.map(Json);
+    }
+    connection_models_of(&st, &c, generation).await.map(Json)
 }
 
 /// A (non-pool) connection's models, from its provider.
-pub(crate) async fn connection_models_of(st: &HeadState, c: &crate::store::ConnectionRow) -> ApiResult<Vec<String>> {
+pub(crate) async fn connection_models_of(st: &HeadState, c: &crate::store::ConnectionRow, generation: u64) -> ApiResult<Vec<String>> {
+    let cache = st.models.clone();
+    let st = st.arc().ok_or_else(|| anyhow::anyhow!("head has stopped"))?;
+    let c = c.clone();
+    cache
+        .get(c.id.clone(), generation, move || async move { list_connection_models(&st, &c).await })
+        .await
+        .map_err(|(status, message)| ApiErr(status, message))
+}
+
+pub(crate) async fn list_connection_models(st: &HeadState, c: &crate::store::ConnectionRow) -> ApiResult<Vec<String>> {
     let key = match c.kind.as_str() {
         "chatgpt" => crate::sessions::chatgpt_tokens(st, &c.id).await?.access_token,
         _ => c.api_key.as_deref().map(|k| st.secrets.decrypt(k)).transpose()?.unwrap_or_default(),
@@ -4289,6 +4322,7 @@ async fn set_connection_realms(
     Json(r): Json<api::RealmsIn>,
 ) -> ApiResult<StatusCode> {
     crate::realms::set_availability(&st, "connections", &id, &r.realms).await?;
+    st.models.clear();
     Ok(StatusCode::NO_CONTENT)
 }
 

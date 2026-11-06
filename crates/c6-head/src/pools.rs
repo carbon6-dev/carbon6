@@ -175,11 +175,17 @@ pub fn not_for_sessions(c: &ConnectionRow, what: &str) -> anyhow::Result<()> {
 }
 
 /// The models a pool offers: each member's, together.
-pub async fn models(st: &HeadState, c: &ConnectionRow) -> anyhow::Result<Vec<String>> {
+pub async fn models(st: &HeadState, c: &ConnectionRow, fresh: bool) -> anyhow::Result<Vec<String>> {
     let mut all = Vec::new();
     for m in members(c) {
+        let generation = st.models.generation();
         let Some(mc) = st.store.connection(&m.connection_id).await? else { continue };
-        match crate::api::connection_models_of(st, &mc).await {
+        let listed = if fresh {
+            crate::api::list_connection_models(st, &mc).await
+        } else {
+            crate::api::connection_models_of(st, &mc, generation).await
+        };
+        match listed {
             Ok(models) => all.extend(models),
             Err(e) => warn!(pool = %c.name, member = %mc.name, "a pool member's models: {}", e.1),
         }

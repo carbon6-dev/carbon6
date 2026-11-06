@@ -4,7 +4,18 @@
 
 use leptos::prelude::*;
 
-use crate::api;
+/// A message box warms the page cache, not its own set of requests. Every
+/// other box and picker shares these pending/completed per-connection lists.
+pub fn prefetch() {
+    let connections = crate::resources::connections();
+    Effect::new(move || {
+        if let Some(Ok(all)) = connections.get() {
+            for c in all {
+                crate::resources::models(c.id);
+            }
+        }
+    });
+}
 
 /// The models offered: by connection, each its list or why not.
 type Offered = Vec<(String, Result<Vec<String>, String>)>;
@@ -39,14 +50,18 @@ pub fn ModelInput(
     let offered = LocalResource::new(move || {
         let (c, open) = (connection.get(), shown.get() && !disabled.get());
         let all = connections.get().and_then(Result::ok);
+        let requests = all.filter(|_| open && list.is_none()).map(|all| {
+            all.into_iter()
+                .filter(|x| c.is_empty() || x.id == c || x.name == c)
+                .map(|x| {
+                    let list = crate::resources::models(x.id);
+                    async move { (x.name, list.await) }
+                })
+                .collect::<Vec<_>>()
+        });
         async move {
-            let all = all.filter(|_| open && list.is_none())?;
-            let chosen: Vec<_> = all.into_iter().filter(|x| c.is_empty() || x.id == c || x.name == c).collect();
-            let mut out = Offered::new();
-            for x in chosen {
-                out.push((x.name.clone(), api::models(x.id.clone()).await));
-            }
-            Some(out)
+            let requests = requests?;
+            Some(futures::future::join_all(requests).await)
         }
     });
     let groups = move || -> Option<Offered> {
