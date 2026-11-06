@@ -5934,9 +5934,10 @@ fn Composer(
                             } else {
                                 view! {
                                     // The desktop tile clips its transcript, not
-                                    // the picker. Phones keep their bottom sheet.
+                                    // the picker. Carry the toolbar's text size
+                                    // across the portal; phones keep their sheet.
                                     <leptos::portal::Portal>
-                                        <div data-pop=picking_pop.get_value() class="fixed z-50 w-max max-w-[min(36rem,calc(100vw-1rem))] space-y-2 overflow-y-auto rounded-lg border border-zinc-200 bg-white p-3 text-zinc-700 shadow-lg dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+                                        <div data-pop=picking_pop.get_value() class="fixed z-50 w-max max-w-[min(36rem,calc(100vw-1rem))] space-y-2 overflow-y-auto rounded-lg border border-zinc-200 bg-white p-3 text-xs text-zinc-700 shadow-lg dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
                                             style=move || {
                                                 let width = window().inner_width().ok().and_then(|w| w.as_f64()).unwrap_or(800.0);
                                                 let height = window().inner_height().ok().and_then(|h| h.as_f64()).unwrap_or(600.0);
@@ -6327,6 +6328,24 @@ mod tests {
                 assert_eq!(html.contains("animate-spin"), state.working && state.waiting == 0, "only the working glyph spins: {html}");
             }
         });
+    }
+
+    #[test]
+    fn composer_model_portals_keep_their_own_typography() {
+        let source = include_str!("session.rs");
+        let picker = source
+            .split("// The desktop tile clips its transcript, not")
+            .nth(1)
+            .unwrap()
+            .split("</leptos::portal::Portal>")
+            .next()
+            .unwrap();
+        let class = picker.split("class=\"").nth(1).unwrap().split('"').next().unwrap();
+        for token in ["text-xs", "text-zinc-700", "dark:text-zinc-200"] {
+            assert!(class.split_whitespace().any(|c| c == token), "desktop portal cannot inherit {token} from the composer toolbar");
+        }
+        let sheet = source.split("fn BottomSheet(").nth(1).unwrap().split("/// Where a subagent sits").next().unwrap();
+        assert!(sheet.contains("bg-white text-sm shadow-xl"), "the phone sheet keeps its independent, larger text size");
     }
 
     #[test]

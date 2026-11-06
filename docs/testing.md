@@ -888,3 +888,24 @@ with no subsequent click; native scroll completion and a one-frame trusted
 press did not cure it. Those failures must remain reported separately, not
 be described as an app-side dismissal or as solved by the state wait.
 
+## Composer model picker typography across portals
+
+Run `cargo test -p c6-ui composer_model_portals_keep_their_own_typography` for
+the native source guard (no app-view rendering). The desktop model/subagent
+popover must carry `text-xs` and its light/dark text colors across the portal;
+the phone BottomSheet keeps its own `text-sm`. Commit `8c7a4307` moved only
+this desktop popover: its text colors were already explicit, and the phone
+portal/sheet was unchanged. No other newly portaled popovers need correction.
+Against the coordinator's final combined production build, run
+`ROOT=/path/to/dist ENGINE=both node crates/c6-ui/tests/model-typography.cjs`.
+This standalone helper reuses `motion.cjs` without changing it or building the
+UI. It asserts computed 12px desktop headings/helper copy, 14px phone sheet
+copy, 16px phone input fields (the anti-iOS-zoom override), 12px offered-model
+rows, retained colors/icons, model/effort selection, and keyboard-bounded phone
+geometry at 390×844 and 320×568 in light/dark Chromium and WebKit. PNGs and
+computed-style JSON go to `/tmp/q1-screenshots/model-after` (`SCREENSHOTS`
+overrides it). Capture the regressed snapshot with
+`BEFORE=1 ROOT=/tmp/q1-four-fixes-dist ENGINE=both node crates/c6-ui/tests/model-typography.cjs`;
+that phase asserts desktop text is larger than 12px and saves the same views
+under `/tmp/q1-screenshots/model-before`. `VIEWPORT=desktop,phone,narrow`,
+`THEME=light,dark`, and browser path overrides work as in `motion.cjs`.
