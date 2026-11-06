@@ -1166,9 +1166,7 @@ fn load<T: for<'de> Deserialize<'de>>(key: &str) -> Option<T> {
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
 let workspaceMotion;
-const tileEaseOut = 'cubic-bezier(.2,0,0,1)';
 const tileEaseMove = 'cubic-bezier(.3,0,0,1)';
-const tileEaseIn = 'cubic-bezier(.4,0,1,1)';
 function tileMotionMode() {
     const motion = window.c6Motion;
     if (motion?.off() || document.documentElement.dataset.motion === 'off') return 'off';
@@ -1196,9 +1194,6 @@ function tileMotionCancel(state) {
     state.before = null;
     for (const animation of state.animations.values()) animation.cancel();
     state.animations.clear();
-    for (const ghost of state.ghosts) ghost.remove();
-    state.ghosts.clear();
-    state.exits.clear();
 }
 export function tileMotionStop() {
     if (!workspaceMotion) return;
@@ -1215,70 +1210,28 @@ function tileMotionAnimate(state, el, frames, duration, easing, done = () => {})
         done();
     };
 }
-function tileMotionGhost(state, key, item, mode) {
-    const ghost = document.createElement('div');
-    const picture = item.el.cloneNode(true);
-    // Clones have no event handlers. Inert/aria-hidden also remove forms and
-    // links from pointer, keyboard and accessibility interaction immediately.
-    ghost.inert = true;
-    ghost.setAttribute('aria-hidden', 'true');
-    picture.removeAttribute('id');
-    picture.removeAttribute('data-tile-motion');
-    picture.removeAttribute('data-pane-motion');
-    for (const el of picture.querySelectorAll('[id]')) el.removeAttribute('id');
-    for (const pop of picture.querySelectorAll('[data-pop]')) {
-        pop.previousElementSibling?.remove();
-        pop.remove();
-    }
-    const r = item.rect;
-    Object.assign(ghost.style, {
-        position: 'fixed', left: r.left + 'px', top: r.top + 'px',
-        width: r.width + 'px', height: r.height + 'px', margin: '0',
-        display: 'flex', flex: 'none', pointerEvents: 'none', zIndex: '30',
-        transform: 'none', transformOrigin: 'center', transition: 'none', overflow: 'hidden',
+function tileMotionReveal(state, tile, duration) {
+    const surface = tile.firstElementChild;
+    if (!surface) return;
+    // Fade an empty veil OFF the final, opaque surface, never fade the tile
+    // itself. Text reflows once at full size, with no outgoing text underneath.
+    // Prepending preserves the final pane-host child used by tileMotionNodes.
+    const veil = document.createElement('div');
+    veil.setAttribute('data-tile-reveal', '');
+    veil.setAttribute('aria-hidden', 'true');
+    Object.assign(veil.style, {
+        position: 'absolute', inset: '0', zIndex: '20', pointerEvents: 'none',
+        borderRadius: 'inherit', background: getComputedStyle(surface).backgroundColor,
     });
-    // Preserve the old layout inside its displayed picture instead of reflowing
-    // text at a partly animated width. Descendant pane transforms are their own
-    // computed transforms, not the ancestor FLIP a second time.
-    Object.assign(picture.style, {
-        position: 'absolute', left: '0', top: '0', margin: '0',
-        width: item.width + 'px', height: item.height + 'px', display: 'flex',
-        transformOrigin: '0 0', transform: `scale(${r.width / item.width},${r.height / item.height})`,
-        opacity: '1', transition: 'none',
-    });
-    for (const pane of picture.querySelectorAll('[data-pane-motion]')) {
-        const old = state.before.get(tileMotionKey(pane));
-        if (old) Object.assign(pane.style, { transform: old.transform, transformOrigin: old.origin, opacity: old.opacity });
-    }
-    ghost.append(picture);
-    document.body.append(ghost);
-    // cloneNode preserves content, not scroll offsets. Only inspect scroll
-    // boxes on this one outgoing root, never every transcript row on a move.
-    const selector = '.overflow-auto, .overflow-x-auto, .overflow-y-auto';
-    const scrollers = Array.from(item.el.querySelectorAll(selector)).filter(el => !el.closest('[data-pop]'));
-    const copies = picture.querySelectorAll(selector);
-    for (let i = 0; i < copies.length; i++) {
-        if (scrollers[i]) { copies[i].scrollTop = scrollers[i].scrollTop; copies[i].scrollLeft = scrollers[i].scrollLeft; }
-    }
-    state.ghosts.add(ghost);
-    state.exits.set(key, { ghost, item });
-    const opacity = item.opacity * (state.before.get(item.parent)?.opacity ?? 1);
-    tileMotionAnimate(state, ghost, mode === 'full' ? [
-        { opacity, transform: 'none' },
-        { opacity: 0, transform: 'scale(.94)' },
-    ] : [{ opacity }, { opacity: 0 }], mode === 'full' ? 150 : 80, tileEaseIn, () => {
-        ghost.remove();
-        state.ghosts.delete(ghost);
-        if (state.exits.get(key)?.ghost === ghost) state.exits.delete(key);
-    });
-    return ghost;
+    surface.prepend(veil);
+    tileMotionAnimate(state, veil, [{ opacity: 1 }, { opacity: 0 }], duration, 'linear', () => veil.remove());
 }
-export function tileMotionPrepare(json) {
+export function tileMotionPrepare() {
     const root = document.querySelector('[data-workspace-motion]');
     if (!root) return;
     if (workspaceMotion?.root !== root) {
         tileMotionStop();
-        const state = { root, before: null, frame: 0, animations: new Map(), ghosts: new Set(), exits: new Map() };
+        const state = { root, before: null, frame: 0, animations: new Map() };
         state.preference = () => { if (tileMotionMode() !== 'full') tileMotionCancel(state); };
         window.addEventListener('c6-motion', state.preference);
         workspaceMotion = state;
@@ -1286,13 +1239,6 @@ export function tileMotionPrepare(json) {
     const state = workspaceMotion;
     const mode = tileMotionMode();
     if (mode === 'off') { tileMotionCancel(state); return; }
-    const phone = !matchMedia('(width >= 48rem) and (height >= 32rem)').matches;
-    const shown = new Set();
-    for (const tile of JSON.parse(json)) {
-        if (!(phone ? tile.phone : tile.desktop)) continue;
-        shown.add('t' + tile.key);
-        for (const [key, current] of tile.panes) if (!phone || current) shown.add('p' + key);
-    }
     if (!state.before) {
         // Read all displayed rects BEFORE cancelling interrupted animations.
         // Batch reads, then writes; one first/last measurement per action.
@@ -1300,58 +1246,12 @@ export function tileMotionPrepare(json) {
         for (const el of tileMotionNodes(root)) {
             const rect = el.getBoundingClientRect();
             if (!rect.width || !rect.height) continue;
-            const parent = el.closest('[data-tile-motion]');
-            const style = getComputedStyle(el);
-            state.before.set(tileMotionKey(el), {
-                el, rect, opacity: Number(style.opacity), width: el.offsetWidth, height: el.offsetHeight,
-                transform: style.transform, origin: style.transformOrigin,
-                parent: parent && parent !== el ? tileMotionKey(parent) : null,
-            });
+            state.before.set(tileMotionKey(el), { el, rect });
         }
-        // A restore can interrupt an exit after its real tile was hidden (or
-        // unmounted). Use the ghost's current picture as First, then discard it
-        // before the real, immediately interactive tile reappears.
-        for (const [key, exit] of state.exits) {
-            if (!shown.has(key)) continue;
-            if (!state.before.has(key)) {
-                const rect = exit.ghost.getBoundingClientRect();
-                state.before.set(key, { ...exit.item, rect, opacity: Number(getComputedStyle(exit.ghost).opacity), ghost: null });
-                for (const pane of exit.ghost.querySelectorAll('[data-pane-motion]')) {
-                    const paneKey = tileMotionKey(pane);
-                    if (state.before.has(paneKey)) continue;
-                    const style = getComputedStyle(pane);
-                    state.before.set(paneKey, {
-                        el: pane, rect: pane.getBoundingClientRect(), parent: key,
-                        opacity: Number(style.opacity), width: pane.offsetWidth, height: pane.offsetHeight,
-                        transform: style.transform, origin: style.transformOrigin,
-                    });
-                }
-            }
-        }
-        for (const animation of state.animations.values()) {
-            if (!state.ghosts.has(animation.effect?.target)) animation.cancel();
-        }
+        for (const animation of state.animations.values()) animation.cancel();
     }
-    for (const [key, exit] of state.exits) {
-        if (!shown.has(key)) continue;
-        state.animations.get(exit.ghost)?.cancel();
-        exit.ghost.remove();
-        state.ghosts.delete(exit.ghost);
-        state.exits.delete(key);
-    }
-    // Snapshot only outgoing roots, before keyed DOM cleanup can tear down
-    // their content. A tile ghost already contains its panes. Coalesce actions
-    // in the same frame without replacing the originally displayed rects.
-    for (const [key, item] of state.before) {
-        if (shown.has(key) && item.ghost) {
-            state.animations.get(item.ghost)?.cancel();
-            item.ghost.remove();
-            state.ghosts.delete(item.ghost);
-            item.ghost = null;
-        } else if (!shown.has(key) && !item.ghost && (!item.parent || shown.has(item.parent))) {
-            item.ghost = tileMotionGhost(state, key, item, mode);
-        }
-    }
+    // Removed/hidden roots disappear immediately. No cloned forms, text or
+    // translucent exit pictures can cover the new layout (or join radio groups).
     if (state.frame) return;
     state.frame = requestAnimationFrame(() => {
         state.frame = 0;
@@ -1364,40 +1264,40 @@ export function tileMotionPrepare(json) {
             const rect = el.getBoundingClientRect();
             if (rect.width && rect.height) after.set(tileMotionKey(el), { el, rect });
         }
-        // Last reads are complete. From here only compositor properties change.
+        const reveals = new Set(), moves = [];
         for (const [key, item] of after) {
             const old = before.get(key);
-            const parent = item.el.hasAttribute('data-pane-motion') ? item.el.closest('[data-tile-motion]') : null;
-            const parentKey = parent ? tileMotionKey(parent) : null;
-            if (parentKey && !before.has(parentKey)) continue; // its tile enters as one picture
+            const tile = item.el.closest('[data-tile-motion]');
+            const parentKey = tile !== item.el ? tileMotionKey(tile) : null;
             if (!old) {
-                if (!reduced) item.el.style.transformOrigin = 'center';
-                tileMotionAnimate(state, item.el, reduced ? [{ opacity: 0 }, { opacity: 1 }] : [
-                    { opacity: 0, transform: 'scale(.94)' },
-                    { opacity: 1, transform: 'none' },
-                ], reduced ? 80 : 220, tileEaseOut);
+                reveals.add(tile);
                 continue;
             }
             const a = item.rect, b = old.rect;
+            if (Math.abs(b.width - a.width) > .5 || Math.abs(b.height - a.height) > .5) {
+                reveals.add(tile);
+                continue;
+            }
             let dx = b.left - a.left, dy = b.top - a.top;
-            let sx = b.width / a.width, sy = b.height / a.height;
-            // A pane's ancestor FLIP already moves/scales it. Compensate in
-            // that ancestor's coordinate space rather than doubling motion.
+            // Same-size moves translate only. The tile already moves its pane;
+            // compensate that translation without ever scaling either root.
             const bp = before.get(parentKey)?.rect, ap = after.get(parentKey)?.rect;
             if (bp && ap) {
-                const px = bp.width / ap.width, py = bp.height / ap.height;
-                dx = (b.left - bp.left) / px - (a.left - ap.left);
-                dy = (b.top - bp.top) / py - (a.top - ap.top);
-                sx /= px; sy /= py;
+                dx -= bp.left - ap.left;
+                dy -= bp.top - ap.top;
             }
-            if (Math.abs(dx) < .5 && Math.abs(dy) < .5 && Math.abs(sx - 1) < .001 && Math.abs(sy - 1) < .001 && old.opacity >= .999) continue;
-            if (!reduced) item.el.style.transformOrigin = '0 0';
-            tileMotionAnimate(state, item.el, reduced ? [
-                { opacity: Math.min(old.opacity, .7) }, { opacity: 1 },
-            ] : [
-                { transform: `translate(${dx}px,${dy}px) scale(${sx},${sy})`, opacity: old.opacity },
-                { transform: 'none', opacity: 1 },
-            ], reduced ? 80 : 220, tileEaseMove);
+            if (Math.abs(dx) < .5 && Math.abs(dy) < .5) continue;
+            if (reduced) reveals.add(tile);
+            else moves.push({ el: item.el, tile, dx, dy });
+        }
+        // Last reads are complete. Tile contents NEVER scale, including entry,
+        // restore and neighbours growing back. A reveal keeps the background
+        // opaque throughout; it cannot double-expose text from another tile.
+        for (const tile of reveals) tileMotionReveal(state, tile, reduced ? 80 : 100);
+        for (const { el, tile, dx, dy } of moves) if (!reveals.has(tile)) {
+            tileMotionAnimate(state, el, [
+                { transform: `translate(${dx}px,${dy}px)` }, { transform: 'none' },
+            ], 220, tileEaseMove);
         }
     });
 }

@@ -93,7 +93,7 @@ function instrumentation() {
     seen.add(animation);
     const effect = animation.effect;
     test.effects.push({ tag: effect.target?.tagName, classes: String(effect.target?.className?.baseVal ?? effect.target?.className ?? ''),
-      workspace: !!effect.target?.matches?.('[data-tile-motion], [data-pane-motion], [inert][aria-hidden="true"]'),
+      workspace: !!effect.target?.matches?.('[data-tile-motion], [data-pane-motion], [data-tile-reveal], [inert][aria-hidden="true"]'),
       tool: !!effect.target?.closest?.('.c6-tool-details'), pseudo: effect.pseudoElement || null,
       name: animation.animationName || animation.transitionProperty || 'web-animation',
       duration: effect.getTiming().duration, iterations: effect.getTiming().iterations,
@@ -1252,6 +1252,8 @@ async function tileAction(page, action) {
   for (const effect of audit.effects) for (const frame of effect.frames) {
     assert(!Object.keys(frame).some(key => /^(left|top|right|bottom|width|height|inlineSize|blockSize)$/.test(key)),
       `tile animates layout rather than transform/opacity: ${JSON.stringify(effect)}`);
+    assert(!frame.transform || /^(none|translate\([^)]*\))$/.test(frame.transform),
+      `tile contents never scale, including opening/closing: ${JSON.stringify(effect)}`);
   }
   return audit;
 }

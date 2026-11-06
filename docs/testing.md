@@ -202,6 +202,19 @@ native drag events exercise production handlers, not OS drag gesture fidelity;
 emulated visual viewports do not replace a physical keyboard/accessibility
 review. Visual spring quality and interrupted-animation velocity still need
 human review.
+
+Tile contents never scale, including opening/closing, maximize/restore, pane
+changes and neighbours growing back. Size changes commit the destination at
+once: an empty surface-coloured veil fades away in 100ms (80ms Reduced), while
+the actual tile and background remain opaque. No outgoing text/form clone is
+inserted over the destination. Only same-size moves translate; Off is instant.
+`node crates/c6-ui/tests/tile-motion.cjs` exercises six long-content tiles in
+three- and four-column arrangements with System/full, Reduced and Off. It
+pauses native WAAPI effects at 0/25/50/75/100% for frame captures under
+`/tmp/m2-screenshots/` (`SCREENSHOTS` overrides), asserts scale remains 1 and
+root opacity remains 1, and records LayoutShift sources in a separate unpaused
+normal-speed maximize/restore run. `ROOT` selects another production build;
+`BEFORE=1` records baseline frames without enforcing the fixed invariants.
 Notice rise/update/dismiss/Undo, catch-up pending-to-summary growth, and the
 mounted comments list are not browser-covered here; notice source guards and
 the shared list helper's VM/real-DOM tests are narrower checks, not integration coverage.
