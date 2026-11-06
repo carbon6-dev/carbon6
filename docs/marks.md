@@ -39,6 +39,12 @@ Which aspects show in these rows and cards is a per-realm setting (`session_face
 
 The off path keeps the current appearance and no per-tile mark signals, aspect scans, timers or listeners. One workspace-level gate mounts the controller only while enabled on desktop; it fills static empty bar slots without remounting tiles, their controls or composers. Turning it off or resizing to phone removes the strips, popovers and pending dwell timers and clears dimming. The existing settings table stores the choice per realm; no migration. Another device reads it on reload, not by a live preference broadcast.
 
+Appearance responds to its pane, not the browser window: below 56rem the
+Settings menu is a compact selector above the content. Theme, Motion and
+Session aspects stack until the content column has room for readable cards.
+Shared switches put their hints below the label and switch, using the full
+row width instead of squeezing descriptions alongside the control.
+
 ### Session bar colour
 
 **Settings → Appearance → Session bar colour** chooses how much of a session's tile bar carries its identity colour:

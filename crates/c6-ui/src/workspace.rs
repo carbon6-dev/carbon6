@@ -3443,7 +3443,7 @@ fn ColumnView(tile: u64, col: u64) -> impl IntoView {
             <Show when=move || pos.get().is_some_and(|p| p.len == 2)>
                 <ColumnHeader label pos=Signal::derive(move || pos.get()) view=Signal::derive(move || view.get()) />
             </Show>
-            <div class="relative flex min-h-0 flex-1 flex-col">
+            <div class="@container/view relative flex min-h-0 min-w-0 flex-1 flex-col">
                 <Show when=move || mounted.get()>
                     {move || view.get().map(|view| view! { <InitialView view col /> })}
                 </Show>

@@ -379,7 +379,7 @@ pub fn FacetsSetting() -> impl IntoView {
             <p class="text-xs text-muted">
                 "What a session's row and its dock line show, each in its own shape. Every value wears the same mark everywhere."
             </p>
-            <div class="grid gap-2 sm:grid-cols-2">
+            <div class="grid gap-2 @lg/settings:grid-cols-2">
                 {ASPECTS.into_iter().map(|aspect| {
                     let (label, hint) = what(aspect);
                     view! {

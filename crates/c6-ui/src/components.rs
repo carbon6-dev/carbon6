@@ -55,14 +55,13 @@ fn switch_row(
     view! {
         <button type="button" role="switch" aria-checked=move || on.get().to_string()
             aria-label=accessible_label title=title disabled=move || disabled.get()
-            class="flex min-h-8 w-full items-center justify-between gap-3 rounded px-1 text-left text-sm outline-none focus-visible:ring-2 focus-visible:ring-sky-500/60 disabled:opacity-50 pointer-coarse:min-h-11"
+            class="grid min-h-8 w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-1 rounded px-1 text-left text-sm outline-none focus-visible:ring-2 focus-visible:ring-sky-500/60 disabled:opacity-50 pointer-coarse:min-h-11"
             on:click=move |_| if !disabled.get_untracked() { on_change.run(!on.get_untracked()) }>
-            <span class="min-w-0"><span>{label}</span>
-                {(!hint.is_empty()).then(|| view! { <span class="block text-xs text-muted">{hint}</span> })}
-            </span>
+            <span class="min-w-0 wrap-anywhere">{label}</span>
             <span aria-hidden="true" class=move || format!("relative h-4 w-7 shrink-0 rounded-full transition-colors {}", if on.get() { "bg-sky-600" } else { "bg-zinc-300 dark:bg-zinc-600" })>
                 <span class=move || format!("absolute left-0.5 top-0.5 size-3 rounded-full bg-white shadow-sm transition-transform {}", if on.get() { "translate-x-3" } else { "" })></span>
             </span>
+            {(!hint.is_empty()).then(|| view! { <span class="col-span-2 text-xs text-muted wrap-anywhere">{hint}</span> })}
         </button>
     }
 }

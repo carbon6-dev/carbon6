@@ -147,16 +147,16 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
     let visible = move |id: &str| here(id) && (id != "account" || auth_required.get().and_then(Result::ok).is_some_and(|s| s.required));
     let heading = move || current.with(|c| page(c)).unwrap_or(("", "", ""));
     view! {
-        <main class="mx-auto max-w-5xl px-4 py-6 md:flex md:gap-8">
-            // A phone picks the page from a list; wider screens get the menu.
-            <select class=format!("{INPUT} mb-4 md:hidden") prop:value=move || current.get() on:change=move |ev| go(event_target_value(&ev))>
+        <main class="mx-auto max-w-5xl px-4 py-6 @4xl/view:flex @4xl/view:gap-8">
+            // A narrow pane reuses the phone selector, even in a wide window.
+            <select class=format!("{INPUT} mb-4 @4xl/view:hidden") prop:value=move || current.get() on:change=move |ev| go(event_target_value(&ev))>
                 {GROUPS.iter().filter(|(_, pages)| pages.iter().any(|p| here(p.0))).map(|(g, pages)| view! {
                     <optgroup label=*g>
                         {pages.iter().filter(|p| visible(p.0)).map(|p| view! { <option value=p.0>{p.1}</option> }).collect_view()}
                     </optgroup>
                 }).collect_view()}
             </select>
-            <nav class="hidden text-sm md:sticky md:top-4 md:block md:w-52 md:shrink-0 md:self-start md:space-y-4">
+            <nav class="hidden text-sm @4xl/view:sticky @4xl/view:top-4 @4xl/view:block @4xl/view:w-52 @4xl/view:shrink-0 @4xl/view:self-start @4xl/view:space-y-4">
                 {GROUPS.iter().filter(|(_, pages)| pages.iter().any(|p| here(p.0))).map(|(g, pages)| view! {
                     <div>
                         <div class="px-3 pb-1 text-[11px] font-semibold uppercase tracking-wide text-muted">{*g}</div>
@@ -175,7 +175,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                     </div>
                 }).collect_view()}
             </nav>
-            <div class="min-w-0 flex-1 space-y-5">
+            <div class="@container/settings min-w-0 flex-1 space-y-5 wrap-anywhere">
                 <div class="border-b border-zinc-200 pb-4 dark:border-zinc-800">
                     <p class="text-xs text-muted">{move || heading().0}</p>
                     <h1 class="text-lg font-semibold">{move || heading().1}</h1>
@@ -465,9 +465,9 @@ fn AppearanceSetting() -> impl IntoView {
     let option = move |value: &'static str, label: &'static str, what: &'static str| {
         view! {
             <label class="flex cursor-pointer items-start gap-3 rounded-md border border-zinc-200 px-3 py-2 has-checked:border-blue-500 has-checked:bg-blue-50 dark:border-zinc-800 dark:has-checked:border-blue-400 dark:has-checked:bg-blue-950">
-                <input type="radio" name="theme" class="mt-1" prop:checked=move || choice.get() == value
+                <input type="radio" name="theme" class="mt-1 shrink-0" prop:checked=move || choice.get() == value
                     on:change=move |_| { theme_set(value); choice.set(value.to_owned()); } />
-                <span>
+                <span class="min-w-0">
                     <span class="block text-sm font-medium">{label}</span>
                     <span class="block text-xs text-muted">{what}</span>
                 </span>
@@ -477,22 +477,22 @@ fn AppearanceSetting() -> impl IntoView {
     let motion_option = move |value: &'static str, label: &'static str, what: &'static str| {
         view! {
             <label class="flex cursor-pointer items-start gap-3 rounded-md border border-zinc-200 px-3 py-2 has-checked:border-blue-500 has-checked:bg-blue-50 dark:border-zinc-800 dark:has-checked:border-blue-400 dark:has-checked:bg-blue-950">
-                <input type="radio" name="motion" class="mt-1" prop:checked=move || motion.get() == value
+                <input type="radio" name="motion" class="mt-1 shrink-0" prop:checked=move || motion.get() == value
                     on:change=move |_| { motion_set(value); motion.set(value.to_owned()); } />
-                <span><span class="block text-sm font-medium">{label}</span><span class="block text-xs text-muted">{what}</span></span>
+                <span class="min-w-0"><span class="block text-sm font-medium">{label}</span><span class="block text-xs text-muted">{what}</span></span>
             </label>
         }
     };
     view! {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <h2 class="font-medium">"Theme"</h2>
-            <div class="grid gap-2 sm:grid-cols-3">
+            <div class="grid gap-2 @xl/settings:grid-cols-3">
                 {option("system", "System", "Follows your device's setting")}
                 {option("light", "Light", "Always light")}
                 {option("dark", "Dark", "Always dark")}
             </div>
             <h2 class="font-medium">"Motion"</h2>
-            <div class="grid gap-2 sm:grid-cols-2">
+            <div class="grid gap-2 @lg/settings:grid-cols-2">
                 {motion_option("system", "System", "Follows your device's setting")}
                 {motion_option("full", "Full", "All motion, regardless of the device setting")}
                 {motion_option("reduced", "Reduced", "Short fades; no travel, spinning or pulsing")}
@@ -556,7 +556,7 @@ fn SessionBarSetting() -> impl IntoView {
             <h2 class="font-medium">"Session bar colour"</h2>
             <crate::components::Switch on=move || display.colour.get() == SessionBarColour::Tinted
                 on_change=save disabled=move || !display.loaded.get() || busy.get() label="Coloured stripe"
-                hint="On: keep the session's colour along the bar's top edge (default). Off: Dot only — keep the bar neutral; show the session's colour only on its dot." />
+                hint="On: a coloured stripe along the bar. Off: Dot only, with a neutral bar." />
             <p class="text-xs text-muted">"Aspect marks keep their colours. Existing hover behaviour and click actions stay the same. Kept in carbon6 across realms and devices."</p>
             {move || display.error.get().map(|e| view! { <ErrorBox message=e /> })}
         </section>
@@ -1764,7 +1764,7 @@ fn UpdatesSetting() -> impl IntoView {
                     </table>
                 }
             })}
-            <div class="grid gap-3 text-sm sm:grid-cols-2">
+            <div class="grid gap-3 text-sm @lg/settings:grid-cols-2">
                 <label class="space-y-1">
                     <span class="block text-xs text-muted">"Channel"</span>
                     <select class=SELECT prop:value=move || s.get().channel on:change=move |ev| { let c = event_target_value(&ev); s.update(|v| v.channel = c); }>
@@ -1963,7 +1963,7 @@ fn ContextWindow(value: RwSignal<String>) -> impl IntoView {
 #[component]
 fn SessionDefaults(subagent_model: RwSignal<String>, compact_at: RwSignal<String>) -> impl IntoView {
     view! {
-        <div class="grid gap-2 sm:grid-cols-2">
+        <div class="grid gap-2 @lg/settings:grid-cols-2">
             <label class="block text-xs text-muted">
                 "Subagent model"
                 <input class=format!("mt-1 {INPUT}") placeholder="empty: the session's own"
@@ -2223,7 +2223,7 @@ fn AddConnection(all: Signal<Vec<Connection>>, on_added: impl Fn() + Copy + Send
                     <code class="font-mono">"claude auth login"</code> " there. No key is stored here."
                 </p>
             })}
-            <div class="grid gap-3 sm:grid-cols-2" class:hidden=pool>
+            <div class="grid gap-3 @lg/settings:grid-cols-2" class:hidden=pool>
                 {field("Name", name, by_kind("Anthropic", "OpenAI", "Ollama"), "text")}
                 {field("Base URL", base_url, by_kind("https://api.anthropic.com (default)", "https://api.openai.com/v1 (default)", "http://127.0.0.1:11434/v1"), "url")}
                 {field("API key", api_key, by_kind("sk-ant-…", "sk-…", "optional for local servers"), "password")}
@@ -2778,7 +2778,7 @@ fn HookRow(hook: RwSignal<Hook>, on_remove: impl Fn() + Copy + Send + Sync + 'st
                 </select>
                 <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| on_remove()>"Remove"</button>
             </div>
-            <div class="grid gap-2 sm:grid-cols-[1fr_1fr_6rem]">
+            <div class="grid gap-2 @xl/settings:grid-cols-[1fr_1fr_6rem]">
                 <label class="space-y-0.5">
                     <span class=label>"Tools (regex)"</span>
                     <input class=format!("{INPUT} py-1 font-mono text-xs")
@@ -3697,11 +3697,11 @@ fn ListItem(
                     on:input=move |ev| set(first.key, event_target_value(&ev)) />
                 <button class=format!("{BUTTON_QUIET} text-xs text-red-600") on:click=move |_| on_remove()>"Remove"</button>
             </div>
-            <div class="grid gap-2 sm:grid-cols-2">
+            <div class="grid gap-2 @lg/settings:grid-cols-2">
                 {lines.into_iter().map(|f| if f.kind == FieldKind::Check {
                     let checked = move || item.with(|m| field_value(m, f.key).and_then(|v| v.as_bool()).unwrap_or(false));
                     view! {
-                        <label class="flex items-start gap-2 text-sm sm:col-span-2" title=f.placeholder>
+                        <label class="flex items-start gap-2 text-sm @lg/settings:col-span-2" title=f.placeholder>
                             <input type="checkbox" class=crate::components::CHECKBOX class:mt-1=true prop:checked=checked
                                 on:change=move |ev| item.update(|m| set_field(m, f.key, serde_json::Value::Bool(event_target_checked(&ev)))) />
                             <span>{f.label}<span class="block text-xs text-muted">{f.placeholder}</span></span>
@@ -3750,7 +3750,7 @@ fn ListItem(
                 } else if matches!(f.kind, FieldKind::Labels | FieldKind::List) {
                     // Parsed when you leave the field, so typing is not reformatted.
                     view! {
-                        <label class="space-y-0.5 sm:col-span-2">
+                        <label class="space-y-0.5 @lg/settings:col-span-2">
                             <span class="text-xs text-muted">{f.label}</span>
                             <input class=input_class(f) placeholder=f.placeholder prop:value=get(f.key)
                                 title=if f.kind == FieldKind::Labels { "Sessions with all of these labels: yours, or worker:, repo:, folder: (a path prefix) and model:" } else { "Comma-separated tool names, in any profile's naming; empty: all tools" }
@@ -3873,7 +3873,7 @@ fn SecretsSetting() -> impl IntoView {
                     }).collect_view().into_any(),
                 })}
             </div>
-            <div class="grid gap-2 sm:grid-cols-2">
+            <div class="grid gap-2 @lg/settings:grid-cols-2">
                 <label class="space-y-0.5">
                     <span class="text-xs text-muted">"Name"</span>
                     <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="GITHUB_TOKEN" prop:disabled=move || editing.get()
@@ -3936,7 +3936,7 @@ fn SubagentLimitsSetting() -> impl IntoView {
                     "Subagents can start subagents of their own, down to this depth: 1 lets a session start subagents that start none. Below one session, at most this many work at once; one more is refused until another finishes."
                 </p>
             </div>
-            <div class="grid gap-2 sm:grid-cols-2">
+            <div class="grid gap-2 @lg/settings:grid-cols-2">
                 <label class="space-y-0.5">
                     <span class="text-xs text-muted">"Depth (1–8)"</span>
                     <input type="number" min="1" max="8" class=format!("{INPUT} py-1")
@@ -3951,7 +3951,7 @@ fn SubagentLimitsSetting() -> impl IntoView {
             <p class="text-sm text-muted">
                 "A background task's end or a subagent's report wakes an idle session, at most this many times an hour; beyond that it waits until the hour allows, or for your next message. A Claude Code session's process stays up this long when idle with no background tasks."
             </p>
-            <div class="grid gap-2 sm:grid-cols-2">
+            <div class="grid gap-2 @lg/settings:grid-cols-2">
                 <label class="space-y-0.5">
                     <span class="text-xs text-muted">"Turns notices start per hour (1–200)"</span>
                     <input type="number" min="1" max="200" class=format!("{INPUT} py-1")
@@ -3966,7 +3966,7 @@ fn SubagentLimitsSetting() -> impl IntoView {
             <p class="text-sm text-muted">
                 "An agent can message another session of its realm. Each send adds one to the last session message it received. The default chain limit is 4; a chain longer than the configured limit is refused, so two agents can't keep waking each other. Your next message resets the count to 0. A session sends at most this many messages an hour."
             </p>
-            <div class="grid gap-2 sm:grid-cols-2">
+            <div class="grid gap-2 @lg/settings:grid-cols-2">
                 <label class="space-y-0.5">
                     <span class="text-xs text-muted">"Longest chain of messages (1–32)"</span>
                     <input type="number" min="1" max="32" class=format!("{INPUT} py-1")
@@ -4103,7 +4103,7 @@ fn ClaudeCodeToolsSetting() -> impl IntoView {
                         </label>
                     </div>
                     <p class="text-xs text-muted">"Up front: loaded into Claude Code's prompt from the start. The rest it finds with its tool search when it needs them, which keeps every turn's prompt small."</p>
-                    <div class="grid gap-1 sm:grid-cols-2">
+                    <div class="grid gap-1 @lg/settings:grid-cols-2">
                         {s.available.into_iter().map(|t| {
                             let on = auto || offered.iter().any(|c| same(c, &t.name));
                             let up = core.iter().any(|c| same(c, &t.name));
@@ -4166,7 +4166,7 @@ fn BriefSetting() -> impl IntoView {
                     "The brief (Mail & chat's home) sorts this realm's mail and Slack, and notifies you at these times with what needs you. Times are in your primary calendar's time zone. Urgent requests (by the memex.triage.urgent prompt, under Prompts) can tell you at once. Notifications go to the channels under Notifications."
                 </p>
             </div>
-            <div class="grid gap-2 sm:grid-cols-2">
+            <div class="grid gap-2 @lg/settings:grid-cols-2">
                 <label class="space-y-0.5">
                     <span class="text-xs text-muted">"Brief times (HH:MM, comma-separated)"</span>
                     <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="08:30, 13:30"
@@ -4220,7 +4220,7 @@ fn WebSearchSetting() -> impl IntoView {
                     "Claude and OpenAI models search the web through their own provider. Others (Ollama, other OpenAI-compatible servers) get a web_search tool through the provider chosen here. Brave and Tavily need an API key, kept as a secret (it must apply to the sessions that search); SearXNG is self-hosted and needs only its URL (with the JSON format enabled)."
                 </p>
             </div>
-            <div class="grid gap-2 sm:grid-cols-2">
+            <div class="grid gap-2 @lg/settings:grid-cols-2">
                 <label class="space-y-0.5">
                     <span class="text-xs text-muted">"Provider"</span>
                     <select class=format!("{INPUT} py-1") prop:value=provider on:change=move |ev| setting.update(|s| s.provider = event_target_value(&ev))>
@@ -4540,7 +4540,7 @@ fn AutomationsSetting() -> impl IntoView {
                     }).collect_view().into_any(),
                 })}
             </div>
-            <div class="grid gap-2 sm:grid-cols-2">
+            <div class="grid gap-2 @lg/settings:grid-cols-2">
                 <label class="space-y-0.5">
                     <span class="text-xs text-muted">"Name"</span>
                     <input class=format!("{INPUT} py-1 text-sm") placeholder="e.g. Morning health check" prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev)) />
@@ -4557,7 +4557,7 @@ fn AutomationsSetting() -> impl IntoView {
                         <option value="series">"When a series crosses a threshold"</option>
                     </select>
                 </label>
-                <label class="space-y-0.5 sm:col-span-2" class:hidden=move || trigger.get() != "series">
+                <label class="space-y-0.5 @lg/settings:col-span-2" class:hidden=move || trigger.get() != "series">
                     <span class="text-xs text-muted">"Threshold (JSON): agg over minutes compared with value, or silent_minutes for points that stop arriving"</span>
                     <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder=r#"{"series": "model_spend", "agg": "sum", "minutes": 1440, "op": ">", "value": 5}"#
                         prop:value=move || threshold.get() on:input=move |ev| threshold.set(event_target_value(&ev)) />
@@ -4592,7 +4592,7 @@ fn AutomationsSetting() -> impl IntoView {
                         {[0u32, 1, 2, 3, 5, 10].into_iter().map(|n| view! { <option value=n.to_string()>{if n == 0 { "never".to_owned() } else { format!("{n} failed runs in a row") }}</option> }).collect_view()}
                     </select>
                 </label>
-                <label class="space-y-0.5 sm:col-span-2" class:hidden=move || trigger.get() != "memex">
+                <label class="space-y-0.5 @lg/settings:col-span-2" class:hidden=move || trigger.get() != "memex">
                     <span class="text-xs text-muted">"Which mail (the message becomes the template's {{input}})"</span>
                     <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="mail.received from:@acme.com subject:invoice (from:, to:, subject:, account:)"
                         prop:value=move || cron.get() on:input=move |ev| cron.set(event_target_value(&ev)) />
@@ -4615,11 +4615,11 @@ fn AutomationsSetting() -> impl IntoView {
                         {move || workflow_list.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|w| view! { <option value=w.name.clone()>{format!("{} (workflow)", w.name)}</option> }).collect_view()}
                     </select>
                 </label>
-                <label class="space-y-0.5 sm:col-span-2">
+                <label class="space-y-0.5 @lg/settings:col-span-2">
                     <span class="text-xs text-muted">"Only when (JSONPath conditions on the event; optional)"</span>
                     <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder=r#"{"$.record.fields.stage": "won"}"# prop:value=move || conditions.get() on:input=move |ev| conditions.set(event_target_value(&ev)) />
                 </label>
-                <label class="space-y-0.5 sm:col-span-2" class:hidden=move || action.get() == "start">
+                <label class="space-y-0.5 @lg/settings:col-span-2" class:hidden=move || action.get() == "start">
                     <span class="text-xs text-muted">"What to do (JSON; \"$.path\" and {{$.path}} take the event's values)"</span>
                     <textarea class=format!("{INPUT} py-1 font-mono text-xs") rows="3" prop:value=move || params.get() on:input=move |ev| params.set(event_target_value(&ev))
                         placeholder=move || match action.get().as_str() {
@@ -4633,7 +4633,7 @@ fn AutomationsSetting() -> impl IntoView {
                     <span class="text-xs text-muted">"At most, runs an hour"</span>
                     <input type="number" min="0" class=format!("{INPUT} py-1 text-sm") prop:value=move || per_hour.get().to_string() on:input=move |ev| per_hour.set(event_target_value(&ev).parse().unwrap_or(60)) />
                 </label>
-                <label class="space-y-0.5 sm:col-span-2" class:hidden=move || trigger.get() != "schedule" || action.get() != "start">
+                <label class="space-y-0.5 @lg/settings:col-span-2" class:hidden=move || trigger.get() != "schedule" || action.get() != "start">
                     <span class="text-xs text-muted">"Input (the template's {{input}})"</span>
                     <input class=format!("{INPUT} py-1 text-sm") placeholder="optional" prop:value=move || input.get() on:input=move |ev| input.set(event_target_value(&ev)) />
                 </label>
@@ -4766,7 +4766,7 @@ fn MemorySetting() -> impl IntoView {
                     }).collect_view().into_any(),
                 })}
             </div>
-            <div class="grid gap-2 sm:grid-cols-[14rem_1fr]">
+            <div class="grid gap-2 @xl/settings:grid-cols-[14rem_1fr]">
                 <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="scope: a label, or empty for all" prop:value=move || scope.get()
                     on:input=move |ev| scope.set(event_target_value(&ev)) />
                 <textarea class=format!("{INPUT} min-h-10 text-sm") rows="2" placeholder="e.g. web1 runs Ubuntu 24.04; nginx is managed by docker compose in /srv/web"
