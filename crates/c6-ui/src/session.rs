@@ -721,10 +721,14 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     // Unlike the live session list, this includes approvals/questions in
     // subagents, even when their threads (or this session's old turns)
     // aren't drawn. Keep the last answer while a ping reloads it.
-    let waiting_list = LocalResource::new(move || {
-        live.attention.track();
-        live.connected.track();
-        api::session_waiting(id_stored.get_value())
+    let waiting_list = LocalResource::new({
+        // The fetcher can outlive the view's arena values.
+        let id = id.clone();
+        move || {
+            live.attention.track();
+            live.connected.track();
+            api::session_waiting(id.clone())
+        }
     });
     let waiting_shown = RwSignal::new(Vec::new());
     Effect::new(move || {
@@ -1941,12 +1945,15 @@ impl SubagentTree {
             let top = top.get();
             live.sessions.with(|ss| ss.iter().find(|s| Some(&s.id) == top.as_ref()).map_or(0, |s| s.subagents_running))
         });
-        let tree = LocalResource::new(move || {
-            spawns.get();
-            working.get();
-            live.attention.track();
-            live.connected.track();
-            api::descendants(session.get_value())
+        let tree = LocalResource::new({
+            let session = session.get_value();
+            move || {
+                spawns.get();
+                working.get();
+                live.attention.track();
+                live.connected.track();
+                api::descendants(session.clone())
+            }
         });
         let list = Memo::new(move |_| {
             let all = tree.get().and_then(Result::ok).unwrap_or_default();
@@ -2138,11 +2145,14 @@ fn Transcript(
     // And as subagents anywhere in the tree start or stop working (your own
     // messages to them leave no event here).
     let working = tree_working(session.root_id.clone().unwrap_or_else(|| session.id.clone()));
-    let children = LocalResource::new(move || {
-        spawns.get();
-        refresh.track();
-        working.get();
-        api::children(id.get_value())
+    let children = LocalResource::new({
+        let id = session.id.clone();
+        move || {
+            spawns.get();
+            refresh.track();
+            working.get();
+            api::children(id.clone())
+        }
     });
     let child_list = Memo::new(move |_| children.get().and_then(Result::ok).unwrap_or_default());
     provide_context(Subagents::new(events, child_list));
@@ -3288,9 +3298,13 @@ fn FindBar(session: String, initial: String, open: RwSignal<bool>, force_open: F
     let current = RwSignal::new(None::<usize>);
     let error = RwSignal::new(None::<String>);
     let session = StoredValue::new(session);
-    let matches = LocalResource::new(move || {
-        let q = applied.get();
-        async move { if q.trim().is_empty() { Ok(None) } else { api::session_matches(session.get_value(), q).await.map(Some) } }
+    let matches = LocalResource::new({
+        let session = session.get_value();
+        move || {
+            let q = applied.get();
+            let session = session.clone();
+            async move { if q.trim().is_empty() { Ok(None) } else { api::session_matches(session, q).await.map(Some) } }
+        }
     });
     let found = Memo::new(move |_| matches.get().and_then(|r| r.ok()).flatten());
     let (reach, follow) = (use_context::<Reach>(), use_context::<Follow>());
@@ -5293,11 +5307,17 @@ fn Composer(
     on_cleanup(cancel_search);
     // Slash commands: the query, and the commands the head offers.
     let command = RwSignal::new(None::<String>);
-    let commands = LocalResource::new(move || async move {
-        let mut list = api::commands(id.get_value()).await.unwrap_or_default();
-        // A side chat has no /clear.
-        list.retain(|c| !(inline && c.name == "clear" && c.source == "built-in"));
-        list
+    let commands = LocalResource::new({
+        let id = id.get_value();
+        move || {
+            let id = id.clone();
+            async move {
+                let mut list = api::commands(id).await.unwrap_or_default();
+                // A side chat has no /clear.
+                list.retain(|c| !(inline && c.name == "clear" && c.source == "built-in"));
+                list
+            }
+        }
     });
     let suggestions = move || -> Vec<Suggestion> {
         if let Some(q) = command.get() {
