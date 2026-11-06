@@ -228,7 +228,7 @@ fn AspectStrip(session: Memo<Option<Session>>, spot: RwSignal<Option<String>>) -
         }
     });
     view! {
-        <span class="flex items-center" data-aspect-strip>
+        <span class="mx-2 flex items-center gap-2" data-aspect-strip>
             <For each=move || aspects.get() key=|a| (a.key.clone(), a.label.clone()) let(a)>
                 {
                     let (enter, click) = (a.key.clone(), a.clone());

@@ -8,7 +8,7 @@ Desktop, left to right: the session's identity dot, title (double-click to renam
 
 Fine-pointer desktop slots use the tile's own width: 36px at 40rem and above, 32px at 30–40rem, and compact 28px below 30rem. Phones and coarse pointers keep 44px targets. Below 30rem of tile width, Changes, Terminal and Pin move into Actions with the same icons. The combined ring, Actions, Focus (Maximize) and Close remain in the bar, leaving the title room to truncate even in a 240px tile. Focus is immediately left of Close, after Actions, at every width where they appear. Below 14rem Focus and Close also move into Actions, in that order, so even four columns at the smallest desktop breakpoint retain usable chrome. No action is removed.
 
-Optional aspect shapes yield first: below 40rem of tile content width they are hidden, before secondary controls collapse below 30rem. The title and core controls keep their room; the aspect preference and phone behaviour are unchanged.
+Optional aspect shapes sit immediately after the intrinsic-width title, left aligned with 8px gaps between marks and breathing room on both sides; spare space stays after the marks, not between them and the title. Long titles truncate to fit. The shapes yield first: below 40rem of tile content width they are hidden, before secondary controls collapse below 30rem. The title and core controls keep their room; the aspect preference and phone behaviour are unchanged.
 
 A two-pane tile below 40rem uses the existing phone navigation: one pane at
 a time, with **Back to the list** in the item's slim header. Both panes stay

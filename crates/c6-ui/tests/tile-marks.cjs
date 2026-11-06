@@ -147,7 +147,11 @@ async function check(browser, origin, label) {
     const after = { title: await title.boundingBox(), close: await control.boundingBox() };
     assert.equal(after.close.width, slotSize); assert.equal(after.close.height, slotSize);
     assert.deepEqual(after.close, before.close, 'marks must not move or squeeze controls');
-    assert.equal(before.title.width - after.title.width, 80, 'five 16px shapes take only title room');
+    if (process.env.BEFORE === '1' || process.env.MARKS_BEFORE === '1') {
+      assert.equal(before.title.width - after.title.width, 80, 'old five 16px shapes take only title room');
+    } else {
+      assert(after.title.width <= before.title.width, 'marks may shrink the title, never stretch it');
+    }
     for (const key of [2, 4, 6]) {
       const labels = await panel(key).locator('[data-aspect-strip] button').evaluateAll(els => els.map(e => e.getAttribute('aria-label').split(':')[0]));
       assert.deepEqual(labels, ['Worker', 'Work', 'Project', 'Repo', 'Model'], 'chosen aspects, with the home realm omitted');
@@ -199,7 +203,11 @@ async function check(browser, origin, label) {
       const controls = [...bar.querySelectorAll('button')].filter(button => button.getClientRects().length).map(button => ({
         label: button.getAttribute('aria-label'), box: rect(button), icon: !!button.querySelector('svg'),
       }));
-      return { bar: rect(bar), title: rect(el), controls };
+      const text = document.createRange();
+      text.selectNodeContents(el);
+      const css = getComputedStyle(el);
+      const titleIntrinsic = text.getBoundingClientRect().width + parseFloat(css.paddingLeft) + parseFloat(css.paddingRight);
+      return { bar: rect(bar), title: rect(el), titleIntrinsic, controls };
     });
     let wideGeometry;
     for (const width of [960, 800, 720, 640, 639, 560, 480, 479, 400, 320, 240, 720]) {
@@ -210,6 +218,22 @@ async function check(browser, origin, label) {
           `${name} yields only below 30rem at ${width}`);
       }
       const geometry = await barGeometry();
+      if (process.env.BEFORE !== '1' && process.env.MARKS_BEFORE !== '1') {
+        assert(geometry.title.width <= geometry.titleIntrinsic + 0.5, 'title does not stretch to push marks right');
+        if (width === 960) assert(Math.abs(geometry.title.width - geometry.titleIntrinsic) < 0.5, 'wide title keeps its natural text width');
+      }
+      if (width >= 640 && process.env.BEFORE !== '1' && process.env.MARKS_BEFORE !== '1') {
+        const marks = await first.locator('[data-aspect-strip] button').evaluateAll(els => els.map(el => {
+          const r = el.getBoundingClientRect(); return { left: r.left, right: r.right, width: r.width };
+        }));
+        assert.equal(marks[0].left - geometry.title.right, 8, 'marks sit immediately after the intrinsic title');
+        for (let i = 1; i < marks.length; i++) {
+          assert.equal(marks[i].left - marks[i - 1].right, 8, 'comfortable gaps between marks');
+        }
+        assert.equal(marks[0].width, 16, 'keep the original mark and icon size');
+        const nextControl = geometry.controls.find(c => c.box.left >= marks.at(-1).right);
+        assert(nextControl && nextControl.box.left - marks.at(-1).right >= 8, 'marks stay clear of controls');
+      }
       await bar.screenshot({ path: path.join(SHOTS, `${label}-bar-${width}.png`) });
       const core = geometry.controls.filter(c => /Open session sheet/.test(c.label) || ['Actions', 'Focus', 'Close this tile'].includes(c.label));
       assert.deepEqual(core.map(c => /Open session sheet/.test(c.label) ? 'Session sheet' : c.label),

@@ -2709,7 +2709,7 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                 // A session of your own is renamed by double-clicking its name
                 // (or from ⋯).
                 <div class="flex min-w-0 flex-1 items-center overflow-hidden">
-                    <span node_ref=title_el class="min-w-0 flex-1 truncate font-medium text-zinc-800 @min-[14rem]/tile:px-1 dark:text-zinc-100"
+                    <span node_ref=title_el class="min-w-0 truncate font-medium text-zinc-800 @min-[14rem]/tile:px-1 dark:text-zinc-100"
                         title=move || if renamable() { format!("{} · Double-click to rename", title.get()) } else { title.get() }
                         on:dblclick=move |ev| if renamable() { ev.stop_propagation(); rename_under_title() }>{title}</span>
                     <span data-tile-aspects=key class="hidden shrink-0 items-center md:@min-[40rem]/tile:flex"></span>
