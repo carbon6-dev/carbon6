@@ -1588,7 +1588,7 @@ fn SessionStrip(chrome: SessionChrome) -> impl IntoView {
     // view's).
     let rename_from = StoredValue::new((8.0, 48.0));
     view! {
-        <ArchivedSession id=chrome.id.get_value() />
+        <ArchivedSession id=chrome.id.get_value() show_title=true />
         <div class="flex h-11 shrink-0 items-center justify-end gap-0.5 border-b border-zinc-200 bg-zinc-50 px-2 text-xs pointer-coarse:gap-0 dark:border-zinc-800 dark:bg-zinc-900/60">
             <SessionControls chrome strip=true />
             <span class="mx-1 h-4 w-px shrink-0 bg-zinc-200 dark:bg-zinc-700"></span>
@@ -1619,7 +1619,7 @@ fn SessionStrip(chrome: SessionChrome) -> impl IntoView {
 
 /// Archiving changes visibility, not the lifetime of an open transcript.
 #[component]
-pub(crate) fn ArchivedSession(id: String) -> impl IntoView {
+pub(crate) fn ArchivedSession(id: String, #[prop(optional)] show_title: bool) -> impl IntoView {
     let live = api::live();
     let id = StoredValue::new(id);
     let saving = RwSignal::new(false);
@@ -1627,8 +1627,9 @@ pub(crate) fn ArchivedSession(id: String) -> impl IntoView {
     view! {
         <Show when=move || live.session(&id.get_value()).is_some_and(|s| s.archived)>
             <div class="flex shrink-0 items-center gap-2 border-b border-zinc-200 px-3 py-1 text-xs dark:border-zinc-800">
-            <span class="min-w-0 flex-1 truncate" title=move || live.session(&id.get_value()).map(|s| s.title)>
-                {move || live.session(&id.get_value()).map(|s| s.title)}
+            // Under a tile bar already showing this session, its title would repeat.
+            <span class="min-w-0 flex-1 truncate" title=move || show_title.then(|| live.session(&id.get_value()).map(|s| s.title)).flatten()>
+                {move || show_title.then(|| live.session(&id.get_value()).map(|s| s.title)).flatten()}
             </span>
             <span class="shrink-0 rounded bg-amber-100 px-1.5 py-0.5 text-[11px] text-amber-800 dark:bg-amber-950 dark:text-amber-300">"Archived"</span>
             <button class=crate::icons::BAR_BUTTON aria-label="Unarchive" title="Unarchive this session to send messages again"
