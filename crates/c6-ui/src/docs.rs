@@ -570,21 +570,11 @@ fn EmbedView(name: String) -> impl IntoView {
 
 // --- The list ---------------------------------------------------------------
 
-/// Kept local until the shared base has a switch. The label stays at the
-/// left edge of the row, including on a phone.
+/// The list's immediate filter uses the shared, trailing switch.
 #[component]
 fn ArchiveSwitch(checked: RwSignal<bool>) -> impl IntoView {
     view! {
-        <button type="button" role="switch" aria-label="Show archived" aria-checked=move || checked.get().to_string()
-            class="flex min-h-11 w-full items-center justify-between gap-3 text-left text-sm text-soft"
-            on:click=move |_| checked.update(|on| *on = !*on)>
-            <span>"Show archived"</span>
-            <span aria-hidden="true"
-                class=move || format!("relative h-6 w-10 shrink-0 rounded-full transition-colors {}", if checked.get() { "bg-sky-600" } else { "bg-zinc-300 dark:bg-zinc-700" })
-            >
-                <span class=move || format!("absolute top-1 size-4 rounded-full bg-white transition-transform {}", if checked.get() { "left-1 translate-x-4" } else { "left-1" })></span>
-            </span>
-        </button>
+        <crate::components::Switch on=move || checked.get() on_change=move |on| checked.set(on) label="Show archived" />
     }
 }
 
@@ -3379,10 +3369,13 @@ mod tests {
             let checked = RwSignal::new(false);
             let html = view! { <ArchiveSwitch checked /> }.to_html();
             assert!(html.contains("role=\"switch\"") && html.contains("aria-checked=\"false\""), "{html}");
-            assert!(html.find(">Show archived").unwrap() < html.find("h-6 w-10").unwrap(), "label must stay left: {html}");
             assert!(
-                html.matches("<button").count() == 1 && html.contains("min-h-11 w-full"),
-                "the entire 44px row must be clickable: {html}"
+                html.find("Show archived</span>").unwrap() < html.find("aria-hidden=\"true\"").unwrap(),
+                "label must stay left: {html}"
+            );
+            assert!(
+                html.matches("<button").count() == 1 && html.contains("w-full") && html.contains("pointer-coarse:min-h-11"),
+                "the entire row must be clickable, with a 44px touch target: {html}"
             );
             checked.set(true);
             let html = view! { <ArchiveSwitch checked /> }.to_html();

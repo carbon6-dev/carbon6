@@ -183,16 +183,10 @@ fn ArchiveDialog(request: ArchiveRequest, archive: SessionArchive) -> impl IntoV
                     <div class="shrink-0 space-y-2">
                         <h2 class="font-medium">"Archive session"</h2>
                         <p class="text-sm text-muted">"Archive docs and decks made by this session or its subagents too? Unchecked items stay available."</p>
-                        <label class="flex min-h-11 cursor-pointer items-center justify-between gap-3 rounded-md px-2 text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800">
-                            <span class="min-w-0">"Archive all docs"<span class="block text-xs text-muted">"Include items with reasons to keep them."</span></span>
-                            <button type="button" role="switch" aria-label="Archive all docs" aria-checked=move || selection.with(|s| s.all).to_string()
-                                class="inline-flex min-h-11 w-11 shrink-0 items-center justify-center rounded-md disabled:opacity-50"
-                                disabled=move || busy.get() on:click=move |_| selection.update(|s| s.all = !s.all)>
-                                <span class=move || format!("relative h-6 w-10 rounded-full transition-colors {}", if selection.with(|s| s.all) { "bg-sky-600" } else { "bg-zinc-300 dark:bg-zinc-700" })>
-                                    <span class=move || format!("absolute left-1 top-1 size-4 rounded-full bg-white transition-transform {}", if selection.with(|s| s.all) { "translate-x-4" } else { "" })></span>
-                                </span>
-                            </button>
-                        </label>
+                        <crate::components::Switch on=move || selection.with(|s| s.all)
+                            on_change=move |on| selection.update(|s| s.all = on)
+                            label="Archive all docs" hint="Include items with reasons to keep them."
+                            disabled=move || busy.get() />
                     </div>
                     <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain divide-y divide-zinc-200 dark:divide-zinc-700" aria-label="Docs to archive">
                         {request.get_value().docs.into_iter().map(|doc| view! { <ArchiveDocRow doc selection busy /> }).collect_view()}
@@ -239,7 +233,7 @@ fn ArchiveDocRow(doc: SessionArchiveDoc, selection: RwSignal<Selection>, busy: R
     let kind = if doc.kind == "deck" { "Deck" } else { "Doc" };
     view! {
         <label class="flex min-h-11 min-w-0 cursor-pointer items-start gap-3 rounded-md px-2 py-3 text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800">
-            <input type="checkbox" class="mt-0.5 size-4 shrink-0" aria-label=format!("Archive {}", doc.title) aria-describedby=description.clone()
+            <input type="checkbox" class=format!("{} mt-0.5", crate::components::CHECKBOX) aria-label=format!("Archive {}", doc.title) aria-describedby=description.clone()
                 prop:checked=move || selection.with(|s| s.checked(&id.get_value()))
                 disabled=move || busy.get() || selection.with(|s| s.all)
                 on:change=move |ev| selection.update(|s| s.toggle(&id.get_value(), event_target_checked(&ev))) />
@@ -316,6 +310,24 @@ mod tests {
     }
 
     #[test]
+    fn rows_are_locked_while_archiving_or_archive_all_is_on() {
+        Owner::new().with(|| {
+            let docs = docs();
+            let selection = RwSignal::new(Selection::new(&docs));
+            let busy = RwSignal::new(false);
+            for (all, saving) in [(false, false), (true, false), (false, true), (false, false)] {
+                selection.update(|s| s.all = all);
+                busy.set(saving);
+                let doc = docs[1].clone();
+                let html = untrack(|| view! { <ArchiveDocRow doc selection busy /> }.to_html());
+                assert_eq!(html.contains(" disabled"), all || saving, "{html}");
+                assert!(html.contains(crate::components::CHECKBOX), "{html}");
+            }
+            assert_eq!(selection.with(|s| s.ids(&docs)), ["safe-doc", "safe-deck"]);
+        });
+    }
+
+    #[test]
     fn rows_show_titles_kinds_and_every_reason_with_touch_height() {
         Owner::new().with(|| {
             let docs = docs();
@@ -330,6 +342,7 @@ mod tests {
                 assert!(html.contains(kind), "{html}");
                 assert!(html.contains("min-h-11"), "{html}");
                 assert!(html.contains("break-words"), "{html}");
+                assert!(html.contains(crate::components::CHECKBOX), "{html}");
                 assert!(html.contains("<svg"), "{html}");
                 for reason in reasons {
                     assert!(html.contains(&reason), "{html}");
