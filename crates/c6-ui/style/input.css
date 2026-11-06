@@ -127,6 +127,12 @@ html.dark {
   input, textarea, select { font-size: 16px !important; }
 }
 
+/* Native content sizing handles typing, placeholders and tile resizes without
+   forcing layout from an input handler. Older browsers use one queued rAF fit. */
+@supports (field-sizing: content) {
+  textarea.grows, textarea[data-c6-autosize] { field-sizing: content; }
+}
+
 @layer components {
   .btn {
     @apply inline-flex min-h-8 items-center justify-center gap-1.5 rounded-md px-3 py-1 text-sm font-medium outline-none focus-visible:ring-2 focus-visible:ring-sky-500/60 disabled:opacity-50;

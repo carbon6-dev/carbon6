@@ -227,6 +227,9 @@ pub fn StatusPill(status: SessionStatus) -> impl IntoView {
 /// its placeholder) is sized to show all of it: measured as if typed, then
 /// emptied again. Without one, as `fit`.
 pub fn fit_hint(el: &web_sys::HtmlTextAreaElement, hint: Option<&str>) {
+    if content_sizing() {
+        return;
+    }
     if el.client_width() == 0 {
         return;
     }
@@ -243,6 +246,9 @@ pub fn fit_hint(el: &web_sys::HtmlTextAreaElement, hint: Option<&str>) {
 }
 
 pub fn fit(el: &web_sys::HtmlTextAreaElement) {
+    if content_sizing() && el.class_name().split_whitespace().any(|c| c == "grows") {
+        return;
+    }
     // Hidden tiles have no layout: scrollHeight would turn a restored draft
     // into a zero-height box. Leave even its existing inline style alone.
     if el.client_width() == 0 {
@@ -272,24 +278,35 @@ pub fn autosize(node: NodeRef<leptos::html::Textarea>, track: impl Fn() + 'stati
 /// Like `autosize`, preserving the placeholder's size on reveal and resize.
 pub fn autosize_hint(node: NodeRef<leptos::html::Textarea>, track: impl Fn() + 'static, hint: impl Fn() -> Option<String> + 'static) {
     use wasm_bindgen::JsCast;
+    if content_sizing() {
+        // Native sizing includes the placeholder and reacts to width/visibility
+        // changes without a measurement, observer, or per-keystroke frame.
+        Effect::new(move || {
+            if let Some(el) = node.get() {
+                let _ = el.set_attribute("data-c6-autosize", "");
+            }
+        });
+        return;
+    }
     let hint = StoredValue::new_local(hint);
-    let queued = StoredValue::new(false);
+    let frame = StoredValue::new(None::<leptos::leptos_dom::helpers::AnimationFrameRequestHandle>);
     let refit = move || {
-        // Text, resize and width-observer notifications may share a frame.
-        // Measure once: repeating height:auto after the first fit/scroll snap
-        // can clamp a sibling scroll box without another net resize to observe.
-        if queued.try_update_value(|queued| std::mem::replace(queued, true)) != Some(false) {
-            return;
-        }
-        request_animation_frame(move || {
-            if queued.try_update_value(|queued| *queued = false).is_none() {
-                return;
-            }
-            if let Some(el) = node.try_get_untracked().flatten() {
-                let hint = hint.try_with_value(|h| untrack(h)).flatten();
-                fit_hint(&el, hint.as_deref());
-            }
-        })
+        // Text, resize and width notifications share one fit per frame.
+        // A duplicate height:auto can clamp a sibling transcript in WebKit
+        // without another net resize for its observer to notice.
+        let Some(None) = frame.try_get_value() else { return };
+        frame.set_value(
+            request_animation_frame_with_handle(move || {
+                if frame.try_update_value(|frame| *frame = None).is_none() {
+                    return;
+                }
+                if let Some(el) = node.try_get_untracked().flatten() {
+                    let hint = hint.try_with_value(|h| untrack(h)).flatten();
+                    fit_hint(&el, hint.as_deref());
+                }
+            })
+            .ok(),
+        );
     };
     Effect::new(move || {
         track();
@@ -299,6 +316,9 @@ pub fn autosize_hint(node: NodeRef<leptos::html::Textarea>, track: impl Fn() + '
     let resized = window_event_listener(leptos::ev::resize, move |_| refit());
     let visible = window_event_listener_untyped("visibilitychange", move |_| refit());
     on_cleanup(move || {
+        if let Some(f) = frame.try_update_value(Option::take).flatten() {
+            f.cancel();
+        }
         resized.remove();
         visible.remove();
     });
@@ -335,6 +355,10 @@ pub fn autosize_hint(node: NodeRef<leptos::html::Textarea>, track: impl Fn() + '
             }
         });
     });
+}
+
+fn content_sizing() -> bool {
+    web_sys::css::supports_with_value("field-sizing", "content").unwrap_or(false)
 }
 
 /// The class of a message box that grows with its text up to 40% of the
@@ -379,25 +403,15 @@ pub fn storage_set(key: &str, value: &str) {
     storage_set_global(&placed_key(key), value);
 }
 
-pub fn storage_remove(key: &str) {
-    if let Ok(Some(s)) = window().local_storage() {
-        let _ = s.remove_item(&placed_key(key));
-    }
-}
-
 /// A message box's text, kept in this browser until it's sent
 /// (`c6.draft.<key>`): a panel that shows something else for a moment, or a
 /// popup closed by mistake, gives it back as it was.
 pub fn draft(key: &str) -> RwSignal<String> {
-    let key = format!("c6.draft.{key}");
-    let text = RwSignal::new(storage_get(&key).unwrap_or_default());
-    Effect::new(move || text.with(|t| if t.is_empty() { storage_remove(&key) } else { storage_set(&key, t) }));
-    text
+    drafts::text(key)
 }
 
 /// Drops a draft that was sent, from code that may outlive its box.
 pub fn forget_draft(key: &str) {
-    storage_remove(&format!("c6.draft.{key}"));
     drafts::forget(key);
 }
 

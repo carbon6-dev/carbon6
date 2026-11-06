@@ -368,6 +368,41 @@ Keep screenshots for both themes; validate new arbitrary utilities in built
 CSS as well as geometry. Emulated keyboard tests do not replace a physical
 phone keyboard/accessibility review.
 
+## Composer latency and draft persistence
+
+Textareas managed by `autosize` use CSS `field-sizing: content` when available.
+The fallback coalesces text, width and visibility changes into one pending
+animation-frame fit, canceled on unmount. Composer input handlers never fit
+synchronously. Native tests cover completion parsing and text-save coalescing,
+including forget-before-teardown; browser checks exercise actual layout/storage:
+
+1. In Chromium (native sizing) and WebKit (fallback when unsupported), type,
+   paste, clear and restore a multiline draft, resize/hide/reveal the tile and
+   show a long suggested placeholder. It grows up to its cap then scrolls,
+   shrinks when cleared, and remains usable at 320px, 390px and desktop widths.
+   Instrument textarea geometry reads: none on the native path, none during
+   input dispatch on the fallback; multiple edits in one frame yield one fit.
+2. Instrument fetch signals and hold mention responses behind an explicit
+   gate. Type `@ab`, wait for its request, then type `@abc`: the first request
+   must abort, not merely have its result ignored. File, memex and Ask reference
+   requests share the 120ms debounce and cancellation. Release the old response:
+   it must never replace the newer suggestions. Moving/clicking the caret
+   without changing a query must not issue requests or reset selection. Escape,
+   completion, removing `@`, and closing the box cancel pending/in-flight work.
+3. Observe localStorage writes while dispatching a burst of edits in one task:
+   there is no synchronous write per edit. The latest text is saved after the
+   250ms debounce; navigate away before it fires and it is flushed on teardown.
+   `pagehide` and becoming hidden flush too. Reload immediately after typing
+   (in the same JS task, within the debounce window), including with restored
+   attachments; the last edit and attachments must return. Send/start a session during that window and return:
+   the forgotten draft must stay gone, not be resurrected by a late save.
+4. Restore a draft with ordered image/file attachments from IndexedDB. Edit text
+   and immediately navigate away; reopen and check text, attachment metadata and
+   ordering. Send and reopen again: neither returns. The attachment transaction
+   queue and restore-ready gate remain unchanged; typing doesn't rewrite payloads.
+   Repeat a failed send (draft stays), storage denial (quiet note), and pasting
+   an attachment before the database opens (restored and new files both stay).
+
 ## Transcript follow: manual browser check
 
 The `c6-ui` workspace unit tests cover input direction and stop/resume decisions. In a browser, use a long session with a streaming reply:

@@ -5217,39 +5217,68 @@ fn Composer(
     // highlighted one.
     let mention = RwSignal::new(None::<(usize, String)>);
     let picked = RwSignal::new(0usize);
-    let matches = LocalResource::new(move || {
-        let q = mention.get().map(|(_, q)| q);
-        let place = files.and_then(|f| f.get());
-        async move {
-            match (q, place) {
-                (Some(q), Some((worker, root))) => api::fs_find(worker, root, q).await.unwrap_or_default(),
-                _ => Vec::new(),
+    let matches = RwSignal::new(Vec::<(String, bool)>::new());
+    let things = RwSignal::new(Vec::<c6_api::MemexThingRef>::new());
+    let refs = RwSignal::new(Vec::<c6_api::Mentionable>::new());
+    // Caret movement within the same query doesn't restart the debounce.
+    let query = Memo::new(move |_| (mention.with(|m| m.as_ref().map(|(_, q)| q.clone())), files.and_then(|f| f.get())));
+    let search = StoredValue::new_local(None::<(leptos::leptos_dom::helpers::TimeoutHandle, web_sys::AbortController)>);
+    let cancel_search = move || {
+        search.update_value(|s| {
+            if let Some((timer, controller)) = s.take() {
+                timer.clear();
+                // Dropping a Rust fetch future doesn't cancel the browser request.
+                // Abort all three actual fetches, including response-body reads.
+                controller.abort();
             }
+        })
+    };
+    Effect::new(move || {
+        let (q, place) = query.get();
+        cancel_search();
+        matches.set(Vec::new());
+        things.set(Vec::new());
+        refs.set(Vec::new());
+        let Some(q) = q else { return };
+        let Ok(controller) = web_sys::AbortController::new() else { return };
+        let signal = controller.signal();
+        let timer = set_timeout_with_handle(
+            move || {
+                if let Some((worker, root)) = place {
+                    let (q, signal) = (q.clone(), signal.clone());
+                    spawn_local(async move {
+                        let found = api::fs_find(worker, root, q, &signal).await.unwrap_or_default();
+                        if !signal.aborted() {
+                            matches.try_set(found);
+                        }
+                    });
+                }
+                if q.chars().count() >= 2 {
+                    let (q, signal) = (q.clone(), signal.clone());
+                    spawn_local(async move {
+                        let found = api::memex_mentions(q, &signal).await.unwrap_or_default();
+                        if !signal.aborted() {
+                            things.try_set(found);
+                        }
+                    });
+                }
+                if q.chars().count() >= 2 {
+                    let session = (!ask).then(|| subagent_id.get_value());
+                    spawn_local(async move {
+                        let found = api::ask_mentionables(q, session, &signal).await.unwrap_or_default();
+                        if !signal.aborted() {
+                            refs.try_set(found);
+                        }
+                    });
+                }
+            },
+            std::time::Duration::from_millis(120),
+        );
+        if let Ok(timer) = timer {
+            search.set_value(Some((timer, controller)));
         }
     });
-    // Things in the memex (people, clients, hosts, topics) for @.
-    let things = LocalResource::new(move || {
-        let q = mention.get().map(|(_, q)| q).filter(|q| q.chars().count() >= 2);
-        async move {
-            match q {
-                Some(q) => api::memex_mentions(q).await.unwrap_or_default(),
-                None => Vec::new(),
-            }
-        }
-    });
-    // Your projects, docs, work, and the mail threads, chat messages and
-    // events that match: in Ask any kind; in a session, those its knowledge
-    // scope allows.
-    let refs = LocalResource::new(move || {
-        let q = mention.get().map(|(_, q)| q).filter(|q| q.chars().count() >= 2);
-        let session = (!ask).then(|| subagent_id.get_value());
-        async move {
-            match q {
-                Some(q) => api::ask_mentionables(q, session).await.unwrap_or_default(),
-                None => Vec::new(),
-            }
-        }
-    });
+    on_cleanup(cancel_search);
     // Slash commands: the query, and the commands the head offers.
     let command = RwSignal::new(None::<String>);
     let commands = LocalResource::new(move || async move {
@@ -5268,12 +5297,12 @@ fn Composer(
             return starts.into_iter().map(Suggestion::Command).collect();
         }
         if mention.with(Option::is_some) {
-            let mut list: Vec<Suggestion> = matches.get().unwrap_or_default().into_iter().map(|(p, d)| Suggestion::File(p, d)).collect();
-            list.extend(things.get().unwrap_or_default().into_iter().take(8).map(|t| {
+            let mut list: Vec<Suggestion> = matches.get().into_iter().map(|(p, d)| Suggestion::File(p, d)).collect();
+            list.extend(things.get().into_iter().take(8).map(|t| {
                 let key = if t.label.is_empty() { t.id.clone() } else { t.label.clone() };
                 Suggestion::Thing(key, t.kind, t.name)
             }));
-            list.extend(refs.get().unwrap_or_default().into_iter().take(10).map(|m| Suggestion::Ref(m.title, m.kind, m.reference)));
+            list.extend(refs.get().into_iter().take(10).map(|m| Suggestion::Ref(m.title, m.kind, m.reference)));
             list
         } else {
             Vec::new()
@@ -5288,8 +5317,12 @@ fn Composer(
             if m.as_ref().map(|x| &x.1) != mention.get_untracked().as_ref().map(|x| &x.1) || c != command.get_untracked() {
                 picked.set(0);
             }
-            mention.set(m);
-            command.set(c);
+            if mention.get_untracked() != m {
+                mention.set(m);
+            }
+            if command.get_untracked() != c {
+                command.set(c);
+            }
         }
     };
     // The suggestions go on a press outside them and the box, or Escape.

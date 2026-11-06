@@ -1086,7 +1086,7 @@ pub async fn ask_claude() -> Result<c6_api::AskClaude, String> {
 
 /// What @ offers in an Ask conversation, or in session `session`'s message
 /// box, within its knowledge scope (docs/ask.md §4).
-pub async fn ask_mentionables(q: String, session: Option<String>) -> Result<Vec<c6_api::Mentionable>, String> {
+pub async fn ask_mentionables(q: String, session: Option<String>, cancel: &web_sys::AbortSignal) -> Result<Vec<c6_api::Mentionable>, String> {
     let realm = realm().get_untracked();
     json(
         Request::get(&format!(
@@ -1095,14 +1095,16 @@ pub async fn ask_mentionables(q: String, session: Option<String>) -> Result<Vec<
             js_sys::encode_uri_component(&realm),
             js_sys::encode_uri_component(session.as_deref().unwrap_or(""))
         ))
+        .abort_signal(Some(cancel))
         .send()
         .await,
     )
     .await
 }
 
-pub async fn memex_mentions(q: String) -> Result<Vec<c6_api::MemexThingRef>, String> {
-    json(Request::get(&format!("/api/v1/memex/mentions?q={}", js_sys::encode_uri_component(&q))).send().await).await
+pub async fn memex_mentions(q: String, cancel: &web_sys::AbortSignal) -> Result<Vec<c6_api::MemexThingRef>, String> {
+    json(Request::get(&format!("/api/v1/memex/mentions?q={}", js_sys::encode_uri_component(&q))).abort_signal(Some(cancel)).send().await)
+        .await
 }
 
 pub async fn memex_delete(id: String) -> Result<(), String> {
@@ -1242,9 +1244,15 @@ pub async fn rewind(id: String, to_seq: u64, restore_files: bool) -> Result<(), 
 }
 
 /// Files and folders under `root` matching `q`, best first: (path, is folder).
-pub async fn fs_find(worker: String, root: String, q: String) -> Result<Vec<(String, bool)>, String> {
-    let v: serde_json::Value =
-        json(Request::get(&format!("/api/v1/workers/{worker}/fs/find")).query([("root", root), ("q", q)]).send().await).await?;
+pub async fn fs_find(worker: String, root: String, q: String, cancel: &web_sys::AbortSignal) -> Result<Vec<(String, bool)>, String> {
+    let v: serde_json::Value = json(
+        Request::get(&format!("/api/v1/workers/{worker}/fs/find"))
+            .query([("root", root), ("q", q)])
+            .abort_signal(Some(cancel))
+            .send()
+            .await,
+    )
+    .await?;
     Ok(v["paths"]
         .as_array()
         .map(|a| a.iter().filter_map(|p| Some((p["path"].as_str()?.to_owned(), p["dir"].as_bool().unwrap_or(false)))).collect())
