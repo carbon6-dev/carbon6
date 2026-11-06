@@ -4635,11 +4635,103 @@ async fn answer_decision(
     Path(id): Path<i64>,
     Json(a): Json<api::DecisionAnswer>,
 ) -> ApiResult<Json<api::Decision>> {
-    let via = if caller.realm.is_some() { "an API token" } else { "carbon6" };
+    // Realm scope is not an auth origin: browsers can be in a realm,
+    // while root API tokens have no realm. Auth supplies names, not secrets.
+    let via = match caller.api_token_name.as_deref() {
+        Some(name) => {
+            let name = name.trim();
+            if !name.is_empty() && name.chars().count() <= 80 && !name.chars().any(char::is_control) { name } else { "an API token" }
+        }
+        None => "carbon6",
+    };
     Ok(Json(crate::decisions::answer(&st, id, &a, via).await?))
 }
 
 /// Starts a session that helps you settle the decision.
 async fn decision_session(State(st): State<Arc<HeadState>>, Path(id): Path<i64>) -> ApiResult<Json<api::Session>> {
     Ok(Json(crate::decisions::start_session(&st, id).await?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn decision_answer_attribution_uses_auth_origin_not_realm() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = crate::start(crate::HeadConfig {
+            data_dir: dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let st = &head.state;
+        crate::realms::create(st, &api::RealmIn { id: "lab".into(), name: "Lab".into(), ..Default::default() }, "you").await.unwrap();
+        let http = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+        let link = st.store.create_login_link().await.unwrap();
+        let login = http.post(format!("{url}/auth/link")).json(&json!({"token": link})).send().await.unwrap();
+        assert_eq!(login.status(), StatusCode::NO_CONTENT);
+        let cookie = login.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_owned();
+
+        // Exercise the real auth middleware and handler, then reload the
+        // decision: neither realm scope nor a token's secret is attribution.
+        for (place, realm) in [("admin", "root"), ("home", "home"), ("lab", "lab")] {
+            let decision = crate::decisions::open(st, &api::DecisionIn { title: "Browser answer".into(), ..Default::default() }, realm, "")
+                .await
+                .unwrap();
+            let response = http
+                .post(format!("{url}/decisions/{}/answer", decision.id))
+                .header("cookie", &cookie)
+                .header("x-c6-realm", place)
+                .json(&json!({"note": "Answered in the browser"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "browser in {place}");
+            let answered: api::Decision = response.json().await.unwrap();
+            assert_eq!(answered.answered_via, "carbon6", "browser in {place}");
+            assert_eq!(answered.state, "answered");
+            assert_eq!(crate::decisions::get(st, decision.id).await.unwrap().unwrap(), answered);
+        }
+
+        for (realm, name, expected) in [
+            (Some("lab"), "Lab automation", "Lab automation"),
+            (None, "Root automation", "Root automation"),
+            (Some("lab"), "  Trimmed name  ", "Trimmed name"),
+            (None, "", "an API token"),
+            (Some("lab"), "   ", "an API token"),
+            (None, "line\nbreak", "an API token"),
+            (Some("lab"), "control\u{7}name", "an API token"),
+            (None, &"x".repeat(81), "an API token"),
+        ] {
+            let token = st.store.create_api_token(name, realm).await.unwrap().token.unwrap();
+            let decision = crate::decisions::open(
+                st,
+                &api::DecisionIn { title: "Token answer".into(), ..Default::default() },
+                realm.unwrap_or("home"),
+                "",
+            )
+            .await
+            .unwrap();
+            let response = http
+                .post(format!("{url}/decisions/{}/answer", decision.id))
+                .bearer_auth(&token)
+                .json(&json!({"note": "Answered through the API"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "token in {realm:?}");
+            let answered: api::Decision = response.json().await.unwrap();
+            assert_eq!(answered.answered_via, expected, "token in {realm:?}");
+            assert!(!serde_json::to_string(&answered).unwrap().contains(&token), "never persist or return the token secret");
+            assert_eq!(answered.state, "answered");
+            assert_eq!(crate::decisions::get(st, decision.id).await.unwrap().unwrap(), answered);
+        }
+        head.shutdown().await.unwrap();
+    }
 }
