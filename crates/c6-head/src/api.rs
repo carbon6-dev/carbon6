@@ -3412,11 +3412,11 @@ async fn terminal_socket(st: Arc<HeadState>, worker_id: WorkerId, tid: String, m
     }
 }
 
-async fn static_asset(uri: Uri, headers: HeaderMap) -> Response {
+async fn static_asset(uri: Uri, method: axum::http::Method, headers: HeaderMap) -> Response {
     if uri.path().trim_start_matches('/').starts_with("api/") {
         return ApiErr(StatusCode::NOT_FOUND, "not found".into()).into_response();
     }
-    crate::assets::static_asset(uri, headers).await
+    crate::assets::static_asset(uri, method, headers).await
 }
 
 // --- The assistant and the operation catalog ----------------------------------

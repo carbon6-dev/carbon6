@@ -39,6 +39,23 @@ fingerprinted immutable caching are based on the original path. API JSON uses
 tower-http's streaming Brotli/gzip compression; event streams, WebSockets and UI
 assets are not dynamically compressed. Native executable settings are unchanged.
 
+**Repeat visits and terminal assets:** embedded assets include an ETag from
+rust-embed's SHA-256 metadata (no runtime body hashing). Non-fingerprinted assets
+remain `no-cache`, so the browser revalidates them; matching `If-None-Match`
+returns an empty 304 with ETag, cache policy and `Vary` intact. Weak tags, lists,
+wildcards, HEAD and distinct Brotli/identity representation tags are supported.
+Fingerprinted assets retain their year-long immutable cache policy.
+
+The HTML's helper scripts are deferred. xterm JS, fit addon and CSS are fetched
+only when a terminal view opens, once per successful asset per page. Concurrent
+opens share loading; failed assets can be retried by closing/reopening. Until
+loading succeeds, the Rust view does not create xterm or attach the PTY socket.
+Closing a view aborts its pending attachment, and disposes the active observer
+and terminal before dropping callbacks. Loading failures display a UI error
+instead of trapping. Test the loader with
+`node --test scripts/test-terminal-assets.cjs`, and HTTP behavior with
+`cargo test -p c6-head assets::tests`.
+
 ## 3. Versions
 
 - **Semver.** `make release BUMP=patch|minor|major` (default `patch`), or `VERSION=x.y.z`. The first release is `0.2.0` (`make release BUMP=minor`): `0.1.0` has been the unreleased development version.
