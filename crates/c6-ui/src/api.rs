@@ -22,6 +22,9 @@ use serde::de::DeserializeOwned;
 pub struct LiveFeed {
     pub workers: ReadSignal<Vec<Worker>>,
     pub sessions: ReadSignal<Vec<Session>>,
+    /// Metadata for open workspace sessions, including those absent from
+    /// the non-archived live list. Never added to that list or the rail.
+    pub(crate) resolved_sessions: RwSignal<std::collections::HashMap<String, Session>>,
     pub connected: ReadSignal<bool>,
     /// The latest change to a document (docs/docs.md §6).
     pub doc: ReadSignal<Option<c6_api::docs::DocChange>>,
@@ -72,7 +75,18 @@ impl LiveFeed {
                 backoff = (backoff * 2).min(10_000);
             }
         });
-        Self { workers, sessions, connected, doc, marks, attention }
+        Self { workers, sessions, resolved_sessions: RwSignal::new(Default::default()), connected, doc, marks, attention }
+    }
+
+    /// The live row wins when present; otherwise an open tile's by-id row.
+    pub fn session(&self, id: &str) -> Option<Session> {
+        self.sessions.with(|ss| ss.iter().find(|s| s.id == id).cloned()).or_else(|| self.resolved_sessions.with(|ss| ss.get(id).cloned()))
+    }
+
+    pub(crate) fn remember_session(&self, session: Session) {
+        let _ = self.resolved_sessions.try_update(|ss| {
+            ss.insert(session.id.clone(), session);
+        });
     }
 
     pub fn worker_name(&self, id: &str) -> String {

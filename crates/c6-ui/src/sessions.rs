@@ -2215,12 +2215,6 @@ fn SessionForm(
     }
 }
 
-/// Raw main-turn status for operational controls, not aggregated display status.
-/// From the session list feed.
-pub fn live_status(id: &str) -> Option<SessionStatus> {
-    api::live().sessions.with(|ss| ss.iter().find(|s| s.id == id).map(|s| s.status))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

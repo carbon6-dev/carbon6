@@ -1079,6 +1079,9 @@ async fn send_input_with(
         return Err(bad_request("message is empty"));
     }
     let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    if session.archived != 0 {
+        return Err(bad_request("this session is archived; unarchive it before sending a message"));
+    }
     if session.observed {
         return Err(bad_request("this is Claude Code's own subagent: it is shown here, and Claude Code runs it"));
     }

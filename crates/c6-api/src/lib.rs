@@ -399,6 +399,9 @@ pub struct Session {
     pub connection_id: String,
     pub model: String,
     pub status: SessionStatus,
+    /// Archived sessions remain readable by id; unarchive before sending.
+    #[serde(default)]
+    pub archived: bool,
     pub error: Option<String>,
     pub effort: Option<String>,
     /// Subagent sessions: the parent session and the Task call that ran it.
@@ -552,6 +555,17 @@ mod session_tests {
         s.subagents_running = 2;
         let wire = serde_json::to_value(&s).unwrap();
         assert_eq!(wire["side_chats_running"], 3);
+        assert_eq!(serde_json::from_value::<Session>(wire).unwrap(), s);
+    }
+
+    #[test]
+    fn session_archived_wire_defaults_and_round_trip() {
+        let mut s = session();
+        assert!(!s.archived, "older servers omit archived");
+        assert_eq!(serde_json::to_value(&s).unwrap()["archived"], false);
+        s.archived = true;
+        let wire = serde_json::to_value(&s).unwrap();
+        assert_eq!(wire["archived"], true);
         assert_eq!(serde_json::from_value::<Session>(wire).unwrap(), s);
     }
 

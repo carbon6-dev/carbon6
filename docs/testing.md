@@ -114,6 +114,19 @@ and right viewport edges, also at 320px and 390px phone widths: expanding the
 palette must not push the card or its controls off screen, or require horizontal
 scrolling. Tall cards scroll within the viewport.
 
+## Archived session tiles: manual browser check
+
+On desktop and a touch phone, type a draft in a session tile, then archive the
+session from another client or its own actions menu. The tile must remain open,
+with its real title/status/mark and a visible **Archived** marker and drawn
+**Unarchive** action. The composer must explain why it cannot send, retain the
+draft and disable sending. Reload, then open the archived session by its direct
+URL in a fresh workspace: both must resolve the same metadata without needing
+the non-archived list. Activate Unarchive by keyboard and touch: it must not
+send the draft; sending afterward works normally. Check an Unarchive failure
+is visible and leaves the session archived. New sends from a stale client are
+also rejected clearly by the head, without queueing input.
+
 ## Tile focus and first click: manual browser check
 
 Focus and active-pane selection run on pointerdown. The pane header and its conditional buttons must stay mounted when only focus/active changes: detaching the original target between pointerdown and click loses its click. Use cached boolean conditions (`Show`) for their presence, not a closure that rebuilds them on every position change. Growing a tile still waits until click bubbles, after the action. The native `c6-ui` tests don't exercise browser event dispatch, so check this in a browser:

@@ -66,9 +66,9 @@ pub fn of(s: &Session) -> String {
     if m::is_mark(&s.colour) { s.colour.clone() } else { m::hashed(&s.id).to_owned() }
 }
 
-/// The mark of a session by id, from the live list.
+/// The mark of a session by id, from the live list or its open tile's metadata.
 pub fn of_id(id: &str) -> Option<String> {
-    api::live().sessions.with(|ss| ss.iter().find(|s| s.id == id).map(of))
+    api::live().session(id).as_ref().map(of)
 }
 
 /// The mark of an aspect's value (`worker:<id>`, `realm:home`…): the one
@@ -294,6 +294,7 @@ mod tests {
             provide_context(api::LiveFeed {
                 workers: signal(Vec::new()).0,
                 sessions: signal(Vec::new()).0,
+                resolved_sessions: RwSignal::new(Default::default()),
                 connected: signal(false).0,
                 doc: signal(None).0,
                 marks: signal(Default::default()).0,

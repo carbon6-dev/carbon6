@@ -359,13 +359,11 @@ impl View {
     pub fn label(&self, live: &LiveFeed) -> String {
         match self {
             View::Sessions => "Sessions".into(),
-            View::Session { id, .. } => {
-                live.sessions.with(|ss| ss.iter().find(|s| &s.id == id).map(|s| s.title.clone())).unwrap_or_else(|| "Session".into())
-            }
+            View::Session { id, .. } => live.session(id).map(|s| s.title).unwrap_or_else(|| "Session".into()),
             // Its name, and the session's.
             View::SessionChanges { id } | View::SessionTerminal { id } | View::SessionFiles { id } | View::SessionOutputs { id, .. } => {
                 let name = self.session_pane().map_or("", |(p, _)| p.name());
-                match live.sessions.with(|ss| ss.iter().find(|s| &s.id == id).map(|s| s.title.clone())) {
+                match live.session(id).map(|s| s.title) {
                     Some(t) => format!("{name} · {t}"),
                     None => name.to_owned(),
                 }
@@ -433,6 +431,13 @@ impl View {
             View::SessionFiles { id } => Some((Pane::Files, id)),
             View::SessionOutputs { id, .. } => Some((Pane::Outputs, id)),
             _ => None,
+        }
+    }
+
+    fn session_id(&self) -> Option<&str> {
+        match self {
+            View::Session { id, .. } => Some(id),
+            _ => self.session_pane().map(|(_, id)| id),
         }
     }
 }
@@ -1281,6 +1286,59 @@ impl Workspace {
     /// flag once they are.
     pub fn watch(&self, live: LiveFeed) {
         let ws = *self;
+        // Open views own their metadata, not their membership in a recent,
+        // non-archived list. This also covers restored layouts, direct links,
+        // minimized tiles and standalone session panes. Keep the last good
+        // row while resolving an omission; never close a view because of it.
+        let open = Memo::new(move |_| {
+            ws.layout.with(|l| {
+                l.tiles.iter().flat_map(|t| &t.columns).filter_map(|c| c.view.session_id().map(str::to_owned)).collect::<HashSet<_>>()
+            })
+        });
+        let fetching = StoredValue::new(HashSet::<String>::new());
+        let retry = RwSignal::new(0u64);
+        Effect::new(move || {
+            retry.track();
+            let ids = open.get();
+            let sessions = live.sessions.get();
+            let mut cached = live.resolved_sessions.get_untracked();
+            cached.retain(|id, _| ids.contains(id));
+            for s in sessions.iter().filter(|s| ids.contains(&s.id)) {
+                cached.insert(s.id.clone(), s.clone());
+            }
+            if live.resolved_sessions.with_untracked(|old| *old != cached) {
+                live.resolved_sessions.set(cached);
+            }
+            for id in ids.into_iter().filter(|id| !sessions.iter().any(|s| s.id == *id)) {
+                // A slow by-id request must get to finish even if newer
+                // live snapshots arrive; never pile up or starve requests.
+                if fetching.try_update_value(|pending| pending.insert(id.clone())) != Some(true) {
+                    continue;
+                }
+                leptos::task::spawn_local(async move {
+                    let result = api::session(id.clone()).await;
+                    let failed = result.is_err();
+                    fetching.try_update_value(|pending| pending.remove(&id));
+                    if let Ok(detail) = result
+                        && open.try_with_untracked(|ids| ids.contains(&id)) == Some(true)
+                        && live.sessions.try_with_untracked(|ss| !ss.iter().any(|s| s.id == id)) == Some(true)
+                    {
+                        live.remember_session(detail.session);
+                    } else if failed {
+                        // Live snapshots are change-driven. A transient
+                        // read failure must recover without another change.
+                        set_timeout(
+                            move || {
+                                if open.try_with_untracked(|ids| ids.contains(&id)) == Some(true) {
+                                    let _ = retry.try_update(|n| *n = n.wrapping_add(1));
+                                }
+                            },
+                            std::time::Duration::from_secs(2),
+                        );
+                    }
+                });
+            }
+        });
         let previous = StoredValue::new(HashMap::<String, SessionStatus>::new());
         Effect::new(move || {
             let sessions = live.sessions.get();
@@ -1932,7 +1990,7 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
             })
         })
     });
-    let session = Memo::new(move |_| shown.get().and_then(|(_, id)| live.sessions.with(|ss| ss.iter().find(|s| s.id == id).cloned())));
+    let session = Memo::new(move |_| shown.get().and_then(|(_, id)| live.session(&id)));
     let colour = Memo::new(move |_| session.get().map(|s| crate::marks::of(&s)));
     let palette_at = RwSignal::new(None::<(f64, f64)>);
     let menu_at = RwSignal::new(None::<(f64, f64)>);
@@ -2069,6 +2127,7 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                 <button class=format!("{btn} hidden md:flex") title="Close this tile" aria-label="Close this tile" on:click=move |_| ws.close_tile(key)>{crate::icons::x()}</button>
                 <crate::activity::SessionsPicker />
             </div>
+            {move || shown.get().map(|(_, id)| view! { <crate::session::ArchivedSession id /> })}
             <Popover at=palette_at class="w-auto">
                 {move || shown.get().map(|(_, id)| view! { <crate::marks::SessionPalette session=id on_pick=move |()| palette_at.set(None) /> })}
             </Popover>
@@ -2122,6 +2181,46 @@ mod tests {
             }
             assert_eq!(desktop_canvas_min(&rects, true), 488, "focus mode needs just one tile");
         }
+    }
+
+    #[test]
+    fn open_session_titles_status_and_marks_do_not_depend_on_the_live_list() {
+        Owner::new().with(|| {
+            let archived: Session = serde_json::from_value(serde_json::json!({
+                "id": "old", "worker_id": "00000000-0000-0000-0000-000000000001", "title": "Saved title",
+                "cwd": "", "connection_id": "c", "model": "m", "status": "idle", "archived": true,
+                "colour": "navy/dots", "error": null, "created_at": 0, "updated_at": 0, "last_seq": 0
+            }))
+            .unwrap();
+            let (sessions, set_sessions) = signal(Vec::new());
+            let live = LiveFeed {
+                workers: signal(Vec::new()).0,
+                sessions,
+                resolved_sessions: RwSignal::new(HashMap::from([("old".to_owned(), archived.clone())])),
+                connected: signal(true).0,
+                doc: signal(None).0,
+                marks: signal(Default::default()).0,
+                attention: signal(0).0,
+            };
+            assert_eq!(View::session("old").label(&live), "Saved title");
+            assert_eq!(View::SessionChanges { id: "old".into() }.label(&live), "Changes · Saved title");
+            assert!(live.sessions.get().is_empty(), "resolved rows never enter the rail");
+            let resolved = live.session("old").unwrap();
+            assert!(resolved.archived);
+            assert_eq!(resolved.status, SessionStatus::Idle);
+            assert_eq!(crate::marks::of(&resolved), "navy/dots");
+            let mut active = archived.clone();
+            active.archived = false;
+            active.title = "Restored title".into();
+            active.status = SessionStatus::Running;
+            set_sessions.set(vec![active.clone()]);
+            assert_eq!(live.session("old"), Some(active), "the fresh live row wins after unarchive");
+            assert_eq!(View::session("old").label(&live), "Restored title");
+            for view in [View::session("old"), View::SessionFiles { id: "old".into() }, View::SessionTerminal { id: "old".into() }] {
+                assert_eq!(view.session_id(), Some("old"));
+            }
+            assert_eq!(View::Sessions.session_id(), None);
+        });
     }
 
     #[test]

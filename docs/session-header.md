@@ -48,6 +48,32 @@ documents and terminal output remain content, including Slack's emoji picker
 and the terminal vendor's Unicode-width data. The native UI tests render
 representative session cards and scan app-owned Rust/HTML/JS to guard this rule.
 
+### Archived sessions stay readable
+
+An open session tile resolves its own metadata by id when the live session list
+omits it. Archiving never closes that tile, including from its own actions menu.
+Its real title, status and mark remain, with a visible **Archived** marker and a
+drawn **Unarchive** button in a slim archive header below the bar (or at the
+session's own strip when the bar represents another view). This leaves the
+existing bar's icons in place and keeps the title and archive action reachable
+on a narrow phone. Restored
+workspace layouts and direct session links behave the same way. Archived
+sessions still do not appear in the non-archived Sessions list or sidebar.
+
+The message box explains **“This session is archived. Unarchive it to send
+messages.”** and disables sending, preserving its draft text and attachments.
+Unarchive is explicit and does not itself send anything; then the draft can be
+sent normally. The head rejects new sends to an archived session with a clear
+archive/unarchive error, covering stale clients too. Previously those sends ran
+the agent while leaving it archived and hidden. Archiving is still not Stop:
+an already-running turn or already-queued message is not cancelled by this UI
+change.
+
+`Session.archived` is a boolean returned by the session API (default false when
+reading older responses). The existing by-id endpoint includes archived
+sessions; the live/list endpoints continue to omit them. No storage or database
+migration is needed.
+
 ## 2. Panes
 
 Changes, Terminal, Files and Outputs are views of their own (`/sessions/{id}/changes`, `/terminal`, `/files`, `/outputs`), each with its name and the session's title. Clicking an icon opens its pane, or closes it if open; ⌘/Ctrl-click opens it in a new tile. Opened beside the session, the session stays and a list beside it goes back in the tile's history; the two share the tile evenly.

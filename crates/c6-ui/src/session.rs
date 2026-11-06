@@ -524,6 +524,15 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         let id = id.clone();
         move || api::session(id.clone())
     });
+    Effect::new(move || {
+        if let Some(Ok(d)) = detail.get()
+            && live.resolved_sessions.with_untracked(|ss| !ss.contains_key(&d.session.id))
+        {
+            // A direct link's successful detail read is also enough for
+            // its tile header, even if the workspace's read failed.
+            live.remember_session(d.session);
+        }
+    });
     let target = target.unwrap_or_default();
     // Where it was found: a window reaching back to there, if that's known.
     let window = match target.at.or_else(|| target.anchor.as_deref().and_then(|a| anchor_seq(a, &id))) {
@@ -535,14 +544,12 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     let Feed { events, streaming, queued, activity, .. } = feed;
     let error = RwSignal::new(None::<String>);
 
-    let status = {
+    let own_session = {
         let id = id.clone();
-        Memo::new(move |_| {
-            sessions::live_status(&id)
-                .or_else(|| detail.get().and_then(|d| d.ok()).map(|d| d.session.status))
-                .unwrap_or(SessionStatus::Starting)
-        })
+        Memo::new(move |_| live.session(&id).or_else(|| detail.get().and_then(Result::ok).map(|d| d.session)))
     };
+    let status = Memo::new(move |_| own_session.get().map_or(SessionStatus::Starting, |s| s.status));
+    let archived = Signal::derive(move || own_session.get().is_some_and(|s| s.archived));
     let running = move || status.get() == SessionStatus::Running || activity.get() == Some(true);
 
     // Follow the bottom of the transcript unless the user scrolled up, or
@@ -997,6 +1004,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         </ScrollBox>
             <div class="hidden md:contents"><SubagentWaiting chrome /></div>
             <PhoneStatus chrome scroller follow=stick latest=Signal::derive(move || feed.to.get().is_none()) />
+            <Show when=move || own_session.with(Option::is_some) fallback=|| view! { <p class="px-3 py-2 text-xs text-muted">"Loading session…"</p> }>
             {move || {
                 // Claude Code's own subagents take no messages.
                 if detail.get().and_then(|d| d.ok()).is_some_and(|d| d.session.observed) {
@@ -1013,7 +1021,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                 });
                 match wake {
                     Some(w) => view! {
-                        <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) error files wake=w />
+                        <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) archived error files wake=w />
                     }.into_any(),
                     None => {
                         let row = detail.get().and_then(|d| d.ok()).map(|d| d.session);
@@ -1024,11 +1032,12 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                         let start = row.map(|s| (s.subagent_connection_id, s.subagent_model, s.subagent_effort)).unwrap_or_default();
                         let subagents = SubagentChoice::follow(events, start, choice.current);
                         view! {
-                            <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) error model=choice files subagents no_claude_code ask />
+                            <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) archived error model=choice files subagents no_claude_code ask />
                         }.into_any()
                     }
                 }
             }}
+            </Show>
         </div>
         <Popover at=glance_at class="w-80">
             <SessionOverview chrome on_done=move |()| glance_at.set(None) />
@@ -1356,8 +1365,10 @@ pub fn RenameForm(session: String, title: String, #[prop(into)] on_done: Callbac
 /// choice.
 #[component]
 pub fn SessionMenu(chrome: SessionChrome, #[prop(into)] on_rename: Callback<()>, #[prop(into)] on_done: Callback<()>) -> impl IntoView {
-    let SessionChrome { id, detail, find_open, like_this, as_template, details, col, view_settings, .. } = chrome;
-    let session = move || detail.get().and_then(Result::ok).map(|d| d.session);
+    let SessionChrome { id, detail, find_open, like_this, as_template, details, view_settings, .. } = chrome;
+    let live = api::live();
+    let session = move || live.session(&id.get_value()).or_else(|| detail.get().and_then(Result::ok).map(|d| d.session));
+    let archive_error = RwSignal::new(None::<String>);
     // Its catch-up card and folding its finished turns, on or off (kept on
     // the head). The switch moves once the head has it.
     let cards = crate::catchup::cards();
@@ -1429,12 +1440,20 @@ pub fn SessionMenu(chrome: SessionChrome, #[prop(into)] on_rename: Callback<()>,
                 })}
             </Show>
             <div class=MENU_RULE></div>
-            <button class=format!("{MENU_ITEM} text-red-600 dark:text-red-400") title="Archive the session and close this column" on:click=move |_| {
+            {move || archive_error.get().map(|message| view! { <ErrorBox message /> })}
+            <button class=format!("{MENU_ITEM} text-red-600 dark:text-red-400") title="Archive or unarchive the session without closing this tile" on:click=move |_| {
+                let archived = session().is_some_and(|s| s.archived);
+                let sid = id.get_value();
                 spawn_local(async move {
-                    if api::archive(id.get_value()).await.is_ok() && let Some(c) = col { c.close(); }
+                    match api::set_archived(sid.clone(), !archived).await {
+                        Ok(()) => {
+                            if let Ok(d) = api::session(sid).await { live.remember_session(d.session); }
+                            on_done.try_run(());
+                        }
+                        Err(e) => archive_error.set(Some(e)),
+                    }
                 });
-                on_done.run(());
-            }>"Archive"</button>
+            }>{move || if session().is_some_and(|s| s.archived) { "Unarchive" } else { "Archive" }}</button>
         </div>
     }
 }
@@ -1587,6 +1606,7 @@ fn SessionStrip(chrome: SessionChrome) -> impl IntoView {
     // view's).
     let rename_from = StoredValue::new((8.0, 48.0));
     view! {
+        <ArchivedSession id=chrome.id.get_value() />
         <div class="flex h-11 shrink-0 items-center justify-end gap-0.5 border-b border-zinc-200 bg-zinc-50 px-2 text-xs pointer-coarse:gap-0 dark:border-zinc-800 dark:bg-zinc-900/60">
             <SessionControls chrome strip=true />
             <span class="mx-1 h-4 w-px shrink-0 bg-zinc-200 dark:bg-zinc-700"></span>
@@ -1612,6 +1632,41 @@ fn SessionStrip(chrome: SessionChrome) -> impl IntoView {
                 }}
             </Popover>
         </div>
+    }
+}
+
+/// Archiving changes visibility, not the lifetime of an open transcript.
+#[component]
+pub(crate) fn ArchivedSession(id: String) -> impl IntoView {
+    let live = api::live();
+    let id = StoredValue::new(id);
+    let saving = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    view! {
+        <Show when=move || live.session(&id.get_value()).is_some_and(|s| s.archived)>
+            <div class="flex shrink-0 items-center gap-2 border-b border-zinc-200 px-3 py-1 text-xs dark:border-zinc-800">
+            <span class="min-w-0 flex-1 truncate" title=move || live.session(&id.get_value()).map(|s| s.title)>
+                {move || live.session(&id.get_value()).map(|s| s.title)}
+            </span>
+            <span class="shrink-0 rounded bg-amber-100 px-1.5 py-0.5 text-[11px] text-amber-800 dark:bg-amber-950 dark:text-amber-300">"Archived"</span>
+            <button class=crate::icons::BAR_BUTTON aria-label="Unarchive" title="Unarchive this session to send messages again"
+                prop:disabled=move || saving.get() on:click=move |_| {
+                    saving.set(true);
+                    let sid = id.get_value();
+                    spawn_local(async move {
+                        match api::set_archived(sid.clone(), false).await {
+                            Ok(()) => {
+                                if let Ok(d) = api::session(sid).await { live.remember_session(d.session); }
+                                error.set(None);
+                            }
+                            Err(e) => error.set(Some(e)),
+                        }
+                        saving.set(false);
+                    });
+                }>{crate::icons::undo()}</button>
+            </div>
+            {move || error.get().map(|e| view! { <p role="alert" class="px-3 py-1 text-xs text-red-600">{e}</p> })}
+        </Show>
     }
 }
 
@@ -4960,6 +5015,7 @@ fn Composer(
     id: String,
     running: Signal<bool>,
     disabled: Signal<bool>,
+    #[prop(optional, into)] archived: Option<Signal<bool>>,
     error: RwSignal<Option<String>>,
     /// Inside a side chat instead of fixed at the bottom of the page.
     #[prop(optional)]
@@ -4984,6 +5040,8 @@ fn Composer(
     #[prop(optional)]
     ask: bool,
 ) -> impl IntoView {
+    let archived = archived.unwrap_or_else(|| Signal::derive(|| false));
+    let disabled = Signal::derive(move || disabled.get() || archived.get());
     let subagent_id = StoredValue::new(id.clone());
     // In Ask, Claude Code runs on the head's machine: why it can't, if so.
     let claude_check = LocalResource::new(move || async move { if ask { api::ask_claude().await.ok() } else { None } });
@@ -5013,7 +5071,7 @@ fn Composer(
         }
         now
     });
-    let shown_next = move || next.get().filter(|_| text.with(String::is_empty) && !running.get()).map(|s| s.text);
+    let shown_next = move || next.get().filter(|_| text.with(String::is_empty) && !running.get() && !disabled.get()).map(|s| s.text);
     // The model row, on phones (always shown on wider screens).
     // Whether the model chip's menu (the model and its subagents') is open.
     let picking = RwSignal::new(false);
@@ -5374,6 +5432,9 @@ fn Composer(
             <div class=if inline { "" } else { READING_ROW }>
             <div class=if inline { "space-y-2" } else { "w-full min-w-0 max-w-4xl space-y-2 px-2 py-1.5 sm:px-3 sm:py-2" }>
                 {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+                <Show when=move || archived.get()>
+                    <p class="text-xs text-muted" role="status">"This session is archived. Unarchive it to send messages."</p>
+                </Show>
                 {move || (!draft_ready.get()).then(|| view! { <p class="text-xs text-muted" role="status">"Restoring draft attachments…"</p> })}
                 {move || draft_note.get().map(|note| view! { <p class="text-xs text-muted" role="status">{note}</p> })}
                 // One box: what's attached, the text, and a toolbar along its
@@ -5473,7 +5534,7 @@ fn Composer(
                         rows="1"
                         enterkeyhint=if touch { "enter" } else { "send" }
                         data-pop=suggest_pop.get_value()
-                        placeholder=move || if let Some(s) = shown_next() { s } else if disabled.get() { "This session failed to start.".to_owned() } else if touch {
+                        placeholder=move || if archived.get() { "Unarchive this session to send messages.".to_owned() } else if let Some(s) = shown_next() { s } else if disabled.get() { "This session failed to start.".to_owned() } else if touch {
                             // A phone's box is narrow: a hint that fits.
                             if running.get() { "Read at its next step…" } else { "@ to mention · / for commands" }.to_owned()
                         } else if running.get() { "Read at the agent's next step…".to_owned() } else { "@ to mention · / for commands".to_owned() }
@@ -6239,6 +6300,7 @@ mod tests {
             provide_context(api::LiveFeed {
                 workers: signal(Vec::new()).0,
                 sessions: signal(Vec::new()).0,
+                resolved_sessions: RwSignal::new(Default::default()),
                 connected: signal(false).0,
                 doc: signal(None).0,
                 marks: signal(Default::default()).0,

@@ -221,6 +221,7 @@ pub fn session(r: &SessionRow, head: Option<WorkerId>) -> api::Session {
             "failed" => api::SessionStatus::Failed,
             _ => api::SessionStatus::Starting,
         },
+        archived: r.archived != 0,
         error: r.error.clone(),
         effort: r.effort.clone(),
         parent_id: r.parent_id.clone(),
