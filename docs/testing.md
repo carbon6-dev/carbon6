@@ -2,6 +2,132 @@
 
 Status: rules in force (2026-10-19); `make check` enforces what a pattern can catch (`scripts/test-lint.sh`).
 
+## Motion: production browser regression
+
+`crates/c6-ui/tests/motion.cjs` serves the built production UI on an owned
+loopback port, with fake HTTP and WebSocket head responses. It does not connect
+to your head, use your browser profile, or require an npm install. Build first
+(coordinate the build when sharing a worktree), then run with Node 24:
+
+```sh
+env -u NO_COLOR make ui
+/home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/motion.cjs --unit
+ENGINE=both /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/motion.cjs
+ENGINE=both /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/motion.cjs --helpers
+```
+
+The local defaults use `playwright-core` at
+`/home/zheilbron/.bun/install/cache/playwright-core@1.50.1@@@1`, Chromium at
+`/tmp/c7-chromium/chrome-linux/chrome`, and the WebKit wrapper
+`/tmp/c7-webkit.sh`. Elsewhere set `PLAYWRIGHT_CORE`, `CHROMIUM`, and
+`WEBKIT_EXECUTABLE`. `ROOT` overrides `crates/c6-ui/dist`. Missing browsers or
+motion hooks fail explicitly; this standalone opt-in harness does not silently
+skip coverage. `--unit` needs only Node and reads the actual `js/motion.js` into
+isolated VM contexts: default/invalid choices, OS changes, explicit Full,
+cross-tab notification, cancellation, and denied/quota-failed storage.
+VM checks also distinguish JavaScript/transition cancellation from preserved CSS keyframes;
+a source regression requires Off to hide outgoing count/notice decorations.
+The notice source guard also keeps the retained last content, immediate inert
+closed state, Undo action and non-ticking timeout (no visual countdown).
+Production list-FLIP VM checks exercise inserted keys, inert removal ghosts,
+interrupted frame cancellation, Full/Reduced/Off keyframes, and absence of
+per-animation-frame geometry reads. They do not mount the comments UI.
+`--helpers` additionally loads the built production helper into a real DOM in
+fresh browser processes: Full/Reduced/Off in each selected engine (six cases
+with `ENGINE=both`). A read-only adapter observes the helper's private WeakMap.
+Native completion must both detach the inert removal ghost and empty the
+state's retained-ghost array; DOM removal alone is not sufficient. Off must
+create neither a ghost nor a timed effect. This still does not mount comments.
+Bounded resize-FLIP checks cover growth interrupted mid-scale, replacement
+animation ownership, and fade-only Reduced/Off behavior without mounting catch-up.
+The glide VM regression checks its shared 200ms deadline, same-target
+deduplication, interruption from displayed position, immediate input/snap
+cancellation, preference changes, detached nodes, and three geometry reads per
+invocation with none in animation frames.
+Chromium also uses `/tmp/c7-browser-libs/usr/lib/x86_64-linux-gnu` when present
+for its local shared libraries; `CHROMIUM_LIBS` overrides that directory and
+the inherited `LD_LIBRARY_PATH` is preserved. The WebKit wrapper owns its own
+library environment.
+`ISOLATE_BROWSER=1` additionally owns a fresh browser process per case, not
+just a fresh context. This is useful when diagnosing old WPE WebKit process
+reuse: it does not retry or suppress an error, and shared-process failures
+should still be reported with the isolated result rather than discarded.
+
+By default each engine runs 1440×1000 desktop and 390×844 phone, light and dark, with
+System (OS normal/reduced), Full (OS normal/reduced), Reduced and Off. For a
+focused rerun, filters accept comma-separated values:
+
+```sh
+ENGINE=webkit VIEWPORT=phone THEME=dark MOTION_CASE=full-reduce ONLY=menu,sheet,tool,sendStop \
+  /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/motion.cjs
+
+# Opt-in corners: 16 cases total with both engines and both themes.
+ISOLATE_BROWSER=1 ENGINE=both VIEWPORT=narrow,landscape MOTION_CASE=full,reduced \
+  ONLY=menu,sheet,phone,tool,sendStop SCREENSHOTS=/tmp/m1-screenshots/corners \
+  /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/motion.cjs
+```
+
+`VIEWPORT=narrow` selects 320×568; `VIEWPORT=landscape` selects 900×480.
+Neither is included in the default matrix. Both use phone checks, including
+the drawer: the fixture uses the product's width < 768 **or** height < 512
+condition, rather than a width-only phone assumption. Labels include the view
+name so corner artifacts do not overwrite the ordinary 390px phone cases.
+
+Checks cover pre-hydration policy and persistence, cross-tab/realm preferences,
+first-frame menu focus/hit-testing/action, phone sheets and scrims, interrupted
+exits and presence disposal, overlay/offset and resized keyboards, desktop tile
+open/close/reorder, phone-row composer position and transcript following,
+native tool disclosure, D2 live/result output height and node identity, and
+first-frame Send/Stop interactivity. Off audits actual computed CSS durations
+and captured effects; Reduced rejects travel, spin/pulse and long effects.
+Native details height interpolation is checked at 160ms when the engine
+supports it; otherwise Full requires a captured 160ms body-reveal fallback.
+The actual open/closed geometry is checked in both cases. The harness prints
+the engine capability, captured timing and whether an intermediate frame was
+observed (the last is diagnostic, not a frame-rate-dependent assertion).
+The Actions menu's real Catch-up switch is toggled off and back on. Its fake
+server holds each response while the test checks the exact PUT payload and
+unchanged `aria-checked`, then acknowledges success and requires the new state.
+Phone checks keep soft-wrapped and explicitly multiline drafts focused across working/idle cycles and
+require a settled absolute end gap below one CSS pixel. They sample after
+additional animation frames, not just the first successful ResizeObserver
+snap: redundant textarea `height:auto` measurement can briefly expand the
+transcript, clamp its end, then leave a gap when the measured height returns.
+Separate checks retain real text-growth and width-change autosizing and verify
+that an empty multiline suggestion grows the box and disappears on working.
+Both draft inputs must reach and retain the true transcript end without a
+test-authored scroll snap before the working/idle cycles begin.
+
+Waits use DOM state, request completion, animation completion, or animation
+frames—not fixed real-time pauses. The browser clock is explicitly advanced
+across the product's 299/301ms Full presence boundary (79/81ms for Reduced),
+and to interrupt an exit before disposal; host load cannot accidentally miss
+the interruption. `C6_TEST_DEADLINE_SECS` controls the generous hang deadline,
+not a performance threshold. FLIP guards record production root geometry
+reads by frame and reject layout-property keyframes; they are not a substitute
+for an engine performance trace proving compositor-only rendering. Synthetic
+native drag events exercise production handlers, not OS drag gesture fidelity;
+emulated visual viewports do not replace a physical keyboard/accessibility
+review. Visual spring quality and interrupted-animation velocity still need
+human review.
+Notice rise/update/dismiss/Undo, catch-up pending-to-summary growth, and the
+mounted comments list are not browser-covered here; notice source guards and
+the shared list helper's VM/real-DOM tests are narrower checks, not integration coverage.
+
+Screenshots (including `-actions-open`, `-menu-open`, `-sheet-open`, `-status-working` and open
+tools) and failure JSON containing effects,
+requests, errors and DOM are saved to `/tmp/m1-screenshots`, overridden with
+`SCREENSHOTS`. These are diagnostic artifacts, not pixel baselines.
+For a before/after bundle comparison, build a clean `git archive` of the base
+commit outside the shared worktree with the same toolchain/flags, then run
+`ROOT=/path/to/base/crates/c6-ui/dist node crates/c6-ui/tests/motion.cjs --sizes`
+and the same command with the current `ROOT`. This emits a **directory
+inventory** of per-file and per-extension HTML/JS/CSS/WASM byte totals, raw and
+reproducible gzip level 9. Both before/after dist directories must be clean:
+Trunk can leave orphan snippet files that inflate an inventory. This command
+does not trace reachable imports or measure network transfer; gzip totals are
+compression estimates, not measured head transfer sizes.
+
 A test is a claim: *this invariant holds*. It must fail **if and only if** the invariant is broken. A slow machine, a busy CI runner, another test running beside it, or the order tests run in must never fail it. The test suite runs on GitHub's runners (`ubuntu-24.04`, `macos-15`), which are shared, small and sometimes slow, and it must hold there.
 
 ## Failure diagnostics

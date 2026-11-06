@@ -19,7 +19,7 @@ const GROUPS: &[(&str, &[Page])] = &[
     (
         "General",
         &[
-            ("appearance", "Appearance", "Light or dark, and what sessions show"),
+            ("appearance", "Appearance", "Theme, motion, and what sessions show"),
             ("account", "Sign-in", "Passkeys, signed-in browsers, API tokens"),
             ("notifications", "Notifications", "Channels, push on this device, links"),
         ],
@@ -451,12 +451,17 @@ extern "C" {
     fn theme_get() -> String;
     #[wasm_bindgen(js_namespace = c6Theme, js_name = set)]
     fn theme_set(choice: &str);
+    #[wasm_bindgen(js_namespace = c6Motion, js_name = get)]
+    fn motion_get() -> String;
+    #[wasm_bindgen(js_namespace = c6Motion, js_name = set)]
+    fn motion_set(choice: &str);
 }
 
 /// Light, dark, or as the system is: kept in this browser.
 #[component]
 fn AppearanceSetting() -> impl IntoView {
     let choice = RwSignal::new(theme_get());
+    let motion = RwSignal::new(motion_get());
     let option = move |value: &'static str, label: &'static str, what: &'static str| {
         view! {
             <label class="flex cursor-pointer items-start gap-3 rounded-md border border-zinc-200 px-3 py-2 has-checked:border-blue-500 has-checked:bg-blue-50 dark:border-zinc-800 dark:has-checked:border-blue-400 dark:has-checked:bg-blue-950">
@@ -469,6 +474,15 @@ fn AppearanceSetting() -> impl IntoView {
             </label>
         }
     };
+    let motion_option = move |value: &'static str, label: &'static str, what: &'static str| {
+        view! {
+            <label class="flex cursor-pointer items-start gap-3 rounded-md border border-zinc-200 px-3 py-2 has-checked:border-blue-500 has-checked:bg-blue-50 dark:border-zinc-800 dark:has-checked:border-blue-400 dark:has-checked:bg-blue-950">
+                <input type="radio" name="motion" class="mt-1" prop:checked=move || motion.get() == value
+                    on:change=move |_| { motion_set(value); motion.set(value.to_owned()); } />
+                <span><span class="block text-sm font-medium">{label}</span><span class="block text-xs text-muted">{what}</span></span>
+            </label>
+        }
+    };
     view! {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <h2 class="font-medium">"Theme"</h2>
@@ -476,6 +490,13 @@ fn AppearanceSetting() -> impl IntoView {
                 {option("system", "System", "Follows your device's setting")}
                 {option("light", "Light", "Always light")}
                 {option("dark", "Dark", "Always dark")}
+            </div>
+            <h2 class="font-medium">"Motion"</h2>
+            <div class="grid gap-2 sm:grid-cols-2">
+                {motion_option("system", "System", "Follows your device's setting")}
+                {motion_option("full", "Full", "All motion, regardless of the device setting")}
+                {motion_option("reduced", "Reduced", "Short fades; no travel, spinning or pulsing")}
+                {motion_option("off", "Off", "No transitions or animations")}
             </div>
             <p class="text-xs text-muted">"Kept in this browser, so each device can have its own."</p>
         </section>

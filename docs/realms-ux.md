@@ -76,11 +76,11 @@ Fixing each call site doesn't last: every new page is another place to forget th
 - **Settings** has what the realm owns, plus the user's display preferences:
   - its lists, with root's inherited entries shown read-only above its own;
   - its toggles;
-  - Appearance (theme in this browser; Show thinking is the user's preference across realms and devices).
+  - Appearance (theme and Motion in this browser; Show thinking is the user's preference across realms and devices).
 
   System pages move to the console.
 - **The live feed** (`WS /api/v1/live`) sends only the realm's sessions, and only the workers it may use. So the dock, inbox, mission control and the session list are right by construction.
-- **This browser's state is kept per realm:** the workspace (tiles and history), finished and pinned sessions, the label filter, analytics and grouping choices. Keys become `c6.<realm>.…`. The theme stays one per browser.
+- **This browser's state is kept per realm:** the workspace (tiles and history), finished and pinned sessions, the label filter, analytics and grouping choices. Keys become `c6.<realm>.…`. Theme and Motion stay one per browser (`c6.theme`, `c6.motion`), including the console.
 - **The assistant** is the realm's, as built (os §3.6).
 
 ## 5. The console
@@ -123,7 +123,7 @@ The same shell, with its own nav:
 - **Realm toggles are each realm's, root's by default:** suggestions, web search, the assistant's settings and subagent limits. Root's (set in the console) applies to a realm until its page changes it; the realm's own is kept as `<key>@<realm>`. The page says which, with **Use root's** to go back (`GET`/`DELETE /api/v1/settings/own/{name}`). Prompts work the same way, per prompt. Sessions read the value for their realm. The memex's settings stay the console's: the memex is one service.
 - **Inherited list entries:** a realm's list pages (skills, agents, commands, hooks, MCP servers, policies, budgets…) show root's entries in use there, read-only ("Also in use, from root"); its own entry of the same name replaces one.
 - **The console's lists are root's:** in the console, Settings' list pages (skills, policies, budgets, secrets…) edit root's entries, the defaults every realm inherits. Pages that are each realm's alone (memory, memex folders and scopes, mail, views, triggers, workflows) aren't in the console.
-- **Saved browser state** lives under `c6.<realm>.…` and `c6.admin.…`. Home starts from what was saved before (`c6.…`). The theme and the last place (`c6.place`) are per browser.
+- **Saved browser state** lives under `c6.<realm>.…` and `c6.admin.…`. Home starts from what was saved before (`c6.…`). Theme, Motion and the last place (`c6.place`) are per browser.
 - **Old addresses:** `/` goes to the last place. `/sessions/<id>` asks the head for its realm (root's go to the console). Console settings pages go to the console, anything else to the last place.
 
 ## 10. Steps

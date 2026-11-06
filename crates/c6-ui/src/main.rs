@@ -270,7 +270,7 @@ fn AppsMenu() -> impl IntoView {
     view! {
         <details node_ref=menu data-pop=pop on:toggle=toggled class="relative shrink-0">
             <summary class=format!("{NAV} cursor-pointer list-none whitespace-nowrap")>"Apps "{crate::icons::chevron_down()}</summary>
-            <div class="absolute left-0 top-8 z-40 flex w-48 flex-col rounded-lg border border-zinc-200 bg-white p-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900" on:click=close>
+            <div class="c6-pop absolute left-0 top-8 z-40 flex w-48 flex-col rounded-lg border border-zinc-200 bg-white p-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900" style="--pop-origin: top left" on:click=close>
                 {move || feeds.get().and_then(Result::ok).map(|f| view! {
                     {(f["mail"] == true).then(|| view! { <Go to=View::Mail class=item own=true>"Mail"</Go> })}
                     {(f["mail"] == true || f["chat"] == true).then(|| view! { <Go to=View::Brief class=item own=true>"Brief"</Go> })}
@@ -295,8 +295,13 @@ fn MobileMenu(#[prop(optional, into)] desktop_attention: Option<Signal<usize>>) 
     let attention = expect_context::<PhoneWaiting>().0;
     let connected = api::live().connected;
     let version = versions();
-    let menu = NodeRef::<leptos::html::Details>::new();
-    let (pop, toggled) = util::details_pop(menu);
+    let open = RwSignal::new(false);
+    let pop = util::dismissable(
+        move || open.get(),
+        move || {
+            open.try_set(false);
+        },
+    );
     let feeds = feeds();
     // Close after choosing something (not on opening the Views drop-down in it).
     let close = move |ev: web_sys::MouseEvent| {
@@ -304,13 +309,12 @@ fn MobileMenu(#[prop(optional, into)] desktop_attention: Option<Signal<usize>>) 
         if target.is_some_and(|t| t.closest("summary").ok().flatten().is_some()) {
             return;
         }
-        if let Some(d) = menu.get_untracked() {
-            d.set_open(false);
-        }
+        open.set(false);
     };
     view! {
-        <details node_ref=menu data-pop=pop on:toggle=toggled class="relative shrink-0 md:shrink xl:hidden">
-            <summary class="relative flex h-11 w-11 cursor-pointer list-none items-center justify-center rounded-md text-sm text-zinc-600 md:block md:h-auto md:w-auto md:px-2 md:py-1 dark:text-zinc-400"
+        <div data-pop=pop class="relative shrink-0 md:shrink xl:hidden">
+            <button class="relative flex h-11 w-11 cursor-pointer items-center justify-center rounded-md text-sm text-zinc-600 md:block md:h-auto md:w-auto md:px-2 md:py-1 dark:text-zinc-400"
+                aria-haspopup="true" aria-expanded=move || open.get().to_string() on:click=move |_| open.update(|o| *o = !*o)
                 aria-label=move || format!("Menu, {} waiting across the app{}", attention.get(), if connected.get() { "" } else { ", reconnecting" })>
                 {crate::icons::menu()}
                 {move || (attention.get() > 0).then(|| view! { <span data-phone-waiting="true" class="absolute right-1 top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-amber-500 px-1 text-[10px] font-semibold leading-none text-white md:hidden">{attention.get()}</span> })}
@@ -318,8 +322,10 @@ fn MobileMenu(#[prop(optional, into)] desktop_attention: Option<Signal<usize>>) 
                 <Show when=move || !connected.get()>
                     <span class="absolute bottom-1 right-1 size-2 rounded-full bg-amber-500 md:hidden" title="Reconnecting"></span>
                 </Show>
-            </summary>
-            <div class="phone-drawer fixed left-0 z-40 w-72 max-w-full space-y-1 overflow-y-auto rounded-r-lg border border-zinc-200 bg-white p-2 shadow-lg md:absolute md:top-11 dark:border-zinc-700 dark:bg-zinc-900" on:click=close>
+            </button>
+            <div class="c6-presence c6-scrim fixed inset-0 z-30 bg-black/30 md:hidden" data-open=move || open.get().to_string() inert=move || !open.get() on:click=move |_| open.set(false)></div>
+            <div class="c6-sheet c6-pane c6-presence phone-drawer fixed left-0 z-40 w-72 max-w-full space-y-1 overflow-y-auto rounded-r-lg border border-zinc-200 bg-white p-2 shadow-lg md:absolute md:top-11 dark:border-zinc-700 dark:bg-zinc-900"
+                data-open=move || open.get().to_string() inert=move || !open.get() on:click=close>
                 <PlaceMenu drawer=true />
                 {place::is_console().then(|| view! {
                     <div class="flex flex-col text-sm">
@@ -370,7 +376,7 @@ fn MobileMenu(#[prop(optional, into)] desktop_attention: Option<Signal<usize>>) 
                     <span class="block font-mono">{move || version.now.get().map(|v| format!("carbon6 {v}"))}</span>
                 </div>
             </div>
-        </details>
+        </div>
     }
 }
 
@@ -460,7 +466,7 @@ fn PlaceMenu(#[prop(optional)] drawer: bool) -> impl IntoView {
             </summary>
             // On a phone, the width of the screen (anchored at the chip, it
             // would run off its edge).
-            <div class=if drawer { "mt-1 rounded-lg border border-zinc-200 bg-white p-1 text-sm dark:border-zinc-700 dark:bg-zinc-900" } else { "absolute left-0 top-9 z-40 w-64 rounded-lg border border-zinc-200 bg-white p-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900" }>
+            <div class=if drawer { "c6-pop mt-1 rounded-lg border border-zinc-200 bg-white p-1 text-sm dark:border-zinc-700 dark:bg-zinc-900" } else { "c6-pop absolute left-0 top-9 z-40 w-64 rounded-lg border border-zinc-200 bg-white p-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900" } style="--pop-origin: top left">
                 <div class="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-muted">"Realms"</div>
                 {move || places.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|p| p.id != "root").map(|p| {
                     let current = here.as_deref() == Some(p.id.as_str());

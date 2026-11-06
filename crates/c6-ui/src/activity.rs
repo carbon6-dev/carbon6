@@ -81,7 +81,7 @@ pub fn Dock() -> impl IntoView {
                 <button class="absolute inset-0 border-r border-zinc-200 bg-zinc-50 hover:bg-zinc-200 dark:border-zinc-800 dark:bg-zinc-950 dark:hover:bg-zinc-800"
                     title="Show the sidebar (⌘\\ keeps it open)" aria-label="Show the sidebar" on:click=move |_| toggle.run(())></button>
             })}
-            <aside class=move || {
+            <aside data-open=move || (kept.get() || peek.get()).to_string() inert=move || !kept.get() && !peek.get() class=move || {
                 let at = if kept.get() {
                     "w-full"
                 } else if peek.get() {
@@ -89,7 +89,7 @@ pub fn Dock() -> impl IntoView {
                 } else {
                     "pointer-events-none invisible absolute inset-y-0 left-0 w-60 -translate-x-full"
                 };
-                format!("flex flex-col border-r border-zinc-200 bg-zinc-50 transition-[translate,visibility] duration-150 ease-out motion-reduce:transition-none dark:border-zinc-800 dark:bg-zinc-950 {at}")
+                format!("c6-sidebar flex flex-col border-r border-zinc-200 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 {at}")
             }>
                 <div class=move || if !activity.get() { "flex shrink-0 flex-col" } else if sessions.get() { "flex max-h-[45%] min-h-0 shrink-0 flex-col" } else { "flex min-h-0 flex-1 flex-col" }>
                     <DockActivity open=activity fold kept toggle />
@@ -540,6 +540,7 @@ fn MissionCard(id: String) -> impl IntoView {
 pub fn SessionsPicker() -> impl IntoView {
     let ws = use_workspace();
     let open = RwSignal::new(false);
+    let present = crate::util::presence(move || open.get());
     let button = NodeRef::<leptos::html::Button>::new();
     let count = move || ws.layout.with(|l| l.tiles.len());
     let close = Callback::new(move |()| {
@@ -553,10 +554,10 @@ pub fn SessionsPicker() -> impl IntoView {
             title="Sessions" aria-label=move || picker_label(count()) aria-haspopup="dialog" aria-expanded=move || open.get().to_string()
             on:click=move |_| open.update(|o| *o = !*o)>
             {crate::icons::icon(crate::icons::Icon::PanelsTopLeft, crate::icons::Size::S16)}
-            <span data-phone-pages="true" class="absolute right-1 top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-zinc-200 px-1 text-[10px] leading-none tabular-nums dark:bg-zinc-700">{count}</span>
+            <span data-phone-pages="true" class="absolute right-1 top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-zinc-200 px-1 text-[10px] leading-none tabular-nums dark:bg-zinc-700"><crate::util::MotionCount value=Signal::derive(count) /></span>
         </button>
-        <Show when=move || open.get()>
-            <leptos::portal::Portal><SessionsSheet close /></leptos::portal::Portal>
+        <Show when=move || present.get()>
+            <leptos::portal::Portal><SessionsSheet close open /></leptos::portal::Portal>
         </Show>
     }
 }
@@ -588,9 +589,9 @@ struct SheetTile {
 /// Ask and the bell live here, rather than taking a permanent footer.
 /// Swipe the handle down, tap outside or Esc to close it.
 #[component]
-fn SessionsSheet(close: Callback<()>) -> impl IntoView {
+fn SessionsSheet(close: Callback<()>, open: RwSignal<bool>) -> impl IntoView {
     let (ws, live) = (use_workspace(), api::live());
-    let pop = crate::util::escapable(|| true, move || close.run(()));
+    let pop = crate::util::escapable(move || open.get(), move || close.run(()));
     let now = RwSignal::new(now_ms());
     let tiles = Memo::new(move |_| {
         ws.layout.with(|l| {
@@ -630,9 +631,9 @@ fn SessionsSheet(close: Callback<()>) -> impl IntoView {
     };
     let link = "block w-full rounded-md px-2 py-2 text-left text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800";
     view! {
-        <div class="fixed inset-0 z-40 bg-black/30" on:click=move |_| close.run(())></div>
-        <div role="dialog" aria-modal="true" aria-label="Sessions" data-pop=pop
-            class="phone-sheet fixed inset-x-0 bottom-0 z-50 flex max-h-[80dvh] flex-col rounded-t-xl border border-zinc-200 bg-white text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
+        <div class="c6-presence c6-scrim fixed inset-0 z-40 bg-black/30" data-open=move || open.get().to_string() inert=move || !open.get() on:click=move |_| close.run(())></div>
+        <div role="dialog" aria-modal="true" aria-label="Sessions" data-pop=pop data-open=move || open.get().to_string() inert=move || !open.get()
+            class="c6-presence c6-sheet phone-sheet fixed inset-x-0 bottom-0 z-50 flex max-h-[80dvh] flex-col rounded-t-xl border border-zinc-200 bg-white text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
             // Its handle: swiped down, the sheet goes.
             <div class="flex shrink-0 touch-none justify-center pb-1 pt-2"
                 on:pointerdown=move |ev: web_sys::PointerEvent| {

@@ -12,7 +12,7 @@ use crate::icons::{Icon, Size, icon};
 use crate::models::ModelInput;
 use crate::panes::Pane;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT, now_ms, storage_get, storage_set};
-use crate::workspace::{ColumnCtx, Go, Popover, ScrollBox, Target, View, below, use_column};
+use crate::workspace::{ColumnCtx, Go, ScrollBox, Target, View, below, use_column};
 use crate::{api, markdown, sessions};
 
 /// The small bordered action buttons on a message row (Edit, Rewind, Ask).
@@ -751,6 +751,10 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     provide_context(GlanceBeside(wide));
     let glance_at = RwSignal::new(None::<(f64, f64)>);
     let sheet = RwSignal::new(false);
+    let sheet_present = crate::util::presence(move || sheet.get());
+    let glance_present = crate::util::presence(move || wide.get());
+    let catchup_size = NodeRef::<leptos::html::Div>::new();
+    crate::util::flip_resize(catchup_size);
     Effect::new(move || {
         if wide.get() {
             glance_at.set(None);
@@ -780,6 +784,11 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     let card_open = Memo::new(move |_| cards.and_then(|c| c.with(|m| m.get(&id_stored.get_value()).filter(|c| c.open).map(|c| c.c.steps))));
     let catch_at = RwSignal::new(None::<(f64, f64)>);
     let catch_sheet = RwSignal::new(false);
+    let catch_present = crate::util::presence(move || catch_sheet.get());
+    let catch_sheet_size = NodeRef::<leptos::html::Div>::new();
+    crate::util::flip_resize(catch_sheet_size);
+    let catch_pop_size = NodeRef::<leptos::html::Div>::new();
+    crate::util::flip_resize(catch_pop_size);
     Effect::new(move || {
         if wide.get() || card_open.get().is_none() {
             catch_at.set(None);
@@ -929,7 +938,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         // The transcript at its reading width and, when the session is wide,
         // the glance beside it, the two centred together; the glance stays
         // in sight as the transcript scrolls.
-        <div class=format!("{READING_ROW} items-start")>
+        <div class=format!("relative {READING_ROW} items-start")>
         <div class=format!("{READING} px-4 pb-8 pt-4")>
             // Its catch-up, where the glance isn't a column: a pill that
             // stays at the top as the transcript scrolls.
@@ -969,10 +978,14 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                 <Transcript session=d.session feed running=Signal::derive(running) timeline />
             })}
         </div>
-        <Show when=move || wide.get()>
-            <aside class=format!("sticky top-0 max-h-[calc(100dvh-8rem)] overflow-y-auto pb-4 pt-4 {GLANCE_COLUMN}")>
+        <Show when=move || glance_present.get()>
+            <aside class=format!("c6-pane c6-presence sticky top-0 max-h-[calc(100dvh-8rem)] overflow-y-auto pb-4 pt-4 {GLANCE_COLUMN}")
+                data-open=move || wide.get().to_string() inert=move || !wide.get()
+                style=move || if wide.get() { "" } else { "position:absolute;right:0" }>
+                <div node_ref=catchup_size>
                 <crate::catchup::CatchupBody session=id_stored.get_value() jump caps=true
                     class="mb-2 border-b border-zinc-200 px-1.5 pb-3 dark:border-zinc-800" />
+                </div>
                 <crate::details::Glance chrome />
             </aside>
         </Show>
@@ -993,6 +1006,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                             stick.set(true);
                             far.set(false);
                             if let Some(el) = scroller.get_untracked() {
+                                crate::workspace::stop_glide_to_end(&el);
                                 el.set_scroll_top(el.scroll_height());
                             }
                         }>
@@ -1041,16 +1055,24 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             }}
             </Show>
         </div>
-        <Popover at=glance_at class="w-80">
+        <SessionPopover at=glance_at class="w-80">
             <SessionOverview chrome on_done=move |()| glance_at.set(None) />
-        </Popover>
-        {move || sheet.get().then(|| view! {
+        </SessionPopover>
+        <Show when=move || sheet_present.get()>
             <BottomSheet open=sheet><SessionOverview chrome on_done=move |()| sheet.set(false) /></BottomSheet>
-        })}
-        <Popover at=catch_at class="w-[min(24rem,calc(100vw-1rem))] p-3">
+        </Show>
+        <SessionPopover at=catch_at class="w-[min(24rem,calc(100vw-1rem))] p-3">
+            <div node_ref=catch_pop_size>
             <crate::catchup::CatchupBody session=id_stored.get_value() jump on_done=move |()| catch_at.set(None) />
-        </Popover>
-        {move || catch_sheet.get().then(|| view! { <crate::catchup::CatchupSheet session=id_stored.get_value() jump open=catch_sheet /> })}
+            </div>
+        </SessionPopover>
+        <Show when=move || catch_present.get()>
+            <BottomSheet open=catch_sheet label="Catch up">
+                <div node_ref=catch_sheet_size>
+                    <crate::catchup::CatchupBody session=id_stored.get_value() jump on_done=move |()| catch_sheet.set(false) />
+                </div>
+            </BottomSheet>
+        </Show>
         </div>
     }
 }
@@ -1543,7 +1565,9 @@ pub fn SessionControls(chrome: SessionChrome, #[prop(optional)] strip: bool) -> 
                 title=move || changed().map_or_else(|| "Changes (⌘-click: a new tile)".to_owned(), |n| format!("Changes: {n} files (⌘-click: a new tile)"))
                 on:click=move |ev| chrome.toggle_pane(Pane::Changes, &ev)>
                 {crate::icons::file_diff()}
-                {move || changed().map(|n| view! { <span class="text-[10px] leading-none tabular-nums">{n}</span> })}
+                <Show when=move || changed().is_some()>
+                    <span class="text-[10px] leading-none tabular-nums"><crate::util::MotionCount value=Signal::derive(move || changed().unwrap_or(0)) /></span>
+                </Show>
             </button>
             <button class=move || format!("{} {}", SESSION_SLOT, if chrome.pane_open(Pane::Terminal) { "bg-zinc-200 dark:bg-zinc-700" } else { "" })
                 aria-label="Terminal" title="Terminal (⌘-click: a new tile)" aria-pressed=move || chrome.pane_open(Pane::Terminal).to_string()
@@ -1604,10 +1628,10 @@ fn SessionStrip(chrome: SessionChrome) -> impl IntoView {
                     rename_from.set_value(below(&ev, 320.0));
                     menu_at.set(if menu_at.get_untracked().is_some() { None } else { Some(below(&ev, 240.0)) });
                 }>{crate::icons::ellipsis()}</button>
-            <Popover at=menu_at class="w-60">
+            <SessionPopover at=menu_at class="w-60">
                 <SessionMenu chrome on_rename=move |()| rename_at.set(Some(rename_from.get_value())) on_done=move |()| menu_at.set(None) />
-            </Popover>
-            <Popover at=rename_at class="w-[min(22rem,calc(100vw-1rem))] p-3">
+            </SessionPopover>
+            <SessionPopover at=rename_at class="w-[min(22rem,calc(100vw-1rem))] p-3">
                 // The name read untracked: a rebuilt form loses what was typed.
                 {move || {
                     let id = chrome.id.get_value();
@@ -1618,7 +1642,7 @@ fn SessionStrip(chrome: SessionChrome) -> impl IntoView {
                         .unwrap_or_default();
                     view! { <RenameForm session=id title on_done=move |()| rename_at.set(None) /> }
                 }}
-            </Popover>
+            </SessionPopover>
         </div>
     }
 }
@@ -1740,16 +1764,50 @@ fn short_subagents(rows: Vec<Session>, all: bool) -> Vec<Session> {
     running.into_iter().chain(ended).collect()
 }
 
+/// Session chrome keeps a popover's position and body through its exit.
+/// Reopening only changes attributes; drafts and expensive glance bodies do
+/// not remount until presence ends. Dismissal/focus behavior matches Popover.
+#[component]
+fn SessionPopover(at: RwSignal<Option<(f64, f64)>>, #[prop(into)] class: String, children: ChildrenFn) -> impl IntoView {
+    let class = StoredValue::new(class);
+    let children = StoredValue::new(children);
+    let open = Memo::new(move |_| at.with(Option::is_some));
+    let present = crate::util::presence(move || open.get());
+    let position = Memo::new(move |previous: Option<&Option<(f64, f64)>>| at.get().or_else(|| previous.copied().flatten()));
+    let pop = StoredValue::new(crate::util::escapable(
+        move || open.get(),
+        move || {
+            at.try_set(None);
+        },
+    ));
+    view! {
+        <Show when=move || present.get()>
+            <div class="c6-presence fixed inset-0 z-40" data-open=move || open.get().to_string() inert=move || !open.get()
+                on:click=move |ev| { ev.stop_propagation(); at.set(None); }></div>
+            <div data-pop=pop.get_value() data-open=move || open.get().to_string() inert=move || !open.get()
+                class=format!("c6-pop c6-presence phone-popover fixed z-50 max-h-[75vh] overflow-y-auto rounded-lg border border-zinc-200 bg-white p-2 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900 {}", class.get_value())
+                style=move || {
+                    let (x, y) = position.get().unwrap_or_default();
+                    format!("left:{x}px;top:{y}px;--c6-pop-y:{y}px;--pop-origin:top left")
+                }>
+                {children.with_value(|c| c())}
+            </div>
+        </Show>
+    }
+}
+
 /// A sheet from the bottom on a phone (the glance, what runs in the
 /// background), about half the screen, closed by a tap outside it, its ✕,
 /// or pulling its handle down.
 #[component]
-fn BottomSheet(open: RwSignal<bool>, children: Children) -> impl IntoView {
+fn BottomSheet(open: RwSignal<bool>, #[prop(default = "Session details")] label: &'static str, children: Children) -> impl IntoView {
     let close = move || open.set(false);
     let pulled_from = StoredValue::new(None::<i32>);
     view! {
-        <div class="fixed inset-0 z-40 bg-black/30" on:click=move |ev| { ev.stop_propagation(); close() }></div>
-        <div role="dialog" aria-modal="true" aria-label="Session details" class="phone-sheet fixed inset-x-0 bottom-0 z-50 flex max-h-[80dvh] flex-col rounded-t-xl border-t border-zinc-200 bg-white text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
+        <div class="c6-scrim c6-presence fixed inset-0 z-40 bg-black/30" data-open=move || open.get().to_string() inert=move || !open.get()
+            on:click=move |ev| { ev.stop_propagation(); close() }></div>
+        <div role="dialog" aria-modal="true" aria-label=label class="c6-sheet c6-presence phone-sheet fixed inset-x-0 bottom-0 z-50 flex max-h-[80dvh] flex-col rounded-t-xl border-t border-zinc-200 bg-white text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
+            data-open=move || open.get().to_string() inert=move || !open.get()
             on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); close() }>
             <div class="relative flex h-9 shrink-0 touch-none items-center justify-center pointer-coarse:h-12"
                 on:pointerdown=move |ev: web_sys::PointerEvent| pulled_from.set_value(Some(ev.client_y()))
@@ -2372,7 +2430,11 @@ fn phone_status_row(state: PhoneStatusState, show: Callback<()>) -> AnyView {
     let primary = if state.waiting > 0 {
         Some((format!("Waiting on you {}", state.waiting), "text-amber-700 dark:text-amber-300", crate::icons::triangle_alert().into_any()))
     } else if state.working {
-        Some(("Working…".into(), "text-sky-700 dark:text-sky-400", crate::icons::loader_circle().into_any()))
+        Some((
+            "Working…".into(),
+            "text-sky-700 dark:text-sky-400",
+            view! { <span class="animate-spin inline-flex">{crate::icons::loader_circle()}</span> }.into_any(),
+        ))
     } else if state.failed {
         Some(("Last turn failed".into(), "text-red-600 dark:text-red-400", crate::icons::circle_x().into_any()))
     } else {
@@ -2452,6 +2514,15 @@ fn PhoneStatus(chrome: SessionChrome, scroller: NodeRef<leptos::html::Div>, foll
         background: phone_background_count(chrome),
         failed: failure.with(Option::is_some),
     });
+    let visible = Memo::new(move |_| state.get().visible());
+    let present = crate::util::presence(move || visible.get());
+    let details_present = crate::util::presence(move || open.get());
+    // Keep the last nonempty row for its exit. Its height belongs to the
+    // transcript immediately; only this absolute visual remains afterwards.
+    let retained = Memo::new(move |previous: Option<&PhoneStatusState>| {
+        let next = state.get();
+        if next.visible() { next } else { previous.copied().unwrap_or_default() }
+    });
     Effect::new(move || {
         let Some(el) = row.get() else { return };
         let mut height = el.client_height();
@@ -2463,6 +2534,7 @@ fn PhoneStatus(chrome: SessionChrome, scroller: NodeRef<leptos::html::Div>, foll
                 if follow.try_get_untracked() == Some(true)
                     && let Some(el) = scroller.try_get_untracked().flatten()
                 {
+                    crate::workspace::stop_glide_to_end(&el);
                     el.set_scroll_top(el.scroll_height());
                 }
             }
@@ -2474,10 +2546,14 @@ fn PhoneStatus(chrome: SessionChrome, scroller: NodeRef<leptos::html::Div>, foll
         }
     });
     view! {
-        <div node_ref=row class="shrink-0 md:hidden">
-            {move || phone_status_row(state.get(), Callback::new(move |_| open.set(true)))}
+        <div node_ref=row class="relative shrink-0 md:hidden" style:height=move || if visible.get() { "44px" } else { "0px" }>
+            <Show when=move || present.get()>
+                <div class="c6-rise c6-presence absolute inset-x-0 bottom-0" data-open=move || visible.get().to_string() inert=move || !visible.get()>
+                    {move || phone_status_row(retained.get(), Callback::new(move |_| open.set(true)))}
+                </div>
+            </Show>
         </div>
-        <Show when=move || open.get()>
+        <Show when=move || details_present.get()>
             <PhoneStatusDetails chrome open failure />
         </Show>
     }
@@ -2497,15 +2573,20 @@ fn PhoneStatusDetails(chrome: SessionChrome, open: RwSignal<bool>, failure: Memo
         },
     );
     Effect::new(move || {
-        if let Some(el) = dialog.get() {
+        if open.get()
+            && let Some(el) = dialog.get()
+        {
             let _ = el.focus();
         }
     });
     view! {
         <leptos::portal::Portal>
-            <div class="phone-dialog fixed inset-0 z-50 flex items-end justify-center bg-black/30 p-2 md:items-center" on:click=move |_| open.set(false)>
+            <div class="c6-presence phone-dialog fixed inset-0 z-50 flex items-end justify-center p-2 md:items-center"
+                data-open=move || open.get().to_string() inert=move || !open.get()>
+                <div class="c6-scrim c6-presence absolute inset-0 bg-black/30" data-open=move || open.get().to_string() inert=move || !open.get() on:click=move |_| open.set(false)></div>
                 <div node_ref=dialog data-pop=pop.clone() role="dialog" aria-modal="true" aria-label="Session status" tabindex="-1"
-                    class="max-h-[80dvh] w-full max-w-lg space-y-3 overflow-y-auto rounded-lg bg-white p-4 text-sm shadow-xl dark:bg-zinc-900"
+                    class="c6-sheet c6-pane c6-presence relative max-h-[80dvh] w-full max-w-lg space-y-3 overflow-y-auto rounded-lg bg-white p-4 text-sm shadow-xl dark:bg-zinc-900"
+                    data-open=move || open.get().to_string() inert=move || !open.get()
                     on:click=|ev| ev.stop_propagation()>
                     <div class="flex items-center justify-between">
                         <h2 class="font-medium">"Session status"</h2>
@@ -3088,7 +3169,7 @@ fn NewSideChat(parent: String, anchor_seq: u64, defaults: (String, String, Strin
 /// The message box's Send: a small soft square (`rounded-full` makes it a
 /// circle), quiet while there's nothing to send, sky once there is.
 pub(crate) const SEND_SHAPE: &str = "rounded-md";
-pub(crate) const SEND: &str = "flex size-5.5 shrink-0 items-center justify-center disabled:opacity-50";
+pub(crate) const SEND: &str = "c6-send flex size-5.5 shrink-0 items-center justify-center disabled:opacity-50";
 pub(crate) const SEND_EMPTY: &str = "bg-zinc-600 text-zinc-200";
 pub(crate) const SEND_READY: &str = "bg-sky-600 text-white hover:bg-sky-700";
 
@@ -3115,7 +3196,7 @@ fn stop_question(n: usize) -> String {
 }
 
 /// Stop: a thin ring, a small square in it.
-const STOP: &str = "flex size-5 shrink-0 items-center justify-center rounded-full border-[1.2px] border-zinc-400 text-muted hover:border-zinc-500 hover:text-zinc-500 disabled:opacity-50";
+const STOP: &str = "c6-send flex size-5.5 shrink-0 items-center justify-center rounded-full border-[1.2px] border-zinc-400 text-muted hover:border-zinc-500 hover:text-zinc-500 disabled:opacity-50";
 
 pub(crate) fn send_icon() -> impl IntoView {
     icon(Icon::ArrowUp, Size::S14)
@@ -4615,7 +4696,7 @@ fn ToolCard(
     let started_open = plan.is_some();
     view! {
         <div id=dom_id class=format!("rounded-md border border-zinc-200 text-sm dark:border-zinc-800 {}", Arrived::class())>
-        <details class="group" open=started_open>
+        <details class="c6-tool-details group" open=started_open on:toggle=crate::util::reveal_tool>
             // A session it made shows on a line of its own below.
             <summary class=if made_session.is_some() {
                 "flex cursor-pointer select-none flex-wrap items-center gap-x-2 px-3 py-1.5"
@@ -5054,9 +5135,15 @@ fn Composer(
     crate::util::autosize_hint(
         area,
         move || {
-            text.track();
-            next.track();
-            running.track();
+            // Working/suggestion changes only affect the empty-box hint.
+            // Refitting an unchanged draft briefly sets height:auto: WebKit
+            // clamps the transcript to that temporary end, then misses the
+            // restored height because ResizeObserver sees no net size change.
+            if text.with(String::is_empty) {
+                next.track();
+                running.track();
+                disabled.track();
+            }
         },
         shown_next,
     );
@@ -5379,6 +5466,9 @@ fn Composer(
     let send_label = if touch { "Send" } else { "Send (Enter)" };
     // Esc stops the session the page shows (not a side chat's).
     let stop_label = if touch || inline { "Stop" } else { "Stop (Esc)" };
+    let armed = Memo::new(move |_| running.get() && esc_armed.is_some_and(|EscArmed(a)| a.get().is_some()));
+    let stop_shown = Memo::new(move |_| running.get() && (!has_text.get() || armed.get()));
+    let split_send = Memo::new(move |_| running.get() && has_text.get() && !armed.get());
     // A pending image shown full size (its index).
     let preview = RwSignal::new(None::<usize>);
     view! {
@@ -5508,7 +5598,6 @@ fn Composer(
                         on:input=move |ev| {
                             text.set(event_target_value(&ev));
                             update_mention();
-                            if let Some(el) = area.get_untracked() { crate::util::fit(&el); }
                         }
                         on:click=move |_| update_mention()
                         on:paste=move |ev| {
@@ -5681,30 +5770,31 @@ fn Composer(
                     </div>
                 })}
                         <div class="relative ml-auto flex shrink-0 items-center gap-0.5">
-                        {move || if running.get() && esc_armed.is_some_and(|EscArmed(a)| a.get().is_some()) {
-                            // One Esc pressed: Stop says what the next one does.
-                            view! { <button class=format!("{STOP} w-auto px-1.5 text-[10px] font-semibold") title="Press Esc again to stop" aria-label="Press Esc again to stop" on:click=stop>"Esc"</button> }.into_any()
-                        } else if running.get() && has_text.get() {
-                            // Both runtimes take it into the running turn (Claude Code's
-                            // process stays up: docs/background.md §4).
-                            // Send (the agent reads it at its next step), and ▾
-                            // beside it for Send now (at once).
-                            view! {
-                                // One split button: Send, then its ▾ (Send now) past a
-                                // full-height darker line, so the two read as one. Its
-                                // halves are rounded, not the box: a clipping box hid
-                                // the menu above it.
-                                <div class="relative flex items-stretch">
-                                    <button class=format!("{SEND} {TAP_SEND} rounded-l-md rounded-r-none {SEND_READY}") title=format!("{send_label}: the agent reads it at its next step") aria-label=send_label
-                                        prop:disabled=move || disabled.get() || !draft_ready.get() on:click=move |_| send()>{send_icon()}</button>
-                                    <button class="flex h-5.5 w-4 shrink-0 items-center justify-center rounded-r-md border-l border-sky-800 bg-sky-600 text-white hover:bg-sky-700 pointer-coarse:h-9 pointer-coarse:w-7"
+                        // Both controls occupy the same 22px slot. State and input
+                        // change immediately; only opacity/scale catch up. The old
+                        // action is inert on that very frame, including via keyboard.
+                        <div class="c6-send-slot">
+                            <button class=move || format!("{SEND} {TAP_SEND} {} {}", if split_send.get() { "rounded-l-md rounded-r-none" } else { SEND_SHAPE }, if has_text.get() { SEND_READY } else { SEND_EMPTY })
+                                data-active=move || (!stop_shown.get()).to_string() inert=move || stop_shown.get()
+                                title=move || if running.get() { format!("{send_label}: the agent reads it at its next step") } else { send_label.to_owned() }
+                                aria-label=send_label prop:disabled=move || disabled.get() || !draft_ready.get() || stop_shown.get()
+                                on:click=move |_| send()>{send_icon()}</button>
+                            <button class=STOP data-active=move || stop_shown.get().to_string() inert=move || !stop_shown.get()
+                                title=move || if armed.get() { "Press Esc again to stop" } else { stop_label }
+                                aria-label=move || if armed.get() { "Press Esc again to stop" } else { "Stop" }
+                                prop:disabled=move || !stop_shown.get() on:click=stop>
+                                {move || if armed.get() { view! { <span class="text-[10px] font-semibold">"Esc"</span> }.into_any() } else { stop_icon().into_any() }}
+                            </button>
+                        </div>
+                        <Show when=move || split_send.get()>
+                                    <button class="c6-send -ml-0.5 flex h-5.5 w-4 shrink-0 items-center justify-center rounded-r-md border-l border-sky-800 bg-sky-600 text-white hover:bg-sky-700 pointer-coarse:h-9 pointer-coarse:w-7"
                                         title="More ways to send" aria-label="More ways to send"
                                         aria-haspopup="menu" prop:aria-expanded=move || send_menu.get().to_string() data-pop=send_pop.get_value()
                                         on:click=move |ev| { ev.stop_propagation(); send_menu.update(|o| *o = !*o); }>
                                         {icon(Icon::ChevronDown, Size::S14)}
                                     </button>
                                     {move || send_menu.get().then(|| view! {
-                                        <div role="menu" data-pop=send_pop.get_value() class="absolute bottom-full right-0 z-40 mb-1 w-max rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
+                                        <div role="menu" data-pop=send_pop.get_value() on:keydown=crate::util::menu_keys class="c6-pop absolute bottom-full right-0 z-40 mb-1 w-max rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900" style="--pop-origin: bottom right">
                                             <button role="menuitem" class="flex w-full items-center gap-4 px-3 py-1.5 text-left hover:bg-zinc-100 pointer-coarse:py-3 dark:hover:bg-zinc-800"
                                                 title="The agent gets it now, not at its next step (Claude Code moves what it waits on to the background; its background agents go on)" on:click=move |_| send_now()>
                                                 <span>"Send now"</span>
@@ -5712,21 +5802,12 @@ fn Composer(
                                             </button>
                                         </div>
                                     })}
-                                </div>
-                            }.into_any()
-                        } else if running.get() {
-                            view! { <button class=STOP title=stop_label aria-label="Stop" on:click=stop>{stop_icon()}</button> }.into_any()
-                        } else {
-                            view! {
-                                <button class=move || format!("{SEND} {TAP_SEND} {SEND_SHAPE} {}", if has_text.get() { SEND_READY } else { SEND_EMPTY })
-                                    title=send_label aria-label=send_label prop:disabled=move || disabled.get() || !draft_ready.get() on:click=move |_| send()>{send_icon()}</button>
-                            }.into_any()
-                        }}
+                        </Show>
                         // Stop (or Esc twice) while Claude Code's own agents run
                         // in the background: they'd stop too, so it asks.
                         {move || guard.filter(|g| g.confirm.get() && running.get()).map(|g| view! {
                             <div class="fixed inset-0 z-30" on:click=move |_| g.confirm.set(false)></div>
-                            <div role="alertdialog" class="absolute bottom-full right-0 z-40 mb-1 w-72 max-w-[90vw] space-y-2 rounded-md border border-zinc-200 bg-white p-3 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
+                            <div role="alertdialog" class="c6-pop absolute bottom-full right-0 z-40 mb-1 w-72 max-w-[90vw] space-y-2 rounded-md border border-zinc-200 bg-white p-3 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900" style="--pop-origin: bottom right">
                                 <p>{move || stop_question(g.agents.get())}</p>
                                 <div class="flex flex-wrap justify-end gap-2">
                                     {move || has_text.get().then(|| view! {
@@ -6018,8 +6099,24 @@ mod tests {
                 if state.background > 0 {
                     assert!(html.contains("text-sky-700") && html.contains("<svg"), "keep the real job icon: {html}");
                 }
+                assert_eq!(html.contains("animate-spin"), state.working && state.waiting == 0, "only the working glyph spins: {html}");
             }
         });
+    }
+
+    #[test]
+    fn session_popovers_retain_position_and_body_and_gate_interactivity_not_mounting() {
+        let source = include_str!("session.rs");
+        let popover = source.split("fn SessionPopover(").nth(1).unwrap().split("fn BottomSheet(").next().unwrap();
+        assert!(popover.contains("let present = crate::util::presence(move || open.get())"));
+        assert!(popover.contains("<Show when=move || present.get()>"));
+        assert!(popover.contains("previous.copied().flatten()"), "closing keeps the exit anchored at the last position");
+        assert!(popover.contains("c6-pop c6-presence phone-popover"));
+        assert!(popover.contains("data-open=move || open.get().to_string() inert=move || !open.get()"));
+        assert!(
+            popover.contains("{children.with_value(|c| c())}"),
+            "children must not be reconstructed on every open/close attribute update"
+        );
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -6051,11 +6148,33 @@ mod tests {
         assert!(view[scroll_end..row].contains("hidden md:contents"), "no duplicate pinned child waiting row on phone");
         let conditional = source.split("fn phone_status_row").nth(1).unwrap().split("/// The most recent turn").next().unwrap();
         assert!(!conditional.contains("<Composer") && !conditional.contains("<Transcript"));
-        assert!(source.contains("node_ref=row class=\"shrink-0 md:hidden\""));
+        assert!(source.contains("node_ref=row class=\"relative shrink-0 md:hidden\""));
+        assert!(source.contains("style:height=move || if visible.get() { \"44px\" } else { \"0px\" }"));
+        assert!(source.contains("class=\"c6-rise c6-presence absolute inset-x-0 bottom-0\""), "exit visuals must not retain layout height");
+        assert!(source.contains("phone_status_row(retained.get()"), "keep the last visible status during exit");
         assert!(
             source.contains("if follow.try_get_untracked() == Some(true)"),
             "row compensation must not force a scrolled-up reader to the end"
         );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn retained_phone_sheet_serializes_open_state_and_disables_closed_tree() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let open = RwSignal::new(false);
+            let html = view! { <BottomSheet open label="Catch up"><button>"Body"</button></BottomSheet> }.to_html();
+            assert_eq!(html.matches("data-open=\"false\"").count(), 2, "CSS needs string states, not boolean custom attributes: {html}");
+            assert_eq!(html.matches(" inert").count(), 2, "scrim and body immediately stop taking input: {html}");
+            assert!(html.contains("c6-sheet c6-presence phone-sheet"), "retain keyboard viewport bounds: {html}");
+            assert!(html.contains("aria-label=\"Catch up\""));
+            assert!(html.contains("Body"), "the exiting body remains mounted");
+            open.set(true);
+            let html = view! { <BottomSheet open><button>"Body"</button></BottomSheet> }.to_html();
+            assert_eq!(html.matches("data-open=\"true\"").count(), 2);
+            assert!(!html.contains(" inert"), "opening must not delay input: {html}");
+        });
     }
 
     #[test]

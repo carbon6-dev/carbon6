@@ -6,6 +6,137 @@ use leptos::prelude::*;
 mod drafts;
 pub use drafts::attachments as draft_attachments;
 
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = c6Motion, js_name = reduced)]
+    pub fn reduced_motion() -> bool;
+    #[wasm_bindgen(js_namespace = c6Motion, js_name = off)]
+    fn motion_off() -> bool;
+    #[wasm_bindgen(js_name = c6FlipResize)]
+    fn watch_flip_resize(element: &web_sys::Element) -> js_sys::Function;
+    #[wasm_bindgen(js_name = c6FlipList)]
+    fn prepare_flip_list(element: &web_sys::Element, keys: &str);
+    #[wasm_bindgen(js_name = c6ToolReveal)]
+    fn tool_reveal(element: &web_sys::Element);
+}
+
+/// Retain an exiting body, not its interactivity. Callers set data-open and
+/// inert from the original state. Reopening cancels disposal, so CSS reverses
+/// from the displayed position instead of remounting or waiting on a timer.
+pub fn presence(open: impl Fn() -> bool + Send + Sync + 'static) -> Memo<bool> {
+    presence_signal(Signal::derive(open))
+}
+
+// Share the timer and effect machinery rather than specializing it for each caller.
+fn presence_signal(open: Signal<bool>) -> Memo<bool> {
+    let open = Memo::new(move |_| open.get());
+    let kept = RwSignal::new(false);
+    let timer = StoredValue::new(None::<TimeoutHandle>);
+    Effect::new(move || {
+        if let Some(timer) = timer.get_value() {
+            timer.clear();
+        }
+        if open.get() {
+            kept.set(true);
+        } else {
+            #[cfg(target_arch = "wasm32")]
+            let duration = if motion_off() {
+                0
+            } else if reduced_motion() {
+                80
+            } else {
+                300
+            };
+            #[cfg(not(target_arch = "wasm32"))]
+            let duration = 300;
+            timer.set_value(
+                set_timeout_with_handle(
+                    move || {
+                        kept.try_set(false);
+                    },
+                    std::time::Duration::from_millis(duration),
+                )
+                .ok(),
+            );
+        }
+    });
+    on_cleanup(move || {
+        if let Some(timer) = timer.get_value() {
+            timer.clear();
+        }
+    });
+    Memo::new(move |_| open.get() || kept.get())
+}
+
+/// A bounded card may opt into resize FLIP. Never attach this to streamed text
+/// or transcript rows: those must not measure or animate as tokens arrive.
+pub fn flip_resize(node: NodeRef<leptos::html::Div>) {
+    Effect::new(move || {
+        if let Some(el) = node.get() {
+            let dispose = send_wrapper::SendWrapper::new(watch_flip_resize(&el));
+            on_cleanup(move || {
+                let _ = dispose.call0(&wasm_bindgen::JsValue::NULL);
+            });
+        }
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn flip_list(node: NodeRef<leptos::html::Div>, next: &[String]) {
+    if let Some(el) = node.get_untracked() {
+        prepare_flip_list(&el, &serde_json::to_string(next).unwrap_or_default());
+    }
+}
+
+pub fn reveal_tool(ev: web_sys::Event) {
+    use wasm_bindgen::JsCast;
+    if let Some(el) = ev.current_target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
+        tool_reveal(&el);
+    }
+}
+
+/// A count's old and new values share a slot. The old one is decoration, not
+/// another announcement. Interruptions replace it, never queue more ticks.
+#[component]
+pub fn MotionCount(#[prop(into)] value: Signal<usize>) -> impl IntoView {
+    let old = RwSignal::new(None::<usize>);
+    #[cfg(target_arch = "wasm32")]
+    {
+        let current = RwSignal::new(value.get_untracked());
+        let timer = StoredValue::new(None::<TimeoutHandle>);
+        Effect::new(move || {
+            let next = value.get();
+            if next != current.get_untracked() {
+                old.set(Some(current.get_untracked()));
+                current.set(next);
+                if let Some(timer) = timer.get_value() {
+                    timer.clear();
+                }
+                timer.set_value(
+                    set_timeout_with_handle(
+                        move || {
+                            old.try_set(None);
+                        },
+                        std::time::Duration::from_millis(160),
+                    )
+                    .ok(),
+                );
+            }
+        });
+        on_cleanup(move || {
+            if let Some(timer) = timer.get_value() {
+                timer.clear();
+            }
+        });
+    }
+    view! {
+        <span class="c6-count">
+            {move || old.get().map(|n| view! { <span class="c6-count-out" aria-hidden="true">{n}</span> })}
+            <For each=move || vec![value.get()] key=|n| *n children=move |n| view! { <span class=move || if old.get().is_some() { "c6-count-in" } else { "" }>{n}</span> } />
+        </span>
+    }
+}
+
 /// Keep the app and its phone sheets in the *visible* viewport. Safari can
 /// overlay its keyboard without resizing 100dvh; Chromium may resize both.
 /// CSS applies these measurements only to phone layouts, not desktop tiles.
@@ -137,8 +268,18 @@ pub fn autosize(node: NodeRef<leptos::html::Textarea>, track: impl Fn() + 'stati
 pub fn autosize_hint(node: NodeRef<leptos::html::Textarea>, track: impl Fn() + 'static, hint: impl Fn() -> Option<String> + 'static) {
     use wasm_bindgen::JsCast;
     let hint = StoredValue::new_local(hint);
+    let queued = StoredValue::new(false);
     let refit = move || {
+        // Text, resize and width-observer notifications may share a frame.
+        // Measure once: repeating height:auto after the first fit/scroll snap
+        // can clamp a sibling scroll box without another net resize to observe.
+        if queued.try_update_value(|queued| std::mem::replace(queued, true)) != Some(false) {
+            return;
+        }
         request_animation_frame(move || {
+            if queued.try_update_value(|queued| *queued = false).is_none() {
+                return;
+            }
             if let Some(el) = node.try_get_untracked().flatten() {
                 let hint = hint.try_with_value(|h| untrack(h)).flatten();
                 fit_hint(&el, hint.as_deref());
@@ -325,23 +466,51 @@ impl Notice {
 #[component]
 pub fn NoticeHost() -> impl IntoView {
     let notice = Notice::get();
-    move || {
-        notice.shown.get().map(|(_, text, undo)| {
-            view! {
-                <div class="notice-safe pointer-events-none fixed inset-x-0 bottom-0 z-50 flex justify-center px-4" role="status">
-                    <div class="pointer-events-auto flex min-h-11 items-center gap-1 rounded-full bg-zinc-900 pl-4 pr-1 text-sm text-white shadow-lg dark:bg-zinc-100 dark:text-zinc-900">
-                        <span class=if undo.is_some() { "" } else { "pr-3" }>{text}</span>
-                        {undo.map(|u| view! {
+    let last = RwSignal::new(None::<Shown>);
+    let previous = RwSignal::new(None::<String>);
+    let timer = StoredValue::new(None::<TimeoutHandle>);
+    Effect::new(move || {
+        if let Some(next) = notice.shown.get() {
+            previous.set(last.get_untracked().filter(|(n, ..)| *n != next.0).map(|(_, text, _)| text));
+            last.set(Some(next));
+            if let Some(timer) = timer.get_value() {
+                timer.clear();
+            }
+            timer.set_value(
+                set_timeout_with_handle(
+                    move || {
+                        previous.try_set(None);
+                    },
+                    std::time::Duration::from_millis(160),
+                )
+                .ok(),
+            );
+        }
+    });
+    on_cleanup(move || {
+        if let Some(timer) = timer.get_value() {
+            timer.clear();
+        }
+    });
+    view! {
+        <div class="c6-presence notice-safe pointer-events-none fixed inset-x-0 bottom-0 z-50 flex justify-center px-4"
+            data-open=move || notice.shown.with(Option::is_some).to_string() inert=move || notice.shown.with(Option::is_none)>
+            <div class="c6-rise pointer-events-auto flex min-h-11 items-center gap-1 rounded-full bg-zinc-900 pl-4 pr-1 text-sm text-white shadow-lg dark:bg-zinc-100 dark:text-zinc-900" role="status">
+                <span class="inline-grid">
+                    {move || previous.get().map(|text| view! { <span aria-hidden="true" class="c6-crossfade-out col-start-1 row-start-1">{text}</span> })}
+                    <For each=move || last.get().map(|s| vec![s]).unwrap_or_default() key=|(n, ..)| *n children=move |(_, text, undo)| view! {
+                        <span class=if undo.is_some() { "c6-crossfade col-start-1 row-start-1" } else { "c6-crossfade col-start-1 row-start-1 pr-3" }>{text}</span>
+                    } />
+                </span>
+                {move || last.get().and_then(|(_, _, undo)| undo).map(|u| view! {
                             " · "
                             <button class="min-h-11 rounded-full px-3 font-medium underline" on:click=move |_| {
                                 notice.shown.set(None);
                                 u.run(());
                             }>"Undo"</button>
-                        })}
-                    </div>
-                </div>
-            }
-        })
+                })}
+            </div>
+        </div>
     }
 }
 
@@ -567,6 +736,31 @@ pub fn details_pop(menu: NodeRef<leptos::html::Details>) -> (String, impl Fn(web
     (pop, toggled)
 }
 
+/// Menu keyboard navigation is live as soon as its buttons mount, independent
+/// of the visual enter. Escape/focus restoration belongs to dismissable.
+pub fn menu_keys(ev: web_sys::KeyboardEvent) {
+    use wasm_bindgen::JsCast;
+    if !matches!(ev.key().as_str(), "ArrowDown" | "ArrowUp" | "Home" | "End") {
+        return;
+    }
+    let Some(menu) = ev.current_target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) else { return };
+    let Ok(items) = menu.query_selector_all("[role=menuitem]:not(:disabled)") else { return };
+    let items = (0..items.length()).filter_map(|i| items.item(i)?.dyn_into::<web_sys::HtmlElement>().ok()).collect::<Vec<_>>();
+    if items.is_empty() {
+        return;
+    }
+    ev.prevent_default();
+    let current =
+        document().active_element().and_then(|active| items.iter().position(|el| el.unchecked_ref::<web_sys::Element>() == &active));
+    let next = match ev.key().as_str() {
+        "Home" => 0,
+        "End" => items.len() - 1,
+        "ArrowUp" => current.unwrap_or(0).checked_sub(1).unwrap_or(items.len() - 1),
+        _ => current.map_or(0, |i| (i + 1) % items.len()),
+    };
+    let _ = items[next].focus();
+}
+
 /// An ellipsis button and its menu. With `row`, it's a row's: on touch screens
 /// always there, elsewhere on hover or keyboard focus (style/input.css).
 /// The menu is fixed to the screen, so a scrolling list doesn't clip it,
@@ -574,6 +768,17 @@ pub fn details_pop(menu: NodeRef<leptos::html::Details>) -> (String, impl Fn(web
 #[component]
 pub fn Menu(items: Vec<(&'static str, Callback<()>)>, #[prop(optional)] row: bool, #[prop(optional, into)] label: String) -> impl IntoView {
     let open = RwSignal::new(None::<(f64, f64)>);
+    let menu = NodeRef::<leptos::html::Div>::new();
+    Effect::new(move || {
+        use wasm_bindgen::JsCast;
+        if open.get().is_some()
+            && let Some(menu) = menu.get()
+            && let Ok(Some(first)) = menu.query_selector("[role=menuitem]")
+            && let Ok(first) = first.dyn_into::<web_sys::HtmlElement>()
+        {
+            let _ = first.focus();
+        }
+    });
     let pop = dismissable(
         move || open.get().is_some(),
         move || {
@@ -604,7 +809,7 @@ pub fn Menu(items: Vec<(&'static str, Callback<()>)>, #[prop(optional)] row: boo
                 open.set(at.or(Some((0.0, 0.0))));
             }>{crate::icons::ellipsis()}</button>
         {move || open.get().map(|(top, right)| view! {
-            <div role="menu" data-pop=pop.clone() class="fixed z-50 min-w-40 rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900"
+            <div node_ref=menu role="menu" data-pop=pop.clone() on:keydown=menu_keys class="c6-pop fixed z-50 min-w-40 rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900"
                 style=format!("top: {}px; right: {}px", top + 4.0, right.max(8.0))>
                 {items.get_value().into_iter().map(|(name, run)| view! {
                     <button role="menuitem" class="flex min-h-11 w-full items-center px-4 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"

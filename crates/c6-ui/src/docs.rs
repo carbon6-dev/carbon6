@@ -570,11 +570,11 @@ fn EmbedView(name: String) -> impl IntoView {
 
 // --- The list ---------------------------------------------------------------
 
-/// The list's immediate filter uses the shared, trailing switch.
+/// The archive filter is immediate, like the other shared switch rows.
 #[component]
 fn ArchiveSwitch(checked: RwSignal<bool>) -> impl IntoView {
     view! {
-        <crate::components::Switch on=move || checked.get() on_change=move |on| checked.set(on) label="Show archived" />
+        <crate::components::Switch on=checked on_change=move |on| checked.set(on) label="Show archived" />
     }
 }
 
@@ -1053,7 +1053,11 @@ fn flash_blocks(root: NodeRef<leptos::html::Div>, ids: &[String]) {
                     let (a, r) = (area.get_bounding_client_rect(), el.get_bounding_client_rect());
                     let opts = web_sys::ScrollToOptions::new();
                     opts.set_top((f64::from(area.scroll_top()) + r.top() - a.top() - (a.height() / 3.0).max(56.0)).max(0.0));
-                    opts.set_behavior(web_sys::ScrollBehavior::Smooth);
+                    opts.set_behavior(if crate::util::reduced_motion() {
+                        web_sys::ScrollBehavior::Instant
+                    } else {
+                        web_sys::ScrollBehavior::Smooth
+                    });
                     area.scroll_to_with_scroll_to_options(&opts);
                 }
                 None => el.scroll_into_view(),
@@ -1376,6 +1380,16 @@ pub fn DocPage(id: String) -> impl IntoView {
     let floating = Memo::new(move |_| panel.get() && fit.get() == Fit::Floating);
     let sheet = Memo::new(move |_| panel.get() && fit.get() == Fit::Sheet);
     let popped = Memo::new(move |_| pop.get().map(|b| (b, fit.get() == Fit::Sheet)));
+    let docked_present = crate::util::presence(move || docked.get());
+    let floating_present = crate::util::presence(move || floating.get());
+    let sheet_present = crate::util::presence(move || sheet.get());
+    let pop_sheet = Memo::new(move |_| popped.with(|p| p.as_ref().is_some_and(|(_, sheet)| *sheet)));
+    let pop_float = Memo::new(move |_| popped.with(|p| p.as_ref().is_some_and(|(_, sheet)| !*sheet)));
+    let pop_sheet_present = crate::util::presence(move || pop_sheet.get());
+    let pop_float_present = crate::util::presence(move || pop_float.get());
+    // Closing clears the selection, not the exiting visual. A reopen of the
+    // same block reverses its transition without replacing its draft/body.
+    let retained_pop = Memo::new(move |previous: Option<&Option<(String, bool)>>| popped.get().or_else(|| previous.cloned().flatten()));
 
     let attaching = RwSignal::new(false);
     let attach_file = move |ev: leptos::ev::Event| {
@@ -1591,7 +1605,7 @@ pub fn DocPage(id: String) -> impl IntoView {
                         export=Callback::new(move |()| exporting.update(|x| *x = !*x))
                         history=Callback::new(move |()| history.update(|x| *x = !*x)) />
                 </div>
-                {move || floating.get().then(|| view! { <FloatingPanel /> })}
+                <Show when=move || floating_present.get()><FloatingPanel open=Signal::derive(move || floating.get()) /></Show>
             </div>
         }
     };
@@ -1701,25 +1715,27 @@ pub fn DocPage(id: String) -> impl IntoView {
                     </main>
                 </div>
                 // Beside the doc, scrolling on its own.
-                {move || docked.get().then(|| view! {
-                    <aside class="sticky top-0 flex w-[26rem] shrink-0 flex-col border-x border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950"
-                        style=move || format!("height: {}px", tile_h.get())>
+                <Show when=move || docked_present.get()>
+                    <aside class="c6-pane c6-presence sticky top-0 flex w-[26rem] shrink-0 flex-col border-x border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950"
+                        data-open=move || docked.get().to_string() inert=move || !docked.get()
+                        style=move || format!("height:{}px;{}", tile_h.get(), if docked.get() { "" } else { "position:absolute;right:0" })>
                         <CommentsPanel />
                     </aside>
-                })}
+                </Show>
             </div>
-            {move || sheet.get().then(|| view! {
-                <Sheet close=Callback::new(move |()| panel.set(false))><CommentsPanel /></Sheet>
-            })}
-            {move || popped.get().map(|(b, on_sheet)| if on_sheet {
-                view! {
-                    <Sheet close=Callback::new(move |()| threads.close_pop())>
+            <Show when=move || sheet_present.get()>
+                <Sheet open=Signal::derive(move || sheet.get()) close=Callback::new(move |()| panel.set(false))><CommentsPanel /></Sheet>
+            </Show>
+            <Show when=move || pop_sheet_present.get()>
+                <Sheet open=Signal::derive(move || pop_sheet.get()) close=Callback::new(move |()| threads.close_pop())>
+                    {move || retained_pop.get().map(|(b, _)| view! {
                         <div class="min-h-0 flex-1 space-y-2 overflow-y-auto overscroll-contain p-3 text-sm"><PopBody block=b /></div>
-                    </Sheet>
-                }.into_any()
-            } else {
-                view! { <BlockPop block=b /> }.into_any()
-            })}
+                    })}
+                </Sheet>
+            </Show>
+            <Show when=move || pop_float_present.get()>
+                {move || retained_pop.get().map(|(b, _)| view! { <BlockPop block=b open=Signal::derive(move || pop_float.get()) /> })}
+            </Show>
         </div>
     }
 }
@@ -1774,11 +1790,13 @@ fn UsedIn(items: Signal<Vec<(View, String)>>) -> impl IntoView {
 /// The comments panel over the doc's right side, hanging from the bar; a
 /// press outside it (or Escape) closes it.
 #[component]
-fn FloatingPanel() -> impl IntoView {
+fn FloatingPanel(open: Signal<bool>) -> impl IntoView {
     let ctx = expect_context::<ThreadsCtx>();
     let node = NodeRef::<leptos::html::Div>::new();
     dismiss(node, "[data-opens=comments]", move || {
-        let _ = ctx.panel.try_set(false);
+        if open.get_untracked() {
+            let _ = ctx.panel.try_set(false);
+        }
     });
     follow_popover(node, move || {
         if let Some(el) = node.try_get_untracked().flatten()
@@ -1788,7 +1806,8 @@ fn FloatingPanel() -> impl IntoView {
         }
     });
     view! {
-        <div node_ref=node class="absolute z-10 flex w-[26rem] max-w-[calc(100%-1rem)] flex-col overflow-hidden rounded-lg border border-zinc-200 bg-white shadow-xl dark:border-zinc-700 dark:bg-zinc-900">
+        <div node_ref=node class="c6-pane c6-presence absolute z-10 flex w-[26rem] max-w-[calc(100%-1rem)] flex-col overflow-hidden rounded-lg border border-zinc-200 bg-white shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
+            data-open=move || open.get().to_string() inert=move || !open.get()>
             <CommentsPanel />
         </div>
     }
@@ -1797,7 +1816,7 @@ fn FloatingPanel() -> impl IntoView {
 /// A sheet from the bottom of the screen (a phone's), over a dimmed page;
 /// a tap above it or Escape closes it.
 #[component]
-fn Sheet(close: Callback<()>, children: Children) -> impl IntoView {
+fn Sheet(open: Signal<bool>, close: Callback<()>, children: Children) -> impl IntoView {
     let node = NodeRef::<leptos::html::Div>::new();
     follow_popover(node, move || {
         if let Some(el) = node.try_get_untracked().flatten() {
@@ -1809,14 +1828,16 @@ fn Sheet(close: Callback<()>, children: Children) -> impl IntoView {
         }
     });
     let keys = window_event_listener(leptos::ev::keydown, move |ev| {
-        if ev.key() == "Escape" && !ev.default_prevented() {
+        if open.get_untracked() && ev.key() == "Escape" && !ev.default_prevented() {
             close.run(());
         }
     });
     on_cleanup(move || keys.remove());
     view! {
-        <div class="fixed inset-0 z-40 bg-black/30" on:click=move |_| close.run(())></div>
-        <div node_ref=node class="fixed inset-x-0 bottom-0 z-50 flex max-h-[85dvh] flex-col overflow-hidden rounded-t-xl border-t border-zinc-200 bg-white shadow-2xl dark:border-zinc-700 dark:bg-zinc-900">
+        <div class="c6-scrim c6-presence fixed inset-0 z-40 bg-black/30" data-open=move || open.get().to_string() inert=move || !open.get()
+            on:click=move |_| close.run(())></div>
+        <div node_ref=node class="c6-sheet c6-presence phone-sheet fixed inset-x-0 bottom-0 z-50 flex max-h-[85dvh] flex-col overflow-hidden rounded-t-xl border-t border-zinc-200 bg-white shadow-2xl dark:border-zinc-700 dark:bg-zinc-900"
+            data-open=move || open.get().to_string() inert=move || !open.get()>
             {children()}
         </div>
     }
@@ -1830,9 +1851,17 @@ fn CommentsPanel() -> impl IntoView {
     let ctx = expect_context::<ThreadsCtx>();
     let archived = read_only();
     let resolved = RwSignal::new(false);
-    let ids = Memo::new(move |_| {
+    let list = NodeRef::<leptos::html::Div>::new();
+    let ids = Memo::new(move |previous: Option<&Vec<String>>| {
         let resolved = resolved.get();
-        ctx.shown.with(|ts| ts.iter().filter(|t| (t.state != "open") == resolved).map(|t| t.id.clone()).collect::<Vec<_>>())
+        let next = ctx.shown.with(|ts| ts.iter().filter(|t| (t.state != "open") == resolved).map(|t| t.id.clone()).collect::<Vec<_>>());
+        // Capture rows before For changes the keyed DOM; comment edits and
+        // new replies keep these IDs and never start list motion.
+        if previous.is_some_and(|previous| previous != &next) {
+            #[cfg(target_arch = "wasm32")]
+            crate::util::flip_list(list, &next);
+        }
+        next
     });
     // A new comment on the tab, or on what has no popover (a slide).
     let new_on = Memo::new(move |_| ctx.commenting.get().filter(|b| !archived.get() && ctx.pop.with(|p| p.as_ref() != Some(b))));
@@ -1852,13 +1881,15 @@ fn CommentsPanel() -> impl IntoView {
             <button class="rounded px-1.5 text-lg leading-none text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
                 title="Close" aria-label="Close the comments" on:click=move |_| ctx.panel.set(false)>{crate::icons::icon(crate::icons::Icon::X, crate::icons::Size::S14)}</button>
         </div>
-        <div class="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain p-3 text-sm">
+        <div node_ref=list class="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain p-3 text-sm">
             <Show when=move || !archived.get()>
             <button class="text-xs text-muted hover:text-zinc-900 hover:underline dark:hover:text-zinc-100"
                 on:click=move |_| { ctx.focus.set(Some(String::new())); ctx.commenting.set(Some(String::new())) }>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" On the whole tab"</button>
             </Show>
             {move || new_on.get().map(|b| view! { <NewComment block=b done=Callback::new(move |()| ctx.commenting.set(None)) /> })}
-            <For each=move || ids.get() key=|id| id.clone() children=move |id| view! { <Thread id about=true /> } />
+            <For each=move || ids.get() key=|id| id.clone() children=move |id| view! {
+                <div data-motion-key=id.clone()><Thread id=id.clone() about=true /></div>
+            } />
             {move || ids.with(Vec::is_empty).then(|| view! {
                 <p class="text-muted">{if resolved.get() { view! { "No resolved comments." }.into_any() } else { view! { "No open comments. Press "{crate::icons::icon(crate::icons::Icon::MessageSquare, crate::icons::Size::S14)}" by a block to start one." }.into_any() }}</p>
             })}
@@ -1875,7 +1906,7 @@ fn CommentsPanel() -> impl IntoView {
 /// A block's comments, in a popover by its 💬 over the doc: a press
 /// outside it or Escape closes it.
 #[component]
-fn BlockPop(block: String) -> impl IntoView {
+fn BlockPop(block: String, open: Signal<bool>) -> impl IntoView {
     let ctx = expect_context::<ThreadsCtx>();
     let node = ctx.pop_node;
     let bid = StoredValue::new(block.clone());
@@ -1889,9 +1920,14 @@ fn BlockPop(block: String) -> impl IntoView {
             ctx.place_pop(&m);
         }
     });
-    dismiss(node, "[data-marks]", move || ctx.close_pop());
+    dismiss(node, "[data-marks]", move || {
+        if open.get_untracked() {
+            ctx.close_pop()
+        }
+    });
     view! {
-        <div node_ref=node class="absolute z-30 w-96 space-y-2 overflow-y-auto overscroll-contain rounded-lg border border-zinc-200 bg-white p-2 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900">
+        <div node_ref=node class="c6-pop c6-presence absolute z-30 w-96 space-y-2 overflow-y-auto overscroll-contain rounded-lg border border-zinc-200 bg-white p-2 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
+            data-open=move || open.get().to_string() inert=move || !open.get()>
             <PopBody block />
         </div>
     }
@@ -2838,6 +2874,9 @@ fn Thread(id: String, about: bool) -> impl IntoView {
     let (doc, tick) = (ctx.doc, ctx.tick);
     let tid = StoredValue::new(id);
     let t = Memo::new(move |_| ctx.shown.with(|ts| ts.iter().find(|t| t.id == tid.get_value()).cloned().unwrap_or_default()));
+    // Opening an existing thread is not an arrival. Keyed comment redraws
+    // (editing text or updating editability) are not arrivals either.
+    let seen = StoredValue::new(t.with_untracked(|t| t.comments.iter().map(|c| c.id.clone()).collect::<std::collections::HashSet<_>>()));
     // A draft: the thread may be drawn again (in the panel and a popover).
     let key = StoredValue::new(format!("reply.{}.{}", doc.get_value(), tid.get_value()));
     let reply = crate::util::draft(&key.get_value());
@@ -2953,11 +2992,14 @@ fn Thread(id: String, about: bool) -> impl IntoView {
             {status}
             <div node_ref=list class="max-h-96 space-y-2 overflow-y-auto">
                 <For each=comments key=|(c, edits)| (c.id.clone(), c.text.clone(), c.editable, edits.clone()) children=move |(c, edits)| {
-                    if c.by == "you" && c.editable {
+                    let arrives = !seen.with_value(|ids| ids.contains(&c.id));
+                    seen.update_value(|ids| { ids.insert(c.id.clone()); });
+                    let body = if c.by == "you" && c.editable {
                         view! { <MyComment c thread=tid.get_value() /> }.into_any()
                     } else {
                         said(&c, edits.map(|_| t.with_untracked(|t| changed_the_doc(ctx, t))))
-                    }
+                    };
+                    view! { <div class=if arrives { "c6-arrive" } else { "" }>{body}</div> }
                 } />
                 {changed_after}
             </div>
@@ -3369,10 +3411,7 @@ mod tests {
             let checked = RwSignal::new(false);
             let html = view! { <ArchiveSwitch checked /> }.to_html();
             assert!(html.contains("role=\"switch\"") && html.contains("aria-checked=\"false\""), "{html}");
-            assert!(
-                html.find("Show archived</span>").unwrap() < html.find("aria-hidden=\"true\"").unwrap(),
-                "label must stay left: {html}"
-            );
+            assert!(html.find(">Show archived").unwrap() < html.find("h-4 w-7").unwrap(), "label must stay left: {html}");
             assert!(
                 html.matches("<button").count() == 1 && html.contains("w-full") && html.contains("pointer-coarse:min-h-11"),
                 "the entire row must be clickable, with a 44px touch target: {html}"
@@ -3478,6 +3517,38 @@ mod tests {
             assert!(edit.get_untracked().is_some());
             assert_eq!(draft.text.get_untracked(), "After");
         });
+    }
+
+    #[test]
+    fn comments_list_captures_flip_before_keyed_updates_only_when_ids_change() {
+        let source = include_str!("docs.rs");
+        let panel = source.split("fn CommentsPanel()").nth(1).unwrap().split("fn BlockPop(").next().unwrap();
+        let memo = panel.split("let ids = Memo::new").nth(1).unwrap().split("// A new comment").next().unwrap();
+        assert!(memo.contains("previous: Option<&Vec<String>>"));
+        assert!(memo.contains("previous.is_some_and(|previous| previous != &next)"), "text/reply updates must not animate the list");
+        assert!(memo.find("crate::util::flip_list(list, &next)").unwrap() < memo.rfind("next").unwrap());
+        assert!(panel.contains("<div node_ref=list class=\"min-h-0 flex-1 space-y-3"));
+        assert!(panel.contains("<div data-motion-key=id.clone()><Thread id=id.clone() about=true /></div>"));
+    }
+
+    #[test]
+    fn docs_motion_retains_panels_and_only_new_comments_arrive() {
+        let source = include_str!("docs.rs");
+        let page = source.split("pub fn DocPage(").nth(1).unwrap().split("fn send_all_button(").next().unwrap();
+        for present in ["docked_present", "floating_present", "sheet_present", "pop_sheet_present", "pop_float_present"] {
+            assert!(page.contains(&format!("<Show when=move || {present}.get()>")), "heavy panels need retained presence: {present}");
+        }
+        assert!(page.contains("let retained_pop = Memo::new"), "closing must not discard the popover's block immediately");
+        let thread = source.split("fn Thread(").nth(1).unwrap().split("thread_local!").next().unwrap();
+        assert!(
+            thread.contains("StoredValue::new(t.with_untracked(|t| t.comments.iter()"),
+            "already visible comments must not arrive again"
+        );
+        assert!(thread.contains("!seen.with_value(|ids| ids.contains(&c.id))"), "edits/editability redraws are not new arrivals");
+        assert!(thread.contains("if arrives { \"c6-arrive\" } else { \"\" }"));
+        let flash = source.split("fn flash_blocks(").nth(1).unwrap().split("fn reveal_targets(").next().unwrap();
+        assert!(flash.contains("crate::util::reduced_motion()"));
+        assert!(flash.contains("web_sys::ScrollBehavior::Instant"), "Reduced/Off cannot inherit smooth scrolling");
     }
 
     #[test]

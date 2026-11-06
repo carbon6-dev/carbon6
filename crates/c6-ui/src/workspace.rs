@@ -732,7 +732,13 @@ impl Layout {
     /// shown that was used last. The last tile closing leaves the home view.
     fn remove_tile(&mut self, ti: usize) {
         if self.tiles.len() == 1 {
-            *self = Layout::new(View::home());
+            // A replacement, not the old tile with new contents: keep keys
+            // monotonic so its ghost can exit while Home is already live.
+            let home = self.new_tile(View::home());
+            self.tiles = vec![home];
+            self.focus = 0;
+            self.full = false;
+            self.place();
             return;
         }
         let focused = self.tiles.get(self.focus).map(|t| t.key).filter(|_| self.focus != ti);
@@ -940,7 +946,305 @@ fn load<T: for<'de> Deserialize<'de>>(key: &str) -> Option<T> {
     serde_json::from_str(&storage_get(key)?).ok()
 }
 
+// Layout is committed by Leptos immediately. Only its picture catches up. Keep
+// this specific to workspace roots: no transcript observation or per-frame
+// layout reads, and never wait for an animation to mount/focus an input.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
+let workspaceMotion;
+const tileEaseOut = 'cubic-bezier(.2,0,0,1)';
+const tileEaseMove = 'cubic-bezier(.3,0,0,1)';
+const tileEaseIn = 'cubic-bezier(.4,0,1,1)';
+function tileMotionMode() {
+    const motion = window.c6Motion;
+    if (motion?.off() || document.documentElement.dataset.motion === 'off') return 'off';
+    return (motion ? motion.reduced() : matchMedia('(prefers-reduced-motion: reduce)').matches) ? 'reduced' : 'full';
+}
+function tileMotionNodes(root) {
+    const nodes = [];
+    for (const tile of root.children) {
+        if (!tile.hasAttribute('data-tile-motion')) continue;
+        nodes.push(tile);
+        // TileView's section ends with the pane host. Walk just these roots,
+        // not the potentially very large transcript/content trees inside them.
+        const host = tile.firstElementChild?.lastElementChild;
+        if (!host?.hasAttribute('data-pane-host')) continue;
+        for (const pane of host.children) if (pane.hasAttribute('data-pane-motion')) nodes.push(pane);
+    }
+    return nodes;
+}
+function tileMotionKey(el) {
+    return el.hasAttribute('data-tile-motion') ? 't' + el.dataset.tileMotion : 'p' + el.dataset.paneMotion;
+}
+function tileMotionCancel(state) {
+    if (state.frame) cancelAnimationFrame(state.frame);
+    state.frame = 0;
+    state.before = null;
+    for (const animation of state.animations.values()) animation.cancel();
+    state.animations.clear();
+    for (const ghost of state.ghosts) ghost.remove();
+    state.ghosts.clear();
+    state.exits.clear();
+}
+export function tileMotionStop() {
+    if (!workspaceMotion) return;
+    tileMotionCancel(workspaceMotion);
+    window.removeEventListener('c6-motion', workspaceMotion.preference);
+    workspaceMotion = undefined;
+}
+function tileMotionAnimate(state, el, frames, duration, easing, done = () => {}) {
+    if (!el.animate || !duration) { done(); return; }
+    const animation = el.animate(frames, { duration, easing });
+    state.animations.set(el, animation);
+    animation.onfinish = animation.oncancel = () => {
+        if (state.animations.get(el) === animation) state.animations.delete(el);
+        done();
+    };
+}
+function tileMotionGhost(state, key, item, mode) {
+    const ghost = document.createElement('div');
+    const picture = item.el.cloneNode(true);
+    // Clones have no event handlers. Inert/aria-hidden also remove forms and
+    // links from pointer, keyboard and accessibility interaction immediately.
+    ghost.inert = true;
+    ghost.setAttribute('aria-hidden', 'true');
+    picture.removeAttribute('id');
+    picture.removeAttribute('data-tile-motion');
+    picture.removeAttribute('data-pane-motion');
+    for (const el of picture.querySelectorAll('[id]')) el.removeAttribute('id');
+    for (const pop of picture.querySelectorAll('[data-pop]')) {
+        pop.previousElementSibling?.remove();
+        pop.remove();
+    }
+    const r = item.rect;
+    Object.assign(ghost.style, {
+        position: 'fixed', left: r.left + 'px', top: r.top + 'px',
+        width: r.width + 'px', height: r.height + 'px', margin: '0',
+        display: 'flex', flex: 'none', pointerEvents: 'none', zIndex: '30',
+        transform: 'none', transformOrigin: 'center', transition: 'none', overflow: 'hidden',
+    });
+    // Preserve the old layout inside its displayed picture instead of reflowing
+    // text at a partly animated width. Descendant pane transforms are their own
+    // computed transforms, not the ancestor FLIP a second time.
+    Object.assign(picture.style, {
+        position: 'absolute', left: '0', top: '0', margin: '0',
+        width: item.width + 'px', height: item.height + 'px', display: 'flex',
+        transformOrigin: '0 0', transform: `scale(${r.width / item.width},${r.height / item.height})`,
+        opacity: '1', transition: 'none',
+    });
+    for (const pane of picture.querySelectorAll('[data-pane-motion]')) {
+        const old = state.before.get(tileMotionKey(pane));
+        if (old) Object.assign(pane.style, { transform: old.transform, transformOrigin: old.origin, opacity: old.opacity });
+    }
+    ghost.append(picture);
+    document.body.append(ghost);
+    // cloneNode preserves content, not scroll offsets. Only inspect scroll
+    // boxes on this one outgoing root, never every transcript row on a move.
+    const selector = '.overflow-auto, .overflow-x-auto, .overflow-y-auto';
+    const scrollers = Array.from(item.el.querySelectorAll(selector)).filter(el => !el.closest('[data-pop]'));
+    const copies = picture.querySelectorAll(selector);
+    for (let i = 0; i < copies.length; i++) {
+        if (scrollers[i]) { copies[i].scrollTop = scrollers[i].scrollTop; copies[i].scrollLeft = scrollers[i].scrollLeft; }
+    }
+    state.ghosts.add(ghost);
+    state.exits.set(key, { ghost, item });
+    const opacity = item.opacity * (state.before.get(item.parent)?.opacity ?? 1);
+    tileMotionAnimate(state, ghost, mode === 'full' ? [
+        { opacity, transform: 'none' },
+        { opacity: 0, transform: 'scale(.94)' },
+    ] : [{ opacity }, { opacity: 0 }], mode === 'full' ? 150 : 80, tileEaseIn, () => {
+        ghost.remove();
+        state.ghosts.delete(ghost);
+        if (state.exits.get(key)?.ghost === ghost) state.exits.delete(key);
+    });
+    return ghost;
+}
+export function tileMotionPrepare(json) {
+    const root = document.querySelector('[data-workspace-motion]');
+    if (!root) return;
+    if (workspaceMotion?.root !== root) {
+        tileMotionStop();
+        const state = { root, before: null, frame: 0, animations: new Map(), ghosts: new Set(), exits: new Map() };
+        state.preference = () => { if (tileMotionMode() !== 'full') tileMotionCancel(state); };
+        window.addEventListener('c6-motion', state.preference);
+        workspaceMotion = state;
+    }
+    const state = workspaceMotion;
+    const mode = tileMotionMode();
+    if (mode === 'off') { tileMotionCancel(state); return; }
+    const phone = !matchMedia('(width >= 48rem) and (height >= 32rem)').matches;
+    const shown = new Set();
+    for (const tile of JSON.parse(json)) {
+        if (!(phone ? tile.phone : tile.desktop)) continue;
+        shown.add('t' + tile.key);
+        for (const [key, current] of tile.panes) if (!phone || current) shown.add('p' + key);
+    }
+    if (!state.before) {
+        // Read all displayed rects BEFORE cancelling interrupted animations.
+        // Batch reads, then writes; one first/last measurement per action.
+        state.before = new Map();
+        for (const el of tileMotionNodes(root)) {
+            const rect = el.getBoundingClientRect();
+            if (!rect.width || !rect.height) continue;
+            const parent = el.closest('[data-tile-motion]');
+            const style = getComputedStyle(el);
+            state.before.set(tileMotionKey(el), {
+                el, rect, opacity: Number(style.opacity), width: el.offsetWidth, height: el.offsetHeight,
+                transform: style.transform, origin: style.transformOrigin,
+                parent: parent && parent !== el ? tileMotionKey(parent) : null,
+            });
+        }
+        // A restore can interrupt an exit after its real tile was hidden (or
+        // unmounted). Use the ghost's current picture as First, then discard it
+        // before the real, immediately interactive tile reappears.
+        for (const [key, exit] of state.exits) {
+            if (!shown.has(key)) continue;
+            if (!state.before.has(key)) {
+                const rect = exit.ghost.getBoundingClientRect();
+                state.before.set(key, { ...exit.item, rect, opacity: Number(getComputedStyle(exit.ghost).opacity), ghost: null });
+                for (const pane of exit.ghost.querySelectorAll('[data-pane-motion]')) {
+                    const paneKey = tileMotionKey(pane);
+                    if (state.before.has(paneKey)) continue;
+                    const style = getComputedStyle(pane);
+                    state.before.set(paneKey, {
+                        el: pane, rect: pane.getBoundingClientRect(), parent: key,
+                        opacity: Number(style.opacity), width: pane.offsetWidth, height: pane.offsetHeight,
+                        transform: style.transform, origin: style.transformOrigin,
+                    });
+                }
+            }
+        }
+        for (const animation of state.animations.values()) {
+            if (!state.ghosts.has(animation.effect?.target)) animation.cancel();
+        }
+    }
+    for (const [key, exit] of state.exits) {
+        if (!shown.has(key)) continue;
+        state.animations.get(exit.ghost)?.cancel();
+        exit.ghost.remove();
+        state.ghosts.delete(exit.ghost);
+        state.exits.delete(key);
+    }
+    // Snapshot only outgoing roots, before keyed DOM cleanup can tear down
+    // their content. A tile ghost already contains its panes. Coalesce actions
+    // in the same frame without replacing the originally displayed rects.
+    for (const [key, item] of state.before) {
+        if (shown.has(key) && item.ghost) {
+            state.animations.get(item.ghost)?.cancel();
+            item.ghost.remove();
+            state.ghosts.delete(item.ghost);
+            item.ghost = null;
+        } else if (!shown.has(key) && !item.ghost && (!item.parent || shown.has(item.parent))) {
+            item.ghost = tileMotionGhost(state, key, item, mode);
+        }
+    }
+    if (state.frame) return;
+    state.frame = requestAnimationFrame(() => {
+        state.frame = 0;
+        const before = state.before;
+        state.before = null;
+        if (!root.isConnected || tileMotionMode() === 'off') return;
+        const reduced = tileMotionMode() === 'reduced';
+        const after = new Map();
+        for (const el of tileMotionNodes(root)) {
+            const rect = el.getBoundingClientRect();
+            if (rect.width && rect.height) after.set(tileMotionKey(el), { el, rect });
+        }
+        // Last reads are complete. From here only compositor properties change.
+        for (const [key, item] of after) {
+            const old = before.get(key);
+            const parent = item.el.hasAttribute('data-pane-motion') ? item.el.closest('[data-tile-motion]') : null;
+            const parentKey = parent ? tileMotionKey(parent) : null;
+            if (parentKey && !before.has(parentKey)) continue; // its tile enters as one picture
+            if (!old) {
+                if (!reduced) item.el.style.transformOrigin = 'center';
+                tileMotionAnimate(state, item.el, reduced ? [{ opacity: 0 }, { opacity: 1 }] : [
+                    { opacity: 0, transform: 'scale(.94)' },
+                    { opacity: 1, transform: 'none' },
+                ], reduced ? 80 : 220, tileEaseOut);
+                continue;
+            }
+            const a = item.rect, b = old.rect;
+            let dx = b.left - a.left, dy = b.top - a.top;
+            let sx = b.width / a.width, sy = b.height / a.height;
+            // A pane's ancestor FLIP already moves/scales it. Compensate in
+            // that ancestor's coordinate space rather than doubling motion.
+            const bp = before.get(parentKey)?.rect, ap = after.get(parentKey)?.rect;
+            if (bp && ap) {
+                const px = bp.width / ap.width, py = bp.height / ap.height;
+                dx = (b.left - bp.left) / px - (a.left - ap.left);
+                dy = (b.top - bp.top) / py - (a.top - ap.top);
+                sx /= px; sy /= py;
+            }
+            if (Math.abs(dx) < .5 && Math.abs(dy) < .5 && Math.abs(sx - 1) < .001 && Math.abs(sy - 1) < .001 && old.opacity >= .999) continue;
+            if (!reduced) item.el.style.transformOrigin = '0 0';
+            tileMotionAnimate(state, item.el, reduced ? [
+                { opacity: Math.min(old.opacity, .7) }, { opacity: 1 },
+            ] : [
+                { transform: `translate(${dx}px,${dy}px) scale(${sx},${sy})`, opacity: old.opacity },
+                { transform: 'none', opacity: 1 },
+            ], reduced ? 80 : 220, tileEaseMove);
+        }
+    });
+}
+"#)]
+extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = tileMotionPrepare)]
+    fn tile_motion_prepare(layout: &str);
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = tileMotionStop)]
+    fn tile_motion_stop();
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(PartialEq, Serialize)]
+struct MotionTile {
+    key: u64,
+    rect: [f64; 4],
+    desktop: bool,
+    phone: bool,
+    panes: Vec<(u64, bool)>,
+    even: bool,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn motion_layout(layout: &Layout) -> Vec<MotionTile> {
+    let rects = layout.rects();
+    layout
+        .tiles
+        .iter()
+        .enumerate()
+        .map(|(i, tile)| {
+            let rect = rects.get(&tile.key).copied().unwrap_or_default();
+            MotionTile {
+                key: tile.key,
+                rect: [rect.left, rect.top, rect.width, rect.height],
+                desktop: !tile.minimized && (!layout.full || layout.focus == i),
+                phone: !tile.minimized && layout.focus == i,
+                panes: tile.columns.iter().enumerate().map(|(i, col)| (col.key, tile.cursor == i)).collect(),
+                even: tile.columns.len() == 2 && layout.bar_column(tile.key) == Some(tile.columns[0].key),
+            }
+        })
+        .collect()
+}
+
 impl Workspace {
+    /// Capture before notifying reactive layout consumers. The rAF callback
+    /// reads their final geometry, without deferring layout, mounting or focus.
+    fn update_layout(&self, change: impl FnOnce(&mut Layout)) {
+        self.layout.update(|layout| {
+            #[cfg(target_arch = "wasm32")]
+            let before = motion_layout(layout);
+            change(layout);
+            #[cfg(target_arch = "wasm32")]
+            {
+                let after = motion_layout(layout);
+                if before != after {
+                    tile_motion_prepare(&serde_json::to_string(&after).unwrap_or_default());
+                }
+            }
+        });
+    }
+
     /// The saved workspace, with the page's URL opened in it.
     pub fn restore() -> Self {
         let here = View::from_location();
@@ -1010,7 +1314,7 @@ impl Workspace {
     /// replaces the focused tile (an item goes beside the list it shows).
     /// A session already shown somewhere is shown where it is.
     pub fn open(&self, from: Option<(u64, u64)>, view: View, how: How) {
-        self.layout.update(|l| {
+        self.update_layout(|l| {
             if view == View::Brief && how != How::NewTile && l.focus_brief() {
                 return;
             }
@@ -1068,18 +1372,18 @@ impl Workspace {
     /// Opens `view` beside pane `col` of tile `tile`, keeping that pane (a
     /// session's Changes beside its transcript).
     pub fn open_after(&self, tile: u64, col: u64, view: View) {
-        self.layout.update(|l| l.open_after(tile, col, view));
+        self.update_layout(|l| l.open_after(tile, col, view));
     }
 
     /// Brings a pane forward (its tile shown and focused; on a phone, the
     /// pane shown).
     pub fn reveal(&self, tile: u64, col: u64) {
-        self.layout.update(|l| l.reveal(tile, col));
+        self.update_layout(|l| l.reveal(tile, col));
     }
 
     /// Moves the item a tile shows (its right pane) into a tile of its own.
     pub fn detach(&self, tile: u64) {
-        self.layout.update(|l| {
+        self.update_layout(|l| {
             let Some(ti) = l.tiles.iter().position(|t| t.key == tile) else { return };
             if l.tiles[ti].columns.len() < 2 {
                 return;
@@ -1093,7 +1397,7 @@ impl Workspace {
 
     /// Back (`delta` < 0) or forward in the focused tile's history.
     pub fn step(&self, delta: isize) {
-        self.layout.update(|l| {
+        self.update_layout(|l| {
             let t = &mut l.tiles[l.focus];
             if delta < 0 {
                 if let Some(prev) = t.back.pop() {
@@ -1111,7 +1415,7 @@ impl Workspace {
 
     /// On a phone, from the item back to the list beside it.
     pub fn show_list(&self, tile: u64) {
-        self.layout.update(|l| {
+        self.update_layout(|l| {
             if let Some(t) = l.tile_mut(tile) {
                 t.cursor = 0;
                 t.active = t.columns[0].key;
@@ -1121,7 +1425,7 @@ impl Workspace {
 
     /// Changes what a column shows in place (e.g. a search's query).
     pub fn replace(&self, tile: u64, col: u64, view: View) {
-        self.layout.update(|l| {
+        self.update_layout(|l| {
             if let Some(c) = l.tile_mut(tile).and_then(|t| t.columns.iter_mut().find(|c| c.key == col)) {
                 c.view = view;
             }
@@ -1131,7 +1435,7 @@ impl Workspace {
     /// Closes a pane: the item (the list stays), or the list (the item
     /// takes the tile); a tile's last pane closes the tile.
     pub fn close_column(&self, tile: u64, col: u64) {
-        self.layout.update(|l| {
+        self.update_layout(|l| {
             let Some(ti) = l.tiles.iter().position(|t| t.key == tile) else { return };
             let t = &mut l.tiles[ti];
             let Some(i) = t.columns.iter().position(|c| c.key == col) else { return };
@@ -1146,7 +1450,7 @@ impl Workspace {
     }
 
     pub fn close_tile(&self, tile: u64) {
-        self.layout.update(|l| {
+        self.update_layout(|l| {
             let Some(ti) = l.tiles.iter().position(|t| t.key == tile) else { return };
             l.remove_tile(ti);
         });
@@ -1154,7 +1458,7 @@ impl Workspace {
 
     /// Minimizes a tile (not the last one shown).
     pub fn minimize(&self, tile: u64) {
-        self.layout.update(|l| {
+        self.update_layout(|l| {
             if let Some(ti) = l.tiles.iter().position(|t| t.key == tile) {
                 l.minimize(ti);
             }
@@ -1163,7 +1467,7 @@ impl Workspace {
 
     /// Brings a tile back, if minimized, and focuses it.
     pub fn show_tile(&self, tile: u64) {
-        self.layout.update(|l| {
+        self.update_layout(|l| {
             if let Some(ti) = l.tiles.iter().position(|t| t.key == tile) {
                 l.show(ti);
             }
@@ -1196,7 +1500,7 @@ impl Workspace {
 
     /// Moves a dragged tile to where it was dropped.
     pub fn move_tile(&self, key: u64, to: Drop) {
-        self.layout.update(|l| l.move_tile(key, to));
+        self.update_layout(|l| l.move_tile(key, to));
     }
 
     pub fn new_tile(&self) {
@@ -1206,7 +1510,7 @@ impl Workspace {
     /// Focus mode on (for the tile `key`) or off: in it, the focused tile
     /// fills the workspace (and stays in it as the focus moves to another).
     pub fn set_full(&self, key: Option<u64>) {
-        self.layout.update(|l| {
+        self.update_layout(|l| {
             if let Some(i) = key.and_then(|k| l.tiles.iter().position(|t| t.key == k)) {
                 l.show(i);
             }
@@ -1223,7 +1527,7 @@ impl Workspace {
     pub fn focus_tile(&self, n: usize) {
         let Some(ti) = self.layout.with_untracked(|l| l.reading_order().get(n).copied()) else { return };
         if self.layout.with_untracked(|l| l.focus != ti || l.tiles[ti].minimized) {
-            self.layout.update(|l| l.show(ti));
+            self.update_layout(|l| l.show(ti));
         }
     }
 
@@ -1234,7 +1538,7 @@ impl Workspace {
         if let Some(i) = self.layout.with_untracked(|l| l.tiles.iter().position(|t| t.key == key))
             && self.layout.with_untracked(|l| l.focus != i)
         {
-            self.layout.update(|l| l.focus = i);
+            self.update_layout(|l| l.focus = i);
         }
     }
 
@@ -1243,13 +1547,13 @@ impl Workspace {
     fn grow(&self, key: u64) {
         let latest = self.layout.with_untracked(|l| l.tile(key).is_none_or(|t| t.used == l.next));
         if !latest && let Some(i) = self.layout.with_untracked(|l| l.tiles.iter().position(|t| t.key == key)) {
-            self.layout.update(|l| l.touch(i));
+            self.update_layout(|l| l.touch(i));
         }
     }
 
     pub fn set_active(&self, tile: u64, col: u64) {
         if self.layout.with_untracked(|l| l.tile(tile).is_some_and(|t| t.active != col)) {
-            self.layout.update(|l| {
+            self.update_layout(|l| {
                 if let Some(t) = l.tile_mut(tile) {
                     t.active = col;
                 }
@@ -1642,8 +1946,10 @@ pub fn ScrollBox(
                 request_animation_frame(move || {
                     if let Some(el) = node.try_get_untracked().flatten() {
                         if follow.map_or(end, |f| f.try_get_untracked() == Some(true)) {
+                            stop_glide_to_end(&el);
                             el.set_scroll_top(el.scroll_height());
                         } else if top > 0 {
+                            stop_glide_to_end(&el);
                             el.set_scroll_top(top);
                         }
                     }
@@ -1657,7 +1963,11 @@ pub fn ScrollBox(
     let touch = StoredValue::new(None::<(i32, i32)>);
     if let Some(follow) = follow {
         Effect::new(move || {
-            if follow.get() || intent.get_value() == Some(ScrollIntent::Toward) {
+            let following = follow.get();
+            if !following && let Some(el) = node.get_untracked() {
+                stop_glide_to_end(&el);
+            }
+            if following || intent.get_value() == Some(ScrollIntent::Toward) {
                 // Opening / Latest explicitly follows; an anchor jump explicitly
                 // stops. Neither should inherit a pending user return to the end.
                 intent.set_value(None);
@@ -1798,19 +2108,33 @@ pub fn ScrollBox(
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = c6GlideToEnd)]
+    fn glide_to_end_js(el: &web_sys::Element);
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = c6StopGlide)]
+    fn stop_glide_to_end_js(el: &web_sys::Element);
+}
+
 /// Follows the end of a scroll box: a short glide down to what just arrived
 /// (rather than a jump for each line), straight there when it is more than
-/// a screen away (as when it opens) or motion is reduced.
+/// a screen away (as when it opens) or motion is reduced. Shares the arrival's
+/// 200ms out curve; JS measures only on invocation and cancels on user input.
 pub fn glide_to_end(el: &web_sys::Element) {
-    let gap = el.scroll_height() - el.scroll_top() - el.client_height();
-    if gap <= 0 {
-        return;
-    }
-    let reduced = window().match_media("(prefers-reduced-motion: reduce)").ok().flatten().is_some_and(|m| m.matches());
-    let opts = web_sys::ScrollToOptions::new();
-    opts.set_top(el.scroll_height() as f64);
-    opts.set_behavior(if reduced || gap > el.client_height() { web_sys::ScrollBehavior::Instant } else { web_sys::ScrollBehavior::Smooth });
-    el.scroll_to_with_scroll_to_options(&opts);
+    #[cfg(target_arch = "wasm32")]
+    glide_to_end_js(el);
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = el;
+}
+
+/// Cancel a glide before a programmatic snap or anchor jump. Does not read
+/// geometry or move the box; the caller can set its intended position now.
+pub fn stop_glide_to_end(el: &web_sys::Element) {
+    #[cfg(target_arch = "wasm32")]
+    stop_glide_to_end_js(el);
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = el;
 }
 
 /// Whether a scrolling area is at its end (allowing a few pixels of rounding).
@@ -1877,6 +2201,8 @@ pub fn Tiles() -> impl IntoView {
         }
     });
     on_cleanup(move || keys.remove());
+    #[cfg(target_arch = "wasm32")]
+    on_cleanup(tile_motion_stop);
     let keys = Memo::new(move |_| ws.layout.with(|l| l.tiles.iter().map(|t| t.key).collect::<Vec<_>>()));
     // In focus mode the focused tile takes the whole workspace (the others
     // keep their places, hidden).
@@ -1887,7 +2213,7 @@ pub fn Tiles() -> impl IntoView {
     // the screen.
     view! {
         <div class="flex min-h-0 min-w-0 flex-1 bg-zinc-100 dark:bg-black md:overflow-x-auto md:p-1">
-            <div class="relative flex min-h-0 min-w-0 flex-1 md:min-w-(--tile-floor)" style=move || format!("--tile-floor:{}px", floor())>
+            <div data-workspace-motion class="relative flex min-h-0 min-w-0 flex-1 md:min-w-(--tile-floor)" style=move || format!("--tile-floor:{}px", floor())>
                 <For each=move || keys.get() key=|k| *k let:key>
                     <TileView key rect=Signal::derive(move || rects.with(|r| r.get(&key).copied().unwrap_or_default())) />
                 </For>
@@ -1941,8 +2267,8 @@ pub fn Popover(at: RwSignal<Option<(f64, f64)>>, #[prop(into)] class: String, ch
             view! {
                 <div class="fixed inset-0 z-40" on:click=move |ev| { ev.stop_propagation(); at.set(None) }></div>
                 <div data-pop=pop.get_value()
-                    class=format!("phone-popover fixed z-50 max-h-[75vh] overflow-y-auto rounded-lg border border-zinc-200 bg-white p-2 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900 {}", class.get_value())
-                    style=format!("left:{x}px;top:{y}px;--c6-pop-y:{y}px")
+                    class=format!("c6-pop phone-popover fixed z-50 max-h-[75vh] overflow-y-auto rounded-lg border border-zinc-200 bg-white p-2 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900 {}", class.get_value())
+                    style=format!("left:{x}px;top:{y}px;--c6-pop-y:{y}px;transform-origin:top left")
                 >
                     {children.with_value(|c| c())}
                 </div>
@@ -2028,8 +2354,9 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
     };
     view! {
         <div
+            data-tile-motion=key
             class=move || format!(
-                "min-h-0 min-w-0 flex-1 md:absolute md:left-(--l) md:top-(--t) md:h-(--h) md:w-(--w) md:p-1 md:transition-[left,top,width,height,opacity] md:duration-150 {} {}",
+                "min-h-0 min-w-0 flex-1 md:absolute md:left-(--l) md:top-(--t) md:h-(--h) md:w-(--w) md:p-1 {} {}",
                 if focused.get() && !minimized.get() { "flex" } else { "hidden" },
                 if minimized.get() || (full.get() && !focused.get()) { "md:hidden" } else { "md:flex" },
             )
@@ -2156,7 +2483,7 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                     </Show>
                 </div>
             </Popover>
-            <div class="flex min-h-0 flex-1">
+            <div data-pane-host class="flex min-h-0 flex-1">
                 <For each=move || cols.get() key=|k| *k let:col>
                     <ColumnView tile=key col />
                 </For>
@@ -2169,6 +2496,85 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glide_frames_never_read_geometry_or_restart_native_smooth_scrolling() {
+        let motion = include_str!("../js/motion.js");
+        let glide = motion.split("window.c6GlideToEnd =").nth(1).expect("the shared bounded scroll helper");
+        let glide = glide.split("\n})();").next().unwrap();
+        for read in ["element.scrollTop", "element.scrollHeight", "element.clientHeight"] {
+            assert_eq!(glide.matches(read).count(), 1, "{read} is sampled once per invocation");
+        }
+        let frame = glide.split("const tick = time => {").nth(1).unwrap().split("\n    };").next().unwrap();
+        for read in [".scrollTop", ".scrollHeight", ".clientHeight", ".offset", "getBoundingClientRect", "getComputedStyle"] {
+            assert!(!frame.contains(read), "no {read} inside the scroll animation frame");
+        }
+        assert!(glide.contains("const duration = 200;"));
+        assert!(!glide.contains("behavior: \"smooth\""));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_glide_never_invokes_a_browser_binding() {
+        // A null browser handle is safe here only because native SSR is a no-op.
+        let element = wasm_bindgen::JsValue::NULL.unchecked_into::<web_sys::Element>();
+        glide_to_end(&element);
+        stop_glide_to_end(&element);
+    }
+
+    #[test]
+    fn motion_plan_tracks_geometry_and_panes_but_not_active_chrome() {
+        let mut layout = Layout::new(View::Sessions);
+        layout.open_tile(View::Workers);
+        let original = motion_layout(&layout);
+        let first = layout.tiles[0].key;
+        let col = layout.tiles[0].columns[0].key;
+        layout.tiles[0].active = 0;
+        layout.tiles[0].columns[0].view = View::Inbox;
+        assert!(original == motion_layout(&layout), "view/chrome updates do not measure or interrupt motion");
+        layout.open_after(first, col, View::Workers);
+        assert!(original != motion_layout(&layout), "pane additions have their own FLIP boundary");
+        assert_eq!(motion_layout(&layout)[0].panes.len(), 2);
+        let split = motion_layout(&layout);
+        layout.tiles[0].cursor = 0;
+        assert!(split != motion_layout(&layout), "phone pane visibility changes animate too");
+    }
+
+    #[test]
+    fn motion_plan_matches_maximize_minimize_restore_and_phone_visibility() {
+        let mut layout = Layout::new(View::Sessions);
+        layout.open_tile(View::Workers);
+        let plan = motion_layout(&layout);
+        assert!(plan.iter().all(|t| t.desktop));
+        assert_eq!(plan.iter().filter(|t| t.phone).count(), 1);
+        assert!(plan[1].phone);
+        layout.full = true;
+        let plan = motion_layout(&layout);
+        assert!(!plan[0].desktop);
+        assert!(plan[1].desktop);
+        assert_eq!(plan[1].rect, [0.0, 0.0, 1.0, 1.0]);
+        layout.full = false;
+        layout.minimize(1);
+        let plan = motion_layout(&layout);
+        assert!(!plan[1].desktop && !plan[1].phone);
+        assert_eq!(plan[0].rect, [0.0, 0.0, 1.0, 1.0]);
+        layout.show(1);
+        assert!(motion_layout(&layout).iter().all(|t| t.desktop));
+    }
+
+    #[test]
+    fn closing_the_last_tile_gives_the_live_home_a_new_motion_identity() {
+        let mut layout = Layout::new(View::Sessions);
+        let (tile, pane) = (layout.tiles[0].key, layout.tiles[0].columns[0].key);
+        layout.full = true;
+        layout.remove_tile(0);
+        assert_ne!(layout.tiles[0].key, tile);
+        assert_ne!(layout.tiles[0].columns[0].key, pane);
+        assert_eq!(layout.tiles[0].columns[0].view, View::home());
+        assert_eq!(layout.tiles[0].stack, Some(0));
+        assert!(!layout.full);
+        assert!(layout.valid());
+    }
 
     #[test]
     fn desktop_tiles_keep_480px_without_squeezing_their_controls() {
@@ -2832,6 +3238,7 @@ fn ColumnView(tile: u64, col: u64) -> impl IntoView {
         // The list beside an item is narrower; a phone shows one pane.
         <div
             id=ctx.root_id()
+            data-pane-motion=col
             class=move || match pos.get() {
                 Some(p) if p.len == 2 && p.index == 0 => format!(
                     "min-w-0 flex-col border-r border-zinc-200 dark:border-zinc-800 md:flex md:shrink-0 {} {}",

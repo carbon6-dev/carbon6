@@ -53,7 +53,7 @@ fn context_arc(percent: u64) -> String {
     format!("{} 100", percent.min(100))
 }
 
-/// A static (never animated) 24px desktop ring with a positive-only background
+/// A 24px desktop ring with a positive-only background
 /// count badge. All three inputs are independent and reactive; plain values
 /// work too via `#[prop(into)]`. The badge may extend outside the 24px box.
 ///
@@ -66,6 +66,7 @@ pub fn SessionRing(
     #[prop(into)] background: Signal<usize>,
 ) -> impl IntoView {
     let label = move || description(state.get(), context.get(), background.get());
+    let count = Memo::new(move |last: Option<&usize>| if background.get() > 0 { background.get() } else { last.copied().unwrap_or(0) });
     view! {
         <span class="relative inline-flex size-6 shrink-0 align-middle">
             <svg width="24" height="24" viewBox="0 0 24 24" class="size-6 shrink-0" fill="none"
@@ -73,7 +74,7 @@ pub fn SessionRing(
                 <title>{label}</title>
                 // A full outer rim; waiting is dashed, failed has a drawn cross.
                 <circle cx="12" cy="12" r="10.5" stroke-width="1.5"
-                    class=move || state.get().rim_class()
+                    class=move || format!("{} {}", state.get().rim_class(), if state.get() == AgentState::Working { "c6-ring-working" } else { "" })
                     stroke-dasharray=move || if state.get() == AgentState::Waiting { "2 2" } else { "none" } />
                 <circle cx="12" cy="12" r="7" stroke-width="2"
                     class="stroke-zinc-200 dark:stroke-zinc-700" />
@@ -88,12 +89,12 @@ pub fn SessionRing(
                 })}
             </svg>
             // The SVG's name includes this count; do not announce it twice.
-            {move || (background.get() > 0).then(|| view! {
+            <span class="c6-presence absolute -right-1.5 -top-1" data-open=move || (background.get() > 0).to_string()>
                 <span aria-hidden="true"
-                    class="absolute -right-1.5 -top-1 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-zinc-700 px-0.5 text-[9px] font-medium leading-none text-white dark:bg-zinc-300 dark:text-zinc-900">
-                    {move || background.get()}
+                    class="c6-ring-badge flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-zinc-700 px-0.5 text-[9px] font-medium leading-none text-white dark:bg-zinc-300 dark:text-zinc-900">
+                    <crate::util::MotionCount value=Signal::derive(move || count.get()) />
                 </span>
-            })}
+            </span>
         </span>
     }
 }
@@ -196,11 +197,11 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn badge_only_appears_for_positive_background_counts() {
+    fn retained_badge_is_only_visible_for_positive_background_counts() {
         for background in [0, 1, 12, usize::MAX] {
             let html = render(AgentState::Working, None, background);
-            assert_eq!(html.contains("aria-hidden=\"true\""), background > 0);
-            assert_eq!(html.matches("<span").count(), if background > 0 { 2 } else { 1 });
+            assert!(html.contains("aria-hidden=\"true\""));
+            assert!(html.contains(if background > 0 { "data-open=\"true\"" } else { "data-open=\"false\"" }));
             if background > 0 {
                 assert!(html.contains(&format!(">{background}</span>")), "{html}");
             }

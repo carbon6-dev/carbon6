@@ -37,12 +37,24 @@ pub fn Switch(
     #[prop(optional, into)] hint: String,
     #[prop(optional, into)] disabled: Signal<bool>,
 ) -> impl IntoView {
+    switch_row(on, UnsyncCallback::new(on_change), label, title, hint, disabled)
+}
+
+// Keep the shared row's view/effects out of every caller's generic handler type.
+fn switch_row(
+    on: Signal<bool>,
+    on_change: UnsyncCallback<bool>,
+    label: String,
+    title: String,
+    hint: String,
+    disabled: Signal<bool>,
+) -> impl IntoView {
     let accessible_label = label.clone();
     view! {
         <button type="button" role="switch" aria-checked=move || on.get().to_string()
             aria-label=accessible_label title=title disabled=move || disabled.get()
             class="flex min-h-8 w-full items-center justify-between gap-3 rounded px-1 text-left text-sm outline-none focus-visible:ring-2 focus-visible:ring-sky-500/60 disabled:opacity-50 pointer-coarse:min-h-11"
-            on:click=move |_| if !disabled.get_untracked() { on_change(!on.get_untracked()) }>
+            on:click=move |_| if !disabled.get_untracked() { on_change.run(!on.get_untracked()) }>
             <span class="min-w-0"><span>{label}</span>
                 {(!hint.is_empty()).then(|| view! { <span class="block text-xs text-muted">{hint}</span> })}
             </span>

@@ -184,9 +184,8 @@ fn ArchiveDialog(request: ArchiveRequest, archive: SessionArchive) -> impl IntoV
                         <h2 class="font-medium">"Archive session"</h2>
                         <p class="text-sm text-muted">"Archive docs and decks made by this session or its subagents too? Unchecked items stay available."</p>
                         <crate::components::Switch on=move || selection.with(|s| s.all)
-                            on_change=move |on| selection.update(|s| s.all = on)
-                            label="Archive all docs" hint="Include items with reasons to keep them."
-                            disabled=move || busy.get() />
+                            on_change=move |all| selection.update(|s| s.all = all) disabled=busy
+                            label="Archive all docs" hint="Include items with reasons to keep them." />
                     </div>
                     <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain divide-y divide-zinc-200 dark:divide-zinc-700" aria-label="Docs to archive">
                         {request.get_value().docs.into_iter().map(|doc| view! { <ArchiveDocRow doc selection busy /> }).collect_view()}
@@ -233,7 +232,7 @@ fn ArchiveDocRow(doc: SessionArchiveDoc, selection: RwSignal<Selection>, busy: R
     let kind = if doc.kind == "deck" { "Deck" } else { "Doc" };
     view! {
         <label class="flex min-h-11 min-w-0 cursor-pointer items-start gap-3 rounded-md px-2 py-3 text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800">
-            <input type="checkbox" class=format!("{} mt-0.5", crate::components::CHECKBOX) aria-label=format!("Archive {}", doc.title) aria-describedby=description.clone()
+            <input type="checkbox" class=format!("mt-0.5 {}", crate::components::CHECKBOX) aria-label=format!("Archive {}", doc.title) aria-describedby=description.clone()
                 prop:checked=move || selection.with(|s| s.checked(&id.get_value()))
                 disabled=move || busy.get() || selection.with(|s| s.all)
                 on:change=move |ev| selection.update(|s| s.toggle(&id.get_value(), event_target_checked(&ev))) />

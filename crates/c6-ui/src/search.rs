@@ -66,7 +66,7 @@ pub fn SearchBox() -> impl IntoView {
         <input
             node_ref=input
             type="search"
-            class="w-44 rounded-md border border-zinc-300 bg-white px-2 py-1 text-xs focus:w-64 dark:border-zinc-700 dark:bg-zinc-900 transition-[width]"
+            class="w-44 rounded-md border border-zinc-300 bg-white px-2 py-1 text-xs focus:w-64 dark:border-zinc-700 dark:bg-zinc-900 transition-[width] duration-quick"
             placeholder="Search sessions (⌘K)"
             prop:value=move || text.get()
             on:input=move |ev| text.set(event_target_value(&ev))
