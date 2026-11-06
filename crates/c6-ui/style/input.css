@@ -65,6 +65,8 @@
     max-height: calc(var(--c6-visible-height, 100dvh) * .8);
   }
   .phone-drawer {
+    --sheet-x: -100%;
+    --sheet-y: 0px;
     top: calc(var(--c6-visible-top, 0px) + 44px);
     max-height: calc(var(--c6-visible-height, 100dvh) - 44px);
   }
@@ -301,7 +303,7 @@ html.dark {
 }
 .c6-sheet {
   transition: translate var(--dur-large) var(--ease-spring), opacity var(--dur-medium) var(--ease-out), visibility 0s;
-  @starting-style { translate: 0 calc(100% * var(--travel)); opacity: 0; }
+  @starting-style { translate: calc(var(--sheet-x, 0px) * var(--travel)) calc(var(--sheet-y, 100%) * var(--travel)); opacity: 0; }
 }
 @media (width < 48rem), (height < 32rem) {
   /* Cover the ~4% phone overshoot without adding padding to desktop panes. */
@@ -312,7 +314,7 @@ html.dark {
   }
 }
 .c6-sheet[data-open="false"], [data-open="false"] > .c6-sheet {
-  translate: 0 calc(100% * var(--travel));
+  translate: calc(var(--sheet-x, 0px) * var(--travel)) calc(var(--sheet-y, 100%) * var(--travel));
   opacity: 0;
   transition: translate var(--dur-sheet-exit) var(--ease-in), opacity var(--dur-sheet-exit) var(--ease-in), visibility 0s var(--dur-sheet-exit);
 }

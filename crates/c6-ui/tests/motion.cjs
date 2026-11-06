@@ -398,9 +398,60 @@ async function menu(f) {
     assert.deepEqual(inputState, { inert: false, disabled: false, focus: true, hit: true }, `drawer accepts focus and input in its first frame: ${JSON.stringify(diagnostic)}`);
     await settle(page);
     await page.screenshot({ path: path.join(SHOTS, `${f.label}-menu-open.png`) });
+    const drawer = page.getByRole('button', { name: /^Menu,/ }).first().locator('..').locator('.phone-drawer');
+    const axis = await drawer.evaluate(el => {
+      window.__drawer = el;
+      el.querySelector('input').blur();
+      return { x: getComputedStyle(el).getPropertyValue('--sheet-x').trim(),
+        y: getComputedStyle(el).getPropertyValue('--sheet-y').trim() };
+    });
+    assert.deepEqual(axis, { x: '-100%', y: '0px' }, 'phone drawer travels left, not down');
     await page.keyboard.press('Escape');
-    await page.waitForFunction(() => document.querySelector('.phone-drawer')?.dataset.open === 'false');
-    assert(await page.locator('.phone-drawer').first().evaluate(el => el.inert), 'closed retained drawer is inert');
+    await page.waitForFunction(() => __drawer.dataset.open === 'false');
+    assert(await drawer.evaluate(el => el.inert), 'closed retained drawer is inert');
+    await settle(page);
+    const closed = await drawer.evaluate(el => {
+      const [x, y = '0px'] = getComputedStyle(el).translate.split(' ');
+      return { x, y };
+    });
+    assert.equal(parseFloat(closed.y), 0, 'drawer never travels vertically');
+    assert.equal(parseFloat(closed.x), f.motion.effective === 'full' ? -100 : 0);
+    const reversal = await drawer.evaluate(async (el, full) => {
+      const toggle = async () => {
+        el.parentElement.querySelector('button[aria-label^="Menu,"]').click();
+        await Promise.resolve(); await Promise.resolve();
+      };
+      const x = () => parseFloat(getComputedStyle(el).translate);
+      await toggle();
+      if (!full) return null;
+      // Seek the actual CSS transition, synchronously with opening it. A slow
+      // host cannot miss an intermediate frame and hang waiting for it again.
+      const transition = el.getAnimations().find(a => a.transitionProperty === 'translate');
+      if (!transition) return { missing: true };
+      transition.pause();
+      transition.currentTime = Number(transition.effect.getTiming().duration) * .16;
+      const before = x();
+      await toggle();
+      const closing = x();
+      await toggle();
+      return { before, closing, reopened: x(), same: el === __drawer, inert: el.inert };
+    }, f.motion.effective === 'full');
+    if (reversal) assert(reversal.same && !reversal.inert && reversal.before > -100 && reversal.before < 0 &&
+      Math.abs(reversal.before - reversal.closing) < 1 && Math.abs(reversal.before - reversal.reopened) < 1,
+      `drawer reverses from its displayed position: ${JSON.stringify(reversal)}`);
+    await settle(page);
+    // VisualViewport keyboard fixture changes only visible space, like Android
+    // Chrome's overlay keyboard; no synthetic resize of the layout viewport.
+    await page.evaluate(() => __keyboard(Math.min(innerHeight, 280)));
+    await settle(page);
+    assert(await drawer.evaluate(el => {
+      const r = el.getBoundingClientRect();
+      return r.width <= innerWidth && r.height <= visualViewport.height - 44 + 1 &&
+        getComputedStyle(el).overflowY === 'auto';
+    }), 'drawer remains bounded and scrollable above the keyboard');
+    await page.screenshot({ path: path.join(SHOTS, `${f.label}-menu-keyboard.png`) });
+    await page.evaluate(() => __keyboard(innerHeight));
+    await page.keyboard.press('Escape');
     await settle(page);
   }
   // Execute in the first rAF after the production action handler, rather than
