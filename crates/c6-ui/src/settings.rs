@@ -804,10 +804,7 @@ fn Realms() -> impl IntoView {
         crate::api::realms_changed().track();
         crate::api::realms()
     });
-    let connections = LocalResource::new(move || {
-        tick.track();
-        crate::api::connections()
-    });
+    let connections = crate::resources::connections();
     let live = crate::api::live();
     let (id, name, description) = (RwSignal::new(String::new()), RwSignal::new(String::new()), RwSignal::new(String::new()));
     let error = RwSignal::new(None::<String>);
@@ -817,6 +814,7 @@ fn Realms() -> impl IntoView {
                 Ok(()) => {
                     error.set(None);
                     tick.update(|t| *t += 1);
+                    connections.refetch();
                 }
                 Err(e) => error.set(Some(e)),
             }
@@ -1873,7 +1871,7 @@ fn Upgrades() -> impl IntoView {
 /// LLM connections: the list, adding one, signing in with ChatGPT.
 #[component]
 fn Connections(signed_in: bool) -> impl IntoView {
-    let connections = LocalResource::new(api::connections);
+    let connections = crate::resources::connections();
     let all = Signal::derive(move || connections.get().and_then(Result::ok).unwrap_or_default());
     let error = RwSignal::new(None::<String>);
     let signed_in = move || signed_in;
@@ -3689,7 +3687,7 @@ fn ListItem(
             }
         )
     };
-    let connections = LocalResource::new(api::connections);
+    let connections = crate::resources::connections();
     view! {
         <div class=move || format!("space-y-2 rounded-md border border-zinc-200 p-3 dark:border-zinc-800 {}", if enabled() { "" } else { "opacity-60" })>
             <div class="flex items-center gap-2">

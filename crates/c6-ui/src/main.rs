@@ -45,6 +45,7 @@ mod place;
 mod projects;
 mod push;
 mod quota;
+mod resources;
 mod search;
 mod session;
 mod session_archive;
@@ -116,6 +117,7 @@ fn Main() -> impl IntoView {
     let live = api::LiveFeed::connect();
     provide_context(live);
     util::watch_visible_viewport();
+    resources::provide();
     provide_context(labels::LabelFilter::restored());
     provide_context(sessions::Grouping::load());
     provide_context(aspects::Facets::load());

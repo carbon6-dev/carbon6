@@ -98,7 +98,7 @@ pub fn Glance(chrome: SessionChrome, #[prop(optional, into)] on_done: Option<Cal
     };
 
     // Runs on: its worker (online or not), model and effort, runtime.
-    let connections = LocalResource::new(api::connections);
+    let connections = crate::resources::connections();
     let runtime = move || {
         let id = connection.get();
         let c = connections.get().and_then(Result::ok)?.into_iter().find(|c| c.id == id)?;

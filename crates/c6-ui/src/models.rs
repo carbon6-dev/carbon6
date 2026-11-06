@@ -34,7 +34,7 @@ pub fn ModelInput(
             shown.try_set(false);
         },
     ));
-    let connections = LocalResource::new(api::connections);
+    let connections = crate::resources::connections();
     // Asked for when the list is first shown, and again for another connection.
     let offered = LocalResource::new(move || {
         let (c, open) = (connection.get(), shown.get() && !disabled.get());

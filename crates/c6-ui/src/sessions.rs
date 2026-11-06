@@ -205,7 +205,7 @@ pub fn SessionsPage() -> impl IntoView {
     let like_this = RwSignal::new(None);
     let live = api::live();
     let now = clock();
-    let connections = LocalResource::new(api::connections);
+    let connections = crate::resources::connections();
     let query = RwSignal::new(String::new());
     let choices = ListChoices {
         show: RwSignal::new(String::new()),
@@ -1241,7 +1241,7 @@ impl SessionSeed {
 /// you like and start it. The new session opens in a tile of its own.
 #[component]
 pub fn NewSessionDialog(seed: SessionSeed, #[prop(into)] on_close: Callback<()>) -> impl IntoView {
-    let connections = LocalResource::new(api::connections);
+    let connections = crate::resources::connections();
     let seed = StoredValue::new(seed);
     view! {
         // Over every tile, wherever it was opened from: inside a tile it
@@ -1410,7 +1410,7 @@ pub fn SessionDialog(
     #[prop(optional)]
     todo: Option<String>,
 ) -> impl IntoView {
-    let connections = LocalResource::new(api::connections);
+    let connections = crate::resources::connections();
     let first = StoredValue::new(first_message);
     let (seed, work, work_refs) = (StoredValue::new(seed), StoredValue::new(work), StoredValue::new(work_refs));
     let todo = StoredValue::new(todo.unwrap_or_default());

@@ -522,10 +522,13 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             }
         });
     }
-    let detail = LocalResource::new({
-        let id = id.clone();
-        move || api::session(id.clone())
-    });
+    let pane_data = crate::resources::session(id.clone());
+    let detail = pane_data.detail;
+    // Reopening a transcript still checks its detail; simultaneous panes
+    // share the pending request instead of starting another one.
+    if detail.get_untracked().is_some() {
+        detail.refetch();
+    }
     Effect::new(move || {
         if let Some(Ok(d)) = detail.get()
             && live.resolved_sessions.with_untracked(|ss| !ss.contains_key(&d.session.id))
@@ -676,6 +679,13 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             }
             _ => None,
         })
+    });
+    Effect::new(move || {
+        if let Some(s) = started.get()
+            && pane_data.folder.get_untracked().as_ref() != Some(&s.cwd)
+        {
+            pane_data.folder.set(Some(s.cwd));
+        }
     });
     // Its folder's git state, for the Changes count and the branch: not
     // over SSH, and while its worker is online.
@@ -3048,7 +3058,7 @@ pub(crate) fn ModelPicker(
     claude_off: Option<Signal<Option<String>>>,
     #[prop(optional, into)] auto: Option<Signal<bool>>,
 ) -> impl IntoView {
-    let connections = LocalResource::new(api::connections);
+    let connections = crate::resources::connections();
     // Effort only where the connection passes it on to the model.
     let supports_effort =
         move |id: &str| connections.get().and_then(Result::ok).is_some_and(|cs| cs.iter().any(|c| c.id == id && c.supports_effort));
@@ -4113,7 +4123,7 @@ fn subagent_thread(id: String, subagents: Subagents, waiting: Signal<bool>) -> A
     let busy = Signal::derive(move || waiting.get() || row.with(|r| r.as_ref().is_some_and(|r| r.status == SessionStatus::Running)));
     let live = move || open.get() || busy.get();
     let sid = StoredValue::new(id.clone());
-    let connections = LocalResource::new(api::connections);
+    let connections = crate::resources::connections();
     view! {
         <div id=format!("sub-{id}") class="mt-1 border-l-2 border-violet-300 pl-3 dark:border-violet-800">
             {move || if live() {
@@ -4150,7 +4160,7 @@ fn SubagentLive(id: String, row: Memo<Option<Session>>, open: RwSignal<bool>, to
     let error = RwSignal::new(None::<String>);
     let wake = RwSignal::new(false);
     let sid = StoredValue::new(id.clone());
-    let connections = LocalResource::new(api::connections);
+    let connections = crate::resources::connections();
     let end = Memo::new(move |_| {
         feed.events.with(|evs| {
             evs.iter().rev().find_map(|e| match &e.kind {
@@ -5093,7 +5103,7 @@ fn Composer(
     let claude_check = LocalResource::new(move || async move { if ask { api::ask_claude().await.ok() } else { None } });
     let claude_off = Signal::derive(move || claude_check.get().flatten().and_then(|c| (!c.available).then_some(c.reason)));
     // Connection kinds: a switch into or out of Claude Code is a handoff.
-    let kinds = LocalResource::new(api::connections);
+    let kinds = crate::resources::connections();
     let text = crate::util::draft(&id);
     let (attachments, draft_note, draft_ready) = crate::util::draft_attachments(Some(&id));
     // What you'd likely type next (docs/suggestions.md): fetched when a turn

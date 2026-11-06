@@ -110,7 +110,7 @@ fn AskBox(on_close: Callback<()>) -> impl IntoView {
 #[component]
 pub fn AssistantSettings() -> impl IntoView {
     let loaded = LocalResource::new(move || api::get_setting("assistant"));
-    let connections = LocalResource::new(api::connections);
+    let connections = crate::resources::connections();
     let (conn, model) = (RwSignal::new(String::new()), RwSignal::new(String::new()));
     let note = RwSignal::new(None::<Result<String, String>>);
     Effect::new(move || {

@@ -117,10 +117,8 @@ pub fn SessionPane(id: String, pane: Pane, #[prop(optional)] output: String) -> 
         .into_any();
     }
     let live = api::live();
-    let detail = LocalResource::new({
-        let id = id.clone();
-        move || api::session(id.clone())
-    });
+    let data = crate::resources::session(id.clone());
+    let detail = data.detail;
     // Where it works: its first event says. Asked again once it has started.
     let started = {
         let id = id.clone();
@@ -128,26 +126,48 @@ pub fn SessionPane(id: String, pane: Pane, #[prop(optional)] output: String) -> 
     };
     let first = LocalResource::new(move || {
         started.track();
-        api::session_events_before(id.clone(), 2, 1, None)
+        let (folder, id) = (data.folder.get(), id.clone());
+        async move {
+            if folder.is_none() {
+                let evs = api::session_events_before(id, 2, 1, None).await.ok()?;
+                evs.into_iter().find_map(|e| match e.kind {
+                    EventKind::Started { cwd, .. } => Some(cwd),
+                    _ => None,
+                })
+            } else {
+                folder
+            }
+        }
     });
+    Effect::new(move || {
+        if let Some(folder) = first.get().flatten()
+            && data.folder.get_untracked().as_ref() != Some(&folder)
+        {
+            data.folder.set(Some(folder));
+        }
+    });
+    let session = Signal::derive(move || detail.get().map(|r| r.map(|d| d.session)));
+    let folder = Signal::derive(move || data.folder.get().or_else(|| first.get().flatten()));
+    view! { <PaneContent pane session folder /> }.into_any()
+}
+
+/// Native pane views consume their parent's confirmed session and actual
+/// folder. They never fetch session metadata before asking the worker.
+#[component]
+fn PaneContent(pane: Pane, session: Signal<Option<Result<c6_api::Session, String>>>, folder: Signal<Option<String>>) -> impl IntoView {
     let note = |text: &'static str| view! { <p class="py-6 text-center text-sm text-muted">{text}</p> }.into_any();
     view! {
         <ScrollBox>
             <div class="px-4 py-3">
                 <Suspense fallback=|| ()>
                     {move || {
-                        let d = match detail.get()? {
-                            Ok(d) => d,
+                        let s = match session.get()? {
+                            Ok(s) => s,
                             Err(e) => return Some(view! { <ErrorBox message=e /> }.into_any()),
                         };
-                        let cwd = first.get()?.ok().and_then(|evs| {
-                            evs.into_iter().find_map(|e| match e.kind {
-                                EventKind::Started { cwd, .. } => Some(cwd),
-                                _ => None,
-                            })
-                        });
-                        let w = d.session.worker_id.to_string();
-                        let ssh = d.session.ssh;
+                        let cwd = folder.get();
+                        let w = s.worker_id.to_string();
+                        let ssh = s.ssh;
                         Some(match (pane, cwd) {
                             (_, None) => note("Available once the session has started."),
                             // The worker can't look at that machine's files.

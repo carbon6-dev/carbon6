@@ -407,6 +407,29 @@ not call a leaked Rust closure. While mounted, resize the tile, append a streame
 reply and scroll: width measurement, transcript following and visibility still
 work, without callbacks or reactive reads after disposal.
 
+## Shared page data: connection and session panes
+
+`cargo test -p c6-ui resources::tests` checks that connection consumers use
+one page-owned resource, sessions share their detail request, closing a tile
+cannot dispose another tile's data, and a new page does not inherit another
+page's cache. These tests inspect resource identities, not rendered HTML.
+
+In a browser, filter Network to `connections` and open several session tiles,
+their model pickers, New session, Usage and Settings. There should be one
+connections-list GET per signed-in page, not one per picker or tile. Rename,
+add or remove a connection, sign in with ChatGPT, and change a connection's
+realm availability: after the successful save the shared list refreshes and
+every picker reflects the confirmed result. Failed saves must not change it.
+
+Open a transcript's Changes, Files and Terminal. They share its session-detail
+request and use the actual folder from Started (including a worktree), not
+the requested folder. With the transcript already loaded they need no first-
+event fetch. Opening a pane directly still loads detail and the first event
+in parallel; starting sessions retain the unavailable note until Started.
+SSH sessions still refuse local Changes/Files and open remote terminals.
+Close the transcript while keeping a pane open, then reopen it: the pane
+must keep working and the transcript must refresh its detail.
+
 ## Task card actions: manual phone check
 
 Check both a session transcript and Decisions, with a coarse pointer at 320px and 390px widths, and on desktop. Use a realm with several open work items and a closed one.
