@@ -2546,13 +2546,13 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                         {move || crate::icons::star(pinnable().is_some_and(|id| ws.pinned.with(|p| p.contains(&id))))}
                     </button>
                 </Show>
-                <button class=format!("{btn} hidden md:@min-[30rem]/tile:flex") title=move || if full.get() { "Defocus: back to the tiles" } else { "Focus: this tile fills the screen" }
+                <button class=btn title="Actions: session actions, history and tile controls" aria-label="Actions"
+                    on:click=move |ev| menu_at.set(if menu_at.get_untracked().is_some() { None } else { Some(below(&ev, 240.0)) })>{crate::icons::ellipsis()}</button>
+                <button class=format!("{btn} hidden md:@min-[14rem]/tile:flex") title=move || if full.get() { "Defocus: back to the tiles" } else { "Focus: this tile fills the screen" }
                     aria-label=move || if full.get() { "Defocus" } else { "Focus" }
                     on:click=move |ev| { ev.stop_propagation(); ws.set_full(if full.get_untracked() { None } else { Some(key) }) }>
                     {move || if full.get() { crate::icons::minimize().into_any() } else { crate::icons::maximize().into_any() }}
                 </button>
-                <button class=btn title="Actions: session actions, history and tile controls" aria-label="Actions"
-                    on:click=move |ev| menu_at.set(if menu_at.get_untracked().is_some() { None } else { Some(below(&ev, 240.0)) })>{crate::icons::ellipsis()}</button>
                 <button class=format!("{btn} hidden md:@min-[14rem]/tile:flex") title="Close this tile" aria-label="Close this tile" on:click=move |_| ws.close_tile(key)>{crate::icons::x()}</button>
                 <crate::activity::SessionsPicker />
             </div>
@@ -2578,11 +2578,11 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                             {move || if pinnable().is_some_and(|id| ws.pinned.with(|p| p.contains(&id))) { "Unpin" } else { "Pin" }}
                         </button>
                     </Show>
-                    <button class=crate::session::MENU_ITEM on:click=move |_| { ws.set_full(if full.get_untracked() { None } else { Some(key) }); menu_at.set(None); }>
-                        {move || if full.get() { crate::icons::minimize().into_any() } else { crate::icons::maximize().into_any() }}
-                        {move || if full.get() { "Defocus" } else { "Focus" }}
-                    </button>
                 </div>
+                <button class=format!("{} hidden md:flex md:@min-[14rem]/tile:hidden", crate::session::MENU_ITEM) on:click=move |_| { ws.set_full(if full.get_untracked() { None } else { Some(key) }); menu_at.set(None); }>
+                    {move || if full.get() { crate::icons::minimize().into_any() } else { crate::icons::maximize().into_any() }}
+                    {move || if full.get() { "Defocus" } else { "Focus" }}
+                </button>
                 <button class=format!("{} hidden md:flex md:@min-[14rem]/tile:hidden", crate::session::MENU_ITEM) on:click=move |_| { menu_at.set(None); ws.close_tile(key); }>{crate::icons::x()}"Close this tile"</button>
                 <div class="flex flex-col border-t border-zinc-200 pt-1 text-xs dark:border-zinc-700">
                     <button class=crate::session::MENU_ITEM disabled=move || !can_back() on:click=move |_| { ws.step(-1); menu_at.set(None); }>{crate::icons::chevron_left()}"Back"</button>
