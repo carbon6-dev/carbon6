@@ -175,11 +175,15 @@ async function check(browser, origin, engine, name, theme) {
       await marker(26); await sheet.waitFor();
       assert.equal(await sheet.locator('textarea').inputValue(), 'Reply draft', 'thread reply survives dismissal');
       const outgoing = await sheet.elementHandle();
+      await sheet.getByRole('button', { name: 'Thread options', exact: true }).click();
       await sheet.getByRole('button', { name: /All comments/ }).click();
       await page.waitForFunction(el => !el.isConnected, outgoing);
       await outgoing.dispose();
       await settle(page);
       assert.equal(await sheet.count(), 1, 'All comments hands off to one panel sheet');
+      const threadRow = sheet.locator('[data-thread-toggle="thread-1"]');
+      assert.equal(await threadRow.getAttribute('aria-expanded'), 'false', 'panel starts with the thread collapsed');
+      await threadRow.click();
       assert.equal(await sheet.locator('textarea').inputValue(), 'Reply draft', 'reply draft survives All comments handoff');
       assert(await tile.locator('[style*="padding-bottom"]').first().evaluate(el => parseFloat(el.style.paddingBottom) > 0),
         'exiting block sheet does not erase incoming panel scroll space');

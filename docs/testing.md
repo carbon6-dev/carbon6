@@ -590,13 +590,36 @@ and dark, at desktop and phone widths, with fine and coarse pointer media:
 
 ## Doc comments: placement browser check
 
-After `env -u NO_COLOR make ui`, run the production sheet regression:
+After `env -u NO_COLOR make ui`, run both production regressions:
 
 ```sh
+ENGINE=both /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/comments-design.cjs
 ENGINE=both /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/comment-sheet.cjs
 ```
 
-It uses `motion.cjs`'s owned loopback fixture and launcher, without a head,
+`comments-design.cjs` checks margin-fit and tight wide tiles, four narrow
+tiles and 390px/320px phones, in both themes and engines. Geometry asserts
+unchanged block positions/sizes across opening, containment, placement beside
+the reading column when its margin fits, and no anchor overlap whenever a
+usable clear rectangle fits the measured box width and control minimum.
+Cases use Motion Off and assert settled geometry, not animated enter/exit
+stability. It checks one thread at a time,
+the separate thread/message menus and their SVGs, multiline replies with
+menus open, nearby Reply/Resolve and the quiet agent footer. Full-panel checks
+cover recursive document order, independent and bulk collapse, per-document
+browser persistence, reply and own-edit drafts, quote jumps, collapsed new
+replies and one scrolling list with no nested thread scrollers. In margin-fit
+light, deferred POST/GET responses check that a successful reply retains its
+thread and textarea, and a late edit-save cannot erase a newer draft after
+collapse/remount/reload. Unread updates are tested via reload with changed
+mocked data; this does not claim coverage of the document's `/live` transport.
+Before/after PNGs and JSON go to `/tmp/q9-comments/`; `BEFORE=1 ROOT=...`
+records the original design without enforcing the new assertions. `VIEWPORT`,
+`THEME`, `ENGINE`, `EVIDENCE` and the motion harness's browser overrides apply.
+Failures, including WebKit startup traps, fail the run; there is no retry loop
+or browser-tier override.
+
+`comment-sheet.cjs` uses `motion.cjs`'s owned loopback fixture and launcher, without a head,
 services, live settings or external requests. Four narrow tiles in a wide
 window (also a short window), and 390px/320px phones, exercise new comments,
 long existing threads and the comments panel in both themes. It checks sheet
@@ -611,13 +634,15 @@ Evidence is saved under `/tmp/q7-sheet/`; `EVIDENCE`, `THEME`, `VIEWPORT`,
 `BEFORE=1 ROOT=/path/to/baseline/dist` records unchanged baseline screenshots
 and geometry without enforcing the new tile-local assertions.
 
-`cargo test -p c6-ui` checks the pure popover placement with offset tile bounds,
-above/below anchors, oversized threads and 320px/390px/desktop widths. In a
+`cargo test -p c6-ui` checks margin and four-strip thread placement, reduced
+widths, offscreen/hidden tiles, containment, recursive thread ordering, and
+the generic panel popover's offset bounds and 320px/390px/desktop widths. In a
 browser, repeat at those widths (with touch on phones):
 
-1. Open a long doc, also with its comments panel beside it on a wide desktop
-   tile. Start a comment on a block near the bottom of the visible tile. The
-   popover flips above; the text box, Cancel and Comment remain reachable.
+1. Open a long doc and start a comment near the bottom of a wide tile. The
+   box uses its margin, or shrinks and avoids the block above/below when
+   possible, without moving the document. Reply, Resolve, Cancel and Comment
+   remain reachable in their respective forms.
 2. Type a long draft, scroll the doc, resize the tile/window and open an existing
    long thread. The box stays inside the visible tile, scrolling its contents
    when necessary, without losing the draft or focus. Cancel, posting, outside

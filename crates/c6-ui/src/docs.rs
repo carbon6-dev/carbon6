@@ -858,6 +858,13 @@ fn DocMenu(
     }
 }
 
+/// This browser's independently opened panel rows and last read reply, per doc.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+struct CommentPrefs {
+    expanded: std::collections::HashSet<String>,
+    read: std::collections::HashMap<String, String>,
+}
+
 /// A doc's comments, shared by its bar, its blocks (each marks its own),
 /// the popover by a block and the panel: the threads as last loaded, and
 /// what is open.
@@ -876,6 +883,9 @@ struct ThreadsCtx {
     panel: RwSignal<bool>,
     /// The block whose comments show in a popover by its 💬.
     pop: RwSignal<Option<String>>,
+    selected: RwSignal<Option<String>>,
+    prefs: RwSignal<CommentPrefs>,
+    edit_epochs: StoredValue<std::collections::HashMap<String, u64>>,
     pop_node: NodeRef<leptos::html::Div>,
     tabs: Memo<Vec<DocTab>>,
     /// The page: what the popover hangs in, and blocks are found in.
@@ -889,6 +899,44 @@ struct ThreadsCtx {
 }
 
 impl ThreadsCtx {
+    fn upsert(self, thread: DocThread) {
+        let _ = self.shown.try_update(|ts| {
+            if let Some(old) = ts.iter_mut().find(|t| t.id == thread.id) {
+                *old = thread;
+            } else {
+                ts.push(thread);
+            }
+        });
+    }
+
+    fn read(self, t: &DocThread) {
+        if let Some(last) = t.comments.last()
+            && self.prefs.with_untracked(|p| p.read.get(&t.id) != Some(&last.id))
+        {
+            self.prefs.update(|p| {
+                p.read.insert(t.id.clone(), last.id.clone());
+            });
+        }
+    }
+
+    fn expand(self, ids: &[String], expanded: bool) {
+        self.prefs.update(|p| {
+            for id in ids {
+                if expanded {
+                    p.expanded.insert(id.clone());
+                    if let Some(last) = self
+                        .shown
+                        .with_untracked(|ts| ts.iter().find(|t| &t.id == id).and_then(|t| t.comments.last()).map(|c| c.id.clone()))
+                    {
+                        p.read.insert(id.clone(), last);
+                    }
+                } else {
+                    p.expanded.remove(id);
+                }
+            }
+        });
+    }
+
     /// A block's 💬 (`marker`) pressed: its popover opens by it (with a
     /// new comment box, `new`), or closes if it was open.
     fn toggle_pop(self, block: String, marker: &web_sys::Element, new: bool) {
@@ -897,6 +945,11 @@ impl ThreadsCtx {
             return;
         }
         self.place_pop(marker);
+        if self.pop.with_untracked(|p| p.as_ref() != Some(&block)) {
+            self.selected.set(
+                self.shown.with_untracked(|ts| ts.iter().find(|t| t.state == "open" && t.anchor.block == block).map(|t| t.id.clone())),
+            );
+        }
         self.pop.set(Some(block.clone()));
         if new {
             self.focus.set(Some(block.clone()));
@@ -953,8 +1006,71 @@ fn popover_at(anchor: Rect, area: Rect, size: (f64, f64)) -> Rect {
     }
 }
 
+/// Keep a usable thread beside the reading column if possible. Otherwise
+/// narrow it to 256px and try every anchor-free strip before accepting any
+/// overlap. 160px leaves room for the header, reply and footer; the comments
+/// scroll in the remaining space. Never reserve space in the document.
+fn thread_at(block: Rect, column: Rect, area: Rect, size: (f64, f64), minimum: f64) -> Rect {
+    let left = area.left + 8.0;
+    let top = area.top + 8.0;
+    let right = (area.left + area.width - 8.0).max(left);
+    let bottom = (area.top + area.height - 8.0).max(top);
+    let height = size.1.min(bottom - top).max(0.0);
+    let at = |x: f64, y: f64, width: f64, height: f64| Rect {
+        left: x.clamp(left, (right - width).max(left)),
+        top: y.clamp(top, (bottom - height).max(top)),
+        width,
+        height,
+    };
+    let margin_right = right - (column.left + column.width).max(block.left + block.width) - 8.0;
+    let margin_left = column.left.min(block.left) - 8.0 - left;
+    if margin_right.max(margin_left) >= 256.0 {
+        let width = size.0.min(margin_right.max(margin_left)).min(right - left).max(0.0);
+        return at(
+            if margin_right >= margin_left {
+                (column.left + column.width).max(block.left + block.width) + 8.0
+            } else {
+                column.left.min(block.left) - 8.0 - width
+            },
+            block.top,
+            width,
+            height,
+        );
+    }
+    let width = 256.0_f64.min(right - left).min(size.0).max(0.0);
+    let right_room = right - block.left - block.width - 8.0;
+    let left_room = block.left - 8.0 - left;
+    // A narrow block can leave usable space within the reading column too.
+    if right_room.max(left_room) >= width {
+        return at(if right_room >= left_room { right - width } else { left }, block.top, width, height);
+    }
+    let below = bottom - block.top - block.height - 8.0;
+    let above = block.top - 8.0 - top;
+    if below.max(above) >= height.min(minimum) {
+        let h = height.min(below.max(above));
+        return at(right - width, if below >= above { block.top + block.height + 8.0 } else { block.top - 8.0 - h }, width, h);
+    }
+    // No usable anchor-free rectangle exists. The least-overlapping corner
+    // is deterministic; the anchor is not replaced with a dashed ghost.
+    let height = height.min(minimum);
+    let overlap = |r: &Rect| {
+        ((r.left + r.width).min(block.left + block.width) - r.left.max(block.left)).max(0.0)
+            * ((r.top + r.height).min(block.top + block.height) - r.top.max(block.top)).max(0.0)
+    };
+    [
+        at(right - width, top, width, height),
+        at(right - width, bottom - height, width, height),
+        at(left, top, width, height),
+        at(left, bottom - height, width, height),
+    ]
+    .into_iter()
+    .min_by(|a, b| overlap(a).total_cmp(&overlap(b)))
+    .unwrap()
+}
+
 fn place_popover(node: &web_sys::HtmlElement, anchor: &web_sys::Element, root: NodeRef<leptos::html::Div>) {
-    let Some(area) = root.try_get_untracked().flatten().and_then(|r| r.parent_element()) else { return };
+    let Some(root) = root.try_get_untracked().flatten() else { return };
+    let Some(area) = root.parent_element() else { return };
     let Some(parent) = node.offset_parent() else { return };
     let (mut a, v) = (rect(area.get_bounding_client_rect()), visible_viewport());
     // The scrollport excludes borders and the reserved scrollbar gutter.
@@ -973,8 +1089,30 @@ fn place_popover(node: &web_sys::HtmlElement, anchor: &web_sys::Element, root: N
     // Constrain before measuring: wrapping and a growing draft change height.
     let _ = style.set_property("max-width", &format!("{}px", (visible.width - 16.0).max(0.0)));
     let _ = style.set_property("max-height", &format!("{}px", (visible.height - 16.0).max(0.0)));
-    let r = node.get_bounding_client_rect();
-    let at = popover_at(rect(anchor.get_bounding_client_rect()), visible, (r.width(), r.height()));
+    let at = if let Some(block) = anchor.closest("[data-block]").ok().flatten() {
+        let block = rect(block.get_bounding_client_rect());
+        let column =
+            root.query_selector("[data-doc-reading]").ok().flatten().map(|el| rect(el.get_bounding_client_rect())).unwrap_or(block);
+        let width = thread_at(block, column, visible, (350.0, 160.0), 160.0).width;
+        let _ = style.set_property("width", &format!("{width}px"));
+        // offsetHeight is untransformed during the popover's entrance.
+        let height = f64::from(node.offset_height());
+        // Menus, multiline replies and errors are non-scrolling chrome too.
+        // Leave them and a line of conversation visible, rather than choosing
+        // an anchor-free rectangle that clips the reply controls.
+        let chrome = node
+            .query_selector("[data-thread-comments]")
+            .ok()
+            .flatten()
+            .map(|list| height - f64::from(list.client_height()) + 32.0)
+            .unwrap_or(160.0);
+        let at = thread_at(block, column, visible, (350.0, height), chrome.max(160.0));
+        let _ = style.set_property("max-height", &format!("{}px", at.height));
+        at
+    } else {
+        let r = node.get_bounding_client_rect();
+        popover_at(rect(anchor.get_bounding_client_rect()), visible, (r.width(), r.height()))
+    };
     let p = parent.get_bounding_client_rect();
     let _ = style.set_property("left", &format!("{}px", at.left - p.left() - f64::from(parent.client_left())));
     let _ = style.set_property("top", &format!("{}px", at.top - p.top() - f64::from(parent.client_top())));
@@ -1237,6 +1375,15 @@ pub fn DocPage(id: String) -> impl IntoView {
     let (tile_w, tile_h) = (RwSignal::new(0.0_f64), RwSignal::new(600.0_f64));
     let panel = RwSignal::new(false);
     let pop = RwSignal::new(None::<String>);
+    let prefs_key = StoredValue::new(format!("c6.doc-comments.{}", id.get_value()));
+    let prefs = RwSignal::new(
+        crate::util::storage_get(&prefs_key.get_value()).and_then(|s| serde_json::from_str::<CommentPrefs>(&s).ok()).unwrap_or_default(),
+    );
+    Effect::new(move || {
+        if let Ok(saved) = serde_json::to_string(&prefs.get()) {
+            crate::util::storage_set(&prefs_key.get_value(), &saved);
+        }
+    });
     let shown_threads = RwSignal::new(Vec::<DocThread>::new());
     let reveal = Callback::new(move |ids: Vec<String>| {
         let Some((on, mut els)) = tabs.with_untracked(|ts| reveal_targets(ts, &ids)) else { return };
@@ -1309,6 +1456,9 @@ pub fn DocPage(id: String) -> impl IntoView {
         commenting: RwSignal::new(None),
         panel,
         pop,
+        selected: RwSignal::new(None),
+        prefs,
+        edit_epochs: StoredValue::new(std::collections::HashMap::new()),
         pop_node: NodeRef::new(),
         tabs,
         root,
@@ -1337,6 +1487,15 @@ pub fn DocPage(id: String) -> impl IntoView {
         if let Some(Ok(t)) = loaded_threads.get()
             && shown_threads.with_untracked(|s| *s != t)
         {
+            prefs.update(|p| {
+                for thread in &t {
+                    if let Some(last) = thread.comments.last()
+                        && !p.read.contains_key(&thread.id)
+                    {
+                        p.read.insert(thread.id.clone(), last.id.clone());
+                    }
+                }
+            });
             shown_threads.set(t);
         }
     });
@@ -1353,7 +1512,7 @@ pub fn DocPage(id: String) -> impl IntoView {
     // resized, and goes with it (another tab, the block deleted).
     Effect::new(move || {
         tile_w.track();
-        // The panel docked or not moves the doc.
+        // The panel and thread boxes stay out of the reading column's layout.
         panel.track();
         fit.track();
         let here = blocks.with(|bs| pop.get().filter(|p| bs.iter().any(|b| b.id == *p)));
@@ -1740,13 +1899,12 @@ pub fn DocPage(id: String) -> impl IntoView {
         <div node_ref=root class="relative" style:padding-bottom=move || format!("{}px",
             (if sheet_present.get() { sheet_space.get() } else { 0.0 })
                 .max(if pop_sheet_present.get() { pop_sheet_space.get() } else { 0.0 }))>
-            // Docked, the panel sits right beside the doc's reading column
-            // and the two are centred together: at a wide tile's edge it
-            // was far from what it's about.
-            <div class="flex items-start justify-center">
-                <div class=move || if docked.get() { "min-w-0 max-w-3xl flex-1" } else { "min-w-0 flex-1" }>
+            // The panel overlays the same grid cell: even All comments must
+            // not shrink, recenter or rewrap the document when it opens.
+            <div class="grid">
+                <div class="min-w-0 [grid-area:1/1]">
                     {move || (state.get() == 2).then(bar)}
-                    <main class="mx-auto max-w-3xl space-y-4 px-4 pb-8 pt-3">
+                    <main data-doc-reading="" class="mx-auto max-w-3xl space-y-4 px-4 pb-8 pt-3">
                         {move || error.get().map(|e| view! {
                             <div class="flex items-start gap-2">
                                 <div class="flex-1"><ErrorBox message=e /></div>
@@ -1762,7 +1920,7 @@ pub fn DocPage(id: String) -> impl IntoView {
                 </div>
                 // Beside the doc, scrolling on its own.
                 <Show when=move || docked_present.get()>
-                    <aside class="c6-pane c6-presence sticky top-0 flex w-[26rem] shrink-0 flex-col border-x border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950"
+                    <aside class="c6-pane c6-presence sticky top-0 z-20 ml-auto flex w-[26rem] self-start flex-col border-x border-zinc-200 bg-white [grid-area:1/1] dark:border-zinc-800 dark:bg-zinc-950"
                         data-open=move || docked.get().to_string() inert=move || !docked.get()
                         style=move || format!("height:{}px;{}", tile_h.get(), if docked.get() { "" } else { "position:absolute;right:0" })>
                         <CommentsPanel />
@@ -1775,7 +1933,7 @@ pub fn DocPage(id: String) -> impl IntoView {
             <Show when=move || pop_sheet_present.get()>
                 <Sheet open=Signal::derive(move || pop_sheet.get()) space=pop_sheet_space close=Callback::new(move |()| threads.close_pop())>
                     {move || retained_pop.get().map(|(b, _)| view! {
-                        <div class="min-h-0 flex-1 space-y-2 overflow-y-auto overscroll-contain p-3 text-sm"><PopBody block=b /></div>
+                        <div class="flex min-h-0 flex-1 flex-col gap-2 overflow-hidden p-3 text-sm"><PopBody block=b /></div>
                     })}
                 </Sheet>
             </Show>
@@ -2047,7 +2205,7 @@ fn CommentsPanel() -> impl IntoView {
     let list = NodeRef::<leptos::html::Div>::new();
     let ids = Memo::new(move |previous: Option<&Vec<String>>| {
         let resolved = resolved.get();
-        let next = ctx.shown.with(|ts| ts.iter().filter(|t| (t.state != "open") == resolved).map(|t| t.id.clone()).collect::<Vec<_>>());
+        let next = ctx.shown.with(|ts| ctx.tabs.with(|tabs| ordered_threads(ts, tabs, resolved)));
         // Capture rows before For changes the keyed DOM; comment edits and
         // new replies keep these IDs and never start list motion.
         if previous.is_some_and(|previous| previous != &next) {
@@ -2065,6 +2223,7 @@ fn CommentsPanel() -> impl IntoView {
         )
     };
     view! {
+        <div data-comments-panel="" class="flex min-h-0 flex-1 flex-col overflow-hidden">
         <div class="flex shrink-0 items-center gap-2 border-b border-zinc-200 px-3 py-2 dark:border-zinc-800">
             <h2 class="flex-1 text-sm font-semibold">"Comments"</h2>
             <div class="flex rounded-md bg-zinc-100 p-0.5 text-xs dark:bg-zinc-800" role="group">
@@ -2074,14 +2233,19 @@ fn CommentsPanel() -> impl IntoView {
             <button class="rounded px-1.5 text-lg leading-none text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
                 title="Close" aria-label="Close the comments" on:click=move |_| ctx.panel.set(false)>{crate::icons::icon(crate::icons::Icon::X, crate::icons::Size::S14)}</button>
         </div>
-        <div node_ref=list class="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain p-3 text-sm">
+        <div node_ref=list data-comments-list="" class="min-h-0 flex-1 space-y-2 overflow-y-auto overscroll-contain p-3 text-sm">
+            <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted">
             <Show when=move || !archived.get()>
             <button class="text-xs text-muted hover:text-zinc-900 hover:underline dark:hover:text-zinc-100"
                 on:click=move |_| { ctx.focus.set(Some(String::new())); ctx.commenting.set(Some(String::new())) }>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" On the whole tab"</button>
             </Show>
+                <span class="flex-1"></span>
+                <button class="hover:underline" on:click=move |_| ctx.expand(&ids.get_untracked(), false)>"Collapse all"</button>
+                <button class="hover:underline" on:click=move |_| ctx.expand(&ids.get_untracked(), true)>"Expand all"</button>
+            </div>
             {move || new_on.get().map(|b| view! { <NewComment block=b done=Callback::new(move |()| ctx.commenting.set(None)) /> })}
             <For each=move || ids.get() key=|id| id.clone() children=move |id| view! {
-                <div data-motion-key=id.clone()><Thread id=id.clone() about=true /></div>
+                <div data-motion-key=id.clone()><PanelThread id=id.clone() /></div>
             } />
             {move || ids.with(Vec::is_empty).then(|| view! {
                 <p class="text-muted">{if resolved.get() { view! { "No resolved comments." }.into_any() } else { view! { "No open comments. Press "{crate::icons::icon(crate::icons::Icon::MessageSquare, crate::icons::Size::S14)}" by a block to start one." }.into_any() }}</p>
@@ -2093,6 +2257,60 @@ fn CommentsPanel() -> impl IntoView {
                 {send_all_button(ctx, false)}
             </div>
         })}
+        </div>
+    }
+}
+
+/// Stable document order, including nested blocks and other tabs. Whole-tab
+/// comments precede that tab's blocks; missing anchors follow the known doc.
+fn ordered_threads(threads: &[DocThread], tabs: &[DocTab], resolved: bool) -> Vec<String> {
+    fn blocks(bs: &[DocBlock], tab: usize, next: &mut usize, order: &mut std::collections::HashMap<String, (usize, usize)>) {
+        for b in bs {
+            order.insert(b.id.clone(), (tab, *next));
+            *next += 1;
+            blocks(&b.children, tab, next, order);
+        }
+    }
+    let mut order = std::collections::HashMap::new();
+    for (i, tab) in tabs.iter().enumerate() {
+        blocks(&tab.blocks, i, &mut 1, &mut order);
+    }
+    let mut shown = threads.iter().filter(|t| (t.state != "open") == resolved).collect::<Vec<_>>();
+    shown.sort_by_key(|t| {
+        if t.anchor.block.is_empty() {
+            (if t.anchor.tab.is_empty() { 0 } else { tabs.iter().position(|tab| tab.id == t.anchor.tab).unwrap_or(tabs.len()) }, 0)
+        } else {
+            order.get(&t.anchor.block).copied().unwrap_or((tabs.len(), usize::MAX))
+        }
+    });
+    shown.into_iter().map(|t| t.id.clone()).collect()
+}
+
+#[component]
+fn PanelThread(id: String) -> impl IntoView {
+    let ctx = expect_context::<ThreadsCtx>();
+    let id = StoredValue::new(id);
+    let t = Memo::new(move |_| ctx.shown.with(|ts| ts.iter().find(|t| t.id == id.get_value()).cloned().unwrap_or_default()));
+    let expanded = Memo::new(move |_| ctx.prefs.with(|p| p.expanded.contains(&id.get_value())));
+    Effect::new(move || {
+        if expanded.get() && ctx.panel.get() {
+            t.with(|t| ctx.read(t));
+        }
+    });
+    let unread =
+        move || !expanded.get() && t.with(|t| t.comments.last().is_some_and(|c| ctx.prefs.with(|p| p.read.get(&t.id) != Some(&c.id))));
+    view! {
+        <section data-panel-thread=id.get_value()>
+            <button data-thread-toggle=id.get_value() class="flex min-h-10 w-full items-center gap-2 rounded px-1 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                aria-expanded=move || expanded.get().to_string()
+                on:click=move |_| ctx.expand(&[id.get_value()], !expanded.get_untracked())>
+                <span class=move || if expanded.get() { "shrink-0 rotate-90" } else { "shrink-0" }>{crate::icons::icon(crate::icons::Icon::ChevronRight, crate::icons::Size::S14)}</span>
+                <span class="min-w-0 flex-1 truncate">{move || t.with(|t| ctx.tabs.with(|tabs| subject(tabs, &t.anchor.block, &t.about, &ctx.doc.get_value()).text))}</span>
+                {move || unread().then(|| view! { <span data-new-reply="" class="shrink-0 text-xs font-medium text-sky-700 dark:text-sky-400">"New reply"</span> })}
+                <ThreadStatus t />
+            </button>
+            <Show when=move || expanded.get()><Thread id=id.get_value() about=true /></Show>
+        </section>
     }
 }
 
@@ -2119,14 +2337,14 @@ fn BlockPop(block: String, open: Signal<bool>) -> impl IntoView {
         }
     });
     view! {
-        <div node_ref=node class="c6-pop c6-presence absolute z-30 w-96 space-y-2 overflow-y-auto overscroll-contain rounded-lg border border-zinc-200 bg-white p-2 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
+        <div node_ref=node data-thread-box="" class="c6-pop c6-presence absolute z-30 flex w-[350px] flex-col gap-2 overflow-hidden rounded-lg border border-zinc-200 bg-white p-2 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
             data-open=move || open.get().to_string() inert=move || !open.get()>
             <PopBody block />
         </div>
     }
 }
 
-/// What a block's popover holds: its open threads, and a new one.
+/// A block's box keeps focus on one conversation (or a new-thread draft).
 #[component]
 fn PopBody(block: String) -> impl IntoView {
     let ctx = expect_context::<ThreadsCtx>();
@@ -2138,24 +2356,40 @@ fn PopBody(block: String) -> impl IntoView {
         })
     });
     let writing = Memo::new(move |_| ctx.commenting.with(|c| c.as_deref() == Some(bid.get_value().as_str())));
+    let selected = Memo::new(move |_| ids.with(|ids| ctx.selected.get().filter(|id| ids.contains(id)).or_else(|| ids.first().cloned())));
+    let t =
+        Memo::new(move |_| ctx.shown.with(|ts| ts.iter().find(|t| Some(&t.id) == selected.get().as_ref()).cloned().unwrap_or_default()));
+    Effect::new(move || {
+        if ctx.pop.get().as_ref() == Some(&bid.get_value()) && !writing.get() {
+            t.with(|t| ctx.read(t));
+        }
+    });
+    let menu = RwSignal::new(false);
+    let menu_id = StoredValue::new(crate::util::dismissable(move || menu.get(), move || menu.set(false)));
     let close = Callback::new(move |()| ctx.close_pop());
     view! {
-        <div class="flex items-center justify-end gap-2 text-xs">
-            <button class="text-muted hover:text-zinc-900 hover:underline dark:hover:text-zinc-100"
-                on:click=move |_| { ctx.close_pop(); ctx.panel.set(true); }>"All comments "{crate::icons::icon(crate::icons::Icon::ArrowUpRight, crate::icons::Size::S14)}</button>
+        <div class="flex shrink-0 items-center gap-2 text-xs">
+            <span class="min-w-0 flex-1"><Show when=move || !writing.get()><ThreadStatus t /></Show></span>
+            <button class="rounded px-1 text-muted hover:bg-zinc-100 dark:hover:bg-zinc-800" aria-label="Thread options" title="Thread options"
+                aria-expanded=move || menu.get().to_string() data-pop=menu_id.get_value()
+                on:click=move |ev| { ev.stop_propagation(); menu.update(|m| *m = !*m); }>{crate::icons::ellipsis()}</button>
             <button class="rounded px-1 text-base leading-none text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
                 title="Close" aria-label="Close" on:click=move |_| close.run(())>{crate::icons::icon(crate::icons::Icon::X, crate::icons::Size::S14)}</button>
         </div>
-        <For each=move || ids.get() key=|id| id.clone() children=move |id| view! { <Thread id about=false /> } />
-        {move || if archived.get() {
-            ().into_any()
-        } else if writing.get() {
-            view! { <NewComment block=bid.get_value() done=close /> }.into_any()
-        } else {
-            view! {
+        <Show when=move || menu.get()>
+        <div data-thread-menu="" data-pop=menu_id.get_value() class="flex shrink-0 flex-wrap gap-x-3 gap-y-1 rounded bg-zinc-100 p-2 text-xs dark:bg-zinc-800">
+            <button class="text-muted hover:text-zinc-900 hover:underline dark:hover:text-zinc-100"
+                on:click=move |_| { ctx.close_pop(); ctx.panel.set(true); }>"All comments "{crate::icons::icon(crate::icons::Icon::ArrowUpRight, crate::icons::Size::S14)}</button>
+            <Show when=move || !archived.get()>
                 <button class="text-xs text-muted hover:text-zinc-900 hover:underline dark:hover:text-zinc-100"
-                    on:click=move |_| { ctx.focus.set(Some(bid.get_value())); ctx.commenting.set(Some(bid.get_value())) }>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" New thread on this block"</button>
-            }.into_any()
+                    on:click=move |_| { menu.set(false); ctx.focus.set(Some(bid.get_value())); ctx.commenting.set(Some(bid.get_value())) }>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" New thread on this block"</button>
+            </Show>
+        </div>
+        </Show>
+        {move || if writing.get() && !archived.get() {
+            view! { <div class="min-h-0 overflow-y-auto"><NewComment block=bid.get_value() done=close /></div> }.into_any()
+        } else {
+            selected.get().map(|id| view! { <Thread id about=false /> }).into_any()
         }}
     }
 }
@@ -2736,7 +2970,9 @@ fn NewComment(block: String, done: Callback<()>) -> impl IntoView {
             && focus.get_untracked().is_some_and(|b| block.with_value(|x| *x == b))
         {
             focus.set(None);
-            let _ = el.focus();
+            let options = web_sys::FocusOptions::new();
+            options.set_prevent_scroll(true);
+            let _ = el.focus_with_options(&options);
         }
     });
     crate::util::autosize(writing, move || text.track());
@@ -2756,19 +2992,26 @@ fn NewComment(block: String, done: Callback<()>) -> impl IntoView {
             crate::util::forget_draft(t);
             crate::util::forget_draft(q);
         });
+        let posted_block = block.get_value();
+        let (text_key, quote_key) = keys.get_value();
+        let doc_id = doc.get_value();
         spawn_local(async move {
-            match api::doc_thread_new(doc.get_value(), &t).await {
-                Ok(_) => {
-                    // The popover stays, showing the new thread.
-                    let _ = ctx.commenting.try_set(None);
+            match api::doc_thread_new(doc_id, &t).await {
+                Ok(thread) => {
+                    // Put the returned conversation in place before selecting
+                    // it; the refresh must not flash an older thread first.
+                    let new_id = thread.id.clone();
+                    ctx.upsert(thread);
+                    if ctx.commenting.try_get_untracked().flatten().as_ref() == Some(&posted_block) {
+                        let _ = ctx.selected.try_set(Some(new_id));
+                        let _ = ctx.commenting.try_set(None);
+                    }
                     let _ = ctx.tick.try_update(|t| *t += 1);
                 }
                 // Not posted: what you wrote comes back.
                 Err(e) => {
-                    keys.with_value(|(t, q)| {
-                        crate::util::storage_set(t, &said);
-                        crate::util::storage_set(q, &quoted);
-                    });
+                    crate::util::storage_set(&format!("c6.draft.{text_key}"), &said);
+                    crate::util::storage_set(&format!("c6.draft.{quote_key}"), &quoted);
                     let _ = text.try_set(said);
                     let _ = quote.try_set(quoted);
                     let _ = error.try_set(Some(e));
@@ -2815,6 +3058,29 @@ fn AgentOnIt(session: String) -> impl IntoView {
         } else {
             view! { <span>"sent to the agent"</span> }.into_any()
         }
+    }
+}
+
+/// Existing thread states, not a new attention or ordering policy.
+#[component]
+fn ThreadStatus(t: Memo<DocThread>) -> impl IntoView {
+    move || {
+        t.with(|t| {
+            if t.state != "open" && !t.state.is_empty() {
+                view! { <span class="shrink-0 text-xs text-muted">{format!("resolved by {}", author(&t.resolved_by))}</span> }.into_any()
+            } else if t.needs_you {
+                view! { <span class="shrink-0 text-xs text-amber-800 dark:text-amber-300">"Your move"</span> }.into_any()
+            } else if t.detached {
+                view! { <span class="shrink-0 text-xs text-muted" title="What it was about is gone or changed">"detached"</span> }
+                    .into_any()
+            } else if t.unsent {
+                view! { <span class="shrink-0 text-xs text-muted">"Send now"</span> }.into_any()
+            } else if t.to_agent && t.comments.last().is_some_and(|c| c.by != format!("session:{}", t.agent)) {
+                view! { <span class="shrink-0 text-xs text-muted"><AgentOnIt session=t.agent.clone() /></span> }.into_any()
+            } else {
+                ().into_any()
+            }
+        })
     }
 }
 
@@ -2900,11 +3166,12 @@ fn MyComment(c: c6_api::docs::DocComment, thread: String) -> impl IntoView {
     let ctx = expect_context::<ThreadsCtx>();
     let archived = read_only();
     let (doc, tick) = (ctx.doc, ctx.tick);
+    let key = StoredValue::new(format!("comment-edit.{}.{}.{}", doc.get_value(), thread, c.id));
     let ids = StoredValue::new((thread, c.id));
     let when = since(c.at).trim_end_matches(" ago").to_owned();
     let shown = RwSignal::new(c.text);
-    let text = RwSignal::new(String::new());
-    let editing = RwSignal::new(false);
+    let text = crate::util::draft(&key.get_value());
+    let editing = RwSignal::new(!text.get_untracked().is_empty());
     let deleting = RwSignal::new(false);
     let busy = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
@@ -2915,17 +3182,26 @@ fn MyComment(c: c6_api::docs::DocComment, thread: String) -> impl IntoView {
     // Into the box as it opens, the cursor after the text.
     Effect::new(move || {
         if let Some(el) = area.get() {
-            let _ = el.focus();
+            let options = web_sys::FocusOptions::new();
+            options.set_prevent_scroll(true);
+            let _ = el.focus_with_options(&options);
             let end = el.value().encode_utf16().count() as u32;
             let _ = el.set_selection_range(end, end);
         }
     });
     let edit = move |_| {
-        text.set(shown.get_untracked());
+        if text.get_untracked().is_empty() {
+            text.set(shown.get_untracked());
+        }
         error.set(None);
         editing.set(true);
     };
     let cancel = move || {
+        ctx.edit_epochs.update_value(|versions| {
+            *versions.entry(key.get_value()).or_default() += 1;
+        });
+        crate::util::forget_draft(&key.get_value());
+        text.set(String::new());
         editing.set(false);
         error.set(None);
     };
@@ -2935,18 +3211,26 @@ fn MyComment(c: c6_api::docs::DocComment, thread: String) -> impl IntoView {
             return;
         }
         if said.trim() == shown.with_untracked(|s| s.trim().to_owned()) {
+            crate::util::forget_draft(&key.get_value());
+            text.set(String::new());
             editing.set(false);
             return;
         }
         busy.set(true);
+        let (thread, comment) = ids.get_value();
+        let (doc_id, draft_key) = (doc.get_value(), key.get_value());
+        let epoch = ctx.edit_epochs.with_value(|v| v.get(&draft_key).copied().unwrap_or(0));
         spawn_local(async move {
-            let (thread, comment) = ids.get_value();
-            let r = api::doc_comment_edit(doc.get_value(), thread, comment, said.clone()).await;
+            let r = api::doc_comment_edit(doc_id, thread, comment, said.clone()).await;
             let _ = busy.try_set(false);
             match r {
                 Ok(_) => {
+                    if ctx.edit_epochs.try_with_value(|v| v.get(&draft_key).copied().unwrap_or(0)) == Some(epoch) {
+                        crate::util::forget_draft(&draft_key);
+                        let _ = text.try_set(String::new());
+                        let _ = editing.try_set(false);
+                    }
                     let _ = shown.try_set(said.trim().to_owned());
-                    let _ = editing.try_set(false);
                     let _ = tick.try_update(|t| *t += 1);
                 }
                 // It stays open with what you wrote (an agent may have got
@@ -2962,13 +3246,15 @@ fn MyComment(c: c6_api::docs::DocComment, thread: String) -> impl IntoView {
             return;
         }
         busy.set(true);
+        let (thread, comment) = ids.get_value();
+        let (doc_id, draft_key) = (doc.get_value(), key.get_value());
         spawn_local(async move {
-            let (thread, comment) = ids.get_value();
-            let r = api::doc_comment_delete(doc.get_value(), thread, comment).await;
+            let r = api::doc_comment_delete(doc_id, thread, comment).await;
             let _ = busy.try_set(false);
             let _ = deleting.try_set(false);
             match r {
                 Ok(()) => {
+                    crate::util::forget_draft(&draft_key);
                     let _ = tick.try_update(|t| *t += 1);
                 }
                 Err(e) => {
@@ -2990,7 +3276,10 @@ fn MyComment(c: c6_api::docs::DocComment, thread: String) -> impl IntoView {
             {move || if editing.get() && !archived.get() {
                 view! {
                     <div class="w-full space-y-1">
-                        <textarea node_ref=area rows="1" class=format!("{INPUT} {COMMENT_GROWS}") prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev))
+                        <textarea node_ref=area rows="1" class=format!("{INPUT} {COMMENT_GROWS}") prop:value=move || text.get() on:input=move |ev| {
+                            ctx.edit_epochs.update_value(|versions| { *versions.entry(key.get_value()).or_default() += 1; });
+                            text.set(event_target_value(&ev));
+                        }
                             on:keydown=move |ev| if ev.key() == "Escape" { ev.prevent_default(); cancel() } else if crate::util::sends(&ev) { ev.prevent_default(); save() } />
                         <div class="flex justify-end gap-2">
                             <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| cancel()>"Cancel"</button>
@@ -3078,7 +3367,17 @@ fn Thread(id: String, about: bool) -> impl IntoView {
     let to_agent = RwSignal::new(t.with_untracked(|t| t.to_agent && !t.agent.is_empty()));
     let error = RwSignal::new(None::<String>);
     let done = move |r: Result<DocThread, String>| match r {
-        Ok(_) => {
+        Ok(thread) => {
+            // A user-resolved single conversation closes, rather than
+            // silently switching to another thread on the same block.
+            if !about
+                && thread.state != "open"
+                && ctx.pop.try_get_untracked().flatten().as_ref() == Some(&thread.anchor.block)
+                && ctx.selected.try_get_untracked().flatten().is_none_or(|id| id == thread.id)
+            {
+                ctx.close_pop();
+            }
+            ctx.upsert(thread);
             let _ = error.try_set(None);
             let _ = tick.try_update(|t| *t += 1);
         }
@@ -3100,10 +3399,11 @@ fn Thread(id: String, about: bool) -> impl IntoView {
         }
         crate::util::forget_draft(&key.get_value());
         reply.set(String::new());
+        let (doc_id, thread_id, draft_key) = (doc.get_value(), tid.get_value(), key.get_value());
         spawn_local(async move {
-            let r = api::doc_thread_reply(doc.get_value(), tid.get_value(), &c).await;
+            let r = api::doc_thread_reply(doc_id, thread_id, &c).await;
             if r.is_err() {
-                crate::util::storage_set(&format!("c6.draft.{}", key.get_value()), &c.text);
+                crate::util::storage_set(&format!("c6.draft.{draft_key}"), &c.text);
                 let _ = reply.try_set(c.text.clone());
             }
             done(r)
@@ -3114,8 +3414,9 @@ fn Thread(id: String, about: bool) -> impl IntoView {
         if archived.get_untracked() {
             return;
         }
+        let (doc_id, thread_id) = (doc.get_value(), tid.get_value());
         spawn_local(async move {
-            match api::doc_threads_send(doc.get_value(), vec![tid.get_value()]).await {
+            match api::doc_threads_send(doc_id, vec![thread_id]).await {
                 Ok(_) => {
                     let _ = tick.try_update(|t| *t += 1);
                 }
@@ -3131,7 +3432,7 @@ fn Thread(id: String, about: bool) -> impl IntoView {
     let list = NodeRef::<leptos::html::Div>::new();
     Effect::new(move || {
         t.with(|t| t.comments.len());
-        if list.get().is_some() {
+        if !about && list.get().is_some() {
             request_animation_frame(move || {
                 if let Some(el) = list.try_get_untracked().flatten() {
                     el.set_scroll_top(el.scroll_height());
@@ -3140,29 +3441,6 @@ fn Thread(id: String, about: bool) -> impl IntoView {
         }
     });
     let open = Memo::new(move |_| t.with(|t| t.state == "open"));
-    // Where it stands: what it was about is gone, the agent working, not
-    // sent yet, resolved, your move.
-    let status = move || {
-        t.with(|t| {
-            let waiting = t.to_agent && !t.needs_you && t.comments.last().is_some_and(|c| c.by != format!("session:{}", t.agent));
-            let resolved = t.state != "open";
-            (t.detached || waiting || t.unsent || resolved || t.needs_you).then(|| {
-                view! {
-                    <div class="flex flex-wrap items-center gap-2 text-xs text-muted">
-                        {t.detached.then(|| view! { <span class="rounded bg-zinc-100 px-1 dark:bg-zinc-800" title="What it was about is gone or changed">"detached"</span> })}
-                        {waiting.then(|| view! { <AgentOnIt session=t.agent.clone() /> })}
-                        {(!archived.get() && t.unsent).then(|| view! {
-                            <button class="rounded-md border border-sky-600 px-2 py-0.5 font-medium text-sky-700 hover:bg-sky-50 pointer-coarse:py-1.5 dark:border-sky-500 dark:text-sky-300 dark:hover:bg-sky-950"
-                                title="Your last comment here hasn't gone to an agent: send the thread now" on:click=send_unsent>"Send now"</button>
-                        })}
-                        {resolved.then(|| view! { <span>{format!("resolved by {}", author(&t.resolved_by))}</span> })}
-                        <span class="flex-1"></span>
-                        {t.needs_you.then(|| view! { <span class="rounded-full bg-amber-100 px-2 py-0.5 font-medium text-amber-800 dark:bg-amber-900/50 dark:text-amber-300">"Your move"</span> })}
-                    </div>
-                }
-            })
-        })
-    };
     // That it changed the doc goes under the agent's newest comment (after
     // them all if it hasn't written one): which comment made which edit
     // isn't kept. Each comment is drawn again only when it changes, so one
@@ -3181,10 +3459,9 @@ fn Thread(id: String, about: bool) -> impl IntoView {
         t.with(|t| (!t.edits.is_empty() && !t.comments.iter().any(|c| c.by.starts_with("session:"))).then(|| changed_the_doc(ctx, t)))
     };
     view! {
-        <div class="space-y-2 rounded-lg border border-zinc-200 p-2 text-sm dark:border-zinc-800" data-thread=tid.get_value()>
+        <div class=if about { "space-y-2 rounded-lg border border-zinc-200 p-2 text-sm dark:border-zinc-800" } else { "flex min-h-0 flex-1 flex-col gap-2 text-sm" } data-thread=tid.get_value()>
             {about.then(|| view! { <About t /> })}
-            {status}
-            <div node_ref=list class="max-h-96 space-y-2 overflow-y-auto">
+            <div node_ref=list data-thread-comments="" class=if about { "space-y-2" } else { "min-h-0 flex-1 space-y-2 overflow-y-auto overscroll-contain" }>
                 <For each=comments key=|(c, edits)| (c.id.clone(), c.text.clone(), c.editable, edits.clone()) children=move |(c, edits)| {
                     let arrives = !seen.with_value(|ids| ids.contains(&c.id));
                     seen.update_value(|ids| { ids.insert(c.id.clone()); });
@@ -3199,8 +3476,9 @@ fn Thread(id: String, about: bool) -> impl IntoView {
             </div>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             <Show when=move || !archived.get()>
-            <div class="relative">
-                <textarea node_ref=area rows="1" class=format!("{INPUT} {COMMENT_GROWS} pr-9") placeholder="Reply…" prop:value=move || reply.get() on:input=move |ev| reply.set(event_target_value(&ev))
+            <div class="flex shrink-0 items-end gap-2">
+            <div class="relative min-w-0 flex-1">
+                <textarea node_ref=area rows="1" class=format!("{INPUT} {} pr-9", if about { COMMENT_GROWS } else { "grows block max-h-24 resize-none overflow-y-auto" }) placeholder="Reply…" prop:value=move || reply.get() on:input=move |ev| reply.set(event_target_value(&ev))
                     on:keydown=move |ev| if crate::util::sends(&ev) { ev.prevent_default(); send() }></textarea>
                 // Send, as the message box's: a soft square, sky once there's text.
                 <button class=move || format!("absolute bottom-1.5 right-1.5 flex h-[22px] w-[22px] items-center justify-center rounded-md {}", if reply.with(|r| r.trim().is_empty()) { "bg-zinc-600 text-zinc-200" } else { "bg-sky-600 text-white" })
@@ -3208,10 +3486,14 @@ fn Thread(id: String, about: bool) -> impl IntoView {
                     {crate::session::send_icon()}
                 </button>
             </div>
-            <div class="flex items-center gap-2">
-                <div class="flex-1"><crate::components::Switch on=move || to_agent.get() on_change=move |v| to_agent.set(v) label="Send to agent" title="Send the thread to an agent" /></div>
                 {move || open.get().then(|| view! {
-                    <button class="text-xs text-muted hover:underline" on:click=move |_| spawn_local(async move { done(api::doc_thread_resolve(doc.get_value(), tid.get_value()).await) })>"Resolve"</button>
+                    <button class="min-h-9 shrink-0 text-xs text-muted hover:underline" on:click=move |_| if !archived.get_untracked() { spawn_local(async move { done(api::doc_thread_resolve(doc.get_value(), tid.get_value()).await) }) }>"Resolve"</button>
+                })}
+            </div>
+            <div class="flex shrink-0 items-center gap-2 text-xs text-muted">
+                <div class="min-w-0 flex-1 [&>button]:min-h-7 [&>button]:text-xs pointer-coarse:[&>button]:min-h-11"><crate::components::Switch on=move || to_agent.get() on_change=move |v| to_agent.set(v) label="Send to agent" title="Send the thread to an agent" /></div>
+                {move || t.with(|t| t.unsent).then(|| view! {
+                    <button class="shrink-0 text-sky-700 hover:underline dark:text-sky-400" title="Your last comment here hasn't gone to an agent: send the thread now" on:click=send_unsent>"Send now"</button>
                 })}
             </div>
             </Show>
@@ -3721,8 +4003,8 @@ mod tests {
         assert!(memo.contains("previous: Option<&Vec<String>>"));
         assert!(memo.contains("previous.is_some_and(|previous| previous != &next)"), "text/reply updates must not animate the list");
         assert!(memo.find("crate::util::flip_list(list, &next)").unwrap() < memo.rfind("next").unwrap());
-        assert!(panel.contains("<div node_ref=list class=\"min-h-0 flex-1 space-y-3"));
-        assert!(panel.contains("<div data-motion-key=id.clone()><Thread id=id.clone() about=true /></div>"));
+        assert!(panel.contains("<div node_ref=list data-comments-list=\"\" class=\"min-h-0 flex-1 space-y-2 overflow-y-auto"));
+        assert!(panel.contains("<div data-motion-key=id.clone()><PanelThread id=id.clone() /></div>"));
     }
 
     #[test]
@@ -3743,6 +4025,90 @@ mod tests {
         let flash = source.split("fn flash_blocks(").nth(1).unwrap().split("fn reveal_targets(").next().unwrap();
         assert!(flash.contains("crate::util::reduced_motion()"));
         assert!(flash.contains("web_sys::ScrollBehavior::Instant"), "Reduced/Off cannot inherit smooth scrolling");
+    }
+
+    #[test]
+    fn thread_boxes_use_margins_then_anchor_free_strips_without_reflow() {
+        use super::{Rect, thread_at};
+        let area = Rect { left: 0.0, top: 0.0, width: 1800.0, height: 900.0 };
+        let column = Rect { left: 500.0, top: 60.0, width: 768.0, height: 1800.0 };
+        let block = Rect { left: 516.0, top: 100.0, width: 736.0, height: 120.0 };
+        let intersects = |a: Rect, b: Rect| {
+            a.left < b.left + b.width && b.left < a.left + a.width && a.top < b.top + b.height && b.top < a.top + a.height
+        };
+        let margin = thread_at(block, column, area, (350.0, 500.0), 160.0);
+        assert_eq!(margin.width, 350.0);
+        assert!(margin.left >= column.left + column.width + 8.0);
+        assert!(!intersects(margin, block));
+        let column = Rect { left: 800.0, ..column };
+        let block = Rect { left: 816.0, ..block };
+        let left = thread_at(block, column, area, (350.0, 500.0), 160.0);
+        assert!(left.left + left.width <= column.left - 8.0);
+        for room in [255.0, 256.0, 349.0, 350.0] {
+            let area = Rect { width: 2.0 * room + 800.0, ..area };
+            let column = Rect { left: room + 16.0, width: 768.0, ..column };
+            let block = Rect { left: column.left, width: column.width, ..block };
+            let placed = thread_at(block, column, area, (350.0, 500.0), 160.0);
+            assert!(!intersects(placed, block));
+            assert_eq!(placed.width, if room >= 256.0 { room.min(350.0) } else { 256.0 });
+        }
+        let area = Rect { width: 1000.0, ..area };
+        let column = Rect { left: 116.0, ..column };
+        for y in [100.0, 700.0] {
+            let block = Rect { left: 132.0, top: y, ..block };
+            let placed = thread_at(block, column, area, (350.0, 500.0), 160.0);
+            assert_eq!(placed.width, 256.0);
+            assert!(!intersects(placed, block), "try above/below before covering the block");
+        }
+        // Outside/partly visible/hidden tiles never produce inverted clamps,
+        // NaNs or a width larger than the visible scrollport.
+        for (width, height) in [(0.0, 0.0), (12.0, 12.0), (200.0, 400.0), (1000.0, 900.0)] {
+            let area = Rect { left: 30.0, top: 40.0, width, height };
+            for (x, y) in [(-1200.0, -500.0), (0.0, 0.0), (1000.0, 1000.0)] {
+                let block = Rect { left: x, top: y, width: 900.0, height: 900.0 };
+                let placed = thread_at(block, block, area, (350.0, 800.0), 160.0);
+                assert!(placed.left.is_finite() && placed.top.is_finite());
+                assert!(placed.width <= (width - 16.0).max(0.0) && placed.height <= (height - 16.0).max(0.0));
+                assert!(placed.left >= area.left + 8.0 && placed.top >= area.top + 8.0);
+                assert!(placed.left + placed.width <= (area.left + width - 8.0).max(area.left + 8.0));
+                assert!(placed.top + placed.height <= (area.top + height - 8.0).max(area.top + 8.0));
+            }
+        }
+    }
+
+    #[test]
+    fn panel_order_follows_tabs_and_nested_blocks_not_attention_or_api_order() {
+        use super::*;
+        let tabs = vec![
+            DocTab {
+                id: "one".into(),
+                blocks: vec![DocBlock {
+                    id: "a".into(),
+                    children: vec![DocBlock { id: "child".into(), ..Default::default() }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            DocTab { id: "two".into(), blocks: vec![DocBlock { id: "b".into(), ..Default::default() }], ..Default::default() },
+        ];
+        let thread = |id: &str, tab: &str, block: &str| DocThread {
+            id: id.into(),
+            state: "open".into(),
+            anchor: c6_api::docs::Anchor { tab: tab.into(), block: block.into(), ..Default::default() },
+            ..Default::default()
+        };
+        let mut threads = vec![
+            thread("b", "two", "b"),
+            thread("child", "one", "child"),
+            thread("a1", "one", "a"),
+            thread("a2", "one", "a"),
+            thread("tab", "one", ""),
+            thread("gone", "unknown", ""),
+        ];
+        threads[0].needs_you = true;
+        assert_eq!(ordered_threads(&threads, &tabs, false), ["tab", "a1", "a2", "child", "b", "gone"]);
+        threads[2].state = "resolved".into();
+        assert_eq!(ordered_threads(&threads, &tabs, true), ["a1"]);
     }
 
     #[test]
@@ -3807,6 +4173,9 @@ mod tests {
                 commenting: RwSignal::new(None),
                 panel: RwSignal::new(false),
                 pop: RwSignal::new(None),
+                selected: RwSignal::new(None),
+                prefs: RwSignal::new(CommentPrefs::default()),
+                edit_epochs: StoredValue::new(std::collections::HashMap::new()),
                 pop_node: NodeRef::new(),
                 tabs: Memo::new(move |_| tabs.get()),
                 root: NodeRef::new(),
