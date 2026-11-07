@@ -740,6 +740,7 @@ names-kept diagnostic files are never counted as production downloads.
 | 7035ec6b baseline | 10,789,325 | 2,664,768 | — |
 | Shared popup listener factories | 10,750,115 | 2,659,154 | 39,210 / 5,614 |
 | Shared checked response-body polling | 10,691,725 | 2,651,304 | 58,390 / 7,850 |
+| Shared list-editor view boundary | 10,688,242 | 2,649,938 | 3,483 / 1,366 |
 
 The whole-module profile repeats S1's names-kept bindgen/`wasm-opt -Oz -g`
 pipeline, twiggy top/dominators/monos, and all-symbol per-crate/per-module
@@ -775,6 +776,17 @@ a scheduler yield. Checking/reading remain lazy; dropping the outer future
 drops the nested body future without promising stronger network cancellation.
 Request sending, serialization and AbortSignal handling are unchanged.
 The response-body change also passes **305/305** native UI tests.
+
+ListSetting keeps its original typed section, fields, keyed rows, event handlers
+and resources, returning one AnyView after construction instead of exposing the
+whole editor type to every Settings branch. There is no HTML-string rendering
+or global component erasure. The focused `settings-lists.cjs` regression passes
+**8/8** contexts on both the exact baseline and this build (Chromium/WebKit,
+light/dark, desktop/phone), including live-update DOM/focus retention, every
+field kind, rejected/successful saves, reload, same-page section navigation and
+root/realm switching. Native UI tests also pass **305/305**. Forcing the
+constructor not to inline saved no additional raw bytes and increased Brotli
+by 956 bytes, so that attribute was not retained.
 
 The broader audit found no accidental release inclusion of native tests,
 SSR, regex, ICU or a second gloo-net implementation. Markdown defaults are

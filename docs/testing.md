@@ -82,9 +82,9 @@ make ui-browser-test
 UI_BROWSER_PASSES=3 make ui-browser-test
 ```
 
-The runner covers workspace-open, motion, comment-sheet, phone-picker and
-theme (`--browser`) in each engine, plus ring-render in Chromium. **ring-render
-is Chromium-only**, because its layer/paint/blocked-main-thread assertions
+The runner covers workspace-open, motion, comment-sheet, phone-picker,
+theme (`--browser`) and settings-lists in each engine, plus ring-render in
+Chromium. **ring-render is Chromium-only**, because its layer/paint/blocked-main-thread assertions
 require CDP; `ENGINE=webkit` now fails explicitly instead of silently launching
 Chromium. Its full default three-run/two-theme workload remains enabled.
 The default motion matrix has 24 contexts per engine; phone-picker has 24.
@@ -97,6 +97,13 @@ every suite. `UI_BROWSER_PASSES=3 BROWSER_SUITES=motion bash scripts/ui-browser-
 runs three full Motion matrices in both engines.
 Logs/screenshots/traces are separated by pass, engine and suite. A failed
 command stops the runner, keeps the evidence, and is never automatically retried.
+
+`settings-lists.cjs` covers the production list editors in light/dark and
+desktop/phone: keyed-row and focus retention during live updates, adding and
+removing, all field kinds, rejected/successful saves, reload and same-page
+section remounts, and the console's root/realm routing selector. It mocks only
+private loopback APIs; no live settings are read or written. To run it alone:
+`ENGINE=both node crates/c6-ui/tests/settings-lists.cjs`.
 
 Existing CI workflows are unchanged: these standalone browser suites were not
 previously CI jobs. A browser runner on Ubuntu 24.04 needs Node 24, npm, the

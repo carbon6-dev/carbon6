@@ -3535,6 +3535,8 @@ fn skill_examples() -> Vec<(&'static str, serde_json::Value)> {
 /// A list setting (commands, agents, skills) edited item by item and saved
 /// to the head, which checks it. `realm`: in the console, whose own list
 /// it edits (root's, or one realm's); else this page's.
+/// Keep the typed editor behind one shared view boundary rather than
+/// expanding its render state into every settings section that uses it.
 #[component]
 fn ListSetting(
     name: &'static str,
@@ -3544,7 +3546,7 @@ fn ListSetting(
     fields: &'static [Field],
     examples: fn() -> Vec<(&'static str, serde_json::Value)>,
     #[prop(optional)] realm: Option<RwSignal<String>>,
-) -> impl IntoView {
+) -> AnyView {
     let rows = RwSignal::new(Vec::<(u64, RwSignal<serde_json::Map<String, serde_json::Value>>)>::new());
     let next = StoredValue::new(0u64);
     let add = move |v: serde_json::Value| {
@@ -3620,6 +3622,7 @@ fn ListSetting(
             </div>
         </section>
     }
+    .into_any()
 }
 
 /// An item's field: `a.b` is field b of the object in a.
