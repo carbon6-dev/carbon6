@@ -335,74 +335,97 @@ impl Feed {
         // How far the log has come: streamed text that arrives late is
         // already in its messages.
         let logged = StoredValue::new(Logged::default());
+        let receive = move |msg| match msg {
+            // Replayed turns don't start and stop it again (the log says
+            // whether one is running).
+            StreamMsg::Event { event } if !synced.get_untracked() || again.get_value() => {
+                logged.update_value(|l| l.note(&event));
+                let last = replay.with_value(|r| r.last().map(|e| e.seq)).or_else(|| events.with_untracked(|e| e.last().map(|e| e.seq)));
+                if last.is_none_or(|l| l < event.seq) {
+                    replay.update_value(|r| r.push(event));
+                }
+            }
+            StreamMsg::Event { event } => {
+                streaming.update(|s| logged.update_value(|l| l.event(s, &event)));
+                if let EventKind::TurnEnded { .. } = event.kind {
+                    activity.set(Some(false));
+                }
+                if let EventKind::TurnStarted { .. } = event.kind {
+                    activity.set(Some(true));
+                }
+                events.update(|evs| {
+                    if evs.last().is_none_or(|l| l.seq < event.seq) {
+                        evs.push(event)
+                    }
+                });
+            }
+            StreamMsg::Window { from: f } => from.set(f),
+            msg @ (StreamMsg::Text { .. } | StreamMsg::Thinking { .. } | StreamMsg::ToolOutput { .. }) => {
+                streaming.maybe_update(|s| logged.with_value(|l| l.stream(s, msg)))
+            }
+            StreamMsg::Activity { running, status } => {
+                activity.set(Some(running));
+                // A retry starts the response over: drop what the failed call streamed.
+                if !status.is_empty() {
+                    streaming.set(Streaming { status, ..Default::default() });
+                } else {
+                    streaming.update(|s| s.status.clear());
+                }
+            }
+            StreamMsg::Queue { queued: q } => queued.set(q),
+            StreamMsg::Synced => {
+                let r = replay.try_update_value(std::mem::take).unwrap_or_default();
+                // Opened at a place: drawn from there, not to the end.
+                if let Window::At(at) = window {
+                    to.set(bound(&r, at));
+                }
+                // Missed while away: what streamed for it goes, and
+                // whether a turn runs is as its last start or end says.
+                if again.get_value() && !r.is_empty() {
+                    streaming.update(|s| logged.update_value(|l| r.iter().for_each(|e| l.event(s, e))));
+                    let running = r.iter().rev().find_map(|e| match e.kind {
+                        EventKind::TurnStarted { .. } => Some(true),
+                        EventKind::TurnEnded { .. } => Some(false),
+                        _ => None,
+                    });
+                    if let Some(running) = running {
+                        activity.set(Some(running));
+                    }
+                }
+                if !r.is_empty() {
+                    events.update(|evs| evs.extend(r));
+                }
+                again.set_value(false);
+                synced.set(true);
+                stream_failed.set(false);
+            }
+            StreamMsg::Secret { call_id, title, value, note } => secrets.update(|s| s.push(SecretCard { call_id, title, value, note })),
+        };
+        // WS frames in one burst are one presentation update, in wire order.
+        // In particular a streamed reply, its durable replacement, usage and
+        // turn end must not each paint an intermediate transcript layout.
+        let pending = StoredValue::new(Vec::<StreamMsg>::new());
+        let frame = StoredValue::new(None::<leptos::leptos_dom::helpers::AnimationFrameRequestHandle>);
+        let flush = move || {
+            if let Some(frame) = frame.try_update_value(Option::take).flatten() {
+                frame.cancel();
+            }
+            if let Some(messages) = pending.try_update_value(std::mem::take) {
+                leptos::reactive::effect::batch(|| {
+                    for message in messages {
+                        receive(message);
+                    }
+                });
+            }
+        };
         let handle = api::stream_session(
             id,
-            move |msg| match msg {
-                // Replayed turns don't start and stop it again (the log says
-                // whether one is running).
-                StreamMsg::Event { event } if !synced.get_untracked() || again.get_value() => {
-                    logged.update_value(|l| l.note(&event));
-                    let last =
-                        replay.with_value(|r| r.last().map(|e| e.seq)).or_else(|| events.with_untracked(|e| e.last().map(|e| e.seq)));
-                    if last.is_none_or(|l| l < event.seq) {
-                        replay.update_value(|r| r.push(event));
-                    }
+            move |msg| {
+                pending.update_value(|p| p.push(msg));
+                if frame.with_value(Option::is_none) {
+                    let next = leptos::leptos_dom::helpers::request_animation_frame_with_handle(flush).ok();
+                    frame.set_value(next);
                 }
-                StreamMsg::Event { event } => {
-                    streaming.update(|s| logged.update_value(|l| l.event(s, &event)));
-                    if let EventKind::TurnEnded { .. } = event.kind {
-                        activity.set(Some(false));
-                    }
-                    if let EventKind::TurnStarted { .. } = event.kind {
-                        activity.set(Some(true));
-                    }
-                    events.update(|evs| {
-                        if evs.last().is_none_or(|l| l.seq < event.seq) {
-                            evs.push(event)
-                        }
-                    });
-                }
-                StreamMsg::Window { from: f } => from.set(f),
-                msg @ (StreamMsg::Text { .. } | StreamMsg::Thinking { .. } | StreamMsg::ToolOutput { .. }) => {
-                    streaming.maybe_update(|s| logged.with_value(|l| l.stream(s, msg)))
-                }
-                StreamMsg::Activity { running, status } => {
-                    activity.set(Some(running));
-                    // A retry starts the response over: drop what the failed call streamed.
-                    if !status.is_empty() {
-                        streaming.set(Streaming { status, ..Default::default() });
-                    } else {
-                        streaming.update(|s| s.status.clear());
-                    }
-                }
-                StreamMsg::Queue { queued: q } => queued.set(q),
-                StreamMsg::Synced => {
-                    let r = replay.try_update_value(std::mem::take).unwrap_or_default();
-                    // Opened at a place: drawn from there, not to the end.
-                    if let Window::At(at) = window {
-                        to.set(bound(&r, at));
-                    }
-                    // Missed while away: what streamed for it goes, and
-                    // whether a turn runs is as its last start or end says.
-                    if again.get_value() && !r.is_empty() {
-                        streaming.update(|s| logged.update_value(|l| r.iter().for_each(|e| l.event(s, e))));
-                        let running = r.iter().rev().find_map(|e| match e.kind {
-                            EventKind::TurnStarted { .. } => Some(true),
-                            EventKind::TurnEnded { .. } => Some(false),
-                            _ => None,
-                        });
-                        if let Some(running) = running {
-                            activity.set(Some(running));
-                        }
-                    }
-                    if !r.is_empty() {
-                        events.update(|evs| evs.extend(r));
-                    }
-                    again.set_value(false);
-                    synced.set(true);
-                    stream_failed.set(false);
-                }
-                StreamMsg::Secret { call_id, title, value, note } => secrets.update(|s| s.push(SecretCard { call_id, title, value, note })),
             },
             move || {
                 // Connecting again (a phone waking, the network back): what
@@ -420,10 +443,18 @@ impl Feed {
                 }
             },
             move || {
+                // Do not misclassify the final live messages as replay when
+                // the socket closes before the scheduled presentation frame.
+                flush();
                 stream_failed.try_set(true);
             },
         );
-        on_cleanup(move || handle.abort());
+        on_cleanup(move || {
+            handle.abort();
+            if let Some(frame) = frame.try_update_value(Option::take).flatten() {
+                frame.cancel();
+            }
+        });
         feed
     }
 

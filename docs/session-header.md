@@ -47,6 +47,10 @@ tool card) keep their anchor ids but take no height or inter-message gap.
 The 16px separation between actual messages and the 28px action-control area
 remain intentional: Edit, Rewind and Ask are positioned in that area and do
 not add height on hover. There is no additional idle status spacer.
+Session-stream messages received before a presentation frame are applied in
+wire order in one reactive batch, including reply replacement, queue changes
+and turn completion. Disconnect flushes pending messages before replay begins;
+unmount cancels its pending frame.
 
 ## Icons throughout the app
 
