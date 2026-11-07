@@ -193,6 +193,25 @@ async fn agents_make_and_change_things_by_your_rule() {
     let d = get(format!("work/{did}")).await;
     assert_eq!(d["todos"][0]["text"], "Schedule the first", "{d}");
     assert_eq!(d["todos"][0]["origin"], sid.as_str(), "the to-do says which session added it");
+    // Its words and prompt change in place (no copy, nothing ticked), and
+    // one no longer wanted comes off without saying it was done.
+    let tid = d["todos"][0]["id"].as_str().unwrap().to_owned();
+    let edit = json!({"action": "todo_edit", "work": did, "id": tid, "text": "Schedule the first drill", "prompt": "Red: … Green: …"});
+    mock.push(Reply::ToolCalls(vec![("work".into(), edit.to_string())]));
+    mock.push(Reply::Text("Changed.".into()));
+    send(M::POST, format!("sessions/{sid}/messages"), json!({"text": "add a test plan to it"})).await;
+    turns(sid.clone(), 10).await;
+    let d = get(format!("work/{did}")).await;
+    let todos = d["todos"].as_array().unwrap();
+    assert_eq!(todos.len(), 1, "changed in place: {d}");
+    assert_eq!((todos[0]["text"].as_str(), todos[0]["prompt"].as_str()), (Some("Schedule the first drill"), Some("Red: … Green: …")));
+    assert_ne!(todos[0]["done"], true);
+    mock.push(Reply::ToolCalls(vec![("work".into(), json!({"action": "todo_remove", "work": did, "id": tid}).to_string())]));
+    mock.push(Reply::Text("Removed.".into()));
+    send(M::POST, format!("sessions/{sid}/messages"), json!({"text": "drop it"})).await;
+    turns(sid.clone(), 11).await;
+    let d = get(format!("work/{did}")).await;
+    assert!(d["todos"].as_array().is_none_or(Vec::is_empty), "removed, not ticked: {d}");
 
     // 7. Your mail only within the session's knowledge scope, and sending in
     // your name asks each time.
@@ -200,7 +219,7 @@ async fn agents_make_and_change_things_by_your_rule() {
     mock.push(tool(threads.clone()));
     mock.push(Reply::Text("Can't.".into()));
     send(M::POST, format!("sessions/{sid}/messages"), json!({"text": "read my mail"})).await;
-    let ev = turns(sid.clone(), 10).await;
+    let ev = turns(sid.clone(), 12).await;
     assert!(last_result(&ev).contains("knowledge scope to include email"), "{}", last_result(&ev));
     let r = send(M::PUT, "settings/memex_scopes".into(), json!([{"name": "mail", "kinds": ["email"]}])).await;
     assert!(r.status().is_success(), "{}", r.text().await.unwrap());
@@ -208,7 +227,7 @@ async fn agents_make_and_change_things_by_your_rule() {
     mock.push(Reply::ToolCalls(vec![("carbon6".into(), threads.to_string()), ("carbon6".into(), mail.to_string())]));
     mock.push(Reply::Text("Asked.".into()));
     send(M::POST, format!("sessions/{sid}/messages"), json!({"text": "read my mail and send a note"})).await;
-    let ev = turns(sid.clone(), 11).await;
+    let ev = turns(sid.clone(), 13).await;
     let outs: Vec<String> =
         ev.iter().filter(|e| e["type"] == "tool_result").rev().take(2).map(|e| e["output"].as_str().unwrap_or("").to_owned()).collect();
     assert!(outs.iter().all(|o| !o.contains("knowledge scope")), "within its scope now: {outs:?}");

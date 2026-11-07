@@ -502,6 +502,27 @@ pub async fn work_tool(st: &HeadState, session: &str, p: &Value) -> anyhow::Resu
         "get" => call_for(st, session, "work.get", json!({"id": work})).await,
         "todo" => call_for(st, session, "work.todos.add", json!({"id": work, "body": {"text": s("text"), "prompt": s("prompt")}})).await,
         "todo_done" => call_for(st, session, "work.todos.edit", json!({"id": work, "todo": id, "body": {"done": true}})).await,
+        // The to-do's words or prompt; the work item's history keeps the
+        // earlier ones.
+        "todo_edit" => {
+            let mut body = json!({});
+            for k in ["text", "prompt"] {
+                if p[k].is_string() {
+                    body[k] = json!(s(k));
+                }
+            }
+            if id.is_empty() || body.as_object().is_none_or(|b| b.is_empty()) {
+                return Err(crate::bad_request("todo_edit takes the to-do's id, and its new text and/or prompt"));
+            }
+            call_for(st, session, "work.todos.edit", json!({"id": work, "todo": id, "body": body})).await
+        }
+        // Takes it off without saying it was done (one that's no longer wanted).
+        "todo_remove" => {
+            if id.is_empty() {
+                return Err(crate::bad_request("todo_remove takes the to-do's id"));
+            }
+            call_for(st, session, "work.todos.remove", json!({"id": work, "todo": id})).await
+        }
         "attach" => call_for(st, session, "work.attach", json!({"id": work, "body": {"ref": s("ref"), "title": s("title")}})).await,
         "edit" => {
             let mut body = json!({});
@@ -512,7 +533,9 @@ pub async fn work_tool(st: &HeadState, session: &str, p: &Value) -> anyhow::Resu
             }
             call_for(st, session, "work.edit", json!({"id": work, "body": body})).await
         }
-        other => Err(crate::bad_request(format!("with work, the actions are get, todo, todo_done, attach and edit, not {other:?}"))),
+        other => Err(crate::bad_request(format!(
+            "with work, the actions are get, todo, todo_done, todo_edit, todo_remove, attach and edit, not {other:?}"
+        ))),
     }
 }
 

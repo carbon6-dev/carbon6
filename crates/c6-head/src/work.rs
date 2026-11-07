@@ -1935,6 +1935,23 @@ pub async fn for_session(st: &HeadState, session_id: &str, p: &Value) -> anyhow:
         return crate::agent_ops::work_tool(st, session_id, p).await;
     }
     let ids = holding(st, &format!("session:{session_id}")).await?;
+    // Changing or removing a to-do goes by the same rule as on any work
+    // item: the session's work is its own, so it's free there.
+    if matches!(p["action"].as_str(), Some("todo_edit" | "todo_remove")) {
+        let todo = p["id"].as_str().unwrap_or("").trim();
+        let mut holder = None;
+        for id in &ids {
+            if load(st, id).await?.is_some_and(|r| r.fields.todos.iter().any(|t| t.id == todo)) {
+                holder = Some(id.clone());
+                break;
+            }
+        }
+        let holder = holder
+            .ok_or_else(|| not_found(format!("no to-do {todo:?} in this session's work; for another work item, give work: its id")))?;
+        let mut p = p.clone();
+        p["work"] = json!(holder);
+        return crate::agent_ops::work_tool(st, session_id, &p).await;
+    }
     if ids.is_empty() {
         return Ok(json!({"work": [], "note": "This session belongs to no work item; the user can add it to one in its header."}));
     }
@@ -2037,7 +2054,11 @@ pub async fn for_session(st: &HeadState, session_id: &str, p: &Value) -> anyhow:
             .await?;
             refresh(st, &id);
         }
-        other => return Err(bad_request(format!("work's actions are get, attach, todo, todo_done and propose, not {other:?}"))),
+        other => {
+            return Err(bad_request(format!(
+                "work's actions are get, attach, todo, todo_done, todo_edit, todo_remove, propose, create and edit, not {other:?}"
+            )));
+        }
     }
     let mut out = Vec::new();
     for id in ids {
