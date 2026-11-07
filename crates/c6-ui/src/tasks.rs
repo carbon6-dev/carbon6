@@ -7,7 +7,7 @@ use leptos::task::spawn_local;
 use crate::api;
 use crate::icons::{Icon, Size, icon};
 use crate::util::{BUTTON_QUIET, clock};
-use crate::workspace::{Popover, below};
+use crate::workspace::ComposerPopover;
 
 #[derive(Clone, PartialEq)]
 struct Task {
@@ -236,26 +236,36 @@ pub fn RunningTasks(session: String, events: RwSignal<Vec<Event>>) -> impl IntoV
     let session = StoredValue::new(session);
     let list = Memo::new(move |_| events.with(|e| lifecycle(e)));
     let counts = Memo::new(move |_| events.with(|e| running_counts(e)));
-    let at = RwSignal::new(None::<(f64, f64)>);
+    let open = RwSignal::new(false);
+    let anchor = NodeRef::<leptos::html::Div>::new();
+    let pop = StoredValue::new(crate::util::dismissable(
+        move || open.get(),
+        move || {
+            open.try_set(false);
+        },
+    ));
     let selected = RwSignal::new(None::<String>);
     let error = RwSignal::new(None::<String>);
     view! {
         <Show when=move || counts.with(|(t, s)| t + s > 0)>
-            <div>
+            <div node_ref=anchor>
                 <button class="text-xs text-sky-700 hover:underline dark:text-sky-400" title="Open the background tasks"
+                    data-pop=pop.get_value() aria-expanded=move || open.get().to_string()
                     on:click=move |ev| {
                         ev.stop_propagation();
-                        at.set(if at.get_untracked().is_some() { None } else { Some(below(&ev, 384.0)) });
+                        open.update(|o| *o = !*o);
                     }>
                     <span class="inline-flex animate-spin">{icon(Icon::LoaderCircle, Size::S14)}</span>" "{move || counts.with(|(t, s)| running_line(*t, *s))}" "{crate::icons::chevron_right()}
                 </button>
-                <Popover at class="w-96 max-w-[calc(100vw-1rem)] space-y-2 text-xs">
+                <Show when=move || open.get()>
+                <ComposerPopover anchor pop=pop.get_value() class="w-96 space-y-2 p-2 text-xs">
                     <p class="text-muted">"Task history remains available when the worker is offline. Inspect streams with Refresh."</p>
                     {task_rows(session, list, error, Callback::new(move |id| {
                         selected.set(Some(id));
-                        at.set(None);
+                        open.set(false);
                     }))}
-                </Popover>
+                </ComposerPopover>
+                </Show>
                 {inspector(session, list, selected)}
             </div>
         </Show>

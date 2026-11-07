@@ -296,6 +296,16 @@ rose-300 on zinc-800 and rose-900/40 status chips, and white on red-600.
 
 ## Motion: production browser regression
 
+`crates/c6-ui/tests/composer-popovers.cjs` checks the running-task, model and
+Send menus in both themes on desktop, in a narrow/short tile, and on a phone
+with an overlay keyboard. It asserts visible tile/viewport bounds and real
+pointer hit-testing, scrolls to the last Stop/Inspect/model choice, opens the
+inspector, sends a message, and resizes a retained model picker. The `+` control
+opens the native file chooser, not a web popover. Run after `make ui`, with the
+same Node/browser overrides as the motion harness. `BEFORE=1 ROOT=...` records
+the old build without enforcing the corrected geometry; `SCREENSHOTS` defaults
+to `/tmp/n3-ui/item1`. Every fixture uses its own loopback head and browser.
+
 ### Transcript layout steps
 
 After `env -u NO_COLOR make ui`, run the owned loopback production fixture:

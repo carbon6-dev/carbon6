@@ -5787,6 +5787,7 @@ fn Composer(
     let beside = if inline { None } else { use_context::<GlanceBeside>() };
     // The ▾ beside Send while the agent works.
     let send_menu = RwSignal::new(false);
+    let send_anchor = NodeRef::<leptos::html::Div>::new();
     let send_pop = StoredValue::new(crate::util::dismissable(
         move || send_menu.get(),
         move || {
@@ -6134,24 +6135,16 @@ fn Composer(
                                     // The desktop tile clips its transcript, not
                                     // the picker. Carry the toolbar's text size
                                     // across the portal; phones keep their sheet.
-                                    <leptos::portal::Portal>
-                                        <div data-pop=picking_pop.get_value() class="fixed z-50 w-max max-w-[min(36rem,calc(100vw-1rem))] space-y-2 overflow-y-auto rounded-lg border border-zinc-200 bg-white p-3 text-xs text-zinc-700 shadow-lg dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
-                                            style=move || {
-                                                let width = window().inner_width().ok().and_then(|w| w.as_f64()).unwrap_or(800.0);
-                                                let height = window().inner_height().ok().and_then(|h| h.as_f64()).unwrap_or(600.0);
-                                                let rect = model_anchor.get_untracked().map(|el| el.get_bounding_client_rect());
-                                                let left = rect.as_ref().map_or(8.0, |r| r.left()).clamp(8.0, (width - 584.0).max(8.0));
-                                                let top = rect.as_ref().map_or(height - 48.0, |r| r.top());
-                                                format!("left:{left}px;bottom:{}px;max-height:{}px", (height - top + 4.0).max(8.0), (top - 12.0).max(40.0).min(height * 0.75))
-                                            }>{contents()}</div>
-                                    </leptos::portal::Portal>
+                                    <crate::workspace::ComposerPopover anchor=model_anchor pop=picking_pop.get_value() class="w-max space-y-2 p-3 text-xs">
+                                        {contents()}
+                                    </crate::workspace::ComposerPopover>
                                 }.into_any()
                             }
                             }}
                         </Show>
                     </div>
                 })}
-                        <div class="relative ml-auto flex shrink-0 items-center gap-0.5">
+                        <div node_ref=send_anchor class="relative ml-auto flex shrink-0 items-center gap-0.5">
                         // Both controls occupy the same 22px slot. State and input
                         // change immediately; only opacity/scale catch up. The old
                         // action is inert on that very frame, including via keyboard.
@@ -6176,13 +6169,13 @@ fn Composer(
                                         {icon(Icon::ChevronDown, Size::S14)}
                                     </button>
                                     {move || send_menu.get().then(|| view! {
-                                        <div role="menu" data-pop=send_pop.get_value() on:keydown=crate::util::menu_keys class="c6-pop absolute bottom-full right-0 z-40 mb-1 w-max rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900" style="--pop-origin: bottom right">
+                                        <crate::workspace::ComposerPopover anchor=send_anchor pop=send_pop.get_value() menu=true class="w-max py-1 text-sm">
                                             <button role="menuitem" class="flex w-full items-center gap-4 px-3 py-1.5 text-left hover:bg-zinc-100 pointer-coarse:py-3 dark:hover:bg-zinc-800"
                                                 title="The agent gets it now, not at its next step (Claude Code moves what it waits on to the background; its background agents go on)" on:click=move |_| send_now()>
                                                 <span>"Send now"</span>
                                                 <crate::components::Kbd text="⌘/Ctrl ⇧ ↵" />
                                             </button>
-                                        </div>
+                                        </crate::workspace::ComposerPopover>
                                     })}
                         </Show>
                         // Stop (or Esc twice) while Claude Code's own agents run
@@ -6644,12 +6637,15 @@ mod tests {
             .split("// The desktop tile clips its transcript, not")
             .nth(1)
             .unwrap()
-            .split("</leptos::portal::Portal>")
+            .split("</crate::workspace::ComposerPopover>")
             .next()
             .unwrap();
         let class = picker.split("class=\"").nth(1).unwrap().split('"').next().unwrap();
-        for token in ["text-xs", "text-zinc-700", "dark:text-zinc-200"] {
-            assert!(class.split_whitespace().any(|c| c == token), "desktop portal cannot inherit {token} from the composer toolbar");
+        assert!(class.split_whitespace().any(|c| c == "text-xs"), "desktop picker keeps the toolbar text size");
+        let shared = include_str!("workspace.rs").split("fn ComposerPopover(").nth(1).unwrap().split("\n#[component]").next().unwrap();
+        assert!(shared.contains("<leptos::portal::Portal>"));
+        for token in ["text-zinc-700", "dark:text-zinc-200"] {
+            assert!(shared.contains(token), "shared portal cannot inherit {token} from the composer toolbar");
         }
         let sheet = source.split("fn BottomSheet(").nth(1).unwrap().split("/// Where a subagent sits").next().unwrap();
         assert!(sheet.contains("bg-white text-sm shadow-xl"), "the phone sheet keeps its independent, larger text size");

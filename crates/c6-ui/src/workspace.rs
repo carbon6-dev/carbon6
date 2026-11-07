@@ -2522,6 +2522,39 @@ pub fn Popover(at: RwSignal<Option<(f64, f64)>>, #[prop(into)] class: String, ch
     }
 }
 
+/// A composer menu opens upward within its tile and visible viewport. Its
+/// caller owns dismissal, so model, task and Send menus keep their semantics.
+#[component]
+pub(crate) fn ComposerPopover(
+    anchor: NodeRef<Div>,
+    pop: String,
+    #[prop(into)] class: String,
+    #[prop(optional)] menu: bool,
+    children: ChildrenFn,
+) -> impl IntoView {
+    #[wasm_bindgen::prelude::wasm_bindgen]
+    extern "C" {
+        #[wasm_bindgen(js_name = c6ComposerPopover)]
+        fn follow(element: &web_sys::Element, anchor: &web_sys::Element) -> js_sys::Function;
+    }
+    let node = NodeRef::<Div>::new();
+    Effect::new(move || {
+        if let (Some(node), Some(anchor)) = (node.get(), anchor.get()) {
+            let dispose = send_wrapper::SendWrapper::new(follow(&node, &anchor));
+            on_cleanup(move || {
+                let _ = dispose.call0(&wasm_bindgen::JsValue::NULL);
+            });
+        }
+    });
+    view! {
+        <leptos::portal::Portal>
+            <div node_ref=node data-pop=pop.clone() role=menu.then_some("menu") on:keydown=move |ev| { if menu { crate::util::menu_keys(ev); } }
+                class=format!("c6-pop fixed z-50 overflow-y-auto rounded-lg border border-zinc-200 bg-white text-zinc-700 shadow-xl dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 {class}")
+                style="visibility:hidden">{children()}</div>
+        </leptos::portal::Portal>
+    }
+}
+
 #[component]
 fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
     let ws = use_workspace();

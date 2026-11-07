@@ -50,6 +50,54 @@ window.c6Motion = (() => {
   };
 })();
 
+// Composer menus live in a portal, but belong to their tile. Prefer the space
+// above the control and scroll within it; the visual viewport excludes an
+// overlay keyboard. Follow layout changes, not an animation-frame polling loop.
+window.c6ComposerPopover = (element, anchor) => {
+  const tile = anchor.closest('[data-tile-surface]');
+  let frame, disposed = false;
+  const fit = () => {
+    frame = undefined;
+    if (disposed || !element.isConnected || !anchor.isConnected) return;
+    const viewport = visualViewport;
+    const area = tile?.getBoundingClientRect();
+    const left = Math.max(area?.left ?? 0, viewport?.offsetLeft ?? 0) + 8;
+    const top = Math.max(area?.top ?? 0, viewport?.offsetTop ?? 0) + 8;
+    const right = Math.max(left, Math.min(area?.right ?? innerWidth,
+      (viewport?.offsetLeft ?? 0) + (viewport?.width ?? innerWidth)) - 8);
+    const bottom = Math.max(top, Math.min(area?.bottom ?? innerHeight,
+      (viewport?.offsetTop ?? 0) + (viewport?.height ?? innerHeight)) - 8);
+    const a = anchor.getBoundingClientRect();
+    const above = Math.max(0, Math.min(a.top - 4, bottom) - top);
+    const below = Math.max(0, bottom - Math.max(a.bottom + 4, top));
+    const up = above >= Math.min(element.scrollHeight, 160) || above >= below;
+    element.style.maxWidth = `${Math.min(right - left, 576)}px`;
+    element.style.maxHeight = `${up ? above : below}px`;
+    const box = element.getBoundingClientRect();
+    element.style.left = `${Math.max(left, Math.min(a.left, right - box.width))}px`;
+    element.style.top = `${Math.max(top, Math.min(up ? a.top - 4 - box.height : a.bottom + 4, bottom - box.height))}px`;
+    element.style.transformOrigin = up ? 'bottom left' : 'top left';
+    element.style.visibility = 'visible';
+  };
+  const schedule = () => { if (!disposed && frame === undefined) frame = requestAnimationFrame(fit); };
+  const sizes = new ResizeObserver(schedule);
+  [element, anchor, tile].filter(Boolean).forEach(el => sizes.observe(el));
+  document.addEventListener('scroll', schedule, true);
+  addEventListener('resize', schedule);
+  visualViewport?.addEventListener('resize', schedule);
+  visualViewport?.addEventListener('scroll', schedule);
+  fit();
+  return () => {
+    disposed = true;
+    if (frame !== undefined) cancelAnimationFrame(frame);
+    sizes.disconnect();
+    document.removeEventListener('scroll', schedule, true);
+    removeEventListener('resize', schedule);
+    visualViewport?.removeEventListener('resize', schedule);
+    visualViewport?.removeEventListener('scroll', schedule);
+  };
+};
+
 // Start anywhere *inside* the phone drawer, not at Android's Back edge.
 // Leave native vertical scrolling and taps alone until a clear outward drag.
 // Release returns control to the sheet's shared CSS tokens/presence state.
