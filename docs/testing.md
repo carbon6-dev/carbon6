@@ -659,7 +659,7 @@ The accompanying source guard retains the model picker's typography checks
 and additionally guards the image portal, all three callers, explicit image
 action sizing and the audited viewport-overlay boundaries. The same escape
 is applied to the shared workspace/session popovers, session overview/catch-up
-phone sheets, document/session-list sheets, session-preview cards, row menus,
+phone sheets, session-preview cards, row menus,
 person cards, session details, file/folder pickers and Add Worker dialog.
 Existing task/decision/archive/Ask/needs-you dialogs already escape via a
 component or caller Portal. Absolute document comment popovers and anchored
@@ -667,10 +667,11 @@ composer menus remain tile-local. The responsive new-session fields panel
 (static on desktop) and stop confirmation (absolute dialog with a fixed click
 catcher) are mixed anchored layouts, not blindly moved to `body` as a pair.
 The browser harness also opens tile Actions, Session details and phone document
-Comments as representative audited surfaces and checks their viewport ancestry
-and bounds. Document Comments now deliberately portals to the owning tile's
-surface, with both sheet and scrim contained there (see the comment-sheet
-regression below); image previews and the other viewport overlays still escape.
+Comments as representative audited surfaces and checks their ancestry and
+bounds. Document Comments and Sessions' Filter, sort and group now deliberately
+portal to the owning tile's surface, with both sheet and scrim contained there
+(see the sheet regressions below); image previews and the other viewport
+overlays still escape.
 
 Use `NEXTEST=1 make test-under-load RUNS=5` for repeated workspace runs. Do not rebuild test binaries in the same target directory while nextest is running: Cargo can remove binaries nextest has listed but not yet started.
 
@@ -727,6 +728,31 @@ and dark, at desktop and phone widths, with fine and coarse pointer media:
 6. Watch the browser console and crash reporter through all of these: no
    browser `.to_html()` calls, disposed-signal panics or horizontal overflow.
    Check newly added arbitrary Tailwind selectors in the generated CSS too.
+
+## Sessions filters: placement browser check
+
+Build once with source unchanged during the build, then run the production
+loopback fixture with Node 24 (the browser/`ROOT` overrides match `motion.cjs`):
+
+```sh
+set -euo pipefail
+ulimit -n 65536
+env -u NO_COLOR make ui
+scripts/ui-size.sh
+node crates/c6-ui/tests/sessions-sheet.cjs
+ENGINE=webkit node crates/c6-ui/tests/sessions-sheet.cjs
+```
+
+Both themes cover the desktop Sort popover, a narrow desktop tile's Filter,
+sort and group sheet, and a phone with an overlay keyboard. The sheet and scrim
+must belong to their own tile, stay within its bounds and above the keyboard,
+and close through Done, Escape and the scrim. The body remains independently
+scrollable. Browser errors fail the run. `SCREENSHOTS` defaults to
+`/tmp/n3-ui/item4`; `BEFORE=1 ROOT=/path/to/baseline/dist` captures baseline
+geometry/screenshots without enforcing the corrected bounds or dismissal checks.
+The native `viewport_portals_escape_tiles_and_keep_their_own_typography` guard
+keeps the document and Sessions sheets tile-local without weakening the guards
+for viewport overlays.
 
 ## Doc comments: placement browser check
 

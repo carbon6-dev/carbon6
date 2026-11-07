@@ -201,6 +201,7 @@ impl ListChoices {
 
 #[component]
 pub fn SessionsPage() -> impl IntoView {
+    let root = NodeRef::<leptos::html::Main>::new();
     let hover = Hover::new();
     let like_this = RwSignal::new(None);
     let live = api::live();
@@ -220,7 +221,7 @@ pub fn SessionsPage() -> impl IntoView {
     let search = move |ev: web_sys::Event| query.set(event_target_value(&ev));
 
     view! {
-        <main class="mx-auto max-w-6xl space-y-4 px-3 py-4 @min-[40rem]/view:space-y-5 @min-[40rem]/view:px-4 @min-[40rem]/view:py-6">
+        <main node_ref=root class="mx-auto max-w-6xl space-y-4 px-3 py-4 @min-[40rem]/view:space-y-5 @min-[40rem]/view:px-4 @min-[40rem]/view:py-6">
             <div class="hidden flex-wrap items-center gap-2 @min-[40rem]/view:flex">
                 <h1 class="mr-2 text-lg font-semibold">"Sessions"</h1>
                 <input type="search" class=format!("{INPUT} {PLACEHOLDER} min-w-48 max-w-sm flex-1") placeholder="Search titles, labels, workers, folders"
@@ -291,7 +292,7 @@ pub fn SessionsPage() -> impl IntoView {
         <SessionPreview hover like_this />
         {move || like_this.get().map(|seed| view! { <NewSessionDialog seed on_close=move |()| like_this.set(None) /> })}
         <Show when=move || sheet.get()>
-            <Sheet open=sheet title="Filter, sort and group" reset=Callback::new(move |()| choices.reset())>
+            <Sheet root open=sheet title="Filter, sort and group" reset=Callback::new(move |()| choices.reset())>
                 <div class="space-y-5">
                     <section class="space-y-2"><ShowChips choices /></section>
                     <section class="space-y-2"><LabelChips choices /></section>
@@ -490,26 +491,33 @@ fn GroupChips(choices: ListChoices) -> impl IntoView {
     }
 }
 
-/// A phone's sheet from the bottom of the screen, over a dimmed page: a
-/// tap above it, Done or Esc closes it; `reset` puts Reset at its top
-/// right.
+/// A sheet from the owning tile's bottom, including in narrow desktop
+/// tiles; without a tile, fall back to the viewport. A tap above it, Done
+/// or Esc closes it; `reset` puts Reset at its top right.
 #[component]
 fn Sheet(
+    root: NodeRef<leptos::html::Main>,
     open: RwSignal<bool>,
     #[prop(into)] title: String,
     #[prop(optional)] reset: Option<Callback<()>>,
     children: ChildrenFn,
 ) -> impl IntoView {
+    use wasm_bindgen::JsCast;
+    let mount = root.get_untracked().and_then(|root| root.closest("[data-tile-surface]").ok().flatten());
+    let position = if mount.is_some() { "absolute" } else { "fixed" };
+    // The phone shell already shrinks the tile above the keyboard.
+    let keyboard = if mount.is_some() { "" } else { "phone-sheet" };
+    let mount = mount.unwrap_or_else(|| document().body().expect("body").unchecked_into());
     let close = move || {
         open.try_set(false);
     };
     let pop = escapable(move || open.get(), close);
     let label = title.clone();
     view! {
-        <leptos::portal::Portal>
-        <div class="fixed inset-0 z-40 bg-black/30" on:click=move |_| close()></div>
+        <leptos::portal::Portal mount=mount>
+        <div class=format!("c6-session-filter-scrim {position} inset-0 z-40 bg-black/30") on:click=move |_| close()></div>
         <div data-pop=pop.clone() role="dialog" aria-label=label.clone()
-            class="fixed inset-x-0 bottom-0 z-50 flex max-h-[85dvh] flex-col rounded-t-xl border-t border-zinc-200 bg-white text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900">
+            class=format!("{keyboard} {position} inset-x-0 bottom-0 z-50 flex max-h-[85%] flex-col rounded-t-xl border-t border-zinc-200 bg-white text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900")>
             <div class="flex shrink-0 items-center gap-2 border-b border-zinc-200 py-1 pl-4 pr-2 dark:border-zinc-800">
                 <h2 class="flex-1 py-2 font-medium">{title.clone()}</h2>
                 {reset.map(|r| view! { <button class="rounded-md px-3 py-2 text-sky-700 dark:text-sky-400" on:click=move |_| r.run(())>"Reset"</button> })}
