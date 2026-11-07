@@ -101,8 +101,7 @@ async fn routes_pick_connection_and_model() {
     let none = add("fresh").await;
     assert_eq!(create(json!({"connection_id": none.id})).await.status(), reqwest::StatusCode::BAD_REQUEST);
 
-    // A pool (docs/pools.md) is for what runs in the head: never a session's,
-    // nor a rule's but for the assistant or suggestions.
+    // A pool (docs/pools.md) is for head-side tasks, never worker sessions.
     let pool: Connection = http
         .post(format!("{api}/connections"))
         .json(&json!({"kind": "pool", "name": "both", "members": [{"connection_id": "main", "slots": 2}, {"connection_id": "cheap", "slots": 1}]}))
@@ -116,7 +115,23 @@ async fn routes_pick_connection_and_model() {
     assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST);
     assert!(r.text().await.unwrap().contains("is a pool"));
     assert_eq!(put(json!([{"name": "x", "connection": "both", "model": "big"}])).await, reqwest::StatusCode::BAD_REQUEST);
-    assert!(put(json!([{"name": "x", "applies_to": ["task:suggest"], "connection": "both", "model": "big"}])).await.is_success());
+    assert_eq!(
+        put(json!([{"name": "x", "applies_to": ["ops"], "connection": "both", "model": "big"}])).await,
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    let labels = ["assistant", "task:suggest", "task:name", "task:catchup", "task:timeline", "task:work", "task:projects"];
+    let mut statuses = Vec::new();
+    for label in labels {
+        let status = put(json!([{"name": "x", "applies_to": [label], "connection": "both", "model": "big"}])).await;
+        statuses.push((label, status));
+        // Even a saved head-side rule must not put a worker session on a pool.
+        if status.is_success() {
+            let r = create(json!({"labels": [label]})).await;
+            assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST);
+            assert!(r.text().await.unwrap().contains("is a pool"));
+        }
+    }
+    assert_eq!(statuses, labels.map(|label| (label, reqwest::StatusCode::NO_CONTENT)));
     // Nor what subagents run on (they run on the worker).
     let rule = json!([{"name": "x", "connection": "main", "model": "big", "subagent_connection": "both", "subagent_model": "big"}]);
     assert_eq!(put(rule).await, reqwest::StatusCode::BAD_REQUEST);

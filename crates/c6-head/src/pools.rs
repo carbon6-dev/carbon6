@@ -1,5 +1,5 @@
 //! Pools (docs/pools.md): connections made of other connections, for what
-//! runs in the head (the memex, the assistant, suggestions). Which member
+//! runs in the head (the memex, the assistant and model-backed tasks). Which member
 //! takes a call is `c6_llm::pool`'s; the head keeps one pool per pool
 //! connection, with its members as configured, and gives them credentials.
 //! Sessions don't use pools: their workers dial their connection
@@ -166,7 +166,7 @@ pub async fn check_members(st: &HeadState, pool_id: &str, members: &[api::PoolMe
 pub fn not_for_sessions(c: &ConnectionRow, what: &str) -> anyhow::Result<()> {
     if c.kind == KIND {
         return Err(bad_request(format!(
-            "{what}: {} is a pool, which only what runs in the head uses (the memex, the assistant, suggestions); sessions dial their \
+            "{what}: {} is a pool for head-side model calls (the memex, the assistant, suggestions, work and projects); sessions dial their \
              connection from their worker, so choose one of its members",
             c.name
         )));

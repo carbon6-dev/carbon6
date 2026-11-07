@@ -220,7 +220,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                         name="routes"
                         title="Model routing"
                         noun="rule"
-                        help="Which connection and model a new session gets when it is started without one (from the Sessions page, c6 run, templates or automations), by its labels: yours, worker:, folder:, host:, template:. The first enabled rule that matches wins. Without a match: the connection's default model, else the model of your latest session on it. A subagent connection and model, if set, run the Task tool's subagents, on any API connection whatever the session runs on (a named agent's model, or one a Task call asks for, still wins; you can also change it in the session). Tools lists only the tools to send to the model, in any profile's naming; empty means all. Sessions keep their starting list; side chats and carbon6 subagents inherit it. The assistant and Claude Code's own tools are unaffected. MCP tools use their full mcp__<server>__<tool> names. A rule for task:suggest picks the model for suggested next messages, task:name for a session's name, task:catchup for its catch-up card and task:timeline for its timeline's lines (on a connection the session's realm may use). Rules for a realm are its own: its sessions use them before root's."
+                        help="Which connection and model a new session gets when it is started without one (from the Sessions page, c6 run, templates or automations), by its labels: yours, worker:, folder:, host:, template:. The first enabled rule that matches wins. Without a match: the connection's default model, else the model of your latest session on it. A subagent connection and model, if set, run the Task tool's subagents, on any API connection whatever the session runs on (a named agent's model, or one a Task call asks for, still wins; you can also change it in the session). Tools lists only the tools to send to the model, in any profile's naming; empty means all. Sessions keep their starting list; side chats and carbon6 subagents inherit it. The assistant and Claude Code's own tools are unaffected. MCP tools use their full mcp__<server>__<tool> names. A rule for task:suggest picks the model for suggested next messages, task:name for a session's name, task:catchup for its catch-up card, task:timeline for its timeline's lines, task:work for work's model calls and task:projects for projects' model calls (on a connection the realm may use). These head-side tasks and the assistant can use pools; sessions and subagents cannot. Rules for a realm are its own: its sessions use them before root's."
                         fields=ROUTE_FIELDS
                         examples=route_examples
                         realm=routes_realm
@@ -1966,7 +1966,7 @@ fn PoolMembers(members: RwSignal<Vec<PoolMember>>, all: Signal<Vec<Connection>>)
                 "Add a member"
             </button>
             <p class="text-xs text-muted">
-                "Each call goes to the least busy member with a free slot, else waits its turn; a member that fails rests and the call goes to another. Pools are for what runs in the head (the memex, the assistant, suggestions), not sessions. Set Settings → Memex → calls at once to about the total of the members' calls at once."
+                "Each call goes to the least busy member with a free slot, else waits its turn; a member that fails rests and the call goes to another. Pools are for head-side model calls (the memex, the assistant, suggestions, work and projects), not sessions or subagents. Set Settings → Memex → calls at once to about the total of the members' calls at once."
             </p>
         </div>
     }
@@ -2232,7 +2232,7 @@ fn AddConnection(all: Signal<Vec<Connection>>, on_added: impl Fn() + Copy + Send
                     <option value="openai">"OpenAI API (Responses)"</option>
                     <option value="openai_compat">"OpenAI-compatible (Chat Completions: Ollama, vLLM, OpenRouter, …)"</option>
                     <option value="claude_code">"Claude Code (each worker's own signed-in claude CLI)"</option>
-                    <option value="pool">"Pool (other connections, for the memex, the assistant and suggestions)"</option>
+                    <option value="pool">"Pool (other connections, for the memex and head-side tasks)"</option>
                 </select>
             </label>
             {move || pool().then(|| view! {

@@ -1862,8 +1862,8 @@ pub async fn check_routes(st: &HeadState, routes: &[api::Route]) -> anyhow::Resu
                 .iter()
                 .find(|c| c.id == want || c.name == want)
                 .ok_or_else(|| bad_request(format!("routing rule {:?}: no connection {want:?}", r.name)))?;
-            // A pool only for what runs in the head (the assistant,
-            // suggestions, catch-ups, timelines and names).
+            // A pool only for what runs in the head (the assistant and
+            // model-backed tasks, including work and projects).
             let head_side = r.applies_to.iter().any(|l| {
                 [
                     crate::assistant::LABEL,
@@ -1871,6 +1871,8 @@ pub async fn check_routes(st: &HeadState, routes: &[api::Route]) -> anyhow::Resu
                     crate::catchup::ROUTE_LABEL,
                     crate::timeline::ROUTE_LABEL,
                     crate::naming::ROUTE_LABEL,
+                    crate::work::ROUTE_LABEL,
+                    crate::projects::ROUTE_LABEL,
                 ]
                 .contains(&l.as_str())
             });
@@ -1878,7 +1880,8 @@ pub async fn check_routes(st: &HeadState, routes: &[api::Route]) -> anyhow::Resu
                 crate::pools::not_for_sessions(
                     c,
                     &format!(
-                        "routing rule {:?} (unless it applies to assistant, task:suggest, task:catchup, task:timeline or task:name)",
+                        "routing rule {:?} (unless it applies to assistant, task:suggest, task:catchup, task:timeline, task:name, \
+                         task:work or task:projects)",
                         r.name
                     ),
                 )?;
