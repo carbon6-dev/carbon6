@@ -743,8 +743,8 @@ impl Store {
             .await?)
     }
 
-    /// Records that the parent's call `call_id` waits on the turn that
-    /// takes input `command_id` of remote subagent `child_id`.
+    /// Records the report obligation for an input of a remote child.
+    /// `call_id` is empty for a steer without a waiting tool.
     pub async fn add_remote_delegation(&self, command_id: &str, child_id: &str, parent_id: &str, call_id: &str) -> anyhow::Result<()> {
         sqlx::query("INSERT OR REPLACE INTO remote_delegations (command_id, child_id, parent_id, call_id, state, created_at) VALUES (?, ?, ?, ?, 'waiting', ?)")
             .bind(command_id)
@@ -757,7 +757,7 @@ impl Store {
         Ok(())
     }
 
-    /// The calls still waiting on a remote subagent: (input command, call).
+    /// Pending report obligations: (input/turn id, call or empty for a notice).
     pub async fn waiting_delegations(&self, child_id: &str) -> anyhow::Result<Vec<(String, String)>> {
         Ok(sqlx::query_as(
             "SELECT command_id, call_id FROM remote_delegations WHERE child_id = ? AND state = 'waiting' ORDER BY created_at",
@@ -1165,19 +1165,23 @@ impl Store {
         use prost::Message;
 
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let mut row = sqlx::query("SELECT last_seq, status FROM sessions WHERE id = ? AND worker_id = ?")
+        let mut row = sqlx::query("SELECT last_seq, status, remote_template FROM sessions WHERE id = ? AND worker_id = ?")
             .bind(session_id)
             .bind(worker_id.to_string())
             .fetch_optional(&mut *tx)
             .await?;
         if row.is_none() && create_subagent_session(&mut tx, worker_id, session_id, events).await? {
-            row = sqlx::query("SELECT last_seq, status FROM sessions WHERE id = ?").bind(session_id).fetch_optional(&mut *tx).await?;
+            row = sqlx::query("SELECT last_seq, status, remote_template FROM sessions WHERE id = ?")
+                .bind(session_id)
+                .fetch_optional(&mut *tx)
+                .await?;
         }
         let Some(row) = row else {
             return Ok(None);
         };
         let mut last = row.get::<i64, _>("last_seq") as u64;
         let mut status: String = row.get("status");
+        let remote = !row.get::<String, _>("remote_template").is_empty();
         let mut stored = Vec::new();
         let mut done = Vec::new();
         let mut delivered: Vec<String> = Vec::new();
@@ -1252,6 +1256,17 @@ impl Store {
                 Some(Kind::SubagentReported(r)) => done.push(r.command_id.clone()),
                 Some(Kind::TurnStarted(_)) => status = "running".into(),
                 Some(Kind::TurnEnded(t)) => {
+                    // Commit the report obligation with the turn end, not
+                    // in its downstream hook. This includes turns resumed
+                    // by the child's own task notices, with no waiting call.
+                    if remote {
+                        sqlx::query("INSERT OR IGNORE INTO remote_delegations (command_id, child_id, parent_id, call_id, state, created_at) SELECT ?, id, parent_id, '', 'waiting', ? FROM sessions WHERE id = ? AND parent_id IS NOT NULL")
+                            .bind(crate::remote::turn_report_id(session_id, ev.seq))
+                            .bind(ev.ts_ms)
+                            .bind(session_id)
+                            .execute(&mut *tx)
+                            .await?;
+                    }
                     status = "idle".into();
                     let reason = match c6_proto::TurnEndReason::try_from(t.reason) {
                         Ok(c6_proto::TurnEndReason::Completed) => "completed",
@@ -1552,6 +1567,37 @@ impl Store {
         insert_command(&mut conn, c, false).await
     }
 
+    /// Retiring delivery obligations and queuing their report are one
+    /// transaction. A stable report id makes replay safe even after ack.
+    pub async fn enqueue_subagent_report(&self, c: &NewCommand<'_>, inputs: &[String]) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM commands WHERE id = ?)").bind(c.id).fetch_one(&mut *tx).await?;
+        if !exists {
+            insert_command(&mut tx, c, false).await?;
+        }
+        for input in inputs {
+            sqlx::query("UPDATE remote_delegations SET state = 'reported' WHERE command_id = ? AND state = 'waiting'")
+                .bind(input)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// A durable, visible queue error, even when the report's parent has
+    /// disappeared. It is never sent to a model as if it were user input.
+    pub async fn subagent_report_failed(&self, c: &NewCommand<'_>, why: &str) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM commands WHERE id = ?)").bind(c.id).fetch_one(&mut *tx).await?;
+        if !exists {
+            insert_command(&mut tx, c, false).await?;
+        }
+        sqlx::query("UPDATE commands SET state = 'rejected', error = ? WHERE id = ?").bind(why).bind(c.id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Sessions whose commands are held.
     pub async fn held_sessions(&self) -> anyhow::Result<Vec<String>> {
         Ok(sqlx::query_scalar("SELECT DISTINCT session_id FROM commands WHERE state = 'held'").fetch_all(&self.pool).await?)
@@ -1650,9 +1696,11 @@ impl Store {
     /// Marks a pending command rejected. A rejected `Create` fails the
     /// session and everything queued behind it. Returns the session id.
     pub async fn reject_command(&self, worker_id: WorkerId, id: &str, reason: &str) -> anyhow::Result<Option<String>> {
+        use prost::Message;
+
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let Some(row) =
-            sqlx::query("UPDATE commands SET state = 'rejected', error = ? WHERE id = ? AND worker_id = ? AND state = 'pending' RETURNING session_id, text")
+            sqlx::query("UPDATE commands SET state = 'rejected', error = ? WHERE id = ? AND worker_id = ? AND state = 'pending' RETURNING session_id, text, data")
                 .bind(reason)
                 .bind(id)
                 .bind(worker_id.to_string())
@@ -1662,7 +1710,16 @@ impl Store {
             return Ok(None);
         };
         let session_id: String = row.get("session_id");
-        if row.get::<Option<String>, _>("text").is_none() {
+        let kind = c6_proto::SessionCommand::decode(row.get::<Vec<u8>, _>("data").as_slice()).ok().and_then(|c| c.kind);
+        if let Some(c6_proto::session_command::Kind::DelegationEnded(d)) = kind {
+            // A rejected report is not a failed Create. Keep its parent
+            // usable and show the actual delivery failure in its queue.
+            sqlx::query("UPDATE commands SET text = ? WHERE id = ?")
+                .bind(format!("Subagent report delivery failed: report from {}. {reason}", d.child_session_id))
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        } else if row.get::<Option<String>, _>("text").is_none() {
             let now = c6_core::now_ms();
             sqlx::query("UPDATE sessions SET status = 'failed', error = ?, updated_at = ?, turn_ended_at = ? WHERE id = ?")
                 .bind(reason)
@@ -1776,6 +1833,116 @@ mod tests {
 
     fn command<'a>(id: &'a str, session_id: &'a str, worker_id: WorkerId, text: Option<&'a str>) -> NewCommand<'a> {
         NewCommand { id, session_id, worker_id, data: id.as_bytes().to_vec(), text }
+    }
+
+    #[tokio::test]
+    async fn a_head_restart_recovers_a_steered_report_committed_before_its_hook() {
+        recover_report_after_ingest("", "steering-call", false).await;
+    }
+
+    #[tokio::test]
+    async fn a_head_restart_recovers_a_report_from_the_childs_own_task_notice() {
+        recover_report_after_ingest("task-notification", "", false).await;
+    }
+
+    #[tokio::test]
+    async fn a_missing_parent_leaves_a_visible_report_failure_and_pending_obligation() {
+        recover_report_after_ingest("", "steering-call", true).await;
+    }
+
+    async fn recover_report_after_ingest(command: &str, delegated_by: &str, missing_parent: bool) {
+        use c6_proto::{SessionCommand, SessionEvent, TurnEndReason, content_block, session_command, session_event::Kind};
+        use prost::Message;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = || crate::HeadConfig {
+            data_dir: dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            auth: false,
+            ..Default::default()
+        };
+        let head = crate::start(config()).await.unwrap();
+        let w = WorkerId::new();
+        if !missing_parent {
+            head.state.store.create_session(&session("parent", w), &[], false).await.unwrap();
+        }
+        let mut child = session("child", w);
+        child.parent_id = Some("parent".into());
+        child.parent_call_id = Some("original-call".into());
+        child.remote_template = "probe".into();
+        head.state.store.create_session(&child, &[], false).await.unwrap();
+        if !delegated_by.is_empty() {
+            head.state.store.add_remote_delegation("input", "child", "parent", "").await.unwrap();
+        }
+        let kinds = [
+            Kind::Started(Default::default()),
+            Kind::User(c6_proto::UserMessage {
+                command_id: "input".into(),
+                command: command.into(),
+                delegated_by: delegated_by.into(),
+                text: "finish the work".into(),
+                ..Default::default()
+            }),
+            Kind::TurnStarted(c6_proto::TurnStarted { turn: 1, ..Default::default() }),
+            Kind::Assistant(c6_proto::AssistantMessage {
+                blocks: vec![c6_proto::ContentBlock {
+                    block: Some(content_block::Block::Text("The recovered final report.".into())),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            Kind::TurnEnded(c6_proto::TurnEnded { turn: 1, reason: TurnEndReason::Completed as i32 }),
+        ];
+        let events: Vec<_> = kinds
+            .into_iter()
+            .enumerate()
+            .map(|(i, kind)| SessionEvent { seq: i as u64 + 1, ts_ms: c6_core::now_ms(), kind: Some(kind) })
+            .collect();
+        // Precisely the crash boundary: the events (and per-turn obligation)
+        // commit, but sessions::ingest's relay hook has not run.
+        head.state.store.ingest(w, "child", &events).await.unwrap().unwrap();
+        assert!(!head.state.store.waiting_delegations("child").await.unwrap().is_empty());
+        assert!(head.state.store.pending_commands(w, 0).await.unwrap().is_empty());
+        head.shutdown().await.unwrap();
+        let head = crate::start(config()).await.unwrap();
+        if missing_parent {
+            let failures = head.state.store.queued_inputs("child").await.unwrap();
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0].state, "rejected");
+            assert!(failures[0].text.as_ref().unwrap().contains("Subagent report delivery failed"));
+            assert!(!head.state.store.waiting_delegations("child").await.unwrap().is_empty());
+            head.state.store.create_session(&session("parent", w), &[], false).await.unwrap();
+            crate::remote::recover(&head.state).await.unwrap();
+            assert!(head.state.store.waiting_delegations("child").await.unwrap().is_empty());
+            assert!(head.state.store.queued_inputs("child").await.unwrap().is_empty(), "successful retry clears the failure");
+            assert_eq!(head.state.store.pending_commands(w, 0).await.unwrap().len(), 1);
+        } else {
+            let reports = head.state.store.pending_commands(w, 0).await.unwrap();
+            assert_eq!(reports.len(), 1);
+            let Some(session_command::Kind::DelegationEnded(ended)) = SessionCommand::decode(reports[0].data.as_slice()).unwrap().kind
+            else {
+                panic!("a report")
+            };
+            assert_eq!(ended.child_session_id, "child");
+            assert_eq!(ended.report, "The recovered final report.");
+            assert!(ended.wake && ended.call_id.is_empty());
+            assert!(head.state.store.waiting_delegations("child").await.unwrap().is_empty());
+            crate::remote::recover(&head.state).await.unwrap();
+            assert_eq!(head.state.store.pending_commands(w, 0).await.unwrap().len(), 1, "recovery queues one report, not one per replay");
+            head.state.store.reject_command(w, &reports[0].id, "parent cannot accept the report").await.unwrap();
+            assert_ne!(
+                head.state.store.session("parent").await.unwrap().unwrap().status,
+                "failed",
+                "a rejected report is not a rejected Create"
+            );
+            let rejected = head.state.store.queued_inputs("parent").await.unwrap();
+            assert_eq!(rejected.len(), 1);
+            assert!(rejected[0].text.as_ref().unwrap().contains("Subagent report delivery failed"));
+            assert!(rejected[0].error.as_ref().unwrap().contains("parent cannot accept"));
+        }
+        head.shutdown().await.unwrap();
     }
 
     #[tokio::test]

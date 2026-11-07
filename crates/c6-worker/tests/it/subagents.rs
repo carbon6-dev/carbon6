@@ -229,8 +229,16 @@ async fn a_worker_restart_keeps_the_subagents_log() {
             let ev = env.events(sid).await;
             let closed = ev.iter().any(|e| matches!(e.kind, EventKind::TurnEnded { reason: TurnEndReason::WorkerRestarted, .. }));
             let idle = env.detail(sid).await?.session.status == SessionStatus::Idle;
-            let (_, journal) = second.journal.load_session(sid).await.ok()??;
-            (closed && idle && ev.len() == journal.len()).then_some(())
+            (closed && idle).then_some(())
+        })
+        .await;
+        // Receipts are deliberately hidden from the transcript API. Wait
+        // for replication, then compare the full durable logs, not a
+        // visible-event count taken before the receipt reached the head.
+        eventually("head and worker logs agree including report receipts", async || {
+            let (_, journal) = second.journal.load_session(sid).await.unwrap().unwrap();
+            let head = env.head.state.store.events_after(sid, 0, i64::MAX).await.unwrap();
+            (head == journal).then_some(())
         })
         .await;
     }

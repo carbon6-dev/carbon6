@@ -54,6 +54,20 @@ impl Journal {
         Ok(sqlx::query("SELECT 1 FROM sessions WHERE id = ?").bind(session_id).fetch_optional(&self.pool).await?.is_some())
     }
 
+    /// Local children own receipts here; template children's obligations
+    /// belong to the head instead (they have no local Delegation).
+    pub async fn local_subagent_ids(&self) -> anyhow::Result<Vec<String>> {
+        let rows = sqlx::query("SELECT id, spec FROM sessions").fetch_all(&self.pool).await?;
+        let mut ids = Vec::new();
+        for row in rows {
+            let spec = CreateSession::decode(row.get::<Vec<u8>, _>("spec").as_slice())?;
+            if spec.delegation.is_some() {
+                ids.push(row.get("id"));
+            }
+        }
+        Ok(ids)
+    }
+
     /// Records a new session with its first event (`SessionStarted`, seq 1).
     pub async fn create_session(&self, session_id: &str, spec: &CreateSession, started: &SessionEvent) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;

@@ -136,6 +136,34 @@ A new tool, `SendMessage` in the Claude tool set and `send_message` in the other
 - **The subagent is running in the background:** the message goes into its inbox and arrives at its next model boundary. The call returns at once. This is how a parent steers its own background subagents.
 - **Allowed targets:** an agent can message only its own children (`parent_id` = caller). Messaging any other session is refused.
 
+**Report ownership survives the task (2026-11-07).** A running child may
+already be on a later turn, resumed by its own shell notices after its original
+background task failed, stopped or was lost. A steer still owns a report for
+the turn that actually consumes it. If no call waits for that turn, the report
+is a **waking notice to the recorded parent**; it does not depend on the old
+background task still existing. A steer queued after a final model request
+belongs to the next turn, not the turn that is finishing. A child's own
+task-notification turns report back too. Direct messages from you still respect
+your **Wake the parent** choice, and automatic-turn limits still apply.
+
+Local report recovery reads consumed inputs and turn ends from the journal.
+Stable `subagent:local:<child>:<end-seq>` notice IDs deduplicate retries; a child
+receipt is written only after its parent recorded the notice, or recovery
+finds the waiting call's durable result/background notice. Merely sending a
+oneshot is not a durable receipt. All unreceipted turns are considered, not
+only the last one. Startup scans local children for these obligations without
+the held-notice recovery window, but does not recreate tools/MCP processes for
+children whose parents already durably recorded their reports. A tracking boundary on creation/first load
+avoids replaying already-reported history from older versions; this is not a
+backfill of old lost reports. An unavailable local parent leaves a visible
+**Subagent report delivery failed** notice on the child and keeps the report
+pending. Remote delivery and rejection visibility are in remote-subagents.md
+§12. Delivery is at-least-once across crashes, not an exactly-once promise.
+
+The tool also preserves a report returned when a running snapshot becomes
+idle before `SendMessage` delivers its input, rather than replacing that report
+with a misleading “Sent” response.
+
 `bash_output` / `BashOutput` take a subagent id (a background task id or a session id). They return the digest above plus any new events since the last read, so a parent can check on a background subagent without waiting for it.
 
 Why a separate tool and not a `resume` parameter on `Task`:

@@ -128,6 +128,132 @@ fn last_seq(events: &[Event]) -> u64 {
     events.last().map_or(0, |e| e.seq)
 }
 
+/// A failed background task no longer owns reports. A genuinely running
+/// resumed child must still report the turn that takes its parent's steer.
+#[tokio::test]
+async fn a_failed_background_subagent_steered_after_failure_wakes_its_parent() {
+    failed_background_resume(true).await;
+}
+
+#[tokio::test]
+async fn a_failed_local_background_subagent_steered_into_its_next_turn_wakes_its_parent() {
+    failed_background_resume(false).await;
+}
+
+async fn failed_background_resume(remote: bool) {
+    let env = Env::new().await;
+    let (sa, sb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (alpha, stop_a) = env.worker("alpha", sa.path()).await;
+    let (_beta, stop_b) = env.worker("beta", sb.path()).await;
+    let (here, there) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    env.templates(json!([{"name": "far", "workers": ["beta"], "cwd": there.path().display().to_string(), "connection": "m", "model": "m", "agents": true}]))
+        .await;
+    let mut task = json!({"description": "failure probe", "prompt": "remote-failure-probe", "run_in_background": true});
+    if remote {
+        task["template"] = json!("far");
+    }
+    env.mock.push(Reply::ToolCalls(vec![("task".into(), task.to_string())]));
+    env.mock.push_about("start failure probe", Reply::Text("Waiting for the failure probe.".into()));
+    let failure = env.mock.push_gated(Reply::Broken("Partial report before the provider failed.".into()));
+    // The transport retries a truncated response. Make its retry a
+    // permanent provider error, rather than letting it consume a parent reply.
+    env.mock.push(Reply::Error(400, "permanent provider failure".into()));
+    let id = env.create(&alpha, here.path(), "start failure probe").await;
+    assert_eq!(env.turn_ended_after(&id, 0).await, TurnEndReason::Completed);
+    let initial_end = last_seq(&env.events(&id).await);
+    env.mock.push_about("start failure probe", Reply::Text("Acknowledged the failed background task.".into()));
+    failure.notify_one();
+    let child_id = eventually("the failed background task reported", async || {
+        let events = env.events(&id).await;
+        let failed = events.iter().any(|e| {
+            matches!(&e.kind,
+            EventKind::BackgroundTask { state, exit_code, .. } if state == "finished" && *exit_code != 0)
+        });
+        let child = env.children(&id).await.into_iter().next()?;
+        let took_notice = events.iter().any(|e| {
+            e.seq > initial_end
+                && matches!(&e.kind,
+            EventKind::User { command, .. } if command == "task-notification")
+        });
+        (failed && took_notice && turn_finished(&events)).then_some(child.id)
+    })
+    .await;
+    assert_eq!(env.turn_ended_after(&child_id, 0).await, TurnEndReason::Error);
+    // Resume independently of the ended background task, as the queued
+    // shell notices did in the incident. The parent's steer arrives after
+    // the final model call starts, and is consumed by the *next* turn.
+    let prelude = env.mock.push_gated(Reply::Text("Prelude, not the requested final report.".into()));
+    env.message(&child_id, "prelude-probe", false).await;
+    eventually("the child's final response streaming", async || {
+        let running = env.head.state.store.session(&child_id).await.unwrap()?.status == "running";
+        (running && env.mock.requests().iter().any(|r| r["messages"].to_string().contains("prelude-probe"))).then_some(())
+    })
+    .await;
+    let seq = last_seq(&env.events(&id).await);
+    env.mock.push_about(
+        "resume failure probe",
+        Reply::ToolCalls(vec![(
+            "send_message".into(),
+            json!({"to": child_id, "message": "finish after failure", "run_in_background": true}).to_string(),
+        )]),
+    );
+    env.mock.push_about("resume failure probe", Reply::Text("The steer was sent.".into()));
+    let gate = env.mock.push_gated(Reply::Text("Recovered final report.".into()));
+    env.message(&id, "resume failure probe", false).await;
+    // The child has started, and SendMessage returned without a new bg id.
+    let parent_events = eventually("the steering parent idle", async || {
+        let events = env.events(&id).await;
+        let sent = result_of(&events, "send_message").is_some();
+        (sent && events.iter().any(|e| e.seq > seq && matches!(e.kind, EventKind::TurnEnded { .. })) && turn_finished(&events))
+            .then_some(events)
+    })
+    .await;
+    let (sent, error) = result_of(&parent_events, "send_message").unwrap();
+    assert!(!error && sent.starts_with("Sent:"), "{sent}\n{}", env.mock.log());
+    if remote {
+        assert_eq!(
+            env.head.state.store.waiting_delegations(&child_id).await.unwrap().len(),
+            1,
+            "a steer owns a durable report obligation even after its background task failed"
+        );
+    }
+    let parent_end = last_seq(&parent_events);
+    env.mock.push_about("resume failure probe", Reply::Text("I received the recovered report.".into()));
+    prelude.notify_one();
+    gate.notify_one();
+    let notice = eventually_or(
+        "the final report to wake the parent",
+        async || {
+            env.events(&id).await.into_iter().find_map(|e| match e.kind {
+                EventKind::User { text, command, .. }
+                    if e.seq > parent_end && command == "task-notification" && text.contains("Recovered final report.") =>
+                {
+                    Some((e.seq, text))
+                }
+                _ => None,
+            })
+        },
+        || env.mock.log(),
+    )
+    .await;
+    assert_eq!(env.turn_ended_after(&id, notice.0).await, TurnEndReason::Completed);
+    assert!(env.head.state.store.waiting_delegations(&child_id).await.unwrap().is_empty());
+    stop_a.cancel();
+    stop_b.cancel();
+}
+
+fn turn_finished(events: &[Event]) -> bool {
+    events
+        .iter()
+        .rev()
+        .find_map(|e| match e.kind {
+            EventKind::TurnStarted { .. } => Some(false),
+            EventKind::TurnEnded { .. } => Some(true),
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
 /// A template agents may start runs as a session of its own on the worker
 /// it names, in its folder, with its prompt before the task; the parent's
 /// call gets its report, and SendMessage continues it through the head.

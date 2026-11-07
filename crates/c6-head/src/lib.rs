@@ -378,6 +378,10 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         tracing::warn!("offering to move apps out of their own realms: {e:#}");
     }
 
+    // Reports whose child events committed before the previous head
+    // stopped, but whose delivery hook did not finish.
+    remote::recover(&state).await?;
+
     // Scheduled automations.
     triggers::spawn_scheduler(state.clone());
     // Series thresholds and retention.

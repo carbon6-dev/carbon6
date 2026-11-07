@@ -219,13 +219,17 @@ pub(crate) enum ActorMsg {
     Delegate(Box<PendingInput>, Option<tokio::sync::oneshot::Sender<Outcome>>),
     /// What a subagent did in a turn no call waited on, for its parent.
     ChildReport {
+        command_id: String,
         text: String,
         wake: bool,
         task_notice: Option<c6_proto::TaskNotice>,
+        recorded: tokio::sync::oneshot::Sender<()>,
     },
+    /// Replay a local report whose turn ended before delivery completed.
+    RecoverReport,
     /// Context for the next input, never a reason to start a turn.
     /// How a remote subagent's turn ended (from the head, as a command).
-    RemoteReport(String, Box<c6_proto::DelegationEnded>),
+    RemoteReport(String, Box<c6_proto::DelegationEnded>, tokio::sync::oneshot::Sender<Result<(), String>>),
     /// Deliver the held notices now, whatever the hourly limit (you asked).
     ReleaseNotices,
     /// Its turn `.0` was cut short by a worker restart: it goes on
@@ -464,6 +468,32 @@ impl SessionManager {
                 warn!(session = %session_id, "resuming for held notices: {e:#}");
             }
         }
+        // Report obligations do not expire while the worker is offline.
+        // The tracking boundary excludes pre-upgrade, already-told history.
+        for session_id in self.journal.local_subagent_ids().await? {
+            let Some((spec, events)) = self.journal.load_session(&session_id).await? else { continue };
+            let Some(delegation) = spec.delegation else { continue };
+            let pending = pending_local_reports(&session_id, &events);
+            if pending.is_empty() {
+                continue;
+            }
+            let parent = self.journal.events_after(&delegation.parent_session_id, 0, u32::MAX).await?;
+            // Do not recreate tools/MCP processes for completed children
+            // whose parents already durably recorded the report. An actor
+            // is needed only for an actual undelivered obligation.
+            let undelivered = pending.iter().any(|(id, end, inputs)| {
+                let outcome = last_turn_outcome(&events[..=*end]);
+                let status = crate::subagent::status_of(outcome.reason, &outcome.report);
+                !inputs.iter().any(|u| report_recorded(&parent, &u.delegated_by, &session_id, status))
+                    && !parent.iter().any(|e| {
+                        matches!(&e.kind,
+                        Some(session_event::Kind::NoticeQueued(n)) if &n.command_id == id)
+                    })
+            });
+            if undelivered && let Err(e) = self.actor(&session_id).await {
+                warn!(session = %session_id, "resuming for a pending subagent report: {e:#}");
+            }
+        }
         Ok(())
     }
 
@@ -611,8 +641,14 @@ impl SessionManager {
                     return Ok(());
                 }
                 let actor = self.actor(&cmd.session_id).await.map_err(internal)?.ok_or("unknown session on this worker")?;
-                let _ = actor.send(ActorMsg::RemoteReport(cmd.command_id, Box::new(d)));
-                Ok(())
+                let (recorded, ack) = tokio::sync::oneshot::channel();
+                actor
+                    .send(ActorMsg::RemoteReport(cmd.command_id, Box::new(d), recorded))
+                    .map_err(|_| "parent stopped before taking the report")?;
+                // Let conn send CommandRejected if the actor cannot record
+                // the report. Logging and silently returning Ok hid the
+                // delivery failure from the head and the parent's queue.
+                ack.await.unwrap_or_else(|_| Err("parent stopped before recording the report".into()))
             }
             Some(session_command::Kind::ReleaseNotices(_)) => {
                 // Loading it delivers what it can; then the rest, now.
@@ -818,7 +854,7 @@ impl SessionManager {
         if let Some(a) = self.actors.lock().unwrap().get(session_id).filter(|a| !a.tx.is_closed()) {
             return Ok(Some(a.clone()));
         }
-        let Some((spec, events)) = self.journal.load_session(session_id).await? else { return Ok(None) };
+        let Some((spec, mut events)) = self.journal.load_session(session_id).await? else { return Ok(None) };
         let started = events.iter().find_map(|e| match &e.kind {
             Some(session_event::Kind::Started(s)) => Some(s.clone()),
             _ => None,
@@ -837,11 +873,30 @@ impl SessionManager {
         if let Some(Some(turn)) = open_turn {
             warn!(session = %session_id, turn, "closing a turn left open by a failed turn");
             let kind = session_event::Kind::TurnEnded(TurnEnded { turn, reason: TurnEndReason::Error as i32 });
-            self.journal.append(session_id, &SessionEvent { seq: next_seq, ts_ms: c6_core::now_ms(), kind: Some(kind) }).await?;
+            let event = SessionEvent { seq: next_seq, ts_ms: c6_core::now_ms(), kind: Some(kind) };
+            self.journal.append(session_id, &event).await?;
+            events.push(event);
+            next_seq += 1;
+        }
+        if spec.delegation.is_some()
+            && !events.iter().any(|e| {
+                matches!(&e.kind,
+            Some(session_event::Kind::SubagentReported(r)) if r.command_id == local_report_tracking(session_id))
+            })
+        {
+            // Adopt old sessions without replaying already-reported history.
+            let event = SessionEvent {
+                seq: next_seq,
+                ts_ms: c6_core::now_ms(),
+                kind: Some(session_event::Kind::SubagentReported(local_report_boundary(session_id))),
+            };
+            self.journal.append(session_id, &event).await?;
+            events.push(event);
             next_seq += 1;
         }
         let turns = events.iter().filter(|e| matches!(e.kind, Some(session_event::Kind::TurnStarted(_)))).count() as u64;
         let mut spec = spec;
+        let local_child = spec.delegation.is_some();
         let conv = conversation_from_log(&mut spec, &events);
         let handle = self.spawn(session_id, spec, started, conv, next_seq, turns, None).await?;
         let tx = handle.tx.clone();
@@ -861,6 +916,9 @@ impl SessionManager {
         // Notices no turn took are delivered again.
         let (auto_turns_ms, noticed, pending) = notices_of(&events);
         let _ = tx.send(ActorMsg::Reloaded { auto_turns_ms, noticed, pending });
+        if local_child && !pending_local_reports(session_id, &events).is_empty() {
+            let _ = tx.send(ActorMsg::RecoverReport);
+        }
         for t in open {
             let (child, remote) = events
                 .iter()
@@ -897,8 +955,18 @@ impl SessionManager {
     ) -> anyhow::Result<mpsc::UnboundedSender<ActorMsg>> {
         let ev = SessionEvent { seq: 1, ts_ms: c6_core::now_ms(), kind: Some(session_event::Kind::Started(started.clone())) };
         self.journal.create_session(session_id, &spec, &ev).await?;
+        self.journal
+            .append(
+                session_id,
+                &SessionEvent {
+                    seq: 2,
+                    ts_ms: c6_core::now_ms(),
+                    kind: Some(session_event::Kind::SubagentReported(local_report_boundary(session_id))),
+                },
+            )
+            .await?;
         let conv = Conversation { history: Vec::new(), context_tokens: 0 };
-        Ok(self.spawn(session_id, spec, started, conv, 2, 0, Some(tools)).await?.tx)
+        Ok(self.spawn(session_id, spec, started, conv, 3, 0, Some(tools)).await?.tx)
     }
 
     /// The shared tool state of a subagent's parent, starting the parent's
@@ -1113,10 +1181,11 @@ impl SessionManager {
             noticed: HashSet::new(),
             on_behalf_of,
             waiting: Vec::new(),
+            handed_reports: HashSet::new(),
+            remote_receipts: Vec::new(),
             manager: self.clone(),
             subagent_default: Arc::new(Mutex::new(crate::subagent::SubagentDefault::of(&spec_default))),
             running_flag: Arc::default(),
-            report: None,
             claude_code: claude_code.clone(),
             claude: None,
             claude_stdin: Arc::default(),
@@ -1364,6 +1433,100 @@ fn set_subagent_default(spec: &mut CreateSession, model: Option<ModelSpec>) {
     spec.subagent_model.clear();
 }
 
+/// A local turn's report belongs to its consumed inputs, not to an
+/// in-memory background task or a queued input for a later turn. The
+/// receipt is appended only after its waiter or parent's journal took it.
+fn pending_local_reports<'a>(sid: &str, events: &'a [SessionEvent]) -> Vec<(String, usize, Vec<&'a c6_proto::UserMessage>)> {
+    let Some(boundary) = events.iter().position(|e| {
+        matches!(&e.kind,
+        Some(session_event::Kind::SubagentReported(r)) if r.command_id == local_report_tracking(sid))
+    }) else {
+        return Vec::new();
+    };
+    let received: HashSet<_> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            Some(session_event::Kind::SubagentReported(r)) => Some(r.command_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut pending = Vec::new();
+    let mut start = boundary + 1;
+    for (end, event) in events.iter().enumerate().skip(start) {
+        if !matches!(event.kind, Some(session_event::Kind::TurnEnded(_))) {
+            continue;
+        }
+        let id = format!("subagent:local:{sid}:{}", event.seq);
+        let inputs: Vec<_> = events[start..end]
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Some(session_event::Kind::User(u)) if u.blocked.is_empty() && u.command != "compact" => Some(u),
+                _ => None,
+            })
+            .collect();
+        if !received.contains(id.as_str()) && !inputs.is_empty() {
+            pending.push((id, end, inputs));
+        }
+        start = end + 1;
+    }
+    pending
+}
+
+/// A successful channel send is not durable delivery. On recovery, look
+/// for the call's real result or its background notice before retiring a
+/// report. A placeholder saying the child is still running/lost does not
+/// acknowledge a later completed report.
+fn report_recorded(events: &[SessionEvent], call: &str, child: &str, status: &str) -> bool {
+    if call.is_empty() {
+        return false;
+    }
+    // Some providers (and the scripted model) reuse ids across turns.
+    // A previous invocation's result must not acknowledge the latest one.
+    let start = events
+        .iter()
+        .rposition(|e| match &e.kind {
+            Some(session_event::Kind::Assistant(a)) => a.blocks.iter().any(|b| {
+                matches!(&b.block,
+            Some(c6_proto::content_block::Block::ToolUse(u)) if u.id == call)
+            }),
+            _ => false,
+        })
+        .unwrap_or(0);
+    let Some(result) = events[start..].iter().rev().find_map(|e| match &e.kind {
+        Some(session_event::Kind::ToolResult(r)) if r.call_id == call => Some(r),
+        _ => None,
+    }) else {
+        return false;
+    };
+    if result.output.starts_with("Started the subagent in the background as ")
+        || result.output.starts_with("Continuing the subagent in the background as ")
+    {
+        let Some(task) = result.output.split(" as ").nth(1).and_then(|s| s.split('.').next()) else {
+            return false;
+        };
+        return events.iter().any(|e| {
+            matches!(&e.kind,
+            Some(session_event::Kind::NoticeQueued(n)) if n.command_id.starts_with(&format!("task:{task}:"))
+                && (status == "lost" || !n.command_id.ends_with(":lost")))
+        });
+    }
+    result.output.contains(&format!("[subagent session {child}]"))
+        || (result.output.contains(&format!("<subagent id=\"{child}\" status=\"{status}\"")))
+}
+
+fn local_report_tracking(sid: &str) -> String {
+    format!("subagent:local:{sid}:tracking")
+}
+
+fn local_report_boundary(sid: &str) -> c6_proto::SubagentReported {
+    c6_proto::SubagentReported {
+        command_id: local_report_tracking(sid),
+        child_session_id: sid.into(),
+        status: "tracking".into(),
+        ..Default::default()
+    }
+}
+
 /// How the log's last turn ended: its reason, final assistant text and
 /// last error.
 fn last_turn_outcome(events: &[SessionEvent]) -> Outcome {
@@ -1534,6 +1697,10 @@ struct Actor {
     on_behalf_of: String,
     /// Delegations waiting for their turn to end: the input's command id.
     waiting: Vec<(String, tokio::sync::oneshot::Sender<Outcome>)>,
+    /// Waiters already given a report in this process. Their source log
+    /// stays pending until the parent records the result durably.
+    handed_reports: HashSet<String>,
+    remote_receipts: Vec<c6_proto::SubagentReported>,
     /// To start subagents.
     manager: SessionManager,
     /// The default for its subagents (as in `spec`), shared with a running
@@ -1541,10 +1708,6 @@ struct Actor {
     subagent_default: crate::subagent::SharedDefault,
     /// Shared with the manager: a turn is running.
     running_flag: Arc<std::sync::atomic::AtomicBool>,
-    /// A subagent's inputs since its last report that no call waits on
-    /// (yours, notices, messages joining a turn): who said what, and
-    /// whether the report should wake the parent.
-    report: Option<(Vec<String>, bool)>,
     /// Shared with the manager: it runs Claude Code now.
     claude_code: Arc<std::sync::atomic::AtomicBool>,
     /// Its Claude Code process while no turn holds it (docs/background.md
@@ -1685,13 +1848,6 @@ impl Actor {
                                 input.prompt = format!("{}\n\n<user-prompt-submit-hook>\n{context}\n</user-prompt-submit-hook>", input.model_text());
                             }
                         }
-                        if self.spec.delegation.is_some() && !input.is_compact() {
-                            let r = self.report.get_or_insert_with(Default::default);
-                            r.0.push(crate::subagent::report_input(
-                                &self.writer.session_id, &input.command, &input.text, &input.from_session_id, &input.from_title, input.api_origin.as_ref(), input.human_origin,
-                            ));
-                            r.1 |= input.wake;
-                        }
                         let held = std::mem::take(&mut self.deferred);
                         let command_id = input.command_id.clone();
                         // Send now in carbon6's own loop: the turn stops (it takes
@@ -1737,9 +1893,8 @@ impl Actor {
                         }
                     }
                     Some(ActorMsg::Delegate(input, done)) => {
-                        match done {
-                            Some(done) => self.waiting.push((input.command_id.clone(), done)),
-                            None => self.report.get_or_insert_with(Default::default).0.push(String::new()),
+                        if let Some(done) = done {
+                            self.waiting.push((input.command_id.clone(), done));
                         }
                         // Notices held for the next input come with it.
                         let held = std::mem::take(&mut self.deferred);
@@ -1749,15 +1904,19 @@ impl Actor {
                         }
                         inbox.push(*input, None);
                     }
-                    Some(ActorMsg::RemoteReport(command_id, ended)) => {
-                        if let Err(e) = self.remote_report(command_id, *ended, running.is_some()).await {
-                            error!(session = %self.writer.session_id, "taking a remote subagent's report: {e:#}");
-                            return;
+                    Some(ActorMsg::RemoteReport(command_id, ended, recorded)) => {
+                        match self.remote_report(command_id, *ended, running.is_some()).await {
+                            Ok(()) => { let _ = recorded.send(Ok(())); }
+                            Err(e) => {
+                                error!(session = %self.writer.session_id, "taking a remote subagent's report: {e:#}");
+                                let _ = recorded.send(Err(format!("could not record subagent report: {e:#}")));
+                                return;
+                            }
                         }
                     }
-                    Some(ActorMsg::ChildReport { text, wake, task_notice }) => {
+                    Some(ActorMsg::ChildReport { command_id, text, wake, task_notice, recorded }) => {
                         let input = PendingInput {
-                            command_id: format!("subagent:{}", uuid::Uuid::now_v7()),
+                            command_id,
                             text,
                             command: "task-notification".into(),
                             task_notice,
@@ -1766,6 +1925,12 @@ impl Actor {
                         if let Err(e) = self.notice(input, running.is_some(), wake).await {
                             error!(session = %self.writer.session_id, "queueing a subagent's report: {e:#}");
                             return;
+                        }
+                        let _ = recorded.send(());
+                    }
+                    Some(ActorMsg::RecoverReport) => {
+                        if let Err(e) = self.settle_delegations().await {
+                            error!(session = %self.writer.session_id, "recovering a subagent's report: {e:#}");
                         }
                     }
                     Some(ActorMsg::ReleaseNotices) => {
@@ -1824,6 +1989,10 @@ impl Actor {
                         let held = lost_native && self.after_stop(running.is_some());
                         if let Err(e) = self.task_event(record, notice, &ev.output, running.is_some() && !held, !held).await {
                             error!(session = %self.writer.session_id, "recording a background task: {e:#}");
+                            return;
+                        }
+                        if let Err(e) = self.record_remote_receipts().await {
+                            error!(session = %self.writer.session_id, "recording subagent report receipts: {e:#}");
                             return;
                         }
                     }
@@ -2008,6 +2177,10 @@ impl Actor {
                             if let Err(e) = self.settle_delegations().await {
                                 error!(session = %self.writer.session_id, "reading a delegation's outcome: {e:#}");
                             }
+                            if let Err(e) = self.record_remote_receipts().await {
+                                error!(session = %self.writer.session_id, "recording subagent report receipts: {e:#}");
+                                return;
+                            }
                         }
                         // The log and the in-memory state may disagree, and
                         // queued inputs may be lost: stop, and let the next
@@ -2029,43 +2202,109 @@ impl Actor {
     /// call waited on goes to its parent as a notice.
     async fn settle_delegations(&mut self) -> anyhow::Result<()> {
         let Some(d) = self.spec.delegation.clone() else { return Ok(()) };
-        let settled: Vec<_> = {
-            let inbox = self.inbox.lock().unwrap();
-            let (done, still): (Vec<_>, Vec<_>) =
-                std::mem::take(&mut self.waiting).into_iter().partition(|(id, _)| !inbox.queue.iter().any(|(i, _)| &i.command_id == id));
+        let sid = self.writer.session_id.clone();
+        let events = self.journal.events_after(&self.writer.session_id, 0, u32::MAX).await?;
+        for (command_id, end, inputs) in pending_local_reports(&sid, &events) {
+            if self.handed_reports.contains(&command_id) {
+                continue;
+            }
+            let (settled, still): (Vec<_>, Vec<_>) =
+                std::mem::take(&mut self.waiting).into_iter().partition(|(id, _)| inputs.iter().any(|u| &u.command_id == id));
             self.waiting = still;
-            done
-        };
-        // A call still waiting gets this turn's report: nothing to tell.
-        let told = settled.iter().any(|(_, tx)| !tx.is_closed());
-        if settled.is_empty() && self.report.is_none() {
+            let outcome = last_turn_outcome(&events[..=end]);
+            let status = crate::subagent::status_of(outcome.reason, &outcome.report);
+            let parent = self.journal.events_after(&d.parent_session_id, 0, u32::MAX).await?;
+            // Sending, rather than testing is_closed, decides ownership. A
+            // waiter can disappear between those operations.
+            let told = inputs.iter().any(|u| report_recorded(&parent, &u.delegated_by, &sid, status));
+            let mut handed = false;
+            for (_, tx) in settled {
+                handed |= tx.send(Outcome { reason: outcome.reason, report: outcome.report.clone(), error: outcome.error.clone() }).is_ok();
+            }
+            if handed {
+                self.handed_reports.insert(command_id);
+                continue;
+            }
+            if !told {
+                let wake = inputs
+                    .iter()
+                    .any(|u| u.wake || !u.delegated_by.is_empty() || u.command == "session-message" || u.command == "task-notification");
+                let said = inputs
+                    .iter()
+                    .filter(|u| u.delegated_by.is_empty() && u.command != "task-notification")
+                    .map(|u| {
+                        crate::subagent::report_input(
+                            &sid,
+                            &u.command,
+                            &u.text,
+                            &u.from_session_id,
+                            &u.from_title,
+                            u.api_origin.as_ref(),
+                            u.human_origin,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let digest = if outcome.reason == TurnEndReason::Completed && !outcome.report.trim().is_empty() {
+                    String::new()
+                } else {
+                    let status = crate::subagent::status_of(outcome.reason, &outcome.report);
+                    crate::subagent::digest(&self.journal, &sid, status, "").await
+                };
+                let body = crate::subagent::report_body(&self.spec, &sid, outcome.reason, &outcome.report, &digest);
+                let text = crate::subagent::unasked_report(&sid, &said, &body);
+                let delivered = async {
+                    let parent = self
+                        .manager
+                        .actor_for(&d.parent_session_id)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("parent {} is not on this worker", d.parent_session_id))?;
+                    let task_notice = Some(crate::subagent::task_report_notice(&self.started.title, &sid, outcome.reason, &outcome.report));
+                    let (recorded, ack) = tokio::sync::oneshot::channel();
+                    parent
+                        .send(ActorMsg::ChildReport { command_id: command_id.clone(), text, wake, task_notice, recorded })
+                        .map_err(|_| anyhow::anyhow!("parent stopped before taking the report"))?;
+                    ack.await.map_err(|_| anyhow::anyhow!("parent stopped before recording the report"))
+                }
+                .await;
+                if let Err(e) = delivered {
+                    self.writer
+                        .append(session_event::Kind::Notice(Notice {
+                            title: "Subagent report delivery failed".into(),
+                            message: format!(
+                                "The report could not reach parent {}: {e:#}. It remains pending in this session's log.",
+                                d.parent_session_id
+                            ),
+                            priority: "high".into(),
+                            ..Default::default()
+                        }))
+                        .await?;
+                    return Err(e);
+                }
+            }
+            self.writer
+                .append(session_event::Kind::SubagentReported(c6_proto::SubagentReported {
+                    command_id,
+                    child_session_id: sid.clone(),
+                    status: crate::subagent::status_of(outcome.reason, &outcome.report).into(),
+                    ..Default::default()
+                }))
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn record_remote_receipts(&mut self) -> anyhow::Result<()> {
+        if self.remote_receipts.is_empty() {
             return Ok(());
         }
         let events = self.journal.events_after(&self.writer.session_id, 0, u32::MAX).await?;
-        let outcome = last_turn_outcome(&events);
-        let report = self.report.take();
-        if !told && let Some((said, wake)) = report {
-            let sid = self.writer.session_id.clone();
-            let digest = if outcome.reason == TurnEndReason::Completed && !outcome.report.trim().is_empty() {
-                String::new()
+        let pending = std::mem::take(&mut self.remote_receipts);
+        for receipt in pending {
+            if report_recorded(&events, &receipt.call_id, &receipt.child_session_id, &receipt.status) {
+                self.writer.append(session_event::Kind::SubagentReported(receipt)).await?;
             } else {
-                let status = crate::subagent::status_of(outcome.reason, &outcome.report);
-                crate::subagent::digest(&self.journal, &sid, status, "").await
-            };
-            let body = crate::subagent::report_body(&self.spec, &sid, outcome.reason, &outcome.report, &digest);
-            let text = crate::subagent::unasked_report(&sid, &said, &body);
-            match self.manager.actor_for(&d.parent_session_id).await {
-                Ok(Some(parent)) => {
-                    // The child's title was seeded from the delegation description.
-                    let task_notice = Some(crate::subagent::task_report_notice(&self.started.title, &sid, outcome.reason, &outcome.report));
-                    let _ = parent.send(ActorMsg::ChildReport { text, wake, task_notice });
-                }
-                Ok(None) => warn!(session = %sid, "a subagent's report has no parent on this worker"),
-                Err(e) => warn!(session = %sid, "a subagent's report could not reach its parent: {e:#}"),
+                self.remote_receipts.push(receipt);
             }
-        }
-        for (_, tx) in settled {
-            let _ = tx.send(Outcome { reason: outcome.reason, report: outcome.report.clone(), error: outcome.error.clone() });
         }
         Ok(())
     }
@@ -2076,6 +2315,11 @@ impl Actor {
     /// notice, which wakes the session if a call had waited. The log then
     /// says it came, so the head stops sending it.
     async fn remote_report(&mut self, command_id: String, ended: c6_proto::DelegationEnded, busy: bool) -> anyhow::Result<()> {
+        if self.remote_receipts.iter().any(|r| r.command_id == command_id) {
+            // Reconnected before the waiting tool recorded its result.
+            // The source command remains pending; do not tell it twice.
+            return Ok(());
+        }
         let reason = TurnEndReason::try_from(ended.reason).unwrap_or(TurnEndReason::Unspecified);
         let reported = c6_proto::SubagentReported {
             command_id,
@@ -2089,6 +2333,11 @@ impl Actor {
             None => Some(ended),
         };
         if let Some(ended) = unanswered {
+            let events = self.journal.events_after(&self.writer.session_id, 0, u32::MAX).await?;
+            if report_recorded(&events, &reported.call_id, &reported.child_session_id, &reported.status) {
+                self.writer.append(session_event::Kind::SubagentReported(reported)).await?;
+                return Ok(());
+            }
             let sid = &ended.child_session_id;
             let body = crate::subagent::report_body(&self.spec, sid, reason, &ended.report, &ended.digest);
             let (text, wake) = if ended.call_id.is_empty() {
@@ -2106,6 +2355,9 @@ impl Actor {
                 ..Default::default()
             };
             self.notice(input, busy, wake).await?;
+        } else {
+            self.remote_receipts.push(reported);
+            return Ok(());
         }
         self.writer.append(session_event::Kind::SubagentReported(reported)).await?;
         Ok(())
@@ -2156,22 +2408,6 @@ impl Actor {
         self.auto_turns.len().checked_sub(self.auto_turn_limit()).map_or(now, |i| (self.auto_turns[i] + HOUR).max(now))
     }
 
-    fn report_notice(&mut self, input: &PendingInput) {
-        if self.spec.delegation.is_some() && input.command == "session-message" {
-            let r = self.report.get_or_insert_with(Default::default);
-            r.0.push(crate::subagent::report_input(
-                &self.writer.session_id,
-                &input.command,
-                &input.text,
-                &input.from_session_id,
-                &input.from_title,
-                input.api_origin.as_ref(),
-                input.human_origin,
-            ));
-            r.1 = true;
-        }
-    }
-
     /// The hour allows another automatic turn: the held notices start one
     /// together.
     fn release_held(&mut self) {
@@ -2216,7 +2452,6 @@ impl Actor {
     /// beyond it, once the hour allows), else it waits for the next input.
     /// `announce`: say so in the log when the limit holds it.
     async fn deliver_notice(&mut self, input: PendingInput, busy: bool, wake: bool, announce: bool) -> anyhow::Result<()> {
-        self.report_notice(&input);
         // What the agent does next follows from this message's chain.
         if input.hops > 0 {
             self.session_tools.set_message_hops(input.hops);
@@ -4480,6 +4715,74 @@ mod notice_tests {
     use super::*;
 
     #[test]
+    fn local_report_recovery_keeps_earlier_turns_and_automatic_resumptions() {
+        let mut events = vec![
+            ev(1, 1, session_event::Kind::Started(Default::default())),
+            ev(2, 2, session_event::Kind::SubagentReported(local_report_boundary("child"))),
+            ev(
+                3,
+                3,
+                session_event::Kind::User(c6_proto::UserMessage {
+                    command_id: "steer".into(),
+                    delegated_by: "call".into(),
+                    ..Default::default()
+                }),
+            ),
+            ev(4, 4, session_event::Kind::TurnEnded(TurnEnded { turn: 1, reason: TurnEndReason::Error as i32 })),
+            ev(
+                5,
+                5,
+                session_event::Kind::User(c6_proto::UserMessage {
+                    command_id: "task:bg1:finished".into(),
+                    command: "task-notification".into(),
+                    ..Default::default()
+                }),
+            ),
+            ev(6, 6, session_event::Kind::TurnEnded(TurnEnded { turn: 2, reason: TurnEndReason::Completed as i32 })),
+        ];
+        let pending = pending_local_reports("child", &events);
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].2[0].command_id, "steer");
+        assert_eq!(pending[1].2[0].command, "task-notification");
+        let id = pending[1].0.clone();
+        events.push(ev(7, 7, session_event::Kind::SubagentReported(c6_proto::SubagentReported { command_id: id, ..Default::default() })));
+        let pending = pending_local_reports("child", &events);
+        assert_eq!(pending.len(), 1, "a later receipt must not erase an earlier pending turn");
+        assert_eq!(pending[0].0, "subagent:local:child:4");
+        assert!(pending_local_reports("legacy-child", &events).is_empty(), "no replay of pre-tracking history");
+    }
+
+    #[test]
+    fn a_waiter_needs_a_durable_result_not_a_lost_or_background_placeholder() {
+        let result = |text: &str| {
+            ev(
+                1,
+                1,
+                session_event::Kind::ToolResult(c6_proto::ToolResult { call_id: "call".into(), output: text.into(), ..Default::default() }),
+            )
+        };
+        assert!(!report_recorded(&[], "call", "child", "completed"));
+        assert!(!report_recorded(&[result("<subagent id=\"child\" status=\"lost\"/>")], "call", "child", "completed"));
+        assert!(report_recorded(&[result("The full report.\n[subagent session child]")], "call", "child", "completed"));
+        let mut events =
+            vec![result("Continuing the subagent in the background as bg2. Its report will arrive as a notice when it finishes.")];
+        assert!(!report_recorded(&events, "call", "child", "completed"));
+        events.push(ev(
+            2,
+            2,
+            session_event::Kind::NoticeQueued(c6_proto::NoticeQueued { command_id: "task:bg2:lost".into(), ..Default::default() }),
+        ));
+        assert!(!report_recorded(&events, "call", "child", "completed"));
+        assert!(report_recorded(&events, "call", "child", "lost"));
+        events.push(ev(
+            3,
+            3,
+            session_event::Kind::NoticeQueued(c6_proto::NoticeQueued { command_id: "task:bg2:finished".into(), ..Default::default() }),
+        ));
+        assert!(report_recorded(&events, "call", "child", "completed"));
+    }
+
+    #[test]
     fn queued_metadata_roundtrips_through_reload_and_the_delivered_user_event() {
         let metadata = crate::subagent::task_report_notice("Review", "child", TurnEndReason::Completed, "# Actual report");
         let queued = c6_proto::NoticeQueued {
@@ -4653,6 +4956,8 @@ mod notice_tests {
         let tx = manager.actor("held").await.unwrap().unwrap();
         for text in ["report 21", "report 22"] {
             tx.send(ActorMsg::ChildReport {
+                command_id: format!("subagent:{text}"),
+                recorded: tokio::sync::oneshot::channel().0,
                 text: text.into(),
                 wake: true,
                 task_notice: Some(crate::subagent::task_report_notice("Review", "child", TurnEndReason::Completed, text)),
@@ -4730,6 +5035,8 @@ mod notice_tests {
         let tx = manager.actor("held").await.unwrap().unwrap();
         for text in ["report 21", "report 22"] {
             tx.send(ActorMsg::ChildReport {
+                command_id: format!("subagent:{text}"),
+                recorded: tokio::sync::oneshot::channel().0,
                 text: text.into(),
                 wake: false,
                 task_notice: Some(crate::subagent::task_report_notice("Review", "child", TurnEndReason::Completed, text)),

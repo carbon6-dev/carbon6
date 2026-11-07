@@ -173,7 +173,7 @@ Built 2026-11-03 (design: carbon6 doc "Claude Code sessions: default-deny tool w
 - When a notice is queued for a session, its actor first appends `NoticeQueued{command_id, text, command, wake}` to that session's log (`Actor::notice`). Then it delivers it: into the inbox, or held (`deliver_notice`). The head stores the event but leaves it out of the transcript, which shows the notice when a turn takes it.
 - Its `command_id`:
   - a background task's end: `task:<task_id>:<state>`, so the same end is never recorded twice;
-  - a subagent's report: `subagent:<uuid>` (it is recorded in the parent's log before anything else, so it needs no fixed id);
+  - a local subagent's report: `subagent:local:<child>:<turn-end-seq>`, stable across retries; the child records its receipt only after the parent durably queued the notice (or its waiting call's result/background notice was recorded);
   - a remote subagent's report ([remote-subagents.md](remote-subagents.md)), which the head sends until the parent logs `SubagentReported`: `subagent:<the head's command id>`, so one sent again is not told twice;
   - for a session message (step 4), the head's command id, which also gains `from_session_id`.
 - **When a turn takes the notice,** its `UserMessage` has the same `command_id`.
@@ -182,6 +182,7 @@ Built 2026-11-03 (design: carbon6 doc "Claude Code sessions: default-deny tool w
 - **Later (step 4):** the head treats `NoticeQueued{command_id}` as a command applied, so it doesn't resend a session message the worker has already recorded.
 - **Waiting notices are shown.** The events API carries `NoticeQueued` (not drawn in the transcript), so the UI knows a notice no turn has taken yet. While the session is idle, a pill above the message box lists them ("2 notices waiting for the agent", each with its first line and sender). Each notice stays hidden for a **3-second grace** from its event timestamp, so input taken promptly doesn't flash as waiting on you. The UI checks once a second even without new events; loading a notice already past the grace shows it immediately. This only delays the display, not delivery, and applies to quiet reports and quota-held notices alike. When the hourly limit holds a notice, its `deliver_at_ms` gives the next free slot; the pill says "delivers itself at 21:14" in your local time. Older workers/log entries without that field show no delivery time. **Deliver now**: `POST /api/v1/sessions/{id}/notices/deliver` sends the worker `ReleaseNotices`, and the held notices start one turn, whatever the hourly limit.
 - **Restart order.** `recover()` already writes `lost` for background tasks open at a restart, and those `lost` ends go through the same path.
+- **A task ending does not end its child's report ownership.** Later child turns, including its own task-notification turns and parent steers, still report to the recorded parent. With no waiting call, those automatic/delegated reports wake it. Local unreceipted turn reports and the head's remote delivery obligations survive restart independently of the old background task; see subagents.md §6 and remote-subagents.md §12. Explicit quiet user reports remain quiet, and the hourly wake limit is unchanged.
 
 Local reports use the child's recorded title (seeded from the delegation
 description); remote reports use its title on the head. Command metadata comes

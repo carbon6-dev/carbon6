@@ -390,7 +390,10 @@ impl Tool for SendMessage {
         };
         if running {
             return match agents.send(&ctx.call_id, to, message, None, ctx.cancel.clone()).await {
-                Ok(_) => ToolOutput::ok(format!(
+                // The snapshot can become idle before send takes the
+                // message. In that case send waited: do not drop its report.
+                Ok(Some(answer)) => ToolOutput::limited(answer, false),
+                Ok(None) => ToolOutput::ok(format!(
                     "Sent: subagent {to} is running and will see your message at its next step. Its report comes when it finishes."
                 )),
                 Err(e) => ToolOutput::err(e),
@@ -487,6 +490,49 @@ impl Tool for SkillTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct EndedBeforeSend;
+
+    #[async_trait]
+    impl Subagents for EndedBeforeSend {
+        async fn run(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: Option<&AgentDef>,
+            _: &ModelChoice,
+            _: Option<&str>,
+            _: CancellationToken,
+        ) -> Result<String, String> {
+            unreachable!()
+        }
+
+        async fn running(&self, _: &str) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        async fn send(&self, _: &str, _: &str, _: &str, _: Option<&str>, _: CancellationToken) -> Result<Option<String>, String> {
+            Ok(Some("The report after the running snapshot became idle.".into()))
+        }
+
+        async fn peek(&self, _: &str) -> Result<String, String> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn send_message_keeps_a_report_returned_after_a_stale_running_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = Arc::new(crate::SessionTools::new(dir.path().to_owned()));
+        session.set_subagents(Some(Arc::new(EndedBeforeSend)));
+        let ctx = ToolCtx { session, cancel: Default::default(), output: Arc::new(|_| {}), call_id: "continue".into() };
+        for tool in [SendMessage::generic(), SendMessage::claude()] {
+            let output = tool.call(&ctx, json!({"to": "child", "message": "finish", "run_in_background": true})).await;
+            assert!(!output.is_error);
+            assert_eq!(output.content, "The report after the running snapshot became idle.");
+        }
+    }
 
     #[test]
     fn skills_index() {
