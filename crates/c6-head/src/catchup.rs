@@ -150,8 +150,9 @@ pub(crate) fn worth_a_card(steps: u64, waiting: usize) -> bool {
 /// Your own message to the session: not another session's, a task's, a
 /// document's comments or the agent's that started it.
 fn yours(kind: &EventKind) -> bool {
-    matches!(kind, EventKind::User { text, command, from_session_id, delegated_by, .. }
-        if from_session_id.is_empty() && delegated_by.is_empty() && !matches!(command.as_str(), "task-notification" | "stop-hook") && doc_comment(text).is_none())
+    matches!(kind, EventKind::User { text, command, from_session_id, delegated_by, origin, .. }
+        if from_session_id.is_empty() && delegated_by.is_empty() && !matches!(command.as_str(), "task-notification" | "stop-hook") && doc_comment(text).is_none()
+            && matches!(origin.as_deref(), None | Some(api::MessageOrigin::Human)))
 }
 
 /// Where a catch-up starts, and when: after `seen`, the last event before
@@ -506,6 +507,10 @@ pub(crate) fn condensed(events: &[Event]) -> String {
                     lines.push(format!("Comments on the document \"{doc}\": {}", clip(text, 300)));
                 } else if yours(&e.kind) {
                     lines.push(format!("User: {}", clip(text, 300)));
+                } else if matches!(&e.kind, EventKind::User { origin, .. }
+                    if matches!(origin.as_deref(), Some(api::MessageOrigin::Api { .. } | api::MessageOrigin::Unknown)))
+                {
+                    lines.push(format!("Automation message: {}", clip(text, 300)));
                 } else if command == "task-notification" {
                     lines.push(format!("(The agent was told: {})", clip(&task_words(text), 120)));
                 }
@@ -708,7 +713,20 @@ pub(crate) mod tests {
             from_session_id: String::new(),
             from_title: String::new(),
             task_notice: None,
+            origin: None,
         }
+    }
+
+    #[test]
+    fn automation_does_not_reset_the_last_human_message_boundary() {
+        for origin in [api::MessageOrigin::Api { token_name: "c6-cli-zmbp".into() }, api::MessageOrigin::Unknown] {
+            let mut input = user("Status update");
+            let EventKind::User { origin: saved, .. } = &mut input else { panic!("user event") };
+            *saved = Some(Box::new(origin));
+            assert!(!yours(&input));
+            assert_eq!(since(&[ev(10, 1000, input)], 9, 900), (9, 900));
+        }
+        assert!(yours(&user("Legacy input")), "legacy presentation is preserved");
     }
 
     pub(crate) fn from_session(title: &str, text: &str) -> EventKind {

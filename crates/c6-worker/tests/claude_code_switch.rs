@@ -181,7 +181,7 @@ async fn sessions_hand_over_between_claude_code_and_carbon6s_loop() {
     for seen in ["find the bug", "[tool call bash:", "own-tool-output", "own answer one", "</carbon6-handoff>"] {
         assert!(p.contains(seen), "{seen} missing from {p}");
     }
-    assert!(p.ends_with("The user now says:\n\ncontinue in claude"), "{p}");
+    assert!(p.ends_with("The next message follows:\n\nMessage sent by an automation, not typed by the user:\ncontinue in claude"), "{p}");
     assert!(mock.requests().len() == 2, "Claude Code ran the turn, not the model");
     let d: SessionDetail = env.get(&format!("/sessions/{sid}")).await;
     assert_eq!((d.session.id.as_str(), d.session.connection_id.as_str(), d.session.model.as_str()), (sid.as_str(), cc.id.as_str(), "opus"));
@@ -191,7 +191,7 @@ async fn sessions_hand_over_between_claude_code_and_carbon6s_loop() {
     env.idle(&sid, 3).await;
     let (calls, prompts) = claude_runs(project.path());
     assert_eq!(arg(&calls[1], "--resume"), Some(conversation.as_str()), "{calls:?}");
-    assert_eq!(prompts[1], "and the tests?");
+    assert_eq!(prompts[1], "Message sent by an automation, not typed by the user:\nand the tests?");
 
     // 4. The worker restarts (journal kept): still Claude Code, same
     // conversation.

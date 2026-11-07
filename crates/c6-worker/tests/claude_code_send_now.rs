@@ -1,10 +1,10 @@
 //! Send now in a Claude Code session (docs/background.md §4): the message
 //! goes from the API through the head and the worker to the Claude Code
-//! process, written as a person's, followed by an interrupt that names it
-//! with `send_now`, so Claude Code delivers it without stopping its
-//! background agents. Both ways: a message sent with Send now, and ⏵ Send
-//! now on a message already with the agent. A binary of its own: it sets
-//! C6_CLAUDE_BIN.
+//! process, labelled as automation without a human marker, followed by an
+//! interrupt that names it with `send_now`, so Claude Code delivers it
+//! without stopping its background agents. Both ways: a message sent with
+//! Send now, and ⏵ Send now on a message already with the agent. A binary
+//! of its own: it sets C6_CLAUDE_BIN.
 
 use std::path::Path;
 
@@ -160,8 +160,8 @@ async fn send_now_reaches_claude_code_as_a_send_now() {
     assert_eq!(ends(&evs), [TurnEndReason::Completed], "delivered into the running turn, not stopped");
     let lines = read();
     assert_eq!(lines.len(), 3, "{lines:?}");
-    assert_eq!(lines[1]["message"]["content"], "PING");
-    assert_eq!(lines[1]["origin"], json!({"kind": "human"}), "written as a person's");
+    assert_eq!(lines[1]["message"]["content"], "Message sent by an automation, not typed by the user:\nPING");
+    assert!(lines[1].get("origin").is_none(), "automation has no human marker: {:?}", lines[1]);
     assert_eq!(lines[2]["request"], json!({"subtype": "interrupt", "send_now": true, "message_uuid": lines[1]["uuid"]}));
     // The command it moved runs on as a background task.
     let moved: Vec<(String, bool)> = evs
@@ -199,7 +199,8 @@ async fn send_now_reaches_claude_code_as_a_send_now() {
     assert_eq!(ends(&evs), [TurnEndReason::Completed, TurnEndReason::Interrupted, TurnEndReason::Completed]);
     assert!(!evs.iter().any(|e| matches!(e.kind, EventKind::Error { .. })), "a stop for Send now is not a failure");
     let lines = read();
-    let later = lines.iter().find(|l| l["message"]["content"] == "later").unwrap();
+    let later = lines.iter().find(|l| l["message"]["content"] == "Message sent by an automation, not typed by the user:\nlater").unwrap();
+    assert!(later.get("origin").is_none(), "automation has no human marker: {later}");
     assert_eq!(lines.last().unwrap()["request"], json!({"subtype": "interrupt", "send_now": true, "message_uuid": later["uuid"]}));
     let last_user = evs.iter().rev().find_map(|e| match &e.kind {
         EventKind::User { text, .. } => Some(text.clone()),

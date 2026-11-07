@@ -960,7 +960,7 @@ async fn create_session(
     if let Some(p) = crate::projects::with_context(&st, work.as_deref(), &prompt).await {
         req.prompt = Some(p);
     }
-    let s = crate::sessions::create(&st, req).await?;
+    let s = crate::sessions::create_from(&st, req, &caller).await?;
     // The work it belongs to (docs/work.md §4), and the to-do it's on.
     crate::work::on_new_session(&st, &s, work.as_deref(), &refs, &prompt, todo.as_deref()).await;
     // Its worktree may be its work's place (docs/dev-starts.md §4).
@@ -971,9 +971,10 @@ async fn create_session(
 async fn create_side_chat(
     State(st): State<Arc<HeadState>>,
     Path(id): Path<String>,
+    Extension(caller): Extension<Caller>,
     Json(req): Json<api::CreateSideChat>,
 ) -> ApiResult<Json<api::Session>> {
-    Ok(Json(crate::sessions::create_side_chat(&st, &id, req).await?))
+    Ok(Json(crate::sessions::create_side_chat_from(&st, &id, req, &caller).await?))
 }
 
 /// The web UI's CA, for devices to trust (public: it is a certificate).
@@ -3466,7 +3467,7 @@ async fn ask_assistant(
     if let Some(realm) = &caller.realm {
         req.realm = Some(realm.clone());
     }
-    Ok(Json(crate::sessions::create_assistant(&st, req).await?))
+    Ok(Json(crate::sessions::create_assistant_from(&st, req, &caller).await?))
 }
 
 /// Whether Ask can run on Claude Code on this machine (docs/ask.md §3).

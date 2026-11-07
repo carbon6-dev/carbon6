@@ -47,7 +47,7 @@ pub(crate) struct Who {
 
 /// Who sent a message that starts a turn.
 pub(crate) fn who(kind: &EventKind) -> Option<Who> {
-    let EventKind::User { text, command, from_session_id, from_title, delegated_by, .. } = kind else { return None };
+    let EventKind::User { text, command, from_session_id, from_title, delegated_by, origin, .. } = kind else { return None };
     let words = |t: &str| clip(t.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or(""), 60);
     let (by, from, words) = if !from_session_id.is_empty() {
         ("session", from_title.clone(), words(text))
@@ -59,6 +59,10 @@ pub(crate) fn who(kind: &EventKind) -> Option<Who> {
         ("doc", doc, String::new())
     } else if !delegated_by.is_empty() {
         ("agent", String::new(), words(text))
+    } else if let Some(api::MessageOrigin::Api { token_name }) = origin.as_deref() {
+        ("api", token_name.clone(), words(text))
+    } else if matches!(origin.as_deref(), Some(api::MessageOrigin::Unknown | api::MessageOrigin::Session)) {
+        ("automation", String::new(), words(text))
     } else {
         ("you", String::new(), words(text))
     };
@@ -247,6 +251,8 @@ fn described(t: &TimelineTurn, events: &[Event]) -> String {
     let started = match t.by.as_str() {
         "you" => format!("the user: \"{}\"", t.words),
         "session" => format!("a message from the session \"{}\": \"{}\"", t.from, t.words),
+        "api" => format!("an API message (token {:?}): {:?}", t.from, t.words),
+        "automation" => format!("an automation message: {:?}", t.words),
         "task" => format!("a background task ended: {}", t.words),
         "doc" => format!("comments on the document \"{}\"", t.from),
         "agent" => format!("the agent that started it: \"{}\"", t.words),
@@ -305,6 +311,23 @@ pub(crate) fn parse_lines(text: &str) -> HashMap<u64, String> {
 mod tests {
     use super::*;
     use crate::catchup::tests::{card_answer, ev, from_session, notice, reply, result, user};
+
+    #[test]
+    fn automation_does_not_become_you_in_folded_turns_or_model_summaries() {
+        for (origin, by, from) in [
+            (api::MessageOrigin::Api { token_name: "c6-cli-zmbp".into() }, "api", "c6-cli-zmbp"),
+            (api::MessageOrigin::Unknown, "automation", ""),
+        ] {
+            let mut input = user("Status update");
+            let EventKind::User { origin: saved, .. } = &mut input else { panic!("user event") };
+            *saved = Some(Box::new(origin));
+            let sender = who(&input).unwrap();
+            assert_eq!((sender.by.as_str(), sender.from.as_str()), (by, from));
+            let described = described(&TimelineTurn { by: sender.by, from: sender.from, words: sender.words, ..Default::default() }, &[]);
+            assert!(!described.contains("the user"), "{described}");
+            assert!(described.contains("Status update"), "{described}");
+        }
+    }
     use serde_json::json;
 
     #[test]

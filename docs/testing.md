@@ -184,6 +184,42 @@ macOS WebKit. Disabling BBQ/LLInt is an investigation control, not the productio
 test configuration or an application workaround. See the N5 investigation in
 `docs/ui-responsiveness.md` for observations and remaining limits.
 
+## Message origin: production-WASM browser regression
+
+Origin is server-only attribution, never a field trusted from a send request.
+Historical event JSON without `origin` remains backward compatible (the existing
+right-aligned bubble); that absence is not proof of a human sender. Newly received
+old-worker input without provenance is recorded as `unknown`, not guessed human.
+Existing `from_session_id` / `from_title` still identify another session.
+
+After the build owner has produced this branch's UI (`env -u NO_COLOR make ui`), run:
+
+```sh
+ENGINE=both SCREENSHOTS=/tmp/s5-api-message-label \
+  /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/message-origin.cjs
+```
+
+The private `motion.cjs` fixture checks Chromium and WebKit, desktop and 390/320px
+phones, in light/dark (12 cases). Named/unnamed API tokens and unknown automation
+use the existing sender card with exact attribution, a plain first-line subject,
+full-message expansion, attachment links and a separate received-prompt disclosure.
+An attachment-only unknown message keeps its link despite an empty subject.
+An unknown-origin `card-answer` keeps its generated session mention and opens the
+mocked session; delegated unknown input says “From the agent that started it”.
+Both retain sender cards and Ask-only actions; ordinary origin text stays plain.
+Human and legacy bubbles stay right-aligned. API/unknown/other-session messages
+offer only Ask; human/legacy retain Edit/Rewind. Phone Message actions says Sender,
+not You, for non-human sources. Ask is opened, filled and cancelled without sending.
+The test checks real icons, applied theme colors and horizontal containment.
+
+`ENGINE`, `VIEWPORT=desktop,phone,phone-small`, `THEME`, `ROOT`, `PLAYWRIGHT_CORE` and
+browser executable overrides use the shared motion harness conventions. Each run
+creates a new evidence subdirectory, with screenshots, per-case failures and
+`results.json` including WASM SHA-256s. Cases run once; all failures remain in the
+count and produce a nonzero exit, including hydration traps. Diagnostic subset
+runs are not substitutes for a failed full matrix. No real head or credentials
+are used, and this browser test does not prove the server's attribution policy.
+
 ## Working ring and transcript rendering
 
 ### Background-notice descriptions

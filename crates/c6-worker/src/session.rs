@@ -596,9 +596,10 @@ impl SessionManager {
                 if self.journal.is_applied(&cmd.command_id).await.map_err(internal)? {
                     return Ok(());
                 }
-                // Only to one of the session's own messages.
+                // Only to one of your messages, not automation or another
+                // session's. Keep legacy messages eligible as the head does.
                 let events = self.journal.events_after(&cmd.session_id, 0, u32::MAX).await.map_err(internal)?;
-                let is_user = events.iter().any(|e| e.seq == r.to_seq && matches!(e.kind, Some(session_event::Kind::User(_))));
+                let is_user = events.iter().any(|e| e.seq == r.to_seq && is_rewindable_message(e));
                 if !is_user {
                     return Err("can only rewind to before one of your messages".into());
                 }
@@ -1281,6 +1282,14 @@ fn own_loop_hooks(
     }
 }
 
+/// Match the head's rewind eligibility, including commands from older
+/// heads. Explicit nonhuman provenance always wins over a human flag.
+fn is_rewindable_message(event: &SessionEvent) -> bool {
+    matches!(&event.kind, Some(session_event::Kind::User(u))
+        if (!u.origin_recorded || u.human_origin)
+            && u.api_origin.is_none() && u.from_session_id.is_empty() && u.delegated_by.is_empty())
+}
+
 /// The handoff a model switch made, if it crossed runtimes.
 fn handoff_of(e: &SessionEvent) -> Option<&c6_proto::Handoff> {
     match &e.kind {
@@ -1352,7 +1361,7 @@ fn claude_conversation(session_id: &str, spec: &CreateSession, events: &[Session
                 // Claude Code's own (imported) conversation goes on as it
                 // is; the transcript only if it has gone.
                 resume: handoff.native || turns_since(h),
-                preamble: Some(format!("{preamble}\n\nThe user now says:")),
+                preamble: Some(format!("{preamble}\n\nThe next message follows:")),
             }
         }
         None => crate::claude_code::ClaudeConversation {
@@ -1362,7 +1371,7 @@ fn claude_conversation(session_id: &str, spec: &CreateSession, events: &[Session
             // in as text with the first question.
             preamble: (!spec.seed.is_empty()).then(|| {
                 format!(
-                    "<conversation-so-far>\n{}\n</conversation-so-far>\n\nThe user branched off the conversation above to ask:",
+                    "<conversation-so-far>\n{}\n</conversation-so-far>\n\nThis session branched off the conversation above. The next message follows:",
                     c6_agent::transcript_text(&spec.seed)
                 )
             }),
@@ -4783,6 +4792,38 @@ mod notice_tests {
     }
 
     #[test]
+    fn new_inputs_persist_server_origins_without_rewriting_the_message() {
+        for (api_origin, human_origin, from_session_id) in [
+            (Some(c6_proto::ApiMessageOrigin { token_name: "build-bot".into() }), false, ""),
+            (Some(c6_proto::ApiMessageOrigin::default()), false, ""),
+            (Some(c6_proto::ApiMessageOrigin { token_name: "mixed".into() }), true, ""),
+            (None, true, ""),
+            (None, false, "other-session"),
+            (None, false, ""),
+        ] {
+            let input = PendingInput {
+                command_id: "command".into(),
+                text: "Original message".into(),
+                prompt: "Expanded command".into(),
+                api_origin: api_origin.clone(),
+                human_origin,
+                from_session_id: from_session_id.into(),
+                ..Default::default()
+            };
+            let session_event::Kind::User(message) = input.event() else { panic!("a UserMessage") };
+            let message = c6_proto::UserMessage::decode(message.encode_to_vec().as_slice()).unwrap();
+            assert_eq!(message.api_origin, api_origin);
+            assert_eq!(message.human_origin, human_origin);
+            assert_eq!(message.from_session_id, from_session_id);
+            assert!(message.origin_recorded, "new unknown inputs must differ from legacy records");
+            assert_eq!(message.text, input.text);
+            assert_eq!(message.prompt, input.prompt);
+        }
+        let old = c6_proto::UserMessage::decode(&b"\x12\x07Status?"[..]).unwrap();
+        assert!(!old.origin_recorded && !old.human_origin && old.api_origin.is_none(), "historical records stay legacy");
+    }
+
+    #[test]
     fn queued_metadata_roundtrips_through_reload_and_the_delivered_user_event() {
         let metadata = crate::subagent::task_report_notice("Review", "child", TurnEndReason::Completed, "# Actual report");
         let queued = c6_proto::NoticeQueued {
@@ -5168,8 +5209,28 @@ mod handoff_tests {
         ModelSpec { connection_id: connection.into(), model: name.into(), connection_kind: kind.into(), ..Default::default() }
     }
     fn user(seq: u64, t: &str) -> SessionEvent {
-        ev(seq, session_event::Kind::User(UserMessage { text: t.into(), ..Default::default() }))
+        ev(seq, session_event::Kind::User(UserMessage { text: t.into(), human_origin: true, ..Default::default() }))
     }
+
+    #[test]
+    fn rewind_only_accepts_legacy_or_human_messages_without_nonhuman_provenance() {
+        for (origin_recorded, human_origin, expected) in
+            [(false, false, true), (false, true, true), (true, false, false), (true, true, true)]
+        {
+            let message = UserMessage { origin_recorded, human_origin, ..Default::default() };
+            assert_eq!(is_rewindable_message(&ev(1, session_event::Kind::User(message.clone()))), expected);
+            for nonhuman in [
+                UserMessage { api_origin: Some(Default::default()), ..message.clone() },
+                UserMessage { from_session_id: "other-session".into(), ..message.clone() },
+                UserMessage { delegated_by: "call".into(), ..message.clone() },
+            ] {
+                assert!(!is_rewindable_message(&ev(1, session_event::Kind::User(nonhuman))), "nonhuman provenance wins");
+            }
+        }
+        assert!(!is_rewindable_message(&ev(1, session_event::Kind::Assistant(Default::default()))));
+        assert!(!is_rewindable_message(&SessionEvent::default()));
+    }
+
     fn assistant(seq: u64, blocks: Vec<content_block::Block>) -> SessionEvent {
         let blocks = blocks.into_iter().map(|b| ContentBlock { block: Some(b), ..Default::default() }).collect();
         ev(seq, session_event::Kind::Assistant(AssistantMessage { turn: 1, blocks, stop_reason: String::new() }))
@@ -5271,7 +5332,7 @@ mod handoff_tests {
         let p = first.preamble.unwrap();
         assert!(p.starts_with("<carbon6-handoff from=\"carbon6's own agent loop (gpt-x)\">"), "{p}");
         assert!(p.contains("fix the cache") && p.contains("[tool call bash: {\"command\":\"ls\"}]") && p.contains("cache.rs"), "{p}");
-        assert!(p.contains("Found cache.rs.") && p.ends_with("The user now says:"), "{p}");
+        assert!(p.contains("Found cache.rs.") && p.ends_with("The next message follows:"), "{p}");
         assert!(!p.contains("private plan") && !p.contains("continue in claude"), "{p}");
         // Later turns resume it.
         let later = claude_conversation("session-1", &spec, &events);

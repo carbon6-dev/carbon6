@@ -129,12 +129,19 @@ impl PendingInput {
             api_origin: self.api_origin.clone(),
             task_notice: self.task_notice.clone(),
             human_origin: self.human_origin,
+            origin_recorded: true,
         })
     }
 
     /// What the model gets: the text (or its expansion), then each attachment.
     pub fn blocks(&self) -> Vec<c6_llm::Block> {
-        history::user_blocks(self.model_text(), &self.attachments)
+        history::user_blocks(&self.attributed_text(), &self.attachments)
+    }
+
+    /// The model-facing text with server-derived attribution. Kept separate
+    /// from raw text and command expansions so hooks and logs retain them.
+    pub fn attributed_text(&self) -> std::borrow::Cow<'_, str> {
+        history::attributed_input_text(self.model_text(), &self.from_session_id, self.api_origin.as_ref(), self.human_origin)
     }
 
     pub fn model_text(&self) -> &str {

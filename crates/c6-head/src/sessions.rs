@@ -87,6 +87,11 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
     create_as(st, req, "").await
 }
 
+/// Creates a session with server-authenticated provenance on its first input.
+pub async fn create_from(st: &HeadState, req: api::CreateSession, caller: &crate::realms::Caller) -> anyhow::Result<api::Session> {
+    create_linked_with_origin(st, req, "", None, caller.api_origin(), caller.human_origin()).await
+}
+
 /// A session acting as an app instance in its realm (docs/apps.md §5.3),
 /// or as the realm (`instance` empty). Only the head starts sessions as an
 /// instance: from its templates, triggers and operations.
@@ -109,6 +114,19 @@ pub struct Link {
 /// A session, linked to a parent's call when `link` is set: the parent's
 /// call waits on its first turn.
 pub async fn create_linked(st: &HeadState, req: api::CreateSession, instance: &str, link: Option<Link>) -> anyhow::Result<api::Session> {
+    create_linked_with_origin(st, req, instance, link, None, false).await
+}
+
+/// The HTTP caller's provenance for the initial prompt, never request-body
+/// fields. Internal callers keep using create_linked with unknown origin.
+async fn create_linked_with_origin(
+    st: &HeadState,
+    req: api::CreateSession,
+    instance: &str,
+    link: Option<Link>,
+    api_origin: Option<c6_proto::ApiMessageOrigin>,
+    human_origin: bool,
+) -> anyhow::Result<api::Session> {
     let worker_id = WorkerId(req.worker_id);
     let worker = st.store.worker(worker_id).await?.ok_or_else(|| bad_request("no such worker"))?;
     if worker.revoked_at.is_some() {
@@ -267,11 +285,26 @@ pub async fn create_linked(st: &HeadState, req: api::CreateSession, instance: &s
     if link.is_none() && named_by_first_line {
         crate::naming::expect(st, &row.id).await?;
     }
-    insert(st, row, spec, prompt.map(|p| (p, files)), input_id, Some(brief)).await
+    let first = prompt.map(|p| UserInput { text: p.to_owned(), attachments: files, api_origin, human_origin, ..Default::default() });
+    insert(st, row, spec, first, input_id, Some(brief)).await
 }
 
 /// A conversation with the assistant (it runs in the head).
 pub async fn create_assistant(st: &HeadState, req: api::AskAssistant) -> anyhow::Result<api::Session> {
+    create_assistant_with_origin(st, req, None, false).await
+}
+
+pub async fn create_assistant_from(st: &HeadState, req: api::AskAssistant, caller: &crate::realms::Caller) -> anyhow::Result<api::Session> {
+    create_assistant_with_origin(st, req, caller.api_origin(), caller.human_origin()).await
+}
+
+/// As create_assistant, carrying only server-authenticated caller provenance.
+async fn create_assistant_with_origin(
+    st: &HeadState,
+    req: api::AskAssistant,
+    api_origin: Option<c6_proto::ApiMessageOrigin>,
+    human_origin: bool,
+) -> anyhow::Result<api::Session> {
     let prompt = req.prompt.trim();
     if prompt.is_empty() {
         return Err(bad_request("ask something"));
@@ -370,7 +403,8 @@ pub async fn create_assistant(st: &HeadState, req: api::AskAssistant) -> anyhow:
         ..Default::default()
     };
     crate::naming::expect(st, &row.id).await?;
-    let session = insert(st, row, spec, Some((prompt, Vec::new())), Uuid::now_v7().to_string(), None).await?;
+    let first = UserInput { text: prompt.to_owned(), api_origin, human_origin, ..Default::default() };
+    let session = insert(st, row, spec, Some(first), Uuid::now_v7().to_string(), None).await?;
     crate::assistant::started(&session.id);
     Ok(session)
 }
@@ -383,6 +417,26 @@ pub async fn route_for(st: &HeadState, connection: &str, model: &str, labels: &[
 
 /// A side chat on `parent_id`, branching after event `anchor_seq`.
 pub async fn create_side_chat(st: &HeadState, parent_id: &str, req: api::CreateSideChat) -> anyhow::Result<api::Session> {
+    create_side_chat_with_origin(st, parent_id, req, None, false).await
+}
+
+pub async fn create_side_chat_from(
+    st: &HeadState,
+    parent_id: &str,
+    req: api::CreateSideChat,
+    caller: &crate::realms::Caller,
+) -> anyhow::Result<api::Session> {
+    create_side_chat_with_origin(st, parent_id, req, caller.api_origin(), caller.human_origin()).await
+}
+
+/// As create_side_chat, carrying only server-authenticated caller provenance.
+async fn create_side_chat_with_origin(
+    st: &HeadState,
+    parent_id: &str,
+    req: api::CreateSideChat,
+    api_origin: Option<c6_proto::ApiMessageOrigin>,
+    human_origin: bool,
+) -> anyhow::Result<api::Session> {
     let parent = st.store.session(parent_id).await?.ok_or_else(|| not_found("no such session"))?;
     if parent.status == "failed" {
         return Err(bad_request("the session failed to start"));
@@ -442,7 +496,8 @@ pub async fn create_side_chat(st: &HeadState, parent_id: &str, req: api::CreateS
     };
     let seed = fork_seed(st, &parent, req.anchor_seq).await?;
     let spec = session_spec(st, &row, false, seed).await?;
-    insert(st, row, spec, Some((prompt, Vec::new())), Uuid::now_v7().to_string(), None).await
+    let first = UserInput { text: prompt.to_owned(), api_origin, human_origin, ..Default::default() };
+    insert(st, row, spec, Some(first), Uuid::now_v7().to_string(), None).await
 }
 
 fn check_effort(effort: Option<String>) -> anyhow::Result<Option<String>> {
@@ -644,7 +699,7 @@ async fn insert(
     st: &HeadState,
     row: SessionRow,
     spec: CreateSession,
-    first: Option<(&str, Vec<c6_proto::Attachment>)>,
+    first: Option<UserInput>,
     input_id: String,
     brief: Option<Brief>,
 ) -> anyhow::Result<api::Session> {
@@ -656,25 +711,15 @@ async fn insert(
     let create =
         SessionCommand { command_id: create_id.clone(), session_id: session_id.clone(), kind: Some(session_command::Kind::Create(spec)) };
     let mut commands = vec![NewCommand { id: &create_id, session_id: &session_id, worker_id, data: create.encode_to_vec(), text: None }];
-    let first_prompt = match &first {
-        Some((text, _)) => mentioned(st, &row, text).await,
-        None => String::new(),
-    };
-    if let Some((text, attachments)) = first {
+    let text = first.as_ref().map(|input| input.text.clone());
+    if let Some(mut input) = first {
+        input.prompt = mentioned(st, &row, &input.text).await;
         commands.push(NewCommand {
             id: &input_id,
             session_id: &session_id,
             worker_id,
-            data: input_command(
-                &input_id,
-                &session_id,
-                UserInput {
-                    prompt: first_prompt,
-                    ..with_command(st, &realm, labels.clone(), UserInput { text: text.to_owned(), attachments, ..Default::default() })
-                        .await?
-                },
-            ),
-            text: Some(text),
+            data: input_command(&input_id, &session_id, with_command(st, &realm, labels.clone(), input).await?),
+            text: text.as_deref(),
         });
     }
     let colour = st.store.create_session(&row, &commands, brief.is_some()).await?;
@@ -1605,7 +1650,13 @@ pub async fn rewind(st: &HeadState, session_id: &str, req: &api::RewindRequest) 
         return Err(bad_request("subagent sessions cannot be rewound"));
     }
     let target = st.store.events_after(session_id, req.to_seq.saturating_sub(1), 1).await?;
-    if !matches!(target.first().and_then(|e| e.kind.as_ref()), Some(session_event::Kind::User(_))) || target[0].seq != req.to_seq {
+    // Retain rewind for historical messages without provenance, but never
+    // offer another session's, an API caller's, or newly unknown input as yours.
+    if !matches!(target.first().and_then(|e| e.kind.as_ref()), Some(session_event::Kind::User(u))
+        if (!u.origin_recorded || u.human_origin)
+            && u.api_origin.is_none() && u.from_session_id.is_empty() && u.delegated_by.is_empty())
+        || target[0].seq != req.to_seq
+    {
         return Err(bad_request("can only rewind to before one of your messages"));
     }
     // A handoff to or from Claude Code cannot be taken back: the other
@@ -2017,7 +2068,15 @@ pub async fn publish_queue(st: &HeadState, session_id: &str) {
 }
 
 /// Stores a batch from a worker and returns the cumulative ack, if any.
-pub async fn ingest(st: &HeadState, worker_id: WorkerId, batch: SessionEventBatch) -> anyhow::Result<Option<u64>> {
+pub async fn ingest(st: &HeadState, worker_id: WorkerId, mut batch: SessionEventBatch) -> anyhow::Result<Option<u64>> {
+    // A new event from an older worker can lack provenance. Record that as
+    // unknown, not as legacy/human input. Only incoming events are marked:
+    // store.ingest ignores replayed sequences without rewriting saved history.
+    for ev in &mut batch.events {
+        if let Some(session_event::Kind::User(u)) = &mut ev.kind {
+            u.origin_recorded = true;
+        }
+    }
     let Some(ing) = st.store.ingest(worker_id, &batch.session_id, &batch.events).await? else {
         debug!(session = %batch.session_id, worker = %worker_id, "events for unknown session ignored");
         return Ok(None);

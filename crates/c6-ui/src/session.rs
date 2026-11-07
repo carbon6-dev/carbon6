@@ -2253,7 +2253,7 @@ fn Transcript(
     let actions_can_rewind = Memo::new(move |_| {
         can_rewind
             && message_actions.get().is_some_and(|seq| {
-                events.with(|evs| evs.iter().any(|e| e.seq == seq && matches!(e.kind, EventKind::User { .. })))
+                events.with(|evs| evs.iter().any(|e| e.seq == seq && own_message(&e.kind)))
                     && rewound.with(|(by, _)| !by.contains_key(&seq))
             })
     });
@@ -2266,7 +2266,7 @@ fn Transcript(
             let shown = &evs[evs.partition_point(|e| e.seq < from)..evs.partition_point(|e| e.seq < to)];
             match timeline {
                 Some(tl) if tl.fold.get() => rewound.with(|(by, _)| tl.pieces(shown, to == u64::MAX, |seq| by.contains_key(&seq))),
-                _ => shown.iter().cloned().map(crate::timeline::Piece::Event).collect::<Vec<_>>(),
+                _ => shown.iter().cloned().map(Box::new).map(crate::timeline::Piece::Event).collect::<Vec<_>>(),
             }
         })
     });
@@ -2336,13 +2336,12 @@ fn Transcript(
                         let only_thinking = thinking_only(&e.kind);
                         let anchorable = can_branch && can_anchor(&e.kind);
                         let task_notification = matches!(&e.kind, EventKind::User { command, .. } if command == "task-notification");
-                        let user_bubble = matches!(&e.kind, EventKind::User { command, from_session_id, .. }
-                            if command != "task-notification" && command != "stop-hook" && from_session_id.is_empty());
+                        let user_bubble = own_message(&e.kind);
                         let user_text = match &e.kind {
                             EventKind::User { text, .. } => Some(text.clone()),
                             _ => None,
                         };
-                        let is_user = user_text.is_some();
+                        let is_user = user_bubble;
                         let by = move || rewound.with(|(by, _)| by.get(&seq).copied());
                         let hidden = move || by().is_some_and(|r| !shown.with(|s| s.contains(&r)));
                         let marker = match &e.kind {
@@ -3704,25 +3703,53 @@ pub(crate) fn too_large(held: &[c6_api::AttachmentUpload], adding: &[c6_api::Att
     (total > 20 * MB).then(|| format!("Too much to send in one message ({}; the limit is 20 MB in all)", mb(total)))
 }
 
-/// A message from another session's agent: not a bubble of yours but a card
+/// Only known human and legacy messages have the user's bubble/actions.
+/// Missing provenance in newly received old-worker input is explicitly Unknown.
+fn own_message(kind: &EventKind) -> bool {
+    matches!(kind, EventKind::User { command, from_session_id, delegated_by, origin, .. }
+        if command != "task-notification" && command != "stop-hook"
+            && from_session_id.is_empty() && delegated_by.is_empty()
+            && matches!(origin.as_deref(), None | Some(c6_api::MessageOrigin::Human)))
+}
+
+/// A message from another session's agent or automation: not a bubble of yours but a card
 /// on the left in the sender's mark. It says what it is, names the sender
 /// as a link, leads with the message's first line (agents are asked to make
 /// it say what it's about), and folds the rest; what the agent was given
 /// sits behind a disclosure.
 #[component]
-fn SessionMessage(from: String, title: String, text: String, prompt: String) -> impl IntoView {
+fn SessionMessage(
+    from: String,
+    title: String,
+    text: String,
+    prompt: String,
+    #[prop(optional)] origin: Option<c6_api::MessageOrigin>,
+    #[prop(optional)] attachments: Option<AnyView>,
+    #[prop(optional)] blocked: String,
+    #[prop(optional)] command: String,
+    #[prop(optional)] delegated: bool,
+) -> impl IntoView {
     let mark = Memo::new({
         let from = from.clone();
         move |_| crate::marks::of_id(&from)
     });
-    let (subject, rest) = subject_of(&text);
+    let (subject, rest) = if command == "card-answer" { (text, None) } else { subject_of(&text) };
+    let subject = message_text(subject, &command);
     let open = RwSignal::new(false);
     let name = if title.is_empty() { "another session".to_owned() } else { title };
+    let label = match origin {
+        Some(c6_api::MessageOrigin::Api { token_name }) if !token_name.is_empty() => format!("Sent via the API · token {token_name}"),
+        Some(c6_api::MessageOrigin::Api { .. }) => "Sent via the API".to_owned(),
+        _ if delegated => "From the agent that started it".to_owned(),
+        Some(c6_api::MessageOrigin::Unknown) => "Sent by an automation".to_owned(),
+        _ => "Message from another session".to_owned(),
+    };
     view! {
-        <div class="flex flex-col items-start">
+        <div class="c6-message-card flex flex-col items-start">
             <div class="max-w-[85%] space-y-1.5 rounded-r-md border-l-4 bg-zinc-50 px-3 py-2 text-sm dark:bg-zinc-900/60"
                 style=move || format!("border-left-color:{}", mark.get().map_or("#a1a1aa", |m| crate::marks::colour_hex(&m)))>
-                <p class="text-[11px] font-medium uppercase tracking-wide text-sky-700 dark:text-sky-400">{icon(Icon::CornerDownRight, Size::S14)}" Message from another session"</p>
+                <p class="break-words text-[11px] font-medium uppercase tracking-wide text-sky-700 dark:text-sky-400">{icon(Icon::CornerDownRight, Size::S14)}" "{label}</p>
+                {(!from.is_empty()).then(|| view! {
                 <Go to=View::session(from.clone()) stop=true
                     class="inline-flex max-w-full items-center gap-1.5 rounded-md border border-sky-300 px-2 py-0.5 text-xs text-sky-800 hover:bg-sky-50 dark:border-sky-800 dark:text-sky-300 dark:hover:bg-sky-950"
                     title="Open the session that sent it">
@@ -3730,12 +3757,17 @@ fn SessionMessage(from: String, title: String, text: String, prompt: String) -> 
                     <span class="truncate font-medium">{name}</span>
                     <span class="shrink-0">{crate::icons::square_arrow_out()}</span>
                 </Go>
+                })}
+                {attachments}
                 <p class="font-medium text-zinc-900 dark:text-zinc-100">{subject}</p>
                 {rest.map(|rest| view! {
                     {move || open.get().then(|| view! { <div class="whitespace-pre-wrap text-zinc-800 dark:text-zinc-200">{rest.clone()}</div> })}
                     <button class="text-xs text-sky-700 hover:underline dark:text-sky-400" on:click=move |_| open.update(|o| *o = !*o)>
                         {move || if open.get() { "Show less" } else { "Show the full message" }}
                     </button>
+                })}
+                {(!blocked.is_empty()).then(|| view! {
+                    <p class="text-xs text-red-600 dark:text-red-400">{format!("Not sent: a UserPromptSubmit hook blocked it. {blocked}")}</p>
                 })}
                 {(!prompt.is_empty()).then(|| view! {
                     <details class="text-xs text-muted">
@@ -3903,7 +3935,7 @@ fn can_anchor(kind: &EventKind) -> bool {
 fn message_action_context(kind: &EventKind) -> (&'static str, String) {
     let (speaker, text) = match kind {
         EventKind::User { text, attachments, .. } => (
-            "You",
+            if own_message(kind) { "You" } else { "Sender" },
             if text.trim().is_empty() { attachments.first().map(|a| a.name.as_str()).unwrap_or("User message") } else { text.as_str() },
         ),
         EventKind::Assistant { blocks, .. } => (
@@ -3977,11 +4009,39 @@ fn task_notice(text: &str, notice: Option<&c6_api::TaskNotice>) -> AnyView {
 
 /// Your transcript message, including card-button answers. Kept separate so
 /// native UI tests exercise the same right-aligned markup as the live view.
+fn user_attachments(session: &str, seq: u64, attachments: &[c6_api::AttachmentInfo]) -> AnyView {
+    attachments
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let url = crate::api::url(&format!("/api/v1/sessions/{session}/attachments/{seq}/{i}"));
+            if a.mime.starts_with("image/") {
+                view! { <TranscriptImage src=url name=a.name.clone() /> }.into_any()
+            } else {
+                transcript_file(url, a.name.clone(), a.size)
+            }
+        })
+        .collect_view()
+        .into_any()
+}
+
+fn message_text(text: String, command: &str) -> AnyView {
+    if command == "card-answer" {
+        let (col, ws) = (use_column(), use_context::<crate::workspace::Workspace>());
+        view! {
+            <span on:click=move |ev| if let Some(ws) = ws { crate::mentions::follow_link(&ev, col, ws); }
+                inner_html=markdown::text_with_mentions(&text)></span>
+        }
+        .into_any()
+    } else {
+        text.into_any()
+    }
+}
+
 fn user_message(session: &str, e: &Event) -> AnyView {
     let EventKind::User { text, attachments, command, prompt, blocked, delegated_by, .. } = &e.kind else {
         return ().into_any();
     };
-    let url = |i: usize| crate::api::url(&format!("/api/v1/sessions/{session}/attachments/{}/{i}", e.seq));
     // In a subagent: who sent it.
     let from = if !delegated_by.is_empty() {
         Some((icon(Icon::CornerDownRight, Size::S14), "from the agent that started it"))
@@ -3992,27 +4052,8 @@ fn user_message(session: &str, e: &Event) -> AnyView {
     };
     let delegated = !delegated_by.is_empty();
     let has_text = !text.is_empty();
-    let text = if command == "card-answer" {
-        let (col, ws) = (use_column(), use_context::<crate::workspace::Workspace>());
-        view! {
-            <span on:click=move |ev| if let Some(ws) = ws { crate::mentions::follow_link(&ev, col, ws); }
-                inner_html=markdown::text_with_mentions(text)></span>
-        }
-        .into_any()
-    } else {
-        text.clone().into_any()
-    };
-    let shown = attachments
-        .iter()
-        .enumerate()
-        .map(|(i, a)| {
-            if a.mime.starts_with("image/") {
-                view! { <TranscriptImage src=url(i) name=a.name.clone() /> }.into_any()
-            } else {
-                transcript_file(url(i), a.name.clone(), a.size)
-            }
-        })
-        .collect_view();
+    let text = message_text(text.clone(), command);
+    let shown = user_attachments(session, e.seq, attachments);
     view! {
         <div class="flex flex-col items-end gap-1.5">
             {from.map(|(icon, text)| view! { <p class="text-[11px] text-violet-700 dark:text-violet-400">{icon}" "{text}</p> })}
@@ -4030,6 +4071,22 @@ fn user_message(session: &str, e: &Event) -> AnyView {
                 </details>
             })}
         </div>
+    }
+    .into_any()
+}
+
+/// Shared nonhuman event renderer, including generated card-answer navigation
+/// and delegated sender metadata. Kept separate from unrelated tool views.
+fn sender_message(session: &str, e: &Event) -> AnyView {
+    let EventKind::User { text, prompt, attachments, blocked, command, delegated_by, from_session_id, from_title, origin, .. } = &e.kind
+    else {
+        return ().into_any();
+    };
+    view! {
+        <SessionMessage from=from_session_id.clone() title=from_title.clone() text=text.clone() prompt=prompt.clone()
+            origin=origin.as_deref().cloned().unwrap_or(c6_api::MessageOrigin::Session)
+            attachments=user_attachments(session, e.seq, attachments) blocked=blocked.clone()
+            command=command.clone() delegated=!delegated_by.is_empty() />
     }
     .into_any()
 }
@@ -4103,10 +4160,11 @@ fn render_event(
         }
         .into_any(),
         // From another session's agent (docs/background.md §6).
-        EventKind::User { text, prompt, from_session_id, from_title, .. } if !from_session_id.is_empty() => view! {
-            <SessionMessage from=from_session_id.clone() title=from_title.clone() text=text.clone() prompt=prompt.clone() />
+        EventKind::User { from_session_id, origin, .. }
+            if !from_session_id.is_empty() || origin.as_deref().is_some_and(|o| !matches!(o, c6_api::MessageOrigin::Human)) =>
+        {
+            sender_message(session, e)
         }
-        .into_any(),
         EventKind::User { .. } => user_message(session, e),
         EventKind::Assistant { blocks, stop_reason, .. } => {
             let interrupted = stop_reason == "interrupted";
@@ -4532,8 +4590,10 @@ fn SubagentPeek(events: RwSignal<Vec<Event>>, streaming: RwSignal<Streaming>) ->
                     EventKind::User { text, delegated_by, command, .. } if command != "task-notification" && !text.is_empty() => {
                         let mark = if command == "session-message" {
                             "message"
-                        } else if delegated_by.is_empty() {
+                        } else if own_message(&e.kind) {
                             "edit"
+                        } else if delegated_by.is_empty() {
+                            "message"
                         } else {
                             "delegated"
                         };
@@ -6433,6 +6493,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_human_and_legacy_messages_offer_own_message_actions() {
+        let mut input = serde_json::json!({"type": "user", "command_id": "message", "text": "Status"});
+        let legacy: EventKind = serde_json::from_value(input.clone()).unwrap();
+        assert!(own_message(&legacy));
+        assert_eq!(message_action_context(&legacy).0, "You");
+        for origin in [
+            serde_json::json!({"kind": "human"}),
+            serde_json::json!({"kind": "api", "token_name": "c6-cli-zmbp"}),
+            serde_json::json!({"kind": "unknown"}),
+            serde_json::json!({"kind": "session"}),
+        ] {
+            let human = origin["kind"] == "human";
+            input["origin"] = origin;
+            let kind: EventKind = serde_json::from_value(input.clone()).unwrap();
+            assert_eq!(own_message(&kind), human);
+            assert_eq!(message_action_context(&kind).0, if human { "You" } else { "Sender" });
+        }
+        input.as_object_mut().unwrap().remove("origin");
+        for field in ["from_session_id", "delegated_by"] {
+            let mut other = input.clone();
+            other[field] = "another-agent".into();
+            assert!(!own_message(&serde_json::from_value(other).unwrap()));
+        }
+    }
+
+    #[test]
     fn phone_message_action_context_is_plain_bounded_text_with_a_speaker() {
         let user: EventKind = serde_json::from_value(serde_json::json!({
             "type": "user", "command_id": "message", "text": "  <b>keep this literal</b>  "
@@ -6870,6 +6956,44 @@ mod tests {
             Some("The worker restarted during the last turn.")
         );
         assert_eq!(last_turn_failure(&[], Some(TurnEndReason::Completed)), None);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn recorded_card_answers_keep_navigation_and_delegated_cards_keep_their_sender() {
+        const ID: &str = "01a18f50-326a-7e26-9348-8ee7c41bb3bd";
+        let owner = Owner::new();
+        owner.with(|| {
+            provide_context(crate::api::LiveFeed {
+                workers: signal(Vec::new()).0,
+                sessions: signal(Vec::new()).0,
+                resolved_sessions: RwSignal::new(Default::default()),
+                connected: signal(false).0,
+                doc: signal(None).0,
+                marks: signal(c6_api::marks::Marks::new()).0,
+                attention: signal(0).0,
+            });
+            for (command, delegated_by, label) in
+                [("card-answer", "", "Sent by an automation"), ("", "parent-call", "From the agent that started it")]
+            {
+                let e: Event = serde_json::from_value(serde_json::json!({
+                    "seq": 17, "ts": 1234, "type": "user", "command_id": "answer-17",
+                    "origin": {"kind": "unknown"}, "command": command, "delegated_by": delegated_by,
+                    "text": format!("Start session: **Cleanup** <script>alert(1)</script>\nStarted session:{ID}.")
+                }))
+                .unwrap();
+                assert!(!own_message(&e.kind), "recorded external input uses the sender renderer");
+                let html = sender_message("s1", &e).to_html();
+                assert!(html.contains("c6-message-card") && html.contains(label), "{html}");
+                assert!(!html.contains("rounded-br-sm"), "not the user's bubble: {html}");
+                assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"), "HTML is escaped: {html}");
+                if command == "card-answer" {
+                    assert!(html.contains(&format!("href=\"/sessions/{ID}\"")), "card answer still links the session: {html}");
+                    assert!(html.contains(&format!("data-ref=\"session:{ID}\"")), "{html}");
+                    assert!(!html.contains("Show the full message"), "don't split a generated mention: {html}");
+                }
+            }
+        });
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -7366,6 +7490,7 @@ mod tests {
             from_session_id: String::new(),
             from_title: String::new(),
             task_notice: None,
+            origin: None,
         };
         let ts = 10_000;
         let evs = [ev(1, ts, queued("task:bg1:finished", "")), ev(2, ts + 47, user("task:bg1:finished"))];

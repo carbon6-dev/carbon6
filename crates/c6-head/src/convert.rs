@@ -38,6 +38,16 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
             wake: u.wake,
             from_session_id: u.from_session_id.clone(),
             from_title: u.from_title.clone(),
+            origin: (if !u.from_session_id.is_empty() {
+                Some(api::MessageOrigin::Session)
+            } else if let Some(origin) = &u.api_origin {
+                Some(api::MessageOrigin::Api { token_name: origin.token_name.clone() })
+            } else if u.human_origin {
+                Some(api::MessageOrigin::Human)
+            } else {
+                u.origin_recorded.then_some(api::MessageOrigin::Unknown)
+            })
+            .map(Box::new),
             task_notice: u.task_notice.as_ref().map(|n| {
                 Box::new(api::TaskNotice {
                     kind: n.kind.clone(),
@@ -293,6 +303,35 @@ pub fn queued(c: &CommandRow) -> api::QueuedInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_origins_are_additive_and_missing_legacy_provenance_stays_absent() {
+        let cases = [
+            (c6_proto::UserMessage::default(), None),
+            (c6_proto::UserMessage { origin_recorded: true, ..Default::default() }, Some(api::MessageOrigin::Unknown)),
+            (c6_proto::UserMessage { human_origin: true, ..Default::default() }, Some(api::MessageOrigin::Human)),
+            (
+                c6_proto::UserMessage {
+                    api_origin: Some(c6_proto::ApiMessageOrigin { token_name: "c6-cli-zmbp".into() }),
+                    human_origin: true,
+                    ..Default::default()
+                },
+                Some(api::MessageOrigin::Api { token_name: "c6-cli-zmbp".into() }),
+            ),
+            (
+                c6_proto::UserMessage { from_session_id: "ops".into(), human_origin: true, ..Default::default() },
+                Some(api::MessageOrigin::Session),
+            ),
+        ];
+        for (input, expected) in cases {
+            let shown = event(&SessionEvent { kind: Some(session_event::Kind::User(input)), ..Default::default() }).unwrap();
+            let api::EventKind::User { origin, .. } = &shown.kind else { panic!("user event") };
+            assert_eq!(origin.as_deref(), expected.as_ref());
+            let json = serde_json::to_value(&shown).unwrap();
+            assert_eq!(json.get("origin").is_some(), expected.is_some());
+            assert_eq!(serde_json::from_value::<api::Event>(json).unwrap(), shown);
+        }
+    }
 
     #[test]
     fn task_notice_metadata_reaches_the_browser_without_changing_the_agent_text() {

@@ -1134,8 +1134,8 @@ impl Process {
             "parent_tool_use_id": null,
             "message": {"role": "user", "content": user_content(&input, preamble)},
         });
-        // Your messages are a person's: Claude Code delivers one sent now
-        // into the running turn only then (not carbon6's notices).
+        // Only an explicitly authenticated browser message is a person's.
+        // API, internal and legacy inputs must not acquire human provenance.
         if is_yours(&input) {
             line["origin"] = serde_json::json!({"kind": "human"});
         }
@@ -1560,7 +1560,7 @@ impl Process {
 /// expansion) with files inline, and images as image blocks.
 fn user_content(input: &PendingInput, preamble: Option<&str>) -> Value {
     let (images, files): (Vec<_>, Vec<_>) = input.attachments.iter().cloned().partition(|a| a.mime.starts_with("image/"));
-    let text = c6_agent::user_text(input.model_text(), &files);
+    let text = c6_agent::user_text(&input.attributed_text(), &files);
     let text = match preamble {
         Some(p) => format!("{p}\n\n{text}"),
         None => text,
@@ -1576,10 +1576,12 @@ fn user_content(input: &PendingInput, preamble: Option<&str>) -> Value {
     Value::Array(blocks)
 }
 
-/// The input is your message, not one of carbon6's notices (a background
-/// task's end, a subagent's report, another session's message).
+/// The input is explicitly human, not API automation or one of carbon6's
+/// notices. Missing provenance never implies a person.
 fn is_yours(input: &PendingInput) -> bool {
-    input.from_session_id.is_empty()
+    input.human_origin
+        && input.api_origin.is_none()
+        && input.from_session_id.is_empty()
         && input.delegated_by.is_empty()
         && !matches!(input.command.as_str(), "task-notification" | "session-message")
 }
@@ -1675,6 +1677,7 @@ async fn told(sink: &Arc<dyn EventSink>, texts: Vec<String>, task_notice: Option
             text,
             command: "task-notification".into(),
             task_notice: task_notice.clone(),
+            origin_recorded: true,
             ..Default::default()
         };
         sink.append(session_event::Kind::User(message)).await?;
@@ -2105,8 +2108,13 @@ impl Mapper {
                     _ => String::new(),
                 };
                 if !text.trim().is_empty() {
-                    log.append(session_event::Kind::User(UserMessage { text, delegated_by: call.to_owned(), ..Default::default() }))
-                        .await?;
+                    log.append(session_event::Kind::User(UserMessage {
+                        text,
+                        delegated_by: call.to_owned(),
+                        origin_recorded: true,
+                        ..Default::default()
+                    }))
+                    .await?;
                 }
                 for b in content.as_array().into_iter().flatten().filter(|b| b["type"] == "tool_result") {
                     let r = tool_result(b);
@@ -2687,7 +2695,53 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"usage":{}}
     }
 
     fn input(id: &str, text: &str) -> PendingInput {
-        PendingInput { command_id: id.into(), text: text.into(), ..Default::default() }
+        PendingInput { command_id: id.into(), text: text.into(), human_origin: true, ..Default::default() }
+    }
+
+    #[test]
+    fn only_explicit_human_inputs_are_yours() {
+        let human = input("human", "Continue.");
+        assert!(is_yours(&human));
+        assert!(!is_yours(&PendingInput { human_origin: false, ..human.clone() }));
+        // Even an inconsistent human flag cannot override server provenance.
+        assert!(!is_yours(&PendingInput {
+            api_origin: Some(c6_proto::ApiMessageOrigin { token_name: "build-bot".into() }),
+            ..human.clone()
+        }));
+        assert!(!is_yours(&PendingInput { from_session_id: "other".into(), ..human.clone() }));
+        assert!(!is_yours(&PendingInput { delegated_by: "call".into(), ..human.clone() }));
+        for command in ["task-notification", "session-message"] {
+            assert!(!is_yours(&PendingInput { command: command.into(), ..human.clone() }));
+        }
+    }
+
+    #[test]
+    fn input_content_labels_api_and_unknown_origins_without_changing_humans_or_sessions() {
+        let human = input("human", "Raw message");
+        assert_eq!(user_content(&human, None), "Raw message");
+        let unknown = PendingInput { human_origin: false, ..human.clone() };
+        assert_eq!(user_content(&unknown, None), "Message sent by an automation, not typed by the user:\nRaw message");
+        let api = PendingInput {
+            api_origin: Some(c6_proto::ApiMessageOrigin { token_name: "build\n\"bot\"".into() }),
+            prompt: "Expanded command".into(),
+            ..human.clone()
+        };
+        assert_eq!(
+            user_content(&api, Some("Preamble")),
+            "Preamble\n\nMessage sent via the API (token \"build\\n\\\"bot\\\"\"), not typed by the user:\nExpanded command"
+        );
+        assert!(api.attributed_text().starts_with("Message sent via the API"), "API overrides even an inconsistent human flag");
+        let unnamed = PendingInput { api_origin: Some(Default::default()), ..unknown.clone() };
+        assert_eq!(user_content(&unnamed, None), "Message sent via the API, not typed by the user:\nRaw message");
+        let session =
+            PendingInput { from_session_id: "other".into(), prompt: "<session-message>Existing wrapper</session-message>".into(), ..api };
+        assert_eq!(user_content(&session, None), "<session-message>Existing wrapper</session-message>");
+        for command in ["task-notification", "session-message"] {
+            assert_eq!(
+                user_content(&PendingInput { command: command.into(), ..unknown.clone() }, None),
+                "Message sent by an automation, not typed by the user:\nRaw message"
+            );
+        }
     }
 
     /// A turn with nothing joining it.
@@ -3858,7 +3912,7 @@ done
 
     /// Runs a turn that waits on a foreground command; once it does, your
     /// message is sent with Send now.
-    async fn send_now_turn(p: &mut Process, first: &str, sink: &Arc<dyn EventSink>, vec_sink: &VecSink) -> TurnEnd {
+    async fn send_now_turn(p: &mut Process, first: &str, sink: &Arc<dyn EventSink>, vec_sink: &VecSink, next: PendingInput) -> TurnEnd {
         let queue = Mutex::new(Vec::new());
         let more = tokio::sync::Notify::new();
         let feed = || Joining { inputs: std::mem::take(&mut *queue.lock().unwrap()), now: Vec::new() };
@@ -3866,7 +3920,7 @@ done
         let turn = p.turn(1, vec![input("c1", first)], false, None, "opus", sink, &feed, &more, &cancel);
         let send = async {
             replied(vec_sink).await;
-            queue.lock().unwrap().push(PendingInput { send_now: true, ..input("c2", "PING now") });
+            queue.lock().unwrap().push(PendingInput { send_now: true, ..next });
             more.notify_one();
         };
         let (end, ()) = tokio::join!(turn, send);
@@ -3887,7 +3941,7 @@ done
         let vec_sink = Arc::new(VecSink::default());
         let sink: Arc<dyn EventSink> = vec_sink.clone();
         let mut p = spawn(&bin, dir.path(), "s", false, Some(observer(dir.path(), tools.clone()).await));
-        let end = send_now_turn(&mut p, "delivering", &sink, &vec_sink).await;
+        let end = send_now_turn(&mut p, "delivering", &sink, &vec_sink, input("c2", "PING now")).await;
         assert_eq!(end, TurnEnd { reason: Some(TurnEndReason::Completed), alive: true, no_conversation: false });
         assert_eq!(
             kinds(&vec_sink),
@@ -3913,6 +3967,44 @@ done
         p.close().await;
     }
 
+    #[tokio::test]
+    async fn automation_sent_mid_turn_never_acquires_human_origin() {
+        for api_origin in [Some(c6_proto::ApiMessageOrigin { token_name: "build-bot".into() }), Some(Default::default()), None] {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = send_now_claude(dir.path());
+            let vec_sink = Arc::new(VecSink::default());
+            let sink: Arc<dyn EventSink> = vec_sink.clone();
+            let mut p = spawn(&bin, dir.path(), "s", false, None);
+            let next = PendingInput { api_origin: api_origin.clone(), human_origin: false, ..input("c2", "PING now") };
+            let end = send_now_turn(&mut p, "delivering", &sink, &vec_sink, next).await;
+            assert_eq!(end.reason, Some(TurnEndReason::Completed));
+            let lines = read_lines(dir.path());
+            assert_eq!(lines[0]["origin"], serde_json::json!({"kind": "human"}));
+            assert!(lines[1].get("origin").is_none(), "automation must not be sent as a person: {:?}", lines[1]);
+            let text = lines[1]["message"]["content"].as_str().expect("labelled text");
+            let label = match &api_origin {
+                Some(origin) if !origin.token_name.is_empty() => "Message sent via the API (token \"build-bot\"), not typed by the user:",
+                Some(_) => "Message sent via the API, not typed by the user:",
+                None => "Message sent by an automation, not typed by the user:",
+            };
+            assert_eq!(text, format!("{label}\nPING now"));
+            assert_eq!(lines[2]["request"]["message_uuid"], lines[1]["uuid"], "Send now still targets the automation input");
+            let events = vec_sink.0.lock().unwrap().clone();
+            let message = events
+                .iter()
+                .find_map(|e| match &e.kind {
+                    Some(session_event::Kind::User(u)) if u.command_id == "c2" => Some(u),
+                    _ => None,
+                })
+                .expect("the delivered input is persisted");
+            assert_eq!(message.api_origin, api_origin);
+            assert!(!message.human_origin);
+            assert!(message.origin_recorded);
+            assert_eq!(message.text, "PING now", "the stored message is not rewritten with a model-only label");
+            p.close().await;
+        }
+    }
+
     /// "stopped": Claude Code stopped only the turn, which ends interrupted
     /// (not failed); the message starts the next turn.
     #[tokio::test]
@@ -3922,7 +4014,7 @@ done
         let vec_sink = Arc::new(VecSink::default());
         let sink: Arc<dyn EventSink> = vec_sink.clone();
         let mut p = spawn(&bin, dir.path(), "s", false, None);
-        let end = send_now_turn(&mut p, "stopped", &sink, &vec_sink).await;
+        let end = send_now_turn(&mut p, "stopped", &sink, &vec_sink, input("c2", "PING now")).await;
         assert_eq!(end, TurnEnd { reason: Some(TurnEndReason::Interrupted), alive: true, no_conversation: false });
         assert_eq!(kinds(&vec_sink), ["user", "turn_started", "assistant", "input_delivered", "usage", "turn_ended"], "not an error");
         // The next turn is the message's.
@@ -3944,7 +4036,7 @@ done
         let vec_sink = Arc::new(VecSink::default());
         let sink: Arc<dyn EventSink> = vec_sink.clone();
         let mut p = spawn(&bin, dir.path(), "s", false, None);
-        let end = send_now_turn(&mut p, "older", &sink, &vec_sink).await;
+        let end = send_now_turn(&mut p, "older", &sink, &vec_sink, input("c2", "PING now")).await;
         assert_eq!(end.reason, Some(TurnEndReason::Interrupted));
         let notices: Vec<c6_proto::Notice> = vec_sink
             .0
@@ -3985,6 +4077,38 @@ done
         let lines = read_lines(dir.path());
         assert_eq!(lines.iter().map(|l| l.get("origin").is_some()).collect::<Vec<_>>(), [false, false, true]);
         assert!(lines.iter().all(|l| l["uuid"].is_string()), "each with its uuid");
+        p.close().await;
+    }
+
+    #[tokio::test]
+    async fn initial_automation_inputs_keep_their_label_and_never_get_human_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = send_now_claude(dir.path());
+        let vec_sink = Arc::new(VecSink::default());
+        let sink: Arc<dyn EventSink> = vec_sink.clone();
+        let mut p = spawn(&bin, dir.path(), "s", false, None);
+        for (turn, api_origin, human_origin, label) in [
+            (
+                1,
+                Some(c6_proto::ApiMessageOrigin { token_name: "ops-controller".into() }),
+                false,
+                "Message sent via the API (token \"ops-controller\"), not typed by the user:",
+            ),
+            (2, Some(Default::default()), false, "Message sent via the API, not typed by the user:"),
+            (3, None, false, "Message sent by an automation, not typed by the user:"),
+            (
+                4,
+                Some(c6_proto::ApiMessageOrigin { token_name: "ops-controller".into() }),
+                true,
+                "Message sent via the API (token \"ops-controller\"), not typed by the user:",
+            ),
+        ] {
+            let next = PendingInput { api_origin, human_origin, ..input(&format!("c{turn}"), "quick: Continue.") };
+            assert_eq!(run(&mut p, turn, &[next], &sink).await.reason, Some(TurnEndReason::Completed));
+            let line = read_lines(dir.path()).pop().unwrap();
+            assert!(line.get("origin").is_none(), "automation must not acquire a human marker: {line}");
+            assert_eq!(line["message"]["content"], format!("{label}\nquick: Continue."));
+        }
         p.close().await;
     }
 

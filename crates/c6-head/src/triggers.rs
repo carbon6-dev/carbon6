@@ -593,45 +593,54 @@ pub async fn on_memex_event(st: &HeadState, realm: &str, kind: &str, data: &Valu
 /// Runs a trigger's action for an event, unless loop protection stops it:
 /// the chain of triggers that led here is too deep, or it ran too often in
 /// the last hour.
-pub async fn act(st: &HeadState, a: &api::Automation, event: &Value, input: &str, via: &str) -> Option<api::TemplateRun> {
-    let chain = CHAIN.try_with(Clone::clone).unwrap_or_default();
-    let stop = if chain.len() >= MAX_DEPTH {
-        Some(format!("loop protection: a chain of {} triggers led here ({})", chain.len(), chain.join(" → ")))
-    } else if via != "manual" && a.per_hour > 0 && runs_last_hour(st, &a.id).await >= a.per_hour as i64 {
-        Some(format!("loop protection: it ran {} times in the last hour (its limit)", a.per_hour))
-    } else {
-        None
-    };
-    if let Some(why) = stop {
-        stopped(st, a, &why, via, &chain).await;
-        return None;
-    }
-    let mut next = chain.clone();
-    next.push(a.id.clone());
-    let run = CHAIN.scope(next, async {
-        if a.action == "start" {
-            let input = match a.action_params.get("input") {
-                Some(t) => match render(t, event) {
-                    Value::String(s) => s,
-                    v => v.to_string(),
-                },
-                None if via == "schedule" || via == "manual" => a.input.clone(),
-                None => input.to_owned(),
-            };
-            fire(st, a, &input, via, &chain).await.map(Some)
+pub fn act<'a>(
+    st: &'a HeadState,
+    a: &'a api::Automation,
+    event: &'a Value,
+    input: &'a str,
+    via: &'a str,
+) -> futures::future::BoxFuture<'a, Option<api::TemplateRun>> {
+    Box::pin(async move {
+        let chain = CHAIN.try_with(Clone::clone).unwrap_or_default();
+        let stop = if chain.len() >= MAX_DEPTH {
+            Some(format!("loop protection: a chain of {} triggers led here ({})", chain.len(), chain.join(" → ")))
+        } else if via != "manual" && a.per_hour > 0 && runs_last_hour(st, &a.id).await >= a.per_hour as i64 {
+            Some(format!("loop protection: it ran {} times in the last hour (its limit)", a.per_hour))
         } else {
-            let result = Box::pin(do_action(st, a, event)).await;
-            record_run(st, a, via, &chain, result.as_ref().err().map(|e| format!("{e:#}"))).await;
-            result.map(|_| None)
-        }
-    });
-    match run.await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(trigger = %a.name, "trigger failed: {e:#}");
             None
+        };
+        if let Some(why) = stop {
+            stopped(st, a, &why, via, &chain).await;
+            return None;
         }
-    }
+        let mut next = chain.clone();
+        next.push(a.id.clone());
+        let run = CHAIN.scope(next, async {
+            if a.action == "start" {
+                let input = match a.action_params.get("input") {
+                    Some(t) => match render(t, event) {
+                        Value::String(s) => s,
+                        v => v.to_string(),
+                    },
+                    None if via == "schedule" || via == "manual" => a.input.clone(),
+                    None => input.to_owned(),
+                };
+                let run: futures::future::BoxFuture<'_, anyhow::Result<api::TemplateRun>> = Box::pin(fire(st, a, &input, via, &chain));
+                run.await.map(Some)
+            } else {
+                let result = Box::pin(do_action(st, a, event)).await;
+                record_run(st, a, via, &chain, result.as_ref().err().map(|e| format!("{e:#}"))).await;
+                result.map(|_| None)
+            }
+        });
+        match run.await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(trigger = %a.name, "trigger failed: {e:#}");
+                None
+            }
+        }
+    })
 }
 
 async fn runs_last_hour(st: &HeadState, id: &str) -> i64 {

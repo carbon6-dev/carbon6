@@ -328,6 +328,9 @@ message UserMessage {
   // Absent/false in old records and internal input means unknown, not human.
   bool human_origin = 13;
   TaskNotice task_notice = 14;
+  // Distinguishes a newly recorded unknown/internal sender from a legacy
+  // journal entry with no provenance. The head also marks new old-worker events.
+  bool origin_recorded = 15;
 }
 
 message ApiMessageOrigin {

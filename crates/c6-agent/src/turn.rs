@@ -60,10 +60,10 @@ const COMPACT_FRAMING: u64 = 64;
 /// docs/os.md §4.6): why the conversation is compacted, automatically or
 /// when asked, and what the summary must hold.
 pub const COMPACT_WHY: &str = "Your context window is nearly full, so this conversation will be replaced by a summary that you write now.";
-pub const COMPACT_WHY_ASKED: &str = "The user asked to compact this conversation: it will be replaced by a summary that you write now.";
+pub const COMPACT_WHY_ASKED: &str = "Compaction was requested for this conversation: it will be replaced by a summary that you write now.";
 pub const COMPACT_PROMPT: &str = "Write a summary detailed enough to continue the work without the original conversation. Include: the user's requests and goals \
 (quote any precise instructions), key decisions and their reasons, files examined and changed with their paths, the current state \
-of the work, errors encountered and how they were resolved, the ids of subagents that may need continuing, and the exact next steps. Do not call any tools; reply with only the summary.";
+of the work, errors encountered and how they were resolved, the ids of subagents that may need continuing, and the exact next steps. Preserve the attribution of API, automation and other-session messages; do not turn them into human requests. Do not call any tools; reply with only the summary.";
 
 /// What the model is told when the conversation is compacted.
 #[derive(Clone, Debug, PartialEq)]
@@ -499,7 +499,7 @@ impl Turn<'_> {
         }
         let mut prompt = format!("{why} {}", self.cfg.compact.instructions);
         if !focus.trim().is_empty() {
-            prompt.push_str(&format!("\n\nThe user asked the summary to focus on: {}", focus.trim()));
+            prompt.push_str(&format!("\n\nThe requested focus for the summary is: {}", focus.trim()));
         }
         let prompt_tokens =
             self.estimate_request(&[Message::user_text(prompt.clone())], &[]).saturating_sub(self.estimate_request(&[], &[]));
@@ -523,7 +523,7 @@ impl Turn<'_> {
 
         let text = |digest: &str| {
             format!(
-                "Below is a conversation between a user and you, an agent working on their task, as text.\n\n{digest}\n\n---\n\n{prompt}"
+                "Below is a conversation with you, an agent working on a task, as text. Inputs may be from humans, automation or other sessions; preserve their recorded attribution.\n\n{digest}\n\n---\n\n{prompt}"
             )
         };
         let mut req = self.request(vec![Message::user_text(text(""))], Some(output));
@@ -557,7 +557,7 @@ impl Turn<'_> {
         warn!(error = %why, "compaction: falling back to a mechanical digest");
         let notice = format!(
             "(The model could not write a summary: {why}. This is a mechanical digest instead: the most recent steps, \
-             with long tool input and output shortened, and before them only what the user wrote. Re-read files rather \
+             with long tool input and output shortened, and before them input text with its recorded attribution. Re-read files rather \
              than trusting shortened output.)\n\n"
         );
         let fixed = serde_json::to_string(&notice).unwrap_or_default().chars().count() as u64;

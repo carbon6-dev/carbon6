@@ -2248,6 +2248,18 @@ pub struct TaskNotice {
     pub markdown: String,
 }
 
+/// Server-recorded message provenance. Only a token's display name is exposed;
+/// absence on a historical event is legacy presentation, not proof of a human.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MessageOrigin {
+    Human,
+    Api { token_name: String },
+    Session,
+    Unknown,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -2301,6 +2313,10 @@ pub enum EventKind {
         /// text remains in `text`. Older events need no backfill.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         task_notice: Option<Box<TaskNotice>>,
+        /// Determined by the server, never by a send request's body. Missing on
+        /// legacy events; newly received unprovenanced input is `unknown`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<Box<MessageOrigin>>,
     },
     TurnStarted {
         turn: u64,
@@ -5254,11 +5270,12 @@ pub struct TimelineTurn {
     pub steps: u64,
     /// Who started it: `you`, `session` (another session's message),
     /// `task` (a background task or subagent ended), `doc` (comments on a
-    /// document), `agent` (the agent that started this subagent), or empty
+    /// document), `agent` (the agent that started this subagent), `api`,
+    /// `automation` (unknown/internal origin), or empty
     /// (nothing said).
     #[serde(default)]
     pub by: String,
-    /// The session's or document's title, for `session` and `doc`.
+    /// The session's/document's title, or the API token's display name.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub from: String,
     /// The first words of the message that started it.

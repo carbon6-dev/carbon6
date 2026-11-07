@@ -268,7 +268,9 @@ async fn what_ends_because_you_stopped_the_agent_does_not_wake_it() {
     assert_eq!(opened.last(), Some(&"what now"), "{opened:?}");
     assert!(opened.iter().any(|t| t.contains("Server") && t.contains("lost")), "{opened:?}");
     let lines = read();
-    let yours = lines.iter().position(|l| l["message"]["content"] == "what now").unwrap();
+    let yours =
+        lines.iter().position(|l| l["message"]["content"] == "Message sent by an automation, not typed by the user:\nwhat now").unwrap();
+    assert!(lines[yours].get("origin").is_none(), "automation has no human marker: {:?}", lines[yours]);
     assert!(lines[..yours].iter().rev().take_while(|l| l["type"] == "user").any(|l| l.to_string().contains("Server")), "{lines:?}");
     stop.cancel();
     head.shutdown().await.unwrap();

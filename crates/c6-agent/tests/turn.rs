@@ -228,6 +228,38 @@ fn large_tool_history(chars: usize) -> Vec<Message> {
 
 #[tokio::test]
 async fn tool_call_then_answer_with_mid_turn_input() {
+    mid_turn_input(
+        PendingInput { command_id: "c2".into(), text: "and say done".into(), human_origin: true, ..Default::default() },
+        "and say done",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn automation_mid_turn_input_keeps_its_origin_and_label() {
+    for (api_origin, human_origin, label) in [
+        (
+            Some(c6_proto::ApiMessageOrigin { token_name: "ops-controller".into() }),
+            false,
+            "Message sent via the API (token \"ops-controller\"), not typed by the user:",
+        ),
+        (
+            Some(c6_proto::ApiMessageOrigin { token_name: "ops-controller".into() }),
+            true,
+            "Message sent via the API (token \"ops-controller\"), not typed by the user:",
+        ),
+        (Some(Default::default()), false, "Message sent via the API, not typed by the user:"),
+        (None, false, "Message sent by an automation, not typed by the user:"),
+    ] {
+        mid_turn_input(
+            PendingInput { command_id: "c2".into(), text: "and say done".into(), api_origin, human_origin, ..Default::default() },
+            &format!("{label}\nand say done"),
+        )
+        .await;
+    }
+}
+
+async fn mid_turn_input(input: PendingInput, expected: &str) {
     let mock = MockLlm::start().await;
     mock.push(Reply::ToolCalls(vec![("write".into(), r#"{"path":"hello.txt","content":"hi\n"}"#.into())]));
     mock.push(Reply::Text("Created hello.txt.".into()));
@@ -238,7 +270,7 @@ async fn tool_call_then_answer_with_mid_turn_input() {
     let sink: Arc<dyn EventSink> = vec_sink.clone();
     let session = Arc::new(SessionTools::new(dir.path().to_owned()));
     let mut conv = Conversation { history: vec![Message::user_text("make hello.txt")], context_tokens: 0 };
-    let mut queued = vec![PendingInput { command_id: "c2".into(), text: "and say done".into(), ..Default::default() }];
+    let mut queued = vec![input.clone()];
     let mut pending = move || std::mem::take(&mut queued);
 
     let reason =
@@ -252,13 +284,18 @@ async fn tool_call_then_answer_with_mid_turn_input() {
     let msgs = reqs[1]["messages"].as_array().unwrap();
     let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
     assert_eq!(roles, vec!["system", "user", "assistant", "tool", "user"]);
-    assert_eq!(msgs[4]["content"], "and say done");
+    assert_eq!(msgs[4]["content"], expected);
     assert_eq!(reqs[0]["tools"].as_array().unwrap().len(), 12);
 
     // The recorded log rebuilds the same conversation.
     let events = vec_sink.events.lock().unwrap().clone();
     let kinds: Vec<&str> = events.iter().map(|e| kind_name(e)).collect();
     assert_eq!(kinds, vec!["turn_started", "assistant", "usage", "tool_result", "user", "assistant", "usage", "turn_ended"]);
+    let Some(session_event::Kind::User(message)) = &events[4].kind else { panic!("delivered input") };
+    assert!(message.origin_recorded);
+    assert_eq!(message.api_origin, input.api_origin);
+    assert_eq!(message.human_origin, input.human_origin);
+    assert_eq!(message.text, input.text);
     let mut rebuilt = vec![Message::user_text("make hello.txt")];
     rebuilt.extend(history_from_events(&events));
     assert_eq!(rebuilt, conv.history);
@@ -279,6 +316,7 @@ async fn an_interrupted_turn_leaves_waiting_input_for_the_next() {
     let queued = Arc::new(std::sync::Mutex::new(vec![PendingInput {
         command_id: "c2".into(),
         text: "stop and do this".into(),
+        human_origin: true,
         ..Default::default()
     }]));
     let waiting = queued.clone();

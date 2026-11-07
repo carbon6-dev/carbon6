@@ -23,7 +23,7 @@ pub struct Prompt {
 }
 
 /// Added to the base prompt of side chats.
-pub const SIDE_CHAT_NOTE: &str = "This is a side chat: the user branched off the conversation above to ask about it. \
+pub const SIDE_CHAT_NOTE: &str = "This is a side chat branched off the conversation above to ask about it. \
 The main session continues on its own and does not receive this chat automatically. Answer the user's questions here; \
 look at files and run read-only commands as needed, but do not change files unless the user asks you to.";
 
