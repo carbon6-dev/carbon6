@@ -3363,6 +3363,10 @@ fn Thread(id: String, about: bool) -> impl IntoView {
     // A draft: the thread may be drawn again (in the panel and a popover).
     let key = StoredValue::new(format!("reply.{}.{}", doc.get_value(), tid.get_value()));
     let reply = crate::util::draft(&key.get_value());
+    // Failed sends are separate from the next draft. Persist immediately:
+    // the request can finish after this thread's box has been closed.
+    let failed_key = StoredValue::new(format!("c6.failed.{}", key.get_value()));
+    let failed = RwSignal::new(failed_replies(&failed_key.get_value()));
     // With an agent already, a reply goes on to it unless you say not.
     let to_agent = RwSignal::new(t.with_untracked(|t| t.to_agent && !t.agent.is_empty()));
     let error = RwSignal::new(None::<String>);
@@ -3385,7 +3389,8 @@ fn Thread(id: String, about: bool) -> impl IntoView {
             let _ = error.try_set(Some(e));
         }
     };
-    // The draft goes as it's sent, and comes back if sending fails.
+    // The draft goes as it's sent. A failure stays recoverable without
+    // replacing anything written while the request was in flight.
     let send = move || {
         if archived.get_untracked() {
             return;
@@ -3399,12 +3404,14 @@ fn Thread(id: String, about: bool) -> impl IntoView {
         }
         crate::util::forget_draft(&key.get_value());
         reply.set(String::new());
-        let (doc_id, thread_id, draft_key) = (doc.get_value(), tid.get_value(), key.get_value());
+        let (doc_id, thread_id, recovery_key) = (doc.get_value(), tid.get_value(), failed_key.get_value());
         spawn_local(async move {
             let r = api::doc_thread_reply(doc_id, thread_id, &c).await;
             if r.is_err() {
-                crate::util::storage_set(&format!("c6.draft.{draft_key}"), &c.text);
-                let _ = reply.try_set(c.text.clone());
+                let mut replies = failed_replies(&recovery_key);
+                replies.push(c);
+                save_failed_replies(&recovery_key, &replies);
+                let _ = failed.try_set(replies);
             }
             done(r)
         });
@@ -3476,6 +3483,30 @@ fn Thread(id: String, about: bool) -> impl IntoView {
             </div>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             <Show when=move || !archived.get()>
+            <Show when=move || !failed.get().is_empty()>
+            <div class="max-h-40 shrink-0 space-y-2 overflow-y-auto">
+            <For each=move || failed.get().into_iter().enumerate() key=|(i, c)| (*i, c.text.clone()) children=move |(i, c)| {
+                let c = StoredValue::new(c);
+                view! {
+                    <div data-failed-reply="" class="space-y-1 rounded-md border border-zinc-300 p-2 dark:border-zinc-700">
+                        <p class="text-xs text-muted">"Not sent. Kept here while you write your next reply."</p>
+                        <pre class="max-h-24 overflow-y-auto whitespace-pre-wrap break-words font-sans text-sm">{c.with_value(|c| c.text.clone())}</pre>
+                        <button class="text-xs text-sky-700 hover:underline disabled:opacity-50 dark:text-sky-400"
+                            disabled=move || !reply.get().is_empty() title="Restore into an empty reply box"
+                            on:click=move |_| {
+                                if !reply.get_untracked().is_empty() { return; }
+                                reply.set(c.with_value(|c| c.text.clone()));
+                                to_agent.set(c.with_value(|c| c.to == "agent"));
+                                let mut replies = failed_replies(&failed_key.get_value());
+                                if i < replies.len() { replies.remove(i); }
+                                save_failed_replies(&failed_key.get_value(), &replies);
+                                failed.set(replies);
+                            }>"Restore reply"</button>
+                    </div>
+                }
+            } />
+            </div>
+            </Show>
             <div class="flex shrink-0 items-end gap-2">
             <div class="relative min-w-0 flex-1">
                 <textarea node_ref=area rows="1" class=format!("{INPUT} {} pr-9", if about { COMMENT_GROWS } else { "grows block max-h-24 resize-none overflow-y-auto" }) placeholder="Reply…" prop:value=move || reply.get() on:input=move |ev| reply.set(event_target_value(&ev))
@@ -3498,6 +3529,16 @@ fn Thread(id: String, about: bool) -> impl IntoView {
             </div>
             </Show>
         </div>
+    }
+}
+
+fn failed_replies(key: &str) -> Vec<c6_api::docs::CommentNew> {
+    crate::util::storage_get(key).and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
+}
+
+fn save_failed_replies(key: &str, replies: &[c6_api::docs::CommentNew]) {
+    if let Ok(text) = serde_json::to_string(replies) {
+        crate::util::storage_set(key, &text);
     }
 }
 

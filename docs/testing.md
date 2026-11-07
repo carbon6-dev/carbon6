@@ -730,6 +730,21 @@ and dark, at desktop and phone widths, with fine and coarse pointer media:
 
 ## Doc comments: placement browser check
 
+`reply-recovery.cjs` holds reply A's request until draft B is typed, then
+fails A. It checks that B is unchanged, A is separately recoverable after a
+real reload, and Restore reply cannot replace a nonempty draft. Desktop,
+narrow desktop tiles and phones run in both themes in Chromium:
+
+```sh
+env -u NO_COLOR make ui
+/home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/reply-recovery.cjs
+```
+
+Screenshots go to `/tmp/n3-ui/item3` (`EVIDENCE` overrides it).
+`BEFORE=1 ROOT=/path/to/baseline/dist` asserts the original overwrite and
+captures before evidence. `ENGINES=chromium,webkit` additionally runs WebKit;
+startup traps fail explicitly rather than being retried or hidden.
+
 After `env -u NO_COLOR make ui`, run both production regressions:
 
 ```sh
