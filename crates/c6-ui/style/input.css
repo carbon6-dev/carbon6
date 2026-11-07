@@ -299,6 +299,11 @@ html.soft {
   content-visibility: auto;
   contain-intrinsic-size: auto 6rem;
 }
+/* Usage, turn-start and tool-result records update existing UI, not a blank
+   message. Leptos's placeholder comments do not make an element nonempty.
+   Keep their ids as targets, without a speculative 6rem height or a gap. */
+.c6-transcript-row:empty,
+.c6-transcript-notices:empty { display: none; }
 
 /* Chart series (the dataviz reference palette's first slots, stepped
    separately for light and dark surfaces). */

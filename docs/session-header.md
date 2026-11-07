@@ -37,6 +37,17 @@ One 44px bar: **app menu, title, plain context ring, Actions, Sessions picker**.
 - **Composer sizing:** working/suggestion changes refit only an empty draft's hint. A nonempty draft still resizes for text and width changes, but not for a status-only update: temporarily measuring it at `height:auto` can make WebKit clamp the transcript to a transient end without a net ResizeObserver size change. Text, resize and width notifications share one queued fit before paint, with no duplicate synchronous input fit. Avoiding repeated measurements preserves true end-following on small phones without moving or recreating the composer.
 - **Model chip:** on phones (including short landscape) its model, effort and subagent choices use the existing keyboard-aware bottom sheet; desktop keeps the anchored popover. Phone sheet controls stack at the normal sheet padding: the Model label sits directly above its full-width field and offered list, with no reserved connection column. Tap outside, tap or swipe the named close handle, or Escape to close; the model sheet has no redundant top X (other shared sheets retain theirs). The sheet retains its body through exit and can reverse without remounting. The model text field still accepts arbitrary ids and lists every offered model, not filtered suggestions; its list flows inside the sheet's scroll area so the keyboard cannot clip it. Selection still takes effect on the next send. New-session, side-chat and Ask forms keep their inline fields; their phone model lists flow in their existing scroll area too, rather than being clipped above or below it. The Sessions page retains its new-session form during subsequent model-list loading, so typing does not detach the focused input. Its Where and how sheet uses the shared keyboard inset and 80% visible-height cap. Desktop form dropdowns are unchanged. All use the existing per-connection model cache warmed by composer prefetch.
 
+## Transcript status and spacing
+
+On desktop, Working, the live turn's numbers and the background-task inspector
+share a single compact line in the reading column's existing bottom padding.
+They do not each add a transcript row or change the scroll range when they
+arrive. Empty log records (usage, turn start, a result already shown inside its
+tool card) keep their anchor ids but take no height or inter-message gap.
+The 16px separation between actual messages and the 28px action-control area
+remain intentional: Edit, Rewind and Ask are positioned in that area and do
+not add height on hover. There is no additional idle status spacer.
+
 ## Icons throughout the app
 
 App-owned chrome uses drawn SVG icons instead of emoji or Unicode pictograms

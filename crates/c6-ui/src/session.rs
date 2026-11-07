@@ -979,7 +979,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         // the glance beside it, the two centred together; the glance stays
         // in sight as the transcript scrolls.
         <div class=format!("relative {READING_ROW} items-start")>
-        <div class=format!("{READING} px-4 pb-8 pt-4")>
+        <div class=format!("relative {READING} px-4 pb-8 pt-4")>
             <Show when=move || feed.stream_failed.get()>
                 <p class="mb-3 text-sm text-muted" role="status">"Session stream disconnected. Reconnecting…"</p>
             </Show>
@@ -2266,7 +2266,7 @@ fn Transcript(
 
     view! {
         // A long unbroken string (a path, a URL) wraps instead of widening it.
-        <div class="space-y-4 [overflow-wrap:anywhere]">
+        <div class="flex flex-col gap-4 [overflow-wrap:anywhere]">
             // Events are append-only: keyed by seq, each renders once, so
             // expanded cards stay open while the turn continues (a folded
             // turn's row too, as it opens and folds).
@@ -2446,24 +2446,26 @@ fn Transcript(
                     {move || has_text.get().then(|| view! { <div class="md" on:click=crate::mentions::link_clicks() inner_html=move || markdown::to_html(&stream_text.get())></div> })}
                 </div>
             })}
-            // Through the whole turn, so the end of the page doesn't come and
-            // go as text starts and stops streaming.
-            {move || running.get().then(|| view! {
-                <div class="hidden items-center gap-2 text-sm text-muted md:flex">
-                    <span class="h-2 w-2 animate-pulse rounded-full bg-blue-500"></span>
-                    {move || stream_status.with(|s| if s.is_empty() { "Working…".to_owned() } else { s.clone() })}
-                </div>
-            })}
-            {move || running.get().then(|| usage.with(|u| u.current_turn.and_then(|n| u.turns.get(&n).copied()))).flatten().map(|t| view! {
-                <p class="font-mono text-[11px] text-muted">{move || format!("This turn: {}", turn_line(&t, Some(now.get())))}</p>
-            })}
             {move || edit_open.get().then(|| view! { <QueueEditBox rows=edit_rows session_id=id.get_value() on_close=Callback::new(move |_| { edit_open.set(false); edit_rows.update(Vec::clear); }) /> })}
             {move || queued.get().into_iter().map(|q| view! { <Queued q session_id=id.get_value() worker_id=worker_id pull=pull /> }).collect_view()}
-            // Phones combine these outside scrolling, directly above the prompt.
-            <div class="hidden md:block">
-                {move || (!running.get()).then(|| view! { <WaitingNotices events now session_id=id.get_value() /> })}
+            // One compact line in the reading column's existing bottom gutter:
+            // status/usage/tasks never add height, even when they arrive apart.
+            // Phones already combine their status outside the scroll box.
+            <div class="absolute bottom-1 inset-x-4 hidden h-6 items-center gap-3 text-xs text-muted md:flex" data-transcript-status="true">
+                {move || running.get().then(|| view! {
+                    <div class="flex min-w-0 flex-1 items-center gap-2">
+                        <span class="h-2 w-2 shrink-0 animate-pulse rounded-full bg-blue-500"></span>
+                        <span class="truncate" title=move || stream_status.get()>
+                            {move || stream_status.with(|s| if s.is_empty() { "Working…".to_owned() } else { s.clone() })}
+                        </span>
+                        <span class="truncate font-mono text-[11px]" title=move || usage.with(|u| u.current_turn.and_then(|n| u.turns.get(&n).copied())).map(|t| format!("This turn: {}", turn_line(&t, Some(now.get()))))>
+                            {move || usage.with(|u| u.current_turn.and_then(|n| u.turns.get(&n).copied())).map(|t| turn_line(&t, Some(now.get())))}
+                        </span>
+                    </div>
+                })}
                 <crate::tasks::RunningTasks session=id.get_value() events />
             </div>
+            {move || (!running.get()).then(|| view! { <div class="c6-transcript-notices hidden md:block"><WaitingNotices events now session_id=id.get_value() /></div> })}
         </div>
     }
 }
