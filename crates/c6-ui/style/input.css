@@ -73,6 +73,11 @@
 /* Colour-only hover/track changes are quick; geometry keeps the small tier. */
 .transition-colors { transition-duration: var(--dur-quick); }
 
+/* The shell must not scroll, even programmatically on composer/button focus.
+   hidden clips paint but still permits focus scrolling its overflow; clip
+   does not create that second scroll container around the real scroll boxes. */
+.c6-app { overflow: clip; }
+
 /* One phone bar, no footer. Keyboard visibility changes the transcript's
    viewport, never swaps or recreates the composer. No motion. */
 @media (width < 48rem), (height < 32rem) {
