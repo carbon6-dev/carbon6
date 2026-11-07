@@ -567,7 +567,7 @@ pub(crate) fn RecentRow(s: Session, at: i64, now: RwSignal<i64>, #[prop(optional
     let to = StoredValue::new(to);
     let (pill, word) = recent_state(&s);
     view! {
-        <a href=href class="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800" title="Open (⌘-click: new tile)"
+        <a href=href class="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800" title="Open (⌘/Ctrl-click: new tile if not already open)"
             on:click=move |ev: web_sys::MouseEvent| {
                 if ev.button() != 0 || ev.shift_key() || ev.alt_key() {
                     return;
@@ -894,7 +894,7 @@ fn SessionRow(s: Session, now: RwSignal<i64>, hover: Hover) -> impl IntoView {
                 }
             }
             on:mouseleave=move |_| hover.hide_soon()>
-        <Go to=View::session(s.id.clone()) class="flex min-w-0 flex-1 items-center gap-3 py-2.5 pl-3 @min-[40rem]/view:pl-4" title="Open beside this list (⌘-click: new tile)">
+        <Go to=View::session(s.id.clone()) class="flex min-w-0 flex-1 items-center gap-3 py-2.5 pl-3 @min-[40rem]/view:pl-4" title="Open beside this list (⌘/Ctrl-click: new tile if not already open)">
             <span class="mt-1.5 h-2.5 w-2.5 shrink-0 self-start rounded-full" style=mark title="Its mark"></span>
             <div class="min-w-0 flex-1">
                 <div class="truncate font-medium">{s.title.clone()}</div>
@@ -920,7 +920,7 @@ fn SessionRow(s: Session, now: RwSignal<i64>, hover: Hover) -> impl IntoView {
 /// The rail's sessions: every session (in this realm, with the label
 /// filter's labels), grouped as the sessions list is, one narrow row each.
 /// Hovering a row pops out its details, with its colour and "New like
-/// this"; clicking opens it (⌘-click: a new tile).
+/// this"; clicking reveals it, or opens it (⌘/Ctrl-click: a new tile if unopened).
 #[component]
 pub fn SessionsRail(open: RwSignal<bool>) -> impl IntoView {
     let live = api::live();

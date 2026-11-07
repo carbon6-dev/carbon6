@@ -139,7 +139,7 @@ fn ChatRow(s: Session, open: Callback<(String, How)>) -> impl IntoView {
                     view! {
                         <div class="flex items-center gap-2">
                             {running.then(|| view! { <span class="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-blue-500" title="running"></span> })}
-                            <button class="min-w-0 flex-1 truncate text-left font-medium hover:underline" title="Open beside (⌘-click: new tile)"
+                            <button class="min-w-0 flex-1 truncate text-left font-medium hover:underline" title="Open beside (⌘/Ctrl-click: new tile if not already open)"
                                 on:click=move |ev| open.run((id.get_value(), How::from_mouse(&ev)))>{t.clone()}</button>
                             <span class="shrink-0 text-xs text-zinc-500">{crate::when::ago(now_ms() - s.updated_at)}</span>
                         </div>

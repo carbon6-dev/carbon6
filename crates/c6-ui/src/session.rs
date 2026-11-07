@@ -1236,7 +1236,7 @@ pub(crate) struct Started {
 #[derive(Clone, Copy)]
 pub struct SessionChrome {
     /// Which pane registered it (a pane's view can be replaced in place).
-    token: u64,
+    pub(crate) token: u64,
     pub(crate) id: StoredValue<String>,
     pub(crate) detail: LocalResource<Result<c6_api::SessionDetail, String>>,
     find_open: RwSignal<bool>,
@@ -1294,7 +1294,9 @@ impl SessionChrome {
 
     /// Whether its pane is on screen (tracked, from the layout).
     fn pane_open(&self, pane: Pane) -> bool {
-        let id = self.id.get_value();
+        // A layout change can queue this header effect just before the
+        // transcript owner is replaced. It is no longer an open pane then.
+        let Some(id) = self.id.try_get_value() else { return false };
         self.col.is_some_and(|c| crate::panes::shown(c.ws, pane, &id).is_some_and(|(_, _, on)| on))
     }
 
@@ -4681,7 +4683,7 @@ fn MadeSession(id: String, title: String) -> impl IntoView {
     let hashed = c6_api::marks::hashed(&id).to_owned();
     view! {
         <div class="flex h-full cursor-pointer items-stretch overflow-hidden rounded-md border border-zinc-200 bg-white hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900 dark:hover:bg-zinc-800"
-            title="Open the session (⌘-click: in a new tile)" on:click=open>
+            title="Open the session (⌘/Ctrl-click: new tile if not already open)" on:click=open>
             <span class="w-1 shrink-0" style=move || crate::marks::fill(&row.with(|r| r.as_ref().map(crate::marks::of)).unwrap_or_else(|| hashed.clone()))></span>
             {move || {
                 let s = row.get();

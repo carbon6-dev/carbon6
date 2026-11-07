@@ -30,6 +30,48 @@ const layout = () => ({ tiles: [tile(2, [{ key: 3, view: { view: 'session', id: 
   tile(4, [{ key: 5, view: { view: 'docs' } }, { key: 6, view: { view: 'docs', id: DOC } }])],
   focus: 1, next: 7, full: false });
 const snapshot = page => page.evaluate(key => JSON.parse(localStorage.getItem(key)), KEY);
+const liveColumns = saved => saved.tiles.flatMap(t => t.columns);
+const sessionColumns = (saved, id = 'parent') => liveColumns(saved).filter(c => c.view.view === 'session' && c.view.id === id);
+
+// Observe the real sockets without replacing the shared fixture's replay or
+// send path. /live is the head feed, not a transcript stream. Listener identity
+// includes capture, just as EventTarget does; our observer adds no listeners.
+function observeSockets() {
+  const Native = window.WebSocket;
+  const draftListeners = window.__workspaceDraftListeners = [];
+  const capture = options => typeof options === 'boolean' ? options : !!options?.capture;
+  const addWindow = window.addEventListener.bind(window), removeWindow = window.removeEventListener.bind(window);
+  window.addEventListener = (type, callback, options) => {
+    if (['pagehide', 'visibilitychange'].includes(type) && callback && !draftListeners.some(l => l.type === type && l.callback === callback && l.capture === capture(options))) {
+      draftListeners.push({ type, callback, capture: capture(options) });
+    }
+    return addWindow(type, callback, options);
+  };
+  window.removeEventListener = (type, callback, options) => {
+    const i = draftListeners.findIndex(l => l.type === type && l.callback === callback && l.capture === capture(options));
+    if (i !== -1) draftListeners.splice(i, 1);
+    return removeWindow(type, callback, options);
+  };
+  window.__workspaceSockets = [];
+  window.WebSocket = new Proxy(Native, { construct(Target, args) {
+    const socket = new Target(...args), listeners = [];
+    const record = { socket, listeners, path: new URL(socket.url).pathname };
+    window.__workspaceSockets.push(record);
+    const add = socket.addEventListener.bind(socket), remove = socket.removeEventListener.bind(socket);
+    socket.addEventListener = (type, callback, options) => {
+      if (callback && !listeners.some(l => l.type === type && l.callback === callback && l.capture === capture(options))) {
+        listeners.push({ type, callback, capture: capture(options) });
+      }
+      return add(type, callback, options);
+    };
+    socket.removeEventListener = (type, callback, options) => {
+      const i = listeners.findIndex(l => l.type === type && l.callback === callback && l.capture === capture(options));
+      if (i !== -1) listeners.splice(i, 1);
+      return remove(type, callback, options);
+    };
+    return socket;
+  } });
+}
 async function waitView(page, view, target, count) {
   try {
     await page.waitForFunction(({ key, view, target, count }) => {
@@ -58,6 +100,7 @@ async function check(browser, origin, viewport, label, platform) {
     // Subsequent seed navigations install this before WASM starts, so the
     // real platform check, not just synthetic modifier flags, is covered.
     await context.addInitScript(platform => Object.defineProperty(navigator, 'platform', { get: () => platform }), platform);
+    await context.addInitScript(observeSockets);
     await page.reload({ waitUntil: 'domcontentloaded' });
     await page.locator('textarea').first().waitFor();
     await settle(page);
@@ -87,12 +130,16 @@ async function check(browser, origin, viewport, label, platform) {
       if (p.endsWith(`/docs/${DOC}/ops`)) return route.fulfill({ json: { id: DOC, rev: 1, ids: [], keys: {}, hashes: {} } });
       return route.fallback();
     });
-    const seed = async (saved, path) => {
+    const seed = async (saved, path, drafts = {}, beforeApp) => {
       // A same-URL/hash goto can be same-document navigation: WASM would
       // never restore the seeded layout. Stop the old app before seeding,
       // also preventing its reactive storage writer from racing this write.
       await page.goto(origin + '/__seed', { waitUntil: 'domcontentloaded' });
-      await page.evaluate(({ key, saved }) => localStorage.setItem(key, JSON.stringify(saved)), { key: KEY, saved });
+      await page.evaluate(({ key, saved, drafts }) => {
+        localStorage.setItem(key, JSON.stringify(saved));
+        for (const [id, text] of Object.entries(drafts)) localStorage.setItem(`c6.home.draft.${id}`, text);
+      }, { key: KEY, saved, drafts });
+      await beforeApp?.();
       await page.goto(origin + '/r/home' + path, { waitUntil: 'domcontentloaded' });
       // DOMContentLoaded precedes WASM's keyboard handlers. A shortcut sent
       // here too early is lost; desktop eagerly mounts both sessions and
@@ -101,6 +148,20 @@ async function check(browser, origin, viewport, label, platform) {
     };
     const parent = () => page.locator('#col-3');
     const documentPane = () => page.locator('#col-6');
+    const streamState = () => page.evaluate(() => window.__workspaceSockets.map(({ socket, path, listeners }) => ({
+      path, state: socket.readyState, messages: listeners.filter(l => l.type === 'message').length,
+    })));
+    const oneStream = async id => {
+      await page.waitForFunction(id => {
+        const streams = window.__workspaceSockets.filter(r => r.path.endsWith(`/sessions/${id}/stream`) && r.socket.readyState <= 1);
+        return streams.length === 1 && streams[0].socket.readyState === 1;
+      }, id);
+      const sockets = await streamState();
+      assert.equal(sockets.filter(s => s.path.endsWith(`/sessions/${id}/stream`) && s.state <= 1).length, 1, `${id} has one live transcript stream`);
+      assert.equal(sockets.find(s => s.path.endsWith(`/sessions/${id}/stream`) && s.state === 1).messages, 1, `${id} has one stream message listener`);
+      assert(sockets.filter(s => s.path.endsWith('/stream') && s.state > 1).every(s => s.messages === 0), 'departed feeds remove their message listeners');
+      assert.equal(sockets.filter(s => s.path.endsWith('/live') && s.state <= 1).length, 1, 'the global head feed is separate and singular');
+    };
     const links = async () => {
       await press('1');
       await parent().locator('textarea').waitFor();
@@ -108,7 +169,8 @@ async function check(browser, origin, viewport, label, platform) {
       f.send({ type: 'assistant', turn: 80, blocks: [{ type: 'text', text:
         `[Document block](/docs/${DOC}#block.2) [Other tab](doc:${DOC}?block=block.3) ` +
         `doc:${DOC} [Other document](/docs/${OTHER_DOC}) [Workers](/workers) ` +
-        `[Session turn](/sessions/parent#e20) [Inbox](/inbox) [Sessions](/)` }], stop_reason: 'end_turn' });
+        `[Session turn](/sessions/parent#e20) [session:parent](session:parent) ` +
+        `[Second session](/sessions/secondary) [Inbox](/inbox) [Sessions](/)` }], stop_reason: 'end_turn' });
       await parent().locator('a[href$="#block.2"]').last().waitFor({ state: 'attached' });
     };
     const clickBlock = () => parent().locator('a[href$="#block.2"]').last().click();
@@ -362,16 +424,223 @@ async function check(browser, origin, viewport, label, platform) {
     assert.deepEqual(workersAgain.tiles[workersAgain.focus].columns, workersTile.columns);
     assert.deepEqual(workersAgain.tiles[workersAgain.focus].back, workersTile.back);
 
-    // Sessions still deliberately allow modifier-created live copies.
-    phase('explicit session copy');
+    phase('session modifier reveals the live transcript and preserves its draft');
     await seed(layout(), '/sessions/parent');
     await links();
+    const parentDraft = 'Parent draft survives targeting, dedupe, history and moves.';
+    const secondaryDraft = 'A different draft belongs only to the second session.';
+    await parent().locator('textarea').fill(parentDraft);
+    const beforeSession = await snapshot(page);
     await parent().locator('a[href$="#e20"]').last().click({ modifiers: [command] });
-    await waitView(page, 'session', { q: '', anchor: 'e20', open: [], at: null }, 3);
-    await page.locator('[id="parent-e20"]').last().waitFor();
-    const sessionCopies = await snapshot(page);
+    const turnTarget = { q: '', anchor: 'e20', open: [], at: null };
+    await waitView(page, 'session', turnTarget, 2);
+    await parent().locator('[id="parent-e20"]').waitFor({ state: 'attached' });
+    assert.equal(await parent().locator('textarea').inputValue(), parentDraft);
+    assert.deepEqual((await snapshot(page)).tiles.map(t => t.columns.map(c => c.key)), beforeSession.tiles.map(t => t.columns.map(c => c.key)));
+    await oneStream('parent');
+    await links();
+    const sameSession = await snapshot(page);
+    // Both a targeted link and a mention use the production Markdown handler.
+    // Targeted sessions deliberately remount to revisit the turn. Untargeted
+    // mentions only reveal, retaining the composer, stream and reading target.
+    for (const selector of ['a[href$="#e20"]', 'a[data-ref="session:parent"]']) {
+      const sameSockets = await streamState(), sameRequests = f.requests.length;
+      await parent().locator('textarea').evaluate(el => { window.__sessionComposer = el; });
+      await parent().locator(selector).last().click({ modifiers: [command] });
+      await waitView(page, 'session', turnTarget, 2);
+      assert.deepEqual((await snapshot(page)).tiles.map(t => [t.key, t.columns, t.back, t.forward]), sameSession.tiles.map(t => [t.key, t.columns, t.back, t.forward]), 'repeat/untargeted session opens neither copy nor history');
+      await parent().locator('[id="parent-e20"]').waitFor({ state: 'attached' });
+      assert.equal(await parent().locator('textarea').inputValue(), parentDraft);
+      await oneStream('parent');
+      if (selector.includes('data-ref')) {
+        assert(await parent().locator('textarea').evaluate(el => el === window.__sessionComposer));
+        assert.deepEqual(await streamState(), sameSockets, 'untargeted opens do not add sockets or stream listeners');
+        assert(!f.requests.slice(sameRequests).some(r => /GET .*\/sessions\/parent$/.test(r)), 'untargeted opens do not fetch another session owner');
+      } else {
+        assert(await page.evaluate(() => !window.__sessionComposer.isConnected), 'a revisited target disposes its previous composer');
+        await links();
+      }
+    }
+    phase('target remount while a composer model popup is open cleans its owner');
+    const lifecycleListeners = await page.evaluate(() => window.__workspaceDraftListeners.length);
+    await parent().getByRole('button', { name: /^Model: .*change it/ }).click();
+    await page.getByPlaceholder('model id', { exact: true }).waitFor();
+    await parent().locator('textarea').evaluate(el => { window.__openPopupComposer = el; });
+    // No pointer outside the popup: that would dismiss it before teardown and
+    // mask a strong-owner reference held by the global popup registry.
+    await press('[');
+    await waitView(page, 'session', undefined, 2);
+    await parent().locator('textarea').waitFor();
+    assert(await page.evaluate(() => !window.__openPopupComposer.isConnected));
+    await page.getByPlaceholder('model id', { exact: true }).waitFor({ state: 'detached' });
+    assert.equal(await parent().locator('textarea').inputValue(), parentDraft);
+    await oneStream('parent');
+    assert.equal(await page.evaluate(() => window.__workspaceDraftListeners.length), lifecycleListeners, 'open-popup teardown replaces all composer listeners without retaining the old owner');
+    await press(']');
+    await waitView(page, 'session', turnTarget, 2);
+    assert.equal(await parent().locator('textarea').inputValue(), parentDraft);
+    await oneStream('parent');
+
+    phase('modifier opens an unopened session in a new tile, then list modifiers reuse it');
+    await links();
+    const sourceSession = (await snapshot(page)).tiles[0];
+    phase('unopened secondary: modifier-click transcript link');
+    await parent().locator('a[href$="/sessions/secondary"]').last().click({ modifiers: [command] });
+    phase('unopened secondary: wait for focused session in three tiles');
+    await waitView(page, 'session', undefined, 3);
+    const newSession = await snapshot(page), secondaryTile = newSession.tiles[newSession.focus];
+    const secondaryKey = secondaryTile.columns[0].key, secondaryPane = page.locator(`#col-${secondaryKey}`);
+    assert.equal(secondaryTile.columns[0].view.id, 'secondary');
+    assert.deepEqual(newSession.tiles[0].columns, sourceSession.columns);
+    assert.deepEqual(newSession.tiles[0].back, sourceSession.back);
+    phase('unopened secondary: wait for replay event secondary-e20');
+    await secondaryPane.locator('[id="secondary-e20"]').waitFor({ state: 'attached' });
+    phase('unopened secondary: fill and retain composer');
+    await secondaryPane.locator('textarea').fill(secondaryDraft);
+    await secondaryPane.locator('textarea').evaluate(el => { window.__secondaryComposer = el; });
+    phase('unopened secondary: require one stream');
+    await oneStream('secondary');
+    // Open the real Sessions list from the transcript, not a synthetic router
+    // call; it is itself single-copy, on both desktop and phone.
+    phase('Sessions list: reinject parent transcript links');
+    await links();
+    phase('Sessions list: modifier-click root link');
+    await parent().locator('a[href$="/"]').last().click({ modifiers: [command] });
+    phase('Sessions list: wait for focused Sessions in four tiles');
+    await waitView(page, 'sessions', undefined, 4);
+    const withList = await snapshot(page), listTile = withList.tiles[withList.focus], listKey = listTile.columns[0].key;
+    const listSource = structuredClone(listTile);
+    for (const id of ['parent', 'secondary', 'parent', 'secondary']) {
+      phase(`Sessions list reuse ${id}: focus list and modifier-click row`);
+      // The previous row's hover preview is a portal above the list and
+      // can cover the next row. Dismiss it as a user would, not with a
+      // forced click that would bypass the real pointer hit test.
+      await page.mouse.move(0, 0);
+      const previewClose = page.getByRole('button', { name: 'Close session details', exact: true });
+      if (await previewClose.isVisible()) await previewClose.click();
+      await press('4');
+      await page.locator(`#col-${listKey} a[href$="/sessions/${id}"]`).first().click({ modifiers: [command] });
+      phase(`Sessions list reuse ${id}: wait for existing session in four tiles`);
+      await waitView(page, 'session', id === 'parent' ? turnTarget : undefined, 4);
+      const after = await snapshot(page);
+      assert.equal(sessionColumns(after, id).length, 1);
+      assert.equal(after.tiles[after.focus].key, id === 'parent' ? 2 : secondaryTile.key);
+      assert.deepEqual(after.tiles.find(t => t.key === listTile.key).columns, listSource.columns);
+      assert.deepEqual(after.tiles.find(t => t.key === listTile.key).back, listSource.back);
+      assert.deepEqual(after.tiles.find(t => t.key === listTile.key).forward, listSource.forward);
+      assert.equal(await (id === 'parent' ? parent() : secondaryPane).locator('textarea').inputValue(), id === 'parent' ? parentDraft : secondaryDraft);
+      phase(`Sessions list reuse ${id}: require one stream`);
+      await oneStream(id);
+    }
+    assert(await secondaryPane.locator('textarea').evaluate(el => el === window.__secondaryComposer));
+    if (viewport.width < 768) {
+      phase('phone picker lists one row per live session and reveals the retained composer');
+      const beforePicker = await snapshot(page);
+      await page.getByRole('button', { name: /^Switch sessions and pages,/ }).click();
+      const picker = page.getByRole('dialog', { name: 'Sessions', exact: true });
+      const parentRow = picker.getByRole('button', { name: /(?:Workspace parent|Motion fixture parent)/ });
+      const secondaryRow = picker.getByRole('button', { name: 'Second document writer', exact: true });
+      assert.equal(await parentRow.count(), 1);
+      assert.equal(await secondaryRow.count(), 1);
+      await parentRow.click();
+      await waitView(page, 'session', turnTarget, 4);
+      const afterPicker = await snapshot(page);
+      assert.deepEqual(afterPicker.tiles.map(t => [t.key, t.columns, t.back, t.forward]), beforePicker.tiles.map(t => [t.key, t.columns, t.back, t.forward]));
+      assert.equal(await parent().locator('textarea').inputValue(), parentDraft);
+      await oneStream('parent');
+    }
+
+    phase('restore keeps the focused session target, companion and independent histories');
+    const firstTarget = { q: '', anchor: 'e20', open: [], at: null };
+    const focusedTarget = { q: '', anchor: 'e30', open: [], at: null };
+    const legacy = { tiles: [tile(2, [{ key: 3, view: { view: 'session', id: 'parent', target: firstTarget } },
+      { key: 7, view: { view: 'session_changes', id: 'parent' } }]),
+      tile(8, [{ key: 9, view: { view: 'session', id: 'parent', target: focusedTarget } }])], focus: 1, next: 10, full: false };
+    legacy.tiles[0].back = [[{ key: 20, view: { view: 'search', q: 'loser-back', kind: '', worker: '' } }]];
+    legacy.tiles[0].forward = [[{ key: 21, view: { view: 'search', q: 'loser-forward', kind: '', worker: '' } }]];
+    legacy.tiles[1].back = [[{ key: 22, view: { view: 'workers' } }]];
+    legacy.next = 23;
+    await seed(legacy, '/sessions/parent', { parent: parentDraft, secondary: secondaryDraft });
+    await waitView(page, 'session', focusedTarget, 2);
+    const focusedSession = await snapshot(page);
+    assert.deepEqual(sessionColumns(focusedSession).map(c => c.key), [9]);
+    assert.deepEqual(focusedSession.tiles[0].columns.map(c => c.key), [7], 'losing transcript leaves its Changes companion');
+    assert.deepEqual(focusedSession.tiles.map(t => [t.back, t.forward]), legacy.tiles.map(t => [t.back, t.forward]));
+    await page.locator('#col-9 [id="parent-e30"]').waitFor({ state: 'attached' });
+    assert.equal(await page.locator('#col-9 textarea').inputValue(), parentDraft);
+    await oneStream('parent');
+    assert.equal((await streamState()).filter(s => s.path.endsWith('/sessions/parent/stream')).length, 1, 'restore collapses losers before any duplicate Feed mounts');
+
+    phase('restore keeps the first session if focus is elsewhere; Home and Realms collapse too');
+    const historySession = tile(8, [{ key: 9, view: { view: 'session', id: 'parent', target: focusedTarget } }]);
+    historySession.back = [[{ key: 9, view: { view: 'session', id: 'parent', target: firstTarget } }]];
+    historySession.forward = [[{ key: 9, view: { view: 'session', id: 'parent', target: focusedTarget } }]];
+    const legacyHomes = { tiles: [tile(2, [{ key: 3, view: { view: 'session', id: 'parent', target: firstTarget } }]), historySession,
+      tile(10, [{ key: 11, view: { view: 'sessions' } }]), tile(12, [{ key: 13, view: { view: 'sessions' } }]),
+      tile(14, [{ key: 15, view: { view: 'realms' } }]), tile(16, [{ key: 17, view: { view: 'realms' } }])], focus: 2, next: 18, full: false };
+    await seed(legacyHomes, '/');
+    await waitView(page, 'sessions', undefined, 4);
+    const firstSession = await snapshot(page), historyShell = firstSession.tiles.find(t => t.key === 8);
+    assert.deepEqual(sessionColumns(firstSession).map(c => c.key), [3]);
+    assert.deepEqual(sessionColumns(firstSession)[0].view.target, firstTarget);
+    for (const view of ['sessions', 'realms']) assert.equal(liveColumns(firstSession).filter(c => c.view.view === view).length, 1);
+    assert(historyShell, 'duplicate-only tile retains its independent history');
+    assert.deepEqual(historyShell.columns, [], 'an already-live Home cannot become a phantom history-shell copy');
+    assert.deepEqual(historyShell.back, historySession.back);
+    assert.deepEqual(historyShell.forward, [...historySession.forward, historySession.columns]);
+    await press('2');
+    const shownShell = (await snapshot(page)).tiles.find(t => t.key === 8);
+    await press('[');
+    await waitView(page, 'session', firstTarget, 4);
+    assert.deepEqual((await snapshot(page)).tiles.find(t => t.key === 8), shownShell, 'Back reveals the surviving transcript without consuming source history');
+    assert.equal(await parent().locator('textarea').inputValue(), parentDraft);
+    await oneStream('parent');
+
+    phase('reload with a focused history-only tile releases initial loading');
+    const focusedShell = structuredClone(firstSession);
+    focusedShell.focus = focusedShell.tiles.findIndex(t => t.key === historyShell.key);
+    let initialGit;
+    await seed(focusedShell, '/', {}, () => {
+      // Subscribe after the previous app is gone, before this startup's
+      // request: a response from an older document cannot satisfy it.
+      if (viewport.width >= 768) initialGit = page.waitForResponse(response =>
+        new URL(response.url()).pathname.endsWith('/git/status') && response.request().method() === 'GET');
+    });
+    await page.getByText("This tile's pages are already open elsewhere.", { exact: false }).waitFor();
+    if (viewport.width >= 768) {
+      // Do not focus another tile: its visible transcript must mount once
+      // the empty focused tile releases the initial-load barrier.
+      await parent().locator('textarea').waitFor();
+      await oneStream('parent');
+      // Also require its deferred initial metadata to finish. Otherwise
+      // the next full-page seed can unload WebKit before fetch starts.
+      const response = await initialGit;
+      assert.equal(response.status(), 200, 'the visible transcript starts its initial git metadata');
+      assert.equal(await response.finished(), null, 'initial git metadata settles before the next fixture navigation');
+    }
+    const afterShellReload = await snapshot(page);
+    assert.equal(afterShellReload.tiles[afterShellReload.focus].key, historyShell.key);
+    assert.deepEqual(afterShellReload.tiles.find(t => t.key === historyShell.key), focusedShell.tiles[focusedShell.focus]);
+
+    for (const view of ['sessions', 'realms']) {
+      phase(`restore prefers the focused ${view} page without losing the other tile's companion/history`);
+      const pages = { tiles: [tile(2, [{ key: 3, view: { view } }, { key: 7, view: { view: 'workers' } }]),
+        tile(8, [{ key: 9, view: { view } }])], focus: 1, next: 10, full: false };
+      pages.tiles[0].back = [[{ key: 20, view: { view: 'search', q: `${view}-back`, kind: '', worker: '' } }]];
+      pages.tiles[0].forward = [[{ key: 21, view: { view: 'search', q: `${view}-forward`, kind: '', worker: '' } }]];
+      pages.next = 22;
+      await seed(pages, view === 'sessions' ? '/' : '/realms');
+      await waitView(page, view, undefined, 2);
+      const restoredPage = await snapshot(page);
+      assert.deepEqual(liveColumns(restoredPage).filter(c => c.view.view === view).map(c => c.key), [9]);
+      assert.deepEqual(restoredPage.tiles[0].columns.map(c => c.key), [7]);
+      assert.deepEqual(restoredPage.tiles.map(t => [t.back, t.forward]), pages.tiles.map(t => [t.back, t.forward]));
+    }
+
     // Seed a legacy document copy; new clicks can no longer create one.
-    const copies = structuredClone(sessionCopies);
+    // Keep a distinct second session, not the formerly intentional live copy.
+    const copies = layout();
+    copies.tiles.push(tile(10, [{ key: 11, view: { view: 'session', id: 'secondary' } }]));
     copies.tiles.splice(2, 0, tile(20, [{ key: 21, view: { view: 'docs', id: DOC, target: 'block.2' } }]));
     copies.next = 22;
     copies.focus = 0;
@@ -381,7 +650,8 @@ async function check(browser, origin, viewport, label, platform) {
     await waitView(page, 'docs', 'block.1', 3);
     const restored = await snapshot(page);
     assert.deepEqual(restored.tiles.map(t => t.key), keys.filter((_, i) => i !== 2), 'first doc copy survives; empty-history duplicate-only tile disappears');
-    assert.equal(restored.tiles.flatMap(t => t.columns).filter(c => c.view.view === 'session' && c.view.id === 'parent').length, 2, 'session copies are not collapsed');
+    assert.equal(sessionColumns(restored).length, 1);
+    assert.equal(sessionColumns(restored, 'secondary').length, 1, 'different sessions remain independent');
     phase('restore keeps focused doc copy and the losing copy companion');
     copies.focus = 2;
     await seed(copies, `/docs/${DOC}#block.1`);
@@ -432,6 +702,95 @@ async function check(browser, origin, viewport, label, platform) {
     assert.equal(afterDetachBack.tiles[afterDetachBack.focus].key, detachedKey);
     assert.deepEqual(afterDetachBack.tiles[1], detachedSource, 'the detached source history remains available');
 
+    phase('session detach hands off same-task text and attachments before the draft debounce');
+    const withSessionList = { tiles: [tile(2, [{ key: 7, view: { view: 'sessions' } },
+      { key: 3, view: { view: 'session', id: 'parent' } }])], focus: 0, next: 8, full: false };
+    withSessionList.tiles[0].cursor = 0; withSessionList.tiles[0].active = 7;
+    await seed(withSessionList, '/', { parent: parentDraft });
+    await page.locator('#col-7 textarea').waitFor();
+    await page.locator('#col-7 a[href$="/sessions/parent"]').first().click();
+    await parent().locator('[id="parent-e20"]').waitFor({ state: 'attached' });
+    await parent().locator('input[type="file"]').setInputFiles({ name: 'q10-draft.txt', mimeType: 'text/plain', buffer: Buffer.from('An unsent session attachment.') });
+    await parent().getByText('q10-draft.txt', { exact: true }).waitFor();
+    const draftListeners = await page.evaluate(() => window.__workspaceDraftListeners.length);
+    const composerListeners = await page.evaluate(() => CSS.supports('field-sizing', 'content') ? 2 : 3);
+    await page.locator('[data-tile-motion="2"]').getByRole('button', { name: 'Actions', exact: true }).click();
+    await page.getByRole('button', { name: 'Into its own tile', exact: true }).waitFor();
+    const freshDraft = 'Typed and detached in one task, before the 250ms text save.';
+    await page.evaluate(text => {
+      const input = document.querySelector('#col-3 textarea');
+      input.value = text;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      if (localStorage.getItem('c6.home.draft.parent') === text) throw new Error('fixture must exercise an unsaved draft');
+      [...document.querySelectorAll('button')].find(b => b.textContent.trim() === 'Into its own tile').click();
+    }, freshDraft);
+    await waitView(page, 'session', undefined, 2);
+    const movedSession = await snapshot(page), movedTile = movedSession.tiles[movedSession.focus];
+    assert.notEqual(movedTile.columns[0].key, 3, 'detach allocates a fresh session column');
+    assert.deepEqual(movedSession.tiles[0].columns.map(c => c.key), [7]);
+    assert.equal(sessionColumns(movedSession).length, 1);
+    const movedPane = page.locator(`#col-${movedTile.columns[0].key}`);
+    await movedPane.locator('textarea').waitFor();
+    assert.equal(await movedPane.locator('textarea').inputValue(), freshDraft, 'new composer must receive the fresh draft, not the last debounced storage value');
+    await movedPane.getByText('q10-draft.txt', { exact: true }).waitFor();
+    await oneStream('parent');
+    assert.equal(await page.evaluate(() => window.__workspaceDraftListeners.length), draftListeners, 'detach replaces, rather than leaks, draft lifecycle listeners');
+    await press('1');
+    const detachedSessionSource = (await snapshot(page)).tiles[0];
+    await press('[');
+    await waitView(page, 'session', undefined, 2);
+    assert.equal((await snapshot(page)).tiles[(await snapshot(page)).focus].key, movedTile.key);
+    assert.deepEqual((await snapshot(page)).tiles[0], detachedSessionSource, 'Back reveals the moved session without consuming source history');
+    if (viewport.width < 768) {
+      await page.getByRole('button', { name: /^Switch sessions and pages,/ }).click();
+      const picker = page.getByRole('dialog', { name: 'Sessions', exact: true });
+      await picker.locator('button[aria-current="page"]').locator('..').getByRole('button', { name: 'Close this session or page', exact: true }).click();
+      // This picker belongs to the removed tile's header, so closing its
+      // own row destroys the dialog along with that tile.
+      await picker.waitFor({ state: 'detached' });
+    } else {
+      await page.locator(`[data-tile-motion="${movedTile.key}"]`).getByRole('button', { name: 'Close this tile', exact: true }).click();
+    }
+    await waitView(page, 'sessions', undefined, 1);
+    await page.waitForFunction(() => window.__workspaceSockets.filter(s => s.path.endsWith('/sessions/parent/stream')).every(s => s.socket.readyState > 1 && !s.listeners.some(l => l.type === 'message')));
+    assert.equal(sessionColumns(await snapshot(page)).length, 0);
+    assert.equal(await page.evaluate(() => window.__workspaceDraftListeners.length), draftListeners - composerListeners, 'closing removes the draft lifecycle and fallback autosize visibility listeners');
+
+    phase('Changes companions keep explicit-copy behavior without copying the transcript');
+    await seed(layout(), '/sessions/parent');
+    for (const count of [3, 4]) {
+      await press('1');
+      await page.locator('[data-tile-motion="2"]').getByRole('button', { name: /Open session sheet/ }).click();
+      await page.getByRole('button', { name: 'Changes', exact: true }).last().click({ modifiers: [command] });
+      await waitView(page, 'session_changes', undefined, count);
+      const companions = await snapshot(page);
+      assert.equal(liveColumns(companions).filter(c => c.view.view === 'session_changes' && c.view.id === 'parent').length, count - 2);
+      assert.equal(sessionColumns(companions).length, 1);
+      await oneStream('parent');
+    }
+    const companionCopies = await snapshot(page);
+    await seed(companionCopies, '/sessions/parent/changes');
+    await waitView(page, 'session_changes', undefined, 4);
+    assert.equal(liveColumns(await snapshot(page)).filter(c => c.view.view === 'session_changes').length, 2, 'restore does not collapse companion copies');
+
+    phase('Back and Forward reveal an existing session target without consuming source history');
+    for (const direction of ['[', ']']) {
+      const saved = { tiles: [tile(2, [{ key: 3, view: { view: 'session', id: 'secondary' } }]),
+        tile(4, [{ key: 5, view: { view: 'session', id: 'parent', target: firstTarget } }])], focus: 0, next: 10, full: false };
+      saved.tiles[0][direction === '[' ? 'back' : 'forward'] = [[{ key: 9, view: { view: 'session', id: 'parent', target: focusedTarget } }]];
+      await seed(saved, '/sessions/secondary');
+      await page.locator('#col-3 textarea').waitFor();
+      const source = (await snapshot(page)).tiles[0];
+      await press(direction);
+      await waitView(page, 'session', focusedTarget, 2);
+      const after = await snapshot(page);
+      assert.deepEqual(after.tiles[0], source, 'session history collision leaves both source stacks intact');
+      assert.deepEqual(sessionColumns(after).map(c => c.key), [5]);
+      assert.equal(await page.locator('#col-5 textarea').inputValue(), freshDraft);
+      assert.equal(await page.locator('#col-3 textarea').inputValue(), secondaryDraft);
+      await oneStream('parent');
+    }
+
     phase('Back and Forward reuse an already-open ordinary page');
     for (const direction of ['[', ']']) {
       const saved = { tiles: [tile(2, [{ key: 3, view: { view: 'session', id: 'parent' } }]),
@@ -447,8 +806,8 @@ async function check(browser, origin, viewport, label, platform) {
     }
 
     phase('in-place search route reveals an existing destination instead of duplicating it');
-    const searches = { tiles: [tile(2, [{ key: 3, view: { view: 'search', q: 'alpha' } }]),
-      tile(4, [{ key: 5, view: { view: 'search', q: 'beta' } }])], focus: 0, next: 6, full: false };
+    const searches = { tiles: [tile(2, [{ key: 3, view: { view: 'search', q: 'alpha', kind: '', worker: '' } }]),
+      tile(4, [{ key: 5, view: { view: 'search', q: 'beta', kind: '', worker: '' } }])], focus: 0, next: 6, full: false };
     await seed(searches, '/search?q=alpha');
     const originalSearch = (await snapshot(page)).tiles[0];
     const query = page.locator('#col-3 input[type="search"]');
@@ -463,40 +822,77 @@ async function check(browser, origin, viewport, label, platform) {
     assert.deepEqual(replaced.tiles[0].back, originalSearch.back);
     assert.deepEqual(replaced.tiles[0].forward, originalSearch.forward);
 
-    if (viewport.width >= 1280) {
-      phase('Home New tile still creates independent launchers');
-      await seed(layout(), `/docs/${DOC}`);
-      for (const count of [3, 4]) {
+    phase('Home New tile requests Sessions once, then reveals the same live page');
+    await seed(layout(), `/docs/${DOC}`);
+    let homeOwner;
+    for (let i = 0; i < 3; i++) {
+      if (viewport.width < 768) {
+        await page.getByRole('button', { name: /^Switch sessions and pages,/ }).click();
+        await page.getByRole('dialog', { name: 'Sessions', exact: true }).getByRole('button', { name: /New session or page/ }).click();
+      } else {
         await page.getByRole('button', { name: 'Tile', exact: true }).click();
-        await waitView(page, 'sessions', undefined, count);
       }
-      const homes = await snapshot(page);
-      assert.equal(homes.tiles.filter(t => t.columns[0].view.view === 'sessions').length, 2);
-      await seed(homes, '/');
-      await waitView(page, 'sessions', undefined, 4);
+      await waitView(page, 'sessions', undefined, 3);
+      const homes = await snapshot(page), owner = homes.tiles[homes.focus];
+      assert.equal(liveColumns(homes).filter(c => c.view.view === 'sessions').length, 1);
+      if (homeOwner) assert.deepEqual([owner.key, owner.columns, owner.back, owner.forward], homeOwner, 'New tile reuses the existing launcher identity/history');
+      homeOwner = [owner.key, owner.columns, owner.back, owner.forward];
+      if (i < 2) await press('1');
+    }
+    const homes = await snapshot(page);
+    await seed(homes, '/');
+    await waitView(page, 'sessions', undefined, 3);
 
+    if (viewport.width >= 1280) {
       phase('drag/drop moves tile identities without copying any panes');
-      await seed(layout(), `/docs/${DOC}`);
-      const before = await snapshot(page);
-      const source = page.locator('[data-tile-motion="4"] [draggable="true"]');
-      const target = page.locator('[data-tile-motion="2"]');
-      // Drive the real HTML drag handlers with a real DataTransfer. Native
-      // pointer DnD support differs by engine; identity is the invariant.
-      const transfer = await page.evaluateHandle(() => new DataTransfer());
-      await source.dispatchEvent('dragstart', { dataTransfer: transfer });
-      const rect = await target.boundingBox();
-      const drop = { dataTransfer: transfer, clientX: rect.x + rect.width * .5, clientY: rect.y + rect.height * .9 };
-      await target.dispatchEvent('dragover', drop);
-      await target.dispatchEvent('drop', drop);
-      await source.dispatchEvent('dragend', { dataTransfer: transfer });
-      await settle(page);
-      const after = await snapshot(page);
-      assert.deepEqual(after.tiles.map(t => [t.key, t.columns, t.back, t.forward]), before.tiles.map(t => [t.key, t.columns, t.back, t.forward]));
-      assert.notDeepEqual(after.tiles.map(t => t.stack), before.tiles.map(t => t.stack), 'drop must actually move the document tile');
-      await transfer.dispose();
+      // Keep the existing document drag, and also move the session tile.
+      // Neither movement may create another Feed or discard a composer draft.
+      for (const [from, to] of [[4, 2], [2, 4]]) {
+        phase(`drag/drop tile ${from} onto ${to}: preserve keyed panes and live composer`);
+        await seed(layout(), `/docs/${DOC}`);
+        await parent().locator('textarea').waitFor();
+        await parent().locator('textarea').fill(parentDraft);
+        await parent().locator('textarea').evaluate(el => { window.__dragComposer = el; });
+        const before = await snapshot(page);
+        const source = page.locator(`[data-tile-motion="${from}"] [draggable="true"]`);
+        const target = page.locator(`[data-tile-motion="${to}"]`);
+        // Drive the real HTML drag handlers with a real DataTransfer. Native
+        // pointer DnD support differs by engine; identity is the invariant.
+        const transfer = await page.evaluateHandle(() => new DataTransfer());
+        await source.dispatchEvent('dragstart', { dataTransfer: transfer });
+        const rect = await target.boundingBox();
+        const drop = { dataTransfer: transfer, clientX: rect.x + rect.width * .5, clientY: rect.y + rect.height * .9 };
+        await target.dispatchEvent('dragover', drop);
+        await target.dispatchEvent('drop', drop);
+        await source.dispatchEvent('dragend', { dataTransfer: transfer });
+        await settle(page);
+        const after = await snapshot(page);
+        // Above/below drops intentionally reorder tiles. Compare each
+        // tile's identity/history by key, independently of its placement.
+        const identities = saved => saved.tiles.map(t => [t.key, t.columns, t.back, t.forward]).sort((a, b) => a[0] - b[0]);
+        assert.deepEqual(identities(after), identities(before));
+        const stacks = saved => saved.tiles.map(t => [t.key, t.stack]).sort((a, b) => a[0] - b[0]);
+        assert.notDeepEqual(stacks(after), stacks(before), 'drop must actually move the tile between stacks');
+        assert.equal(sessionColumns(after).length, 1);
+        assert(await parent().locator('textarea').evaluate(el => el === window.__dragComposer), 'drag keeps the live composer DOM');
+        assert.equal(await parent().locator('textarea').inputValue(), parentDraft);
+        await oneStream('parent');
+        await transfer.dispose();
+      }
     }
     assert.deepEqual(f.errors, [], `${label}: browser errors`);
     console.log(`PASS workspace-open ${label}`);
+  } catch (error) {
+    if (f) {
+      console.error(`FAIL during ${f.phase}: ${error.message}`);
+      console.error('WORKSPACE FAILURE DIAGNOSTICS', JSON.stringify(await f.page.evaluate(key => ({
+        url: location.href, layout: JSON.parse(localStorage.getItem(key)),
+        links: Array.from(document.querySelectorAll('[data-pane-motion] a[href]'), a => ({ href: a.getAttribute('href'), text: a.textContent })),
+        sockets: window.__workspaceSockets?.map(({ socket, path, listeners }) => ({ path, state: socket.readyState, messages: listeners.filter(l => l.type === 'message').length })),
+      }), KEY).catch(diagnostic => ({ error: diagnostic.message }))));
+      console.error('RECENT REQUESTS', JSON.stringify(f.requests.slice(-25)));
+    }
+    throw error;
   } finally { await f?.context?.close(); }
 }
 

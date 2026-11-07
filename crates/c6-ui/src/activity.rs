@@ -210,7 +210,11 @@ fn MinimizedItem(key: u64, n: usize, views: Vec<View>) -> impl IntoView {
     let ws = use_workspace();
     let live = api::live();
     let views = StoredValue::new(views);
-    let label = move || views.with_value(|vs| vs.iter().map(|v| v.label(&live)).collect::<Vec<_>>().join("  ›  "));
+    let label = move || {
+        views.with_value(|vs| {
+            if vs.is_empty() { "History".to_owned() } else { vs.iter().map(|v| v.label(&live)).collect::<Vec<_>>().join("  ›  ") }
+        })
+    };
     let session = Memo::new(move |_| {
         views.with_value(|vs| match vs.last() {
             Some(View::Session { id, .. }) => live.sessions.with(|ss| ss.iter().find(|s| &s.id == id).cloned()),
@@ -274,7 +278,7 @@ fn DockItem(s: Session, t: Tracked) -> impl IntoView {
         <div class="group flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-zinc-200/60 dark:hover:bg-zinc-800/60">
             <span class="h-6 w-1 shrink-0 rounded-sm" style=crate::marks::fill(&crate::marks::of(&s)) title="Its mark"></span>
             <span class=dot(s.display_status(), t)></span>
-            <Go to=View::session(s.id.clone()) class="min-w-0 flex-1" title="Open (⌘-click: new tile)">
+            <Go to=View::session(s.id.clone()) class="min-w-0 flex-1" title="Open (⌘/Ctrl-click: new tile if not already open)">
                 <div class="flex items-center gap-1.5">
                     <span class="min-w-0 flex-1 truncate text-sm">{s.title.clone()}</span>
                     <span class="flex shrink-0 items-center gap-0.5"><crate::aspects::AspectGlyphs s=s.clone() /></span>
@@ -502,7 +506,7 @@ fn MissionCard(id: String) -> impl IntoView {
         <div class="flex h-48 min-w-0 flex-col rounded-lg border @sm/view:h-64 border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
             <div class="group flex flex-wrap items-center gap-2 border-b border-zinc-100 px-3 py-2 dark:border-zinc-800">
                 {move || session.get().map(|s| view! { <span class=dot(s.display_status(), tracked())></span> })}
-                <Go to=View::session(open_id.clone()) class="min-w-0 flex-1 basis-1/2 truncate text-sm font-medium hover:underline" title="Open (⌘-click: new tile)">
+                <Go to=View::session(open_id.clone()) class="min-w-0 flex-1 basis-1/2 truncate text-sm font-medium hover:underline" title="Open (⌘/Ctrl-click: new tile if not already open)">
                     {move || session.get().map(|s| s.title).unwrap_or_else(|| "Session".into())}
                 </Go>
                 <span class="max-w-full truncate text-[11px] text-muted">
@@ -606,7 +610,7 @@ fn SessionsSheet(close: Callback<()>, open: RwSignal<bool>) -> impl IntoView {
                             View::Session { id, .. } => Some(id.clone()),
                             _ => None,
                         }),
-                        label: view.map(|v| v.label(&live)).unwrap_or_default(),
+                        label: view.map(|v| v.label(&live)).unwrap_or_else(|| "History".to_owned()),
                         focused: i == l.focus,
                         minimized: t.minimized,
                     }

@@ -210,7 +210,7 @@ fn ResultCard(res: SearchResult, q: String) -> impl IntoView {
         <div class="rounded-lg border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
             <div class="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-0.5 border-b border-zinc-100 px-4 py-2 dark:border-zinc-800">
                 <div class="min-w-0 truncate">
-                    <Go to=title_view class="font-medium hover:underline" title="Open beside the results (⌘-click: new tile)">{s.title.clone()}</Go>
+                    <Go to=title_view class="font-medium hover:underline" title="Open beside the results (⌘/Ctrl-click: new tile if not already open)">{s.title.clone()}</Go>
                     {parent.map(|p| view! { <span class="ml-2 text-xs text-muted">{format!("in “{p}”")}</span> })}
                 </div>
                 <div class="flex shrink-0 items-center gap-2 text-xs text-muted">
@@ -231,7 +231,7 @@ fn ResultCard(res: SearchResult, q: String) -> impl IntoView {
 #[component]
 fn HitRow(h: SearchHit, to: View) -> impl IntoView {
     view! {
-        <Go to class="block px-4 py-2 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-800/60" title="Open beside the results (⌘-click: new tile)">
+        <Go to class="block px-4 py-2 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-800/60" title="Open beside the results (⌘/Ctrl-click: new tile if not already open)">
             <span class="mr-2 inline-block rounded bg-zinc-100 px-1.5 text-[11px] text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400">{kind_label(&h.kind).to_owned()}</span>
             <span class=if matches!(h.kind.as_str(), "tool_call" | "tool_result") { "font-mono text-xs text-zinc-700 dark:text-zinc-300" } else { "text-zinc-700 dark:text-zinc-300" }>
                 {snippet(h.snippet)}

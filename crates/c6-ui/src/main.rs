@@ -264,7 +264,7 @@ fn DesktopHeader(counts: Memo<(usize, usize)>) -> impl IntoView {
             {(!console).then(|| view! { <HeaderItem name="search" priority=105><search::SearchBox /></HeaderItem> })}
             <HeaderItem name="tile" priority=15>
                 <button class="rounded-md px-2 py-1 text-xs text-muted hover:bg-zinc-200/60 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
-                    title=move || format!("New tile (or ⌘-click a link): {} open · ⌘1–9 switch tiles · ⌘[ ⌘] back and forward", ws.layout.with(|l| l.tiles.len()))
+                    title=move || format!("Open Home starter (or reveal it): {} tiles open · ⌘1–9 switch tiles · ⌘[ ⌘] back and forward", ws.layout.with(|l| l.tiles.len()))
                     on:click=move |_| ws.new_tile()>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" Tile"</button>
             </HeaderItem>
             {(!console).then(|| view! { <span data-header-fixed class="shrink-0"><notify::NotifyToggle /></span> })}

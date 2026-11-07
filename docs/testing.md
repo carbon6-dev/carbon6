@@ -1054,21 +1054,27 @@ pane, restore its tile, and reveal it even if another tile fills the workspace.
 If explicit live copies exist, the origin tile wins, then the focused tile,
 then the first matching tile in saved order. `NewTile` (⌘-click on Mac,
 Ctrl-click elsewhere) creates a new tile only for a destination not already
-open, except sessions and their companion panes, which retain explicit copies.
+open, except explicit session companion panes, which retain copies. Sessions
+themselves always reveal their existing transcript, including from mentions,
+lists and the phone picker; companion destinations remain distinct.
 Ordinary “New tile” link actions use `OwnTile`; the pane's “Into its own tile”
-action detaches its existing pane, without copying it. The blank Home command
-still makes an independent launcher. Opening a
+action detaches its existing pane, without copying it. Home's New tile command
+requests the Sessions starter and reveals it if already live. Sessions and
+Realms starters each have only one live copy, also from an empty workspace. Opening a
 destination found only in history does not steal or rewrite that history entry.
 
 Saved-layout restore collapses current single-copy page duplicates (including
-Docs indexes, but not session/companion copies or explicit Home launchers),
+Docs indexes, sessions, Sessions and Realms starters, but not companion copies),
 retaining the focused copy/active pane or the first in saved order, with its
 exact reading target and key. Only duplicate single-copy panes are
 removed; their companion panes and history stacks stay. A duplicate-only tile
 without history disappears. One with history traverses Back, then Forward, to
 its nearest useful page, preserving skipped snapshots and the opposite stack.
-If all its history is already-open pages, a fresh Home pane retains both stacks
-and the outgoing page in Forward. This may retain an extra navigation tile:
+If all its history is already-open pages, Home retains both stacks and the
+outgoing page in Forward, provided Home is not already live. Otherwise a
+labelled history-only tile retains those stacks without mounting any page.
+Back/Forward reveals a live destination or mounts it after its owner closes.
+This may retain an extra navigation tile:
 deleting it or grafting its independent history onto the winner would lose or
 change navigation. Restore is idempotent and makes no rendering-to-HTML calls.
 
@@ -1098,7 +1104,9 @@ companion elsewhere in `open_after`.
 
 Session turn targets and document block targets reuse the destination and
 record target changes in the destination tile's Back/Forward history, keeping
-pane keys. Untargeted links only focus: they do not reset the reading target,
+pane keys. A session target deliberately remounts its transcript owner to
+revisit the turn; header controls and menus are keyed to that registration,
+and queued old layout effects tolerate its disposal. Untargeted links only focus: they do not reset the reading target,
 add history, or discard Forward. Documents accept `/docs/<id>#<block>` and
 `/docs/<id>?block=<block>` (a nonempty hash wins); the address bar uses the hash.
 The same targets work on `doc:<id>` Markdown links. In-app links retain their
@@ -1109,7 +1117,7 @@ the same target again explicitly revisits it; focus alone does not.
 
 Run `cargo test -p c6-ui workspace::tests` for the real pure `Layout::open`
 path (every view and opening mode, either pane, minimize/maximize, duplicates,
-targets, history and legacy saved Docs). `cargo test -p c6-ui` also covers
+targets, history and legacy saved documents, sessions and starters). `cargo test -p c6-ui` also covers
 Markdown target preservation and document tab/slide reveal selection.
 
 After building the final combined UI **once**, run:
@@ -1123,11 +1131,16 @@ launcher, session/live fixtures and bounded condition waits. It checks desktop
 and 320×568: actual doc links/mentions, links inside a document, query-targeted
 tab selection, incoming session-created documents, pane key/DOM/editor identity,
 target Back/Forward, minimized docs under a maximized session, modifier reuse
-of open docs/pages and new tiles for unopened destinations, unchanged explicit
-session copies, focused/first duplicate collapse on restore, retained companion
+of open documents/sessions/pages and new tiles for unopened destinations,
+explicit companion copies, focused/first duplicate collapse on restore, retained companion
 panes and history-only navigation shells, pane detaching, Back/Forward and
 in-place route collisions, Home's New tile, and real drag/drop without copying
-panes. Both `MacIntel` (⌘-click) and `Linux x86_64` (Ctrl-click) browser platform
+panes. Session cases check independent per-session composer drafts, stream
+cleanup and no transient duplicate transcript mount during restore. Pop-up
+bookkeeping holds weak owners: a closed dismiss effect or an open menu must
+not retain a departed transcript's stream, timers or draft listeners. A focused
+history-only tile also releases initial loading after reload. Both
+`MacIntel` (⌘-click) and `Linux x86_64` (Ctrl-click) browser platform
 identities are tested; native Mac Ctrl-click remains a context click.
 Set `VIEWPORT=desktop|narrow` or `PLATFORM=MacIntel|Linux x86_64` to focus a case.
 The draft-retention
@@ -1149,7 +1162,8 @@ Search, and attention all reach the shared destination policy. “Used in” ope
 the referring Work/Project through `Go`, not another doc. The sessions hover
 “New tile”, new-session dialog, and work resume now use `OwnTile`; genuine
 modifier clicks and session companion modifiers retain `NewTile`. The workspace
-blank-tile command intentionally creates a fresh Home. Workspace drag/drop only
+blank-tile command opens or reveals its one Home starter (Sessions, or Realms
+in the console). Workspace drag/drop only
 moves existing tiles; there is no document `text/uri-list` drop opener to patch.
 
 `ONLY=sessionTarget` isolates session query/turn targets, target Back/Forward,

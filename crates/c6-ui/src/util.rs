@@ -568,7 +568,7 @@ type Hook = wasm_bindgen::closure::Closure<dyn FnMut(web_sys::Event)>;
 /// away.
 struct Up {
     id: u64,
-    owner: Option<Owner>,
+    owner: Option<leptos::reactive::owner::WeakOwner>,
     put_away: PutAway,
 }
 
@@ -687,7 +687,10 @@ fn pop_up(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static
     let key = format!("pop{id}");
     let mine = format!("[data-pop=\"{key}\"]");
     let marked = key.clone();
-    let owner = Owner::current();
+    // The dismiss effect and SHOWN registry outlive individual renders.
+    // A strong owner here creates a cycle that prevents pane cleanup,
+    // leaving its old transcript stream and draft listeners alive.
+    let owner = Owner::current().map(|o| o.downgrade());
     let hooks = StoredValue::new_local(None::<Dismiss>);
     Effect::new(move || {
         if !shown() {
@@ -703,7 +706,14 @@ fn pop_up(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static
             let mut s = s.borrow_mut();
             // Within it as components go, or on the page (a drop-down in a
             // panel the same component pops up).
-            let holds = |x: &Up| owner.as_ref().zip(x.owner.as_ref()).is_some_and(|(o, of)| within(o, of)) || inside(&marked, x.id);
+            let holds = |x: &Up| {
+                owner
+                    .as_ref()
+                    .and_then(|o| o.upgrade())
+                    .zip(x.owner.as_ref().and_then(|o| o.upgrade()))
+                    .is_some_and(|(o, of)| within(&o, &of))
+                    || inside(&marked, x.id)
+            };
             let (stay, gone) = opening(std::mem::take(&mut *s), holds);
             *s = stay;
             s.push(Up { id, owner: owner.clone(), put_away: std::rc::Rc::new(close.clone()) });
@@ -1025,6 +1035,20 @@ mod tests {
     #[test]
     fn its_opener_carries_its_mark_or_is_its_summary() {
         assert_eq!(opener_selector("pop3"), ":is(button, summary, input, [role=button])[data-pop=\"pop3\"], [data-pop=\"pop3\"] > summary");
+    }
+
+    #[test]
+    fn popup_registry_does_not_keep_a_departed_component_alive() {
+        let owner = Owner::new();
+        let cleaned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        owner.with({
+            let cleaned = cleaned.clone();
+            move || on_cleanup(move || cleaned.store(true, std::sync::atomic::Ordering::SeqCst))
+        });
+        let shown = Up { id: 1, owner: Some(owner.downgrade()), put_away: std::rc::Rc::new(|| {}) };
+        drop(owner);
+        assert!(cleaned.load(std::sync::atomic::Ordering::SeqCst), "popup bookkeeping must not block component cleanup");
+        assert!(shown.owner.unwrap().upgrade().is_none());
     }
 
     #[test]
