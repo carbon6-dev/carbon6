@@ -12,6 +12,15 @@ use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
 async fn a_message_sent_mid_turn_is_with_the_agent() {
+    mid_turn_input(false).await;
+}
+
+#[tokio::test]
+async fn api_queue_edits_replace_the_original_browser_origin() {
+    mid_turn_input(true).await;
+}
+
+async fn mid_turn_input(edit_via_api: bool) {
     let mock = MockLlm::start().await;
     let (head_dir, state, project) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let head = c6_head::start(HeadConfig {
@@ -61,13 +70,39 @@ async fn a_message_sent_mid_turn_is_with_the_agent() {
     eventually("the turn to be running", async || (mock.requests().len() == 1).then_some(())).await;
 
     // Sent now: the agent has it, and reads it at its next step.
-    http.post(format!("{api}/sessions/{id}/messages")).json(&json!({"text": "second"})).send().await.unwrap();
+    let login = head.state.store.create_login_link().await.unwrap();
+    let signed_in = http.post(format!("{api}/auth/link")).json(&json!({"token": login})).send().await.unwrap();
+    let cookie = signed_in.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap();
+    let r = http
+        .post(format!("{api}/sessions/{id}/messages"))
+        .header(reqwest::header::COOKIE, cookie)
+        .header("x-c6-realm", "home")
+        .json(&json!({"text": "second"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
     let queued = eventually("the message to be with the agent", async || {
         let d = detail(&id).await?;
         (d.queued.len() == 1 && d.queued[0].with_agent).then_some(d.queued)
     })
     .await;
     assert_eq!(queued[0].text, "second");
+    let expected = if edit_via_api {
+        let token = head.state.store.create_api_token("queue-editor", None).await.unwrap().token.unwrap();
+        let r = http
+            .post(format!("{api}/catalog/call"))
+            .bearer_auth(&token)
+            .json(&json!({"op": "sessions.queue.edit", "input": {"id": id, "command_id": queued[0].command_id,
+                "body": {"text": "Don't do that: edited by API", "human_origin": true}}}))
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+        "Don't do that: edited by API"
+    } else {
+        "second"
+    };
 
     // The step ends: the agent takes it, and the queue empties.
     gate.notify_one();
@@ -77,7 +112,17 @@ async fn a_message_sent_mid_turn_is_with_the_agent() {
     })
     .await;
     assert_eq!(mock.requests().len(), 2);
-    assert!(mock.requests()[1]["messages"].to_string().contains("second"), "it joined the turn");
+    assert!(mock.requests()[1]["messages"].to_string().contains(expected), "it joined the turn");
+    let events = worker.journal.events_after(&id, 0, u32::MAX).await.unwrap();
+    let input = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            Some(c6_proto::session_event::Kind::User(u)) if u.text == expected => Some(u),
+            _ => None,
+        })
+        .expect("the consumed input is logged");
+    assert_eq!(input.human_origin, !edit_via_api);
+    assert_eq!(input.api_origin.as_ref().map(|o| o.token_name.as_str()), edit_via_api.then_some("queue-editor"));
     stop.cancel();
 }
 

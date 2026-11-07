@@ -162,6 +162,12 @@ Built 2026-11-03 (design: carbon6 doc "Claude Code sessions: default-deny tool w
 
 ## 5. Notices that are never lost
 
+### Input provenance in subagent reports
+
+- A subagent's unasked report names the input's known source: a session message, its own resume, an API caller, or a signed-in browser's human input. API input names only the token's display name (`api_origin`), never its secret. Catalog/CLI `sessions.send` and direct HTTP sends retain the same provenance.
+- Only the server's authenticated browser route sets `UserInput.human_origin` (field 16); workers retain it as `UserMessage.human_origin` (13), including edits to queued input. API request bodies and agents cannot claim human origin. Authority to act on your behalf is not evidence that you typed the input.
+- Unknown and older input stays neutral in the updated reporters: **Sent to subagent …**, not **The user messaged …**. No history migration guesses who sent an old message. The additive fields work head-first during an update: old workers ignore the new input field, so a new head treats their events as unknown for remote reports and Watchers; updated workers preserve the bit, and an older head's input remains unknown. An old worker's own preformatted local report keeps that binary's old wording until the worker is upgraded. API provenance, when present, takes precedence over a human bit.
+
 ### Record before deliver
 
 - When a notice is queued for a session, its actor first appends `NoticeQueued{command_id, text, command, wake}` to that session's log (`Actor::notice`). Then it delivers it: into the inbox, or held (`deliver_notice`). The head stores the event but leaves it out of the transcript, which shows the notice when a turn takes it.

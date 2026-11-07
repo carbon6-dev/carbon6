@@ -1966,7 +1966,9 @@ async fn send_message(
     // You answered: you'd seen how it stood (docs/work.md §3), not the
     // turn this starts.
     let at = now_ms();
-    let queued = crate::sessions::send_input_as(&st, &id, &req, uuid::Uuid::now_v7().to_string(), "", caller.api_origin()).await?;
+    let queued =
+        crate::sessions::send_input_as(&st, &id, &req, uuid::Uuid::now_v7().to_string(), "", caller.api_origin(), caller.human_origin())
+            .await?;
     // The message is queued: failing to note this mustn't make the send
     // look failed (and get it sent twice).
     if let Err(e) = crate::work::seen_session(&st, &id, at).await {
@@ -3168,10 +3170,11 @@ async fn dismiss_rejected(State(st): State<Arc<HeadState>>, Path(id): Path<Strin
 
 async fn edit_queued(
     State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
     Path((id, command_id)): Path<(String, String)>,
     Json(req): Json<api::EditQueuedInput>,
 ) -> ApiResult<Json<api::QueuedInput>> {
-    Ok(Json(crate::sessions::edit_queued(&st, &id, &command_id, &req.text).await?))
+    Ok(Json(crate::sessions::edit_queued(&st, &id, &command_id, &req.text, &caller).await?))
 }
 
 async fn cancel_queued(State(st): State<Arc<HeadState>>, Path((id, command_id)): Path<(String, String)>) -> ApiResult<StatusCode> {
@@ -4401,12 +4404,16 @@ async fn get_openapi(State(st): State<Arc<HeadState>>) -> Json<serde_json::Value
 }
 
 /// Runs an operation (the CLI): destructive ones need `confirmed`.
-async fn call_catalog(State(st): State<Arc<HeadState>>, Json(c): Json<api::CatalogCall>) -> ApiResult<Json<serde_json::Value>> {
+async fn call_catalog(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Json(c): Json<api::CatalogCall>,
+) -> ApiResult<Json<serde_json::Value>> {
     let op = crate::catalog::find(&c.op).ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, format!("no operation {:?}", c.op)))?;
     if op.effect == crate::catalog::Effect::Destructive && !c.confirmed {
         return Err(ApiErr(StatusCode::CONFLICT, format!("{} is destructive ({}); confirm to run it", op.name, op.summary)));
     }
-    Ok(Json(crate::assistant::execute(&st, op, c.input, "you", None).await?))
+    Ok(Json(crate::assistant::execute_for_caller(&st, op, c.input, "you", caller).await?))
 }
 
 /// Your answers to the assistant's question (a form).

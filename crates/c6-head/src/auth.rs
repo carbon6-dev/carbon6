@@ -403,12 +403,18 @@ pub async fn require(State(st): State<Arc<HeadState>>, mut req: Request, next: N
     // The head calling itself (the assistant, as you), within the realm
     // its conversation works in: there, as that realm's token would.
     if let Some(call) = req.extensions().get::<crate::assistant::InternalCall>().cloned() {
-        if let Some(realm) = call.realm {
-            let caller = Caller { console: call.console, ..Caller::in_realm(&realm) };
-            if let Err((status, error)) = crate::realms::admit(&st, &caller, req.method(), req.uri().path()).await {
-                return (status, Json(api::ApiError { error })).into_response();
-            }
-            req.extensions_mut().insert(caller);
+        let caller = call.caller;
+        // Forwarding a token through the catalog is not browser sign-in.
+        // Keep the same account-management restriction as direct API calls.
+        if caller.api_token_name.is_some() && req.uri().path().starts_with("/api/v1/auth/") && !PUBLIC.contains(&req.uri().path()) {
+            return (StatusCode::UNAUTHORIZED, Json(api::ApiError { error: "invalid API token".into() })).into_response();
+        }
+        if let Err((status, error)) = crate::realms::admit(&st, &caller, req.method(), req.uri().path()).await {
+            return (status, Json(api::ApiError { error })).into_response();
+        }
+        let realm = caller.realm.clone();
+        req.extensions_mut().insert(caller);
+        if let Some(realm) = realm {
             // Its settings are the realm's own, as a realm's page's are.
             return crate::store::SETTINGS_REALM.scope(realm, next.run(req)).await;
         }
@@ -456,12 +462,6 @@ pub async fn require(State(st): State<Arc<HeadState>>, mut req: Request, next: N
         }
     }
     let place = browser_place(&req);
-    if !st.auth.required {
-        return match place {
-            Some(place) => in_place(&st, place, req, next).await,
-            None => next.run(req).await,
-        };
-    }
     let ok = match cookie_token(req.headers()) {
         Some(t) => st.store.check_auth_session(&t).await.unwrap_or_else(|e| {
             tracing::warn!("checking session: {e:#}");
@@ -469,11 +469,17 @@ pub async fn require(State(st): State<Arc<HeadState>>, mut req: Request, next: N
         }),
         None => false,
     };
+    if !st.auth.required {
+        return match place {
+            Some(place) => in_place(&st, place, ok, req, next).await,
+            None => next.run(req).await,
+        };
+    }
     if !ok {
         return (StatusCode::UNAUTHORIZED, Json(api::ApiError { error: "sign in required".into() })).into_response();
     }
     match place {
-        Some(place) => in_place(&st, place, req, next).await,
+        Some(place) => in_place(&st, place, ok, req, next).await,
         // A page that doesn't say where it is gets nothing but this
         // browser's own business: a mistake fails closed.
         None if crate::catalog::route_scope(req.method().as_str(), &path) == crate::catalog::Scope::Device => next.run(req).await,
@@ -498,10 +504,10 @@ fn browser_place(req: &Request) -> Option<String> {
 /// Runs a browser's request where it comes from: the console as root, a
 /// realm's page as that realm (like its API token), with its settings
 /// lists being the realm's own.
-async fn in_place(st: &Arc<HeadState>, place: String, mut req: Request, next: Next) -> Response {
+async fn in_place(st: &Arc<HeadState>, place: String, authenticated_browser: bool, mut req: Request, next: Next) -> Response {
     use crate::realms::Caller;
     if place == ADMIN_PLACE {
-        req.extensions_mut().insert(Caller { browser: true, ..Caller::root() });
+        req.extensions_mut().insert(Caller { browser: true, authenticated_browser, ..Caller::root() });
         return next.run(req).await;
     }
     let refuse = |status: StatusCode, error: String| (status, Json(api::ApiError { error })).into_response();
@@ -510,7 +516,7 @@ async fn in_place(st: &Arc<HeadState>, place: String, mut req: Request, next: Ne
         Ok(_) => return refuse(StatusCode::BAD_REQUEST, format!("no realm {place:?}")),
         Err(e) => return refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
-    let caller = Caller { browser: true, ..Caller::in_realm(&place) };
+    let caller = Caller { browser: true, authenticated_browser, ..Caller::in_realm(&place) };
     if let Err((status, error)) = crate::realms::admit(st, &caller, req.method(), req.uri().path()).await {
         return refuse(status, error);
     }

@@ -51,7 +51,7 @@ pub async fn for_session(st: &HeadState, parent: &SessionRow, what: &str, params
             if !running {
                 st.store.add_remote_delegation(&id, &child.id, &parent.id, &call_id).await?;
             }
-            if let Err(e) = crate::sessions::send_input_as(st, &child.id, &req, id.clone(), &call_id, None).await {
+            if let Err(e) = crate::sessions::send_input_as(st, &child.id, &req, id.clone(), &call_id, None, false).await {
                 st.store.delegation_reported(&id).await?;
                 return Err(e);
             }
@@ -143,6 +143,7 @@ async fn relay(st: &HeadState, child_id: &str, end_seq: u64, reason: i32) -> any
                         &u.from_session_id,
                         &u.from_title,
                         u.api_origin.as_ref(),
+                        u.human_origin,
                     ));
                 }
             }

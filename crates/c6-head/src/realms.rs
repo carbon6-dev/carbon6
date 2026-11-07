@@ -24,6 +24,9 @@ pub struct Caller {
     /// Your browser (a realm's page or the console), not a token: it may
     /// learn what waits in other realms (docs/realms-ux.md §6).
     pub browser: bool,
+    /// A verified browser sign-in, not just a page header with sign-in off.
+    /// Only authentication middleware sets this; agent calls never do.
+    pub authenticated_browser: bool,
     /// The console's assistant, acting in this realm with your approval
     /// (docs/assistant.md §Realms): what it writes is the console's.
     pub console: bool,
@@ -34,15 +37,19 @@ pub struct Caller {
 
 impl Caller {
     pub fn root() -> Self {
-        Self { realm: None, browser: false, console: false, api_token_name: None }
+        Self { realm: None, browser: false, authenticated_browser: false, console: false, api_token_name: None }
     }
 
     pub fn in_realm(realm: &str) -> Self {
-        Self { realm: Some(realm.to_owned()), browser: false, console: false, api_token_name: None }
+        Self { realm: Some(realm.to_owned()), browser: false, authenticated_browser: false, console: false, api_token_name: None }
     }
 
     pub fn api_origin(&self) -> Option<c6_proto::ApiMessageOrigin> {
         self.api_token_name.as_ref().map(|name| c6_proto::ApiMessageOrigin { token_name: name.clone() })
+    }
+
+    pub fn human_origin(&self) -> bool {
+        self.browser && self.authenticated_browser && self.api_token_name.is_none()
     }
 
     /// Whose decisions and the like a caller lists: its realm's; the

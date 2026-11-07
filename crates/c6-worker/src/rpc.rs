@@ -189,6 +189,7 @@ async fn session_queue_op(worker: &Arc<Worker>, p: &Value) -> anyhow::Result<Val
                 command: input.command,
                 wake: input.wake,
                 api_origin: input.api_origin,
+                human_origin: input.human_origin,
                 ..Default::default()
             })
         }

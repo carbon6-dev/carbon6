@@ -1017,7 +1017,7 @@ pub async fn effective_config(st: &HeadState, session_id: &str) -> anyhow::Resul
 pub(crate) const ARCHIVED_INPUT_MESSAGE: &str = "this session is archived; unarchive it before sending a message";
 
 pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage) -> anyhow::Result<api::QueuedInput> {
-    send_input_as(st, session_id, req, Uuid::now_v7().to_string(), "", None).await
+    send_input_as(st, session_id, req, Uuid::now_v7().to_string(), "", None, false).await
 }
 
 /// A button sends your message as typed, marked so Watchers do not mistake
@@ -1047,8 +1047,16 @@ pub async fn send_input_as(
     id: String,
     delegated_by: &str,
     api_origin: Option<c6_proto::ApiMessageOrigin>,
+    human_origin: bool,
 ) -> anyhow::Result<api::QueuedInput> {
-    send_input_with(st, session_id, req, id, UserInput { delegated_by: delegated_by.to_owned(), api_origin, ..Default::default() }).await
+    send_input_with(
+        st,
+        session_id,
+        req,
+        id,
+        UserInput { delegated_by: delegated_by.to_owned(), api_origin, human_origin, ..Default::default() },
+    )
+    .await
 }
 
 /// What the model gets for `text` in `session`: the text with what it
@@ -1175,7 +1183,13 @@ async fn pending_of(st: &HeadState, session_id: &str, command_id: &str) -> anyho
 /// and memex attachments that go with it). 409 once it is in flight, 409
 /// when a connected worker cannot do it (an older one), 503 while the
 /// worker cannot be reached (the row stays as it is).
-pub async fn edit_queued(st: &HeadState, session_id: &str, command_id: &str, text: &str) -> anyhow::Result<api::QueuedInput> {
+pub async fn edit_queued(
+    st: &HeadState,
+    session_id: &str,
+    command_id: &str,
+    text: &str,
+    caller: &crate::realms::Caller,
+) -> anyhow::Result<api::QueuedInput> {
     let text = text.trim();
     if text.is_empty() {
         return Err(bad_request("message is empty"));
@@ -1195,6 +1209,9 @@ pub async fn edit_queued(st: &HeadState, session_id: &str, command_id: &str, tex
         // again below. A command was the old text's too.
         let mut input = input;
         input.text = text.to_owned();
+        // This caller wrote the replacement, not the original sender.
+        input.api_origin = caller.api_origin();
+        input.human_origin = caller.human_origin();
         input.attachments.retain(|a| !a.name.starts_with("@memex:"));
         input.command.clear();
         input.command_candidates_json.clear();

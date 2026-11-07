@@ -324,7 +324,9 @@ message UserMessage {
   uint32 hops = 11;
   // Present for HTTP API input; only the token's display name, never its secret.
   ApiMessageOrigin api_origin = 12;
-  // Field 13 belongs to human-origin attribution.
+  // Known human input: set only by the head for a signed-in browser.
+  // Absent/false in old records and internal input means unknown, not human.
+  bool human_origin = 13;
   TaskNotice task_notice = 14;
 }
 
@@ -818,6 +820,11 @@ message UserInput {
   // @-mentions (chat threads, mail, events, projects, docs, work), read by
   // the head within the session's knowledge scope. The log shows `text`.
   string prompt = 16;
+  // Set only by the head for a signed-in browser, retained in UserMessage.
+  // Old heads/workers omit it; unknown input must not be called human.
+  // Tag 16 was used for this bool only in deployed carbon6 fork builds;
+  // stored-command decoding upgrades those bytes before protobuf decoding.
+  bool human_origin = 18;
 }
 
 message Interrupt {

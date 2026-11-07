@@ -697,7 +697,8 @@ pub(crate) fn report_body(spec: &CreateSession, sid: &str, reason: TurnEndReason
 }
 
 /// Attribute an unasked input before its source is lost in `said` (also
-/// used by the head for remote subagents). A resume is not a user message.
+/// used by the head for remote subagents). A resume is not a user message;
+/// missing provenance (including older input) never implies a human.
 pub fn report_input(
     sid: &str,
     command: &str,
@@ -705,6 +706,7 @@ pub fn report_input(
     from_id: &str,
     from_title: &str,
     api_origin: Option<&c6_proto::ApiMessageOrigin>,
+    human_origin: bool,
 ) -> String {
     let sender = if from_title.is_empty() { from_id } else { from_title };
     if from_id == sid {
@@ -716,8 +718,10 @@ pub fn report_input(
         format!("Sent to subagent {sid} via the API{token}: \"{text}\"")
     } else if command == "resume" {
         format!("Subagent {sid} resumed: \"{text}\"")
-    } else {
+    } else if human_origin {
         format!("The user messaged subagent {sid} directly: \"{text}\"")
+    } else {
+        format!("Sent to subagent {sid}: \"{text}\"")
     }
 }
 
@@ -993,17 +997,21 @@ mod tests {
 
     #[test]
     fn unasked_reports_name_the_input_source() {
-        let own = report_input("ops", "session-message", "Continue after restart.", "ops", "Deploy head", None);
+        let own = report_input("ops", "session-message", "Continue after restart.", "ops", "Deploy head", None, false);
         let text = unasked_report("ops", &[own], "Deployed.");
         assert!(text.starts_with("Subagent ops (Deploy head) resumed itself:"), "{text}");
         assert!(!text.contains("The user"));
-        let resume = unasked_report("ops", &[report_input("ops", "resume", "Continue.", "", "", None)], "Done.");
+        let resume = unasked_report("ops", &[report_input("ops", "resume", "Continue.", "", "", None, true)], "Done.");
         assert!(resume.starts_with("Subagent ops resumed:"), "{resume}");
         assert!(!resume.contains("The user"));
-        let other = report_input("ops", "session-message", "Deploy.", "coordinator", "Coordinator", None);
+        let other = report_input("ops", "session-message", "Deploy.", "coordinator", "Coordinator", None, false);
         assert!(other.starts_with("Session \"Coordinator\" (coordinator) messaged subagent ops:"));
-        let user = report_input("ops", "", "Status?", "", "", None);
+        let user = report_input("ops", "", "Status?", "", "", None, true);
         assert!(user.starts_with("The user messaged subagent ops directly:"));
+        for command in ["", "review", "task-notification"] {
+            let unknown = report_input("ops", command, "Status?", "", "", None, false);
+            assert_eq!(unknown, "Sent to subagent ops: \"Status?\"");
+        }
         assert!(!unasked_report("ops", &["an older worker's input".into()], "Done.").contains("The user"));
     }
 
@@ -1011,14 +1019,35 @@ mod tests {
     fn api_inputs_name_only_the_token_display_name() {
         for command in ["", "resume"] {
             let origin = c6_proto::ApiMessageOrigin { token_name: "ops-controller".into() };
-            let text = report_input("ops", command, "Continue.", "", "", Some(&origin));
+            // API provenance wins even over an inconsistent human flag.
+            let text = report_input("ops", command, "Continue.", "", "", Some(&origin), true);
             assert_eq!(text, "Sent to subagent ops via the API (token \"ops-controller\"): \"Continue.\"");
-            let unnamed = report_input("ops", command, "Continue.", "", "", Some(&Default::default()));
+            let unnamed = report_input("ops", command, "Continue.", "", "", Some(&Default::default()), false);
             assert_eq!(unnamed, "Sent to subagent ops via the API: \"Continue.\"");
         }
         let origin = c6_proto::ApiMessageOrigin { token_name: "name\n\"quoted\"".into() };
-        let text = report_input("ops", "", "Continue.", "", "", Some(&origin));
+        let text = report_input("ops", "", "Continue.", "", "", Some(&origin), false);
         assert!(text.contains(r#"name\n\"quoted\""#), "{text}");
+    }
+
+    #[test]
+    fn older_wire_inputs_and_events_have_unknown_origin() {
+        use prost::Message;
+        // Only text, as an older head/worker encoded it: no origin field.
+        let input = c6_proto::UserInput::decode(&b"\x0a\x07Status?"[..]).unwrap();
+        let event = c6_proto::UserMessage::decode(&b"\x12\x07Status?"[..]).unwrap();
+        assert!(!input.human_origin && input.api_origin.is_none());
+        assert!(!event.human_origin && event.api_origin.is_none());
+        let report = report_input(
+            "ops",
+            &event.command,
+            &event.text,
+            &event.from_session_id,
+            &event.from_title,
+            event.api_origin.as_ref(),
+            event.human_origin,
+        );
+        assert_eq!(report, "Sent to subagent ops: \"Status?\"");
     }
 
     fn conn(id: &str, name: &str, kind: &str, default_model: &str) -> SubagentConnection {

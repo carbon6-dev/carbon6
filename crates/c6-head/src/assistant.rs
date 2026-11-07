@@ -41,14 +41,12 @@ const WAIT: Duration = Duration::from_secs(3600);
 /// lifetimes. Includes transport retries and ignores SSE keepalive bytes.
 const MODEL_LIMITS: c6_llm::limit::Limits = c6_llm::limit::Limits { total: Duration::from_secs(600), idle: Duration::from_secs(300) };
 
-/// Marks a request the head makes to itself (the assistant's calls): it is
-/// you, already signed in, limited to the realm the conversation works in
-/// (root, or none: every realm).
+/// Marks a request the head dispatches to itself. Catalog calls retain
+/// their authenticated caller; agent calls retain their approved authority
+/// and realm, without pretending the input was typed by a human.
 #[derive(Clone, Default)]
 pub struct InternalCall {
-    pub realm: Option<String>,
-    /// The console's assistant, acting in `realm` with your approval.
-    pub console: bool,
+    pub caller: crate::realms::Caller,
 }
 
 #[derive(Default)]
@@ -447,6 +445,8 @@ impl Actor {
                     text: input.text,
                     attachments: input.attachments,
                     prompt,
+                    api_origin: input.api_origin,
+                    human_origin: input.human_origin,
                     ..Default::default()
                 });
                 if running.is_none() {
@@ -1409,11 +1409,25 @@ pub async fn execute(st: &HeadState, op: &Op, args: Value, made_by: &str, realm:
 
 /// `execute`; `console`: as the console's assistant, in `realm` with your
 /// approval (what it writes is the console's).
-async fn execute_as(st: &HeadState, op: &Op, mut args: Value, made_by: &str, realm: Option<&str>, console: bool) -> anyhow::Result<Value> {
+async fn execute_as(st: &HeadState, op: &Op, args: Value, made_by: &str, realm: Option<&str>, console: bool) -> anyhow::Result<Value> {
+    let caller =
+        crate::realms::Caller { realm: realm.filter(|r| *r != crate::realms::ROOT).map(str::to_owned), console, ..Default::default() };
+    execute_for_caller(st, op, args, made_by, caller).await
+}
+
+/// Catalog calls retain the authenticated caller, including browser/API
+/// provenance. Agent calls above have authority, not a human input origin.
+pub async fn execute_for_caller(
+    st: &HeadState,
+    op: &Op,
+    mut args: Value,
+    made_by: &str,
+    caller: crate::realms::Caller,
+) -> anyhow::Result<Value> {
     if !args.is_object() {
         args = json!({});
     }
-    let realm = realm.filter(|r| *r != crate::realms::ROOT);
+    let realm = caller.realm.as_deref();
     match &op.via {
         // As you, on the realm's knowledge (home's, from root), as the API
         // calls it.
@@ -1465,7 +1479,7 @@ async fn execute_as(st: &HeadState, op: &Op, mut args: Value, made_by: &str, rea
                 .uri(&uri)
                 .header(axum::http::header::CONTENT_TYPE, "application/json")
                 .body(body)?;
-            req.extensions_mut().insert(InternalCall { realm: realm.map(str::to_owned), console });
+            req.extensions_mut().insert(InternalCall { caller });
             use tower::ServiceExt;
             let resp = router.oneshot(req).await?;
             let status = resp.status();

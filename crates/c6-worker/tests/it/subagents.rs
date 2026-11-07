@@ -459,9 +459,20 @@ async fn message_to_a_subagent_reports_back(via_api: bool) {
     assert!(r.status().is_success(), "{}", r.status());
     eventually("subagent answered", async || (turn_end(&env.events(&child_id).await) == Some(TurnEndReason::Completed)).then_some(()))
         .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
     // The parent records the report for later (docs/background.md §5), but runs no turn.
-    let since: Vec<Event> = env.events(&id).await.into_iter().filter(|e| e.seq > parent_seq).collect();
+    // TurnEnded precedes the report hook: wait for the durable notice,
+    // not a pause that a loaded machine could outlast.
+    let since = eventually("the report to be queued in the parent", async || {
+        let since: Vec<Event> = env.events(&id).await.into_iter().filter(|e| e.seq > parent_seq).collect();
+        since
+            .iter()
+            .any(|e| {
+                matches!(&e.kind, EventKind::NoticeQueued { text, .. }
+            if text.contains("Half the haystack is searched."))
+            })
+            .then_some(since)
+    })
+    .await;
     assert!(!since.iter().any(|e| matches!(e.kind, EventKind::TurnStarted { .. })), "nothing ran in the parent: {since:?}");
 
     // Its next input brings the report.
@@ -496,6 +507,16 @@ async fn message_to_a_subagent_reports_back(via_api: bool) {
     );
     assert_eq!(metadata.markdown, "Half the haystack is searched.");
     assert!(report.text.contains(&label), "raw attribution is retained");
+    let logged = worker.journal.events_after(&child_id, 0, u32::MAX).await.unwrap();
+    let input = logged
+        .iter()
+        .find_map(|e| match &e.kind {
+            Some(c6_proto::session_event::Kind::User(u)) if u.text == "How far did you get?" => Some(u),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(input.human_origin, !via_api, "only the signed-in browser is human");
+    assert_eq!(input.api_origin.as_ref().map(|o| o.token_name.as_str()), via_api.then_some("ops-controller"));
 
     // With wake: the parent starts a turn by itself.
     env.mock.push(Reply::Text("All of it now.".into())); // the subagent

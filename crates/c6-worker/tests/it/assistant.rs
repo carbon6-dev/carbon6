@@ -10,6 +10,191 @@ use c6_testkit::eventually;
 use c6_testkit::{MockLlm, Reply};
 use serde_json::{Value, json};
 
+/// The public catalog must dispatch as the authenticated caller, not as
+/// an origin-less internal administrator. Exercise real auth and events.
+#[tokio::test]
+async fn catalog_forwards_authenticated_callers_and_input_origins() {
+    catalog_callers_and_input_origins(true).await;
+}
+
+#[tokio::test]
+async fn auth_off_catalog_never_treats_headers_or_body_as_human_identity() {
+    catalog_callers_and_input_origins(false).await;
+}
+
+async fn catalog_callers_and_input_origins(auth: bool) {
+    use c6_proto::session_event::Kind;
+    let mock = MockLlm::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let secret = head.state.store.create_api_token("ops-controller", None).await.unwrap().token.unwrap();
+    let http = reqwest::Client::builder()
+        .default_headers([(reqwest::header::AUTHORIZATION, format!("Bearer {secret}").parse().unwrap())].into_iter().collect())
+        .build()
+        .unwrap();
+    let r = http.post(format!("{api}/connections")).json(&json!({"name": "m", "base_url": mock.base_url()})).send().await.unwrap();
+    assert!(r.status().is_success());
+    let r =
+        http.put(format!("{api}/settings/assistant")).json(&json!({"model": {"connection": "m", "model": "mock-1"}})).send().await.unwrap();
+    assert!(r.status().is_success());
+    mock.push(Reply::Text("ready".into()));
+    let session: Session =
+        http.post(format!("{api}/assistant")).json(&json!({"prompt": "start"})).send().await.unwrap().json().await.unwrap();
+    eventually("the initial turn to end", async || {
+        head.state
+            .store
+            .events_after(&session.id, 0, i64::MAX)
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e.kind, Some(Kind::TurnEnded(_))))
+            .then_some(())
+    })
+    .await;
+
+    let login = head.state.store.create_login_link().await.unwrap();
+    let signed_in = reqwest::Client::new().post(format!("{api}/auth/link")).json(&json!({"token": login})).send().await.unwrap();
+    let cookie = signed_in.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap();
+    let browser = reqwest::Client::builder()
+        .default_headers(
+            [
+                (reqwest::header::COOKIE, cookie.parse().unwrap()),
+                (reqwest::header::HeaderName::from_static("x-c6-realm"), "admin".parse().unwrap()),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .build()
+        .unwrap();
+    for (i, (catalog, human)) in [(false, false), (true, false), (false, true), (true, true)].into_iter().enumerate() {
+        let text = format!("Don't do that: input {i}");
+        mock.push(Reply::Text(format!("ack {i}")));
+        let client = if human { &browser } else { &http };
+        // Request-body provenance is never trusted, in either direction.
+        let body = json!({"text": text, "human_origin": !human, "api_origin": {"token_name": "forged"}});
+        let request = if catalog {
+            client.post(format!("{api}/catalog/call")).json(&json!({"op": "sessions.send", "input": {"id": session.id, "body": body}}))
+        } else {
+            client.post(format!("{api}/sessions/{}/messages", session.id)).json(&body)
+        };
+        // A valid token takes precedence even alongside a signed-in cookie.
+        let r = request.header(reqwest::header::COOKIE, cookie).header("x-c6-realm", "admin").send().await.unwrap();
+        assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+        let events = eventually("the sent input's turn to end", async || {
+            let events = head.state.store.events_after(&session.id, 0, i64::MAX).await.unwrap();
+            (events.iter().filter(|e| matches!(e.kind, Some(Kind::TurnEnded(_)))).count() == i + 2).then_some(events)
+        })
+        .await;
+        let input = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                Some(Kind::User(u)) if u.text == text => Some(u),
+                _ => None,
+            })
+            .expect("the input was recorded");
+        assert_eq!(input.human_origin, human, "catalog={catalog}, human={human}");
+        assert_eq!(input.api_origin.as_ref().map(|o| o.token_name.as_str()), (!human).then_some("ops-controller"));
+        assert!(!format!("{events:?}").contains(&secret), "only the token name is retained");
+    }
+
+    let unsigned = reqwest::Client::new();
+    if !auth {
+        mock.push(Reply::Text("unsigned input acknowledged".into()));
+    }
+    let r = unsigned
+        .post(format!("{api}/catalog/call"))
+        .header("x-c6-realm", "admin")
+        .json(&json!({"op": "sessions.send", "input": {"id": session.id,
+            "body": {"text": "Don't do that: unsigned input", "human_origin": true}}}))
+        .send()
+        .await
+        .unwrap();
+    if auth {
+        assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED);
+    } else {
+        assert!(r.status().is_success());
+        let events = eventually("the unsigned input's turn to end", async || {
+            let events = head.state.store.events_after(&session.id, 0, i64::MAX).await.unwrap();
+            (events.iter().filter(|e| matches!(e.kind, Some(Kind::TurnEnded(_)))).count() == 6).then_some(events)
+        })
+        .await;
+        let input = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                Some(Kind::User(u)) if u.text == "Don't do that: unsigned input" => Some(u),
+                _ => None,
+            })
+            .unwrap();
+        assert!(!input.human_origin && input.api_origin.is_none(), "an auth-off page header/body is not human identity");
+    }
+
+    // Acting with your authority is not proof that you typed the message.
+    mock.push(Reply::Text("agent input acknowledged".into()));
+    c6_head::assistant::execute(
+        &head.state,
+        c6_head::catalog::find("sessions.send").unwrap(),
+        json!({"id": session.id, "body": {"text": "Don't do that: agent input", "human_origin": true}}),
+        "agent",
+        None,
+    )
+    .await
+    .unwrap();
+    let events = eventually("the agent-authored input's turn to end", async || {
+        let events = head.state.store.events_after(&session.id, 0, i64::MAX).await.unwrap();
+        (events.iter().filter(|e| matches!(e.kind, Some(Kind::TurnEnded(_)))).count() == if auth { 6 } else { 7 }).then_some(events)
+    })
+    .await;
+    let input = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            Some(Kind::User(u)) if u.text == "Don't do that: agent input" => Some(u),
+            _ => None,
+        })
+        .unwrap();
+    assert!(!input.human_origin && input.api_origin.is_none());
+
+    let scoped_secret = head.state.store.create_api_token("home-only", Some("home")).await.unwrap().token.unwrap();
+    let scoped = reqwest::Client::new()
+        .post(format!("{api}/catalog/call"))
+        .bearer_auth(&scoped_secret)
+        .json(&json!({"op": "sessions.send", "input": {"id": session.id, "body": {"text": "not admitted"}}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(scoped.status(), reqwest::StatusCode::FORBIDDEN, "realm tokens still cannot use the catalog");
+    let unconfirmed = http
+        .post(format!("{api}/catalog/call"))
+        .json(&json!({"op": "connections.delete", "input": {"id": "unused"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unconfirmed.status(), reqwest::StatusCode::CONFLICT);
+    let direct = http.get(format!("{api}/auth/tokens")).send().await.unwrap();
+    if auth {
+        assert_eq!(direct.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+    let forwarded = http
+        .post(format!("{api}/catalog/call"))
+        .json(&json!({"op": "auth.tokens.create", "input": {"body": {"name": "must-not-be-created"}}}))
+        .send()
+        .await
+        .unwrap();
+    assert!(!forwarded.status().is_success(), "the catalog cannot turn a token into browser sign-in");
+    let tokens: Value = browser.get(format!("{api}/auth/tokens")).send().await.unwrap().json().await.unwrap();
+    assert!(!tokens.to_string().contains("must-not-be-created"));
+    head.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn assistant_restart_closes_abandoned_turns_without_replaying_tools() {
     use c6_proto::{Approval, Question, SessionEvent, SessionEventBatch, ToolResult, TurnEndReason, TurnStarted, session_event::Kind};

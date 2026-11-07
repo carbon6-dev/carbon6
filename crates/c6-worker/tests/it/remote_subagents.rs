@@ -307,7 +307,20 @@ async fn stopping_and_messaging_remote(via_api: bool) {
         assert!(r.status().is_success(), "{}", r.status());
         Some(token)
     } else {
-        env.message(&child_id, "Just fix it.", true).await;
+        // Explicit browser sign-in, not an origin-less test request.
+        let token = env.head.state.store.create_login_link().await.unwrap();
+        let signed_in = env.http.post(format!("{}/auth/link", env.api)).json(&json!({"token": token})).send().await.unwrap();
+        let cookie = signed_in.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap();
+        let r = env
+            .http
+            .post(format!("{}/sessions/{child_id}/messages", env.api))
+            .header(reqwest::header::COOKIE, cookie)
+            .header("x-c6-realm", "home")
+            .json(&json!({"text": "Just fix it.", "wake": true}))
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success(), "{}", r.status());
         None
     };
     assert_eq!(env.turn_ended_after(&id, seq).await, TurnEndReason::Completed);
@@ -322,6 +335,16 @@ async fn stopping_and_messaging_remote(via_api: bool) {
         format!("The user messaged subagent {child_id} directly: \"Just fix it.\"")
     };
     assert!(notice.contains(&label) && notice.contains("Fixed by hand."), "{notice}");
+    let logged = env.head.state.store.events_after(&child_id, 0, i64::MAX).await.unwrap();
+    let input = logged
+        .iter()
+        .find_map(|e| match &e.kind {
+            Some(c6_proto::session_event::Kind::User(u)) if u.text == "Just fix it." => Some(u),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(input.human_origin, !via_api);
+    assert_eq!(input.api_origin.as_ref().map(|o| o.token_name.as_str()), via_api.then_some("ops-controller"));
     if let Some(secret) = secret {
         assert!(!notice.contains(&secret), "the token secret never enters the report");
     }
