@@ -485,7 +485,9 @@ composer menus remain tile-local. The responsive new-session fields panel
 catcher) are mixed anchored layouts, not blindly moved to `body` as a pair.
 The browser harness also opens tile Actions, Session details and phone document
 Comments as representative audited surfaces and checks their viewport ancestry
-and bounds.
+and bounds. Document Comments now deliberately portals to the owning tile's
+surface, with both sheet and scrim contained there (see the comment-sheet
+regression below); image previews and the other viewport overlays still escape.
 
 Use `NEXTEST=1 make test-under-load RUNS=5` for repeated workspace runs. Do not rebuild test binaries in the same target directory while nextest is running: Cargo can remove binaries nextest has listed but not yet started.
 
@@ -544,6 +546,27 @@ and dark, at desktop and phone widths, with fine and coarse pointer media:
    Check newly added arbitrary Tailwind selectors in the generated CSS too.
 
 ## Doc comments: placement browser check
+
+After `env -u NO_COLOR make ui`, run the production sheet regression:
+
+```sh
+ENGINE=both /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/comment-sheet.cjs
+```
+
+It uses `motion.cjs`'s owned loopback fixture and launcher, without a head,
+services, live settings or external requests. Four narrow tiles in a wide
+window (also a short window), and 390px/320px phones, exercise new comments,
+long existing threads and the comments panel in both themes. It checks sheet
+and scrim containment, a real click/typing/Escape in another tile, independent
+sheets in two documents, final-block visibility, scrollable short-tile controls,
+focus return (including switching blocks without unmounting), draft retention,
+the All comments handoff, resize, keyboard maximize/restore, tile removal and
+a position-only move of the retained tile. Phone
+sheets keep the full width and follow a visual-viewport-only keyboard change.
+Evidence is saved under `/tmp/q7-sheet/`; `EVIDENCE`, `THEME`, `VIEWPORT`,
+`ENGINE` and the motion harness's browser/`ROOT` overrides are supported.
+`BEFORE=1 ROOT=/path/to/baseline/dist` records unchanged baseline screenshots
+and geometry without enforcing the new tile-local assertions.
 
 `cargo test -p c6-ui` checks the pure popover placement with offset tile bounds,
 above/below anchors, oversized threads and 320px/390px/desktop widths. In a

@@ -6482,7 +6482,6 @@ mod tests {
             (source, "SessionPopover"),
             (source, "PhoneStatusDetails"),
             (include_str!("workspace.rs"), "Popover"),
-            (include_str!("docs.rs"), "Sheet"),
             (include_str!("sessions.rs"), "Sheet"),
             (include_str!("sessions.rs"), "RailCard"),
             (include_str!("util.rs"), "Menu"),
@@ -6506,6 +6505,15 @@ mod tests {
             }
             assert!(fixed_layers > 0, "the {name} guard must inspect actual viewport-fixed markup");
         }
+        // Comment sheets are intentionally tile-local, including their scrim:
+        // narrow desktop tiles are not phones filling the whole workspace.
+        let comments = include_str!("docs.rs").split("fn Sheet(").nth(1).unwrap().split("\n#[component]").next().unwrap();
+        assert!(comments.contains("root.closest(\"[data-tile-surface]\")"));
+        assert!(comments.contains("if mount.is_some() { \"absolute\" } else { \"fixed\" }"));
+        assert!(comments.contains("<leptos::portal::Portal mount=mount>"));
+        assert!(comments.contains("{position} inset-0 z-40") && comments.contains("{position} inset-x-0 bottom-0 z-50"));
+        assert!(comments.contains("bg-white text-sm text-zinc-900") && comments.contains("dark:text-zinc-100"));
+        assert!(include_str!("workspace.rs").contains("data-tile-surface=\"\""));
         // BottomSheet deliberately leaves portal ownership at its retained
         // callsites (including Model); keep the SSR state/markup test below.
         let mut before = product;

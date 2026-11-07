@@ -194,7 +194,7 @@ async function check(browser, origin, engine, name, theme) {
     if (!before && name.startsWith('phone')) {
       await page.getByRole('button', { name: 'Comments', exact: true }).click();
       const sheet = page.locator('.phone-sheet:visible');
-      await assertEscaped(sheet, 'document comments sheet');
+      await assertEscaped(sheet, 'document comments sheet', true);
       await page.keyboard.press('Escape');
       await sheet.waitFor({ state: 'detached' });
     }
@@ -210,17 +210,23 @@ async function check(browser, origin, engine, name, theme) {
 async function assertFocus(opener) {
   assert(await opener.evaluate(el => document.activeElement === el), 'dismissal returns focus to the opener');
 }
-async function assertEscaped(surface, label) {
+async function assertEscaped(surface, label, tileLocal = false) {
   await surface.waitFor();
   const result = await surface.evaluate(el => {
     const r = el.getBoundingClientRect(), s = getComputedStyle(el);
     // c6-sheet deliberately paints a padded overshoot tail below the window;
     // its negative margin cancels that tail, not any interactive content.
     const tail = Math.min(0, parseFloat(s.marginBottom) || 0);
-    return { inTile: !!el.closest('[data-tile-motion]'), left: r.left, right: r.right,
+    const tile = el.closest('[data-tile-surface]')?.getBoundingClientRect();
+    return { inTile: !!el.closest('[data-tile-motion]'), tile: tile && { left: tile.left, right: tile.right, top: tile.top, bottom: tile.bottom }, left: r.left, right: r.right,
       top: r.top, bottom: r.bottom + tail, width: innerWidth, height: innerHeight };
   });
-  assert(!result.inTile, `${label}: fixed surface escapes the tile`);
+  if (tileLocal) {
+    assert(result.inTile && result.tile, `${label}: comments deliberately mount in the owning tile`);
+    assert(result.left >= result.tile.left - 1 && result.right <= result.tile.right + 1
+      && result.top >= result.tile.top - 1 && result.bottom <= result.tile.bottom + 1,
+      `${label}: sheet is contained by the tile: ${JSON.stringify(result)}`);
+  } else assert(!result.inTile, `${label}: fixed surface escapes the tile`);
   assert(result.left >= -1 && result.right <= result.width + 1 && result.top >= -1 && result.bottom <= result.height + 1,
     `${label}: surface stays within the window: ${JSON.stringify(result)}`);
 }

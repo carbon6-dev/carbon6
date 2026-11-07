@@ -779,8 +779,8 @@ pub fn DocsPage() -> impl IntoView {
 // --- A document -------------------------------------------------------------
 
 /// How the comments panel sits: beside the doc in a wide tile, over the
-/// doc's right side in a narrower one, or as a sheet from the bottom on a
-/// phone.
+/// doc's right side in a narrower one, or as a sheet from the tile's bottom
+/// in a narrow tile (including a phone).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fit {
     Docked,
@@ -1430,6 +1430,7 @@ pub fn DocPage(id: String) -> impl IntoView {
     let pop_float = Memo::new(move |_| popped.with(|p| p.as_ref().is_some_and(|(_, sheet)| !*sheet)));
     let pop_sheet_present = crate::util::presence(move || pop_sheet.get());
     let pop_float_present = crate::util::presence(move || pop_float.get());
+    let (sheet_space, pop_sheet_space) = (RwSignal::new(0.0_f64), RwSignal::new(0.0_f64));
     // Closing clears the selection, not the exiting visual. A reopen of the
     // same block reverses its transition without replacing its draft/body.
     let retained_pop = Memo::new(move |previous: Option<&Option<(String, bool)>>| popped.get().or_else(|| previous.cloned().flatten()));
@@ -1736,7 +1737,9 @@ pub fn DocPage(id: String) -> impl IntoView {
         }
     };
     view! {
-        <div node_ref=root class="relative">
+        <div node_ref=root class="relative" style:padding-bottom=move || format!("{}px",
+            (if sheet_present.get() { sheet_space.get() } else { 0.0 })
+                .max(if pop_sheet_present.get() { pop_sheet_space.get() } else { 0.0 }))>
             // Docked, the panel sits right beside the doc's reading column
             // and the two are centred together: at a wide tile's edge it
             // was far from what it's about.
@@ -1767,10 +1770,10 @@ pub fn DocPage(id: String) -> impl IntoView {
                 </Show>
             </div>
             <Show when=move || sheet_present.get()>
-                <Sheet open=Signal::derive(move || sheet.get()) close=Callback::new(move |()| panel.set(false))><CommentsPanel /></Sheet>
+                <Sheet open=Signal::derive(move || sheet.get()) space=sheet_space close=Callback::new(move |()| panel.set(false))><CommentsPanel /></Sheet>
             </Show>
             <Show when=move || pop_sheet_present.get()>
-                <Sheet open=Signal::derive(move || pop_sheet.get()) close=Callback::new(move |()| threads.close_pop())>
+                <Sheet open=Signal::derive(move || pop_sheet.get()) space=pop_sheet_space close=Callback::new(move |()| threads.close_pop())>
                     {move || retained_pop.get().map(|(b, _)| view! {
                         <div class="min-h-0 flex-1 space-y-2 overflow-y-auto overscroll-contain p-3 text-sm"><PopBody block=b /></div>
                     })}
@@ -1856,31 +1859,176 @@ fn FloatingPanel(open: Signal<bool>) -> impl IntoView {
     }
 }
 
-/// A sheet from the bottom of the screen (a phone's), over a dimmed page;
-/// a tap above it or Escape closes it.
+/// A sheet from the owning tile's bottom. Deliberately absolute in that
+/// tile, not fixed under containment or fixed across the entire workspace.
+/// The tile clips the spring's overshoot; other tiles remain interactive.
 #[component]
-fn Sheet(open: Signal<bool>, close: Callback<()>, children: ChildrenFn) -> impl IntoView {
+fn Sheet(open: Signal<bool>, space: RwSignal<f64>, close: Callback<()>, children: ChildrenFn) -> impl IntoView {
+    use wasm_bindgen::JsCast;
+    let ctx = expect_context::<ThreadsCtx>();
+    let mount = ctx.root.get_untracked().and_then(|root| root.closest("[data-tile-surface]").ok().flatten());
+    let position = if mount.is_some() { "absolute" } else { "fixed" };
+    let mount = mount.unwrap_or_else(|| document().body().expect("body").unchecked_into());
     let node = NodeRef::<leptos::html::Div>::new();
-    follow_popover(node, move || {
-        if let Some(el) = node.try_get_untracked().flatten() {
-            let v = visible_viewport();
-            let height = window().inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(v.top + v.height);
-            let style = web_sys::HtmlElement::style(&el);
-            let _ = style.set_property("bottom", &format!("{}px", (height - v.top - v.height).max(0.0)));
-            let _ = style.set_property("max-height", &format!("{}px", v.height * 0.85));
+    let column = use_column();
+    // Safari does not always focus a clicked button. Keep the actual block
+    // marker (or panel button) as the fallback, not body or another tile.
+    let opener = move || {
+        ctx.root
+            .get_untracked()
+            .and_then(|root| {
+                let selector = ctx
+                    .pop
+                    .get_untracked()
+                    .map(|b| format!("{} > [data-marks] button", block_sel(&b)))
+                    .unwrap_or_else(|| "[data-opens=comments]".into());
+                root.query_selector(&selector).ok().flatten().or_else(|| document().active_element().filter(|el| root.contains(Some(el))))
+            })
+            .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok())
+    };
+    let previous = StoredValue::new(send_wrapper::SendWrapper::new(opener()));
+    Effect::new(move || {
+        let showing = open.get();
+        ctx.pop.track();
+        // A retained sheet can reopen on a different block during its exit.
+        // Return to that opener, not the one from the original mount.
+        if showing {
+            previous.set_value(send_wrapper::SendWrapper::new(opener()));
+        }
+    });
+    on_cleanup(move || {
+        // Changing Fit or handing a block sheet to All comments is not a
+        // dismissal. Do not focus the old marker over the replacement UI.
+        if ctx.panel.try_get_untracked() == Some(true) || ctx.pop.try_get_untracked().flatten().is_some() {
+            return;
+        }
+        // Closing one tile must not steal focus back from another. A removed
+        // tile/opener likewise has nowhere to return focus to.
+        let fallback = ctx
+            .root
+            .try_get_untracked()
+            .flatten()
+            .and_then(|r| r.query_selector("[data-opens=comments]").ok().flatten())
+            .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok());
+        let previous = previous.get_value();
+        if let Some(target) = previous.as_ref().filter(|el| el.is_connected()).or(fallback.as_ref()) {
+            let active_tile = document().active_element().and_then(|el| el.closest("[data-tile-surface]").ok().flatten());
+            let own_tile = target.closest("[data-tile-surface]").ok().flatten();
+            if active_tile.is_none() || active_tile == own_tile {
+                let options = web_sys::FocusOptions::new();
+                options.set_prevent_scroll(true);
+                let _ = target.focus_with_options(&options);
+            }
+        }
+    });
+    let placed = StoredValue::new(None::<(Rect, f64, f64, f64, Option<String>)>);
+    let place = move || {
+        let Some(el) = node.try_get_untracked().flatten() else { return };
+        let v = visible_viewport();
+        let tile = el.offset_parent().map(|p| rect(p.get_bounding_client_rect())).unwrap_or(v);
+        let visible = (tile.top + tile.height).min(v.top + v.height) - tile.top.max(v.top);
+        let style = web_sys::HtmlElement::style(&el);
+        let bottom_inset = (tile.top + tile.height - v.top - v.height).max(0.0);
+        let _ = style.set_property("bottom", &format!("{bottom_inset}px"));
+        let block = ctx.pop.get_untracked();
+        let mut limit = visible.max(0.0) * 0.85;
+        if let Some(root) = ctx.root.try_get_untracked().flatten()
+            && let Some(area) = root.parent_element()
+            && let Some(block) = block.as_ref().and_then(|b| root.query_selector(&block_sel(b)).ok().flatten())
+        {
+            // A long thread must leave actual reading room above it, not just
+            // 15% of a short tile (mostly occupied by the tile's bar). A huge
+            // block gets a readable beginning; the sheet keeps at least half
+            // the visible tile for its own scrolling controls.
+            let context = block.get_bounding_client_rect().height().min(visible.max(0.0) * 0.35);
+            let room = tile.top + tile.height - bottom_inset - area.get_bounding_client_rect().top().max(v.top) - context - 16.0;
+            limit = limit.min(room.max(visible.max(0.0) * 0.5));
+        }
+        let _ = style.set_property("max-height", &format!("{limit}px"));
+        // The phone spring paints an overshoot tail below its layout bottom.
+        let height = f64::from(el.offset_height())
+            + window()
+                .get_computed_style(&el)
+                .ok()
+                .flatten()
+                .and_then(|s| s.get_property_value("margin-bottom").ok())
+                .and_then(|s| s.trim_end_matches("px").parse::<f64>().ok())
+                .unwrap_or(0.0)
+                .min(0.0);
+        let next = (tile, height, bottom_inset, v.top, block.clone());
+        if placed.get_value().as_ref() == Some(&next) {
+            return;
+        }
+        placed.set_value(Some(next));
+        // Make room even for the final block. Only scroll on opening or a
+        // real geometry change, not on every scroll event while reading.
+        // The document owns the reservation across sheet handoffs and exits;
+        // an outgoing sheet must not erase the incoming sheet's space.
+        let _ = space.try_set(height + 16.0);
+        if let Some(block) = block {
+            // Reactive styles are queued. Let the reservation reach the DOM
+            // before scrolling, or the final block clamps at the old end.
+            request_animation_frame(move || {
+                if open.try_get_untracked() != Some(true) || ctx.pop.try_get_untracked().flatten().as_ref() != Some(&block) {
+                    return;
+                }
+                let Some(root) = ctx.root.try_get_untracked().flatten() else { return };
+                if let Some(area) = root.parent_element()
+                    && let Some(block) = root.query_selector(&block_sel(&block)).ok().flatten()
+                {
+                    let a = area.get_bounding_client_rect();
+                    let b = block.get_bounding_client_rect();
+                    let top = a.top().max(v.top) + 8.0;
+                    // Final layout top, not the entrance animation's translated top.
+                    let bottom = tile.top + tile.height - bottom_inset - height - 8.0;
+                    let target = b.top().clamp(top, (bottom - b.height()).max(top));
+                    area.set_scroll_top(area.scroll_top() + (b.top() - target).round() as i32);
+                }
+            });
+        }
+    };
+    follow_popover(node, place);
+    Effect::new(move || {
+        let showing = open.get();
+        ctx.pop.track();
+        node.track();
+        // Presence can reverse an exit without mounting another Sheet. A
+        // reopen or a different block still needs its own placement pass.
+        placed.set_value(None);
+        if showing {
+            request_animation_frame(move || {
+                if open.try_get_untracked() == Some(true) {
+                    place();
+                }
+            });
         }
     });
     let keys = window_event_listener(leptos::ev::keydown, move |ev| {
-        if open.get_untracked() && ev.key() == "Escape" && !ev.default_prevented() {
+        if open.try_get_untracked() != Some(true) || ev.key() != "Escape" || ev.default_prevented() {
+            return;
+        }
+        let Some(el) = node.try_get_untracked().flatten() else { return };
+        let target = ev.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok());
+        let target_tile = target.as_ref().and_then(|t| t.closest("[data-tile-surface]").ok().flatten());
+        let same_tile = if target_tile.is_some() {
+            target_tile == el.closest("[data-tile-surface]").ok().flatten()
+        } else {
+            // With no focused DOM control, Escape belongs to the workspace's
+            // focused tile, never every open document sheet.
+            column.is_some_and(|c| c.ws.layout.with_untracked(|l| l.tiles.get(l.focus).is_some_and(|t| t.key == c.tile)))
+        };
+        let other_sheet = target.and_then(|t| t.closest(".c6-sheet").ok().flatten()).is_some_and(|s| !s.is_same_node(Some(&el)));
+        if same_tile && !other_sheet {
+            ev.prevent_default();
             close.run(());
         }
     });
     on_cleanup(move || keys.remove());
     view! {
-        <leptos::portal::Portal>
-        <div class="c6-scrim c6-presence fixed inset-0 z-40 bg-black/30" data-open=move || open.get().to_string() inert=move || !open.get()
-            on:click=move |_| close.run(())></div>
-        <div node_ref=node class="c6-sheet c6-presence phone-sheet fixed inset-x-0 bottom-0 z-50 flex max-h-[85dvh] flex-col overflow-hidden rounded-t-xl border-t border-zinc-200 bg-white shadow-2xl dark:border-zinc-700 dark:bg-zinc-900"
+        <leptos::portal::Portal mount=mount>
+        <div class=format!("c6-comment-scrim c6-scrim c6-presence {position} inset-0 z-40 bg-black/30") data-open=move || open.get().to_string() inert=move || !open.get()
+            on:click=move |ev| { ev.stop_propagation(); close.run(()); }></div>
+        <div node_ref=node class=format!("c6-sheet c6-presence phone-sheet {position} inset-x-0 bottom-0 z-50 flex max-h-[85%] flex-col overflow-hidden rounded-t-xl border-t border-zinc-200 bg-white text-sm text-zinc-900 shadow-2xl dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100")
             data-open=move || open.get().to_string() inert=move || !open.get()>
             {children()}
         </div>
@@ -2264,14 +2412,15 @@ fn BlockView(
             // In its right margin, inside the block: outside it, the pointer
             // left the block on its way and the buttons hid, and at the
             // panel's edge they sat over the scrollbar. 💬 shows on hover
-            // (always on a touch screen, which has none); with open
+            // or keyboard focus (always on a touch screen, which has none);
+            // opacity keeps the opener focusable when a sheet closes. With open
             // comments, a lasting marker with their count opens them. A
             // block is edited by a double-click, or Edit in the doc's bar.
             <div data-marks="" class="absolute right-0.5 top-0.5 flex items-center">
                 {move || match open_n.get() {
                     0 if archived.get() => ().into_any(),
                     0 => view! {
-                        <button class="invisible rounded px-1 text-xs text-muted hover:bg-zinc-100 group-hover:visible pointer-coarse:visible dark:hover:bg-zinc-800"
+                        <button class="rounded px-1 text-xs text-muted opacity-0 hover:bg-zinc-100 group-hover:opacity-100 focus:opacity-100 pointer-coarse:opacity-100 dark:hover:bg-zinc-800"
                             title="Comment on this" aria-label="Comment on this block" on:click=move |ev| marker(ev, true)>{crate::icons::icon(crate::icons::Icon::MessageSquare, crate::icons::Size::S14)}</button>
                     }.into_any(),
                     n => view! {
