@@ -1530,6 +1530,8 @@ pub fn SessionMenu(chrome: SessionChrome, #[prop(into)] on_rename: Callback<()>,
             <button class=MENU_ITEM on:click=move |_| { details.set(true); on_done.run(()) }>
                 "Session details…"<span class=MENU_HINT>"usage, config"</span>
             </button>
+            <crate::details::CopySession session=id.get_value() />
+            <crate::details::CopySession session=id.get_value() link=true />
             <Show when=seeds>
                 <div class=MENU_RULE></div>
                 <button class=MENU_ITEM

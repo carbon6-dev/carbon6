@@ -25,6 +25,38 @@ const LABEL: &str = "w-[4.5rem] shrink-0 text-[10px] font-medium uppercase track
 const HEADING: &str = "px-1.5 pt-2 text-[10px] font-medium uppercase tracking-wide text-muted";
 const MUTED: &str = "text-muted";
 
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+/// Copy the full identifier or a realm-qualified link, never the short label.
+#[component]
+pub fn CopySession(session: String, #[prop(optional)] link: bool, #[prop(optional)] inline: bool) -> impl IntoView {
+    let label = if link { "Copy session link" } else { "Copy session ID" };
+    let title = if inline { session.clone() } else { label.into() };
+    let text = if inline { short_id(&session) } else { label.into() };
+    let value =
+        if link { format!("{}{}", window().location().origin().unwrap_or_default(), View::session(session).href()) } else { session };
+    let value = StoredValue::new(value);
+    let status = RwSignal::new("");
+    view! {
+        <button class=if inline { "inline-flex items-center gap-2 rounded font-mono hover:underline" } else { crate::session::MENU_ITEM }
+            title=title aria-label=label on:click=move |_| {
+                spawn_local(async move {
+                    let result = wasm_bindgen_futures::JsFuture::from(window().navigator().clipboard().write_text(&value.get_value())).await;
+                    let _ = status.try_set(if result.is_ok() { "Copied" } else { "Couldn't copy" });
+                });
+            }>
+            {text}<span class="font-sans text-xs text-muted" role="status">{move || status.get()}</span>
+        </button>
+    }
+}
+
+#[component]
+fn SessionId(session: String) -> impl IntoView {
+    line("Session ID", view! { <CopySession session inline=true /> }, None)
+}
+
 /// The git state of a session's folder, (files changed, current branch):
 /// looked at when `at` (worker, folder) is known, and again after each
 /// turn. `None`: not a repository, or it couldn't be asked.
@@ -276,6 +308,7 @@ pub fn Glance(chrome: SessionChrome, #[prop(optional, into)] on_done: Option<Cal
     view! {
         <div class="space-y-px">
             {waiting}
+            <SessionId session=id.get_value() />
             {runs_on}
             {place}
             {branch}
@@ -425,6 +458,7 @@ pub fn SessionDetails(session: String, usage: Memo<UsageStats>, #[prop(into)] on
                     <h2 class="flex-1 font-medium">"Session details"</h2>
                     <button class=crate::icons::BAR_BUTTON title="Close (Esc)" aria-label="Close" on:click=move |_| on_close.run(())>{crate::icons::x()}</button>
                 </div>
+                <SessionId session=session.clone() />
                 <section class="space-y-1">
                     <h3 class="text-sm font-medium">"Usage"</h3>
                     <Usage usage />
@@ -439,6 +473,14 @@ pub fn SessionDetails(session: String, usage: Memo<UsageStats>, #[prop(into)] on
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_ids_show_eight_characters_without_changing_the_full_id() {
+        let id = "01a1b4ba-e2bb-7444-8962-fb70504fcd1d";
+        assert_eq!(short_id(id), "01a1b4ba");
+        assert_eq!(short_id("parent"), "parent");
+        assert_eq!(short_id(""), "");
+    }
 
     #[test]
     fn a_folder_is_shortened_to_its_last_two_parts() {

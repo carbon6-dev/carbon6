@@ -240,6 +240,21 @@ a separate tile. Screenshots default to `/tmp/q1-screenshots/panes/`.
 
 ## Browser-local themes
 
+### Session identity
+
+`node crates/c6-ui/tests/session-identity.cjs` checks the production session
+glance, details and shared desktop/phone Actions menu in both themes, wide and
+320px desktop tiles, and 320/390px phones. The ID shows eight characters with
+the full value on hover; clicking copies the full ID. Actions offers **Copy
+session ID** and **Copy session link** (including the realm). The fixture
+records clipboard writes and checks denied writes never report success.
+Screenshots go to `/tmp/n3-ui/item6` (`SCREENSHOTS` overrides it). It uses the
+motion harness's browser paths and `ENGINE` override, with no live head.
+
+`BEFORE=1 ROOT=/tmp/n3-ui/item2/pristine-235fae5c-dist` captures the same
+glance/menu/details matrix without expecting the new ID controls. It records
+their absence explicitly in JSON and prefixes screenshots with `before-`.
+
 `crates/c6-ui/tests/theme.cjs` checks System, Light and Dark, including migration
 of the former browser-local Soft preview (and legacy Dim) to Dark before paint:
 
