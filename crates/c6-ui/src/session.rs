@@ -422,9 +422,18 @@ impl Feed {
             id,
             move |msg| {
                 pending.update_value(|p| p.push(msg));
+                // Hidden tabs pause animation frames but can keep receiving
+                // WS data. Keep the model current instead of buffering it
+                // until the tab is shown again.
+                if document().hidden() {
+                    flush();
+                    return;
+                }
                 if frame.with_value(Option::is_none) {
-                    let next = leptos::leptos_dom::helpers::request_animation_frame_with_handle(flush).ok();
-                    frame.set_value(next);
+                    match leptos::leptos_dom::helpers::request_animation_frame_with_handle(flush) {
+                        Ok(next) => frame.set_value(Some(next)),
+                        Err(_) => flush(),
+                    }
                 }
             },
             move || {
