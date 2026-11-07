@@ -227,13 +227,17 @@ simple_tool!(
     TaskWithdraw,
     "task_withdraw",
     "TaskWithdraw",
-    "Withdraws a task card you proposed that no longer needs doing (you did it after all, or the user asked for it here).",
+    "Withdraws a task card you proposed that no longer needs doing (you did it after all).",
     json!({"type": "object", "properties": {
         "id": {"type": "integer"},
         "why": {"type": "string"}
     }, "required": ["id", "why"], "additionalProperties": false}),
     Concurrency::Shared,
-    |ctx, input| { result(call(ctx, "session.task_withdraw", input).await, |v| format!("task card #{} withdrawn", v["id"])) }
+    |ctx, input| {
+        result(call(ctx, "session.task_withdraw", input).await, |v| {
+            v["message"].as_str().map(str::to_owned).unwrap_or_else(|| format!("task card #{} withdrawn", v["id"]))
+        })
+    }
 );
 
 /// Whether `name` is a task-card tool (subagents don't get them: what they

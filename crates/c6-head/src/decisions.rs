@@ -765,7 +765,7 @@ pub async fn task_card(st: &HeadState, session_id: &str, what: &str, params: &Va
         let d = get(st, id).await?.ok_or_else(|| not_found("no such task card"))?;
         if d.state == "answered" {
             let option = d.answer.as_ref().and_then(|a| a["option"].as_str()).unwrap_or("(no option)");
-            return Err(bad_request(format!("Task card #{id} was already answered: {option}.")));
+            return Ok(json!({"id": id, "message": format!("task card #{id} already closed: {option}, nothing to do")}));
         }
         if !matches!(d.state.as_str(), "open" | "snoozed") {
             return Err(bad_request(format!("Task card #{id} was already {}.", d.state)));
@@ -852,7 +852,8 @@ async fn task_answer_message(st: &HeadState, d: &api::Decision, text: String) {
 async fn do_task_here(st: &HeadState, d: &api::Decision) -> anyhow::Result<()> {
     let session = d.context["session"].as_str().ok_or_else(|| bad_request("the card names no session"))?;
     let text = format!(
-        "Do the task you proposed here, in this session (task card #{}: {}).\n\n{}",
+        "Do the task you proposed here, in this session (task card #{}: {}).\n\n\
+         This task card is already closed as Do it here; nothing more is needed from you to close or withdraw it.\n\n{}",
         d.id,
         d.title,
         d.context["prompt"].as_str().unwrap_or("").trim()

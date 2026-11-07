@@ -465,8 +465,13 @@ async fn task_card_answers_start_idle_turns_and_withdraw_explains_them() {
         let command = Cards::input(&session.id, &shown);
         t.worker.sessions.handle(command.clone()).await.unwrap();
         let withdraw = |id| json!({"id": id, "why": "No longer needed"});
-        let error = c6_head::decisions::task_card(t.head(), &session.id, "task_withdraw", &withdraw(card.id)).await.unwrap_err();
-        assert_eq!(error.to_string(), format!("Task card #{} was already answered: {option}.", card.id));
+        let before = t.get(&format!("decisions/{}", card.id)).await;
+        for _ in 0..2 {
+            let result = c6_head::decisions::task_card(t.head(), &session.id, "task_withdraw", &withdraw(card.id)).await.unwrap();
+            assert_eq!(result["id"], card.id);
+            assert_eq!(result["message"], format!("task card #{} already closed: {option}, nothing to do", card.id));
+            assert_eq!(t.get(&format!("decisions/{}", card.id)).await, before, "withdrawing cannot change the answer");
+        }
         for (sid, id) in [(&other.id, card.id), (&session.id, i64::MAX)] {
             let error = c6_head::decisions::task_card(t.head(), sid, "task_withdraw", &withdraw(id)).await.unwrap_err();
             assert_eq!(error.to_string(), "no open task card of this session by that id");
@@ -515,6 +520,47 @@ async fn task_card_answers_start_idle_turns_and_withdraw_explains_them() {
     assert_eq!(t.get(&format!("decisions/{}", card.id)).await["state"], "open");
     assert_eq!(t.worker.journal.events_after(&session.id, 0, u32::MAX).await.unwrap(), before);
     c6_head::decisions::task_card(t.head(), &session.id, "task_withdraw", &json!({"id": card.id, "why": "No destination"})).await.unwrap();
+    t.close().await;
+}
+
+#[tokio::test]
+async fn doing_a_task_here_already_closes_its_card_and_withdraw_is_a_successful_noop() {
+    let t = Cards::new().await;
+    let session = t.start(false).await;
+    let card = t.propose(&session.id, "Clean up the retry module here").await;
+    let gate = t.mock.push_gated(Reply::ToolCalls(vec![(
+        "task_withdraw".into(),
+        json!({"id": card.id, "why": "The user asked for it here."}).to_string(),
+    )]));
+    t.mock.push(Reply::Text("Cleaned up the retry module.".into()));
+    // The redundant withdrawal happens only after the answer is recorded.
+    t.post(&format!("decisions/{}/answer", card.id), json!({"option": "Do it here"})).await;
+    gate.notify_one();
+    t.idle(&session.id, 2).await;
+
+    let events = t.events(&session.id).await;
+    assert!(
+        events.iter().any(|event| {
+            matches!(&event.kind, EventKind::User { text, .. }
+            if text.contains("Do the task you proposed here")
+                && text.contains("already closed")
+                && text.contains("nothing more is needed from you to close or withdraw it"))
+        }),
+        "the agent is explicitly told that the card needs no further action: {events:?}"
+    );
+    let results: Vec<_> = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::ToolResult { tool, output, is_error, .. } if tool == "task_withdraw" => Some((output.as_str(), *is_error)),
+            _ => None,
+        })
+        .collect();
+    let message = format!("task card #{} already closed: Do it here, nothing to do", card.id);
+    assert_eq!(results, [(message.as_str(), false)], "the tool reports a successful no-op, not a withdrawal or error");
+    let closed = t.get(&format!("decisions/{}", card.id)).await;
+    assert_eq!(closed["state"], "answered");
+    assert_eq!(closed["answer"]["option"], "Do it here");
+    assert!(closed["sessions"].as_array().unwrap().is_empty(), "no extra session is started");
     t.close().await;
 }
 

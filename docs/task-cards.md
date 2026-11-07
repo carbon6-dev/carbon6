@@ -23,8 +23,8 @@ The current session carries on undisturbed, never waiting on a card.
   - `prompt` must stand alone, including file paths and enough context to act without this conversation, which is not forwarded automatically. The new session also gets its session instructions and environment; this is context delivery, not file or realm isolation.
   - `worktree: true` starts the task in a fresh git worktree, so it doesn't touch the current one. That's the default when this session uses one.
   - Returns the card's id.
-- **And its pair,** `task_withdraw {id, why}`: the agent withdraws a card that went stale, for example because it fixed the thing after all or the user asked for it in this session.
-  - If this session's card was already answered, the tool says what happened, for example `Task card #177 was already answered: Not now.` It still refuses unknown ids and cards proposed by another session.
+- **And its pair,** `task_withdraw {id, why}`: the agent withdraws a card that went stale, for example because it fixed the thing after all.
+  - If this session's card was already answered, the tool succeeds without changing it and says what happened, for example `task card #177 already closed: Not now, nothing to do`. It still refuses unknown ids and cards proposed by another session.
 - **When to propose:** that guidance is an editable prompt, `session.task_cards` (Settings → Prompts), added to the session's instructions when the tool is on. Not tool text in code. The default says:
   - **propose:** dead code, stale docs, missing coverage, a confirmed TODO, a security issue noticed in passing;
   - **don't propose:** vague code-smell observations, trivial fixes better done now, low-confidence hunches, or anything the user asked for in this session;
@@ -65,7 +65,7 @@ The click sends your message to the proposing session: `Start session: task card
 
 ### 4.1 The other answers
 
-- **Do it here** sends the card's prompt to the session that proposed it, as a message from you ("Do the task you proposed here … (task card #N: title)"). If the session is in a turn, the message waits for it, as yours do.
+- **Do it here** sends the card's prompt to the session that proposed it, as a message from you ("Do the task you proposed here … (task card #N: title)"). The message explicitly says the card is already closed and the agent need not close or withdraw it. If the session is in a turn, the message waits for it, as yours do.
 - **Save for later** adds the card as a to-do (docs/work.md §12) to the open work, in the card's realm, that holds the session (its root, for a subagent): its title as the text, its prompt as the prompt, `from: decision:<id>`, and the session as its origin. If no work holds the session, it makes new work, as below. The work name follows the live session list; the action always uses the session's current work when clicked.
 - **Save elsewhere… → New work** makes a work item titled like the card, with that one to-do.
 - **Save elsewhere… → an existing work item** files the same to-do, with its prompt and origin, into the chosen open work item, without moving the proposing session.
@@ -109,5 +109,6 @@ An archived or stopped proposer cannot prevent the card's action: the save, dism
    - each non-waking answer shows immediately as your message, streams at the same journal position as reload, and reaches the next input once, without a new turn, status change, queue count or held-notice pill;
    - consuming or redelivering an answer never adds another transcript line; the UI renders the normal right-aligned user bubble, not a system note;
    - busy and offline delivery, head/worker restarts, journal trimming/restoration, rejected notes and older workers preserve quietness;
-   - withdrawing an answered card reports the answer without exposing another session's cards;
+   - withdrawing an answered card succeeds as a no-op and reports the answer without exposing another session's cards;
+   - Do it here explicitly tells the agent its card is already closed, and a redundant withdrawal returns a successful already-closed tool result;
    - a subagent doesn't get the tool.
