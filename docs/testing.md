@@ -956,6 +956,22 @@ A test is a claim: *this invariant holds*. It must fail **if and only if** the i
 
 `.config/nextest.toml` shows each failure's complete captured stdout and stderr both immediately and at the end of the run (`failure-output = "immediate-final"`, `final-status-level = "fail"`). The final status list alone does not include that output: nextest's default only prints it immediately, where a long parallel run can bury it. Keep capture enabled so concurrent tests' diagnostics stay together.
 
+### Background-subagent recovery fixtures
+
+The failed-subagent recovery regressions keep their model scripts apart from
+automatic naming: the opening has more than three words, and the fixture waits
+for its `session_naming:<id>` setting to disappear before queuing later scoped
+replies. A naming prompt quotes the opening conversation, so an ordinary
+`MockLlm::push_about` marker can match it too. A reply consumed by naming is not
+evidence that the real parent's report was lost.
+
+A delivered failure notice is not an acknowledgement barrier: its `User` event
+is persisted before the new `TurnStarted`. Wait for a `TurnEnded` **after that
+notice**, not the previous turn's end, before sending the resume input. Otherwise
+the resume can join the acknowledgement turn, changing both the scripted request
+order and the opening read by deferred naming. Final completion failures show
+the model trace and both parent and child event histories, including model errors.
+
 ## Rules
 
 1. **Wait for a condition, never for a time.**

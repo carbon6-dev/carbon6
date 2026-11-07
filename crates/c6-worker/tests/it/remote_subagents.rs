@@ -348,30 +348,52 @@ async fn failed_background_resume(remote: bool) {
     // The transport retries a truncated response. Make its retry a
     // permanent provider error, rather than letting it consume a parent reply.
     env.mock.push(Reply::Error(400, "permanent provider failure".into()));
-    let id = env.create(&alpha, here.path(), "start failure probe").await;
+    let id = env.create(&alpha, here.path(), "start failure probe in background").await;
     assert_eq!(env.turn_ended_after(&id, 0).await, TurnEndReason::Completed);
+    // Finish naming this opening before adding later scoped replies. With
+    // only three words naming waits for the next turn, whose quoted inputs
+    // can include the resume marker and consume its scripted conversation reply.
+    eventually_or(
+        "initial automatic naming finished",
+        async || env.head.state.store.setting(&format!("session_naming:{id}")).await.unwrap().is_none().then_some(()),
+        || env.mock.log(),
+    )
+    .await;
     let initial_end = last_seq(&env.events(&id).await);
     env.mock.push_about("start failure probe", Reply::Text("Acknowledged the failed background task.".into()));
     failure.notify_one();
-    let child_id = eventually("the failed background task reported", async || {
-        let events = env.events(&id).await;
-        let failed = events.iter().any(|e| {
-            matches!(&e.kind,
+    let (child_id, failed_notice) = eventually_or(
+        "the failed background task reported",
+        async || {
+            let events = env.events(&id).await;
+            let failed = events.iter().any(|e| {
+                matches!(&e.kind,
             EventKind::BackgroundTask { state, exit_code, .. } if state == "finished" && *exit_code != 0)
-        });
-        let child = env.children(&id).await.into_iter().next()?;
-        let took_notice = events.iter().any(|e| {
-            e.seq > initial_end
-                && matches!(&e.kind,
-            EventKind::User { command, .. } if command == "task-notification")
-        });
-        (failed && took_notice && turn_finished(&events)).then_some(child.id)
-    })
+            });
+            let child = env.children(&id).await.into_iter().next()?;
+            let notice = events.iter().find(|e| {
+                e.seq > initial_end
+                    && matches!(&e.kind,
+                EventKind::User { command, .. } if command == "task-notification")
+            })?;
+            failed.then_some((child.id, notice.seq))
+        },
+        || env.mock.log(),
+    )
     .await;
+    // A User receipt precedes TurnStarted: turn_finished could still see
+    // the initial turn's end and let the resume join the acknowledgement.
+    assert_eq!(
+        env.turn_ended_after(&id, failed_notice).await,
+        TurnEndReason::Completed,
+        "model trace:\n{}\nparent events:\n{:#?}",
+        env.mock.log(),
+        env.events(&id).await,
+    );
     assert_eq!(env.turn_ended_after(&child_id, 0).await, TurnEndReason::Error);
     // Resume independently of the ended background task, as the queued
     // shell notices did in the incident. The parent's steer arrives after
-    // the final model call starts, and is consumed by the *next* turn.
+    // the final model call starts, and is consumed at its next model step.
     let prelude = env.mock.push_gated(Reply::Text("Prelude, not the requested final report.".into()));
     env.message(&child_id, "prelude-probe", false).await;
     eventually("the child's final response streaming", async || {
@@ -431,7 +453,15 @@ async fn failed_background_resume(remote: bool) {
         || env.mock.log(),
     )
     .await;
-    assert_eq!(env.turn_ended_after(&id, notice.0).await, TurnEndReason::Completed);
+    let reason = env.turn_ended_after(&id, notice.0).await;
+    assert_eq!(
+        reason,
+        TurnEndReason::Completed,
+        "model trace:\n{}\nparent events:\n{:#?}\nchild events:\n{:#?}",
+        env.mock.log(),
+        env.events(&id).await,
+        env.events(&child_id).await,
+    );
     assert!(env.head.state.store.waiting_delegations(&child_id).await.unwrap().is_empty());
     stop_a.cancel();
     stop_b.cancel();
