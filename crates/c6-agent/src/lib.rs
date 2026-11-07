@@ -101,6 +101,8 @@ pub struct PendingInput {
     pub hops: u32,
     /// HTTP API origin, with only a token's display name (no secret).
     pub api_origin: Option<c6_proto::ApiMessageOrigin>,
+    /// Producer-supplied display metadata; the original text stays unchanged.
+    pub task_notice: Option<c6_proto::TaskNotice>,
     /// Send now: a running turn gets it at once, not at its next step
     /// (docs/background.md §4). Not logged.
     pub send_now: bool,
@@ -122,6 +124,7 @@ impl PendingInput {
             from_title: self.from_title.clone(),
             hops: self.hops,
             api_origin: self.api_origin.clone(),
+            task_notice: self.task_notice.clone(),
         })
     }
 

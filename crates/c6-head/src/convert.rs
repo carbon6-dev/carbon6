@@ -38,6 +38,15 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
             wake: u.wake,
             from_session_id: u.from_session_id.clone(),
             from_title: u.from_title.clone(),
+            task_notice: u.task_notice.as_ref().map(|n| {
+                Box::new(api::TaskNotice {
+                    kind: n.kind.clone(),
+                    title: n.title.clone(),
+                    session_id: n.session_id.clone(),
+                    status: n.status.clone(),
+                    markdown: n.markdown.clone(),
+                })
+            }),
         },
         Kind::SubagentSpawned(s) => api::EventKind::SubagentSpawned {
             call_id: s.call_id.clone(),
@@ -284,6 +293,35 @@ pub fn queued(c: &CommandRow) -> api::QueuedInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_notice_metadata_reaches_the_browser_without_changing_the_agent_text() {
+        let raw = "Sent via the API.\n<subagent id=\"ops\">Report: exact raw text</subagent>";
+        let metadata = c6_proto::TaskNotice {
+            kind: "subagent".into(),
+            title: "zmbp ops".into(),
+            session_id: "ops".into(),
+            status: "completed".into(),
+            markdown: "## Checks passed\n\nAll **done**.".into(),
+        };
+        let input = SessionEvent {
+            seq: 2,
+            ts_ms: 3,
+            kind: Some(session_event::Kind::User(c6_proto::UserMessage {
+                text: raw.into(),
+                command: "task-notification".into(),
+                task_notice: Some(metadata.clone()),
+                ..Default::default()
+            })),
+        };
+        let shown = event(&input).unwrap();
+        let api::EventKind::User { text, task_notice: Some(n), .. } = shown.kind else { panic!("structured task notice") };
+        assert_eq!(text, raw);
+        assert_eq!(
+            (n.kind, n.title, n.session_id, n.status, n.markdown),
+            (metadata.kind, metadata.title, metadata.session_id, metadata.status, metadata.markdown)
+        );
+    }
 
     #[test]
     fn a_card_answer_is_an_ordinary_user_event() {

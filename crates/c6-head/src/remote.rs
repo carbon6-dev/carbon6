@@ -181,6 +181,7 @@ async fn relay(st: &HeadState, child_id: &str, end_seq: u64, reason: i32) -> any
         digest: digest.clone(),
         said,
         wake,
+        task_notice: Some(c6_worker::task_report_notice(&child.title, child_id, reason, &report)),
     };
     if settled.is_empty() {
         send(st, &parent_id, ended("", said, wake)).await?;
@@ -210,6 +211,7 @@ pub async fn rejected(st: &HeadState, session_id: &str, command_id: &str, why: &
                     child_session_id: session_id.to_owned(),
                     reason: TurnEndReason::Error as i32,
                     digest,
+                    task_notice: Some(c6_worker::task_report_notice(&child.title, session_id, TurnEndReason::Error, why)),
                     ..Default::default()
                 };
                 send(st, &parent_id, ended).await?;

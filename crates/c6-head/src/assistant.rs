@@ -240,7 +240,7 @@ enum Reply {
         cancelled: bool,
     },
     /// A subagent the conversation started (`c6_delegate`) ended its turn.
-    Delegation(c6_proto::DelegationEnded),
+    Delegation(Box<c6_proto::DelegationEnded>),
 }
 
 type Waiters = Arc<Mutex<HashMap<String, oneshot::Sender<Reply>>>>;
@@ -479,13 +479,14 @@ impl Actor {
                 let waiter = self.env.waiters.lock().unwrap().remove(&d.call_id);
                 match waiter {
                     Some(w) => {
-                        let _ = w.send(Reply::Delegation(d));
+                        let _ = w.send(Reply::Delegation(Box::new(d)));
                     }
                     None if !d.call_id.is_empty() => {
                         self.inbox.lock().unwrap().push(PendingInput {
                             command_id: cmd.command_id,
                             text: report_text(&d),
                             command: "task-notification".into(),
+                            task_notice: d.task_notice.clone(),
                             ..Default::default()
                         });
                         if running.is_none() {

@@ -2235,6 +2235,19 @@ impl Handoff {
     }
 }
 
+/// Readable background-notice metadata, separate from the exact text the agent
+/// received. Absent in old journals and from workers that do not provide it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(default)]
+pub struct TaskNotice {
+    pub kind: String,
+    pub title: String,
+    pub session_id: String,
+    pub status: String,
+    pub markdown: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -2284,6 +2297,10 @@ pub enum EventKind {
         from_session_id: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         from_title: String,
+        /// Structured description of a background notice; raw agent-facing
+        /// text remains in `text`. Older events need no backfill.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_notice: Option<Box<TaskNotice>>,
     },
     TurnStarted {
         turn: u64,

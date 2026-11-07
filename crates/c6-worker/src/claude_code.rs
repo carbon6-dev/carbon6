@@ -397,13 +397,15 @@ pub(crate) struct Process {
     /// A line read while idle that begins a turn.
     pending: Option<Value>,
     /// Background-task notifications since the last turn ended.
-    notified: Vec<String>,
+    notified: Vec<(String, c6_proto::TaskNotice)>,
+    /// SDK task ids are not session ids. Keep their structured labels separately.
+    task_labels: HashMap<String, (String, String)>,
     /// Tasks Claude Code's subagents own: their ends are theirs to hear.
     subagent_tasks: HashSet<String>,
     /// Its own tasks that ended while no turn ran, as notices for the agent
     /// ([`Process::take_unwoken`]), and when to deliver them if Claude Code
     /// hasn't started a turn for them by itself.
-    unwoken: Vec<String>,
+    unwoken: Vec<(String, c6_proto::TaskNotice)>,
     wake_due: Option<tokio::time::Instant>,
     /// You stopped its last turn: until when a turn it starts by itself is
     /// taken as the stop's doing (`None` once one of its tasks ends on its
@@ -681,6 +683,7 @@ impl Process {
             unconfirmed: Default::default(),
             pending: None,
             notified: Vec::new(),
+            task_labels: HashMap::new(),
             subagent_tasks: HashSet::new(),
             unwoken: Vec::new(),
             wake_due: None,
@@ -1010,7 +1013,7 @@ impl Process {
             // starts a turn for it; when it doesn't (seen with a long build),
             // the agent would wait for good, so the session tells it.
             if !v["task_id"].as_str().is_some_and(|t| self.subagent_tasks.contains(t)) {
-                self.unwoken.push(unwoken_notice(&v, status));
+                self.unwoken.push((unwoken_notice(&v, status), sdk_task_notice(&v, &self.task_labels)));
                 self.wake_due.get_or_insert_with(|| tokio::time::Instant::now() + WAKE_GRACE);
             }
         }
@@ -1024,10 +1027,11 @@ impl Process {
     }
 
     /// The notice for those tasks (`None`: nothing is waiting).
-    pub fn take_unwoken(&mut self) -> Option<String> {
+    pub fn take_unwoken(&mut self) -> Option<(String, c6_proto::TaskNotice)> {
         self.wake_due = None;
         let notices = std::mem::take(&mut self.unwoken);
-        (!notices.is_empty()).then(|| notices.join("\n"))
+        (!notices.is_empty())
+            .then(|| (notices.iter().map(|(text, _)| text.as_str()).collect::<Vec<_>>().join("\n"), combined_task_notice(&notices)))
     }
 
     /// Whether its last turn was one it started by itself right after your
@@ -1089,6 +1093,15 @@ impl Process {
     async fn side_line(&mut self, v: &Value, sink: &Arc<dyn EventSink>) -> anyhow::Result<()> {
         if v["type"] == "system"
             && v["subtype"] == "task_started"
+            && let Some(id) = v["task_id"].as_str()
+        {
+            self.task_labels.insert(
+                id.into(),
+                (v["description"].as_str().unwrap_or_default().into(), v["task_type"].as_str().unwrap_or_default().into()),
+            );
+        }
+        if v["type"] == "system"
+            && v["subtype"] == "task_started"
             && v["owned_by_subagent"].as_bool() == Some(true)
             && let Some(t) = v["task_id"].as_str()
         {
@@ -1099,7 +1112,7 @@ impl Process {
         }
         if v["type"] == "system" && v["subtype"] == "task_notification" && v["parent_tool_use_id"].is_null() {
             let summary = v["summary"].as_str().or(v["description"].as_str()).unwrap_or("A background task ended.");
-            self.notified.push(summary.to_owned());
+            self.notified.push((summary.to_owned(), sdk_task_notice(v, &self.task_labels)));
             let field = |k: &str| v[k].as_str().unwrap_or("").to_owned();
             self.turn_tasks.push((field("task_id"), field("status")));
         }
@@ -1261,9 +1274,10 @@ impl Process {
         } else if self.notified.is_empty() {
             vec!["A background task ended.".to_owned()]
         } else {
-            vec![self.notified.join("\n")]
+            vec![self.notified.iter().map(|(text, _)| text.as_str()).collect::<Vec<_>>().join("\n")]
         };
-        told(sink, texts).await?;
+        let task_notice = (!quiet && !self.notified.is_empty()).then(|| combined_task_notice(&self.notified));
+        told(sink, texts, task_notice).await?;
         sink.append(session_event::Kind::TurnStarted(TurnStarted { turn: self.mapper.turn, ..Default::default() })).await?;
         *started = true;
         Ok(())
@@ -1422,7 +1436,7 @@ impl Process {
                     self.unshown = quiet && !started;
                     if self.unshown {
                         let texts = self.queued_notices().await;
-                        told(sink, texts).await?;
+                        told(sink, texts, None).await?;
                         sink.append(session_event::Kind::Notice(c6_proto::Notice {
                             title: "Stopped before replying".into(),
                             message: "Right after you stopped the agent, Claude Code started a turn by itself for this notice; carbon6 stopped it before the agent replied. The agent reads it with your next message.".into(),
@@ -1654,17 +1668,53 @@ fn is_task_notice(v: &Value) -> bool {
 }
 
 /// Logs what the agent was told, each as a task notification.
-async fn told(sink: &Arc<dyn EventSink>, texts: Vec<String>) -> anyhow::Result<()> {
+async fn told(sink: &Arc<dyn EventSink>, texts: Vec<String>, task_notice: Option<c6_proto::TaskNotice>) -> anyhow::Result<()> {
     for text in texts {
         let message = UserMessage {
             command_id: format!("task:{}", uuid::Uuid::now_v7()),
             text,
             command: "task-notification".into(),
+            task_notice: task_notice.clone(),
             ..Default::default()
         };
         sink.append(session_event::Kind::User(message)).await?;
     }
     Ok(())
+}
+
+/// Only SDK fields and task-start metadata are used, never notification prose.
+fn sdk_task_notice(v: &Value, labels: &HashMap<String, (String, String)>) -> c6_proto::TaskNotice {
+    let label = v["task_id"].as_str().and_then(|id| labels.get(id));
+    let title =
+        v["description"].as_str().filter(|s| !s.trim().is_empty()).or_else(|| label.map(|(title, _)| title.as_str())).unwrap_or_default();
+    let native_type =
+        v["task_type"].as_str().filter(|s| !s.is_empty()).or_else(|| label.map(|(_, kind)| kind.as_str())).unwrap_or_default();
+    let status = v["status"].as_str().unwrap_or_default();
+    let markdown = v["summary"].as_str().filter(|s| !s.trim().is_empty()).map(str::to_owned).unwrap_or_else(|| format!("Task {status}."));
+    c6_proto::TaskNotice {
+        kind: match native_type {
+            "local_bash" => "command",
+            "local_agent" => "subagent",
+            _ => "task",
+        }
+        .into(),
+        title: title.into(),
+        status: status.into(),
+        markdown,
+        ..Default::default()
+    }
+}
+
+fn combined_task_notice(notices: &[(String, c6_proto::TaskNotice)]) -> c6_proto::TaskNotice {
+    if notices.len() == 1 {
+        return notices[0].1.clone();
+    }
+    c6_proto::TaskNotice {
+        kind: "task".into(),
+        title: "Background tasks".into(),
+        markdown: notices.iter().map(|(_, n)| format!("{} · {}\n\n{}", n.title, n.status, n.markdown)).collect::<Vec<_>>().join("\n\n"),
+        ..Default::default()
+    }
 }
 
 /// Asks Claude Code to stop its turn (Esc). Its background agents stop with
@@ -2258,6 +2308,22 @@ mod tests {
     use c6_proto::SessionEvent;
 
     use super::*;
+
+    #[test]
+    fn sdk_notice_uses_structured_task_labels_not_summary_prose_or_ids() {
+        let labels = HashMap::from([("sdk-id".into(), ("Run checks".into(), "local_bash".into()))]);
+        let event = serde_json::json!({"task_id": "sdk-id", "status": "failed", "summary": "## Actual result\nOne failed."});
+        let notice = sdk_task_notice(&event, &labels);
+        assert_eq!((notice.kind.as_str(), notice.title.as_str(), notice.status.as_str()), ("command", "Run checks", "failed"));
+        assert!(notice.session_id.is_empty(), "a CLI task id is not a session id");
+        assert_eq!(notice.markdown, "## Actual result\nOne failed.");
+        let agent =
+            sdk_task_notice(&serde_json::json!({"task_type": "local_agent", "description": "Review", "status": "completed"}), &labels);
+        assert_eq!((agent.kind.as_str(), agent.title.as_str()), ("subagent", "Review"));
+        let unknown = sdk_task_notice(&serde_json::json!({"task_id": "raw-id", "summary": "Agent XYZ completed"}), &labels);
+        assert_eq!(unknown.kind, "task");
+        assert!(unknown.title.is_empty(), "do not parse prose or display the SDK id");
+    }
 
     #[derive(Default)]
     struct VecSink(Mutex<Vec<SessionEvent>>);
@@ -3191,6 +3257,9 @@ done
         assert_eq!(events[5..].iter().map(kind).collect::<Vec<_>>(), ["user", "turn_started", "assistant", "usage", "turn_ended"]);
         let Some(session_event::Kind::User(u)) = &events[5].kind else { panic!() };
         assert_eq!((u.command.as_str(), u.text.as_str()), ("task-notification", "Build finished"));
+        let metadata = u.task_notice.as_ref().expect("live SDK notification metadata");
+        assert_eq!(metadata.markdown, "Build finished");
+        assert_eq!(metadata.status, "completed");
         p.close().await;
     }
 
@@ -3265,7 +3334,10 @@ done
         assert!(p.wake_due().is_none(), "nothing has ended yet");
         let began = idle_until_or_turn(&mut p, &sink, |p| p.wake_due().is_some()).await;
         assert!(!began, "this Claude Code starts no turn for it");
-        let notice = p.take_unwoken().expect("the build's end is waiting");
+        let (notice, task_notice) = p.take_unwoken().expect("the build's end is waiting");
+        assert_eq!(task_notice.status, "completed");
+        assert_eq!(task_notice.markdown, "Build finished");
+        assert!(task_notice.session_id.is_empty());
         assert!(
             notice.contains(r#"status="completed""#)
                 && notice.contains("Task: Build finished")
@@ -3279,6 +3351,7 @@ done
             command_id: "task:claude-wake:1".into(),
             text: notice,
             command: "task-notification".into(),
+            task_notice: Some(task_notice),
             ..Default::default()
         };
         assert_eq!(run(&mut p, 2, &[wake], &sink).await.reason, Some(TurnEndReason::Completed));

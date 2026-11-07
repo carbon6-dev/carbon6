@@ -2287,6 +2287,7 @@ fn Transcript(
                         let seq = e.seq;
                         let only_thinking = thinking_only(&e.kind);
                         let anchorable = can_branch && can_anchor(&e.kind);
+                        let task_notification = matches!(&e.kind, EventKind::User { command, .. } if command == "task-notification");
                         let user_text = match &e.kind {
                             EventKind::User { text, .. } => Some(text.clone()),
                             _ => None,
@@ -2350,7 +2351,7 @@ fn Transcript(
                             <div
                                 id=format!("{}-e{seq}", id.get_value())
                                 class=move || format!("c6-transcript-row group relative {arrive} {} {} {}",
-                                    if anchorable { "pb-7" } else { "" },
+                                    if anchorable && !task_notification { "pb-7" } else { "" },
                                     if hidden() || (only_thinking && !show_thinking.get()) { "hidden" } else { "" },
                                     if by().is_some() { "opacity-50" } else { "" })
                             >
@@ -2390,7 +2391,13 @@ fn Transcript(
                                     }.into_any()
                                 }}
                                 {anchorable.then(|| view! {
-                                    <div class="absolute bottom-0 right-0 flex gap-1 opacity-0 transition group-hover:opacity-100">
+                                    // A quiet notice may be narrower than its actions. Let
+                                    // those wrap below it, never over its disclosure/icon.
+                                    <div class=if task_notification {
+                                        "mt-1 flex flex-wrap justify-end gap-1 opacity-0 transition group-hover:opacity-100"
+                                    } else {
+                                        "absolute bottom-0 right-0 flex gap-1 opacity-0 transition group-hover:opacity-100"
+                                    }>
                                         {move || (can_rewind && is_user && by().is_none()).then(|| view! {
                                             <button class=UBTN title="Change this message and send it again (rewinds to before it)" on:click=move |_| rewinding.set(Some((seq, true)))>{crate::icons::pencil()}" Edit"</button>
                                             <button class=UBTN title="Rewind the conversation (and optionally files) to before this message" on:click=move |_| rewinding.set(Some((seq, false)))>{crate::icons::undo()}" Rewind"</button>
@@ -3797,6 +3804,60 @@ fn can_anchor(kind: &EventKind) -> bool {
     matches!(kind, EventKind::Assistant { .. } | EventKind::User { .. })
 }
 
+/// Describe only structured metadata. An older notice is not evidence of who
+/// sent it; its exact agent-facing text remains available in the disclosure.
+fn task_notice_label(notice: Option<&c6_api::TaskNotice>) -> (String, String) {
+    let Some(n) = notice else { return ("Background notice".into(), String::new()) };
+    let status = match n.status.as_str() {
+        "completed" | "finished" => "finished",
+        "completed without a report" => "finished without a report",
+        "failed" => "failed",
+        "interrupted" => "interrupted",
+        "lost" => "lost",
+        "stopped" | "stopped_by_user" => "stopped",
+        _ => "",
+    };
+    let title = n.title.trim();
+    match n.kind.as_str() {
+        "subagent" => (format!("Report from {}", if title.is_empty() { "a subagent" } else { title }), status.into()),
+        "command" => {
+            let what = if status.is_empty() { "ended" } else { status };
+            let title = if title.is_empty() { "Background command".into() } else { format!("Background command {what}: {title}") };
+            (title, if n.title.trim().is_empty() { what.into() } else { String::new() })
+        }
+        _ => (if title.is_empty() { "Background notice".into() } else { title.into() }, status.into()),
+    }
+}
+
+fn task_notice(text: &str, notice: Option<&c6_api::TaskNotice>) -> AnyView {
+    let (label, status) = task_notice_label(notice);
+    let full = if status.is_empty() { label.clone() } else { format!("{label} · {status}") };
+    let content = notice.map(|n| n.markdown.clone()).filter(|s| !s.trim().is_empty());
+    let source = notice.filter(|n| !n.session_id.is_empty()).map(|n| {
+        let title = if n.title.trim().is_empty() { "subagent" } else { n.title.trim() };
+        view! { <a class="text-accent hover:underline" href=format!("/sessions/{}", n.session_id)>{format!("Open {title}")}</a> }
+    });
+    view! {
+        <details class="c6-task-notice min-w-0 text-xs text-muted">
+            <summary class="flex cursor-pointer select-none items-center gap-1" title=full>
+                <span class="shrink-0">{crate::icons::corner_down_right()}</span>
+                <span class="min-w-0 truncate">{label}</span>
+                {(!status.is_empty()).then(|| view! { <span class="shrink-0">" · "{status}</span> })}
+            </summary>
+            {source.map(|link| view! { <p class="mt-2">{link}</p> })}
+            {match content {
+                Some(markdown) => view! { <div class="md mt-2 min-w-0 break-words text-sm text-zinc-800 dark:text-zinc-200" inner_html=crate::markdown::with_citations(&markdown, &[])></div> }.into_any(),
+                None => view! { <p class="mt-2">"No structured description was recorded for this notice."</p> }.into_any(),
+            }}
+            <details class="mt-2">
+                <summary class="cursor-pointer select-none">"Raw text the agent received"</summary>
+                <pre class="mt-1 max-h-60 overflow-auto whitespace-pre-wrap break-all rounded-md bg-zinc-100 p-2 font-mono text-[11px] dark:bg-zinc-900">{text.to_owned()}</pre>
+            </details>
+        </details>
+    }
+    .into_any()
+}
+
 /// Your transcript message, including card-button answers. Kept separate so
 /// native UI tests exercise the same right-aligned markup as the live view.
 fn user_message(session: &str, e: &Event) -> AnyView {
@@ -3919,14 +3980,7 @@ fn render_event(
         EventKind::BackgroundTask { task_id, kind, description, state, exit_code, elapsed_ms, .. } => {
             crate::tasks::ended_line(task_id, kind, description, state, *exit_code, *elapsed_ms).unwrap_or_else(|| ().into_any())
         }
-        // What the agent was told about a task: folded.
-        EventKind::User { text, command, .. } if command == "task-notification" => view! {
-            <details class="text-xs text-muted">
-                <summary class="cursor-pointer select-none">{crate::icons::corner_down_right()}" the agent was told"</summary>
-                <pre class="mt-1 max-h-60 overflow-auto whitespace-pre-wrap rounded-md bg-zinc-100 p-2 font-mono text-[11px] dark:bg-zinc-900">{text.clone()}</pre>
-            </details>
-        }
-        .into_any(),
+        EventKind::User { text, command, task_notice: notice, .. } if command == "task-notification" => task_notice(text, notice.as_deref()),
         EventKind::User { text, command, .. } if command == "stop-hook" => view! {
             <p class="flex items-start gap-2 text-xs text-amber-700 dark:text-amber-400"><span>{crate::icons::rotate()}</span><span class="whitespace-pre-wrap">{text.clone()}</span></p>
         }
@@ -6269,6 +6323,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn background_notice_labels_use_metadata_not_agent_facing_prose() {
+        use c6_api::TaskNotice;
+        assert_eq!(task_notice_label(None), ("Background notice".into(), String::new()));
+        let mut notice = TaskNotice { kind: "subagent".into(), title: "zmbp ops".into(), status: "completed".into(), ..Default::default() };
+        assert_eq!(task_notice_label(Some(&notice)), ("Report from zmbp ops".into(), "finished".into()));
+        notice.status = "failed".into();
+        assert_eq!(task_notice_label(Some(&notice)).1, "failed");
+        notice.title.clear();
+        assert_eq!(task_notice_label(Some(&notice)).0, "Report from a subagent");
+        notice.kind = "command".into();
+        notice.title = "Run all checks".into();
+        notice.status = "finished".into();
+        assert_eq!(task_notice_label(Some(&notice)), ("Background command finished: Run all checks".into(), String::new()));
+        notice.status = "something an old worker did not describe".into();
+        assert_eq!(task_notice_label(Some(&notice)).0, "Background command ended: Run all checks");
+        let old: Event = serde_json::from_value(serde_json::json!({
+            "seq": 1, "ts": 1, "type": "user", "command_id": "old",
+            "command": "task-notification", "text": "The user messaged subagent unknown directly"
+        }))
+        .unwrap();
+        let EventKind::User { task_notice, .. } = old.kind else { panic!("user event") };
+        assert!(task_notice.is_none(), "old events need no migration or fabricated attribution");
+    }
+
+    #[test]
     fn only_session_authored_creation_brings_documents_forward_not_streaming_edits() {
         for by in ["session:one", "session:two"] {
             for what in ["created", "changed", "deleted", "commented", "exported"] {
@@ -7035,6 +7114,7 @@ mod tests {
             wake: false,
             from_session_id: String::new(),
             from_title: String::new(),
+            task_notice: None,
         };
         let ts = 10_000;
         let evs = [ev(1, ts, queued("task:bg1:finished", "")), ev(2, ts + 47, user("task:bg1:finished"))];

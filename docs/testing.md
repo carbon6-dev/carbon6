@@ -4,6 +4,24 @@ Status: rules in force (2026-10-19); `make check` enforces what a pattern can ca
 
 ## Working ring and transcript rendering
 
+### Background-notice descriptions
+
+After building the UI, run the production-WASM regression (Node and browser
+overrides are the same as `motion.cjs`):
+
+```sh
+ENGINE=both SCREENSHOTS=/tmp/q5-told node crates/c6-ui/tests/task-notices.cjs
+```
+
+It checks light/dark themes on desktop, four narrow tiles, and 390/320px phones.
+Closed notices stay one line and retain their icon; subagent names/statuses and
+command descriptions come from metadata. Expanded reports render Markdown and
+link to their session, with the exact model-facing text folded separately. Old
+events without metadata keep a neutral fallback and their original text. Browser
+errors fail the run. `BEFORE=1 ROOT=/path/to/base/dist` captures the old closed and
+expanded rows with identical fixtures, without asserting the new presentation.
+Screenshot names begin `before-`/`after-`, so both sets coexist.
+
 After `env -u NO_COLOR make ui`, run the production Chromium regression with
 the same Node/Playwright/browser overrides as `motion.cjs`:
 

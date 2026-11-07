@@ -707,6 +707,7 @@ pub(crate) mod tests {
             wake: false,
             from_session_id: String::new(),
             from_title: String::new(),
+            task_notice: None,
         }
     }
 

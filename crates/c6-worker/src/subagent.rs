@@ -666,6 +666,20 @@ pub fn status_of(reason: TurnEndReason, report: &str) -> &'static str {
     }
 }
 
+/// Display a report without the model-facing attribution or digest wrappers.
+/// Callers use the child's title (or its delegation description), never its id.
+pub fn task_report_notice(title: &str, sid: &str, reason: TurnEndReason, report: &str) -> c6_proto::TaskNotice {
+    let status = status_of(reason, report);
+    let markdown = if reason == TurnEndReason::Completed && !report.trim().is_empty() {
+        report.to_owned()
+    } else if report.trim().is_empty() {
+        format!("Subagent {status}.")
+    } else {
+        format!("Subagent {status}.\n\n{report}")
+    };
+    c6_proto::TaskNotice { kind: "subagent".into(), title: title.into(), session_id: sid.into(), status: status.into(), markdown }
+}
+
 /// A subagent's depth in its tree: a local subagent's from its delegation,
 /// a remote one's from the head (a top-level session is 0).
 pub(crate) fn depth_of(spec: &CreateSession) -> u32 {
@@ -953,6 +967,29 @@ impl c6_tools::Hooks for SubagentHooks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn report_notice_uses_the_report_and_plain_outcome_not_the_model_digest() {
+        let report = "## Result\n\n**Passed.**\n";
+        let notice = task_report_notice("Review changes", "child", TurnEndReason::Completed, report);
+        assert_eq!(
+            (notice.kind.as_str(), notice.title.as_str(), notice.session_id.as_str(), notice.status.as_str()),
+            ("subagent", "Review changes", "child", "completed")
+        );
+        assert_eq!(notice.markdown, report, "successful Markdown stays verbatim");
+        let failed = task_report_notice("", "raw-id", TurnEndReason::Error, "Partial **findings**.");
+        assert!(failed.title.is_empty(), "the UI supplies subagent, not the raw id");
+        assert_eq!(failed.markdown, "Subagent failed.\n\nPartial **findings**.");
+        for (reason, status) in [
+            (TurnEndReason::Completed, "completed without a report"),
+            (TurnEndReason::WorkerRestarted, "lost"),
+            (TurnEndReason::Interrupted, "interrupted"),
+        ] {
+            let notice = task_report_notice("Review", "child", reason, "");
+            assert_eq!(notice.status, status);
+            assert_eq!(notice.markdown, format!("Subagent {status}."));
+        }
+    }
 
     #[test]
     fn unasked_reports_name_the_input_source() {

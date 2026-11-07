@@ -181,6 +181,7 @@ pub(crate) enum ActorMsg {
         task_id: String,
         kind: String,
         description: String,
+        native_type: String,
         notify: bool,
         pgid: i32,
         /// A subagent's session.
@@ -220,6 +221,7 @@ pub(crate) enum ActorMsg {
     ChildReport {
         text: String,
         wake: bool,
+        task_notice: Option<c6_proto::TaskNotice>,
     },
     /// Context for the next input, never a reason to start a turn.
     /// How a remote subagent's turn ended (from the head, as a command).
@@ -872,6 +874,7 @@ impl SessionManager {
                 task_id: t.task_id,
                 kind: t.kind,
                 description: t.description,
+                native_type: t.native_type,
                 notify: t.notify,
                 pgid: t.pgid,
                 child,
@@ -1342,6 +1345,7 @@ fn notices_of(events: &[SessionEvent]) -> (Vec<i64>, Vec<String>, Vec<(PendingIn
                     from_session_id: n.from_session_id.clone(),
                     from_title: n.from_title.clone(),
                     hops: n.hops,
+                    task_notice: n.task_notice.clone(),
                     ..Default::default()
                 },
                 n.wake,
@@ -1750,11 +1754,12 @@ impl Actor {
                             return;
                         }
                     }
-                    Some(ActorMsg::ChildReport { text, wake }) => {
+                    Some(ActorMsg::ChildReport { text, wake, task_notice }) => {
                         let input = PendingInput {
                             command_id: format!("subagent:{}", uuid::Uuid::now_v7()),
                             text,
                             command: "task-notification".into(),
+                            task_notice,
                             ..Default::default()
                         };
                         if let Err(e) = self.notice(input, running.is_some(), wake).await {
@@ -1816,7 +1821,7 @@ impl Actor {
                         // stop, so its process was): the agent hears it with
                         // your next message, and isn't woken for it.
                         let held = lost_native && self.after_stop(running.is_some());
-                        if let Err(e) = self.task_event(record, notice, running.is_some() && !held, !held).await {
+                        if let Err(e) = self.task_event(record, notice, &ev.output, running.is_some() && !held, !held).await {
                             error!(session = %self.writer.session_id, "recording a background task: {e:#}");
                             return;
                         }
@@ -1839,7 +1844,7 @@ impl Actor {
                             return;
                         }
                     }
-                    Some(ActorMsg::Lost { task_id, kind, description, notify, pgid, child, remote }) => {
+                    Some(ActorMsg::Lost { task_id, kind, description, native_type, notify, pgid, child, remote }) => {
                         // A held shell command kept running: take it up again,
                         // and its end reaches the agent as usual.
                         if kind == "shell" && self.session_tools.background.adopt(&task_id) {
@@ -1862,9 +1867,9 @@ impl Actor {
                         // Claude Code's own tasks died with its process: its agent
                         // hears it from us.
                         let tell = notify || kind == "claude_code";
-                        let record = BackgroundTask { task_id, kind, description, state: "lost".into(), notify, ..Default::default() };
+                        let record = BackgroundTask { task_id, kind, description, native_type, state: "lost".into(), notify, ..Default::default() };
                         let notice = tell.then(|| task_notice(&record, &report));
-                        if let Err(e) = self.task_event(record, notice, running.is_some(), true).await {
+                        if let Err(e) = self.task_event(record, notice, "", running.is_some(), true).await {
                             error!(session = %self.writer.session_id, "recording a lost background task: {e:#}");
                             return;
                         }
@@ -1959,12 +1964,13 @@ impl Actor {
                     }
                 }
                 _ = tokio::time::sleep_until(wake_at.unwrap_or_else(tokio::time::Instant::now)), if running.is_none() && wake_at.is_some() => {
-                    if let Some(text) = self.claude.as_mut().and_then(|p| p.take_unwoken()) {
+                    if let Some((text, task_notice)) = self.claude.as_mut().and_then(|p| p.take_unwoken()) {
                         info!(session = %self.writer.session_id, "Claude Code didn't wake for its finished tasks: telling the agent");
                         let input = PendingInput {
                             command_id: format!("task:claude-wake:{}", uuid::Uuid::now_v7()),
                             text,
                             command: "task-notification".into(),
+                            task_notice: Some(task_notice),
                             ..Default::default()
                         };
                         if let Err(e) = self.notice(input, false, true).await {
@@ -2049,7 +2055,9 @@ impl Actor {
             let text = crate::subagent::unasked_report(&sid, &said, &body);
             match self.manager.actor_for(&d.parent_session_id).await {
                 Ok(Some(parent)) => {
-                    let _ = parent.send(ActorMsg::ChildReport { text, wake });
+                    // The child's title was seeded from the delegation description.
+                    let task_notice = Some(crate::subagent::task_report_notice(&self.started.title, &sid, outcome.reason, &outcome.report));
+                    let _ = parent.send(ActorMsg::ChildReport { text, wake, task_notice });
                 }
                 Ok(None) => warn!(session = %sid, "a subagent's report has no parent on this worker"),
                 Err(e) => warn!(session = %sid, "a subagent's report could not reach its parent: {e:#}"),
@@ -2093,6 +2101,7 @@ impl Actor {
                 command_id: format!("subagent:{}", reported.command_id),
                 text,
                 command: "task-notification".into(),
+                task_notice: ended.task_notice,
                 ..Default::default()
             };
             self.notice(input, busy, wake).await?;
@@ -2188,6 +2197,7 @@ impl Actor {
             from_session_id: input.from_session_id.clone(),
             from_title: input.from_title.clone(),
             hops: input.hops,
+            task_notice: input.task_notice.clone(),
             deliver_at_ms: if wake && !busy && self.inbox.lock().unwrap().queue.is_empty() {
                 let delay = self.next_auto_turn().saturating_duration_since(tokio::time::Instant::now());
                 if delay.is_zero() { 0 } else { c6_core::now_ms() + delay.as_millis() as i64 }
@@ -2256,11 +2266,19 @@ impl Actor {
     /// Logs a background task's start or end and, for an end the agent
     /// should hear about, queues the notice (`notice`). Its id names the
     /// task and how it ended, so the same end is never told twice.
-    async fn task_event(&mut self, record: BackgroundTask, notice: Option<String>, busy: bool, wake: bool) -> anyhow::Result<()> {
+    async fn task_event(
+        &mut self,
+        record: BackgroundTask,
+        notice: Option<String>,
+        output: &str,
+        busy: bool,
+        wake: bool,
+    ) -> anyhow::Result<()> {
         let command_id = format!("task:{}:{}", record.task_id, record.state);
+        let task_notice = Some(background_task_notice(&record, output));
         self.writer.append(session_event::Kind::BackgroundTask(record)).await?;
         let Some(text) = notice else { return Ok(()) };
-        let input = PendingInput { command_id, text, command: "task-notification".into(), ..Default::default() };
+        let input = PendingInput { command_id, text, command: "task-notification".into(), task_notice, ..Default::default() };
         self.notice(input, busy, wake).await
     }
 
@@ -3594,6 +3612,35 @@ pub(crate) fn duration_text(secs: u64) -> String {
     }
 }
 
+fn background_task_notice(t: &BackgroundTask, output: &str) -> c6_proto::TaskNotice {
+    let command = t.kind == "shell" || t.native_type == "local_bash";
+    let kind = if command {
+        "command"
+    } else if t.native_type == "local_agent" {
+        "subagent"
+    } else {
+        "task"
+    };
+    let what = if command { "Command" } else { "Task" };
+    let status = t.state.replace('_', " ");
+    let markdown = if !output.trim().is_empty() {
+        if command { format!("```text\n{output}\n```") } else { output.to_owned() }
+    } else if t.state == "lost" {
+        format!("{what} lost: its process stopped before it reported an outcome. Check its work before running it again.")
+    } else if t.state == "finished" && command {
+        format!("{what} exited with code {}.", t.exit_code)
+    } else {
+        format!("{what} {status}.")
+    };
+    c6_proto::TaskNotice {
+        kind: kind.into(),
+        title: t.description.clone(),
+        status: if t.state == "finished" && t.exit_code != 0 { "failed".into() } else { t.state.clone() },
+        markdown,
+        ..Default::default()
+    }
+}
+
 fn task_notice(t: &BackgroundTask, output: &str) -> String {
     // One of Claude Code's own tasks, lost with its process (its id is the
     // CLI's; Claude Code itself can no longer say what became of it).
@@ -4426,7 +4473,58 @@ mod claude_code_tools_tests {
 
 #[cfg(test)]
 mod notice_tests {
+    use prost::Message;
+
     use super::*;
+
+    #[test]
+    fn queued_metadata_roundtrips_through_reload_and_the_delivered_user_event() {
+        let metadata = crate::subagent::task_report_notice("Review", "child", TurnEndReason::Completed, "# Actual report");
+        let queued = c6_proto::NoticeQueued {
+            command_id: "subagent:report".into(),
+            text: "Original raw attribution <subagent>".into(),
+            command: "task-notification".into(),
+            task_notice: Some(metadata.clone()),
+            ..Default::default()
+        };
+        let decoded = c6_proto::NoticeQueued::decode(queued.encode_to_vec().as_slice()).unwrap();
+        let (_, _, pending) = notices_of(&[ev(1, 1, session_event::Kind::NoticeQueued(decoded))]);
+        let (input, _) = &pending[0];
+        assert_eq!(input.task_notice, Some(metadata.clone()));
+        assert_eq!(input.text, queued.text);
+        let session_event::Kind::User(message) = input.event() else { panic!("a UserMessage") };
+        let decoded = c6_proto::UserMessage::decode(message.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.task_notice, Some(metadata));
+        assert_eq!(decoded.text, queued.text);
+        let (_, _, old) = notices_of(&[ev(1, 1, self::queued("old", false))]);
+        assert!(old[0].0.task_notice.is_none(), "old logs remain neutral");
+    }
+
+    #[test]
+    fn background_metadata_uses_the_record_and_output_not_the_raw_notice() {
+        let record = BackgroundTask {
+            task_id: "raw-id".into(),
+            kind: "shell".into(),
+            description: "Run checks".into(),
+            state: "finished".into(),
+            exit_code: 1,
+            ..Default::default()
+        };
+        let notice = background_task_notice(&record, "warning: one failed");
+        assert_eq!((notice.kind.as_str(), notice.title.as_str(), notice.status.as_str()), ("command", "Run checks", "failed"));
+        assert!(notice.session_id.is_empty());
+        assert_eq!(notice.markdown, "```text\nwarning: one failed\n```");
+        assert_eq!(background_task_notice(&record, "").markdown, "Command exited with code 1.");
+        let mut lost = BackgroundTask { kind: "claude_code".into(), state: "lost".into(), ..record };
+        let notice = background_task_notice(&lost, "");
+        assert_eq!(notice.kind, "task");
+        assert!(notice.markdown.starts_with("Task lost:"));
+        assert!(!notice.markdown.contains('<'));
+        lost.native_type = "local_bash".into();
+        assert_eq!(background_task_notice(&lost, "").kind, "command");
+        lost.native_type = "local_agent".into();
+        assert_eq!(background_task_notice(&lost, "").kind, "subagent");
+    }
 
     struct Head(String);
 
@@ -4552,7 +4650,12 @@ mod notice_tests {
     async fn hold(manager: &SessionManager) -> mpsc::UnboundedSender<ActorMsg> {
         let tx = manager.actor("held").await.unwrap().unwrap();
         for text in ["report 21", "report 22"] {
-            tx.send(ActorMsg::ChildReport { text: text.into(), wake: true }).unwrap();
+            tx.send(ActorMsg::ChildReport {
+                text: text.into(),
+                wake: true,
+                task_notice: Some(crate::subagent::task_report_notice("Review", "child", TurnEndReason::Completed, text)),
+            })
+            .unwrap();
         }
         let events =
             logged(manager, |events| events.iter().filter(|e| matches!(e.kind, Some(session_event::Kind::Error(_)))).count() == 2).await;
@@ -4564,6 +4667,7 @@ mod notice_tests {
             })
             .collect();
         assert_eq!(held.len(), 2);
+        assert!(held.iter().all(|n| n.task_notice.as_ref().is_some_and(|m| m.title == "Review" && m.session_id == "child")));
         assert!(held.iter().all(|n| n.deliver_at_ms > c6_core::now_ms()), "the UI gets the next free slot");
         tx
     }
@@ -4579,6 +4683,15 @@ mod notice_tests {
         let request = mock.requests()[0].to_string();
         assert!(request.contains("report 21") && request.contains("report 22"), "{request}");
         assert!(notices_of(&events).2.is_empty());
+        let delivered: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Some(session_event::Kind::User(u)) if u.text.starts_with("report ") => Some(u),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(delivered.len(), 2);
+        assert!(delivered.iter().all(|u| u.task_notice.as_ref().is_some_and(|m| m.markdown == u.text)));
     }
 
     #[tokio::test]
@@ -4614,7 +4727,12 @@ mod notice_tests {
         let _clock = pause_clock();
         let tx = manager.actor("held").await.unwrap().unwrap();
         for text in ["report 21", "report 22"] {
-            tx.send(ActorMsg::ChildReport { text: text.into(), wake: false }).unwrap();
+            tx.send(ActorMsg::ChildReport {
+                text: text.into(),
+                wake: false,
+                task_notice: Some(crate::subagent::task_report_notice("Review", "child", TurnEndReason::Completed, text)),
+            })
+            .unwrap();
         }
         barrier(&manager, "held-without-wake").await;
         tokio::time::advance(HOUR).await;
@@ -4678,6 +4796,7 @@ mod notice_tests {
                 text: text.into(),
                 wake: true,
                 command: "task-notification".into(),
+                task_notice: Some(crate::subagent::task_report_notice("Review", "child", TurnEndReason::Completed, text)),
                 ..Default::default()
             };
             manager.journal.append("held", &ev(82 + i as u64, c6_core::now_ms(), session_event::Kind::NoticeQueued(notice))).await.unwrap();

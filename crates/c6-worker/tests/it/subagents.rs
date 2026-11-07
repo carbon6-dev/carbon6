@@ -481,6 +481,21 @@ async fn message_to_a_subagent_reports_back(via_api: bool) {
         format!("The user messaged subagent {child_id} directly:")
     };
     assert!(req.contains(&label.replace('"', "\\\"")), "{req}");
+    let producer_events = env.head.state.store.events_after(&id, parent_seq, i64::MAX).await.unwrap();
+    let report = producer_events
+        .iter()
+        .find_map(|e| match &e.kind {
+            Some(c6_proto::session_event::Kind::User(u)) if u.command == "task-notification" => Some(u),
+            _ => None,
+        })
+        .unwrap();
+    let metadata = report.task_notice.as_ref().expect("local child report metadata");
+    assert_eq!(
+        (metadata.kind.as_str(), metadata.title.as_str(), metadata.session_id.as_str(), metadata.status.as_str()),
+        ("subagent", "dig", child_id.as_str(), "completed")
+    );
+    assert_eq!(metadata.markdown, "Half the haystack is searched.");
+    assert!(report.text.contains(&label), "raw attribution is retained");
 
     // With wake: the parent starts a turn by itself.
     env.mock.push(Reply::Text("All of it now.".into())); // the subagent

@@ -108,7 +108,7 @@ inspection is portal-backed so moving it into a sheet does not clip it.
   - `success` → Completed;
   - `error_during_execution` after our interrupt → Interrupted;
   - anything else → Error.
-- **A turn with no confirmed input before it** is self-started. Before its `TurnStarted`, the actor appends a `UserMessage` with `command: "task-notification"`. Its text is the summaries of the `task_notification`s seen since the last `result`, so the transcript shows why the agent woke. The UI labels it "woken by bg…".
+- **A turn with no confirmed input before it** is self-started. Before its `TurnStarted`, the actor appends a `UserMessage` with `command: "task-notification"`. Its text is the summaries of the `task_notification`s seen since the last `result`, so the transcript shows why the agent woke. The UI describes structured task/report metadata when supplied, or labels an older unstructured event neutrally as "Background notice" (§5).
 - **The mapper** keeps its per-process state (calls, mirrored subagents, native tasks) across turns. It closes mirrored subagents at their call's result, as now, and at process exit.
 - **Self-started turns** don't count toward the hourly limit. carbon6 can't prevent them without killing the process; it only shows them, except the one right after you stop the agent, which it stops (Stopping, below).
 
@@ -171,10 +171,21 @@ Built 2026-11-03 (design: carbon6 doc "Claude Code sessions: default-deny tool w
   - a remote subagent's report ([remote-subagents.md](remote-subagents.md)), which the head sends until the parent logs `SubagentReported`: `subagent:<the head's command id>`, so one sent again is not told twice;
   - for a session message (step 4), the head's command id, which also gains `from_session_id`.
 - **When a turn takes the notice,** its `UserMessage` has the same `command_id`.
+- **Readable transcript rows.** Optional `task_notice` metadata (`kind`, `title`, `session_id`, `status`, `markdown`) travels with the queued notice, its delivered `UserMessage`, and remote `DelegationEnded` reports. The closed row keeps its corner-arrow icon and one small line: for example, "Report from zmbp ops · finished" or "Background command finished: Run all checks". Long titles truncate rather than widen a tile; the full description remains in the summary's tooltip. Expanding shows the readable Markdown report first, a link to its session when present, then a separately folded "Raw text the agent received". The model's original text is unchanged. Labels never infer a sender by parsing that text. Older workers/events without metadata show "Background notice" and an explanation above the raw-text disclosure, not a claim that a person sent it. These are additive protocol/API fields; no database migration or historical rewrite is needed.
 - **On load** (`SessionManager::load`, `notices_of`), every `NoticeQueued` whose `command_id` has no `UserMessage` is delivered again, under the same rule as when it first arrived (without announcing a hold again). That covers worker restarts and actors that stopped mid-turn. A Claude Code session's notice counts as taken once the CLI echoes it.
 - **Later (step 4):** the head treats `NoticeQueued{command_id}` as a command applied, so it doesn't resend a session message the worker has already recorded.
 - **Waiting notices are shown.** The events API carries `NoticeQueued` (not drawn in the transcript), so the UI knows a notice no turn has taken yet. While the session is idle, a pill above the message box lists them ("2 notices waiting for the agent", each with its first line and sender). Each notice stays hidden for a **3-second grace** from its event timestamp, so input taken promptly doesn't flash as waiting on you. The UI checks once a second even without new events; loading a notice already past the grace shows it immediately. This only delays the display, not delivery, and applies to quiet reports and quota-held notices alike. When the hourly limit holds a notice, its `deliver_at_ms` gives the next free slot; the pill says "delivers itself at 21:14" in your local time. Older workers/log entries without that field show no delivery time. **Deliver now**: `POST /api/v1/sessions/{id}/notices/deliver` sends the worker `ReleaseNotices`, and the held notices start one turn, whatever the hourly limit.
 - **Restart order.** `recover()` already writes `lost` for background tasks open at a restart, and those `lost` ends go through the same path.
+
+Local reports use the child's recorded title (seeded from the delegation
+description); remote reports use its title on the head. Command metadata comes
+from task description, state and captured output; a nonzero exit is displayed
+as failed. Claude Code live SDK notices use structured task descriptions,
+types, statuses and summaries. SDK task ids are not session ids and are never
+used as links or display titles. Transcript-only notices recovered after Stop
+may have no structured identity; they retain the neutral fallback rather than
+parsing their XML-like text. Historical descriptions above quote the old row
+wording; new rows use the descriptions in §5.
 
 ### The hourly limit
 

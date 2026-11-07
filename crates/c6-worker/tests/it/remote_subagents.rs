@@ -383,6 +383,28 @@ async fn a_parent_restart_still_gets_the_report() {
     )
     .await;
     assert!(notice.contains("Counted to ten."), "{notice}");
+    let producer_events = env.head.state.store.events_after(&id, 0, i64::MAX).await.unwrap();
+    let report = producer_events
+        .iter()
+        .find_map(|e| match &e.kind {
+            Some(c6_proto::session_event::Kind::User(u)) if u.command == "task-notification" => Some(u),
+            _ => None,
+        })
+        .unwrap();
+    let metadata = report.task_notice.as_ref().expect("remote report metadata survived the parent's restart");
+    assert_eq!(
+        (metadata.kind.as_str(), metadata.title.as_str(), metadata.session_id.as_str(), metadata.status.as_str()),
+        ("subagent", "long", child_id.as_str(), "completed")
+    );
+    assert_eq!(metadata.markdown, "Counted to ten.");
+    let queued = producer_events
+        .iter()
+        .find_map(|e| match &e.kind {
+            Some(c6_proto::session_event::Kind::NoticeQueued(n)) => n.task_notice.as_ref(),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(queued, metadata);
     let events = env.events(&id).await;
     let (out, _) = result_of(&events, "task").unwrap();
     assert!(out.contains(&format!("<subagent id=\"{child_id}\" status=\"running\" on=\"beta\"/>")), "{out}");

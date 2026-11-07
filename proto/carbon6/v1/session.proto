@@ -80,6 +80,7 @@ message NoticeQueued {
   // When the hourly limit next permits this notice's automatic delivery
   // (Unix milliseconds); zero if it is not held by the limit.
   int64 deliver_at_ms = 9;
+  TaskNotice task_notice = 10;
 }
 
 // The session's default for its subagents changed (you picked one in the
@@ -286,6 +287,16 @@ message SessionStarted {
   bool hosted_search_off = 19;
 }
 
+// Display metadata supplied by a task's producer, never parsed from its prose.
+// Missing metadata on older events retains the neutral notice presentation.
+message TaskNotice {
+  string kind = 1;
+  string title = 2;
+  string session_id = 3;
+  string status = 4;
+  string markdown = 5;
+}
+
 message UserMessage {
   string command_id = 1;
   string text = 2;
@@ -313,6 +324,8 @@ message UserMessage {
   uint32 hops = 11;
   // Present for HTTP API input; only the token's display name, never its secret.
   ApiMessageOrigin api_origin = 12;
+  // Field 13 belongs to human-origin attribution.
+  TaskNotice task_notice = 14;
 }
 
 message ApiMessageOrigin {
@@ -545,6 +558,7 @@ message DelegationEnded {
   // (older heads send plain text), and whether its report wakes the parent.
   repeated string said = 6;
   bool wake = 7;
+  TaskNotice task_notice = 8;
 }
 
 // Deliver the session's held notices now (docs/background.md §5): they
