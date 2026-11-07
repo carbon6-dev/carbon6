@@ -188,6 +188,7 @@ test-under-load: ## Run the test suite with every CPU core kept busy (RUNS=1; NE
 	NEXTEST=$(NEXTEST) scripts/test-under-load.sh $(or $(RUNS),1)
 
 check: ## Check formatting, clippy every target (including wasm), lint tests and ratchet built UI size (docs/testing.md)
+	@python3 scripts/check-session-tags.py --self-test
 	@cargo fmt --all --check || { echo "check: unformatted code; run cargo fmt --all" >&2; exit 1; }
 	@for args in "--workspace --all-targets" "-p c6-ui --target wasm32-unknown-unknown"; do \
 		if cargo clippy --locked $$args --message-format short 2>&1 | tee /dev/stderr | grep -vE '^warning: spurious network' | grep -qE '^(warning|error)'; then \

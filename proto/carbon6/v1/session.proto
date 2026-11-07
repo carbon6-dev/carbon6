@@ -80,7 +80,10 @@ message NoticeQueued {
   // When the hourly limit next permits this notice's automatic delivery
   // (Unix milliseconds); zero if it is not held by the limit.
   int64 deliver_at_ms = 9;
-  TaskNotice task_notice = 10;
+  // Preview journals used 10 for bool quiet, then 5384d8e2 reused it for
+  // TaskNotice. Both encodings must remain unknown fields when replayed.
+  reserved 10;
+  TaskNotice task_notice = 11;
 }
 
 // The session's default for its subagents changed (you picked one in the
