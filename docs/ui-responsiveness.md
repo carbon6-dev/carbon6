@@ -726,3 +726,48 @@ are retained; request serialization still happens inside the original async
 wrapper. `reply-recovery.cjs --responses` checks malformed JSON, structured and
 fallback errors, body-read rejection and post-mount sign-out in real browsers;
 its normal mode still checks delayed mutation failure and draft recovery.
+
+## S8: whole-module WASM savings — November 7, 2026
+
+The exact starting point is `c6/next` **7035ec6b**, not main. Production
+`make ui` initially fails the unchanged **10,724,780 raw / 2,667,328 Brotli**
+ceilings: raw is 64,545 bytes over and Brotli has just 2,560 bytes of room.
+Measurements use the locked UI profile, Binaryen 123 and Brotli quality 11;
+names-kept diagnostic files are never counted as production downloads.
+
+| Build | Raw bytes | Brotli bytes | Saving, raw / Brotli |
+|---|---:|---:|---:|
+| 7035ec6b baseline | 10,789,325 | 2,664,768 | — |
+| Shared popup listener factories | 10,750,115 | 2,659,154 | 39,210 / 5,614 |
+
+The whole-module profile repeats S1's names-kept bindgen/`wasm-opt -Oz -g`
+pipeline, twiggy top/dominators/monos, and all-symbol per-crate/per-module
+shallow totals. An isolated exact **235fae5c** archive build provides the
+growth comparison: executable code grows **159,700 bytes**, data **11,544**.
+Its larger diagnostic name section is not an executable-code saving.
+New session overview/jobs, picker and message-editing work is visible in
+the growth; inline deserialization moving into `api::json` must not be
+mistaken for an independent 294 KB API regression.
+
+Largest current individual renderers remain Settings **212,459**, workspace
+construction **160,872**, App **73,556**, and ProjectPage **47,013** raw
+diagnostic bytes. EventKind's largest flattened deserializer is **65,922**.
+Drop/component/For families span modules and overlap those renderers.
+New job/detail component types, repeated navigation/popover/form types, and
+shared HTTP/body polling are additional candidates, not just list editors.
+
+Popup dismissal now shares one non-generic effect/listener factory behind
+boxed `shown` and reference-counted `close` callbacks. Tracking stays inside
+the same effect; capture/passive flags, weak ownership, outside-press policy,
+nested Escape ordering, focus restoration and cleanup are unchanged. All
+current close captures are shared reactive handles, not clone-sensitive
+owned state. No views, DOM attributes, icons or overlay lifecycles are erased
+or merged by this change. Native UI tests pass **305/305**.
+
+The broader audit found no accidental release inclusion of native tests,
+SSR, regex, ICU or a second gloo-net implementation. Markdown defaults are
+already disabled; its supported tables/strikethrough/task lists remain.
+Unused Debug derives do not explain significant retained code. Panic/crash
+diagnostics, static help/icon tables and stable sorting remain intact.
+Offline second-pass convergence saves only **434 Brotli bytes** (Os: 1,289),
+so no optimizer/linker/profile changes are retained on that evidence.

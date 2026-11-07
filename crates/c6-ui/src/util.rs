@@ -674,7 +674,7 @@ impl Drop for Dismiss {
 /// value returned: a press on its button is no press outside, so the button
 /// alone toggles it. `close` may run once its component is gone: `try_set`.
 pub fn dismissable(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static) -> String {
-    pop_up(shown, close, true, None)
+    pop_up(Box::new(shown), std::rc::Rc::new(close), true, None)
 }
 
 /// As `dismissable`, for what covers the page to catch a press outside it
@@ -682,13 +682,13 @@ pub fn dismissable(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone 
 /// wheels and focus left to what covers the page. What it shows carries
 /// `data-pop` (and its button, if one opens it, for focus to go back to).
 pub fn escapable(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static) -> String {
-    pop_up(shown, close, false, None)
+    pop_up(Box::new(shown), std::rc::Rc::new(close), false, None)
 }
 
 /// An Escape-dismissed hover preview. Until explicitly pinned, another
 /// passive preview may replace it; a pinned preview blocks passive hover.
 pub fn previewable(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static, pinned: RwSignal<bool>) -> String {
-    pop_up(shown, close, false, Some(pinned))
+    pop_up(Box::new(shown), std::rc::Rc::new(close), false, Some(pinned))
 }
 
 /// A retained phone dialog: contain keyboard focus and make the background
@@ -754,12 +754,11 @@ pub fn drawer_gesture(open: RwSignal<bool>, element: NodeRef<leptos::html::Div>,
     let _ = (open, element, close);
 }
 
-fn pop_up(
-    shown: impl Fn() -> bool + 'static,
-    close: impl Fn() + Clone + 'static,
-    outside_closes: bool,
-    pinned: Option<RwSignal<bool>>,
-) -> String {
+// Share the effect and DOM listener factories across caller closure types.
+// Rc preserves the callbacks' existing lifetime beyond an individual render;
+// an arena callback would instead depend on its reactive owner staying alive.
+#[inline(never)]
+fn pop_up(shown: Box<dyn Fn() -> bool>, close: std::rc::Rc<dyn Fn()>, outside_closes: bool, pinned: Option<RwSignal<bool>>) -> String {
     use wasm_bindgen::JsCast;
     let id = POPS.with(|n| {
         n.set(n.get() + 1);
@@ -802,7 +801,7 @@ fn pop_up(
             };
             let (stay, gone) = opening(std::mem::take(&mut *s), holds);
             *s = stay;
-            s.push(Up { id, owner: owner.clone(), put_away: std::rc::Rc::new(close.clone()), pinned });
+            s.push(Up { id, owner: owner.clone(), put_away: close.clone(), pinned });
             gone
         });
         for x in gone {
