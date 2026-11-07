@@ -1968,9 +1968,16 @@ async fn send_message(
     // You answered: you'd seen how it stood (docs/work.md §3), not the
     // turn this starts.
     let at = now_ms();
-    let queued =
-        crate::sessions::send_input_as(&st, &id, &req, uuid::Uuid::now_v7().to_string(), "", caller.api_origin(), caller.human_origin())
-            .await?;
+    let queued = crate::sessions::send_input_as(
+        &st,
+        &id,
+        &req,
+        uuid::Uuid::now_v7().to_string(),
+        "",
+        caller.api_origin(),
+        caller.human_origin(st.auth.required),
+    )
+    .await?;
     // The message is queued: failing to note this mustn't make the send
     // look failed (and get it sent twice).
     if let Err(e) = crate::work::seen_session(&st, &id, at).await {

@@ -227,6 +227,11 @@ async fn seed(api: &Api, dir: &Path) -> (String, u64) {
     api.idle(&id, 1).await;
     api.say(&id, "DROP_PRIVATE").await;
     let events = api.idle(&id, 2).await;
+    for event in &events {
+        if let EventKind::User { origin, .. } = &event.kind {
+            assert_eq!(origin.as_deref(), Some(&c6_api::MessageOrigin::Human), "auth-off browser inputs remain the person's messages");
+        }
+    }
     let to_seq = user_seq(&events, "DROP_PRIVATE");
     (id, to_seq)
 }
@@ -261,12 +266,84 @@ async fn claude_rewind_resets_native_history_before_acknowledging_and_fails_clos
     enroll::enroll(&enrollment.token).await.unwrap().save(state.path()).unwrap();
     let worker = WorkerProcess::start(state.path()).await;
     let mut api = Api {
-        http: reqwest::Client::new(),
+        // The product's page path, not an unattributed HTTP automation client.
+        http: reqwest::Client::builder()
+            .default_headers([(reqwest::header::HeaderName::from_static("x-c6-realm"), "home".parse().unwrap())].into_iter().collect())
+            .build()
+            .unwrap(),
         url: format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port()),
         worker: worker.id.clone(),
         cc: Value::Null,
     };
-    api.cc = api.post("/connections", json!({"kind": "claude_code", "name": "fake rewind", "base_url": ""})).await;
+    // Connection setup is the console's page; session traffic below is home.
+    api.cc = api
+        .http
+        .post(format!("{}/connections", api.url))
+        .header("x-c6-realm", "admin")
+        .json(&json!({"kind": "claude_code", "name": "fake rewind", "base_url": ""}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // A token still wins over page context with sign-in off: its initial
+    // message is an API card, and the head must refuse to queue its rewind.
+    let token_dir = tempfile::tempdir().unwrap();
+    let token = head.state.store.create_api_token("rewind-controller", None).await.unwrap().token.unwrap();
+    let created: Value = api
+        .http
+        .post(format!("{}/sessions", api.url))
+        .bearer_auth(&token)
+        .json(&json!({"worker_id": api.worker, "cwd": token_dir.path(), "connection_id": api.cc["id"],
+            "model": "opus", "prompt": "API_INPUT", "human_origin": true, "origin": {"kind": "human"}}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token_id = created["id"].as_str().unwrap();
+    let token_events = api.idle(token_id, 1).await;
+    assert!(token_events.iter().any(|e| matches!(&e.kind, EventKind::User { origin, .. }
+        if origin.as_deref() == Some(&c6_api::MessageOrigin::Api { token_name: "rewind-controller".into() }))));
+    let response = api
+        .http
+        .post(format!("{}/sessions/{token_id}/rewind", api.url))
+        .json(&json!({"to_seq": user_seq(&token_events, "API_INPUT")}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(response.text().await.unwrap().contains("can only rewind to before one of your messages"));
+    assert_eq!(rewinds(&api.events(token_id).await), 0);
+
+    // Unknown is not a human claim, but must not lock the person out of
+    // their session. Exercise the worker's actual native reset as well.
+    let unknown_dir = tempfile::tempdir().unwrap();
+    let created: Value = reqwest::Client::new()
+        .post(format!("{}/sessions", api.url))
+        .json(&json!({"worker_id": api.worker, "cwd": unknown_dir.path(), "connection_id": api.cc["id"],
+            "model": "opus", "prompt": "UNKNOWN_INPUT", "human_origin": true}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let unknown_id = created["id"].as_str().unwrap();
+    let unknown_events = api.idle(unknown_id, 1).await;
+    assert!(unknown_events.iter().any(|e| matches!(&e.kind, EventKind::User { origin, .. }
+        if origin.as_deref() == Some(&c6_api::MessageOrigin::Unknown))));
+    api.rewind(unknown_id, user_seq(&unknown_events, "UNKNOWN_INPUT")).await;
+    api.rewound(unknown_id, 1).await;
 
     // A: a completed tool turn cuts at its FINAL top-level assistant UUID.
     let a = tempfile::tempdir().unwrap();

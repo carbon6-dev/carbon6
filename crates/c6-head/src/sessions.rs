@@ -89,7 +89,7 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
 
 /// Creates a session with server-authenticated provenance on its first input.
 pub async fn create_from(st: &HeadState, req: api::CreateSession, caller: &crate::realms::Caller) -> anyhow::Result<api::Session> {
-    create_linked_with_origin(st, req, "", None, caller.api_origin(), caller.human_origin()).await
+    create_linked_with_origin(st, req, "", None, caller.api_origin(), caller.human_origin(st.auth.required)).await
 }
 
 /// A session acting as an app instance in its realm (docs/apps.md §5.3),
@@ -295,7 +295,7 @@ pub async fn create_assistant(st: &HeadState, req: api::AskAssistant) -> anyhow:
 }
 
 pub async fn create_assistant_from(st: &HeadState, req: api::AskAssistant, caller: &crate::realms::Caller) -> anyhow::Result<api::Session> {
-    create_assistant_with_origin(st, req, caller.api_origin(), caller.human_origin()).await
+    create_assistant_with_origin(st, req, caller.api_origin(), caller.human_origin(st.auth.required)).await
 }
 
 /// As create_assistant, carrying only server-authenticated caller provenance.
@@ -426,7 +426,7 @@ pub async fn create_side_chat_from(
     req: api::CreateSideChat,
     caller: &crate::realms::Caller,
 ) -> anyhow::Result<api::Session> {
-    create_side_chat_with_origin(st, parent_id, req, caller.api_origin(), caller.human_origin()).await
+    create_side_chat_with_origin(st, parent_id, req, caller.api_origin(), caller.human_origin(st.auth.required)).await
 }
 
 /// As create_side_chat, carrying only server-authenticated caller provenance.
@@ -1338,7 +1338,7 @@ pub async fn edit_queued(
         input.text = text.to_owned();
         // This caller wrote the replacement, not the original sender.
         input.api_origin = caller.api_origin();
-        input.human_origin = caller.human_origin();
+        input.human_origin = caller.human_origin(st.auth.required);
         input.attachments.retain(|a| !a.name.starts_with("@memex:"));
         input.command.clear();
         input.command_candidates_json.clear();
@@ -1785,11 +1785,11 @@ pub async fn rewind(st: &HeadState, session_id: &str, req: &api::RewindRequest) 
         return Err(bad_request("subagent sessions cannot be rewound"));
     }
     let target = st.store.events_after(session_id, req.to_seq.saturating_sub(1), 1).await?;
-    // Retain rewind for historical messages without provenance, but never
-    // offer another session's, an API caller's, or newly unknown input as yours.
+    // Unknown provenance is not evidence against the person. Only positive
+    // nonhuman provenance (including agent notices) prevents rewind.
     if !matches!(target.first().and_then(|e| e.kind.as_ref()), Some(session_event::Kind::User(u))
-        if (!u.origin_recorded || u.human_origin)
-            && u.api_origin.is_none() && u.from_session_id.is_empty() && u.delegated_by.is_empty())
+        if u.api_origin.is_none() && u.from_session_id.is_empty() && u.delegated_by.is_empty()
+            && !matches!(u.command.as_str(), "task-notification" | "stop-hook"))
         || target[0].seq != req.to_seq
     {
         return Err(bad_request("can only rewind to before one of your messages"));

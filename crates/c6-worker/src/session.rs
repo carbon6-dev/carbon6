@@ -1379,11 +1379,12 @@ fn own_loop_hooks(
 }
 
 /// Match the head's rewind eligibility, including commands from older
-/// heads. Explicit nonhuman provenance always wins over a human flag.
+/// heads. Unknown provenance alone cannot bar the person's actions; explicit
+/// nonhuman provenance always wins over a human flag.
 fn is_rewindable_message(event: &SessionEvent) -> bool {
     matches!(&event.kind, Some(session_event::Kind::User(u))
-        if (!u.origin_recorded || u.human_origin)
-            && u.api_origin.is_none() && u.from_session_id.is_empty() && u.delegated_by.is_empty())
+        if u.api_origin.is_none() && u.from_session_id.is_empty() && u.delegated_by.is_empty()
+            && !matches!(u.command.as_str(), "task-notification" | "stop-hook"))
 }
 
 /// The handoff a model switch made, if it crossed runtimes.
@@ -5776,16 +5777,16 @@ mod handoff_tests {
     }
 
     #[test]
-    fn rewind_only_accepts_legacy_or_human_messages_without_nonhuman_provenance() {
-        for (origin_recorded, human_origin, expected) in
-            [(false, false, true), (false, true, true), (true, false, false), (true, true, true)]
-        {
+    fn rewind_accepts_legacy_human_and_unknown_messages_without_nonhuman_provenance() {
+        for (origin_recorded, human_origin) in [(false, false), (false, true), (true, false), (true, true)] {
             let message = UserMessage { origin_recorded, human_origin, ..Default::default() };
-            assert_eq!(is_rewindable_message(&ev(1, session_event::Kind::User(message.clone()))), expected);
+            assert!(is_rewindable_message(&ev(1, session_event::Kind::User(message.clone()))));
             for nonhuman in [
                 UserMessage { api_origin: Some(Default::default()), ..message.clone() },
                 UserMessage { from_session_id: "other-session".into(), ..message.clone() },
                 UserMessage { delegated_by: "call".into(), ..message.clone() },
+                UserMessage { command: "task-notification".into(), ..message.clone() },
+                UserMessage { command: "stop-hook".into(), ..message.clone() },
             ] {
                 assert!(!is_rewindable_message(&ev(1, session_event::Kind::User(nonhuman))), "nonhuman provenance wins");
             }

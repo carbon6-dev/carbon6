@@ -18,7 +18,7 @@ async fn catalog_forwards_authenticated_callers_and_input_origins() {
 }
 
 #[tokio::test]
-async fn auth_off_catalog_never_treats_headers_or_body_as_human_identity() {
+async fn auth_off_browser_path_is_human_but_tokens_and_body_cannot_claim_it() {
     catalog_callers_and_input_origins(false).await;
 }
 
@@ -97,17 +97,20 @@ async fn catalog_callers_and_input_origins(auth: bool) {
     let login = head.state.store.create_login_link().await.unwrap();
     let signed_in = reqwest::Client::new().post(format!("{api}/auth/link")).json(&json!({"token": login})).send().await.unwrap();
     let cookie = signed_in.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap();
-    let browser = reqwest::Client::builder()
-        .default_headers(
-            [
-                (reqwest::header::COOKIE, cookie.parse().unwrap()),
-                (reqwest::header::HeaderName::from_static("x-c6-realm"), "admin".parse().unwrap()),
-            ]
-            .into_iter()
-            .collect(),
-        )
-        .build()
-        .unwrap();
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("x-c6-realm", "admin".parse().unwrap());
+    if auth {
+        headers.insert(reqwest::header::COOKIE, cookie.parse().unwrap());
+        let no_page = reqwest::Client::new()
+            .post(format!("{api}/sessions/{}/messages", session.id))
+            .header(reqwest::header::COOKIE, cookie)
+            .json(&json!({"text": "cookie without page context", "human_origin": true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(no_page.status(), reqwest::StatusCode::BAD_REQUEST, "a cookie alone is not the browser path");
+    }
+    let browser = reqwest::Client::builder().default_headers(headers).build().unwrap();
     for (i, (catalog, human)) in [(false, false), (true, false), (false, true), (true, true)].into_iter().enumerate() {
         let text = format!("Don't do that: input {i}");
         mock.push(Reply::Text(format!("ack {i}")));
@@ -121,7 +124,8 @@ async fn catalog_callers_and_input_origins(auth: bool) {
             client.post(format!("{api}/sessions/{}/messages", session.id)).json(&body)
         };
         // A valid token takes precedence even alongside a signed-in cookie.
-        let r = request.header(reqwest::header::COOKIE, cookie).header("x-c6-realm", "admin").send().await.unwrap();
+        let request = if human { request } else { request.header(reqwest::header::COOKIE, cookie) };
+        let r = request.header("x-c6-realm", "admin").send().await.unwrap();
         assert!(r.status().is_success(), "{}", r.text().await.unwrap());
         let events = eventually("the sent input's turn to end", async || {
             let events = head.state.store.events_after(&session.id, 0, i64::MAX).await.unwrap();
@@ -168,41 +172,41 @@ async fn catalog_callers_and_input_origins(auth: bool) {
     }
 
     let unsigned = reqwest::Client::new();
-    if !auth {
-        mock.push(Reply::Text("unsigned input acknowledged".into()));
-    }
-    let r = unsigned
-        .post(format!("{api}/catalog/call"))
-        .header("x-c6-realm", "admin")
-        .json(&json!({"op": "sessions.send", "input": {"id": session.id,
-            "body": {"text": "Don't do that: unsigned input", "human_origin": true}}}))
-        .send()
-        .await
-        .unwrap();
-    if auth {
-        assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED);
-    } else {
-        assert!(r.status().is_success());
-        let events = eventually("the unsigned input's turn to end", async || {
-            let events = head.state.store.events_after(&session.id, 0, i64::MAX).await.unwrap();
-            (events.iter().filter(|e| matches!(e.kind, Some(Kind::TurnEnded(_)))).count() == 6).then_some(events)
-        })
-        .await;
-        let input = events
-            .iter()
-            .find_map(|e| match &e.kind {
-                Some(Kind::User(u)) if u.text == "Don't do that: unsigned input" => Some(u),
-                _ => None,
+    for placed in [true, false] {
+        let text = if placed { "Don't do that: unsigned page input" } else { "Don't do that: unknown input" };
+        if !auth {
+            mock.push(Reply::Text("unsigned input acknowledged".into()));
+        }
+        let request = unsigned.post(format!("{api}/catalog/call")).json(&json!({"op": "sessions.send", "input": {"id": session.id,
+            "body": {"text": text, "human_origin": true, "origin": {"kind": "human"}}}}));
+        let r = if placed { request.header("x-c6-realm", "admin") } else { request }.send().await.unwrap();
+        if auth {
+            assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED);
+        } else {
+            assert!(r.status().is_success());
+            let events = eventually("the unsigned input's turn to end", async || {
+                let events = head.state.store.events_after(&session.id, 0, i64::MAX).await.unwrap();
+                (events.iter().filter(|e| matches!(e.kind, Some(Kind::TurnEnded(_)))).count() == if placed { 6 } else { 7 })
+                    .then_some(events)
             })
-            .unwrap();
-        assert!(!input.human_origin && input.api_origin.is_none(), "an auth-off page header/body is not human identity");
-        assert!(input.origin_recorded);
-        let public: Vec<Event> =
-            http.get(format!("{api}/sessions/{}/events?after=0", session.id)).send().await.unwrap().json().await.unwrap();
-        assert!(public.iter().any(|e| matches!(&e.kind, EventKind::User { text, origin, .. }
-            if text == "Don't do that: unsigned input" && matches!(origin.as_deref(), Some(c6_api::MessageOrigin::Unknown)))));
-        let content = model_input_text("Don't do that: unsigned input");
-        assert!(content.contains("Message sent by an automation, not typed by the user:"), "{content}");
+            .await;
+            let input = events
+                .iter()
+                .find_map(|e| match &e.kind {
+                    Some(Kind::User(u)) if u.text == text => Some(u),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(input.human_origin, placed, "only the auth-off page path is human, never a body assertion");
+            assert!(input.api_origin.is_none());
+            assert!(input.origin_recorded);
+            let public: Vec<Event> =
+                http.get(format!("{api}/sessions/{}/events?after=0", session.id)).send().await.unwrap().json().await.unwrap();
+            assert!(public.iter().any(|e| matches!(&e.kind, EventKind::User { text, origin, .. }
+            if text == &input.text && origin.as_deref() == Some(if placed { &c6_api::MessageOrigin::Human } else { &c6_api::MessageOrigin::Unknown }))));
+            let content = model_input_text(text);
+            assert_eq!(content.contains("Message sent by an automation, not typed by the user:"), !placed, "{content}");
+        }
     }
 
     // Acting with your authority is not proof that you typed the message.
@@ -218,7 +222,7 @@ async fn catalog_callers_and_input_origins(auth: bool) {
     .unwrap();
     let events = eventually("the agent-authored input's turn to end", async || {
         let events = head.state.store.events_after(&session.id, 0, i64::MAX).await.unwrap();
-        (events.iter().filter(|e| matches!(e.kind, Some(Kind::TurnEnded(_)))).count() == if auth { 6 } else { 7 }).then_some(events)
+        (events.iter().filter(|e| matches!(e.kind, Some(Kind::TurnEnded(_)))).count() == if auth { 6 } else { 8 }).then_some(events)
     })
     .await;
     let input = events
@@ -416,6 +420,9 @@ async fn head_records_old_worker_origins_without_rewriting_legacy_and_limits_rew
         },
         UserMessage { text: "known session".into(), from_session_id: "other".into(), ..Default::default() },
         UserMessage { text: "known delegation".into(), delegated_by: "parent-call".into(), ..Default::default() },
+        UserMessage { text: "recorded unknown".into(), origin_recorded: true, ..Default::default() },
+        UserMessage { text: "internal notice".into(), command: "task-notification".into(), ..Default::default() },
+        UserMessage { text: "internal hook".into(), command: "stop-hook".into(), ..Default::default() },
     ];
     let events: Vec<_> = messages
         .iter()
@@ -429,7 +436,7 @@ async fn head_records_old_worker_origins_without_rewriting_legacy_and_limits_rew
         c6_head::sessions::ingest(&head.state, worker_id, SessionEventBatch { session_id: row.id.clone(), events: events.clone() })
             .await
             .unwrap(),
-        Some(8)
+        Some(11)
     );
     let saved = head.state.store.events_after(&row.id, 0, i64::MAX).await.unwrap();
     assert_eq!(&saved[..3], &events[..3], "replayed legacy events are not backfilled");
@@ -444,6 +451,9 @@ async fn head_records_old_worker_origins_without_rewriting_legacy_and_limits_rew
         json!({"kind": "human"}),
         json!({"kind": "api", "token_name": "ops-controller"}),
         json!({"kind": "session"}),
+        json!({"kind": "unknown"}),
+        json!({"kind": "unknown"}),
+        json!({"kind": "unknown"}),
         json!({"kind": "unknown"}),
     ];
     for (i, origin) in expected_origins.iter().enumerate() {
@@ -467,9 +477,9 @@ async fn head_records_old_worker_origins_without_rewriting_legacy_and_limits_rew
     for (event, origin) in public[3..].iter().zip(expected_origins) {
         assert_eq!(event["origin"], origin);
     }
-    for seq in 1..=8 {
+    for seq in 1..=11 {
         let response = http.post(format!("{api}/sessions/{}/rewind", row.id)).json(&json!({"to_seq": seq})).send().await.unwrap();
-        let expected = if seq == 1 || seq == 5 { reqwest::StatusCode::ACCEPTED } else { reqwest::StatusCode::BAD_REQUEST };
+        let expected = if matches!(seq, 1 | 4 | 5 | 9) { reqwest::StatusCode::ACCEPTED } else { reqwest::StatusCode::BAD_REQUEST };
         assert_eq!(response.status(), expected, "rewind seq={seq}: {}", response.text().await.unwrap());
     }
     head.shutdown().await.unwrap();

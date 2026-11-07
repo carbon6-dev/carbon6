@@ -2436,8 +2436,8 @@ fn Transcript(
                         let only_thinking = thinking_only(&e.kind);
                         let anchorable = can_branch && can_anchor(&e.kind);
                         let task_notification = matches!(&e.kind, EventKind::User { command, .. } if command == "task-notification");
-                        let user_bubble = own_message(&e.kind);
-                        let is_user = user_bubble;
+                        let user_bubble = person_bubble(&e.kind);
+                        let is_user = own_message(&e.kind);
                         let by = move || rewound.with(|(by, _)| by.get(&seq).copied());
                         let hidden = move || by().is_some_and(|r| !shown.with(|s| s.contains(&r)));
                         let marker = match &e.kind {
@@ -3983,13 +3983,20 @@ pub(crate) fn too_large(held: &[c6_api::AttachmentUpload], adding: &[c6_api::Att
     (total > 20 * MB).then(|| format!("Too much to send in one message ({}; the limit is 20 MB in all)", mb(total)))
 }
 
-/// Only known human and legacy messages have the user's bubble/actions.
-/// Missing provenance in newly received old-worker input is explicitly Unknown.
+/// The person's actions are barred only by positive nonhuman provenance.
+/// Unknown input stays neutral in presentation, not locked against editing.
 fn own_message(kind: &EventKind) -> bool {
     matches!(kind, EventKind::User { command, from_session_id, delegated_by, origin, .. }
         if command != "task-notification" && command != "stop-hook"
             && from_session_id.is_empty() && delegated_by.is_empty()
-            && matches!(origin.as_deref(), None | Some(c6_api::MessageOrigin::Human)))
+            && matches!(origin.as_deref(), None | Some(c6_api::MessageOrigin::Human | c6_api::MessageOrigin::Unknown)))
+}
+
+/// Human and legacy bubbles keep their existing presentation. Eligibility for
+/// Edit/Rewind must not invent a human identity for explicitly unknown input.
+fn person_bubble(kind: &EventKind) -> bool {
+    own_message(kind)
+        && !matches!(kind, EventKind::User { origin, .. } if matches!(origin.as_deref(), Some(c6_api::MessageOrigin::Unknown)))
 }
 
 /// A message from another session's agent or automation: not a bubble of yours but a card
@@ -4021,7 +4028,7 @@ fn SessionMessage(
         Some(c6_api::MessageOrigin::Api { token_name }) if !token_name.is_empty() => format!("Sent via the API · token {token_name}"),
         Some(c6_api::MessageOrigin::Api { .. }) => "Sent via the API".to_owned(),
         _ if delegated => "From the agent that started it".to_owned(),
-        Some(c6_api::MessageOrigin::Unknown) => "Sent by an automation".to_owned(),
+        Some(c6_api::MessageOrigin::Unknown) => "Message · origin unknown".to_owned(),
         _ => "Message from another session".to_owned(),
     };
     view! {
@@ -4215,7 +4222,13 @@ fn can_anchor(kind: &EventKind) -> bool {
 fn message_action_context(kind: &EventKind) -> (&'static str, String) {
     let (speaker, text) = match kind {
         EventKind::User { text, attachments, .. } => (
-            if own_message(kind) { "You" } else { "Sender" },
+            if person_bubble(kind) {
+                "You"
+            } else if own_message(kind) {
+                "Message"
+            } else {
+                "Sender"
+            },
             if text.trim().is_empty() { attachments.first().map(|a| a.name.as_str()).unwrap_or("User message") } else { text.as_str() },
         ),
         EventKind::Assistant { blocks, .. } => (
@@ -4440,11 +4453,7 @@ fn render_event(
         }
         .into_any(),
         // From another session's agent (docs/background.md §6).
-        EventKind::User { from_session_id, origin, .. }
-            if !from_session_id.is_empty() || origin.as_deref().is_some_and(|o| !matches!(o, c6_api::MessageOrigin::Human)) =>
-        {
-            sender_message(session, e)
-        }
+        EventKind::User { .. } if !person_bubble(&e.kind) => sender_message(session, e),
         EventKind::User { .. } => user_message(session, e),
         EventKind::Assistant { blocks, stop_reason, .. } => {
             let interrupted = stop_reason == "interrupted";
@@ -4864,7 +4873,7 @@ fn SubagentPeek(events: RwSignal<Vec<Event>>, streaming: RwSignal<Streaming>) ->
                     EventKind::User { text, delegated_by, command, .. } if command != "task-notification" && !text.is_empty() => {
                         let mark = if command == "session-message" {
                             "message"
-                        } else if own_message(&e.kind) {
+                        } else if person_bubble(&e.kind) {
                             "edit"
                         } else if delegated_by.is_empty() {
                             "message"
@@ -6810,10 +6819,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_human_and_legacy_messages_offer_own_message_actions() {
+    fn only_positive_nonhuman_origins_bar_own_message_actions_and_unknown_stays_neutral() {
         let mut input = serde_json::json!({"type": "user", "command_id": "message", "text": "Status"});
         let legacy: EventKind = serde_json::from_value(input.clone()).unwrap();
         assert!(own_message(&legacy));
+        assert!(person_bubble(&legacy));
         assert_eq!(message_action_context(&legacy).0, "You");
         for origin in [
             serde_json::json!({"kind": "human"}),
@@ -6822,10 +6832,32 @@ mod tests {
             serde_json::json!({"kind": "session"}),
         ] {
             let human = origin["kind"] == "human";
+            let unknown = origin["kind"] == "unknown";
             input["origin"] = origin;
             let kind: EventKind = serde_json::from_value(input.clone()).unwrap();
-            assert_eq!(own_message(&kind), human);
-            assert_eq!(message_action_context(&kind).0, if human { "You" } else { "Sender" });
+            assert_eq!(own_message(&kind), human || unknown);
+            assert_eq!(person_bubble(&kind), human);
+            assert_eq!(
+                message_action_context(&kind).0,
+                if human {
+                    "You"
+                } else if unknown {
+                    "Message"
+                } else {
+                    "Sender"
+                }
+            );
+            for field in ["from_session_id", "delegated_by"] {
+                let mut other = input.clone();
+                other[field] = "another-agent".into();
+                let kind = serde_json::from_value(other).unwrap();
+                assert!(!own_message(&kind) && !person_bubble(&kind), "nonhuman provenance wins over origin");
+            }
+            for command in ["task-notification", "stop-hook"] {
+                let mut other = input.clone();
+                other["command"] = command.into();
+                assert!(!own_message(&serde_json::from_value(other).unwrap()), "agent notices are not editable");
+            }
         }
         input.as_object_mut().unwrap().remove("origin");
         for field in ["from_session_id", "delegated_by"] {
@@ -7463,7 +7495,7 @@ mod tests {
                 attention: signal(0).0,
             });
             for (command, delegated_by, label) in
-                [("card-answer", "", "Sent by an automation"), ("", "parent-call", "From the agent that started it")]
+                [("card-answer", "", "Message · origin unknown"), ("", "parent-call", "From the agent that started it")]
             {
                 let e: Event = serde_json::from_value(serde_json::json!({
                     "seq": 17, "ts": 1234, "type": "user", "command_id": "answer-17",
@@ -7471,7 +7503,8 @@ mod tests {
                     "text": format!("Start session: **Cleanup** <script>alert(1)</script>\nStarted session:{ID}.")
                 }))
                 .unwrap();
-                assert!(!own_message(&e.kind), "recorded external input uses the sender renderer");
+                assert!(!person_bubble(&e.kind), "recorded external input uses the sender renderer");
+                assert_eq!(own_message(&e.kind), delegated_by.is_empty(), "unknown alone cannot bar Edit/Rewind");
                 let html = sender_message("s1", &e).to_html();
                 assert!(html.contains("c6-message-card") && html.contains(label), "{html}");
                 assert!(!html.contains("rounded-br-sm"), "not the user's bubble: {html}");

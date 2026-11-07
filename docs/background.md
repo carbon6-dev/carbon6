@@ -203,8 +203,8 @@ Built 2026-11-03 (design: carbon6 doc "Claude Code sessions: default-deny tool w
 
 ### Input provenance in subagent reports
 
-- A subagent's unasked report names the input's known source: a session message, its own resume, an API caller, or a signed-in browser's human input. API input names only the token's display name (`api_origin`), never its secret. Catalog/CLI `sessions.send` and direct HTTP sends retain the same provenance.
-- Only the server's authenticated browser route sets `UserInput.human_origin` (field 16); workers retain it as `UserMessage.human_origin` (13), including edits to queued input. API request bodies and agents cannot claim human origin. Authority to act on your behalf is not evidence that you typed the input.
+- A subagent's unasked report names the input's known source: a session message, its own resume, an API caller, or the browser page's human input. API input names only the token's display name (`api_origin`), never its secret. Catalog/CLI `sessions.send` and direct HTTP sends retain the same provenance.
+- Only the server's browser page path sets `UserInput.human_origin` (field 16): the UI supplies `X-C6-Realm` (`c6_realm=` for requests without headers), plus a verified cookie when sign-in is required. With sign-in off, the page marker alone represents the person. API tokens take precedence over page context and cookies in either mode; request bodies and internal/agent execution cannot claim human origin. Workers retain it as `UserMessage.human_origin` (13), including edits to queued input. Authority to act on your behalf is not evidence that you typed the input.
 - Unknown and older input stays neutral in the updated reporters: **Sent to subagent …**, not **The user messaged …**. No history migration guesses who sent an old message. The additive fields work head-first during an update: old workers ignore the new input field, so a new head treats their events as unknown for remote reports and Watchers; updated workers preserve the bit, and an older head's input remains unknown. An old worker's own preformatted local report keeps that binary's old wording until the worker is upgraded. API provenance, when present, takes precedence over a human bit.
 
 ### Direct message attribution
@@ -215,12 +215,14 @@ Built 2026-11-03 (design: carbon6 doc "Claude Code sessions: default-deny tool w
   sessions, Ask and side chats; request bodies cannot supply provenance. Acting
   with the user's authority is not evidence they typed it.
 - API and unknown/internal inputs reuse the other-session card, labelled
-  **Sent via the API · token c6-cli-zmbp** or **Sent by an automation**. An API
+  **Sent via the API · token c6-cli-zmbp** or neutrally **Message · origin unknown**. An API
   caller without a display name says **Sent via the API**. Cards retain content,
-  attachments, expansion/hook context and Ask, but not Edit or Rewind, on desktop
-  and phone. Folded turns and catch-up summaries preserve the distinction too.
-  Signed-in browser input keeps the user's bubble and actions. The head and
-  worker also reject rewinding explicitly nonhuman messages.
+  attachments, expansion/hook context and Ask on desktop and phone. Edit and
+  Rewind are unavailable only for positive nonhuman provenance: API, another
+  session, delegation or agent notices. Unknown alone never bars those actions,
+  but is not relabelled human. Folded turns and catch-up summaries preserve the
+  distinction too. Browser-page input keeps the user's bubble and actions with
+  sign-in off or a valid sign-in cookie. The head and worker use the same rewind rule.
 - `UserMessage.origin_recorded` (15) distinguishes explicitly unknown input
   from legacy records. The head marks newly ingested old-worker messages, so
   missing origin is neutral during head-first upgrades. Already stored events

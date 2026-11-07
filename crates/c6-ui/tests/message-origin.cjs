@@ -8,7 +8,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { serve, fixture, settle, within, launchBrowser, session } = require('./motion.cjs');
-const playwright = require(process.env.PLAYWRIGHT_CORE || '/home/zheilbron/.bun/install/cache/playwright-core@1.50.1@@@1');
+const playwright = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
 const root = path.resolve(process.env.ROOT || path.join(__dirname, '../dist'));
 const shots = path.join(process.env.SCREENSHOTS || '/tmp/s5-api-message-label', `${Date.now()}-${process.pid}`);
 const views = {
@@ -21,14 +21,16 @@ const linked = { ...session(mentionId), title: 'Automation result session' };
 const messages = [
   { key: 'api-token', origin: { kind: 'api', token_name: 'c6-cli-zmbp' }, label: 'Sent via the API · token c6-cli-zmbp' },
   { key: 'api-empty', origin: { kind: 'api', token_name: '' }, label: 'Sent via the API' },
-  { key: 'unknown', origin: { kind: 'unknown' }, label: 'Sent by an automation' },
+  { key: 'unknown', origin: { kind: 'unknown' }, label: 'Message · origin unknown' },
   { key: 'human', origin: { kind: 'human' }, own: true },
   { key: 'legacy', own: true }, // Deliberately no origin property in historical JSON.
   { key: 'session', from_session_id: 'sender', from_title: 'Release helper', label: 'Message from another session' },
-  { key: 'unknown-attachment-only', origin: { kind: 'unknown' }, label: 'Sent by an automation', attachmentOnly: true },
-  { key: 'card-answer', origin: { kind: 'unknown' }, command: 'card-answer', mention: true, label: 'Sent by an automation' },
+  { key: 'unknown-attachment-only', origin: { kind: 'unknown' }, label: 'Message · origin unknown', attachmentOnly: true },
+  { key: 'card-answer', origin: { kind: 'unknown' }, command: 'card-answer', mention: true, label: 'Message · origin unknown' },
   { key: 'delegated', origin: { kind: 'unknown' }, delegated_by: 'parent-call', label: 'From the agent that started it' },
 ].map((message, i) => ({ ...message, seq: 70 + i,
+  editable: !!message.own || (message.origin?.kind === 'unknown' && !message.delegated_by),
+  speaker: message.own ? 'You' : message.origin?.kind === 'unknown' && !message.delegated_by ? 'Message' : 'Sender',
   subject: message.attachmentOnly ? '' : message.mention ? `Started session:${mentionId}.` : `${message.key}: **plain text** & <origin-probe>`,
   rest: message.attachmentOnly || message.mention ? '' : `Second line for ${message.key}.\n\nLiteral <origin-rest> and **not Markdown**; session:${mentionId} stays plain.\n/tmp/${'unbrokenpath'.repeat(24)}/notes.txt`,
   prompt: `Exact model-facing context for ${message.key}.\n<origin-prompt> & **literal**`,
@@ -98,14 +100,22 @@ async function exercise(f, label, phone, theme, evidence) {
       const bubble = row.locator('.rounded-br-sm');
       assert.equal(await bubble.textContent(), `${message.subject}\n\n${message.rest}`, 'bubble retains the full plain text');
       assert.equal(await bubble.locator('strong, origin-probe, origin-rest, a.c6-mention').count(), 0, 'bubble text is not HTML/Markdown or a generated mention');
-      assert.equal(await bubble.evaluate(el => getComputedStyle(el.parentElement).alignItems), 'flex-end', 'bubble remains right-aligned');
+      // Chromium 158 serializes specified flex-start/end as flow-start/end.
+      // Normalize that spelling, then prove the actual reading-column edge.
+      assert.equal(await bubble.evaluate(el => getComputedStyle(el.parentElement).alignItems.replace(/^flow-/, 'flex-')), 'flex-end', 'bubble remains right-aligned');
       const boxes = await bubble.evaluate(el => ({ bubble: el.getBoundingClientRect().right, parent: el.parentElement.getBoundingClientRect().right }));
       assert(Math.abs(boxes.bubble - boxes.parent) < 1, 'bubble right edge stays on the reading column');
       await contained(bubble, `${message.key} bubble`);
     } else {
       assert.equal(await card.count(), 1, `${message.key}: sender card, not your bubble`);
       assert.equal(await row.locator('.rounded-br-sm').count(), 0);
-      assert.equal(await card.evaluate(el => getComputedStyle(el).alignItems), 'flex-start', 'sender card stays left-aligned');
+      assert.equal(await card.evaluate(el => getComputedStyle(el).alignItems.replace(/^flow-/, 'flex-')), 'flex-start', 'sender card stays left-aligned');
+      const cardEdge = await card.evaluate(el => ({
+        direction: getComputedStyle(el).flexDirection,
+        gap: el.firstElementChild.getBoundingClientRect().left - el.getBoundingClientRect().left,
+      }));
+      assert.equal(cardEdge.direction, 'column', 'card is not a reversed flex column');
+      assert(Math.abs(cardEdge.gap) < 1, 'card left edge stays on the reading column');
       const caption = card.locator(':scope > div > p').first();
       assert.equal((await caption.textContent()).trim(), message.label, 'exact attribution, including the empty-token fallback');
       await icon(caption.locator('svg'), `${message.key} sender icon`);
@@ -180,11 +190,12 @@ async function exercise(f, label, phone, theme, evidence) {
     if (message.own) await save(`${message.key}-bubble`);
 
     f.phase = `${message.key}: actions and Ask`;
-    // Hidden desktop controls must not secretly retain Edit/Rewind for senders.
+    // Unknown is neutral, not positively nonhuman. Only positive API/session/
+    // delegated provenance removes Edit/Rewind, including hidden controls.
     const edit = row.getByRole('button', { name: 'Edit', exact: true, includeHidden: true });
     const rewind = row.getByRole('button', { name: 'Rewind', exact: true, includeHidden: true });
-    assert.equal(await edit.count(), message.own ? 1 : 0, 'only human/legacy have desktop Edit');
-    assert.equal(await rewind.count(), message.own ? 1 : 0, 'only human/legacy have desktop Rewind');
+    assert.equal(await edit.count(), message.editable ? 1 : 0, 'only positive nonhuman provenance bars desktop Edit');
+    assert.equal(await rewind.count(), message.editable ? 1 : 0, 'only positive nonhuman provenance bars desktop Rewind');
     const inlineAsk = row.getByRole('button', { name: 'Ask', exact: true, includeHidden: true });
     assert.equal(await inlineAsk.count(), 1, 'every source remains askable');
     if (phone) {
@@ -196,11 +207,13 @@ async function exercise(f, label, phone, theme, evidence) {
       const sheet = page.getByRole('dialog', { name: 'Message actions', exact: true });
       await sheet.waitFor();
       assert.match(await sheet.getAttribute('class'), /\bphone-message-actions\b/);
-      assert.equal(await sheet.getByText(message.own ? 'You' : 'Sender', { exact: true }).count(), 1, 'sheet never calls automation You');
-      assert.equal(await sheet.getByText(message.own ? 'Sender' : 'You', { exact: true }).count(), 0);
+      assert.equal(await sheet.getByText(message.speaker, { exact: true }).count(), 1, 'sheet preserves known-human, neutral and nonhuman attribution');
+      for (const other of ['You', 'Message', 'Sender'].filter(speaker => speaker !== message.speaker)) {
+        assert.equal(await sheet.getByText(other, { exact: true }).count(), 0, 'never invent a human identity for unknown input');
+      }
       if (message.attachmentOnly) assert.equal(await sheet.getByText(message.file, { exact: true }).count(), 1, 'empty-text action context uses the attachment name');
-      assert.equal(await sheet.getByRole('button', { name: 'Edit', exact: true }).count(), message.own ? 1 : 0);
-      assert.equal(await sheet.getByRole('button', { name: 'Rewind…', exact: true }).count(), message.own ? 1 : 0);
+      assert.equal(await sheet.getByRole('button', { name: 'Edit', exact: true }).count(), message.editable ? 1 : 0);
+      assert.equal(await sheet.getByRole('button', { name: 'Rewind…', exact: true }).count(), message.editable ? 1 : 0);
       const ask = sheet.getByRole('button', { name: 'Ask in a side chat', exact: true });
       await icon(ask.locator('svg'), `${message.key} sheet Ask icon`);
       await contained(sheet, `${message.key} actions sheet`);
@@ -223,10 +236,45 @@ async function exercise(f, label, phone, theme, evidence) {
     if (message.key === 'api-token') await save('api-token-ask');
     await activate(input.locator('..').getByRole('button', { name: 'Cancel', exact: true }));
     await input.waitFor({ state: 'hidden' });
+
+    // Both a human bubble and a neutral unknown card must really enter the
+    // edit and rewind flows, not merely expose inert-looking action buttons.
+    if (message.key === 'human' || message.key === 'unknown') {
+      for (const action of ['Edit', 'Rewind']) {
+        f.phase = `${message.key}: ${action} entry`;
+        await row.scrollIntoViewIfNeeded();
+        if (phone) {
+          await activate(row.getByRole('button', { name: 'Message actions', exact: true }));
+          const sheet = page.getByRole('dialog', { name: 'Message actions', exact: true });
+          await activate(sheet.getByRole('button', { name: action === 'Edit' ? 'Edit' : 'Rewind…', exact: true }));
+          await sheet.waitFor({ state: 'hidden' });
+        } else {
+          await row.hover();
+          await activate(row.getByRole('button', { name: action, exact: true }));
+        }
+        if (action === 'Edit') {
+          const editor = page.locator('[data-message-edit]');
+          await editor.getByText('The agent has this message', { exact: true }).waitFor();
+          assert.equal(await editor.locator('textarea').count(), 0, 'Edit does not attempt withdrawal or replace the draft');
+          await activate(editor.getByRole('button', { name: 'Send correction', exact: true }));
+          assert.equal(await editor.locator('textarea').inputValue(), `${message.subject}\n\n${message.rest}`, 'eligible message retains its original text for correction');
+          await activate(editor.getByRole('button', { name: 'Discard draft', exact: true }));
+          await editor.waitFor({ state: 'hidden' });
+        } else {
+          // RewindPanel is the transcript row's sibling, not inside the row.
+          const confirmation = page.getByText(/^Rewind the conversation to before this message\?/).locator('..');
+          await confirmation.waitFor();
+          assert.equal(await confirmation.getByRole('checkbox').isChecked(), false, 'restoring files still needs explicit consent');
+          assert.equal(await confirmation.getByRole('button', { name: 'Rewind', exact: true }).isEnabled(), true, 'rewind is available after the stream is ready');
+          await activate(confirmation.getByRole('button', { name: 'Cancel', exact: true }));
+          await confirmation.waitFor({ state: 'hidden' });
+        }
+      }
+    }
     // Read RPCs and transcript viewed/seen receipts also use POST. Only the
     // message-action endpoints would send, branch, interrupt or rewind here.
     assert.deepEqual(f.requests.filter(request => /^(POST|PUT|PATCH|DELETE) .*\/(messages|side-chats|rewind|interrupt)$/.test(request)), [],
-      'opening, filling and cancelling Ask never sends or rewinds anything');
+      'opening/cancelling Ask, Edit and Rewind never sends or rewinds anything');
   }
   f.phase = 'card-answer mention navigation';
   const answer = messages.find(message => message.mention);

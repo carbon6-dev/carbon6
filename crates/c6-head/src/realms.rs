@@ -48,8 +48,10 @@ impl Caller {
         self.api_token_name.as_ref().map(|name| c6_proto::ApiMessageOrigin { token_name: name.clone() })
     }
 
-    pub fn human_origin(&self) -> bool {
-        self.browser && self.authenticated_browser && self.api_token_name.is_none()
+    /// The page path represents the person when sign-in is off. With sign-in
+    /// on, it also needs a verified cookie. Tokens never become browser input.
+    pub fn human_origin(&self, auth_required: bool) -> bool {
+        self.browser && (!auth_required || self.authenticated_browser) && self.api_token_name.is_none()
     }
 
     /// Whose decisions and the like a caller lists: its realm's; the

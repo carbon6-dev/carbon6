@@ -240,25 +240,40 @@ Historical event JSON without `origin` remains backward compatible (the existing
 right-aligned bubble); that absence is not proof of a human sender. Newly received
 old-worker input without provenance is recorded as `unknown`, not guessed human.
 Existing `from_session_id` / `from_title` still identify another session.
+The browser's own request path supplies `X-C6-Realm` (or `c6_realm=` for requests
+without headers). It records human input with sign-in off; sign-in on additionally
+requires a verified cookie. Tokens keep their API origin even beside page context
+and cookies. Body fields and internal execution cannot impersonate the person.
+
+`assistant::auth_off_browser_path_is_human_but_tokens_and_body_cannot_claim_it`
+and its auth-on counterpart exercise real HTTP sends, creation, catalog dispatch,
+side chats and internal calls. `claude_code_rewind` uses the same page marker,
+asserts human origin, checks token precedence/rejected rewind with sign-in off,
+and retains all native reset barriers and fail-closed assertions. Head/worker
+tests cover legacy and unknown rewind eligibility; Watchers' policy matrix checks
+that only known human input, including auth-off page input, is a human correction.
 
 After the build owner has produced this branch's UI (`env -u NO_COLOR make ui`), run:
 
 ```sh
 ENGINE=both SCREENSHOTS=/tmp/s5-api-message-label \
-  /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/message-origin.cjs
+  node crates/c6-ui/tests/message-origin.cjs
 ```
 
 The private `motion.cjs` fixture checks Chromium and WebKit, desktop and 390/320px
-phones, in light/dark (12 cases). Named/unnamed API tokens and unknown automation
+phones, in light/dark (12 cases). Named/unnamed API tokens and unknown input
 use the existing sender card with exact attribution, a plain first-line subject,
 full-message expansion, attachment links and a separate received-prompt disclosure.
 An attachment-only unknown message keeps its link despite an empty subject.
 An unknown-origin `card-answer` keeps its generated session mention and opens the
 mocked session; delegated unknown input says “From the agent that started it”.
-Both retain sender cards and Ask-only actions; ordinary origin text stays plain.
-Human and legacy bubbles stay right-aligned. API/unknown/other-session messages
-offer only Ask; human/legacy retain Edit/Rewind. Phone Message actions says Sender,
-not You, for non-human sources. Ask is opened, filled and cancelled without sending.
+Unknown stays neutrally labelled “Message · origin unknown”, with Edit/Rewind
+available but no invented human identity. Delegated, API and other-session input
+retain Ask-only actions. Human and legacy bubbles stay right-aligned and retain
+Edit/Rewind. Phone Message actions says Message for unknown, Sender for positive
+non-human sources, and You for human/legacy. Ask is opened, filled and cancelled without sending.
+Human and unknown inputs also enter Edit/correction and explicit Rewind
+confirmation, then cancel without sending, withdrawing or rewinding anything.
 The test checks real icons, applied theme colors and horizontal containment.
 
 `ENGINE`, `VIEWPORT=desktop,phone,phone-small`, `THEME`, `ROOT`, `PLAYWRIGHT_CORE` and

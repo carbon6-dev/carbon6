@@ -432,7 +432,7 @@ fn reasons(events: &[SessionEvent]) -> Vec<&'static str> {
                     && u.delegated_by.is_empty()
                     && u.human_origin
                     && u.api_origin.is_none()
-                    && !matches!(u.command.as_str(), "task-notification" | "card-answer")
+                    && !matches!(u.command.as_str(), "task-notification" | "stop-hook" | "card-answer")
                     && corrects(&u.text) =>
             {
                 add("correction")
@@ -1950,6 +1950,9 @@ mod tests {
         assert!(reasons(std::slice::from_ref(&consumed)).is_empty());
         assert_eq!(digest(std::slice::from_ref(&consumed)), "[3] user: Don't do that; the task card was declined\n");
         let Some(Kind::User(u)) = &mut consumed.kind else { unreachable!() };
+        u.command = "stop-hook".into();
+        assert!(reasons(std::slice::from_ref(&consumed)).is_empty());
+        let Some(Kind::User(u)) = &mut consumed.kind else { unreachable!() };
         u.command.clear();
         assert!(reasons(&[consumed]).contains(&"correction"));
     }
@@ -1968,6 +1971,38 @@ mod tests {
             let event = SessionEvent { seq: 1, kind: Some(Kind::User(input.clone())), ..Default::default() };
             assert_eq!(reasons(std::slice::from_ref(&event)).contains(&"correction"), correction);
             assert_eq!(digest(&[event]), format!("[1] {source}: Don't do that\n"));
+        }
+    }
+
+    #[test]
+    fn browser_corrections_follow_the_heads_signin_policy_not_body_or_token_claims() {
+        use crate::realms::Caller;
+        for auth_required in [false, true] {
+            for authenticated_browser in [false, true] {
+                for browser in [false, true] {
+                    for api_token_name in [None, Some("ops-controller".to_owned())] {
+                        let caller = Caller { browser, authenticated_browser, api_token_name, ..Caller::root() };
+                        let human = browser && (!auth_required || authenticated_browser) && caller.api_token_name.is_none();
+                        assert_eq!(caller.human_origin(auth_required), human);
+                        let input = c6_proto::UserMessage {
+                            text: "Don't do that".into(),
+                            human_origin: caller.human_origin(auth_required),
+                            api_origin: caller.api_origin(),
+                            origin_recorded: true,
+                            ..Default::default()
+                        };
+                        let event = SessionEvent { kind: Some(Kind::User(input.clone())), ..Default::default() };
+                        assert_eq!(reasons(&[event]).contains(&"correction"), human);
+                        for input in [
+                            c6_proto::UserMessage { from_session_id: "another-session".into(), ..input.clone() },
+                            c6_proto::UserMessage { delegated_by: "parent-call".into(), ..input.clone() },
+                        ] {
+                            let event = SessionEvent { kind: Some(Kind::User(input)), ..Default::default() };
+                            assert!(!reasons(&[event]).contains(&"correction"), "nonhuman provenance overrides the browser");
+                        }
+                    }
+                }
+            }
         }
     }
 }
