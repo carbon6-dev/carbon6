@@ -1039,7 +1039,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             let fresh = events.with(|evs| evs.len()).saturating_sub(left_at.get());
             view! {
                 <div class=format!("pointer-events-none sticky bottom-3 {READING_ROW}")>
-                    <div class=format!("flex justify-end px-4 {READING}")>
+                    <div class=format!("flex justify-center px-4 {READING}")>
                     <button class="pointer-events-auto rounded-full border border-zinc-300 bg-white/95 px-3 py-1 text-xs font-medium shadow-md hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-900/95 dark:hover:bg-zinc-800"
                         title="To the latest (End)"
                         on:click=move |_| {
@@ -1053,7 +1053,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                                 el.set_scroll_top(el.scroll_height());
                             }
                         }>
-                        {if fresh > 0 { format!("{fresh} new") } else { "Latest".to_owned() }}" "{icon(Icon::ArrowDownToLine, Size::S14)}
+                        {if fresh > 0 { format!("{fresh} newer") } else { "Latest".to_owned() }}" "{icon(Icon::ArrowDownToLine, Size::S14)}
                     </button>
                     </div>
                     {glance_room(wide)}
