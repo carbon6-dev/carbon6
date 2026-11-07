@@ -694,16 +694,18 @@ async function sheet(f) {
   const { page, motion } = f;
   const step = name => { f.phase = `sheet: ${name}`; if (process.env.DEBUG_FIXTURE) console.log(`  ${f.phase}`); };
   const ring = page.getByRole('button', { name: /Open session sheet/ }).first();
-  const dialog = page.getByRole('dialog', { name: 'Session details', exact: true });
+  const dialog = page.getByRole('dialog', { name: 'Session', exact: true });
   step('initial open');
   await ring.click();
   await dialog.waitFor();
   assert(await dialog.evaluate(el => el.classList.contains('c6-sheet') && el.dataset.open === 'true' && !el.inert));
+  assert.equal(await dialog.getByRole('button', { name: 'Close', exact: true }).count(), 0, 'Session has no top X');
+  assert.equal(await dialog.getByRole('button', { name: 'Close Session', exact: true }).count(), 1, 'one named close handle');
   assert(await page.locator('.c6-scrim[data-open="true"]').count(), 'production scrim uses the same presence state');
   await settle(page);
   await visibleBounds(dialog);
   await page.screenshot({ path: path.join(SHOTS, `${f.label}-sheet-open.png`) });
-  await dialog.getByRole('button', { name: 'Close', exact: true }).click();
+  await dialog.getByRole('button', { name: 'Close Session', exact: true }).click();
   await dialog.waitFor({ state: 'detached' });
   step('overlay keyboard');
   await ring.click(); await dialog.waitFor();
@@ -711,14 +713,14 @@ async function sheet(f) {
   await page.evaluate(() => __keyboard(400, 20));
   await settle(page);
   await visibleBounds(dialog);
-  await dialog.getByRole('button', { name: 'Close', exact: true }).click();
+  await dialog.getByRole('button', { name: 'Close Session', exact: true }).click();
   await dialog.waitFor({ state: 'detached' });
   await page.evaluate(() => __keyboard(innerHeight));
   await page.setViewportSize({ width: 390, height: 500 });
   step('resized keyboard');
   await page.evaluate(() => __keyboard(innerHeight));
   await ring.click(); await dialog.waitFor(); await settle(page); await visibleBounds(dialog);
-  await dialog.getByRole('button', { name: 'Close', exact: true }).click();
+  await dialog.getByRole('button', { name: 'Close Session', exact: true }).click();
   await dialog.waitFor({ state: 'detached' });
   await page.setViewportSize(f.viewport);
   await page.evaluate(() => __keyboard(innerHeight));
@@ -758,7 +760,7 @@ async function sheet(f) {
     await ring.evaluate(el => el.click());
     await page.clock.runFor(32); // Advance rAF/effects explicitly under the fake clock.
     await page.waitForFunction(() => document.querySelector('.c6-sheet[data-open="true"]'));
-    await dialog.evaluate(el => { window.__retained = el; el.querySelector('button[aria-label="Close"]').click(); });
+    await dialog.evaluate(el => { window.__retained = el; el.querySelector('button[aria-label="Close Session"]').click(); });
     if (motion.effective !== 'off') {
       assert(await page.evaluate(() => __retained.isConnected && __retained.inert && __retained.dataset.open === 'false'));
       const exit = await page.evaluate(() => {
@@ -773,7 +775,7 @@ async function sheet(f) {
       await page.clock.runFor(retention + 1);
       assert(await page.evaluate(() => __retained.isConnected && !__retained.inert && __retained.dataset.open === 'true'),
         'interrupted exit keeps the same body and cancels its stale disposal');
-      await dialog.evaluate(el => el.querySelector('button[aria-label="Close"]').click());
+      await dialog.evaluate(el => el.querySelector('button[aria-label="Close Session"]').click());
       await page.clock.runFor(retention - 1);
       const retained = await page.evaluate(() => ({ connected: __retained.isConnected, now: performance.now(), timers: __motionTest.timers }));
       assert(retained.connected, `retained through ${retention - 1}ms: ${JSON.stringify(retained)}`);

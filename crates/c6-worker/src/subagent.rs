@@ -478,11 +478,12 @@ impl Subagents for Runner {
         cancel: CancellationToken,
     ) -> Result<Option<String>, String> {
         let p = &self.parent;
-        let (child_id, remote) = self.resolve(to).await?;
-        if remote {
+        let spawn = self.resolve_spawn(to).await?;
+        let child_id = &spawn.child_session_id;
+        if spawn.remote.is_some() {
             // The head sends it; an idle subagent's turn reports to this call.
             let rx = p.manager.wait_remote(&p.session_id, call_id);
-            let params = serde_json::json!({"to": child_id, "message": message, "call_id": call_id});
+            let params = serde_json::json!({"to": child_id, "message": message, "call_id": call_id, "background": background});
             let sent = match self.head("session.subagent_message", params).await {
                 Ok(v) => v,
                 Err(e) => {
@@ -494,9 +495,15 @@ impl Subagents for Runner {
                 p.manager.take_remote_wait(&p.session_id, call_id);
                 return Ok(None);
             }
-            return self.wait_remote(&child_id, call_id, rx, cancel).await.map(Some);
+            // The head has accepted a new run, not a steer (or a refused
+            // input). Its RPC enqueues before replying, unlike local Delegate.
+            if let Err(e) = self.link_continuation(&spawn, call_id, background).await {
+                p.manager.take_remote_wait(&p.session_id, call_id);
+                return Err(e);
+            }
+            return self.wait_remote(child_id, call_id, rx, cancel).await.map(Some);
         }
-        let child = match p.manager.actor_for(&child_id).await {
+        let child = match p.manager.actor_for(child_id).await {
             Ok(Some(c)) => c,
             Ok(None) => return Err(format!("subagent {to} is no longer on this worker")),
             Err(e) => return Err(format!("subagent {to} could not be loaded: {e:#}")),
@@ -508,13 +515,17 @@ impl Subagents for Runner {
             ..Default::default()
         };
         // Running: the message joins its turn; the report comes as it would.
-        if p.manager.is_running(&child_id) && background.is_none() {
+        let running = p.manager.is_running(child_id);
+        if running && background.is_none() {
             child.send(crate::session::ActorMsg::Delegate(Box::new(input), None)).map_err(|_| format!("subagent {to} stopped"))?;
             return Ok(None);
         }
         let root = p.spec.delegation.as_ref().map_or(p.session_id.as_str(), |d| d.root_session_id.as_str()).to_owned();
         let _working = self.permit(&root)?;
-        self.delegate(&child_id, &child, input, cancel).await.map(Some)
+        if !running {
+            self.link_continuation(&spawn, call_id, background).await?;
+        }
+        self.delegate(child_id, &child, input, cancel).await.map(Some)
     }
 
     async fn peek(&self, to: &str) -> Result<String, String> {
@@ -554,6 +565,13 @@ impl Runner {
     /// session id or background task id (it must have been started here),
     /// and whether it is remote.
     async fn resolve(&self, to: &str) -> Result<(String, bool), String> {
+        let spawn = self.resolve_spawn(to).await?;
+        Ok((spawn.child_session_id, spawn.remote.is_some()))
+    }
+
+    /// Resolve only durable identities, retaining the original delegation's
+    /// metadata for a continuation (never the child's mutable title).
+    async fn resolve_spawn(&self, to: &str) -> Result<SubagentSpawned, String> {
         let p = &self.parent;
         let events = p.manager.journal().events_after(&p.session_id, 0, u32::MAX).await.map_err(|e| format!("{e:#}"))?;
         events
@@ -562,11 +580,22 @@ impl Runner {
                 Some(session_event::Kind::SubagentSpawned(sp))
                     if !to.is_empty() && (sp.child_session_id == to || sp.background_task_id == to) =>
                 {
-                    Some((sp.child_session_id.clone(), sp.remote.is_some()))
+                    Some(sp.clone())
                 }
                 _ => None,
             })
             .ok_or_else(|| format!("no subagent {to:?} was started in this session"))
+    }
+
+    /// A new background run of the same child has a new task/call identity.
+    /// Keep earlier links intact so either task id still resolves to it.
+    async fn link_continuation(&self, spawn: &SubagentSpawned, call_id: &str, background: Option<&str>) -> Result<(), String> {
+        let Some(background) = background else { return Ok(()) };
+        let mut link = spawn.clone();
+        link.call_id = call_id.to_owned();
+        link.background_task_id = background.to_owned();
+        self.parent.log.append(session_event::Kind::SubagentSpawned(link)).await.map_err(|e| format!("{e:#}"))?;
+        Ok(())
     }
 
     /// Asks the head about this session's remote subagents.
@@ -766,13 +795,15 @@ pub(crate) async fn digest(journal: &Journal, child_id: &str, status: &str, by: 
 
 /// The subagents a session's log says it started.
 pub fn spawned_children(events: &[c6_proto::SessionEvent]) -> Vec<String> {
-    events
-        .iter()
-        .filter_map(|e| match &e.kind {
-            Some(session_event::Kind::SubagentSpawned(sp)) => Some(sp.child_session_id.clone()),
-            _ => None,
-        })
-        .collect()
+    let mut children = Vec::new();
+    for e in events {
+        if let Some(session_event::Kind::SubagentSpawned(sp)) = &e.kind
+            && !children.contains(&sp.child_session_id)
+        {
+            children.push(sp.child_session_id.clone());
+        }
+    }
+    children
 }
 
 /// A subagent's digest from its log (`events`), with its own subagents'
@@ -824,7 +855,9 @@ pub fn digest_text(
                 }
             }
             Some(session_event::Kind::Error(err)) => errors.push(first_line(&err.message)),
-            Some(session_event::Kind::SubagentSpawned(sp)) => children.push((sp.child_session_id.clone(), sp.description.clone())),
+            Some(session_event::Kind::SubagentSpawned(sp)) if !children.iter().any(|(id, _)| id == &sp.child_session_id) => {
+                children.push((sp.child_session_id.clone(), sp.description.clone()));
+            }
             _ => {}
         }
     }
@@ -971,6 +1004,23 @@ impl c6_tools::Hooks for SubagentHooks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continuation_links_keep_one_child_in_the_tree_and_digest() {
+        let spawn = SubagentSpawned { child_session_id: "child".into(), description: "same name".into(), ..Default::default() };
+        let events: Vec<_> = [
+            spawn.clone(),
+            SubagentSpawned { call_id: "continue".into(), background_task_id: "bg2".into(), ..spawn.clone() },
+            SubagentSpawned { child_session_id: "sibling".into(), ..spawn },
+        ]
+        .into_iter()
+        .map(|sp| c6_proto::SessionEvent { kind: Some(session_event::Kind::SubagentSpawned(sp)), ..Default::default() })
+        .collect();
+        assert_eq!(spawned_children(&events), ["child", "sibling"]);
+        let digest = digest_text(&events, "parent", "interrupted", "", &Default::default());
+        assert_eq!(digest.matches("child \"same name\"").count(), 1, "{digest}");
+        assert_eq!(digest.matches("sibling \"same name\"").count(), 1, "{digest}");
+    }
 
     #[test]
     fn report_notice_uses_the_report_and_plain_outcome_not_the_model_digest() {

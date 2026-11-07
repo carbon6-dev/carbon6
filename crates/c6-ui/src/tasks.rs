@@ -1,13 +1,12 @@
 //! Background task lifecycle history and read-only stream inspection.
 
-use c6_api::{Event, EventKind, Session, SessionStatus};
+use c6_api::{Event, EventKind, Session, SessionStatus, TurnEndReason};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 use crate::api;
 use crate::icons::{Icon, Size, icon};
 use crate::util::{BUTTON_QUIET, clock};
-use crate::workspace::ComposerPopover;
 
 #[derive(Clone, PartialEq)]
 struct Task {
@@ -15,6 +14,8 @@ struct Task {
     kind: String,
     description: String,
     since: i64,
+    since_seq: u64,
+    updated_at: i64,
     state: String,
     exit_code: i32,
     elapsed_ms: u64,
@@ -32,6 +33,16 @@ impl Task {
 
     fn can_stop(&self) -> bool {
         self.running()
+    }
+
+    fn elapsed(&self, now: i64) -> String {
+        // A child-only fallback has no run start/duration evidence. Its
+        // creation and last update are not this run's elapsed time.
+        if self.since_seq == 0 {
+            "Elapsed unknown".into()
+        } else {
+            elapsed(if self.running() { now - self.since } else { self.elapsed_ms.min(i64::MAX as u64) as i64 })
+        }
     }
 
     /// Stopped: by you, the agent or Claude Code.
@@ -73,26 +84,6 @@ impl Task {
     }
 }
 
-/// A task's state as a dot: running, finished, failed, stopped or lost.
-fn state_dot(state: &str, running: bool) -> &'static str {
-    match state {
-        _ if running => "animate-pulse bg-blue-500",
-        "finished" => "bg-emerald-500",
-        "failed" => "bg-red-500",
-        "lost" => "bg-amber-500",
-        _ => "bg-zinc-400",
-    }
-}
-
-/// What kind of task, in words.
-fn kind_name(kind: &str) -> &'static str {
-    match kind {
-        "claude_code" => "Claude Code",
-        "agent" => "agent",
-        _ => "shell",
-    }
-}
-
 /// Latest lifecycle record for every known task; running tasks come first.
 /// No worker request is needed, including for ended or lost tasks.
 fn lifecycle(events: &[Event]) -> Vec<Task> {
@@ -106,12 +97,16 @@ fn lifecycle(events: &[Event]) -> Vec<Task> {
             // Started again: a new run, unless it was running (Claude Code
             // moved it to the background).
             let since = if state == "started" && !before.is_some_and(Task::running) { e.ts } else { since };
+            let since_seq =
+                if state == "started" && !before.is_some_and(Task::running) { e.seq } else { before.map_or(e.seq, |t| t.since_seq) };
             out.retain(|r| &r.id != task_id);
             out.push(Task {
                 id: task_id.clone(),
                 kind: kind.clone(),
                 description: description.clone(),
                 since,
+                since_seq,
+                updated_at: e.ts,
                 state: state.clone(),
                 exit_code: *exit_code,
                 elapsed_ms: *elapsed_ms,
@@ -139,7 +134,8 @@ pub fn elapsed(ms: i64) -> String {
 /// What's running now: the tasks that keep the session showing as running
 /// (those that tell the agent when they end, and Claude Code's own), and
 /// the servers and watchers that don't.
-pub fn running_counts(events: &[Event]) -> (usize, usize) {
+#[cfg(test)]
+fn running_counts(events: &[Event]) -> (usize, usize) {
     lifecycle(events)
         .iter()
         .filter(|t| t.running())
@@ -151,20 +147,235 @@ pub fn running_counts(events: &[Event]) -> (usize, usize) {
 /// Claude's read-only mirrors are represented by its native task records,
 /// whose foreground flag tells us whether they really run in the background.
 pub(crate) fn background_count(events: &[Event], subagents: &[Session]) -> usize {
-    let children = subagents.iter().filter(|s| s.status == SessionStatus::Running && !s.observed).collect::<Vec<_>>();
-    let tasks = lifecycle(events)
-        .into_iter()
-        .filter(|t| t.running() && !t.foreground)
-        .filter(|t| {
-            !events.iter().any(|e| match &e.kind {
-                EventKind::SubagentSpawned { child_session_id, background_task_id, .. } => {
-                    background_task_id == &t.id && children.iter().any(|s| &s.id == child_session_id)
+    jobs(events, subagents).iter().filter(|j| j.task.running()).count()
+}
+
+/// One identity, with the latest run's state and all its task IDs. A resume
+/// may allocate another task ID but must not allocate another visible job.
+#[derive(Clone, PartialEq)]
+pub(crate) struct Job {
+    pub(crate) id: String,
+    task: Task,
+    child: Option<Session>,
+    task_ids: Vec<String>,
+}
+
+fn native_identity(id: &str) -> Option<String> {
+    let parts: Vec<serde_json::Value> = serde_json::from_str(id.strip_prefix("claude:")?).ok()?;
+    Some(format!("claude:{}", serde_json::to_string(parts.get(..2)?).ok()?))
+}
+
+fn jobs(events: &[Event], children: &[Session]) -> Vec<Job> {
+    // A log can straddle the worker upgrade that began linking native
+    // mirrors. Resolve all explicit scope/task aliases before grouping so
+    // unlinked runs share the linked child's identity in either order.
+    // If runs have different mirrors, the latest explicit link by event
+    // sequence chooses their representative child, even for exact links.
+    let mut native_children: std::collections::HashMap<String, (u64, String)> = std::collections::HashMap::new();
+    for e in events {
+        if let EventKind::SubagentSpawned { child_session_id, background_task_id, .. } = &e.kind
+            && let Some(id) = native_identity(background_task_id)
+        {
+            let linked = native_children.entry(id).or_insert_with(|| (e.seq, child_session_id.clone()));
+            if e.seq > linked.0 {
+                *linked = (e.seq, child_session_id.clone());
+            }
+        }
+    }
+    let mut out: Vec<Job> = Vec::new();
+    for task in lifecycle(events).into_iter().filter(|t| !t.foreground) {
+        let native = native_identity(&task.id);
+        let child_id = native.as_ref().and_then(|id| native_children.get(id).map(|(_, child)| child.clone())).or_else(|| {
+            events.iter().find_map(|e| match &e.kind {
+                EventKind::SubagentSpawned { child_session_id, background_task_id, .. } if background_task_id == &task.id => {
+                    Some(child_session_id.clone())
                 }
-                _ => false,
+                _ => None,
             })
-        })
-        .count();
-    children.len() + tasks
+        });
+        let id = child_id.clone().or(native).unwrap_or_else(|| task.id.clone());
+        if let Some(job) = out.iter_mut().find(|j| j.id == id) {
+            job.task_ids.push(task.id.clone());
+            if task.since_seq >= job.task.since_seq {
+                job.task = task;
+            }
+        } else {
+            let child = child_id.as_ref().and_then(|id| children.iter().find(|s| &s.id == id)).cloned();
+            out.push(Job { id, task_ids: vec![task.id.clone()], task, child });
+        }
+    }
+    for child in children.iter().filter(|s| !s.observed) {
+        if out.iter().any(|j| j.id == child.id) {
+            continue;
+        }
+        // A known foreground-only spawn belongs to the transcript, not here.
+        let foreground = events.iter().any(|e| {
+            matches!(&e.kind,
+            EventKind::SubagentSpawned { child_session_id, background_task_id, .. }
+                if child_session_id == &child.id && background_task_id.is_empty())
+        });
+        if foreground {
+            continue;
+        }
+        let state = if matches!(child.status, SessionStatus::Running | SessionStatus::Starting) {
+            "started"
+        } else if child.status == SessionStatus::Failed {
+            "failed"
+        } else {
+            match child.end_reason {
+                Some(TurnEndReason::Interrupted) => "stopped_by_user",
+                Some(TurnEndReason::Error | TurnEndReason::WorkerRestarted | TurnEndReason::Unknown) => "failed",
+                _ => "finished",
+            }
+        };
+        out.push(Job {
+            id: child.id.clone(),
+            child: Some(child.clone()),
+            task_ids: Vec::new(),
+            task: Task {
+                id: child.id.clone(),
+                kind: "agent".into(),
+                description: child.title.clone(),
+                since: child.created_at,
+                since_seq: 0,
+                updated_at: child.updated_at,
+                state: state.into(),
+                exit_code: 0,
+                elapsed_ms: 0,
+                notify: true,
+                native_type: String::new(),
+                foreground: false,
+            },
+        });
+    }
+    for job in &mut out {
+        let original = events.iter().find_map(|e| match &e.kind {
+            EventKind::SubagentSpawned { child_session_id, description, .. } if child_session_id == &job.id => Some(description.clone()),
+            _ => None,
+        });
+        if job.child.is_some() || original.is_some() {
+            if job.task.kind != "claude_code" {
+                job.task.kind = "agent".into();
+            }
+            job.task.description = job
+                .child
+                .as_ref()
+                .map(|s| s.title.clone())
+                .filter(|t| !t.trim().is_empty())
+                .or(original.filter(|t| !t.trim().is_empty()))
+                .unwrap_or_else(|| "Background agent".into());
+        } else if job.task.description.trim().is_empty() {
+            job.task.description = if job.task.native_type == "local_agent" { "Background agent" } else { "Background command" }.into();
+        }
+    }
+    out.sort_by_key(|j| (j.task.since, j.task.since_seq, j.id.clone()));
+    out
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) enum Page {
+    Landing,
+    Details,
+    History,
+    Inspect(String),
+    Actions(String),
+}
+
+pub(crate) fn job_list(chrome: crate::session::SessionChrome) -> Memo<Vec<Job>> {
+    Memo::new(move |_| {
+        let rows = chrome.subagents.rows().into_iter().map(|(s, _)| s).collect::<Vec<_>>();
+        chrome.events.with(|e| jobs(e, &rows))
+    })
+}
+
+pub(crate) fn history_label(list: &[Job]) -> String {
+    let failed = list.iter().filter(|j| !j.task.running() && j.task.failed()).count();
+    let interrupted = list.iter().filter(|j| !j.task.running() && j.task.stopped()).count();
+    let mut label = "History".to_owned();
+    if failed > 0 {
+        label.push_str(&format!(" · {failed} failed"));
+    }
+    if interrupted > 0 {
+        label.push_str(&format!(" · {interrupted} interrupted"));
+    }
+    label
+}
+
+pub(crate) fn actions_label(list: &[Job], page: &Page) -> &'static str {
+    let Page::Actions(id) = page else { return "Background job" };
+    if list.iter().find(|j| &j.id == id).is_some_and(|j| j.task.kind == "agent" || j.task.native_type == "local_agent") {
+        "Background agent"
+    } else {
+        "Background command"
+    }
+}
+
+/// The same compact rows on all surfaces; only live identities land here.
+#[component]
+pub(crate) fn JobRows(
+    list: Memo<Vec<Job>>,
+    navigate: Callback<(Page, web_sys::MouseEvent)>,
+    #[prop(default = false)] history: bool,
+) -> impl IntoView {
+    let now = clock();
+    let filter = RwSignal::new("All");
+    let limit = RwSignal::new(30usize);
+    let rows = Memo::new(move |_| {
+        let mut rows = list
+            .get()
+            .into_iter()
+            .filter(|j| {
+                if history {
+                    !j.task.running()
+                        && match filter.get() {
+                            "Failed" => j.task.failed(),
+                            "Interrupted" => j.task.stopped(),
+                            _ => true,
+                        }
+                } else {
+                    j.task.running()
+                }
+            })
+            .collect::<Vec<_>>();
+        if history {
+            rows.sort_by_key(|j| std::cmp::Reverse(j.task.updated_at));
+        }
+        rows
+    });
+    view! {
+        {history.then(|| view! {
+            <div class="flex gap-2" aria-label="History filters">
+                {["All", "Failed", "Interrupted"].into_iter().map(|value| view! {
+                    <button class=format!("{BUTTON_QUIET} min-h-11") aria-pressed=move || (filter.get() == value).to_string()
+                        on:click=move |_| { filter.set(value); limit.set(30); }>{value}</button>
+                }).collect_view()}
+            </div>
+        })}
+        <Show when=move || !rows.with(Vec::is_empty) fallback=move || view! { <p class="py-2 text-xs text-muted">{if history { "No matching history" } else { "Nothing running now" }}</p> }>
+            <div class="divide-y divide-zinc-100 dark:divide-zinc-800">
+                {move || rows.get().into_iter().take(if history { limit.get() } else { usize::MAX }).map(|job| {
+                    let task = job.task;
+                    let id = StoredValue::new(job.id);
+                    let agent = task.kind == "agent" || task.native_type == "local_agent";
+                    let kind = if agent { "Agent" } else if task.notify || task.kind == "claude_code" { "Command" } else { "Server / Watcher" };
+                    let name = task.description.clone();
+                    let actions = format!("Actions for {name}");
+                    view! {
+                        <div class="flex min-h-11 items-center gap-2 text-[13px]" data-background-job=id.get_value()>
+                            <span role="img" aria-label=kind class="shrink-0 text-sky-600 dark:text-sky-400">{icon(if agent { Icon::Bot } else { Icon::SquareTerminal }, Size::S16)}</span>
+                            <button class="min-h-11 min-w-0 flex-1 truncate text-left" on:click=move |ev| navigate.run((Page::Inspect(id.get_value()), ev))>{name}</button>
+                            <span class="shrink-0 text-xs tabular-nums text-muted">{move || task.elapsed(now.get())}</span>
+                            <button class=crate::components::SESSION_BAR_BUTTON aria-label=actions
+                                on:click=move |ev| navigate.run((Page::Actions(id.get_value()), ev))>{crate::icons::ellipsis()}</button>
+                        </div>
+                    }
+                }).collect_view()}
+            </div>
+        </Show>
+        {move || (history && rows.with(Vec::len) > limit.get()).then(|| view! {
+            <button class=format!("{BUTTON_QUIET} min-h-11") on:click=move |_| limit.update(|n| *n += 30)>"Show more"</button>
+        })}
+    }
 }
 
 /// The words beside the running-task spinner at the bottom of a transcript.
@@ -183,170 +394,121 @@ pub fn background_agents(events: &[Event]) -> usize {
     lifecycle(events).iter().filter(|t| t.running() && t.kind == "claude_code" && t.native_type == "local_agent" && !t.foreground).count()
 }
 
-/// What the tasks running now are, servers and watchers too.
-pub fn running(events: &[Event]) -> Vec<String> {
-    lifecycle(events).into_iter().filter(Task::running).map(|t| t.description).collect()
+pub(crate) fn stop_unavailable(connected: bool, session: Option<&Session>, workers: &[c6_api::Worker]) -> bool {
+    !connected || session.is_none_or(|s| crate::session::worker_offline(s, workers))
 }
 
-/// The last few tasks that failed or were stopped, beside those running.
-const RECENT: usize = 3;
-
-/// The tasks a session's ◌ N lists: those running, then the last few that
-/// failed or were stopped, newest first; `all`: every one.
-fn short_list(tasks: Vec<Task>, all: bool) -> Vec<Task> {
-    if all {
-        return tasks;
-    }
-    let (running, ended): (Vec<Task>, Vec<Task>) = tasks.into_iter().partition(Task::running);
-    let recent = ended.into_iter().rev().filter(|t| t.failed() || t.stopped()).take(RECENT);
-    running.into_iter().chain(recent).collect()
-}
-
-/// How many tasks the short list leaves out.
-pub fn left_out(events: &[Event]) -> usize {
-    let tasks = lifecycle(events);
-    let total = tasks.len();
-    total - short_list(tasks, false).len()
-}
-
-/// A session's tasks for its bar's ◌ N (see [`short_list`]), each with its
-/// state and time, Inspect, and Stop while it runs. Nothing when there are
-/// none to show.
+/// Inspect and actions replace the sheet body; their live record also removes
+/// Stop if the job ends while its menu is open. No optimistic stop success.
 #[component]
-pub fn BackgroundTasks(session: String, events: RwSignal<Vec<Event>>, #[prop(into)] all: Signal<bool>) -> impl IntoView {
-    let session = StoredValue::new(session);
-    let list = Memo::new(move |_| short_list(events.with(|e| lifecycle(e)), all.get()));
-    let selected = RwSignal::new(None::<String>);
-    let error = RwSignal::new(None::<String>);
-    view! {
-        <Show when=move || !list.with(Vec::is_empty)>
-            <div class="space-y-2">
-                <p class="text-[10px] font-medium uppercase tracking-wide text-muted">"Tasks"</p>
-                {task_rows(session, list, error, Callback::new(move |id| selected.set(Some(id))))}
-            </div>
-        </Show>
-        {inspector(session, list, selected)}
-    }
-}
-
-/// A quiet line for the bottom of the transcript, shown only while
-/// something runs (docs/background.md §4): it opens the session's tasks.
-#[component]
-pub fn RunningTasks(session: String, events: RwSignal<Vec<Event>>) -> impl IntoView {
-    let session = StoredValue::new(session);
-    let list = Memo::new(move |_| events.with(|e| lifecycle(e)));
-    let counts = Memo::new(move |_| events.with(|e| running_counts(e)));
-    let open = RwSignal::new(false);
-    let anchor = NodeRef::<leptos::html::Div>::new();
-    let pop = StoredValue::new(crate::util::dismissable(
-        move || open.get(),
-        move || {
-            open.try_set(false);
-        },
-    ));
-    let selected = RwSignal::new(None::<String>);
-    let error = RwSignal::new(None::<String>);
-    view! {
-        <Show when=move || counts.with(|(t, s)| t + s > 0)>
-            <div node_ref=anchor>
-                <button class="text-xs text-sky-700 hover:underline dark:text-sky-400" title="Open the background tasks"
-                    data-pop=pop.get_value() aria-expanded=move || open.get().to_string()
-                    on:click=move |ev| {
-                        ev.stop_propagation();
-                        open.update(|o| *o = !*o);
-                    }>
-                    <span class="inline-flex animate-spin">{icon(Icon::LoaderCircle, Size::S14)}</span>" "{move || counts.with(|(t, s)| running_line(*t, *s))}" "{crate::icons::chevron_right()}
-                </button>
-                <Show when=move || open.get()>
-                <ComposerPopover anchor pop=pop.get_value() class="w-96 space-y-2 p-2 text-xs">
-                    <p class="text-muted">"Task history remains available when the worker is offline. Inspect streams with Refresh."</p>
-                    {task_rows(session, list, error, Callback::new(move |id| {
-                        selected.set(Some(id));
-                        open.set(false);
-                    }))}
-                </ComposerPopover>
-                </Show>
-                {inspector(session, list, selected)}
-            </div>
-        </Show>
-    }
-}
-
-/// The tasks, each with what it is, how it stands, Inspect and (while it
-/// runs) Stop.
-fn task_rows(
-    session: StoredValue<String>,
-    list: Memo<Vec<Task>>,
-    error: RwSignal<Option<String>>,
-    inspect: Callback<String>,
+pub(crate) fn JobDetail(
+    chrome: crate::session::SessionChrome,
+    list: Memo<Vec<Job>>,
+    page: RwSignal<Page>,
+    navigate: Callback<(Page, web_sys::MouseEvent)>,
+    on_done: Callback<()>,
 ) -> impl IntoView {
+    let selected = Memo::new(move |_| {
+        let (Page::Inspect(id) | Page::Actions(id)) = page.get() else { return None };
+        list.with(|rows| rows.iter().find(|j| j.id == id).cloned())
+    });
+    let task = Memo::new(move |_| selected.get().map(|j| j.task));
+    let error = RwSignal::new(None::<String>);
+    let stopping = RwSignal::new(false);
     let now = clock();
+    let offline = Memo::new(move |_| chrome.background_stale());
     view! {
-        {move || list.get().into_iter().map(|t| {
-            let id = t.id.clone();
-            let inspect_id = t.id.clone();
-            let running = t.running();
-            let can_stop = t.can_stop();
-            let status = t.status();
-            let notification = t.notification();
-            // What it is first, in words; its id and how its
-            // end is reported on hover.
-            let about = format!("{} · {notification}", t.id);
+        {move || selected.get().map(|job| {
+            let agent = job.task.kind == "agent" || job.task.native_type == "local_agent";
             view! {
-                <div class="space-y-1 border-t border-zinc-100 pt-2 dark:border-zinc-800">
-                    <div class="flex items-start gap-2" title=about>
-                        <span class=format!("mt-1 h-2 w-2 shrink-0 rounded-full {}", state_dot(&t.state, running))></span>
-                        <span class="line-clamp-2 min-w-0 flex-1 text-[13px] text-zinc-800 dark:text-zinc-100">{t.description.clone()}</span>
-                    </div>
-                    <div class="flex flex-wrap items-center gap-2 pl-4 text-zinc-600 dark:text-zinc-400">
-                        <span class="rounded bg-zinc-100 px-1 text-[10px] dark:bg-zinc-800">{kind_name(&t.kind)}</span>
-                        <span>{status}</span>
-                        <span>{move || if running { elapsed(now.get() - t.since) } else if t.state == "lost" { "elapsed unknown".into() } else { elapsed(t.elapsed_ms as i64) }}</span>
-                        <span class="flex-1"></span>
-                        <button class="rounded-md border border-zinc-200 px-2 py-0.5 text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800" on:click=move |_| {
-                            inspect.run(inspect_id.clone());
-                        }>"Inspect"</button>
-                        {can_stop.then(|| view! { <button class="rounded-md border border-red-200 px-2 py-0.5 text-red-700 hover:bg-red-50 dark:border-red-900 dark:text-red-400 dark:hover:bg-red-950" on:click=move |_| {
-                        let id = id.clone();
-                        spawn_local(async move {
-                            if let Err(e) = api::stop_task(session.get_value(), id).await {
-                                error.set(Some(e));
-                            }
-                        });
-                    }>"Stop"</button> })}
-                    </div>
-                </div>
+                <h3 class="break-words font-semibold">{job.task.description.clone()}</h3>
+                <p class="text-xs text-muted">{format!("{} · {}", if agent { "Agent" } else { "Command" }, job.task.status())}" · "{move || task.get().map(|t| t.elapsed(now.get()))}</p>
             }
-        }).collect_view()}
-        {move || error.get().map(|e| view! { <p class="text-red-600">{e}</p> })}
+        })}
+        <Show when=move || matches!(page.get(), Page::Actions(_)) fallback=move || view! {
+            {move || selected.get().map(|job| {
+                if job.task_ids.is_empty() {
+                    view! { <ChildSnapshot child=job.id /> }.into_any()
+                } else {
+                    view! { <TaskInspector session=chrome.id.get_value() task /> }.into_any()
+                }
+            })}
+            <details class="text-xs">
+                <summary class="min-h-11 cursor-pointer py-3">"Runs and raw IDs"</summary>
+                <pre class="whitespace-pre-wrap break-all">{move || selected.get().map(|job| {
+                    let mut lines = vec![format!("Job {}", job.id)];
+                    chrome.events.with(|events| {
+                        for e in events {
+                            if let EventKind::BackgroundTask { task_id, state, elapsed_ms, .. } = &e.kind
+                                && job.task_ids.contains(task_id) {
+                                lines.push(format!("{} · {} · {} · {}", e.ts, task_id, state, elapsed(*elapsed_ms as i64)));
+                            }
+                        }
+                    });
+                    lines.join("\n")
+                })}</pre>
+            </details>
+        }>
+            <button class="flex min-h-11 w-full items-center gap-2 text-left" on:click=move |ev| {
+                if let Some(job) = selected.get_untracked() { navigate.run((Page::Inspect(job.id), ev)); }
+            }>{icon(Icon::Info, Size::S16)}"Inspect"{crate::icons::chevron_right()}</button>
+            <Show when=move || selected.with(|j| j.as_ref().is_some_and(|j| j.task.can_stop() && (!j.task_ids.is_empty() || !j.child.as_ref().is_some_and(|s| s.observed))))>
+                <button class="flex min-h-11 w-full items-center gap-2 border-t border-zinc-200 text-left text-red-600 disabled:opacity-40 dark:border-zinc-700 dark:text-red-400"
+                    disabled=move || offline.get() || stopping.get() on:click=move |_| {
+                        if offline.get_untracked() {
+                            error.set(Some("Stop unavailable: reconnect and load the session's current state first.".into()));
+                            return;
+                        }
+                        let Some(job) = selected.get_untracked() else { return };
+                        error.set(None); stopping.set(true);
+                        spawn_local(async move {
+                            let result = if job.task_ids.is_empty() { api::interrupt(job.id).await }
+                                else { api::stop_task(chrome.id.get_value(), job.task.id).await };
+                            if let Err(e) = result { error.set(Some(e)); }
+                            stopping.set(false);
+                        });
+                    }>{crate::icons::stop()}{move || if selected.with(|j| j.as_ref().is_some_and(|j| j.task.kind == "agent" || j.task.native_type == "local_agent")) { "Stop this agent" } else { "Stop this command" }}</button>
+            </Show>
+        </Show>
+        {move || error.get().map(|message| view! { <p role="alert" class="break-words text-red-600 dark:text-red-400">{message}</p> })}
+        {move || selected.get().and_then(|j| j.child).map(|child| view! {
+            <button class="flex min-h-11 items-center gap-2" on:click=move |ev| {
+                let id = child.id.clone();
+                if ev.meta_key() || ev.ctrl_key() {
+                    if let Some(col) = chrome.col { crate::panes::open(col, crate::workspace::View::session(id), true); }
+                } else {
+                    chrome.subagents.go(id.clone(), move || {
+                        if let Some(col) = chrome.col { crate::panes::open(col, crate::workspace::View::session(id), false); }
+                    });
+                }
+                on_done.run(());
+            }>{icon(Icon::ExternalLink, Size::S16)}"Open thread"</button>
+        })}
     }
 }
 
-/// The inspector of the task chosen, while one is.
-fn inspector(session: StoredValue<String>, list: Memo<Vec<Task>>, selected: RwSignal<Option<String>>) -> impl IntoView {
-    move || {
-        selected.get().map(|id| {
-            let task = Memo::new(move |_| list.with(|tasks| tasks.iter().find(|t| t.id == id).cloned()));
-            view! {
-                <leptos::portal::Portal>
-                    <TaskInspector session=session.get_value() task on_close=Callback::new(move |_| selected.set(None)) />
-                </leptos::portal::Portal>
-            }
-        })
+#[component]
+fn ChildSnapshot(child: String) -> impl IntoView {
+    let snapshot = LocalResource::new(move || api::session_events_before(child.clone(), u64::MAX, 100, None));
+    view! {
+        <button class=format!("{BUTTON_QUIET} min-h-11") on:click=move |_| snapshot.refetch()>"Refresh"</button>
+        <p class="text-xs text-muted">"Read-only output · latest 100 events"</p>
+        <Suspense fallback=|| view! { <p>"Loading output…"</p> }>
+            {move || snapshot.get().map(|result| match result {
+                Err(message) => view! { <p role="alert">{message}</p> }.into_any(),
+                Ok(events) => view! { <pre class="whitespace-pre-wrap break-words text-xs">{events.iter().filter_map(|e| match &e.kind {
+                    EventKind::Assistant { blocks, .. } => Some(blocks.iter().filter_map(|b| match b { c6_api::ContentBlock::Text { text, .. } => Some(text.as_str()), _ => None }).collect::<Vec<_>>().join("\n")),
+                    _ => None,
+                }).collect::<Vec<_>>().join("\n")}</pre> }.into_any(),
+            })}
+        </Suspense>
     }
 }
 
 /// Mounted only while open. The resource tracks lifecycle, never the clock or
 /// model output, so ordinary session deltas do not cause snapshot polling.
 #[component]
-fn TaskInspector(session: String, task: Memo<Option<Task>>, on_close: Callback<()>) -> impl IntoView {
-    let dialog = NodeRef::<leptos::html::Div>::new();
-    let pop = crate::util::escapable(|| true, move || on_close.run(()));
-    Effect::new(move || {
-        if let Some(el) = dialog.get() {
-            let _ = el.focus();
-        }
-    });
+fn TaskInspector(session: String, task: Memo<Option<Task>>) -> impl IntoView {
     let snapshot = LocalResource::new(move || {
         let task = task.get();
         let session = session.clone();
@@ -356,16 +518,8 @@ fn TaskInspector(session: String, task: Memo<Option<Task>>, on_close: Callback<(
         }
     });
     view! {
-        <div class="phone-dialog fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-2 sm:p-4"
-            on:click=move |_| on_close.run(())>
-            <div node_ref=dialog role="dialog" aria-modal="true" aria-label="Background task inspector" data-pop=pop tabindex="-1"
-                class="flex max-h-[90vh] w-full max-w-4xl flex-col gap-3 overflow-auto rounded-lg bg-white p-3 text-sm shadow-xl sm:p-4 dark:bg-zinc-900"
-                on:click=|ev| ev.stop_propagation()>
-                <div class="flex flex-wrap items-center gap-2">
-                    <h2 class="min-w-0 flex-1 break-all font-medium">{move || task.get().map(|t| format!("Task {} · {}", t.id, t.kind))}</h2>
-                    <button class=BUTTON_QUIET on:click=move |_| snapshot.refetch()>"Refresh"</button>
-                    <button class=BUTTON_QUIET on:click=move |_| on_close.run(())>"Close"</button>
-                </div>
+        <div class="space-y-3">
+                <button class=format!("{BUTTON_QUIET} min-h-11") on:click=move |_| snapshot.refetch()>"Refresh"</button>
                 <p class="text-xs text-muted">"Read-only live snapshot. Use Refresh to see new output; there is no automatic polling. Inspecting does not wake the model, consume output or change its read cursor."</p>
                 {move || task.get().map(|t| view! {
                     <p class="text-xs text-muted">{format!("Session history: {} · {}", t.status(), t.notification())}</p>
@@ -391,7 +545,6 @@ fn TaskInspector(session: String, task: Memo<Option<Task>>, on_close: Callback<(
                         }.into_any(),
                     })}
                 </Suspense>
-            </div>
         </div>
     }
 }
@@ -504,6 +657,34 @@ mod tests {
             *kind = "claude_code".into();
             *native_type = native.into();
             *foreground = fg;
+        }
+        e
+    }
+
+    fn child_session(id: &str, title: &str, status: &str, observed: bool) -> Session {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "worker_id": "00000000-0000-0000-0000-000000000001", "title": title, "cwd": "/src",
+            "connection_id": "anthropic", "model": "m", "status": status, "error": null, "effort": null,
+            "created_at": 0, "updated_at": 0, "last_seq": 0, "observed": observed
+        }))
+        .unwrap()
+    }
+
+    fn spawn_event(seq: u64, child: &str, task: &str, description: &str) -> Event {
+        serde_json::from_value(serde_json::json!({
+            "seq": seq, "ts": seq as i64 * 1000, "type": "subagent_spawned", "call_id": format!("call-{seq}"),
+            "child_session_id": child, "background_task_id": task, "description": description
+        }))
+        .unwrap()
+    }
+
+    fn agent(seq: u64, task: &str, state: &str, description: &str) -> Event {
+        let mut e = event(seq, task, state);
+        if let EventKind::BackgroundTask { kind, description: text, notify, exit_code, .. } = &mut e.kind {
+            *kind = "agent".into();
+            *text = description.into();
+            *notify = true;
+            *exit_code = 0;
         }
         e
     }
@@ -692,20 +873,332 @@ mod tests {
     }
 
     #[test]
-    fn the_short_list_has_the_running_and_the_last_few_stopped_or_failed() {
-        let evs = [
-            event(1, "old fail", "failed"),
-            event(2, "ok", "finished"),
-            event(3, "stopped", "stopped_by_user"),
-            event(4, "f2", "failed"),
-            event(5, "f3", "lost"),
-            event(6, "f4", "failed"),
-            event(7, "run", "started"),
+    fn jobs_merge_linked_continuations_and_count_only_the_latest_outcome() {
+        let child = child_session("child", "Human child title", "running", false);
+        let mut events = vec![
+            spawn_event(1, "child", "bg1", "Original task description"),
+            agent(2, "bg1", "started", "Original task description"),
+            agent(3, "bg1", "failed", "Original task description"),
+            spawn_event(4, "child", "bg2", "Original task description"),
+            agent(5, "bg2", "started", "continue child"),
         ];
-        let ids = |all| short_list(lifecycle(&evs), all).into_iter().map(|t| t.id).collect::<Vec<_>>();
-        assert_eq!(ids(false), ["run", "f4", "f3", "f2"], "the newest three ended badly, after what runs");
-        assert_eq!(ids(true).len(), 7);
-        assert_eq!(left_out(&evs), 3);
+        let children = [child];
+        let list = jobs(&events, &children);
+        assert_eq!(list.len(), 1, "a continuation is another run, not another job");
+        let job = &list[0];
+        assert_eq!(job.id, "child");
+        assert_eq!(job.task.id, "bg2");
+        assert!(job.task.running());
+        assert_eq!(job.task.description, "Human child title", "never expose the raw continue description as its name");
+        assert_eq!((job.task.since, job.task.since_seq), (5000, 5), "elapsed starts at this run, not the original spawn");
+        let mut ids = job.task_ids.clone();
+        ids.sort();
+        assert_eq!(ids, ["bg1", "bg2"], "Inspect retains both attempts' IDs");
+        assert_eq!(background_count(&events, &children), 1);
+        assert_eq!(history_label(&list), "History", "a resumed job's earlier failure is not a current problem count");
+
+        events.push(agent(6, "bg2", "stopped_by_user", "continue child"));
+        let list = jobs(&events, &children);
+        assert_eq!(list.len(), 1);
+        assert!(!list[0].task.running());
+        assert_eq!(list[0].task.id, "bg2");
+        assert_eq!(background_count(&events, &children), 0);
+        assert_eq!(history_label(&list), "History · 1 interrupted", "only the latest run's outcome counts");
+
+        events.extend([
+            spawn_event(7, "child", "bg3", "Original task description"),
+            agent(8, "bg3", "started", "continue bg1"),
+            agent(9, "bg3", "finished", "continue bg1"),
+        ]);
+        let list = jobs(&events, &children);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].task.id, "bg3");
+        assert_eq!(list[0].task_ids.len(), 3);
+        assert!(!list[0].task.failed());
+        assert!(!list[0].task.stopped());
+        assert_eq!(history_label(&list), "History", "a successful latest run clears earlier failure/interruption counts");
+    }
+
+    #[test]
+    fn jobs_with_the_same_human_title_keep_distinct_identities() {
+        let children = [
+            child_session("child-a", "Review the layout", "running", false),
+            child_session("child-b", "Review the layout", "running", false),
+        ];
+        let events = [
+            spawn_event(1, "child-a", "bg1", "Review the layout"),
+            agent(2, "bg1", "started", "Review the layout"),
+            spawn_event(3, "child-b", "bg2", "Review the layout"),
+            agent(4, "bg2", "started", "Review the layout"),
+        ];
+        let list = jobs(&events, &children);
+        assert_eq!(list.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(), ["child-a", "child-b"]);
+        assert!(list.iter().all(|j| j.task.description == "Review the layout" && j.task.running()));
+        assert_eq!(background_count(&events, &children), 2, "merge identities, never names");
+    }
+
+    #[test]
+    fn jobs_choose_the_later_start_sequence_when_timestamps_tie() {
+        let mut events = [
+            spawn_event(1, "child", "old", "Review"),
+            agent(2, "old", "started", "Review"),
+            agent(3, "old", "failed", "Review"),
+            spawn_event(4, "child", "latest", "Review"),
+            agent(5, "latest", "started", "continue child"),
+        ];
+        for e in &mut events {
+            e.ts = 1000;
+        }
+        // lifecycle visits running tasks first, so the old failed run is
+        // encountered later during merging despite its earlier start.
+        let list = jobs(&events, &[]);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].task.id, "latest");
+        assert!(list[0].task.running());
+        assert_eq!((list[0].task.since, list[0].task.since_seq), (1000, 5));
+        assert_eq!(list[0].task_ids.len(), 2);
+        assert_eq!(history_label(&list), "History");
+    }
+
+    #[test]
+    fn unlinked_native_jobs_collapse_runs_but_preserve_scope_and_task_identity() {
+        let old = r#"claude:["scope-a","agent","run","zzz"]"#;
+        let latest = r#"claude:["scope-a","agent","run","aaa"]"#;
+        let other_scope = r#"claude:["scope-b","agent","run","aaa"]"#;
+        let other_task = r#"claude:["scope-a","other","run","aaa"]"#;
+        let events = [
+            native(1, old, "started", "local_agent", false),
+            native(2, old, "failed", "local_agent", false),
+            native(3, latest, "started", "local_agent", false),
+            native(4, latest, "finished", "local_agent", false),
+            native(5, other_scope, "started", "local_agent", false),
+            native(6, other_task, "started", "local_agent", false),
+        ];
+        let list = jobs(&events, &[]);
+        assert_eq!(list.len(), 3);
+        let job = list.iter().find(|j| j.id == r#"claude:["scope-a","agent"]"#).unwrap();
+        assert_eq!(job.task.id, latest, "run IDs are opaque, not sorted lexically");
+        assert_eq!(job.task_ids.len(), 2);
+        assert_eq!(job.task.kind, "claude_code");
+        assert_eq!(job.task.native_type, "local_agent");
+        assert_eq!(job.task.status(), "finished");
+        assert!(!job.task.failed(), "native completion has no OS exit-code semantics");
+        assert!(list.iter().any(|j| j.id == r#"claude:["scope-b","agent"]"#));
+        assert!(list.iter().any(|j| j.id == r#"claude:["scope-a","other"]"#));
+        assert_eq!(background_count(&events, &[]), 2);
+        assert_eq!(history_label(&list), "History");
+    }
+
+    #[test]
+    fn linked_native_mirrors_keep_native_kind_and_real_task_target() {
+        let old = r#"claude:["scope","agent","run","old"]"#;
+        let latest = r#"claude:["scope","agent","run","new"]"#;
+        let children = [child_session("mirror", "Human mirror title", "running", true)];
+        let mut events = vec![
+            spawn_event(1, "mirror", old, "Original agent description"),
+            native(2, old, "started", "local_agent", false),
+            native(3, old, "failed", "local_agent", false),
+            spawn_event(4, "mirror", latest, "Original agent description"),
+            native(5, latest, "started", "local_agent", false),
+        ];
+        let list = jobs(&events, &children);
+        assert_eq!(list.len(), 1, "the observed mirror must not become another row");
+        let job = &list[0];
+        assert_eq!(job.id, "mirror", "an explicit spawn link takes precedence over the legacy native identity");
+        assert_eq!(job.task.id, latest, "Stop targets the real native registry task, not the read-only mirror");
+        assert!(job.child.as_ref().unwrap().observed);
+        assert_eq!(job.task.description, "Human mirror title");
+        assert_eq!(job.task.kind, "claude_code", "the human title must not change native lifecycle semantics to agent");
+        assert_eq!(job.task.native_type, "local_agent");
+        assert!(job.task.can_stop());
+        assert_eq!(job.task.notification(), "Claude Code handles completion");
+        assert_eq!(job.task_ids.len(), 2);
+        assert_eq!(history_label(&list), "History");
+
+        events.push(native(6, latest, "finished", "local_agent", false));
+        let list = jobs(&events, &children);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].task.kind, "claude_code");
+        assert_eq!(list[0].task.status(), "finished", "never invent an OS exit status for a native agent");
+        assert!(!list[0].task.can_stop());
+        assert!(!list[0].task.failed());
+        assert_eq!(history_label(&list), "History");
+    }
+
+    fn assert_mixed_native_links(link_latest: bool) {
+        let old = r#"claude:["scope","agent","run","old"]"#;
+        let latest = r#"claude:["scope","agent","run","new"]"#;
+        let children = [child_session("mirror", "Human mirror title", "running", true)];
+        let mut events = vec![
+            native(1, old, "started", "local_agent", false),
+            native(2, old, "failed", "local_agent", false),
+            native(3, latest, "started", "local_agent", false),
+            // Resolve links before grouping, even when their event comes
+            // after the task records or only names the old failed run.
+            spawn_event(4, "mirror", if link_latest { latest } else { old }, "Original agent description"),
+        ];
+        let list = jobs(&events, &children);
+        assert_eq!(list.len(), 1, "linked and unlinked runs of the same native scope/task are one job");
+        let job = &list[0];
+        assert_eq!(job.id, "mirror");
+        assert_eq!(job.child.as_ref().unwrap().id, "mirror", "the unlinked run acquires only the explicit identity alias");
+        assert_eq!(job.task.id, latest, "online Stop keeps the real current registry task target");
+        assert_eq!(job.task.kind, "claude_code");
+        assert_eq!(job.task.native_type, "local_agent");
+        assert_eq!(job.task.description, "Human mirror title");
+        assert!(job.task.running() && job.task.can_stop());
+        assert_eq!(job.task_ids.len(), 2);
+        assert!(job.task_ids.iter().any(|id| id == old));
+        assert!(job.task_ids.iter().any(|id| id == latest));
+        assert_eq!(background_count(&events, &children), 1);
+        assert_eq!(history_label(&list), "History", "the old failed attempt is not a separate history job");
+
+        events.push(native(5, latest, "finished", "local_agent", false));
+        let list = jobs(&events, &children);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].task.id, latest);
+        assert_eq!(list[0].task.status(), "finished");
+        assert_eq!(list[0].task_ids.len(), 2);
+        assert_eq!(background_count(&events, &children), 0);
+        assert_eq!(history_label(&list), "History");
+
+        let different_scope = r#"claude:["different-scope","agent","run","new"]"#;
+        events.push(native(6, different_scope, "started", "local_agent", false));
+        let list = jobs(&events, &children);
+        assert_eq!(list.len(), 2, "aliases must not cross native scopes");
+        assert!(list.iter().any(|j| j.id == r#"claude:["different-scope","agent"]"# && j.child.is_none()));
+    }
+
+    #[test]
+    fn unlinked_native_old_run_merges_under_the_latest_linked_mirror() {
+        assert_mixed_native_links(true);
+    }
+
+    #[test]
+    fn unlinked_native_latest_run_merges_under_the_old_linked_mirror() {
+        assert_mixed_native_links(false);
+    }
+
+    #[test]
+    fn native_scope_task_uses_latest_explicit_mirror_for_all_linked_runs() {
+        let old = r#"claude:["scope","agent","run","old"]"#;
+        let latest = r#"claude:["scope","agent","run","new"]"#;
+        let other_scope = r#"claude:["other-scope","agent","run","new"]"#;
+        let other_task = r#"claude:["scope","other-task","run","new"]"#;
+        let children = [
+            child_session("old-mirror", "Same title", "idle", true),
+            child_session("new-mirror", "Same title", "running", true),
+            child_session("other-scope", "Same title", "running", true),
+            child_session("other-task", "Same title", "running", true),
+        ];
+        let mut events = vec![
+            spawn_event(1, "old-mirror", old, "Same title"),
+            native(2, old, "started", "local_agent", false),
+            native(3, old, "failed", "local_agent", false),
+            native(4, latest, "started", "local_agent", false),
+            spawn_event(5, "new-mirror", latest, "Same title"),
+        ];
+        let list = jobs(&events, &children);
+        assert_eq!(list.len(), 1, "exact links to different mirrors must not split one native scope/task");
+        assert_eq!(list[0].id, "new-mirror", "latest explicit link sequence selects the representative mirror");
+        assert_eq!(list[0].child.as_ref().unwrap().id, "new-mirror");
+        assert_eq!(list[0].task.id, latest, "canonical mirror choice never changes the current native Stop target");
+        assert_eq!(list[0].task_ids.len(), 2);
+        assert_eq!(history_label(&list), "History");
+
+        events.extend([
+            spawn_event(6, "other-scope", other_scope, "Same title"),
+            native(7, other_scope, "started", "local_agent", false),
+            spawn_event(8, "other-task", other_task, "Same title"),
+            native(9, other_task, "started", "local_agent", false),
+        ]);
+        let list = jobs(&events, &children);
+        assert_eq!(list.len(), 3, "same-title explicit aliases preserve unrelated scopes and tasks");
+        assert!(list.iter().any(|j| j.id == "other-scope" && j.task.id == other_scope));
+        assert!(list.iter().any(|j| j.id == "other-task" && j.task.id == other_task));
+        assert_eq!(background_count(&events, &children), 3);
+    }
+
+    #[test]
+    fn stop_fails_closed_for_disconnected_missing_failed_or_offline_session_state() {
+        let mut session = child_session("child", "Agent", "running", false);
+        let worker: c6_api::Worker = serde_json::from_value(serde_json::json!({
+            "id": session.worker_id, "name": "Worker", "hostname": "host", "os": "linux", "arch": "x86_64",
+            "version": null, "status": "online", "enrolled_at": 0, "last_seen": null,
+            "connected_since": null, "rtt_us": null
+        }))
+        .unwrap();
+        let mut workers = [worker];
+        assert!(!stop_unavailable(true, Some(&session), &workers), "a known online worker keeps real Stop available");
+        assert!(stop_unavailable(false, Some(&session), &workers), "a stale online worker snapshot is not a live connection");
+        assert!(stop_unavailable(true, None, &workers), "pending/missing session detail fails closed");
+        let failed_detail: Result<&Session, &str> = Err("detail request failed");
+        assert!(stop_unavailable(true, failed_detail.ok(), &workers), "failed detail fails closed too");
+        for status in [c6_api::WorkerStatus::Offline, c6_api::WorkerStatus::Revoked] {
+            workers[0].status = status;
+            assert!(stop_unavailable(true, Some(&session), &workers));
+        }
+        assert!(stop_unavailable(true, Some(&session), &[]), "an absent worker is unavailable");
+        session.on_head = true;
+        assert!(!stop_unavailable(true, Some(&session), &[]), "known head sessions need no worker");
+        assert!(stop_unavailable(false, Some(&session), &[]), "head sessions still require the live connection");
+    }
+
+    #[test]
+    fn child_only_fallback_elapsed_is_unknown_until_run_evidence_exists() {
+        let mut child = child_session("child", "Agent", "running", false);
+        child.created_at = 1000;
+        child.updated_at = 90000;
+        let list = jobs(&[], &[child.clone()]);
+        assert_eq!(list[0].task.elapsed(100000), "Elapsed unknown", "child age is not the current run's age");
+        assert_eq!(list[0].task.elapsed_ms, 0);
+
+        child.status = SessionStatus::Idle;
+        child.end_reason = Some(TurnEndReason::Completed);
+        let list = jobs(&[], &[child.clone()]);
+        assert_eq!(list[0].task.elapsed(100000), "Elapsed unknown", "last update minus creation is not a completed run duration");
+
+        let mut events = vec![spawn_event(1, "child", "bg1", "Agent"), agent(2, "bg1", "started", "Agent")];
+        let list = jobs(&events, &[child.clone()]);
+        assert_eq!(list[0].task.elapsed(9000), "7s", "an explicit run restores its real start time");
+        events.push(agent(3, "bg1", "finished", "Agent"));
+        let list = jobs(&events, &[child]);
+        assert_eq!(list[0].task.elapsed(100000), "2s", "ended tasks use their recorded elapsed duration");
+    }
+
+    #[test]
+    fn child_failure_without_a_turn_end_reason_is_a_failed_history_job() {
+        let mut child = child_session("never-started", "Could not start", "failed", false);
+        child.error = Some("worker could not start it".into());
+        assert_eq!(child.end_reason, None);
+        let list = jobs(&[], &[child]);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].task.state, "failed");
+        assert!(list[0].task.failed());
+        assert!(!list[0].task.running());
+        assert!(!list[0].task.can_stop());
+        assert_eq!(history_label(&list), "History · 1 failed");
+    }
+
+    #[test]
+    fn explicitly_foreground_children_and_native_tasks_are_absent_from_background_jobs() {
+        let native_id = r#"claude:["scope","foreground","run","one"]"#;
+        let children = [
+            child_session("foreground-child", "Foreground child", "running", false),
+            child_session("mirror", "Foreground mirror", "running", true),
+        ];
+        let mut events = vec![
+            spawn_event(1, "foreground-child", "", "Foreground child"),
+            spawn_event(2, "mirror", native_id, "Foreground mirror"),
+            native(3, native_id, "started", "local_agent", true),
+            native(4, "foreground-command", "started", "local_bash", true),
+        ];
+        assert!(jobs(&events, &children).is_empty(), "a native identity link does not imply background execution");
+        assert_eq!(background_count(&events, &children), 0);
+        events.push(native(5, native_id, "failed", "local_agent", true));
+        let list = jobs(&events, &children);
+        assert!(list.is_empty(), "foreground-only failures do not enter background History either");
+        assert_eq!(history_label(&list), "History");
     }
 
     #[test]

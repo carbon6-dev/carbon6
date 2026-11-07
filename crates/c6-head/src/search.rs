@@ -315,7 +315,8 @@ pub async fn session_matches(store: &Store, session_id: &str, q: &str) -> anyhow
         }
         for e in store.events_after(&parent, 0, i64::MAX).await? {
             if let Some(session_event::Kind::SubagentSpawned(sp)) = &e.kind {
-                spawned_at.insert(sp.child_session_id.clone(), e.seq as i64);
+                // Later links update task identities, not the child's place.
+                spawned_at.entry(sp.child_session_id.clone()).or_insert(e.seq as i64);
             }
         }
     }
@@ -464,6 +465,81 @@ pub async fn search(store: &Store, req: &api::SearchQuery, head: Option<c6_core:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn continuation_spawn_links_keep_the_original_child_insertion_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("c6h.db")).await.unwrap();
+        let worker = c6_core::WorkerId::new();
+        sqlx::query(
+            "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at) \
+             VALUES ('parent', ?, 'Parent', '', 'c', 'm', 'idle', 0, 0)",
+        )
+        .bind(worker.to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let user = |seq| SessionEvent {
+            seq,
+            kind: Some(session_event::Kind::User(c6_proto::UserMessage { text: "needle".into(), ..Default::default() })),
+            ..Default::default()
+        };
+        let spawn = |seq, sp| SessionEvent { seq, kind: Some(session_event::Kind::SubagentSpawned(sp)), ..Default::default() };
+        let first = c6_proto::SubagentSpawned {
+            call_id: "first-call".into(),
+            child_session_id: "first".into(),
+            description: "Same title".into(),
+            ..Default::default()
+        };
+        let sibling = c6_proto::SubagentSpawned { call_id: "sibling-call".into(), child_session_id: "sibling".into(), ..first.clone() };
+        assert!(
+            store
+                .ingest(worker, "parent", &[user(1), spawn(2, first.clone()), user(3), spawn(4, sibling), user(5)])
+                .await
+                .unwrap()
+                .is_some()
+        );
+        for (id, call) in [("first", "first-call"), ("sibling", "sibling-call")] {
+            let started = SessionEvent {
+                seq: 1,
+                kind: Some(session_event::Kind::Started(c6_proto::SessionStarted {
+                    title: "Same title".into(),
+                    parent_session_id: "parent".into(),
+                    parent_call_id: call.into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            assert!(store.ingest(worker, id, &[started, user(2)]).await.unwrap().is_some());
+        }
+        let before = session_matches(&store, "parent", "needle").await.unwrap();
+        let places = |m: &api::SessionMatches| {
+            m.matches.iter().map(|hit| (hit.open.last().cloned().unwrap_or_else(|| "parent".into()), hit.at)).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            places(&before),
+            [("parent".into(), 1), ("first".into(), 2), ("parent".into(), 3), ("sibling".into(), 4), ("parent".into(), 5)]
+        );
+
+        let continuation = c6_proto::SubagentSpawned { call_id: "continue-call".into(), background_task_id: "bg2".into(), ..first };
+        assert!(store.ingest(worker, "parent", &[spawn(6, continuation)]).await.unwrap().is_some());
+        let after = session_matches(&store, "parent", "needle").await.unwrap();
+        assert_eq!(after, before, "a new task link must not move or duplicate the child's matches after its sibling");
+        assert!(store.ingest(worker, "first", &[user(3)]).await.unwrap().is_some());
+        let resumed = session_matches(&store, "parent", "needle").await.unwrap();
+        assert_eq!(
+            places(&resumed),
+            [
+                ("parent".into(), 1),
+                ("first".into(), 2),
+                ("first".into(), 2),
+                ("parent".into(), 3),
+                ("sibling".into(), 4),
+                ("parent".into(), 5)
+            ],
+            "new child matches also remain at its original insertion, before the sibling"
+        );
+    }
 
     #[test]
     fn card_answers_are_searchable_as_user_messages() {

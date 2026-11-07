@@ -77,7 +77,7 @@ pub fn git_state(at: Memo<Option<(String, String)>>, events: RwSignal<Vec<Event>
 
 /// A line of the glance: a small label, what it says (wrapping rather than
 /// cut short), and what clicking it does.
-fn line(label: &'static str, body: impl IntoView + 'static, act: Option<Callback<web_sys::MouseEvent>>) -> AnyView {
+pub(crate) fn line(label: &'static str, body: impl IntoView + 'static, act: Option<Callback<web_sys::MouseEvent>>) -> AnyView {
     let label = view! { <span class=LABEL>{label}</span> };
     let body = view! { <span class="min-w-0 flex-1 [overflow-wrap:anywhere]">{body}</span> };
     match act {
@@ -216,27 +216,38 @@ pub fn Glance(chrome: SessionChrome, #[prop(optional, into)] on_done: Option<Cal
         api::work_of(format!("session:{}", id.get_value()))
     });
     let work = move || {
-        serves().then(|| {
-            let body = move || match item.get().and_then(Result::ok).and_then(|w| w.into_iter().next()) {
-                Some(w) => view! {
-                    <span title=w.why.clone()>{crate::icons::diamond()}" "{w.fields.title}</span>
-                    <span class=MUTED>{format!(" · {}", c6_api::work::state_label(&w.state))}</span>
-                }
-                .into_any(),
-                None => view! { <span class=MUTED>"none"</span> }.into_any(),
-            };
-            line("Work", body, Some(Callback::new(move |ev: web_sys::MouseEvent| work_at.set(Some(below(&ev, 384.0))))))
-        })
+        if !serves() {
+            return None;
+        }
+        let w = item.get().and_then(Result::ok).and_then(|w| w.into_iter().next())?;
+        let body = view! {
+            <span title=w.why.clone()>{crate::icons::diamond()}" "{w.fields.title}</span>
+            <span class=MUTED>{format!(" · {}", c6_api::work::state_label(&w.state))}</span>
+        };
+        Some(line("Work", body, Some(Callback::new(move |ev: web_sys::MouseEvent| work_at.set(Some(below(&ev, 384.0)))))))
     };
 
     let labels_at = RwSignal::new(None::<(f64, f64)>);
     let labels = move || {
         let s = session.get()?;
         let all: Vec<String> = crate::labels::shown_auto(&s.auto_labels).into_iter().chain(s.labels).collect();
-        let body = if all.is_empty() {
-            view! { <span class=MUTED>"none"</span> }.into_any()
-        } else {
-            view! { <span class="font-mono text-[11px]" title=all.join(" ")>{all.join("  ")}</span> }.into_any()
+        if all.is_empty() {
+            return None;
+        }
+        // Only the summary is formatted; the editor keeps every raw label.
+        let body = view! {
+            <span class="inline-flex flex-wrap gap-1">
+                {all.into_iter().map(|label| {
+                    let (name, value) = label.split_once(':')
+                        .map(|(n, v)| (format!("{n}:"), v.to_owned()))
+                        .unwrap_or_else(|| (String::new(), label.clone()));
+                    view! {
+                        <span class="inline-flex max-w-full flex-wrap items-baseline gap-x-1 rounded bg-zinc-100 px-1.5 py-0.5 text-[11px] dark:bg-zinc-800" title=label>
+                            <span class="font-medium text-muted">{name}</span><span>{value}</span>
+                        </span>
+                    }
+                }).collect_view()}
+            </span>
         };
         Some(line("Labels", body, Some(Callback::new(move |ev: web_sys::MouseEvent| labels_at.set(Some(below(&ev, 384.0)))))))
     };
@@ -244,16 +255,12 @@ pub fn Glance(chrome: SessionChrome, #[prop(optional, into)] on_done: Option<Cal
     // Its watchers (docs/watchers.md §3): who follows it, each opening its
     // session, looked at again when the session's state changes.
     let moved = Signal::derive(move || session.get().map(|s| format!("{:?}", s.status)).unwrap_or_default());
-    let watchers = move || {
-        let _ = session.get()?;
-        Some(line("Watchers", view! { <crate::watchers::SessionWatchers session_id=id.get_value() moved /> }, None))
-    };
 
     let context_at = RwSignal::new(None::<(f64, f64)>);
     let context = move || {
         usage.with(|u| {
             let body = match u.context {
-                None => view! { <span class=MUTED>"known after the first model call"</span> }.into_any(),
+                None => view! { <span class=MUTED>"Not measured yet"</span> }.into_any(),
                 Some(used) => {
                     let pct = (used * 100).checked_div(u.context_window);
                     let full = pct.is_some_and(|p| p >= 80);
@@ -296,6 +303,7 @@ pub fn Glance(chrome: SessionChrome, #[prop(optional, into)] on_done: Option<Cal
 
     let published = Memo::new(move |_| events.with(|e| e.iter().any(|e| matches!(e.kind, EventKind::Output { .. }))));
     let show_output = move |name: Option<String>| {
+        chrome.remember_output_return();
         if let Some(c) = col {
             match name {
                 Some(n) => crate::panes::show_output(c, &id.get_value(), n),
@@ -315,7 +323,15 @@ pub fn Glance(chrome: SessionChrome, #[prop(optional, into)] on_done: Option<Cal
             {changes}
             {work}
             {labels}
-            {watchers}
+            <Show when=move || session.get().is_some()>
+                <div class="flex flex-wrap gap-x-3 px-1.5 py-1.5 text-[11px] text-muted">
+                    <Show when=serves>
+                        <button class="min-h-7 hover:underline pointer-coarse:min-h-11" on:click=move |ev| work_at.set(Some(below(&ev, 384.0)))>"Assign work"</button>
+                    </Show>
+                    <button class="min-h-7 hover:underline pointer-coarse:min-h-11" on:click=move |ev| labels_at.set(Some(below(&ev, 384.0)))>"Edit labels"</button>
+                </div>
+                <crate::watchers::SessionWatchers session_id=id.get_value() moved />
+            </Show>
             {context}
             <Show when=move || published.get()>
                 <div class=HEADING>"Newest outputs"</div>
@@ -373,7 +389,7 @@ pub fn Context(session: String, events: RwSignal<Vec<Event>>, usage: Memo<UsageS
         usage.with(|u| {
             let window = u.context_window;
             let Some(used) = u.context else {
-                return view! { <p class="py-1 text-xs text-muted">"Known after the first model call."</p> }.into_any();
+                return view! { <p class="py-1 text-xs text-muted">"Not measured yet"</p> }.into_any();
             };
             let system = (system_chars.get() / 4).min(used);
             let rest = used - system;

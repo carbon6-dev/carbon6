@@ -529,39 +529,75 @@ async function run(browser, origin, theme, run) {
 
 async function desktopTaskWords(f, name) {
   const { page } = f;
-  const button = page.locator('button[title="Open the background tasks"]:visible');
+  const tile = page.locator('[data-tile-motion="10"]');
+  const button = tile.getByRole('button', { name: /^\d+ background tasks?$/ });
   const cases = [
-    ['task1', true, 'started', '1 background task'],
-    ['task2', true, 'started', '2 background tasks'],
-    ['server1', false, 'started', '2 background tasks · 1 server'],
-    ['server2', false, 'started', '2 background tasks · 2 servers'],
-    ['task1', true, 'finished', '1 background task · 2 servers'],
-    ['task2', true, 'finished', '2 servers'],
-    ['server2', false, 'finished', '1 server'],
+    ['task1', true, 'started', 1],
+    ['task2', true, 'started', 2],
+    ['server1', false, 'started', 3],
+    ['server2', false, 'started', 4],
+    ['task1', true, 'finished', 3],
+    ['task2', true, 'finished', 2],
+    ['server2', false, 'finished', 1],
   ];
-  for (const [i, [id, notify, state, words]] of cases.entries()) {
-    f.send({ type: 'background_task', task_id: `q11-desktop-${id}`, kind: 'shell', description: `Q11 desktop ${id}`,
-      state, notify, exit_code: 0, elapsed_ms: 0, native_type: '', foreground: false });
-    await page.waitForFunction(words => [...document.querySelectorAll('button[title="Open the background tasks"]')].some(el =>
-      el.getBoundingClientRect().width && el.textContent.replace(/\s+/g, ' ').trim() === words), words);
+  const wasFull = await tile.getByRole('button', { name: 'Defocus', exact: true }).count() !== 0;
+  if (!wasFull) {
+    await tile.getByRole('button', { name: 'Focus', exact: true }).click();
     await settle(page);
-    assert.equal((await button.textContent()).replace(/\s+/g, ' ').trim(), words, 'desktop task/server wording has no redundant running');
-    if (!i) await button.evaluate(el => {
-      window.__desktopTasks = { button: el, spinner: el.querySelector('.animate-spin'), chevron: el.querySelector(':scope > svg') };
-    });
-    assert(await button.evaluate(el => {
-      const p = __desktopTasks;
-      return p.button === el && p.spinner?.isConnected && p.chevron?.isConnected &&
-        p.spinner === el.querySelector('.animate-spin') && p.chevron === el.querySelector(':scope > svg') &&
-        el.querySelectorAll('svg').length === 2 && p.spinner.getAnimations().some(a => a.animationName === 'spin') &&
-        !!p.chevron.querySelector('path[d="m9 18 6-6-6-6"]');
-    }), 'desktop wording updates retain the drawn spinner and chevron');
-    await button.scrollIntoViewIfNeeded();
-    await page.screenshot({ path: path.join(output, `${name}-desktop-tasks-${i + 1}.png`), animations: 'disabled' });
   }
-  f.send({ type: 'background_task', task_id: 'q11-desktop-server1', kind: 'shell', description: 'Q11 desktop server1',
-    state: 'finished', notify: false });
-  await button.waitFor({ state: 'detached' });
+  const originalStyle = await tile.getAttribute('style');
+  try {
+    // Correctness-only, after all measured windows: exercise actual wide and
+    // narrow containers without turning a desktop window into a phone.
+    for (const surface of ['wide', 'narrow']) {
+      await tile.evaluate((el, width) => el.style.setProperty('width', `${width}px`, 'important'), surface === 'wide' ? 1440 : 600);
+      if (surface === 'wide') await tile.locator('[data-session-sheet="wide"]:visible').waitFor();
+      else await tile.locator('[data-session-sheet="wide"]:visible').waitFor({ state: 'hidden' });
+      const live = new Set();
+      for (const [i, [id, notify, state, count]] of cases.entries()) {
+        const identity = `q11-desktop-${id}`;
+        if (state === 'started') live.add(identity); else live.delete(identity);
+        f.send({ type: 'background_task', task_id: identity, kind: 'shell', description: `Q11 desktop ${id}`,
+          state, notify, exit_code: 0, elapsed_ms: 0, native_type: '', foreground: false });
+        if (surface === 'wide') {
+          const overview = tile.locator('[data-session-sheet="wide"]:visible');
+          await overview.getByRole('heading', { name: `Running now · ${count}`, exact: true }).waitFor();
+          const identities = await overview.locator('[data-background-job]:visible').evaluateAll(rows => rows.map(row => row.dataset.backgroundJob));
+          assert.deepEqual(identities, [...live], 'wide list counts all distinct jobs, including servers');
+          assert.equal(await button.count(), 0, 'wide list forbids the duplicate composer background link');
+        } else {
+          const words = `${count} background task${count === 1 ? '' : 's'}`;
+          await tile.getByRole('button', { name: words, exact: true }).waitFor();
+          await settle(page);
+          assert.equal((await button.textContent()).replace(/\s+/g, ' ').trim(), words, 'narrow link uses the merged job count, including servers');
+          if (!i) await button.evaluate(el => {
+            const [status, chevron] = el.querySelectorAll('svg');
+            window.__desktopTasks = { button: el, status, chevron };
+          });
+          assert(await button.evaluate(el => {
+            const p = __desktopTasks, icons = [...el.querySelectorAll('svg')];
+            const drawn = svg => {
+              const r = svg?.getBoundingClientRect(), b = svg?.getBBox();
+              return r?.width > 0 && r.height > 0 && b?.width > 0 && b.height > 0 &&
+                getComputedStyle(svg).visibility !== 'hidden' && !!svg.querySelector('path,circle,line,polyline,rect');
+            };
+            return p.button === el && p.status?.isConnected && p.chevron?.isConnected &&
+              icons.length === 2 && icons[0] === p.status && icons[1] === p.chevron && drawn(p.status) && drawn(p.chevron) &&
+              !!p.chevron.querySelector('path[d="m9 18 6-6-6-6"]');
+          }), 'narrow wording updates retain a nonzero drawn status icon and chevron');
+          await button.scrollIntoViewIfNeeded();
+        }
+        await page.screenshot({ path: path.join(output, `${name}-desktop-${surface}-tasks-${i + 1}.png`), animations: 'disabled' });
+      }
+      f.send({ type: 'background_task', task_id: 'q11-desktop-server1', kind: 'shell', description: 'Q11 desktop server1',
+        state: 'finished', notify: false });
+      if (surface === 'wide') await tile.locator('[data-session-sheet="wide"]').getByText('Nothing running now', { exact: true }).waitFor();
+      await button.waitFor({ state: 'detached' });
+    }
+  } finally {
+    await tile.evaluate((el, style) => { if (style === null) el.removeAttribute('style'); else el.setAttribute('style', style); }, originalStyle);
+    if (!wasFull) await tile.getByRole('button', { name: 'Defocus', exact: true }).click();
+  }
 }
 
 // Focused phone regression; reuse the real production page, WS fixtures and CDP
@@ -789,7 +825,9 @@ async function runPhone(browser, origin, theme, choice, deviceScaleFactor) {
   const motion = { choice, os: choice === 'full' ? 'no-preference' : 'reduce', effective: choice };
   const title = 'Q11 retained phone session with a deliberately very long title that must truncate without overlapping any controls';
   const tiles = Array.from({ length: 12 }, (_, i) => ({ key: i * 2 + 2,
-    columns: [{ key: i * 2 + 3, view: i ? { view: 'sessions' } : { view: 'session', id: 'parent' } }],
+    // Single-copy destinations are deduplicated on restore. Use distinct
+    // search queries, not eleven saved copies of the Sessions destination.
+    columns: [{ key: i * 2 + 3, view: i ? { view: 'search', q: `Q11 hidden page ${i}`, kind: '', worker: '' } : { view: 'session', id: 'parent' } }],
     cursor: 0, active: i * 2 + 3, used: i * 2 + 3, back: [], forward: [], stack: 0, minimized: i > 0 }));
   let waiting = [];
   const f = await fixture(browser, origin, { width: widths[0], height: 844 }, theme, motion, () => {},
@@ -835,8 +873,7 @@ async function runPhone(browser, origin, theme, choice, deviceScaleFactor) {
   try {
     await state('idle');
     step('long title');
-    // Minimized Sessions pages also render this title in hidden lists. Follow
-    // the visible ring to its own bar rather than waiting on the first match.
+    // Follow the visible ring to its own bar, not an unrelated page title.
     await ring.locator('..').locator('span.truncate').filter({ hasText: title }).waitFor();
     step('retain header');
     await ring.evaluate(el => {
@@ -957,12 +994,14 @@ async function runPhone(browser, origin, theme, choice, deviceScaleFactor) {
       assert.deepEqual(movement.moved, [], 'no other header node moves while 0 -> 1 -> 2 -> 12 -> 123');
       // A real touch on the visual ring must use the existing sheet action.
       await ring.tap();
-      const dialog = page.getByRole('dialog', { name: 'Session details', exact: true });
+      const dialog = page.getByRole('dialog', { name: 'Session', exact: true });
       await dialog.waitFor(); await settle(page);
       assert.equal(await ring.getAttribute('aria-expanded'), 'true');
-      for (const name of ['Changes', 'Terminal', 'Files', 'Outputs']) await dialog.getByRole('button', { name, exact: true }).waitFor();
+      for (const name of ['Changes', 'Terminal']) await dialog.getByRole('button', { name, exact: true }).waitFor();
+      for (const name of ['Files', 'Outputs', 'Close']) assert.equal(await dialog.getByRole('button', { name, exact: true }).count(), 0,
+        `Session has no ${name} pane button or top X`);
       await shot('session-sheet');
-      await dialog.getByRole('button', { name: 'Close', exact: true }).tap();
+      await dialog.getByRole('button', { name: 'Close Session', exact: true }).tap();
       await dialog.waitFor({ state: 'detached' });
       assert.equal(await ring.getAttribute('aria-expanded'), 'false');
       const states = [];

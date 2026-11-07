@@ -302,9 +302,93 @@ between visible states. Real approval/question cards keep their Allow/Deny and
 Send/Cancel actions and send the expected mocked API payloads.
 Screenshots and geometry JSON go to `/tmp/q11-ring/row-link/` by default. `THEME`,
 `MOTION`, `WIDTHS` and `SCALE` can select a smaller diagnostic matrix.
-The normal desktop mode also checks singular/plural task and server labels,
-including mixed counts, after its measured workload; its spinner and chevron
-must remain mounted while the wording changes.
+After its measured workload, the normal desktop mode checks wide and narrow
+tile containers independently of the desktop viewport. The wide Running now
+list must match merged task/server identities and suppress the duplicate
+composer link. The narrow link counts every merged job, including servers,
+with singular/plural background-task wording. Its nonzero drawn status icon
+and chevron must remain mounted throughout those updates (an hourglass does
+not need a CSS spin animation). Phone sheet navigation checks only Changes
+and Terminal and closes through the named **Close Session** handle, not a top X.
+
+## Session sheet: merged background work
+
+`crates/c6-ui/tests/session-sheet.cjs` uses the shared production-WASM browser
+fixture (`motion.cjs`), a private loopback origin and mocked HTTP/WebSocket
+head. Build first; the fixture does not start a real head or change settings.
+
+```sh
+ENGINE=both SCREENSHOTS=/tmp/s3-sheet \
+  /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/session-sheet.cjs
+```
+
+The matrix covers Chromium and WebKit, light/dark, a wide desktop tile, a
+338px tile inside the same 1600px desktop window, and 320/390/430px phones.
+The seeded `/sessions/parent/children?tree=1` descendants and real spawn/task
+lifecycle records include a resumed child linked to two task IDs, two child
+IDs with the same title, a background command, a foreground-only native task,
+two native run IDs with one scope/task identity and its read-only mirror,
+failed/interrupted latest outcomes and enough completed commands to paginate.
+Assertions cover unique live identities, current-run stable ordering, count
+agreement, title-to-Inspect, labelled agent/command action surfaces and exact
+selected-job Stop requests (never the parent or same-named sibling). History
+counts deduplicate child/task records and exclude a resumed child's earlier
+failure. All/Failed/Interrupted filters, bounded non-duplicating history chunks,
+and Back retaining the chosen filter, loaded rows, scroll position and action
+opener focus are checked, alongside wide expanded details, compact Details
+drill-in and quiet History.
+With no Usage event, expanded Context must say **Not measured yet**, not 0%.
+Only phones get Changes/Terminal sheet buttons; Files/Outputs and duplicate
+desktop pane controls are forbidden. Busy/idle and drill-in screenshots use
+`after-<engine>-<theme>-<view>-<state>.png` names.
+
+After the core checks, each case adds a producer-shaped observed native child:
+an initially unlinked spawn followed by spawn updates linking two encoded
+`[scope, task, "run", run_id]` IDs to that same child. It must remain one job
+with both attempts inspectable. A rejected Stop must show its error and stay
+actionable; a later end while actions are open must remove Stop without
+another request. Details checks empty outputs/Work/Labels, retained assignment
+and raw-label editors, and a live four-output publication: only the newest
+three previews plus Show all, which opens the actual Outputs pane with all four.
+The pane's real Back control must restore the retained compact Details body
+(not the landing page); selecting an individual recent output must also open
+that output and return to Details. Wide desktop closes the side pane to
+restore its expanded glance.
+
+Additional narrow/phone cases render a real nested transcript on its own feed:
+it must not inherit the parent's SessionChrome/background link or phone status
+button, even as hidden DOM. The root retains exactly one correctly named
+opener for its desktop/phone surface. With Outputs
+front, focusing another tile must not reopen the origin sheet; the deferred
+return survives until the actual Back control restores Details, whose eventual
+dismissal focuses its ring. Files remains in session Actions rather than the
+sheet; SSH hides Files and disables Changes without disabling Terminal.
+Offline workers, disconnected live feeds and failed session-detail reads keep
+known rows inspectable, show the stale notice on every sheet page, and disable
+Stop without submitting it. The default cohort has 36 cases: 20 core layouts,
+eight nested/focus-return cases and eight SSH/stale-capability cases.
+
+Capture the pinned old UI **only after its build has finished**:
+
+```sh
+BEFORE=1 ROOT=/tmp/s3-sheet/before-dist SCREENSHOTS=/tmp/s3-sheet ENGINE=both \
+  /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/session-sheet.cjs
+```
+
+Baseline mode uses the old ring's `Open session sheet` accessible name,
+`Session` heading and wide `Glance` aside. It records identical busy/idle inputs
+without enforcing the new attributes or presentation; `before-` names preserve
+both sets. `THEMES` and `VIEWS` select comma-separated cases; `ENGINE`, `ROOT`,
+`PLAYWRIGHT_CORE`, `CHROMIUM` and `WEBKIT_EXECUTABLE` follow `motion.cjs`.
+`EXTRAS=0` selects only the core matrix; `EXTRAS=only` selects the additional
+cases (their narrow/phone variants follow `VIEWS`, restrictions run once per
+engine). Baseline mode never runs the new-UI-only extra assertions.
+Failures save a `-FAIL.png` and JSON with the first error, console, requests,
+snapshots and Stop targets. WebKit hydration/WASM traps remain failures, not
+retries or ignored cases; report a failed cohort alongside any later rerun.
+The shared `motion.cjs` sheet regression now targets the **Session** dialog
+and **Close Session** handle. Its overlay/resized keyboard bounds, interrupted
+exit node retention, cancellation and timed-disposal assertions are unchanged.
 
 ## Published files: root replay, loading and versions
 

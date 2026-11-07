@@ -166,15 +166,19 @@ pub fn SessionWatchers(session_id: String, moved: Signal<String>) -> impl IntoVi
             return None;
         }
         let last = w.findings.first().cloned();
-        Some(view! {
-            <span class="inline-flex flex-wrap items-baseline gap-x-2">
-                {w.watchers.into_iter().map(|(name, sid)| view! {
-                    <Go to=View::Session { id: sid, target: None } class="text-violet-700 hover:underline dark:text-violet-400" title="Its session">
-                        {name}
-                    </Go>
-                }).collect_view()}
-                {last.map(|f| view! { <span class="text-muted" title=f.text.clone()>{format!("· {}: {}", f.kind, f.text.chars().take(80).collect::<String>())}</span> })}
-            </span>
-        })
+        Some(crate::details::line(
+            "Watchers",
+            view! {
+                <span class="inline-flex flex-wrap items-baseline gap-x-2">
+                    {w.watchers.into_iter().map(|(name, sid)| view! {
+                        <Go to=View::Session { id: sid, target: None } class="text-violet-700 hover:underline dark:text-violet-400" title="Its session">
+                            {name}
+                        </Go>
+                    }).collect_view()}
+                    {last.map(|f| view! { <span class="text-muted" title=f.text.clone()>{format!("· {}: {}", f.kind, f.text.chars().take(80).collect::<String>())}</span> })}
+                </span>
+            },
+            None,
+        ))
     }
 }

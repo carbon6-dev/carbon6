@@ -145,8 +145,8 @@ pub fn Recent(events: RwSignal<Vec<Event>>, #[prop(into)] on_pick: Callback<Opti
                     </button>
                 }
             }).collect_view()}
-            {(n > 3).then(|| view! {
-                <button class="px-1.5 text-[11px] text-muted hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" on:click=move |_| on_pick.run(None)>{format!("All {n}")}</button>
+            {(n > 0).then(|| view! {
+                <button class="min-h-7 px-1.5 text-[11px] text-muted hover:text-zinc-900 hover:underline pointer-coarse:min-h-11 dark:hover:text-zinc-100" on:click=move |_| on_pick.run(None)>"Show all"</button>
             })}
         }
     }

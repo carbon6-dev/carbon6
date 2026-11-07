@@ -128,6 +128,196 @@ fn last_seq(events: &[Event]) -> u64 {
     events.last().map_or(0, |e| e.seq)
 }
 
+/// Continuing in the background joins the new task to the existing child,
+/// including when another child has the same description. A later continuation
+/// may address the child by that new task id, not just its original session id.
+#[tokio::test]
+async fn a_background_continuation_links_its_existing_local_child() {
+    background_continuation_identity(false).await;
+}
+
+#[tokio::test]
+async fn a_background_continuation_links_its_existing_remote_child() {
+    background_continuation_identity(true).await;
+}
+
+async fn background_continuation_identity(remote: bool) {
+    let env = Env::new().await;
+    let (sa, sb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (alpha, stop_a) = env.worker("alpha", sa.path()).await;
+    let (_beta, stop_b) = env.worker("beta", sb.path()).await;
+    let (here, there) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    env.templates(json!([{"name": "far", "workers": ["beta"], "cwd": there.path().display().to_string(), "connection": "m", "model": "m", "agents": true}]))
+        .await;
+    let mut task = json!({"description": "same description", "prompt": "identity-child"});
+    if remote {
+        task["template"] = json!("far");
+    }
+    env.mock.push(Reply::ToolCalls(vec![("task".into(), task.to_string()), ("task".into(), task.to_string())]));
+    env.mock.push(Reply::Text("First child done.".into()));
+    env.mock.push(Reply::Text("Second child done.".into()));
+    env.mock.push(Reply::Text("Both children done.".into()));
+    let id = env.create(&alpha, here.path(), "identity-parent create both existing children").await;
+    assert_eq!(env.turn_ended_after(&id, 0).await, TurnEndReason::Completed);
+    // A short opening defers naming until a later turn. Let this opening's
+    // unscripted naming request finish before adding scoped conversation
+    // replies, which also match the opening quoted in a naming request.
+    eventually("initial automatic naming finished", async || {
+        env.head.state.store.setting(&format!("session_naming:{id}")).await.unwrap().is_none().then_some(())
+    })
+    .await;
+    let originals: Vec<EventKind> =
+        env.events(&id).await.into_iter().filter_map(|e| matches!(e.kind, EventKind::SubagentSpawned { .. }).then_some(e.kind)).collect();
+    assert_eq!(originals.len(), 2);
+    let child_id = match &originals[0] {
+        EventKind::SubagentSpawned { child_session_id, description, remote: target, .. } => {
+            assert_eq!(description, "same description");
+            assert_eq!(target.is_some(), remote);
+            child_session_id.clone()
+        }
+        _ => unreachable!(),
+    };
+    let sibling_id = match &originals[1] {
+        EventKind::SubagentSpawned { child_session_id, description, .. } => {
+            assert_eq!(description, "same description");
+            assert_ne!(child_session_id, &child_id);
+            child_session_id.clone()
+        }
+        _ => unreachable!(),
+    };
+    let sibling_events = env.events(&sibling_id).await;
+    let mut to = child_id.clone();
+    for run in 1..=2 {
+        let seq = last_seq(&env.events(&id).await);
+        let child_seq = last_seq(&env.events(&child_id).await);
+        let message = format!("identity-continuation-{run}");
+        env.mock.push_about(
+            "identity-parent",
+            Reply::ToolCalls(vec![("send_message".into(), json!({"to": to, "message": message, "run_in_background": true}).to_string())]),
+        );
+        env.mock.push_about("identity-parent", Reply::Text("Waiting for the continuation.".into()));
+        let gate = env.mock.push_gated(Reply::Text(format!("Continuation {run} done.")));
+        env.message(&id, &format!("continue identity {run}"), false).await;
+        assert_eq!(env.turn_ended_after(&id, seq).await, TurnEndReason::Completed);
+        let parent = eventually_or(
+            "the continuation task's durable identity link",
+            async || {
+                let events = env.events(&id).await;
+                let linked = events.iter().any(|e| e.seq > seq && matches!(e.kind, EventKind::SubagentSpawned { .. }));
+                let started = events.iter().any(|e| {
+                    e.seq > seq
+                        && matches!(&e.kind,
+                    EventKind::BackgroundTask { kind, state, .. } if kind == "agent" && state == "started")
+                });
+                (linked && started).then_some(events)
+            },
+            || env.mock.log(),
+        )
+        .await;
+        let call_id = parent
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::ToolResult { call_id, tool, is_error, output, .. } if e.seq > seq && tool == "send_message" => {
+                    assert!(!is_error && output.starts_with("Continuing the subagent in the background as "), "{output}");
+                    Some(call_id.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        let task_id = parent
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::BackgroundTask { task_id, kind, state, .. } if e.seq > seq && kind == "agent" && state == "started" => {
+                    Some(task_id.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_ne!(task_id, to, "each run has a new task identity");
+        let mut expected = originals[0].clone();
+        if let EventKind::SubagentSpawned { call_id: call, background_task_id, .. } = &mut expected {
+            *call = call_id.clone();
+            *background_task_id = task_id.clone();
+        }
+        let links: Vec<_> = parent.iter().filter(|e| matches!(e.kind, EventKind::SubagentSpawned { .. })).collect();
+        assert_eq!(links.len(), 2 + run);
+        assert_eq!(links[0].kind, originals[0], "the original link is unchanged");
+        assert_eq!(links[1].kind, originals[1], "the same-named sibling is unchanged");
+        assert_eq!(links.last().unwrap().kind, expected, "only call/task change; child, description, agent, model and remote stay intact");
+        let journal = alpha.journal.events_after(&id, 0, u32::MAX).await.unwrap();
+        assert!(journal.iter().any(|e| matches!(&e.kind,
+            Some(c6_proto::session_event::Kind::SubagentSpawned(sp))
+                if sp.child_session_id == child_id && sp.call_id == call_id && sp.background_task_id == task_id)));
+        assert_eq!(c6_worker::spawned_children(&journal).len(), 2, "run links do not duplicate children");
+        eventually("the same child takes the continuation", async || {
+            env.events(&child_id).await.into_iter().find(|e| {
+                e.seq > child_seq
+                    && matches!(&e.kind,
+                EventKind::User { text, delegated_by, .. } if text == &message && delegated_by == &call_id)
+            })
+        })
+        .await;
+        assert_eq!(env.events(&sibling_id).await, sibling_events, "names do not route the continuation");
+        assert_eq!(env.children(&id).await.len(), 2, "no duplicate session is created");
+        let parent_seq = last_seq(&parent);
+        env.mock.push_about("identity-parent", Reply::Text("Received the continuation report.".into()));
+        gate.notify_one();
+        assert_eq!(env.turn_ended_after(&child_id, child_seq).await, TurnEndReason::Completed);
+        assert_eq!(env.turn_ended_after(&id, parent_seq).await, TurnEndReason::Completed);
+        to = task_id;
+    }
+
+    // Matching descriptions never authorize a send, even when both match.
+    let seq = last_seq(&env.events(&id).await);
+    env.mock.push_about(
+        "identity-parent",
+        Reply::ToolCalls(vec![(
+            "send_message".into(),
+            json!({"to": "same description", "message": "Do not route by name.", "run_in_background": true}).to_string(),
+        )]),
+    );
+    env.mock.push_about("identity-parent", Reply::Text("A durable id is required.".into()));
+    env.message(&id, "try an ambiguous name", false).await;
+    assert_eq!(env.turn_ended_after(&id, seq).await, TurnEndReason::Completed);
+    let events = env.events(&id).await;
+    let (out, error) = result_of(&events, "send_message").unwrap();
+    assert!(error && out.contains("no subagent"), "{out}");
+    assert!(!events.iter().any(|e| e.seq > seq && matches!(e.kind, EventKind::SubagentSpawned { .. })));
+
+    if remote {
+        // The state check still succeeds for an archived child, but sending
+        // fails. Its failed background task must not fabricate a run link.
+        let child_events = env.events(&child_id).await;
+        let r = env.http.patch(format!("{}/sessions/{child_id}", env.api)).json(&json!({"archived": true})).send().await.unwrap();
+        assert!(r.status().is_success());
+        let seq = last_seq(&events);
+        env.mock.push_about(
+            "identity-parent",
+            Reply::ToolCalls(vec![(
+                "send_message".into(),
+                json!({"to": to, "message": "Do not enqueue this.", "run_in_background": true}).to_string(),
+            )]),
+        );
+        env.mock.push_about("identity-parent", Reply::Text("Waiting for the refused continuation.".into()));
+        env.mock.push_about("identity-parent", Reply::Text("The child must be unarchived first.".into()));
+        env.message(&id, "try the archived child", false).await;
+        let refused = eventually("the refused continuation task finished", async || {
+            let events = env.events(&id).await;
+            let failed = events.iter().any(|e| {
+                e.seq > seq
+                    && matches!(&e.kind,
+                EventKind::BackgroundTask { state, exit_code, .. } if state == "finished" && *exit_code != 0)
+            });
+            (failed && turn_finished(&events)).then_some(events)
+        })
+        .await;
+        assert!(!refused.iter().any(|e| e.seq > seq && matches!(e.kind, EventKind::SubagentSpawned { .. })));
+        assert_eq!(env.events(&child_id).await, child_events, "the refused send never resumes the child");
+    }
+    stop_a.cancel();
+    stop_b.cancel();
+}
+
 /// A failed background task no longer owns reports. A genuinely running
 /// resumed child must still report the turn that takes its parent's steer.
 #[tokio::test]
@@ -210,6 +400,11 @@ async fn failed_background_resume(remote: bool) {
     .await;
     let (sent, error) = result_of(&parent_events, "send_message").unwrap();
     assert!(!error && sent.starts_with("Sent:"), "{sent}\n{}", env.mock.log());
+    assert_eq!(
+        parent_events.iter().filter(|e| matches!(e.kind, EventKind::SubagentSpawned { .. })).count(),
+        1,
+        "steering a running child does not create a continuation run link"
+    );
     if remote {
         assert_eq!(
             env.head.state.store.waiting_delegations(&child_id).await.unwrap().len(),

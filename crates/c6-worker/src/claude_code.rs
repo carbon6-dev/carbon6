@@ -666,6 +666,7 @@ impl Process {
             children: HashMap::new(),
             backgrounded: HashSet::new(),
             task_calls: HashMap::new(),
+            call_tasks: HashMap::new(),
             call_usage: HashMap::new(),
             per_call: false,
         };
@@ -1776,6 +1777,10 @@ struct Child {
     log: Arc<dyn EventSink>,
     depth: u32,
     open: bool,
+    /// Its original parent/spawn, retained so a later native task start
+    /// can link this same mirror without inventing another child.
+    parent_log: Arc<dyn EventSink>,
+    spawn: SubagentSpawned,
 }
 
 /// Maps stream-json lines to session events, for as long as its process
@@ -1807,6 +1812,9 @@ struct Mapper {
     /// The call that started each task, by the CLI's task id: a task the
     /// CLI moves to the background later says only its id.
     task_calls: HashMap<String, String>,
+    /// Exact native registry ID by originating tool call, not the SDK's
+    /// task ID. The task start may precede or follow its mirror's creation.
+    call_tasks: HashMap<String, String>,
     /// Each conversation's model call so far, by whose it is (`None`: the
     /// session's; else the call that started a subagent): its message id,
     /// model and usage. Claude Code sends a message per content block, each
@@ -1869,7 +1877,7 @@ impl Mapper {
     /// https://code.claude.com/docs/en/agent-sdk/typescript#sdktaskstartedmessage
     /// Process these before parent_tool_use_id routing: nested tasks belong
     /// in the common task registry too, even when their traffic is mirrored.
-    fn native_task(&self, v: &Value) -> bool {
+    fn native_task(&mut self, v: &Value) -> bool {
         if v["type"] != "system" {
             return false;
         }
@@ -1886,7 +1894,7 @@ impl Mapper {
             // does not promise a shell command for every kind of task. A
             // foreground one holds the turn until it ends or the CLI moves it.
             let foreground = v["is_backgrounded"].as_bool() == Some(false);
-            bg.start_native(
+            let id = bg.start_native(
                 &self.scope,
                 task_id,
                 run,
@@ -1894,6 +1902,9 @@ impl Mapper {
                 v["task_type"].as_str().unwrap_or(""),
                 foreground,
             );
+            if let Some(call) = v["tool_use_id"].as_str().filter(|c| !c.is_empty()) {
+                self.call_tasks.insert(call.to_owned(), id);
+            }
             return true;
         }
         // The CLI moved a foreground command or subagent to the background
@@ -1978,17 +1989,16 @@ impl Mapper {
         let id = uuid::Uuid::now_v7().to_string();
         let description = input["description"].as_str().unwrap_or("Subagent").to_owned();
         let agent = input["subagent_type"].as_str().filter(|a| *a != "general-purpose").unwrap_or_default().to_owned();
-        parent_log
-            .append(session_event::Kind::SubagentSpawned(SubagentSpawned {
-                call_id: call.to_owned(),
-                child_session_id: id.clone(),
-                agent: agent.clone(),
-                description: description.clone(),
-                background_task_id: String::new(),
-                model: None,
-                remote: None,
-            }))
-            .await?;
+        let spawn = SubagentSpawned {
+            call_id: call.to_owned(),
+            child_session_id: id.clone(),
+            agent: agent.clone(),
+            description: description.clone(),
+            background_task_id: self.call_tasks.get(call).cloned().unwrap_or_default(),
+            model: None,
+            remote: None,
+        };
+        parent_log.append(session_event::Kind::SubagentSpawned(spawn.clone())).await?;
         let started = SessionStarted {
             command_id: String::new(),
             title: if agent.is_empty() { description } else { format!("{description} ({agent})") },
@@ -2017,7 +2027,8 @@ impl Mapper {
         obs.journal.create_session(&id, &spec, &ev).await?;
         let log: Arc<dyn EventSink> = Arc::new(crate::session::Writer::new(id.clone(), obs.journal.clone(), obs.link.clone(), 2));
         log.append(session_event::Kind::TurnStarted(TurnStarted { turn: 1, ..Default::default() })).await?;
-        self.children.insert(call.to_owned(), Child { id: id.clone(), log: log.clone(), depth: parent_depth + 1, open: true });
+        self.children
+            .insert(call.to_owned(), Child { id: id.clone(), log: log.clone(), depth: parent_depth + 1, open: true, parent_log, spawn });
         Ok(Some((id, log)))
     }
 
@@ -2059,6 +2070,14 @@ impl Mapper {
                 }
                 if let Some(task) = v["task_id"].as_str() {
                     self.task_calls.insert(task.to_owned(), call.to_owned());
+                }
+                if let (Some(id), Some(child)) = (self.call_tasks.get(call), self.children.get_mut(call))
+                    && child.spawn.background_task_id != *id
+                {
+                    let mut spawn = child.spawn.clone();
+                    spawn.background_task_id = id.clone();
+                    child.parent_log.append(session_event::Kind::SubagentSpawned(spawn.clone())).await?;
+                    child.spawn = spawn;
                 }
                 return Ok(());
             }
@@ -2365,11 +2384,22 @@ mod tests {
                 children: HashMap::new(),
                 backgrounded: HashSet::new(),
                 task_calls: HashMap::new(),
+                call_tasks: HashMap::new(),
                 call_usage: HashMap::new(),
                 per_call: false,
             };
             if child {
-                mapper.children.insert("task".into(), Child { id: "child".into(), log: recorded.clone(), depth: 1, open: true });
+                mapper.children.insert(
+                    "task".into(),
+                    Child {
+                        id: "child".into(),
+                        log: recorded.clone(),
+                        depth: 1,
+                        open: true,
+                        parent_log: recorded.clone(),
+                        spawn: SubagentSpawned::default(),
+                    },
+                );
             }
             // Recorded Claude Code 2.1.311 shape: narration indexes refer to
             // the original content array, including empty/unsupported blocks.
@@ -2457,6 +2487,7 @@ mod tests {
             children: HashMap::new(),
             backgrounded: HashSet::new(),
             task_calls: HashMap::new(),
+            call_tasks: HashMap::new(),
             call_usage: HashMap::new(),
             per_call: false,
         };
@@ -2563,6 +2594,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_agent_mirrors_link_exact_registry_ids_in_either_start_order() {
+        for (task_first, backgrounded) in [(true, true), (false, true), (true, false), (false, false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let tools = Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()));
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            tools.background.set_sink(Some(tx));
+            let observer = observer(dir.path(), tools.clone()).await;
+            let journal = observer.journal.clone();
+            let recorded = Arc::new(VecSink::default());
+            let sink: Arc<dyn EventSink> = recorded.clone();
+            let mut mapper = Mapper {
+                turn: 1,
+                scope: "cli-conversation".into(),
+                output_root: None,
+                saw_output: false,
+                result: None,
+                interrupted: false,
+                observer: Some(observer),
+                calls: HashMap::new(),
+                mcp_calls: HashSet::new(),
+                children: HashMap::new(),
+                backgrounded: HashSet::new(),
+                task_calls: HashMap::new(),
+                call_tasks: HashMap::new(),
+                call_usage: HashMap::new(),
+                per_call: false,
+            };
+            let call = serde_json::json!({"type":"assistant","message":{"content":[{
+                "type":"tool_use","id":"agent-call","name":"Agent",
+                "input":{"description":"Review session layout","subagent_type":"explorer","prompt":"Review it."}
+            }]}});
+            let start = serde_json::json!({
+                "type":"system","subtype":"task_started","task_id":"native-agent","run_id":"run-1",
+                "tool_use_id":"agent-call","description":"SDK task description","task_type":"local_agent",
+                "is_backgrounded":backgrounded
+            });
+            let traffic = serde_json::json!({"type":"assistant","parent_tool_use_id":"agent-call",
+                "message":{"content":[{"type":"text","text":"Checking the layout."}]}});
+            mapper.handle(&call, &sink).await.unwrap();
+            for frame in if task_first { [&start, &traffic] } else { [&traffic, &start] } {
+                mapper.handle(frame, &sink).await.unwrap();
+            }
+            let task = rx.try_recv().unwrap();
+            assert_eq!(task.native_type, "local_agent");
+            assert_eq!(task.foreground, !backgrounded, "linking does not promote foreground work to background work");
+            assert_eq!(task.id, "claude:[\"cli-conversation\",\"native-agent\",\"run\",\"run-1\"]");
+            let spawns = || {
+                recorded
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|e| match &e.kind {
+                        Some(session_event::Kind::SubagentSpawned(s)) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let linked = spawns();
+            assert_eq!(linked.len(), if task_first { 1 } else { 2 });
+            let last = linked.last().unwrap();
+            assert_eq!(
+                (last.call_id.as_str(), last.description.as_str(), last.agent.as_str()),
+                ("agent-call", "Review session layout", "explorer")
+            );
+            assert_eq!(last.background_task_id, task.id, "the exact registry ID, not the native task ID or an inferred name");
+            if !task_first {
+                assert!(linked[0].background_task_id.is_empty());
+                let mut original = linked[0].clone();
+                original.background_task_id = task.id.clone();
+                assert_eq!(original, *last, "the late link preserves the original child, call and metadata");
+            }
+            assert_eq!(mapper.children.len(), 1);
+            assert_eq!(mapper.children["agent-call"].id, last.child_session_id);
+            let (spec, child_events) = journal.load_session(&last.child_session_id).await.unwrap().unwrap();
+            assert!(spec.delegation.unwrap().observed, "the mirror stays read-only");
+            assert_eq!(child_events.iter().filter(|e| matches!(e.kind, Some(session_event::Kind::Started(_)))).count(), 1);
+            // A replayed start must not append another link or create a child.
+            mapper.handle(&start, &sink).await.unwrap();
+            assert_eq!(spawns(), linked);
+            if !backgrounded {
+                mapper
+                    .handle(
+                        &serde_json::json!({"type":"system","subtype":"task_updated",
+                    "task_id":"native-agent","run_id":"run-1","patch":{"is_backgrounded":true}}),
+                        &sink,
+                    )
+                    .await
+                    .unwrap();
+                let moved = rx.try_recv().unwrap();
+                assert_eq!(moved.id, task.id);
+                assert!(!moved.foreground, "only the native lifecycle moves the task into the background");
+                assert_eq!(spawns(), linked, "backgrounding keeps the existing mirror identity link");
+            }
+            assert_eq!(
+                tools.background.native_stop(&task.id).as_deref(),
+                Some("native-agent"),
+                "the underlying native task retains its real Stop target"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn bash_native_tasks_are_not_mirrored_as_subagents() {
         for (backgrounded, moved) in [(false, false), (false, true), (true, false)] {
             let dir = tempfile::tempdir().unwrap();
@@ -2593,6 +2727,7 @@ mod tests {
                 children: HashMap::new(),
                 backgrounded: HashSet::new(),
                 task_calls: HashMap::new(),
+                call_tasks: HashMap::new(),
                 call_usage: HashMap::new(),
                 per_call: false,
             };
@@ -3818,6 +3953,7 @@ done
             children: HashMap::new(),
             backgrounded: HashSet::new(),
             task_calls: HashMap::new(),
+            call_tasks: HashMap::new(),
             call_usage: HashMap::new(),
             per_call: false,
         };
@@ -4138,6 +4274,7 @@ done
             children: HashMap::new(),
             backgrounded: HashSet::new(),
             task_calls: HashMap::new(),
+            call_tasks: HashMap::new(),
             call_usage: HashMap::new(),
             per_call: false,
         };
