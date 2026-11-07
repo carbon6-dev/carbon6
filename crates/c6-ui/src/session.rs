@@ -1743,7 +1743,7 @@ pub(crate) fn ArchivedSession(id: String, #[prop(optional)] show_title: bool) ->
     }
 }
 
-/// What runs in a session's background, from its overview or status Show: subagents
+/// What runs in a session's background, from its overview or status row: subagents
 /// and tasks running, then the last few that failed or were stopped, each
 /// with its state, name and time; a task with Inspect and (while it runs)
 /// Stop, a subagent going to its thread. Show all lists every one.
@@ -1766,8 +1766,8 @@ fn BackgroundWork(chrome: SessionChrome, #[prop(into)] on_done: Callback<()>) ->
     view! {
         <div class="space-y-2 p-1 text-xs">
             <p class="text-muted" title=move || chrome.busy.get().join("\n")>{move || match phone_background_count(chrome) {
-                0 => "Nothing runs in the background now.".to_owned(),
-                n => format!("{n} running in the background"),
+                0 => "No background tasks.".to_owned(),
+                n => crate::tasks::running_line(n, 0),
             }}</p>
             <Show when=move || !chrome.running.get()>
                 <WaitingNotices events=chrome.events now session_id=chrome.id.get_value() />
@@ -2513,18 +2513,25 @@ fn phone_status_row(state: PhoneStatusState, show: Callback<()>) -> AnyView {
     } else {
         None
     };
+    let background = (state.background > 0).then(|| crate::tasks::running_line(state.background, 0));
+    let label = primary.iter().map(|(label, _, _)| label.as_str()).chain(background.as_deref()).collect::<Vec<_>>().join(". ");
     view! {
-        <div class="flex h-11 items-center gap-2 border-t border-zinc-200 bg-zinc-50 px-3 text-[11px] min-[360px]:text-xs dark:border-zinc-800 dark:bg-zinc-900" data-phone-status="true">
-            <div role="status" class="flex min-w-0 flex-1 items-center gap-2 overflow-hidden whitespace-nowrap">
-                {primary.map(|(label, tone, icon)| view! { <span class=format!("flex items-center gap-1 {tone}")>{icon}{label}</span> })}
-                {(state.background > 0).then(|| view! {
-                    <span class="flex items-center gap-1 text-sky-700 dark:text-sky-400">
-                        {crate::icons::hourglass()}{format!("Background {}", state.background)}
+        <div class="relative flex h-11 items-center bg-zinc-50 pl-3 pr-10 text-[11px] min-[360px]:text-xs pointer-fine:hover:bg-zinc-100 dark:bg-zinc-900 dark:pointer-fine:hover:bg-zinc-800" data-phone-status="true">
+            <div role="status" class="flex min-w-0 flex-1 flex-col justify-center overflow-hidden whitespace-nowrap">
+                {primary.map(|(label, tone, icon)| view! {
+                    <span class=format!("flex min-w-0 items-center gap-1 leading-4 {tone}")>
+                        {icon}<span class="truncate">{label}</span>
+                    </span>
+                })}
+                {background.map(|label| view! {
+                    <span class="flex min-w-0 items-center gap-1 leading-4 text-sky-700 dark:text-sky-400">
+                        {crate::icons::hourglass()}<span class="truncate">{label}</span>
                     </span>
                 })}
             </div>
-            <button type="button" class="group flex h-11 min-w-11 shrink-0 items-center justify-center outline-none" aria-label="Show session status details" on:click=move |_| show.run(())>
-                <span class="flex h-8 items-center rounded-md border border-zinc-300 px-2 group-focus-visible:ring-2 group-focus-visible:ring-inset group-focus-visible:ring-sky-500 dark:border-zinc-700">"Show"</span>
+            <button type="button" class="absolute inset-0 flex w-full items-center justify-end border-t border-zinc-200 px-3 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-sky-500 dark:border-zinc-800"
+                aria-label=format!("{label}. Open session status details") aria-haspopup="dialog" on:click=move |_| show.run(())>
+                {crate::icons::chevron_right()}
             </button>
         </div>
     }.into_any()
@@ -6389,41 +6396,78 @@ mod tests {
             for (state, expected) in [
                 (PhoneStatusState::default(), vec![]),
                 (PhoneStatusState { working: true, ..Default::default() }, vec!["Working…"]),
-                (PhoneStatusState { background: 2, ..Default::default() }, vec!["Background 2"]),
-                (PhoneStatusState { working: true, background: 2, ..Default::default() }, vec!["Working…", "Background 2"]),
+                (PhoneStatusState { background: 2, ..Default::default() }, vec!["2 background tasks"]),
+                (PhoneStatusState { working: true, background: 2, ..Default::default() }, vec!["Working…", "2 background tasks"]),
                 (PhoneStatusState { working: true, waiting: 1, ..Default::default() }, vec!["Waiting on you 1"]),
                 (
                     PhoneStatusState { working: true, waiting: 1, background: 2, ..Default::default() },
-                    vec!["Waiting on you 1", "Background 2"],
+                    vec!["Waiting on you 1", "2 background tasks"],
                 ),
                 (PhoneStatusState { failed: true, ..Default::default() }, vec!["Last turn failed"]),
-                (PhoneStatusState { failed: true, background: 2, ..Default::default() }, vec!["Last turn failed", "Background 2"]),
+                (PhoneStatusState { failed: true, background: 2, ..Default::default() }, vec!["Last turn failed", "2 background tasks"]),
             ] {
                 let html = phone_status_row(state, Callback::new(|_| {})).to_html();
                 if expected.is_empty() {
                     assert!(
-                        !html.contains("data-phone-status") && !html.contains("Show") && !html.contains("h-11"),
+                        !html.contains("data-phone-status") && !html.contains("<button") && !html.contains("h-11"),
                         "no reserved quiet row: {html}"
                     );
                 } else {
-                    assert!(html.contains("h-11") && html.contains("<button") && html.contains("Show session status details"), "{html}");
+                    assert!(html.contains("h-11") && html.contains("absolute inset-0 flex w-full"), "{html}");
+                    assert_eq!(html.matches("<button").count(), 1, "one whole-row opener: {html}");
+                    assert!(html.contains("aria-haspopup=\"dialog\""), "{html}");
+                    assert!(html.contains(&format!("aria-label=\"{}. Open session status details\"", expected.join(". "))), "{html}");
+                    assert!(html.contains("focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-sky-500"), "{html}");
+                    let (status, button) = html.split_once("</div><button").expect("live status is a sibling of the opener");
+                    assert!(status.contains("role=\"status\"") && !status.contains("<button"), "{html}");
+                    assert!(button.contains("m9 18 6-6-6-6") && button.contains("aria-hidden=\"true\""), "drawn chevron: {html}");
                 }
-                for label in ["Working…", "Background 2", "Waiting on you 1", "Last turn failed"] {
+                for label in ["Working…", "2 background tasks", "Waiting on you 1", "Last turn failed"] {
                     assert_eq!(html.contains(label), expected.contains(&label), "{state:?}: {html}");
                 }
-                assert!(!html.contains("Background 0") && !html.contains("Idle") && !html.contains("idle"), "{html}");
+                assert!(
+                    !html.contains("0 background tasks")
+                        && !html.contains("running")
+                        && !html.contains(">Show<")
+                        && !html.contains("Idle")
+                        && !html.contains("idle"),
+                    "{html}"
+                );
                 assert_eq!(
                     html.matches("<svg").count(),
-                    usize::from(state.working || state.waiting > 0 || state.failed) + usize::from(state.background > 0),
-                    "every visible state keeps its drawn icon: {html}"
+                    usize::from(state.working || state.waiting > 0 || state.failed)
+                        + usize::from(state.background > 0)
+                        + usize::from(state.visible()),
+                    "every visible state keeps its drawn icon and the chevron: {html}"
                 );
                 if state.waiting > 0 {
                     assert!(html.contains("text-amber-700"), "waiting is amber: {html}");
                 }
                 if state.background > 0 {
-                    assert!(html.contains("text-sky-700") && html.contains("<svg"), "keep the real job icon: {html}");
+                    assert!(html.contains("text-sky-700") && html.contains("M12 6v6l4 2"), "keep the real clock icon: {html}");
                 }
                 assert_eq!(html.contains("animate-spin"), state.working && state.waiting == 0, "only the working glyph spins: {html}");
+            }
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn phone_status_background_wording_matches_desktop_at_every_count() {
+        let owner = Owner::new();
+        owner.with(|| {
+            for count in [1, 2, 12, 123, usize::MAX] {
+                let words = crate::tasks::running_line(count, 0);
+                let html =
+                    phone_status_row(PhoneStatusState { working: true, background: count, ..Default::default() }, Callback::new(|_| {}))
+                        .to_html();
+                assert!(html.contains(&format!("<span class=\"truncate\">{words}</span>")), "{html}");
+                assert!(html.contains(&format!("aria-label=\"Working…. {words}. Open session status details\"")), "{html}");
+                assert!(
+                    html.contains("flex-col justify-center") && html.contains("leading-4"),
+                    "two labels stay inside the same 44px row: {html}"
+                );
+                assert!(!html.contains("running"), "{html}");
             }
         });
     }
@@ -6547,7 +6591,7 @@ mod tests {
                         !context.contains("blue") && !context.contains("amber") && !context.contains("animate"),
                         "context is not agent state: {html}"
                     );
-                    assert!(html.contains("2 background tasks running."), "{html}");
+                    assert!(html.contains("2 background tasks."), "{html}");
                 }
             }
         });

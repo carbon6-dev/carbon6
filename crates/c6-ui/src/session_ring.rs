@@ -41,9 +41,8 @@ pub fn description(state: AgentState, context: Option<u64>, background: usize) -
         None => "Context usage unavailable.".to_owned(),
     };
     let background = match background {
-        0 => "No background tasks running.".to_owned(),
-        1 => "1 background task running.".to_owned(),
-        count => format!("{count} background tasks running."),
+        0 => "No background tasks.".to_owned(),
+        count => format!("{}.", crate::tasks::running_line(count, 0)),
     };
     format!("{}. {context} {background}", state.label())
 }
@@ -126,10 +125,10 @@ mod tests {
             (AgentState::Waiting, "Waiting on you"),
             (AgentState::Failed, "Last turn failed"),
         ] {
-            assert_eq!(description(state, Some(137), 2), format!("{label}. Context 137 percent used. 2 background tasks running."));
+            assert_eq!(description(state, Some(137), 2), format!("{label}. Context 137 percent used. 2 background tasks."));
         }
-        assert_eq!(description(AgentState::Idle, None, 0), "Idle. Context usage unavailable. No background tasks running.");
-        assert_eq!(description(AgentState::Working, Some(0), 1), "Working. Context 0 percent used. 1 background task running.");
+        assert_eq!(description(AgentState::Idle, None, 0), "Idle. Context usage unavailable. No background tasks.");
+        assert_eq!(description(AgentState::Working, Some(0), 1), "Working. Context 0 percent used. 1 background task.");
     }
 
     #[test]

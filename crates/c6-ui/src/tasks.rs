@@ -171,9 +171,9 @@ pub(crate) fn background_count(events: &[Event], subagents: &[Session]) -> usize
 pub fn running_line(tasks: usize, servers: usize) -> String {
     let plural = |n: usize, one: &str, many: &str| if n == 1 { format!("1 {one}") } else { format!("{n} {many}") };
     match (tasks, servers) {
-        (0, s) => format!("{} running", plural(s, "server", "servers")),
-        (t, 0) => format!("{} running", plural(t, "background task", "background tasks")),
-        (t, s) => format!("{} running · {}", plural(t, "task", "tasks"), plural(s, "server", "servers")),
+        (0, s) => plural(s, "server", "servers"),
+        (t, 0) => plural(t, "background task", "background tasks"),
+        (t, s) => format!("{} · {}", plural(t, "background task", "background tasks"), plural(s, "server", "servers")),
     }
 }
 
@@ -716,8 +716,11 @@ mod tests {
             with("done", "finished", "shell", true),
         ];
         assert_eq!(running_counts(&evs), (2, 1), "Claude Code's own count as tasks");
-        assert_eq!(running_line(2, 1), "2 tasks running · 1 server");
-        assert_eq!(running_line(1, 0), "1 background task running");
-        assert_eq!(running_line(0, 2), "2 servers running");
+        assert_eq!(running_line(2, 1), "2 background tasks · 1 server");
+        assert_eq!(running_line(1, 2), "1 background task · 2 servers");
+        assert_eq!(running_line(1, 0), "1 background task");
+        assert_eq!(running_line(2, 0), "2 background tasks");
+        assert_eq!(running_line(0, 1), "1 server");
+        assert_eq!(running_line(0, 2), "2 servers");
     }
 }

@@ -5,7 +5,7 @@
 // animation without asserting the new compositor invariant. Timings are evidence,
 // never pass/fail thresholds: shared machines do not have a fixed frame budget.
 // PHONE=1 instead checks 320/360/390/430px, light/dark, Full/Reduced/Off,
-// DSF 1/2, with screenshots/JSON in /tmp/q11-ring. THEME, MOTION, WIDTHS,
+// DSF 1/2, with screenshots/JSON in /tmp/q11-ring/row-link. THEME, MOTION, WIDTHS,
 // SCALE and EVIDENCE can narrow/label a diagnostic run; ROOT selects the build.
 // Both modes are Chromium-only: layers() requires CDP. CHROMIUM selects a
 // browser binary (133 by default); this is not a WebKit/Firefox touch proof.
@@ -14,7 +14,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { serve, fixture, settle, launchBrowser } = require('./motion.cjs');
 const phone = process.env.PHONE === '1';
-const output = process.env.EVIDENCE || (phone ? '/tmp/q11-ring' : '/tmp/q3-ring');
+const output = process.env.EVIDENCE || (phone ? '/tmp/q11-ring/row-link' : '/tmp/q3-ring');
 const baseline = process.env.BASELINE === '1';
 const phase = process.env.LABEL || (baseline ? 'before' : 'after');
 // LABEL is deliberately caller-owned: use distinct labels for scale 1/2 runs.
@@ -519,12 +519,269 @@ async function run(browser, origin, theme, run) {
       { display: 'block', spin: 1, sweep: 1, rim: 'hidden' }, 'restore Full after static preferences');
     }
     if (!baseline && run === 0) await visualFrames(page, `${phase}-${theme}`, states);
+    // Wording is correctness-only: never add these events to the measured
+    // workload, CPU profile, natural trace window or compositor challenge.
+    if (!baseline) await desktopTaskWords(f, `${phase}-${theme}-${run}`);
     assert.deepEqual(f.errors, [], 'no crashes, invalid streams or external requests');
   } finally { await context.close(); }
 }
 
+async function desktopTaskWords(f, name) {
+  const { page } = f;
+  const button = page.locator('button[title="Open the background tasks"]:visible');
+  const cases = [
+    ['task1', true, 'started', '1 background task'],
+    ['task2', true, 'started', '2 background tasks'],
+    ['server1', false, 'started', '2 background tasks · 1 server'],
+    ['server2', false, 'started', '2 background tasks · 2 servers'],
+    ['task1', true, 'finished', '1 background task · 2 servers'],
+    ['task2', true, 'finished', '2 servers'],
+    ['server2', false, 'finished', '1 server'],
+  ];
+  for (const [i, [id, notify, state, words]] of cases.entries()) {
+    f.send({ type: 'background_task', task_id: `q11-desktop-${id}`, kind: 'shell', description: `Q11 desktop ${id}`,
+      state, notify, exit_code: 0, elapsed_ms: 0, native_type: '', foreground: false });
+    await page.waitForFunction(words => [...document.querySelectorAll('button[title="Open the background tasks"]')].some(el =>
+      el.getBoundingClientRect().width && el.textContent.replace(/\s+/g, ' ').trim() === words), words);
+    await settle(page);
+    assert.equal((await button.textContent()).replace(/\s+/g, ' ').trim(), words, 'desktop task/server wording has no redundant running');
+    if (!i) await button.evaluate(el => {
+      window.__desktopTasks = { button: el, spinner: el.querySelector('.animate-spin'), chevron: el.querySelector(':scope > svg') };
+    });
+    assert(await button.evaluate(el => {
+      const p = __desktopTasks;
+      return p.button === el && p.spinner?.isConnected && p.chevron?.isConnected &&
+        p.spinner === el.querySelector('.animate-spin') && p.chevron === el.querySelector(':scope > svg') &&
+        el.querySelectorAll('svg').length === 2 && p.spinner.getAnimations().some(a => a.animationName === 'spin') &&
+        !!p.chevron.querySelector('path[d="m9 18 6-6-6-6"]');
+    }), 'desktop wording updates retain the drawn spinner and chevron');
+    await button.scrollIntoViewIfNeeded();
+    await page.screenshot({ path: path.join(output, `${name}-desktop-tasks-${i + 1}.png`), animations: 'disabled' });
+  }
+  f.send({ type: 'background_task', task_id: 'q11-desktop-server1', kind: 'shell', description: 'Q11 desktop server1',
+    state: 'finished', notify: false });
+  await button.waitFor({ state: 'detached' });
+}
+
 // Focused phone regression; reuse the real production page, WS fixtures and CDP
 // layer probe, not the desktop transcript benchmark or a synthetic badge DOM.
+const backgroundWords = count => `${count} background task${count === 1 ? '' : 's'}`;
+
+async function phoneStatusRow(f, { state, task, setWaiting, shot, genuineCards }) {
+  const { page } = f, row = page.locator('[data-phone-status]');
+  const debug = step => { if (process.env.DEBUG_FIXTURE) console.log(`  ROW ${step}`); };
+  const opener = row.getByRole('button', { name: /Open session status details$/ });
+  const dialog = page.getByRole('dialog', { name: 'Session status', exact: true });
+  const composer = page.locator('textarea').first();
+  const variants = [
+    { name: 'background', agent: 'idle', background: 2, labels: [backgroundWords(2)] },
+    { name: 'working', agent: 'working', background: 0, labels: ['Working…'] },
+    { name: 'working-background', agent: 'working', background: 2, labels: ['Working…', backgroundWords(2)] },
+    { name: 'waiting', agent: 'waiting', background: 0, labels: ['Waiting on you 1'] },
+    { name: 'waiting-background', agent: 'waiting', background: 2, labels: ['Waiting on you 1', backgroundWords(2)] },
+    { name: 'failed', agent: 'failed', background: 0, labels: ['Last turn failed'] },
+    { name: 'failed-background', agent: 'failed', background: 2, labels: ['Last turn failed', backgroundWords(2)] },
+  ];
+  const set = async variant => {
+    debug(`variant ${variant.name || variant.agent}`);
+    // Keep a visible reason alive while independent WS/API sources converge.
+    // Removing the last task before starting the next primary would genuinely
+    // create a quiet intermediate state, not a row-layout regression.
+    for (let i = 1; i <= variant.background; i++) task(i, 'started');
+    setWaiting(variant.agent === 'waiting' ? [{ key: 'q11-row-approval', kind: 'approval', title: 'Q11 row fixture',
+      at: 1, session_id: 'parent', call_id: 'q11-row-approval' }] : []);
+    f.send({ type: 'turn_ended', turn: 950, reason: ['failed', 'working'].includes(variant.agent) ? 'error' : 'completed' });
+    // Waiting must win even while running; Working must beat a saved error.
+    // A failed turn in an idle session keeps the composer usable. The separate
+    // failed-session rim case already covers status=failed (disabled composer).
+    await state(variant.agent === 'waiting' ? 'working' : variant.agent,
+      variant.agent === 'waiting' ? { awaiting_approval: true } : {});
+    if (variant.agent !== 'idle') await row.getByRole('status').getByText(variant.labels[0], { exact: true }).waitFor();
+    for (let i = variant.background + 1; i <= 2; i++) task(i, 'finished');
+    if (variant.labels.length) {
+      for (const text of variant.labels) await row.getByRole('status').getByText(text, { exact: true }).waitFor();
+      await page.waitForFunction(expected => {
+        const status = document.querySelector('[data-phone-status] [role="status"]');
+        return status && status.textContent.replace(/\s+/g, '') === expected.join('').replace(/\s+/g, '');
+      }, variant.labels);
+    } else await page.waitForFunction(() => !document.querySelector('[data-phone-status]')?.closest('[data-open="true"]'));
+    await settle(page);
+  };
+  const inspect = async labels => {
+    assert.equal(await row.locator('button').count(), 1, 'one native full-row opener; no nested/leftover Show buttons');
+    const details = await row.evaluate((el, labels) => {
+      const button = el.querySelector('button'), status = el.querySelector('[role="status"]');
+      const box = window.__phone.box, r = box(el), b = box(button), s = box(status);
+      const texts = [...status.querySelectorAll('*')].filter(node => labels.includes(node.textContent.trim()) &&
+        ![...node.children].some(child => child.textContent.trim() === node.textContent.trim()));
+      const textBoxes = texts.map(node => { const range = document.createRange(); range.selectNodeContents(node); return box(range); });
+      const chevron = button.querySelector('svg');
+      return { row: r, button: b, status: s, labels: status.textContent.replace(/\s+/g, ' ').trim(),
+        name: button.getAttribute('aria-label'), tag: button.tagName, type: button.type,
+        separateStatus: !button.contains(status), interactiveStatus: !!status.querySelector('button,a,input,[role="button"]'),
+        overflow: status.scrollWidth > status.clientWidth || status.scrollHeight > status.clientHeight,
+        scrollSize: { width: status.scrollWidth, height: status.scrollHeight, clientWidth: status.clientWidth, clientHeight: status.clientHeight },
+        textOverflow: texts.some(node => node.scrollWidth > node.clientWidth || node.scrollHeight > node.clientHeight),
+        textBoxes, lineCount: texts.length, icons: status.querySelectorAll('svg').length,
+        chevrons: button.querySelectorAll('svg').length, chevronHidden: !!chevron?.closest('[aria-hidden="true"]') };
+    }, labels);
+    assert.equal(details.tag, 'BUTTON'); assert.equal(details.type, 'button');
+    assert.equal(details.row.height, 44); assert.equal(details.button.height, 44);
+    assert(Math.abs(details.button.width - details.row.width) < .1 && Math.abs(details.button.x - details.row.x) < .1 &&
+      Math.abs(details.button.y - details.row.y) < .1, 'full-width 44px overlay, including its border');
+    assert(details.separateStatus && !details.interactiveStatus, 'live status is a noninteractive sibling, not nested in the button');
+    // A rotating loader's square box extends into empty corners (18px scroll
+    // height for a 16px line); its circular ink and the text still fit. Check
+    // actual label ranges, not that transformed box's scrollable overflow.
+    assert.equal(details.textOverflow, false, `all status wording fits without overflow: ${JSON.stringify(details)}`);
+    assert.equal(details.scrollSize.width, details.scrollSize.clientWidth, 'status has no horizontal overflow');
+    assert.equal(details.lineCount, labels.length, 'one readable line per primary/background label');
+    for (const b of details.textBoxes) assert(b.x >= details.status.x && b.right <= details.status.right && b.y >= details.status.y &&
+      b.bottom <= details.status.bottom && b.height <= 16.5, 'full status text fits the live region in 16px lines');
+    for (const text of labels) assert(details.name.includes(text), 'accessible opener name includes every current status');
+    assert(details.name.endsWith('. Open session status details'));
+    assert.equal(details.icons, labels.length, 'one drawn primary/hourglass SVG per status line');
+    assert.equal(details.chevrons, 1); assert(details.chevronHidden, 'decorative drawn chevron is aria-hidden');
+    return details;
+  };
+  await composer.fill('Q11 retain this draft and focus during every status variant'); await composer.focus();
+  await set(variants[0]);
+  await composer.evaluate(el => {
+    const scroll = [...document.querySelectorAll('div')].filter(node => node.clientHeight > 100 &&
+      node.scrollHeight > node.clientHeight + 300 && getComputedStyle(node).overflowY === 'auto')
+      .sort((a, b) => b.scrollHeight - a.scrollHeight)[0];
+    if (!scroll) throw new Error('real transcript scroll viewport missing');
+    window.__row = { composer: el, scroll, samples: [], sampling: false, clicks: 0, openings: 0 };
+    __row.position = () => ({ composer: __phone.box(el), viewport: __phone.box(scroll), top: scroll.scrollTop,
+      gap: scroll.scrollHeight - scroll.clientHeight - scroll.scrollTop, focused: document.activeElement === el });
+    let wasOpen = false;
+    __row.observer = new MutationObserver(() => {
+      // Reopening during retained exit correctly reuses the same dialog node.
+      // Count closed -> open transitions, not allocations of new DOM nodes.
+      const open = !!document.querySelector('[role="dialog"][aria-label="Session status"][data-open="true"]');
+      if (open && !wasOpen) __row.openings++;
+      wasOpen = open;
+    });
+    __row.observer.observe(document, { subtree: true, childList: true, attributes: true, attributeFilter: ['data-open'] });
+    if (!window.__rowClickHookInstalled) {
+      window.__rowClickHookInstalled = true;
+      document.addEventListener('click', event => {
+        if (event.target.closest('[data-phone-status] button')) __row.clicks++;
+      });
+    }
+    __row.sample = () => {
+      if (!__row.sampling) return;
+      __row.samples.push(__row.position()); requestAnimationFrame(__row.sample);
+    };
+  });
+  debug('initial end-follow');
+  await page.waitForFunction(() => Math.abs(__row.position().gap) < 1);
+  const layouts = [];
+  // Sample every frame across all seven visible variants; the viewport and
+  // nonempty composer must stay put, with focus and end-follow preserved.
+  await page.evaluate(() => { __row.baseline = __row.position(); __row.sampling = true; requestAnimationFrame(__row.sample); });
+  for (const variant of variants) {
+    await set(variant); layouts.push({ variant: variant.name, ...await inspect(variant.labels) });
+    await shot(`row-${variant.name}`);
+  }
+  const follow = await page.evaluate(() => { __row.sampling = false; return { baseline: __row.baseline, samples: __row.samples }; });
+  assert(follow.samples.length);
+  for (const sample of follow.samples) {
+    for (const box of ['composer', 'viewport']) for (const key of ['x', 'y', 'width', 'height'])
+      assert(Math.abs(sample[box][key] - follow.baseline[box][key]) < 1, `${box} geometry stays fixed through visible variants`);
+    assert(sample.focused, 'status variants never take draft focus'); assert(Math.abs(sample.gap) < 1, 'visible variants keep end-follow');
+  }
+  debug('native PageUp reader');
+  await page.evaluate(() => __row.scroll.focus()); await page.keyboard.press('PageUp');
+  await page.waitForFunction(() => __row.position().gap > 100); await settle(page);
+  await page.waitForFunction(() => {
+    const top = __row.scroll.scrollTop; __row.stable = top === __row.top ? (__row.stable || 0) + 1 : 0; __row.top = top;
+    return __row.stable >= 2;
+  }, null, { polling: 'raf' });
+  const readerTop = await page.evaluate(() => __row.scroll.scrollTop);
+  await composer.focus();
+  for (const variant of variants) {
+    await set(variant);
+    assert(Math.abs(await page.evaluate(() => __row.scroll.scrollTop) - readerTop) < 1, 'native PageUp reader is not snapped by visible status changes');
+  }
+  await page.evaluate(() => __row.scroll.focus()); await page.keyboard.press('End');
+  await page.waitForFunction(() => Math.abs(__row.position().gap) < 1);
+  const activation = async (name, action, keyboard = false) => {
+    debug(`activation ${name}`);
+    const before = await page.evaluate(() => ({ clicks: __row.clicks, openings: __row.openings }));
+    await action(); await dialog.waitFor(); await settle(page);
+    assert.equal(await dialog.count(), 1, `${name}: exactly one status dialog`);
+    assert.deepEqual(await page.evaluate(() => ({ clicks: __row.clicks, openings: __row.openings })),
+      { clicks: before.clicks + 1, openings: before.openings + 1 }, `${name}: one native activation opens once`);
+    await page.keyboard.press('Escape'); await dialog.waitFor({ state: 'detached' });
+    if (keyboard) assert(await opener.evaluate(el => document.activeElement === el), 'Escape restores the keyboard opener');
+  };
+  for (const key of ['Enter', 'Space']) {
+    await composer.focus();
+    let focused = false;
+    for (let i = 0; i < 40 && !focused; i++) {
+      await page.keyboard.press('Shift+Tab'); focused = await opener.evaluate(el => document.activeElement === el);
+    }
+    assert(focused, 'full-row opener is reachable by native keyboard traversal');
+    const focus = await opener.evaluate(el => ({ visible: el.matches(':focus-visible'), shadow: getComputedStyle(el).boxShadow }));
+    assert(focus.visible && /inset/.test(focus.shadow) && /2px/.test(focus.shadow), 'keyboard focus has a visible inset 2px ring');
+    await shot(`row-focus-${key.toLowerCase()}`);
+    await activation(key, () => page.keyboard.press(key), true);
+  }
+  for (const target of ['text', 'blank', 'chevron']) await activation(target, async () => {
+    const point = await row.evaluate((el, target) => {
+      let rect = (target === 'chevron' ? el.querySelector('button svg') : el).getBoundingClientRect();
+      if (target === 'text') {
+        const walker = document.createTreeWalker(el.querySelector('[role="status"]'), NodeFilter.SHOW_TEXT);
+        let text; while ((text = walker.nextNode()) && !text.textContent.trim()) { /* skip whitespace */ }
+        const range = document.createRange(); range.selectNodeContents(text); rect = range.getBoundingClientRect();
+      }
+      const x = target === 'blank' ? rect.right - 45 : rect.x + rect.width / 2;
+      const y = target === 'blank' ? rect.top + 2 : rect.y + rect.height / 2;
+      return { x, y, hit: document.elementFromPoint(x, y)?.closest('button') === el.querySelector('button') };
+    }, target);
+    assert(point.hit, `${target} hits the same full-row button`); await page.touchscreen.tap(point.x, point.y);
+  });
+  await set({ agent: 'idle', background: 0, labels: [] });
+  assert(await page.evaluate(() => {
+    const el = document.querySelector('[data-phone-status]');
+    return !el || (!!el.closest('[inert]') && el.closest('[data-open]').parentElement.getBoundingClientRect().height === 0);
+  }), 'quiet immediately yields its height and makes any retained exit inert');
+  await row.waitFor({ state: 'detached' });
+  assert.equal(await row.count(), 0, 'quiet has no status row');
+  await shot('row-quiet');
+  const cards = [];
+  if (genuineCards) for (const action of ['Allow', 'Deny', 'Send', 'Cancel']) {
+    debug(`genuine card ${action}`);
+    const approval = ['Allow', 'Deny'].includes(action), id = `q11-${action.toLowerCase()}`, kind = approval ? 'approval' : 'question';
+    const event = approval ? { type: kind, call_id: id, state: 'requested', tool: 'bash', input: '{"command":"echo q11-fixture"}', policy: 'ask', message: 'Q11 genuine approval card' } :
+      { type: kind, call_id: id, state: 'asked', title: `Q11 genuine ${action} question`, fields: [{ name: 'answer', label: 'Q11 answer', type: 'text', required: true }], answer: null };
+    f.send(event); setWaiting([{ key: id, kind, title: `Q11 ${action}`, at: 1, session_id: 'parent', call_id: id }]);
+    await state('waiting'); await row.getByText('Waiting on you 1', { exact: true }).waitFor();
+    await opener.tap(); await dialog.waitFor();
+    await dialog.getByRole('button', { name: 'Show', exact: true }).tap(); await dialog.waitFor({ state: 'detached' });
+    const card = page.locator(`#waiting-parent-${id}`); await card.waitFor();
+    await page.waitForFunction(id => { const r = document.getElementById(`waiting-parent-${id}`)?.getBoundingClientRect(); return r && r.top >= 44 && r.bottom <= innerHeight; }, id);
+    for (const name of approval ? ['Allow', 'Deny'] : ['Send', 'Cancel']) assert(await card.getByRole('button', { name, exact: true }).isEnabled(), 'genuine card actions remain independently actionable');
+    if (action === 'Send') await card.locator('input').fill('Q11 concrete answer');
+    const request = page.waitForRequest(request => request.method() === 'POST' && request.url().endsWith(`/${approval ? 'approvals' : 'answers'}/${id}`));
+    await card.getByRole('button', { name: action, exact: true }).tap(); const sent = await request;
+    const payload = sent.postDataJSON();
+    assert.deepEqual(payload, approval ? { allow: action === 'Allow' } : { values: { answer: action === 'Send' ? 'Q11 concrete answer' : null }, cancelled: action === 'Cancel' }, 'real card sends the right mocked API action, not a row click');
+    const response = await sent.response(); assert(response?.ok(), 'fixture accepts the genuine card request'); await response.finished();
+    if (approval) await card.getByText(action === 'Allow' ? 'Approved.' : 'Denied.', { exact: true }).waitFor();
+    else await page.waitForFunction(id => [...document.querySelectorAll(`#waiting-parent-${id} button`)].every(button => button.disabled), id);
+    cards.push({ action, payload }); await shot(`row-card-${action.toLowerCase()}`);
+    f.send({ ...event, state: approval ? (action === 'Allow' ? 'allowed' : 'denied') : (action === 'Send' ? 'answered' : 'cancelled') });
+    setWaiting([]); await state('idle');
+    await page.waitForFunction(() => !document.querySelector('[data-phone-status]')?.closest('[data-open="true"]')); await settle(page);
+  }
+  await composer.fill('');
+  await page.evaluate(() => { __row.observer.disconnect(); __row.scroll.focus(); }); await page.keyboard.press('End');
+  await page.waitForFunction(() => Math.abs(__row.position().gap) < 1);
+  return { layouts, follow, readerTop, cards };
+}
+
 async function runPhone(browser, origin, theme, choice, deviceScaleFactor) {
   const widths = (process.env.WIDTHS || '320,360,390,430').split(',').map(Number);
   assert(widths.every(width => [320, 360, 390, 430].includes(width)), 'phone WIDTHS: 320,360,390,430');
@@ -659,13 +916,13 @@ async function runPhone(browser, origin, theme, choice, deviceScaleFactor) {
         step(`background ${count}`);
         while (current < count) task(++current, 'started');
         await page.waitForFunction(count => {
-          const p = __phone, text = count === 0 ? 'No background tasks running.' : `${count} background task${count === 1 ? '' : 's'} running.`;
+          const p = __phone, text = count === 0 ? 'No background tasks.' : `${count} background task${count === 1 ? '' : 's'}.`;
           return p.ring.getAttribute('aria-label').includes(text) &&
             p.badge.parentElement.dataset.open === String(count > 0) &&
             (count === 0 || (p.badge.textContent === String(count) && !p.badge.querySelector('.c6-count-out')));
         }, count);
         await settle(page);
-        if (count) await row.getByText(`Background ${count}`, { exact: true }).waitFor();
+        if (count) await row.getByText(backgroundWords(count), { exact: true }).waitFor();
         const badge = await page.evaluate(() => {
           const p = __phone, b = p.box(p.badge), intersects = el => {
             const r = p.box(el); return b.x < r.right && b.right > r.x && b.y < r.bottom && b.bottom > r.y;
@@ -685,11 +942,12 @@ async function runPhone(browser, origin, theme, choice, deviceScaleFactor) {
         }
         counts.push({ count, ...badge });
         if (count) {
-          const show = row.getByRole('button', { name: 'Show session status details', exact: true });
-          assert.equal(await show.textContent(), 'Show', 'first ring change preserves the existing status-row opener');
-          assert.equal((await row.boundingBox()).height, 44, 'composer Background row stays 44px');
-          assert.equal((await show.boundingBox()).height, 44, 'status-row opener keeps its 44px target');
-          assert.equal(await row.locator('svg').count(), 1, 'Background keeps its drawn hourglass SVG');
+          const open = row.getByRole('button', { name: /Open session status details$/ });
+          assert.equal(await row.locator('button').count(), 1, 'one full-row status opener');
+          const rowBox = await row.boundingBox(), buttonBox = await open.boundingBox();
+          assert.equal(rowBox.height, 44); assert.equal(buttonBox.height, 44);
+          assert(Math.abs(rowBox.width - buttonBox.width) < .1, 'status opener spans the full row');
+          assert.equal(await row.locator('svg').count(), 2, 'Background keeps its hourglass plus the drawn chevron');
         }
         await shot(`background-${count}`);
       }
@@ -712,7 +970,7 @@ async function runPhone(browser, origin, theme, choice, deviceScaleFactor) {
         // Starting already lights the shared rim; the unchanged composer row
         // reports Working only once the session is actually running.
         if (status === 'running') await row.getByText('Working…', { exact: true }).waitFor();
-        await row.getByText('Background 123', { exact: true }).waitFor();
+        await row.getByText(backgroundWords(123), { exact: true }).waitFor();
         step(`${status} drawing/layers`);
         const drawing = await page.evaluate(() => {
           const p = __phone, spin = p.root.querySelector('.c6-ring-working'), sweep = spin.querySelector('.c6-ring-sweep');
@@ -777,7 +1035,7 @@ async function runPhone(browser, origin, theme, choice, deviceScaleFactor) {
       f.send({ type: 'turn_ended', turn: 901, reason: 'completed' });
       await state('idle'); await named('Idle');
       for (let i = 1; i <= 123; i++) task(i, 'finished');
-      await page.waitForFunction(() => __phone.ring.getAttribute('aria-label').includes('No background tasks running.') &&
+      await page.waitForFunction(() => __phone.ring.getAttribute('aria-label').includes('No background tasks.') &&
         !document.querySelector('[data-phone-status]')?.closest('[data-open="true"]'));
       await settle(page);
       assert(await page.evaluate(() => __phone.retained() && __rim.getAttribute('stroke-dasharray') === 'none' &&
@@ -785,7 +1043,10 @@ async function runPhone(browser, origin, theme, choice, deviceScaleFactor) {
         !__contextArc.closest('svg').querySelector('path')), 'Idle restores neutral solid rim, no cross/spin, all SVGs retained');
       assert.equal(await row.count(), 0, 'no idle composer status row');
       await shot('idle');
-      records.push({ label, geometry, counts, movement, states, waitingCue, failedCue });
+      const statusRow = await phoneStatusRow(f, { state, task, setWaiting: value => { waiting = value; }, shot,
+        genuineCards: width === widths[0] });
+      assert(await page.evaluate(() => __phone.retained()), 'full-row interactions retain every original header SVG');
+      records.push({ label, geometry, counts, movement, states, waitingCue, failedCue, statusRow });
       fs.writeFileSync(path.join(output, `phone-${theme}-${choice}-dsf${deviceScaleFactor}.json`), JSON.stringify(records, null, 2));
       assert.deepEqual(f.errors, [], 'no crashes, invalid streams or external requests');
       console.log(`PASS ${label}`);

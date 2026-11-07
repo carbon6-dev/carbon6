@@ -68,7 +68,7 @@ paint and compositor events for attribution. See the Q3 section of
 For the shared phone/desktop header ring, run:
 
 ```sh
-PHONE=1 EVIDENCE=/tmp/q11-ring/ring-only /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/ring-render.cjs
+PHONE=1 EVIDENCE=/tmp/q11-ring/row-link /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/ring-render.cjs
 ```
 
 This mode checks 320/360/390/430px, both themes, Full/Reduced/Off and DSF 1/2.
@@ -76,8 +76,17 @@ It uses twelve open pages, a long session title, and real background-task events
 for counts 0/1/2/12/123. It checks 44px bar/targets, title ellipsis, no badge
 collision or header movement throughout count transitions, retained icons,
 ring-to-sheet touch navigation, state cues and the two Full compositor layers.
-Screenshots and geometry JSON go to `/tmp/q11-ring/` by default. `THEME`,
+It also checks all seven visible composer-status variants and quiet, the single
+full-width 44px opener, full task wording, chevron and visible keyboard focus,
+Enter/Space/Escape and taps on each part of the row. Geometry and native PageUp
+checks preserve the draft, composer, transcript viewport and reader position
+between visible states. Real approval/question cards keep their Allow/Deny and
+Send/Cancel actions and send the expected mocked API payloads.
+Screenshots and geometry JSON go to `/tmp/q11-ring/row-link/` by default. `THEME`,
 `MOTION`, `WIDTHS` and `SCALE` can select a smaller diagnostic matrix.
+The normal desktop mode also checks singular/plural task and server labels,
+including mixed counts, after its measured workload; its spinner and chevron
+must remain mounted while the wording changes.
 
 ## Content-fitted desktop header
 
@@ -809,9 +818,14 @@ shared state/context ring (the only phone route to Changes/Terminal/Files/Output
 Sheets and dialogs must stay within the visible viewport and scroll.
 
 Drive idle, main-working, waiting, last-turn failure and background-only
-states. No idle row or Background 0; working must not follow aggregate child
+states. No idle row or “0 background tasks”; working must not follow aggregate child
 status. Deduplicate linked task/subagent records and exclude foreground native
-work and mirrors. Show must expose cards, errors, Inspect/Stop and history.
+work and mirrors. The whole 44px status row, with its chevron and visible inset
+focus, must expose cards, errors, Inspect/Stop and history. Its task count reads
+“1 background task” / “2 background tasks”, matching desktop without “running”.
+Waiting-card Show navigation and real approval/answer actions stay intact.
+Every visible status variant, including combined two-line statuses, stays 44px
+high without resizing the transcript viewport when switching between them.
 Hold a draft and focused composer element across these transitions: it must
 stay mounted and at the same bottom position; the transcript loses/gains 44px.
 Following remains at the bottom, while a scrolled-up reader stays put.
