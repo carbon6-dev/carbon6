@@ -304,6 +304,14 @@ html.soft {
    Keep their ids as targets, without a speculative 6rem height or a gap. */
 .c6-transcript-row:empty,
 .c6-transcript-notices:empty { display: none; }
+/* The live tail must have its real height BEFORE following it. A guessed
+   6rem row, followed a frame later by its measured height, moves both content
+   and scrollbar twice. Older rows still skip off-screen work and remember
+   their measured sizes; this is not a virtual-list spacer. */
+.c6-transcript-row:nth-last-child(-n + 16) {
+  content-visibility: visible;
+  contain-intrinsic-size: none;
+}
 
 /* Chart series (the dataviz reference palette's first slots, stepped
    separately for light and dark surfaces). */

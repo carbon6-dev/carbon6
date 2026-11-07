@@ -51,6 +51,10 @@ Session-stream messages received before a presentation frame are applied in
 wire order in one reactive batch, including reply replacement, queue changes
 and turn completion. Disconnect flushes pending messages before replay begins;
 unmount cancels its pending frame.
+The newest 16 event elements use their real layout height immediately. Older
+off-screen rows retain `content-visibility: auto` and remembered measured
+heights. This avoids following a guessed 6rem tail row and then correcting
+both the transcript and its scrollbar again when its real height arrives.
 
 ## Icons throughout the app
 
