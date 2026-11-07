@@ -2,6 +2,38 @@
 
 Status: rules in force (2026-10-19); `make check` enforces what a pattern can catch (`scripts/test-lint.sh`).
 
+## Browser crashes: preserve the first failure (N5)
+
+The shared production-browser fixture labels the known intermittent Linux
+Playwright WebKit/WASM trap **signature**, not a proven engine defect. It still
+rejects its crash promise, records every browser error, and fails every existing
+assertion. There is no expected-failure allowance or automatic successful retry.
+An `unreachable` trap can follow a Rust panic; inspect earlier console messages
+and `/api/v1/ui/error` reports before attributing it to WebKit. A later disposed
+value or null DOM error after an initial memory trap is not independent proof of
+its cause. A clean isolated rerun is evidence about intermittency, not a pass for
+the failed run. Preserve both logs and the exact WASM SHA-256.
+
+The panic hook now captures its JavaScript/WASM stack synchronously, rather than
+letting the subsequent abort trap replace it. Crash reports prefix that stack
+with bounded mounted tile/pane keys, static view kinds, and browser user agent.
+The snapshot reads neither view payloads, message text, titles, nor saved layout.
+`pending` distinguishes an unmounted pane shell; retained hidden panes still
+count as mounted. The existing head endpoint's 2,000-character stack cap applies.
+
+```sh
+node --test crates/c6-ui/tests/crash.cjs
+node crates/c6-ui/tests/motion.cjs --unit
+# Actual restore/dedupe, target visits, tile closure, menus, and draft retention:
+ENGINE=both node crates/c6-ui/tests/workspace-open.cjs
+```
+
+Browser executable and `ROOT` overrides are the same as `motion.cjs`. On Linux,
+setting `navigator.platform` to `MacIntel` in a test does **not** run Safari or
+macOS WebKit. Disabling BBQ/LLInt is an investigation control, not the production
+test configuration or an application workaround. See the N5 investigation in
+`docs/ui-responsiveness.md` for observations and remaining limits.
+
 ## Working ring and transcript rendering
 
 ### Background-notice descriptions

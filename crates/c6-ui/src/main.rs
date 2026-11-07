@@ -71,7 +71,8 @@ use workspace::{Go, View};
 
 #[wasm_bindgen::prelude::wasm_bindgen]
 extern "C" {
-    /// js/crash.js: the banner that offers a reload.
+    /// js/crash.js: the reload banner; captures a JS stack while the panic's
+    /// app-level Wasm callers are still on it (before the subsequent trap).
     #[wasm_bindgen(catch, js_name = c6Crashed)]
     fn js_crashed(message: &str) -> Result<(), wasm_bindgen::JsValue>;
 

@@ -28,6 +28,17 @@ const CASES = [
   { name: 'off', choice: 'off', os: 'reduce', effective: 'off' },
 ];
 const selected = (env, value) => !process.env[env] || process.env[env].split(',').includes(value);
+// Diagnostic only: even a familiar engine signature remains a fatal error.
+// `unreachable` can also follow a Rust panic; never call it an engine bug on
+// the strength of its text, or retry/ignore it in an assertion run.
+function crashDiagnostic(engine, error, consoleMessages = []) {
+  const panic = consoleMessages.some(message => /panicked at|already been disposed/.test(message.text));
+  if (panic) return 'Rust panic observed; inspect the panic and stack before attributing a later WASM trap to WebKit';
+  if (engine === 'webkit' && /RuntimeError|out of bounds|null.*table|unreachable/i.test(String(error.stack || error))) {
+    return 'Known intermittent WebKit/WASM trap signature (N5, docs/testing.md); cause unresolved, still FAIL; preserve the first error and exact WASM hash';
+  }
+  return 'Browser failure; not classified as the intermittent WebKit/WASM signature';
+}
 async function within(label, action) {
   let timer;
   try {
@@ -154,6 +165,7 @@ async function fixture(browser, origin, viewport, theme, motion, started, contex
   let sessionView = { catchup: true, fold: false }, deferredView;
   page.on('pageerror', error => {
     errors.push(String(error.stack || error)); console.error('PAGEERROR', error.stack || error);
+    console.error('CRASH DIAGNOSTIC', crashDiagnostic(browser.browserType().name(), error, consoleMessages));
     fail(new Error(`browser crash during ${progress.phase}: ${error.stack || error}`));
   });
   page.on('console', message => {
@@ -1372,7 +1384,11 @@ async function browserHelpers(playwright, engine) {
           let fail;
           const crash = new Promise((_, reject) => { fail = reject; });
           crash.catch(() => {});
-          page.on('pageerror', error => { errors.push(String(error.stack || error)); fail(error); });
+          page.on('pageerror', error => {
+            errors.push(String(error.stack || error));
+            console.error('CRASH DIAGNOSTIC', crashDiagnostic(name, error));
+            fail(error);
+          });
           await context.route('**/*', route => {
             if (route.request().url() === origin + '/__helper') return route.fulfill({ contentType: 'text/html', body:
               '<!doctype html><style>#list>div{height:40px;width:200px}</style><div id="list"><div data-motion-key="a">A</div><div data-motion-key="b">B</div></div>' });
@@ -1506,6 +1522,13 @@ async function main() {
 
 function unitTests() {
   const { test } = require('node:test');
+  test('crash diagnostics distinguish panic evidence without treating familiar WebKit traps as passes', () => {
+    const trap = new WebAssembly.RuntimeError('Out of bounds memory access');
+    assert.match(crashDiagnostic('webkit', trap), /cause unresolved, still FAIL/);
+    assert.match(crashDiagnostic('chromium', trap), /not classified/);
+    assert.match(crashDiagnostic('webkit', trap, [{ text: 'panicked at traits.rs:767: already been disposed' }]), /^Rust panic observed/);
+    assert.match(crashDiagnostic('webkit', new Error('bad selector')), /not classified/);
+  });
   const vm = require('node:vm');
   const source = fs.readFileSync(path.join(__dirname, '../js/motion.js'), 'utf8');
   const load = ({ choice, reduced = false, failRead = false, failWrite = false, cssAnimations = false } = {}) => {

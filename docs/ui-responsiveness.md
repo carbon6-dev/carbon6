@@ -583,3 +583,61 @@ all-state galleries. `frames.html` is a self-contained before/after frame viewer
 `final-summary.json` and `final-summary.md` contain the complete per-case results.
 Historical measurements above are not rewritten to imply
 that the fixed arc proved an overall speedup.
+
+## N5: browser traps and disposed values — November 7, 2026
+
+Investigation base: `c6/next` at `235fae5c`, not `upstream/main`. Evidence,
+commands, pinned artifacts, and read-only ops questions are under
+`/tmp/n5-webkit/`. This investigation does not change production optimization,
+panic strategy, or the WASM size ratchet; a clean rerun is not evidence that an
+intermittent crash has been repaired.
+
+### Keep the two fault classes separate
+
+The older symbolized `/tmp/q10-symbols-browser.log` contains a **Chromium**
+disposed `StoredValue<String>` read in `SessionChrome::pane_open`, called from
+tile-header render effects after the transcript owner was replaced. This is
+an application lifetime error, not a WebKit-specific diagnosis. Commit
+`ef4d715b`, already an ancestor of the investigation base, makes that read
+fallible, keys header controls by chrome registration token, and prevents old
+transcript cleanup from removing its replacement's registration. The composer
+commands resource already captures an owned session ID before its deferred
+future (`16c8f5b3`, also an ancestor). Neither old expression is present at the
+requested base. No additional fallible getters are added speculatively.
+
+The separately recorded November 6 DecisionLink stack maps a disposed resource
+read to `count.get()` in `decisions.rs`. It identifies the failing renderer,
+**not who disposed its owner**. Its old optimized artifact is not interchangeable
+with today's WASM function indices. Duplicate layout normalization operates on
+plain layout data before creating reactive owners; a variable called `owners`
+in that normalization is not a collection of Leptos owners. Runtime target
+navigation and tile closure remain necessary lifetime regressions.
+
+An out-of-bounds trap occurs *before* the later disposed-value report in
+`/tmp/q10-workspace-verified-webkit-desktop-linux.log`. Subsequent failures on
+an already broken page cannot establish a shared cause. Conversely, a Rust
+panic followed by `unreachable` is the expected abort path and must not be
+counted as an unexplained engine trap. A validator accepts WASM's structural
+and type rules, not the runtime correctness of its pointers or application
+lifetimes; validation alone cannot prove an engine defect.
+
+### Diagnostics, without conversation contents
+
+The existing crash report's stack field now includes a synchronous JS/WASM
+stack for Rust panics, a bounded snapshot of actually mounted view kinds and
+numeric tile/pane keys, and the browser user agent. The marker shares the
+keyed content's mount lifetime and reuses its existing wrapper: no extra DOM
+node, title, session/document ID, saved-layout read, or message text. Hidden
+retained content remains mounted; a deferred shell is `pending`. The first
+report still wins over later fallout, and the reload banner works without
+Leptos or successful reporting. No telemetry endpoint or server behavior is
+changed. Browser tests annotate the familiar intermittent WebKit trap
+signature but **still fail** on it; all existing assertions remain in force.
+
+The live head was not accessed. Before this patch the endpoint logs only
+`page`, `message`, and `stack`, not the User-Agent header. Ask ops for the
+deployed asset hash, timestamped first reports, and any existing access-log
+metadata that can distinguish real Safari from synthetic WPE's Safari-shaped
+UA; absent metadata is not evidence of absent Safari crashes. Detailed,
+privacy-preserving read-only requests are in `ops-questions.md` in the evidence
+directory. No operational action has been taken.

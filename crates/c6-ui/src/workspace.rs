@@ -167,6 +167,45 @@ fn enc(s: &str) -> String {
 }
 
 impl View {
+    /// Crash diagnostics: enum type only, never any of the view's payload.
+    /// Keep js/crash.js's allowlist in sync.
+    fn crash_kind(&self) -> &'static str {
+        match self {
+            Self::Sessions => "sessions",
+            Self::Session { .. } => "session",
+            Self::SessionChanges { .. } => "session_changes",
+            Self::SessionTerminal { .. } => "session_terminal",
+            Self::SessionFiles { .. } => "session_files",
+            Self::SessionOutputs { .. } => "session_outputs",
+            Self::Search { .. } => "search",
+            Self::Workers => "workers",
+            Self::Worker { .. } => "worker",
+            Self::Settings { .. } => "settings",
+            Self::Inbox => "inbox",
+            Self::Mission => "mission",
+            Self::Usage => "usage",
+            Self::Chats => "chats",
+            Self::Analytics => "analytics",
+            Self::Activity => "activity",
+            Self::Memex => "memex",
+            Self::Mail => "mail",
+            Self::Chat => "chat",
+            Self::Conversation { .. } => "conversation",
+            Self::Brief => "brief",
+            Self::Calendar => "calendar",
+            Self::Contacts => "contacts",
+            Self::Photos => "photos",
+            Self::Decisions => "decisions",
+            Self::Work { .. } => "work",
+            Self::Projects { .. } => "projects",
+            Self::Docs { .. } => "docs",
+            Self::Collections { .. } => "collections",
+            Self::Realms => "realms",
+            Self::Explore { .. } => "explore",
+            Self::App { .. } => "app",
+        }
+    }
+
     pub fn session(id: impl Into<String>) -> Self {
         View::Session { id: id.into(), target: None }
     }
@@ -4326,13 +4365,18 @@ fn ColumnView(tile: u64, col: u64) -> impl IntoView {
             <Show when=move || pos.get().is_some_and(|p| p.len == 2)>
                 <ColumnHeader label pos=Signal::derive(move || pos.get()) view=Signal::derive(move || view.get()) />
             </Show>
-            <div class="@container/view relative flex min-h-0 min-w-0 flex-1 flex-col">
-                <Show when=move || mounted.get()>
-                    <For each=move || content.get() key=|(view, visit)| (view.clone(), *visit) let:content>
-                        <InitialView view=content.0 col />
-                    </For>
-                </Show>
-            </div>
+            <Show when=move || mounted.get()>
+                <For each=move || content.get() key=|(view, visit)| (view.clone(), *visit) let:content>
+                    // This existing wrapper shares the content's keyed mount
+                    // lifetime. A reactive attribute on the outer shell could
+                    // name the next view before it renders (or panics).
+                    {let kind = content.0.crash_kind(); view! {
+                        <div data-pane-kind=kind class="@container/view relative flex min-h-0 min-w-0 flex-1 flex-col">
+                            <InitialView view=content.0 col />
+                        </div>
+                    }}
+                </For>
+            </Show>
         </div>
     }
 }
