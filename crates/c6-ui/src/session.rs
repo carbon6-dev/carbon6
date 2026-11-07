@@ -2161,6 +2161,46 @@ fn tool_results(session: &str, evs: &[Event]) -> HashMap<String, ToolResultView>
         .collect()
 }
 
+/// Keep every hidden entry's original rewind owner, but describe the fold in
+/// conversation terms: your bubbles and nonempty text replies, not tool steps,
+/// reasoning, notifications, turn bookkeeping or previous rewind markers.
+fn rewound_events(evs: &[Event]) -> (HashMap<u64, u64>, HashMap<u64, (usize, usize)>) {
+    let mut by = HashMap::<u64, u64>::new();
+    let mut counts = HashMap::<u64, (usize, usize)>::new();
+    for (i, e) in evs.iter().enumerate() {
+        if let EventKind::Rewound { to_seq, .. } = e.kind {
+            for x in &evs[..i] {
+                if x.seq >= to_seq && !by.contains_key(&x.seq) && !matches!(x.kind, EventKind::Checkpoint { .. }) {
+                    by.insert(x.seq, e.seq);
+                    let count = counts.entry(e.seq).or_default();
+                    match &x.kind {
+                        EventKind::User { command, from_session_id, .. }
+                            if command != "task-notification" && command != "stop-hook" && from_session_id.is_empty() =>
+                        {
+                            count.0 += 1
+                        }
+                        EventKind::Assistant { blocks, .. }
+                            if blocks.iter().any(|b| matches!(b, ContentBlock::Text { text, .. } if !text.trim().is_empty())) =>
+                        {
+                            count.1 += 1
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    (by, counts)
+}
+
+fn rewind_count_label((messages, replies): (usize, usize)) -> String {
+    if messages == 1 && replies == 1 {
+        "1 message and its reply".into()
+    } else {
+        format!("{messages} message{}, {replies} repl{}", if messages == 1 { "" } else { "s" }, if replies == 1 { "y" } else { "ies" })
+    }
+}
+
 /// A session's transcript, with the side chats branching from its messages
 /// shown under them (recursively). `timeline` (a session's own
 /// transcript): its turns, each finished one a row while they fold.
@@ -2308,24 +2348,8 @@ fn Transcript(
         })
     });
     // Events no longer counting since a rewind: seq → the Rewound's seq;
-    // and how many each rewind covers.
-    let rewound = Memo::new(move |_| {
-        events.with(|evs| {
-            let mut by = HashMap::<u64, u64>::new();
-            let mut counts = HashMap::<u64, usize>::new();
-            for (i, e) in evs.iter().enumerate() {
-                if let EventKind::Rewound { to_seq, .. } = e.kind {
-                    for x in &evs[..i] {
-                        if x.seq >= to_seq && !by.contains_key(&x.seq) && !matches!(x.kind, EventKind::Checkpoint { .. }) {
-                            by.insert(x.seq, e.seq);
-                            *counts.entry(e.seq).or_default() += 1;
-                        }
-                    }
-                }
-            }
-            (by, counts)
-        })
-    });
+    // and the human messages/text replies each rewind covers.
+    let rewound = Memo::new(move |_| events.with(|evs| rewound_events(evs)));
     let actions_can_rewind = Memo::new(move |_| {
         can_rewind
             && message_actions.get().is_some_and(|seq| {
@@ -2493,8 +2517,8 @@ fn Transcript(
                                                 <span class="flex-1"></span>
                                                 <button class="underline" on:click=move |_| shown.update(|s| if !s.remove(&seq) { s.insert(seq); })>
                                                     {move || {
-                                                        let n = rewound.with(|(_, c)| c.get(&seq).copied().unwrap_or(0));
-                                                        if shown.with(|s| s.contains(&seq)) { format!("hide {n} rewound") } else { format!("show {n} rewound") }
+                                                        let count = rewind_count_label(rewound.with(|(_, c)| c.get(&seq).copied().unwrap_or_default()));
+                                                        if shown.with(|s| s.contains(&seq)) { format!("hide {count}") } else { format!("show {count}") }
                                                     }}
                                                 </button>
                                             </div>
@@ -6838,6 +6862,73 @@ mod tests {
         );
         assert_eq!(rewind_result(&events[..2], 72, 101), None, "retry ignores the previous error");
         assert_eq!(rewind_result(&events, 72, 101), Some(Ok(())));
+    }
+
+    #[test]
+    fn rewind_count_uses_conversation_terms_and_singulars() {
+        for (counts, label) in [
+            ((1, 1), "1 message and its reply"),
+            ((2, 3), "2 messages, 3 replies"),
+            ((2, 1), "2 messages, 1 reply"),
+            ((1, 2), "1 message, 2 replies"),
+            ((1, 0), "1 message, 0 replies"),
+            ((2, 0), "2 messages, 0 replies"),
+            ((0, 1), "0 messages, 1 reply"),
+            ((0, 0), "0 messages, 0 replies"),
+        ] {
+            assert_eq!(rewind_count_label(counts), label);
+        }
+    }
+
+    #[test]
+    fn rewind_count_excludes_bookkeeping_and_preserves_nested_fold_ownership() {
+        let kinds = serde_json::json!([
+            {"type": "user", "command_id": "first", "text": "Interrupted message"},
+            {"type": "turn_started", "turn": 1},
+            {"type": "assistant", "turn": 1, "blocks": [{"type": "text", "text": "Partial reply"}], "stop_reason": "interrupted"},
+            {"type": "turn_ended", "turn": 1, "reason": "interrupted"},
+            {"type": "rewound", "to_seq": 1, "restored_files": false},
+            {"type": "user", "command_id": "second", "text": "", "attachments": [{"name": "notes.txt", "mime": "text/plain", "size": 4}]},
+            {"type": "user", "command_id": "third", "text": "Another message"},
+            {"type": "assistant", "turn": 2, "blocks": [{"type": "text", "text": "First block"}, {"type": "text", "text": "Second block"}], "stop_reason": "tool_use"},
+            {"type": "assistant", "turn": 2, "blocks": [{"type": "text", "text": "Second reply"}], "stop_reason": "tool_use"},
+            {"type": "assistant", "turn": 2, "blocks": [{"type": "text", "text": "Third reply"}], "stop_reason": "end_turn"},
+            {"type": "checkpoint"},
+            {"type": "user", "command_id": "notice", "command": "task-notification", "text": "Background notice"},
+            {"type": "user", "command_id": "hook", "command": "stop-hook", "text": "Hook notice"},
+            {"type": "user", "command_id": "agent", "from_session_id": "other", "text": "Agent message"},
+            {"type": "assistant", "turn": 2, "blocks": [{"type": "thinking", "text": "Reasoning"}], "stop_reason": ""},
+            {"type": "assistant", "turn": 2, "blocks": [{"type": "tool_use", "id": "call", "name": "bash", "input_json": "{}"}], "stop_reason": "tool_use"},
+            {"type": "assistant", "turn": 2, "blocks": [{"type": "text", "text": "  \n "}], "stop_reason": ""},
+            {"type": "assistant", "turn": 2, "blocks": [], "stop_reason": "interrupted"},
+            {"type": "tool_result", "call_id": "call", "tool": "bash", "output": "ok", "is_error": false, "truncated": false, "duration_ms": 1},
+            {"type": "usage", "model": "test", "input_tokens": 1, "output_tokens": 1, "cache_read_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
+            {"type": "error", "message": "Fixture error"},
+            {"type": "rewound", "to_seq": 1, "restored_files": false},
+            {"type": "rewound", "to_seq": 6, "restored_files": false}
+        ]);
+        let events: Vec<Event> = kinds
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(i, kind)| {
+                let mut event = kind.clone();
+                event["seq"] = (i + 1).into();
+                event["ts"] = 1.into();
+                serde_json::from_value(event).unwrap()
+            })
+            .collect();
+        let (by, counts) = rewound_events(&events);
+        assert_eq!(counts[&5], (1, 1), "four raw entries are one message and its interrupted reply");
+        assert_eq!(counts[&22], (2, 3), "count each text reply once, not its blocks or whole turn");
+        assert_eq!(counts[&23], (0, 0), "a repeated rewind cannot count already-rewound messages twice");
+        assert_eq!((1..=4).map(|seq| by[&seq]).collect::<Vec<_>>(), vec![5; 4]);
+        assert_eq!(by[&5], 22, "an older marker still folds but does not inflate the count");
+        assert_eq!(by[&6], 22);
+        assert_eq!(by[&22], 23);
+        assert!(!by.contains_key(&11), "checkpoints retain their existing non-folded policy");
+        assert!(!by.contains_key(&23));
     }
 
     #[test]

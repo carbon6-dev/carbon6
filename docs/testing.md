@@ -1467,6 +1467,35 @@ including forget-before-teardown; browser checks exercise actual layout/storage:
    Repeat a failed send (draft stays), storage denial (quiet note), and pasting
    an attachment before the database opens (restored and new files both stay).
 
+## Rewound marker: conversation counts and disclosure
+
+`cargo test --locked -p c6-ui rewind` checks the marker's pure counting and
+wording helpers. Count your message bubbles (including attachment-only messages)
+and Assistant entries with nonempty text, once per entry even if there are
+several text blocks. Several text replies in one turn remain separate replies.
+Tool-only/think-only entries, empty interrupted responses, task notifications,
+stop-hook notices, incoming agent messages, usage, errors and turn metadata do
+not inflate the count. The marker says "1 message and its reply", "2 messages,
+3 replies", or "1 message, 0 replies", with singular/plural variants. The
+membership map is unchanged: all rewound activity still folds, checkpoints
+retain their existing policy, and nested/repeated rewinds never recount entries
+already owned by an earlier marker.
+
+After `make ui`, run `ENGINE=both node crates/c6-ui/tests/rewind-marker.cjs`
+against that dist (or set `ROOT` to a coordinator's built dist). The script
+reuses `motion.cjs`'s installed Playwright/browser overrides and owned loopback
+HTTP/WebSocket fixtures; it never starts a real head, worker or model or uses
+live settings. Desktop 1440px and touch phone 390px/320px, in Light and Dark,
+cover a four-entry interrupted turn, an unanswered message, multiple messages
+and text replies mixed with tools/notices/usage, and nested rewinds. Real
+clicks/taps verify both show/hide labels, retained message DOM and fold ownership,
+the undo icon, file-restoration status/error, no horizontal page overflow,
+no session mutation requests and no browser/dropped-closure errors. Waits are
+condition-based with the shared five-minute hang guard (`docs/testing.md` rules),
+not timed pauses. This covers only the marker, not the Edit/Rewind form.
+Use `ENGINE=chromium|webkit`, `WIDTH=1440|390|320` and `THEME=light|dark` to
+isolate an exact case; preserve any original failed cohort before rerunning.
+
 ## Transcript follow: manual browser check
 
 The native `child_lists_invalidate_on_spawn_not_tool_results_or_task_reports`
