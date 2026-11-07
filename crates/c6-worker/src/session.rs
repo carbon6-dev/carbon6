@@ -168,6 +168,8 @@ pub(crate) enum ActorMsg {
         to_seq: u64,
         restore_files: bool,
     },
+    /// Confirm a local child's queues and work are idle before its parent rewinds.
+    RewindIdle(tokio::sync::oneshot::Sender<bool>),
     /// An input, possibly switching the session's model from it on, and
     /// what is needed to pick the variant of a custom command it invokes.
     Input(Box<PendingInput>, Option<ModelSpec>, Box<CommandChoice>),
@@ -607,6 +609,39 @@ impl SessionManager {
                 if events.iter().any(|e| e.seq >= r.to_seq && handoff_of(e).is_some()) {
                     return Err(HANDOFF_REWIND.into());
                 }
+                if let Some(started) = events.iter().find_map(|e| match &e.kind {
+                    Some(session_event::Kind::Started(s)) => Some(s.clone()),
+                    _ => None,
+                }) && runtime_of(started, &events).tool_profile == crate::claude_code::PROFILE
+                {
+                    let previous = self.journal.claude_rewind(&cmd.session_id).await.map_err(internal)?;
+                    if let Some((pending, 0)) = &previous {
+                        if pending.to_seq != r.to_seq || pending.restore_files != r.restore_files {
+                            return Err("Another rewind is awaiting confirmation; retry the same target and file-restore choice".into());
+                        }
+                        // An explicit HTTP retry has a new command ID. Keep
+                        // the old intent/receipt: actor recovery confirms it
+                        // first, then applies this command independently.
+                    } else {
+                        // Before loading an idle actor (which may wake notices),
+                        // or interrupting a live turn. Restart must observe the
+                        // intent before any further model input.
+                        self.journal
+                            .prepare_claude_rewind(
+                                &cmd.session_id,
+                                &crate::claude_code::Reset {
+                                    command_id: cmd.command_id.clone(),
+                                    to_seq: r.to_seq,
+                                    restore_files: r.restore_files,
+                                    session_id: uuid::Uuid::now_v7().to_string(),
+                                    fresh: true,
+                                    withdrawn: previous.map_or_else(Vec::new, |(r, _)| r.withdrawn),
+                                },
+                            )
+                            .await
+                            .map_err(internal)?;
+                    }
+                }
                 let actor = self.actor(&cmd.session_id).await.map_err(internal)?.ok_or("unknown session on this worker")?;
                 let _ = actor.send(ActorMsg::Rewind { command_id: cmd.command_id, to_seq: r.to_seq, restore_files: r.restore_files });
                 Ok(())
@@ -849,6 +884,58 @@ impl SessionManager {
         Ok(self.load(session_id).await?.map(|h| h.tx))
     }
 
+    /// Check the whole local tree, not just a child's current model turn.
+    /// Raw task/link history remains relevant after a crash or a rewind.
+    async fn rewind_children_stopped(&self, events: &[SessionEvent]) -> anyhow::Result<()> {
+        let mut pending = Vec::new();
+        let mut seen = HashSet::new();
+        let mut descendants = events.to_vec();
+        loop {
+            for event in &descendants {
+                if let Some(session_event::Kind::SubagentSpawned(child)) = &event.kind {
+                    anyhow::ensure!(
+                        child.remote.is_none(),
+                        "Remote subagent {} cannot confirm quiescence; stop confirmation is required before rewinding",
+                        child.child_session_id
+                    );
+                    anyhow::ensure!(!child.child_session_id.is_empty(), "A subagent's identity is unknown; cannot confirm it stopped");
+                    if seen.insert(child.child_session_id.clone()) {
+                        pending.push(child.child_session_id.clone());
+                    }
+                }
+            }
+            let Some(id) = pending.pop() else { return Ok(()) };
+            self.journal.confirm_shell_writers_stopped(&id).await?;
+            let handle = self.actors.lock().unwrap().get(&id).filter(|h| !h.tx.is_closed()).cloned();
+            let registry = if let Some(handle) = handle {
+                anyhow::ensure!(
+                    !handle.running.load(std::sync::atomic::Ordering::SeqCst)
+                        && handle.inbox.lock().unwrap().queue.is_empty()
+                        && !handle.tools.background.list().iter().any(|t| t.running),
+                    "Subagent {id} is still working; stop or wait for it before retrying Rewind"
+                );
+                // A mailbox barrier also covers inputs/notices not yet moved
+                // into Inbox and notices held on the actor's hourly timer.
+                let (reply, idle) = tokio::sync::oneshot::channel();
+                handle.tx.send(ActorMsg::RewindIdle(reply)).map_err(|_| anyhow::anyhow!("Subagent {id} stopped before confirming idle"))?;
+                let idle = tokio::time::timeout(std::time::Duration::from_secs(5), idle)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Subagent {id} did not confirm idle"))?
+                    .map_err(|_| anyhow::anyhow!("Subagent {id} stopped before confirming idle"))?;
+                anyhow::ensure!(idle, "Subagent {id} has pending work; stop or wait for it before retrying Rewind");
+                handle.tools.background.cancel_shell_contexts();
+                handle.tools.background.list()
+            } else {
+                Vec::new()
+            };
+            let Some((_, events)) = self.journal.load_session(&id).await? else {
+                anyhow::bail!("Subagent {id} has no local history; cannot confirm it stopped");
+            };
+            rewind_child_history_stopped(&id, &events, &registry)?;
+            descendants = events;
+        }
+    }
+
     /// The session's live actor and tools, starting it from the journal if
     /// needed.
     async fn load(&self, session_id: &str) -> anyhow::Result<Option<Handle>> {
@@ -1053,6 +1140,14 @@ impl SessionManager {
         let labels = session_labels(&spec.labels, &started.repo, &started.cwd, &started.home, &spawn_model(&spec), &started.ssh_target);
         let ssh = remote.then(|| Arc::new(c6_tools::remote::SshHost::new(&started.ssh_target, &started.home)));
         let session_tools = Arc::new(SessionTools::with_ssh(PathBuf::from(&started.cwd), ssh));
+        session_tools.background.set_shell_owner(self.journal.shell_owner(session_id, &on_behalf_of));
+        // Unlogged starts still own IDs. Reserve before exposing tools, not
+        // through the asynchronous reload mailbox after launches can begin.
+        for source in self.journal.shell_writer_sources(session_id).await? {
+            if let Some(n) = source.strip_prefix("bg").and_then(|n| n.parse().ok()) {
+                session_tools.background.reserve_ids(n);
+            }
+        }
         session_tools.browser.set_profile(self.state_dir.join("browser").join(session_id));
         // Shell commands outlive the worker, and its next run takes them up
         // (docs/restarts.md §3).
@@ -1189,6 +1284,7 @@ impl SessionManager {
             running_flag: Arc::default(),
             claude_code: claude_code.clone(),
             claude: None,
+            withdrawn: HashSet::new(),
             claude_stdin: Arc::default(),
             handoff_announced: false,
             stopping: false,
@@ -1377,6 +1473,132 @@ fn claude_conversation(session_id: &str, spec: &CreateSession, events: &[Session
             }),
         },
     }
+}
+
+/// Apply the worker's durable CLI branch selection as well as public history.
+/// Missing local chain metadata is safe: rewinds then use kept-history seeding.
+async fn journal_claude_conversation(
+    journal: &Journal,
+    session_id: &str,
+    spec: &CreateSession,
+    events: &[SessionEvent],
+) -> anyhow::Result<crate::claude_code::ClaudeConversation> {
+    let mut conversation = claude_conversation(session_id, spec, events);
+    let handoff_seq = events.iter().rev().find(|e| handoff_of(e).is_some()).map_or(0, |e| e.seq);
+    let mut since = handoff_seq;
+    let rewound_seq = events.iter().rev().find(|e| matches!(e.kind, Some(session_event::Kind::Rewound(_)))).map_or(0, |e| e.seq);
+    let mut reset_found = false;
+    if let Some((reset, applied)) = journal.claude_rewind(session_id).await? {
+        anyhow::ensure!(applied != 0, "Claude Code rewind is not confirmed; retry Rewind before sending more input");
+        if applied > handoff_seq && applied >= rewound_seq {
+            reset_found = true;
+            since = applied;
+            conversation.id = reset.session_id;
+            conversation.resume =
+                !reset.fresh || events.iter().any(|e| e.seq > applied && matches!(e.kind, Some(session_event::Kind::TurnStarted(_))));
+            // Apply earlier rewinds before selecting this reset's cutoff:
+            // a later marker can withdraw text before a historical target.
+            let before: Vec<_> = events.iter().filter(|e| e.seq < applied).cloned().collect();
+            let kept: Vec<_> = c6_agent::effective_events(&before).into_iter().filter(|e| e.seq < reset.to_seq).collect();
+            conversation.preamble = Some(c6_agent::rewind_context(&[seed_events(spec), kept].concat(), c6_agent::HANDOFF_BUDGET));
+        }
+    }
+    // A pre-upgrade rewind, or a replacement worker without the old journal:
+    // there is no trustworthy Claude branch mapping. Never resume the original
+    // session. Fresh kept-history seeding is the only safe reconstruction.
+    if rewound_seq > handoff_seq && !reset_found {
+        since = rewound_seq;
+        conversation.id = uuid::Uuid::now_v7().to_string();
+        conversation.resume = false;
+        conversation.preamble = Some(c6_agent::rewind_context(&[seed_events(spec), events.to_vec()].concat(), c6_agent::HANDOFF_BUDGET));
+    }
+    for e in c6_agent::effective_events(events).iter().rev().filter(|e| e.seq > since) {
+        if let Some(session_event::Kind::TurnEnded(_)) = &e.kind
+            && let Some(boundary) = journal.claude_turn(session_id, e.seq).await?
+        {
+            conversation.id = boundary.session_id;
+            conversation.resume = true;
+            break;
+        }
+    }
+    Ok(conversation)
+}
+
+/// Sources removed by any rewind. Late task/subagent notices must never put
+/// the withdrawn work back into the conversation, including after restart.
+fn withdrawn_sources(events: &[SessionEvent]) -> HashSet<String> {
+    let kept: HashSet<_> = c6_agent::effective_events(events).iter().map(|e| e.seq).collect();
+    events
+        .iter()
+        .filter(|e| !kept.contains(&e.seq))
+        .filter_map(|e| match &e.kind {
+            Some(session_event::Kind::BackgroundTask(t)) if t.state == "started" => Some(t.task_id.clone()),
+            Some(session_event::Kind::SubagentSpawned(s)) => Some(s.child_session_id.clone()),
+            Some(session_event::Kind::NoticeQueued(n)) => Some(n.command_id.clone()),
+            _ => None,
+        })
+        .filter(|source| !source.is_empty())
+        .collect()
+}
+
+fn withdrawn_input(sources: &HashSet<String>, input: &PendingInput) -> bool {
+    sources.contains(&input.command_id)
+        || sources.contains(&input.from_session_id)
+        || input.task_notice.as_ref().is_some_and(|n| sources.contains(&n.session_id))
+        || input.command_id.strip_prefix("task:").and_then(|s| s.rsplit_once(':')).is_some_and(|(id, _)| sources.contains(id))
+}
+
+/// A missing actor after restart is not evidence that its work stopped.
+/// Require a durable turn boundary, no pending notices, and closed raw tasks.
+fn rewind_child_history_stopped(id: &str, events: &[SessionEvent], registry: &[c6_tools::TaskInfo]) -> anyhow::Result<()> {
+    anyhow::ensure!(!registry.iter().any(|t| t.running), "Subagent {id} has running background tasks");
+    let last_work = events.iter().rev().find_map(|event| match &event.kind {
+        Some(kind @ (session_event::Kind::User(_) | session_event::Kind::TurnStarted(_) | session_event::Kind::TurnEnded(_))) => Some(kind),
+        _ => None,
+    });
+    anyhow::ensure!(
+        matches!(last_work, Some(session_event::Kind::TurnEnded(end))
+            if matches!(TurnEndReason::try_from(end.reason),
+                Ok(TurnEndReason::Completed | TurnEndReason::Interrupted | TurnEndReason::Error))),
+        "Subagent {id} has no confirmed terminal turn boundary"
+    );
+    anyhow::ensure!(notices_of(events).2.is_empty(), "Subagent {id} has pending notices");
+    let mut tasks = HashMap::new();
+    for event in events {
+        if let Some(session_event::Kind::BackgroundTask(task)) = &event.kind {
+            tasks.insert(&task.task_id, task);
+        }
+    }
+    for task in tasks.values() {
+        anyhow::ensure!(
+            matches!(task.state.as_str(), "finished" | "failed" | "lost" | "stopped" | "stopped_by_user"),
+            "Subagent {id} has an unclosed background task {}",
+            task.task_id
+        );
+        if task.state == "lost" && task.kind != "agent" {
+            let pgid = events.iter().find_map(|event| match &event.kind {
+                Some(session_event::Kind::BackgroundTask(start)) if start.task_id == task.task_id && start.state == "started" => {
+                    Some(start.pgid)
+                }
+                _ => None,
+            });
+            anyhow::ensure!(
+                pgid.is_some_and(
+                    |pgid| pgid > 0 && nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), None) == Err(nix::errno::Errno::ESRCH)
+                ),
+                "Subagent {id} lost background task {} without confirming its process stopped",
+                task.task_id
+            );
+        } else if task.state == "lost" {
+            anyhow::ensure!(
+                events.iter().any(|event| matches!(&event.kind,
+                    Some(session_event::Kind::SubagentSpawned(child)) if child.background_task_id == task.task_id)),
+                "Subagent {id} lost background task {} without a known child",
+                task.task_id
+            );
+        }
+    }
+    Ok(())
 }
 
 /// What a log says about its notices (docs/background.md §5): when notices
@@ -1722,6 +1944,7 @@ struct Actor {
     /// Its Claude Code process while no turn holds it (docs/background.md
     /// §4), and that process's input.
     claude: Option<crate::claude_code::Process>,
+    withdrawn: HashSet<String>,
     claude_stdin: crate::claude_code::Stdin,
     /// The log says a switch away from Claude Code waits for its tasks.
     handoff_announced: bool,
@@ -1740,19 +1963,69 @@ type ParentTools = (Arc<SessionTools>, bool);
 /// process if it is still up. `None`: the turn failed to record itself.
 type TurnTask = tokio::task::JoinHandle<Option<(Conversation, Option<crate::claude_code::Process>)>>;
 
+struct CancelShellContexts(Arc<SessionTools>);
+
+impl Drop for CancelShellContexts {
+    fn drop(&mut self) {
+        // An unrelated actor failure can also strand an in-flight tool call.
+        // Reload creates fresh tools; the old callbacks must stay canceled.
+        self.0.background.cancel_shell_contexts();
+    }
+}
+
 impl Actor {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<ActorMsg>) {
+        // Locals drop before arguments: seal old callbacks before rx closes
+        // and another caller can reload the actor, including on task abort.
+        let _shell_contexts = CancelShellContexts(self.session_tools.clone());
+        match self.journal.events_after(&self.writer.session_id, 0, u32::MAX).await {
+            Ok(events) => self.withdrawn = withdrawn_sources(&events),
+            Err(e) => {
+                error!("loading withdrawn task sources: {e:#}");
+                return;
+            }
+        }
+        if let Ok(Some((r, _))) = self.journal.claude_rewind(&self.writer.session_id).await {
+            self.withdrawn.extend(r.withdrawn);
+        }
         self.take_up_held().await;
         let mut running: Option<(TurnTask, CancellationToken)> = None;
-        // A rewind that waits for the running turn to stop.
-        let mut rewind: Option<(String, u64, bool)> = None;
-        loop {
-            if running.is_none()
-                && let Some((command_id, to_seq, restore)) = rewind.take()
-                && let Err(e) = self.rewind(command_id, to_seq, restore).await
-            {
-                error!(session = %self.writer.session_id, "rewinding: {e:#}");
+        // Rewinds wait for the running turn to stop. Do not let a retry
+        // replace the original receipt while cancellation is still pending.
+        let mut rewinds = match self.journal.claude_rewind(&self.writer.session_id).await {
+            Ok(Some((r, 0))) => VecDeque::from([(r.command_id, r.to_seq, r.restore_files)]),
+            Ok(_) => VecDeque::new(),
+            Err(e) => {
+                error!("loading Claude Code rewind: {e:#}");
                 return;
+            }
+        };
+        loop {
+            while running.is_none()
+                && let Some((command_id, to_seq, restore)) = rewinds.pop_front()
+            {
+                // Recovery and head redelivery may queue the same receipt.
+                // Never replay a confirmed rewind over subsequent input.
+                match self.journal.is_applied(&command_id).await {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(e) => {
+                        error!("checking rewind receipt: {e:#}");
+                        return;
+                    }
+                }
+                if let Err(e) = self.rewind(command_id, to_seq, restore).await {
+                    error!(session = %self.writer.session_id, "rewinding: {e:#}");
+                    let _ = self
+                        .writer
+                        .append(session_event::Kind::Error(ErrorEvent {
+                            message: format!(
+                                "Rewind could not be confirmed; no further messages were sent. Retry Rewind after resolving this: {e:#}"
+                            ),
+                        }))
+                        .await;
+                    return;
+                }
             }
             let handoff_waits = running.is_none() && self.handoff_waits();
             if handoff_waits && !self.handoff_announced {
@@ -2114,8 +2387,21 @@ impl Actor {
                         }
                     }
                     Some(ActorMsg::Rewind { command_id, to_seq, restore_files }) => {
+                        match self.journal.is_applied(&command_id).await {
+                            Ok(true) => continue,
+                            Ok(false) => {},
+                            Err(e) => { error!("checking rewind receipt: {e:#}"); return; }
+                        }
                         if let Some((_, cancel)) = &running { cancel.cancel(); }
-                        rewind = Some((command_id, to_seq, restore_files));
+                        rewinds.push_back((command_id, to_seq, restore_files));
+                    }
+                    Some(ActorMsg::RewindIdle(reply)) => {
+                        let idle = running.is_none()
+                            && self.inbox.lock().unwrap().queue.is_empty()
+                            && self.deferred.is_empty()
+                            && !self.session_tools.background.list().iter().any(|t| t.running)
+                            && rx.is_empty();
+                        let _ = reply.send(idle);
                     }
                 },
                 // Claude Code wrote while no turn ran: a background task's
@@ -2324,6 +2610,17 @@ impl Actor {
     /// notice, which wakes the session if a call had waited. The log then
     /// says it came, so the head stops sending it.
     async fn remote_report(&mut self, command_id: String, ended: c6_proto::DelegationEnded, busy: bool) -> anyhow::Result<()> {
+        if self.withdrawn.contains(&ended.child_session_id) {
+            self.writer
+                .append(session_event::Kind::SubagentReported(c6_proto::SubagentReported {
+                    command_id,
+                    child_session_id: ended.child_session_id,
+                    call_id: ended.call_id,
+                    status: "withdrawn".into(),
+                }))
+                .await?;
+            return Ok(());
+        }
         if self.remote_receipts.iter().any(|r| r.command_id == command_id) {
             // Reconnected before the waiting tool recorded its result.
             // The source command remains pending; do not tell it twice.
@@ -2432,6 +2729,9 @@ impl Actor {
     /// (`NoticeQueued`), so a reload delivers it if no turn took it, then
     /// delivered (`deliver_notice`). One already recorded is ignored.
     async fn notice(&mut self, input: PendingInput, busy: bool, wake: bool) -> anyhow::Result<()> {
+        if self.withdrawn_input(&input) {
+            return Ok(());
+        }
         if !self.noticed.insert(input.command_id.clone()) {
             return Ok(());
         }
@@ -2461,6 +2761,9 @@ impl Actor {
     /// beyond it, once the hour allows), else it waits for the next input.
     /// `announce`: say so in the log when the limit holds it.
     async fn deliver_notice(&mut self, input: PendingInput, busy: bool, wake: bool, announce: bool) -> anyhow::Result<()> {
+        if self.withdrawn_input(&input) {
+            return Ok(());
+        }
         // What the agent does next follows from this message's chain.
         if input.hops > 0 {
             self.session_tools.set_message_hops(input.hops);
@@ -2520,9 +2823,13 @@ impl Actor {
         busy: bool,
         wake: bool,
     ) -> anyhow::Result<()> {
+        let withdrawn = self.withdrawn.contains(&record.task_id);
         let command_id = format!("task:{}:{}", record.task_id, record.state);
-        let task_notice = Some(background_task_notice(&record, output));
+        let task_notice = (!withdrawn).then(|| background_task_notice(&record, output));
         self.writer.append(session_event::Kind::BackgroundTask(record)).await?;
+        if withdrawn {
+            return Ok(());
+        }
         let Some(text) = notice else { return Ok(()) };
         let input = PendingInput { command_id, text, command: "task-notification".into(), task_notice, ..Default::default() };
         self.notice(input, busy, wake).await
@@ -2539,10 +2846,14 @@ impl Actor {
     async fn rewind(&mut self, command_id: String, to_seq: u64, restore_files: bool) -> anyhow::Result<()> {
         let sid = self.writer.session_id.clone();
         let events = self.journal.events_after(&sid, 0, u32::MAX).await?;
+        if self.runs_claude_code() {
+            self.reset_claude(&events, &command_id, to_seq, restore_files).await?;
+        }
         let mut restore_error = String::new();
         let mut restored = false;
         if restore_files {
-            let commit = events.iter().filter(|e| e.seq < to_seq).rev().find_map(|e| match &e.kind {
+            let effective = c6_agent::effective_events(&events);
+            let commit = effective.iter().filter(|e| e.seq < to_seq).rev().find_map(|e| match &e.kind {
                 Some(session_event::Kind::Checkpoint(c)) if !c.commit.is_empty() => Some(c.commit.clone()),
                 _ => None,
             });
@@ -2557,8 +2868,252 @@ impl Actor {
         self.writer.append(session_event::Kind::Rewound(Rewound { command_id, to_seq, restored_files: restored, restore_error })).await?;
         info!(session = %sid, to_seq, restored, "rewound");
         let events = self.journal.events_after(&sid, 0, u32::MAX).await?;
+        self.withdrawn = withdrawn_sources(&events);
+        if let Some((r, _)) = self.journal.claude_rewind(&sid).await? {
+            self.withdrawn.extend(r.withdrawn);
+        }
+        let withdrawn = &self.withdrawn;
+        self.deferred.retain(|(i, _)| !withdrawn_input(withdrawn, i));
+        self.inbox.lock().unwrap().queue.retain(|(i, _)| !withdrawn_input(withdrawn, i));
         self.conv = Some(conversation_from_log(&mut self.spec, &events));
         Ok(())
+    }
+
+    fn withdrawn_input(&self, input: &PendingInput) -> bool {
+        withdrawn_input(&self.withdrawn, input)
+    }
+
+    async fn reset_claude(&mut self, events: &[SessionEvent], command_id: &str, to_seq: u64, restore_files: bool) -> anyhow::Result<()> {
+        use crate::claude_code::{Launch, Observer, Process, Reset};
+        self.session_tools.background.cancel_shell_contexts();
+        let sid = &self.writer.session_id;
+        let mut reset = Reset {
+            command_id: command_id.into(),
+            to_seq,
+            restore_files,
+            session_id: uuid::Uuid::now_v7().to_string(),
+            fresh: true,
+            withdrawn: self.withdrawn.iter().cloned().collect(),
+        };
+        // Intent is durable before touching the old process. A crash or a
+        // failed initialization cannot let the next actor resume old history.
+        self.journal.prepare_claude_rewind(sid, &reset).await?;
+        let known_kept: HashSet<_> = events
+            .iter()
+            .filter(|e| e.seq < to_seq)
+            .filter_map(|e| match &e.kind {
+                Some(session_event::Kind::BackgroundTask(t)) if t.state == "started" => Some(t.task_id.as_str()),
+                Some(session_event::Kind::SubagentSpawned(s)) => Some(s.child_session_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        // Pending intent atomically closes shell admission for this tree.
+        // Reservations precede process creation, independent of task sinks.
+        // Capture source IDs before any fallible cleanup and retain them in
+        // ownership rows even after absence is confirmed or this actor exits.
+        reset
+            .withdrawn
+            .extend(self.journal.shell_writer_sources(sid).await?.into_iter().filter(|source| !known_kept.contains(source.as_str())));
+        reset.withdrawn.sort();
+        reset.withdrawn.dedup();
+        self.journal.prepare_claude_rewind(sid, &reset).await?;
+        if let Some(p) = self.claude.take() {
+            p.stop_for_rewind().await?;
+        }
+        // A prior actor/worker or failed initialization may have lost its
+        // leader while descendants survived. Missing Process is not proof.
+        crate::claude_code::confirm_stopped(&self.journal, sid, std::time::Duration::from_secs(3)).await?;
+        self.journal.confirm_shell_writers_stopped(sid).await?;
+        // Registry insertion precedes asynchronous ActorMsg::Task logging.
+        // Snapshot after stopping the old process so queued starts/ends and
+        // stop-generated Lost events cannot evade source tracking.
+        for task in self.session_tools.background.list() {
+            if task.kind == c6_tools::TaskKind::ClaudeCode || !known_kept.contains(task.id.as_str()) {
+                reset.withdrawn.push(task.id);
+            }
+        }
+        reset.withdrawn.extend(
+            events
+                .iter()
+                .filter(|e| e.seq >= to_seq)
+                .filter_map(|e| match &e.kind {
+                    Some(session_event::Kind::SubagentSpawned(s)) => Some(s.child_session_id.clone()),
+                    Some(session_event::Kind::BackgroundTask(t)) if t.state == "started" => Some(t.task_id.clone()),
+                    Some(session_event::Kind::NoticeQueued(n)) => Some(n.command_id.clone()),
+                    _ => None,
+                })
+                .filter(|source| !source.is_empty()),
+        );
+        reset.withdrawn.sort();
+        reset.withdrawn.dedup();
+        self.journal.prepare_claude_rewind(sid, &reset).await?;
+        // carbon6 tasks may be remote, where cancellation cannot be confirmed
+        // while disconnected. Do not pretend their work stopped. Native CLI
+        // tasks and mirrored subagents have already stopped with the process.
+        anyhow::ensure!(
+            !self.session_tools.background.list().iter().any(|t| t.running && t.kind != c6_tools::TaskKind::ClaudeCode),
+            "Stop or wait for carbon6 background tasks/subagents before rewinding"
+        );
+        // A child's own background work or descendants can outlive its turn.
+        self.manager.rewind_children_stopped(events).await?;
+        let registry = self.session_tools.background.list();
+        let mut durable_tasks = HashMap::new();
+        for e in events {
+            if let Some(session_event::Kind::BackgroundTask(t)) = &e.kind {
+                durable_tasks.insert(&t.task_id, t);
+            }
+        }
+        for task in durable_tasks.values().filter(|t| t.state == "started" && t.kind != "claude_code") {
+            if registry.iter().any(|t| t.id == task.task_id && !t.running) {
+                continue;
+            }
+            if task.kind == "agent"
+                && events.iter().any(|e| {
+                    matches!(&e.kind,
+                Some(session_event::Kind::SubagentSpawned(s)) if s.background_task_id == task.task_id)
+                })
+            {
+                continue;
+            }
+            // Recovery normally handles orphan shells through ActorMsg::Lost,
+            // but a pending reset runs before that mailbox. Stop/check here so
+            // file restore cannot race a recovered writer. Unknown identity is
+            // a refusal, never permission to kill another process or continue.
+            stop_orphan(task.pgid, &task.description);
+            anyhow::ensure!(
+                task.pgid > 0 && nix::sys::signal::killpg(nix::unistd::Pid::from_raw(task.pgid), None) == Err(nix::errno::Errno::ESRCH),
+                "Background task {} has not confirmed that it stopped; stop it before retrying Rewind",
+                task.task_id
+            );
+        }
+        let effective = c6_agent::effective_events(events);
+        let kept: Vec<_> = effective.iter().filter(|e| e.seq < to_seq).collect();
+        let mut cutoff = None;
+        if let Some(e) = kept.iter().rev().find(|e| matches!(e.kind, Some(session_event::Kind::TurnEnded(_))))
+            && let Some(session_event::Kind::TurnEnded(t)) = &e.kind
+            && t.reason == TurnEndReason::Completed as i32
+            && !kept.iter().any(|later| {
+                later.seq > e.seq
+                    && matches!(
+                        later.kind,
+                        Some(
+                            session_event::Kind::User(_)
+                                | session_event::Kind::Assistant(_)
+                                | session_event::Kind::ToolResult(_)
+                                | session_event::Kind::Compaction(_)
+                        )
+                    )
+            })
+            && let Some(boundary) = self.journal.claude_turn(sid, e.seq).await?
+            && !boundary.cutoff_uuid.is_empty()
+            && uuid::Uuid::parse_str(&boundary.cutoff_uuid).is_ok()
+            && uuid::Uuid::parse_str(&boundary.session_id).is_ok()
+        {
+            cutoff = Some(boundary);
+        }
+        let bin = crate::claude_code::find_claude().ok_or_else(|| anyhow::anyhow!("Claude Code is not installed on this worker"))?;
+        let model = self.spec.model.as_ref().cloned().unwrap_or_default();
+        let tools = self.claude_code_subagent_tools();
+        let core = claude_code_core(&self.spec);
+        let names = tools
+            .iter()
+            .map(|t| {
+                let n = t.spec().name;
+                if core.iter().any(|c| c6_tools::tool_allowed(std::slice::from_ref(c), &n)) { format!("{n}*") } else { n }
+            })
+            .collect();
+        let launch = Launch {
+            conversation: reset.session_id.clone(),
+            effort: (!model.effort.is_empty()).then_some(model.effort),
+            settings: Some(claude_code_settings(&self.spec, self.hooks.as_ref().map(|h| h.claude_settings()).as_deref())),
+            system_prompt: (!tools.is_empty()).then(|| self.claude_code_system_prompt(&tools)),
+            tools: names,
+            worker: c6_core::build().into(),
+            native: claude_code_native(&self.spec),
+            extra_args: Vec::new(),
+        };
+        let bridge = if tools.is_empty() { None } else { self.manager.bridge().await };
+        let register = || {
+            bridge.as_ref().map(|b| {
+                b.register(crate::mcp_bridge::Entry {
+                    session_id: sid.clone(),
+                    session: self.session_tools.clone(),
+                    tools: tools.clone(),
+                    cancel: Mutex::default(),
+                    journal: self.journal.clone(),
+                    matched: Mutex::default(),
+                    policies: self.policies.clone(),
+                    instructions: CLAUDE_CODE_INTRO.into(),
+                    core: core.clone(),
+                })
+            })
+        };
+        let observer = Arc::new(Observer {
+            tools: self.session_tools.clone(),
+            journal: self.journal.clone(),
+            link: self.link.clone(),
+            session_id: sid.clone(),
+            spec: self.spec.clone(),
+            started: self.started.clone(),
+        });
+        let mut attempts = Vec::new();
+        if let Some(cutoff) = cutoff {
+            let mut fork = launch.clone();
+            fork.conversation = cutoff.session_id;
+            // The cutoff is inclusive. Choose a fresh fork ID, then adopt the
+            // session_id from stream-json on every subsequent turn.
+            fork.extra_args = vec![
+                "--resume-session-at".into(),
+                cutoff.cutoff_uuid,
+                "--fork-session".into(),
+                "--session-id".into(),
+                reset.session_id.clone(),
+            ];
+            attempts.push((fork, true));
+        }
+        attempts.push((launch, false));
+        let mut last_error = String::new();
+        for (mut launch, resume) in attempts {
+            reset.fresh = !resume;
+            if !resume {
+                reset.session_id = uuid::Uuid::now_v7().to_string();
+                launch.conversation = reset.session_id.clone();
+            }
+            self.journal.prepare_claude_rewind(sid, &reset).await?;
+            let mut p = match Process::spawn(
+                &bin,
+                launch,
+                resume,
+                &self.session_tools.cwd(),
+                &model.model,
+                self.claude_stdin.clone(),
+                register(),
+                Some(observer.clone()),
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    last_error = e.to_string();
+                    continue;
+                }
+            };
+            match p.ready(&reset.session_id).await {
+                Ok(confirmed_id) => {
+                    reset.session_id = confirmed_id;
+                    self.journal.prepare_claude_rewind(sid, &reset).await?;
+                    p.record_in(&self.manager.claude_dir());
+                    self.claude = Some(p);
+                    return Ok(());
+                }
+                Err(e) => {
+                    last_error = format!("{e:#}");
+                    p.stop_for_rewind().await?;
+                    // Do not let fresh fallback conceal a failed fork's
+                    // surviving descendants, including across a restart.
+                    crate::claude_code::confirm_stopped(&self.journal, sid, std::time::Duration::from_secs(3)).await?;
+                }
+            }
+        }
+        anyhow::bail!("Claude Code could not initialize the kept conversation: {last_error}")
     }
 
     /// Runs the session on `model` from the next turn on. Earlier reasoning
@@ -2802,6 +3357,7 @@ impl Actor {
         self.turns += 1;
         let turn = self.turns;
         let cancel = CancellationToken::new();
+        self.session_tools.background.shell_context(&cancel);
         let model = self.spec.model.clone().unwrap_or_default();
         let provider = Provider::from_kind(&model.connection_kind).unwrap_or(Provider::OpenAiChat);
         let info = model_info(provider, &model.model);
@@ -2937,8 +3493,14 @@ impl Actor {
                 };
                 // Which of Claude Code's conversations this turn continues
                 // (and what a new one is told first), as the log has it.
-                let conversation = match log.events_after(&writer.session_id, 0, u32::MAX).await {
-                    Ok(events) => claude_conversation(&writer.session_id, spec_for_claude.as_ref().expect("a Claude Code turn"), &events),
+                let conversation = match async {
+                    let events = log.events_after(&writer.session_id, 0, u32::MAX).await?;
+                    journal_claude_conversation(&log, &writer.session_id, spec_for_claude.as_ref().expect("a Claude Code turn"), &events)
+                        .await
+                }
+                .await
+                {
+                    Ok(conversation) => conversation,
                     Err(e) => {
                         error!(session = %writer.session_id, "turn failed: {e:#}");
                         return None;
@@ -3090,7 +3652,7 @@ async fn claude_turn(
     }
     // A new conversation gets the preamble first (also when a resume finds
     // none: the first turn may have failed before Claude Code saved it).
-    let preamble = (bin.is_some() && !conversation.resume).then_some(conversation.preamble.as_deref()).flatten();
+    let preamble = p.needs_preamble().then_some(conversation.preamble.as_deref()).flatten();
     let mut end = p.turn(turn, inputs.clone(), false, preamble, model, sink, &feed, &more, cancel).await?;
     if end.no_conversation
         && let Some(bin) = &bin
@@ -3835,7 +4397,7 @@ impl EventSink for Writer {
 /// Stops a background command left running by a previous worker process,
 /// if process group `pgid` still runs that command (pids get reused).
 fn stop_orphan(pgid: i32, command: &str) {
-    if pgid <= 0 {
+    if pgid <= 0 || command.trim().is_empty() {
         return;
     }
     let args = std::process::Command::new("ps").args(["-o", "args=", "-p", &pgid.to_string()]).output();
@@ -4536,6 +5098,7 @@ mod label_tests {
         let mut other = spawn("sleep 78; echo other-test");
         let pid = |c: &Group| c.0.id() as i32;
         // A different command under that pid is left alone.
+        stop_orphan(pid(&other), "   ");
         stop_orphan(pid(&other), "sleep 77; echo orphan-test");
         stop_orphan(pid(&orphan), "sleep 77; echo orphan-test");
         c6_testkit::eventually("the orphan to stop", async || orphan.0.try_wait().unwrap()).await;
@@ -5229,6 +5792,606 @@ mod handoff_tests {
         }
         assert!(!is_rewindable_message(&ev(1, session_event::Kind::Assistant(Default::default()))));
         assert!(!is_rewindable_message(&SessionEvent::default()));
+    }
+
+    #[tokio::test]
+    async fn claude_rewind_mapping_survives_reload_and_missing_metadata_never_resumes_old_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(&dir.path().join("journal.db")).await.unwrap();
+        let spec = CreateSession::default();
+        let started = ev(1, session_event::Kind::Started(SessionStarted::default()));
+        journal.create_session("s", &spec, &started).await.unwrap();
+        let mut events = vec![
+            started,
+            user(2, "APPLE"),
+            user(3, "BANANA"),
+            ev(4, session_event::Kind::Rewound(Rewound { command_id: "r".into(), to_seq: 3, ..Default::default() })),
+        ];
+        let old = journal_claude_conversation(&journal, "s", &spec, &events).await.unwrap();
+        assert!(!old.resume);
+        assert_ne!(old.id, "s");
+        let preamble = old.preamble.unwrap();
+        assert!(preamble.contains("APPLE") && !preamble.contains("BANANA"), "{preamble}");
+
+        let reset = crate::claude_code::Reset {
+            command_id: "r".into(),
+            to_seq: 3,
+            restore_files: false,
+            session_id: "fork".into(),
+            fresh: false,
+            withdrawn: Vec::new(),
+        };
+        journal.prepare_claude_rewind("s", &reset).await.unwrap();
+        assert!(journal_claude_conversation(&journal, "s", &spec, &events).await.is_err(), "pending resets must fail closed");
+        for e in &events[1..] {
+            journal.append("s", e).await.unwrap();
+        }
+        drop(journal);
+        let journal = Journal::open(&dir.path().join("journal.db")).await.unwrap();
+        let fork = journal_claude_conversation(&journal, "s", &spec, &events).await.unwrap();
+        assert!(fork.resume);
+        assert_eq!(fork.id, "fork");
+        journal
+            .record_claude_turn(
+                "s",
+                5,
+                &crate::claude_code::Boundary {
+                    session_id: "returned-fork-id".into(),
+                    input_uuids: vec!["top-level-user".into()],
+                    cutoff_uuid: "final-assistant".into(),
+                },
+            )
+            .await
+            .unwrap();
+        events.push(ev(5, session_event::Kind::TurnEnded(TurnEnded { turn: 2, reason: TurnEndReason::Completed as i32 })));
+        let next = journal_claude_conversation(&journal, "s", &spec, &events).await.unwrap();
+        assert_eq!(next.id, "returned-fork-id");
+        assert!(next.resume);
+        assert_eq!(journal.claude_turn("s", 5).await.unwrap().unwrap().input_uuids, ["top-level-user"]);
+    }
+
+    #[tokio::test]
+    async fn fresh_reset_applies_prior_rewinds_before_a_historical_cutoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(&dir.path().join("journal.db")).await.unwrap();
+        let spec = CreateSession::default();
+        let started = ev(1, session_event::Kind::Started(SessionStarted::default()));
+        journal.create_session("s", &spec, &started).await.unwrap();
+        let events = vec![
+            started,
+            user(2, "APPLE"),
+            user(3, "PRIVATE_WITHDRAWN"),
+            user(4, "HISTORICAL_TARGET"),
+            ev(5, session_event::Kind::Rewound(Rewound { command_id: "r1".into(), to_seq: 3, ..Default::default() })),
+            ev(6, session_event::Kind::Rewound(Rewound { command_id: "r2".into(), to_seq: 4, ..Default::default() })),
+        ];
+        journal
+            .prepare_claude_rewind(
+                "s",
+                &crate::claude_code::Reset {
+                    command_id: "r2".into(),
+                    to_seq: 4,
+                    restore_files: false,
+                    session_id: "fresh".into(),
+                    fresh: true,
+                    withdrawn: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        for event in &events[1..] {
+            journal.append("s", event).await.unwrap();
+        }
+        let context = journal_claude_conversation(&journal, "s", &spec, &events).await.unwrap();
+        assert!(!context.resume);
+        let preamble = context.preamble.unwrap();
+        assert!(preamble.contains("APPLE") && !preamble.contains("PRIVATE") && !preamble.contains("HISTORICAL_TARGET"), "{preamble}");
+    }
+
+    #[test]
+    fn late_notices_from_withdrawn_tasks_and_children_are_not_new_context() {
+        let events = vec![
+            ev(
+                1,
+                session_event::Kind::BackgroundTask(BackgroundTask {
+                    task_id: "kept".into(),
+                    state: "started".into(),
+                    ..Default::default()
+                }),
+            ),
+            user(2, "withdraw this turn"),
+            ev(
+                3,
+                session_event::Kind::SubagentSpawned(c6_proto::SubagentSpawned { child_session_id: "child".into(), ..Default::default() }),
+            ),
+            ev(
+                4,
+                session_event::Kind::BackgroundTask(BackgroundTask {
+                    task_id: "bg1".into(),
+                    state: "started".into(),
+                    ..Default::default()
+                }),
+            ),
+            ev(5, session_event::Kind::Rewound(Rewound { to_seq: 2, ..Default::default() })),
+        ];
+        let sources = withdrawn_sources(&events);
+        assert_eq!(sources, HashSet::from(["child".into(), "bg1".into()]));
+        assert!(withdrawn_input(&sources, &PendingInput { from_session_id: "child".into(), ..Default::default() }));
+        assert!(withdrawn_input(&sources, &PendingInput { command_id: "task:bg1:finished".into(), ..Default::default() }));
+        assert!(withdrawn_input(
+            &sources,
+            &PendingInput {
+                task_notice: Some(c6_proto::TaskNotice { session_id: "child".into(), ..Default::default() }),
+                ..Default::default()
+            }
+        ));
+        assert!(!withdrawn_input(&sources, &PendingInput { command_id: "task:kept:finished".into(), ..Default::default() }));
+    }
+
+    #[tokio::test]
+    async fn rewind_withdraws_held_native_wake_by_full_command_id_and_persists_it() {
+        let wake = "task:claude-wake:0199-not-a-task-id";
+        let events = vec![
+            ev(1, session_event::Kind::Started(SessionStarted::default())),
+            user(2, "withdraw the task"),
+            ev(
+                3,
+                session_event::Kind::NoticeQueued(c6_proto::NoticeQueued {
+                    command_id: wake.into(),
+                    text: "withdrawn native task output".into(),
+                    task_notice: Some(c6_proto::TaskNotice { kind: "task".into(), ..Default::default() }),
+                    ..Default::default()
+                }),
+            ),
+            ev(4, session_event::Kind::Rewound(Rewound { command_id: "rewind".into(), to_seq: 2, ..Default::default() })),
+        ];
+        let sources = withdrawn_sources(&events);
+        assert!(sources.contains(wake), "the synthetic wake has no task/session provenance; retain its full command ID");
+        let input = PendingInput { command_id: wake.into(), text: "withdrawn native task output".into(), ..Default::default() };
+        assert!(withdrawn_input(&sources, &input));
+        let mut held = vec![(input.clone(), true)];
+        held.retain(|(input, _)| !withdrawn_input(&sources, input));
+        assert!(held.is_empty(), "the next user input must not release the withdrawn wake");
+        assert!(!withdrawn_input(&sources, &PendingInput { command_id: "task:claude-wake:new".into(), ..Default::default() }));
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(&dir.path().join("journal.db")).await.unwrap();
+        let reset = crate::claude_code::Reset {
+            command_id: "rewind".into(),
+            to_seq: 2,
+            restore_files: false,
+            session_id: "fresh".into(),
+            fresh: true,
+            withdrawn: sources.into_iter().collect(),
+        };
+        journal.prepare_claude_rewind("s", &reset).await.unwrap();
+        drop(journal);
+        let journal = Journal::open(&dir.path().join("journal.db")).await.unwrap();
+        let (reset, _) = journal.claude_rewind("s").await.unwrap().unwrap();
+        assert!(withdrawn_input(&reset.withdrawn.into_iter().collect(), &input), "worker restart must retain suppression");
+    }
+
+    fn rewind_child_events() -> Vec<SessionEvent> {
+        vec![
+            ev(1, session_event::Kind::Started(SessionStarted::default())),
+            ev(2, session_event::Kind::TurnStarted(TurnStarted { turn: 1, ..Default::default() })),
+            ev(3, session_event::Kind::TurnEnded(TurnEnded { turn: 1, reason: TurnEndReason::Completed as i32 })),
+        ]
+    }
+
+    fn rewind_child_link(id: &str) -> SessionEvent {
+        ev(4, session_event::Kind::SubagentSpawned(c6_proto::SubagentSpawned { child_session_id: id.into(), ..Default::default() }))
+    }
+
+    async fn rewind_test_manager() -> (tempfile::TempDir, SessionManager) {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(&dir.path().join("journal.db")).await.unwrap());
+        let manager = SessionManager::new(journal, Arc::new(HeadLink::default()), dir.path().join("worktrees"));
+        (dir, manager)
+    }
+
+    #[tokio::test]
+    async fn shell_writer_unlogged_start_blocks_failed_rewind_reload_and_late_notice() {
+        if !c6_testkit::have("python3") {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let (state, manager) = rewind_test_manager().await;
+        let work = tempfile::tempdir().unwrap();
+        let file = work.path().join("owned.txt");
+        std::fs::write(&file, "checkpoint").unwrap();
+        let checkpoint = Checkpoints::new(state.path(), "s", work.path()).snapshot().await.unwrap();
+        std::fs::write(&file, "unrestored").unwrap();
+        let events = [
+            ev(
+                1,
+                session_event::Kind::Started(SessionStarted {
+                    tool_profile: crate::claude_code::PROFILE.into(),
+                    cwd: work.path().display().to_string(),
+                    ..Default::default()
+                }),
+            ),
+            ev(2, session_event::Kind::Checkpoint(Checkpoint { commit: checkpoint, error: String::new() })),
+            user(3, "withdraw this"),
+        ];
+        manager.journal.import("s", &CreateSession::default(), &events).await.unwrap();
+        let old = manager.load("s").await.unwrap().unwrap();
+        // Force the forwarding/mailbox gap: retain Started outside the actor.
+        let (tx, mut notices) = mpsc::unbounded_channel();
+        old.tools.background.set_sink(Some(tx));
+        let old_context = CancellationToken::new();
+        old.tools.background.shell_context(&old_context);
+        let command = "exec python3 -c 'import pathlib,time\np=pathlib.Path(\"writer-progress\")\nwhile True:\n p.write_text(str(time.monotonic_ns()))\n time.sleep(0.01)'";
+        let task = old.tools.background.spawn(command, work.path(), true, &old_context).await.unwrap();
+        let started = c6_testkit::within("unforwarded shell start", notices.recv()).await.unwrap();
+        assert_eq!(started.state, c6_tools::TaskState::Started);
+        let progress = work.path().join("writer-progress");
+        let tick = c6_testkit::eventually("shell to write its progress", async || {
+            std::fs::read_to_string(&progress).ok().filter(|text| !text.is_empty())
+        })
+        .await;
+        let rewind = || SessionCommand {
+            session_id: "s".into(),
+            command_id: "rewind".into(),
+            kind: Some(session_command::Kind::Rewind(c6_proto::Rewind { to_seq: 3, restore_files: true })),
+        };
+        manager.handle(rewind()).await.unwrap();
+        c6_testkit::within("failed actor to exit", old.tx.closed()).await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "unrestored");
+        let raw = manager.journal.events_after("s", 0, u32::MAX).await.unwrap();
+        assert!(!raw.iter().any(|e| matches!(e.kind, Some(session_event::Kind::BackgroundTask(_) | session_event::Kind::Rewound(_)))));
+        assert!(raw.iter().any(|e| matches!(&e.kind, Some(session_event::Kind::Error(e)) if e.message.contains("Background shell"))));
+        assert!(manager.journal.claude_rewind("s").await.unwrap().unwrap().0.withdrawn.contains(&task));
+
+        // Fresh SessionTools has no registry or raw task from which to recover.
+        let reloaded = manager.load("s").await.unwrap().unwrap();
+        assert!(reloaded.tools.background.list().is_empty());
+        c6_testkit::within("reloaded actor to refuse the live writer", reloaded.tx.closed()).await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "unrestored");
+        assert!(!manager.journal.is_applied("rewind").await.unwrap());
+        assert!(old_context.is_cancelled());
+        c6_testkit::eventually("writer to keep writing after both failed attempts", async || {
+            std::fs::read_to_string(&progress).ok().filter(|text| !text.is_empty() && text != &tick)
+        })
+        .await;
+
+        old.tools.background.kill_by_user(&task).unwrap();
+        let done = c6_testkit::within("unforwarded shell completion", notices.recv()).await.unwrap();
+        c6_testkit::eventually("owned shell group to disappear", async || manager.journal.confirm_shell_writers_stopped("s").await.ok())
+            .await;
+        assert!(manager.journal.shell_writer_sources("s").await.unwrap().contains(&task), "ESRCH must not erase source identity");
+
+        // Only now is a fake no-model initialize allowed, followed by restore.
+        let bin = state.path().join("claude-shell-rewind");
+        std::fs::write(
+            &bin,
+            r#"#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    v = json.loads(line)
+    assert v['type'] == 'control_request' and v['request']['subtype'] == 'initialize'
+    print(json.dumps({'type': 'control_response', 'response': {'subtype': 'success', 'request_id': v['request_id']}}), flush=True)
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        struct RestoreBin(Option<PathBuf>);
+        impl Drop for RestoreBin {
+            fn drop(&mut self) {
+                let _ = crate::claude_code::replace_test_bin(self.0.take());
+            }
+        }
+        let _bin = RestoreBin(crate::claude_code::replace_test_bin(Some(bin)));
+        manager.handle(rewind()).await.unwrap();
+        c6_testkit::eventually("rewind after confirmed shell absence", async || {
+            manager.journal.is_applied("rewind").await.unwrap().then_some(())
+        })
+        .await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "checkpoint");
+        assert!(!progress.exists(), "only a confirmed stopped writer may have its new files restored away");
+        let fresh = manager.load("s").await.unwrap().unwrap();
+        fresh.tx.send(ActorMsg::Task(done)).unwrap();
+        c6_testkit::eventually("late task event to be recorded without a notice", async || {
+            let raw = manager.journal.events_after("s", 0, u32::MAX).await.unwrap();
+            raw.iter().any(|e| matches!(&e.kind, Some(session_event::Kind::BackgroundTask(t)) if t.task_id == task)).then_some(())
+        })
+        .await;
+        let raw = manager.journal.events_after("s", 0, u32::MAX).await.unwrap();
+        assert!(!raw.iter().any(|e| matches!(&e.kind, Some(session_event::Kind::NoticeQueued(n)) if n.command_id.contains(&task))));
+        assert!(
+            old.tools.background.spawn("touch stale-callback", work.path(), false, &old_context).await.is_err(),
+            "old ToolCtx must stay canceled after marker"
+        );
+        assert!(!work.path().join("stale-callback").exists());
+        let next = fresh.tools.background.spawn("true", work.path(), false, &CancellationToken::new()).await.unwrap();
+        assert_ne!(next, task, "reload must reserve IDs from unlogged ownership rows");
+        if let Some(pgid) = started.pgid {
+            assert_eq!(nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), None), Err(nix::errno::Errno::ESRCH));
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_writer_leader_exit_and_unknown_remote_are_not_stop_proof() {
+        let (dir, manager) = rewind_test_manager().await;
+        let owner = manager.journal.shell_owner("s", "s");
+        let reservation = owner.reserve("bg7").await.unwrap();
+        let mut leader = tokio::process::Command::new("sleep").arg("300").process_group(0).kill_on_drop(true).spawn().unwrap();
+        let pgid = leader.id().unwrap() as i32;
+        let mut member = tokio::process::Command::new("sleep").arg("300").process_group(pgid).kill_on_drop(true).spawn().unwrap();
+        owner.launched(&reservation, Some(pgid)).await.unwrap();
+        leader.kill().await.unwrap();
+        assert!(manager.journal.confirm_shell_writers_stopped("s").await.is_err());
+        let reopened = Journal::open(&dir.path().join("journal.db")).await.unwrap();
+        assert!(reopened.confirm_shell_writers_stopped("s").await.is_err());
+        assert!(member.try_wait().unwrap().is_none(), "persisted group checks must not signal survivors");
+        member.kill().await.unwrap();
+        reopened.confirm_shell_writers_stopped("s").await.unwrap();
+        assert_eq!(reopened.shell_writer_sources("s").await.unwrap(), ["bg7"]);
+        let remote = owner.reserve("bg8").await.unwrap();
+        owner.launched(&remote, None).await.unwrap();
+        assert!(reopened.confirm_shell_writers_stopped("s").await.unwrap_err().to_string().contains("unknown writer identity"));
+    }
+
+    #[tokio::test]
+    async fn shell_writer_pending_root_closes_descendant_admission_and_unknown_inflight_blocks_reset() {
+        let (_dir, manager) = rewind_test_manager().await;
+        let child = manager.journal.shell_owner("child", "root");
+        let before = child.reserve("bg1").await.unwrap();
+        let reset = crate::claude_code::Reset {
+            command_id: "r".into(),
+            to_seq: 2,
+            restore_files: true,
+            session_id: "native".into(),
+            fresh: true,
+            withdrawn: Vec::new(),
+        };
+        manager.journal.prepare_claude_rewind("root", &reset).await.unwrap();
+        assert!(child.reserve("bg2").await.is_err(), "root intent must close descendant admission atomically");
+        assert!(manager.journal.confirm_shell_writers_stopped("root").await.is_err(), "pre-intent unknown launch is a durable barrier");
+        assert_eq!(manager.journal.shell_writer_sources("root").await.unwrap(), ["child"]);
+        child.not_launched(&before).await.unwrap();
+        manager.journal.confirm_shell_writers_stopped("root").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rewind_explicit_retry_preserves_pending_receipt_and_rejects_changed_target_or_files() {
+        let (dir, manager) = rewind_test_manager().await;
+        let events = [
+            ev(1, session_event::Kind::Started(SessionStarted { tool_profile: crate::claude_code::PROFILE.into(), ..Default::default() })),
+            user(2, "retry here"),
+            user(3, "another target"),
+        ];
+        manager.journal.import("s", &CreateSession::default(), &events).await.unwrap();
+        let mut pending = crate::claude_code::Reset {
+            command_id: "old".into(),
+            to_seq: 2,
+            restore_files: false,
+            session_id: "pending-native-id".into(),
+            fresh: true,
+            withdrawn: vec!["withdrawn".into()],
+        };
+        manager.journal.prepare_claude_rewind("s", &pending).await.unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        manager.actors.lock().unwrap().insert(
+            "s".into(),
+            Handle {
+                tx,
+                tools: Arc::new(SessionTools::new(dir.path().into())),
+                running: Arc::default(),
+                claude_code: Arc::default(),
+                inbox: Arc::default(),
+            },
+        );
+        let command = |id: &str, to_seq, restore_files| SessionCommand {
+            session_id: "s".into(),
+            command_id: id.into(),
+            kind: Some(session_command::Kind::Rewind(c6_proto::Rewind { to_seq, restore_files })),
+        };
+        for (id, to_seq, files) in [("changed-target", 3, false), ("changed-files", 2, true)] {
+            assert!(manager.handle(command(id, to_seq, files)).await.unwrap_err().contains("awaiting confirmation"));
+        }
+        assert!(rx.try_recv().is_err());
+        manager.handle(command("retry", 2, false)).await.unwrap();
+        assert!(matches!(rx.recv().await, Some(ActorMsg::Rewind { command_id, to_seq: 2, restore_files: false }) if command_id == "retry"));
+        let (durable, applied) = manager.journal.claude_rewind("s").await.unwrap().unwrap();
+        assert_eq!(serde_json::to_value(durable).unwrap(), serde_json::to_value(&pending).unwrap());
+        assert_eq!(applied, 0, "dispatch must not overwrite or acknowledge the old receipt");
+        assert!(!manager.journal.is_applied("old").await.unwrap());
+        assert!(!manager.journal.is_applied("retry").await.unwrap());
+
+        // Both commands get their own durable marker. Once confirmed, stale
+        // head redelivery must not reach the actor or rewind future input.
+        manager
+            .journal
+            .append("s", &ev(4, session_event::Kind::Rewound(Rewound { command_id: "old".into(), to_seq: 2, ..Default::default() })))
+            .await
+            .unwrap();
+        pending.command_id = "retry".into();
+        manager.journal.prepare_claude_rewind("s", &pending).await.unwrap();
+        manager
+            .journal
+            .append("s", &ev(5, session_event::Kind::Rewound(Rewound { command_id: "retry".into(), to_seq: 2, ..Default::default() })))
+            .await
+            .unwrap();
+        manager.journal.append("s", &user(6, "future input")).await.unwrap();
+        for id in ["old", "retry"] {
+            assert!(manager.journal.is_applied(id).await.unwrap());
+            manager.handle(command(id, 2, false)).await.unwrap();
+        }
+        assert!(rx.try_recv().is_err(), "confirmed receipts must not reenter the actor mailbox");
+        assert_eq!(manager.journal.events_after("s", 0, u32::MAX).await.unwrap().len(), 6);
+    }
+
+    #[tokio::test]
+    async fn rewind_checks_idle_child_registry_and_inbox_without_model_calls() {
+        let (dir, manager) = rewind_test_manager().await;
+        manager.journal.import("child", &CreateSession::default(), &rewind_child_events()).await.unwrap();
+        let tools = Arc::new(SessionTools::new(dir.path().into()));
+        let (task, _) = tools.background.start_agent("child background work", false);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = Handle { tx, tools: tools.clone(), running: Arc::default(), claude_code: Arc::default(), inbox: Arc::default() };
+        manager.actors.lock().unwrap().insert("child".into(), handle.clone());
+        let links = [rewind_child_link("child")];
+        let error = manager.rewind_children_stopped(&links).await.unwrap_err().to_string();
+        assert!(error.contains("child") && error.contains("still working"), "{error}");
+
+        tools.background.finish_agent(&task, Ok("done".into()));
+        handle.inbox.lock().unwrap().push(PendingInput { command_id: "queued".into(), ..Default::default() }, None);
+        assert!(manager.rewind_children_stopped(&links).await.is_err(), "queued child input must block even between model turns");
+        handle.inbox.lock().unwrap().queue.clear();
+        let reply = tokio::spawn(async move {
+            let Some(ActorMsg::RewindIdle(reply)) = rx.recv().await else { panic!("expected a child mailbox barrier") };
+            reply.send(true).unwrap();
+        });
+        manager.rewind_children_stopped(&links).await.unwrap();
+        reply.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rewind_child_mailbox_refusal_overrides_idle_cached_flags() {
+        let (dir, manager) = rewind_test_manager().await;
+        manager.journal.import("child", &CreateSession::default(), &rewind_child_events()).await.unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        manager.actors.lock().unwrap().insert(
+            "child".into(),
+            Handle {
+                tx,
+                tools: Arc::new(SessionTools::new(dir.path().into())),
+                running: Arc::default(),
+                claude_code: Arc::default(),
+                inbox: Arc::default(),
+            },
+        );
+        let reply = tokio::spawn(async move {
+            let Some(ActorMsg::RewindIdle(reply)) = rx.recv().await else { panic!("expected a child mailbox barrier") };
+            reply.send(false).unwrap();
+        });
+        let error = manager.rewind_children_stopped(&[rewind_child_link("child")]).await.unwrap_err().to_string();
+        assert!(error.contains("pending work"), "{error}");
+        reply.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rewind_checks_descendant_raw_tasks_even_if_rewound_and_no_actor_survived() {
+        let (_dir, manager) = rewind_test_manager().await;
+        let mut child = rewind_child_events();
+        child.push(rewind_child_link("grandchild"));
+        manager.journal.import("child", &CreateSession::default(), &child).await.unwrap();
+        let mut grandchild = rewind_child_events();
+        grandchild.push(ev(
+            4,
+            session_event::Kind::BackgroundTask(BackgroundTask {
+                task_id: "bg1".into(),
+                kind: "shell".into(),
+                state: "started".into(),
+                ..Default::default()
+            }),
+        ));
+        grandchild.push(ev(5, session_event::Kind::Rewound(Rewound { to_seq: 4, ..Default::default() })));
+        manager.journal.import("grandchild", &CreateSession::default(), &grandchild).await.unwrap();
+        let links = [rewind_child_link("child")];
+        let error = manager.rewind_children_stopped(&links).await.unwrap_err().to_string();
+        assert!(error.contains("grandchild") && error.contains("unclosed background task"), "{error}");
+        manager
+            .journal
+            .append(
+                "grandchild",
+                &ev(
+                    6,
+                    session_event::Kind::BackgroundTask(BackgroundTask {
+                        task_id: "bg1".into(),
+                        kind: "shell".into(),
+                        state: "finished".into(),
+                        ..Default::default()
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        manager.rewind_children_stopped(&links).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rewind_unknown_child_turn_notices_and_remote_descendants_fail_closed() {
+        let (_dir, manager) = rewind_test_manager().await;
+        let links = [rewind_child_link("child")];
+        assert!(manager.rewind_children_stopped(&links).await.is_err(), "missing history is not confirmation");
+        let mut events = rewind_child_events();
+        events.truncate(2);
+        manager.journal.import("child", &CreateSession::default(), &events).await.unwrap();
+        let error = manager.rewind_children_stopped(&links).await.unwrap_err().to_string();
+        assert!(error.contains("terminal turn boundary"), "{error}");
+        manager
+            .journal
+            .append("child", &ev(3, session_event::Kind::TurnEnded(TurnEnded { turn: 1, reason: TurnEndReason::WorkerRestarted as i32 })))
+            .await
+            .unwrap();
+        assert!(manager.rewind_children_stopped(&links).await.is_err(), "a recovery marker is not stop confirmation");
+        manager
+            .journal
+            .append("child", &ev(4, session_event::Kind::TurnEnded(TurnEnded { turn: 1, reason: TurnEndReason::Completed as i32 })))
+            .await
+            .unwrap();
+        manager
+            .journal
+            .append(
+                "child",
+                &ev(
+                    5,
+                    session_event::Kind::NoticeQueued(c6_proto::NoticeQueued { command_id: "pending-wake".into(), ..Default::default() }),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(manager.rewind_children_stopped(&links).await.unwrap_err().to_string().contains("pending notices"));
+        manager
+            .journal
+            .append(
+                "child",
+                &ev(6, session_event::Kind::User(c6_proto::UserMessage { command_id: "pending-wake".into(), ..Default::default() })),
+            )
+            .await
+            .unwrap();
+        manager
+            .journal
+            .append("child", &ev(7, session_event::Kind::TurnEnded(TurnEnded { turn: 2, reason: TurnEndReason::Completed as i32 })))
+            .await
+            .unwrap();
+        manager
+            .journal
+            .append(
+                "child",
+                &ev(
+                    8,
+                    session_event::Kind::SubagentSpawned(c6_proto::SubagentSpawned {
+                        child_session_id: "remote-grandchild".into(),
+                        remote: Some(Default::default()),
+                        ..Default::default()
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        let error = manager.rewind_children_stopped(&links).await.unwrap_err().to_string();
+        assert!(error.contains("remote-grandchild") && error.contains("Remote subagent"), "{error}");
+    }
+
+    #[test]
+    fn rewind_lost_child_process_with_unknown_identity_is_not_confirmed_stopped() {
+        let mut events = rewind_child_events();
+        for (seq, state) in [(4, "started"), (5, "lost")] {
+            events.push(ev(
+                seq,
+                session_event::Kind::BackgroundTask(BackgroundTask {
+                    task_id: "bg1".into(),
+                    kind: "shell".into(),
+                    state: state.into(),
+                    ..Default::default()
+                }),
+            ));
+        }
+        let error = rewind_child_history_stopped("child", &events, &[]).unwrap_err().to_string();
+        assert!(error.contains("without confirming its process stopped"), "{error}");
     }
 
     fn assistant(seq: u64, blocks: Vec<content_block::Block>) -> SessionEvent {

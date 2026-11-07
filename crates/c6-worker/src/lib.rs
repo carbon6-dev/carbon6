@@ -161,6 +161,9 @@ impl Worker {
 /// `UserInput.send_now`, `Interrupt.send_now`), and its extension's.
 pub(crate) fn capabilities(worker: &Worker, claude_code: bool, runtime: bool) -> Vec<String> {
     let mut c: Vec<String> = claude_code.then(|| "claude_code".to_owned()).into_iter().collect();
+    if claude_code {
+        c.push("claude_rewind".into());
+    }
     c.push("queue_ops".into());
     c.push("send_now".into());
     if runtime && worker.runs_kit_jobs() {

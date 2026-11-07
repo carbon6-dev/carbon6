@@ -1398,6 +1398,13 @@ impl Store {
         Ok(n.unwrap_or(0) as u64)
     }
 
+    /// The current conversation, not the append-only audit log. Apply
+    /// rewinds before callers take a prefix, window or digest: a marker
+    /// outside that window can withdraw events inside it.
+    pub async fn effective_events(&self, session_id: &str) -> anyhow::Result<Vec<c6_proto::SessionEvent>> {
+        Ok(c6_agent::effective_events(&self.events_after(session_id, 0, i64::MAX).await?))
+    }
+
     pub async fn events_after(&self, session_id: &str, after: u64, limit: i64) -> anyhow::Result<Vec<c6_proto::SessionEvent>> {
         use prost::Message;
         let rows = sqlx::query("SELECT data FROM events WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT ?")
@@ -1788,8 +1795,61 @@ impl Store {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// A full raw conversation with a withdrawn turn (including a summary),
+    /// a replacement, and a second rewind. Used by model-context readers.
+    pub(crate) fn rewind_history() -> Vec<c6_proto::SessionEvent> {
+        use c6_proto::{AssistantMessage, ContentBlock, SessionEvent, UserMessage, content_block, session_event::Kind};
+        let user = |text: &str| Kind::User(UserMessage { text: text.into(), ..Default::default() });
+        let answer = |turn, text: &str| {
+            Kind::Assistant(AssistantMessage {
+                turn,
+                blocks: vec![ContentBlock { block: Some(content_block::Block::Text(text.into())), ..Default::default() }],
+                ..Default::default()
+            })
+        };
+        [
+            Kind::Started(Default::default()),
+            user("KEEP original user question"),
+            Kind::TurnStarted(c6_proto::TurnStarted { turn: 1, ..Default::default() }),
+            answer(1, "KEEP_ANSWER"),
+            Kind::TurnEnded(c6_proto::TurnEnded { turn: 1, reason: c6_proto::TurnEndReason::Completed as i32 }),
+            user("DROP_PRIVATE withdrawn question"),
+            Kind::TurnStarted(c6_proto::TurnStarted { turn: 2, ..Default::default() }),
+            answer(2, "PRIVATE_WITHDRAWN_ANSWER"),
+            Kind::ToolResult(c6_proto::ToolResult { output: "PRIVATE_TOOL_RESULT".into(), ..Default::default() }),
+            Kind::Compaction(c6_proto::Compaction { summary: "PRIVATE_SUMMARY".into(), ..Default::default() }),
+            Kind::TurnEnded(c6_proto::TurnEnded { turn: 2, reason: c6_proto::TurnEndReason::Completed as i32 }),
+            Kind::Rewound(c6_proto::Rewound { to_seq: 6, ..Default::default() }),
+            user("KEEP replacement user question"),
+            Kind::TurnStarted(c6_proto::TurnStarted { turn: 3, ..Default::default() }),
+            answer(3, "KEEP_REPLACEMENT_ANSWER"),
+            Kind::TurnEnded(c6_proto::TurnEnded { turn: 3, reason: c6_proto::TurnEndReason::Completed as i32 }),
+            user("DROP_PRIVATE again"),
+            answer(4, "PRIVATE_WITHDRAWN_AGAIN"),
+            Kind::Rewound(c6_proto::Rewound { to_seq: 17, ..Default::default() }),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, kind)| SessionEvent { seq: i as u64 + 1, ts_ms: i as i64, kind: Some(kind) })
+        .collect()
+    }
+
+    pub(crate) async fn insert_events(store: &Store, id: &str, events: &[c6_proto::SessionEvent]) {
+        use prost::Message;
+        for e in events {
+            sqlx::query("INSERT INTO events (session_id, seq, ts, data) VALUES (?, ?, ?, ?)")
+                .bind(id)
+                .bind(e.seq as i64)
+                .bind(e.ts_ms)
+                .bind(e.encode_to_vec())
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        }
+    }
 
     fn session(id: &str, worker_id: WorkerId) -> SessionRow {
         SessionRow {

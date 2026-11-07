@@ -177,13 +177,14 @@ pub fn portable_messages(msgs: Vec<Message>) -> Vec<Message> {
 }
 
 /// A plain-text rendering of a conversation, for backends that cannot be
-/// given a history (Claude Code). Long tool output is shortened.
+/// given a history (Claude Code). Rewinds and compactions apply, including
+/// separately numbered ancestor segments. Long tool output is shortened.
 pub fn transcript_text(events: &[SessionEvent]) -> String {
     fn clip(s: &str, max: usize) -> String {
         if s.chars().count() <= max { s.to_owned() } else { format!("{}… (shortened)", s.chars().take(max).collect::<String>()) }
     }
     let mut out = String::new();
-    for ev in events {
+    for ev in &effective_events(events) {
         match &ev.kind {
             Some(session_event::Kind::User(u)) if !u.blocked.is_empty() => {}
             Some(session_event::Kind::User(u)) => {
@@ -221,6 +222,16 @@ pub const HANDOFF_BUDGET: usize = 120_000;
 /// behind. `from` names the runtime it leaves. Within `budget` characters,
 /// keeping the most recent steps.
 pub fn handoff_context(events: &[SessionEvent], from: &str, budget: usize) -> String {
+    history_context(events, &format!("This session was handed over to you from {from} at this point."), from, budget)
+}
+
+/// Fresh-runtime rewind fallback: only the kept transcript, never a claim
+/// that a runtime switch or deletion of files/logs happened.
+pub fn rewind_context(events: &[SessionEvent], budget: usize) -> String {
+    history_context(events, "The user rewound this conversation. Continue from only the kept history below.", "kept history", budget)
+}
+
+fn history_context(events: &[SessionEvent], introduction: &str, from: &str, budget: usize) -> String {
     let mut transcript = transcript_text(&effective_events(events));
     let total = transcript.chars().count();
     if total > budget {
@@ -235,7 +246,7 @@ pub fn handoff_context(events: &[SessionEvent], from: &str, budget: usize) -> St
     let transcript = if transcript.is_empty() { "(nothing yet)" } else { transcript };
     format!(
         "<carbon6-handoff from=\"{from}\">\n\
-         This session was handed over to you from {from} at this point. You did not take part in the conversation below and have \
+         {introduction} You did not take part in the conversation below and have \
          none of its native state: it is a transcript carbon6 rebuilt from the session's log, for context only.\n\
          - Tool calls in it were made by the earlier runtime with its own tools; their results are as recorded (long ones shortened).\n\
          - Its hidden reasoning, provider-side state and any unfinished tool calls did not carry over.\n\
@@ -686,6 +697,36 @@ mod tests {
                 Block::Text("again".into()),
             ]
         );
+    }
+
+    #[test]
+    fn text_transcripts_apply_rewinds_before_compactions_in_each_seed_segment() {
+        let user = |text: &str| session_event::Kind::User(UserMessage { text: text.into(), ..Default::default() });
+        let mut events = vec![
+            ev(session_event::Kind::Started(Default::default())),
+            ev(user("KEEP_PARENT")),
+            ev(user("DROP_PRIVATE")),
+            ev(session_event::Kind::Compaction(c6_proto::Compaction { summary: "PRIVATE_SUMMARY".into(), ..Default::default() })),
+            ev(session_event::Kind::Rewound(c6_proto::Rewound { to_seq: 3, ..Default::default() })),
+            ev(user("KEEP_REPLACEMENT")),
+        ];
+        for (i, e) in events.iter_mut().enumerate() {
+            e.seq = i as u64 + 1;
+        }
+        let mut own = vec![
+            ev(session_event::Kind::Started(Default::default())),
+            ev(user("KEEP_CHILD")),
+            ev(user("PRIVATE_CHILD")),
+            ev(session_event::Kind::Rewound(c6_proto::Rewound { to_seq: 3, ..Default::default() })),
+        ];
+        for (i, e) in own.iter_mut().enumerate() {
+            e.seq = i as u64 + 1;
+        }
+        events.extend(own);
+        for text in [transcript_text(&events), handoff_context(&events, "Claude Code", HANDOFF_BUDGET)] {
+            assert!(text.contains("KEEP_PARENT") && text.contains("KEEP_REPLACEMENT") && text.contains("KEEP_CHILD"), "{text}");
+            assert!(!text.contains("PRIVATE"), "{text}");
+        }
     }
 
     #[test]

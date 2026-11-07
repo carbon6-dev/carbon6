@@ -530,7 +530,7 @@ pub async fn status(st: &HeadState) -> anyhow::Result<api::MemexStatus> {
 pub async fn on_events(st: &HeadState, session_id: &str, events: &[SessionEvent]) {
     use session_event::Kind;
     let interesting = events.iter().any(|e| {
-        matches!(e.kind, Some(Kind::Output(_) | Kind::Memory(_) | Kind::TurnEnded(_)))
+        matches!(e.kind, Some(Kind::Output(_) | Kind::Memory(_) | Kind::TurnEnded(_) | Kind::Rewound(_)))
             || matches!(&e.kind, Some(Kind::ToolResult(r)) if is_web_tool(&r.tool) && !r.is_error)
     });
     if !interesting {
@@ -577,9 +577,14 @@ pub async fn on_events(st: &HeadState, session_id: &str, events: &[SessionEvent]
                     enqueue(st, "memex.ingest", in_realm(json!(item), &realm)).await;
                 }
             }
-            Some(Kind::TurnEnded(_)) if session.parent_call_id.is_none() => {
-                if let Some(item) = digest(st, &session, labels.clone()).await {
-                    enqueue(st, "memex.ingest", in_realm(json!(item), &realm)).await;
+            Some(Kind::TurnEnded(_) | Kind::Rewound(_)) if session.parent_call_id.is_none() => {
+                match digest(st, &session, labels.clone()).await {
+                    Ok(Some(item)) => enqueue(st, "memex.ingest", in_realm(json!(item), &realm)).await,
+                    // Rewinding all messages must also withdraw an older exported digest.
+                    Ok(None) => {
+                        enqueue(st, "memex.delete", in_realm(json!({"source": "carbon6", "external_id": session.id}), &realm)).await;
+                    }
+                    Err(e) => warn!(session = %session_id, "reading its memex digest: {e:#}"),
                 }
             }
             _ => {}
@@ -639,9 +644,9 @@ async fn web_item(st: &HeadState, session: &SessionRow, ev: &SessionEvent, r: &c
 
 /// A session's digest: per turn, what was asked, what tools did, and the
 /// answer; the latest turns within `DIGEST_CHARS`.
-async fn digest(st: &HeadState, session: &SessionRow, labels: Vec<String>) -> Option<api::MemexItemIn> {
+async fn digest(st: &HeadState, session: &SessionRow, labels: Vec<String>) -> anyhow::Result<Option<api::MemexItemIn>> {
     use c6_proto::content_block::Block;
-    let events = st.store.events_after(&session.id, 0, i64::MAX).await.ok()?;
+    let events = st.store.effective_events(&session.id).await?;
     let mut turns: Vec<String> = Vec::new();
     let mut cur: Option<(String, Vec<String>, String)> = None;
     let flush = |cur: &mut Option<(String, Vec<String>, String)>, turns: &mut Vec<String>| {
@@ -687,7 +692,7 @@ async fn digest(st: &HeadState, session: &SessionRow, labels: Vec<String>) -> Op
     }
     flush(&mut cur, &mut turns);
     if turns.is_empty() {
-        return None;
+        return Ok(None);
     }
     // The latest turns first in what is kept, then put back in order.
     let mut kept = Vec::new();
@@ -705,7 +710,7 @@ async fn digest(st: &HeadState, session: &SessionRow, labels: Vec<String>) -> Op
         text.push_str(&format!("({} earlier turns not shown)\n\n", turns.len() - kept.len()));
     }
     text.push_str(&kept.join("\n\n"));
-    Some(api::MemexItemIn {
+    Ok(Some(api::MemexItemIn {
         kind: "session".into(),
         source: "carbon6".into(),
         external_id: session.id.clone(),
@@ -715,7 +720,7 @@ async fn digest(st: &HeadState, session: &SessionRow, labels: Vec<String>) -> Op
         labels,
         meta: json!({"session_id": session.id, "turns": turns.len(), "model": session.model, "worker": session.worker_name}),
         ..Default::default()
-    })
+    }))
 }
 
 fn clip(s: &str, n: usize) -> String {
@@ -789,4 +794,83 @@ pub async fn card(st: &HeadState, key: &str) -> anyhow::Result<String> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rewind_hooks_queue_digest_refresh_and_delete_without_another_turn_end() {
+        let (_dir, head, _mock, _id) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        // Observe queue writes transactionally: delivery may drain the real
+        // outbox before the test reads it, but cannot erase this test ledger.
+        sqlx::query("CREATE TABLE test_memex_queued (method TEXT, params TEXT)").execute(&st.store.pool).await.unwrap();
+        sqlx::query(
+            "CREATE TRIGGER test_memex_queue_insert AFTER INSERT ON memex_outbox BEGIN \
+             INSERT INTO test_memex_queued (method, params) VALUES (new.method, new.params); END",
+        )
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+        let events = crate::store::tests::rewind_history();
+        crate::store::tests::insert_events(&st.store, "session", &events).await;
+        // Only the rewind hook runs, not a TurnEnded hook.
+        on_events(st, "session", &events[18..]).await;
+        let rewind = SessionEvent {
+            seq: 20,
+            kind: Some(session_event::Kind::Rewound(c6_proto::Rewound { to_seq: 2, ..Default::default() })),
+            ..Default::default()
+        };
+        crate::store::tests::insert_events(&st.store, "session", std::slice::from_ref(&rewind)).await;
+        on_events(st, "session", &[rewind]).await;
+        let queued: Vec<(String, String)> = sqlx::query_as(
+            "SELECT method, params FROM test_memex_queued WHERE json_extract(params, '$.external_id') = 'session' ORDER BY rowid",
+        )
+        .fetch_all(&st.store.pool)
+        .await
+        .unwrap();
+        assert_eq!(queued.len(), 2, "{queued:?}");
+        assert_eq!(queued[0].0, "memex.ingest");
+        let refresh: Value = serde_json::from_str(&queued[0].1).unwrap();
+        assert!(refresh["text"].as_str().unwrap().contains("KEEP_REPLACEMENT_ANSWER"));
+        assert!(!refresh["text"].as_str().unwrap().contains("PRIVATE"));
+        assert_eq!(refresh["realm"], crate::realms::HOME);
+        assert_eq!(queued[1].0, "memex.delete");
+        let delete: Value = serde_json::from_str(&queued[1].1).unwrap();
+        assert_eq!(delete, json!({"source": "carbon6", "external_id": "session", "realm": crate::realms::HOME}));
+        head.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_digest_excludes_withdrawn_turns_and_can_be_withdrawn_entirely() {
+        let (_dir, head, _mock, _id) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        let events = crate::store::tests::rewind_history();
+        crate::store::tests::insert_events(&st.store, "session", &events).await;
+        let session = st.store.session("session").await.unwrap().unwrap();
+        let item = digest(st, &session, vec!["repo:notes".into()]).await.unwrap().unwrap();
+        assert!(item.text.contains("KEEP original user question"), "{}", item.text);
+        assert!(item.text.contains("KEEP_REPLACEMENT_ANSWER"), "{}", item.text);
+        assert!(!item.text.contains("PRIVATE"), "{}", item.text);
+        assert!(!item.text.contains("DROP"), "{}", item.text);
+        assert_eq!(item.meta["turns"], 2);
+        assert_eq!(item.labels, ["repo:notes"]);
+        assert_eq!(st.store.events_after("session", 0, i64::MAX).await.unwrap(), events);
+        crate::store::tests::insert_events(
+            &st.store,
+            "session",
+            &[SessionEvent {
+                seq: 20,
+                kind: Some(session_event::Kind::Rewound(c6_proto::Rewound { to_seq: 2, ..Default::default() })),
+                ..Default::default()
+            }],
+        )
+        .await;
+        // No surviving messages means an old memex digest must be deleted,
+        // not silently kept or replaced with withdrawn conversation text.
+        assert!(digest(st, &session, Vec::new()).await.unwrap().is_none());
+        head.shutdown().await.unwrap();
+    }
 }

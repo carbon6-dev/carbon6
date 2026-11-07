@@ -6,6 +6,7 @@
 
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use anyhow::Context;
 use c6_proto::{CreateSession, SessionEvent, session_event};
@@ -21,6 +22,65 @@ pub struct Journal {
     pub appended: Notify,
 }
 
+struct ShellOwner {
+    journal: Arc<Journal>,
+    session_id: String,
+    root_session_id: String,
+}
+
+#[async_trait::async_trait]
+impl c6_tools::ShellOwner for ShellOwner {
+    async fn reserve(&self, task_id: &str) -> std::io::Result<String> {
+        let id = uuid::Uuid::now_v7().to_string();
+        // One write statement serializes admission with prepare_claude_rewind.
+        // A launch either owns a durable unknown barrier before reset closes
+        // admission, or cannot create a child at all (including descendants).
+        let inserted = sqlx::query(
+            "INSERT INTO shell_writers (writer_id, session_id, root_session_id, task_id)
+             SELECT ?, ?, ?, ? WHERE NOT EXISTS (
+                 SELECT 1 FROM claude_rewinds WHERE session_id IN (?, ?) AND applied_seq = 0
+             )",
+        )
+        .bind(&id)
+        .bind(&self.session_id)
+        .bind(&self.root_session_id)
+        .bind(task_id)
+        .bind(&self.session_id)
+        .bind(&self.root_session_id)
+        .execute(&self.journal.pool)
+        .await
+        .map_err(std::io::Error::other)?;
+        if inserted.rows_affected() != 1 {
+            return Err(std::io::Error::other("Shell launch refused while Rewind awaits confirmation"));
+        }
+        Ok(id)
+    }
+
+    async fn launched(&self, reservation: &str, local_pgid: Option<i32>) -> std::io::Result<()> {
+        let updated = sqlx::query("UPDATE shell_writers SET pgid = ? WHERE writer_id = ? AND session_id = ?")
+            .bind(local_pgid)
+            .bind(reservation)
+            .bind(&self.session_id)
+            .execute(&self.journal.pool)
+            .await
+            .map_err(std::io::Error::other)?;
+        if updated.rows_affected() != 1 {
+            return Err(std::io::Error::other("Shell writer ownership was lost"));
+        }
+        Ok(())
+    }
+
+    async fn not_launched(&self, reservation: &str) -> std::io::Result<()> {
+        sqlx::query("DELETE FROM shell_writers WHERE writer_id = ? AND session_id = ? AND pgid IS NULL")
+            .bind(reservation)
+            .bind(&self.session_id)
+            .execute(&self.journal.pool)
+            .await
+            .map_err(std::io::Error::other)?;
+        Ok(())
+    }
+}
+
 /// Upload position of a session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cursor {
@@ -30,6 +90,125 @@ pub struct Cursor {
 }
 
 impl Journal {
+    pub fn shell_owner(self: &Arc<Self>, session_id: &str, root_session_id: &str) -> Arc<dyn c6_tools::ShellOwner> {
+        Arc::new(ShellOwner { journal: self.clone(), session_id: session_id.into(), root_session_id: root_session_id.into() })
+    }
+
+    /// Include unlogged children by owner ID, and own tasks by task ID. Rows
+    /// survive ESRCH so a failed reset cannot lose late-notice provenance.
+    pub async fn shell_writer_sources(&self, session_id: &str) -> anyhow::Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT DISTINCT CASE WHEN session_id = ? THEN task_id ELSE session_id END
+             FROM shell_writers WHERE session_id = ? OR root_session_id = ?",
+        )
+        .bind(session_id)
+        .bind(session_id)
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Never signal a persisted group. Leader completion and SSH proxy exit
+    /// are not proof. Only ESRCH retires local writer ownership, not its ID.
+    pub async fn confirm_shell_writers_stopped(&self, session_id: &str) -> anyhow::Result<()> {
+        let rows = sqlx::query(
+            "SELECT writer_id, task_id, pgid FROM shell_writers
+             WHERE (session_id = ? OR root_session_id = ?) AND absent = 0",
+        )
+        .bind(session_id)
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        for row in rows {
+            let task: String = row.get("task_id");
+            let pgid: Option<i32> = row.try_get("pgid")?;
+            let Some(pgid) = pgid else {
+                anyhow::bail!("Background shell {task} has unknown writer identity (incomplete launch or SSH); cannot confirm it stopped");
+            };
+            anyhow::ensure!(
+                nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), None) == Err(nix::errno::Errno::ESRCH),
+                "Background shell {task} process group {pgid} has not confirmed that it stopped"
+            );
+            sqlx::query("UPDATE shell_writers SET absent = 1 WHERE writer_id = ?")
+                .bind(row.get::<String, _>("writer_id"))
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn track_claude_process(&self, session_id: &str, pgid: i32) -> anyhow::Result<()> {
+        anyhow::ensure!(pgid > 0, "Claude Code process group is unknown");
+        sqlx::query("INSERT OR IGNORE INTO claude_processes (session_id, pgid) VALUES (?, ?)")
+            .bind(session_id)
+            .bind(pgid)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn claude_processes(&self, session_id: &str) -> anyhow::Result<Vec<i32>> {
+        let groups = sqlx::query_scalar::<_, i64>("SELECT pgid FROM claude_processes WHERE session_id = ? ORDER BY pgid")
+            .bind(session_id)
+            .fetch_all(&self.pool)
+            .await?;
+        groups
+            .into_iter()
+            .map(|pgid| {
+                let pgid = i32::try_from(pgid)?;
+                anyhow::ensure!(pgid > 0, "Claude Code process group is unknown");
+                Ok(pgid)
+            })
+            .collect()
+    }
+
+    /// Only callers that observed ESRCH may retire a cleanup barrier.
+    pub async fn untrack_claude_process(&self, session_id: &str, pgid: i32) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM claude_processes WHERE session_id = ? AND pgid = ?")
+            .bind(session_id)
+            .bind(pgid)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn claude_turn(&self, session_id: &str, seq: u64) -> anyhow::Result<Option<crate::claude_code::Boundary>> {
+        let data: Option<String> = sqlx::query_scalar("SELECT data FROM claude_turns WHERE session_id = ? AND seq = ?")
+            .bind(session_id)
+            .bind(seq as i64)
+            .fetch_optional(&self.pool)
+            .await?;
+        data.map(|s| serde_json::from_str(&s).map_err(Into::into)).transpose()
+    }
+
+    pub async fn record_claude_turn(&self, session_id: &str, seq: u64, boundary: &crate::claude_code::Boundary) -> anyhow::Result<()> {
+        sqlx::query("INSERT OR REPLACE INTO claude_turns (session_id, seq, data) VALUES (?, ?, ?)")
+            .bind(session_id)
+            .bind(seq as i64)
+            .bind(serde_json::to_string(boundary)?)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn claude_rewind(&self, session_id: &str) -> anyhow::Result<Option<(crate::claude_code::Reset, u64)>> {
+        let row = sqlx::query("SELECT data, applied_seq FROM claude_rewinds WHERE session_id = ?")
+            .bind(session_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|r| Ok((serde_json::from_str(&r.get::<String, _>("data"))?, r.get::<i64, _>("applied_seq") as u64))).transpose()
+    }
+
+    pub async fn prepare_claude_rewind(&self, session_id: &str, reset: &crate::claude_code::Reset) -> anyhow::Result<()> {
+        sqlx::query("INSERT OR REPLACE INTO claude_rewinds (session_id, command_id, data) VALUES (?, ?, ?)")
+            .bind(session_id)
+            .bind(&reset.command_id)
+            .bind(serde_json::to_string(reset)?)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -217,6 +396,14 @@ impl Journal {
 }
 
 async fn append_in(tx: &mut sqlx::SqliteConnection, session_id: &str, event: &SessionEvent) -> anyhow::Result<()> {
+    if let Some(session_event::Kind::Rewound(r)) = &event.kind {
+        sqlx::query("UPDATE claude_rewinds SET applied_seq = ? WHERE session_id = ? AND command_id = ?")
+            .bind(event.seq as i64)
+            .bind(session_id)
+            .bind(&r.command_id)
+            .execute(&mut *tx)
+            .await?;
+    }
     sqlx::query("INSERT INTO events (session_id, seq, data) VALUES (?, ?, ?)")
         .bind(session_id)
         .bind(event.seq as i64)

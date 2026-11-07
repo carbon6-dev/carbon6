@@ -2,6 +2,55 @@
 
 Status: rules in force (2026-10-19); `make check` enforces what a pattern can catch (`scripts/test-lint.sh`).
 
+## Effective conversation projections after rewind
+
+The native-memory reset regression runs a fake stream-JSON CLI with its own
+independent history. It uses no installed Claude or real model:
+
+```sh
+set -euo pipefail
+ulimit -n 65536
+cargo nextest run --locked -p c6-worker --test claude_code_rewind
+```
+
+It checks final assistant UUID cutoffs after tools, returned session-ID adoption,
+the initialization barrier, fresh kept-history fallback, first-message rewind,
+worker restart, lost metadata, side-chat seeds, unsupported/disconnected workers,
+and a failed reset that blocks inputs even after restart. Worker unit regressions
+also check held native wake withdrawal and recursive child/background quiescence.
+The `shell_writer_` worker regressions hold a shell's Started event outside the
+actor, fail rewind, reload empty tools, and verify that neither restore nor a
+Rewound receipt can bypass the live writer. They also cover surviving group
+members after leader exit, unknown/SSH ownership, pending-root launch admission,
+late-notice suppression, and task-ID reservation. The tools regression cancels a
+context while its durable reservation is awaiting completion and verifies that
+no process starts. Old worker-turn contexts stay canceled after confirmation;
+actor exit cancels them too, while a later turn uses a new token.
+The worker-local journal migration is `0005_claude_rewind.sql`; the head needs no
+migration for native-memory reset.
+
+The model-context regressions use synthetic append-only logs, a temporary head
+and mock model endpoints only; no real model or installed CLI is needed:
+
+```sh
+set -euo pipefail
+ulimit -n 65536
+cargo nextest run --locked -p c6-agent -p c6-head --lib \
+  -E 'test(history::tests::) | test(effective_context_tests::) | test(rewind) | test(withdrawn) | test(names_read_the_effective) | test(proposals_read_the_first_effective)'
+```
+
+The shared head fixture has two rewinds, a withdrawn user message, reply, tool
+result and compaction, plus surviving original/replacement turns. It checks
+nested side-chat seeds with overlapping sequence numbers; the shared text and
+handoff renderers; catch-up windows whose rewind marker is outside the requested
+window; naming that stops after its opening replies; cached timeline turns;
+suggestion/work-note evidence; work grouping; workflow replies; watcher digest
+windows; and exported memex digests. These are projections of the full effective
+log **before** any prefix/window/budget is selected. Raw event evidence remains
+available and tests assert that projection does not rewrite it. Previously
+published notes/documents and another session's already-delivered context are
+not retroactively erased by these tests or by a rewind.
+
 ## Browser installation and pinned engines (S2)
 
 Use Node 24 and npm on PATH. The browser suites have a private npm manifest and

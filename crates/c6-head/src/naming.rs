@@ -21,9 +21,8 @@ const MAX_CHARS: usize = 60;
 /// What the model reads at most, and of each message.
 const MAX_INPUT_CHARS: usize = 8_000;
 const MAX_MESSAGE_CHARS: usize = 2_000;
-/// How far into a session its opening is looked for, in pages of events.
-const PAGES: usize = 20;
-const PAGE: i64 = 500;
+/// How far into the effective conversation its opening is looked for.
+const OPENING_EVENTS: usize = 10_000;
 
 /// Where a session that waits for its name says how far it got (a
 /// settings key: no column of its own). No key: it was named, you named
@@ -173,6 +172,7 @@ async fn make(st: &HeadState, row: &SessionRow, opening: &str) -> anyhow::Result
 /// first message has only a few words (never tool output). With whether
 /// it had only a few.
 async fn opening(st: &HeadState, id: &str) -> anyhow::Result<(String, bool)> {
+    let events = st.store.effective_events(id).await?;
     let clip = |t: &str| -> String {
         let t = t.trim();
         if t.chars().count() > MAX_MESSAGE_CHARS {
@@ -185,41 +185,35 @@ async fn opening(st: &HeadState, id: &str) -> anyhow::Result<(String, bool)> {
     let mut few = None;
     let mut said = String::new();
     let mut replies = 0;
-    let mut after = 0;
-    'pages: for _ in 0..PAGES {
-        let page = st.store.events_after(id, after, PAGE).await?;
-        let Some(last) = page.last() else { break };
-        after = last.seq;
-        for e in &page {
-            match &e.kind {
-                // Yours, not another session's agent's.
-                Some(session_event::Kind::User(u)) if u.from_session_id.is_empty() && !u.text.trim().is_empty() => {
-                    few.get_or_insert_with(|| few_words(&u.text));
-                    out.push_str(&format!("User: {}\n", clip(&u.text)));
-                }
-                Some(session_event::Kind::Assistant(a)) => {
-                    let text: String = a
-                        .blocks
-                        .iter()
-                        .filter_map(|b| match &b.block {
-                            Some(content_block::Block::Text(t)) => Some(t.as_str()),
-                            _ => None,
-                        })
-                        .collect();
-                    if !text.trim().is_empty() {
-                        said = text;
-                    }
-                }
-                Some(session_event::Kind::TurnEnded(_)) if !said.is_empty() => {
-                    out.push_str(&format!("Agent: {}\n\n", clip(&std::mem::take(&mut said))));
-                    replies += 1;
-                    let turns = if few == Some(true) { 2 } else { 1 };
-                    if replies >= turns || out.len() > MAX_INPUT_CHARS {
-                        break 'pages;
-                    }
-                }
-                _ => {}
+    for e in events.iter().take(OPENING_EVENTS) {
+        match &e.kind {
+            // Yours, not another session's agent's.
+            Some(session_event::Kind::User(u)) if u.from_session_id.is_empty() && !u.text.trim().is_empty() => {
+                few.get_or_insert_with(|| few_words(&u.text));
+                out.push_str(&format!("User: {}\n", clip(&u.text)));
             }
+            Some(session_event::Kind::Assistant(a)) => {
+                let text: String = a
+                    .blocks
+                    .iter()
+                    .filter_map(|b| match &b.block {
+                        Some(content_block::Block::Text(t)) => Some(t.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if !text.trim().is_empty() {
+                    said = text;
+                }
+            }
+            Some(session_event::Kind::TurnEnded(_)) if !said.is_empty() => {
+                out.push_str(&format!("Agent: {}\n\n", clip(&std::mem::take(&mut said))));
+                replies += 1;
+                let turns = if few == Some(true) { 2 } else { 1 };
+                if replies >= turns || out.len() > MAX_INPUT_CHARS {
+                    break;
+                }
+            }
+            _ => {}
         }
     }
     let out = out.trim_end();
@@ -274,6 +268,22 @@ fn clean(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn names_read_the_effective_opening_before_stopping_at_a_reply() {
+        let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
+        let mut events = crate::store::tests::rewind_history();
+        // A short opening asks naming to include two turns. Its second
+        // raw turn is private; its second effective turn is the replacement.
+        if let Some(session_event::Kind::User(u)) = &mut events[1].kind {
+            u.text = "hi".into();
+        }
+        crate::store::tests::insert_events(&head.state.store, "session", &events).await;
+        let (text, few) = opening(&head.state, "session").await.unwrap();
+        assert!(few && text.contains("KEEP_ANSWER") && text.contains("KEEP_REPLACEMENT_ANSWER"), "{text}");
+        assert!(!text.contains("PRIVATE"), "{text}");
+        head.shutdown().await.unwrap();
+    }
 
     #[test]
     fn cleans_the_name() {

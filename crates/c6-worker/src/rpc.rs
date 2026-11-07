@@ -557,7 +557,7 @@ mod tests {
         assert_eq!(crate::capabilities(&worker, false, true), vec!["queue_ops", "send_now", "kits"]);
         assert_eq!(crate::capabilities(&worker, false, false), vec!["queue_ops", "send_now"]);
         worker.overrides.lock().unwrap().kit_jobs = Some(false);
-        assert_eq!(crate::capabilities(&worker, true, true), vec!["claude_code", "queue_ops", "send_now"]);
+        assert_eq!(crate::capabilities(&worker, true, true), vec!["claude_code", "claude_rewind", "queue_ops", "send_now"]);
         let e = handle(&worker, "kit.job", json!({"spec": {}, "command": []})).await.unwrap_err();
         assert!(e.to_string().contains("C6_KIT_JOBS=off"), "{e}");
     }

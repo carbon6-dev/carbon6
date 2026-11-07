@@ -144,16 +144,26 @@ pub(crate) async fn rule_for(st: &HeadState, row: &crate::store::SessionRow, lab
 /// The last exchanges, as the model reads them: your messages, the agent's
 /// final words, and which tools it used (never their output).
 pub(crate) async fn exchanges(st: &HeadState, session_id: &str, last_seq: u64) -> anyhow::Result<String> {
+    // A rewind after last_seq can withdraw text within it. Project the
+    // complete log before selecting recent turns or their preceding input.
+    let events = st.store.effective_events(session_id).await?;
     let mut turns: Vec<String> = Vec::new();
-    let mut end = last_seq;
+    let mut end = events.partition_point(|e| e.seq <= last_seq);
     let mut size = 0;
     while end > 0 && turns.len() < 3 {
-        let events = st.store.turn_events(session_id, end).await?;
-        let Some(first) = events.first() else { break };
+        let turn = events[..end].iter().rposition(|e| matches!(e.kind, Some(session_event::Kind::TurnStarted(_))));
+        // Inputs can precede TurnStarted. Keep them with that turn rather
+        // than borrowing a raw event before it (or counting it twice).
+        let start = turn.map_or(0, |turn| {
+            events[..turn]
+                .iter()
+                .rposition(|e| matches!(e.kind, Some(session_event::Kind::TurnStarted(_) | session_event::Kind::TurnEnded(_))))
+                .map_or(0, |i| i + 1)
+        });
         let mut you = Vec::new();
         let mut said = String::new();
         let mut tools: Vec<String> = Vec::new();
-        for e in &events {
+        for e in &events[start..end] {
             match &e.kind {
                 // Yours, not another session's agent's.
                 Some(session_event::Kind::User(u)) if u.from_session_id.is_empty() => you.push(u.text.trim().to_owned()),
@@ -176,16 +186,6 @@ pub(crate) async fn exchanges(st: &HeadState, session_id: &str, last_seq: u64) -
                 _ => {}
             }
         }
-        // The turn's own message comes just before its start.
-        if you.is_empty()
-            && let Some(prev) =
-                st.store.events_after(session_id, first.seq.saturating_sub(3), 3).await?.into_iter().rev().find_map(|e| match e.kind {
-                    Some(session_event::Kind::User(u)) if e.seq < first.seq && u.from_session_id.is_empty() => Some(u.text),
-                    _ => None,
-                })
-        {
-            you.push(prev.trim().to_owned());
-        }
         let mut t = String::new();
         for y in you.iter().filter(|y| !y.is_empty()) {
             t.push_str(&format!("User: {y}\n"));
@@ -201,7 +201,7 @@ pub(crate) async fn exchanges(st: &HeadState, session_id: &str, last_seq: u64) -
             break;
         }
         turns.push(t);
-        end = first.seq.saturating_sub(1);
+        end = start;
     }
     turns.reverse();
     let all = turns.join("\n");
@@ -287,6 +287,26 @@ fn clean(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn exchanges_project_rewinds_before_selecting_turns_or_a_cutoff() {
+        let (_dir, head, _mock, _id) = crate::work::tests::routing_fixture().await;
+        let events = crate::store::tests::rewind_history();
+        crate::store::tests::insert_events(&head.state.store, "session", &events).await;
+        let text = exchanges(&head.state, "session", 19).await.unwrap();
+        assert!(text.contains("KEEP_ANSWER"), "{text}");
+        assert!(text.contains("KEEP_REPLACEMENT_ANSWER"), "{text}");
+        assert_eq!(text.matches("User: KEEP original user question").count(), 1, "{text}");
+        assert_eq!(text.matches("User: KEEP replacement user question").count(), 1, "{text}");
+        assert!(!text.contains("PRIVATE"), "{text}");
+        assert!(!text.contains("DROP"), "{text}");
+        // The withdrawing marker lies after the requested historical cutoff.
+        let earlier = exchanges(&head.state, "session", 11).await.unwrap();
+        assert!(earlier.contains("KEEP_ANSWER"), "{earlier}");
+        assert!(!earlier.contains("PRIVATE"), "{earlier}");
+        assert!(!earlier.contains("replacement"), "{earlier}");
+        head.shutdown().await.unwrap();
+    }
 
     #[test]
     fn cleans_the_answer() {

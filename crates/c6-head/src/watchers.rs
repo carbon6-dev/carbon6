@@ -722,7 +722,12 @@ async fn wake(st: &HeadState, name: &str, key: &str, forced: &[String], message:
     let s = state_for(st, &d, key, &realm, watched.as_ref()).await?;
     let mut diff = String::new();
     if let Some(w) = &watched {
-        let dig = digest(&events);
+        // Wake reasons and the cursor describe the raw audit stream. The
+        // new model context describes only the surviving conversation;
+        // even a rewind beyond this window can withdraw text inside it.
+        let from = position.max(w.last_seq - WINDOW).max(0) as u64;
+        let through = events.last().map_or(w.last_seq.max(0) as u64, |e| e.seq);
+        let dig = current_digest(st, &w.id, from, through).await?;
         input_shown = dig.clone();
         values.push(("digest", if dig.is_empty() { "(nothing new)".into() } else { dig }));
         values.push(("title", w.title.clone()));
@@ -870,6 +875,12 @@ async fn wake(st: &HeadState, name: &str, key: &str, forced: &[String], message:
             .await?;
     }
     Ok(())
+}
+
+async fn current_digest(st: &HeadState, session_id: &str, after: u64, through: u64) -> anyhow::Result<String> {
+    let events = st.store.effective_events(session_id).await?;
+    let window: Vec<_> = events.into_iter().filter(|e| e.seq > after && e.seq <= through).take(WINDOW as usize).collect();
+    Ok(digest(&window))
 }
 
 fn clip_end(s: &str, n: usize) -> String {
@@ -1828,6 +1839,26 @@ pub fn spawn(st: std::sync::Arc<HeadState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn current_digest_projects_before_windowing_but_rewinds_still_wake() {
+        let (_dir, head, _mock, _id) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        let events = crate::store::tests::rewind_history();
+        crate::store::tests::insert_events(&st.store, "session", &events).await;
+        let text = current_digest(st, "session", 0, 19).await.unwrap();
+        assert!(text.contains("KEEP_ANSWER"), "{text}");
+        assert!(text.contains("KEEP_REPLACEMENT_ANSWER"), "{text}");
+        assert!(!text.contains("PRIVATE"), "{text}");
+        assert!(!text.contains("DROP"), "{text}");
+        // The rewind is outside this window, not outside its meaning.
+        assert!(current_digest(st, "session", 5, 11).await.unwrap().is_empty());
+        let raw = st.store.events_after("session", 0, i64::MAX).await.unwrap();
+        assert!(reasons(&raw).contains(&"correction"));
+        assert_eq!(raw.last().unwrap().seq, 19);
+        assert_eq!(raw, events);
+        head.shutdown().await.unwrap();
+    }
 
     fn result(output: &str, is_error: bool) -> SessionEvent {
         SessionEvent {

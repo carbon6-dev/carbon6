@@ -666,8 +666,16 @@ async fn fork_seed(st: &HeadState, session: &SessionRow, upto: u64) -> anyhow::R
         }
         _ => Vec::new(),
     };
+    seed.extend(fork_events(st.store.effective_events(&session.id).await?, upto));
+    Ok(seed)
+}
+
+/// Slice only after applying the parent's complete rewind history. A
+/// rewind after the anchor must not be lost along with its withdrawn steps.
+fn fork_events(events: Vec<SessionEvent>, upto: u64) -> Vec<SessionEvent> {
+    let mut seed = Vec::new();
     let mut calls = std::collections::HashSet::new();
-    for ev in st.store.events_after(&session.id, 0, i64::MAX).await? {
+    for ev in events {
         match &ev.kind {
             Some(session_event::Kind::Assistant(a)) if ev.seq <= upto => {
                 for b in &a.blocks {
@@ -682,7 +690,81 @@ async fn fork_seed(st: &HeadState, session: &SessionRow, upto: u64) -> anyhow::R
             _ => {}
         }
     }
-    Ok(seed)
+    seed
+}
+
+#[cfg(test)]
+mod effective_context_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn nested_fork_seeds_apply_each_complete_rewind_log_before_the_anchor() {
+        let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
+        let events = crate::store::tests::rewind_history();
+        crate::store::tests::insert_events(&head.state.store, "session", &events).await;
+        let parent = head.state.store.session("session").await.unwrap().unwrap();
+        // A historical anchor whose withdrawn turn preceded it: the
+        // later rewind must be applied before cutting the seed here.
+        let seed = fork_seed(&head.state, &parent, 15).await.unwrap();
+        let text = c6_agent::transcript_text(&seed);
+        assert!(text.contains("KEEP_ANSWER") && text.contains("KEEP_REPLACEMENT_ANSWER"), "{text}");
+        assert!(!text.contains("PRIVATE"), "{text}");
+
+        let mut side = parent.clone();
+        side.id = "side".into();
+        side.parent_id = Some(parent.id.clone());
+        side.fork_seq = Some(15);
+        head.state.store.create_session(&side, &[], false).await.unwrap();
+        let mut own = events.clone();
+        if let Some(session_event::Kind::User(u)) = &mut own[1].kind {
+            u.text = "KEEP_SIDE".into();
+        }
+        crate::store::tests::insert_events(&head.state.store, &side.id, &own).await;
+        let nested = fork_seed(&head.state, &side, 15).await.unwrap();
+        let text = c6_agent::transcript_text(&nested);
+        assert!(text.contains("KEEP_SIDE") && text.contains("KEEP original user question"), "{text}");
+        assert_eq!(text.matches("KEEP_REPLACEMENT_ANSWER").count(), 2, "overlapping seqs stay in their own segment: {text}");
+        assert!(!text.contains("PRIVATE"), "{text}");
+        // Direct model replay, Claude Code's seed text, and handoffs all
+        // consume the same filtered nested seed, without native state.
+        let messages = format!("{:?}", c6_agent::history_from_events(&nested));
+        let handoff = c6_agent::handoff_context(&nested, "carbon6", c6_agent::HANDOFF_BUDGET);
+        assert!(!messages.contains("PRIVATE") && !handoff.contains("PRIVATE"));
+        head.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn fork_seeds_still_answer_tool_calls_after_the_anchor() {
+        use c6_proto::{AssistantMessage, ContentBlock, ToolResult, ToolUse, content_block};
+        let event = |seq, kind| SessionEvent { seq, ts_ms: 0, kind: Some(kind) };
+        let events = vec![
+            event(1, session_event::Kind::Started(Default::default())),
+            event(
+                2,
+                session_event::Kind::Assistant(AssistantMessage {
+                    blocks: vec![ContentBlock {
+                        block: Some(content_block::Block::ToolUse(ToolUse {
+                            id: "kept".into(),
+                            name: "read".into(),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            ),
+            event(
+                3,
+                session_event::Kind::ToolResult(ToolResult { call_id: "kept".into(), output: "KEEP_RESULT".into(), ..Default::default() }),
+            ),
+            event(
+                4,
+                session_event::Kind::ToolResult(ToolResult { call_id: "other".into(), output: "NOT_IN_SEED".into(), ..Default::default() }),
+            ),
+        ];
+        let text = c6_agent::transcript_text(&fork_events(events, 2));
+        assert!(text.contains("KEEP_RESULT") && !text.contains("NOT_IN_SEED"), "{text}");
+    }
 }
 
 /// What a new session's memex brief is about.
@@ -1646,6 +1728,12 @@ pub async fn resume(
 /// conversation.
 pub async fn rewind(st: &HeadState, session_id: &str, req: &api::RewindRequest) -> anyhow::Result<()> {
     let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    if st.store.connection(&session.connection_id).await?.is_some_and(|c| c.kind == "claude_code") {
+        let worker: WorkerId = session.worker_id.parse()?;
+        if !st.registry.get(worker).is_some_and(|w| w.capabilities.iter().any(|c| c == "claude_rewind")) {
+            return Err(bad_request("This worker cannot confirm a Claude Code memory rewind. Connect an updated worker before rewinding."));
+        }
+    }
     if session.parent_call_id.is_some() {
         return Err(bad_request("subagent sessions cannot be rewound"));
     }

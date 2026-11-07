@@ -1824,7 +1824,7 @@ pub async fn propose(st: &HeadState, caller: &Caller) -> anyhow::Result<Vec<Work
         let title: String = s.get("title");
         let first = st
             .store
-            .events_after(&id, 0, 20)
+            .effective_events(&id)
             .await
             .unwrap_or_default()
             .into_iter()
@@ -2174,6 +2174,64 @@ pub(crate) mod tests {
             .map(|(label, model)| json!({"name": model, "applies_to": [label], "connection": "api", "model": model, "enabled": true}))
             .collect();
         st.store.set_setting(crate::sessions::ROUTES, &serde_json::to_string(&routes).unwrap()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn note_evidence_excludes_withdrawn_exchanges() {
+        let (_dir, head, _mock, id) = routing_fixture().await;
+        let st = &head.state;
+        let events = crate::store::tests::rewind_history();
+        crate::store::tests::insert_events(&st.store, "session", &events).await;
+        sqlx::query("UPDATE sessions SET last_seq = ? WHERE id = 'session'")
+            .bind(events.last().unwrap().seq as i64)
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+        let item = get(st, &id, &Caller::root()).await.unwrap();
+        let evidence = described(st, &item).await.unwrap();
+        assert!(evidence.contains("KEEP original user question"), "{evidence}");
+        assert!(evidence.contains("KEEP_REPLACEMENT_ANSWER"), "{evidence}");
+        assert!(!evidence.contains("PRIVATE"), "{evidence}");
+        assert!(!evidence.contains("DROP"), "{evidence}");
+        assert_eq!(st.store.events_after("session", 0, i64::MAX).await.unwrap(), events);
+        head.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn proposals_read_the_first_effective_message_after_the_raw_prefix() {
+        use c6_proto::{SessionEvent, session_event::Kind};
+        let (_dir, head, mock, _id) = routing_fixture().await;
+        let st = &head.state;
+        let mut events = crate::store::tests::rewind_history();
+        events.extend([
+            SessionEvent { seq: 20, kind: Some(Kind::Notice(Default::default())), ..Default::default() },
+            SessionEvent {
+                seq: 21,
+                kind: Some(Kind::Rewound(c6_proto::Rewound { to_seq: 2, ..Default::default() })),
+                ..Default::default()
+            },
+            SessionEvent {
+                seq: 22,
+                kind: Some(Kind::User(c6_proto::UserMessage { text: "CURRENT_FIRST_MESSAGE".into(), ..Default::default() })),
+                ..Default::default()
+            },
+        ]);
+        crate::store::tests::insert_events(&st.store, "session", &events).await;
+        // Root keeps no memex requests; only the session contributes here.
+        sqlx::query("UPDATE sessions SET realm = ?, updated_at = ? WHERE id = 'session'")
+            .bind(crate::realms::ROOT)
+            .bind(now_ms())
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+        note_routes(st, &[(ROUTE_LABEL, "small")]).await;
+        mock.push(c6_testkit::Reply::Text(json!({"work": []}).to_string()));
+        assert!(propose(st, &Caller::in_realm(crate::realms::ROOT)).await.unwrap().is_empty());
+        let request = mock.requests().last().unwrap()["messages"].to_string();
+        assert!(request.contains("CURRENT_FIRST_MESSAGE"), "{request}");
+        assert!(!request.contains("KEEP original"), "{request}");
+        assert!(!request.contains("PRIVATE"), "{request}");
+        head.shutdown().await.unwrap();
     }
 
     #[tokio::test]

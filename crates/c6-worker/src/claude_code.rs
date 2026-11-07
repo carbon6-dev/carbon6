@@ -27,6 +27,11 @@ pub const PROFILE: &str = "claude_code";
 /// What the log shows as a Claude Code session's system prompt.
 pub const SYSTEM_PROMPT: &str = "(Claude Code's own system prompt)";
 
+#[cfg(test)]
+pub(crate) fn replace_test_bin(bin: Option<PathBuf>) -> Option<PathBuf> {
+    std::mem::replace(&mut *tests::BIN.lock().unwrap(), bin)
+}
+
 /// The `claude` binary: `$C6_CLAUDE_BIN`, then `PATH`, then the usual
 /// install locations (services often run without the user's PATH).
 pub fn find_claude() -> Option<PathBuf> {
@@ -68,6 +73,28 @@ pub struct ClaudeConversation {
     /// What a new conversation is told first, before the inputs: a side
     /// chat's branched-from context, or a handoff's transcript.
     pub preamble: Option<String>,
+}
+
+/// Main-chain IDs, not API message IDs or the result event's UUID. A tool
+/// turn ends at its final assistant entry, not the tool-call entry.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct Boundary {
+    pub session_id: String,
+    pub input_uuids: Vec<String>,
+    pub cutoff_uuid: String,
+}
+
+/// Durable reset intent. A failed or interrupted reset blocks further turns
+/// until it has been retried successfully; old session files are never removed.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Reset {
+    pub command_id: String,
+    pub to_seq: u64,
+    pub restore_files: bool,
+    pub session_id: String,
+    pub fresh: bool,
+    #[serde(default)]
+    pub withdrawn: Vec<String>,
 }
 
 /// How long an idle process with no background tasks stays up, unless
@@ -426,6 +453,7 @@ pub(crate) struct Process {
     /// `assistant` line's uuid, as in its transcript), and the tasks it
     /// reported ended during the running turn.
     last_uuid: Option<String>,
+    boundary: Boundary,
     turn_tasks: Vec<(String, String)>,
     /// Of the turn you stopped: its last message, when it ended, and the
     /// tasks it reported ended (to find, or else name, what it queued).
@@ -502,7 +530,94 @@ fn is_claude_for(pid: i32, conversation: &str) -> bool {
     out.status.success() && !conversation.is_empty() && line.contains("claude") && line.contains(conversation)
 }
 
+/// A persisted PGID may have been reused: never signal it here. Only ESRCH
+/// proves that an old group's writers (including orphaned children) are gone.
+/// Live groups, zombies and permission errors all keep the durable barrier.
+pub async fn confirm_stopped(journal: &crate::journal::Journal, session_id: &str, wait: Duration) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let mut pending = Vec::new();
+        for pgid in journal.claude_processes(session_id).await? {
+            match killpg(Pid::from_raw(pgid), None) {
+                Err(nix::errno::Errno::ESRCH) => journal.untrack_claude_process(session_id, pgid).await?,
+                Ok(()) => pending.push(pgid),
+                Err(e) => anyhow::bail!("Cannot confirm Claude Code process group {pgid} stopped: {e}"),
+            }
+        }
+        if pending.is_empty() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "Claude Code process groups have not confirmed that they stopped: {pending:?}"
+        );
+        tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + Duration::from_millis(25))).await;
+    }
+}
+
 impl Process {
+    /// Persist before any input, including reuse after a turn and initialize
+    /// attempts that fail before a PID file or fork transcript is written.
+    async fn track(&self) -> anyhow::Result<()> {
+        if let Some(observer) = &self.mapper.observer {
+            let pgid = self.pgid.ok_or_else(|| anyhow::anyhow!("Claude Code process group is unknown"))?;
+            observer.journal.track_claude_process(&observer.session_id, pgid.as_raw()).await?;
+        }
+        Ok(())
+    }
+
+    pub fn needs_preamble(&self) -> bool {
+        !self.resumed && self.mapper.turn == 0
+    }
+
+    /// The SDK's no-model initialization handshake. In print mode Claude
+    /// loads/validates the requested resume before acknowledging initialize.
+    /// This also detects the hidden cutoff flag on versions that omit it from
+    /// --help: an unsupported flag exits instead of acknowledging the reset.
+    pub async fn ready(&mut self, session_id: &str) -> anyhow::Result<String> {
+        self.track().await?;
+        let source = self.launch.conversation.clone();
+        let mut confirmed_id = session_id.to_owned();
+        let request_id = uuid::Uuid::now_v7().to_string();
+        write_line(
+            &self.stdin,
+            &serde_json::json!({"type":"control_request", "request_id":request_id,
+            "request":{"subtype":"initialize"}}),
+        )
+        .await?;
+        let ready = async {
+            while let Some((end, v)) = self.lines.recv().await {
+                self.consumed(end, &v);
+                if v["type"] == "assistant" || v["type"] == "result" {
+                    anyhow::bail!("Claude Code started a turn before confirming its reset");
+                }
+                if let Some(id) = v["session_id"].as_str().filter(|id| !id.is_empty()) {
+                    anyhow::ensure!(
+                        uuid::Uuid::parse_str(id).is_ok() && (id == session_id || id != source),
+                        "Claude Code resumed an unexpected conversation"
+                    );
+                    confirmed_id = id.to_owned();
+                }
+                if v["type"] == "control_response" && v["response"]["request_id"] == request_id {
+                    anyhow::ensure!(
+                        v["response"]["subtype"] == "success",
+                        "Claude Code refused initialization: {}",
+                        v["response"]["error"]
+                    );
+                    return Ok(());
+                }
+            }
+            anyhow::bail!("Claude Code exited before confirming its reset")
+        };
+        // A product startup limit, generous enough for a cold CLI on a loaded
+        // worker. Failure never permits resuming the abandoned conversation.
+        tokio::time::timeout(Duration::from_secs(60), ready).await??;
+        self.launch.conversation = confirmed_id.clone();
+        self.launch.extra_args.clear();
+        self.mapper.scope = confirmed_id.clone();
+        Ok(confirmed_id)
+    }
+
     /// Starts `claude` for a conversation. `stdin` is the session's (see
     /// [`Stdin`]); `mcp` serves carbon6's tools to it for as long as it runs.
     #[allow(clippy::too_many_arguments)]
@@ -694,6 +809,7 @@ impl Process {
             cwd: cwd.to_owned(),
             transcripts: transcripts_root(),
             last_uuid: None,
+            boundary: Boundary::default(),
             turn_tasks: Vec::new(),
             stop_mark: None,
             idle_since: tokio::time::Instant::now(),
@@ -880,6 +996,7 @@ impl Process {
             cwd: cwd.to_owned(),
             transcripts: transcripts_root(),
             last_uuid: None,
+            boundary: Boundary::default(),
             turn_tasks: Vec::new(),
             stop_mark: None,
             idle_since: tokio::time::Instant::now(),
@@ -1253,6 +1370,7 @@ impl Process {
     async fn confirm(&mut self, uuid: &str, started: &mut bool, sink: &Arc<dyn EventSink>) -> anyhow::Result<()> {
         let Some(i) = self.unconfirmed.iter().position(|w| w.uuid == uuid) else { return Ok(()) };
         let w = self.unconfirmed.remove(i).expect("found");
+        self.boundary.input_uuids.push(uuid.to_owned());
         if !w.recorded {
             sink.append(w.input.event()).await?;
         }
@@ -1305,7 +1423,9 @@ impl Process {
         more: &tokio::sync::Notify,
         cancel: &CancellationToken,
     ) -> anyhow::Result<TurnEnd> {
+        self.track().await?;
         self.mapper.turn = turn;
+        self.boundary = Boundary { session_id: self.launch.conversation.clone(), ..Default::default() };
         // This turn hears about whatever ended before it.
         self.unwoken.clear();
         self.wake_due = None;
@@ -1397,6 +1517,21 @@ impl Process {
                 },
             };
             let main = v["parent_tool_use_id"].is_null();
+            if main {
+                if let Some(id) = v["session_id"].as_str().filter(|id| !id.is_empty()) {
+                    self.boundary.session_id = id.to_owned();
+                    self.launch.conversation = id.to_owned();
+                }
+                if v["type"] == "assistant" {
+                    // Never carry the preceding tool-call UUID forward if
+                    // this final entry lacks one: that requires fresh-history
+                    // fallback rather than an unsafe, incomplete cut.
+                    let blocks = v["message"]["content"].as_array();
+                    let final_reply =
+                        blocks.is_some_and(|bs| bs.iter().any(|b| b["type"] == "text") && !bs.iter().any(|b| b["type"] == "tool_use"));
+                    self.boundary.cutoff_uuid = if final_reply { v["uuid"].as_str().unwrap_or_default().to_owned() } else { String::new() };
+                }
+            }
             if main
                 && matches!(v["type"].as_str(), Some("user" | "assistant"))
                 && let Some(uuid) = v["uuid"].as_str()
@@ -1455,7 +1590,14 @@ impl Process {
                         self.mapper.result.unwrap_or(TurnEndReason::Completed)
                     };
                     if !self.unshown {
-                        sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: reason as i32 })).await?;
+                        let seq = sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: reason as i32 })).await?;
+                        if let Some(obs) = &self.mapper.observer {
+                            // Seq, not the CLI/actor's turn counter: quiet turns
+                            // need not be shown, so counters can repeat after a
+                            // worker restart. A crash before this write leaves
+                            // no trusted cutoff and must use fresh history.
+                            obs.journal.record_claude_turn(&obs.session_id, seq, &self.boundary).await?;
+                        }
                     }
                     self.stop_mark = mark;
                     self.notified.clear();
@@ -1544,13 +1686,26 @@ impl Process {
         let _ = self.mapper.close_children(TurnEndReason::Interrupted).await;
     }
 
+    /// Rewind must not wait forever if signaling or child cleanup fails.
+    /// Its durable PGID survives timeout/Drop; confirm_stopped gates retries.
+    pub async fn stop_for_rewind(self) -> anyhow::Result<()> {
+        tokio::time::timeout(Duration::from_secs(5), async move {
+            self.track().await?;
+            self.stop().await;
+            Ok(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Claude Code did not stop within the rewind cleanup limit"))?
+    }
+
     async fn kill(&mut self) {
         if let Some(pg) = self.pgid {
             // SIGINT lets Claude Code save its transcript; then make sure.
             let _ = killpg(pg, Signal::SIGINT);
-            if tokio::time::timeout(Duration::from_secs(3), self.wait_exit()).await.is_err() {
-                let _ = killpg(pg, Signal::SIGKILL);
-            }
+            let _ = tokio::time::timeout(Duration::from_secs(3), self.wait_exit()).await;
+            // The CLI may exit before a child that ignored SIGINT. Its
+            // surviving process-group members must not outlive the reset.
+            let _ = killpg(pg, Signal::SIGKILL);
         }
         let _ = tokio::time::timeout(Duration::from_secs(3), self.wait_exit()).await;
         self.release_held();
@@ -2877,6 +3032,100 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"usage":{}}
                 "Message sent by an automation, not typed by the user:\nRaw message"
             );
         }
+    }
+
+    /// A dead leader is not proof that its group's writers stopped. The
+    /// durable barrier survives reopening the journal and never signals the
+    /// surviving member (both children are ours so the test can reap them).
+    #[tokio::test]
+    async fn pgid_barrier_survives_leader_loss_and_journal_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.db");
+        let journal = crate::journal::Journal::open(&path).await.unwrap();
+        let sid = "carbon6-owner";
+        let mut leader = tokio::process::Command::new("sleep").arg("300").process_group(0).kill_on_drop(true).spawn().unwrap();
+        let pgid = leader.id().unwrap() as i32;
+        let mut member = tokio::process::Command::new("sleep").arg("300").process_group(pgid).kill_on_drop(true).spawn().unwrap();
+        journal.track_claude_process(sid, pgid).await.unwrap();
+        journal.track_claude_process(sid, pgid).await.unwrap();
+        assert!(journal.claude_processes("not-the-owner").await.unwrap().is_empty());
+        leader.kill().await.unwrap();
+        assert!(confirm_stopped(&journal, sid, Duration::ZERO).await.is_err());
+        assert_eq!(journal.claude_processes(sid).await.unwrap(), [pgid]);
+        drop(journal);
+
+        let journal = crate::journal::Journal::open(&path).await.unwrap();
+        assert!(confirm_stopped(&journal, sid, Duration::from_millis(30)).await.is_err());
+        assert_eq!(journal.claude_processes(sid).await.unwrap(), [pgid]);
+        assert!(member.try_wait().unwrap().is_none(), "checking a persisted PGID must not signal it");
+        member.kill().await.unwrap();
+        confirm_stopped(&journal, sid, Duration::ZERO).await.unwrap();
+        assert!(journal.claude_processes(sid).await.unwrap().is_empty());
+    }
+
+    /// The fake itself checks SQLite when input arrives: a Rust assertion
+    /// after ready/turn would not prove the record preceded model input.
+    fn pgid_checking_claude(dir: &Path) -> PathBuf {
+        script(
+            dir,
+            "claude-pgid",
+            r#"#!/usr/bin/env python3
+import json, os, sqlite3, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    with sqlite3.connect('journal.db') as db:
+        assert db.execute('SELECT pgid FROM claude_processes WHERE session_id = ?', ('0199-main',)).fetchall() == [(os.getpgrp(),)]
+    with open('checked-inputs', 'a') as out:
+        out.write(request['type'] + '\n')
+    if request['type'] == 'control_request':
+        print(json.dumps({'type': 'control_response', 'response': {'subtype': 'error', 'request_id': request['request_id'], 'error': 'test initialization rejected'}}), flush=True)
+    else:
+        print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'usage': {}}), flush=True)
+"#,
+        )
+    }
+
+    #[tokio::test]
+    async fn pgid_is_durable_before_rejected_initialization() {
+        if !c6_testkit::have("python3") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let bin = pgid_checking_claude(dir.path());
+        let observer = observer(dir.path(), Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()))).await;
+        let mut p = spawn(&bin, dir.path(), "cli-conversation-not-owner", false, Some(observer.clone()));
+        let pgid = p.pgid.unwrap().as_raw();
+        let error = p.ready(&uuid::Uuid::now_v7().to_string()).await.unwrap_err();
+        assert!(error.to_string().contains("test initialization rejected"), "{error:#}");
+        assert_eq!(std::fs::read_to_string(dir.path().join("checked-inputs")).unwrap(), "control_request\n");
+        assert_eq!(observer.journal.claude_processes(&observer.session_id).await.unwrap(), [pgid]);
+        assert!(observer.journal.claude_processes("cli-conversation-not-owner").await.unwrap().is_empty());
+        // Failed initialize attempts have no pidfile, but stopping/Drop must
+        // not retire their durable barrier without a separate ESRCH check.
+        assert!(p.pidfile.is_none());
+        p.stop_for_rewind().await.unwrap();
+        assert_eq!(observer.journal.claude_processes(&observer.session_id).await.unwrap(), [pgid]);
+        confirm_stopped(&observer.journal, &observer.session_id, Duration::ZERO).await.unwrap();
+        assert!(observer.journal.claude_processes(&observer.session_id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pgid_is_durable_before_turn_input_and_process_reuse() {
+        if !c6_testkit::have("python3") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let bin = pgid_checking_claude(dir.path());
+        let observer = observer(dir.path(), Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()))).await;
+        let mut p = spawn(&bin, dir.path(), "cli-conversation-not-owner", false, Some(observer.clone()));
+        let sink: Arc<dyn EventSink> = Arc::new(VecSink::default());
+        for turn in 1..=2 {
+            let end = run(&mut p, turn, &[input(&format!("c{turn}"), "hi")], &sink).await;
+            assert_eq!(end.reason, Some(TurnEndReason::Completed));
+        }
+        assert_eq!(std::fs::read_to_string(dir.path().join("checked-inputs")).unwrap(), "user\nuser\n");
+        p.stop_for_rewind().await.unwrap();
+        confirm_stopped(&observer.journal, &observer.session_id, Duration::ZERO).await.unwrap();
     }
 
     /// A turn with nothing joining it.

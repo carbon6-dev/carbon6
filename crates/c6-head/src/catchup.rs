@@ -128,17 +128,11 @@ pub async fn get(st: &HeadState, id: &str, q: &api::CatchupQuery, caller: &Calle
     Ok(Some(out))
 }
 
-/// The events after `after`, up to `last` (the newest [`MAX_EVENTS`] at most).
-async fn read(st: &HeadState, id: &str, after: u64, last: u64) -> anyhow::Result<Vec<Event>> {
-    let mut at = after.max(last.saturating_sub(MAX_EVENTS));
-    let mut out = Vec::new();
-    while at < last {
-        let page = st.store.events_after(id, at, 1000).await?;
-        let Some(end) = page.last() else { break };
-        at = end.seq;
-        out.extend(page.iter().filter_map(crate::convert::event));
-    }
-    Ok(out)
+/// The effective events after `after`, up to `last` (the newest
+/// [`MAX_EVENTS`] at most). Read rewind markers before slicing the window.
+pub(crate) async fn read(st: &HeadState, id: &str, after: u64, last: u64) -> anyhow::Result<Vec<Event>> {
+    let after = after.max(last.saturating_sub(MAX_EVENTS));
+    Ok(st.store.effective_events(id).await?.iter().filter(|e| e.seq > after && e.seq <= last).filter_map(crate::convert::event).collect())
 }
 
 /// A card is worth it for [`THRESHOLD`] steps or more, or anything
@@ -690,6 +684,23 @@ pub(crate) async fn ask(st: &HeadState, row: &SessionRow, label: &str, what: &st
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn catchup_summaries_apply_rewinds_before_windowing() {
+        let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
+        let events = crate::store::tests::rewind_history();
+        crate::store::tests::insert_events(&head.state.store, "session", &events).await;
+        // The rewind markers are outside this requested historical window.
+        // A raw slice would expose the withdrawn question and answer.
+        let withdrawn = read(&head.state, "session", 5, 11).await.unwrap();
+        assert!(withdrawn.is_empty(), "{withdrawn:?}");
+        let effective = read(&head.state, "session", 0, 19).await.unwrap();
+        let text = condensed(&effective);
+        assert!(text.contains("KEEP_ANSWER") && text.contains("KEEP_REPLACEMENT_ANSWER"), "{text}");
+        assert!(!text.contains("PRIVATE"), "{text}");
+        assert_eq!(effective.iter().map(|e| e.seq).collect::<Vec<_>>(), [1, 2, 3, 4, 5, 13, 14, 15, 16]);
+        head.shutdown().await.unwrap();
+    }
 
     #[test]
     fn catchup_previews_remove_citations_before_clipping() {
