@@ -54,8 +54,9 @@ fn write_private(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
 }
 
 /// A secret's value, if `realm` has it, or root (root's are every
-/// realm's, as its settings are): for a kit job's environment, an app's
-/// OAuth client.
+/// realm's, as its settings are): for head-side uses such as an app's
+/// OAuth client. Worker-bound kit credentials instead check scope in
+/// `kitjobs::run` before decrypting.
 pub async fn value_in(st: &crate::HeadState, realm: &str, name: &str) -> anyhow::Result<Option<String>> {
     match st.store.secret(realm, name).await? {
         Some((blob, _, _)) => Ok(Some(st.secrets.decrypt(&blob)?)),

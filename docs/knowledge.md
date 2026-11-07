@@ -182,6 +182,7 @@ Steps 1–2 depend on apps.md's ownership (its step 1); 6 depends on its instanc
 
 - **Kit jobs** (`kitjobs.rs`): the head runs a kit tool on a worker with no session and no model. Workers with a container runtime say so (capability `kits`) and answer `kit.job`; `C6_KIT_JOBS=off` keeps a worker out of them (its sessions' kits still run).
   - A job is a realm's (an app's, or the knowledge store's that asked to read a file) and runs only on a worker available to that realm: one kept to it first, else one that serves every realm. With none connected it fails; it never goes elsewhere. A file in a watched folder is read by its folder's worker, which must serve the realm too.
+  - An app job's approved secrets come from its realm, else root. As with session credentials, a secret with any `worker:` selectors is given only to a worker whose name matches one of them; other labels do not change this check. The destination is chosen once, then scopes are checked before decryption or delivery. A mismatch refuses the job without sending an RPC or moving it to a different worker. A head-local run has no worker identity and cannot receive worker-scoped secrets; unscoped secrets still work there.
   - The job runs in a folder of its own under the worker's state, with its inputs written there first, in the sandbox the kit's permissions describe.
   - What it leaves in `out/` comes back, up to 64 MB.
   - A first run may build the kit's image; the head allows 35 minutes on top of the run's own limit for that.
