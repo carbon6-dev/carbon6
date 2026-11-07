@@ -501,7 +501,15 @@ async fn check(resp: Result<Response, gloo_net::Error>) -> Result<Response, Stri
 // body remains lazy and dropping the returned future still drops the decode.
 #[inline(never)]
 fn json<T: DeserializeOwned + 'static>(req: Result<Response, gloo_net::Error>) -> LocalBoxFuture<'static, Result<T, String>> {
-    Box::pin(async move { check(req).await?.json().await.map_err(|e| e.to_string()) })
+    Box::pin(async move { serde_json::from_str(&response_text(req).await?).map_err(|e| e.to_string()) })
+}
+
+// HTTP checking and body-read polling do not depend on T. Keep them shared
+// rather than specializing their state and error paths for every JSON type.
+// This is gloo's Response::json sequence, with the same lazy read and errors.
+#[inline(never)]
+fn response_text(req: Result<Response, gloo_net::Error>) -> LocalBoxFuture<'static, Result<String, String>> {
+    Box::pin(async move { check(req).await?.text().await.map_err(|e| e.to_string()) })
 }
 
 async fn send_json<T: DeserializeOwned + 'static>(req: RequestBuilder, body: &impl Serialize) -> Result<T, String> {

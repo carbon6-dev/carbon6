@@ -739,6 +739,7 @@ names-kept diagnostic files are never counted as production downloads.
 |---|---:|---:|---:|
 | 7035ec6b baseline | 10,789,325 | 2,664,768 | — |
 | Shared popup listener factories | 10,750,115 | 2,659,154 | 39,210 / 5,614 |
+| Shared checked response-body polling | 10,691,725 | 2,651,304 | 58,390 / 7,850 |
 
 The whole-module profile repeats S1's names-kept bindgen/`wasm-opt -Oz -g`
 pipeline, twiggy top/dominators/monos, and all-symbol per-crate/per-module
@@ -763,6 +764,17 @@ nested Escape ordering, focus restoration and cleanup are unchanged. All
 current close captures are shared reactive handles, not clone-sensitive
 owned state. No views, DOM attributes, icons or overlay lifecycles are erased
 or merged by this change. Native UI tests pass **305/305**.
+
+Successful JSON responses now share a non-generic boxed future for HTTP
+checking and reading the body as text, before typed serde decoding. This
+is the locked gloo-net 0.7 `Response::json` sequence: the same text reader
+and serde parser, including transparent serde error strings. `check`'s
+structured-error/status-text fallback and 401 sign-out remain unchanged.
+The extra future allocation per JSON response does not spawn a task or add
+a scheduler yield. Checking/reading remain lazy; dropping the outer future
+drops the nested body future without promising stronger network cancellation.
+Request sending, serialization and AbortSignal handling are unchanged.
+The response-body change also passes **305/305** native UI tests.
 
 The broader audit found no accidental release inclusion of native tests,
 SSR, regex, ICU or a second gloo-net implementation. Markdown defaults are
