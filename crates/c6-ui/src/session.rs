@@ -612,7 +612,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             }
         });
     }
-    let Feed { events, streaming, queued, activity, .. } = feed;
+    let Feed { events, queued, activity, .. } = feed;
     let error = RwSignal::new(None::<String>);
 
     let own_session = {
@@ -715,18 +715,9 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     }
     Effect::new(move || {
         events.track();
-        streaming.track();
-        queued.track();
         if stick.get() {
             // Back at the end: what you scrolled back to goes again.
             feed.trim();
-            request_animation_frame(move || {
-                if stick.try_get_untracked() == Some(true)
-                    && let Some(el) = scroller.try_get_untracked().flatten()
-                {
-                    crate::workspace::glide_to_end(&el);
-                }
-            });
         }
     });
 
@@ -1018,8 +1009,8 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         // The transcript at its reading width and, when the session is wide,
         // the glance beside it, the two centred together; the glance stays
         // in sight as the transcript scrolls.
-        <div class=format!("relative {READING_ROW} items-start")>
-        <div class=format!("relative {READING} px-4 pb-8 pt-4")>
+        <div class=format!("relative {READING_ROW} items-start overflow-clip")>
+        <div class=format!("relative {READING} px-4 pb-8 pt-4") data-follow-content="true">
             <Show when=move || feed.stream_failed.get()>
                 <p class="mb-3 text-sm text-muted" role="status">"Session stream disconnected. Reconnecting…"</p>
             </Show>
@@ -1102,7 +1093,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         })}
         </ScrollBox>
             <div class="hidden md:contents"><SubagentWaiting chrome /></div>
-            <PhoneStatus chrome scroller follow=stick latest=Signal::derive(move || feed.to.get().is_none()) />
+            <PhoneStatus chrome latest=Signal::derive(move || feed.to.get().is_none()) />
             <Show when=move || own_session.with(Option::is_some) fallback=|| view! { <p class="px-3 py-2 text-xs text-muted">"Loading session…"</p> }>
             {move || {
                 // Claude Code's own subagents take no messages.
@@ -2593,11 +2584,11 @@ fn last_turn_failure(evs: &[Event], fallback: Option<TurnEndReason>) -> Option<S
 }
 
 /// The row is a sibling of ScrollBox and Composer, never an overlay. Its
-/// appearance only shrinks the transcript. ResizeObserver runs before paint:
-/// following snaps to the same bottom without a glide; scrolled-up content
-/// keeps its scrollTop (no content above its message anchor has changed).
+/// appearance only shrinks the transcript. ScrollBox handles that viewport
+/// resize with the same motion-aware follow as content growth; a scrolled-up
+/// reader keeps their scrollTop. There is no second competing scroll writer.
 #[component]
-fn PhoneStatus(chrome: SessionChrome, scroller: NodeRef<leptos::html::Div>, follow: RwSignal<bool>, latest: Signal<bool>) -> impl IntoView {
+fn PhoneStatus(chrome: SessionChrome, latest: Signal<bool>) -> impl IntoView {
     let row = NodeRef::<leptos::html::Div>::new();
     let open = RwSignal::new(false);
     let live = api::live();
@@ -2625,28 +2616,6 @@ fn PhoneStatus(chrome: SessionChrome, scroller: NodeRef<leptos::html::Div>, foll
     let retained = Memo::new(move |previous: Option<&PhoneStatusState>| {
         let next = state.get();
         if next.visible() { next } else { previous.copied().unwrap_or_default() }
-    });
-    Effect::new(move || {
-        let Some(el) = row.get() else { return };
-        let mut height = el.client_height();
-        let callback = wasm_bindgen::closure::Closure::<dyn FnMut(js_sys::Array)>::new(move |_: js_sys::Array| {
-            let Some(row) = row.try_get_untracked().flatten() else { return };
-            let next = row.client_height();
-            if next != height {
-                height = next;
-                if follow.try_get_untracked() == Some(true)
-                    && let Some(el) = scroller.try_get_untracked().flatten()
-                {
-                    crate::workspace::stop_glide_to_end(&el);
-                    el.set_scroll_top(el.scroll_height());
-                }
-            }
-        });
-        if let Ok(observer) = web_sys::ResizeObserver::new(wasm_bindgen::JsCast::unchecked_ref(callback.as_ref())) {
-            observer.observe(&el);
-            let kept = send_wrapper::SendWrapper::new((observer, callback));
-            on_cleanup(move || kept.0.disconnect());
-        }
     });
     view! {
         <div node_ref=row class="relative shrink-0 md:hidden" style:height=move || if visible.get() { "44px" } else { "0px" }>
@@ -6616,10 +6585,9 @@ mod tests {
         assert!(source.contains("style:height=move || if visible.get() { \"44px\" } else { \"0px\" }"));
         assert!(source.contains("class=\"c6-rise c6-presence absolute inset-x-0 bottom-0\""), "exit visuals must not retain layout height");
         assert!(source.contains("phone_status_row(retained.get()"), "keep the last visible status during exit");
-        assert!(
-            source.contains("if follow.try_get_untracked() == Some(true)"),
-            "row compensation must not force a scrolled-up reader to the end"
-        );
+        let status = source.split("fn PhoneStatus(").nth(1).unwrap().split("/// A portal avoids").next().unwrap();
+        assert!(!status.contains("set_scroll_top") && !status.contains("glide_to_end"), "one ScrollBox controller owns following");
+        assert!(view.contains("<ScrollBox node_ref=scroller follow=stick"), "the shared controller must retain the reader's follow intent");
     }
 
     #[cfg(not(target_arch = "wasm32"))]

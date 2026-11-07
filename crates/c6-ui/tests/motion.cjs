@@ -163,7 +163,7 @@ async function fixture(browser, origin, viewport, theme, motion, started, contex
     }
     if (/bad stream message|unreachable|panicked at|ResizeObserver loop/.test(message.text())) errors.push(message.text());
   });
-  await page.addInitScript(instrumentation);
+  if (seed.instrumentation !== false) await page.addInitScript(instrumentation);
   // Never send a request to another origin, even if production code regresses.
   await context.route('**/*', route => {
     const url = route.request().url();
@@ -265,7 +265,11 @@ async function fixture(browser, origin, viewport, theme, motion, started, contex
       deferredView = { received, reply };
       return { request, release };
     },
-    send: event => send({ type: 'event', event: { seq: sequence++, ts: Date.now(), ...event } }),
+    send: event => {
+      const seq = sequence++;
+      send({ type: 'event', event: { seq, ts: Date.now(), ...event } });
+      return seq;
+    },
     stream: send,
     output: text => send({ type: 'tool_output', call_id: 'motion-tool', text }),
     setState: async (next, patch = {}) => {
@@ -1768,50 +1772,126 @@ function unitTests() {
       dispose(); assert(disconnected);
     }
   });
-  test('production glide shares the 200ms arrival clock, batches reads, and cancels or snaps immediately', () => {
+  test('production follow composes bounded compositor corrections without frame work and yields the displayed position to input', () => {
     const setup = choice => {
-      const f = load({ choice }), frames = new Map(), listeners = new Map(), writes = [];
-      let time = 0, serial = 0, reads = 0, top = 0, height = 200;
-      f.window.performance = { now: () => time };
-      f.window.requestAnimationFrame = callback => { const id = ++serial; frames.set(id, callback); return id; };
-      f.window.cancelAnimationFrame = id => frames.delete(id);
-      f.window.Element = class { closest() { return null; } };
+      const f = load({ choice }), effects = [], listeners = new Map(), writes = [];
+      let reads = 0, top = 0, height = 200;
+      f.window.requestAnimationFrame = () => assert.fail('no JS scroll animation frames');
+      let onSize, onMutation, disconnected = 0;
+      const observed = new Set();
+      f.window.ResizeObserver = class {
+        constructor(callback) { onSize = callback; }
+        observe(row) { observed.add(row); } unobserve(row) { observed.delete(row); }
+        disconnect() { observed.clear(); disconnected++; }
+      };
+      f.window.MutationObserver = class {
+        constructor(callback) { onMutation = callback; }
+        observe() {} disconnect() { disconnected++; }
+      };
+      f.window.Element = class { closest() { return null; } matches() { return false; } querySelectorAll() { return []; } };
       const el = new f.window.Element();
+      const content = { animate(keyframes, options) {
+        assert.equal(options.duration, 200);
+        assert.equal(options.composite, 'replace');
+        const animation = { currentTime: null, keyframes, options, canceled: false,
+          effect: { setKeyframes(next) { animation.keyframes = next; } },
+          cancel() { animation.canceled = true; animation.oncancel?.(); } };
+        effects.push(animation);
+        return animation;
+      } };
       Object.assign(el, {
         isConnected: true,
+        style: { overflowAnchor: '' },
         addEventListener: (name, callback) => listeners.set(name, callback),
         removeEventListener: name => listeners.delete(name),
+        querySelector(selector) { assert.equal(selector, '[data-follow-content]'); return content; },
         scrollTo(options) { assert.equal(options.behavior, 'instant'); top = options.top; writes.push(top); },
       });
       for (const [name, value] of Object.entries({ scrollTop: () => top, scrollHeight: () => height, clientHeight: () => 100 })) {
         Object.defineProperty(el, name, { get() { reads++; return value(); } });
       }
-      return { ...f, el, frames, writes, listeners,
+      return { ...f, el, effects, writes, listeners, observed,
+        size: (row, height) => onSize([{ target: row, contentRect: { height } }]),
+        mutation: records => onMutation(records), disconnected: () => disconnected,
         top: () => top, reads: () => reads, grow: value => { height = value; },
-        frame(at) { time = at; const work = [...frames.values()]; frames.clear(); work.forEach(callback => callback(at)); },
+        frame(at) { for (const effect of effects) if (!effect.canceled) {
+          effect.currentTime = at;
+          if (at >= 200) { effect.onfinish?.(); effect.canceled = true; }
+        } },
       };
     };
     const f = setup('full');
     f.window.c6GlideToEnd(f.el);
     assert.equal(f.reads(), 3);
-    f.frame(50); assert(f.top() > 0 && f.top() < 100);
-    assert.equal(f.reads(), 3, 'frames write scroll position without remeasuring');
-    f.window.c6GlideToEnd(f.el); // Same destination must retain its original deadline.
-    f.frame(200); assert.equal(f.top(), 100); assert.equal(f.frames.size, 0); assert.equal(f.reads(), 6);
+    assert.equal(f.top(), 100, 'real end commits once');
+    assert.equal(f.el.style.overflowAnchor, 'none', 'following owns anchoring');
+    assert.equal(f.effects[0].keyframes[0].transform, 'translateY(100px)');
+    const row = { style: {} };
+    f.size(row, 159.25);
+    assert.equal(row.style.containIntrinsicBlockSize, '159.25px', 'tail exit preserves measured narrow height, not an old wide auto estimate');
+    const added = new f.window.Element();
+    added.matches = () => true;
+    f.mutation([{ addedNodes: [added], removedNodes: [] }]);
+    assert(f.observed.has(added), 'new rows share the existing size observer');
+    f.mutation([{ addedNodes: [], removedNodes: [added] }]);
+    assert(!f.observed.has(added), 'trimmed rows are released');
+    f.frame(50);
+    assert.equal(f.reads(), 3, 'animation playback never measures geometry');
+    const initialWrites = f.writes.length;
+    f.window.c6GlideToEnd(f.el);
+    assert.equal(f.effects.length, 1); assert.equal(f.writes.length, initialWrites, 'same target does not restart or write');
+    f.frame(200); assert.equal(f.top(), 100); assert.equal(f.listeners.size, 0); assert.equal(f.reads(), 6);
 
     const interrupted = setup('full');
     interrupted.window.c6GlideToEnd(interrupted.el); interrupted.frame(60);
-    const displayed = interrupted.top(); interrupted.grow(250);
+    const first = interrupted.effects[0]; interrupted.grow(250);
     interrupted.window.c6GlideToEnd(interrupted.el);
-    assert.equal(interrupted.top(), displayed, 'a new destination starts from the displayed position');
-    interrupted.frame(260); assert.equal(interrupted.top(), 150); assert.equal(interrupted.reads(), 6);
+    assert.equal(interrupted.top(), 150);
+    assert.equal(interrupted.effects.length, 2);
+    assert.equal(first.currentTime, 60); assert(first.canceled, 'one native replace effect presents the summed trajectory');
+    // Independent bisection of the approved Bezier, rather than the production
+    // Newton solver, verifies that replacement preserves the old clock.
+    const remaining = (offset, age) => {
+      const x = Math.min(1, age / 200);
+      let low = 0, high = 1;
+      for (let i = 0; i < 40; i++) {
+        const t = (low + high) / 2;
+        if (.6 * t - 1.2 * t * t + 1.6 * t * t * t < x) low = t; else high = t;
+      }
+      const t = (low + high) / 2;
+      return offset * (1 - t * t * (3 - 2 * t));
+    };
+    const value = frame => Number(frame.transform.match(/^translateY\((.*)px\)$/)[1]);
+    assert(Math.abs(value(interrupted.effects[1].keyframes[0]) - remaining(100, 60) - 50) < .001);
+    interrupted.grow(260); interrupted.window.c6GlideToEnd(interrupted.el);
+    assert.equal(interrupted.effects.length, 2, 'pending changes share one effect in the frame');
+    const combined = interrupted.effects[1].keyframes;
+    assert(Math.abs(value(combined[0]) - remaining(100, 60) - 60) < .001);
+    const deadline = combined.find(frame => frame.offset === .7); // Old age 60 + 140ms.
+    assert(Math.abs(value(deadline) - remaining(60, 140)) < .001, 'the old correction expires at its original deadline');
+    for (const frame of combined) assert(Math.abs(value(frame) - remaining(100, 60 + frame.offset * 200) - remaining(60, frame.offset * 200)) < .001,
+      'native keyframes retain each independent correction clock');
+    for (let i = 1; i < combined.length; i++) {
+      const a = combined[i - 1], b = combined[i], time = (a.offset + b.offset) * 100;
+      assert(Math.abs((value(a) + value(b)) / 2 - remaining(100, 60 + time) - remaining(60, time)) < .1,
+        'linear interpolation of overlapping curves stays subpixel between keyframes');
+    }
+    interrupted.frame(200); assert.equal(interrupted.top(), 160); assert.equal(interrupted.reads(), 9);
+
+    const shrink = setup('full'); shrink.window.c6GlideToEnd(shrink.el); shrink.frame(200);
+    shrink.grow(150); shrink.el.scrollTo({ top: 50, behavior: 'instant' }); // Browser clamp before RO.
+    shrink.window.c6GlideToEnd(shrink.el);
+    assert.equal(shrink.effects.at(-1).keyframes[0].transform, 'translateY(-50px)', 'shrink compensates the prior end, not the clamped scrollTop');
 
     for (const input of ['wheel', 'touchstart', 'touchmove', 'pointerdown', 'keydown']) {
       const canceled = setup('full');
       canceled.window.c6GlideToEnd(canceled.el); canceled.frame(40);
       canceled.listeners.get(input)({ key: 'ArrowUp', target: canceled.el });
+      assert(canceled.top() > 0 && canceled.top() < 100, `${input} hands the displayed position to native input`);
       const count = canceled.writes.length; canceled.frame(200);
-      assert.equal(canceled.frames.size, 0); assert.equal(canceled.listeners.size, 0);
+      assert.equal(canceled.listeners.size, 0);
+      assert.equal(canceled.el.style.overflowAnchor, '', 'native anchoring returns when reading above');
+      assert.equal(canceled.disconnected(), 2, 'both row observers release on leaving follow');
       assert.equal(canceled.writes.length, count, `${input} cancels without later writes`);
       assert.equal(canceled.reads(), 3);
     }
@@ -1821,17 +1901,19 @@ function unitTests() {
     snapped.frame(200); assert.equal(snapped.top(), 100); assert.equal(snapped.reads(), 3);
     const changed = setup('full');
     changed.window.c6GlideToEnd(changed.el); changed.frame(40); changed.api.set('reduced');
-    assert.equal(changed.top(), 100); assert.equal(changed.frames.size, 0); assert.equal(changed.reads(), 3);
+    assert.equal(changed.top(), 100); assert.equal(changed.listeners.size, 0); assert.equal(changed.reads(), 3);
     for (const choice of ['reduced', 'off']) {
       const still = setup(choice); still.window.c6GlideToEnd(still.el);
-      assert.equal(still.top(), 100); assert.equal(still.frames.size, 0); assert.equal(still.reads(), 3);
+      assert.equal(still.top(), 100); assert.equal(still.effects.length, 0); assert.equal(still.reads(), 3);
     }
     const far = setup('full'); far.grow(400); far.window.c6GlideToEnd(far.el);
-    assert.equal(far.top(), 300); assert.equal(far.frames.size, 0);
+    assert.equal(far.top(), 300); assert.equal(far.effects.length, 0);
     const detached = setup('full');
     detached.window.c6GlideToEnd(detached.el); detached.frame(40); detached.el.isConnected = false;
+    detached.size(row, 0);
+    assert.equal(detached.disconnected(), 2, 'detaching the scroll box releases its row observers');
     const count = detached.writes.length; detached.frame(200);
-    assert.equal(detached.writes.length, count); assert.equal(detached.frames.size, 0);
+    assert.equal(detached.writes.length, count); assert.equal(detached.listeners.size, 0);
   });
 }
 

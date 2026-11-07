@@ -2086,39 +2086,28 @@ pub fn ScrollBox(
         });
         type ResizeWatch = (web_sys::ResizeObserver, wasm_bindgen::closure::Closure<dyn Fn(js_sys::Array)>);
         let observer = StoredValue::new_local(None::<ResizeWatch>);
-        let frame = StoredValue::new(None::<leptos::leptos_dom::helpers::AnimationFrameRequestHandle>);
         let stop = move || {
             observer.try_update_value(|o| {
                 if let Some(watch) = o.take() {
                     watch.0.disconnect();
                 }
             });
-            if let Some(frame) = frame.try_update_value(Option::take).flatten() {
-                frame.cancel();
-            }
         };
         Effect::new(move || {
             let Some(el) = node.get() else { return };
             // One at a time: a box drawn anew isn't watched twice.
             stop();
             let to_end = wasm_bindgen::closure::Closure::<dyn Fn(js_sys::Array)>::new(move |_: js_sys::Array| {
-                // Scrolling can materialize contained rows and resize again. Do
-                // not measure or scroll inside resize delivery; coalesce a frame.
-                let Some(None) = frame.try_get_value() else { return };
-                let next = leptos::leptos_dom::helpers::request_animation_frame_with_handle(move || {
-                    if frame.try_update_value(|f| *f = None).is_none() {
-                        return;
-                    }
-                    // Input or unmount may have stopped following since delivery.
-                    if let Some(el) = node.try_get_untracked().flatten()
-                        && follow.try_get_untracked() == Some(true)
-                        && el.client_height() > 0
-                    {
-                        glide_to_end(&el);
-                    }
-                })
-                .ok();
-                frame.set_value(next);
+                // Before paint, including shrink/clamp: commit the real end
+                // and compensate its picture with a compositor translation.
+                // Live stream updates are already batched by presentation frame.
+                // No scroll writes or measurements run during the animation.
+                if let Some(el) = node.try_get_untracked().flatten()
+                    && follow.try_get_untracked() == Some(true)
+                    && el.client_height() > 0
+                {
+                    glide_to_end(&el);
+                }
             });
             if let Ok(obs) = web_sys::ResizeObserver::new(to_end.as_ref().unchecked_ref()) {
                 obs.observe(&el);
@@ -2239,10 +2228,11 @@ extern "C" {
     fn stop_glide_to_end_js(el: &web_sys::Element);
 }
 
-/// Follows the end of a scroll box: a short glide down to what just arrived
-/// (rather than a jump for each line), straight there when it is more than
-/// a screen away (as when it opens) or motion is reduced. Shares the arrival's
-/// 200ms out curve; JS measures only on invocation and cancels on user input.
+/// Commits the end once and glides its inverse translation on the compositor.
+/// Growth and shrink add bounded 200ms corrections without restarting earlier
+/// motion. Pending corrections in one frame combine into one effect.
+/// Reduced/Off and jumps larger than a screen are immediate. User input
+/// cancels to the displayed reading position before native scrolling proceeds.
 pub fn glide_to_end(el: &web_sys::Element) {
     #[cfg(target_arch = "wasm32")]
     glide_to_end_js(el);
@@ -2720,10 +2710,12 @@ mod tests {
         for read in ["element.scrollTop", "element.scrollHeight", "element.clientHeight"] {
             assert_eq!(glide.matches(read).count(), 1, "{read} is sampled once per invocation");
         }
-        let frame = glide.split("const tick = time => {").nth(1).unwrap().split("\n    };").next().unwrap();
-        for read in [".scrollTop", ".scrollHeight", ".clientHeight", ".offset", "getBoundingClientRect", "getComputedStyle"] {
-            assert!(!frame.contains(read), "no {read} inside the scroll animation frame");
+        for work in ["requestAnimationFrame", "getBoundingClientRect", "getComputedStyle", "scale(", "scaleY("] {
+            assert!(!glide.contains(work), "the compositor glide needs no {work}");
         }
+        assert!(glide.contains("content.animate(keyframes,"));
+        assert!(glide.contains("composite: 'replace'"), "additive effects did not advance in blocked Chromium films");
+        assert!(glide.contains("age: motion.age + elapsed"), "replacement must preserve each correction's clock");
         assert!(glide.contains("const duration = 200;"));
         assert!(!glide.contains("behavior: \"smooth\""));
     }

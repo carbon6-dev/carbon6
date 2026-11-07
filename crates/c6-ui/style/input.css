@@ -313,7 +313,7 @@ html.soft {
    6rem row, followed a frame later by its measured height, moves both content
    and scrollbar twice. Older rows still skip off-screen work and remember
    their measured sizes; this is not a virtual-list spacer. */
-.c6-transcript-row:nth-last-child(-n + 16) {
+.c6-transcript-row:nth-last-child(-n + 16 of .c6-transcript-row) {
   content-visibility: visible;
   contain-intrinsic-size: none;
 }

@@ -257,10 +257,15 @@ window.c6ToolReveal = details => {
   };
 };
 
-// Match c6-arrive: 200ms, cubic-bezier(.2,0,0,1). Only an invocation
-// measures the scroll box. Frames write scroll position, never read layout.
+// Commit the real scroll range once, then translate the reading column back
+// to its previous picture. WAAPI glides that inverse away on the compositor;
+// there is no per-frame JS, scroll write, layout measurement or content scale.
+// The containing row clips overflow so this visual cannot enlarge scrollHeight.
 window.c6GlideToEnd = (() => {
   const active = new Map();
+  const settled = new WeakMap();
+  const anchoring = new WeakMap();
+  const rowWatches = new WeakMap();
   const duration = 200;
   const inputs = ["wheel", "touchstart", "touchmove", "pointerdown"];
   const scrollKeys = new Set(["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " ", "Spacebar"]);
@@ -274,58 +279,138 @@ window.c6GlideToEnd = (() => {
     }
     return t * t * (3 - 2 * t);
   };
-  const stop = element => {
+  const rememberRows = element => {
+    if (rowWatches.has(element)) return;
+    const dispose = () => {
+      sizes.disconnect(); changes.disconnect(); rowWatches.delete(element);
+    };
+    const sizes = new ResizeObserver(entries => {
+      if (!element.isConnected) { dispose(); return; }
+      for (const { target, contentRect } of entries) {
+        // Explicit fallback, not `auto`: the engine's remembered auto size
+        // can predate a width change while the row was forced visible in the
+        // live tail. Keep that real size when it leaves the tail, too.
+        const height = `${contentRect.height}px`;
+        if (target.style.containIntrinsicBlockSize !== height) target.style.containIntrinsicBlockSize = height;
+      }
+    });
+    const visit = (node, action) => {
+      if (!(node instanceof Element)) return;
+      if (node.matches('.c6-transcript-row')) action(node);
+      for (const row of node.querySelectorAll('.c6-transcript-row')) action(row);
+    };
+    const changes = new MutationObserver(records => {
+      if (!element.isConnected) { dispose(); return; }
+      for (const record of records) {
+        for (const node of record.removedNodes) visit(node, row => sizes.unobserve(row));
+        for (const node of record.addedNodes) visit(node, row => sizes.observe(row));
+      }
+    });
+    visit(element, row => sizes.observe(row));
+    changes.observe(element, { childList: true, subtree: true });
+    rowWatches.set(element, dispose);
+  };
+  const offsetAt = (state, time) => {
+    if (state.curve.length === 2) return state.curve[0].value * (1 - ease(Math.min(1, Math.max(0, time / duration))));
+    const right = state.curve.findIndex(point => point.time >= time);
+    if (right <= 0) return right === 0 ? state.curve[0].value : 0;
+    const a = state.curve[right - 1], b = state.curve[right];
+    return a.value + (b.value - a.value) * (time - a.time) / (b.time - a.time);
+  };
+  const clear = element => {
     const state = active.get(element);
     if (!state) return;
     active.delete(element);
-    cancelAnimationFrame(state.frame);
+    state.animation.onfinish = state.animation.oncancel = null;
+    state.animation.cancel();
     for (const type of inputs) element.removeEventListener(type, state.input, true);
     element.removeEventListener("keydown", state.key, true);
   };
-  // Programmatic snaps/anchor jumps cancel without moving the current picture.
+  const stop = element => {
+    const state = active.get(element);
+    const offset = state ? offsetAt(state, state.animation.currentTime || 0) : 0;
+    clear(element);
+    settled.delete(element);
+    rowWatches.get(element)?.();
+    if (anchoring.has(element)) {
+      element.style.overflowAnchor = anchoring.get(element);
+      anchoring.delete(element);
+    }
+    // Give native wheel/touch/key/scrollbar input the displayed position, not
+    // the destination hidden behind the inverse. No geometry read is needed.
+    if (state && element.isConnected) element.scrollTo({ top: state.target - offset, behavior: "instant" });
+  };
   window.c6StopGlide = stop;
   addEventListener("c6-motion", () => {
     if (!c6Motion.reduced()) return;
     for (const [element, state] of active) {
-      stop(element);
+      clear(element);
       if (element.isConnected) element.scrollTo({ top: state.target, behavior: "instant" });
     }
   });
   return element => {
     if (!element.isConnected) { stop(element); return; }
+    rememberRows(element);
+    // Native scroll anchoring must not compensate the same translated rows a
+    // second time when their effects finish. Restore it when the reader stops
+    // following, so late layout above an older reading position still anchors.
+    if (!anchoring.has(element)) anchoring.set(element, element.style.overflowAnchor);
+    element.style.overflowAnchor = 'none';
     const from = element.scrollTop;
     const height = element.scrollHeight;
     const viewport = element.clientHeight;
     const target = Math.max(0, height - viewport);
-    const gap = target - from;
-    if (gap <= 0) { stop(element); return; }
-    if (c6Motion.reduced() || gap > viewport) {
-      stop(element);
-      element.scrollTo({ top: target, behavior: "instant" });
+    const state = active.get(element);
+    // Remember the prior end even after finishing: browser clamping can
+    // already have changed scrollTop when content or a phone row shrinks.
+    const delta = target - (state?.target ?? settled.get(element) ?? from);
+    settled.set(element, target);
+    const content = element.querySelector('[data-follow-content]');
+    if (c6Motion.reduced() || !content || Math.abs(delta) > viewport) {
+      clear(element);
+      if (from !== target) element.scrollTo({ top: target, behavior: "instant" });
       return;
     }
-    // Repeated resize notifications for one destination must not keep moving
-    // its finish line. A new target starts from the actual displayed position.
-    if (active.get(element)?.target === target) return;
-    stop(element);
-    const state = { target, start: performance.now(), frame: 0 };
-    state.input = () => { if (active.get(element) === state) stop(element); };
-    state.key = event => {
+    if (from !== target) element.scrollTo({ top: target, behavior: "instant" });
+    if (delta === 0) return;
+    const next = state || { motions: [] };
+    next.target = target;
+    // Keep the age of every correction: growth must not restart an old curve
+    // or pull a new one into an almost-expired clock. Chromium can advertise
+    // an accelerated layer for additive transforms yet freeze those pixels
+    // during a blocked main thread. Present their summed trajectory as ONE
+    // replace transform instead. Only overlapping curves need 2ms keyframes;
+    // playback has no JS work, and each old contribution still expires on time.
+    const previous = state?.animation;
+    const elapsed = previous?.currentTime || 0;
+    next.motions = next.motions.map(motion => ({ ...motion, age: motion.age + elapsed })).filter(motion => motion.age < duration);
+    if (previous?.currentTime === null && next.motions.length) next.motions.at(-1).offset += delta;
+    else next.motions.push({ offset: delta, age: 0 });
+    const times = next.motions.length === 1 ? [0, duration] : [...new Set([
+      ...Array.from({ length: 101 }, (_, i) => i * 2), ...next.motions.map(motion => duration - motion.age),
+    ])].sort((a, b) => a - b);
+    next.curve = times.map(time => ({ time, value: next.motions.reduce((sum, motion) =>
+      sum + motion.offset * (1 - ease(Math.min(1, (motion.age + time) / duration))), 0) }));
+    const keyframes = next.curve.map(point => ({ offset: point.time / duration, transform: `translateY(${point.value}px)` }));
+    if (previous?.currentTime === null) { previous.effect.setKeyframes(keyframes); return; }
+    const animation = content.animate(keyframes, {
+      duration, easing: next.motions.length === 1 ? 'cubic-bezier(.2,0,0,1)' : 'linear', composite: 'replace',
+    });
+    next.animation = animation;
+    if (previous) { previous.onfinish = previous.oncancel = null; previous.cancel(); }
+    const finished = () => {
+      if (active.get(element) === next && next.animation === animation) clear(element);
+    };
+    animation.onfinish = animation.oncancel = finished;
+    if (state) return;
+    next.input = () => { if (active.get(element) === next) stop(element); };
+    next.key = event => {
       if (!scrollKeys.has(event.key)) return;
       if (event.target instanceof Element && event.target.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])')) return;
-      state.input();
+      next.input();
     };
-    active.set(element, state);
-    for (const type of inputs) element.addEventListener(type, state.input, { capture: true, passive: true });
-    element.addEventListener("keydown", state.key, true);
-    const tick = time => {
-      if (active.get(element) !== state) return;
-      if (!element.isConnected) { stop(element); return; }
-      const progress = Math.min(1, Math.max(0, (time - state.start) / duration));
-      element.scrollTo({ top: from + gap * ease(progress), behavior: "instant" });
-      if (progress === 1) stop(element);
-      else state.frame = requestAnimationFrame(tick);
-    };
-    state.frame = requestAnimationFrame(tick);
+    active.set(element, next);
+    for (const type of inputs) element.addEventListener(type, next.input, { capture: true, passive: true });
+    element.addEventListener("keydown", next.key, true);
   };
 })();

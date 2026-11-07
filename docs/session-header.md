@@ -32,7 +32,7 @@ One 44px bar: **app menu, title, plain context ring, Actions, Sessions picker**.
 - **Sessions:** one flat list of open sessions/pages, including hidden ones, with a current highlight and close controls; recently viewed, All sessions and New session or page follow it. Ask and the Needs you bell are in this sheet, centred on one header line with matching 20px visual pills inside 44px touch targets. The bell occupies the rows' close-control column; there is no header X. Tap outside, tap or swipe down on the handle, or press Escape to close. The handle is a native button named **Close Sessions**, including for screen readers. The old long-press/reorder footer is removed.
 - **Status:** immediately above the still-mounted composer, outside the transcript scroll area, a 44px row exists only for **Working…** (calmer spinning loader-circle), **Waiting on you N** (triangle-alert), **Last turn failed** (circle-x), or positive **Background N** (hourglass). All icons are drawn SVG. Background work is independent of main-agent work. **Show** opens waiting cards, failure details and task/subagent controls; appearing/updating the row never takes focus from the composer. Its keyboard focus treatment stays inside the smaller visual button within the 44px target. Linked child/task records count once; foreground native work and read-only mirrors do not inflate the count. Completed history and held notices remain in the session overview when idle, without an idle row. Desktop retains its existing transcript task/waiting affordances.
 - Row insertion/removal consumes transcript height, not composer position. Following stays bottom-anchored; reading older content stays put. The visual viewport bounds the app, sheets and dialogs with an overlay keyboard. Landscape uses this same layout when height is below 512px.
-- **Motion:** the status row yields its height once, immediately, with a compositor-only rise/fade; its exiting visual stays out of flow and inert. The existing ResizeObserver still snaps following readers to the end without gliding. Session/status sheets and the glance retain their bodies through the exit and reverse if reopened; closed trees are inert immediately, and heavy bodies unmount after presence ends. Phone sheets use the shared 280ms spring enter/200ms exit and 30% scrim; desktop glance/panels use the shared 40px slide/fade (220ms enter/150ms exit). These effects never animate streaming text or delay input; the shared motion preference controls reduced/off behavior.
+- **Motion:** the status row yields its height once, immediately, with a compositor-only rise/fade; its exiting visual stays out of flow and inert. ScrollBox alone compensates its viewport change using the motion-aware transcript following below, not a competing phone-only snap. Session/status sheets and the glance retain their bodies through the exit and reverse if reopened; closed trees are inert immediately, and heavy bodies unmount after presence ends. Phone sheets use the shared 280ms spring enter/200ms exit and 30% scrim; desktop glance/panels use the shared 40px slide/fade (220ms enter/150ms exit). These effects never animate streaming text or delay input; the shared motion preference controls reduced/off behavior.
 - **App drawer:** on phones the ☰ drawer enters from and exits to the left, with the same sheet timings and uninterrupted reversal. Swipe left starting anywhere inside it, not at the Android Back edge: a clear horizontal drag follows the finger in Full, then closes at 35% of its width on release or springs back if released early/reversed. Vertical/diagonal starts keep native nested scrolling; taps, outside tap and Escape still work. It accepts input from its first frame. System follows the OS; Reduced fades without travel and Off is immediate, with the same swipe-to-close threshold in each setting. Its keyboard-aware height and 288px width (capped to the viewport) stay unchanged.
 - **Composer sizing:** working/suggestion changes refit only an empty draft's hint. A nonempty draft still resizes for text and width changes, but not for a status-only update: temporarily measuring it at `height:auto` can make WebKit clamp the transcript to a transient end without a net ResizeObserver size change. Text, resize and width notifications share one queued fit before paint, with no duplicate synchronous input fit. Avoiding repeated measurements preserves true end-following on small phones without moving or recreating the composer.
 - **Model chip:** on phones (including short landscape) its model, effort and subagent choices use the existing keyboard-aware bottom sheet; desktop keeps the anchored popover. Phone sheet controls stack at the normal sheet padding: the Model label sits directly above its full-width field and offered list, with no reserved connection column. Tap outside, tap or swipe the named close handle, or Escape to close; the model sheet has no redundant top X (other shared sheets retain theirs). The sheet retains its body through exit and can reverse without remounting. The model text field still accepts arbitrary ids and lists every offered model, not filtered suggestions; its list flows inside the sheet's scroll area so the keyboard cannot clip it. Selection still takes effect on the next send. New-session, side-chat and Ask forms keep their inline fields; their phone model lists flow in their existing scroll area too, rather than being clipped above or below it. The Sessions page retains its new-session form during subsequent model-list loading, so typing does not detach the focused input. Its Where and how sheet uses the shared keyboard inset and 80% visible-height cap. Desktop form dropdowns are unchanged. All use the existing per-connection model cache warmed by composer prefetch.
@@ -50,11 +50,38 @@ not add height on hover. There is no additional idle status spacer.
 Session-stream messages received before a presentation frame are applied in
 wire order in one reactive batch, including reply replacement, queue changes
 and turn completion. Disconnect flushes pending messages before replay begins;
-unmount cancels its pending frame.
+unmount cancels its pending frame. Hidden tabs flush immediately rather than
+buffering while animation frames are paused; failed frame registration also
+flushes without dropping messages.
 The newest 16 event elements use their real layout height immediately. Older
-off-screen rows retain `content-visibility: auto` and remembered measured
-heights. This avoids following a guessed 6rem tail row and then correcting
-both the transcript and its scrollbar again when its real height arrives.
+off-screen rows retain `content-visibility: auto`. While following, a shared
+ResizeObserver remembers row heights as explicit intrinsic block sizes: the
+browser's `auto` cache can otherwise restore a width-old height when a row
+leaves the forced-visible tail after a tile resize. This avoids following a
+guessed 6rem tail row and then correcting both the transcript and its scrollbar
+again when its real height arrives. Removed rows are unobserved; stopping
+following disconnects the row observers.
+
+While following, ScrollBox's ResizeObserver commits the real end before paint
+and applies an inverse translation to the reading column. In Full, that
+translation glides away on the compositor in 200ms, without scaling text or
+writing scrollTop on every animation frame. New growth adds its own bounded
+correction without restarting earlier correction clocks; corrections still
+pending in one presentation frame combine. One native replace-transform effect
+presents their summed trajectory (2ms keyframes only when curves overlap).
+Native additive composition advertised acceleration in Chromium but did not
+advance the recorded text during a blocked main thread. Shrink uses the previous
+logical end, not the already-clamped scrollTop. The surrounding row clips the visual overflow,
+so translation cannot itself enlarge the scroll range. The glance is not
+translated. Reduced/Off, initial restoration and moves larger than a viewport
+are immediate. Native input cancels to the currently displayed reading
+position before wheel/touch/key/scrollbar scrolling proceeds. Native scroll
+anchoring is disabled while following so it cannot compensate the translated
+rows again when their effects finish; stopping restores the previous anchoring
+style for readers above the end. Reading above the end does not call the follow
+helper at all. The fixed app shell uses `overflow: clip`, not `hidden`: focusing
+the composer must not programmatically scroll the shell and move the entire
+transcript outside its own scroll box. Actual scroll boxes remain scrollable.
 
 ## Icons throughout the app
 

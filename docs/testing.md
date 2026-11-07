@@ -198,6 +198,49 @@ silently changing accents or treating rounded figures as a pass.
 
 ## Motion: production browser regression
 
+### Transcript layout steps
+
+After `env -u NO_COLOR make ui`, run the owned loopback production fixture:
+
+```sh
+/home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/transcript-steps.cjs
+```
+
+It sends through the real composer, presents a long transcript, starts a turn,
+updates usage, runs a tool call/result, starts a background task, queues a second
+message, streams a reply, and finishes the reply/turn/task/queue in a burst.
+Both themes, a 400px desktop tile and a phone are checked in Full/Reduced/Off.
+Per-frame scrollTop, scrollHeight, viewport, unchanged-message position and
+estimated native thumb geometry are saved alongside DOM mutations and row
+ResizeObserver records. It counts distinct scroll corrections for the whole
+send-and-finish scenario, requires no usage/task-status height change, checks
+bounded translation-only Full effects (none in Reduced/Off), and asserts that
+upward input prevents later messages moving the reader. The narrow tile also
+exercises rows leaving the live tail after a width change; their measured
+height must not revert to an older intrinsic-size cache, including after an
+upward pause, a 400→520px width change and native End to resume. Composer focus must
+not pan the fixed app shell. It does not treat smoothly translated pixels as
+additional logical scroll corrections. Thumb geometry is estimated from the
+scroll range, not a measurement of a platform's native scrollbar raster.
+The light desktop Off case also holds a pending frame, hides the document,
+and requires the whole wire-ordered queue to flush and cancel that handle.
+Hidden delivery and a failed visible frame registration must both make progress
+without a subsequent animation frame.
+
+`EVIDENCE` chooses the output directory (default `/tmp/q8-steps/after`);
+`ROOT` selects an independently built baseline; `BEFORE=1` records that baseline
+without asserting the new layout/animation invariants. `THEMES`, `VIEWS`
+(`desktop,tile,phone`) and `MOTIONS` select cases. Chromium-only diagnostics
+`CPU_RATE=4 TRACE=1` save a DevTools trace and active reading-column compositor
+reasons. These are measurements, not machine-speed pass/fail thresholds.
+`BLOCK_MS=300` diagnostic saves timestamped compositor frames during a busy
+main-thread interval and the effect's entry clock; `BLOCK_PHASE=text` selects
+overlapping queue/text corrections instead of the default tool-call phase.
+The shared fixture's per-frame animation scanner is deliberately disabled here:
+this harness observes production effects at creation and samples only its
+unchanged anchor, rather than materializing every off-screen event. No live
+head, settings, services or browser profile are used.
+
 `ONLY=sessionsPicker` checks the phone Sessions header's visual alignment,
 retained SVG icons, accessible close handle, and tap-outside/handle/swipe/Escape
 dismissal. Include `VIEWPORT=narrow,phone,landscape THEME=light,dark` for the
@@ -864,14 +907,17 @@ or unmount, and never `forget()` the closure. The message box uses the same
 ownership pattern. The transcript's on-sight IntersectionObserver retains its
 callback until cleanup too (as the glance outline already does).
 
-Transcript-follow resize delivery must not measure or scroll synchronously:
-deliver its callback twice in one task and assert that only one animation frame
-is queued. Scroll away before that frame runs: it must recheck following and
-leave the reading position alone. Queue another frame and close the tile in the
-same task: cleanup must disconnect the observer and cancel the queued frame, with
-no late reads or dropped-closure errors. With normal-motion WebKit and many tall
-contained rows, stream and resize at phone and desktop widths; no ResizeObserver
-loop warning is acceptable (also repeat with reduced motion and in Chromium).
+Transcript-follow resize delivery commits the real end synchronously before
+paint, with one native inverse-translation trajectory rather than a queued
+scroll-animation frame. Deliver its callback twice without changing geometry:
+the second invocation must not write scrollTop or restart the native effect.
+Scroll away and deliver again: it must recheck following and leave the reading
+position alone. Close the tile: cleanup must disconnect the observer before
+dropping its callback, with no late reads or dropped-closure errors. The helper's
+row-height observers also disconnect when following stops or the root detaches.
+With normal-motion WebKit and many tall contained rows, stream and resize at
+phone and desktop widths; no ResizeObserver loop warning is acceptable (also
+repeat with reduced motion and in Chromium).
 
 In browser automation, wrap the native observers before loading the app and
 record each callback and its observed elements. Open and close session tiles
