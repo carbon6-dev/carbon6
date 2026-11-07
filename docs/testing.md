@@ -1000,6 +1000,14 @@ Screenshots go to `/tmp/n3-ui/item3` (`EVIDENCE` overrides it).
 captures before evidence. `ENGINES=chromium,webkit` additionally runs WebKit;
 startup traps fail explicitly rather than being retried or hidden.
 
+`reply-recovery.cjs --responses` checks the shared HTTP decoder against
+malformed successful JSON, a structured 503, non-JSON status-text fallback,
+a rejected response-body read, and a 401 arriving after the workspace mounts
+(which must replace it with sign-in). Every case owns its mocked responses
+and browser context. Use `ENGINES=chromium,webkit` for both engines; no live
+head or settings are touched. The normal mode above still covers deferred
+mutation failure and draft preservation.
+
 After `env -u NO_COLOR make ui`, run both production regressions:
 
 ```sh

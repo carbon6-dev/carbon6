@@ -708,10 +708,21 @@ Production `make ui` measurements, with the existing Brotli quality-11 hook:
 |---|---:|---:|---:|
 | 5384d8e2 baseline | 10,713,719 | 2,665,834 | — |
 | Shared typed icon boundary | 10,692,720 | 2,656,541 | 20,999 / 9,293 |
+| Shared response-decoding futures | 10,676,549 | 2,637,469 | 16,171 / 19,072 |
 
-The size ceilings stay **10,724,780 raw / 2,667,328 Brotli**. This first saving
-alone leaves only 10,787 Brotli bytes of room, so more savings are needed.
+The size ceilings stay **10,724,780 raw / 2,667,328 Brotli**. These savings
+leave 29,859 Brotli bytes of room, so more savings are needed.
 The existing native icon tests cover every path at every size; production
 browser checks include the component gallery in both themes, desktop/phone
 and Chromium/WebKit, plus live snapshot/transcript and retained-node checks
 in `tests/ring-render.cjs`. Size reduction is not a claim of faster rendering.
+
+Response decoding and empty-response checking now return boxed local futures
+from non-inlined factories. This shares their poll machinery instead of
+embedding it into every endpoint/resource future. Each decode adds one small
+allocation, not a task or scheduler yield. The original lazy bodies, gloo JSON
+decoder, status/error handling, 401 sign-out and drop/cancellation behavior
+are retained; request serialization still happens inside the original async
+wrapper. `reply-recovery.cjs --responses` checks malformed JSON, structured and
+fallback errors, body-read rejection and post-mount sign-out in real browsers;
+its normal mode still checks delayed mutation failure and draft recovery.

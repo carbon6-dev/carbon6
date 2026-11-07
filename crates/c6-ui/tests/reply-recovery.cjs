@@ -80,13 +80,66 @@ async function check(browser, origin, engine, name, theme) {
     console.log(`PASS ${engine}/${name}/${theme}${before ? ' (baseline overwrite reproduced)' : ''}`);
   } finally { release(); await f?.context.close(); }
 }
+
+// Exercise the shared production decoder without a real head. A successful
+// status still needs valid JSON; failures retain structured/fallback errors,
+// and a later 401 must replace an already-mounted app with sign-in.
+async function responses(browser, origin, engine) {
+  for (const kind of ['malformed', 'structured', 'fallback', 'body-read', 'unauthorized']) {
+    let f, release = () => {};
+    const released = new Promise(resolve => { release = resolve; });
+    try {
+      f = await fixture(browser, origin, { width: 1440, height: 900 }, 'light',
+        { choice: 'off', effective: 'off', os: 'reduce' }, partial => { f = partial; }, {}, {
+          ready: kind === 'unauthorized' ? 'textarea' : 'body',
+          setup: async ({ context, page }) => {
+            if (kind === 'body-read') await page.addInitScript(() => {
+              const text = Response.prototype.text;
+              Response.prototype.text = function (...args) {
+                return this.url.endsWith('/auth/status') ? Promise.reject(new Error('Fixture body read failed')) : text.apply(this, args);
+              };
+            });
+            if (kind === 'unauthorized') {
+              await context.route('**/api/v1/connections', async route => {
+                await released;
+                await route.fulfill({ status: 401, json: { error: 'Fixture expired sign-in' } });
+              });
+            } else if (kind !== 'body-read') {
+              await context.route('**/api/v1/auth/status', route => kind === 'structured'
+                ? route.fulfill({ status: 503, json: { error: 'Fixture decoder unavailable' } })
+                : route.fulfill({ status: kind === 'fallback' ? 403 : 200, contentType: 'application/json', body: '{' }));
+            }
+          },
+        });
+      const { page } = f;
+      if (kind === 'unauthorized') {
+        release();
+        await page.getByRole('heading', { name: 'Sign in to carbon6', exact: true }).waitFor();
+        assert.equal(await page.locator('textarea').count(), 0, '401 removes the signed-in workspace');
+      } else {
+        const error = page.getByText('Cannot reach the head:', { exact: false });
+        await error.waitFor();
+        const message = await error.textContent();
+        const expected = { malformed: /EOF while parsing an object/, structured: /Fixture decoder unavailable/,
+          fallback: /Forbidden/, 'body-read': /Fixture body read failed/ }[kind];
+        assert.match(message, expected);
+      }
+      assert.deepEqual(f.errors, [], 'no panic or browser crash on an API failure');
+      console.log(`PASS ${engine}/responses/${kind}`);
+    } finally { release(); await f?.context.close(); }
+  }
+}
+
 (async () => {
   fs.mkdirSync(evidence, { recursive: true });
   const { server, origin } = await serve();
   try {
     for (const engine of (process.env.ENGINES || 'chromium').split(',')) {
       const browser = await launchBrowser(playwright, engine);
-      try { for (const name of Object.keys(cases)) for (const theme of ['light', 'dark']) await check(browser, origin, engine, name, theme); }
+      try {
+        if (process.argv.includes('--responses')) await responses(browser, origin, engine);
+        else for (const name of Object.keys(cases)) for (const theme of ['light', 'dark']) await check(browser, origin, engine, name, theme);
+      }
       finally { await browser.close(); }
     }
   } finally { await new Promise(resolve => server.close(resolve)); }

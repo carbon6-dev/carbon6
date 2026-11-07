@@ -8,7 +8,7 @@ use c6_api::{
     StreamMsg, Worker,
 };
 use futures::StreamExt;
-use futures::future::{AbortHandle, abortable};
+use futures::future::{AbortHandle, LocalBoxFuture, abortable};
 use gloo_net::http::{RequestBuilder, Response};
 use gloo_net::websocket::Message;
 use gloo_net::websocket::futures::WebSocket;
@@ -497,16 +497,20 @@ async fn check(resp: Result<Response, gloo_net::Error>) -> Result<Response, Stri
     Err(msg)
 }
 
-async fn json<T: DeserializeOwned>(req: Result<Response, gloo_net::Error>) -> Result<T, String> {
-    check(req).await?.json().await.map_err(|e| e.to_string())
+// Keep response decoding out of every endpoint/resource's poll state. The
+// body remains lazy and dropping the returned future still drops the decode.
+#[inline(never)]
+fn json<T: DeserializeOwned + 'static>(req: Result<Response, gloo_net::Error>) -> LocalBoxFuture<'static, Result<T, String>> {
+    Box::pin(async move { check(req).await?.json().await.map_err(|e| e.to_string()) })
 }
 
-async fn send_json<T: DeserializeOwned>(req: RequestBuilder, body: &impl Serialize) -> Result<T, String> {
+async fn send_json<T: DeserializeOwned + 'static>(req: RequestBuilder, body: &impl Serialize) -> Result<T, String> {
     json(req.json(body).map_err(|e| e.to_string())?.send().await).await
 }
 
-async fn empty(req: Result<Response, gloo_net::Error>) -> Result<(), String> {
-    check(req).await.map(drop)
+#[inline(never)]
+fn empty(req: Result<Response, gloo_net::Error>) -> LocalBoxFuture<'static, Result<(), String>> {
+    Box::pin(async move { check(req).await.map(drop) })
 }
 
 pub async fn create_enrollment(name: Option<String>) -> Result<Enrollment, String> {
