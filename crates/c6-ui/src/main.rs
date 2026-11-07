@@ -230,7 +230,7 @@ fn DesktopHeader(counts: Memo<(usize, usize)>) -> impl IntoView {
                         <HeaderItem name="workers" priority=30><NavLink to=View::Workers label="Workers" /></HeaderItem>
                         <HeaderItem name="analytics" priority=40><NavLink to=View::Analytics label="Analytics" /></HeaderItem>
                         <HeaderItem name="activity" priority=60><NavLink to=View::Activity label="Activity" /></HeaderItem>
-                        <HeaderItem name="spending" priority=35><NavLink to=View::Usage label="Spending" /></HeaderItem>
+                        <HeaderItem name="usage" priority=35><NavLink to=View::Usage label="Usage" /></HeaderItem>
                         <HeaderItem name="settings" priority=10><NavLink to=View::Settings { note: None, section: String::new() } label="Settings" /></HeaderItem>
                     }.into_any()
                 } else {
@@ -417,7 +417,7 @@ fn MobileMenu(#[prop(optional)] desktop: bool, #[prop(optional, into)] desktop_a
                         <Go to=View::Workers class=MENU>"Workers"</Go>
                         <Go to=View::Analytics class=MENU>"Analytics"</Go>
                         <Go to=View::Activity class=MENU>"Activity"</Go>
-                        <Go to=View::Usage class=MENU>"Spending"</Go>
+                        <Go to=View::Usage class=MENU>"Usage"</Go>
                         <Go to=View::Settings { note: None, section: String::new() } class=MENU>"Settings"</Go>
                     </div>
                 })}
@@ -451,7 +451,7 @@ fn MobileMenu(#[prop(optional)] desktop: bool, #[prop(optional, into)] desktop_a
                     <views::ViewsMenu class=MENU />
                     <div class="flex items-center"><Go to=View::Activity class=MENU>"Activity"</Go><monitor::ActivityBadge /></div>
                     <Go to=View::Analytics class=MENU>"Analytics"</Go>
-                    <Go to=View::Usage class=MENU>"Usage and budgets"</Go>
+                    <Go to=View::Usage class=MENU>"Usage"</Go>
                     <Go to=View::Settings { note: None, section: String::new() } class=MENU>"Settings"</Go>
                 </div>
                 <button class=MENU on:click=move |_| ws.new_tile()>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" New tile"</button>

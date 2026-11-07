@@ -105,7 +105,7 @@ The same shell, with its own nav:
 - Workers;
 - Connections and routing;
 - Defaults: root's skills, agents, commands, hooks, MCP servers, policies, prompts and secrets, which realms inherit;
-- Spending: prices, the overall cap, usage and analytics across realms;
+- Usage: prices, the overall cap, usage and analytics across realms;
 - Apps and packages;
 - Grants and commons review;
 - Sign-in and tokens; Notifications (the public URL);

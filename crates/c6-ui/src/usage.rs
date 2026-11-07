@@ -1,4 +1,4 @@
-//! Usage and budgets: tokens and cost by day, model, connection, label and
+//! Usage: tokens and cost by day, model, connection, label and
 //! session, for the label filter's sessions; where each budget stands.
 
 use c6_api::{BudgetStatus, UsageReport, UsageRow};

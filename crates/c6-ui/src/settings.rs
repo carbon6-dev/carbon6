@@ -235,7 +235,7 @@ pub fn SettingsPage(note: Option<String>, section: String) -> impl IntoView {
                         name="prices"
                         title="Prices"
                         noun="price"
-                        help="What model calls cost, in USD per million tokens, for Usage and budgets. A model is an exact id or a prefix ending in * (claude-sonnet-*); the most specific entry wins. Cache read and write default to the input price. Copy the numbers from your provider's price list; models without a price count as $0 (Usage lists them)."
+                        help="What model calls cost, in USD per million tokens, for Usage. A model is an exact id or a prefix ending in * (claude-sonnet-*); the most specific entry wins. Cache read and write default to the input price. Copy the numbers from your provider's price list; models without a price count as $0 (Usage lists them)."
                         fields=PRICE_FIELDS
                         examples=price_examples
                     />

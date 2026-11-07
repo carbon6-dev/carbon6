@@ -143,6 +143,27 @@ events survive tail summaries. No child aggregation is needed. These are
 confirmed UI replay/order cases, not a claim to have diagnosed a particular
 live session's missing deliverable; that original incident remains unconfirmed.
 
+## Usage navigation naming
+
+`node crates/c6-ui/tests/usage-name.cjs` checks that the console header and
+console/realm menus all say **Usage**, including wide and 320px desktop tiles
+and 320/390px phones in both themes. It follows the real menu link and checks
+the console's Prices help uses the same name. Clipboard, session-details Usage
+and the model quota popup are not changed by this naming pass. Screenshots and
+control geometry go to `/tmp/n3-ui/item7`; `SCREENSHOTS` and `ENGINE` use the
+shared production browser harness's overrides.
+
+`BEFORE=1 ROOT=/tmp/n3-ui/item2/pristine-235fae5c-dist` captures the same
+matrix with the old console/realm names and Prices help. Filenames have
+`before-`/`after-` prefixes so neither phase overwrites the other.
+
+The naming pass does not fix two inherited desktop-menu behaviours: its
+opener is hidden when all measured header items fit (the fixture resizes to
+1024px to open it), and `max-w-full` constrains its drawer to the narrow opener
+wrapper. Geometry JSON and logs record that existing desktop link overflow;
+phone link containment remains an assertion. Do not report those screenshots
+as proof that the unrelated desktop drawer layout was repaired.
+
 ## Content-fitted desktop header
 
 The desktop header uses measured item widths, not an `xl` navigation cutoff.

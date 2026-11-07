@@ -29,7 +29,7 @@ carbon6 should work like an operating system for agents. It provides general pri
 | Structured storage | **Collections** of typed records (4.1) | New |
 | Asking the user | **Decisions** (4.2) | New; replaces approvals, action items and questions |
 | Events and scheduling | **Triggers** (4.3) | Generalizes automations |
-| Numbers over time | **Series** (4.4) | New; usage and budgets move onto it |
+| Numbers over time | **Series** (4.4) | New; Usage moves onto it, including budgets |
 | Screens | **Views** (4.5) | New |
 | Packages | **Apps** (5) | New |
 | Permissions | Realms, grants, policies, secrets, budgets, realm-scoped API tokens | Partly exists |
@@ -378,7 +378,7 @@ threshold(series, condition /* e.g. sum over 7 days < 10, no point for 2 hours *
 
 - **Queries:** sum, average, minimum, maximum and last value, over windows, grouped by dimension.
 - **Sources:** trigger mappings (4.3), agents (`series_record`), the API, and carbon6 itself.
-- **Built in:** carbon6 records model spend, tokens and session counts per realm and label as series. **Usage and budgets move onto series:** a budget is a threshold whose action is to stop spending.
+- **Built in:** carbon6 records model spend, tokens and session counts per realm and label as series. **Usage moves onto series:** a budget is a threshold whose action is to stop spending.
 
 **As built (step 6):**
 - **Storage:** migration `0036` adds `series` (per realm: unit, description, dimensions, retention) and `points` (time, value, dimensions, source).
@@ -667,7 +667,7 @@ In short; the details are in 12, and how existing data is upgraded is in 13.
 | Memex scopes by label | Realm + grants, with label scopes inside a realm |
 | Tool-call approvals, action items, workflow approve steps, assistant questions | Kinds of decision |
 | Automations (schedules, webhooks, memex events) | Triggers, with more events and actions |
-| Usage and budgets | Series and thresholds |
+| Usage | Series and thresholds |
 | Settings shared by everything | Root defaults, inherited and overridden per realm |
 | API tokens that reach everything (except sign-in) | Tokens scoped to realms; the root token reaches everything |
 | Prompts in code (briefing guidance, action-item prompt, compaction) | Root skills you can edit |

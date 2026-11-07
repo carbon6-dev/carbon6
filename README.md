@@ -435,9 +435,9 @@ The host inventory (**Settings → Hosts**) lists machines your workers reach ov
 - **Fleet runs:** a template's **Hosts by label** (`role:web, env:prod`, or `*`) starts one session per matching host, through that host's worker.
 - **Checks:** the **Workers** page lists hosts with their last check (reachable, latency and system, or why not) and a **Check** button. With a check interval, the head checks on its own and sends a `host` notification when a host stops answering or comes back.
 
-### Usage and budgets
+### Usage
 
-**Usage and budgets** (in the ☰ menu) shows tokens and cost for the sessions matching the label filter, over today or the last 7, 30 or 90 days: totals, a daily chart, and breakdowns by model, connection, label, and the most expensive sessions (subagents count toward the session that started them).
+**Usage** (in the ☰ menu, and the console's header) shows tokens and cost for the sessions matching the label filter, over today or the last 7, 30 or 90 days: totals, a daily chart, and breakdowns by model, connection, label, and the most expensive sessions (subagents count toward the session that started them).
 
 - **Prices** (**Settings → Prices**): USD per million tokens, per model id or prefix (`claude-sonnet-*`); cache reads and writes default to the input price. Models without a price count as $0, and Usage lists them.
 - **Budgets** (**Settings → Budgets**): a limit per day, week or month for sessions with given labels (`automation:`, `client:acme`, or everything).
