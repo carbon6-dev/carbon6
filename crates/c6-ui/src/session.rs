@@ -3901,7 +3901,7 @@ fn can_anchor(kind: &EventKind) -> bool {
 fn message_action_context(kind: &EventKind) -> (&'static str, String) {
     let (speaker, text) = match kind {
         EventKind::User { text, attachments, .. } => (
-            "User",
+            "You",
             if text.trim().is_empty() { attachments.first().map(|a| a.name.as_str()).unwrap_or("User message") } else { text.as_str() },
         ),
         EventKind::Assistant { blocks, .. } => (
@@ -6443,7 +6443,7 @@ mod tests {
             "type": "user", "command_id": "message", "text": "  <b>keep this literal</b>  "
         }))
         .unwrap();
-        assert_eq!(message_action_context(&user), ("User", "<b>keep this literal</b>".into()));
+        assert_eq!(message_action_context(&user), ("You", "<b>keep this literal</b>".into()));
         let agent = EventKind::Assistant {
             turn: 1,
             blocks: vec![
