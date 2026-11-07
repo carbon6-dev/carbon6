@@ -114,6 +114,13 @@ How agents write docs (lead with the answer, sections sized to the ask, tables f
 
 ## 9. Where documents are kept, and who writes them
 
+- **Back to the session that made it:** a doc or deck created by a session
+  wears that session's coloured mark beside the title in its sticky header.
+  Hover for the session's name; click to open it (⌘/Ctrl-click: its own tile).
+  The title and mark stay on one line, with only a dot for the session on
+  phones. **⋯ → Open the session that made it** opens the same destination.
+  This is the original creator, not a later editor; documents made by you or
+  an API token have no session mark or menu entry.
 - **Per realm, in its knowledge database** (docs/knowledge.md §3): tables `docs`, `doc_tabs`, `doc_blocks`, `doc_ops` (the history), `doc_snapshots`, `doc_threads`, `doc_comments` and `doc_exports`. They share transactions with records and the graph. Themes are records of the system collection `deck_themes`.
 - **Search:** each live tab (each deck, with its notes) is mirrored as an item of kind `doc` or `deck`, so memex search, the Brief and agents find them. The mirror is rewritten when a change settles, not on every op. Archive removes those mirrors with `unmirror`; Unarchive puts them back with `mirror`. Archived docs never turn up in memex or agent search, but reading a known id, link or `doc:` mention still works.
 - **Blobs** for images and files go where the realm keeps its blobs.

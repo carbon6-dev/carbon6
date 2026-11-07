@@ -63,23 +63,29 @@ fn remember_titles<'a>(docs: impl IntoIterator<Item = &'a DocSummary>) {
     });
 }
 
+fn owning_session(by: &str) -> Option<String> {
+    by.strip_prefix("session:").filter(|id| !id.is_empty()).map(str::to_owned)
+}
+
 /// The session a document came from: its mark, and a link to it.
 #[component]
 fn FromSession(id: String) -> impl IntoView {
     let live = api::live();
-    let session = {
-        let id = id.clone();
-        move || live.sessions.with(|ss| ss.iter().find(|s| s.id == id).cloned())
-    };
-    let s2 = session.clone();
+    let detail = crate::resources::session(id.clone()).detail;
+    let id = StoredValue::new(id);
+    let session = move || live.session(&id.get_value()).or_else(|| detail.get().and_then(Result::ok).map(|d| d.session));
+    let name = Signal::derive(move || {
+        session().map(|s| s.title).filter(|s| !s.trim().is_empty()).unwrap_or_else(|| format!("Session {}", id.get_value()))
+    });
+    let mark = Signal::derive(move || session().as_ref().map(crate::marks::of).unwrap_or_else(|| session_mark(&id.get_value())));
     view! {
-        <span class="inline-flex min-w-0 items-center gap-1">
-            "from "
-            {move || session().map(|s| view! { <span class="h-2 w-2 shrink-0 rounded-sm" style=crate::marks::fill(&crate::marks::of(&s))></span> })}
-            <Go to=View::session(id.clone()) class="truncate hover:underline" stop=true>
-                {move || s2().map(|s| s.title).filter(|t| !t.trim().is_empty()).unwrap_or_else(|| "a session".into())}
-            </Go>
-        </span>
+        <Go to=View::session(id.get_value()) stop=true title="Open the session that made it"
+            class="flex h-11 w-8 shrink-0 items-center justify-center rounded-md hover:bg-zinc-100 pointer-coarse:w-11 dark:hover:bg-zinc-800">
+            <span data-doc-owner="" class="flex h-full w-full items-center justify-center" title=move || format!("Open session: {}", name.get())>
+                <crate::marks::Glyph mark shape=crate::marks::Shape::Circle size=10 />
+                <span class="sr-only">{move || format!("Open the session that made it: {}", name.get())}</span>
+            </span>
+        </Go>
     }
 }
 
@@ -827,12 +833,14 @@ fn ArchiveMenuItem(archived: bool, run: Callback<()>, busy: RwSignal<bool>) -> i
 /// The shared text-only menu cannot carry the Archive/Unarchive SVGs.
 #[component]
 fn DocMenu(
+    owner: Memo<Option<String>>,
     archived: Memo<bool>,
     busy: RwSignal<bool>,
     archive: Callback<()>,
     export: Callback<()>,
     history: Callback<()>,
 ) -> impl IntoView {
+    let (col, ws) = (use_column(), use_workspace());
     let open = RwSignal::new(false);
     let pop = crate::util::dismissable(
         move || open.get(),
@@ -841,12 +849,21 @@ fn DocMenu(
         },
     );
     view! {
-        <div class="relative shrink-0">
+        <div class="shrink-0">
             <button class="flex h-11 w-11 items-center justify-center rounded-md text-muted hover:bg-zinc-100 dark:hover:bg-zinc-800"
                 title="Document actions" aria-label="Document actions" aria-haspopup="menu" aria-expanded=move || open.get().to_string()
                 data-pop=pop.clone() on:click=move |_| open.update(|o| *o = !*o)>{crate::icons::ellipsis()}</button>
             {move || open.get().then(|| view! {
-                <div role="menu" data-pop=pop.clone() class="absolute right-0 z-50 min-w-40 rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
+                <div role="menu" data-pop=pop.clone() class="absolute right-4 top-full z-50 min-w-40 max-w-full rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
+                    {move || owner.get().map(|id| view! {
+                        <button role="menuitem" class="flex min-h-11 w-full items-center px-4 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                            on:click=move |ev| {
+                                open.set(false);
+                                let to = View::session(id.clone());
+                                let how = How::from_mouse(&ev);
+                                match col { Some(c) => c.open(to, how), None => ws.open(None, to, how) }
+                            }>"Open the session that made it"</button>
+                    })}
                     <button role="menuitem" class="flex min-h-11 w-full items-center px-4 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
                         on:click=move |_| { open.set(false); export.run(()); }>"Export…"</button>
                     <button role="menuitem" class="flex min-h-11 w-full items-center px-4 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
@@ -1301,6 +1318,7 @@ pub fn DocPage(id: String) -> impl IntoView {
     });
     let shown_doc = Memo::new(move |_| doc.with(|d| d.as_ref().and_then(|r| r.as_ref().ok()).cloned()));
     let summary = Memo::new(move |_| shown_doc.with(|d| d.as_ref().map(|d| d.summary.clone()).unwrap_or_default()));
+    let owner = Memo::new(move |_| summary.with(|s| owning_session(&s.created_by)));
     let archived = Memo::new(move |_| summary.with(|s| s.archived_at.is_some()));
     provide_context(ReadOnly(archived));
     let tabs = Memo::new(move |_| shown_doc.with(|d| d.as_ref().map(|d| d.tabs.clone()).unwrap_or_default()));
@@ -1768,24 +1786,27 @@ pub fn DocPage(id: String) -> impl IntoView {
 
     let bar = move || {
         view! {
-            <div class="sticky top-0 z-20 border-b border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950">
-                <div class="mx-auto flex max-w-3xl flex-wrap items-center gap-1 px-4 py-1">
+            <div data-doc-header="" class="sticky top-0 z-20 border-b border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950">
+                <div class="relative mx-auto flex max-w-3xl flex-wrap items-center gap-1 px-4 py-1">
                     <span class="shrink-0 text-muted" title=move || summary.with(|s| s.kind.clone())>{move || summary.with(|s| kind_mark(&s.kind))}</span>
+                    <div data-doc-heading="" class="flex min-w-0 flex-1 basis-40 items-center gap-1">
+                    {move || owner.get().map(|id| view! { <FromSession id /> })}
                     {move || if renaming.get() && !archived.get() {
                         view! {
-                            <input node_ref=rename_ref class=format!("{INPUT} min-w-0 flex-1 basis-40 font-semibold") prop:value=move || title.get()
+                            <input node_ref=rename_ref class=format!("{INPUT} min-w-0 flex-1 font-semibold") prop:value=move || title.get()
                                 on:input=move |ev| title.set(event_target_value(&ev))
                                 on:keydown=move |ev| if ev.key() == "Enter" { rename() } else if ev.key() == "Escape" { renaming.set(false) }
                                 on:blur=move |_| rename() />
                         }.into_any()
                     } else {
                         view! {
-                            <h1 class="min-w-0 flex-1 basis-40 truncate text-lg font-semibold" title=move || if archived.get() { "Archived document" } else { "Click to rename" }
+                            <h1 class="min-w-0 flex-1 truncate text-lg font-semibold" title=move || if archived.get() { "Archived document" } else { "Click to rename" }
                                 on:click=move |_| { if !archived.get_untracked() { title.set(summary.with_untracked(|s| s.title.clone())); renaming.set(true); } }>
                                 {move || summary.with(|s| s.title.clone())}
                             </h1>
                         }.into_any()
                     }}
+                    </div>
                     <button data-opens="comments" class=move || format!("{BAR} {}", if panel.get() { "bg-zinc-100 dark:bg-zinc-800" } else { "" })
                         title=move || if panel.get() { "Hide the comments" } else { "Show the comments" }
                         on:click=move |_| panel.update(|p| *p = !*p)>
@@ -1804,7 +1825,7 @@ pub fn DocPage(id: String) -> impl IntoView {
                         </button>
                     })}
                     <UsedIn items=used />
-                    <DocMenu archived busy=archive_busy archive
+                    <DocMenu owner archived busy=archive_busy archive
                         export=Callback::new(move |()| exporting.update(|x| *x = !*x))
                         history=Callback::new(move |()| history.update(|x| *x = !*x)) />
                 </div>
@@ -1818,7 +1839,6 @@ pub fn DocPage(id: String) -> impl IntoView {
             <header class="space-y-1">
                 <p class="flex flex-wrap items-center gap-x-1 text-xs text-muted">
                     {move || summary.with(|s| view! {
-                        {s.created_by.strip_prefix("session:").map(|id| view! { <FromSession id=id.to_owned() />" · " })}
                         {format!("Version {} · changed {} by {}", s.rev, since(s.updated_at), author_named(&s.updated_by))}
                         {(!s.labels.is_empty()).then(|| format!(" · {}", s.labels.iter().map(|l| format!("#{l}")).collect::<Vec<_>>().join(" ")))}
                     })}
@@ -3876,6 +3896,14 @@ fn base64_of(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_session_creators_have_an_owning_session_link() {
+        assert_eq!(super::owning_session("session:creator"), Some("creator".into()));
+        for by in ["you", "assistant", "token:session:creator", "session:", ""] {
+            assert_eq!(super::owning_session(by), None, "{by}");
+        }
+    }
+
     #[test]
     fn session_authors_use_the_captured_feed_during_delayed_rendering() {
         use super::*;

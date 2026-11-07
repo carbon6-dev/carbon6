@@ -276,6 +276,29 @@ motion harness's browser paths and `ENGINE` override, with no live head.
 glance/menu/details matrix without expecting the new ID controls. It records
 their absence explicitly in JSON and prefixes screenshots with `before-`.
 
+### Sticky document ownership
+
+`node crates/c6-ui/tests/doc-owner.cjs` uses the production browser fixture
+with real docs and decks, long titles and enough content to scroll. Both
+themes cover 1200/320px desktop tiles and 320/390px phones. It asserts the
+creator's dot stays beside the single-line title and remains in the sticky
+header, names the session on hover and for screen readers, follows live
+name/pattern changes, and opens the same retained destination as **⋯ → Open
+the session that made it**. It also checks a creator outside the live feed
+and the absence of ownership controls for user/token-created documents even
+when a session last edited them. Existing title/action SVGs remain present.
+
+Screenshots and geometry go to `/tmp/n3-ui/item8` (`SCREENSHOTS` overrides it).
+`BEFORE=1 ROOT=/tmp/n3-ui/item2/pristine-235fae5c-dist` records the same matrix
+and explicitly records absent header marks/menu entries, without applying the
+new assertions to the pristine build. `ENGINE=webkit` selects WebKit; cases
+own separate browser processes; `CASE` selects a diagnostic name fragment.
+The pristine 390px phone deck emits one startup ResizeObserver delivery error,
+also reproduced after the change. Both modes record it explicitly in JSON and
+the log while checking the layout/navigation; AFTER rejects repeated delivery
+errors, errors after startup and all other browser errors. Neither mode changes
+a live head or settings.
+
 `crates/c6-ui/tests/theme.cjs` checks System, Light and Dark, including migration
 of the former browser-local Soft preview (and legacy Dim) to Dark before paint:
 
