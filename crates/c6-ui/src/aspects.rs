@@ -276,7 +276,7 @@ fn AspectCard(a: Aspect, session: Session, #[prop(into)] on_done: Callback<()>) 
         <div class="space-y-2 p-1">
             <div class="flex items-center gap-2">
                 <Glyph mark shape=a.shape() size=14 />
-                <span class="text-[11px] uppercase tracking-wide text-zinc-500">{a.what()}</span>
+                <span class="text-[11px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400">{a.what()}</span>
                 <span class="min-w-0 flex-1 truncate font-medium" title=a.label.clone()>{a.label.clone()}</span>
                 {page.map(|v| view! { <Go to=v class="inline-flex shrink-0 items-center gap-1 text-xs text-blue-600 hover:underline dark:text-blue-400">"Open"{crate::icons::icon(crate::icons::Icon::ArrowUpRight, crate::icons::Size::S14)}</Go> })}
             </div>
@@ -286,7 +286,7 @@ fn AspectCard(a: Aspect, session: Session, #[prop(into)] on_done: Callback<()>) 
                 let n = list.len();
                 view! {
                     <div class="space-y-0.5">
-                        <div class="text-[11px] text-zinc-500">{match n { 0 => "No other session has it".to_owned(), 1 => "1 other session".to_owned(), n => format!("{n} other sessions") }}</div>
+                        <div class="text-[11px] text-zinc-500 dark:text-zinc-400">{match n { 0 => "No other session has it".to_owned(), 1 => "1 other session".to_owned(), n => format!("{n} other sessions") }}</div>
                         {list.into_iter().take(8).map(|(id, title, mk)| view! {
                             <Go to=View::session(id) class="flex items-center gap-1.5 rounded px-1 py-0.5 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800">
                                 <Glyph mark=Signal::stored(mk) shape=Shape::Circle size=8 />
@@ -298,7 +298,7 @@ fn AspectCard(a: Aspect, session: Session, #[prop(into)] on_done: Callback<()>) 
                 }
             }}
             <div class="border-t border-zinc-200 pt-2 dark:border-zinc-800">
-                <div class="pb-1 text-[11px] text-zinc-500">"Its mark, wherever it shows"</div>
+                <div class="pb-1 text-[11px] text-zinc-500 dark:text-zinc-400">"Its mark, wherever it shows"</div>
                 <ValuePalette key=a.key.clone() on_pick=on_done />
             </div>
         </div>

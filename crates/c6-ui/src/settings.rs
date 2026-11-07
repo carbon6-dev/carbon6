@@ -464,7 +464,7 @@ fn radio_name(group: &str) -> String {
     format!("{group}-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
 }
 
-/// Light, dark, soft, or as the system is: kept in this browser.
+/// Light, dark, or as the system is: kept in this browser.
 #[component]
 fn AppearanceSetting() -> impl IntoView {
     let theme_name = radio_name("theme");
@@ -509,11 +509,10 @@ fn AppearanceSetting() -> impl IntoView {
     view! {
         <section class="space-y-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
             <h2 class="font-medium">"Theme"</h2>
-            <div class="grid gap-2 @lg/settings:grid-cols-2 @4xl/settings:grid-cols-4">
+            <div class="grid gap-2 @lg/settings:grid-cols-2 @4xl/settings:grid-cols-3">
                 {option("system", "System", "Follows your device's setting")}
                 {option("light", "Light", "Always light")}
                 {option("dark", "Dark", "Always dark")}
-                {option("soft", "Soft", "Dark with softer greys")}
             </div>
             <h2 class="font-medium">"Motion"</h2>
             <div class="grid gap-2 @lg/settings:grid-cols-2">

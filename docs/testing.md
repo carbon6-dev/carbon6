@@ -185,39 +185,82 @@ a separate tile. Screenshots default to `/tmp/q1-screenshots/panes/`.
 
 ## Browser-local themes
 
-`crates/c6-ui/tests/theme.cjs` checks System, Light, unchanged Dark and Soft:
+`crates/c6-ui/tests/theme.cjs` checks System, Light and Dark, including migration
+of the former browser-local Soft preview (and legacy Dim) to Dark before paint:
 
 ```sh
 node --test crates/c6-ui/tests/theme.cjs
-SCREENSHOTS=/tmp/p3-screenshots node crates/c6-ui/tests/theme.cjs --browser
+SCREENSHOTS=/tmp/q6-dark/after node crates/c6-ui/tests/theme.cjs --browser
 ENGINE=webkit THEME_DELAY_MS=1000 node crates/c6-ui/tests/theme.cjs --browser
 ```
 
 Use Node 24 and the same browser overrides as the motion harness. The browser
 test delays the real theme bootstrap fetch, holds WASM, and checks the first
-body frames before the application renders. It also tests four usable radio
+body frames before the application renders. It also tests three usable radio
 cards at 240/320/400/480/640px tile and phone widths, persistence, OS changes,
 and real cross-tab palette and selected-card updates.
 
 `theme.cjs --browser --workspace-radios` additionally checks one/five/six-tile
-workspaces and duplicate retained Appearance views: actual native `.checked`
-properties, selected-card paint, Soft/System persistence through maximizing
+workspaces and restored duplicate Settings tiles collapsing to one Appearance
+view with its selection intact: actual native `.checked`
+properties, selected-card paint, Dark/System persistence through maximizing
 another tile, restore and reload, and same-document/cross-tab motion-choice
-synchronization. Native group names are per mounted instance; hidden views
+synchronization. Navigating away from Appearance and back verifies that Dark
+and the selected motion survive a remount, with fresh, distinct native group
+names. Native group names are per mounted instance; hidden views
 still participate in document-wide groups. Inert cloned radios participate
 too, which is another reason tile motion must not clone outgoing content.
-The same run exercises both custom `Choices` callers (session questions and
+The saved-duplicate cases respect Settings' single-copy restore policy rather
+than waiting for an intentionally removed second Appearance tile.
+The suite also exercises both custom `Choices` callers (session questions and
 decision forms), optional clearing, and the actual session aspect palette
-through that lifecycle. `--workspace-choices` runs just the custom-control audit.
+through that lifecycle. `--workspace-choices` runs the custom-control audit
+independently of the native-radio cases.
 Unsent forms reconstruct their existing defaults after reload; saved aspect
 marks persist. These checks do not add persistence to unsent forms.
 
-Soft keeps the requested greys and existing accents, not a blanket contrast
-guarantee. The sample document's red `#f87171` on chip `#33343a` is 4.484:1:
-it rounds to 4.5 but is below the unrounded AA threshold. Current Tailwind 4
-red-400 resolves to sRGB8 `#ff6467`, measuring 4.294:1 on that chip. The test
-prints both the sample swatches and the actual built tokens rather than
-silently changing accents or treating rounded figures as a pass.
+Dark now uses the former Soft page/panel/chip greys `#1c1d21`, `#25262b`,
+`#33343a`, with `#4a4b52` for stronger borders. Dark-only red-400 `#ff7476`
+replaces `#ff6467`: the latter measured only 4.294:1 on the lighter chip.
+Light's palette is unchanged. The contrast tests assert the unrounded 4.5:1
+threshold for muted, red, white, blue, amber and green text on all three
+backgrounds, and print measured ratios from both exact swatches and the built
+Tailwind tokens (resolved by the browser to sRGB8). SVG text fills and the
+muted utility are checked too; shape/border colours are not text colours.
+Saved `soft` is rewritten to `dark` by the parser-blocking bootstrap, including
+cross-tab updates, so there is no obsolete fourth radio or unselected choice.
+
+Dark contrast reference (sRGB8, page / panel / chip; rounded here, never for
+the assertions):
+
+| Text | Colour | Page | Panel | Chip |
+| --- | --- | ---: | ---: | ---: |
+| Muted / zinc-400 | `#9f9fa9` | 6.420 | 5.757 | 4.729 |
+| Red-400 | `#ff7476` | 6.424 | 5.761 | 4.732 |
+| White | `#ffffff` | 16.839 | 15.099 | 12.404 |
+| Blue-400 | `#51a2ff` | 6.385 | 5.725 | 4.703 |
+| Sky-400 | `#00bcff` | 7.728 | 6.929 | 5.692 |
+| Amber-400 | `#ffb900` | 9.776 | 8.766 | 7.201 |
+| Emerald-400 | `#00d492` | 8.686 | 7.789 | 6.398 |
+
+The accompanying grey-text audit adds dark-only zinc-400 text to Ask and
+aspect popovers and readable fills to the grant graph and two-hop diagram
+labels; icons keep their colours. Zinc-500 is too weak for dark text, but
+remains a shape/border colour. Document charts' zinc-300 axis labels at 0.6
+opacity still pass on their actual page/panel backgrounds (4.94 / 4.65).
+Authored SVG diagrams are isolated images with their own palettes, not CSS
+text that the parent theme can universally recolour.
+
+This is not a blanket claim about every inherited text treatment: bare
+`text-red-600` errors/removal actions (for example `settings.rs`, `push.rs`,
+`memex.rs` and `session.rs`) remain below 4.5 on Dark page/panel/chip
+(3.53 / 3.17 / 2.60). They need per-text-site dark variants, not a global
+red-600 token lift: white on solid red-600 buttons still passes at 4.77.
+Selected autocomplete notes in `chat/composer.rs` and `chat/mod.rs` also have
+a pre-existing opacity-60 shortfall (~3.12 on sky-700). These are separate
+text-site accessibility follow-ups, not a reason to lighten button backgrounds.
+The browser contrast check additionally asserts red-200/300 on red-950,
+rose-300 on zinc-800 and rose-900/40 status chips, and white on red-600.
 
 ## Motion: production browser regression
 

@@ -118,8 +118,8 @@
 
 /* Grey text that reads on either theme: text-muted for secondary text
    (zinc-500 on white, zinc-400 on the dark greys), text-soft a step
-   stronger (zinc-600 / zinc-300). Bare zinc-500 on zinc-900 is about
-   3.7:1, below AA's 4.5:1. */
+   stronger (zinc-600 / zinc-300). Bare zinc-500 on the dark chip is
+   below AA's 4.5:1; keep it for shapes, not dark text. */
 :root {
   --c6-muted: var(--color-zinc-500);
   --c6-soft: var(--color-zinc-600);
@@ -159,27 +159,18 @@
   [data-tile-aspects] { display: none; }
 }
 
-/* Dark mode's three background greys, page, panels and chips, a step
-   softer than Tailwind's zinc-950/900/800 (the near-black read as too
-   dark); text and accents are unchanged and keep 4.5:1 or more on them.
-   Unlayered, so they win over the theme's own values. */
+/* Dark uses the former Soft preview's page / panel / chip greys (including
+   SVG figures), with zinc-700 for stronger borders. Muted zinc-400, white,
+   sky/blue-400, amber-400 and emerald-400 keep >=4.5:1 on all three;
+   red-400 needs the dark-only lift below (4.73:1 on the chip, versus 4.29).
+   tests/theme.cjs checks exact swatches and actual built text tokens.
+   Unlayered, so these win over the theme's own values; Light is unchanged. */
 html.dark {
-  --color-zinc-950: #141417;
-  --color-zinc-900: #1c1c20;
-  --color-zinc-800: #2a2a2f;
-}
-/* Soft is still dark: only its greys change, not text or accent tokens.
-   Page / panels (including SVG figures) / chips and subtle borders;
-   zinc-700 gives the composer and other stronger borders their own step.
-   Muted #a1a1aa reads 6.5704 / 5.8915 / 4.8397:1 on these backgrounds.
-   The sample's red #f87171 on a chip is 4.4841:1 (rounds to 4.5, below
-   AA); current Tailwind red-400 resolves to #ff6467, only 4.2944:1 there.
-   Keep the requested palette and accents; tests/theme.cjs reports both. */
-html.soft {
   --color-zinc-950: #1c1d21;
   --color-zinc-900: #25262b;
   --color-zinc-800: #33343a;
   --color-zinc-700: #4a4b52;
+  --color-red-400: #ff7476;
 }
 
 /* Phones: iOS zooms into fields with text under 16px when they get

@@ -209,7 +209,7 @@ fn GrantGraph(realms: Vec<Value>, grants: Vec<Value>) -> impl IntoView {
                 Some(view! {
                     <g>
                         <line x1=format!("{:.0}", a.0) y1=format!("{:.0}", a.1) x2=format!("{x2:.0}") y2=format!("{y2:.0}") class="stroke-teal-600" stroke-width="1.5" stroke-dasharray=if dashed { "4 3" } else { "" } marker-end="url(#arrow)" />
-                        <text x=format!("{:.0}", (a.0 + b.0) / 2.0) y=format!("{:.0}", (a.1 + b.1) / 2.0 - 4.0) text-anchor="middle" class="fill-zinc-500 text-[10px]">{label}</text>
+                        <text x=format!("{:.0}", (a.0 + b.0) / 2.0) y=format!("{:.0}", (a.1 + b.1) / 2.0 - 4.0) text-anchor="middle" class="fill-zinc-500 text-[10px] dark:fill-zinc-400">{label}</text>
                     </g>
                 })
             }).collect_view()}
@@ -712,7 +712,7 @@ fn Neighborhood(realm: String, section: String, object: ExObject) -> impl IntoVi
                             view! {
                                 <a href=href on:click={ let nav = nav.clone(); move |ev: web_sys::MouseEvent| follow(ev, to.clone(), &nav) }>
                                     <title>{format!("{} {}: {}", r.kind, r.title, r.sub)}</title>
-                                    {diagram_label(x, y, &r.kind, short(&r.title), format!("fill-current {size}"))}
+                                    {diagram_label(x, y, &r.kind, short(&r.title), format!("fill-current dark:fill-zinc-200 {size}"))}
                                 </a>
                             }
                         }).collect_view()}

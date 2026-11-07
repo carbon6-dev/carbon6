@@ -6,30 +6,32 @@
 // Retained-tile radio regression only: add --workspace-radios.
 // First-paint only, no WASM needed: add --paint-only. Both modes use ROOT=dist.
 // Browser options match motion.cjs: ENGINE, PLAYWRIGHT_CORE, CHROMIUM, etc.
-// WIDTHS=240,320,400,480,640 THEMES=light,dark,soft,system LAYOUTS=tile,phone
+// WIDTHS=240,320,400,480,640 THEMES=light,dark,system LAYOUTS=tile,phone
 // THEME_DELAY_MS=300 delays the actual bootstrap fetch; WASM is held separately.
-// SCREENSHOTS=/tmp/p3-screenshots records the Soft session and four-card picker.
+// SCREENSHOTS=/tmp/q6-dark/after records the Dark session and three-card picker.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const UI = path.resolve(__dirname, '..');
 const source = fs.readFileSync(path.join(UI, 'js/theme.js'), 'utf8');
-const pages = { light: '#fafafa', dark: '#141417', soft: '#1c1d21' };
-const darkTokens = ['#141417', '#1c1c20', '#2a2a2f'];
-const softTokens = ['#1c1d21', '#25262b', '#33343a', '#4a4b52'];
+const pages = { light: '#fafafa', dark: '#1c1d21' };
+const darkTokens = ['#1c1d21', '#25262b', '#33343a', '#4a4b52'];
 const accentTokens = ['zinc-400', 'red-400', 'white', 'sky-400', 'amber-400', 'emerald-400', 'blue-400'];
+const redPairs = [['red-300', 'red-950'], ['red-200', 'red-950'], ['rose-300', 'zinc-800'], ['white', 'red-600']];
 const rgb = hex => `rgb(${hex.slice(1).match(/../g).map(c => parseInt(c, 16)).join(', ')})`;
 
-function bootstrap(choice, osDark = false, denied = false, withMeta = true) {
+function bootstrap(choice, osDark = false, denied = false, withMeta = true, readOnly = false) {
   const values = new Map(choice === null ? [] : [['c6.theme', choice]]);
   const classes = new Set(), root = { style: {}, classList: {
     toggle(name, on) { if (on) classes.add(name); else classes.delete(name); },
+    remove(name) { classes.delete(name); },
+    add(name) { classes.add(name); },
     contains: name => classes.has(name),
   } };
   const storage = {
     getItem(key) { if (denied) throw Error('denied'); return values.get(key) ?? null; },
-    setItem(key, value) { if (denied) throw Error('denied'); values.set(key, value); },
+    setItem(key, value) { if (denied || readOnly) throw Error('denied'); values.set(key, value); },
   };
   const media = new EventTarget();
   media.matches = osDark;
@@ -61,9 +63,10 @@ function bootstrap(choice, osDark = false, denied = false, withMeta = true) {
 }
 
 function expected(choice, osDark = false) {
-  const dark = choice === 'soft' || choice === 'dark' || choice === 'system' && osDark;
-  return { choice, dark, soft: choice === 'soft', scheme: dark ? 'dark' : 'light',
-    colour: pages[choice === 'soft' ? 'soft' : dark ? 'dark' : 'light'] };
+  if (choice === 'soft' || choice === 'dim') choice = 'dark';
+  const dark = choice === 'dark' || choice === 'system' && osDark;
+  return { choice, dark, soft: false, scheme: dark ? 'dark' : 'light',
+    colour: pages[dark ? 'dark' : 'light'] };
 }
 
 function luminance(hex) {
@@ -94,10 +97,50 @@ async function builtContrast(page) {
       if (bytes[3] !== 255) throw Error(`invalid colour ${name}: ${token}`);
       return [name, { token, hex: '#' + bytes.slice(0, 3).map(c => c.toString(16).padStart(2, '0')).join('') }];
     }));
-  }, accentTokens);
-  for (const [name, { token, hex }] of Object.entries(colours)) {
-    const ratios = softTokens.slice(0, 3).map(bg => contrast(hex, bg));
-    console.log(`BUILT contrast ${name}: ${token} -> sRGB8 ${hex}, page/panel/chip ${ratios.map(r => r.toFixed(9)).join(' / ')}:1${ratios[2] < 4.5 ? ' [chip below AA 4.5]' : ''}`);
+  }, [...new Set([...accentTokens, ...redPairs.flat(), 'rose-900'])]);
+  for (const name of accentTokens) {
+    const { token, hex } = colours[name];
+    const ratios = darkTokens.slice(0, 3).map(bg => contrast(hex, bg));
+    console.log(`BUILT contrast ${name}: ${token} -> sRGB8 ${hex}, page/panel/chip ${ratios.map(r => r.toFixed(9)).join(' / ')}:1`);
+    assert(ratios.every(r => r >= 4.5), `${name} must meet AA on every Dark background`);
+  }
+  for (const [fg, bg] of redPairs) {
+    const ratio = contrast(colours[fg].hex, colours[bg].hex);
+    console.log(`BUILT pair ${fg} ${colours[fg].hex} on ${bg} ${colours[bg].hex}: ${ratio.toFixed(9)}:1`);
+    assert(ratio >= 4.5, `${fg} on ${bg} chip/button must meet AA`);
+  }
+  const blend = (fg, bg, alpha) => '#' + fg.slice(1).match(/../g).map((c, i) =>
+    Math.round(parseInt(c, 16) * alpha + parseInt(bg.slice(1 + 2 * i, 3 + 2 * i), 16) * (1 - alpha)).toString(16).padStart(2, '0')).join('');
+  const roseRatios = darkTokens.slice(0, 3).map(bg => contrast(colours['rose-300'].hex, blend(colours['rose-900'].hex, bg, .4)));
+  console.log(`BUILT pair rose-300 on rose-900/40 over page/panel/chip: ${roseRatios.map(r => r.toFixed(9)).join(' / ')}:1`);
+  assert(roseRatios.every(r => r >= 4.5), 'rose status chips must meet AA');
+  assert.equal(colours['red-400'].hex, '#ff7476', 'Dark-only red lift');
+  // Test actual utilities too, not just token variables. The SVG probe uses
+  // the production diagram's depth-two opacity, including its alpha blend.
+  const text = await page.evaluate(() => {
+    const probe = document.createElement('div');
+    probe.innerHTML = '<span class="text-muted">muted</span><span class="text-zinc-500 dark:text-zinc-400">secondary</span><svg><text class="fill-zinc-500 dark:fill-zinc-400">edge</text><text class="fill-current dark:fill-zinc-200 opacity-80">node</text></svg>';
+    document.body.append(probe);
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = 1;
+    const ctx = canvas.getContext('2d', { colorSpace: 'srgb' });
+    const result = [...probe.querySelectorAll('span, text')].map(el => {
+      const css = getComputedStyle(el);
+      return { name: el.textContent, colours: ['#1c1d21', '#25262b', '#33343a'].map(bg => {
+        ctx.globalAlpha = 1; ctx.fillStyle = bg; ctx.fillRect(0, 0, 1, 1);
+        ctx.globalAlpha = Number(css.opacity);
+        ctx.fillStyle = el.localName === 'text' ? css.fill : css.color;
+        ctx.fillRect(0, 0, 1, 1);
+        return '#' + [...ctx.getImageData(0, 0, 1, 1).data].slice(0, 3).map(c => c.toString(16).padStart(2, '0')).join('');
+      }) };
+    });
+    probe.remove();
+    return result;
+  });
+  for (const row of text) {
+    const ratios = row.colours.map((fg, i) => contrast(fg, darkTokens[i]));
+    console.log(`BUILT text ${row.name}: ${row.colours.join(' / ')}, page/panel/chip ${ratios.map(r => r.toFixed(9)).join(' / ')}:1`);
+    assert(ratios.every(r => r >= 4.5), `${row.name} utility/fill with opacity must meet AA`);
   }
   return colours;
 }
@@ -111,22 +154,27 @@ function unitTests() {
       assert.equal(f.events(), 1);
     }
   });
-  test('missing/unknown storage follows OS; legacy Dim remains unchanged Dark', () => {
+  test('missing/unknown storage follows OS; legacy Dim and Soft migrate to selected Dark', () => {
     for (const os of [false, true]) {
       for (const choice of [null, '', 'unknown']) assert.deepEqual(bootstrap(choice, os).snapshot(), expected('system', os));
-      assert.deepEqual(bootstrap('dim', os).snapshot(), expected('dark', os));
+      for (const legacy of ['dim', 'soft']) {
+        const f = bootstrap(legacy, os);
+        assert.deepEqual(f.snapshot(), expected('dark', os));
+        assert.equal(f.values.get('c6.theme'), 'dark', `${legacy} is rewritten, not a fourth choice`);
+      }
     }
   });
   test('switching removes stale Soft/dark classes and persists only in this browser', () => {
     const f = bootstrap('soft');
+    f.root.classList.add('soft');
     for (const choice of ['dark', 'light', 'soft', 'system']) {
       f.theme.set(choice);
       assert.deepEqual(f.snapshot(), expected(choice));
-      assert.equal(f.values.get('c6.theme'), choice);
+      assert.equal(f.values.get('c6.theme'), expected(choice).choice);
       assert.deepEqual(bootstrap(f.values.get('c6.theme')).snapshot(), expected(choice));
     }
   });
-  test('only System follows OS changes; Soft does not become ordinary Dark', () => {
+  test('only System follows OS changes; migrated Soft stays Dark', () => {
     for (const choice of ['system', 'light', 'dark', 'soft']) {
       const f = bootstrap(choice);
       for (const os of [true, false]) {
@@ -139,6 +187,7 @@ function unitTests() {
     const f = bootstrap('light', true);
     f.storage('soft');
     assert.deepEqual(f.snapshot(), expected('soft', true));
+    assert.equal(f.values.get('c6.theme'), 'dark');
     const events = f.events();
     f.storage('dark', 'c6.other');
     assert.equal(f.events(), events);
@@ -153,6 +202,9 @@ function unitTests() {
     f.theme.set('soft');
     assert.deepEqual(f.snapshot(), expected('system', true));
     assert.doesNotThrow(() => bootstrap('soft', false, false, false));
+    const readOnly = bootstrap('soft', false, false, true, true);
+    assert.deepEqual(readOnly.snapshot(), expected('dark'));
+    assert.equal(readOnly.values.get('c6.theme'), 'soft', 'failed write still presents selected Dark');
   });
   test('parser-blocking bootstrap precedes stylesheet; other helpers stay deferred', () => {
     const html = fs.readFileSync(path.join(UI, 'index.html'), 'utf8');
@@ -165,20 +217,23 @@ function unitTests() {
       assert(html.includes(`<script defer src="/js/${helper}.js"></script>`));
     }
   });
-  test('Dark is unchanged; Soft only repoints grey tokens, including border steps', () => {
+  test('Dark takes the Soft greys and accessible red; there is no Soft selector or Light override', () => {
     const css = fs.readFileSync(path.join(UI, 'style/input.css'), 'utf8');
     const tokens = selector => [...css.match(new RegExp(`html\\.${selector} \\{([^}]+)\\}`))[1]
       .matchAll(/--color-zinc-(\d+): (#[\da-f]+);/g)].map(m => [m[1], m[2]]);
-    assert.deepEqual(tokens('dark'), ['950', '900', '800'].map((shade, i) => [shade, darkTokens[i]]));
-    assert.deepEqual(tokens('soft'), ['950', '900', '800', '700'].map((shade, i) => [shade, softTokens[i]]));
-    const soft = css.match(/html\.soft \{([^}]+)\}/)[1];
-    assert.equal(soft.match(/--/g).length, 4, 'no text/accent overrides');
+    assert.deepEqual(tokens('dark'), ['950', '900', '800', '700'].map((shade, i) => [shade, darkTokens[i]]));
+    assert(!css.includes('html.soft'));
+    assert(!css.includes('html.light'));
+    const overrides = [...css.matchAll(/--color-red-400:\s*([^;]+);/g)];
+    assert.equal(overrides.length, 1, 'one red-400 override');
+    assert.equal(overrides[0][1], '#ff7476');
+    assert(css.match(/html\.dark \{([^}]+)\}/)[1].includes('--color-red-400: #ff7476;'));
   });
-  test('Settings reuses the radio helper for all four choices in a named content grid', () => {
+  test('Settings reuses the radio helper for three choices in a named content grid', () => {
     const rust = fs.readFileSync(path.join(UI, 'src/settings.rs'), 'utf8');
     const appearance = rust.slice(rust.indexOf('fn AppearanceSetting()'), rust.indexOf('/// The user\'s identity colour'));
-    assert.deepEqual([...appearance.matchAll(/\{option\("([^"]+)"/g)].map(m => m[1]), ['system', 'light', 'dark', 'soft']);
-    assert(appearance.includes('@lg/settings:grid-cols-2 @4xl/settings:grid-cols-4'));
+    assert.deepEqual([...appearance.matchAll(/\{option\("([^"]+)"/g)].map(m => m[1]), ['system', 'light', 'dark']);
+    assert(appearance.includes('@lg/settings:grid-cols-2 @4xl/settings:grid-cols-3'));
     assert(appearance.includes('Custom::new("c6-theme")'));
     assert(appearance.includes('on_cleanup(move || theme.remove())'));
     assert(appearance.includes('Custom::new("c6-motion-choice")'));
@@ -191,21 +246,27 @@ function unitTests() {
       assert(rust.includes(`radio_name("${group}")`), `${group} needs its own instance-local radio group`);
     }
   });
-  test('exact sRGB contrast: muted passes; specified chip red rounds up but is below 4.5', t => {
-    const colours = { muted: '#a1a1aa', red: '#f87171', white: '#ffffff',
-      blue: '#38bdf8', amber: '#fbbf24', green: '#34d399' };
+  test('exact sRGB contrast: every named Dark text accent meets unrounded AA on page, panel and chip', t => {
+    const colours = { muted: '#9f9fa9', red: '#ff7476', white: '#ffffff',
+      blue: '#51a2ff', sky: '#00bcff', amber: '#ffb900', green: '#00d492' };
     for (const [name, colour] of Object.entries(colours)) {
-      const ratios = softTokens.slice(0, 3).map(bg => contrast(colour, bg));
+      const ratios = darkTokens.slice(0, 3).map(bg => contrast(colour, bg));
       t.diagnostic(`${name} ${colour}, page/panel/chip: ${ratios.map(r => r.toFixed(9)).join(' / ')}:1`);
-      if (name !== 'red') assert(ratios.every(r => r >= 4.5));
+      assert(ratios.every(r => r >= 4.5), `${name} must pass without rounding`);
     }
-    assert(Math.abs(contrast(colours.muted, softTokens[2]) - 4.8396616782811295) < 1e-12);
-    const red = contrast(colours.red, softTokens[2]);
-    assert(red < 4.5 && red > 4.48);
-    assert.equal(red.toFixed(1), '4.5');
-    const builtRed = contrast('#ff6467', softTokens[2]);
-    assert(Math.abs(builtRed - 4.294438) < 1e-6);
-    t.diagnostic(`Tailwind 4 red-400 sRGB8 #ff6467 on chip: ${builtRed.toFixed(9)}:1, also below 4.5`);
+    const css = fs.readFileSync(path.join(UI, 'style/input.css'), 'utf8');
+    assert(css.includes(`--color-red-400: ${colours.red};`), 'test the shipped Dark red');
+  });
+  test('audited secondary text and SVG labels have dark-only readable greys', () => {
+    for (const file of ['chats.rs', 'aspects.rs']) {
+      const rust = fs.readFileSync(path.join(UI, 'src', file), 'utf8');
+      for (const match of rust.matchAll(/"([^"\n]*\btext-zinc-500\b[^"\n]*)"/g)) {
+        assert(match[1].includes('dark:text-zinc-400'), `${file}: ${match[1]}`);
+      }
+    }
+    const rust = fs.readFileSync(path.join(UI, 'src/explorer.rs'), 'utf8');
+    assert(rust.includes('fill-zinc-500 text-[10px] dark:fill-zinc-400'));
+    assert(rust.includes('fill-current dark:fill-zinc-200 {size}'));
   });
 }
 
@@ -252,7 +313,7 @@ async function firstPaint(browser, origin, choice, os) {
       meta: document.querySelector('meta[name="theme-color"]').content,
       booted: !!window.wasmBindings, elements: document.body.children.length }));
     const e = expected(choice, os === 'dark');
-    assert.equal(result.choice, choice);
+    assert.equal(result.choice, e.choice);
     assert.equal(result.scheme, e.scheme);
     assert.equal(result.meta, e.colour);
     assert.equal(result.booted, false, 'checks must run before WASM starts');
@@ -265,7 +326,18 @@ async function firstPaint(browser, origin, choice, os) {
     }
     assert(held, 'WASM request must be held, not merely fast enough to win the race');
     console.log(`PASS first paint ${choice}, OS ${os}: ${result.frames.length} frames, delayed theme fetch, WASM held`);
-    if (choice === 'soft' && os === 'dark') await builtContrast(page);
+    if (choice === 'dark' && os === 'dark') await builtContrast(page);
+    if (choice === 'light' && os === 'dark') {
+      const colour = await page.evaluate(() => {
+        const canvas = document.createElement('canvas');
+        canvas.width = canvas.height = 1;
+        const ctx = canvas.getContext('2d', { colorSpace: 'srgb' });
+        ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--color-red-400');
+        ctx.fillRect(0, 0, 1, 1);
+        return '#' + [...ctx.getImageData(0, 0, 1, 1).data].slice(0, 3).map(c => c.toString(16).padStart(2, '0')).join('');
+      });
+      assert.equal(colour, '#ff6467', 'Light keeps Tailwind red-400');
+    }
   } finally { release(); await context.close(); }
 }
 
@@ -275,10 +347,10 @@ async function assertTheme(page, choice, os = false) {
     scheme: document.documentElement.style.colorScheme,
     colour: document.querySelector('meta[name="theme-color"]').content }));
   assert.deepEqual(actual, expected(choice, os));
-  if (choice === 'dark' || choice === 'soft') {
+  if (expected(choice, os).dark) {
     const tokens = await page.evaluate(() => ['950', '900', '800', '700']
       .map(shade => getComputedStyle(document.documentElement).getPropertyValue(`--color-zinc-${shade}`).trim()));
-    assert.deepEqual(tokens.slice(0, choice === 'soft' ? 4 : 3), choice === 'soft' ? softTokens : darkTokens);
+    assert.deepEqual(tokens, darkTokens);
   }
 }
 
@@ -295,48 +367,45 @@ async function cardBounds(page) {
         overflow: label.scrollWidth > label.clientWidth + 1 };
     });
   });
-  assert.equal(result.length, 4);
+  assert.equal(result.length, 3);
   assert(result.every(card => card.fits && !card.overflow), `theme cards overflow/overlap: ${JSON.stringify(result)}`);
 }
 
 async function switching(browser, origin, layout, fixture, settle) {
   const motion = { choice: 'off', effective: 'off', os: 'no-preference' };
-  const f = await fixture(browser, origin, layout === 'phone' ? { width: 640, height: 844 } :
+  const f = await fixture(browser, origin, layout === 'phone' ? { width: 390, height: 844 } :
     { width: 1600, height: 1000 }, 'dark', motion, () => {});
   try {
-    const darkAccents = await f.page.evaluate(names => names
-      .map(name => getComputedStyle(document.documentElement).getPropertyValue(`--color-${name}`).trim()), accentTokens);
+    // Exercise the legacy setter as well as startup and real cross-tab writes.
     await f.page.evaluate(() => c6Theme.set('soft'));
-    await assertTheme(f.page, 'soft');
-    const softAccents = await f.page.evaluate(names => names
-      .map(name => getComputedStyle(document.documentElement).getPropertyValue(`--color-${name}`).trim()), accentTokens);
-    assert.deepEqual(softAccents, darkAccents, 'Soft must not repoint text/accent tokens');
+    await assertTheme(f.page, 'dark');
     const composer = await f.page.locator('textarea').first().evaluate(el =>
       getComputedStyle(el.closest('.rounded-xl')).borderTopColor);
-    assert.equal(composer, rgb('#4a4b52'), 'Soft composer keeps its stronger border');
-    if (process.env.SCREENSHOTS) await f.page.screenshot({ path: path.join(process.env.SCREENSHOTS, `soft-theme-session-${layout}.png`) });
+    assert.equal(composer, rgb('#4a4b52'), 'Dark composer keeps its stronger border');
+    if (process.env.SCREENSHOTS) await f.page.screenshot({ path: path.join(process.env.SCREENSHOTS, `dark-theme-session-${layout}.png`) });
     await f.page.evaluate(() => localStorage.removeItem('c6.home.workspace.v2'));
     await f.page.goto(`${origin}/r/home/settings/appearance`, { waitUntil: 'domcontentloaded' });
     await f.page.locator('input[name|=theme]').first().waitFor();
     const radios = f.page.locator('input[name|=theme]');
-    assert.equal(await radios.count(), 4);
-    const themes = (process.env.THEMES || 'light,dark,soft,system').split(',');
+    assert.equal(await radios.count(), 3);
+    assert(await radios.nth(2).isChecked(), 'legacy Soft lands on the selected Dark card');
+    const themes = (process.env.THEMES || 'light,dark,system').split(',');
     for (const width of (process.env.WIDTHS || '240,320,400,480,640').split(',').map(Number)) {
       if (layout === 'phone') await f.page.setViewportSize({ width, height: 844 });
       else await f.page.locator('[data-tile-motion]').first().evaluate((el, width) => { el.style.width = `${width + 8}px`; }, width);
       await settle(f.page);
       for (const choice of themes) {
-        const index = ['system', 'light', 'dark', 'soft'].indexOf(choice);
+        const index = ['system', 'light', 'dark'].indexOf(choice);
         assert(index >= 0, `unknown THEMES choice ${choice}`);
         await radios.nth(index).check();
         await assertTheme(f.page, choice, true);
         assert.equal(await f.page.evaluate(() => localStorage.getItem('c6.theme')), choice);
         await cardBounds(f.page);
-        if (process.env.SCREENSHOTS && choice === 'soft') {
+        if (process.env.SCREENSHOTS && choice === 'dark') {
           const target = layout === 'tile' ? f.page.locator('[data-tile-motion]').first() : f.page;
-          await target.screenshot({ path: path.join(process.env.SCREENSHOTS, `soft-theme-${layout}-${width}.png`) });
+          await target.screenshot({ path: path.join(process.env.SCREENSHOTS, `dark-theme-${layout}-${width}.png`) });
         }
-        console.log(`PASS ${layout} ${width}px ${choice}: four usable cards, theme and persistence`);
+        console.log(`PASS ${layout} ${width}px ${choice}: three usable cards, theme and persistence`);
       }
     }
     // Both windows render the production Settings component. Real storage
@@ -344,37 +413,42 @@ async function switching(browser, origin, layout, fixture, settle) {
     const peer = await f.context.newPage();
     await peer.goto(`${origin}/r/home/settings/appearance`, { waitUntil: 'domcontentloaded' });
     await peer.locator('input[name|=theme]').first().waitFor();
-    for (const [choice, index] of [['soft', 3], ['dark', 2], ['light', 1], ['system', 0]]) {
+    await peer.evaluate(() => localStorage.setItem('c6.theme', 'soft'));
+    await f.page.waitForFunction(() => c6Theme.get() === 'dark' && document.querySelectorAll('input[name|=theme]')[2].checked);
+    await peer.waitForFunction(() => c6Theme.get() === 'dark' && document.querySelectorAll('input[name|=theme]')[2].checked);
+    assert.equal(await peer.evaluate(() => localStorage.getItem('c6.theme')), 'dark', 'legacy cross-tab write is migrated');
+    for (const [choice, index] of [['dark', 2], ['light', 1], ['system', 0]]) {
       await radios.nth(index).check();
       await peer.waitForFunction(choice => c6Theme.get() === choice &&
-        document.querySelectorAll('input[name|=theme]')[['system', 'light', 'dark', 'soft'].indexOf(choice)].checked, choice);
+        document.querySelectorAll('input[name|=theme]')[['system', 'light', 'dark'].indexOf(choice)].checked, choice);
       await assertTheme(peer, choice, true);
     }
     await f.page.emulateMedia({ colorScheme: 'light' });
     await f.page.waitForFunction(() => !c6Theme.isDark());
     await assertTheme(f.page, 'system');
-    await radios.nth(3).check();
+    await radios.nth(2).check();
     await f.page.emulateMedia({ colorScheme: 'dark' });
-    await assertTheme(f.page, 'soft', true);
+    await assertTheme(f.page, 'dark', true);
     await f.page.emulateMedia({ colorScheme: 'light' });
-    await assertTheme(f.page, 'soft');
+    await assertTheme(f.page, 'dark');
     await f.page.reload({ waitUntil: 'domcontentloaded' });
-    await f.page.locator('input[name|=theme]').nth(3).waitFor();
-    assert(await f.page.locator('input[name|=theme]').nth(3).isChecked(), 'Soft survives reload');
-    await assertTheme(f.page, 'soft');
+    await f.page.locator('input[name|=theme]').nth(2).waitFor();
+    assert(await f.page.locator('input[name|=theme]').nth(2).isChecked(), 'Dark survives reload');
+    await assertTheme(f.page, 'dark');
     assert.deepEqual(f.errors, [], 'no production UI errors');
-    console.log(`PASS ${layout}: cross-tab selected card, OS changes, Soft reload`);
+    console.log(`PASS ${layout}: migrated Soft, cross-tab selected card, OS changes, Dark reload`);
   } finally { await f.context.close(); }
 }
 
 // Use real retained tiles, not CSS-resized copies of a single settings page.
-// A second Appearance tile exercises document-wide native radio grouping too.
+// Settings is single-copy: saved duplicates collapse, and section navigation
+// remounts Appearance with fresh document-wide native radio group names.
 async function workspaceRadios(browser, origin, fixture, settle) {
   const f = await fixture(browser, origin, { width: 1600, height: 1000 }, 'dark',
     { choice: 'system', effective: 'full', os: 'no-preference' }, () => {});
   const { page } = f;
   try {
-    for (const [layout, count, repeated] of [['single', 1], ['grid', 5], ['stack', 6], ['grid-retained', 5, true], ['stack-retained', 6, true]]) {
+    for (const [layout, count, repeated] of [['single', 1], ['grid', 5], ['stack', 6], ['grid-saved-duplicate', 5, true], ['stack-saved-duplicate', 6, true]]) {
       await page.evaluate(({ count, repeated }) => {
         const views = [{ view: 'settings', section: 'appearance' }, { view: 'session', id: 'parent' },
           { view: 'workers' }, { view: 'sessions' }, repeated ? { view: 'settings', section: 'appearance' } : { view: 'workers' }, { view: 'docs', id: '' }];
@@ -387,7 +461,6 @@ async function workspaceRadios(browser, origin, fixture, settle) {
       }, { count, repeated: !!repeated });
       await page.goto(`${origin}/r/home/settings/appearance`, { waitUntil: 'domcontentloaded' });
       await page.getByRole('heading', { name: 'Theme', exact: true }).first().waitFor();
-      if (repeated) await page.locator('[data-tile-motion="14"]').getByRole('heading', { name: 'Theme', exact: true }).waitFor();
       const appearance = page.locator('[data-tile-motion="10"]');
       const check = async (phase, motion = 'system') => {
         await settle(page);
@@ -401,23 +474,44 @@ async function workspaceRadios(browser, origin, fixture, settle) {
               styled: radios.filter(r => r.checked).every(r =>
                 getComputedStyle(r.closest('label')).borderColor !== getComputedStyle(radios.find(r => !r.checked).closest('label')).borderColor) }] : [];
           }) }));
-        assert.equal(state.theme, 'soft', `${layout}/${phase}: applied palette`);
+        assert.equal(state.theme, 'dark', `${layout}/${phase}: applied palette`);
         assert.equal(state.motion, motion, `${layout}/${phase}: applied motion choice`);
-        assert.equal(state.soft, true, `${layout}/${phase}: Soft palette remains applied`);
+        assert.equal(state.soft, false, `${layout}/${phase}: no obsolete Soft class`);
         assert.equal(state.effectiveMotion, motion === 'system' ? 'full' : motion, `${layout}/${phase}: effective motion`);
-        assert.equal(state.panels.length, repeated ? 2 : 1, `${layout}/${phase}: Appearance views stay mounted`);
+        assert.equal(state.panels.length, 1, `${layout}/${phase}: one surviving Appearance view`);
+        assert.equal(state.panels[0].key, '10', `${layout}/${phase}: original Settings tile survives`);
         for (const panel of state.panels) {
-          assert.deepEqual(panel.checked, ['Soft', motion[0].toUpperCase() + motion.slice(1)], `${layout}/${phase}: actual checked properties ${JSON.stringify(state)}`);
+          assert.deepEqual(panel.checked, ['Dark', motion[0].toUpperCase() + motion.slice(1)], `${layout}/${phase}: actual checked properties ${JSON.stringify(state)}`);
           assert.equal(panel.selectedCards, 2, `${layout}/${phase}: selected card CSS`);
           assert(panel.styled, `${layout}/${phase}: selected border painted`);
         }
         console.log(`PASS radios ${layout}/${phase}: ${JSON.stringify(state)}`);
       };
       await check('initial');
+      if (repeated) {
+        assert.equal(await page.locator('[data-tile-motion="14"]').count(), 0, `${layout}: saved duplicate Settings tile collapsed`);
+      }
       await appearance.getByRole('radio', { name: /^Light/ }).check();
-      await appearance.getByRole('radio', { name: /^Soft/ }).check();
+      await appearance.getByRole('radio', { name: /^Dark/ }).check();
       await appearance.getByRole('radio', { name: /^Off/ }).check();
       await check('motion-off', 'off');
+      const names = () => appearance.locator('input[name|=theme], input[name|=motion]').evaluateAll(radios =>
+        [...new Set(radios.map(r => r.name))]);
+      const beforeNames = await names();
+      assert.equal(beforeNames.length, 2, `${layout}: theme and motion have distinct native groups`);
+      const section = async (value, label) => {
+        const selector = appearance.locator('main > select');
+        if (await selector.isVisible()) await selector.selectOption(value);
+        else await appearance.locator('main > nav').getByRole('button', { name: label, exact: true }).click();
+      };
+      await section('docs', 'Docs');
+      await appearance.locator('input[name|=theme]').first().waitFor({ state: 'detached' });
+      await section('appearance', 'Appearance');
+      await appearance.getByRole('heading', { name: 'Theme', exact: true }).waitFor();
+      await check('remounted', 'off');
+      const afterNames = await names();
+      assert.equal(afterNames.length, 2, `${layout}: remounted theme and motion have distinct native groups`);
+      assert(afterNames.every(name => !beforeNames.includes(name)), `${layout}: each mounted instance has fresh native group names`);
       await appearance.getByRole('radio', { name: /^Full/ }).check();
       await check('motion-full', 'full');
       await appearance.getByRole('radio', { name: /^System/ }).last().check();
@@ -444,7 +538,6 @@ async function workspaceRadios(browser, origin, fixture, settle) {
       }
       await page.reload({ waitUntil: 'domcontentloaded' });
       await page.getByRole('heading', { name: 'Theme', exact: true }).first().waitFor();
-      if (repeated) await page.locator('[data-tile-motion="14"]').getByRole('heading', { name: 'Theme', exact: true }).waitFor();
       await check('reload');
     }
     assert.deepEqual(f.errors, [], 'no production UI errors');
@@ -566,7 +659,7 @@ async function browserTests() {
       return;
     }
     await within('theme first-paint and switching', async () => {
-      for (const choice of ['system', 'light', 'dark', 'soft']) for (const os of ['light', 'dark']) {
+      for (const choice of ['system', 'light', 'dark', 'soft', 'dim']) for (const os of ['light', 'dark']) {
         await firstPaint(browser, origin, choice, os);
       }
       if (!process.argv.includes('--paint-only')) for (const layout of (process.env.LAYOUTS || 'tile,phone').split(',')) {
