@@ -373,7 +373,7 @@ pub fn TurnRow(session: String, span: Span, timeline: Timeline) -> impl IntoView
         <div id=format!("{session}-t{start}") class="c6-fold">
             <button class=ROW aria-expanded=move || open().to_string() title=crate::when::full(span.at)
                 on:click=move |_| tl.toggle(start, end)>
-                <span class="w-3 shrink-0 text-xs text-muted">{move || if open() { crate::icons::chevron_down().into_any() } else { crate::icons::chevron_right().into_any() }}</span>
+                <span class="w-3 shrink-0 text-xs text-muted">{move || if open() { crate::icons::chevron_down() } else { crate::icons::chevron_right() }}</span>
                 <span class="min-w-0 flex-1">
                     <span class="block truncate font-medium">{by}</span>
                     {move || Some(said()).filter(|s| !s.is_empty()).map(|s| view! { <span class="block truncate text-xs text-soft">{s}</span> })}
@@ -486,7 +486,7 @@ pub fn Outline(timeline: Timeline, #[prop(into)] on_go: Callback<TimelineTurn>) 
                         <div>
                             <button class=format!("{LINE} font-medium") aria-expanded=move || is_open().to_string()
                                 on:click=move |_| open.update(|o| if !o.remove(&start) { o.insert(start); })>
-                                <span class="w-3 shrink-0 text-muted">{move || if is_open() { crate::icons::chevron_down().into_any() } else { crate::icons::chevron_right().into_any() }}</span>
+                                <span class="w-3 shrink-0 text-muted">{move || if is_open() { crate::icons::chevron_down() } else { crate::icons::chevron_right() }}</span>
                                 <span class="tabular-nums">{label}</span>
                                 {h.running.then(|| view! { <span class="size-1.5 shrink-0 self-center animate-pulse rounded-full bg-blue-500"></span> })}
                             </button>

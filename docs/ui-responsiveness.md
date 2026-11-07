@@ -687,3 +687,31 @@ it does not reopen them, use hidden controls, force clicks, or retry. No
 production fix is made speculatively. Existing CI remains unchanged rather
 than adding a required job known to fail. Full cohort counts and evidence
 locations are recorded in `docs/testing.md`.
+
+## S1: typed icon boundaries and WASM headroom — November 7, 2026
+
+Size work starts at `c6/next` **5384d8e2**, not main. A names-kept
+wasm-bindgen/Binaryen build and twiggy top/dominators/monos identify large
+Settings/workspace render functions and generic component/drop machinery.
+Diagnostic names are excluded from production download measurements.
+
+Icons now return `AnyView` at the shared SVG boundary; callers use it directly
+instead of boxing it again. The SVG's attributes remain a **typed tuple**.
+This does not enable `erase_components` or its erased-attribute rebuild path:
+same-type updates still delegate to the typed SVG diff. All 108 vendored
+icons, three sizes, strokes, fills, accessible attributes and markup helpers
+are unchanged. No new CSS classes, dependency changes or browser SSR calls.
+
+Production `make ui` measurements, with the existing Brotli quality-11 hook:
+
+| Build | Raw bytes | Brotli bytes | Saving, raw / Brotli |
+|---|---:|---:|---:|
+| 5384d8e2 baseline | 10,713,719 | 2,665,834 | — |
+| Shared typed icon boundary | 10,692,720 | 2,656,541 | 20,999 / 9,293 |
+
+The size ceilings stay **10,724,780 raw / 2,667,328 Brotli**. This first saving
+alone leaves only 10,787 Brotli bytes of room, so more savings are needed.
+The existing native icon tests cover every path at every size; production
+browser checks include the component gallery in both themes, desktop/phone
+and Chromium/WebKit, plus live snapshot/transcript and retained-node checks
+in `tests/ring-render.cjs`. Size reduction is not a claim of faster rendering.

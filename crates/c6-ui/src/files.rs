@@ -59,7 +59,7 @@ pub fn FileBrowser(worker_id: String, #[prop(optional)] root: Option<String>) ->
                                                 <li class=move || if open_file.get().as_deref() == Some(full2.as_str()) { "bg-zinc-200 dark:bg-zinc-800" } else { "" }>
                                                     <button class="flex w-full items-center gap-2 px-2 py-1 text-left hover:bg-zinc-100 dark:hover:bg-zinc-900"
                                                         on:click=move |_| if is_dir { dir.set(full.clone()) } else { open_file.set(Some(full.clone())) }>
-                                                        <span class="w-4 text-muted">{if is_dir { crate::icons::chevron_right().into_any() } else { ().into_any() }}</span>
+                                                        <span class="w-4 text-muted">{if is_dir { crate::icons::chevron_right() } else { ().into_any() }}</span>
                                                         <span class=if is_dir { "min-w-0 flex-1 truncate font-medium" } else { "min-w-0 flex-1 truncate" }>{name}</span>
                                                         <span class="shrink-0 text-[11px] text-muted">{mtime.map(|t| ago(now - t)).unwrap_or_default()}</span>
                                                     </button>
@@ -557,7 +557,7 @@ pub fn FilePicker(
                                                     view! {
                                                         <li><button class="flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
                                                             on:click=move |_| if is_dir { dir.set(full.clone()) } else { read(full.clone(), name.clone()) }>
-                                                            <span class="w-3 text-muted">{if is_dir { crate::icons::chevron_right().into_any() } else { ().into_any() }}</span>
+                                                            <span class="w-3 text-muted">{if is_dir { crate::icons::chevron_right() } else { ().into_any() }}</span>
                                                             <span class=if is_dir { "truncate" } else { "truncate font-mono text-xs" }>{shown}</span>
                                                         </button></li>
                                                     }

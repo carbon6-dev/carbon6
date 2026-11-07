@@ -2743,7 +2743,7 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                 <button class=format!("{btn} hidden md:@min-[14rem]/tile:flex") title=move || if full.get() { "Defocus: back to the tiles" } else { "Focus: this tile fills the screen" }
                     aria-label=move || if full.get() { "Defocus" } else { "Focus" }
                     on:click=move |ev| { ev.stop_propagation(); ws.set_full(if full.get_untracked() { None } else { Some(key) }) }>
-                    {move || if full.get() { crate::icons::minimize().into_any() } else { crate::icons::maximize().into_any() }}
+                    {move || if full.get() { crate::icons::minimize() } else { crate::icons::maximize() }}
                 </button>
                 <button class=format!("{btn} hidden md:@min-[14rem]/tile:flex") title="Close this tile" aria-label="Close this tile" on:click=move |_| ws.close_tile(key)>{crate::icons::x()}</button>
                 <crate::activity::SessionsPicker />
@@ -2772,7 +2772,7 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                     </Show>
                 </div>
                 <button class=format!("{} hidden md:flex md:@min-[14rem]/tile:hidden", crate::session::MENU_ITEM) on:click=move |_| { ws.set_full(if full.get_untracked() { None } else { Some(key) }); menu_at.set(None); }>
-                    {move || if full.get() { crate::icons::minimize().into_any() } else { crate::icons::maximize().into_any() }}
+                    {move || if full.get() { crate::icons::minimize() } else { crate::icons::maximize() }}
                     {move || if full.get() { "Defocus" } else { "Focus" }}
                 </button>
                 <button class=format!("{} hidden md:flex md:@min-[14rem]/tile:hidden", crate::session::MENU_ITEM) on:click=move |_| { menu_at.set(None); ws.close_tile(key); }>{crate::icons::x()}"Close this tile"</button>

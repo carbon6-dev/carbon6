@@ -109,7 +109,7 @@ fn author_names() -> impl Fn(&str) -> String + Copy {
 }
 
 fn kind_mark(kind: &str) -> AnyView {
-    if kind == "deck" { crate::icons::chart().into_any() } else { crate::icons::file().into_any() }
+    if kind == "deck" { crate::icons::chart() } else { crate::icons::file() }
 }
 
 /// Reloads `tick` whenever a document changes over the live feed (`id`:
@@ -824,7 +824,7 @@ fn ArchiveMenuItem(archived: bool, run: Callback<()>, busy: RwSignal<bool>) -> i
     view! {
         <button role="menuitem" class="flex min-h-11 w-full items-center gap-2 px-4 text-left hover:bg-zinc-100 disabled:opacity-50 dark:hover:bg-zinc-800"
             disabled=move || busy.get() on:click=move |_| run.run(())>
-            {if archived { crate::icons::icon(crate::icons::Icon::ArchiveRestore, crate::icons::Size::S16).into_any() } else { crate::icons::icon(crate::icons::Icon::Archive, crate::icons::Size::S16).into_any() }}
+            {if archived { crate::icons::icon(crate::icons::Icon::ArchiveRestore, crate::icons::Size::S16) } else { crate::icons::icon(crate::icons::Icon::Archive, crate::icons::Size::S16) }}
             {if archived { "Unarchive" } else { "Archive" }}
         </button>
     }

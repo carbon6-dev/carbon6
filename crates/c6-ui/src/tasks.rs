@@ -413,11 +413,11 @@ pub fn ended_line(task_id: &str, kind: &str, description: &str, state: &str, exi
     let agent = kind == "agent";
     let native = kind == "claude_code";
     let status_icon = match state {
-        "finished" if native || exit_code == 0 => crate::icons::check().into_any(),
-        "finished" | "failed" => icon(Icon::CircleX, Size::S14).into_any(),
-        "stopped" | "stopped_by_user" => crate::icons::stop().into_any(),
-        "lost" => crate::icons::warning().into_any(),
-        _ => crate::icons::circle().into_any(),
+        "finished" if native || exit_code == 0 => crate::icons::check(),
+        "finished" | "failed" => icon(Icon::CircleX, Size::S14),
+        "stopped" | "stopped_by_user" => crate::icons::stop(),
+        "lost" => crate::icons::warning(),
+        _ => crate::icons::circle(),
     };
     let (what, tone) = match state {
         "started" => return None,

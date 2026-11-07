@@ -698,7 +698,7 @@ fn grouped(
             view! {
                 <div>
                     <button class=button on:click=toggle title=format!("{key}: {}", value.clone().unwrap_or_else(|| format!("no {key}")))>
-                        <span class="w-3 shrink-0 text-sm text-muted">{move || if is_folded.get() { crate::icons::chevron_right().into_any() } else { crate::icons::chevron_down().into_any() }}</span>
+                        <span class="w-3 shrink-0 text-sm text-muted">{move || if is_folded.get() { crate::icons::chevron_right() } else { crate::icons::chevron_down() }}</span>
                         {(!compact).then(|| view! { <span class="shrink-0 text-muted">{format!("{key}:")}</span> })}
                         <span class="min-w-0 truncate">{name}</span>
                         <span class="ml-auto shrink-0 tabular-nums">{count}</span>
@@ -922,7 +922,7 @@ pub fn SessionsRail(open: RwSignal<bool>) -> impl IntoView {
     view! {
         <div class="flex items-center gap-1 pb-1 pl-1.5 pr-3 pt-2 text-[11px] font-semibold uppercase tracking-wide text-muted">
             <button class=crate::activity::FOLD title=move || if open.get() { "Fold" } else { "Unfold" } on:click=move |_| open.update(|o| *o = !*o)>
-                {move || if open.get() { crate::icons::chevron_down().into_any() } else { crate::icons::chevron_right().into_any() }}
+                {move || if open.get() { crate::icons::chevron_down() } else { crate::icons::chevron_right() }}
             </button>
             <span class="flex-1 pl-0.5">"Sessions"
                 {move || (!open.get()).then(|| view! { <span class="ml-1.5 rounded-full bg-zinc-200 px-1.5 font-normal tabular-nums dark:bg-zinc-800">{sessions.with(Vec::len)}</span> })}

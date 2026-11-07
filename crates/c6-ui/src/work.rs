@@ -96,12 +96,12 @@ fn moved(w: &WorkItem) -> i64 {
 /// The kind of thing a ref points at, as a drawn icon.
 fn kind_mark(reference: &str) -> AnyView {
     match reference.split(':').next().unwrap_or("") {
-        "session" => icon(Icon::Bot, Size::S14).into_any(),
-        "request" | "thread" => crate::icons::mail().into_any(),
-        "chat" => crate::icons::message().into_any(),
-        "decision" => crate::icons::help().into_any(),
-        "doc" => icon(Icon::FileText, Size::S14).into_any(),
-        _ => icon(Icon::ArrowUpRight, Size::S14).into_any(),
+        "session" => icon(Icon::Bot, Size::S14),
+        "request" | "thread" => crate::icons::mail(),
+        "chat" => crate::icons::message(),
+        "decision" => crate::icons::help(),
+        "doc" => icon(Icon::FileText, Size::S14),
+        _ => icon(Icon::ArrowUpRight, Size::S14),
     }
 }
 

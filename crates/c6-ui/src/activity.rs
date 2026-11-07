@@ -132,7 +132,7 @@ fn DockActivity(open: RwSignal<bool>, fold: &'static str, kept: RwSignal<bool>, 
             <div class="flex items-center justify-between pb-1 pl-1.5 pr-3 pt-3 text-[11px] font-semibold uppercase tracking-wide text-muted">
                 <span class="flex items-center gap-1.5">
                     <button class=fold title=move || if open.get() { "Fold" } else { "Unfold" } on:click=move |_| open.update(|o| *o = !*o)>
-                        {move || if open.get() { crate::icons::chevron_down().into_any() } else { crate::icons::chevron_right().into_any() }}
+                        {move || if open.get() { crate::icons::chevron_down() } else { crate::icons::chevron_right() }}
                     </button>
                     "Activity"
                     {move || (!open.get() && !items.with(Vec::is_empty)).then(|| view! {

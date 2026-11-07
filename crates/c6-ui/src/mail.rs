@@ -696,7 +696,7 @@ pub(crate) fn file_kind(mime: &str, name: &str) -> (AnyView, String) {
     } else {
         ext
     };
-    (icon(mark, Size::S16).into_any(), kind)
+    (icon(mark, Size::S16), kind)
 }
 
 /// "230 KB", "1.4 MB".

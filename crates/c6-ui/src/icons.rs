@@ -610,17 +610,21 @@ impl Icon {
 
 /// Decorative; the enclosing control owns its accessible name. Paths are
 /// trusted, vendored data, not user HTML. No rendering a view back to a string.
-pub fn icon(name: Icon, size: Size) -> impl IntoView {
+/// Already an `AnyView`: callers need not erase it again.
+pub fn icon(name: Icon, size: Size) -> AnyView {
     drawn(name, size, false)
 }
 
-fn drawn(name: Icon, size: Size, filled: bool) -> impl IntoView {
+fn drawn(name: Icon, size: Size, filled: bool) -> AnyView {
+    // Share the SVG's render state across its many parent view types. Erase
+    // only this view boundary, not its attributes: updates keep typed diffs.
     view! {
         <svg viewBox="0 0 24 24" class=format!("inline-block {} max-w-full shrink-0 align-text-bottom", size.class())
             width=size.pixels() height=size.pixels() fill=if filled { "currentColor" } else { "none" }
             stroke="currentColor" stroke-width=size.stroke() stroke-linecap="round" stroke-linejoin="round"
             aria-hidden="true" inner_html=name.paths()></svg>
     }
+    .into_any()
 }
 
 /// The same source as `icon`, for existing HTML-string renderers. This must
@@ -658,7 +662,7 @@ pub mod html {
 // while new code can choose a typed name and size. No second path-data system.
 macro_rules! legacy_icons {
     ($($function:ident => $name:ident, $size:ident;)+) => { $(
-        pub fn $function() -> impl IntoView { icon(Icon::$name, Size::$size) }
+        pub fn $function() -> AnyView { icon(Icon::$name, Size::$size) }
     )+ };
 }
 
@@ -727,26 +731,26 @@ legacy_icons! {
 /// Remaining C16 entry points are kept even after their last local caller
 /// migrates, so an adjacent branch can still use the same icon system.
 #[allow(dead_code, reason = "C16 compatibility entry point; typed call sites now choose their own size")]
-pub fn arrow_down_right() -> impl IntoView {
+pub fn arrow_down_right() -> AnyView {
     icon(Icon::ArrowDownRight, Size::S16)
 }
 #[allow(dead_code, reason = "C16 compatibility entry point; Explorer now selects a typed kind")]
-pub fn zap() -> impl IntoView {
+pub fn zap() -> AnyView {
     icon(Icon::Zap, Size::S16)
 }
 #[allow(dead_code, reason = "C16 compatibility entry point; relationship labels now choose 14px")]
-pub fn arrows_left_right() -> impl IntoView {
+pub fn arrows_left_right() -> AnyView {
     icon(Icon::ArrowLeftRight, Size::S16)
 }
 
 /// Filled only for pinned/starred and stop states, not other chrome.
-pub fn star(on: bool) -> impl IntoView {
+pub fn star(on: bool) -> AnyView {
     drawn(Icon::Star, Size::S16, on)
 }
-pub fn stop() -> impl IntoView {
+pub fn stop() -> AnyView {
     drawn(Icon::Square, Size::S14, true)
 }
-pub fn check_box(on: bool) -> impl IntoView {
+pub fn check_box(on: bool) -> AnyView {
     icon(if on { Icon::SquareCheck } else { Icon::Square }, Size::S14)
 }
 
@@ -803,26 +807,26 @@ pub(crate) mod tests {
     #[test]
     fn restored_icons_share_the_accessible_svg_grid() {
         for mark in [
-            bell_off().into_any(),
-            brain().into_any(),
-            grid_plus().into_any(),
-            info().into_any(),
-            help().into_any(),
-            user().into_any(),
-            plus().into_any(),
-            stop().into_any(),
-            quote().into_any(),
-            list().into_any(),
-            list_ordered().into_any(),
-            icon(Icon::Calendar, Size::S16).into_any(),
-            layout_template().into_any(),
-            arrow_left().into_any(),
-            arrow_right().into_any(),
-            arrow_up_right().into_any(),
-            icon(Icon::ArrowDownRight, Size::S16).into_any(),
-            corner_down_right().into_any(),
-            locate_fixed().into_any(),
-            undo().into_any(),
+            bell_off(),
+            brain(),
+            grid_plus(),
+            info(),
+            help(),
+            user(),
+            plus(),
+            stop(),
+            quote(),
+            list(),
+            list_ordered(),
+            icon(Icon::Calendar, Size::S16),
+            layout_template(),
+            arrow_left(),
+            arrow_right(),
+            arrow_up_right(),
+            icon(Icon::ArrowDownRight, Size::S16),
+            corner_down_right(),
+            locate_fixed(),
+            undo(),
         ] {
             let html = mark.to_html();
             assert_eq!(html.matches("<svg").count(), 1, "{html}");

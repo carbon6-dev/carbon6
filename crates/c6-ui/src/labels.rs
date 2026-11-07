@@ -276,7 +276,7 @@ fn ConfigLists(c: EffectiveConfig) -> impl IntoView {
                         let on = a.skipped.is_none();
                         view! {
                             <div class=format!("flex flex-wrap items-center gap-2 text-sm {}", if on { "" } else { "opacity-50" })>
-                                <span>{if on { crate::icons::check().into_any() } else { crate::icons::minus().into_any() }}</span>
+                                <span>{if on { crate::icons::check() } else { crate::icons::minus() }}</span>
                                 <span class="font-mono text-xs">{a.name}</span>
                                 {a.applies_to.into_iter().map(|l| view! { <LabelChip label=l auto=true /> }).collect_view()}
                                 {a.skipped.map(|s| view! { <span class="text-xs text-muted">{s}</span> })}

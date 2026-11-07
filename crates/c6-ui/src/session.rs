@@ -1656,10 +1656,10 @@ fn SessionOverview(chrome: SessionChrome, #[prop(into)] on_done: Callback<()>) -
                         disabled=move || matches!(pane, Pane::Changes | Pane::Files) && chrome.ssh()
                         on:click=move |ev| { chrome.show_pane(pane, &ev); on_done.run(()); }>
                         {match pane {
-                            Pane::Changes => crate::icons::file_diff().into_any(),
-                            Pane::Terminal => crate::icons::square_terminal().into_any(),
-                            Pane::Files => crate::icons::folder().into_any(),
-                            Pane::Outputs => crate::icons::package().into_any(),
+                            Pane::Changes => crate::icons::file_diff(),
+                            Pane::Terminal => crate::icons::square_terminal(),
+                            Pane::Files => crate::icons::folder(),
+                            Pane::Outputs => crate::icons::package(),
                         }}
                         {pane.name()}
                     </button>
@@ -2599,7 +2599,7 @@ fn phone_status_row(state: PhoneStatusState, show: Callback<()>) -> AnyView {
         return ().into_any();
     }
     let primary = if state.waiting > 0 {
-        Some((format!("Waiting on you {}", state.waiting), "text-amber-700 dark:text-amber-300", crate::icons::triangle_alert().into_any()))
+        Some((format!("Waiting on you {}", state.waiting), "text-amber-700 dark:text-amber-300", crate::icons::triangle_alert()))
     } else if state.working {
         Some((
             "Working…".into(),
@@ -2607,7 +2607,7 @@ fn phone_status_row(state: PhoneStatusState, show: Callback<()>) -> AnyView {
             view! { <span class="animate-spin inline-flex">{crate::icons::loader_circle()}</span> }.into_any(),
         ))
     } else if state.failed {
-        Some(("Last turn failed".into(), "text-red-600 dark:text-red-400", crate::icons::circle_x().into_any()))
+        Some(("Last turn failed".into(), "text-red-600 dark:text-red-400", crate::icons::circle_x()))
     } else {
         None
     };
@@ -3984,9 +3984,9 @@ fn user_message(session: &str, e: &Event) -> AnyView {
     let url = |i: usize| crate::api::url(&format!("/api/v1/sessions/{session}/attachments/{}/{i}", e.seq));
     // In a subagent: who sent it.
     let from = if !delegated_by.is_empty() {
-        Some((icon(Icon::CornerDownRight, Size::S14).into_any(), "from the agent that started it"))
+        Some((icon(Icon::CornerDownRight, Size::S14), "from the agent that started it"))
     } else if command == "resume" {
-        Some((crate::icons::rotate().into_any(), "resumed by you"))
+        Some((crate::icons::rotate(), "resumed by you"))
     } else {
         None
     };
@@ -4060,9 +4060,9 @@ fn render_event(
             }
             s => {
                 let (icon, what, tone) = match s {
-                    "allowed" => (crate::icons::check().into_any(), "Approved", "text-emerald-700 dark:text-emerald-400"),
-                    "denied" => (icon(Icon::CircleX, Size::S14).into_any(), "Denied", "text-red-600 dark:text-red-400"),
-                    _ => (crate::icons::hourglass().into_any(), "No answer: not run", "text-muted"),
+                    "allowed" => (crate::icons::check(), "Approved", "text-emerald-700 dark:text-emerald-400"),
+                    "denied" => (icon(Icon::CircleX, Size::S14), "Denied", "text-red-600 dark:text-red-400"),
+                    _ => (crate::icons::hourglass(), "No answer: not run", "text-muted"),
                 };
                 view! { <p class=format!("flex items-center gap-2 text-xs {tone}")><span>{icon}</span><span>{what}</span></p> }.into_any()
             }
@@ -4566,10 +4566,10 @@ fn SubagentPeek(events: RwSignal<Vec<Event>>, streaming: RwSignal<Streaming>) ->
         <div class="space-y-0.5 pb-1 text-xs text-muted">
             {move || lines.get().into_iter().map(|(mark, text)| view! {
                 <p class="flex gap-2 truncate"><span class="w-3 shrink-0">{match mark {
-                    "message" | "delegated" => icon(Icon::CornerDownRight, Size::S14).into_any(),
-                    "edit" => crate::icons::user().into_any(),
-                    "tool" => crate::icons::chevron_right().into_any(),
-                    "error" => icon(Icon::CircleX, Size::S14).into_any(),
+                    "message" | "delegated" => icon(Icon::CornerDownRight, Size::S14),
+                    "edit" => crate::icons::user(),
+                    "tool" => crate::icons::chevron_right(),
+                    "error" => icon(Icon::CircleX, Size::S14),
                     _ => ().into_any(),
                 }}</span><span class="truncate font-mono">{text}</span></p>
             }).collect_view()}
@@ -4986,9 +4986,9 @@ fn ToolCard(
             }>
                 {move || {
                     let (icon, cls) = match result.get() {
-                        None => (icon(Icon::LoaderCircle, Size::S14).into_any(), "animate-spin text-blue-500"),
-                        Some(r) if r.is_error => (icon(Icon::CircleX, Size::S14).into_any(), "text-red-500"),
-                        Some(_) => (crate::icons::check().into_any(), "text-emerald-600"),
+                        None => (icon(Icon::LoaderCircle, Size::S14), "animate-spin text-blue-500"),
+                        Some(r) if r.is_error => (icon(Icon::CircleX, Size::S14), "text-red-500"),
+                        Some(_) => (crate::icons::check(), "text-emerald-600"),
                     };
                     view! { <span class=format!("shrink-0 text-xs {cls}")>{icon}</span> }
                 }}
@@ -5049,14 +5049,14 @@ fn ToolCard(
                 {move || match doc.get() {
                     Some((id, title, kind, what)) => view! {
                         <crate::workspace::Go to=crate::workspace::View::Docs { id, target: None } class="inline-flex h-full max-w-full items-center gap-2 rounded-md border border-zinc-200 px-2 text-sm hover:bg-zinc-50 dark:border-zinc-700 dark:hover:bg-zinc-900">
-                            <span class="shrink-0 text-muted">{if kind == "deck" { crate::icons::chart().into_any() } else { crate::icons::file().into_any() }}</span>
+                            <span class="shrink-0 text-muted">{if kind == "deck" { crate::icons::chart() } else { crate::icons::file() }}</span>
                             <span class="min-w-0 truncate font-medium">{title}</span>
                             <span class="shrink-0 text-xs text-muted">{what}</span>
                         </crate::workspace::Go>
                     }.into_any(),
                     None => view! {
                         <div class="inline-flex h-full max-w-full items-center gap-2 rounded-md border border-zinc-200 px-2 text-sm text-muted dark:border-zinc-700">
-                            <span class="shrink-0">{if deck { crate::icons::chart().into_any() } else { crate::icons::file().into_any() }}</span>
+                            <span class="shrink-0">{if deck { crate::icons::chart() } else { crate::icons::file() }}</span>
                             <span class="min-w-0 truncate">{let title = doc_title.clone(); move || if result.with(Option::is_some) { "No document returned".to_owned() } else { title.clone() }}</span>
                         </div>
                     }.into_any(),
@@ -5092,9 +5092,9 @@ fn ToolBody(
                     <ul class="space-y-1 text-sm">
                         {items.into_iter().map(|(text, status)| {
                             let (mark, cls) = match status.as_str() {
-                                "completed" => (crate::icons::check_box(true).into_any(), "text-muted line-through"),
-                                "in_progress" => (crate::icons::play().into_any(), "font-medium"),
-                                _ => (crate::icons::check_box(false).into_any(), ""),
+                                "completed" => (crate::icons::check_box(true), "text-muted line-through"),
+                                "in_progress" => (crate::icons::play(), "font-medium"),
+                                _ => (crate::icons::check_box(false), ""),
                             };
                             view! { <li class=format!("flex gap-2 {cls}")><span>{mark}</span><span>{text}</span></li> }
                         }).collect_view()}

@@ -359,7 +359,7 @@ fn SessionPeek(id: String) -> impl IntoView {
             .into_any()
         }
         None => view! {
-            {title_row(None, icon(Icon::CircleDashed, Size::S16).into_any(), short.clone(), None)}
+            {title_row(None, icon(Icon::CircleDashed, Size::S16), short.clone(), None)}
             <div class="text-xs text-muted">"Not among this realm's sessions"</div>
         }
         .into_any(),
@@ -403,7 +403,7 @@ fn DocPeek(id: String) -> impl IntoView {
             Some(Err(e)) => (title.clone(), e, false),
         };
         view! {
-            {title_row(None, icon(Icon::FileText, Size::S16).into_any(), title, archived.then(|| ("Archived".to_owned(), STATE_QUIET)))}
+            {title_row(None, icon(Icon::FileText, Size::S16), title, archived.then(|| ("Archived".to_owned(), STATE_QUIET)))}
             <div class="truncate text-xs text-muted">{line}</div>
         }
     }

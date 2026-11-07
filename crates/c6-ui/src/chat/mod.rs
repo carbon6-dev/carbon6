@@ -528,10 +528,10 @@ fn Sidebar() -> impl IntoView {
             </div>
             <div class="min-h-0 flex-1 space-y-3 overflow-y-auto p-2">
                 <div class="space-y-0.5">
-                    {nav("Unreads", crate::icons::menu().into_any(), Pane::Unreads, Signal::derive(move || total("unread")), false)}
-                    {nav("Threads", crate::icons::message().into_any(), Pane::Threads, Signal::derive(move || chat.threads_new.get() as i64), true)}
+                    {nav("Unreads", crate::icons::menu(), Pane::Unreads, Signal::derive(move || total("unread")), false)}
+                    {nav("Threads", crate::icons::message(), Pane::Threads, Signal::derive(move || chat.threads_new.get() as i64), true)}
                     {nav("Activity", view! { "@" }.into_any(), Pane::Activity, Signal::derive(move || total("mentions")), true)}
-                    {nav("Saved", crate::icons::bookmark().into_any(), Pane::Saved, Signal::derive(|| 0), false)}
+                    {nav("Saved", crate::icons::bookmark(), Pane::Saved, Signal::derive(|| 0), false)}
                 </div>
                 <input class="w-full rounded-md border border-zinc-200 bg-white px-2 py-1 text-xs dark:border-zinc-800 dark:bg-zinc-900" type="search"
                     placeholder="Filter conversations" prop:value=move || filter.get() on:input=move |ev| filter.set(event_target_value(&ev)) />
@@ -568,7 +568,7 @@ fn Section(name: String, list: Vec<Value>, prefs_tick: RwSignal<u32>) -> impl In
                     storage_set(&format!("c6.chat.fold.{n1}"), if folded { "0" } else { "1" });
                     prefs_tick.update(|t| *t += 1);
                 }>
-                    <span class="w-3">{if folded { crate::icons::chevron_right().into_any() } else { crate::icons::chevron_down().into_any() }}</span>{name.clone()}
+                    <span class="w-3">{if folded { crate::icons::chevron_right() } else { crate::icons::chevron_down() }}</span>{name.clone()}
                 </button>
                 <button class="hidden text-[10px] normal-case group-hover:inline hover:underline" title="Sort"
                     on:click=move |_| {
@@ -769,7 +769,7 @@ fn ConversationPane(place: Place, at: Option<String>) -> impl IntoView {
                 view! {
                     <button class="text-sm text-muted hover:text-amber-500" title=if starred { "Unstar" } else { "Star" }
                         on:click=move |_| chat.act("memex.chat.prefs", json!({"workspace": w, "channel": ch, "starred": !starred}))>
-                        {if starred { crate::icons::star(true).into_any() } else { crate::icons::star(false).into_any() }}
+                        {if starred { crate::icons::star(true) } else { crate::icons::star(false) }}
                     </button>
                     {(c["muted"] == true).then(|| view! { <span class="rounded bg-zinc-200 px-1 text-[10px] text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400">"muted"</span> })}
                     <span class="min-w-0 flex-1 truncate text-xs text-muted" title=c["topic"].as_str().unwrap_or("").to_owned()>{c["topic"].as_str().unwrap_or("").to_owned()}</span>

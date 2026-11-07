@@ -893,7 +893,7 @@ fn Documents(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> im
                 let doc = d.doc.clone();
                 let doc2 = d.doc.clone();
                 let current = d.role.clone();
-                let mark = if d.kind == "deck" { crate::icons::chart().into_any() } else { crate::icons::file().into_any() };
+                let mark = if d.kind == "deck" { crate::icons::chart() } else { crate::icons::file() };
                 let title = d.title.clone();
                 view! {
                     <div class="flex items-center gap-2 rounded px-2 py-1 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900">
