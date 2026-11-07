@@ -1869,14 +1869,20 @@ fn BottomSheet(
     open: RwSignal<bool>,
     #[prop(default = "Session details")] label: &'static str,
     #[prop(default = true)] close_icon: bool,
+    #[prop(optional)] panel: Option<NodeRef<leptos::html::Div>>,
+    #[prop(optional)] pop: Option<String>,
+    #[prop(default = "")] class: &'static str,
+    #[prop(optional)] instant: bool,
     children: Children,
 ) -> impl IntoView {
     let close = move || open.set(false);
     let pulled_from = StoredValue::new(None::<i32>);
+    let tabindex = panel.map(|_| "-1");
+    let panel = panel.unwrap_or_default();
     view! {
-        <div class="c6-scrim c6-presence fixed inset-0 z-40 bg-black/30" data-open=move || open.get().to_string() inert=move || !open.get()
+        <div class="c6-scrim c6-presence fixed inset-0 z-40 bg-black/30" class:phone-instant-scrim=instant data-open=move || open.get().to_string() inert=move || !open.get()
             on:click=move |ev| { ev.stop_propagation(); close() }></div>
-        <div role="dialog" aria-modal="true" aria-label=label class="c6-sheet c6-presence phone-sheet fixed inset-x-0 bottom-0 z-50 flex max-h-[80dvh] flex-col rounded-t-xl border-t border-zinc-200 bg-white text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
+        <div node_ref=panel data-pop=pop role="dialog" aria-modal="true" aria-label=label tabindex=tabindex class=format!("c6-sheet c6-presence phone-sheet fixed inset-x-0 bottom-0 z-50 flex max-h-[80dvh] flex-col rounded-t-xl border-t border-zinc-200 bg-white text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900 {class}")
             data-open=move || open.get().to_string() inert=move || !open.get()
             on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); close() }>
             <div class="relative flex h-9 shrink-0 touch-none items-center justify-center pointer-coarse:h-12"
@@ -2202,6 +2208,27 @@ fn Transcript(
     let asking = RwSignal::new(None::<u64>);
     // Rewinding or editing a message: (seq, edit).
     let rewinding = RwSignal::new(None::<(u64, bool)>);
+    // One phone picker for the transcript, not one modal/listener per message.
+    // Selecting its context never changes the draft or starts an action.
+    let message_actions = RwSignal::new(None::<u64>);
+    let actions_open = RwSignal::new(false);
+    let actions_present = crate::util::presence(move || actions_open.get());
+    let actions_panel = NodeRef::<leptos::html::Div>::new();
+    crate::util::modal(actions_open, actions_panel);
+    let actions_pop = StoredValue::new(crate::util::escapable(
+        move || actions_open.get(),
+        move || {
+            actions_open.try_set(false);
+        },
+    ));
+    let actions_context = Memo::new(move |_| {
+        events.with(|evs| {
+            evs.iter()
+                .find(|e| Some(e.seq) == message_actions.get())
+                .map(|e| message_action_context(&e.kind))
+                .unwrap_or(("Message", String::new()))
+        })
+    });
     // Events no longer counting since a rewind: seq → the Rewound's seq;
     // and how many each rewind covers.
     let rewound = Memo::new(move |_| {
@@ -2220,6 +2247,13 @@ fn Transcript(
             }
             (by, counts)
         })
+    });
+    let actions_can_rewind = Memo::new(move |_| {
+        can_rewind
+            && message_actions.get().is_some_and(|seq| {
+                events.with(|evs| evs.iter().any(|e| e.seq == seq && matches!(e.kind, EventKind::User { .. })))
+                    && rewound.with(|(by, _)| !by.contains_key(&seq))
+            })
     });
     // What's drawn: the window (before it, only the summary's events), to
     // the end or where a jump stops it; while finished turns fold, each one
@@ -2300,6 +2334,8 @@ fn Transcript(
                         let only_thinking = thinking_only(&e.kind);
                         let anchorable = can_branch && can_anchor(&e.kind);
                         let task_notification = matches!(&e.kind, EventKind::User { command, .. } if command == "task-notification");
+                        let user_bubble = matches!(&e.kind, EventKind::User { command, from_session_id, .. }
+                            if command != "task-notification" && command != "stop-hook" && from_session_id.is_empty());
                         let user_text = match &e.kind {
                             EventKind::User { text, .. } => Some(text.clone()),
                             _ => None,
@@ -2363,7 +2399,11 @@ fn Transcript(
                             <div
                                 id=format!("{}-e{seq}", id.get_value())
                                 class=move || format!("c6-transcript-row group relative {arrive} {} {} {}",
-                                    if anchorable && !task_notification { "pb-7" } else { "" },
+                                    if anchorable {
+                                        if user_bubble { "md:pb-7" }
+                                        else if task_notification { "min-h-11 pr-12 md:min-h-0 md:pr-0" }
+                                        else { "min-h-11 pr-12 md:min-h-0 md:pr-0 md:pb-7" }
+                                    } else { "" },
                                     if hidden() || (only_thinking && !show_thinking.get()) { "hidden" } else { "" },
                                     if by().is_some() { "opacity-50" } else { "" })
                             >
@@ -2403,12 +2443,34 @@ fn Transcript(
                                     }.into_any()
                                 }}
                                 {anchorable.then(|| view! {
+                                    // The fixed 44px metadata target has its own row below
+                                    // an ordinary user bubble, otherwise a reserved gutter.
+                                    // Neither changes size when the portalled sheet opens.
+                                    <div class=if user_bubble { "flex h-11 justify-end md:hidden" } else { "absolute right-0 top-0 md:hidden" }>
+                                    <button type="button" class="flex size-11 items-center justify-center rounded-md text-muted hover:bg-zinc-100 focus-visible:ring-2 focus-visible:ring-sky-500/60 dark:hover:bg-zinc-800"
+                                        aria-label="Message actions" title="Message actions" aria-haspopup="dialog"
+                                        aria-expanded=move || (actions_open.get() && message_actions.get() == Some(seq)).to_string()
+                                        data-pop=move || if message_actions.get() == Some(seq) { actions_pop.get_value() } else { String::new() }
+                                        on:click=move |ev| {
+                                            use wasm_bindgen::JsCast;
+                                            ev.stop_propagation();
+                                            // Safari doesn't focus tapped buttons. Mark the real
+                                            // opener before modal() captures where to return.
+                                            if let Some(el) = ev.current_target().and_then(|t| t.dyn_into::<web_sys::HtmlElement>().ok()) {
+                                                let options = web_sys::FocusOptions::new();
+                                                options.set_prevent_scroll(true);
+                                                let _ = el.focus_with_options(&options);
+                                            }
+                                            message_actions.set(Some(seq));
+                                            actions_open.set(true);
+                                        }>{crate::icons::ellipsis()}</button>
+                                    </div>
                                     // A quiet notice may be narrower than its actions. Let
                                     // those wrap below it, never over its disclosure/icon.
                                     <div class=if task_notification {
-                                        "mt-1 flex flex-wrap justify-end gap-1 opacity-0 transition group-hover:opacity-100"
+                                        "mt-1 hidden flex-wrap justify-end gap-1 opacity-0 transition group-hover:opacity-100 md:flex"
                                     } else {
-                                        "absolute bottom-0 right-0 flex gap-1 opacity-0 transition group-hover:opacity-100"
+                                        "absolute bottom-0 right-0 hidden gap-1 opacity-0 transition group-hover:opacity-100 md:flex"
                                     }>
                                         {move || (can_rewind && is_user && by().is_none()).then(|| view! {
                                             <button class=UBTN title="Change this message and send it again (rewinds to before it)" on:click=move |_| rewinding.set(Some((seq, true)))>{crate::icons::pencil()}" Edit"</button>
@@ -2478,6 +2540,38 @@ fn Transcript(
                 <crate::tasks::RunningTasks session=id.get_value() events />
             </div>
             {move || (!running.get()).then(|| view! { <div class="c6-transcript-notices hidden md:block"><WaitingNotices events now session_id=id.get_value() /></div> })}
+            <Show when=move || actions_present.get()>
+                <leptos::portal::Portal>
+                    <BottomSheet open=actions_open label="Message actions" panel=actions_panel pop=actions_pop.get_value() class="phone-message-actions" instant=true>
+                        <div class="space-y-1 px-2 pb-3">
+                            <h2 class="font-medium">"Message actions"</h2>
+                            <p class="text-xs font-medium text-muted">{move || actions_context.get().0}</p>
+                            <p class="line-clamp-2 break-words text-sm text-muted">{move || actions_context.get().1}</p>
+                        </div>
+                        {move || actions_can_rewind.get().then(|| view! {
+                            <button type="button" class="flex min-h-12 w-full items-center gap-3 rounded-md px-3 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                                on:click=move |_| {
+                                    actions_open.set(false);
+                                    if let Some(seq) = message_actions.get_untracked() { rewinding.set(Some((seq, true))); }
+                                }>{crate::icons::pencil()}"Edit"</button>
+                        })}
+                        <button type="button" class="flex min-h-12 w-full items-center gap-3 rounded-md px-3 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                            on:click=move |_| {
+                                actions_open.set(false);
+                                asking.set(message_actions.get_untracked());
+                            }>{crate::icons::corner_down_right()}"Ask in a side chat"</button>
+                        {move || actions_can_rewind.get().then(|| view! {
+                            <div class="mt-2 border-t border-zinc-200 pt-2 dark:border-zinc-700">
+                                <button type="button" class="flex min-h-12 w-full items-center gap-3 rounded-md px-3 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                                    on:click=move |_| {
+                                        actions_open.set(false);
+                                        if let Some(seq) = message_actions.get_untracked() { rewinding.set(Some((seq, false))); }
+                                    }>{crate::icons::undo()}"Rewind…"</button>
+                            </div>
+                        })}
+                    </BottomSheet>
+                </leptos::portal::Portal>
+            </Show>
         </div>
     }
 }
@@ -3801,6 +3895,28 @@ fn memory_line(op: &str, id: &str, scope: &str, text: &str) -> AnyView {
 
 fn can_anchor(kind: &EventKind) -> bool {
     matches!(kind, EventKind::Assistant { .. } | EventKind::User { .. })
+}
+
+/// Bounded plain text for the picker, never another markdown render of a message.
+fn message_action_context(kind: &EventKind) -> (&'static str, String) {
+    let (speaker, text) = match kind {
+        EventKind::User { text, attachments, .. } => (
+            "User",
+            if text.trim().is_empty() { attachments.first().map(|a| a.name.as_str()).unwrap_or("User message") } else { text.as_str() },
+        ),
+        EventKind::Assistant { blocks, .. } => (
+            "Agent",
+            blocks
+                .iter()
+                .find_map(|b| match b {
+                    ContentBlock::Text { text, .. } if !text.trim().is_empty() => Some(text.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("Tool activity"),
+        ),
+        _ => ("Message", ""),
+    };
+    (speaker, text.trim().chars().take(160).collect())
 }
 
 /// Describe only structured metadata. An older notice is not evidence of who
@@ -6322,6 +6438,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn phone_message_action_context_is_plain_bounded_text_with_a_speaker() {
+        let user: EventKind = serde_json::from_value(serde_json::json!({
+            "type": "user", "command_id": "message", "text": "  <b>keep this literal</b>  "
+        }))
+        .unwrap();
+        assert_eq!(message_action_context(&user), ("User", "<b>keep this literal</b>".into()));
+        let agent = EventKind::Assistant {
+            turn: 1,
+            blocks: vec![
+                ContentBlock::Thinking { text: "Private reasoning is not an excerpt".into() },
+                ContentBlock::Text { text: "界".repeat(180), citations: Vec::new() },
+            ],
+            stop_reason: String::new(),
+        };
+        let (speaker, excerpt) = message_action_context(&agent);
+        assert_eq!(speaker, "Agent");
+        assert_eq!(excerpt, "界".repeat(160));
+        let tool_only = EventKind::Assistant { turn: 1, blocks: Vec::new(), stop_reason: String::new() };
+        assert_eq!(message_action_context(&tool_only), ("Agent", "Tool activity".into()));
+    }
+
+    #[test]
+    fn phone_message_actions_keep_a_gutter_and_use_the_existing_action_paths() {
+        let source = include_str!("session.rs").split("#[cfg(test)]").next().unwrap();
+        let trigger = source.split("// The fixed 44px metadata target").nth(1).unwrap().split("// A quiet notice").next().unwrap();
+        assert!(source.contains("min-h-11 pr-12 md:min-h-0 md:pr-0 md:pb-7"));
+        assert!(source.contains("if user_bubble { \"md:pb-7\" }"), "ordinary user text keeps its full width");
+        assert!(trigger.contains("flex h-11 justify-end md:hidden"), "ordinary user bubbles have a real metadata row");
+        assert!(trigger.contains("size-11") && trigger.contains("md:hidden"));
+        assert!(trigger.contains("crate::icons::ellipsis()"));
+        assert!(trigger.contains("message_actions.set(Some(seq))") && trigger.contains("actions_open.set(true)"));
+        assert!(!trigger.contains("rewinding.set") && !trigger.contains("asking.set"));
+        assert!(!trigger.contains("pointerdown") && !trigger.contains("touchstart"));
+        let sheet = source.split("<BottomSheet open=actions_open").nth(1).unwrap().split("</BottomSheet>").next().unwrap();
+        assert!(sheet.contains("label=\"Message actions\"") && sheet.contains("class=\"phone-message-actions\""));
+        assert!(sheet.contains("instant=true") && source.contains("class:phone-instant-scrim=instant"));
+        assert!(sheet.contains("Ask in a side chat") && sheet.contains("Rewind…"));
+        assert!(sheet.contains("rewinding.set(Some((seq, true)))") && sheet.contains("rewinding.set(Some((seq, false)))"));
+        assert!(sheet.contains("asking.set(message_actions.get_untracked())"));
+        assert_eq!(sheet.matches("actions_can_rewind.get()").count(), 2, "Edit and Rewind share live eligibility");
+        assert!(!sheet.contains("Copy") && !sheet.contains("inner_html"));
+        assert!(source.contains("crate::util::modal(actions_open, actions_panel)"));
+        assert!(source.contains("node_ref=panel data-pop=pop role=\"dialog\" aria-modal=\"true\" aria-label=label tabindex=tabindex"));
+        assert!(source.contains("let tabindex = panel.map(|_| \"-1\")"));
+    }
+
+    #[test]
     fn background_notice_labels_use_metadata_not_agent_facing_prose() {
         use c6_api::TaskNotice;
         assert_eq!(task_notice_label(None), ("Background notice".into(), String::new()));
@@ -6659,6 +6822,7 @@ mod tests {
             assert!(html.contains("c6-sheet c6-presence phone-sheet"), "retain keyboard viewport bounds: {html}");
             assert!(html.contains("aria-label=\"Catch up\""));
             assert!(html.contains("aria-label=\"Close\""), "other shared sheets retain their close icon: {html}");
+            assert!(!html.contains("tabindex=") && !html.contains("data-pop="), "default sheets keep their existing focus markup: {html}");
             assert!(html.contains("Body"), "the exiting body remains mounted");
             open.set(true);
             let html = view! { <BottomSheet open><button>"Body"</button></BottomSheet> }.to_html();

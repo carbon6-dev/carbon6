@@ -678,6 +678,69 @@ pub fn escapable(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 
     pop_up(shown, close, false)
 }
 
+/// A retained phone dialog: contain keyboard focus and make the background
+/// inert only while open. The dialog needs `tabindex="-1"`; Search is never
+/// automatically focused (which would summon the phone keyboard).
+pub fn modal(open: RwSignal<bool>, element: NodeRef<leptos::html::Div>) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        #[wasm_bindgen::prelude::wasm_bindgen]
+        extern "C" {
+            #[wasm_bindgen(js_name = c6Modal)]
+            fn modal(element: &web_sys::Element, close: &js_sys::Function) -> js_sys::Function;
+        }
+        Effect::new(move || {
+            if open.get()
+                && let Some(element) = element.get()
+            {
+                use wasm_bindgen::JsCast;
+                let close = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                    open.try_set(false);
+                });
+                let dispose = send_wrapper::SendWrapper::new(modal(&element, close.as_ref().unchecked_ref()));
+                let close = send_wrapper::SendWrapper::new(close);
+                on_cleanup(move || {
+                    let _ = dispose.call0(&wasm_bindgen::JsValue::NULL);
+                    drop(close);
+                });
+            }
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (open, element);
+}
+
+/// Both edge drawers share gesture arbitration and the motion preference.
+/// `data-drawer-side="right"` mirrors the app menu's outward close gesture.
+pub fn drawer_gesture(open: RwSignal<bool>, element: NodeRef<leptos::html::Div>, close: Callback<()>) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen::JsCast;
+        #[wasm_bindgen::prelude::wasm_bindgen]
+        extern "C" {
+            #[wasm_bindgen(js_name = c6DrawerSwipe)]
+            fn swipe(element: &web_sys::Element, close: &js_sys::Function) -> js_sys::Function;
+        }
+        Effect::new(move || {
+            if let Some(element) = element.get() {
+                let close = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                    if open.get_untracked() {
+                        close.run(());
+                    }
+                });
+                let dispose = send_wrapper::SendWrapper::new(swipe(&element, close.as_ref().unchecked_ref()));
+                let close = send_wrapper::SendWrapper::new(close);
+                on_cleanup(move || {
+                    let _ = dispose.call0(&wasm_bindgen::JsValue::NULL);
+                    drop(close);
+                });
+            }
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (open, element, close);
+}
+
 fn pop_up(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static, outside_closes: bool) -> String {
     use wasm_bindgen::JsCast;
     let id = POPS.with(|n| {
@@ -753,6 +816,9 @@ fn pop_up(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static
                 if !escape || !SHOWN.with(|s| innermost(&s.borrow().iter().map(|x| x.id).collect::<Vec<_>>(), id)) {
                     return;
                 }
+                // This key closed the innermost popup. Do not also deliver
+                // its default platform close request to a parent modal.
+                ev.prevent_default();
                 ev.stop_propagation();
                 close();
                 if let Some(el) = &opener {
@@ -762,8 +828,8 @@ fn pop_up(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static
         ));
         let opts = web_sys::AddEventListenerOptions::new();
         opts.set_capture(true);
-        opts.set_passive(true);
         for (kind, f) in &d.hooks {
+            opts.set_passive(*kind != "keydown");
             let _ = document().add_event_listener_with_callback_and_add_event_listener_options(kind, f.as_ref().unchecked_ref(), &opts);
         }
         hooks.set_value(Some(d));

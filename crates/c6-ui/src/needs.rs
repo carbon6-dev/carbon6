@@ -178,6 +178,12 @@ pub fn NeedsYou(#[prop(optional)] labelled: bool, #[prop(optional)] touch: bool)
         );
     });
     let open = RwSignal::new(false);
+    let panel = NodeRef::<leptos::html::Div>::new();
+    if touch {
+        // In the phone picker this dialog is portalled outside its parent's
+        // focus trap. Give the nested sheet its own modal focus boundary.
+        crate::util::modal(open, panel);
+    }
     let present = crate::util::presence(move || open.get());
     let anchor = RwSignal::new((0.0_f64, 8.0_f64));
     // Escape closes it, wherever focus is, and puts focus back on the pill.
@@ -224,6 +230,9 @@ pub fn NeedsYou(#[prop(optional)] labelled: bool, #[prop(optional)] touch: bool)
                 aria-haspopup="dialog" aria-expanded=move || open.get().to_string() aria-label=title title=title data-pop=pop.get_value()
                 on:click=move |ev| {
                     use wasm_bindgen::JsCast;
+                    if touch && let Some(el) = ev.current_target().and_then(|t| t.dyn_into::<web_sys::HtmlElement>().ok()) {
+                        let _ = el.focus();
+                    }
                     if let Some(el) = ev.current_target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
                         let rect = el.get_bounding_client_rect();
                         let width = window().inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -248,7 +257,7 @@ pub fn NeedsYou(#[prop(optional)] labelled: bool, #[prop(optional)] touch: bool)
                 <leptos::portal::Portal>
                 // A click outside closes it (on a phone the page dims).
                 <div class="c6-presence c6-scrim fixed inset-0 z-40 bg-black/30 md:bg-transparent" data-open=move || open.get().to_string() inert=move || !open.get() on:click=move |_| open.set(false)></div>
-                <div role="dialog" aria-label="What needs you" data-pop=pop.get_value() data-open=move || open.get().to_string() inert=move || !open.get()
+                <div node_ref=panel tabindex=touch.then_some("-1") role="dialog" aria-label="What needs you" data-pop=pop.get_value() data-open=move || open.get().to_string() inert=move || !open.get()
                     style=move || { let (top, right) = anchor.get(); format!("--needs-top:{top}px;--needs-right:{right}px") }
                     class="c6-presence c6-sheet c6-pane phone-sheet fixed inset-x-0 bottom-0 z-50 flex max-h-[80dvh] flex-col rounded-t-xl border border-zinc-200 bg-white text-sm shadow-lg md:inset-x-auto md:bottom-auto md:right-(--needs-right) md:top-(--needs-top) md:max-h-[70vh] md:w-[420px] md:rounded-lg dark:border-zinc-700 dark:bg-zinc-900">
                     <div class="flex items-center gap-2 border-b border-zinc-200 px-3 py-2 dark:border-zinc-800">

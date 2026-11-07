@@ -307,10 +307,12 @@ this harness observes production effects at creation and samples only its
 unchanged anchor, rather than materializing every off-screen event. No live
 head, settings, services or browser profile are used.
 
-`ONLY=sessionsPicker` checks the phone Sessions header's visual alignment,
-retained SVG icons, accessible close handle, and tap-outside/handle/swipe/Escape
-dismissal. Include `VIEWPORT=narrow,phone,landscape THEME=light,dark` for the
-320px, 390px and short-height phone layouts.
+`ONLY=sessionsPicker` smoke-checks the phone Sessions right drawer's header
+alignment, retained SVG icons, absence of a redundant top X/handle, and
+tap-outside/Escape dismissal. Include
+`VIEWPORT=narrow,phone,landscape THEME=light,dark` for the 320px, 390px and
+short-height phone layouts. The dedicated `phone-picker.cjs` regression below
+adds native right swipes, search, keyboard/focus containment and message actions.
 
 `ONLY=modelPicker` checks the composer chip's bottom sheet on those phone
 layouts and its unchanged desktop popover: arbitrary model ids, the last item
@@ -1311,3 +1313,106 @@ overrides it). Capture the regressed snapshot with
 that phase asserts desktop text is larger than 12px and saves the same views
 under `/tmp/q1-screenshots/model-before`. `VIEWPORT=desktop,phone,narrow`,
 `THEME=light,dark`, and browser path overrides work as in `motion.cjs`.
+
+## Phone Sessions right drawer and message actions (N4)
+
+Use the coordinator's **combined production UI build**; this script never
+builds the UI. It reuses `serve`, `fixture`, `settle`, `within`, `launchBrowser`
+and the fake session factory from `motion.cjs`, with an owned loopback origin,
+fake HTTP/WebSocket responses and a fresh browser context for every case. No
+live settings, services, credentials, browser profile or npm install are used.
+
+```sh
+NODE=/home/zheilbron/.nvm/versions/node/v24.16.0/bin/node
+# Preserve/copy the baseline dist before the coordinator replaces it.
+BASELINE=1 ROOT=/tmp/n4-picker/before-dist MOTION_CASE=full "$NODE" crates/c6-ui/tests/phone-picker.cjs
+# Run only after the coordinator reports the combined build is ready.
+ROOT=/path/to/coordinator/crates/c6-ui/dist "$NODE" crates/c6-ui/tests/phone-picker.cjs
+# Optional additional WebKit modal/search/menu coverage; native swipes remain Chromium-only.
+ENGINE=both ROOT=/path/to/coordinator/crates/c6-ui/dist "$NODE" crates/c6-ui/tests/phone-picker.cjs
+```
+
+The default matrix is 320×568, 390×844, 430×932 and 1440×1000, light/dark,
+Full/Reduced/Off: 24 Chromium contexts, or 48 with `ENGINE=both`.
+`VIEWPORT=narrow,phone,wide,desktop`, `THEME=light,dark`, and
+`MOTION_CASE=full,reduced,off` select cases without changing their assertions.
+`PLAYWRIGHT_CORE`, `CHROMIUM`, `CHROMIUM_LIBS` and `WEBKIT_EXECUTABLE` use the
+same installed-browser overrides as `motion.cjs`; Node and Playwright must
+already be available. `C6_TEST_DEADLINE_SECS` changes the hang guard, not a
+rendering-speed threshold. Screenshots default to `/tmp/n4-picker/`
+(`SCREENSHOTS` overrides it), with `before-`/`after-` prefixes so evidence
+coexists. `BASELINE=1` records the old Sessions sheet and hovered inline message
+actions, rather than asserting the new phone presentation.
+`PICKER_DIAGNOSTICS=1` additionally saves desktop message/action bounds,
+hover/display/opacity JSON and phone Ask focus/DOM evidence. Assertions do not
+change; hover screenshots always await animation completion before capture.
+Each engine normally reuses one browser process with a fresh context per
+case. To investigate a runtime trap, select one viewport/theme/motion case
+per invocation for a fresh browser process. Preserve the original failed
+run separately from any isolated-case cohort; a passing rerun does not make
+the shared-process run a clean pass or establish the cause of a WASM trap.
+
+The fixed-build checks require the named list opener and `Sessions` dialog,
+right-side shared `phone-drawer`, no top X/handle, keyboard-bounded geometry,
+an exactly 44px header row with actual 44px Ask/bell/row-close touch targets,
+and centered 20px visual Ask/bell pills (also under coarse-pointer CSS),
+no Search autofocus, native inert background, a complete forward/backward Tab
+cycle, and focus return after Escape, scrim and swipe close. Search keeps local
+title results available while the fake saved-history response is held, uses a
+200ms debounce, blurs on Enter without losing the query, separates open
+sessions/open pages/history, rejects a late older response and retries an
+explicit failed request. A dedicated opt-in recent-session seed leaves the
+shared fixture's defaults unchanged: empty search must order Open sessions →
+Other open pages → Recently viewed; typing must put all matching session
+groups (including saved history) before matching pages. Real saved hits retain highlighted snippets,
+surrounding context, entry-kind and worker metadata. A short local query must
+label an on-head session as `head`; a saved on-head hit with an empty worker
+name must use the same identity fallback. An `open_in` side-chat
+result routes to its parent session, retaining the query, anchor and expansion
+chain in the workspace target and URL. Response gates and animation completion
+are awaited; there are no sleeps or action retries to hide missed taps.
+The nested bell loads two real fake-attention links plus Mark all seen. It
+must contain forward/backward Tab, make the parent picker inert, reject focus
+back into its Search, and consume the first Escape without closing Sessions.
+Escape returns focus to the actual tapped bell and restores only the picker,
+not the still-modal app background. The retained Ask button must open its
+existing usable assistant form. Resizing an open picker to desktop must close
+it and release native inert, without resurrecting the modal on returning to phone.
+
+Chromium CDP supplies **native emulated touch**, including cancellation and
+compatibility-click behavior. The fixture retains one CDP session until its
+browser context closes: detaching mid-case resets Chromium touch emulation.
+Gesture helpers assert coarse pointer capability and nonzero touch points
+afterward, so later form checks still exercise the phone policy.
+Small/wrong-way/vertical starts and cancellation
+must not dismiss; an outward pull reversed to a short release must snap back;
+a long right release must close and restore focus. Full alone finger-tracks;
+Reduced/Off retain gesture semantics without travel and their phone overlays
+open/close instantly (zero duration, not the generic 80ms Reduced token).
+Full Chromium also pauses the actual entrance at its `transitionrun` signal,
+requires a real percentage `translate`, then uses native touch to pick it up:
+35px finger movement must add exactly 35px to the displayed position without
+a jump. The shared `motion.cjs --unit` swipe test separately checks percentage
+and pixel pickup on both drawer sides at two widths, and ensures an existing
+entrance offset does not count toward the finger-release threshold.
+WebKit has no equivalent
+Playwright native drag API, so its run explicitly reports no swipe proof; it
+still runs every other modal, search, keyboard and action-menu assertion.
+Keyboard cases synthesize visual-viewport insets; this is not physical-device
+keyboard coverage or proof of Android Back-edge gestures.
+
+Own messages expose Edit / Ask in a side chat / Rewind…; agent replies expose
+Ask only. Both have always-visible 44px phone more targets and named
+`Message actions` dialogs with inert/Tab containment and focus restoration
+after Escape, Close and scrim dismissal. Own metadata has its own 44px row
+below the full-width bubble; the agent target stays in its reserved text
+gutter. Opening the portalled sheet must retain the row and its exact layout,
+and must not send, rewind or branch. Edit and Rewind open their existing
+confirmation panels, leave file restoration unchecked, and are cancelled
+without mutations. Own and agent Ask forms each submit a real fake-API
+`side-chats` request with the selected anchor; their existing autofocus must
+reach the textarea before any test `fill()` or focus action. A controlled JSON error
+acknowledges that route without inventing a running side chat. Desktop keeps
+its existing inline Edit/Rewind/Ask actions and has no phone more button or
+Sessions drawer. Browser crashes, UI error reports, external requests, and
+unexpected settings mutations fail the run.

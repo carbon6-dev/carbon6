@@ -327,13 +327,7 @@ fn AppsMenu() -> impl IntoView {
 #[derive(Clone, Copy)]
 struct PhoneWaiting(Signal<u64>);
 
-#[wasm_bindgen::prelude::wasm_bindgen]
-extern "C" {
-    #[wasm_bindgen(js_name = c6DrawerSwipe)]
-    fn drawer_swipe(element: &web_sys::Element, close: &js_sys::Function) -> js_sys::Function;
-}
-
-/// Phones and narrower windows: the nav, views and search in a menu.
+/// Phones and narrower windows: app navigation (session search is in its picker).
 #[component]
 fn MobileMenu(#[prop(optional)] desktop: bool, #[prop(optional, into)] desktop_attention: Option<Signal<usize>>) -> impl IntoView {
     let ws = workspace::use_workspace();
@@ -342,22 +336,13 @@ fn MobileMenu(#[prop(optional)] desktop: bool, #[prop(optional, into)] desktop_a
     let version = versions();
     let open = RwSignal::new(false);
     let drawer = NodeRef::<leptos::html::Div>::new();
-    #[cfg(target_arch = "wasm32")]
-    Effect::new(move || {
-        use wasm_bindgen::JsCast;
-
-        if let Some(el) = drawer.get() {
-            let close = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
-                open.try_set(false);
-            });
-            let dispose = send_wrapper::SendWrapper::new(drawer_swipe(&el, close.as_ref().unchecked_ref()));
-            let close = send_wrapper::SendWrapper::new(close);
-            on_cleanup(move || {
-                let _ = dispose.call0(&wasm_bindgen::JsValue::NULL);
-                drop(close);
-            });
-        }
-    });
+    util::drawer_gesture(
+        open,
+        drawer,
+        Callback::new(move |()| {
+            open.try_set(false);
+        }),
+    );
     let pop = util::dismissable(
         move || open.get(),
         move || {
@@ -435,7 +420,7 @@ fn MobileMenu(#[prop(optional)] desktop: bool, #[prop(optional, into)] desktop_a
                         <Go to=View::Settings { note: None, section: String::new() } class=MENU>"Settings"</Go>
                     </div>
                 })}
-                <div class:hidden=place::is_console() on:click=|ev| ev.stop_propagation()><search::SearchBox /></div>
+                {desktop.then(|| view! { <div class:hidden=place::is_console() on:click=|ev| ev.stop_propagation()><search::SearchBox /></div> })}
                 <div class="flex flex-col text-sm" class:hidden=place::is_console()>
                     <Go to=View::Sessions class=MENU>"Sessions"</Go>
                     <span data-header-destination="inbox" class="contents"><Go to=View::Inbox class=MENU>"Inbox"

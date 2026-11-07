@@ -177,7 +177,7 @@ async function fixture(browser, origin, viewport, theme, motion, started, contex
     if (url.pathname.endsWith('/live')) {
       lives.add(socket);
       socket.onClose(() => lives.delete(socket));
-      socket.send(JSON.stringify({ type: 'sessions', sessions: [session('parent', state)] }));
+      socket.send(JSON.stringify({ type: 'sessions', sessions: [session('parent', state), ...(seed.sessions || [])] }));
       socket.send(JSON.stringify({ type: 'workers', workers: [worker] }));
       socket.send(JSON.stringify({ type: 'marks', marks }));
     } else if (url.pathname.endsWith('/stream')) {
@@ -275,7 +275,7 @@ async function fixture(browser, origin, viewport, theme, motion, started, contex
     setState: async (next, patch = {}) => {
       assert(lives.size, 'live fixture connected'); state = next;
       for (const live of lives) {
-        live.send(JSON.stringify({ type: 'sessions', sessions: [{ ...session('parent', state), ...patch }] }));
+        live.send(JSON.stringify({ type: 'sessions', sessions: [{ ...session('parent', state), ...patch }, ...(seed.sessions || [])] }));
         live.send(JSON.stringify({ type: 'attention' }));
       }
     },
@@ -392,7 +392,9 @@ async function drawer(f) {
   const { page, context, motion } = f;
   const opener = page.getByRole('button', { name: /^Menu,/ }).first();
   const panel = opener.locator('..').locator('.phone-drawer');
-  const cdp = await context.newCDPSession(page);
+  // Detaching a secondary CDP session resets Chromium's touch emulation.
+  // The owned fixture context releases this session with the rest of its page.
+  const cdp = f.touchSession ||= await context.newCDPSession(page);
   const touch = (type, x, y) => cdp.send('Input.dispatchTouchEvent', {
     type, touchPoints: type === 'touchEnd' || type === 'touchCancel' ? [] : [{ x, y, id: 1 }],
   });
@@ -507,7 +509,10 @@ async function drawer(f) {
     await page.keyboard.press('Escape');
     await page.waitForFunction(() => __swipeDrawer.dataset.open === 'false' && __swipeDrawer.inert);
     await settle(page);
-  } finally { await cdp.detach(); }
+  } finally {
+    assert(await page.evaluate(() => matchMedia('(pointer: coarse)').matches && navigator.maxTouchPoints > 0),
+      'native drawer gestures preserve the touch-first device policy for subsequent checks');
+  }
 }
 
 async function menu(f) {
@@ -518,27 +523,34 @@ async function menu(f) {
       await new Promise(resolve => requestAnimationFrame(resolve));
       const drawer = document.querySelector('.phone-drawer[data-open="true"]');
       if (!drawer) return { missing: true };
-      const input = drawer.querySelector('input');
-      if (!input) return { missingInput: true };
-      input.focus();
-      const box = input.getBoundingClientRect();
+      const control = drawer.querySelector('summary');
+      if (!control) return { missingControl: true };
+      control.focus();
+      const box = control.getBoundingClientRect();
       const x = box.x + box.width / 2, y = box.y + box.height / 2;
       const onscreen = x >= 0 && x < innerWidth && y >= visualViewport.offsetTop && y < visualViewport.offsetTop + visualViewport.height;
       const hit = document.elementFromPoint(x, y);
-      input.click(); // Dispatch is live even if the entering picture is offscreen.
-      return { inert: !!input.closest('[inert]'), disabled: input.disabled, focus: document.activeElement === input,
-        hit: !onscreen || hit === input || input.contains(hit),
-        diagnostic: { input: { x: box.x, y: box.y, width: box.width, height: box.height },
+      const expanded = control.parentElement.open;
+      control.click(); // Dispatch is live even if the entering picture is offscreen.
+      const action = control.parentElement.open !== expanded;
+      // The first-frame probe opens real nested navigation. Restore it so
+      // the following Escape tests the drawer, not that child popup.
+      control.click();
+      return { inert: !!control.closest('[inert]'), disabled: !!control.disabled, focus: document.activeElement === control,
+        action, restored: control.parentElement.open === expanded,
+        search: !!drawer.querySelector('input[type="search"]'),
+        hit: !onscreen || hit === control || control.contains(hit),
+        diagnostic: { control: { x: box.x, y: box.y, width: box.width, height: box.height },
           onscreen, hit: hit?.outerHTML.slice(0, 250), translate: getComputedStyle(drawer).translate, viewport: innerHeight } };
     });
-    const { diagnostic, ...inputState } = drawerFrame;
-    assert.deepEqual(inputState, { inert: false, disabled: false, focus: true, hit: true }, `drawer accepts focus and input in its first frame: ${JSON.stringify(diagnostic)}`);
+    const { diagnostic, ...controlState } = drawerFrame;
+    assert.deepEqual(controlState, { inert: false, disabled: false, focus: true, hit: true, action: true, restored: true, search: false }, `phone drawer retains first-frame nested navigation interactivity without the old Search: ${JSON.stringify(diagnostic)}`);
     await settle(page);
     await page.screenshot({ path: path.join(SHOTS, `${f.label}-menu-open.png`) });
     const drawer = page.getByRole('button', { name: /^Menu,/ }).first().locator('..').locator('.phone-drawer');
     const axis = await drawer.evaluate(el => {
       window.__drawer = el;
-      el.querySelector('input').blur();
+      if (el.contains(document.activeElement)) document.activeElement.blur();
       return { x: getComputedStyle(el).getPropertyValue('--sheet-x').trim(),
         y: getComputedStyle(el).getPropertyValue('--sheet-y').trim() };
     });
@@ -765,8 +777,16 @@ async function sessionsPicker(f) {
   const opener = page.getByRole('button', { name: /^Switch sessions and pages/ });
   const dialog = page.getByRole('dialog', { name: 'Sessions', exact: true });
   const open = async () => { await opener.click(); await dialog.waitFor(); await settle(page); };
-  const closed = async () => { await page.waitForFunction(() => !document.querySelector('[role="dialog"][aria-label="Sessions"][data-open="true"]')); await settle(page); };
+  const closed = async () => {
+    await page.waitForFunction(() => !document.querySelector('[role="dialog"][aria-label="Sessions"][data-open="true"]'));
+    await settle(page);
+    assert(await opener.evaluate(el => document.activeElement === el), 'Sessions returns focus to its opener');
+  };
   await open();
+  const pages = await page.evaluate(() => JSON.parse(localStorage.getItem('c6.home.workspace.v2')).tiles.length);
+  assert.equal(await opener.getAttribute('aria-label'), `Switch sessions and pages, ${pages} open`);
+  assert.equal(await opener.locator('[data-phone-pages]').textContent(), String(pages), 'list badge retains every open page');
+  assert.equal(await dialog.getByText('Open sessions', { exact: true }).count(), 1, 'open sessions retain their own group');
   const header = await dialog.evaluate(el => {
     const h = el.querySelector('h2').parentElement;
     const [ask, bell] = h.querySelectorAll('button');
@@ -774,25 +794,24 @@ async function sessionsPicker(f) {
     const box = e => { const r = e.getBoundingClientRect(); return { right: r.right, cy: r.y + r.height / 2, height: r.height }; };
     return { buttons: h.querySelectorAll('button').length, title: box(h.querySelector('h2')),
       ask: box(ask), askPill: box(ask.querySelector('span')), bell: box(bell), bellPill: box(bell.querySelector('span')), rowX: box(rowX),
-      icons: h.querySelectorAll('svg').length, handle: el.querySelector('button[aria-label="Close Sessions"]')?.tagName };
+      icons: h.querySelectorAll('svg').length, handle: el.querySelector('button[aria-label="Close Sessions"]')?.tagName,
+      side: el.dataset.drawerSide, right: el.getBoundingClientRect().right };
   });
   assert.equal(header.buttons, 2, 'header has Ask and bell, not an extra X');
   assert.equal(header.icons, 2, 'Ask and bell keep their drawn SVG icons');
-  assert.equal(header.handle, 'BUTTON', 'screen readers can activate the named close handle');
+  assert.equal(header.handle, undefined, 'right drawer has no top X or close handle');
+  assert.equal(header.side, 'right', 'Sessions uses the shared right-edge drawer');
+  assert.equal(header.ask.height, 44, 'Ask retains its 44px header touch target');
+  assert.equal(header.bell.height, 44, 'bell retains its 44px header touch target');
+  assert.equal(header.rowX.height, 44, 'session close controls retain their 44px target');
   assert.equal(header.askPill.height, header.bellPill.height, JSON.stringify(header));
   assert(Math.abs(header.title.cy - header.ask.cy) < 1 && Math.abs(header.ask.cy - header.bell.cy) < 1, JSON.stringify(header));
-  assert(Math.abs(header.bell.right - header.rowX.right) < 1, `header ends at the row close column: ${JSON.stringify(header)}`);
+  assert(header.bell.right <= header.right && header.rowX.right <= header.right, `header and row controls fit the drawer: ${JSON.stringify(header)}`);
   await page.screenshot({ path: path.join(SHOTS, `${f.label}-sessions-picker.png`) });
-  await dialog.getByRole('button', { name: 'Close Sessions', exact: true }).click(); await closed();
-  await open(); await page.keyboard.press('Escape'); await closed();
+  await page.keyboard.press('Escape'); await closed();
   await open(); await page.locator('.c6-scrim[data-open="true"]').click({ position: { x: 2, y: 2 } }); await closed();
-  await open();
-  await dialog.getByRole('button', { name: 'Close Sessions', exact: true }).evaluate(el => {
-    el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, clientY: 10, pointerId: 1 }));
-    el.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, clientY: 60, pointerId: 1 }));
-    el.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, clientY: 60, pointerId: 1 }));
-  });
-  await closed();
+  // Native right-swipe/cancel/reversal coverage, search, focus containment and
+  // message actions live in phone-picker.cjs; no synthetic handle remains.
 }
 
 async function modelPicker(f) {
@@ -1566,8 +1585,8 @@ function unitTests() {
     f.api.set('reduced'); assert.equal(f.canceled(), 1); assert.equal(f.cssCanceled(), 0); assert.equal(f.transitionCanceled(), 1);
     f.api.set('off'); assert.equal(f.canceled(), 2); assert.equal(f.cssCanceled(), 0); assert.equal(f.transitionCanceled(), 2);
   });
-  test('production drawer swipe claims only clear left touch drags and releases through shared CSS', () => {
-    const setup = (choice = 'full') => {
+  test('production drawer swipe claims only clear outward touch drags and releases through shared CSS', () => {
+    const setup = (choice = 'full', side = 'left', translate = '0px', width = 288) => {
       const f = load({ choice }), listeners = new Map(), global = new Map(), mediaListeners = new Map();
       const attributes = new Map(), styles = new Map(), captured = new Set();
       let closed = 0, reads = 0, prevented = 0;
@@ -1576,9 +1595,9 @@ function unitTests() {
       f.window.matchMedia = query => { assert.equal(query, '(width < 48rem), (height < 32rem)'); return media; };
       f.window.addEventListener = (type, fn) => global.set(type, fn);
       f.window.removeEventListener = type => global.delete(type);
-      f.window.getComputedStyle = () => { reads++; return { translate: '0px' }; };
-      const element = { dataset: { open: 'true' },
-        getBoundingClientRect: () => { reads++; return { width: 288, left: 0 }; },
+      f.window.getComputedStyle = () => { reads++; return { translate }; };
+      const element = { dataset: { open: 'true', drawerSide: side },
+        getBoundingClientRect: () => { reads++; return { width, left: 0 }; },
         style: { setProperty: (key, value) => styles.set(key, value), removeProperty: key => styles.delete(key) },
         setAttribute: (key, value) => attributes.set(key, value), removeAttribute: key => attributes.delete(key),
         setPointerCapture: id => captured.add(id), hasPointerCapture: id => captured.has(id),
@@ -1613,6 +1632,39 @@ function unitTests() {
       f.send('pointerdown'); f.send('pointermove', 50, 100); f.send('pointerup');
       assert.equal(f.closed(), 1, `${choice} retains gesture semantics; CSS alone scales motion`);
       f.dispose(); assert.equal(f.listeners.size, 0); assert.equal(f.global.size, 0); assert.equal(f.mediaListeners.size, 0);
+    }
+    for (const choice of ['full', 'reduced', 'off']) {
+      const f = setup(choice, 'right');
+      f.send('pointerdown', 40, 100); f.send('pointermove', 80, 101);
+      assert(f.attributes.has('data-dragging')); assert.equal(f.styles.get('--drawer-pull'), '40px');
+      f.send('pointermove', 180, 101); f.send('pointermove', 65, 101); f.send('pointerup', 65, 101);
+      assert.equal(f.closed(), 0, 'right-side reversal stays open');
+      let stopped = 0;
+      f.send('click', 0, 0, { detail: 1, stopImmediatePropagation: () => { stopped++; } });
+      assert.equal(stopped, 1, 'right drawer suppresses the inner compatibility click after dragging');
+      f.send('pointerdown', 40, 100); f.send('pointermove', 185, 101); f.send('pointerup', 185, 101);
+      assert.equal(f.closed(), 1, `${choice}: right drawer closes outward, using the same 35% threshold`);
+      assert.equal(f.captured.size, 0); assert.equal(f.styles.size, 0); assert.equal(f.attributes.size, 0);
+      f.dispose();
+    }
+    for (const side of ['left', 'right']) for (const width of [288, 360]) {
+      const sign = side === 'right' ? 1 : -1;
+      for (const translate of [`${sign * 50}%`, `${sign * 50}% 0px`, `${sign * width / 2}px 0px`]) {
+        const f = setup('full', side, translate, width);
+        f.send('pointerdown', 100, 100);
+        f.send('pointermove', 100 + sign * 40, 101);
+        assert.equal(f.styles.get('--drawer-pull'), `${sign * (width / 2 + 40)}px`,
+          `interrupted ${side} entrance resolves ${translate} against its actual ${width}px width before adding finger travel`);
+        f.send('pointerup', 100 + sign * 40, 101);
+        assert.equal(f.closed(), 0, 'pickup offset does not count toward the 35% finger-release threshold');
+        assert.equal(f.styles.size, 0); assert.equal(f.captured.size, 0); f.dispose();
+      }
+    }
+    for (const [dx, dy] of [[5, 40], [25, 25], [-30, 0]]) {
+      const f = setup('full', 'right'); f.send('pointerdown', 40, 100); f.send('pointermove', 40 + dx, 100 + dy);
+      f.send('pointermove', 185, 100); f.send('pointerup', 185, 100);
+      assert.equal(f.prevented(), 0, 'right drawer preserves vertical, diagonal and inward starts for the whole gesture');
+      assert.equal(f.closed(), 0); assert.equal(f.captured.size, 0); f.dispose();
     }
     for (const [dx, dy] of [[-5, 40], [-25, 25], [30, 0]]) {
       const f = setup(); f.send('pointerdown'); f.send('pointermove', 200 + dx, 100 + dy);
@@ -1942,5 +1994,5 @@ function bundleSizes() {
   console.log(JSON.stringify({ root: ROOT, compression: 'per-file gzip level 9 estimate; not head transfer measurements', totals, files }, null, 2));
 }
 
-module.exports = { serve, fixture, settle, within, launchBrowser };
+module.exports = { serve, fixture, settle, within, launchBrowser, session };
 if (require.main === module) main().catch(error => { console.error(error.stack || error); process.exitCode = 1; });

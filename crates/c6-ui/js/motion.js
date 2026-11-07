@@ -51,10 +51,11 @@ window.c6Motion = (() => {
 })();
 
 // Start anywhere *inside* the phone drawer, not at Android's Back edge.
-// Leave native vertical scrolling and taps alone until a clear left drag.
+// Leave native vertical scrolling and taps alone until a clear outward drag.
 // Release returns control to the sheet's shared CSS tokens/presence state.
 window.c6DrawerSwipe = (element, close) => {
   const phone = matchMedia("(width < 48rem), (height < 32rem)");
+  const direction = element.dataset.drawerSide === "right" ? 1 : -1;
   let drag, suppressClick = false;
   const reset = () => {
     const previous = drag;
@@ -68,7 +69,9 @@ window.c6DrawerSwipe = (element, close) => {
     suppressClick = false;
     if (event.pointerType !== "touch" || !event.isPrimary || !phone.matches || element.dataset.open !== "true") return;
     const box = element.getBoundingClientRect();
-    drag = { id: event.pointerId, x: event.clientX, y: event.clientY, width: box.width, from: box.left, distance: 0, claimed: false };
+    const x = getComputedStyle(element).translate.split(" ")[0];
+    const translate = (parseFloat(x) || 0) * (x.endsWith("%") ? box.width / 100 : 1);
+    drag = { id: event.pointerId, x: event.clientX, y: event.clientY, width: box.width, from: translate, distance: 0, claimed: false };
   };
   const move = event => {
     if (!drag || drag.id !== event.pointerId) return;
@@ -76,17 +79,17 @@ window.c6DrawerSwipe = (element, close) => {
     const dx = event.clientX - drag.x, dy = event.clientY - drag.y;
     if (!drag.claimed) {
       if (Math.max(Math.abs(dx), Math.abs(dy)) < 10) return;
-      // Lock the *whole* gesture to scrolling/rightward motion, even if it
-      // turns left later. A diagonal must not steal a nested vertical scroll.
-      if (dx >= 0 || -dx <= Math.abs(dy) * 1.5) { reset(); return; }
+      // Lock the *whole* gesture to scrolling/inward motion, even if it
+      // turns outward later. A diagonal must not steal a vertical scroll.
+      if (dx * direction <= 0 || dx * direction <= Math.abs(dy) * 1.5) { reset(); return; }
       drag.claimed = true;
       suppressClick = true;
       element.setPointerCapture(event.pointerId);
       element.setAttribute("data-dragging", "");
     }
     event.preventDefault();
-    drag.distance = Math.max(0, -dx);
-    element.style.setProperty("--drawer-pull", `${Math.max(-drag.width, Math.min(0, drag.from + dx))}px`);
+    drag.distance = Math.max(0, dx * direction);
+    element.style.setProperty("--drawer-pull", `${direction * Math.max(0, Math.min(drag.width, direction * (drag.from + dx)))}px`);
   };
   const up = event => {
     if (!drag || drag.id !== event.pointerId) return;
@@ -134,6 +137,52 @@ window.c6DrawerSwipe = (element, close) => {
     removeEventListener("keydown", escape);
     removeEventListener("c6-motion", policy);
     phone.removeEventListener("change", reset);
+  };
+};
+
+// Modal phone overlays retain their DOM for exit motion, but release native
+// interaction immediately on close. Inert only sibling branches, never an
+// ancestor of the dialog; remember pre-existing inert state (hidden tiles).
+window.c6Modal = (element, close) => {
+  const opener = document.activeElement;
+  const phone = matchMedia("(width < 48rem), (height < 32rem)");
+  const resized = () => { if (!phone.matches) close(); };
+  phone.addEventListener("change", resized);
+  // Let the browser deliver its platform close request (including Android
+  // Back), without inserting fake session navigation/history entries.
+  const watcher = typeof CloseWatcher === 'function' ? new CloseWatcher() : null;
+  if (watcher) watcher.onclose = close;
+  const hidden = [];
+  for (let branch = element; branch.parentElement; branch = branch.parentElement) {
+    for (const sibling of branch.parentElement.children) {
+      if (sibling !== branch && sibling instanceof HTMLElement && !sibling.matches('.c6-scrim') && !sibling.inert) {
+        sibling.inert = true;
+        hidden.push(sibling);
+      }
+    }
+    if (branch.parentElement === document.body) break;
+  }
+  element.focus({ preventScroll: true });
+  const keys = event => {
+    if (event.key !== "Tab") return;
+    const items = [...element.querySelectorAll('button, input, select, textarea, a[href], [tabindex]')]
+      .filter(el => !el.disabled && el.tabIndex >= 0 && !el.closest('[inert]') && el.getClientRects().length);
+    const index = items.indexOf(document.activeElement);
+    if (event.shiftKey ? index <= 0 : index < 0 || index === items.length - 1) {
+      event.preventDefault();
+      (event.shiftKey ? items.at(-1) : items[0])?.focus();
+    }
+    if (!items.length) event.preventDefault();
+  };
+  element.addEventListener('keydown', keys);
+  return () => {
+    phone.removeEventListener("change", resized);
+    watcher?.destroy();
+    element.removeEventListener('keydown', keys);
+    for (const sibling of hidden) sibling.inert = false;
+    if ((element.contains(document.activeElement) || document.activeElement === document.body) && opener?.isConnected && !opener.closest('[inert]')) {
+      opener.focus({ preventScroll: true });
+    }
   };
 };
 

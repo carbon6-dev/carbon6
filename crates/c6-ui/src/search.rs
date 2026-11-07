@@ -21,7 +21,7 @@ const KINDS: [(&str, &str); 8] = [
     ("summary", "summary"),
 ];
 
-fn kind_label(kind: &str) -> &str {
+pub(crate) fn kind_label(kind: &str) -> &str {
     KINDS.iter().find(|(k, _)| *k == kind).map_or(kind, |(_, l)| l)
 }
 
@@ -167,7 +167,7 @@ pub fn SearchPage(q: String, kind: String, worker: String) -> impl IntoView {
 
 /// A note about words too short to search for.
 #[component]
-fn Ignored(words: Vec<String>) -> impl IntoView {
+pub(crate) fn Ignored(words: Vec<String>) -> impl IntoView {
     (!words.is_empty()).then(|| {
         let list = words.iter().map(|w| format!("“{w}”")).collect::<Vec<_>>().join(", ");
         let plural = words.len() > 1;
@@ -240,7 +240,7 @@ fn HitRow(h: SearchHit, to: View) -> impl IntoView {
     }
 }
 
-fn snippet(parts: Vec<SnippetPart>) -> impl IntoView {
+pub(crate) fn snippet(parts: Vec<SnippetPart>) -> impl IntoView {
     parts
         .into_iter()
         .map(|p| {

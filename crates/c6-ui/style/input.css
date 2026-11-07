@@ -98,6 +98,21 @@
     top: calc(var(--c6-visible-top, 0px) + 44px);
     max-height: calc(var(--c6-visible-height, 100dvh) - 44px);
   }
+  .c6-sheet.phone-picker {
+    --sheet-x: 100%;
+    --sheet-y: 0px;
+    /* A full-height edge must not overshoot and expose a strip behind it. */
+    --ease-spring: var(--ease-out);
+    top: var(--c6-visible-top, 0px);
+    width: min(24rem, calc(100vw - 44px));
+    height: var(--c6-visible-height, 100dvh);
+    max-height: var(--c6-visible-height, 100dvh);
+    margin-bottom: 0;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  /* The compact Ask pill still gets the header's full 44px target; the
+     shared coarse-pointer .btn minimum is only 40px. */
+  .phone-picker > :first-child > .btn { height: 100%; }
   .phone-dialog {
     top: var(--c6-visible-top, 0px);
     bottom: var(--c6-keyboard-inset, 0px);
@@ -392,6 +407,13 @@ html.dark {
   @starting-style { opacity: 0; }
 }
 .c6-scrim[data-open="false"], [data-open="false"] > .c6-scrim { opacity: 0; transition: opacity var(--dur-sheet-exit) var(--ease-in), visibility 0s var(--dur-sheet-exit); }
+/* These phone overlays are immediate for Reduced as well as Off. Keep the
+   shared full-motion edge translations; never scale the drawer's contents. */
+:root:not([data-motion="full"]) :is(.phone-picker, .phone-message-actions, .phone-instant-scrim) {
+  --dur-large: 0ms;
+  --dur-medium: 0ms;
+  --dur-sheet-exit: 0ms;
+}
 .c6-pane:not(.c6-sheet) {
   transition: opacity var(--dur-medium) var(--ease-out), translate var(--dur-medium) var(--ease-out), visibility 0s;
   @starting-style { opacity: 0; translate: calc(40px * var(--travel)) 0; }

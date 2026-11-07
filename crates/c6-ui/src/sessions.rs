@@ -556,40 +556,6 @@ pub(crate) fn recent_state(s: &Session) -> (&'static str, &'static str) {
     }
 }
 
-/// A recently viewed session: its mark, title, state and when you viewed
-/// it. It opens in the focused tile (⌘/Ctrl-click: a new one), then
-/// `close` runs (the phone's sheet closes).
-#[component]
-pub(crate) fn RecentRow(s: Session, at: i64, now: RwSignal<i64>, #[prop(optional)] close: Option<Callback<()>>) -> impl IntoView {
-    let (ws, col) = (use_workspace(), use_column());
-    let to = View::session(s.id.clone());
-    let href = to.href();
-    let to = StoredValue::new(to);
-    let (pill, word) = recent_state(&s);
-    view! {
-        <a href=href class="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800" title="Open (⌘/Ctrl-click: new tile if not already open)"
-            on:click=move |ev: web_sys::MouseEvent| {
-                if ev.button() != 0 || ev.shift_key() || ev.alt_key() {
-                    return;
-                }
-                ev.prevent_default();
-                let how = How::from_mouse(&ev);
-                match col {
-                    Some(c) => c.open(to.get_value(), how),
-                    None => ws.open(None, to.get_value(), how),
-                }
-                if let Some(c) = close {
-                    c.run(());
-                }
-            }>
-            <span class="h-2.5 w-2.5 shrink-0 rounded-full" style=crate::marks::fill(&crate::marks::of(&s)) title="Its mark"></span>
-            <span class="min-w-0 flex-1 truncate">{s.title.clone()}</span>
-            <span class=format!("inline-flex shrink-0 items-center rounded-full px-2 py-0.5 text-xs font-medium {pill}")>{word}</span>
-            <span class="w-14 shrink-0 text-right text-xs text-muted">{move || ago(now.get() - at)}</span>
-        </a>
-    }
-}
-
 /// How sessions are grouped: label keys, outermost first, kept in the head
 /// (`session_grouping`) and shared by the sessions list and the rail.
 #[derive(Clone, Copy)]
