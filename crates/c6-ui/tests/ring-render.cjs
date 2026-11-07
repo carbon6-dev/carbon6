@@ -4,11 +4,17 @@
 // Production UI, private fake head. BASELINE=1 records the old inner-SVG
 // animation without asserting the new compositor invariant. Timings are evidence,
 // never pass/fail thresholds: shared machines do not have a fixed frame budget.
+// PHONE=1 instead checks 320/360/390/430px, light/dark, Full/Reduced/Off,
+// DSF 1/2, with screenshots/JSON in /tmp/q11-ring. THEME, MOTION, WIDTHS,
+// SCALE and EVIDENCE can narrow/label a diagnostic run; ROOT selects the build.
+// Both modes are Chromium-only: layers() requires CDP. CHROMIUM selects a
+// browser binary (133 by default); this is not a WebKit/Firefox touch proof.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { serve, fixture, settle, launchBrowser } = require('./motion.cjs');
-const output = process.env.EVIDENCE || '/tmp/q3-ring';
+const phone = process.env.PHONE === '1';
+const output = process.env.EVIDENCE || (phone ? '/tmp/q11-ring' : '/tmp/q3-ring');
 const baseline = process.env.BASELINE === '1';
 const phase = process.env.LABEL || (baseline ? 'before' : 'after');
 // LABEL is deliberately caller-owned: use distinct labels for scale 1/2 runs.
@@ -517,13 +523,291 @@ async function run(browser, origin, theme, run) {
   } finally { await context.close(); }
 }
 
+// Focused phone regression; reuse the real production page, WS fixtures and CDP
+// layer probe, not the desktop transcript benchmark or a synthetic badge DOM.
+async function runPhone(browser, origin, theme, choice, deviceScaleFactor) {
+  const widths = (process.env.WIDTHS || '320,360,390,430').split(',').map(Number);
+  assert(widths.every(width => [320, 360, 390, 430].includes(width)), 'phone WIDTHS: 320,360,390,430');
+  const motion = { choice, os: choice === 'full' ? 'no-preference' : 'reduce', effective: choice };
+  const title = 'Q11 retained phone session with a deliberately very long title that must truncate without overlapping any controls';
+  const tiles = Array.from({ length: 12 }, (_, i) => ({ key: i * 2 + 2,
+    columns: [{ key: i * 2 + 3, view: i ? { view: 'sessions' } : { view: 'session', id: 'parent' } }],
+    cursor: 0, active: i * 2 + 3, used: i * 2 + 3, back: [], forward: [], stack: 0, minimized: i > 0 }));
+  let waiting = [];
+  const f = await fixture(browser, origin, { width: widths[0], height: 844 }, theme, motion, () => {},
+    { deviceScaleFactor }, { instrumentation: false, layout: { tiles, focus: 0, next: 30, full: false },
+      events: [{ seq: 66, ts: 66, type: 'usage', model: 'test', input_tokens: 25600, output_tokens: 0,
+        cache_read_tokens: 0, cache_write_tokens: 0, reasoning_tokens: 0, context_window: 128000 }],
+      setup: async ({ page, context }) => {
+        await page.addInitScript(() => {
+          window.__phoneSnapshots = 0;
+          const NativeSocket = window.WebSocket;
+          window.WebSocket = class extends NativeSocket {
+            constructor(...args) {
+              super(...args);
+              this.addEventListener('message', message => {
+                if (JSON.parse(message.data).type === 'sessions') window.__phoneSnapshots++;
+              });
+            }
+          };
+        });
+        await context.route('**/api/v1/sessions/parent/waiting', route => route.fulfill({ json: waiting }));
+      } });
+  const { page, context } = f;
+  const records = [];
+  let label;
+  const step = name => { f.phase = `${label || 'phone startup'}: ${name}`; if (process.env.DEBUG_FIXTURE) console.log(`  PHONE ${f.phase}`); };
+  const ring = page.getByRole('button', { name: /Open session sheet/ }).first();
+  const row = page.locator('[data-phone-status]');
+  const state = async (next, patch = {}) => {
+    step(`live state ${next}/${patch.status || 'default'}`);
+    const snapshots = await page.evaluate(() => __phoneSnapshots);
+    await f.setState(next, { title, ...patch });
+    await page.waitForFunction(previous => __phoneSnapshots > previous, snapshots);
+  };
+  const named = async text => page.waitForFunction(text => __phone.ring.getAttribute('aria-label').startsWith(text + '.'), text);
+  const shot = async suffix => {
+    // Playwright temporarily cancels infinite CSS animations for this capture
+    // and restores them afterwards. Never freeze/seek the product during checks.
+    await page.screenshot({ path: path.join(output, `${label}-${suffix}.png`), animations: 'disabled' });
+  };
+  const task = (i, state) => f.send({ type: 'background_task', task_id: `q11-task-${i}`, kind: 'shell',
+    description: `Q11 real background fixture ${i}`, state, exit_code: 0, elapsed_ms: 0, notify: false,
+    native_type: '', foreground: false });
+  try {
+    await state('idle');
+    step('long title');
+    // Minimized Sessions pages also render this title in hidden lists. Follow
+    // the visible ring to its own bar rather than waiting on the first match.
+    await ring.locator('..').locator('span.truncate').filter({ hasText: title }).waitFor();
+    step('retain header');
+    await ring.evaluate(el => {
+      const bar = el.parentElement, root = el.querySelector('.c6-ring-rim')?.parentElement;
+      if (!root || getComputedStyle(root).display === 'none' || !root.getBoundingClientRect().width) {
+        throw new Error('PHONE=1 requires the rebuilt shared SessionRing on phones (not the old plain context ring)');
+      }
+      window.__rim = root.querySelector('circle[r="10.5"]');
+      window.__contextArc = root.querySelector('circle[r="7"][pathLength]');
+      window.__phone = { ring: el, root, bar, title: bar.querySelector(':scope > div > span.truncate'),
+        actions: bar.querySelector('button[aria-label="Actions"]'),
+        picker: bar.querySelector('button[aria-label^="Switch sessions and pages"]'),
+        menu: bar.querySelector('button[aria-label^="Menu,"]'),
+        badge: root.querySelector('.c6-ring-badge'), icons: [...bar.querySelectorAll('svg')] };
+      __phone.box = el => { const r = el.getBoundingClientRect(); return { x: r.x, y: r.y, width: r.width, height: r.height, right: r.right, bottom: r.bottom }; };
+      __phone.retained = () => [__phone.ring, __phone.root, __phone.bar, __phone.title, __rim, __contextArc, ...__phone.icons].every(el => el?.isConnected) &&
+        __phone.icons.length === __phone.bar.querySelectorAll('svg').length &&
+        __phone.ring === __phone.bar.querySelector('button[aria-label$="Open session sheet"]');
+      // Watch all visible non-ring header elements on every rendered frame,
+      // including the menu/ellipsis SVGs and the Sessions picker's own count.
+      __phone.watch = () => {
+        const bar = __phone.box(__phone.bar);
+        __phone.watched = [...__phone.bar.querySelectorAll('*')].filter(el => {
+          const r = __phone.box(el);
+          // The retained, closed app drawer is also a descendant of the bar.
+          // Its offscreen body is not a visible header node.
+          return !__phone.ring.contains(el) && !el.closest('[inert]') && r.width && r.height &&
+            r.x < bar.right && r.right > bar.x && r.y < bar.bottom && r.bottom > bar.y;
+        });
+        __phone.boxes = __phone.watched.map(__phone.box); __phone.moved = []; __phone.samples = 0; __phone.sampling = true;
+        const sample = () => {
+          if (!__phone.sampling) return;
+          __phone.samples++;
+          __phone.watched.forEach((el, i) => {
+            const now = __phone.box(el), was = __phone.boxes[i];
+            if (!el.isConnected || ['x', 'y', 'width', 'height'].some(key => Math.abs(now[key] - was[key]) > .1))
+              __phone.moved.push({ tag: el.tagName, class: el.getAttribute('class'), was, now });
+          });
+          requestAnimationFrame(sample);
+        };
+        requestAnimationFrame(sample);
+      };
+    });
+    await named('Idle');
+    assert(await page.evaluate(() => !!__contextArc), 'fixture supplies a real, visible 20% context arc');
+    const cdp = await context.newCDPSession(page);
+    for (const width of widths) {
+      label = `phone-${theme}-${choice}-${width}-dsf${deviceScaleFactor}`;
+      f.phase = label;
+      await page.setViewportSize({ width, height: 844 });
+      await page.waitForFunction(width => innerWidth === width && Math.abs(__phone.bar.getBoundingClientRect().width - width) < 1, width);
+      await settle(page);
+      const geometry = await page.evaluate(() => {
+        const p = __phone, style = getComputedStyle(p.title);
+        return { retained: p.retained(), bar: p.box(p.bar), root: p.box(p.root), title: p.box(p.title),
+          truncated: p.title.scrollWidth > p.title.clientWidth, overflow: style.overflowX, ellipsis: style.textOverflow,
+          targets: [p.menu, p.ring, p.actions, p.picker].map(p.box),
+          picker: p.picker.getAttribute('aria-label'), pickerCount: p.picker.querySelector('[data-phone-pages]').textContent,
+          contextDash: __contextArc.getAttribute('stroke-dasharray') };
+      });
+      assert(geometry.retained, `${label}: resizing retains the header and every SVG`);
+      assert.equal(geometry.bar.height, 44, 'one 44px phone bar');
+      assert.equal(geometry.root.width, 24); assert.equal(geometry.root.height, 24);
+      for (const box of geometry.targets) {
+        assert.equal(box.width, 44, '44px interactive target width'); assert.equal(box.height, 44, '44px interactive target height');
+        // The bar's 1px border can centre its 44px children on a half pixel.
+        assert(box.x >= 0 && box.right <= width && box.y >= geometry.bar.y - .6 && box.bottom <= geometry.bar.bottom + .6);
+      }
+      assert(geometry.truncated && geometry.overflow === 'hidden' && geometry.ellipsis === 'ellipsis', `long title visibly truncates: ${JSON.stringify(geometry)}`);
+      assert(geometry.title.right <= geometry.targets[1].x, 'title stays outside ring target');
+      assert.equal(geometry.picker, 'Switch sessions and pages, 12 open');
+      assert.equal(geometry.pickerCount, '12', 'independent Sessions count remains visible');
+      assert.equal(geometry.contextDash, '20 100');
+      await page.evaluate(() => __phone.watch());
+      const counts = [];
+      let current = 0;
+      for (const count of [0, 1, 2, 12, 123]) {
+        step(`background ${count}`);
+        while (current < count) task(++current, 'started');
+        await page.waitForFunction(count => {
+          const p = __phone, text = count === 0 ? 'No background tasks running.' : `${count} background task${count === 1 ? '' : 's'} running.`;
+          return p.ring.getAttribute('aria-label').includes(text) &&
+            p.badge.parentElement.dataset.open === String(count > 0) &&
+            (count === 0 || (p.badge.textContent === String(count) && !p.badge.querySelector('.c6-count-out')));
+        }, count);
+        await settle(page);
+        if (count) await row.getByText(`Background ${count}`, { exact: true }).waitFor();
+        const badge = await page.evaluate(() => {
+          const p = __phone, b = p.box(p.badge), intersects = el => {
+            const r = p.box(el); return b.x < r.right && b.right > r.x && b.y < r.bottom && b.bottom > r.y;
+          };
+          return { box: b, retained: p.retained(), state: p.ring.getAttribute('aria-label'),
+            visible: getComputedStyle(p.badge).opacity, contextDash: __contextArc.getAttribute('stroke-dasharray'),
+            overlaps: [p.title, p.actions, p.picker, p.picker.querySelector('[data-phone-pages]')].map(intersects),
+            hit: document.elementFromPoint(p.root.getBoundingClientRect().x + 12, p.root.getBoundingClientRect().y + 12)?.closest('button') === p.ring };
+        });
+        assert(badge.retained && badge.hit, 'badge updates retain all SVGs and the ring hit target');
+        assert(badge.state.startsWith('Idle.'), 'background count never becomes main-agent Working');
+        assert.equal(badge.contextDash, geometry.contextDash, 'background count never changes context');
+        assert.equal(badge.visible, count ? '1' : '0', 'positive-only badge');
+        if (count) {
+          assert.deepEqual(badge.overlaps, [false, false, false, false], 'badge is outside title, ellipsis, Sessions button and its count');
+          assert(badge.box.x >= 0 && badge.box.right <= width && badge.box.y >= geometry.bar.y && badge.box.bottom <= geometry.bar.bottom, 'badge is not clipped by the phone bar');
+        }
+        counts.push({ count, ...badge });
+        if (count) {
+          const show = row.getByRole('button', { name: 'Show session status details', exact: true });
+          assert.equal(await show.textContent(), 'Show', 'first ring change preserves the existing status-row opener');
+          assert.equal((await row.boundingBox()).height, 44, 'composer Background row stays 44px');
+          assert.equal((await show.boundingBox()).height, 44, 'status-row opener keeps its 44px target');
+          assert.equal(await row.locator('svg').count(), 1, 'Background keeps its drawn hourglass SVG');
+        }
+        await shot(`background-${count}`);
+      }
+      const movement = await page.evaluate(() => { __phone.sampling = false; return { samples: __phone.samples, moved: __phone.moved }; });
+      assert(movement.samples > 0, 'observed rendered frames through all count transitions');
+      assert.deepEqual(movement.moved, [], 'no other header node moves while 0 -> 1 -> 2 -> 12 -> 123');
+      // A real touch on the visual ring must use the existing sheet action.
+      await ring.tap();
+      const dialog = page.getByRole('dialog', { name: 'Session details', exact: true });
+      await dialog.waitFor(); await settle(page);
+      assert.equal(await ring.getAttribute('aria-expanded'), 'true');
+      for (const name of ['Changes', 'Terminal', 'Files', 'Outputs']) await dialog.getByRole('button', { name, exact: true }).waitFor();
+      await shot('session-sheet');
+      await dialog.getByRole('button', { name: 'Close', exact: true }).tap();
+      await dialog.waitFor({ state: 'detached' });
+      assert.equal(await ring.getAttribute('aria-expanded'), 'false');
+      const states = [];
+      for (const status of ['starting', 'running']) {
+        await state('working', { status }); await named('Working');
+        // Starting already lights the shared rim; the unchanged composer row
+        // reports Working only once the session is actually running.
+        if (status === 'running') await row.getByText('Working…', { exact: true }).waitFor();
+        await row.getByText('Background 123', { exact: true }).waitFor();
+        step(`${status} drawing/layers`);
+        const drawing = await page.evaluate(() => {
+          const p = __phone, spin = p.root.querySelector('.c6-ring-working'), sweep = spin.querySelector('.c6-ring-sweep');
+          const animations = el => el.getAnimations().map(a => ({ name: a.animationName, duration: a.effect.getTiming().duration,
+            iterations: a.effect.getTiming().iterations, frames: a.effect.getKeyframes() }));
+          return { retained: p.retained(), spin: animations(spin), sweep: animations(sweep),
+            spinTag: spin.tagName, sweepTag: sweep.tagName.toLowerCase(), clip: getComputedStyle(sweep.parentElement).overflow,
+            rimVisibility: getComputedStyle(__rim.closest('svg')).visibility,
+            blue: __rim.classList.contains('stroke-blue-500') && sweep.querySelector('path').classList.contains('stroke-blue-500'),
+            contextTransforms: [__contextArc.closest('svg'), p.root].map(el => getComputedStyle(el).transform),
+            contextAnimations: animations(__contextArc.closest('svg')),
+            contextMoves: !!__contextArc.closest('.c6-ring-working, .c6-ring-sweep'),
+            svgAnimations: [...p.root.querySelectorAll('svg *')].flatMap(el => animations(el)),
+            contextDash: __contextArc.getAttribute('stroke-dasharray') };
+        });
+        assert(drawing.retained, 'starting/running preserves all header SVGs');
+        assert.deepEqual(drawing.contextTransforms, ['none', 'none']); assert.equal(drawing.contextMoves, false);
+        assert.equal(drawing.contextDash, geometry.contextDash); assert.deepEqual(drawing.svgAnimations, []);
+        assert.deepEqual(drawing.contextAnimations, [], 'context SVG has no animation');
+        assert.equal(drawing.spinTag, 'SPAN'); assert.equal(drawing.sweepTag, 'svg'); assert.equal(drawing.clip, 'hidden');
+        assert(drawing.blue, 'Working keeps its blue cue in Full, Reduced and Off');
+        assert.equal(drawing.rimVisibility, choice === 'full' ? 'hidden' : 'visible');
+        let compositor;
+        if (choice === 'full') {
+          for (const [key, name, duration] of [['spin', 'spin', 1400], ['sweep', 'c6-ring-sweep', 2800]]) {
+            assert.equal(drawing[key].length, 1); assert.equal(drawing[key][0].name, name);
+            assert.equal(drawing[key][0].duration, duration); assert.equal(drawing[key][0].iterations, Infinity);
+            for (const frame of drawing[key][0].frames) assert.deepEqual(Object.keys(frame).filter(key =>
+              !['offset', 'computedOffset', 'easing', 'composite'].includes(key)), ['transform'], `${name} animates transform only`);
+          }
+          assert(drawing.spin[0].frames.every(frame => frame.easing === 'linear'), 'linear 1.4s spin');
+          assert.deepEqual(drawing.sweep[0].frames.map(frame => [frame.transform, frame.offset, frame.easing]),
+            [['rotate(-136.35deg)', 0, 'ease-in-out'], ['rotate(-16.3deg)', .5, 'ease-in-out'],
+              ['rotate(-136.35deg)', 1, 'ease-in-out']], '2.8s breathing keeps its original extrema and half-cycle easing');
+          compositor = await layers(cdp, page);
+          for (const key of ['spin', 'sweep']) assert(compositor[key]?.layers.some(layer =>
+            layer.reasons.compositingReasons.some(reason => /active.*transform animation/i.test(reason))),
+          `${label}/${status}: ${key} has its own active-transform compositor layer: ${JSON.stringify(compositor[key])}`);
+          assert.notEqual(compositor.spin.backendNodeId, compositor.sweep.backendNodeId);
+        } else {
+          assert.deepEqual(drawing.spin, [], `${choice} has no spin`); assert.deepEqual(drawing.sweep, [], `${choice} has no breathing`);
+        }
+        states.push({ status, drawing, compositor });
+      }
+      await settle(page); await shot('working');
+      waiting = [{ key: 'q11-approval', kind: 'approval', title: 'Q11 fixture approval', detail: title,
+        at: 1, session_id: 'parent', call_id: 'q11-approval' }];
+      await state('waiting'); await named('Waiting on you');
+      await row.getByText('Waiting on you 1', { exact: true }).waitFor(); await settle(page);
+      const waitingCue = await page.evaluate(() => ({ dash: __rim.getAttribute('stroke-dasharray'), stroke: getComputedStyle(__rim).stroke }));
+      assert.equal(waitingCue.dash, '2 2', 'Waiting is a dashed amber rim');
+      assert(await page.evaluate(() => __rim.classList.contains('stroke-amber-500')));
+      await shot('waiting');
+      waiting = [];
+      f.send({ type: 'turn_ended', turn: 900, reason: 'error' });
+      await state('failed', { status: 'failed' }); await named('Last turn failed');
+      await row.getByText('Last turn failed', { exact: true }).waitFor(); await settle(page);
+      const failedCue = await page.evaluate(() => ({ dash: __rim.getAttribute('stroke-dasharray'),
+        cross: !!__contextArc.closest('svg').querySelector('path[d="m10 10 4 4m0-4-4 4"]'), red: __rim.classList.contains('stroke-red-500') }));
+      assert(failedCue.red && failedCue.cross && failedCue.dash === 'none', 'Failed has the red solid rim and drawn cross');
+      await shot('failed');
+      f.send({ type: 'turn_ended', turn: 901, reason: 'completed' });
+      await state('idle'); await named('Idle');
+      for (let i = 1; i <= 123; i++) task(i, 'finished');
+      await page.waitForFunction(() => __phone.ring.getAttribute('aria-label').includes('No background tasks running.') &&
+        !document.querySelector('[data-phone-status]')?.closest('[data-open="true"]'));
+      await settle(page);
+      assert(await page.evaluate(() => __phone.retained() && __rim.getAttribute('stroke-dasharray') === 'none' &&
+        __rim.classList.contains('stroke-zinc-400') && !__phone.root.querySelector('.c6-ring-working') &&
+        !__contextArc.closest('svg').querySelector('path')), 'Idle restores neutral solid rim, no cross/spin, all SVGs retained');
+      assert.equal(await row.count(), 0, 'no idle composer status row');
+      await shot('idle');
+      records.push({ label, geometry, counts, movement, states, waitingCue, failedCue });
+      fs.writeFileSync(path.join(output, `phone-${theme}-${choice}-dsf${deviceScaleFactor}.json`), JSON.stringify(records, null, 2));
+      assert.deepEqual(f.errors, [], 'no crashes, invalid streams or external requests');
+      console.log(`PASS ${label}`);
+    }
+  } catch (error) {
+    if (label) await page.screenshot({ path: path.join(output, `${label}-FAIL.png`), timeout: 5000 }).catch(() => {});
+    throw new Error(`${label || 'phone startup'}: ${error.stack || error}`);
+  } finally { await context.close(); }
+}
+
 (async () => {
   fs.mkdirSync(output, { recursive: true });
   const { server, origin } = await serve();
   const browser = await launchBrowser(playwright, 'chromium');
   try {
     for (const theme of (process.env.THEME || 'light,dark').split(',')) {
-      for (let runIndex = 0; runIndex < Number(process.env.RUNS || 3); runIndex++) await run(browser, origin, theme, runIndex);
+      if (phone) {
+        for (const choice of (process.env.MOTION || 'full,reduced,off').split(',')) {
+          assert(['full', 'reduced', 'off'].includes(choice), 'phone MOTION: full,reduced,off');
+          for (const dsf of process.env.SCALE ? [scale] : [1, 2]) await runPhone(browser, origin, theme, choice, dsf);
+        }
+      } else for (let runIndex = 0; runIndex < Number(process.env.RUNS || 3); runIndex++) await run(browser, origin, theme, runIndex);
     }
   } finally { await browser.close(); await new Promise(resolve => server.close(resolve)); }
 })().catch(error => { console.error(error.stack || error); process.exitCode = 1; });

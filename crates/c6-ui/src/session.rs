@@ -1570,22 +1570,8 @@ pub fn SessionMenu(chrome: SessionChrome, #[prop(into)] on_rename: Callback<()>,
     }
 }
 
-/// How full the context is, as a 16px ring (amber from 80%).
-fn context_ring(pct: Option<u64>) -> impl IntoView {
-    // The circle's length: 2π × 6.
-    const ROUND: f64 = 37.7;
-    let p = pct.unwrap_or(0).min(100) as f64;
-    view! {
-        <svg viewBox="0 0 16 16" class="size-4 shrink-0" fill="none" stroke-width="2" aria-hidden="true">
-            <circle cx="8" cy="8" r="6" class="stroke-zinc-300 dark:stroke-zinc-600" />
-            <circle cx="8" cy="8" r="6" class="stroke-zinc-600 dark:stroke-zinc-300"
-                stroke-dasharray=format!("{:.2} {ROUND}", ROUND * p / 100.0) transform="rotate(-90 8 8)" />
-        </svg>
-    }
-}
-
-/// Context and state are independent inputs to the desktop experiment. The
-/// phone deliberately keeps its plain context ring and its prompt status row.
+/// Context and state are independent inputs to the shared phone/desktop ring.
+/// The phone's separate prompt status row remains independent too.
 impl SessionChrome {
     fn ring_state(&self) -> crate::session_ring::AgentState {
         use crate::session_ring::AgentState;
@@ -1622,24 +1608,17 @@ impl SessionChrome {
 
 /// One ring route to the session sheet, followed by fixed desktop pane slots.
 #[component]
-pub fn SessionControls(chrome: SessionChrome, #[prop(optional)] strip: bool) -> impl IntoView {
+pub fn SessionControls(chrome: SessionChrome) -> impl IntoView {
     let changed = move || chrome.git.get().flatten().map(|g| g.0).filter(|n| *n > 0);
     let glance_open = move || chrome.glance_at.get().is_some() || chrome.sheet.get();
-    let ring_title = move || match chrome.context_percent() {
-        Some(p) => format!("Context: {p}% used · Session sheet (⌘I)"),
-        None => "Context: known after the first model call · Session sheet (⌘I)".to_owned(),
-    };
     view! {
         <button id=chrome.ring_id() class=SESSION_SLOT
             aria-label=move || format!("{} Open session sheet", chrome.ring_description())
             title=move || format!("{} Open session sheet (⌘I)", chrome.ring_description())
             aria-haspopup="dialog" aria-expanded=move || glance_open().to_string()
             on:click=move |ev| chrome.toggle_glance(ev.current_target().and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok()))>
-            <span class=if strip { "flex" } else { "md:hidden" } title=ring_title>{move || context_ring(chrome.context_percent())}</span>
-            <span class=if strip { "hidden" } else { "hidden md:flex" }>
-                <crate::session_ring::SessionRing state=Signal::derive(move || chrome.ring_state())
-                    context=Signal::derive(move || chrome.context_percent()) background=Signal::derive(move || phone_background_count(chrome)) />
-            </span>
+            <crate::session_ring::SessionRing state=Signal::derive(move || chrome.ring_state())
+                context=Signal::derive(move || chrome.context_percent()) background=Signal::derive(move || phone_background_count(chrome)) />
         </button>
         <div class="hidden shrink-0 items-center md:@min-[30rem]/tile:flex">
             <button class=move || format!("{} md:pointer-fine:min-w-(--tile-bar-slot) md:pointer-fine:w-auto md:pointer-fine:px-1 {}", SESSION_SLOT, if chrome.pane_open(Pane::Changes) { "bg-zinc-200 dark:bg-zinc-700" } else { "" })
@@ -1701,7 +1680,7 @@ fn SessionStrip(chrome: SessionChrome) -> impl IntoView {
     view! {
         <ArchivedSession id=chrome.id.get_value() show_title=true />
         <div class="flex h-11 shrink-0 items-center justify-end gap-0.5 border-b border-zinc-200 bg-zinc-50 px-2 text-xs pointer-coarse:gap-0 dark:border-zinc-800 dark:bg-zinc-900/60">
-            <SessionControls chrome strip=true />
+            <SessionControls chrome />
             <span class="mx-1 h-4 w-px shrink-0 bg-zinc-200 dark:bg-zinc-700"></span>
             <button class=crate::icons::BAR_BUTTON aria-label="Actions"
                 title="Actions: rename, find, files, outputs, details, new like this, save as template, catch-up, fold finished turns, archive"
@@ -6554,12 +6533,44 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn phone_context_arc_is_neutral_at_every_usage_level() {
-        for used in [None, Some(0), Some(25), Some(90), Some(137)] {
-            let html = context_ring(used).to_html();
-            assert!(html.contains("stroke-zinc-600 dark:stroke-zinc-300"), "{html}");
-            assert!(!html.contains("blue") && !html.contains("amber") && !html.contains("animate"), "context is not agent state: {html}");
+    fn shared_header_context_arc_is_neutral_at_every_usage_level() {
+        use crate::session_ring::{AgentState, SessionRing};
+        let owner = Owner::new();
+        owner.with(|| {
+            for state in [AgentState::Idle, AgentState::Working, AgentState::Waiting, AgentState::Failed] {
+                for used in [None, Some(0), Some(25), Some(90), Some(137)] {
+                    let html = untrack(|| view! { <SessionRing state=state context=used background=2_usize /> }.to_html());
+                    let context = html.split("role=\"img\"").nth(1).unwrap().split("</svg>").next().unwrap();
+                    assert!(context.contains("stroke-zinc-600 dark:stroke-zinc-300") || used.is_none(), "{html}");
+                    assert!(context.contains("stroke-zinc-200 dark:stroke-zinc-700"), "{html}");
+                    assert!(
+                        !context.contains("blue") && !context.contains("amber") && !context.contains("animate"),
+                        "context is not agent state: {html}"
+                    );
+                    assert!(html.contains("2 background tasks running."), "{html}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn phone_desktop_and_session_strip_share_one_ring_and_sheet_target() {
+        let source = include_str!("session.rs");
+        let controls = source.split("pub fn SessionControls(").nth(1).unwrap().split("pub(crate) const SESSION_SLOT").next().unwrap();
+        let ring = controls.split("</button>").next().unwrap();
+        assert_eq!(controls.matches("<crate::session_ring::SessionRing ").count(), 1);
+        assert!(!ring.contains("<span"), "no separate responsive ring drawings");
+        for expected in [
+            "class=SESSION_SLOT",
+            "chrome.toggle_glance",
+            "chrome.ring_state()",
+            "chrome.context_percent()",
+            "phone_background_count(chrome)",
+        ] {
+            assert!(ring.contains(expected), "shared ring lost {expected}");
         }
+        let strip = source.split("fn SessionStrip(").nth(1).unwrap().split("/// A session's").next().unwrap();
+        assert!(strip.contains("<SessionControls chrome />"));
     }
 
     #[test]

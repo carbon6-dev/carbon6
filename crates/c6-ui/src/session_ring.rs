@@ -1,6 +1,6 @@
-//! Desktop session indicator: context usage inside, independent agent state outside.
-//! The phone's plain context ring lives elsewhere. This component has no button
-//! behaviour; its caller owns the hit target, tooltip and session-sheet action.
+//! Shared phone/desktop session indicator: context inside, agent state outside.
+//! This component has no button behaviour; its caller owns the hit target,
+//! tooltip and session-sheet action.
 
 use leptos::prelude::*;
 
@@ -53,7 +53,7 @@ fn context_arc(percent: u64) -> String {
     format!("{} 100", percent.min(100))
 }
 
-/// A 24px desktop ring with a positive-only background
+/// A 24px phone/desktop ring with a positive-only background
 /// count badge. All three inputs are independent and reactive; plain values
 /// work too via `#[prop(into)]`. The badge may extend outside the 24px box.
 ///

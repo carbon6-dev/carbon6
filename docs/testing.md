@@ -65,6 +65,20 @@ next-rAF latencies are **not presentation times**; use the trace's layout,
 paint and compositor events for attribution. See the Q3 section of
 `docs/ui-responsiveness.md` for measured findings and limitations.
 
+For the shared phone/desktop header ring, run:
+
+```sh
+PHONE=1 EVIDENCE=/tmp/q11-ring/ring-only /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/ring-render.cjs
+```
+
+This mode checks 320/360/390/430px, both themes, Full/Reduced/Off and DSF 1/2.
+It uses twelve open pages, a long session title, and real background-task events
+for counts 0/1/2/12/123. It checks 44px bar/targets, title ellipsis, no badge
+collision or header movement throughout count transitions, retained icons,
+ring-to-sheet touch navigation, state cues and the two Full compositor layers.
+Screenshots and geometry JSON go to `/tmp/q11-ring/` by default. `THEME`,
+`MOTION`, `WIDTHS` and `SCALE` can select a smaller diagnostic matrix.
+
 ## Content-fitted desktop header
 
 The desktop header uses measured item widths, not an `xl` navigation cutoff.
@@ -791,7 +805,7 @@ short landscape viewport, with the keyboard closed, a resized viewport and an
 overlay/offset visual viewport. Check one 44px top bar and no footer. Open
 the app menu (realm, search, Activity, notifications, connection/version),
 Sessions (Ask, bell, close/switch/new), Actions (Find/details/history), and the
-plain context ring (the only phone route to Changes/Terminal/Files/Outputs).
+shared state/context ring (the only phone route to Changes/Terminal/Files/Outputs).
 Sheets and dialogs must stay within the visible viewport and scroll.
 
 Drive idle, main-working, waiting, last-turn failure and background-only
