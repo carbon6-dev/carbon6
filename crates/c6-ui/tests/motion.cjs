@@ -1121,7 +1121,7 @@ async function tool(f) {
   await details.waitFor();
   assert.equal(await details.getAttribute('open'), null, 'tool arrival stays collapsed');
   const collapsedHeight = (await details.boundingBox()).height;
-  await details.evaluate(el => { window.__tool = el; window.__pre = el.querySelector('pre'); });
+  await details.evaluate(el => { window.__tool = el; });
   const effectStart = await page.evaluate(() => {
     __motionTest.disclosureSamples = []; __motionTest.disclosureSampling = true;
     const sample = () => {
@@ -1140,6 +1140,10 @@ async function tool(f) {
     return __tool.getBoundingClientRect().height - __tool.querySelector('summary').getBoundingClientRect().height >= target - .5;
   });
   await settle(page);
+  // Closed tool bodies are lazy. Capture the real output node only after
+  // opening, then require that exact node to survive streaming and completion.
+  await details.locator('pre').waitFor({ state: 'attached' });
+  await details.evaluate(el => { window.__pre = el.querySelector('pre'); });
   const timing = await details.evaluate(el => {
     const supported = CSS.supports('interpolate-size', 'allow-keywords') && CSS.supports('selector(details::details-content)');
     const css = getComputedStyle(el, '::details-content');
