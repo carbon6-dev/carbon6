@@ -69,6 +69,7 @@ mod side_chat;
 mod subagent_models;
 mod subagents;
 mod suggestions;
+mod take_back;
 mod task_cards;
 mod triggers;
 mod updates;

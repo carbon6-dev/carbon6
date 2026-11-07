@@ -83,6 +83,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/settings/agents", get(get_agents).put(put_agents))
         .route("/api/v1/commands", get(list_commands))
         .route("/api/v1/sessions/{id}/messages", post(send_message).layer(axum::extract::DefaultBodyLimit::max(ATTACHED_BODY)))
+        .route("/api/v1/sessions/{id}/messages/{command_id}/take-back", post(take_back_message))
         .route("/api/v1/sessions/{id}/seen", post(seen_session))
         .route("/api/v1/sessions/{id}/viewed", post(viewed_session))
         .route("/api/v1/sessions/recent", get(recent_sessions))
@@ -3180,6 +3181,11 @@ async fn edit_queued(
 
 async fn cancel_queued(State(st): State<Arc<HeadState>>, Path((id, command_id)): Path<(String, String)>) -> ApiResult<StatusCode> {
     crate::sessions::cancel_queued(&st, &id, &command_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn take_back_message(State(st): State<Arc<HeadState>>, Path((id, command_id)): Path<(String, String)>) -> ApiResult<StatusCode> {
+    crate::sessions::take_back_message(&st, &id, &command_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

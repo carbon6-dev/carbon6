@@ -1851,6 +1851,125 @@ that phase asserts desktop text is larger than 12px and saves the same views
 under `/tmp/q1-screenshots/model-before`. `VIEWPORT=desktop,phone,narrow`,
 `THEME=light,dark`, and browser path overrides work as in `motion.cjs`.
 
+## Transcript Edit: taken choices and confirmed explicit rewind (S4 part 2)
+
+Build the production UI, then run the loopback-only browser regression with
+Node 24 and the motion harness's installed-browser overrides:
+
+```sh
+set -euo pipefail
+ulimit -n 65536
+env -u NO_COLOR make ui
+ENGINE=both /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/message-edit.cjs
+```
+
+`message-edit.cjs` owns a fresh browser process/context per desktop/phone case,
+fake HTTP/WebSocket responses and a loopback origin. It never calls a model,
+real head or worker, or writes live settings. A transcript `User` is already
+taken: Edit immediately shows **The agent has this message**, without a
+take-back request or a fictitious pre-ownership transcript route. No tail pull,
+Send or Rewind request happens merely on Edit. The original draft survives with
+**Send correction** (keeps history) and **Rewind…** (separate confirmation).
+Correction sends normally, preserves the original reply, and retains edited
+text and the same textarea node on a failed Send. Original row and SVG node
+identity survive Edit entry and streamed delivery; bounding a view's root for
+WASM size must not reparse its live attributes. Explicit rewind never
+automatically resends. Its HTTP response only acknowledges enqueue: hold back
+the durable event and assert that the editor stays closed, then publish a
+`Rewound` with the requested `to_seq` and `seq` above the event highwater captured
+at the confirmation click. An older matching marker or a new marker for another
+target must not unlock the editor. HTTP rejection or a new durable `Error` keeps
+the draft and must not send a replacement. Only the matching new durable marker
+allows editing, followed by a separate ordinary Send. An unconfirmed queued
+cancellation must not claim withdrawal: retain the draft and offer the taken
+choices (rewind needs a resolved transcript sequence). Phone cases enter through the real Message actions sheet,
+which retains Edit. `phone-picker.cjs` also checks this taken-message entry.
+The ordinary-send form is shared with the queue editor in single-message mode,
+without Add/reorder/drop controls. Separate bulk-queue checks exercise the
+intentional tail pull, reorder/add/drop and discard controls without sending.
+Queued bubbles have two distinct entry points: **Edit** calls take-back for
+only that command; **Edit queue…** intentionally pulls its tail. The
+`queued-ready`, `queued-taken-race`, `queued-unconfirmed` and `queued-pending`
+browser cases run on desktop and phone. They gate cancellation, remove the
+selected queue row, and retain the Transcript-owned panel/draft across a
+matching `User` arriving. An unrelated User cannot provide rewind identity.
+Before that exact User exists, uncertainty offers correction and explains why
+rewind must wait, without inventing an event sequence. A late User while typing
+must preserve the same correction textarea/value; failed Send keeps both.
+Assertions reject any single-edit tail-pull/cancel request or mutation of later
+queued inputs. After building the combined UI, `CASE=queued- ENGINE=both`
+selects these 16 browser cases; the complete matrix has 52 cases.
+Textarea Send shortcuts use the existing input policy; Enter on Discard draft
+must close the draft without bubbling into Send.
+All waits use response/DOM conditions, not cancellation timing sleeps; browser
+crashes fail the original run rather than being retried away.
+`ENGINE=chromium|webkit|both`, `ROOT` and browser overrides match `motion.cjs`;
+`CASE=phone/taken` selects one diagnostic case without hiding the original run.
+
+The corresponding head integration tests exercise real head/worker ownership,
+delivery winning cancellation, later messages left intact and ordinary Send
+without `Rewound`. These are separate from the browser's controlled API gates;
+neither uses real models. Transcript Edit must not reuse `pull_queued`, whose
+intentional queue-editor behavior includes later messages.
+
+```sh
+set -euo pipefail
+ulimit -n 65536
+cargo nextest run --locked -p c6-worker --test it -E 'test(take_back::)'
+```
+
+Unconfirmed `pending` answers must return 409 with exactly
+`The agent has this message`, not 503 or success. The HTTP queued-cancel and
+bulk-pull regressions give the anchor that answer, assert target and later rows
+are untouched, and fail if any later cancellation RPC is sent. This does not
+change the bulk editor's intentional tail semantics on confirmed cancellations.
+The tests also refuse unsupported/head workers, bad RPC replies, offline or
+disconnected workers, stale pending rows over a recorded `UserMessage`,
+cross-session/non-input IDs and cross-realm tokens. Stale-row fixtures enqueue
+the command **before** appending its `UserMessage`, then reset it to pending;
+enqueueing a new command after a fabricated prior delivery would put the event
+below its legitimate scan floor.
+
+The authoritative scan is bounded by persisted `commands.enqueued_after_seq`
+and a captured `sessions.last_seq`, and reads/decodes outside `BEGIN IMMEDIATE`.
+Legacy rows get floor 0 from migration, so they retain the conservative scan
+from the start of the log. The short retirement transaction rechecks pending
+state, session/floor and the captured highwater, failing closed with the same
+exact 409 if concurrent changes invalidate the scan. Ownership checks must not
+depend on the asynchronously maintained activity index or an event-sequence
+pre-ownership endpoint.
+
+The store regression builds 100,000 valid historical events, enqueues the
+target at that durable highwater, and appends 32 more events. It reports 25
+outside-scan and retirement samples, with no flaky wall-time threshold:
+
+```sh
+set -euo pipefail
+ulimit -n 65536
+cargo test --locked -p c6-head --lib 'store::tests::take_back_' -- --nocapture
+```
+
+Retirement timing includes pool acquisition, `BEGIN IMMEDIATE`, the conditional
+update and commit: an upper bound on the lock-held interval, not an exact
+SQLite lock profiler. Assertions check the 100000..100032 scan bounds, skip a
+poisoned historical prefix, preserve the floor across held-command release,
+and refuse changes between the outside read and retirement. A separate legacy
+row omits the new column to verify its conservative default.
+
+Replacement is deliberately **not** a connection-generation failure. The
+scripted replacement test accepts 204 after the original worker confirms
+cancellation, then explicitly ingests delivery from a snapshot selected before
+retirement. It demonstrates the inherited restart gap, not a real replacement
+actor: `Inbox.seen` suppresses late duplicates only in its own process. A new
+process can deliver an already selected command after the old process's
+successful cancellation; there is no cross-restart guarantee. The test also
+checks that no cancellation or resend is guessed for the replacement and later
+input stays untouched.
+Worker `User` events are appended only after an input leaves the inbox, so
+all transcript messages are already taken and enter correction/rewind choices
+without attempting withdrawal. The command-id endpoint is for queued input,
+not a way to remove a delivered transcript event from the agent's history.
+
 ## Phone Sessions right drawer and message actions (N4)
 
 Use the coordinator's **combined production UI build**; this script never

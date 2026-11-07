@@ -19,8 +19,8 @@ use uuid::Uuid;
 use crate::store::{NewCommand, SessionRow};
 use crate::{HeadState, bad_request, conflict, convert, not_found};
 
-/// The worker could not be reached (or did not answer): the request was
-/// fine and can be retried (the head answers 503).
+/// The worker could not confirm the request (unreachable, no answer, or
+/// unconfirmed ownership): it can be retried (the head answers 503).
 #[derive(Debug)]
 pub struct WorkerUnreachable(pub String);
 
@@ -1408,14 +1408,61 @@ pub async fn cancel_queued(st: &HeadState, session_id: &str, command_id: &str) -
         Err(e) => return Err(unreachable(e)),
     };
     match state.as_str() {
-        "cancelled" | "pending" => {}
-        "in_flight" | "delivered" => {
-            return Err(conflict("that message is on its way to the agent now; wait for its turn"));
+        "cancelled" => {}
+        "in_flight" | "delivered" | "pending" => {
+            return Err(conflict("The agent has this message"));
         }
         _ => return Err(anyhow::anyhow!("the worker answered {state:?}")),
     }
     if !st.store.cancel_pending_command(command_id).await? {
         return Err(conflict("that message is on its way to the agent now; wait for its turn"));
+    }
+    publish_queue(st, session_id).await;
+    Ok(())
+}
+
+/// Withdraws exactly one input command, never a queue tail or a rewind.
+/// An already recorded UserMessage is owned by the worker, even if the
+/// pending metadata is stale. Neither text nor a browser's queue snapshot
+/// is evidence of ownership. Only an inbox removal confirms cancellation:
+/// `pending` may still be in transit to
+/// the actor, and cannot promise that the agent will never receive it.
+pub async fn take_back_message(st: &HeadState, session_id: &str, command_id: &str) -> anyhow::Result<()> {
+    const TAKEN: &str = "The agent has this message";
+    let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    takes_input(&session)?;
+    if command_id.is_empty()
+        || pending_of(st, session_id, command_id).await?.is_none()
+        || st.store.input_recorded(session_id, command_id).await?
+    {
+        return Err(conflict(TAKEN));
+    }
+    let worker_id: WorkerId = session.worker_id.parse()?;
+    // The head's assistant has no queue_ops cancellation RPC. Unlike
+    // pulling its head-held queue, this needs confirmed inbox ownership.
+    if st.assistant.head_id() == Some(worker_id) {
+        return Err(conflict("this session's worker cannot confirm message withdrawal"));
+    }
+    queue_gate(st, worker_id, &session.worker_name)?;
+    let reply = st
+        .registry
+        .call(
+            worker_id,
+            "session.queue_op",
+            json!({ "session_id": session_id, "command_id": command_id, "op": "cancel" }),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .map_err(unreachable)?;
+    match reply["state"].as_str().unwrap_or_default() {
+        "cancelled" => {}
+        "in_flight" | "delivered" | "pending" => return Err(conflict(TAKEN)),
+        state => return Err(anyhow::anyhow!("the worker answered {state:?}")),
+    }
+    // Delivery/another operation may have changed the durable row while
+    // the RPC was in flight. Never claim success over that lost race.
+    if !st.store.take_back_pending_input(session_id, command_id).await? {
+        return Err(conflict(TAKEN));
     }
     publish_queue(st, session_id).await;
     Ok(())
@@ -1453,9 +1500,9 @@ pub async fn pull_queued(st: &HeadState, session_id: &str, command_id: &str) -> 
                 Err(e) => return Err(unreachable(e)),
             };
             match state.as_str() {
-                "cancelled" | "pending" => {}
-                "in_flight" | "delivered" => {
-                    return Err(conflict("that message is on its way to the agent now; wait for its turn"));
+                "cancelled" => {}
+                "in_flight" | "delivered" | "pending" => {
+                    return Err(conflict("The agent has this message"));
                 }
                 _ => return Err(anyhow::anyhow!("the worker answered {state:?}")),
             }

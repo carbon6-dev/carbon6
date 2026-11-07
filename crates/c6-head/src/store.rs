@@ -637,6 +637,8 @@ pub struct CommandRow {
     pub error: Option<String>,
     /// The worker handed it to the agent, which reads it at its next step.
     pub with_agent: i64,
+    /// Session event highwater at enqueue; zero for pre-migration commands.
+    pub enqueued_after_seq: i64,
 }
 
 /// What an event batch changed.
@@ -1511,8 +1513,9 @@ pub struct NewCommand<'a> {
 /// it stays behind them), else pending.
 async fn insert_command(tx: &mut sqlx::SqliteConnection, c: &NewCommand<'_>, held: bool) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT INTO commands (id, session_id, worker_id, data, text, created_at, state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, \
-         CASE WHEN ?7 OR EXISTS (SELECT 1 FROM commands WHERE session_id = ?2 AND state = 'held') THEN 'held' ELSE 'pending' END)",
+        "INSERT INTO commands (id, session_id, worker_id, data, text, created_at, state, enqueued_after_seq) VALUES (?1, ?2, ?3, ?4, ?5, ?6, \
+         CASE WHEN ?7 OR EXISTS (SELECT 1 FROM commands WHERE session_id = ?2 AND state = 'held') THEN 'held' ELSE 'pending' END, \
+         COALESCE((SELECT last_seq FROM sessions WHERE id = ?2), 0))",
     )
     .bind(c.id)
     .bind(c.session_id)
@@ -1626,15 +1629,18 @@ impl Store {
                 Some((id, data)) if id == c.id => data,
                 _ => &c.data,
             };
-            sqlx::query("INSERT INTO commands (id, session_id, worker_id, data, text, created_at) VALUES (?, ?, ?, ?, ?, ?)")
-                .bind(&c.id)
-                .bind(&c.session_id)
-                .bind(&c.worker_id)
-                .bind(data)
-                .bind(&c.text)
-                .bind(c.created_at)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "INSERT INTO commands (id, session_id, worker_id, data, text, created_at, enqueued_after_seq) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&c.id)
+            .bind(&c.session_id)
+            .bind(&c.worker_id)
+            .bind(data)
+            .bind(&c.text)
+            .bind(c.created_at)
+            .bind(c.enqueued_after_seq)
+            .execute(&mut *tx)
+            .await?;
         }
         tx.commit().await?;
         Ok(held.len())
@@ -1792,6 +1798,84 @@ impl Store {
         let r = sqlx::query("UPDATE commands SET state = 'done' WHERE id = ? AND state = 'pending'").bind(id).execute(&self.pool).await?;
         Ok(r.rows_affected() > 0)
     }
+
+    /// A durable UserMessage means the worker already owns this input,
+    /// regardless of stale pending metadata. Read the authoritative log,
+    /// not the asynchronously backfilled analytics index. A command that
+    /// disappeared or stopped being pending is also unavailable to take back.
+    pub(crate) async fn input_recorded(&self, session_id: &str, command_id: &str) -> anyhow::Result<bool> {
+        Ok(self.check_pending_input(session_id, command_id).await?.is_none())
+    }
+
+    /// Retires only this still-pending, unrecorded input after the worker
+    /// confirms inbox cancellation. Decode the bounded log outside the write
+    /// transaction; a cheap highwater recheck refuses concurrent log changes.
+    pub(crate) async fn take_back_pending_input(&self, session_id: &str, command_id: &str) -> anyhow::Result<bool> {
+        let Some(check) = self.check_pending_input(session_id, command_id).await? else { return Ok(false) };
+        self.retire_checked_input(session_id, command_id, check).await
+    }
+
+    async fn check_pending_input(&self, session_id: &str, command_id: &str) -> anyhow::Result<Option<InputCheck>> {
+        let mut conn = self.pool.acquire().await?;
+        let row = sqlx::query(
+            "SELECT c.enqueued_after_seq, s.last_seq FROM commands c JOIN sessions s ON s.id = c.session_id \
+             WHERE c.id = ? AND c.session_id = ? AND c.state = 'pending'",
+        )
+        .bind(command_id)
+        .bind(session_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        let check = InputCheck { after_seq: row.get("enqueued_after_seq"), through_seq: row.get("last_seq") };
+        if input_recorded_on(&mut conn, session_id, command_id, check).await? { Ok(None) } else { Ok(Some(check)) }
+    }
+
+    async fn retire_checked_input(&self, session_id: &str, command_id: &str, check: InputCheck) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let retired = sqlx::query(
+            "UPDATE commands SET state = 'done' WHERE id = ?1 AND session_id = ?2 AND state = 'pending' \
+             AND enqueued_after_seq = ?3 AND EXISTS (SELECT 1 FROM sessions WHERE id = ?2 AND last_seq = ?4)",
+        )
+        .bind(command_id)
+        .bind(session_id)
+        .bind(check.after_seq)
+        .bind(check.through_seq)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        tx.commit().await?;
+        Ok(retired)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InputCheck {
+    after_seq: i64,
+    through_seq: i64,
+}
+
+async fn input_recorded_on(
+    conn: &mut sqlx::SqliteConnection,
+    session_id: &str,
+    command_id: &str,
+    check: InputCheck,
+) -> anyhow::Result<bool> {
+    use futures::TryStreamExt;
+    use prost::Message;
+
+    let mut rows = sqlx::query("SELECT data FROM events WHERE session_id = ? AND seq > ? AND seq <= ? ORDER BY seq")
+        .bind(session_id)
+        .bind(check.after_seq)
+        .bind(check.through_seq)
+        .fetch(conn);
+    while let Some(row) = rows.try_next().await? {
+        let event = c6_proto::SessionEvent::decode(row.get::<Vec<u8>, _>("data").as_slice())?;
+        if matches!(event.kind, Some(c6_proto::session_event::Kind::User(u)) if u.command_id == command_id) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -1893,6 +1977,118 @@ pub(crate) mod tests {
 
     fn command<'a>(id: &'a str, session_id: &'a str, worker_id: WorkerId, text: Option<&'a str>) -> NewCommand<'a> {
         NewCommand { id, session_id, worker_id, data: id.as_bytes().to_vec(), text }
+    }
+
+    fn input_event(seq: u64, command_id: &str) -> c6_proto::SessionEvent {
+        c6_proto::SessionEvent {
+            seq,
+            ts_ms: c6_core::now_ms(),
+            kind: Some(c6_proto::session_event::Kind::User(c6_proto::UserMessage {
+                command_id: command_id.into(),
+                text: "synthetic input".into(),
+                ..Default::default()
+            })),
+        }
+    }
+
+    #[tokio::test]
+    async fn take_back_bounds_a_100k_event_history_outside_the_retirement_transaction() {
+        use prost::Message;
+        use std::time::Instant;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("c6h.db")).await.unwrap();
+        let worker = WorkerId::new();
+        store.create_session(&session("s", worker), &[], false).await.unwrap();
+        let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        for start in (1..=100_000).step_by(500) {
+            let mut q = sqlx::QueryBuilder::new("INSERT INTO events (session_id, seq, ts, data) ");
+            q.push_values(start..start + 500, |mut row, seq| {
+                let event = input_event(seq, "history");
+                row.push_bind("s").push_bind(seq as i64).push_bind(event.ts_ms).push_bind(event.encode_to_vec());
+            });
+            q.build().execute(&mut *tx).await.unwrap();
+        }
+        sqlx::query("UPDATE sessions SET last_seq = 100000 WHERE id = 's'").execute(&mut *tx).await.unwrap();
+        tx.commit().await.unwrap();
+        store.enqueue_command(&command("target", "s", worker, Some("draft"))).await.unwrap();
+        // A held command keeps its original durable floor when handed over.
+        store.create_session(&session("held", worker), &[], false).await.unwrap();
+        store.ingest(worker, "held", &[input_event(1, "other")]).await.unwrap().unwrap();
+        {
+            let mut conn = store.pool.acquire().await.unwrap();
+            insert_command(&mut conn, &command("held-input", "held", worker, Some("held draft")), true).await.unwrap();
+        }
+        store.release_held("held", None).await.unwrap();
+        assert_eq!(store.queued_inputs("held").await.unwrap()[0].enqueued_after_seq, 1);
+
+        let tail: Vec<_> = (100_001..=100_032).map(|seq| input_event(seq, "other")).collect();
+        store.ingest(worker, "s", &tail).await.unwrap().unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM events WHERE session_id = 's'").fetch_one(&store.pool).await.unwrap();
+        assert_eq!(count, 100_032);
+        let mut scans = Vec::new();
+        let mut retirements = Vec::new();
+        for _ in 0..25 {
+            sqlx::query("UPDATE commands SET state = 'pending' WHERE id = 'target'").execute(&store.pool).await.unwrap();
+            let start = Instant::now();
+            let check = store.check_pending_input("s", "target").await.unwrap().unwrap();
+            scans.push(start.elapsed().as_micros());
+            assert_eq!((check.after_seq, check.through_seq), (100_000, 100_032));
+            let start = Instant::now();
+            assert!(store.retire_checked_input("s", "target", check).await.unwrap());
+            retirements.push(start.elapsed().as_micros());
+        }
+        scans.sort_unstable();
+        retirements.sort_unstable();
+        eprintln!(
+            "100k history / 32 scanned / 25 samples (microseconds): outside scan min/median/max={}/{}/{}; retirement BEGIN+UPDATE+COMMIT including pool acquire min/median/max={}/{}/{}",
+            scans[0], scans[12], scans[24], retirements[0], retirements[12], retirements[24],
+        );
+        // A corrupt historical prefix must not even be decoded for a new command.
+        sqlx::query("UPDATE events SET data = X'FF' WHERE session_id = 's' AND seq = 1").execute(&store.pool).await.unwrap();
+        sqlx::query("UPDATE commands SET state = 'pending' WHERE id = 'target'").execute(&store.pool).await.unwrap();
+        assert!(!store.input_recorded("s", "target").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn take_back_rechecks_log_highwater_pending_and_enqueue_floor_without_locked_decoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("c6h.db")).await.unwrap();
+        let worker = WorkerId::new();
+        store.create_session(&session("s", worker), &[], false).await.unwrap();
+        store.enqueue_command(&command("target", "s", worker, Some("draft"))).await.unwrap();
+        let check = store.check_pending_input("s", "target").await.unwrap().unwrap();
+        store.ingest(worker, "s", &[input_event(1, "other")]).await.unwrap().unwrap();
+        assert!(!store.retire_checked_input("s", "target", check).await.unwrap(), "even an unrelated log advance fails closed");
+        let check = store.check_pending_input("s", "target").await.unwrap().unwrap();
+        sqlx::query("UPDATE commands SET enqueued_after_seq = 1 WHERE id = 'target'").execute(&store.pool).await.unwrap();
+        assert!(!store.retire_checked_input("s", "target", check).await.unwrap(), "changed enqueue boundary fails closed");
+        let check = store.check_pending_input("s", "target").await.unwrap().unwrap();
+        assert!(store.cancel_pending_command("target").await.unwrap());
+        assert!(!store.retire_checked_input("s", "target", check).await.unwrap(), "another retirement wins");
+        sqlx::query("UPDATE commands SET state = 'pending', enqueued_after_seq = 0 WHERE id = 'target'")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let check = store.check_pending_input("s", "target").await.unwrap().unwrap();
+        assert_eq!(check.after_seq, 0, "legacy floor remains conservative");
+        store.ingest(worker, "s", &[input_event(2, "target")]).await.unwrap().unwrap();
+        sqlx::query("UPDATE commands SET state = 'pending' WHERE id = 'target'").execute(&store.pool).await.unwrap();
+        assert!(!store.retire_checked_input("s", "target", check).await.unwrap());
+        assert!(store.input_recorded("s", "target").await.unwrap(), "legacy scan sees durable ownership despite stale pending state");
+        assert!(!store.take_back_pending_input("s", "target").await.unwrap());
+        store.ingest(worker, "s", &[input_event(3, "legacy")]).await.unwrap().unwrap();
+        // A pre-migration command has no enqueue boundary: the schema's
+        // default must refuse a recorded input even below today's highwater.
+        sqlx::query(
+            "INSERT INTO commands (id, session_id, worker_id, data, text, created_at) VALUES ('legacy', 's', ?, X'', 'old draft', 0)",
+        )
+        .bind(worker.to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(store.queued_inputs("s").await.unwrap().iter().find(|c| c.id == "legacy").unwrap().enqueued_after_seq, 0);
+        assert!(store.input_recorded("s", "legacy").await.unwrap());
     }
 
     #[tokio::test]

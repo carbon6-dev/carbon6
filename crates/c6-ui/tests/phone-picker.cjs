@@ -67,7 +67,7 @@ function historyFixture() {
     setup: async ({ page }) => {
       page.on('request', request => {
         const p = new URL(request.url()).pathname;
-        if (request.method() === 'POST' && /\/(side-chats|rewind|messages)$/.test(p)) {
+        if (request.method() === 'POST' && /\/(side-chats|rewind|messages|take-back)$/.test(p)) {
           actionRequests.push({ path: p, body: request.postDataJSON() });
         }
       });
@@ -87,6 +87,10 @@ function historyFixture() {
       // controlled failure keeps this test from inventing a running session.
       await page.route('**/api/v1/sessions/parent/side-chats', route => route.fulfill({
         status: 409, json: { error: 'Fixture Ask route reached' },
+      }));
+      // Unwanted-request trap: transcript Edit must never attempt withdrawal.
+      await page.route('**/api/v1/sessions/parent/messages/picker-own/take-back', route => route.fulfill({
+        status: 409, json: { error: 'The agent has this message' },
       }));
       await page.route('**/api/v1/search?*', async route => {
         const url = new URL(route.request().url()), q = url.searchParams.get('q');
@@ -527,11 +531,23 @@ async function messageActions(f, phone, history, save) {
         await open();
         await dialog.getByRole('button', { name: edit ? 'Edit' : 'Rewind…', exact: true }).tap();
         await dialog.waitFor({ state: 'hidden' });
-        const confirm = page.getByRole('button', { name: edit ? 'Resend' : 'Rewind', exact: true });
+        if (edit) {
+          const panel = page.locator('[data-message-edit]');
+          await panel.getByText('The agent has this message', { exact: true }).waitFor();
+          assert.equal(await panel.locator('textarea').count(), 0, 'taken messages offer choices before opening the editor');
+          assert.deepEqual(await panel.getByRole('button').allTextContents(), ['Send correction', 'Rewind…', 'Close']);
+          assert.equal(history.actionRequests.length, actions, 'transcript Edit starts Taken without attempting withdrawal');
+          await panel.getByRole('button', { name: 'Send correction', exact: true }).tap();
+          assert.equal(await panel.locator('textarea').inputValue(), ownText, 'correction keeps the original draft');
+          assert.equal(history.actionRequests.length, actions, 'opening correction does not send, rewind, or withdraw');
+          await save('edit-entry');
+          await panel.getByRole('button', { name: 'Discard draft', exact: true }).tap();
+          continue;
+        }
+        const confirm = page.getByRole('button', { name: 'Rewind', exact: true });
         await confirm.waitFor();
         const panel = confirm.locator('..').locator('..');
-        if (edit) assert.equal(await panel.locator('textarea').inputValue(), ownText, 'Edit opens the existing draft, not an immediate resend');
-        else assert.match(await panel.textContent(), /Rewind the conversation to before this message\?/);
+        assert.match(await panel.textContent(), /Rewind the conversation to before this message\?/);
         assert.equal(await panel.getByRole('checkbox').isChecked(), false, 'file restoration is never selected automatically');
         assert.equal(history.actionRequests.length, actions, 'Edit/Rewind entry requires a separate confirmation before any mutation');
         await save(edit ? 'edit-entry' : 'rewind-entry');

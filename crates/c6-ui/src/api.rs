@@ -696,6 +696,12 @@ pub async fn cancel_queued_input(id: String, command_id: String) -> Result<(), S
     empty(Request::delete(&format!("/api/v1/sessions/{id}/queue/{}", enc(&command_id))).send().await).await
 }
 
+/// Withdraw exactly one queued command after worker confirmation, never a tail
+/// or an already-taken transcript event.
+pub async fn take_back(id: String, command_id: String) -> Result<(), String> {
+    empty(Request::post(&format!("/api/v1/sessions/{id}/messages/{}/take-back", enc(&command_id))).send().await).await
+}
+
 /// Pulls a queued message and every message queued after it out of the
 /// queue (they are canceled), to be re-sent edited, reordered or dropped.
 pub async fn pull_queued(id: String, command_id: String) -> Result<Vec<QueuedInput>, String> {
