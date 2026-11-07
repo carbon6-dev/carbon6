@@ -116,7 +116,7 @@ async function send(f, name, phone) {
 
 async function main() {
   fs.mkdirSync(output, { recursive: true });
-  const playwright = require(process.env.PLAYWRIGHT_CORE || '/home/zheilbron/.bun/install/cache/playwright-core@1.50.1@@@1');
+  const playwright = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
   const { server, origin } = await serve();
   try {
     for (const theme of (process.env.THEMES || 'light,dark').split(',')) for (const view of (process.env.VIEWS || 'desktop,tile,phone').split(',')) {

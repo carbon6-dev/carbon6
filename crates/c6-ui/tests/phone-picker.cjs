@@ -764,7 +764,7 @@ async function check(browser, origin, engine, name, theme, motionName) {
 
 async function main() {
   fs.mkdirSync(shots, { recursive: true });
-  const playwright = require(process.env.PLAYWRIGHT_CORE || '/home/zheilbron/.bun/install/cache/playwright-core@1.50.1@@@1');
+  const playwright = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
   const engine = process.env.ENGINE || 'chromium';
   assert(['chromium', 'webkit', 'both'].includes(engine), 'ENGINE=chromium,webkit,both');
   const names = process.env.VIEWPORT ? process.env.VIEWPORT.split(',') : Object.keys(sizes);

@@ -644,7 +644,7 @@ async function workspaceChoices(browser, origin, fixture, settle) {
 async function browserTests() {
   if (process.env.SCREENSHOTS) fs.mkdirSync(process.env.SCREENSHOTS, { recursive: true });
   const { serve, fixture, settle, within, launchBrowser } = require('./motion.cjs');
-  const playwright = require(process.env.PLAYWRIGHT_CORE || '/home/zheilbron/.bun/install/cache/playwright-core@1.50.1@@@1');
+  const playwright = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
   const { server, origin } = await serve();
   let browser;
   try {

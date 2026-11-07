@@ -7,7 +7,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { serve, fixture, settle, launchBrowser } = require('./motion.cjs');
-const playwright = require(process.env.PLAYWRIGHT_CORE || '/home/zheilbron/.bun/install/cache/playwright-core@1.50.1@@@1');
+const playwright = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
 const output = process.env.SCREENSHOTS || '/tmp/n3-ui/item5';
 const views = {
   desktop: { width: 1440, height: 1000, tiles: 1 },

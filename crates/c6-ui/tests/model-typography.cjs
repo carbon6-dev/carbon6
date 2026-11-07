@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 
-// No build or dependencies: use motion.cjs's production fixture and browser paths.
+// No build: use motion.cjs's production fixture and the locked browser install.
 // BEFORE=1 records the regressed build; the default phase asserts the fixed size.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -113,7 +113,7 @@ async function check(browser, origin, engine, name, theme) {
 
 async function main() {
   fs.mkdirSync(shots, { recursive: true });
-  const playwright = require(process.env.PLAYWRIGHT_CORE || '/home/zheilbron/.bun/install/cache/playwright-core@1.50.1@@@1');
+  const playwright = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
   const engine = process.env.ENGINE || 'both';
   assert(['chromium', 'webkit', 'both'].includes(engine));
   const names = process.env.VIEWPORT ? process.env.VIEWPORT.split(',') : Object.keys(viewports);

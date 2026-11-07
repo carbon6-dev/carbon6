@@ -7,7 +7,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { serve, fixture, settle, within, launchBrowser } = require('./motion.cjs');
-const playwright = require(process.env.PLAYWRIGHT_CORE || '/home/zheilbron/.bun/install/cache/playwright-core@1.50.1@@@1');
+const playwright = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
 const before = process.env.BEFORE === '1';
 const shots = process.env.SCREENSHOTS || '/tmp/q2-screenshots';
 const DOC = '00000000-0000-0000-0000-000000000042';

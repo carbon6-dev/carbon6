@@ -8,7 +8,8 @@
 // DSF 1/2, with screenshots/JSON in /tmp/q11-ring/row-link. THEME, MOTION, WIDTHS,
 // SCALE and EVIDENCE can narrow/label a diagnostic run; ROOT selects the build.
 // Both modes are Chromium-only: layers() requires CDP. CHROMIUM selects a
-// browser binary (133 by default); this is not a WebKit/Firefox touch proof.
+// browser binary (the pinned Playwright revision by default); this is not a
+// WebKit/Firefox touch proof. Reject ENGINE=webkit rather than mislabel coverage.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -21,7 +22,7 @@ const phase = process.env.LABEL || (baseline ? 'before' : 'after');
 const scale = Number(process.env.SCALE || 1);
 assert([1, 2].includes(scale), 'SCALE must be 1 or 2');
 const paragraphs = Number(process.env.PARAGRAPHS || 12);
-const playwright = require(process.env.PLAYWRIGHT_CORE || '/home/zheilbron/.bun/install/cache/playwright-core@1.50.1@@@1');
+const playwright = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const prose = (i, count = paragraphs) => `Q3 item ${i}\n\n` + ('A **rendered** paragraph with `inline code`, a [local link](/r/home/sessions/parent), and some ordinary transcript text.\n\n'.repeat(count)) +
   '\n```rust\nfn main() {\n    println!("a highlighted code block");\n}\n```\n\n| Column | Value |\n| --- | --- |\n| entry | measured |\n';
@@ -1058,6 +1059,7 @@ async function runPhone(browser, origin, theme, choice, deviceScaleFactor) {
 }
 
 (async () => {
+  assert(!process.env.ENGINE || process.env.ENGINE === 'chromium', 'ring-render requires Chromium CDP; WebKit is not covered by this suite');
   fs.mkdirSync(output, { recursive: true });
   const { server, origin } = await serve();
   const browser = await launchBrowser(playwright, 'chromium');

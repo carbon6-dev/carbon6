@@ -12,7 +12,7 @@ const phase = before ? 'before' : 'after';
 async function main() {
   fs.mkdirSync(output, { recursive: true });
   const { server, origin } = await serve();
-  const playwright = require(process.env.PLAYWRIGHT_CORE || '/home/zheilbron/.bun/install/cache/playwright-core@1.50.1@@@1');
+  const playwright = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
   try {
     for (const theme of ['light', 'dark']) for (const view of ['desktop', 'tile', 'phone']) {
       const browser = await launchBrowser(playwright, process.env.ENGINE || 'chromium');

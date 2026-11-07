@@ -7,7 +7,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { serve, fixture, settle, within, launchBrowser } = require('./motion.cjs');
-const playwright = require(process.env.PLAYWRIGHT_CORE || '/home/zheilbron/.bun/install/cache/playwright-core@1.50.1@@@1');
+const playwright = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
 const before = process.env.BEFORE === '1';
 const evidence = process.env.EVIDENCE || '/tmp/n3-ui/item3';
 const doc = { id: 'reply-doc', realm: 'home', kind: 'doc', title: 'Replies without lost drafts', rev: 1,

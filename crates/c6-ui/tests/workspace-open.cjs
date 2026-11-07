@@ -6,7 +6,7 @@
 // No UI build here: the combined-change build owner supplies ROOT.
 const assert = require('node:assert/strict');
 const { serve, fixture, settle, within, launchBrowser } = require('./motion.cjs');
-const playwright = require(process.env.PLAYWRIGHT_CORE || '/home/zheilbron/.bun/install/cache/playwright-core@1.50.1@@@1');
+const playwright = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
 const KEY = 'c6.home.workspace.v2';
 const DOC = '00000000-0000-0000-0000-000000000042';
 const OTHER_DOC = '00000000-0000-0000-0000-000000000043';
@@ -539,7 +539,7 @@ async function check(browser, origin, viewport, label, platform) {
       await page.getByRole('button', { name: /^Switch sessions and pages,/ }).click();
       const picker = page.getByRole('dialog', { name: 'Sessions', exact: true });
       const parentRow = picker.getByRole('button', { name: /(?:Workspace parent|Motion fixture parent)/ });
-      const secondaryRow = picker.getByRole('button', { name: 'Second document writer', exact: true });
+      const secondaryRow = picker.getByRole('button', { name: 'Second document writer idle · Workspace fixture', exact: true });
       assert.equal(await parentRow.count(), 1);
       assert.equal(await secondaryRow.count(), 1);
       await parentRow.click();

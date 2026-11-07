@@ -2,6 +2,8 @@
 #
 # docker-* targets need only Docker (with buildx); everything else needs a
 # local Rust toolchain with the wasm32-unknown-unknown target and Trunk.
+# Browser tests additionally use Node 24/npm; ui-browser-install provisions
+# their locked JS dependency, matching browsers and OS libraries.
 
 .DEFAULT_GOAL := help
 SHELL := /bin/bash
@@ -50,7 +52,7 @@ DEB_ARGS      = --build-arg UBUNTU=$(UBUNTU) --build-arg DEB_VERSION=$(DEB_VERSI
 
 .PHONY: help docker-build docker-build-all docker-test docker-lint-image docker-check docker-fmt docker-images docker-head docker-head-stop docker-token docker-login-link \
         docker-deb docker-deb-all docker-deb-test deb deb-test deb-smoke brew-dist brew brew-install brew-test release release-notes \
-        ui build print-version test test-under-load check dev-head dev-token dev-login-link dev-worker clean \
+        ui ui-browser-install ui-browser-test build print-version test test-under-load check dev-head dev-token dev-login-link dev-worker clean \
         site site-serve site-check site-publish
 
 help: ## Show this help
@@ -164,6 +166,13 @@ release-notes: ## Print the CHANGELOG.md section the next release would add
 
 ui: ## Build the web UI into crates/c6-ui/dist (embedded into c6h)
 	cd crates/c6-ui && trunk build --release
+
+ui-browser-install: ## Install locked browser-test dependencies, matching Chromium/WebKit and OS libraries (Linux needs sudo)
+	npm ci --prefix crates/c6-ui/tests
+	node crates/c6-ui/tests/node_modules/playwright-core/cli.js install --with-deps chromium webkit
+
+ui-browser-test: ## Test the built production UI in pinned Chromium/WebKit (build with make ui first; UI_BROWSER_PASSES=3 for repeated full matrices)
+	bash scripts/ui-browser-tests.sh
 
 build: ui ## Build release binaries (c6h, c6w, c6) into target/release, knowing their exact version (C6_BUILD_VERSION: the release, or <release>+git<commit time>.<commit> between releases)
 	C6_BUILD_VERSION=$(DEB_VERSION) cargo build --release --locked -p c6h -p c6w -p c6

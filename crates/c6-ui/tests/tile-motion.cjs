@@ -104,7 +104,7 @@ async function capture(page, label, action, mode) {
 
 async function main() {
   fs.mkdirSync(shots, { recursive: true });
-  const playwright = require(process.env.PLAYWRIGHT_CORE || '/home/zheilbron/.bun/install/cache/playwright-core@1.50.1@@@1');
+  const playwright = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
   const { server, origin } = await serve();
   const browser = await launchBrowser(playwright, 'chromium');
   const results = [];

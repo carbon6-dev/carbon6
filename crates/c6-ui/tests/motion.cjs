@@ -2,7 +2,7 @@
 'use strict';
 
 // Built production WASM/CSS, with a private loopback origin and fake head.
-// No npm install, real head, credentials, fixed ports, or test-only UI required.
+// Pinned test-local Playwright; no real head, credentials, fixed ports, or test-only UI.
 // See docs/testing.md, "Motion: production browser regression".
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -35,9 +35,9 @@ function crashDiagnostic(engine, error, consoleMessages = []) {
   const panic = consoleMessages.some(message => /panicked at|already been disposed/.test(message.text));
   if (panic) return 'Rust panic observed; inspect the panic and stack before attributing a later WASM trap to WebKit';
   if (engine === 'webkit' && /RuntimeError|out of bounds|null.*table|unreachable/i.test(String(error.stack || error))) {
-    return 'Known intermittent WebKit/WASM trap signature (N5, docs/testing.md); cause unresolved, still FAIL; preserve the first error and exact WASM hash';
+    return 'WebKit/WASM trap: FAIL; old revision 2123 cold-load failures were absent in the revision 2388 comparison (S2, docs/testing.md); preserve the first error, browser revision and exact WASM hash';
   }
-  return 'Browser failure; not classified as the intermittent WebKit/WASM signature';
+  return 'Browser failure; not classified as a WebKit/WASM trap';
 }
 async function within(label, action) {
   let timer;
@@ -955,10 +955,10 @@ async function modelForms(f) {
     // fields to their page so a still-open Ask form cannot stand in for Sessions.
     const formPage = page.locator('main').filter({ has: page.locator('h1').filter({ hasText: name === 'ask' ? /^Ask$/ : /^Sessions$/ }) }).last();
     const input = formPage.getByPlaceholder('model id', { exact: true });
+    const fields = name === 'new-session' ? formPage.getByTitle(phoneViewport(f.viewport) ? 'Where and how it runs' :
+      'Change where and how it runs', { exact: true }) : null;
     step(`${route} fields`);
-    if (name === 'new-session') {
-      await formPage.getByTitle(phoneViewport(f.viewport) ? 'Where and how it runs' : 'Change where and how it runs', { exact: true }).click();
-    }
+    if (fields) await fields.click();
     await input.waitFor(); await settle(page);
     assert.equal(await page.getByRole('dialog', { name: 'Model', exact: true }).count(), 0, 'form fields remain inline, not nested sheets');
     const controls = input.locator('..').locator('..').locator('..').locator('..');
@@ -982,16 +982,29 @@ async function modelForms(f) {
     step(`${route} model`);
     await offered.evaluate(el => el.scrollIntoView({ block: 'center' })); await visibleBounds(offered);
     await offered.click();
+    if (fields) {
+      await settle(page);
+      assert.equal(await fields.getAttribute('aria-expanded'), 'true',
+        `${route}: choosing a model must keep the fields open so effort remains usable`);
+    }
     if (!cold) assert.equal(f.requests.filter(r => r.endsWith('/connections/test/models')).length, prefetched, `${route} shares the composer's prefetched list`);
     assert.equal(await input.inputValue(), 'fixture-model-32', `${name} still selects offered models`);
     const effort = controls.getByRole('combobox', { name: 'Reasoning effort', exact: true });
     step(`${route} effort`);
     await effort.evaluate(el => el.scrollIntoView({ block: 'center' }));
     await visibleBounds(effort);
+    step(`${route} effort selection`);
     await effort.selectOption('high');
     assert.equal(await effort.inputValue(), 'high');
+    if (fields) {
+      await settle(page);
+      assert.equal(await fields.getAttribute('aria-expanded'), 'true',
+        `${route}: choosing effort must keep the fields open so the model list remains usable`);
+    }
     const asked = f.requests.filter(r => r.endsWith('/connections/test/models')).length;
+    step(`${route} reopen model list`);
     await controls.getByTitle('Every model the connection offers', { exact: true }).click();
+    step(`${route} reopened model list visible`);
     await offered.waitFor();
     assert.equal(f.requests.filter(r => r.endsWith('/connections/test/models')).length, asked, `${name} reuses its shared model list`);
     await page.keyboard.press('Escape');
@@ -1171,6 +1184,9 @@ async function tool(f) {
   await page.waitForFunction(() => __tool.open);
   await page.waitForFunction(() => {
     const body = __tool.querySelector('summary').nextElementSibling;
+    // The native toggle queues the lazy body mount after `open` changes.
+    // Wait for that body before measuring; keep the same expanded-height check.
+    if (!body) return false;
     const target = body.scrollHeight + parseFloat(getComputedStyle(body).borderTopWidth);
     return __tool.getBoundingClientRect().height - __tool.querySelector('summary').getBoundingClientRect().height >= target - .5;
   });
@@ -1359,11 +1375,11 @@ async function tiles(f) {
 }
 
 function launchBrowser(playwright, name) {
-  const localLibs = '/tmp/c7-browser-libs/usr/lib/x86_64-linux-gnu';
-  const libraries = process.env.CHROMIUM_LIBS || (fs.existsSync(localLibs) ? localLibs : '');
+  assert(['chromium', 'webkit'].includes(name), `unsupported browser: ${name}`);
+  const libraries = process.env.CHROMIUM_LIBS;
   return playwright[name].launch({ headless: true, timeout: DEADLINE,
-    executablePath: name === 'webkit' ? (process.env.WEBKIT_EXECUTABLE || '/tmp/c7-webkit.sh') : (process.env.CHROMIUM || '/tmp/c7-chromium/chrome-linux/chrome'),
-    ...(name === 'chromium' ? { args: ['--no-sandbox'], env: { ...process.env,
+    executablePath: name === 'webkit' ? process.env.WEBKIT_EXECUTABLE : process.env.CHROMIUM,
+    ...(name === 'chromium' && libraries ? { env: { ...process.env,
       LD_LIBRARY_PATH: [libraries, process.env.LD_LIBRARY_PATH].filter(Boolean).join(':') } } : {}) });
 }
 
@@ -1448,9 +1464,10 @@ async function main() {
   if (process.argv.includes('--help')) {
     console.log('node crates/c6-ui/tests/motion.cjs\n' +
       'ROOT=crates/c6-ui/dist PLAYWRIGHT_CORE=/path/to/playwright-core CHROMIUM=/path/to/chrome WEBKIT_EXECUTABLE=/path/to/webkit-wrapper\n' +
-      'CHROMIUM_LIBS=/path/to/shared-libraries (local /tmp/c7-browser-libs default when present)\n' +
+      'Default: make ui-browser-install (locked test-local core and matching browsers)\n' +
+      'CHROMIUM_LIBS=/path/to/shared-libraries (optional diagnostic override)\n' +
       'ENGINE=chromium|webkit|both (default chromium; WEBKIT=1 also supported)\n' +
-      'ISOLATE_BROWSER=1 owns a fresh browser process per case (useful for the local old WPE WebKit)\n' +
+      'ISOLATE_BROWSER=1 owns a fresh browser process per case (diagnostic only; default shares one)\n' +
       'ONLY=policy,menu,drawer,sheet,sessionsPicker,modelPicker,modelForms,phone,tool,tiles,sendStop THEME=light,dark VIEWPORT=desktop,phone,narrow,landscape (default desktop,phone) MOTION_CASE=system,system-reduce,full,full-reduce,reduced,off\n' +
       'narrow=320x568; landscape=900x480; both opt-in views use the phone/short-height checks\n' +
       '--helpers tests real-DOM production list cleanup in Full/Reduced/Off (ENGINE=both selects all six)\n' +
@@ -1459,7 +1476,7 @@ async function main() {
       'SCREENSHOTS=/tmp/m1-screenshots (final and failure screenshots plus JSON diagnostics)');
     return;
   }
-  const playwright = require(process.env.PLAYWRIGHT_CORE || '/home/zheilbron/.bun/install/cache/playwright-core@1.50.1@@@1');
+  const playwright = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
   const engine = process.env.ENGINE || (process.env.WEBKIT ? 'webkit' : 'chromium');
   assert(['chromium', 'webkit', 'both'].includes(engine), `Unknown ENGINE=${engine}`);
   for (const [env, allowed] of Object.entries({ ONLY: ['policy', 'menu', 'drawer', 'sheet', 'sessionsPicker', 'modelPicker', 'modelForms', 'phone', 'tool', 'tiles', 'sendStop'],
@@ -1522,9 +1539,24 @@ async function main() {
 
 function unitTests() {
   const { test } = require('node:test');
+  test('browser launcher uses Playwright-managed binaries unless explicitly overridden', async () => {
+    for (const name of ['chromium', 'webkit']) {
+      let options;
+      const browser = {};
+      const playwright = { [name]: { launch: async value => { options = value; return browser; } } };
+      assert.equal(await launchBrowser(playwright, name), browser);
+      assert.equal(options.executablePath, name === 'webkit' ? process.env.WEBKIT_EXECUTABLE : process.env.CHROMIUM);
+      assert.equal(options.headless, true);
+      assert.equal(options.timeout, DEADLINE);
+      assert.equal(options.args, undefined, 'no ad hoc browser flags');
+      assert.equal(options.env?.LD_LIBRARY_PATH, name === 'chromium' && process.env.CHROMIUM_LIBS ?
+        [process.env.CHROMIUM_LIBS, process.env.LD_LIBRARY_PATH].filter(Boolean).join(':') : undefined);
+    }
+    assert.throws(() => launchBrowser({}, 'firefox'), /unsupported browser/);
+  });
   test('crash diagnostics distinguish panic evidence without treating familiar WebKit traps as passes', () => {
     const trap = new WebAssembly.RuntimeError('Out of bounds memory access');
-    assert.match(crashDiagnostic('webkit', trap), /cause unresolved, still FAIL/);
+    assert.match(crashDiagnostic('webkit', trap), /WebKit\/WASM trap: FAIL/);
     assert.match(crashDiagnostic('chromium', trap), /not classified/);
     assert.match(crashDiagnostic('webkit', trap, [{ text: 'panicked at traits.rs:767: already been disposed' }]), /^Rust panic observed/);
     assert.match(crashDiagnostic('webkit', new Error('bad selector')), /not classified/);

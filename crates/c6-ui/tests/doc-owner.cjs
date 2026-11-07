@@ -165,7 +165,7 @@ async function check(browser, origin, theme, width, phone, kind, creator = 'pare
 async function main() {
   fs.mkdirSync(shots, { recursive: true });
   const { server, origin } = await serve();
-  const playwright = require(process.env.PLAYWRIGHT_CORE || '/home/zheilbron/.bun/install/cache/playwright-core@1.50.1@@@1');
+  const playwright = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
   const run = async (theme, width, phone, kind, creator = 'parent') => {
     if (process.env.CASE && !`${theme}-${kind}-${phone ? 'phone' : 'tile'}-${width}-${creator}`.includes(process.env.CASE)) return;
     const browser = await launchBrowser(playwright, process.env.ENGINE || 'chromium');

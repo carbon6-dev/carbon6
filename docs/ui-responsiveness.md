@@ -461,7 +461,9 @@ themes. The existing sheet/sendStop matrix passes all twelve Chromium contexts.
 Shared-process WebKit passes five desktop contexts before an out-of-bounds
 hydration crash on desktop/dark/Off; that case passes alone and all twelve
 WebKit contexts pass with isolated browser processes. The shared-process failure
-is retained, not silently replaced by isolated results.
+is retained, not silently replaced by isolated results. This is historical
+WebKit 2123 evidence; S2 below replaces the test dependency with WebKit 2388
+after an alternating same-WASM cold-load comparison, without retries.
 
 An extra `ONLY=tool` check fails because its saved `__pre` is null. It fails
 again alone and identically against the pinned baseline distribution. This
@@ -590,7 +592,8 @@ Investigation base: `c6/next` at `235fae5c`, not `upstream/main`. Evidence,
 commands, pinned artifacts, and read-only ops questions are under
 `/tmp/n5-webkit/`. This investigation does not change production optimization,
 panic strategy, or the WASM size ratchet; a clean rerun is not evidence that an
-intermittent crash has been repaired.
+intermittent crash has been repaired. The later S2 test-engine comparison below
+supersedes treating the old WebKit 2123 trap as a current accepted test limitation.
 
 ### Keep the two fault classes separate
 
@@ -631,8 +634,9 @@ node, title, session/document ID, saved-layout read, or message text. Hidden
 retained content remains mounted; a deferred shell is `pending`. The first
 report still wins over later fallout, and the reload banner works without
 Leptos or successful reporting. No telemetry endpoint or server behavior is
-changed. Browser tests annotate the familiar intermittent WebKit trap
-signature but **still fail** on it; all existing assertions remain in force.
+changed. Browser tests **still fail** on every WebKit trap; their diagnostic now
+references the old/new engine comparison below. All existing assertions remain
+in force, and panic evidence is still distinguished from a subsequent abort.
 
 The live head was not accessed. Before this patch the endpoint logs only
 `page`, `message`, and `stack`, not the User-Agent header. Ask ops for the
@@ -641,3 +645,45 @@ metadata that can distinguish real Safari from synthetic WPE's Safari-shaped
 UA; absent metadata is not evidence of absent Safari crashes. Detailed,
 privacy-preserving read-only requests are in `ops-questions.md` in the evidence
 directory. No operational action has been taken.
+
+## S2: pinned browser-test dependency — November 7, 2026
+
+S2 branches from `c6/next` at `5384d8e2`. The approved N7 experiment alternated the same
+production WASM for 60 rounds per arm: Playwright-core 1.50.1 / WebKit 2123
+failed 12 of 231 loads (10 out-of-bounds, one unreachable, one disposed-value
+panic); Playwright-core 1.65.0 / WebKit 2388 failed 0 of 240 (Fisher p≈0.0002).
+Commands are preserved at `/tmp/n7-webkit/run.sh` and `repeat-any.cjs`, with raw
+results in `/tmp/n5-webkit/n7/`. This is evidence to replace the old test engine,
+not source-level proof of a specific WebKit defect or coverage of real Safari.
+
+Browser tests now resolve a test-local npm lockfile pinning Playwright-core
+1.65.0, with browsers and OS dependencies installed by that package's own CLI.
+On Linux it pins WebKit 2388 (27.2) and Chromium/headless-shell 1254
+(158.0.8127.18). The old ad hoc `/tmp` wrappers, binaries and extracted libraries
+are no longer defaults. Explicit binary/core/library overrides remain for
+controlled comparisons, not normal qualification. Production Rust, WASM,
+optimization, panic behavior, settings and services are unchanged. No runtime
+retry, expected trap or relaxed assertion was added. See `docs/testing.md` for
+installation, repeated suite results, remaining blockers, and CI prerequisites.
+
+`ring-render.cjs` is still Chromium-only: compositor layers, exact paint records
+and the blocked-main-thread screencast require CDP. It now rejects a WebKit
+engine request instead of silently counting a Chromium launch as WebKit proof.
+The matching Chromium is tested as well; old Chromium 133 profiling results
+above remain historical measurements, not performance claims for version 158.
+
+S2 does **not** claim a fully green combined browser qualification. The required
+UI build, check and native suite pass (1,167 tests, two skipped), but Motion
+records separate New Session fields-panel dismissal/list-reopen/effort-selection
+failures: all three unfiltered invocations fail in each engine. The other four
+cross-engine suites pass three full invocations each, as does Chromium's ring
+suite. **Zero WASM traps were observed**, including in the failed cohorts.
+Native event tracing hits the intended offered-model button before the panel
+becomes hidden; the same panel-open invariant fails in an old Playwright
+1.50.1/Chromium 133 control against the same WASM. Isolated modelForms reruns of
+all three failed WebKit cases pass without erasing their full-run failures. The test now
+explicitly requires the fields to stay expanded after model/effort selection;
+it does not reopen them, use hidden controls, force clicks, or retry. No
+production fix is made speculatively. Existing CI remains unchanged rather
+than adding a required job known to fail. Full cohort counts and evidence
+locations are recorded in `docs/testing.md`.

@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 'use strict';
 
-// Production WASM and CSS, private loopback head, no credentials or npm install.
+// Production WASM and CSS, pinned test-local Playwright, private loopback head.
 // See docs/testing.md. Like motion.cjs, deadlines catch hangs, not slow machines.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
-const { settle } = require('./motion.cjs');
-const playwright = require(process.env.PLAYWRIGHT_CORE || '/home/zheilbron/.bun/install/cache/playwright-core@1.50.1@@@1');
+const { settle, launchBrowser } = require('./motion.cjs');
+const playwright = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
 const ROOT = path.resolve(process.env.ROOT || path.join(__dirname, '../dist'));
 const SHOTS = process.env.SCREENSHOTS || '/tmp/z2-screenshots';
 const DEADLINE = Number(process.env.C6_TEST_DEADLINE_SECS || 300) * 1000;
@@ -166,13 +166,27 @@ async function check(browser, origin, label) {
     phase('marks yield before secondary controls in narrow desktop tiles');
     const strip = await first.locator('[data-aspect-strip]').elementHandle();
     const tileRoot = page.locator('[data-tile-motion="2"]');
+    const openActions = async () => {
+      const previous = await page.locator('.phone-popover').evaluateAll(els => els.map(el => el.dataset.pop));
+      await bar.getByRole('button', { name: 'Actions', exact: true }).click();
+      // Actions is portaled out of the tile. Identify only the newly mounted
+      // menu, not an arbitrary realm menu or another tile's retained details.
+      await page.waitForFunction(previous => [...document.querySelectorAll('.phone-popover')]
+        .some(el => !previous.includes(el.dataset.pop)), previous);
+      const fresh = (await page.locator('.phone-popover').evaluateAll(els => els.map(el => el.dataset.pop)))
+        .filter(key => !previous.includes(key));
+      assert.equal(fresh.length, 1, 'the intended tile opens exactly one new portaled Actions menu');
+      assert.match(fresh[0], /^pop\d+$/, 'menu has a stable popover identity');
+      const menu = page.locator(`.phone-popover[data-pop="${fresh[0]}"]`);
+      await menu.waitFor();
+      return menu;
+    };
     // Saving the setting focused its tile. Focus the session before applying
     // fixture widths: clicking Actions must not trigger a workspace layout
     // update that restores the tile's normal width during the assertions.
-    await bar.getByRole('button', { name: 'Actions', exact: true }).click();
-    await first.locator(':scope > .phone-popover').waitFor();
+    const initialMenu = await openActions();
     await page.keyboard.press('Escape');
-    await first.locator(':scope > .phone-popover').waitFor({ state: 'detached' });
+    await initialMenu.waitFor({ state: 'detached' });
     await settle(page);
     const originalWidth = await tileRoot.evaluate(el => el.style.width);
     // Resize the real tile, not the window: phone mode must remain off. The
@@ -263,11 +277,7 @@ async function check(browser, origin, label) {
       assert(await composer.evaluate(el => el.isConnected), 'resize retains the composer');
       for (const handle of fixedControls) assert(await handle.evaluate(el => el.isConnected), 'resize retains fixed controls');
       if (width < 480) {
-        await bar.getByRole('button', { name: 'Actions', exact: true }).click();
-        // Scope to this tile's Actions popover, not unrelated realm menus
-        // elsewhere in the wall (including menus inside closed details).
-        const menu = first.locator(':scope > .phone-popover');
-        await menu.waitFor();
+        const menu = await openActions();
         for (const name of ['Changes', 'Terminal', 'Pin']) {
           const action = menu.getByRole('button', { name, exact: true });
           assert(await action.isVisible(), `${name} remains available in Actions at ${width}`);
@@ -376,11 +386,7 @@ async function main() {
     const engine = process.env.ENGINE || 'chromium';
     assert(['chromium', 'webkit', 'both'].includes(engine));
     for (const name of engine === 'both' ? ['chromium', 'webkit'] : [engine]) {
-      const libraries = process.env.CHROMIUM_LIBS || '/tmp/c7-browser-libs/usr/lib/x86_64-linux-gnu';
-      const browser = await playwright[name].launch({ headless: true, timeout: DEADLINE,
-        executablePath: name === 'webkit' ? (process.env.WEBKIT_EXECUTABLE || '/tmp/c7-webkit.sh') : (process.env.CHROMIUM || '/tmp/c7-chromium/chrome-linux/chrome'),
-        ...(name === 'chromium' ? { args: ['--no-sandbox'], env: { ...process.env,
-          LD_LIBRARY_PATH: [libraries, process.env.LD_LIBRARY_PATH].filter(Boolean).join(':') } } : {}) });
+      const browser = await launchBrowser(playwright, name);
       try { for (const theme of ['light', 'dark']) await check(browser, origin, `${name}-${theme}`); }
       finally { await browser.close(); }
     }

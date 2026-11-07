@@ -91,7 +91,7 @@ async function check(browser, origin, theme, width, phone, consolePage) {
 async function main() {
   fs.mkdirSync(shots, { recursive: true });
   const { server, origin } = await serve();
-  const playwright = require(process.env.PLAYWRIGHT_CORE || '/home/zheilbron/.bun/install/cache/playwright-core@1.50.1@@@1');
+  const playwright = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
   const run = async (theme, width, phone, consolePage) => {
     const browser = await launchBrowser(playwright, process.env.ENGINE || 'chromium');
     try { await check(browser, origin, theme, width, phone, consolePage); }

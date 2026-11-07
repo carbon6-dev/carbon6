@@ -2,10 +2,160 @@
 
 Status: rules in force (2026-10-19); `make check` enforces what a pattern can catch (`scripts/test-lint.sh`).
 
-## Browser crashes: preserve the first failure (N5)
+## Browser installation and pinned engines (S2)
 
-The shared production-browser fixture labels the known intermittent Linux
-Playwright WebKit/WASM trap **signature**, not a proven engine defect. It still
+Use Node 24 and npm on PATH. The browser suites have a private npm manifest and
+lockfile in `crates/c6-ui/tests`, pinning **playwright-core 1.65.0**. Install once
+per checkout (and again after changing the lockfile):
+
+```sh
+make ui-browser-install
+```
+
+This runs `npm ci --prefix crates/c6-ui/tests` and the **installed package's**
+`cli.js install --with-deps chromium webkit`. On Linux the latter installs OS
+libraries through apt (sudo required); on macOS no Linux library wrapper is
+needed. It downloads the matching browsers to Playwright's normal user cache
+(`~/.cache/ms-playwright` on Linux), or `PLAYWRIGHT_BROWSERS_PATH` if set for both
+installation and execution. Do not use an unpinned `npx playwright` download.
+The package pins WebKit **2388 (27.2)** and Chromium/headless-shell **1254
+(158.0.8127.18)** on this Linux host. Playwright's platform overrides still
+apply (for example WebKit on macOS 14); these are Playwright builds, not branded
+Safari. No test dependency, browser binary or library defaults to `/tmp` or a
+hard-coded developer-specific home path. Screenshot/evidence output may still use `/tmp`.
+
+```sh
+set -euo pipefail
+ulimit -n 65536
+env -u NO_COLOR make ui
+make ui-browser-test
+# Three complete passes, no retries or assertion changes:
+UI_BROWSER_PASSES=3 make ui-browser-test
+```
+
+The runner covers workspace-open, motion, comment-sheet, phone-picker and
+theme (`--browser`) in each engine, plus ring-render in Chromium. **ring-render
+is Chromium-only**, because its layer/paint/blocked-main-thread assertions
+require CDP; `ENGINE=webkit` now fails explicitly instead of silently launching
+Chromium. Its full default three-run/two-theme workload remains enabled.
+The default motion matrix has 24 contexts per engine; phone-picker has 24.
+Each suite keeps its normal shared-process/context policy. `ISOLATE_BROWSER`
+is not enabled. `BROWSER_ENGINES=webkit` selects just that engine for a complete
+pass; `BROWSER_TEST_OUTPUT` changes the default `dist/browser-tests` output.
+Logs/screenshots/traces are separated by pass, engine and suite. A failed
+command stops the runner, keeps the evidence, and is never automatically retried.
+
+Existing CI workflows are unchanged: these standalone browser suites were not
+previously CI jobs. A browser runner on Ubuntu 24.04 needs Node 24, npm, the
+existing Rust/Trunk/Brotli setup, `make ui-browser-install` (including sudo apt),
+`env -u NO_COLOR make ui`, then `make ui-browser-test`; preserve
+`dist/browser-tests` on failure. Do not enable a required browser job while the
+independent Motion fields-panel failure recorded below is unresolved.
+Downloads/apt are installation steps, not network access by the tests: the
+fixtures still serve only private loopback origins. Rust test jobs are unchanged.
+
+### Why change WebKit?
+
+The approved N7 cold-load comparison alternated the same production WASM for
+60 rounds per arm. The old Playwright 1.50.1/WebKit 2123 failed **12/231 loads**
+(10 out-of-bounds, one unreachable, one disposed-value panic); Playwright
+1.65.0/WebKit 2388 failed **0/240** (Fisher p≈0.0002). Original commands are
+`/tmp/n7-webkit/run.sh` and `repeat-any.cjs`; raw results are under
+`/tmp/n5-webkit/n7/`. Those are historical evidence locations, **not runtime
+dependencies**. This supports replacing the old test engine, not a claim that
+a particular WebKit source bug was identified, all application lifetime errors
+were repaired, or real Safari was tested. The S2 verification results below
+record the new full-suite cohorts separately from that cold-load experiment.
+
+### S2 verification: November 7, 2026
+
+Branch base: `c6/next` at `5384d8e2`, Linux x86-64/Debian 12, Node 24.16.0.
+The installer and both smoke launches succeeded using the standard cache and
+OS libraries, with no browser/core/library overrides for qualification.
+Production WASM: **10,713,719 bytes**, Brotli **2,665,834 bytes**, SHA-256
+`8dc5d6b0d6d7b2f526aa0a802e1b556ee4ec99bd2ad11bd450f934a743fb3001`.
+The production source, optimization and size ratchet were not changed.
+
+The required command sequence ran with `set -euo pipefail; ulimit -n 65536`:
+`env -u NO_COLOR make ui; make check; make test`. All succeeded: clippy had no
+warnings, test lint and size checks passed, and nextest reported **1,167 passed,
+2 skipped** (two slow tests passed). A final `make check` also passed.
+
+Three full invocations per engine are recorded for workspace-open and the
+comment-sheet/phone-picker/theme matrices, and three full default Chromium
+ring-render invocations. Motion qualification remains blocked, as explained
+below; this is **not three green passes of the combined browser runner**.
+
+| Suite | WebKit 2388 | Chromium 1254 / 158.0.8127.18 |
+| --- | --- | --- |
+| workspace-open | 3 complete passes, 12 viewport/platform scenarios | 3 complete passes, 12 scenarios |
+| comment-sheet | 3 complete passes, 24 cases | 3 complete passes, 24 cases |
+| phone-picker | 3 complete passes, 72 contexts | 3 complete passes, 72 contexts |
+| theme `--browser` | 3 complete passes, 276 reported PASS checks | 3 complete passes, 276 reported PASS checks |
+| ring-render | Not applicable: requires CDP; no WebKit result claimed | 3 complete passes, 18 default theme/workload runs, including tracing, blocked-main-thread and raster assertions |
+| motion | **0/3 complete passes**: failed after 6, 9 and 1 passing contexts respectively; 3 failing contexts retained | **0/3 complete passes**: each stopped on the first context's fields-panel invariant |
+
+**Observed WASM traps: zero** in these repeated cohorts and in the failed
+Motion/initial harness runs. This is an observed count, not a proof of universal
+engine reliability or a passing result for the independent failed assertions.
+
+The first runs exposed two stale harness assumptions, retained in the logs:
+workspace-open matched the secondary Sessions row's title as its entire
+accessible name, omitting its status/worker subtitle; motion dereferenced a
+lazy tool body before its native toggle mounted it. The exact row name now
+includes the subtitle (the count must still be one), and the geometry wait
+waits for the body before applying its unchanged expanded-height predicate.
+The tool failure reproduced alone; the corrected check passed in both engines.
+
+Additional tile-marks coverage initially timed out twice because Actions was
+looked up beneath the tile after its popover had moved into a body portal.
+The test now identifies exactly one newly mounted `data-pop` identity after
+clicking the intended tile's Actions, keeps that identity for Escape, and
+retains all availability/icon/resize/geometry/retained-node assertions. The
+complete four-case Chromium/WebKit light/dark matrix then passed.
+
+**Unresolved Motion interaction, not a WASM trap:** choosing an offered model
+can hide New Session's where/how fields before effort can be used. A diagnostic
+trace records native pointerdown/mousedown/mouseup/click on the intended
+`fixture-model-32` button, nested in both `data-pop` regions, followed by the
+fields becoming hidden and their opener changing from expanded to collapsed.
+The saved failure diagnostics have empty browser-error arrays. The same
+panel-open failure reproduced with the old **Playwright 1.50.1 / Chromium
+133.0.6943.16** as an explicitly labelled control against the same production
+WASM; it is not introduced solely by Chromium 158. WebKit also recorded
+fields/list-reopen and effort-selection hangs in the full runs. Isolated
+modelForms reruns of all three failed WebKit cases (dark/System,
+dark/Full-reduce and light/System-reduce) passed; those diagnostic reruns do
+not erase the failed full cohorts. No production fix or claim of a
+source-level cause is made here.
+
+The harness now explicitly requires the fields to remain expanded after both
+model and effort selection, rather than concealing dismissal behind a
+five-minute hidden-control wait. It never reopens the panel for the test,
+selects a hidden control, forces a click, retries a failed case, or filters
+modelForms out of the normal matrix. The requested three-green-full-pass
+qualification cannot be claimed while that independent failure remains.
+
+Supporting checks: motion VM/launcher **13 passed**, theme VM **12 passed**,
+crash VM **8 passed, 1 browser-only test skipped**, real-DOM motion helpers
+**6 passed**, plus syntax checks for all CJS files and the Bash runner. A
+stubbed runner check verified 33 suite invocations for three two-engine passes,
+the theme browser flag, Chromium-only ring selection, retained failure logs,
+and immediate propagation of a simulated exit 7 without retry.
+
+Raw evidence is local to the S2 worktree under `dist/s2-verification/`
+(installation, provenance, required/final checks, initial failures, isolated
+reruns and event diagnostic), `dist/s2-workspace/`,
+`dist/s2-{chromium,webkit}-additional/`, and `dist/s2-motion-blocker/`.
+Pass/engine/suite subdirectories preserve distinct cohorts. The earlier
+`dist/s2-{chromium,webkit}*` fail-fast runs are retained too, not overwritten
+or counted as clean passes. Explicit old-engine paths occur only in that
+labelled control command, never in the checked-in default setup.
+
+## Browser crashes: preserve the first failure (N5, updated S2)
+
+The shared production-browser fixture identifies a WebKit/WASM trap as a fatal
+failure and notes the old/new comparison above, not a proven source defect. It still
 rejects its crash promise, records every browser error, and fails every existing
 assertion. There is no expected-failure allowance or automatic successful retry.
 An `unreachable` trap can follow a Rust panic; inspect earlier console messages
@@ -482,7 +632,7 @@ selection and cache reuse.
 
 `crates/c6-ui/tests/motion.cjs` serves the built production UI on an owned
 loopback port, with fake HTTP and WebSocket head responses. It does not connect
-to your head, use your browser profile, or require an npm install. Build first
+to your head or use your browser profile. Install the pinned browsers above and build first
 (coordinate the build when sharing a worktree), then run with Node 24:
 
 ```sh
@@ -492,11 +642,10 @@ ENGINE=both /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/te
 ENGINE=both /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/motion.cjs --helpers
 ```
 
-The local defaults use `playwright-core` at
-`/home/zheilbron/.bun/install/cache/playwright-core@1.50.1@@@1`, Chromium at
-`/tmp/c7-chromium/chrome-linux/chrome`, and the WebKit wrapper
-`/tmp/c7-webkit.sh`. Elsewhere set `PLAYWRIGHT_CORE`, `CHROMIUM`, and
-`WEBKIT_EXECUTABLE`. `ROOT` overrides `crates/c6-ui/dist`. Missing browsers or
+Defaults resolve the locked test-local `playwright-core` and its matching
+installed browsers. `PLAYWRIGHT_CORE`, `CHROMIUM`, `WEBKIT_EXECUTABLE`, and
+`CHROMIUM_LIBS` remain explicit **diagnostic overrides**; do not use them for
+the pinned-engine qualification or CI. `ROOT` overrides `crates/c6-ui/dist`. Missing browsers or
 motion hooks fail explicitly; this standalone opt-in harness does not silently
 skip coverage. `--unit` needs only Node and reads the actual `js/motion.js` into
 isolated VM contexts: default/invalid choices, OS changes, explicit Full,
@@ -520,10 +669,8 @@ The glide VM regression checks its shared 200ms deadline, same-target
 deduplication, interruption from displayed position, immediate input/snap
 cancellation, preference changes, detached nodes, and three geometry reads per
 invocation with none in animation frames.
-Chromium also uses `/tmp/c7-browser-libs/usr/lib/x86_64-linux-gnu` when present
-for its local shared libraries; `CHROMIUM_LIBS` overrides that directory and
-the inherited `LD_LIBRARY_PATH` is preserved. The WebKit wrapper owns its own
-library environment.
+`CHROMIUM_LIBS`, if explicitly set, augments the inherited `LD_LIBRARY_PATH`;
+the default uses the OS libraries installed by Playwright, with no wrapper.
 `ISOLATE_BROWSER=1` additionally owns a fresh browser process per case, not
 just a fresh context. This is useful when diagnosing old WPE WebKit process
 reuse: it does not retry or suppress an error, and shared-process failures
@@ -681,7 +828,7 @@ and the document's SVG drawing are local fixtures. Each case gets private
 browser storage and a fresh browser process.
 
 Build in the worktree being tested, then run with Node 24 and Playwright Core
-1.50.1 (or a compatible installation). No npm install or UI rebuild occurs in
+1.65.0 from the locked install above. No npm install or UI rebuild occurs in
 the harness. The build requires Trunk, the WASM Rust target, Tailwind and
 `brotli` on PATH. Do not pipe `make ui` through `tail` without `pipefail`: a
 failed build must not silently test an older `dist`.

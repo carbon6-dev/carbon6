@@ -126,7 +126,7 @@ async function check(browser, origin, platform) {
 }
 
 async function main() {
-  const playwright = require(process.env.PLAYWRIGHT_CORE || '/home/zheilbron/.bun/install/cache/playwright-core@1.50.1@@@1');
+  const playwright = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
   const { server, origin } = await serve();
   let browser;
   try {

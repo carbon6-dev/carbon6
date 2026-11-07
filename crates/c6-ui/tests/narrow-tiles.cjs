@@ -184,7 +184,7 @@ async function splitPanes(page, theme) {
 
 async function main() {
   fs.mkdirSync(shots, { recursive: true });
-  const playwright = require(process.env.PLAYWRIGHT_CORE || '/home/zheilbron/.bun/install/cache/playwright-core@1.50.1@@@1');
+  const playwright = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
   const { server, origin } = await serve();
   let browser;
   const newFixture = async (viewport, theme, options = {}) => {

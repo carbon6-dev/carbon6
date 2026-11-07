@@ -230,7 +230,7 @@ test('synchronous fetch failure still shows exactly one reload banner', () => {
 const browserTest = process.env.CRASH_BROWSER === '1' ? test : test.skip;
 browserTest('production mounted markers: pending, focus, single-copy dedupe and close', { timeout: Number(process.env.C6_TEST_DEADLINE_SECS || 300) * 1000 }, async () => {
   const { serve, fixture, settle, launchBrowser } = require('./motion.cjs');
-  const playwright = require(process.env.PLAYWRIGHT_CORE || '/home/zheilbron/.bun/install/cache/playwright-core@1.50.1@@@1');
+  const playwright = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
   const { server, origin } = await serve();
   const motion = { choice: 'off', effective: 'off', os: 'no-preference' };
   const layout = {
