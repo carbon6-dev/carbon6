@@ -266,6 +266,7 @@ pub async fn answer(st: &HeadState, id: i64, a: &api::DecisionAnswer, via: &str)
     // Destinations are chosen at answer time, including for older cards.
     // The work writer checks that the target is open and in this realm.
     let task_destination = d.kind == "task" && reference.starts_with("task:") && option.is_some_and(|o| o.starts_with(TASK_TO_WORK_PREFIX));
+    let task_new_work = d.kind == "task" && reference.starts_with("task:") && option == Some(TASK_TO_NEW_WORK);
     match option {
         Some(o) if !task_destination && !d.options.iter().any(|x| x.label == o) => {
             return Err(bad_request(format!("{o:?} is not one of its options")));
@@ -285,7 +286,7 @@ pub async fn answer(st: &HeadState, id: i64, a: &api::DecisionAnswer, via: &str)
             return Err(bad_request(format!("{}: {s:?} is not one of its choices", f.name)));
         }
     }
-    if a.values.keys().any(|k| !d.form.iter().any(|f| &f.name == k)) {
+    if a.values.keys().any(|k| !(task_new_work && k == "work_title") && !d.form.iter().any(|f| &f.name == k)) {
         return Err(bad_request("answer only the fields it asks for"));
     }
     let answer = json!({"option": option, "values": a.values});
@@ -382,7 +383,14 @@ async fn act(
             }
             Some(TASK_HERE) => do_task_here(st, d).await?,
             Some(o) if matches!(o, TASK_TO_WORK | TASK_TO_NEW_WORK) || o.starts_with(TASK_TO_WORK_PREFIX) => {
-                let id = crate::work::keep_todo(st, d, o == TASK_TO_WORK, o.strip_prefix(TASK_TO_WORK_PREFIX)).await?;
+                // The name is data, never part of an action identifier. Old
+                // clients/cards without a name still use the card's title.
+                let title = if o == TASK_TO_NEW_WORK {
+                    values.get("work_title").map(|v| v.as_str().ok_or_else(|| bad_request("work_title must be text"))).transpose()?
+                } else {
+                    None
+                };
+                let id = crate::work::keep_todo(st, d, o == TASK_TO_WORK, o.strip_prefix(TASK_TO_WORK_PREFIX), title).await?;
                 let work = crate::work::get(st, &id, &Caller::root()).await?;
                 task_answer_message(
                     st,

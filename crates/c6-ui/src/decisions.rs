@@ -270,7 +270,7 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
             }
         });
     };
-    let answer = move |option: Option<String>| {
+    let submit = move |option: Option<String>, work_title: Option<String>| {
         let start_task = task && option.as_deref() == Some(TaskAction::Start.option());
         let mut fields = serde_json::Map::new();
         for (f, v) in values.get_value() {
@@ -278,6 +278,9 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
             if !text.trim().is_empty() {
                 fields.insert(f.name.clone(), json!(text));
             }
+        }
+        if let Some(title) = work_title {
+            fields.insert("work_title".into(), json!(title));
         }
         let a = c6_api::DecisionAnswer { option, values: fields, note: note.get_untracked() };
         busy.set(true);
@@ -300,6 +303,7 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
             busy.set(false);
         });
     };
+    let answer = move |option| submit(option, None);
     let start = move |_| {
         busy.set(true);
         spawn_local(async move {
@@ -382,7 +386,8 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
                 let session_title = Signal::derive(move || proposing.get().map(|s| s.title).filter(|t| !t.is_empty())
                     .or_else(|| task_session.get_value()).unwrap_or_else(|| "the proposing session".into()));
                 let work_title = Signal::derive(move || proposing.get().and_then(|s| s.work).map(|w| w.title));
-                view! { <TaskActions busy session_title work_title realm=d.realm.clone() answer=Callback::new(move |o| answer(Some(o))) /> }.into_any()
+                view! { <TaskActions busy session_title work_title card_title=d.title.clone() realm=d.realm.clone()
+                    answer=Callback::new(move |(o, title)| submit(Some(o), title)) /> }.into_any()
             } else { view! {
                 {values.get_value().into_iter().map(|(f, v)| {
                     let label = format!("{}{}", if f.label.is_empty() { f.name.clone() } else { f.label.clone() }, if f.required { " *" } else { "" });
@@ -516,11 +521,13 @@ fn TaskActions(
     busy: RwSignal<bool>,
     session_title: Signal<String>,
     work_title: Signal<Option<String>>,
+    card_title: String,
     realm: String,
-    answer: Callback<String>,
+    answer: Callback<(String, Option<String>)>,
 ) -> impl IntoView {
     let chooser = RwSignal::new(false);
     let realm = StoredValue::new(realm);
+    let card_title = StoredValue::new(card_title);
     let trigger = NodeRef::<leptos::html::Button>::new();
     let close = Callback::new(move |()| {
         chooser.set(false);
@@ -529,9 +536,9 @@ fn TaskActions(
         }
     });
     view! {
-        {task_actions(busy, session_title, work_title, answer, chooser, trigger)}
+        {task_actions(busy, session_title, work_title, Callback::new(move |o| answer.run((o, None))), chooser, trigger)}
         <Show when=move || chooser.get()>
-            <TaskWorkChooser busy realm=realm.get_value() answer=Callback::new(move |option| {
+            <TaskWorkChooser busy realm=realm.get_value() card_title=card_title.get_value() answer=Callback::new(move |option| {
                 close.run(());
                 answer.run(option);
             }) close />
@@ -574,14 +581,29 @@ fn task_actions(
 }
 
 #[component]
-fn TaskWorkChooser(busy: RwSignal<bool>, realm: String, answer: Callback<String>, close: Callback<()>) -> impl IntoView {
+fn TaskWorkChooser(
+    busy: RwSignal<bool>,
+    realm: String,
+    card_title: String,
+    answer: Callback<(String, Option<String>)>,
+    close: Callback<()>,
+) -> impl IntoView {
     let realm = StoredValue::new(realm);
     let works = LocalResource::new(move || api::task_work_list(realm.get_value()));
     let query = RwSignal::new(String::new());
     let search = NodeRef::<leptos::html::Input>::new();
+    let naming = RwSignal::new(false);
+    let title = RwSignal::new(card_title);
+    let name = NodeRef::<leptos::html::Input>::new();
     Effect::new(move || {
         if let Some(input) = search.get() {
             let _ = input.focus();
+        }
+    });
+    Effect::new(move || {
+        if let Some(input) = name.get() {
+            let _ = input.focus();
+            input.select();
         }
     });
     let rows =
@@ -597,10 +619,11 @@ fn TaskWorkChooser(busy: RwSignal<bool>, realm: String, answer: Callback<String>
                         <h2 class="flex-1 font-medium">"Save elsewhere"</h2>
                         <button class=format!("{BUTTON_QUIET} pointer-coarse:min-h-11") aria-label="Close" on:click=move |_| close.run(())>{crate::icons::x()}</button>
                     </div>
+                    <Show when=move || naming.get() fallback=move || view! {
                     <input node_ref=search class=format!("{INPUT} shrink-0") type="search" aria-label="Search open work" placeholder="Search open work…"
                         prop:value=move || query.get() on:input=move |ev| query.set(event_target_value(&ev)) />
                     <div class="min-h-0 overflow-y-auto">
-                        {task_work_choices(busy, rows, answer)}
+                        {task_work_choices(busy, rows, Callback::new(move |o| answer.run((o, None))), Callback::new(move |()| naming.set(true)))}
                         <Suspense fallback=|| view! { <p class="p-2 text-sm text-muted">"Loading work…"</p> }>
                             {move || works.get().map(|r| match r {
                                 Err(e) => view! { <ErrorBox message=e /> }.into_any(),
@@ -608,6 +631,25 @@ fn TaskWorkChooser(busy: RwSignal<bool>, realm: String, answer: Callback<String>
                             })}
                         </Suspense>
                     </div>
+                    }>
+                        <form class="min-h-0 space-y-3 overflow-y-auto" on:submit=move |ev| {
+                            ev.prevent_default();
+                            if !busy.get_untracked() && !title.with_untracked(|t| t.trim().is_empty()) {
+                                answer.run((TaskAction::SaveNew.option().into(), Some(title.get_untracked())));
+                            }
+                        }>
+                            <label class="block space-y-1 text-sm">
+                                <span>"Work name"</span>
+                                <input node_ref=name class=format!("{INPUT} w-full") type="text" aria-label="Work name"
+                                    prop:value=move || title.get() on:input=move |ev| title.set(event_target_value(&ev)) />
+                            </label>
+                            <div class="flex flex-wrap gap-2">
+                                <button type="submit" class=format!("{BUTTON} pointer-coarse:min-h-11")
+                                    disabled=move || busy.get() || title.with(|t| t.trim().is_empty())>"Create work"</button>
+                                <button type="button" class=format!("{BUTTON_QUIET} pointer-coarse:min-h-11") on:click=move |_| close.run(())>"Cancel"</button>
+                            </div>
+                        </form>
+                    </Show>
                 </div>
             </div>
         </leptos::portal::Portal>
@@ -623,10 +665,15 @@ fn task_work_options(works: &[c6_api::work::WorkItem], realm: &str, query: &str)
         .collect()
 }
 
-fn task_work_choices(busy: RwSignal<bool>, rows: Signal<Vec<(String, String)>>, answer: Callback<String>) -> impl IntoView {
+fn task_work_choices(
+    busy: RwSignal<bool>,
+    rows: Signal<Vec<(String, String)>>,
+    answer: Callback<String>,
+    new: Callback<()>,
+) -> impl IntoView {
     let class = "block w-full break-words rounded-md px-3 py-2 text-left text-sm hover:bg-zinc-100 disabled:opacity-50 pointer-coarse:min-h-11 dark:hover:bg-zinc-800";
     view! {
-        <button class=class disabled=move || busy.get() on:click=move |_| answer.run(TaskAction::SaveNew.option().into())>"New work"</button>
+        <button class=class disabled=move || busy.get() on:click=move |_| new.run(())>"New work"</button>
         <For each=move || rows.get() key=|(option, _)| option.clone() let:row>
             <button class=class disabled=move || busy.get() on:click=move |_| answer.run(row.0.clone())>{row.1}</button>
         </For>
@@ -922,7 +969,9 @@ mod tests {
         assert_eq!(task_work_options(&works, "home", " C6 "), all[..1]);
         assert!(task_work_options(&works, "home", "missing").is_empty());
         let owner = Owner::new();
-        let html = owner.with(|| untrack(|| task_work_choices(RwSignal::new(false), Signal::stored(all), Callback::new(|_| ())).to_html()));
+        let html = owner.with(|| {
+            untrack(|| task_work_choices(RwSignal::new(false), Signal::stored(all), Callback::new(|_| ()), Callback::new(|_| ())).to_html())
+        });
         assert_eq!(html.matches("New work").count(), 1);
         assert!(html.contains("Improve C6") && html.contains("Fix the pager"));
         assert_eq!(html.matches("<button").count(), 3);

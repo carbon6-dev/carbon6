@@ -1212,10 +1212,17 @@ pub async fn on_new_session(st: &HeadState, s: &api::Session, work: Option<&str>
 
 /// A task card kept as a to-do (docs/task-cards.md §4.1): added to the
 /// work its session belongs to (`into_session_work`), else to new work
-/// named after it. An explicit target must be open and in the card's realm
+/// named after it (or with the explicitly confirmed `new_title`). An explicit
+/// target must be open and in the card's realm
 /// (the answer endpoint already checks the caller can see that realm).
 /// Returns the work item's id.
-pub async fn keep_todo(st: &HeadState, d: &api::Decision, into_session_work: bool, destination: Option<&str>) -> anyhow::Result<String> {
+pub async fn keep_todo(
+    st: &HeadState,
+    d: &api::Decision,
+    into_session_work: bool,
+    destination: Option<&str>,
+    new_title: Option<&str>,
+) -> anyhow::Result<String> {
     let origin = d.context["session"].as_str().unwrap_or("").to_owned();
     let mut target = match destination {
         Some(id) => {
@@ -1253,7 +1260,7 @@ pub async fn keep_todo(st: &HeadState, d: &api::Decision, into_session_work: boo
             id
         }
         None => {
-            let mut f = WorkFields { title: check_title(&d.title)?, status: "open".into(), ..Default::default() };
+            let mut f = WorkFields { title: check_title(new_title.unwrap_or(&d.title))?, status: "open".into(), ..Default::default() };
             add_todo_to(&mut f, todo)?;
             insert(st, &d.realm, &f, &[], &crate::agent_ops::by("you")).await?
         }
@@ -2228,6 +2235,90 @@ pub(crate) mod tests {
             assert_eq!(mock.requests().last().unwrap()["model"], expected);
             assert_eq!(load(st, &id).await.unwrap().unwrap().fields.note.unwrap().next, expected);
         }
+        head.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn task_card_new_work_name_is_structured_validated_and_optional() {
+        let (_dir, head, _mock, original) = routing_fixture().await;
+        let st = &head.state;
+        let card_title = "Review \"quoted\" cards: \\ <config> & 日本語";
+        let card = crate::decisions::task_card(
+            st,
+            "session",
+            "task_propose",
+            &json!({"title": card_title, "prompt": "Review the config safely."}),
+        )
+        .await
+        .unwrap();
+        let id = card["id"].as_i64().unwrap();
+        let url = format!("http://127.0.0.1:{}/api/v1/decisions/{id}/answer", head.ui_addrs[0].port());
+        let http = reqwest::Client::new();
+        let initial = rows(st, Some(crate::realms::HOME), false).await.unwrap().len();
+        for value in [json!(null), json!(false), json!({"title": "bad"}), json!("  "), json!("x".repeat(MAX_TITLE + 1))] {
+            let response =
+                http.post(&url).json(&json!({"option": "Add as new work", "values": {"work_title": value}})).send().await.unwrap();
+            assert!(response.status().is_client_error(), "{}", response.text().await.unwrap());
+            assert_eq!(crate::decisions::get(st, id).await.unwrap().unwrap().state, "open");
+            assert_eq!(rows(st, Some(crate::realms::HOME), false).await.unwrap().len(), initial);
+        }
+        // This reserved field is accepted only for task-card New work.
+        let response =
+            http.post(&url).json(&json!({"option": "Add to this work", "values": {"work_title": "not allowed"}})).send().await.unwrap();
+        assert!(response.status().is_client_error());
+        let name = "My \"work\": \\ <script> & 日本語\nsecond line";
+        let response = http.post(&url).json(&json!({"option": "Add as new work", "values": {"work_title": name}})).send().await.unwrap();
+        assert!(response.status().is_success(), "{}", response.text().await.unwrap());
+        let saved = rows(st, Some(crate::realms::HOME), false).await.unwrap().into_iter().find(|w| w.fields.title == name).unwrap();
+        assert_eq!(saved.fields.todos.len(), 1);
+        let todo = &saved.fields.todos[0];
+        assert_eq!(todo.text, card_title, "the work name must not rename the selected card's to-do");
+        assert_eq!(todo.prompt, "Review the config safely.");
+        assert_eq!(todo.origin, "session");
+        assert_eq!(todo.from, format!("decision:{id}"));
+        assert!(load(st, &original).await.unwrap().unwrap().fields.todos.is_empty());
+        let answered = crate::decisions::get(st, id).await.unwrap().unwrap();
+        assert_eq!(answered.answer.unwrap()["values"]["work_title"], name);
+
+        // Old clients retain the existing option and card-title fallback.
+        let card = crate::decisions::task_card(st, "session", "task_propose", &json!({"title": "Legacy card", "prompt": "Keep it"}))
+            .await
+            .unwrap();
+        crate::decisions::answer(
+            st,
+            card["id"].as_i64().unwrap(),
+            &api::DecisionAnswer { option: Some(crate::decisions::TASK_TO_NEW_WORK.into()), ..Default::default() },
+            "test",
+        )
+        .await
+        .unwrap();
+        assert!(rows(st, Some(crate::realms::HOME), false).await.unwrap().iter().any(|w| w.fields.title == "Legacy card"));
+        let question = crate::decisions::open(
+            st,
+            &api::DecisionIn {
+                title: "Not a task".into(),
+                options: vec![api::DecisionOption { label: crate::decisions::TASK_TO_NEW_WORK.into(), ..Default::default() }],
+                ..Default::default()
+            },
+            crate::realms::HOME,
+            "",
+        )
+        .await
+        .unwrap();
+        assert!(
+            crate::decisions::answer(
+                st,
+                question.id,
+                &api::DecisionAnswer {
+                    option: Some(crate::decisions::TASK_TO_NEW_WORK.into()),
+                    values: serde_json::from_value(json!({"work_title": name})).unwrap(),
+                    ..Default::default()
+                },
+                "test"
+            )
+            .await
+            .is_err()
+        );
         head.shutdown().await.unwrap();
     }
 

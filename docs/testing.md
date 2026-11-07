@@ -1195,12 +1195,30 @@ while one refresh runs. All pickers retain native controls and drawn icons.
 
 ## Task card actions: manual phone check
 
+`task-work-name.cjs` is the production browser regression for Save elsewhere's
+New work confirmation. It checks the selected title seed, safe structured
+submission of quotes/backslashes/Unicode/markup-like text, Enter and button
+confirmation, empty-name prevention, Escape cancellation, reseeding on reopen,
+and unchanged existing-work actions. Run after `env -u NO_COLOR make ui`:
+
+```sh
+/home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/task-work-name.cjs
+```
+
+Both themes cover desktop, a narrow desktop tile and a phone. Evidence goes to
+`/tmp/n3-ui/item9` (`EVIDENCE` overrides it). `BEFORE=1 ROOT=...` asserts the
+old immediate submission and captures before screenshots; `ENGINES=webkit`
+selects the additional WebKit check. The head regression
+`work::tests::task_card_new_work_name_is_structured_validated_and_optional`
+checks the HTTP answer, validation without creating work, unchanged to-do
+contents, and compatibility with old unnamed answers.
+
 Check both a session transcript and Decisions, with a coarse pointer at 320px and 390px widths, and on desktop. Use a realm with several open work items and a closed one.
 
 1. The actions read **Start session**, **Do it here**, **Save for later**, **Not now** in that order. Only Start session is filled; the next two have identical visible outlines and heights. They share one wrapping row, with no split arrow or stray divider. Coarse-pointer targets are at least 44px tall; desktop buttons remain compact.
 2. Save for later's tooltip names the proposing session's work. Clicking it sends `Add to this work`, without a picker. With no work, it creates new work. Do it here's tooltip names the proposing session.
 3. **Save elsewhere…** opens over the workspace, not inside the card. Scroll the transcript so the card is directly above the message box, then open it again: the whole dialog remains visible, with a scrolling list rather than content clipped by the composer. Try light/dark mode and the phone keyboard.
-4. The chooser offers **New work** once and open work only in the card's realm. Search is case-insensitive. A nonmatching search shows an empty-state message but keeps New work available. The New work choice sends `Add as new work`; an existing work item sends `Add to work:<id>` and receives the card's title, prompt and origin as a to-do.
+4. The chooser offers **New work** once and open work only in the card's realm. Search is case-insensitive. A nonmatching search shows an empty-state message but keeps New work available. New work opens a focused, editable name seeded from the selected card title, without submitting. Enter or **Create work** sends `Add as new work` with `values.work_title`; Cancel or Escape sends nothing. An existing work item sends `Add to work:<id>` and receives the card's title, prompt and origin as a to-do.
 5. Close, outside click and Escape dismiss the chooser; Escape must not stop the session. Focus returns to Save elsewhere. A failed save leaves the card open with an error; all action buttons disable while a save is pending. Check the chooser with a long list and a long work title.
 6. With only task cards open, the transcript shows **Suggested tasks (N)** without an empty **Waiting for you** heading. Add a question or approval: Waiting for you returns. Answer the last non-task decision: its heading disappears while Suggested tasks stays.
 
