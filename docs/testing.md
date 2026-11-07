@@ -306,6 +306,36 @@ same Node/browser overrides as the motion harness. `BEFORE=1 ROOT=...` records
 the old build without enforcing the corrected geometry; `SCREENSHOTS` defaults
 to `/tmp/n3-ui/item1`. Every fixture uses its own loopback head and browser.
 
+### Transcript pointer and keyboard focus
+
+```sh
+ENGINE=both SCREENSHOTS=/tmp/n3-ui/item5 node crates/c6-ui/tests/transcript-focus.cjs
+```
+
+Build the production UI first (`env -u NO_COLOR make ui`); Node 24, browser
+paths and `ROOT` use the motion harness overrides below. The owned loopback
+fixture checks both themes on desktop, a four-tile workspace (under 400px per
+tile), and 390/320px DSF-2 phones. Mouse/touch on transcript text and returning
+from the composer must not create a transcript outline. Clicking an already
+keyboard-focused transcript can retain the browser's native keyboard cue;
+that mixed-input state is captured separately. Moving pointer focus away and
+back must clear it. Phone status open/close (Close, outside tap and Escape)
+and session-sheet open/close must not focus-outline the transcript either.
+Native Shift+Tab traversal, Home, PageDown, PageUp and End retain a painted
+keyboard cue and working keyboard scrolling, including across background-task
+updates.
+Screenshots and computed focus/outline JSON distinguish these input modes;
+`ENGINE`, `THEME` and `VIEWPORT` can select a diagnostic subset.
+Each scenario owns a fresh browser process as well as its context; startup
+errors fail rather than being retried or suppressed.
+
+The white outline in the Q11 `phone-dark-reduced-390-dsf2-background-12.png`
+capture is inherited keyboard-test focus, not a touch/status interaction:
+`ring-render.cjs`'s `phoneStatusRow` ends by explicitly focusing its transcript
+and pressing End, then the same page is resized for the next width's captures.
+Do not remove the scroll container's native keyboard focus indicator to hide
+that test state. No production focus or styling change is needed for it.
+
 ### Transcript layout steps
 
 After `env -u NO_COLOR make ui`, run the owned loopback production fixture:
