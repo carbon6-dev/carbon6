@@ -108,7 +108,7 @@ pub fn SessionPane(id: String, pane: Pane, #[prop(optional)] output: String) -> 
         let chosen = RwSignal::new(Some(output).filter(|o| !o.is_empty()));
         return view! {
             <ScrollBox>
-                <div class="px-4 py-3"><crate::outputs::Outputs session=id events=feed.events chosen /></div>
+                <div class="px-4 py-3"><crate::outputs::Outputs session=id events=feed.events synced=feed.synced chosen /></div>
             </ScrollBox>
         }
         .into_any();

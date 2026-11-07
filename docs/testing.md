@@ -120,6 +120,29 @@ The normal desktop mode also checks singular/plural task and server labels,
 including mixed counts, after its measured workload; its spinner and chevron
 must remain mounted while the wording changes.
 
+## Published files: root replay, loading and versions
+
+After building, `node crates/c6-ui/tests/outputs.cjs` checks independent
+transcript/Outputs feeds of the same root session in light/dark desktop,
+narrow-tile and phone layouts. It withholds the Outputs feed's `Synced` while
+the transcript already has its Published row: pending replay must say loading,
+not “Nothing published yet”. After replay, republishing an old filename must
+bring it to the top and make it the default preview; older titles and content
+remain selectable as versions. Long version titles must not widen the control
+past its pane; the two-column layout follows the pane's container width, not
+the desktop window. A live root publication must also appear.
+`BEFORE=1 ROOT=/path/to/base/dist` reproduces the old false-empty message and
+first-publication ordering. `ENGINE=webkit`, `THEMES`, `VIEWS` and `SCREENSHOTS`
+select the browser, cases and private evidence directory.
+
+The worker integration test
+`subagents::normal_subagent_publication_replays_to_independent_root_subscribers`
+uses a real task/publish flow and two head WebSockets to check that a normal
+subagent publishes into the root log, not its child log, and that old Output
+events survive tail summaries. No child aggregation is needed. These are
+confirmed UI replay/order cases, not a claim to have diagnosed a particular
+live session's missing deliverable; that original incident remains unconfirmed.
+
 ## Content-fitted desktop header
 
 The desktop header uses measured item widths, not an `xl` navigation cutoff.
