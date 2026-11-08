@@ -1,5 +1,7 @@
 //! Background task lifecycle history and read-only stream inspection.
 
+use std::collections::HashMap;
+
 use c6_api::{Event, EventKind, Session, SessionStatus, TurnEndReason};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -87,37 +89,56 @@ impl Task {
 /// Latest lifecycle record for every known task; running tasks come first.
 /// No worker request is needed, including for ended or lost tasks.
 fn lifecycle(events: &[Event]) -> Vec<Task> {
-    let mut out: Vec<Task> = Vec::new();
+    let mut latest: HashMap<&str, Task> = HashMap::new();
     for e in events {
         if let EventKind::BackgroundTask { task_id, kind, description, state, exit_code, elapsed_ms, notify, native_type, foreground } =
             &e.kind
         {
-            let before = out.iter().find(|t| &t.id == task_id);
+            let before = latest.get(task_id.as_str());
             let since = before.map(|t| t.since).unwrap_or(e.ts);
             // Started again: a new run, unless it was running (Claude Code
             // moved it to the background).
             let since = if state == "started" && !before.is_some_and(Task::running) { e.ts } else { since };
             let since_seq =
                 if state == "started" && !before.is_some_and(Task::running) { e.seq } else { before.map_or(e.seq, |t| t.since_seq) };
-            out.retain(|r| &r.id != task_id);
-            out.push(Task {
-                id: task_id.clone(),
-                kind: kind.clone(),
-                description: description.clone(),
-                since,
-                since_seq,
-                updated_at: e.ts,
-                state: state.clone(),
-                exit_code: *exit_code,
-                elapsed_ms: *elapsed_ms,
-                notify: *notify,
-                native_type: native_type.clone(),
-                foreground: *foreground,
-            });
+            latest.insert(
+                task_id,
+                Task {
+                    id: task_id.clone(),
+                    kind: kind.clone(),
+                    description: description.clone(),
+                    since,
+                    since_seq,
+                    updated_at: e.ts,
+                    state: state.clone(),
+                    exit_code: *exit_code,
+                    elapsed_ms: *elapsed_ms,
+                    notify: *notify,
+                    native_type: native_type.clone(),
+                    foreground: *foreground,
+                },
+            );
         }
     }
-    out.sort_by_key(|t| !t.running());
-    out
+    // Walking back finds each task's last record first. Reverse each group
+    // to retain last-record order, with running tasks still ahead of ended.
+    let mut running = Vec::new();
+    let mut ended = Vec::new();
+    for e in events.iter().rev() {
+        if let EventKind::BackgroundTask { task_id, .. } = &e.kind
+            && let Some(task) = latest.remove(task_id.as_str())
+        {
+            if task.running() {
+                running.push(task);
+            } else {
+                ended.push(task);
+            }
+        }
+    }
+    running.reverse();
+    ended.reverse();
+    running.extend(ended);
+    running
 }
 
 pub fn elapsed(ms: i64) -> String {
@@ -146,8 +167,8 @@ fn running_counts(events: &[Event]) -> (usize, usize) {
 /// A carbon6 background subagent also has a task record: count it once.
 /// Claude's read-only mirrors are represented by its native task records,
 /// whose foreground flag tells us whether they really run in the background.
-pub(crate) fn background_count(events: &[Event], subagents: &[Session]) -> usize {
-    jobs(events, subagents).iter().filter(|j| j.task.running()).count()
+pub(crate) fn background_count(jobs: &[Job]) -> usize {
+    jobs.iter().filter(|j| j.task.running()).count()
 }
 
 /// One identity, with the latest run's state and all its task IDs. A resume
@@ -165,55 +186,61 @@ fn native_identity(id: &str) -> Option<String> {
     Some(format!("claude:{}", serde_json::to_string(parts.get(..2)?).ok()?))
 }
 
-fn jobs(events: &[Event], children: &[Session]) -> Vec<Job> {
+pub(crate) fn jobs(events: &[Event], children: &[Session]) -> Vec<Job> {
     // A log can straddle the worker upgrade that began linking native
     // mirrors. Resolve all explicit scope/task aliases before grouping so
     // unlinked runs share the linked child's identity in either order.
     // If runs have different mirrors, the latest explicit link by event
     // sequence chooses their representative child, even for exact links.
-    let mut native_children: std::collections::HashMap<String, (u64, String)> = std::collections::HashMap::new();
+    let mut spawns: HashMap<&str, (&str, bool)> = HashMap::new();
+    let mut task_children: HashMap<&str, &str> = HashMap::new();
+    let mut native_children: HashMap<String, (u64, &str)> = HashMap::new();
     for e in events {
-        if let EventKind::SubagentSpawned { child_session_id, background_task_id, .. } = &e.kind
-            && let Some(id) = native_identity(background_task_id)
-        {
-            let linked = native_children.entry(id).or_insert_with(|| (e.seq, child_session_id.clone()));
-            if e.seq > linked.0 {
-                *linked = (e.seq, child_session_id.clone());
+        if let EventKind::SubagentSpawned { child_session_id, background_task_id, description, .. } = &e.kind {
+            // Description and exact task links keep their first log match;
+            // any foreground-only spawn excludes a child-only fallback.
+            let spawn = spawns.entry(child_session_id).or_insert((description, false));
+            spawn.1 |= background_task_id.is_empty();
+            task_children.entry(background_task_id).or_insert(child_session_id);
+            if let Some(id) = native_identity(background_task_id) {
+                let linked = native_children.entry(id).or_insert((e.seq, child_session_id));
+                if e.seq > linked.0 {
+                    *linked = (e.seq, child_session_id);
+                }
             }
         }
     }
+    let mut children_by_id = HashMap::new();
+    for child in children {
+        children_by_id.entry(child.id.as_str()).or_insert(child);
+    }
     let mut out: Vec<Job> = Vec::new();
+    let mut job_indices: HashMap<String, usize> = HashMap::new();
     for task in lifecycle(events).into_iter().filter(|t| !t.foreground) {
         let native = native_identity(&task.id);
-        let child_id = native.as_ref().and_then(|id| native_children.get(id).map(|(_, child)| child.clone())).or_else(|| {
-            events.iter().find_map(|e| match &e.kind {
-                EventKind::SubagentSpawned { child_session_id, background_task_id, .. } if background_task_id == &task.id => {
-                    Some(child_session_id.clone())
-                }
-                _ => None,
-            })
-        });
-        let id = child_id.clone().or(native).unwrap_or_else(|| task.id.clone());
-        if let Some(job) = out.iter_mut().find(|j| j.id == id) {
+        let child_id = native
+            .as_ref()
+            .and_then(|id| native_children.get(id).map(|(_, child)| *child))
+            .or_else(|| task_children.get(task.id.as_str()).copied());
+        let id = child_id.map(str::to_owned).or(native).unwrap_or_else(|| task.id.clone());
+        if let Some(&index) = job_indices.get(&id) {
+            let job = &mut out[index];
             job.task_ids.push(task.id.clone());
             if task.since_seq >= job.task.since_seq {
                 job.task = task;
             }
         } else {
-            let child = child_id.as_ref().and_then(|id| children.iter().find(|s| &s.id == id)).cloned();
+            let child = child_id.and_then(|id| children_by_id.get(id)).copied().cloned();
+            job_indices.insert(id.clone(), out.len());
             out.push(Job { id, task_ids: vec![task.id.clone()], task, child });
         }
     }
     for child in children.iter().filter(|s| !s.observed) {
-        if out.iter().any(|j| j.id == child.id) {
+        if job_indices.contains_key(&child.id) {
             continue;
         }
         // A known foreground-only spawn belongs to the transcript, not here.
-        let foreground = events.iter().any(|e| {
-            matches!(&e.kind,
-            EventKind::SubagentSpawned { child_session_id, background_task_id, .. }
-                if child_session_id == &child.id && background_task_id.is_empty())
-        });
+        let foreground = spawns.get(child.id.as_str()).is_some_and(|(_, foreground)| *foreground);
         if foreground {
             continue;
         }
@@ -228,6 +255,7 @@ fn jobs(events: &[Event], children: &[Session]) -> Vec<Job> {
                 _ => "finished",
             }
         };
+        job_indices.insert(child.id.clone(), out.len());
         out.push(Job {
             id: child.id.clone(),
             child: Some(child.clone()),
@@ -249,10 +277,7 @@ fn jobs(events: &[Event], children: &[Session]) -> Vec<Job> {
         });
     }
     for job in &mut out {
-        let original = events.iter().find_map(|e| match &e.kind {
-            EventKind::SubagentSpawned { child_session_id, description, .. } if child_session_id == &job.id => Some(description.clone()),
-            _ => None,
-        });
+        let original = spawns.get(job.id.as_str()).map(|(description, _)| (*description).to_owned());
         if job.child.is_some() || original.is_some() {
             if job.task.kind != "claude_code" {
                 job.task.kind = "agent".into();
@@ -282,10 +307,7 @@ pub(crate) enum Page {
 }
 
 pub(crate) fn job_list(chrome: crate::session::SessionChrome) -> Memo<Vec<Job>> {
-    Memo::new(move |_| {
-        let rows = chrome.subagents.rows().into_iter().map(|(s, _)| s).collect::<Vec<_>>();
-        chrome.events.with(|e| jobs(e, &rows))
-    })
+    chrome.jobs
 }
 
 pub(crate) fn history_label(list: &[Job]) -> String {
@@ -604,6 +626,10 @@ pub fn ended_line(task_id: &str, kind: &str, description: &str, state: &str, exi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn background_count(events: &[Event], subagents: &[Session]) -> usize {
+        super::background_count(&jobs(events, subagents))
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
@@ -1117,6 +1143,152 @@ mod tests {
         assert!(list.iter().any(|j| j.id == "other-scope" && j.task.id == other_scope));
         assert!(list.iter().any(|j| j.id == "other-task" && j.task.id == other_task));
         assert_eq!(background_count(&events, &children), 3);
+    }
+
+    #[test]
+    fn indexed_spawns_keep_first_exact_link_and_description_and_any_foreground_marker() {
+        let children = [
+            child_session("first", " ", "running", false),
+            child_session("later", "Later mirror", "running", true),
+            child_session("foreground", "Foreground", "running", false),
+        ];
+        let events = [
+            spawn_event(1, "first", "task", "Original description"),
+            spawn_event(2, "later", "task", "Later link"),
+            spawn_event(3, "first", "continuation", "Later description"),
+            spawn_event(4, "foreground", "unrecorded", "Background first"),
+            spawn_event(5, "foreground", "", "Foreground later"),
+            agent(6, "task", "started", "Task description"),
+        ];
+        let list = jobs(&events, &children);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, "first", "exact task links keep their first event match");
+        assert_eq!(list[0].task.description, "Original description", "a blank child title uses the first spawn description");
+        assert_eq!(list[0].task.id, "task");
+    }
+
+    #[test]
+    fn indexed_native_aliases_choose_highest_sequence_not_last_position_and_keep_first_tie() {
+        let old = r#"claude:["scope","task","old"]"#;
+        let latest = r#"claude:["scope","task","latest"]"#;
+        let children = [
+            child_session("new-mirror", "Newest", "running", true),
+            child_session("old-mirror", "Old", "idle", true),
+            child_session("tied-mirror", "Tied", "running", true),
+        ];
+        let events = [
+            spawn_event(20, "new-mirror", latest, "Newest"),
+            spawn_event(10, "old-mirror", old, "Old"),
+            spawn_event(20, "tied-mirror", old, "Tied"),
+            native(2, old, "finished", "local_agent", false),
+            native(4, latest, "started", "local_agent", false),
+        ];
+        let list = jobs(&events, &children);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, "new-mirror");
+        assert_eq!(list[0].task.id, latest, "alias selection preserves the latest run's real Stop target");
+        assert_eq!(list[0].task_ids.len(), 2);
+    }
+
+    #[test]
+    fn long_history_merges_native_runs_excludes_foreground_children_and_keeps_original_descriptions() {
+        const LANES: usize = 96;
+        const RUNS: usize = 8;
+        let mut events = Vec::new();
+        let mut children = Vec::new();
+        for lane in 0..LANES {
+            let old_mirror = format!("old-mirror-{lane}");
+            let mirror = format!("mirror-{lane}");
+            let child = format!("child-{lane}");
+            let foreground = format!("foreground-{lane}");
+            children.extend([
+                child_session(&old_mirror, "Same title", "idle", true),
+                child_session(&mirror, " ", if lane % 3 == 0 { "idle" } else { "running" }, true),
+                child_session(&child, " ", if lane % 2 == 0 { "idle" } else { "running" }, false),
+                child_session(&foreground, "Same title", "running", false),
+            ]);
+            for run in 0..RUNS {
+                let task = format!(r#"claude:["scope-{}","agent-{}","run-{run}"]"#, lane / 4, lane % 4);
+                let linked = if run < RUNS / 2 { &old_mirror } else { &mirror };
+                let description = if run == 0 || run == RUNS / 2 {
+                    format!("Original native description {lane}")
+                } else {
+                    format!("continue native {lane}")
+                };
+                let seq = events.len() as u64 + 1;
+                events.extend([spawn_event(seq, linked, &task, &description), native(seq + 1, &task, "started", "local_agent", false)]);
+                if run + 1 < RUNS || lane % 3 == 0 {
+                    events.push(native(seq + 2, &task, if run + 1 < RUNS { "failed" } else { "finished" }, "local_agent", false));
+                }
+            }
+            let first = format!("ordinary-{lane}-first");
+            let latest = format!("ordinary-{lane}-latest");
+            let seq = events.len() as u64 + 1;
+            events.extend([
+                spawn_event(seq, &child, &first, &format!("Original child description {lane}")),
+                agent(seq + 1, &first, "started", "Original task"),
+                agent(seq + 2, &first, "failed", "Original task"),
+                spawn_event(seq + 3, &child, &latest, "continue child"),
+                agent(seq + 4, &latest, "started", "continue child"),
+            ]);
+            if lane % 2 == 0 {
+                events.push(agent(seq + 5, &latest, "finished", "continue child"));
+            }
+            let seq = events.len() as u64 + 1;
+            events.extend([
+                spawn_event(seq, &foreground, "", "Foreground only"),
+                native(seq + 1, &format!("foreground-command-{lane}"), "started", "local_bash", true),
+            ]);
+            for turn in 0..16 {
+                let seq = events.len() as u64 + 1;
+                events.push(Event {
+                    seq,
+                    ts: seq as i64 * 1000,
+                    kind: EventKind::Assistant {
+                        turn,
+                        blocks: vec![c6_api::ContentBlock::Text { text: format!("Update {lane}/{turn}"), citations: Vec::new() }],
+                        stop_reason: "end_turn".into(),
+                    },
+                });
+            }
+        }
+        assert!(events.len() > 4000, "exercise a long log without a timing-dependent assertion");
+        let list = jobs(&events, &children);
+        assert_eq!(list.len(), LANES * 2, "native mirrors and foreground children must not become extra jobs");
+        let by_id: HashMap<_, _> = list.iter().map(|job| (job.id.as_str(), job)).collect();
+        for lane in 0..LANES {
+            let native = by_id[format!("mirror-{lane}").as_str()];
+            assert_eq!(native.task.id, format!(r#"claude:["scope-{}","agent-{}","run-{}"]"#, lane / 4, lane % 4, RUNS - 1));
+            assert_eq!(native.task.kind, "claude_code");
+            assert_eq!(native.task_ids.len(), RUNS);
+            assert_eq!(native.task.running(), lane % 3 != 0);
+            assert_eq!(native.task.description, format!("Original native description {lane}"));
+            let ordinary = by_id[format!("child-{lane}").as_str()];
+            assert_eq!(ordinary.task.id, format!("ordinary-{lane}-latest"));
+            assert_eq!(ordinary.task_ids.len(), 2);
+            assert_eq!(ordinary.task.running(), lane % 2 != 0);
+            assert_eq!(ordinary.task.description, format!("Original child description {lane}"));
+        }
+        assert_eq!(super::background_count(&list), LANES / 3 * 2 + LANES / 2);
+        assert_eq!(history_label(&list), "History", "earlier failed attempts must not leak into current outcomes");
+    }
+
+    #[test]
+    fn job_surfaces_and_background_count_share_the_session_memos() {
+        let tasks = include_str!("tasks.rs");
+        let access = tasks.split("pub(crate) fn job_list(").nth(1).unwrap().split("\n}").next().unwrap();
+        assert!(access.contains("chrome.jobs"));
+        assert!(!access.contains("Memo::new") && !access.contains(".get("), "return the same memo, not a new reducer or cloned list");
+        let source = include_str!("session.rs");
+        let constructor =
+            source.split("let jobs = Memo::new(move |_| {").nth(1).unwrap().split("let chrome = SessionChrome {").next().unwrap();
+        assert!(constructor.contains("subagents.rows()") && constructor.contains("events.with(|evs| crate::tasks::jobs(evs, &rows))"));
+        assert!(constructor.contains("let background = Memo::new(move |_| jobs.with(|list| crate::tasks::background_count(list)))"));
+        assert!(!constructor.contains(".get("), "the background count borrows the shared list without cloning");
+        let count = source.split("fn phone_background_count(").nth(1).unwrap().split("\n}").next().unwrap();
+        assert!(count.contains("chrome.background.get()"));
+        assert!(!count.contains("jobs(") && !count.contains("events.with") && !count.contains("subagents.rows()"));
+        assert!(source.contains("pub(crate) jobs: Memo<Vec<crate::tasks::Job>>"));
     }
 
     #[test]

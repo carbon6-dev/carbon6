@@ -862,6 +862,11 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             catch_sheet.set(false);
         }
     });
+    let jobs = Memo::new(move |_| {
+        let rows = subagents.rows().into_iter().map(|(s, _)| s).collect::<Vec<_>>();
+        events.with(|evs| crate::tasks::jobs(evs, &rows))
+    });
+    let background = Memo::new(move |_| jobs.with(|list| crate::tasks::background_count(list)));
     let chrome = SessionChrome {
         token: SessionChrome::next_token(),
         id: id_stored,
@@ -879,6 +884,8 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         connection: Signal::derive(move || choice.current.with(|(c, _, _)| c.clone())),
         git,
         subagents,
+        jobs,
+        background,
         running: Signal::derive(running),
         waiting,
         root: meta_root,
@@ -1273,6 +1280,10 @@ pub struct SessionChrome {
     pub(crate) connection: Signal<String>,
     pub(crate) git: LocalResource<Option<(usize, String)>>,
     pub(crate) subagents: SubagentTree,
+    /// One job history shared by every surface in the pane.
+    pub(crate) jobs: Memo<Vec<crate::tasks::Job>>,
+    /// One background-job count shared by the pane's status consumers.
+    background: Memo<usize>,
     /// A turn is running.
     pub(crate) running: Signal<bool>,
     /// Its decisions/cards and approvals/questions throughout its subagents.
@@ -2772,8 +2783,7 @@ fn phone_status_row(state: PhoneStatusState, show: Callback<()>, status: Signal<
 }
 
 fn phone_background_count(chrome: SessionChrome) -> usize {
-    let rows = chrome.subagents.rows().into_iter().map(|(s, _)| s).collect::<Vec<_>>();
-    chrome.events.with(|evs| crate::tasks::background_count(evs, &rows))
+    chrome.background.get()
 }
 
 /// The most recent turn, not the most recent error anywhere in the transcript.
