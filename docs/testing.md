@@ -1,5 +1,86 @@
 # Tests that fail only when something is wrong
 
+## Background work and typing benchmark (S15)
+
+`crates/c6-ui/tests/background-work.cjs` serves production WASM on a private
+loopback origin with fake head HTTP/WebSockets. It never touches a live head,
+browser profile or settings. See `docs/background-work.md` for the complete
+baseline inventory, protocol, measurements and caveats. No runtime change
+qualified in the bounded S15 release investigation; production remains exact
+`8a5ac826`. The new file is an audit/benchmark, not a performance fix.
+
+Build with `set -euo pipefail; ulimit -n 65536; env -u NO_COLOR make ui`.
+Using Node 24 and the same pinned Chromium/Playwright setup as `motion.cjs`:
+
+```sh
+EVIDENCE=/tmp/s15-bg LABEL=after node crates/c6-ui/tests/background-work.cjs
+EVIDENCE=/tmp/s15-bg LABEL=after-live STREAMING=1 node crates/c6-ui/tests/background-work.cjs
+# Independently saved baseline production dist, same benchmark:
+ROOT=/tmp/s15-bg/before-dist LABEL=before BASELINE=1 node crates/c6-ui/tests/background-work.cjs
+ROOT=/tmp/s15-bg/before-dist LABEL=before-live BASELINE=1 STREAMING=1 node crates/c6-ui/tests/background-work.cjs
+# Controlled repeats against immutable production builds: five pairs for each
+# scenario, alternating order, fresh serial browsers, no idle extrapolation.
+EVIDENCE=/tmp/background-repeat LABEL=repeat PAIRS=5 \
+  BASE_ROOT=/path/to/pinned-baseline/dist FINAL_ROOT=/path/to/candidate/dist \
+  node crates/c6-ui/tests/background-work.cjs
+```
+
+Each run warms up for 15 s, measures a real 60 s idle window, then types 200
+characters with 40 ms pacing under 4x CDP CPU throttling. The live control also
+delivers exactly 200 chunks at 20 Hz after a rich-Markdown prefix and waits for
+the trailing final chunk to render. The producer starts inside the measured
+typing window, and live Markdown mutations are a positive control for the
+observer used to assert that quiet draft input does not rewrite history.
+Playwright waits for each key's acknowledgements; 40 ms is the requested hold,
+not an independent fixed arrival schedule. Keep measured wall time and raw key
+timestamps alongside latency, and do not interpret the proxy as hardware INP.
+The saved JSON has request paths, timer
+callbacks, long tasks, approximate key-to-render latency and CDP task/script
+time. CPU profiles and a DevTools timeline are saved beside it. These durations
+are measurement windows, not sleeps used as correctness completion barriers.
+
+`PAIRS` requires at least five and defaults to both quiet/live scenarios. Six
+pairs balance which build goes first. The driver hashes both WASM builds, records
+trial order/host/load/status, and reports per-build medians/ranges and within-pair
+differences. Repeats use the same 15 s warmup and typing/stream workload but omit
+the full-minute idle phase (`TYPING_ONLY=1`); measure idle separately with the
+ordinary commands above. Do not pool them with old full-mode single trials.
+`SCENARIOS=live` selects a separately labelled live-only ablation. Repeated
+children use `MEASURE_ONLY=1`, skipping post-measure behavioral assertions, not
+the 200-key/final-stream-tail/error checks. Run full mode against the final build
+as well to verify behavior. Never compile, test, or run another browser alongside
+timed trials.
+
+For the final S15 exclusive timing slot, sample `vmstat 1 31` before each batch,
+discard its first since-boot row, and require all 30 one-second samples to show
+at least 95% idle CPU and a run queue no greater than four. The coordinator
+amended the original ceiling of two before any isolated ablation trial, after
+eight rejected windows established a normal host-service floor of three/four;
+the original cohorts and rejected windows retain their original classification.
+The amendment, scripts and accepted windows are under `/tmp/s15-bg/ablation/`.
+Inspect `ps -e` across
+all users for compilers, tests and browsers before sampling. Retain failed gate
+windows as well as the accepted one. Record load averages too, but do not call
+an elevated, slowly decaying load average proof of current CPU contention.
+This is a measurement-environment gate, not an application performance threshold.
+
+The committed harness reports timings without performance pass/fail thresholds;
+the external bounded release screen uses its separately documented, predeclared
+retention rule. Default behavioral controls cover no
+ordinary-key mention/suggestion/model/message calls, no quiet transcript Markdown
+mutations, complete draft retention, all 200 stream chunks/final text and no
+browser errors. `EXPERIMENTAL_POLICIES=visible-counters` additionally checks
+the discarded candidate's counter invalidation/sharing and visible-owned
+fallback/pane-transition policy against its pinned artifact; those policies
+are not required of baseline production and this mode is off by default.
+Work still has duplicate resources and broad snapshot invalidation. Its
+event/shared-query experiment and extended editor-race regression remain in
+discarded patches/artifacts, not the baseline suite.
+Document visibility state is injected for the deterministic
+scheduling regression; it is not a real Android backgrounding or browser
+timer-throttling measurement. Pane checks use real workspace controls and viewport
+changes. Existing workspace/phone regressions exercise navigation separately.
+
 Status: rules in force (2026-10-19); `make check` enforces what a pattern can catch (`scripts/test-lint.sh`).
 
 ## Safe HTML in UI Markdown

@@ -883,3 +883,9 @@ Unused Debug derives do not explain significant retained code. Panic/crash
 diagnostics, static help/icon tables and stable sorting remain intact.
 Offline second-pass convergence saves only **434 Brotli bytes** (Os: 1,289),
 so no optimizer/linker/profile changes are retained on that evidence.
+
+## Background activity and long-stream typing (S15)
+
+See [the background-work audit](background-work.md) for the pinned baseline
+inventory, production typing/idle protocol, measured comparisons, function/module
+attribution, visibility policy, regression coverage and remaining decisions.
