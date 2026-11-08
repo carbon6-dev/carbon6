@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 
+use futures::future::LocalBoxFuture;
 use leptos::prelude::*;
 
 use crate::api;
@@ -64,7 +65,25 @@ pub fn connections() -> Connections {
 #[inline(never)]
 #[track_caller]
 pub fn setting(name: &'static str) -> LocalResource<Result<serde_json::Value, String>> {
-    LocalResource::new(move || api::get_setting(name))
+    local(move || api::get_setting(name))
+}
+
+/// A fresh caller-owned resource with construction shared by result type.
+/// Invoke the fetcher synchronously so its dependency reads stay tracked;
+/// boxing the returned future must not delay them inside another async block.
+#[track_caller]
+pub fn local<T, Fut>(fetcher: impl Fn() -> Fut + 'static) -> LocalResource<T>
+where
+    T: 'static,
+    Fut: Future<Output = T> + 'static,
+{
+    local_boxed(Box::new(move || Box::pin(fetcher())))
+}
+
+#[inline(never)]
+#[track_caller]
+fn local_boxed<T: 'static>(fetcher: Box<dyn Fn() -> LocalBoxFuture<'static, T>>) -> LocalResource<T> {
+    LocalResource::new(fetcher)
 }
 
 /// A header can join an initial pane read, without accepting an old answer
@@ -133,6 +152,46 @@ pub fn session(id: String) -> SessionData {
 mod tests {
     use super::*;
     use leptos::reactive::graph::ToAnySource;
+
+    #[test]
+    fn boxed_resources_keep_distinct_values_and_caller_cleanup() {
+        let parent = Owner::new();
+        parent.with(|| {
+            let first = local(|| async { 1u32 });
+            let second = local(|| async { 2u32 });
+            assert_ne!(first.to_any_source(), second.to_any_source());
+            first.set(Some(3));
+            second.set(Some(4));
+            let child = Owner::new();
+            let child_read = child.with(|| local(|| async { 1u32 }));
+            assert_ne!(first.to_any_source(), child_read.to_any_source());
+            child.cleanup();
+            assert!(child_read.is_disposed());
+            assert_eq!(first.get_untracked(), Some(3));
+            assert_eq!(second.get_untracked(), Some(4));
+        });
+    }
+
+    #[test]
+    fn boxed_resource_invokes_fetcher_synchronously_without_polling_body() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let invoked = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            let polled = std::rc::Rc::new(std::cell::Cell::new(false));
+            let calls = invoked.clone();
+            let body = polled.clone();
+            let _value = local(move || {
+                calls.set(calls.get() + 1);
+                let body = body.clone();
+                async move {
+                    body.set(true);
+                    1u8
+                }
+            });
+            assert_eq!(invoked.get(), 1);
+            assert!(!polled.get());
+        });
+    }
 
     #[test]
     fn same_name_settings_are_distinct_caller_resources() {

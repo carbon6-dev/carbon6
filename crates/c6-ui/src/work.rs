@@ -51,7 +51,7 @@ fn open_work() -> (OpenWork, RwSignal<u32>) {
             h.clear();
         }
     });
-    let list = LocalResource::new(move || {
+    let list = crate::resources::local(move || {
         tick.track();
         api::realm().track();
         api::work_list(false)
@@ -140,7 +140,7 @@ fn resume(w: &WorkItem) -> bool {
 pub fn WorkPage() -> impl IntoView {
     let (list, tick) = open_work();
     let show_closed = RwSignal::new(false);
-    let closed = crate::util::steady(LocalResource::new(move || {
+    let closed = crate::util::steady(crate::resources::local(move || {
         let on = show_closed.get();
         tick.track();
         async move { if on { api::work_list(true).await } else { Ok(Vec::new()) } }
@@ -928,11 +928,11 @@ fn WorkGlyph(id: String) -> impl IntoView {
 pub fn SessionWork(session_id: String, title: Signal<String>) -> impl IntoView {
     let reference = StoredValue::new(format!("session:{session_id}"));
     let tick = RwSignal::new(0u32);
-    let mine = LocalResource::new(move || {
+    let mine = crate::resources::local(move || {
         tick.track();
         api::work_of(reference.get_value())
     });
-    let all = LocalResource::new(move || {
+    let all = crate::resources::local(move || {
         tick.track();
         api::work_list(false)
     });
@@ -1100,7 +1100,7 @@ fn ProjectPick(w: WorkItem, apply: Callback<Result<WorkItem, String>>) -> impl I
 pub fn LeftOpen() -> impl IntoView {
     let (list, tick) = open_work();
     // Projects that stalled or need you (docs/projects.md §9).
-    let projects = LocalResource::new(move || {
+    let projects = crate::resources::local(move || {
         tick.track();
         api::projects_list(false)
     });
@@ -1156,7 +1156,7 @@ pub fn RequestWork(id: i64, #[prop(into)] title: String) -> impl IntoView {
     let reference = StoredValue::new(format!("request:{id}"));
     let title = StoredValue::new(title);
     let tick = RwSignal::new(0u32);
-    let mine = LocalResource::new(move || {
+    let mine = crate::resources::local(move || {
         tick.track();
         api::work_of(reference.get_value())
     });

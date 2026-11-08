@@ -589,7 +589,7 @@ fn TaskWorkChooser(
     close: Callback<()>,
 ) -> impl IntoView {
     let realm = StoredValue::new(realm);
-    let works = LocalResource::new(move || api::task_work_list(realm.get_value()));
+    let works = crate::resources::local(move || api::task_work_list(realm.get_value()));
     let query = RwSignal::new(String::new());
     let search = NodeRef::<leptos::html::Input>::new();
     let naming = RwSignal::new(false);

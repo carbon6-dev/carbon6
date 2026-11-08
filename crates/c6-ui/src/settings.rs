@@ -1520,7 +1520,7 @@ fn SuggestionsSetting() -> impl IntoView {
 fn DocsSetting() -> impl IntoView {
     let write_name = radio_name("docs-write");
     let shown = RwSignal::new(None::<c6_api::docs::DocsSettings>);
-    let loaded = LocalResource::new(move || {
+    let loaded = crate::resources::local(move || {
         api::realm().track();
         api::get_setting("docs")
     });
@@ -1613,7 +1613,7 @@ fn DocsGoogle() -> impl IntoView {
 #[component]
 fn WorkSetting() -> impl IntoView {
     let shown = RwSignal::new(None::<c6_api::work::WorkSettings>);
-    let loaded = LocalResource::new(move || {
+    let loaded = crate::resources::local(move || {
         api::realm().track();
         api::get_setting("work")
     });
@@ -3556,7 +3556,7 @@ fn ListSetting(
         rows.update(|r| r.push((id, RwSignal::new(m))));
     };
     let status = RwSignal::new(None::<Result<&'static str, String>>);
-    let loaded = LocalResource::new(move || {
+    let loaded = crate::resources::local(move || {
         let chosen = realm.map(|r| r.get());
         async move {
             match chosen {

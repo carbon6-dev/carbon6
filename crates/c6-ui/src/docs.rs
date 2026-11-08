@@ -1653,7 +1653,7 @@ pub fn DocPage(id: String) -> impl IntoView {
             }
         });
     };
-    let used_in = LocalResource::new(move || {
+    let used_in = crate::resources::local(move || {
         tick.track();
         api::work_of(format!("doc:{}", id.get_value()))
     });
@@ -3855,7 +3855,7 @@ fn when_hm(ms: i64) -> String {
 fn Version(id: String, rev: i64, restore: Callback<(i64, Option<String>)>) -> impl IntoView {
     let archived = read_only();
     let id = StoredValue::new(id);
-    let old = LocalResource::new(move || async move { api::doc_read(&id.get_value(), &format!("view=full&at={rev}")).await });
+    let old = crate::resources::local(move || async move { api::doc_read(&id.get_value(), &format!("view=full&at={rev}")).await });
     view! {
         <div class="space-y-1 rounded border border-amber-200 bg-amber-50/50 p-2 dark:border-amber-900 dark:bg-amber-950/20">
             <div class="text-xs font-medium text-amber-800 dark:text-amber-300">{format!("As it was at version {rev}")}</div>

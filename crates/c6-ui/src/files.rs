@@ -85,7 +85,7 @@ pub fn FileBrowser(worker_id: String, #[prop(optional)] root: Option<String>) ->
 
 #[component]
 fn FileViewer(worker_id: String, path: String) -> impl IntoView {
-    let file = LocalResource::new({
+    let file = crate::resources::local({
         let (w, p) = (worker_id.clone(), path.clone());
         move || api::fs_read(w.clone(), p.clone())
     });
@@ -141,8 +141,8 @@ fn CodeView(text: String) -> impl IntoView {
 #[component]
 pub fn Changes(worker_id: String, path: String) -> impl IntoView {
     let (w1, p1, w2, p2) = (worker_id.clone(), path.clone(), worker_id, path);
-    let status = LocalResource::new(move || api::git_status(w1.clone(), p1.clone()));
-    let diff = LocalResource::new(move || api::git_diff(w2.clone(), p2.clone()));
+    let status = crate::resources::local(move || api::git_status(w1.clone(), p1.clone()));
+    let diff = crate::resources::local(move || api::git_diff(w2.clone(), p2.clone()));
     let refresh = move |_| {
         status.refetch();
         diff.refetch();

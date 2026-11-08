@@ -743,6 +743,7 @@ names-kept diagnostic files are never counted as production downloads.
 | Shared list-editor view boundary | 10,688,242 | 2,649,938 | 3,483 / 1,366 |
 | Shared stable activity ordering | 10,680,340 | 2,650,316 | 7,902 / -378 |
 | Shared fresh-setting construction | 10,664,451 | 2,647,125 | 15,889 / 3,191 |
+| Shared resource construction by result type | 10,584,246 | 2,638,163 | 80,205 / 8,962 |
 
 The whole-module profile repeats S1's names-kept bindgen/`wasm-opt -Oz -g`
 pipeline, twiggy top/dominators/monos, and all-symbol per-crate/per-module
@@ -752,6 +753,20 @@ Its larger diagnostic name section is not an executable-code saving.
 New session overview/jobs, picker and message-editing work is visible in
 the growth; inline deserialization moving into `api::json` must not be
 mistaken for an independent 294 KB API regression.
+
+The final code section is **9,769,458 bytes**, down **204,593** from this
+baseline and **44,893** below exact 235fae5c. Data changes from **699,291** to
+**698,919**. These code/data byte counts match production, independently of
+diagnostic names. Full old/baseline/final attribution checks cover all **50**
+leading-crate buckets and **214** lexical crate/UI-path rows. Largest lexical crate
+changes are c6_ui **-94,708**, reactive_graph **-66,483**, leptos **-22,219**,
+core **-11,565**, alloc **-5,172**, and tachys **+1,692**. They are not complete
+source ownership or per-download allocations; generic UI machinery appears
+under framework labels, and module-reference views overlap the crate view.
+An additional source-inventory rollup covers all **63** crate-root modules,
+their **7** production children, and crate root, including zero-retained rows.
+It folds root functions/types into `(root)` rather than inventing modules
+from their symbol names, and checks both top-level and nested partition sums.
 
 At 7035ec6b, the largest individual renderers are Settings **212,459**, workspace
 construction **160,872**, App **73,556**, and ProjectPage **47,013** raw
@@ -798,15 +813,68 @@ unchanged. No dynamic comparator, new allocation, tie-breaker or unstable sort
 is introduced. Native UI tests pass **306/306**. This saves raw bytes while
 costing **378 Brotli bytes**; both measurements are retained in the table.
 
-Ten plain setting readers now call one non-inlined resource factory. Each
-call still creates a distinct caller-owned resource: no cache, coalescing,
-extra boxing or changed dependencies. Realm-tracked readers keep their
-explicit tracking. Native UI tests pass **309/309**, including same-name
+Ten plain setting readers first share one non-inlined resource factory. Each
+call still creates a distinct caller-owned resource: no cache, coalescing or
+changed dependencies. This narrow step adds no boxing; the next boundary
+below does. Realm-tracked readers keep their explicit tracking. Native UI
+tests pass **309/309**, including same-name
 independence and parent/child cleanup; the expanded Settings browser suite
 passes **8/8** on both the original and candidate builds. It also verifies
 whole-JSON validation, exact save payloads and a fresh read after remount.
 The fixture waits for the actual loaded value before editing, rather than
 mistaking an initially rendered empty textarea for a completed resource.
+
+Thirty resource-constructor positions now share construction by three result
+types: JSON Value (18), WorkItem lists (8) and ProjectItem lists (4). Every
+original fetch closure is unchanged, including synchronous dependency reads,
+conditional empty results and steady-list wrappers. The helper invokes each
+fetcher synchronously under the original owner/observer, then boxes its
+returned future. It does not add an owner, cache, task or scheduler yield;
+LocalResource retains its scheduling, refetch and cleanup machinery. Costs
+are one boxed callback per resource and one additional boxed future per fetch,
+plus indirect calls/polling; SSR also constructs these boxes without polling
+the API body. Native UI tests pass **311/311**, including independent owners
+and synchronous factory invocation with an unpolled body.
+The Settings regression passes **8/8** on this build. The new resource lifecycle
+suite passes **16/16** on both the exact baseline and this build (both engines,
+light/dark), covering tracked Saved queries, tick refetch, errors/recovery,
+remounts and conditional Work/Projects lists. Held responses preserve the
+baseline's serial same-owner fetching; a disposed owner's late error cannot
+replace fresh remounted content. No stronger cancellation guarantee is claimed.
+
+Combined production savings are **205,079 raw / 26,605 Brotli bytes**, leaving
+**140,534 raw / 29,165 Brotli bytes** under the unchanged ceilings. Both
+requested headroom goals are met, with more than 100 KiB raw and 20 KiB Brotli
+remaining. A separate pending approximately 25 KB raw change is not included
+in these measurements. No further size trials are needed for this target.
+
+Final verification runs `env -u NO_COLOR make ui`, `make check`, then
+`make test`, with the documented 65,536 file-descriptor limit. All three pass;
+the workspace run passes **1,262 tests**, with two deliberately ignored
+upgrade-fixture generators and no failures. Motion VM tests pass **13/13**,
+theme tests **12/12**, and crash VM tests **8/8** (the separate opt-in mounted
+crash browser test is not enabled). The rebuilt production files match the
+immutable browser snapshot byte-for-byte; CSS also matches the exact baseline.
+
+The broader pinned-browser run is **not wholly green**. Its original
+workspace-open Changes/backdrop failures reproduce in Chromium and WebKit,
+including isolated final-artifact reruns and baseline controls. Full Motion's
+first desktop/light/system context fails its model/effort assertion on both
+engines; baseline controls reproduce that assertion. The standalone WebKit
+modelForms check passes on both
+artifacts, while the exact full first-context rerun fails: this is an
+interaction-sensitive baseline failure, not a passing full suite. Original
+cohorts remain failed; final-run assertions and normal deadlines are unchanged.
+The extra WebKit full-context rerun failed later, after effort selection. Two
+fixed baseline controls both stopped at model selection, so attribution of
+that later effort-selection variant remains unverified.
+
+Independent final coverage passes phone-picker **48/48**, comment-sheet
+**16/16**, Settings **8/8**, resource lifecycle **16/16**, response failures
+and sign-out **10/10**, reply recovery **12/12**, and session-sheet **36/36**.
+Theme passes in both engines and ring-render in Chromium. Motion's explicitly
+labelled subset excluding modelForms passes **24/24 per engine**; it is not a
+full Motion pass. These are Linux Playwright 1.65.0 engines, not physical Safari.
 
 The broader audit found no accidental release inclusion of native tests,
 SSR, regex, ICU or a second gloo-net implementation. Markdown defaults are

@@ -36,7 +36,7 @@ fn empty(what: impl IntoView + 'static) -> AnyView {
 #[component]
 pub(crate) fn Unreads() -> impl IntoView {
     let chat = Chat::get();
-    let list = LocalResource::new(move || {
+    let list = crate::resources::local(move || {
         chat.tick.track();
         api::rpc("memex.chat.unreads", json!({}))
     });
@@ -84,7 +84,7 @@ pub(crate) fn Unreads() -> impl IntoView {
 #[component]
 pub(crate) fn Threads() -> impl IntoView {
     let chat = Chat::get();
-    let list = LocalResource::new(move || {
+    let list = crate::resources::local(move || {
         chat.tick.track();
         api::rpc("memex.chat.threads", json!({"limit": 50}))
     });
@@ -130,7 +130,7 @@ pub(crate) fn Threads() -> impl IntoView {
 pub(crate) fn Activity() -> impl IntoView {
     let chat = Chat::get();
     let only = RwSignal::new("all");
-    let list = LocalResource::new(move || {
+    let list = crate::resources::local(move || {
         chat.tick.track();
         api::rpc("memex.chat.activity", json!({"limit": 100}))
     });
@@ -172,7 +172,7 @@ pub(crate) fn Activity() -> impl IntoView {
 pub(crate) fn Saved() -> impl IntoView {
     let chat = Chat::get();
     let done = RwSignal::new(false);
-    let list = LocalResource::new(move || {
+    let list = crate::resources::local(move || {
         chat.tick.track();
         api::rpc("memex.chat.saved", json!({"done": done.get()}))
     });
@@ -247,7 +247,7 @@ pub(crate) fn parse(q: &str) -> Value {
 pub(crate) fn SearchResults(q: String) -> impl IntoView {
     let chat = Chat::get();
     let query = q.clone();
-    let list = LocalResource::new(move || {
+    let list = crate::resources::local(move || {
         let mut p = parse(&query);
         if let Some(w) = chat.shown_workspace() {
             p["workspace"] = json!(w);
@@ -283,13 +283,13 @@ pub(crate) fn Details(place: Place) -> impl IntoView {
     let p = place.clone();
     let conv = Memo::new(move |_| chat.conversation(&p.workspace, &p.channel));
     let (fp, lp, rp) = (place.clone(), place.clone(), place.clone());
-    let files = LocalResource::new(move || {
+    let files = crate::resources::local(move || {
         api::rpc("memex.chat.search", json!({"workspace": fp.workspace, "in": fp.channel, "has": "file", "limit": 20}))
     });
-    let links = LocalResource::new(move || {
+    let links = crate::resources::local(move || {
         api::rpc("memex.chat.search", json!({"workspace": lp.workspace, "in": lp.channel, "has": "link", "limit": 20}))
     });
-    let recent = LocalResource::new(move || {
+    let recent = crate::resources::local(move || {
         api::rpc("memex.chat.messages", json!({"workspace": rp.workspace, "channel": rp.channel, "limit": 200}))
     });
     let tab = RwSignal::new("about");

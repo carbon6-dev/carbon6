@@ -656,7 +656,7 @@ fn ObjectPane(realm: String, section: String, kind: String, id: String) -> impl 
 fn Neighborhood(realm: String, section: String, object: ExObject) -> impl IntoView {
     let nav = nav();
     let (r1, k1, i1) = (realm.clone(), object.kind.clone(), object.id.clone());
-    let data = LocalResource::new(move || api::realm_neighborhood(r1.clone(), k1.clone(), i1.clone()));
+    let data = crate::resources::local(move || api::realm_neighborhood(r1.clone(), k1.clone(), i1.clone()));
     let short = |s: &str| {
         let t: String = s.chars().take(16).collect();
         if s.chars().count() > 16 { format!("{t}…") } else { t }

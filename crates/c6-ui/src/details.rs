@@ -211,7 +211,7 @@ pub fn Glance(chrome: SessionChrome, #[prop(optional, into)] on_done: Option<Cal
     let work_at = RwSignal::new(None::<(f64, f64)>);
     let serves = move || session.get().is_some_and(|s| s.parent_id.is_none() && !s.observed && s.instance.is_empty());
     let tag = Memo::new(move |_| session.get().and_then(|s| s.work).map(|w| w.id));
-    let item = LocalResource::new(move || {
+    let item = crate::resources::local(move || {
         tag.track();
         api::work_of(format!("session:{}", id.get_value()))
     });

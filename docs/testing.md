@@ -83,7 +83,7 @@ UI_BROWSER_PASSES=3 make ui-browser-test
 ```
 
 The runner covers workspace-open, motion, comment-sheet, phone-picker,
-theme (`--browser`) and settings-lists in each engine, plus ring-render in
+theme (`--browser`), settings-lists and resource-lifecycle in each engine, plus ring-render in
 Chromium. **ring-render is Chromium-only**, because its layer/paint/blocked-main-thread assertions
 require CDP; `ENGINE=webkit` now fails explicitly instead of silently launching
 Chromium. Its full default three-run/two-theme workload remains enabled.
@@ -104,6 +104,19 @@ removing, all field kinds, rejected/successful saves, reload and same-page
 section remounts, and the console's root/realm routing selector. It mocks only
 private loopback APIs; no live settings are read or written. To run it alone:
 `ENGINE=both node crates/c6-ui/tests/settings-lists.cjs`.
+
+`resource-lifecycle.cjs` covers caller-owned resources in 16 desktop contexts
+(Chromium/WebKit, light/dark): Saved's synchronous `done` dependency, action-tick
+refetch without remount, error/recovery, fresh pane remounts, and the conditional
+Work/Projects closed-list queries. Held Saved responses preserve the baseline
+framework's serial same-owner fetch policy: the newer query runs after the old
+one completes. A separate held response from a disposed owner is released only
+after fresh remounted content renders, with a distinct error to detect a stale
+replacement. This does not assert stronger cancellation or absence of transient
+old results within the same owner. All APIs are private loopback mocks. Run:
+`ENGINE=both node crates/c6-ui/tests/resource-lifecycle.cjs`.
+For separately labelled diagnostics, `RESOURCE_CASE=chat|stale|work|projects` and
+`THEME=light|dark` select one case/theme (comma-separated lists are also accepted).
 
 Existing CI workflows are unchanged: these standalone browser suites were not
 previously CI jobs. A browser runner on Ubuntu 24.04 needs Node 24, npm, the

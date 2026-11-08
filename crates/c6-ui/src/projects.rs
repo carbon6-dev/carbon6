@@ -40,7 +40,7 @@ fn open_work(p: &ProjectItem) -> usize {
 pub fn ProjectsLink(class: &'static str) -> impl IntoView {
     let tick = RwSignal::new(0u32);
     crate::decisions::reload_quietly(tick);
-    let list = LocalResource::new(move || {
+    let list = crate::resources::local(move || {
         tick.track();
         api::realm().track();
         api::projects_list(false)
@@ -61,12 +61,12 @@ pub fn ProjectsPage() -> impl IntoView {
     crate::decisions::reload_quietly(tick);
     let show_closed = RwSignal::new(false);
     // Steady: a reload that brings the same list back doesn't redraw it.
-    let list = crate::util::steady(LocalResource::new(move || {
+    let list = crate::util::steady(crate::resources::local(move || {
         tick.track();
         api::realm().track();
         api::projects_list(false)
     }));
-    let closed = crate::util::steady(LocalResource::new(move || {
+    let closed = crate::util::steady(crate::resources::local(move || {
         let on = show_closed.get();
         tick.track();
         async move { if on { api::projects_list(true).await } else { Ok(Vec::new()) } }

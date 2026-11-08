@@ -791,7 +791,7 @@ fn ConversationPane(place: Place, at: Option<String>) -> impl IntoView {
 fn ThreadPane(place: Place, thread_ts: String) -> impl IntoView {
     let chat = Chat::get();
     let (p, t) = (place.clone(), thread_ts.clone());
-    let messages = LocalResource::new(move || {
+    let messages = crate::resources::local(move || {
         chat.tick.track();
         api::rpc("memex.chat.thread", json!({"workspace": p.workspace, "channel": p.channel, "thread_ts": t}))
     });
