@@ -1844,7 +1844,7 @@ pub fn DocPage(id: String) -> impl IntoView {
                             <input node_ref=rename_ref class=format!("{INPUT} min-w-0 flex-1 font-semibold") prop:value=move || title.get()
                                 on:input=move |ev| title.set(event_target_value(&ev))
                                 on:keydown=move |ev| if ev.key() == "Enter" { rename() } else if ev.key() == "Escape" { renaming.set(false) }
-                                on:blur=move |_| rename() />
+                                on:blur=move |_| if renaming.get_untracked() { rename() } />
                         }.into_any()
                     } else {
                         view! {
@@ -4299,6 +4299,18 @@ mod tests {
         }
         assert!(controls.find("(phone && arrow)").unwrap() < controls.find("format!(\"Send {} to agent\"").unwrap());
         assert!(controls.find("format!(\"Send {} to agent\"").unwrap() < controls.find("(!phone && arrow)").unwrap());
+    }
+
+    #[test]
+    fn desktop_document_rename_blur_only_commits_an_open_editor() {
+        let source = include_str!("docs.rs");
+        let page = source.split("pub fn DocPage(").nth(1).unwrap();
+        let input = page.split("<input node_ref=rename_ref").nth(1).unwrap().split("/>").next().unwrap();
+        assert!(input.contains("ev.key() == \"Enter\" { rename() }"));
+        assert!(input.contains("ev.key() == \"Escape\" { renaming.set(false) }"));
+        assert!(input.contains("on:blur=move |_| if renaming.get_untracked() { rename() }"));
+        let rename = page.split("let rename = move || {").nth(1).unwrap().split("let add_block").next().unwrap();
+        assert!(rename.find("renaming.set(false)").unwrap() < rename.find("spawn_local").unwrap());
     }
 
     #[test]

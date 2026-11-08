@@ -157,11 +157,16 @@ body, including the session's inner content wrapper: total chrome is at most
 They also check 44px phone control targets, 320px control collisions, selected-pane titles, two-way title
 switching, the back button, a session ring even over a document, session pin/
 unpin, close-pane/close-tile actions, ring-opened Changes/Terminal, Files,
-session details and Find. Document Actions exercise rename, comments, edit,
+session details and Find. Catch-up switches and native Copy feedback must
+retain the open Actions menu; ordinary navigation still dismisses it.
+Document Actions exercise Escape cancellation and Enter rename, comments, edit,
 history, export, archive/unarchive and opening the owning session. A standalone
 document's Used in link opens real work, dismisses Actions, retains the document
 DOM and returns through tile history. Generic tile
-Back/Forward, detach and minimize are exercised too. Runtime browser errors,
+Back/Forward, detach and minimize are exercised too. Wide desktop also checks
+document rename through Enter and blur with exactly one PATCH per save, plus
+Escape cancellation with no PATCH and no cancelled draft on reopening.
+Runtime browser errors,
 including WASM traps, are always fatal. Console errors are fatal except for
 exactly `Viewport argument key "interactive-widget" not recognized and ignored.`
 from WebKit, at most once per page. This unsupported-key engine diagnostic was
@@ -194,30 +199,50 @@ operation's timeout (default 300 seconds), not the entire matrix's duration.
 A separate per-context hang watchdog uses twice that timeout so an operation
 failure can save its screenshot/JSON before the browser closes.
 
-The S14 production build is **10,674,761 bytes raw / 2,662,708 Brotli**,
-SHA-256 `94ed2e5ad68ffb557bdcc339231b6f093e3b9f826f6e8e4809c79e76d0af296a`.
-Against the exact `8a5ac826` baseline (10,594,434 / 2,643,871 bytes), that is
-**+80,327 raw / +18,837 Brotli**. The unchanged ceilings (10,724,780 /
-2,667,328) leave **50,019 raw / 4,620 Brotli bytes**. No icon, typed-view or
-size-budget exemption was used. The new `w-70` and height-aware `md:flex`,
-`md:block` and `md:hidden` utilities are present in the generated CSS.
-The final unfiltered Chromium/WebKit run completed **168 contexts** (160 phone,
-8 desktop); every phone's measured bar and total top chrome were **44px**.
-The 390px session+document/session-visible capture fell from **132px to 44px**.
-With `set -euo pipefail; ulimit -n 65536`, the required `env -u NO_COLOR make ui`,
-`make check`, `make test` sequence passed: no clippy warnings, test lint and size
-guards passed, and **1,270 tests passed, 2 skipped**. Logs, exact artifact
-manifest, before/after screenshots and geometry are under `/tmp/s14-bar/`;
-`after-browser-final.log` and `final-browser-summary.json` identify the final
-main cohort. Physical Android/iOS hardware was not exercised.
-Affected-suite qualification on the same artifact also passed **112 contexts**:
-comment-sheet 16, image-preview phone 8, comments-design phone 8, session-sheet
-36 (`compat-final/`), and document ownership 22 per engine (`compat-final2/`).
+Final S14 size revision plus desktop rename blur guard: the production build is
+**10,653,175 bytes raw / 2,657,897 Brotli**, SHA-256
+`2ddccdbfe330c49c17c879084677fc136be6496aacbe4f830249abe9b32d64f7`.
+Against exact `8a5ac826` (10,594,434 / 2,643,871 bytes), that is
+**+58,741 raw / +14,026 Brotli**; it saves **21,586 raw / 4,811 Brotli** versus
+the initial `4f6169b6` implementation. Unchanged ceilings (10,724,780 /
+2,667,328) leave **71,605 raw / 9,431 Brotli bytes**. The approximate +25KB raw /
++6KB Brotli reduction goal was not met; the coordinator selected the smallest
+measured Brotli candidate rather than continuing size experiments. That Small1
+source was recovered and its compiler bytes reproduced exactly at 10,653,136 /
+2,656,211; the separately approved blur guard changes that by +39 raw / +1,686
+Brotli. No icon, typed-view or budget exemption was used. The `w-70` and
+height-aware `md:flex`, `md:block` and `md:hidden` utilities are present.
+
+The final unfiltered Chromium/WebKit cohort completed **168 contexts** (160
+phone, 8 desktop); all 160 initial phone screenshots and geometry were independently
+validated, with bar and total top chrome **44px** throughout. The 390px
+session+document/session-visible capture fell from **132px to 44px**. The
+separately labelled guard smoke passed 8 contexts. With `set -euo pipefail;
+ulimit -n 65536`, the required `env -u NO_COLOR make ui`, `make check`, `make test`
+sequence passed: warning-free Clippy, test lint and size guards, and **1,271
+tests passed, 2 skipped**. Logs `ui-guard-final.log`, `check-guard-final.log`,
+`test-guard-final.log`, `after-browser-small-final.log`, the independent
+`size-final-browser-summary.json`, artifact manifest `guard-final-artifacts.sha256`,
+before captures and final `size-final/` screenshots are under `/tmp/s14-bar/`.
+Physical Android/iOS hardware was not exercised; combined-branch size is unmeasured.
+
+Affected suites passed on the same final artifact: comment-sheet 16 contexts,
+image-preview phone 8 cases, comments-design phone 8 contexts, session-sheet 36
+contexts, document ownership 22 contexts per engine, and full phone-picker 48
+contexts (`compat-guard-final/`). These are not combined into a context total:
+an image-preview case can exercise multiple fixtures.
 The ownership test scrolls the deck's real nested sorter when the outer page
 fits; positive scrolling, fixed-header geometry, owning-session mark fallback,
 navigation dismissal and retained document assertions remain mandatory. Earlier
 failed owner-navigation and ancestor-only deck-scroll cohorts remain labelled
 in `/tmp/s14-bar/report.md`; they were not counted as passes or silently retried.
+The pre-guard desktop smoke's duplicate Enter PATCH failure also remains there;
+the exact-once assertion was retained and Escape coverage added. A pre-guard
+full test run had one unrelated worker handoff fixture failure under concurrent
+load (1,269 passed, 1 failed, 2 skipped); its one exact isolated rerun passed.
+The final guard full test run above passed without retries. The coordinator's
+known workspace-open Changes/presence-scrim timeout reproduces on `8a5ac826`;
+it is recorded, not fixed here or claimed as a passing suite for this change.
 
 `settings-lists.cjs` covers the production list editors in light/dark and
 desktop/phone: keyed-row and focus retention during live updates, adding and

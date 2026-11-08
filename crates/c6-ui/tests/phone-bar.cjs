@@ -534,6 +534,38 @@ async function check(browser, origin, theme, viewportName, viewport, test, deskt
         await page.getByRole('button', { name: 'Document actions', exact: true }).click();
         await page.getByRole('menuitem', { name: 'Open the session that made it', exact: true }).waitFor();
         await page.keyboard.press('Escape');
+        await page.getByRole('menuitem', { name: 'Open the session that made it', exact: true }).waitFor({ state: 'hidden' });
+        const header = page.locator('[data-doc-header]:visible');
+        const heading = header.locator('[data-doc-heading] h1');
+        const input = header.locator('[data-doc-heading]').getByRole('textbox');
+        const entered = `${TITLE} desktop Enter`;
+        const blurred = `${TITLE} desktop blur`;
+        phase(page, 'cancel desktop document rename with Escape');
+        await heading.click();
+        await input.fill(`${TITLE} cancelled desktop draft`);
+        await input.press('Escape');
+        await input.waitFor({ state: 'hidden' });
+        await settle(page);
+        assert.deepEqual(calls.filter(c => c.docPatch), [], 'desktop Escape cancellation does not PATCH the document');
+        assert.equal(await heading.textContent(), TITLE, 'desktop Escape cancellation leaves the document title unchanged');
+        phase(page, 'desktop document rename with Enter');
+        await heading.click();
+        assert.equal(await input.inputValue(), TITLE, 'reopened desktop rename discards the cancelled draft');
+        await input.fill(entered);
+        await input.press('Enter');
+        await input.waitFor({ state: 'hidden' });
+        await header.getByRole('heading', { name: entered, exact: true }).waitFor();
+        assert.equal(await heading.textContent(), entered, 'desktop Enter rename updates the document heading');
+        assert.deepEqual(calls.filter(c => c.docPatch).map(c => c.docPatch.title), [entered], 'desktop Enter saves the exact title through PATCH');
+        phase(page, 'desktop document rename with blur');
+        await heading.click();
+        await input.fill(blurred);
+        await header.getByRole('button', { name: 'Document actions', exact: true }).focus();
+        await input.waitFor({ state: 'hidden' });
+        await header.getByRole('heading', { name: blurred, exact: true }).waitFor();
+        assert.equal(await heading.textContent(), blurred, 'desktop blur rename updates the document heading');
+        assert.deepEqual(calls.filter(c => c.docPatch).map(c => c.docPatch.title), [entered, blurred], 'desktop Enter and blur each PATCH their exact title');
+        await capture(f, prefix, 'desktop-renames');
       }
       return;
     }
