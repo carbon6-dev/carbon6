@@ -972,6 +972,25 @@ the resume can join the acknowledgement turn, changing both the scripted request
 order and the opening read by deferred naming. Final completion failures show
 the model trace and both parent and child event histories, including model errors.
 
+### Google mail import completion
+
+`google_mail_calendar_contacts` waits for two boundaries before asserting mail
+views: the Gmail connector round has ended, **then** `memex.status.extracting` is
+zero. Kit ingestion uses `wait:false`, so a round can finish after queuing raw
+mail but before the mail rows exist. Extraction jobs remain counted while their
+messages are stored and their `mail.received` events are emitted. Read the round
+first: an empty queue sampled before the round finishes enqueuing is not a
+completion signal.
+
+The fixture disables scheduled Gmail runs and observes progress from the current
+round before this wait (for Carol's import, Alice's new automation and inbox
+message). An old round's end alone does not identify a newly requested sync.
+There is no Memex understanding model in this fixture, so queue drain is the
+missing import boundary, not a general model-triage barrier. The `needs_reply`
+assertion still runs once after completion: failed ingestion or incorrect
+classification must fail it, rather than being polled until it changes. Failures
+include the mail views, extraction status, connector activity and model trace.
+
 ## Rules
 
 1. **Wait for a condition, never for a time.**

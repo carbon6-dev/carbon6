@@ -15,8 +15,7 @@ use axum::{Form, Json, Router};
 use base64::Engine;
 use c6_api::{Connection, Event, EventKind, Session};
 use c6_head::HeadConfig;
-use c6_testkit::eventually;
-use c6_testkit::{MockLlm, Reply};
+use c6_testkit::{MockLlm, Reply, eventually, eventually_or};
 use c6_worker::{ConnState, Identity, Worker, conn, enroll};
 use serde_json::{Value, json};
 use tokio::sync::watch;
@@ -365,11 +364,25 @@ async fn google_mail_calendar_contacts() {
         }
     };
     let mail_idle = async || {
-        eventually("the previous mail sync round finished", async || {
-            let activity = c6_head::activity::get(&head.state).await.unwrap();
-            let mail = activity["connectors"].as_array()?.iter().find(|c| c["realm"] == "home" && c["app"] == "gmail")?;
-            (!mail["round"]["ended_at"].is_null()).then_some(())
-        })
+        let snapshot = Mutex::new(String::new());
+        eventually_or(
+            "the mail sync round and its queued reads finished",
+            async || {
+                let activity = c6_head::activity::get(&head.state).await.unwrap();
+                *snapshot.lock().unwrap() = format!("connector activity={activity}");
+                let mail = activity["connectors"].as_array()?.iter().find(|c| c["realm"] == "home" && c["app"] == "gmail")?;
+                if mail["round"]["ended_at"].is_null() {
+                    return None;
+                }
+                // The kit queues mail with wait:false. Read the queue only
+                // AFTER the round ends (all items enqueued); a job remains
+                // counted until its message is stored and its event emitted.
+                let status = c6_head::memex::call_in(&head.state, "home", "memex.status", json!({})).await.unwrap();
+                *snapshot.lock().unwrap() += &format!("\nmemex status={status}");
+                (status["extracting"] == 0).then_some(())
+            },
+            || format!("{}\nmodel trace:\n{}", snapshot.lock().unwrap(), mock.log()),
+        )
         .await;
     };
 
@@ -653,7 +666,15 @@ async fn google_mail_calendar_contacts() {
         let v = rpc("memex.mail.threads", json!({"view": view})).await;
         v.as_array().unwrap().iter().map(|t| t["thread_id"].as_str().unwrap().to_owned()).collect()
     };
-    assert!(threads("needs_reply").await.contains(&"t7".to_owned()), "Carol's, before");
+    let needs_reply = threads("needs_reply").await;
+    assert!(
+        needs_reply.contains(&"t7".to_owned()),
+        "Carol's, before: needs_reply={needs_reply:?}\ninbox={}\nmemex status={}\nconnector activity={}\nmodel trace:\n{}",
+        rpc("memex.mail.threads", json!({"view": "inbox"})).await,
+        c6_head::memex::call_in(&head.state, "home", "memex.status", json!({})).await.unwrap(),
+        c6_head::activity::get(&head.state).await.unwrap(),
+        mock.log(),
+    );
     {
         let mut s = g.lock().unwrap();
         s.messages.get_mut("m7").unwrap().1 = vec!["SPAM".into(), "UNREAD".into(), "CATEGORY_PERSONAL".into()];
