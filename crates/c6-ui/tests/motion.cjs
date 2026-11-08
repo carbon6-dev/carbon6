@@ -1002,6 +1002,15 @@ async function modelForms(f) {
       await settle(page);
       assert.equal(await fields.getAttribute('aria-expanded'), 'true',
         `${route}: choosing effort must keep the fields open so the model list remains usable`);
+      if (!phoneViewport(f.viewport)) {
+        // Selecting a model removes the list and can expose this row under
+        // a stationary pointer. Exercise that hover regardless of geometry:
+        // a passive preview must not displace an explicitly opened panel.
+        await formPage.getByTitle('Open beside this list (⌘/Ctrl-click: new tile if not already open)', { exact: true }).first().hover();
+        await settle(page);
+        assert.equal(await fields.getAttribute('aria-expanded'), 'true', `${route}: row hover keeps the fields open`);
+        assert.equal(await page.locator('[data-session-preview]').count(), 0, `${route}: hover cannot cover the active form`);
+      }
     }
     const asked = f.requests.filter(r => r.endsWith('/connections/test/models')).length;
     step(`${route} reopen model list`);
@@ -1009,7 +1018,69 @@ async function modelForms(f) {
     step(`${route} reopened model list visible`);
     await offered.waitFor();
     assert.equal(f.requests.filter(r => r.endsWith('/connections/test/models')).length, asked, `${name} reuses its shared model list`);
+    step(`${route} Escape model list`);
     await page.keyboard.press('Escape');
+    await offered.waitFor({ state: 'hidden' });
+    if (fields) {
+      assert.equal(await fields.getAttribute('aria-expanded'), 'true', `${route}: first Escape closes only the model list`);
+      step(`${route} Escape fields`);
+      await page.keyboard.press('Escape');
+      await input.waitFor({ state: 'hidden' });
+      assert.equal(await fields.getAttribute('aria-expanded'), 'false', `${route}: second Escape closes the fields`);
+      assert(await fields.evaluate(el => el === document.activeElement), `${route}: Escape restores the fields opener`);
+      step(`${route} reopen fields`);
+      await fields.click();
+      await input.waitFor();
+      assert(await input.evaluate(el => el === window.__formModelInput), `${route}: reopening retains the model input`);
+      assert.equal(await input.inputValue(), 'fixture-model-32', `${route}: reopening retains the model`);
+      assert.equal(await effort.inputValue(), 'high', `${route}: reopening retains effort`);
+      if (phoneViewport(f.viewport)) {
+        step(`${route} outside tap`);
+        await formPage.locator('.fixed.inset-0.bg-black\\/30').click({ position: { x: 2, y: 2 } });
+        await input.waitFor({ state: 'hidden' });
+        assert.equal(await fields.getAttribute('aria-expanded'), 'false', `${route}: outside tap dismisses the sheet`);
+      } else {
+        step(`${route} inline fields dismissal`);
+        // Desktop's fields are inline, not an outside-click popover.
+        await formPage.getByRole('searchbox').click();
+        assert.equal(await fields.getAttribute('aria-expanded'), 'true', `${route}: outside click preserves inline fields`);
+        await fields.click();
+        await input.waitFor({ state: 'hidden' });
+        const row = formPage.getByTitle('Open beside this list (⌘/Ctrl-click: new tile if not already open)', { exact: true }).first();
+        const rail = page.locator('aside.c6-sidebar').getByRole('button', { name: 'Session details', exact: true }).first();
+        const preview = page.locator('[data-session-preview]');
+        step(`${route} passive preview handoff`);
+        await row.hover();
+        await preview.waitFor();
+        const listPop = await preview.getAttribute('data-pop');
+        // Focus keeps an unpinned preview alive across actionability/scroll
+        // delays: its hide timer cannot turn a blocked handoff into a pass.
+        await preview.getByRole('button', { name: 'Close session details', exact: true }).focus();
+        await rail.hover();
+        await page.waitForFunction(listPop => {
+          const els = document.querySelectorAll('[data-session-preview]');
+          return els.length === 1 && els[0].getAttribute('data-pop') !== listPop;
+        }, listPop);
+        await preview.getByRole('button', { name: 'Close session details', exact: true }).focus();
+        await row.hover();
+        await page.waitForFunction(listPop => {
+          const els = document.querySelectorAll('[data-session-preview]');
+          return els.length === 1 && els[0].getAttribute('data-pop') === listPop;
+        }, listPop);
+        await page.getByRole('button', { name: 'Close session details', exact: true }).click();
+        step(`${route} explicit preview`);
+        await fields.click();
+        await input.waitFor();
+        await formPage.getByRole('button', { name: 'Session details', exact: true }).first().click();
+        await page.locator('[data-session-preview]').waitFor();
+        await input.waitFor({ state: 'hidden' });
+        assert.equal(await fields.getAttribute('aria-expanded'), 'false', `${route}: explicit details still displaces the fields`);
+        await rail.hover();
+        await settle(page);
+        assert.equal(await preview.getAttribute('data-pop'), listPop, `${route}: passive hover cannot displace pinned details`);
+        await page.getByRole('button', { name: 'Close session details', exact: true }).click();
+      }
+    }
     await page.screenshot({ path: path.join(SHOTS, `${f.label}-${route}-models.png`) });
     await page.evaluate(() => __keyboard(innerHeight));
   }

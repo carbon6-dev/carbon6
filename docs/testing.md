@@ -91,6 +91,10 @@ The default motion matrix has 24 contexts per engine; phone-picker has 24.
 Each suite keeps its normal shared-process/context policy. `ISOLATE_BROWSER`
 is not enabled. `BROWSER_ENGINES=webkit` selects just that engine for a complete
 pass; `BROWSER_TEST_OUTPUT` changes the default `dist/browser-tests` output.
+`BROWSER_SUITES=motion` selects that entire suite without filtering its contexts
+or checks (space-separated names select several suites); the default still runs
+every suite. `UI_BROWSER_PASSES=3 BROWSER_SUITES=motion bash scripts/ui-browser-tests.sh`
+runs three full Motion matrices in both engines.
 Logs/screenshots/traces are separated by pass, engine and suite. A failed
 command stops the runner, keeps the evidence, and is never automatically retried.
 
@@ -98,8 +102,9 @@ Existing CI workflows are unchanged: these standalone browser suites were not
 previously CI jobs. A browser runner on Ubuntu 24.04 needs Node 24, npm, the
 existing Rust/Trunk/Brotli setup, `make ui-browser-install` (including sudo apt),
 `env -u NO_COLOR make ui`, then `make ui-browser-test`; preserve
-`dist/browser-tests` on failure. Do not enable a required browser job while the
-independent Motion fields-panel failure recorded below is unresolved.
+`dist/browser-tests` on failure. Do not treat the historical S2 results below
+as a passing combined browser run; the independent fields-panel fix and its
+qualification are recorded under S11.
 Downloads/apt are installation steps, not network access by the tests: the
 fixtures still serve only private loopback origins. Rust test jobs are unchanged.
 
@@ -163,7 +168,7 @@ clicking the intended tile's Actions, keeps that identity for Escape, and
 retains all availability/icon/resize/geometry/retained-node assertions. The
 complete four-case Chromium/WebKit light/dark matrix then passed.
 
-**Unresolved Motion interaction, not a WASM trap:** choosing an offered model
+**S2's unresolved Motion interaction, not a WASM trap (fixed in S11 below):** choosing an offered model
 can hide New Session's where/how fields before effort can be used. A diagnostic
 trace records native pointerdown/mousedown/mouseup/click on the intended
 `fixture-model-32` button, nested in both `data-pop` regions, followed by the
@@ -200,6 +205,127 @@ Pass/engine/suite subdirectories preserve distinct cohorts. The earlier
 `dist/s2-{chromium,webkit}*` fail-fast runs are retained too, not overwritten
 or counted as clean passes. Explicit old-engine paths occur only in that
 labelled control command, never in the checked-in default setup.
+
+### S11: New Session fields and passive session previews
+
+This was a product bug, not a stale expectation that inline fields should
+disappear. Selecting an offered model removed the list and exposed a session
+row beneath the stationary pointer. The resulting native mouseover opened its
+hover preview, whose registration displaced the unrelated fields panel in the
+shared popup stack. The model click reached the right button and selected the
+model; no overlay interception, lost model state or model-picker portal was
+needed to reproduce the failure.
+
+An untouched `7035ec6b` production build reproduced the original strict
+model-selection failure in Chromium. Its event trace kept the pointer at
+`(1250, 782)`: model click at 1167.1ms, session-row mouseover at 1182.1ms,
+fields collapsed at 1183.6ms, and input focus lost afterward. These are
+observations, not timing requirements in the regression test.
+
+Passive session-list/rail hover now checks the popup registry before opening.
+It may replace another passive preview (including rail-to-list handoff) but
+cannot displace an explicit panel or a pinned preview. Clicking Session
+details is still explicit and may replace another popup. Preview-to-preview
+opening treats rail and list cards as alternatives, even where their component
+owners are ancestors; otherwise both cards could remain visible. The strict
+model/effort assertions remain, with deterministic row-hover coverage, model
+list reopening, two-level Escape/focus restoration, retained input/model/effort,
+phone outside-tap dismissal and desktop inline-field dismissal checks added.
+Desktop outside clicks intentionally leave inline fields open; Change/Done or
+Escape closes them. The phone sheet also closes on an outside tap.
+
+For an interactive browser check, use both themes on desktop, a narrow
+workspace tile and a phone: open New Session's fields, type a custom model,
+choose an offered model and High effort, reopen the list, and press Escape
+twice. Only the list closes first, then the fields, with focus back on the
+opener. Reopen and verify both selections remain. A pointer crossing a session
+row while the fields are open must not show its passive preview; after closing
+the fields, hovering still works and clicking Session details still opens it.
+On a phone also dismiss via the scrim and Done, without starting a session.
+
+Initial targeted authoring probes are retained separately: one was stopped
+at an outside-click target whose heading is intentionally hidden in a narrow
+tile (the check now clicks the visible search box); the next and its isolated
+diagnostic exposed the two-preview ownership case above. No assertion was
+removed, no click is forced, and these partial probes are not qualification
+passes. The handoff check keeps the old unpinned card focused so its hide timer
+cannot make a blocked handoff pass, then requires exactly one replacement card.
+
+Final verification used Playwright 1.65.0 with Chromium **158.0.8127.18**
+(revision 1254) and WebKit **27.2** (revision 2388). The focused System-motion
+modelForms run passed **8/8 contexts** (both engines, themes and viewport
+classes); the isolated desktop handoff check passed separately. Scripted
+exploratory checks passed **12/12** engine × theme × layout cases: a
+1,152px-wide desktop tile, a measured 387.33px-wide tile in a three-column
+workspace, and a 390px phone viewport. They checked model/effort selection,
+Escape/focus/state retention, desktop outside-click behavior, and phone
+scrim/footer-Done dismissal, with no browser errors. These are real headless
+browser interactions and screenshots, not human visual or physical-device QA;
+interactive signoff using the checklist above remains outstanding.
+
+The requested full qualification used
+`UI_BROWSER_PASSES=3 BROWSER_SUITES=motion bash scripts/ui-browser-tests.sh`,
+without context/test filters, isolated-browser mode or retries:
+
+| Full motion pass | Chromium | WebKit |
+| --- | --- | --- |
+| 1 | 24/24 passed | 24/24 passed |
+| 2 | 24/24 passed | 24/24 passed |
+| 3 | 24/24 passed | 24/24 passed |
+
+That is **72/72 per engine, 144/144 contexts total**, with no browser errors
+or WASM traps. Each matrix includes modelForms, both themes, desktop/phone,
+and all six motion policies. The focused and exploratory runs above are
+separate evidence, not substitutes for any full cohort. Logs/screenshots
+remain under `dist/s11-motion/pass-{1,2,3}/{chromium,webkit}/motion/`;
+`dist/s11-final-verification/motion-counts.json` verifies the 24 distinct
+expected context labels and completion marker in each log.
+
+The first external exploratory harness seeded its alleged narrow tiles into
+one stack, leaving them full-width, and matched both phone Done buttons. That
+partial run is preserved, not counted as narrow coverage. Corrected setup
+requires the measured narrow width and targets the actual phone-sheet footer;
+the failed phone case passed in isolation before the fresh 12-case matrix.
+Both engines also confirmed on the untouched base that the desktop summary
+Done and phone footer Done are simultaneously visible at 390px. This separate
+responsive-display issue is unchanged and remains a follow-up, not a reason
+to weaken the modelForms assertions.
+
+An additional, non-required `workspace-open phone-picker` runner attempt
+stopped in the first Chromium desktop/Linux workspace context: the Changes
+companion check's `.last()` Changes click was intercepted by an open
+`c6-presence fixed inset-0 z-40` layer until the 300-second deadline. The exact
+workspace case failed the same way in isolation on the final bundle and on
+the untouched `7035ec6b` bundle. This is preserved as a separate baseline
+failure, not a passing extra suite or an explanation for modelForms; the
+runner never reached phone-picker. Logs are
+`dist/s11-final-verification/{popup-regressions,workspace-isolated,workspace-exact-base}.log`.
+Its source-level cause remains uninvestigated in this change.
+
+`env -u NO_COLOR make ui` passed. `make check` passed formatting, native/wasm
+Clippy without warnings and test-lint, then failed only the already-exceeded
+raw size guard below; the Brotli guard passed. `make test` passed **1,257/1,257
+tests**, with **2 skipped**. The motion VM/launcher checks passed **13 tests**;
+JavaScript/Bash syntax, whitespace, and runner-stub checks also passed. The
+runner checks cover the default suite set, three motion-only passes, rejected
+suite names/whitespace-only selections, and immediate exit-7 propagation
+without retry.
+
+Local evidence is under `dist/s11-final-verification/` (build/check/test,
+versions, size/source hashes, focused and exploratory logs),
+`dist/s11-exploratory/` (12-case results and screenshots), and
+`dist/s11-model-forms-targeted-final/`. Initial exploratory evidence remains
+under `dist/s11-exploratory-initial-layout-and-done/`; the corrected isolated
+phone run is under `dist/s11-exploratory-phone-correction/`. No diagnostic
+rerun replaces a failed or stopped cohort.
+
+The final production build is **10,789,584 bytes raw / 2,663,888 Brotli**,
+versus the untouched base's **10,789,325 / 2,664,768**: **+259 bytes raw,
+−880 Brotli**. The raw ceiling remains **10,724,780**, already exceeded by
+the untouched base; Brotli remains below its **2,667,328** ceiling. No budget,
+optimization setting, icon or rendered-view representation was changed.
+Final WASM SHA-256:
+`0d838456a2b8a55cc4333783ccfbfd1693cb86977c515d501af607343c6362ab`.
 
 ## Browser crashes: preserve the first failure (N5, updated S2)
 

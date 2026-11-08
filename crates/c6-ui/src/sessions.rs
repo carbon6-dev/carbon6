@@ -864,7 +864,7 @@ fn SessionRow(s: Session, now: RwSignal<i64>, hover: Hover) -> impl IntoView {
                 use wasm_bindgen::JsCast;
                 if !window().match_media("(hover: hover)").ok().flatten().is_some_and(|m| m.matches()) { return; }
                 if let Some(el) = ev.current_target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
-                    hover.show(id.clone(), &el);
+                    hover.preview(id.clone(), &el);
                 }
             }
             on:mouseleave=move |_| hover.hide_soon()>
@@ -974,6 +974,12 @@ impl Hover {
         Hover { shown: RwSignal::new(None), generation: StoredValue::new(0), pinned: RwSignal::new(false) }
     }
 
+    fn preview(&self, id: String, row: &web_sys::Element) {
+        if crate::util::hover_allowed() {
+            self.show(id, row);
+        }
+    }
+
     fn show(&self, id: String, row: &web_sys::Element) {
         if self.pinned.get_untracked() {
             return;
@@ -1038,7 +1044,7 @@ fn PreviewButton(id: String, hover: Hover) -> impl IntoView {
 #[component]
 fn SessionPreview(hover: Hover, like_this: RwSignal<Option<SessionSeed>>) -> impl IntoView {
     let live = api::live();
-    let pop = StoredValue::new(escapable(move || hover.shown.with(Option::is_some), move || hover.hide_now()));
+    let pop = StoredValue::new(crate::util::previewable(move || hover.shown.with(Option::is_some), move || hover.hide_now(), hover.pinned));
     // A heartbeat may change the row, not the identity of this preview.
     // In particular it mustn't recreate its picker or discard focus.
     let shown = move || {
@@ -1077,7 +1083,7 @@ fn RailRow(s: Session, hover: Hover) -> impl IntoView {
             on:mouseenter=move |ev| {
                 if !window().match_media("(hover: hover)").ok().flatten().is_some_and(|m| m.matches()) { return; }
                 if let Some(el) = ev.current_target().and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok()) {
-                    hover.show(id.clone(), &el);
+                    hover.preview(id.clone(), &el);
                 }
             }
             on:mouseleave=move |_| hover.hide_soon()

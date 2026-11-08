@@ -570,6 +570,7 @@ struct Up {
     id: u64,
     owner: Option<leptos::reactive::owner::WeakOwner>,
     put_away: PutAway,
+    pinned: Option<RwSignal<bool>>,
 }
 
 thread_local! {
@@ -577,6 +578,12 @@ thread_local! {
     /// What pops up now, outermost first: one at a time, or one within
     /// another (a drop-down in a menu).
     static SHOWN: std::cell::RefCell<Vec<Up>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Passive previews may replace one another, but must not displace an
+/// explicitly opened panel (including one just exposed by a closing list).
+pub fn hover_allowed() -> bool {
+    SHOWN.with(|s| s.borrow().iter().all(|up| up.pinned.is_some_and(|p| p.try_get_untracked() == Some(false))))
 }
 
 /// Of what's up (outermost first) when another pops up: what stays (what
@@ -667,7 +674,7 @@ impl Drop for Dismiss {
 /// value returned: a press on its button is no press outside, so the button
 /// alone toggles it. `close` may run once its component is gone: `try_set`.
 pub fn dismissable(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static) -> String {
-    pop_up(shown, close, true)
+    pop_up(shown, close, true, None)
 }
 
 /// As `dismissable`, for what covers the page to catch a press outside it
@@ -675,7 +682,13 @@ pub fn dismissable(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone 
 /// wheels and focus left to what covers the page. What it shows carries
 /// `data-pop` (and its button, if one opens it, for focus to go back to).
 pub fn escapable(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static) -> String {
-    pop_up(shown, close, false)
+    pop_up(shown, close, false, None)
+}
+
+/// An Escape-dismissed hover preview. Until explicitly pinned, another
+/// passive preview may replace it; a pinned preview blocks passive hover.
+pub fn previewable(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static, pinned: RwSignal<bool>) -> String {
+    pop_up(shown, close, false, Some(pinned))
 }
 
 /// A retained phone dialog: contain keyboard focus and make the background
@@ -741,7 +754,12 @@ pub fn drawer_gesture(open: RwSignal<bool>, element: NodeRef<leptos::html::Div>,
     let _ = (open, element, close);
 }
 
-fn pop_up(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static, outside_closes: bool) -> String {
+fn pop_up(
+    shown: impl Fn() -> bool + 'static,
+    close: impl Fn() + Clone + 'static,
+    outside_closes: bool,
+    pinned: Option<RwSignal<bool>>,
+) -> String {
     use wasm_bindgen::JsCast;
     let id = POPS.with(|n| {
         n.set(n.get() + 1);
@@ -770,6 +788,11 @@ fn pop_up(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static
             // Within it as components go, or on the page (a drop-down in a
             // panel the same component pops up).
             let holds = |x: &Up| {
+                // Rail and list previews can share an ancestor owner, but
+                // are alternatives, not popups nested within one another.
+                if pinned.is_some() && x.pinned.is_some() {
+                    return false;
+                }
                 owner
                     .as_ref()
                     .and_then(|o| o.upgrade())
@@ -779,7 +802,7 @@ fn pop_up(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static
             };
             let (stay, gone) = opening(std::mem::take(&mut *s), holds);
             *s = stay;
-            s.push(Up { id, owner: owner.clone(), put_away: std::rc::Rc::new(close.clone()) });
+            s.push(Up { id, owner: owner.clone(), put_away: std::rc::Rc::new(close.clone()), pinned });
             gone
         });
         for x in gone {
@@ -1092,6 +1115,19 @@ mod tests {
     }
 
     #[test]
+    fn passive_hover_cannot_displace_another_popup() {
+        assert!(hover_allowed());
+        let pinned = RwSignal::new(false);
+        SHOWN.with(|s| s.borrow_mut().push(Up { id: 1, owner: None, put_away: std::rc::Rc::new(|| {}), pinned: Some(pinned) }));
+        let _cleanup = Dismiss { id: 1, hooks: Vec::new() };
+        assert!(hover_allowed(), "moving between rail and list rows can replace a passive preview");
+        pinned.set(true);
+        assert!(!hover_allowed(), "an explicitly pinned preview blocks passive hover");
+        SHOWN.with(|s| s.borrow_mut()[0].pinned = None);
+        assert!(!hover_allowed(), "hover must not close an explicit panel");
+    }
+
+    #[test]
     fn escape_puts_away_the_innermost_only() {
         assert!(innermost(&[1, 2], 2));
         assert!(!innermost(&[1, 2], 1));
@@ -1111,7 +1147,7 @@ mod tests {
             let cleaned = cleaned.clone();
             move || on_cleanup(move || cleaned.store(true, std::sync::atomic::Ordering::SeqCst))
         });
-        let shown = Up { id: 1, owner: Some(owner.downgrade()), put_away: std::rc::Rc::new(|| {}) };
+        let shown = Up { id: 1, owner: Some(owner.downgrade()), put_away: std::rc::Rc::new(|| {}), pinned: None };
         drop(owner);
         assert!(cleaned.load(std::sync::atomic::Ordering::SeqCst), "popup bookkeeping must not block component cleanup");
         assert!(shown.owner.unwrap().upgrade().is_none());
