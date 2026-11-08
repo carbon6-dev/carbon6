@@ -13,6 +13,19 @@ mod tests {
     use prost::Message;
 
     #[test]
+    fn narration_uses_a_fresh_tag_without_reclassifying_historical_blocks() {
+        for (bytes, block) in [
+            (b"\x0a\x06Update".as_slice(), content_block::Block::Text("Update".into())),
+            (b"\x12\x06Update".as_slice(), content_block::Block::Thinking("Update".into())),
+            (b"\x4a\x06Update".as_slice(), content_block::Block::Narration("Update".into())),
+        ] {
+            let decoded = ContentBlock::decode(bytes).unwrap();
+            assert_eq!(decoded.block.as_ref(), Some(&block));
+            assert_eq!(decoded.encode_to_vec(), bytes);
+        }
+    }
+
+    #[test]
     fn notice_queued_accepts_both_historical_tag_10_encodings() {
         // Literal protobuf wire bytes, not generated with today's schema:
         // command_id="c", text="n", quiet=true (168f3248).

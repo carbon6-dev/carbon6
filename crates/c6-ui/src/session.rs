@@ -4267,7 +4267,7 @@ fn message_action_context(kind: &EventKind) -> (&'static str, String) {
             blocks
                 .iter()
                 .find_map(|b| match b {
-                    ContentBlock::Text { text, .. } if !text.trim().is_empty() => Some(text.as_str()),
+                    ContentBlock::Text { text, .. } | ContentBlock::Narration { text } if !text.trim().is_empty() => Some(text.as_str()),
                     _ => None,
                 })
                 .unwrap_or("Tool activity"),
@@ -4496,6 +4496,7 @@ fn render_event(
                         }.into_any(),
                         ContentBlock::Text { text, citations } => view! { <div class="md" on:click=crate::mentions::link_clicks() inner_html=markdown::with_citations(text, citations)></div> }.into_any(),
                         ContentBlock::Thinking { text } => view! { <Thinking text=text.clone() show=crate::settings::show_thinking() /> }.into_any(),
+                        ContentBlock::Narration { text } => view! { <SummarizedUpdate text=text.clone() /> }.into_any(),
                         ContentBlock::ToolUse { id, name, input_json } => {
                             // Memos: a card redraws for its own result and output, not
                             // for every other call's (or every streamed token).
@@ -4573,6 +4574,19 @@ fn render_event(
 fn thinking_only(kind: &EventKind) -> bool {
     matches!(kind, EventKind::Assistant { blocks, stop_reason, .. }
         if stop_reason != "interrupted" && blocks.iter().all(|b| matches!(b, ContentBlock::Thinking { .. })))
+}
+
+/// Keep each summary in its own item so a future full-text action can live
+/// beside its label without flattening the transcript into generated HTML.
+#[component]
+fn SummarizedUpdate(text: String) -> impl IntoView {
+    let (col, ws) = (crate::workspace::use_column(), use_context::<crate::workspace::Workspace>());
+    view! {
+        <div data-summarized-update class="summarized-update flex items-start gap-2 text-xs text-muted">
+            <span class="shrink-0 font-medium">"Summarized update"</span>
+            <div class="md min-w-0 flex-1" on:click=move |ev| if let Some(ws) = ws { crate::mentions::follow_link(&ev, col, ws); } inner_html=markdown::to_html(&text)></div>
+        </div>
+    }
 }
 
 #[component]
@@ -7640,6 +7654,10 @@ mod tests {
         assert!(thinking_only(&event(vec![thinking.clone()], "tool_use")), "no empty event or branching controls");
         assert!(!thinking_only(&event(vec![thinking.clone()], "interrupted")), "keep the interruption notice");
         assert!(
+            !thinking_only(&event(vec![ContentBlock::Narration { text: "Visible summary".into() }], "tool_use")),
+            "summarized updates remain visible when thinking is hidden"
+        );
+        assert!(
             !thinking_only(&event(
                 vec![thinking.clone(), ContentBlock::Text { text: "Status update".into(), citations: vec![] }],
                 "end_turn"
@@ -7653,6 +7671,29 @@ mod tests {
             )),
             "a reasoning-plus-tools turn still shows its tool cards"
         );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn summarized_updates_are_quiet_labeled_items_independent_of_thinking() {
+        let owner = Owner::new();
+        owner.with(|| {
+            for show in [false, true] {
+                let html = view! {
+                    <SummarizedUpdate text="**Checking the setting** before continuing.".to_owned() />
+                    <SummarizedUpdate text="Second, separate summary.".to_owned() />
+                    <Thinking text="Private reasoning".to_owned() show=Signal::stored(show) />
+                }
+                .to_html();
+                assert_eq!(html.matches("data-summarized-update").count(), 2, "keep per-item boundaries: {html}");
+                assert_eq!(html.matches(">Summarized update</span>").count(), 2, "{html}");
+                assert!(html.contains("<strong>Checking the setting</strong>"), "summaries keep Markdown: {html}");
+                assert!(html.contains("Second, separate summary."), "{html}");
+                assert!(html.contains("text-xs text-muted"), "summary is quiet, not ordinary reply styling: {html}");
+                assert_eq!(html.contains("Private reasoning"), show, "only reasoning follows Show thinking: {html}");
+                assert!(!html.contains("Ask for the full text"), "future actions are not implemented: {html}");
+            }
+        });
     }
 
     #[cfg(not(target_arch = "wasm32"))]

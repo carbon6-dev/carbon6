@@ -373,6 +373,7 @@ message ContentBlock {
     string redacted_thinking = 5;       // Anthropic, opaque data
     Reasoning reasoning = 6;            // OpenAI Responses
     Opaque opaque = 7;                  // provider-run tools (web search …)
+    string narration = 9;              // server-summarized update, not reply text or private reasoning
   }
   // Display-only annotations on text (Responses url_citation, including
   // title, URL and character offsets). Absent in older events.

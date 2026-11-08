@@ -220,6 +220,8 @@ html.dark {
   /* Rendered markdown from model output. */
   /* Long words and inline code wrap rather than widen the transcript. */
   .md { @apply text-sm leading-relaxed; overflow-wrap: anywhere; }
+  /* A server summary stays visible but is quieter than the actual reply. */
+  .summarized-update .md { @apply text-xs; }
   .md > * + * { @apply mt-3; }
   .md h1 { @apply text-lg font-semibold; }
   .md h2 { @apply text-base font-semibold; }

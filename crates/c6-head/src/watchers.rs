@@ -500,6 +500,9 @@ fn digest(events: &[SessionEvent]) -> String {
                         Some(content_block::Block::Text(t)) if !t.trim().is_empty() => {
                             lines.push(format!("[{}] agent: {}", e.seq, clip(&api::citations::clean(t), 600)))
                         }
+                        Some(content_block::Block::Narration(t)) if !t.trim().is_empty() => {
+                            lines.push(format!("[{}] agent (summarized update): {}", e.seq, clip(t, 600)))
+                        }
                         Some(content_block::Block::ToolUse(t)) => {
                             lines.push(format!("[{}] agent calls {} {}", e.seq, t.name, clip(&t.input_json, 400)))
                         }

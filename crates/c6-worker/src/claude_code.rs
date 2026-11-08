@@ -2446,7 +2446,7 @@ fn tool_result(b: &Value) -> ToolResult {
     }
 }
 
-/// Narration indexes name visible updates encoded as thinking, not reasoning.
+/// Narration indexes name summarized updates encoded as thinking, not reasoning.
 /// Use original content positions before filtering empty or unsupported blocks.
 fn assistant_blocks(v: &Value) -> Vec<ContentBlock> {
     v["message"]["content"]
@@ -2465,7 +2465,7 @@ fn assistant_blocks(v: &Value) -> Vec<ContentBlock> {
 fn assistant_block(b: &Value, narration: bool) -> Option<ContentBlock> {
     let block = match b["type"].as_str()? {
         "text" => content_block::Block::Text(b["text"].as_str()?.to_owned()),
-        "thinking" if narration => content_block::Block::Text(b["thinking"].as_str().filter(|t| !t.is_empty())?.to_owned()),
+        "thinking" if narration => content_block::Block::Narration(b["thinking"].as_str().filter(|t| !t.is_empty())?.to_owned()),
         "thinking" => content_block::Block::Thinking(b["thinking"].as_str().filter(|t| !t.is_empty())?.to_owned()),
         "tool_use" => content_block::Block::ToolUse(ToolUse {
             id: b["id"].as_str()?.to_owned(),
@@ -2593,7 +2593,7 @@ mod tests {
                 .collect();
             use content_block::Block;
             assert!(
-                matches!(blocks.as_slice(), [Block::Thinking(t), Block::Text(n), Block::Text(before), Block::ToolUse(_), Block::Text(after)]
+                matches!(blocks.as_slice(), [Block::Thinking(t), Block::Narration(n), Block::Text(before), Block::ToolUse(_), Block::Text(after)]
                 if t == "Private reasoning" && n == "The loop limit protects against cycles."
                     && before == "Checking the setting now." && after == "Cleanup is under way.")
             );
@@ -2611,6 +2611,63 @@ mod tests {
             let blocks = assistant_blocks(&frame);
             assert!(matches!(&blocks[0].block, Some(content_block::Block::Thinking(t)) if t == "Reasoning"));
             assert!(matches!(&blocks[1].block, Some(content_block::Block::Text(t)) if t == "Reply"));
+        }
+    }
+
+    #[test]
+    fn recorded_coordinator_summary_keeps_narration_provenance() {
+        // Relevant fields from the Coordinator's Claude Code 2.1.311 JSONL,
+        // lines 28939–28943, 2026-11-08. Opaque signatures, usage and tool
+        // inputs are omitted. The actual signatures classify the empty block
+        // as "thinking" and the 264-character summary as "narration".
+        // Local JSONL has no narration_block_indexes; the SDK adds them from
+        // those signatures. They index this frame, not apiBlockIndex or the
+        // non-empty blocks remaining after filtering.
+        let frames: Vec<Value> = serde_json::from_str(
+            r#"[
+                {"type":"assistant","thinkingDisplay":"updates","apiBlockIndex":0,"message":{
+                    "id":"msg_011Cgq1iDTmVz2S73WksHj73","content":[{"type":"thinking","thinking":""}]
+                }},
+                {"type":"assistant","thinkingDisplay":"updates","apiBlockIndex":1,"message":{
+                    "id":"msg_011Cgq1iDTmVz2S73WksHj73","content":[{"type":"thinking","thinking":"Carbon6 is capping how often helper notices can wake me while I'm idle, and I'm going to ask both helpers to report only on changes, not progress. Each update currently costs two wake-ups because the helpers send both a session message and an end-of-turn report.\n\n"}]
+                }},
+                {"type":"assistant","apiBlockIndex":2,"message":{
+                    "id":"msg_011Cgq1iDTmVz2S73WksHj73","content":[{"type":"tool_use","id":"toolu_01YaxdNrRaZikJDjiqutx9oA","name":"mcp__carbon6__SendMessage","input":{}}]
+                }},
+                {"type":"assistant","apiBlockIndex":3,"message":{
+                    "id":"msg_011Cgq1iDTmVz2S73WksHj73","content":[{"type":"tool_use","id":"toolu_01MhE8gNMSvYn8xtDpSpa6PD","name":"mcp__carbon6__SendMessage","input":{}}]
+                }}
+            ]"#,
+        )
+        .unwrap();
+        let summary = frames[1]["message"]["content"][0]["thinking"].as_str().unwrap();
+        assert_eq!(summary.len(), 264);
+
+        for batched in [false, true] {
+            for narration in [false, true] {
+                let mut frames = frames.clone();
+                if batched {
+                    let content: Vec<_> = frames.iter().flat_map(|f| f["message"]["content"].as_array().unwrap().clone()).collect();
+                    frames.truncate(1);
+                    frames[0]["message"]["content"] = content.into();
+                }
+                if narration {
+                    // SDK metadata reconstructed from the actual signature
+                    // classification, not copied from the local JSONL.
+                    let (frame, block) = if batched { (0, 1) } else { (1, 0) };
+                    frames[frame]["narration_block_indexes"] = serde_json::json!([block]);
+                }
+                let blocks: Vec<_> = frames.iter().flat_map(assistant_blocks).collect();
+                assert_eq!(blocks.len(), 3, "empty thinking is omitted, not the summary or either tool");
+                match &blocks[0].block {
+                    Some(content_block::Block::Narration(text)) if narration => assert_eq!(text, summary),
+                    Some(content_block::Block::Thinking(text)) if !narration => assert_eq!(text, summary),
+                    other => panic!("unexpected summary classification: {other:?}"),
+                }
+                for (block, id) in blocks[1..].iter().zip(["toolu_01YaxdNrRaZikJDjiqutx9oA", "toolu_01MhE8gNMSvYn8xtDpSpa6PD"]) {
+                    assert!(matches!(&block.block, Some(content_block::Block::ToolUse(tool)) if tool.id == id));
+                }
+            }
         }
     }
 

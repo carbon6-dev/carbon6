@@ -89,6 +89,87 @@ async function check(browser, origin, engine, theme, view) {
   } finally { await f?.context.close(); }
 }
 
+async function checkSummarizedUpdates(browser, origin, engine, theme, width, showThinking) {
+  const label = `${engine}-${theme}-summaries-${width}-thinking-${showThinking}`;
+  const events = [
+    { seq: 70, ts: 70, type: 'assistant', turn: 70, blocks: [{ type: 'text', text: 'Ordinary reply stays full size.' }], stop_reason: 'end_turn' },
+    { seq: 71, ts: 71, type: 'assistant', turn: 71, blocks: [
+      { type: 'narration', text: '**First summary** stays visible with a long_wrapping_summary_word_that_must_not_widen_the_phone.' },
+      { type: 'narration', text: 'Second, separate summary.' },
+    ], stop_reason: 'tool_use' },
+    { seq: 72, ts: 72, type: 'assistant', turn: 71, blocks: [{ type: 'thinking', text: 'Genuine private reasoning.' }], stop_reason: 'tool_use' },
+    { seq: 73, ts: 73, type: 'assistant', turn: 71, blocks: [
+      { type: 'tool_use', id: 'summary-tool', name: 'Bash', input_json: '{"command":"echo summary-fixture"}' },
+    ], stop_reason: 'tool_use' },
+    { seq: 74, ts: 74, type: 'tool_result', call_id: 'summary-tool', tool: 'Bash', output: 'summary-fixture', is_error: false,
+      truncated: false, duration_ms: 1 },
+    { seq: 75, ts: 75, type: 'assistant', turn: 71, blocks: [{ type: 'text', text: 'Historical update stored as plain Text.' }], stop_reason: 'end_turn' },
+  ];
+  let f;
+  try {
+    f = await fixture(browser, origin, { width, height: 1000 }, theme,
+      { choice: 'off', effective: 'off', os: 'reduce' }, partial => { f = partial; }, {}, {
+        instrumentation: false, events,
+        path: '/sessions/parent', layout: layout({ view: 'session', id: 'parent' }),
+        setup: async ({ context }) => context.route('**/api/**', route => {
+          if (new URL(route.request().url()).pathname.endsWith('/settings/transcript')) {
+            return route.fulfill({ json: { show_thinking: showThinking } });
+          }
+          return route.fallback();
+        }),
+      });
+    const { page } = f;
+    const items = page.locator('[data-summarized-update]');
+    await items.nth(1).waitFor();
+    assert.equal(await items.count(), 2, 'each narration block retains its own item');
+    assert.equal(await items.getByText('Summarized update', { exact: true }).count(), 2);
+    assert.equal(await items.first().locator('strong').textContent(), 'First summary', 'keep summary Markdown');
+    assert.equal(await items.locator('details, summary, button').count(), 0, 'visible summaries, not a Thinking disclosure or unbuilt action');
+    const ordinary = page.locator('#parent-e70 .md');
+    const historical = page.locator('#parent-e75');
+    assert.equal(await historical.locator('[data-summarized-update]').count(), 0, 'do not reclassify old Text');
+    assert.equal((await ordinary.textContent()).trim(), 'Ordinary reply stays full size.');
+    await page.waitForFunction(show => document.body.textContent.includes('Genuine private reasoning.') === show, showThinking);
+    const sizes = await page.evaluate(() => ({
+      reply: parseFloat(getComputedStyle(document.querySelector('#parent-e70 .md')).fontSize),
+      summary: parseFloat(getComputedStyle(document.querySelector('[data-summarized-update] .md')).fontSize),
+      overflow: document.documentElement.scrollWidth > innerWidth,
+    }));
+    assert(sizes.summary < sizes.reply, `summaries are quieter than replies: ${JSON.stringify(sizes)}`);
+    assert.equal(sizes.overflow, false, 'summary wraps on phones');
+    const icons = await page.locator('#parent-e73 svg').count();
+    assert(icons > 0, 'the neighboring tool retains its icon');
+
+    const append = event => {
+      const seq = f.send(event);
+      events.push({ ...event, seq, ts: Date.now() });
+      return seq;
+    };
+    append({ type: 'turn_started', turn: 101 });
+    f.stream({ type: 'thinking', turn: 101, text: 'Transient unclassified thinking.' });
+    if (showThinking) await page.getByText('Transient unclassified thinking.', { exact: true }).waitFor();
+    const live = append({ type: 'assistant', turn: 101, blocks: [{ type: 'narration', text: 'Live classified summary.' }], stop_reason: 'tool_use' });
+    await page.locator(`#parent-e${live} [data-summarized-update]`).waitFor();
+    assert.equal(await items.count(), 3);
+    assert.equal(await page.getByText('Transient unclassified thinking.', { exact: true }).count(), 0, 'durable narration replaces provisional thinking');
+    append({ type: 'assistant', turn: 101, blocks: [{ type: 'text', text: 'Actual answer after the summary.' }], stop_reason: 'end_turn' });
+    append({ type: 'turn_ended', turn: 101, reason: 'completed' });
+    await page.getByText('Actual answer after the summary.', { exact: true }).waitFor();
+
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.locator(`#parent-e${live} [data-summarized-update]`).waitFor();
+    assert.equal(await items.count(), 3, 'replay retains summary provenance');
+    assert.equal(await items.getByText('Summarized update', { exact: true }).count(), 3);
+    assert.equal(await page.locator('#parent-e73 svg').count(), icons, 'tool icons survive replay unchanged');
+    assert.equal(await page.locator('#parent-e75 [data-summarized-update]').count(), 0, 'historical Text stays unchanged on replay');
+    await page.waitForFunction(show => document.body.textContent.includes('Genuine private reasoning.') === show, showThinking);
+    assert.equal(await page.getByText('Ask for the full text', { exact: true }).count(), 0);
+    assert.deepEqual(f.errors, []);
+    await page.screenshot({ path: path.join(shots, `${label}.png`) });
+    console.log(`PASS ${label}: separate quiet labeled summaries, live/replay, old Text, thinking preference, Markdown, wrapping and tool icons`);
+  } finally { await f?.context.close(); }
+}
+
 (async () => {
   fs.mkdirSync(shots, { recursive: true });
   const { server, origin } = await serve();
@@ -99,6 +180,9 @@ async function check(browser, origin, engine, theme, view) {
       try {
         for (const theme of (process.env.THEME || 'light,dark').split(',')) for (const view of (process.env.VIEW || 'transcript,doc').split(',')) {
           await check(browser, origin, engine, theme, view); passed++;
+        }
+        for (const theme of (process.env.THEME || 'light,dark').split(',')) for (const width of [1440, 320]) for (const show of [false, true]) {
+          await checkSummarizedUpdates(browser, origin, engine, theme, width, show); passed++;
         }
       } finally { await browser.close(); }
     }

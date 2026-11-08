@@ -166,6 +166,7 @@ carbon6.v1.ContentBlock 5 string redacted_thinking
 carbon6.v1.ContentBlock 6 Reasoning reasoning
 carbon6.v1.ContentBlock 7 Opaque opaque
 carbon6.v1.ContentBlock 8 string annotations_json
+carbon6.v1.ContentBlock 9 string narration
 carbon6.v1.Opaque 1 string provider
 carbon6.v1.Opaque 2 string json
 carbon6.v1.Opaque 3 string label

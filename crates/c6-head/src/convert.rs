@@ -91,6 +91,7 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
                             api::ContentBlock::Text { text: t.clone(), citations: api::citations::annotations(&b.annotations_json) }
                         }
                         content_block::Block::Thinking(t) => api::ContentBlock::Thinking { text: t.clone() },
+                        content_block::Block::Narration(t) => api::ContentBlock::Narration { text: t.clone() },
                         content_block::Block::ToolUse(u) => {
                             api::ContentBlock::ToolUse { id: u.id.clone(), name: u.name.clone(), input_json: u.input_json.clone() }
                         }
@@ -380,6 +381,35 @@ mod tests {
         assert_eq!((shown.seq, shown.ts), (17, 1234));
         assert!(matches!(shown.kind, api::EventKind::User { command_id, text: s, command, prompt, wake: false, .. }
             if command_id == id && s == text && command == "card-answer" && prompt.is_empty()));
+    }
+
+    #[test]
+    fn narration_reaches_the_api_without_reclassifying_old_text_or_thinking() {
+        let saved = SessionEvent {
+            kind: Some(session_event::Kind::Assistant(c6_proto::AssistantMessage {
+                turn: 1112,
+                blocks: vec![
+                    c6_proto::ContentBlock { block: Some(content_block::Block::Narration("Summary".into())), ..Default::default() },
+                    c6_proto::ContentBlock { block: Some(content_block::Block::Text("Old reply".into())), ..Default::default() },
+                    c6_proto::ContentBlock { block: Some(content_block::Block::Thinking("Reasoning".into())), ..Default::default() },
+                ],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let shown = event(&saved).unwrap();
+        let json = serde_json::to_value(&shown).unwrap();
+        assert_eq!(json["blocks"][0], serde_json::json!({"type": "narration", "text": "Summary"}));
+        let decoded: api::Event = serde_json::from_value(json).unwrap();
+        let api::EventKind::Assistant { blocks, .. } = decoded.kind else { panic!("not an assistant event") };
+        assert_eq!(
+            blocks,
+            vec![
+                api::ContentBlock::Narration { text: "Summary".into() },
+                api::ContentBlock::Text { text: "Old reply".into(), citations: vec![] },
+                api::ContentBlock::Thinking { text: "Reasoning".into() },
+            ]
+        );
     }
 
     #[test]

@@ -150,7 +150,12 @@ pub fn portable_events(events: &[SessionEvent]) -> Vec<SessionEvent> {
         .cloned()
         .map(|mut ev| {
             if let Some(session_event::Kind::Assistant(a)) = &mut ev.kind {
-                a.blocks.retain(|b| matches!(b.block, Some(content_block::Block::Text(_)) | Some(content_block::Block::ToolUse(_))));
+                a.blocks.retain(|b| {
+                    matches!(
+                        b.block,
+                        Some(content_block::Block::Text(_) | content_block::Block::Narration(_) | content_block::Block::ToolUse(_))
+                    )
+                });
             }
             ev
         })
@@ -195,6 +200,7 @@ pub fn transcript_text(events: &[SessionEvent]) -> String {
                 for b in &a.blocks {
                     match &b.block {
                         Some(content_block::Block::Text(t)) => out.push_str(&format!("\n## Assistant\n{t}\n")),
+                        Some(content_block::Block::Narration(t)) => out.push_str(&format!("\n## Assistant (summarized update)\n{t}\n")),
                         Some(content_block::Block::ToolUse(u)) => {
                             out.push_str(&format!("\n[tool call {}: {}]\n", u.name, clip(&u.input_json, 2000)))
                         }
@@ -333,6 +339,9 @@ pub(crate) fn block_from_proto(b: &c6_proto::ContentBlock) -> Option<Block> {
             Block::AnnotatedText { text: t.clone(), annotations_json: b.annotations_json.clone() }
         }),
         content_block::Block::Thinking(t) => Some(Block::Thinking(t.clone())),
+        // Display provenance must not drop visible context on a handoff to
+        // another model. The Claude CLI owns replay of its original blocks.
+        content_block::Block::Narration(t) => Some(Block::Text(t.clone())),
         content_block::Block::ToolUse(u) => {
             Some(Block::ToolUse { id: u.id.clone(), name: u.name.clone(), input_json: u.input_json.clone() })
         }
@@ -657,6 +666,29 @@ mod tests {
         assert_eq!(block_from_proto(&proto), Some(block));
         let old = ContentBlock { block: Some(content_block::Block::Text("Old reply".into())), ..Default::default() };
         assert_eq!(block_from_proto(&old), Some(Block::Text("Old reply".into())));
+    }
+
+    #[test]
+    fn narration_is_kept_in_handoff_context_without_becoming_private_reasoning() {
+        let block = ContentBlock { block: Some(content_block::Block::Narration("Visible summary".into())), ..Default::default() };
+        assert_eq!(block_from_proto(&block), Some(Block::Text("Visible summary".into())));
+        let events = vec![ev(session_event::Kind::Assistant(c6_proto::AssistantMessage {
+            blocks: vec![
+                block,
+                ContentBlock { block: Some(content_block::Block::Thinking("Private reasoning".into())), ..Default::default() },
+            ],
+            ..Default::default()
+        }))];
+        let text = transcript_text(&events);
+        assert!(text.contains("## Assistant (summarized update)\nVisible summary"), "{text}");
+        let portable = portable_events(&events);
+        assert!(
+            matches!(&events[0].kind, Some(session_event::Kind::Assistant(a)) if a.blocks.len() == 2),
+            "the original transcript remains intact"
+        );
+        let history = history_from_events(&portable);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].blocks, vec![Block::Text("Visible summary".into())], "cross-model side chats keep summaries, not reasoning");
     }
 
     #[test]

@@ -124,6 +124,16 @@ attribute removal, escaped XSS strings, cross-cell containment, block HTML,
 ordinary paragraphs, and intact following content. Screenshots default to
 `/tmp/s9-markdown-html` (`SCREENSHOTS` overrides); no retries are performed.
 
+The same suite also checks narration on desktop and 320px phones in both
+themes and with **Show thinking** on/off: separate quiet **Summarized update**
+items, Markdown, live thinking-to-narration replacement, replay, unchanged
+historical Text and neighboring tool icons, and wrapping without page overflow.
+The worker's real-log regression is
+`claude_code::tests::recorded_coordinator_summary_keeps_narration_provenance`;
+protocol, head conversion and UI render tests cover the new Narration block
+without reclassifying historical Text/Thinking. No database migration or
+full-text request action is part of this display change.
+
 ## Effective conversation projections after rewind
 
 The native-memory reset regression runs a fake stream-JSON CLI with its own

@@ -43,6 +43,7 @@ fn entries(ev: &SessionEvent) -> Vec<(u32, &'static str, String)> {
             for (i, b) in a.blocks.iter().enumerate() {
                 let (kind, text) = match &b.block {
                     Some(content_block::Block::Text(t)) => ("assistant", t.clone()),
+                    Some(content_block::Block::Narration(t)) => ("assistant", format!("Summarized update: {t}")),
                     Some(content_block::Block::Thinking(t)) => ("thinking", t.clone()),
                     Some(content_block::Block::SignedThinking(t)) => ("thinking", t.text.clone()),
                     Some(content_block::Block::Reasoning(r)) => ("thinking", r.summary.clone()),
@@ -556,6 +557,21 @@ mod tests {
         };
         assert_eq!(entries(&input), [(0, "user", text.into())]);
         assert_eq!(crate::convert::event(&input).unwrap().seq, 17, "search points to the user message");
+    }
+
+    #[test]
+    fn narration_is_searchable_as_a_labeled_assistant_update() {
+        let input = SessionEvent {
+            kind: Some(session_event::Kind::Assistant(c6_proto::AssistantMessage {
+                blocks: vec![c6_proto::ContentBlock {
+                    block: Some(content_block::Block::Narration("Visible summary".into())),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(entries(&input), [(0, "assistant", "Summarized update: Visible summary".into())]);
     }
 
     #[test]

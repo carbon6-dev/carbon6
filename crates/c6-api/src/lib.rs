@@ -2555,6 +2555,10 @@ pub enum ContentBlock {
     Thinking {
         text: String,
     },
+    /// A visible server-summarized update, distinct from a reply or reasoning.
+    Narration {
+        text: String,
+    },
     ToolUse {
         id: String,
         name: String,
