@@ -564,7 +564,7 @@ async function desktopTaskWords(f, name) {
           await overview.getByRole('heading', { name: `Running now · ${count}`, exact: true }).waitFor();
           const identities = await overview.locator('[data-background-job]:visible').evaluateAll(rows => rows.map(row => row.dataset.backgroundJob));
           assert.deepEqual(identities, [...live], 'wide list counts all distinct jobs, including servers');
-          assert.equal(await button.count(), 0, 'wide list forbids the duplicate composer background link');
+          assert.equal(await button.count(), 1, 'option A keeps the right-hand opener beside the wide list');
         } else {
           const words = `${count} background task${count === 1 ? '' : 's'}`;
           await tile.getByRole('button', { name: words, exact: true }).waitFor();
