@@ -293,6 +293,25 @@ async function pin(page) {
 async function sessionActions(f, prefix) {
   const { page } = f;
   await openActions(page);
+  phase(page, 'session Switch and Copy keep Actions open');
+  const retainedMenu = await pop(page).elementHandle();
+  const catchup = pop(page).getByRole('switch', { name: 'Catch-up', exact: true });
+  await catchup.waitFor();
+  assert.equal(await catchup.getAttribute('aria-checked'), 'true', 'fixture begins with Catch-up enabled');
+  for (const on of [false, true]) {
+    await catchup.click();
+    await page.waitForFunction(on => document.querySelector('.phone-popover [role="switch"][aria-label="Catch-up"]')
+      ?.getAttribute('aria-checked') === String(on), on);
+    assert.equal(await pop(page).count(), 1, 'changing Catch-up keeps Actions open');
+    assert(await retainedMenu.evaluate(el => el.isConnected), 'changing Catch-up retains the open menu');
+  }
+  const copy = action(page, 'Copy session ID');
+  await copy.click();
+  // No clipboard stub or permissions change: either native result is valid
+  // feedback, and neither result may dismiss the Actions menu.
+  await copy.getByRole('status').filter({ hasText: /^(Copied|Couldn't copy)$/ }).waitFor();
+  assert.equal(await pop(page).count(), 1, 'Copy feedback keeps Actions open');
+  assert(await retainedMenu.evaluate(el => el.isConnected), 'Copy feedback retains the open menu');
   phase(page, 'open Find in session');
   await action(page, /^Find in session/).click();
   const find = page.getByPlaceholder('Find in this session');
@@ -381,10 +400,22 @@ async function documentActions(f, prefix, calls) {
     await sheet.waitFor({ state: 'hidden' });
   }
   await openActions(page);
-  phase(page, 'rename document');
+  phase(page, 'cancel document rename with Escape');
   await action(page, 'Rename document').click();
   const title = page.getByRole('textbox', { name: 'Document title', exact: true });
   await title.waitFor();
+  const patchesBeforeCancel = calls.filter(c => c.docPatch);
+  await title.fill(`${TITLE} cancelled draft`);
+  await title.press('Escape');
+  await title.waitFor({ state: 'hidden' });
+  await settle(page);
+  assert.deepEqual(calls.filter(c => c.docPatch), patchesBeforeCancel, 'Escape cancellation does not PATCH the document');
+  assert.equal(await bar(page).locator('[data-phone-title]').textContent(), TITLE, 'Escape cancellation leaves the document title unchanged');
+  await openActions(page);
+  phase(page, 'rename document with Enter');
+  await action(page, 'Rename document').click();
+  await title.waitFor();
+  assert.equal(await title.inputValue(), TITLE, 'reopened rename discards the cancelled draft');
   await title.fill(`${TITLE} renamed`);
   await title.press('Enter');
   await title.waitFor({ state: 'hidden' });

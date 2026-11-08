@@ -875,7 +875,7 @@ fn DocMenuItems(
     export: Callback<()>,
     history: Callback<()>,
     close: Callback<()>,
-) -> impl IntoView {
+) -> AnyView {
     let (col, ws) = (use_column(), use_workspace());
     let live = api::live();
     view! {
@@ -901,6 +901,7 @@ fn DocMenuItems(
             on:click=move |_| { close.run(()); history.run(()); }>"History"</button>
         {move || view! { <ArchiveMenuItem archived=archived.get() busy run=Callback::new(move |()| { close.run(()); archive.run(()); }) /> }}
     }
+    .into_any()
 }
 
 /// This browser's independently opened panel rows and last read reply, per doc.
@@ -1788,7 +1789,7 @@ pub fn DocPage(id: String) -> impl IntoView {
             let _ = el.focus();
         }
     });
-    let toggle_edit = move |_| {
+    let toggle_edit = Callback::new(move |()| {
         if archived.get_untracked() {
             return;
         }
@@ -1799,7 +1800,7 @@ pub fn DocPage(id: String) -> impl IntoView {
         } else {
             edit_all.set(true);
         }
-    };
+    });
     // The blocks drawn, each kept while it's unchanged; the one open in
     // Markdown as it was when opened, so a change to it from elsewhere
     // waits until you're done rather than taking what you're typing.
@@ -1854,23 +1855,12 @@ pub fn DocPage(id: String) -> impl IntoView {
                         }.into_any()
                     }}
                     </div>
-                    <button data-opens="comments" class=move || format!("{BAR} {}", if panel.get() { "bg-zinc-100 dark:bg-zinc-800" } else { "" })
-                        title=move || if panel.get() { "Hide the comments" } else { "Show the comments" }
-                        on:click=move |_| panel.update(|p| *p = !*p)>
-                        {crate::icons::icon(crate::icons::Icon::MessageSquare, crate::icons::Size::S14)}" "{move || match open_n.get() { 0 => "Comments".to_owned(), n => format!("{n} open") }}
-                    </button>
+                    {comments_button(panel, open_n, false)}
                     // A comment on the whole doc, wherever you've scrolled to.
-                    <Show when=move || !archived.get()><button data-opens="comments" class=BAR title="Comment on the whole doc"
-                        on:click=move |_| { panel.set(true); threads.focus.set(Some(String::new())); threads.commenting.set(Some(String::new())); }>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" Comment"</button>
+                    <Show when=move || !archived.get()>{whole_doc_comment_button(threads, false)}
                     </Show>
-                    {move || (!archived.get() && unsent.get() > 0).then(|| send_all_button(threads, true))}
-                    {move || (!archived.get() && !is_deck.get()).then(|| view! {
-                        <button class=move || format!("{BAR} {}", if edit_all.get() { "bg-zinc-100 font-medium dark:bg-zinc-800" } else { "" })
-                            title=move || if edit_all.get() { "Back to reading" } else { "Edit the doc: a click on a block opens it in Markdown" }
-                            on:click=toggle_edit>
-                            {move || if edit_all.get() { view! { "Done" }.into_any() } else { view! { {crate::icons::pencil()}" Edit" }.into_any() }}
-                        </button>
-                    })}
+                    {move || (!archived.get() && unsent.get() > 0).then(|| send_all_button(threads, true, false))}
+                    {move || (!archived.get() && !is_deck.get()).then(|| edit_doc_button(edit_all, toggle_edit, false))}
                     <UsedIn items=used />
                     <DocMenu owner archived busy=archive_busy archive
                         export=Callback::new(move |()| exporting.update(|x| *x = !*x))
@@ -1879,6 +1869,7 @@ pub fn DocPage(id: String) -> impl IntoView {
                 <Show when=move || floating_present.get()><FloatingPanel open=Signal::derive(move || floating.get()) /></Show>
             </div>
         }
+        .into_any()
     };
     let content = move || {
         view! {
@@ -1894,27 +1885,15 @@ pub fn DocPage(id: String) -> impl IntoView {
                             phone_renaming.set(true);
                         }>{crate::icons::pencil()}" Rename document"</button>
                     </Show>
-                    <button role="menuitem" data-opens="comments" class=DOC_PHONE_ACTION aria-pressed=move || panel.get().to_string()
-                        on:click=move |_| panel.update(|p| *p = !*p)>
-                        {crate::icons::icon(crate::icons::Icon::MessageSquare, crate::icons::Size::S14)}
-                        {move || format!("{} comments{}", if panel.get() { "Hide" } else { "Show" }, match open_n.get() { 0 => String::new(), n => format!(" ({n} open)") })}
-                    </button>
+                    {comments_button(panel, open_n, true)}
                     <Show when=move || !archived.get()>
-                        <button role="menuitem" data-opens="comments" class=DOC_PHONE_ACTION on:click=move |_| {
-                            panel.set(true);
-                            threads.focus.set(Some(String::new()));
-                            threads.commenting.set(Some(String::new()));
-                        }>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" Comment on the whole doc"</button>
+                        {whole_doc_comment_button(threads, true)}
                     </Show>
                     <Show when=move || { !archived.get() && unsent.get() > 0 }>
-                        <button role="menuitem" class=DOC_PHONE_ACTION disabled=move || sending.get() on:click=move |_| threads.send_all.run(())>
-                            {crate::icons::arrow_up()}{move || format!("Send {} to agent", unsent.get())}
-                        </button>
+                        {send_all_button(threads, true, true)}
                     </Show>
                     <Show when=move || !archived.get() && !is_deck.get()>
-                        <button role="menuitem" class=DOC_PHONE_ACTION on:click=toggle_edit>
-                            {crate::icons::pencil()}{move || if edit_all.get() { "Done" } else { "Edit document" }}
-                        </button>
+                        {edit_doc_button(edit_all, toggle_edit, true)}
                     </Show>
                     <Show when=move || !used.with(Vec::is_empty)>
                         <div class="border-y border-zinc-200 py-1 dark:border-zinc-700">
@@ -2070,16 +2049,71 @@ pub fn DocPage(id: String) -> impl IntoView {
     }
 }
 
-/// "Send N to agent": your open comments not sent yet go, each thread to
-/// its session.
-fn send_all_button(ctx: ThreadsCtx, arrow: bool) -> impl IntoView {
+/// Construct each control once, keeping its typed DOM behind a shared boundary.
+/// Presentation changes attributes and labels, never ownership or mount policy.
+fn comments_button(panel: RwSignal<bool>, open_n: Memo<usize>, phone: bool) -> AnyView {
     view! {
-        <button class="shrink-0 rounded-md bg-sky-600 px-2 py-1 text-xs font-medium text-white hover:bg-sky-700 disabled:opacity-50"
-            title="Your open comments that haven't gone to an agent: each thread goes to its session, which answers in it"
-            disabled=move || ctx.sending.get() on:click=move |_| ctx.send_all.run(())>
-            {move || format!("Send {} to agent", ctx.unsent.get())}{arrow.then(|| view! { " "{crate::icons::arrow_up()} })}
+        <button role=phone.then_some("menuitem") data-opens="comments"
+            class=move || if phone { DOC_PHONE_ACTION.to_owned() } else { format!("{BAR} {}", if panel.get() { "bg-zinc-100 dark:bg-zinc-800" } else { "" }) }
+            title=move || (!phone).then(|| if panel.get() { "Hide the comments" } else { "Show the comments" })
+            aria-pressed=move || phone.then(|| panel.get().to_string())
+            on:click=move |_| panel.update(|p| *p = !*p)>
+            {crate::icons::icon(crate::icons::Icon::MessageSquare, crate::icons::Size::S14)}
+            {(!phone).then_some(" ")}
+            {move || if phone {
+                format!("{} comments{}", if panel.get() { "Hide" } else { "Show" }, match open_n.get() { 0 => String::new(), n => format!(" ({n} open)") })
+            } else {
+                match open_n.get() { 0 => "Comments".to_owned(), n => format!("{n} open") }
+            }}
         </button>
     }
+    .into_any()
+}
+
+fn whole_doc_comment_button(ctx: ThreadsCtx, phone: bool) -> AnyView {
+    view! {
+        <button role=phone.then_some("menuitem") data-opens="comments" class=if phone { DOC_PHONE_ACTION } else { BAR }
+            title=(!phone).then_some("Comment on the whole doc")
+            on:click=move |_| { ctx.panel.set(true); ctx.focus.set(Some(String::new())); ctx.commenting.set(Some(String::new())); }>
+            {crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}
+            {if phone { " Comment on the whole doc" } else { " Comment" }}
+        </button>
+    }
+    .into_any()
+}
+
+fn edit_doc_button(edit_all: RwSignal<bool>, toggle_edit: Callback<()>, phone: bool) -> AnyView {
+    view! {
+        <button role=phone.then_some("menuitem")
+            class=move || if phone { DOC_PHONE_ACTION.to_owned() } else { format!("{BAR} {}", if edit_all.get() { "bg-zinc-100 font-medium dark:bg-zinc-800" } else { "" }) }
+            title=move || (!phone).then(|| if edit_all.get() { "Back to reading" } else { "Edit the doc: a click on a block opens it in Markdown" })
+            on:click=move |_| toggle_edit.run(())>
+            {phone.then(crate::icons::pencil)}
+            {move || if phone {
+                (if edit_all.get() { "Done" } else { "Edit document" }).into_any()
+            } else if edit_all.get() {
+                view! { "Done" }.into_any()
+            } else {
+                view! { {crate::icons::pencil()}" Edit" }.into_any()
+            }}
+        </button>
+    }
+    .into_any()
+}
+
+/// "Send N to agent": your open comments not sent yet go, each thread to
+/// its session. The phone keeps its arrow before the text; the bar after it.
+fn send_all_button(ctx: ThreadsCtx, arrow: bool, phone: bool) -> AnyView {
+    view! {
+        <button role=phone.then_some("menuitem")
+            class=if phone { DOC_PHONE_ACTION } else { "shrink-0 rounded-md bg-sky-600 px-2 py-1 text-xs font-medium text-white hover:bg-sky-700 disabled:opacity-50" }
+            title=(!phone).then_some("Your open comments that haven't gone to an agent: each thread goes to its session, which answers in it")
+            disabled=move || ctx.sending.get() on:click=move |_| ctx.send_all.run(())>
+            {(phone && arrow).then(crate::icons::arrow_up)}
+            {move || format!("Send {} to agent", ctx.unsent.get())}{(!phone && arrow).then(|| view! { " "{crate::icons::arrow_up()} })}
+        </button>
+    }
+    .into_any()
 }
 
 /// "Used in N ▾": the projects and work that refer to a doc, as a menu
@@ -2398,7 +2432,7 @@ fn CommentsPanel() -> impl IntoView {
         {move || (!archived.get() && ctx.unsent.get() > 0).then(|| view! {
             <div class="flex shrink-0 items-center gap-2 border-t border-zinc-200 px-3 py-2 dark:border-zinc-800">
                 <span class="flex-1 text-xs text-muted">{move || format!("{} not sent yet", ctx.unsent.get())}</span>
-                {send_all_button(ctx, false)}
+                {send_all_button(ctx, false, false)}
             </div>
         })}
         </div>
@@ -4207,10 +4241,10 @@ mod tests {
         let actions = page.split("<ViewActions>").nth(1).unwrap().split("</ViewActions>").next().unwrap();
         for action in [
             "Rename document",
-            "panel.update",
-            "Comment on the whole doc",
-            "threads.send_all.run(())",
-            "on:click=toggle_edit",
+            "comments_button(panel, open_n, true)",
+            "whole_doc_comment_button(threads, true)",
+            "send_all_button(threads, true, true)",
+            "edit_doc_button(edit_all, toggle_edit, true)",
             "used.get()",
             "<DocMenuItems owner archived",
         ] {
@@ -4227,6 +4261,44 @@ mod tests {
         for action in ["Open the session that made it", "Export…", "History", "<ArchiveMenuItem"] {
             assert!(menu.contains(action), "desktop and phone must share {action}");
         }
+        assert!(menu.contains(") -> AnyView"));
+        for action in [
+            "comments_button(panel, open_n, false)",
+            "whole_doc_comment_button(threads, false)",
+            "send_all_button(threads, true, false)",
+            "edit_doc_button(edit_all, toggle_edit, false)",
+        ] {
+            assert!(page.contains(action), "desktop must use the same constructor: {action}");
+        }
+        let controls = source.split("fn comments_button(").nth(1).unwrap().split("/// \"Used in N").next().unwrap();
+        for behavior in [
+            "role=phone.then_some(\"menuitem\")",
+            "DOC_PHONE_ACTION",
+            "data-opens=\"comments\"",
+            "aria-pressed=move || phone.then(|| panel.get().to_string())",
+            "panel.update(|p| *p = !*p)",
+            "Hide the comments",
+            "Show the comments",
+            "bg-zinc-100 dark:bg-zinc-800",
+            "bg-zinc-100 font-medium dark:bg-zinc-800",
+            "n => format!(\"{n} open\")",
+            "n => format!(\" ({n} open)\")",
+            "ctx.panel.set(true)",
+            "ctx.focus.set(Some(String::new()))",
+            "ctx.commenting.set(Some(String::new()))",
+            "Comment on the whole doc",
+            "on:click=move |_| toggle_edit.run(())",
+            "phone.then(crate::icons::pencil)",
+            "view! { {crate::icons::pencil()}\" Edit\" }.into_any()",
+            "disabled=move || ctx.sending.get()",
+            "ctx.send_all.run(())",
+            "(phone && arrow).then(crate::icons::arrow_up)",
+            "(!phone && arrow).then(|| view! { \" \"{crate::icons::arrow_up()} })",
+        ] {
+            assert!(controls.contains(behavior), "shared controls must retain {behavior}");
+        }
+        assert!(controls.find("(phone && arrow)").unwrap() < controls.find("format!(\"Send {} to agent\"").unwrap());
+        assert!(controls.find("format!(\"Send {} to agent\"").unwrap() < controls.find("(!phone && arrow)").unwrap());
     }
 
     #[test]

@@ -1229,7 +1229,7 @@ pub struct Workspace {
     /// pane key, while it is shown.
     pub chrome: RwSignal<HashMap<u64, crate::session::SessionChrome>>,
     /// View-owned phone actions, mounted in the single tile bar's popover.
-    view_actions: RwSignal<HashMap<u64, (u64, ChildrenFn)>>,
+    view_actions: RwSignal<Vec<(u64, u64, ChildrenFn)>>,
     /// Sessions that finished or failed while not shown, newest first.
     pub attention: RwSignal<Vec<String>>,
     pub pinned: RwSignal<Vec<String>>,
@@ -1470,7 +1470,7 @@ impl Workspace {
             navigation: RwSignal::new((0, 0)),
             brief_request: RwSignal::new(request),
             chrome: RwSignal::new(HashMap::new()),
-            view_actions: RwSignal::new(HashMap::new()),
+            view_actions: RwSignal::new(Vec::new()),
             attention: RwSignal::new(load(ATTENTION_KEY).unwrap_or_default()),
             pinned: RwSignal::new(load(PINNED_KEY).unwrap_or_default()),
             dragging: RwSignal::new(None),
@@ -2033,14 +2033,15 @@ pub(crate) fn ViewActions(children: ChildrenFn) -> impl IntoView {
             children()
         });
         col.ws.view_actions.update(|m| {
-            m.insert(col.col, (token, children));
+            let entry = (col.col, token, children);
+            if let Some(old) = m.iter_mut().find(|(key, _, _)| *key == col.col) {
+                *old = entry;
+            } else {
+                m.push(entry);
+            }
         });
         on_cleanup(move || {
-            col.ws.view_actions.update(|m| {
-                if m.get(&col.col).is_some_and(|(t, _)| *t == token) {
-                    m.remove(&col.col);
-                }
-            });
+            col.ws.view_actions.update(|m| m.retain(|(key, t, _)| *key != col.col || *t != token));
         });
     }
 }
@@ -2539,7 +2540,7 @@ pub fn below_element(el: Option<&web_sys::Element>, width: f64) -> (f64, f64) {
 /// closes it, and so does Esc wherever focus is (focus going back to what
 /// opened it).
 #[component]
-pub fn Popover(at: RwSignal<Option<(f64, f64)>>, #[prop(into)] class: String, children: ChildrenFn) -> impl IntoView {
+pub fn Popover(at: RwSignal<Option<(f64, f64)>>, #[prop(into)] class: String, children: ChildrenFn) -> AnyView {
     let class = StoredValue::new(class);
     let children = StoredValue::new(children);
     let pop = StoredValue::new(crate::util::escapable(
@@ -2548,7 +2549,7 @@ pub fn Popover(at: RwSignal<Option<(f64, f64)>>, #[prop(into)] class: String, ch
             at.try_set(None);
         },
     ));
-    move || {
+    (move || {
         at.get().map(|(x, y)| {
             view! {
                 <leptos::portal::Portal>
@@ -2562,7 +2563,8 @@ pub fn Popover(at: RwSignal<Option<(f64, f64)>>, #[prop(into)] class: String, ch
                 </leptos::portal::Portal>
             }
         })
-    }
+    })
+    .into_any()
 }
 
 /// A composer menu opens upward within its tile and visible viewport. Its
@@ -2599,7 +2601,7 @@ pub(crate) fn ComposerPopover(
 }
 
 #[component]
-fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
+fn TileView(key: u64, rect: Signal<Rect>) -> AnyView {
     let ws = use_workspace();
     let phone = expect_context::<TileLoading>().one_pane;
     let bar_colour = expect_context::<crate::settings::SessionBarDisplay>().colour;
@@ -2689,7 +2691,7 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
             return None;
         }
         let col = current.get()?.key;
-        ws.view_actions.with(|m| m.get(&col).cloned())
+        ws.view_actions.with(|m| m.iter().find(|(key, _, _)| *key == col).map(|(_, token, actions)| (*token, actions.clone())))
     };
     // The rename box opens under the name (from ⋯ as from a double-click).
     let title_el = NodeRef::<leptos::html::Span>::new();
@@ -2907,6 +2909,7 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
         </section>
         </div>
     }
+    .into_any()
 }
 
 #[cfg(test)]
