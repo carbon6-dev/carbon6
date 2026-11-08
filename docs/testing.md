@@ -124,7 +124,7 @@ UI_BROWSER_PASSES=3 make ui-browser-test
 ```
 
 The runner covers workspace-open, motion, comment-sheet, phone-picker,
-theme (`--browser`), settings-lists, resource-lifecycle and markdown-html in each engine, plus ring-render in
+theme (`--browser`), settings-lists, resource-lifecycle, markdown-html and status-row in each engine, plus ring-render in
 Chromium. **ring-render is Chromium-only**, because its layer/paint/blocked-main-thread assertions
 require CDP; `ENGINE=webkit` now fails explicitly instead of silently launching
 Chromium. Its full default three-run/two-theme workload remains enabled.
@@ -168,6 +168,44 @@ as a passing combined browser run; the independent fields-panel fix and its
 qualification are recorded under S11.
 Downloads/apt are installation steps, not network access by the tests: the
 fixtures still serve only private loopback origins. Rust test jobs are unchanged.
+
+### Fixed-place status row (S12)
+
+`status-row.cjs` checks option A: the working state and live `turn_line` stay on
+the left; background tasks stay on the right, including while idle. The idle
+left side is empty. Desktop retains its 24px bottom gutter; the phone reserves
+the same 44px slot in every state, including idle with no tasks. Stats ellipsize
+before the nonwrapping task label; their full text remains available on hover
+and focus (the whole-row opener exposes it on phones). The existing waiting,
+failure and approval/answer actions are not replaced with new controls.
+
+The production-browser matrix covers light/dark, a wide desktop, a 338px tile
+in a desktop viewport, and 320/360/390/430px phones. Each transitions through
+working/idle with 0, 1 and 12 background jobs. It compares exact task x/y/size,
+row bounds, composer bounds and transcript viewport/scroll position, samples
+rendered transition frames, checks a single baseline and ellipsis, and exercises
+the desktop link and phone's full 44px opener. Long stream status and elapsed
+ticks must retain task placement and opener focus. Without tasks, the narrow
+phone's stats use the available width rather than an elapsed-only cap. All APIs
+are private loopback mocks, not live settings. Ticking stats stay outside the
+state/task live regions so screen readers are not interrupted every second.
+Run with:
+
+```sh
+BROWSER_SUITES=status-row BROWSER_TEST_OUTPUT=/tmp/s12-row/browser bash scripts/ui-browser-tests.sh
+```
+
+Each case saves working/idle screenshots and measured geometry. `BEFORE=1`
+captures identical inputs against the base build without applying the new
+layout assertions; it is a separately labelled comparison, not a passing test.
+
+Measured against the exact `c6/next` base `8874366d`: production WASM is
+10,594,434 raw / 2,643,871 Brotli bytes, **+3,332 / +2,207 bytes**. The unchanged
+ceilings retain 130,346 raw / 23,457 Brotli bytes of headroom. Both new arbitrary
+Tailwind classes (`max-w-[60%]`, `max-[360px]:max-w-[calc(4ch+1px)]`) are present in the
+built CSS. Baseline screenshots reproduce a 144.5px desktop task-link jump in
+the narrow tile and an 8px vertical task-line jump on the 320px phone; the new
+regression requires zero movement and a fixed slot, including idle with no jobs.
 
 ### Why change WebKit?
 
@@ -1619,16 +1657,18 @@ shared state/context ring (the only phone route to Changes/Terminal/Files/Output
 Sheets and dialogs must stay within the visible viewport and scroll.
 
 Drive idle, main-working, waiting, last-turn failure and background-only
-states. No idle row or “0 background tasks”; working must not follow aggregate child
+states. The idle slot is empty, never “0 background tasks”; working must not follow aggregate child
 status. Deduplicate linked task/subagent records and exclude foreground native
 work and mirrors. The whole 44px status row, with its chevron and visible inset
 focus, must expose cards, errors, Inspect/Stop and history. Its task count reads
 “1 background task” / “2 background tasks”, matching desktop without “running”.
 Waiting-card Show navigation and real approval/answer actions stay intact.
-Every visible status variant, including combined two-line statuses, stays 44px
-high without resizing the transcript viewport when switching between them.
+Every status variant uses one line in the same 44px slot, including quiet idle,
+without resizing the transcript viewport when switching between them. Working
+and live turn stats stay left; background tasks stay right. On narrow phones,
+stats ellipsize to elapsed time before the task label can wrap.
 Hold a draft and focused composer element across these transitions: it must
-stay mounted and at the same bottom position; the transcript loses/gains 44px.
+stay mounted and at the same bottom position; the transcript height never changes.
 Following remains at the bottom, while a scrolled-up reader stays put.
 
 At desktop height, exercise actual 240/320/400/480/640px tiles, not just the

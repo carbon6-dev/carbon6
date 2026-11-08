@@ -202,8 +202,8 @@ async function check(browser, origin, engine, theme, view) {
       await sheet.getByText('Context', { exact: true }).waitFor();
       await sheet.getByText('Not measured yet', { exact: true }).waitFor();
       assert.equal(await sheet.getByText('0%', { exact: true }).count(), 0, 'missing Usage must not invent a zero-percent context measurement');
-      assert.equal(await page.getByRole('button', { name: /\d+ background tasks? running/ }).count(), 0,
-        'wide glance does not duplicate its live list above the composer');
+      assert.equal(await page.locator('[data-transcript-status] [data-status-tasks]').count(), 1,
+        'option A retains the right-hand opener even with the wide glance visible');
       const metadata = await sheet.getByText('Runs on', { exact: true }).elementHandle();
       const runningHeading = await sheet.getByRole('heading', { name: 'Running now · 3', exact: true }).elementHandle();
       assert(await metadata.evaluate((el, next) => !!(el.compareDocumentPosition(next) & Node.DOCUMENT_POSITION_FOLLOWING), runningHeading),
@@ -699,7 +699,7 @@ async function main() {
       const data = fs.readFileSync(path.join(root, file));
       return { file, bytes: data.length, sha256: crypto.createHash('sha256').update(data).digest('hex') };
     }) }, null, 2));
-  const playwright = require(process.env.PLAYWRIGHT_CORE || '/home/zheilbron/.bun/install/cache/playwright-core@1.50.1@@@1');
+  const playwright = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
   const engine = process.env.ENGINE || 'both';
   assert(['chromium', 'webkit', 'both'].includes(engine), `Unknown ENGINE=${engine}`);
   const { server, origin } = await serve();

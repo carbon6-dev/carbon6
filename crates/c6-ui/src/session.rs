@@ -1111,7 +1111,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         })}
         </ScrollBox>
             <div class="hidden md:contents"><SubagentWaiting chrome /></div>
-            <PhoneStatus chrome latest=Signal::derive(move || feed.to.get().is_none()) />
+            <PhoneStatus chrome streaming=feed.streaming latest=Signal::derive(move || feed.to.get().is_none()) />
             <Show when=move || own_session.with(Option::is_some) fallback=|| view! { <p class="px-3 py-2 text-xs text-muted">"Loading session…"</p> }>
             {move || {
                 // Claude Code's own subagents take no messages.
@@ -2626,20 +2626,22 @@ fn Transcript(
             // status/usage/tasks never add height, even when they arrive apart.
             // Phones already combine their status outside the scroll box.
             <div class="absolute bottom-1 inset-x-4 hidden h-6 items-center gap-3 text-xs text-muted md:flex" data-transcript-status="true">
+                <div class="flex min-w-0 flex-1 items-center gap-2">
                 {move || running.get().then(|| view! {
-                    <div class="flex min-w-0 flex-1 items-center gap-2">
                         <span class="h-2 w-2 shrink-0 animate-pulse rounded-full bg-blue-500"></span>
-                        <span class="truncate" title=move || stream_status.get()>
+                        <span class="max-w-[60%] shrink-0 truncate" data-working-label="true" title=move || stream_status.get()>
                             {move || stream_status.with(|s| if s.is_empty() { "Working…".to_owned() } else { s.clone() })}
                         </span>
-                        <span class="truncate font-mono text-[11px]" title=move || usage.with(|u| u.current_turn.and_then(|n| u.turns.get(&n).copied())).map(|t| format!("This turn: {}", turn_line(&t, Some(now.get()))))>
+                        <span class="min-w-0 flex-1 truncate font-mono text-[11px]" data-turn-stats="true" tabindex="0"
+                            aria-label=move || usage.with(|u| u.current_turn.and_then(|n| u.turns.get(&n).copied())).map(|t| format!("This turn: {}", turn_line(&t, Some(now.get()))))
+                            title=move || usage.with(|u| u.current_turn.and_then(|n| u.turns.get(&n).copied())).map(|t| format!("This turn: {}", turn_line(&t, Some(now.get()))))>
                             {move || usage.with(|u| u.current_turn.and_then(|n| u.turns.get(&n).copied())).map(|t| turn_line(&t, Some(now.get())))}
                         </span>
-                    </div>
                 })}
+                </div>
                 {chrome.map(|chrome| view! {
-                    <Show when=move || phone_background_count(chrome) != 0 && !chrome.wide.get()>
-                        <button class="inline-flex items-center gap-1 text-xs text-sky-700 dark:text-sky-400" on:click=move |ev| chrome.toggle_glance(ev.current_target().and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok()))>
+                    <Show when=move || phone_background_count(chrome) != 0>
+                        <button class="inline-flex shrink-0 items-center gap-1 whitespace-nowrap text-xs text-sky-700 dark:text-sky-400" data-status-tasks="true" on:click=move |ev| chrome.toggle_glance(ev.current_target().and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok()))>
                             {crate::icons::hourglass()}{move || crate::tasks::running_line(phone_background_count(chrome), 0)}{crate::icons::chevron_right()}
                         </button>
                     </Show>
@@ -2699,8 +2701,9 @@ impl PhoneStatusState {
     }
 }
 
-/// Kept independent of browser hooks so all eight B layouts can be SSR-tested.
-fn phone_status_row(state: PhoneStatusState, show: Callback<()>) -> AnyView {
+/// Kept independent of browser hooks so the local states can be SSR-tested.
+/// Only state changes replace the row; live text/stats retain its opener.
+fn phone_status_row(state: PhoneStatusState, show: Callback<()>, status: Signal<String>, turn: Signal<Option<String>>) -> AnyView {
     if !state.visible() {
         return ().into_any();
     }
@@ -2710,7 +2713,13 @@ fn phone_status_row(state: PhoneStatusState, show: Callback<()>) -> AnyView {
         Some((
             "Working…".into(),
             "text-sky-700 dark:text-sky-400",
-            view! { <span class="animate-spin inline-flex">{crate::icons::loader_circle()}</span> }.into_any(),
+            view! {
+                <span class="relative inline-flex shrink-0">
+                    <span class="animate-spin inline-flex">{crate::icons::loader_circle()}</span>
+                    <span class="absolute inset-1 animate-pulse rounded-full bg-blue-500"></span>
+                </span>
+            }
+            .into_any(),
         ))
     } else if state.failed {
         Some(("Last turn failed".into(), "text-red-600 dark:text-red-400", crate::icons::circle_x()))
@@ -2720,21 +2729,42 @@ fn phone_status_row(state: PhoneStatusState, show: Callback<()>) -> AnyView {
     let background = (state.background > 0).then(|| crate::tasks::running_line(state.background, 0));
     let label = primary.iter().map(|(label, _, _)| label.as_str()).chain(background.as_deref()).collect::<Vec<_>>().join(". ");
     view! {
-        <div class="relative flex h-11 items-center bg-zinc-50 pl-3 pr-10 text-[11px] min-[360px]:text-xs pointer-fine:hover:bg-zinc-100 dark:bg-zinc-900 dark:pointer-fine:hover:bg-zinc-800" data-phone-status="true">
-            <div role="status" class="flex min-w-0 flex-1 flex-col justify-center overflow-hidden whitespace-nowrap">
+        <div class="relative flex h-11 items-center bg-zinc-50 pl-3 pr-7 text-[11px] min-[360px]:text-xs pointer-fine:hover:bg-zinc-100 dark:bg-zinc-900 dark:pointer-fine:hover:bg-zinc-800" data-phone-status="true">
+            <div class="flex min-w-0 flex-1 items-center gap-2 overflow-hidden whitespace-nowrap">
+                <span class="flex min-w-0 flex-1 items-center gap-1 leading-4 text-muted">
                 {primary.map(|(label, tone, icon)| view! {
-                    <span class=format!("flex min-w-0 items-center gap-1 leading-4 {tone}")>
-                        {icon}<span class="truncate">{label}</span>
+                    <span role="status" class=format!("flex max-w-[60%] shrink-0 items-center gap-1 {tone}")>
+                        {icon}<span class="truncate" data-working-label="true">{move || {
+                            let stream = status.get();
+                            if state.working && state.waiting == 0 && !stream.is_empty() { stream } else { label.clone() }
+                        }}</span>
                     </span>
                 })}
+                // The extra pixel keeps all of "12s…" despite fractional ch/layout rounding.
+                {state.working.then(|| view! {
+                    <span class={if state.background > 0 {
+                        "min-w-0 flex-1 truncate font-mono text-[11px] max-[360px]:max-w-[calc(4ch+1px)]"
+                    } else {
+                        "min-w-0 flex-1 truncate font-mono text-[11px]"
+                    }} data-turn-stats="true"
+                        title=move || turn.get().map(|line| format!("This turn: {line}"))>{move || turn.get()}</span>
+                })}
+                </span>
                 {background.map(|label| view! {
-                    <span class="flex min-w-0 items-center gap-1 leading-4 text-sky-700 dark:text-sky-400">
+                    <span role="status" class="flex shrink-0 items-center gap-1 leading-4 text-sky-700 dark:text-sky-400" data-status-tasks="true">
                         {crate::icons::hourglass()}<span class="truncate">{label}</span>
                     </span>
                 })}
             </div>
             <button type="button" class="absolute inset-0 flex w-full items-center justify-end border-t border-zinc-200 px-3 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-sky-500 dark:border-zinc-800"
-                aria-label=format!("{label}. Open session status details") aria-haspopup="dialog" on:click=move |_| show.run(())>
+                aria-label=move || {
+                    let stream = status.get();
+                    let primary = if state.working && state.waiting == 0 && !stream.is_empty() { label.replacen("Working…", &stream, 1) } else { label.clone() };
+                    let stats = if state.working { turn.get().map(|line| format!(". This turn: {line}")).unwrap_or_default() } else { String::new() };
+                    format!("{primary}{stats}. Open session status details")
+                }
+                title=move || if state.working { turn.get().map(|line| format!("This turn: {line}")) } else { None }
+                aria-haspopup="dialog" on:click=move |_| show.run(())>
                 {crate::icons::chevron_right()}
             </button>
         </div>
@@ -2773,14 +2803,24 @@ fn last_turn_failure(evs: &[Event], fallback: Option<TurnEndReason>) -> Option<S
     )
 }
 
-/// The row is a sibling of ScrollBox and Composer, never an overlay. Its
-/// appearance only shrinks the transcript. ScrollBox handles that viewport
-/// resize with the same motion-aware follow as content growth; a scrolled-up
-/// reader keeps their scrollTop. There is no second competing scroll writer.
+/// A fixed 44px sibling of ScrollBox and Composer, never an overlay. Even
+/// quiet/idle reserves the slot: status and task changes cannot resize the
+/// transcript or compete with its single follow/scroll controller.
 #[component]
-fn PhoneStatus(chrome: SessionChrome, latest: Signal<bool>) -> impl IntoView {
+fn PhoneStatus(chrome: SessionChrome, streaming: RwSignal<Streaming>, latest: Signal<bool>) -> impl IntoView {
     let row = NodeRef::<leptos::html::Div>::new();
     let open = RwSignal::new(false);
+    let now = RwSignal::new(now_ms());
+    let ticker = set_interval_with_handle(move || now.set(now_ms()), std::time::Duration::from_secs(1)).ok();
+    on_cleanup(move || {
+        if let Some(t) = ticker {
+            t.clear();
+        }
+    });
+    let status = Signal::derive(move || streaming.with(|s| s.status.clone()));
+    let turn = Signal::derive(move || {
+        chrome.usage.with(|u| u.current_turn.and_then(|n| u.turns.get(&n).copied())).map(|t| turn_line(&t, Some(now.get())))
+    });
     let live = api::live();
     let failure = Memo::new(move |_| {
         if chrome.running.get() {
@@ -2799,21 +2839,12 @@ fn PhoneStatus(chrome: SessionChrome, latest: Signal<bool>) -> impl IntoView {
         failed: failure.with(Option::is_some),
     });
     let visible = Memo::new(move |_| state.get().visible());
-    let present = crate::util::presence(move || visible.get());
     let details_present = crate::util::presence(move || open.get());
-    // Keep the last nonempty row for its exit. Its height belongs to the
-    // transcript immediately; only this absolute visual remains afterwards.
-    let retained = Memo::new(move |previous: Option<&PhoneStatusState>| {
-        let next = state.get();
-        if next.visible() { next } else { previous.copied().unwrap_or_default() }
-    });
     view! {
-        <div node_ref=row class="relative shrink-0 md:hidden" style:height=move || if visible.get() { "44px" } else { "0px" }>
-            <Show when=move || present.get()>
-                <div class="c6-rise c6-presence absolute inset-x-0 bottom-0" data-open=move || visible.get().to_string() inert=move || !visible.get()>
-                    {move || phone_status_row(retained.get(), Callback::new(move |_| open.set(true)))}
-                </div>
-            </Show>
+        <div node_ref=row class="relative h-11 shrink-0 md:hidden" data-phone-status-slot="true">
+            <div class="absolute inset-x-0 bottom-0" data-open=move || visible.get().to_string() inert=move || !visible.get()>
+                {move || phone_status_row(state.get(), Callback::new(move |_| open.set(true)), status, turn)}
+            </div>
         </div>
         <Show when=move || details_present.get()>
             <PhoneStatusDetails chrome open failure />
@@ -7172,11 +7203,11 @@ mod tests {
                 (PhoneStatusState { failed: true, ..Default::default() }, vec!["Last turn failed"]),
                 (PhoneStatusState { failed: true, background: 2, ..Default::default() }, vec!["Last turn failed", "2 background tasks"]),
             ] {
-                let html = phone_status_row(state, Callback::new(|_| {})).to_html();
+                let html = phone_status_row(state, Callback::new(|_| {}), Signal::derive(String::new), Signal::derive(|| None)).to_html();
                 if expected.is_empty() {
                     assert!(
                         !html.contains("data-phone-status") && !html.contains("<button") && !html.contains("h-11"),
-                        "no reserved quiet row: {html}"
+                        "quiet slot has no false status or opener: {html}"
                     );
                 } else {
                     assert!(html.contains("h-11") && html.contains("absolute inset-0 flex w-full"), "{html}");
@@ -7224,14 +7255,18 @@ mod tests {
         owner.with(|| {
             for count in [1, 2, 12, 123, usize::MAX] {
                 let words = crate::tasks::running_line(count, 0);
-                let html =
-                    phone_status_row(PhoneStatusState { working: true, background: count, ..Default::default() }, Callback::new(|_| {}))
-                        .to_html();
+                let html = phone_status_row(
+                    PhoneStatusState { working: true, background: count, ..Default::default() },
+                    Callback::new(|_| {}),
+                    Signal::derive(String::new),
+                    Signal::derive(|| None),
+                )
+                .to_html();
                 assert!(html.contains(&format!("<span class=\"truncate\">{words}</span>")), "{html}");
                 assert!(html.contains(&format!("aria-label=\"Working…. {words}. Open session status details\"")), "{html}");
                 assert!(
-                    html.contains("flex-col justify-center") && html.contains("leading-4"),
-                    "two labels stay inside the same 44px row: {html}"
+                    html.contains("flex min-w-0 flex-1 items-center gap-2") && html.contains("leading-4") && !html.contains("flex-col"),
+                    "two labels share one line inside the same 44px row: {html}"
                 );
                 assert!(!html.contains("running"), "{html}");
             }
@@ -7420,11 +7455,10 @@ mod tests {
         assert!(view[scroll_end..row].contains("hidden md:contents"), "no duplicate pinned child waiting row on phone");
         let conditional = source.split("fn phone_status_row").nth(1).unwrap().split("/// The most recent turn").next().unwrap();
         assert!(!conditional.contains("<Composer") && !conditional.contains("<Transcript"));
-        assert!(source.contains("node_ref=row class=\"relative shrink-0 md:hidden\""));
-        assert!(source.contains("style:height=move || if visible.get() { \"44px\" } else { \"0px\" }"));
-        assert!(source.contains("class=\"c6-rise c6-presence absolute inset-x-0 bottom-0\""), "exit visuals must not retain layout height");
-        assert!(source.contains("phone_status_row(retained.get()"), "keep the last visible status during exit");
+        assert!(source.contains("node_ref=row class=\"relative h-11 shrink-0 md:hidden\" data-phone-status-slot=\"true\""));
         let status = source.split("fn PhoneStatus(").nth(1).unwrap().split("/// A portal avoids").next().unwrap();
+        assert!(!status.contains("style:height") && !status.contains("c6-rise"), "status changes never resize or translate the slot");
+        assert!(status.contains("phone_status_row(state.get()"), "idle clears the left state immediately, without a retained working exit");
         assert!(!status.contains("set_scroll_top") && !status.contains("glide_to_end"), "one ScrollBox controller owns following");
         assert!(view.contains("<ScrollBox node_ref=scroller follow=stick"), "the shared controller must retain the reader's follow intent");
     }
