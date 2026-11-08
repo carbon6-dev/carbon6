@@ -488,7 +488,7 @@ type ModelTask = (&'static str, RwSignal<String>, RwSignal<String>, RwSignal<Str
 #[component]
 pub fn MemexSettings() -> impl IntoView {
     let status = LocalResource::new(api::memex_status);
-    let loaded = LocalResource::new(move || api::get_setting("memex"));
+    let loaded = crate::resources::setting("memex");
     let connections = crate::resources::connections();
     let (conn, model, chars) = (RwSignal::new(String::new()), RwSignal::new(String::new()), RwSignal::new(String::new()));
     let (auto, approve) = (RwSignal::new(false), RwSignal::new(true));

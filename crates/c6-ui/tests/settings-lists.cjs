@@ -19,6 +19,7 @@ async function check(browser, origin, phone, theme, engine) {
     templates: [{ name: 'template', connection: 'missing-connection', model: 'test', effort: 'medium', workers: ['old'],
       worktree_options: { base: 'main', setup: ['one', 'two'], fetch: false }, enabled: true }],
     views: [{ name: 'board', kind: 'board', source: { collection: 'deals' }, actions: [], enabled: true }],
+    'mcp-servers': [{ name: 'initial', transport: 'http', url: 'https://example.invalid/initial' }],
     routes: {
       root: [{ name: 'root-rule', tools: ['old'], enabled: true }],
       home: [{ name: 'home-rule', tools: [], enabled: true }],
@@ -54,6 +55,8 @@ async function check(browser, origin, phone, theme, engine) {
     });
   try {
     const { page } = f;
+    const step = name => { if (process.env.DEBUG_FIXTURE) console.log(`  SETTINGS ${name}`); };
+    step('commands');
     const section = page.getByRole('heading', { name: 'Slash commands', exact: true }).locator('xpath=../..');
     const names = section.getByPlaceholder('name, typed as /name');
     assert.equal(await names.count(), 2);
@@ -89,6 +92,7 @@ async function check(browser, origin, phone, theme, engine) {
     await names.first().waitFor();
     assert.equal(await names.first().inputValue(), 'edited-tail', 'remount loads saved data');
 
+    step('templates');
     await names.first().evaluate(el => { window.__commandsBeforeNavigation = el; });
     await navigateSection(page, 'automation', 'Templates');
     const template = page.getByPlaceholder('e.g. disk-check');
@@ -115,6 +119,7 @@ async function check(browser, origin, phone, theme, engine) {
     await navigateSection(page, 'automation', 'Templates');
     await template.waitFor();
     assert.equal(await field(template.locator('xpath=../..'), 'Effort').inputValue(), 'high', 'other section retains its saved values');
+    step('views');
     await navigateSection(page, 'views', 'Views');
     const viewName = page.getByPlaceholder('e.g. pipeline (its address: /views/pipeline)');
     await viewName.waitFor();
@@ -127,6 +132,42 @@ async function check(browser, origin, phone, theme, engine) {
     assert.deepEqual(writes.at(-1).value[0].source, { collection: 'clients' });
     assert.equal(writes.at(-1).value[0].actions, 'unfinished JSON', 'invalid JSON remains editable text for head validation');
 
+    step('MCP: open');
+    const settingRead = () => page.waitForResponse(response => {
+      const url = new URL(response.url());
+      return response.request().method() === 'GET' && url.pathname.endsWith('/settings/mcp-servers');
+    });
+    const initialRead = settingRead();
+    await navigateSection(page, 'tools', 'MCP servers');
+    const connectors = page.getByRole('heading', { name: 'MCP servers (connectors)', exact: true }).locator('xpath=..');
+    const json = connectors.locator('textarea');
+    await json.waitFor();
+    await (await initialRead).finished();
+    await page.waitForFunction(el => el.value.includes('"initial"'), await json.elementHandle());
+    step('MCP: invalid JSON');
+    assert.deepEqual(JSON.parse(await json.inputValue()), saved['mcp-servers'], 'whole-setting JSON loads before editing');
+    await json.fill('{unfinished');
+    const beforeInvalid = writes.length;
+    await connectors.getByRole('button', { name: 'Save', exact: true }).click();
+    await connectors.getByText(/^Not valid JSON:/).waitFor();
+    step('MCP: valid JSON');
+    assert.equal(writes.length, beforeInvalid, 'invalid whole-setting JSON is rejected before sending');
+    const mcp = [{ name: 'fixture', transport: 'http', url: 'https://example.invalid/mcp' }];
+    await json.fill(JSON.stringify(mcp));
+    await connectors.getByRole('button', { name: 'Save', exact: true }).click();
+    await connectors.getByText('Saved. New sessions will use it.', { exact: true }).waitFor();
+    assert.deepEqual(writes.at(-1).value, mcp);
+    step('MCP: remount');
+    await navigateSection(page, 'commands', 'Slash commands');
+    await names.first().waitFor();
+    const remountRead = settingRead();
+    await navigateSection(page, 'tools', 'MCP servers');
+    await json.waitFor();
+    await (await remountRead).finished();
+    await page.waitForFunction(el => el.value.includes('"fixture"'), await json.elementHandle());
+    assert.deepEqual(JSON.parse(await json.inputValue()), mcp, 'a fresh owner reloads the saved JSON setting');
+
+    step('routing');
     await page.goto(origin + '/admin/settings/routing', { waitUntil: 'domcontentloaded' });
     const rule = page.getByPlaceholder('e.g. Ops on the cheap model');
     await rule.waitFor();

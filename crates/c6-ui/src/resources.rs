@@ -1,6 +1,7 @@
-//! Confirmed head data shared by the signed-in page, not by each picker or
-//! workspace tile. Resources belong to Main so closing one consumer cannot
-//! dispose data still used by another.
+//! Page-owned caches for confirmed head data, plus fresh caller-owned resources.
+//! Connections, sessions and model lists belong to Main so closing one consumer
+//! cannot dispose data still used by another. `setting` shares only construction:
+//! every call makes a distinct resource owned by its caller, even for the same name.
 
 use std::collections::HashMap;
 
@@ -56,6 +57,14 @@ pub fn provide() {
 
 pub fn connections() -> Connections {
     expect_context::<Page>().connections
+}
+
+/// A fresh setting read owned by the caller, not a page cache or a shared request.
+/// Share the fetcher specialization without changing plain reads' dependencies.
+#[inline(never)]
+#[track_caller]
+pub fn setting(name: &'static str) -> LocalResource<Result<serde_json::Value, String>> {
+    LocalResource::new(move || api::get_setting(name))
 }
 
 /// A header can join an initial pane read, without accepting an old answer
@@ -124,6 +133,52 @@ pub fn session(id: String) -> SessionData {
 mod tests {
     use super::*;
     use leptos::reactive::graph::ToAnySource;
+
+    #[test]
+    fn same_name_settings_are_distinct_caller_resources() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let first = setting("assistant");
+            let second = setting("assistant");
+            assert_ne!(first.to_any_source(), second.to_any_source(), "same-name reads must not share an instance");
+            first.set(Some(Ok(serde_json::json!({"value": "first"}))));
+            second.set(Some(Err("second read failed".to_owned())));
+            assert_eq!(first.get_untracked(), Some(Ok(serde_json::json!({"value": "first"}))));
+            assert_eq!(second.get_untracked(), Some(Err("second read failed".to_owned())));
+        });
+    }
+
+    #[test]
+    fn different_name_settings_keep_independent_values() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let assistant = setting("assistant");
+            let memex = setting("memex");
+            assert_ne!(assistant.to_any_source(), memex.to_any_source(), "different settings must not share an instance");
+            assistant.set(Some(Ok(serde_json::json!({"name": "assistant"}))));
+            memex.set(Some(Ok(serde_json::json!({"name": "memex"}))));
+            assert_eq!(assistant.get_untracked(), Some(Ok(serde_json::json!({"name": "assistant"}))));
+            assert_eq!(memex.get_untracked(), Some(Ok(serde_json::json!({"name": "memex"}))));
+        });
+    }
+
+    #[test]
+    fn cleaning_up_a_child_setting_leaves_the_parent_resource_usable() {
+        let parent = Owner::new();
+        parent.with(|| {
+            let parent_read = setting("assistant");
+            parent_read.set(Some(Ok(serde_json::json!({"owner": "parent"}))));
+            let child = Owner::new();
+            let child_read = child.with(|| setting("assistant"));
+            assert_ne!(parent_read.to_any_source(), child_read.to_any_source());
+            child_read.set(Some(Ok(serde_json::json!({"owner": "child"}))));
+            child.cleanup();
+            assert!(child_read.is_disposed(), "the child's fresh read must belong to the child owner");
+            assert_eq!(parent_read.get_untracked(), Some(Ok(serde_json::json!({"owner": "parent"}))));
+            parent_read.set(Some(Ok(serde_json::json!({"owner": "parent", "after_cleanup": true}))));
+            assert_eq!(parent_read.get_untracked(), Some(Ok(serde_json::json!({"owner": "parent", "after_cleanup": true}))));
+        });
+    }
 
     #[test]
     fn consumers_share_page_resources_after_a_tile_is_disposed() {

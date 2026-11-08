@@ -742,6 +742,7 @@ names-kept diagnostic files are never counted as production downloads.
 | Shared checked response-body polling | 10,691,725 | 2,651,304 | 58,390 / 7,850 |
 | Shared list-editor view boundary | 10,688,242 | 2,649,938 | 3,483 / 1,366 |
 | Shared stable activity ordering | 10,680,340 | 2,650,316 | 7,902 / -378 |
+| Shared fresh-setting construction | 10,664,451 | 2,647,125 | 15,889 / 3,191 |
 
 The whole-module profile repeats S1's names-kept bindgen/`wasm-opt -Oz -g`
 pipeline, twiggy top/dominators/monos, and all-symbol per-crate/per-module
@@ -796,6 +797,16 @@ including the minimum/maximum i64 values; Viewed and Title policies are
 unchanged. No dynamic comparator, new allocation, tie-breaker or unstable sort
 is introduced. Native UI tests pass **306/306**. This saves raw bytes while
 costing **378 Brotli bytes**; both measurements are retained in the table.
+
+Ten plain setting readers now call one non-inlined resource factory. Each
+call still creates a distinct caller-owned resource: no cache, coalescing,
+extra boxing or changed dependencies. Realm-tracked readers keep their
+explicit tracking. Native UI tests pass **309/309**, including same-name
+independence and parent/child cleanup; the expanded Settings browser suite
+passes **8/8** on both the original and candidate builds. It also verifies
+whole-JSON validation, exact save payloads and a fresh read after remount.
+The fixture waits for the actual loaded value before editing, rather than
+mistaking an initially rendered empty textarea for a completed resource.
 
 The broader audit found no accidental release inclusion of native tests,
 SSR, regex, ICU or a second gloo-net implementation. Markdown defaults are

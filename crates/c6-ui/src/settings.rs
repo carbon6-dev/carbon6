@@ -2586,7 +2586,7 @@ fn JsonSetting(
 ) -> impl IntoView {
     let text = RwSignal::new(String::new());
     let status = RwSignal::new(None::<Result<&'static str, String>>);
-    let loaded = LocalResource::new(move || api::get_setting(name));
+    let loaded = crate::resources::setting(name);
     Effect::new(move || {
         if let Some(Ok(v)) = loaded.get() {
             let pretty = serde_json::to_string_pretty(&v).unwrap_or_default();
@@ -2712,7 +2712,7 @@ fn HooksSetting() -> impl IntoView {
         rows.update(|r| r.push((id, RwSignal::new(h))));
     };
     let status = RwSignal::new(None::<Result<&'static str, String>>);
-    let loaded = LocalResource::new(move || api::get_setting("hooks"));
+    let loaded = crate::resources::setting("hooks");
     Effect::new(move || {
         if let Some(Ok(v)) = loaded.get() {
             rows.set(Vec::new());
@@ -3109,13 +3109,13 @@ fn channel_examples() -> Vec<(&'static str, serde_json::Value)> {
 #[component]
 fn NotifyExtras() -> impl IntoView {
     let url = RwSignal::new(String::new());
-    let loaded = LocalResource::new(move || api::get_setting("public_url"));
+    let loaded = crate::resources::setting("public_url");
     Effect::new(move || {
         if let Some(Ok(v)) = loaded.get() {
             url.set(v["url"].as_str().unwrap_or_default().to_owned());
         }
     });
-    let channels = LocalResource::new(move || api::get_setting("channels"));
+    let channels = crate::resources::setting("channels");
     let test_name = RwSignal::new(String::new());
     let status = RwSignal::new(None::<Result<String, String>>);
     let save = move |_| {
@@ -3941,7 +3941,7 @@ fn SecretsSetting() -> impl IntoView {
 #[component]
 fn SubagentLimitsSetting() -> impl IntoView {
     let setting = RwSignal::new(c6_api::SubagentLimits::default());
-    let loaded = LocalResource::new(move || api::get_setting("subagent-limits"));
+    let loaded = crate::resources::setting("subagent-limits");
     Effect::new(move || {
         if let Some(Ok(v)) = loaded.get() {
             setting.set(serde_json::from_value(v).unwrap_or_default());
@@ -4025,7 +4025,7 @@ fn ClaudeCodeToolsSetting() -> impl IntoView {
     let setting = RwSignal::new(None::<c6_api::ClaudeCodeTools>);
     // The extra Claude Code settings, as typed (JSON).
     let extra = RwSignal::new(String::new());
-    let loaded = LocalResource::new(move || api::get_setting("claude-code-tools"));
+    let loaded = crate::resources::setting("claude-code-tools");
     Effect::new(move || {
         if let Some(Ok(v)) = loaded.get() {
             let s: Option<c6_api::ClaudeCodeTools> = serde_json::from_value(v).ok();
@@ -4170,7 +4170,7 @@ fn ClaudeCodeToolsSetting() -> impl IntoView {
 fn BriefSetting() -> impl IntoView {
     let setting = RwSignal::new(c6_api::BriefSetting::default());
     let times = RwSignal::new(String::new());
-    let loaded = LocalResource::new(move || api::get_setting("brief"));
+    let loaded = crate::resources::setting("brief");
     Effect::new(move || {
         if let Some(Ok(v)) = loaded.get() {
             let s: c6_api::BriefSetting = serde_json::from_value(v).unwrap_or_default();
@@ -4226,7 +4226,7 @@ fn BriefSetting() -> impl IntoView {
 #[component]
 fn WebSearchSetting() -> impl IntoView {
     let setting = RwSignal::new(c6_api::WebSearchSetting::default());
-    let loaded = LocalResource::new(move || api::get_setting("web-search"));
+    let loaded = crate::resources::setting("web-search");
     Effect::new(move || {
         if let Some(Ok(v)) = loaded.get() {
             setting.set(serde_json::from_value(v).unwrap_or_default());
