@@ -2,6 +2,47 @@
 
 Status: rules in force (2026-10-19); `make check` enforces what a pattern can catch (`scripts/test-lint.sh`).
 
+## Safe HTML in UI Markdown
+
+`crates/c6-ui/src/markdown.rs` is shared by transcripts, documents, comments,
+and the other UI Markdown views. Both pulldown-cmark `Html` blocks and
+`InlineHtml` events (including table cells) use the same sanitizer, before
+trusted mention/citation markup is added. It rebuilds only `br`, `ul`, `ol`,
+`li`, `b`, `strong`, `i`, `em`, `code`, `sub`, `sup`, `p`, and `kbd`, with no
+attributes. Tag names are case-insensitive; `br` also accepts `/>`. No HTML
+dependency, URL policy change, or change to code fences/backticks is needed.
+
+Other tags, comments, malformed tags and incomplete trees remain escaped,
+visible text. Encoded tags are never decoded into markup. Paired tags must
+close in order at the same Markdown nesting depth, before the current
+container ends; an incomplete streamed list cannot reach the next cell or
+paragraph. Lists contain only `li` children (apart from whitespace); nested
+lists and paragraphs can appear in `li`, not in formatting tags or another
+paragraph. Nesting is capped at 32. Rejected tags and their still-pending
+wrappers stay text rather than relying on browser repair; independently
+balanced fragments can render after a rejected tag. Rejected raw-text/RCDATA
+bodies (`script`, `style`, `iframe`, `textarea`, `title`, `xmp`, `noembed`,
+`noframes`, `noscript`, `plaintext`) and comments stay literal, including any
+allowlisted-looking strings inside them. Markdown paragraph wrappers around
+valid block tags are omitted to avoid invalid `<p><ul>` nesting. HTML blocks keep their
+existing literal text/entity handling; inline Markdown keeps its usual parser.
+This policy is for UI Markdown, not the separate HTML-slide/export sanitizer.
+
+```sh
+set -euo pipefail
+ulimit -n 65536
+cargo nextest run --locked -p c6-ui -E 'test(markdown::tests::)'
+env -u NO_COLOR make ui
+# After make ui-browser-install; private loopback head, no live configuration:
+node crates/c6-ui/tests/markdown-html.cjs
+```
+
+The browser regression checks real list/break DOM in both transcript and doc,
+in Light and Dark, in pinned Chromium and WebKit. It also checks nested lists,
+attribute removal, escaped XSS strings, cross-cell containment, block HTML,
+ordinary paragraphs, and intact following content. Screenshots default to
+`/tmp/s9-markdown-html` (`SCREENSHOTS` overrides); no retries are performed.
+
 ## Effective conversation projections after rewind
 
 The native-memory reset regression runs a fake stream-JSON CLI with its own
@@ -83,7 +124,7 @@ UI_BROWSER_PASSES=3 make ui-browser-test
 ```
 
 The runner covers workspace-open, motion, comment-sheet, phone-picker,
-theme (`--browser`), settings-lists and resource-lifecycle in each engine, plus ring-render in
+theme (`--browser`), settings-lists, resource-lifecycle and markdown-html in each engine, plus ring-render in
 Chromium. **ring-render is Chromium-only**, because its layer/paint/blocked-main-thread assertions
 require CDP; `ENGINE=webkit` now fails explicitly instead of silently launching
 Chromium. Its full default three-run/two-theme workload remains enabled.
