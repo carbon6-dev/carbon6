@@ -13,7 +13,7 @@ use serde_json::{Map, Value};
 
 use crate::api;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT, ago, now_ms};
-use crate::workspace::{Go, How, Rect, View, use_column, use_workspace};
+use crate::workspace::{Go, How, Rect, View, ViewActions, use_column, use_workspace};
 
 fn since(at: i64) -> String {
     ago(now_ms() - at)
@@ -801,6 +801,10 @@ const DOCKED_FROM: f64 = 1120.0;
 /// A button in the doc's bar.
 const BAR: &str = "shrink-0 rounded-md px-2 py-1 text-sm text-soft hover:bg-zinc-100 dark:hover:bg-zinc-800";
 
+/// Full-width actions in the phone workspace menu, with a 44px touch target.
+const DOC_PHONE_ACTION: &str =
+    "flex min-h-11 w-full items-center gap-2 px-4 text-left hover:bg-zinc-100 disabled:opacity-50 dark:hover:bg-zinc-800";
+
 #[derive(Clone, Copy)]
 struct ReadOnly(Memo<bool>);
 
@@ -840,7 +844,6 @@ fn DocMenu(
     export: Callback<()>,
     history: Callback<()>,
 ) -> impl IntoView {
-    let (col, ws) = (use_column(), use_workspace());
     let open = RwSignal::new(false);
     let pop = crate::util::dismissable(
         move || open.get(),
@@ -855,23 +858,48 @@ fn DocMenu(
                 data-pop=pop.clone() on:click=move |_| open.update(|o| *o = !*o)>{crate::icons::ellipsis()}</button>
             {move || open.get().then(|| view! {
                 <div role="menu" data-pop=pop.clone() class="absolute right-4 top-full z-50 min-w-40 max-w-full rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
-                    {move || owner.get().map(|id| view! {
-                        <button role="menuitem" class="flex min-h-11 w-full items-center px-4 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
-                            on:click=move |ev| {
-                                open.set(false);
-                                let to = View::session(id.clone());
-                                let how = How::from_mouse(&ev);
-                                match col { Some(c) => c.open(to, how), None => ws.open(None, to, how) }
-                            }>"Open the session that made it"</button>
-                    })}
-                    <button role="menuitem" class="flex min-h-11 w-full items-center px-4 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
-                        on:click=move |_| { open.set(false); export.run(()); }>"Export…"</button>
-                    <button role="menuitem" class="flex min-h-11 w-full items-center px-4 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
-                        on:click=move |_| { open.set(false); history.run(()); }>"History"</button>
-                    {move || view! { <ArchiveMenuItem archived=archived.get() busy run=Callback::new(move |()| { open.set(false); archive.run(()); }) /> }}
+                    <DocMenuItems owner archived busy archive export history close=Callback::new(move |()| open.set(false)) />
                 </div>
             })}
         </div>
+    }
+}
+
+/// The same document actions in the desktop menu and the phone workspace bar.
+#[component]
+fn DocMenuItems(
+    owner: Memo<Option<String>>,
+    archived: Memo<bool>,
+    busy: RwSignal<bool>,
+    archive: Callback<()>,
+    export: Callback<()>,
+    history: Callback<()>,
+    close: Callback<()>,
+) -> impl IntoView {
+    let (col, ws) = (use_column(), use_workspace());
+    let live = api::live();
+    view! {
+        {move || owner.get().map(|id| {
+            let detail = crate::resources::session(id.clone()).detail;
+            let mark_id = id.clone();
+            let mark = Signal::derive(move || {
+                live.session(&mark_id).or_else(|| detail.get().and_then(Result::ok).map(|d| d.session))
+                    .as_ref().map(crate::marks::of).unwrap_or_else(|| session_mark(&mark_id))
+            });
+            view! {
+            <button role="menuitem" class="flex min-h-11 w-full items-center px-4 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                on:click=move |ev| {
+                    close.run(());
+                    let to = View::session(id.clone());
+                    let how = How::from_mouse(&ev);
+                    match col { Some(c) => c.open(to, how), None => ws.open(None, to, how) }
+                }><span class="mr-2 md:hidden"><crate::marks::Glyph mark shape=crate::marks::Shape::Circle size=10 /></span>"Open the session that made it"</button>
+        }})}
+        <button role="menuitem" class="flex min-h-11 w-full items-center px-4 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
+            on:click=move |_| { close.run(()); export.run(()); }>"Export…"</button>
+        <button role="menuitem" class="flex min-h-11 w-full items-center px-4 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
+            on:click=move |_| { close.run(()); history.run(()); }>"History"</button>
+        {move || view! { <ArchiveMenuItem archived=archived.get() busy run=Callback::new(move |()| { close.run(()); archive.run(()); }) /> }}
     }
 }
 
@@ -1297,7 +1325,6 @@ pub fn DocPage(id: String) -> impl IntoView {
         let Some(r) = loaded.get() else { return };
         match r {
             Ok(d) => {
-                remember_titles([&d.summary]);
                 if doc.with_untracked(|x| !matches!(x, Some(Ok(o)) if *o == d)) {
                     doc.set(Some(Ok(d)));
                 }
@@ -1318,6 +1345,13 @@ pub fn DocPage(id: String) -> impl IntoView {
     });
     let shown_doc = Memo::new(move |_| doc.with(|d| d.as_ref().and_then(|r| r.as_ref().ok()).cloned()));
     let summary = Memo::new(move |_| shown_doc.with(|d| d.as_ref().map(|d| d.summary.clone()).unwrap_or_default()));
+    // The single phone bar uses the workspace's title cache. Local edits
+    // must update it too, without waiting for a live-feed echo/refetch.
+    Effect::new(move || {
+        if state.get() == 2 {
+            summary.with(|s| remember_titles([s]));
+        }
+    });
     let owner = Memo::new(move |_| summary.with(|s| owning_session(&s.created_by)));
     let archived = Memo::new(move |_| summary.with(|s| s.archived_at.is_some()));
     provide_context(ReadOnly(archived));
@@ -1335,6 +1369,7 @@ pub fn DocPage(id: String) -> impl IntoView {
     let is_deck = Memo::new(move |_| summary.with(|s| s.kind == "deck"));
     let doc_rev = Memo::new(move |_| summary.with(|s| s.rev));
     let renaming = RwSignal::new(false);
+    let phone_renaming = RwSignal::new(false);
     let title = RwSignal::new(String::new());
     let history = RwSignal::new(false);
     let exporting = RwSignal::new(false);
@@ -1492,6 +1527,7 @@ pub fn DocPage(id: String) -> impl IntoView {
             edit.set(None);
             edit_all.set(false);
             renaming.set(false);
+            phone_renaming.set(false);
             adding_open.set(false);
             chip_ctx.editing.set(None);
             threads.commenting.set(None);
@@ -1555,6 +1591,7 @@ pub fn DocPage(id: String) -> impl IntoView {
         let Some(el) = root.get() else { return };
         // The tile's scrolling area, which the page fills.
         let Some(area) = el.parent_element() else { return };
+        let previous_phone = StoredValue::new(None::<bool>);
         let on = Closure::<dyn Fn(js_sys::Array)>::new(move |entries: js_sys::Array| {
             let Some(e) = entries.get(0).dyn_ref::<web_sys::ResizeObserverEntry>().map(|e| e.content_rect()) else { return };
             // Hidden: nothing to go by.
@@ -1563,6 +1600,8 @@ pub fn DocPage(id: String) -> impl IntoView {
             }
             let phone = crate::util::touch_first()
                 || !window().match_media("(min-width: 48rem) and (min-height: 32rem)").ok().flatten().is_some_and(|m| m.matches());
+            let changed_layout = previous_phone.get_value() != Some(phone);
+            previous_phone.set_value(Some(phone));
             let f = if e.width() >= DOCKED_FROM {
                 Fit::Docked
             } else if phone || e.width() < 640.0 {
@@ -1573,9 +1612,10 @@ pub fn DocPage(id: String) -> impl IntoView {
             // A scrollbar coming or going is no resize: the popover makes
             // the page just tall enough for one, the narrower page rewraps,
             // the popover is placed again, the scrollbar goes, and round it
-            // went for good. Only a real change of width counts.
+            // went for good. A real width change or crossing the phone's
+            // height-aware breakpoint counts (its toolbar may now be hidden).
             let resized = tile_w.try_get_untracked().is_some_and(|w| (w - e.width()).abs() >= 24.0);
-            if resized && fit.try_get_untracked().is_some_and(|x| x != f) {
+            if (resized || changed_layout) && fit.try_get_untracked().is_some_and(|x| x != f) {
                 let _ = fit.try_set(f);
             }
             if resized {
@@ -1696,6 +1736,7 @@ pub fn DocPage(id: String) -> impl IntoView {
         }
         let t = title.get_untracked();
         renaming.set(false);
+        phone_renaming.set(false);
         if t.trim().is_empty() {
             return;
         }
@@ -1731,6 +1772,7 @@ pub fn DocPage(id: String) -> impl IntoView {
     // The boxes to add a block and rename it: the cursor in them as they open.
     let add_ref = NodeRef::<leptos::html::Textarea>::new();
     let rename_ref = NodeRef::<leptos::html::Input>::new();
+    let phone_rename_ref = NodeRef::<leptos::html::Input>::new();
     Effect::new(move || {
         if let Some(el) = add_ref.get() {
             let _ = el.focus();
@@ -1738,6 +1780,11 @@ pub fn DocPage(id: String) -> impl IntoView {
     });
     Effect::new(move || {
         if let Some(el) = rename_ref.get() {
+            let _ = el.focus();
+        }
+    });
+    Effect::new(move || {
+        if let Some(el) = phone_rename_ref.get() {
             let _ = el.focus();
         }
     });
@@ -1786,7 +1833,7 @@ pub fn DocPage(id: String) -> impl IntoView {
 
     let bar = move || {
         view! {
-            <div data-doc-header="" class="sticky top-0 z-20 border-b border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950">
+            <div data-doc-header="" class="sticky top-0 z-20 hidden border-b border-zinc-200 bg-white md:block dark:border-zinc-800 dark:bg-zinc-950">
                 <div class="relative mx-auto flex max-w-3xl flex-wrap items-center gap-1 px-4 py-1">
                     <span class="shrink-0 text-muted" title=move || summary.with(|s| s.kind.clone())>{move || summary.with(|s| kind_mark(&s.kind))}</span>
                     <div data-doc-heading="" class="flex min-w-0 flex-1 basis-40 items-center gap-1">
@@ -1835,7 +1882,66 @@ pub fn DocPage(id: String) -> impl IntoView {
     };
     let content = move || {
         view! {
+            <ViewActions>
+                <div data-doc-phone-actions="" class="md:hidden">
+                    <div class="flex items-center gap-2 px-4 py-2 text-xs text-muted">
+                        {move || summary.with(|s| kind_mark(&s.kind))}
+                        <span class="truncate">{move || summary.with(|s| s.title.clone())}</span>
+                    </div>
+                    <Show when=move || !archived.get()>
+                        <button role="menuitem" class=DOC_PHONE_ACTION on:click=move |_| {
+                            title.set(summary.with_untracked(|s| s.title.clone()));
+                            phone_renaming.set(true);
+                        }>{crate::icons::pencil()}" Rename document"</button>
+                    </Show>
+                    <button role="menuitem" data-opens="comments" class=DOC_PHONE_ACTION aria-pressed=move || panel.get().to_string()
+                        on:click=move |_| panel.update(|p| *p = !*p)>
+                        {crate::icons::icon(crate::icons::Icon::MessageSquare, crate::icons::Size::S14)}
+                        {move || format!("{} comments{}", if panel.get() { "Hide" } else { "Show" }, match open_n.get() { 0 => String::new(), n => format!(" ({n} open)") })}
+                    </button>
+                    <Show when=move || !archived.get()>
+                        <button role="menuitem" data-opens="comments" class=DOC_PHONE_ACTION on:click=move |_| {
+                            panel.set(true);
+                            threads.focus.set(Some(String::new()));
+                            threads.commenting.set(Some(String::new()));
+                        }>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" Comment on the whole doc"</button>
+                    </Show>
+                    <Show when=move || { !archived.get() && unsent.get() > 0 }>
+                        <button role="menuitem" class=DOC_PHONE_ACTION disabled=move || sending.get() on:click=move |_| threads.send_all.run(())>
+                            {crate::icons::arrow_up()}{move || format!("Send {} to agent", unsent.get())}
+                        </button>
+                    </Show>
+                    <Show when=move || !archived.get() && !is_deck.get()>
+                        <button role="menuitem" class=DOC_PHONE_ACTION on:click=toggle_edit>
+                            {crate::icons::pencil()}{move || if edit_all.get() { "Done" } else { "Edit document" }}
+                        </button>
+                    </Show>
+                    <Show when=move || !used.with(Vec::is_empty)>
+                        <div class="border-y border-zinc-200 py-1 dark:border-zinc-700">
+                            <p class="px-4 py-1 text-xs text-muted">{move || format!("Used in {}", used.with(Vec::len))}</p>
+                            {move || used.get().into_iter().map(|(to, label)| view! {
+                                <Go to class="flex min-h-11 items-center px-4 text-sky-700 hover:bg-zinc-100 dark:text-sky-400 dark:hover:bg-zinc-800">{label}</Go>
+                            }).collect_view()}
+                        </div>
+                    </Show>
+                    <DocMenuItems owner archived busy=archive_busy archive
+                        export=Callback::new(move |()| exporting.update(|x| *x = !*x))
+                        history=Callback::new(move |()| history.update(|x| *x = !*x))
+                        close=Callback::new(|()| ()) />
+                </div>
+            </ViewActions>
             <Show when=move || archived.get()><ArchivedBanner unarchive=archive busy=archive_busy /></Show>
+            // Keep the phone rename editor in the live body, not the transient
+            // Actions menu or the desktop toolbar hidden at this breakpoint.
+            <Show when=move || phone_renaming.get() && !archived.get()>
+                <form data-doc-phone-rename="" class="flex items-center gap-2 md:hidden" on:submit=move |ev| { ev.prevent_default(); rename(); }>
+                    <input node_ref=phone_rename_ref class=format!("{INPUT} min-w-0 flex-1") aria-label="Document title"
+                        prop:value=move || title.get() on:input=move |ev| title.set(event_target_value(&ev))
+                        on:keydown=move |ev| if ev.key() == "Escape" { ev.prevent_default(); phone_renaming.set(false); } />
+                    <button type="button" class=BUTTON_QUIET on:click=move |_| phone_renaming.set(false)>"Cancel"</button>
+                    <button type="submit" class=BUTTON>"Rename"</button>
+                </form>
+            </Show>
             <header class="space-y-1">
                 <p class="flex flex-wrap items-center gap-x-1 text-xs text-muted">
                     {move || summary.with(|s| view! {
@@ -2055,6 +2161,15 @@ fn Sheet(open: Signal<bool>, space: RwSignal<f64>, close: Callback<()>, children
         ctx.root
             .get_untracked()
             .and_then(|root| {
+                if ctx.pop.get_untracked().is_none() && crate::util::phone() {
+                    // The phone's menu item has already unmounted. Return
+                    // to its persistent opener, not the hidden desktop bar.
+                    return root
+                        .closest("[data-tile-surface]")
+                        .ok()
+                        .flatten()
+                        .and_then(|tile| tile.query_selector("[data-tile-bar] button[aria-label=Actions]").ok().flatten());
+                }
                 let selector = ctx
                     .pop
                     .get_untracked()
@@ -2086,7 +2201,16 @@ fn Sheet(open: Signal<bool>, space: RwSignal<f64>, close: Callback<()>, children
             .root
             .try_get_untracked()
             .flatten()
-            .and_then(|r| r.query_selector("[data-opens=comments]").ok().flatten())
+            .and_then(|r| {
+                if crate::util::phone() {
+                    r.closest("[data-tile-surface]")
+                        .ok()
+                        .flatten()
+                        .and_then(|tile| tile.query_selector("[data-tile-bar] button[aria-label=Actions]").ok().flatten())
+                } else {
+                    r.query_selector("[data-opens=comments]").ok().flatten()
+                }
+            })
             .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok());
         let previous = previous.get_value();
         if let Some(target) = previous.as_ref().filter(|el| el.is_connected()).or(fallback.as_ref()) {
@@ -4074,6 +4198,35 @@ mod tests {
         assert!(memo.find("crate::util::flip_list(list, &next)").unwrap() < memo.rfind("next").unwrap());
         assert!(panel.contains("<div node_ref=list data-comments-list=\"\" class=\"min-h-0 flex-1 space-y-2 overflow-y-auto"));
         assert!(panel.contains("<div data-motion-key=id.clone()><PanelThread id=id.clone() /></div>"));
+    }
+
+    #[test]
+    fn phone_doc_actions_register_live_controls_and_keep_rename_outside_the_menu() {
+        let source = include_str!("docs.rs");
+        let page = source.split("pub fn DocPage(").nth(1).unwrap().split("fn send_all_button(").next().unwrap();
+        let actions = page.split("<ViewActions>").nth(1).unwrap().split("</ViewActions>").next().unwrap();
+        for action in [
+            "Rename document",
+            "panel.update",
+            "Comment on the whole doc",
+            "threads.send_all.run(())",
+            "on:click=toggle_edit",
+            "used.get()",
+            "<DocMenuItems owner archived",
+        ] {
+            assert!(actions.contains(action), "the phone menu must expose {action}");
+        }
+        assert!(actions.contains("!archived.get() && unsent.get() > 0"));
+        assert!(actions.contains("!archived.get() && !is_deck.get()"));
+        assert!(!actions.contains("node_ref=phone_rename_ref"), "closing Actions must not remove the rename editor");
+        assert!(page.contains("node_ref=phone_rename_ref"));
+        assert!(page.contains("phone_renaming.set(false)"));
+        assert!(page.contains("class=\"sticky top-0 z-20 hidden border-b"));
+        assert!(page.contains("bg-white md:block"), "use the same height-aware breakpoint as workspace chrome");
+        let menu = source.split("fn DocMenuItems(").nth(1).unwrap().split("/// A doc's comments").next().unwrap();
+        for action in ["Open the session that made it", "Export…", "History", "<ArchiveMenuItem"] {
+            assert!(menu.contains(action), "desktop and phone must share {action}");
+        }
     }
 
     #[test]

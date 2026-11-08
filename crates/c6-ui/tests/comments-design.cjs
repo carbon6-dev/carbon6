@@ -219,7 +219,11 @@ async function check(browser, origin, engine, name, theme) {
       await anchor.locator('[data-marks] button').click(); await pop().waitFor(); await settle(page);
     };
     const openPanel = async () => {
-      await tile.locator('button[data-opens="comments"]').first().click(); await panel().waitFor(); await settle(page);
+      if (!before && (width < 768 || height < 512)) {
+        await tile.locator('[data-tile-bar]').getByRole('button', { name: 'Actions', exact: true }).click();
+        await page.locator('.phone-popover:visible').getByRole('menuitem', { name: /^Show comments(?: \(\d+ open\))?$/ }).click();
+      } else await tile.locator('button[data-opens="comments"]').first().click();
+      await panel().waitFor(); await settle(page);
     };
     const reloadClosed = async () => {
       await page.reload({ waitUntil: 'domcontentloaded' }); await anchor.waitFor(); await settle(page);

@@ -190,8 +190,20 @@ async function check(browser, origin, engine, name, theme) {
       await dismiss(() => sheet.getByRole('button', { name: 'Close the comments' }).click());
     }
     f.phase = 'comments panel';
-    const panelOpener = tile.locator('button[data-opens="comments"]').first();
-    await panelOpener.click(); await capture('panel');
+    const phoneActions = !before && (width < 768 || height < 512);
+    const panelOpener = phoneActions
+      ? tile.locator('[data-tile-bar]').getByRole('button', { name: 'Actions', exact: true })
+      : tile.locator('button[data-opens="comments"]').first();
+    const openPanel = async () => {
+      f.phase = 'comments panel: open persistent opener';
+      await panelOpener.click();
+      if (phoneActions) {
+        f.phase = 'comments panel: choose Show comments';
+        await page.locator('.phone-popover:visible').getByRole('menuitem', { name: /^Show comments(?: \(\d+ open\))?$/ }).click();
+      }
+      f.phase = 'comments panel: content and focus checks';
+    };
+    await openPanel(); await capture('panel');
     if (!before) {
       if (count > 1) {
         const otherDoc = page.locator(`[data-tile-motion="${2 + (count - 1) * 2}"]`);
@@ -219,9 +231,9 @@ async function check(browser, origin, engine, name, theme) {
         await outer.evaluate((el, left) => el.style.setProperty('--l', left), left);
       }
       await dismiss(() => sheet.getByRole('button', { name: 'Close the comments' }).click());
-      assert(await panelOpener.evaluate(el => document.activeElement === el), 'Close returns focus to comments button');
+      assert(await panelOpener.evaluate(el => document.activeElement === el), 'Close returns focus to the persistent comments opener');
       if (count === 1) {
-        await panelOpener.click(); await sheet.waitFor();
+        await openPanel(); await sheet.waitFor();
         const writing = await sheet.locator('textarea').elementHandle();
         await writing.focus();
         // Visual-viewport-only keyboard shrink/pan, without a window resize.

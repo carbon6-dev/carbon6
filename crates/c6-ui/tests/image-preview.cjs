@@ -192,7 +192,8 @@ async function check(browser, origin, engine, name, theme) {
     await preview('drawing', drawing);
     assert.equal(await page.locator('[contenteditable=true]').count(), 0, 'drawing preview does not start editing the block');
     if (!before && name.startsWith('phone')) {
-      await page.getByRole('button', { name: 'Comments', exact: true }).click();
+      await page.locator('[data-tile-bar]:visible').getByRole('button', { name: 'Actions', exact: true }).click();
+      await page.locator('.phone-popover:visible').getByRole('menuitem', { name: 'Show comments', exact: true }).click();
       const sheet = page.locator('.phone-sheet:visible');
       await assertEscaped(sheet, 'document comments sheet', true);
       await page.keyboard.press('Escape');

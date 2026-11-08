@@ -1696,7 +1696,7 @@ fn SessionOverview(chrome: SessionChrome, #[prop(into)] on_done: Callback<()>, #
     view! { <BackgroundWork chrome on_done wide /> }
 }
 
-/// A session's own strip, when its tile's bar speaks for another view
+/// A desktop session's own strip, when its tile's bar speaks for another view
 /// beside it (a doc): its panes and its actions (⋯), at the right.
 #[component]
 fn SessionStrip(chrome: SessionChrome) -> impl IntoView {
@@ -1708,7 +1708,7 @@ fn SessionStrip(chrome: SessionChrome) -> impl IntoView {
     let rename_from = StoredValue::new((8.0, 48.0));
     view! {
         <ArchivedSession id=chrome.id.get_value() show_title=true />
-        <div class="flex h-11 shrink-0 items-center justify-end gap-0.5 border-b border-zinc-200 bg-zinc-50 px-2 text-xs pointer-coarse:gap-0 dark:border-zinc-800 dark:bg-zinc-900/60">
+        <div data-session-strip class="hidden h-11 shrink-0 items-center justify-end gap-0.5 border-b border-zinc-200 bg-zinc-50 px-2 text-xs md:flex pointer-coarse:gap-0 dark:border-zinc-800 dark:bg-zinc-900/60">
             <SessionControls chrome />
             <span class="mx-1 h-4 w-px shrink-0 bg-zinc-200 dark:bg-zinc-700"></span>
             <button class=crate::icons::BAR_BUTTON aria-label="Actions"

@@ -123,7 +123,7 @@ make ui-browser-test
 UI_BROWSER_PASSES=3 make ui-browser-test
 ```
 
-The runner covers workspace-open, motion, comment-sheet, phone-picker,
+The runner covers workspace-open, motion, comment-sheet, phone-picker, phone-bar,
 theme (`--browser`), settings-lists, resource-lifecycle, markdown-html and status-row in each engine, plus ring-render in
 Chromium. **ring-render is Chromium-only**, because its layer/paint/blocked-main-thread assertions
 require CDP; `ENGINE=webkit` now fails explicitly instead of silently launching
@@ -138,6 +138,86 @@ every suite. `UI_BROWSER_PASSES=3 BROWSER_SUITES=motion bash scripts/ui-browser-
 runs three full Motion matrices in both engines.
 Logs/screenshots/traces are separated by pass, engine and suite. A failed
 command stops the runner, keeps the evidence, and is never automatically retried.
+
+### Phone single-bar production browser regression (S14)
+
+`phone-bar.cjs` reuses Motion's built-production fixture, private loopback
+origin and pinned browser launcher. It runs **80 phone contexts per engine**:
+light/dark at 320×568, 390×844 and 430×932 portrait, plus 900×430 and 430×320
+short landscape, in eight states (session alone, session+doc with either pane
+shown, session+Changes, session+Terminal, standalone doc, Settings and Sessions).
+Four additional contexts check wide and narrow-tile desktop chrome, for
+**84 fresh contexts per engine** in total. The default
+has no context filters or retries. APIs, document updates and terminal PTY
+traffic are local fixtures; real bundled xterm mounts without starting a shell.
+
+The phone checks measure the sole `[data-tile-bar]` through to the actual pane
+body, including the session's inner content wrapper: total chrome is at most
+44px, with no visible column header, session strip or sticky document toolbar.
+They also check 44px phone control targets, 320px control collisions, selected-pane titles, two-way title
+switching, the back button, a session ring even over a document, session pin/
+unpin, close-pane/close-tile actions, ring-opened Changes/Terminal, Files,
+session details and Find. Document Actions exercise rename, comments, edit,
+history, export, archive/unarchive and opening the owning session. A standalone
+document's Used in link opens real work, dismisses Actions, retains the document
+DOM and returns through tile history. Generic tile
+Back/Forward, detach and minimize are exercised too. Runtime browser errors,
+including WASM traps, are always fatal. Console errors are fatal except for
+exactly `Viewport argument key "interactive-widget" not recognized and ignored.`
+from WebKit, at most once per page. This unsupported-key engine diagnostic was
+observed on the pristine baseline, not classified as an application failure.
+Its raw message and named classification remain in every capture's evidence;
+the same message in Chromium, duplicates, and all other console errors fail.
+
+```sh
+# Build once, owned by the caller; never race a second build with a capture.
+env -u NO_COLOR make ui
+ENGINE=chromium node crates/c6-ui/tests/phone-bar.cjs
+ENGINE=webkit node crates/c6-ui/tests/phone-bar.cjs
+BROWSER_SUITES=phone-bar BROWSER_TEST_OUTPUT=/tmp/s14-bar/matrix bash scripts/ui-browser-tests.sh
+
+# Run against the pristine build before replacing it, then against the new one.
+# BEFORE captures initial screenshots/geometries; it does not assert the new
+# header/control contract, but browser errors remain fatal.
+BEFORE=1 ENGINE=chromium SCREENSHOTS=/tmp/s14-bar node crates/c6-ui/tests/phone-bar.cjs
+ENGINE=chromium SCREENSHOTS=/tmp/s14-bar node crates/c6-ui/tests/phone-bar.cjs
+```
+
+`SCREENSHOTS` defaults to `/tmp/s14-bar`; names begin with `before-` or `after-`
+and include engine/theme/viewport/state. Each capture saves a screenshot and
+geometry/error JSON; failures retain a screenshot and request/error diagnostic.
+`ENGINE=both` selects both engines. `THEME`, `VIEWPORT` and `CASE` accept
+comma-separated exact names for separately labelled focused diagnostics (for
+example `THEME=dark VIEWPORT=portrait-320 CASE=session-doc-doc`). These are
+subsets, not full-matrix qualification. `C6_TEST_DEADLINE_SECS` sets each
+operation's timeout (default 300 seconds), not the entire matrix's duration.
+A separate per-context hang watchdog uses twice that timeout so an operation
+failure can save its screenshot/JSON before the browser closes.
+
+The S14 production build is **10,674,761 bytes raw / 2,662,708 Brotli**,
+SHA-256 `94ed2e5ad68ffb557bdcc339231b6f093e3b9f826f6e8e4809c79e76d0af296a`.
+Against the exact `8a5ac826` baseline (10,594,434 / 2,643,871 bytes), that is
+**+80,327 raw / +18,837 Brotli**. The unchanged ceilings (10,724,780 /
+2,667,328) leave **50,019 raw / 4,620 Brotli bytes**. No icon, typed-view or
+size-budget exemption was used. The new `w-70` and height-aware `md:flex`,
+`md:block` and `md:hidden` utilities are present in the generated CSS.
+The final unfiltered Chromium/WebKit run completed **168 contexts** (160 phone,
+8 desktop); every phone's measured bar and total top chrome were **44px**.
+The 390px session+document/session-visible capture fell from **132px to 44px**.
+With `set -euo pipefail; ulimit -n 65536`, the required `env -u NO_COLOR make ui`,
+`make check`, `make test` sequence passed: no clippy warnings, test lint and size
+guards passed, and **1,270 tests passed, 2 skipped**. Logs, exact artifact
+manifest, before/after screenshots and geometry are under `/tmp/s14-bar/`;
+`after-browser-final.log` and `final-browser-summary.json` identify the final
+main cohort. Physical Android/iOS hardware was not exercised.
+Affected-suite qualification on the same artifact also passed **112 contexts**:
+comment-sheet 16, image-preview phone 8, comments-design phone 8, session-sheet
+36 (`compat-final/`), and document ownership 22 per engine (`compat-final2/`).
+The ownership test scrolls the deck's real nested sorter when the outer page
+fits; positive scrolling, fixed-header geometry, owning-session mark fallback,
+navigation dismissal and retained document assertions remain mandatory. Earlier
+failed owner-navigation and ancestor-only deck-scroll cohorts remain labelled
+in `/tmp/s14-bar/report.md`; they were not counted as passes or silently retried.
 
 `settings-lists.cjs` covers the production list editors in light/dark and
 desktop/phone: keyed-row and focus retention during live updates, adding and

@@ -12,8 +12,8 @@
 //! Each tile keeps its own
 //! back and forward history (⌘[ and ⌘]).
 //!
-//! On a phone one tile shows at a time (a switcher at the bottom) and one
-//! pane of it, with back in its header.
+//! On a phone one tile and one pane show at a time, with a single bar for
+//! navigation, the shown pane's actions and the Sessions picker.
 //!
 //! The layout is saved in the browser; the URL shows the focused column.
 //! It also tracks attention: sessions that finished or failed while not
@@ -1088,6 +1088,18 @@ impl Layout {
         Some(session.unwrap_or(last.key))
     }
 
+    /// The phone's ring belongs to the visible session or its companion's
+    /// session, not necessarily the column whose title/actions are shown.
+    fn phone_session_column(&self, tile: u64) -> Option<u64> {
+        let t = self.tile(tile)?;
+        let current = t.columns.get(t.cursor)?;
+        if matches!(current.view, View::Session { .. }) {
+            return Some(current.key);
+        }
+        let companion = current.view.session_pane().map(|(_, id)| id);
+        t.columns.iter().find(|c| matches!(&c.view, View::Session { id, .. } if companion.is_none_or(|owner| owner == id))).map(|c| c.key)
+    }
+
     /// Where a session's pane is open, if it is: (tile key, pane key).
     pub fn find_pane(&self, pane: crate::panes::Pane, id: &str) -> Option<(u64, u64)> {
         self.tiles.iter().find_map(|t| t.columns.iter().find(|c| c.view.session_pane() == Some((pane, id))).map(|c| (t.key, c.key)))
@@ -1216,6 +1228,8 @@ pub struct Workspace {
     /// What each session pane offers its tile's bar (its actions, ⋯), by
     /// pane key, while it is shown.
     pub chrome: RwSignal<HashMap<u64, crate::session::SessionChrome>>,
+    /// View-owned phone actions, mounted in the single tile bar's popover.
+    view_actions: RwSignal<HashMap<u64, (u64, ChildrenFn)>>,
     /// Sessions that finished or failed while not shown, newest first.
     pub attention: RwSignal<Vec<String>>,
     pub pinned: RwSignal<Vec<String>>,
@@ -1456,6 +1470,7 @@ impl Workspace {
             navigation: RwSignal::new((0, 0)),
             brief_request: RwSignal::new(request),
             chrome: RwSignal::new(HashMap::new()),
+            view_actions: RwSignal::new(HashMap::new()),
             attention: RwSignal::new(load(ATTENTION_KEY).unwrap_or_default()),
             pinned: RwSignal::new(load(PINNED_KEY).unwrap_or_default()),
             dragging: RwSignal::new(None),
@@ -1965,6 +1980,8 @@ pub struct ColumnCtx {
     pub visible: Signal<bool>,
     /// The column keyboard shortcuts act on.
     pub active: Signal<bool>,
+    /// The height-aware phone layout: only the tile's single bar is used.
+    one_pane: RwSignal<bool>,
     /// Scroll position, kept while the column is folded away, and whether
     /// it was at the end (then it comes back at the end, however much was
     /// added meanwhile).
@@ -1991,15 +2008,41 @@ impl ColumnCtx {
 
     /// Whether its tile's bar speaks for it: it's the tile's last column,
     /// or one of its own panes is beside it (tracked: a column opened or
-    /// closed beside it changes it).
+    /// closed beside it changes it). Phones always use the single tile bar.
     pub fn in_bar(&self) -> bool {
         let (tile, col) = (self.tile, self.col);
-        self.ws.layout.with(|l| l.bar_column(tile) == Some(col))
+        self.one_pane.get() || self.ws.layout.with(|l| l.bar_column(tile) == Some(col))
     }
 }
 
 pub fn use_column() -> Option<ColumnCtx> {
     use_context::<ColumnCtx>()
+}
+
+/// A view lends its actions to the phone bar without moving or serializing
+/// its content. The token keeps replacements from cleaning up a newer view.
+#[component]
+pub(crate) fn ViewActions(children: ChildrenFn) -> impl IntoView {
+    if let Some(col) = use_column() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let token = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let children: ChildrenFn = std::sync::Arc::new(move || {
+            // Render under the popover's disposable row owner, but retain
+            // the source column for navigation from the borrowed controls.
+            provide_context(col);
+            children()
+        });
+        col.ws.view_actions.update(|m| {
+            m.insert(col.col, (token, children));
+        });
+        on_cleanup(move || {
+            col.ws.view_actions.update(|m| {
+                if m.get(&col.col).is_some_and(|(t, _)| *t == token) {
+                    m.remove(&col.col);
+                }
+            });
+        });
+    }
 }
 
 /// Opens a view: from inside a column, beside it (or with `own`, in a tile
@@ -2558,6 +2601,7 @@ pub(crate) fn ComposerPopover(
 #[component]
 fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
     let ws = use_workspace();
+    let phone = expect_context::<TileLoading>().one_pane;
     let bar_colour = expect_context::<crate::settings::SessionBarDisplay>().colour;
     let live = api::live();
     let focused = Memo::new(move |_| ws.layout.with(|l| l.tiles.get(l.focus).map(|t| t.key) == Some(key)));
@@ -2567,10 +2611,14 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
     let minimized = Memo::new(move |_| ws.layout.with(|l| l.tile(key).is_some_and(|t| t.minimized)));
     let tile = Memo::new(move |_| ws.layout.with(|l| l.tile(key).cloned()));
     let cols = Memo::new(move |_| tile.get().map(|t| t.columns.iter().map(|c| c.key).collect::<Vec<_>>()).unwrap_or_default());
+    let current = Memo::new(move |_| tile.get().and_then(|t| t.columns.get(t.cursor).cloned()));
     // The tile's name: what it was opened on, and the item open in it.
     let title = Signal::derive(move || {
         tile.get()
             .map(|t| {
+                if phone.get() {
+                    return t.columns.get(t.cursor).map(|c| c.view.label(&live)).unwrap_or_else(|| "History".into());
+                }
                 if t.columns.is_empty() {
                     "History".to_owned()
                 } else {
@@ -2582,20 +2630,36 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
     let can_back = move || tile.get().is_some_and(|t| !t.back.is_empty());
     let can_forward = move || tile.get().is_some_and(|t| !t.forward.is_empty());
     let two = move || tile.get().is_some_and(|t| t.columns.len() == 2);
+    let panes_at = RwSignal::new(None::<(f64, f64)>);
     // The session the tile shows on its own (beside a list, its pane pins it).
-    let pinnable = move || match tile.get().map(|t| t.columns) {
-        Some(c) if c.len() == 1 => match &c[0].view {
-            View::Session { id, .. } => Some(id.clone()),
-            _ => None,
-        },
-        _ => None,
+    let pinnable = move || {
+        if phone.get() {
+            current.get().and_then(|c| match c.view {
+                View::Session { id, .. } => Some(id),
+                _ => None,
+            })
+        } else {
+            match tile.get().map(|t| t.columns) {
+                Some(c) if c.len() == 1 => match &c[0].view {
+                    View::Session { id, .. } => Some(id.clone()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
     };
     // The session it shows (alone, as the item beside a list, or with one
     // of its panes beside it): its pane, and how it is now. The bar wears
     // its colour and says its state.
     let shown = Memo::new(move |_| {
         ws.layout.with(|l| {
-            let col = l.bar_column(key)?;
+            let col = if phone.get() {
+                // A companion still belongs to its session: keep the ring
+                // while the title and Actions speak for the shown pane.
+                l.phone_session_column(key)?
+            } else {
+                l.bar_column(key)?
+            };
             l.tile(key)?.columns.iter().find(|c| c.key == col).and_then(|c| match &c.view {
                 View::Session { id, .. } => Some((col, id.clone())),
                 _ => None,
@@ -2606,9 +2670,27 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
     let colour = Memo::new(move |_| session.get().map(|s| crate::marks::of(&s)));
     let palette_at = RwSignal::new(None::<(f64, f64)>);
     let menu_at = RwSignal::new(None::<(f64, f64)>);
+    // Navigation can dispose a borrowed action before its bubbling click
+    // reaches our wrapper. Close from the persistent bar owner as well.
+    Effect::new(move || {
+        if phone.get() {
+            current.track();
+            menu_at.set(None);
+            panes_at.set(None);
+        }
+    });
     let rename_at = RwSignal::new(None::<(f64, f64)>);
-    let renamable = move || session.get().is_some_and(|s| s.parent_id.is_none() && !s.observed);
+    let session_actions = move || !phone.get() || current.get().is_some_and(|c| matches!(c.view, View::Session { .. }));
+    let renamable = move || session_actions() && session.get().is_some_and(|s| s.parent_id.is_none() && !s.observed);
     let chrome = move || shown.get().and_then(|(col, _)| ws.chrome.with(|m| m.get(&col).copied()));
+    let menu_chrome = move || session_actions().then(chrome).flatten();
+    let view_actions = move || {
+        if !phone.get() {
+            return None;
+        }
+        let col = current.get()?.key;
+        ws.view_actions.with(|m| m.get(&col).cloned())
+    };
     // The rename box opens under the name (from ⋯ as from a double-click).
     let title_el = NodeRef::<leptos::html::Span>::new();
     let rename_under_title = move || {
@@ -2693,7 +2775,7 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
             // is an optional stripe along its top. Mouse slots relax from
             // 28 to 32 to 36px with tile width; below 30rem secondary
             // controls move into ⋯, after optional marks yield below 40rem.
-            <div class="relative flex h-11 shrink-0 cursor-grab items-center border-b border-zinc-200 bg-zinc-50 text-xs active:cursor-grabbing md:@container md:px-1 dark:border-zinc-800 dark:bg-zinc-900"
+            <div data-tile-bar=key class="relative flex h-11 shrink-0 cursor-grab items-center border-b border-zinc-200 bg-zinc-50 text-xs active:cursor-grabbing md:@container md:px-1 dark:border-zinc-800 dark:bg-zinc-900"
                 draggable=move || if many.get() { "true" } else { "false" }
                 title="Drag to move this tile: onto another tile's top or bottom half, or its left or right edge for a new column"
                 on:dragstart=move |ev: web_sys::DragEvent| {
@@ -2710,6 +2792,10 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                 }
             >
                 <span class="md:hidden"><crate::MobileMenu /></span>
+                <Show when=move || phone.get() && tile.get().is_some_and(|t| t.cursor > 0)>
+                    <button class=btn aria-label="Back to the previous pane" title=move || tile.get().and_then(|t| t.columns.first().map(|c| format!("Back to {}", c.view.label(&live))))
+                        on:click=move |_| ws.show_list(key)>{crate::icons::chevron_left()}</button>
+                </Show>
                 {move || colour.get().filter(|_| bar_colour.get() != c6_api::SessionBarColour::DotOnly).map(|c| view! { <div class="pointer-events-none absolute inset-x-0 top-0 hidden h-1 md:block" style=crate::marks::fill(&c)></div> })}
                 <Show when=move || colour.get().is_some()>
                     <button class="hidden h-11 w-5 shrink-0 items-center justify-center md:flex" title="This session's mark: change it" aria-label="Its mark" on:click=move |ev| palette_at.set(Some(below(&ev, 380.0)))>
@@ -2719,7 +2805,13 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                 // A session of your own is renamed by double-clicking its name
                 // (or from ⋯).
                 <div class="flex min-w-0 flex-1 items-center overflow-hidden">
-                    <span node_ref=title_el class="min-w-0 truncate font-medium text-zinc-800 @min-[14rem]/tile:px-1 dark:text-zinc-100"
+                    <button class="flex h-11 min-w-0 flex-1 items-center text-left font-medium text-zinc-800 outline-none focus-visible:ring-2 focus-visible:ring-sky-500/60 md:hidden dark:text-zinc-100"
+                        aria-label="Switch panes" title=title disabled=move || !two()
+                        on:click=move |ev| panes_at.set(Some(below(&ev, 280.0)))>
+                        <span data-phone-title class="truncate">{title}</span>
+                        <Show when=two>{crate::icons::chevron_down()}</Show>
+                    </button>
+                    <span node_ref=title_el class="hidden min-w-0 truncate font-medium text-zinc-800 @min-[14rem]/tile:px-1 md:block dark:text-zinc-100"
                         title=move || if renamable() { format!("{} · Double-click to rename", title.get()) } else { title.get() }
                         on:dblclick=move |ev| if renamable() { ev.stop_propagation(); rename_under_title() }>{title}</span>
                     <span data-tile-aspects=key class="hidden shrink-0 items-center md:@min-[40rem]/tile:flex"></span>
@@ -2760,11 +2852,14 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                 })}
             </Popover>
             <Popover at=menu_at class="w-60">
-                <For each=chrome key=|c| c.token let:c>
+                <For each=menu_chrome key=|c| c.token let:c>
                     <crate::session::SessionMenu chrome=c on_rename=move |()| rename_under_title() on_done=move |()| menu_at.set(None) />
                 </For>
-                <div class="hidden flex-col md:flex md:@min-[30rem]/tile:hidden">
-                    <Show when=move || shown.get().is_some()>
+                <For each=view_actions key=|(token, _)| *token let:actions>
+                    <div on:click=move |_| menu_at.set(None)>{(actions.1)()}</div>
+                </For>
+                <div class="flex flex-col md:@min-[30rem]/tile:hidden">
+                    <Show when=move || session_actions() && shown.get().is_some()>
                         <button class=crate::session::MENU_ITEM disabled=move || pinnable().is_none() on:click=move |_| { if let Some(id) = pinnable() { ws.toggle_pin(&id); } menu_at.set(None); }>
                             {move || crate::icons::star(pinnable().is_some_and(|id| ws.pinned.with(|p| p.contains(&id))))}
                             {move || if pinnable().is_some_and(|id| ws.pinned.with(|p| p.contains(&id))) { "Unpin" } else { "Pin" }}
@@ -2775,7 +2870,10 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                     {move || if full.get() { crate::icons::minimize() } else { crate::icons::maximize() }}
                     {move || if full.get() { "Defocus" } else { "Focus" }}
                 </button>
-                <button class=format!("{} hidden md:flex md:@min-[14rem]/tile:hidden", crate::session::MENU_ITEM) on:click=move |_| { menu_at.set(None); ws.close_tile(key); }>{crate::icons::x()}"Close this tile"</button>
+                <Show when=move || phone.get() && two()>
+                    <button class=crate::session::MENU_ITEM on:click=move |_| { menu_at.set(None); if let Some(c) = current.get_untracked() { ws.close_column(key, c.key); } }>{crate::icons::x()}"Close this pane"</button>
+                </Show>
+                <button class=format!("{} md:@min-[14rem]/tile:hidden", crate::session::MENU_ITEM) on:click=move |_| { menu_at.set(None); ws.close_tile(key); }>{crate::icons::x()}"Close this tile"</button>
                 <div class="flex flex-col border-t border-zinc-200 pt-1 text-xs dark:border-zinc-700">
                     <button class=crate::session::MENU_ITEM disabled=move || !can_back() on:click=move |_| { ws.step(-1); menu_at.set(None); }>{crate::icons::chevron_left()}"Back"</button>
                     <button class=crate::session::MENU_ITEM disabled=move || !can_forward() on:click=move |_| { ws.step(1); menu_at.set(None); }>{crate::icons::chevron_right()}"Forward"</button>
@@ -2789,6 +2887,14 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                         <button class=crate::session::MENU_ITEM on:click=move |ev| { palette_at.set(Some(below(&ev, 380.0))); menu_at.set(None); }>{crate::icons::circle()}"Session mark"</button>
                     </Show>
                 </div>
+            </Popover>
+            <Popover at=panes_at class="w-70">
+                <For each=move || tile.get().map(|t| t.columns).unwrap_or_default() key=|c| c.key let:column>
+                    <button class=crate::session::MENU_ITEM aria-current=move || current.get().filter(|c| c.key == column.key).map(|_| "page")
+                        on:click=move |_| { ws.reveal(key, column.key); panes_at.set(None); }>
+                        {move || column.view.label(&live)}
+                    </button>
+                </For>
             </Popover>
             <div data-pane-host class="flex min-h-0 flex-1">
                 <Show when=move || tile.get().is_some_and(|t| t.columns.is_empty())>
@@ -3925,6 +4031,33 @@ mod tests {
         assert_ne!(l.bar_column(tile), Some(key));
     }
 
+    #[test]
+    fn phone_ring_follows_the_visible_session_and_stays_with_its_companions() {
+        let mut l = Layout::new(View::session("s1"));
+        let tile = l.tiles[0].key;
+        let session = l.tiles[0].columns[0].key;
+        assert_eq!(l.phone_session_column(tile), Some(session));
+        for view in [
+            View::Docs { id: "d1".into(), target: None },
+            View::SessionChanges { id: "s1".into() },
+            View::SessionTerminal { id: "s1".into() },
+        ] {
+            l.open_after(tile, session, view);
+            assert_eq!(l.tiles[0].cursor, 1);
+            assert_eq!(l.phone_session_column(tile), Some(session));
+            l.tiles[0].cursor = 0;
+            assert_eq!(l.phone_session_column(tile), Some(session));
+        }
+        l.open_after(tile, session, View::session("s2"));
+        assert_eq!(l.phone_session_column(tile), Some(l.tiles[0].columns[1].key), "two sessions use the visible one's ring");
+        l.open_after(tile, session, View::SessionChanges { id: "unrelated".into() });
+        assert_eq!(l.phone_session_column(tile), None, "do not lend a different session's ring to a companion");
+        for view in [View::Docs { id: "d1".into(), target: None }, View::Settings { note: None, section: String::new() }, View::Sessions] {
+            let l = Layout::new(view);
+            assert_eq!(l.phone_session_column(l.tiles[0].key), None);
+        }
+    }
+
     fn r(left: f64, top: f64, width: f64, height: f64) -> Rect {
         Rect { left, top, width, height }
     }
@@ -4344,7 +4477,12 @@ fn ColumnView(tile: u64, col: u64) -> impl IntoView {
             was.copied().unwrap_or(false),
             ws.layout.with(|l| {
                 let one_pane = loading.one_pane.get();
-                l.pane_shown(tile, col, one_pane) && (!one_pane || l.tiles.get(l.focus).is_some_and(|t| t.key == tile))
+                let focused = l.tiles.get(l.focus).is_some_and(|t| t.key == tile);
+                // A companion's phone bar borrows its session's live ring
+                // and sheet. Mount that session after the visible content's
+                // first paint, without eagerly mounting other hidden panes.
+                let ring = one_pane && focused && loading.released.get() && l.phone_session_column(tile) == Some(col);
+                (l.pane_shown(tile, col, one_pane) || ring) && (!one_pane || focused)
             }),
             ws.layout.with(|l| l.tiles.get(l.focus).is_some_and(|t| t.key == tile)),
             loading.released.get(),
@@ -4371,6 +4509,7 @@ fn ColumnView(tile: u64, col: u64) -> impl IntoView {
         col,
         visible: Signal::derive(move || pos.get().is_some()),
         active: Signal::derive(move || pos.get().is_some_and(|p| p.active)),
+        one_pane: loading.one_pane,
         scroll: StoredValue::new((0, false)),
     };
     provide_context(ctx);
@@ -4414,9 +4553,9 @@ fn ColumnView(tile: u64, col: u64) -> impl IntoView {
     }
 }
 
-/// A pane's slim header, shown when its tile has two panes: its name, pin
-/// (sessions), and close (the tile's ✕ closes the tile). On a phone, the
-/// item's header goes back to the list beside it.
+/// A pane's desktop-only slim header, shown when its tile has two panes:
+/// its name, pin (sessions), and close (the tile's ✕ closes the tile).
+/// Narrow desktop uses Back here; phones use their single tile bar.
 #[component]
 fn ColumnHeader(label: Signal<String>, pos: Signal<Option<Pos>>, view: Signal<Option<View>>) -> impl IntoView {
     let ctx = use_column().expect("in a pane");
@@ -4429,8 +4568,8 @@ fn ColumnHeader(label: Signal<String>, pos: Signal<Option<Pos>>, view: Signal<Op
     // 24px round a 16px glyph (the bar is 28px), 40px on a touch screen.
     let btn = "flex size-6 shrink-0 items-center justify-center rounded text-muted outline-none focus-visible:ring-2 focus-visible:ring-sky-500/60 pointer-fine:hover:bg-zinc-200 pointer-fine:hover:text-zinc-900 pointer-coarse:size-10 dark:pointer-fine:hover:bg-zinc-800 dark:pointer-fine:hover:text-zinc-100";
     view! {
-        <div class=move || format!(
-            "flex h-7 shrink-0 items-center gap-1 border-b border-zinc-100 px-2 text-[11px] pointer-coarse:h-11 pointer-coarse:gap-0 dark:border-zinc-900 {}",
+        <div data-pane-bar class=move || format!(
+            "hidden h-7 shrink-0 items-center gap-1 border-b border-zinc-100 px-2 text-[11px] md:flex pointer-coarse:h-11 pointer-coarse:gap-0 dark:border-zinc-900 {}",
             if ctx.active.get() { "text-zinc-700 dark:text-zinc-300" } else { "text-muted" },
         )>
             <Show when=move || pos.get().is_some_and(|p| p.index == 1)>

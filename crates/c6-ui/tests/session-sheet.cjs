@@ -463,7 +463,10 @@ async function check(browser, origin, engine, theme, view) {
       'Show all opens the real Outputs pane with the complete root replay');
     await capture('published-pane');
     const returnToDetails = async () => {
-      await outputPane.getByRole('button', { name: view === 'wide' ? 'Close this pane' : 'Back to the list', exact: true }).click();
+      if (view.startsWith('phone')) {
+        await outputPane.locator('xpath=ancestor::*[@data-tile-surface][1]').locator('[data-tile-bar]')
+          .getByRole('button', { name: 'Back to the previous pane', exact: true }).click();
+      } else await outputPane.getByRole('button', { name: view === 'wide' ? 'Close this pane' : 'Back to the list', exact: true }).click();
       await sheet.getByText('Runs on', { exact: true }).waitFor();
       if (view !== 'wide') {
         await heading(sheet, 'Session details');
@@ -669,7 +672,10 @@ async function isolation(browser, origin, engine, theme, view) {
     await page.keyboard.press('Control+1');
     await outputs.waitFor();
     assert.equal(await page.locator('[data-session-sheet]:visible').count(), 0, 'returning to Outputs does not prematurely consume the deferred return token');
-    await outputs.getByRole('button', { name: 'Back to the list', exact: true }).click();
+    if (view.startsWith('phone')) {
+      await outputs.locator('xpath=ancestor::*[@data-tile-surface][1]').locator('[data-tile-bar]')
+        .getByRole('button', { name: 'Back to the previous pane', exact: true }).click();
+    } else await outputs.getByRole('button', { name: 'Back to the list', exact: true }).click();
     await heading(sheet, 'Session details');
     assert(await retained.evaluate(el => el.isConnected), 'origin Details body survives focusing another tile');
     await page.keyboard.press('Escape');
