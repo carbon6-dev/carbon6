@@ -19,7 +19,7 @@ fn conversations(all: &[Session], realm: &str) -> Vec<Session> {
         .filter(|s| realm.is_empty() || s.realm == realm)
         .cloned()
         .collect();
-    list.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+    crate::sessions::sort_by_activity(&mut list);
     list
 }
 

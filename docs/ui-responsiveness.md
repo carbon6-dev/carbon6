@@ -741,6 +741,7 @@ names-kept diagnostic files are never counted as production downloads.
 | Shared popup listener factories | 10,750,115 | 2,659,154 | 39,210 / 5,614 |
 | Shared checked response-body polling | 10,691,725 | 2,651,304 | 58,390 / 7,850 |
 | Shared list-editor view boundary | 10,688,242 | 2,649,938 | 3,483 / 1,366 |
+| Shared stable activity ordering | 10,680,340 | 2,650,316 | 7,902 / -378 |
 
 The whole-module profile repeats S1's names-kept bindgen/`wasm-opt -Oz -g`
 pipeline, twiggy top/dominators/monos, and all-symbol per-crate/per-module
@@ -751,7 +752,7 @@ New session overview/jobs, picker and message-editing work is visible in
 the growth; inline deserialization moving into `api::json` must not be
 mistaken for an independent 294 KB API regression.
 
-Largest current individual renderers remain Settings **212,459**, workspace
+At 7035ec6b, the largest individual renderers are Settings **212,459**, workspace
 construction **160,872**, App **73,556**, and ProjectPage **47,013** raw
 diagnostic bytes. EventKind's largest flattened deserializer is **65,922**.
 Drop/component/For families span modules and overlap those renderers.
@@ -787,6 +788,14 @@ field kind, rejected/successful saves, reload, same-page section navigation and
 root/realm switching. Native UI tests also pass **305/305**. Forcing the
 constructor not to inline saved no additional raw bytes and increased Brotli
 by 956 bytes, so that attribute was not retained.
+
+The identical newest-activity Session sorts in Sessions, Ask conversations,
+Mission's fallback and a View's session feed now share one non-inlined concrete
+stable-sort function. Equal timestamps retain their original input order,
+including the minimum/maximum i64 values; Viewed and Title policies are
+unchanged. No dynamic comparator, new allocation, tie-breaker or unstable sort
+is introduced. Native UI tests pass **306/306**. This saves raw bytes while
+costing **378 Brotli bytes**; both measurements are retained in the table.
 
 The broader audit found no accidental release inclusion of native tests,
 SSR, regex, ICU or a second gloo-net implementation. Markdown defaults are

@@ -59,6 +59,13 @@ fn shows(s: &Session, show: &str) -> bool {
     }
 }
 
+/// Newest activity first, preserving input order when timestamps are equal.
+/// Keep one stable-sort specialization for the lists sharing this policy.
+#[inline(never)]
+pub(crate) fn sort_by_activity(list: &mut [Session]) {
+    list.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+}
+
 /// The sessions in the order `sort` says: for Recently viewed, those you
 /// viewed (`viewed`: id and when) newest first, then the rest by last
 /// activity.
@@ -72,7 +79,7 @@ fn sorted(mut list: Vec<Session>, sort: Sort, viewed: &[(String, i64)]) -> Vec<S
                 None => (true, Reverse(s.updated_at)),
             });
         }
-        Sort::Activity => list.sort_by_key(|s| Reverse(s.updated_at)),
+        Sort::Activity => sort_by_activity(&mut list),
         Sort::Title => list.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()).then(b.updated_at.cmp(&a.updated_at))),
     }
     list
@@ -2267,6 +2274,25 @@ mod tests {
 
     fn ids(list: &[Session]) -> Vec<&str> {
         list.iter().map(|s| s.id.as_str()).collect()
+    }
+
+    #[test]
+    fn activity_sort_is_descending_and_keeps_equal_timestamps_in_input_order() {
+        let input = vec![
+            session("middle-z", "Zulu", 20),
+            session("latest-z", "Zulu", i64::MAX),
+            session("oldest-z", "Zulu", i64::MIN),
+            session("middle-a", "Alpha", 20),
+            session("latest-a", "Alpha", i64::MAX),
+            session("oldest-a", "Alpha", i64::MIN),
+            session("middle-m", "Middle", 20),
+        ];
+        let expected = ["latest-z", "latest-a", "middle-z", "middle-a", "middle-m", "oldest-z", "oldest-a"];
+        let mut list = input.clone();
+        sort_by_activity(&mut list);
+        assert_eq!(ids(&list), expected);
+        assert!(list.windows(2).all(|pair| pair[0].updated_at >= pair[1].updated_at));
+        assert_eq!(ids(&sorted(input, Sort::Activity, &[])), expected);
     }
 
     #[test]

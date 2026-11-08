@@ -390,7 +390,7 @@ pub fn MissionPage() -> impl IntoView {
             return tracked;
         }
         let mut recent: Vec<Session> = live.sessions.get().into_iter().filter(|s| crate::labels::matches(s, &f)).collect();
-        recent.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+        crate::sessions::sort_by_activity(&mut recent);
         recent.into_iter().take(6).map(|s| s.id).collect()
     });
     view! {
