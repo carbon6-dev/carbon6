@@ -352,6 +352,14 @@ async fn transcript_display_preference_round_trips_across_realms_and_restart() {
     let invalid = http.put(&url).json(&json!({"show_thinking": "yes"})).send().await.unwrap();
     assert_eq!(invalid.status(), 422);
     assert!(get("admin").await.show_thinking, "invalid writes leave the saved value alone");
+    // When entries show their time: on exchanges by default, as chosen.
+    assert_eq!(get("home").await.times, c6_api::TranscriptTimes::Exchanges);
+    let r = http.put(&url).json(&json!({"show_thinking": true, "times": "all"})).send().await.unwrap();
+    assert_eq!(r.status(), 204);
+    assert_eq!(get("home").await.times, c6_api::TranscriptTimes::All);
+    let bad = http.put(&url).json(&json!({"show_thinking": true, "times": "sometimes"})).send().await.unwrap();
+    assert_eq!(bad.status(), 422);
+    assert_eq!(get("home").await.times, c6_api::TranscriptTimes::All);
     head.shutdown().await.unwrap();
 
     let head = c6_head::start(config()).await.unwrap();

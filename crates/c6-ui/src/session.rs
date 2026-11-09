@@ -138,6 +138,19 @@ impl UsageStats {
     }
 }
 
+/// A pause between entries long enough to mark (30 minutes).
+const PAUSE_MS: i64 = 30 * 60_000;
+
+/// A pause as it's marked: "45 min", "2 h", "3 h 20 min".
+fn pause(ms: i64) -> String {
+    let m = ms.max(0) / 60_000;
+    match (m / 60, m % 60) {
+        (0, m) => format!("{m} min"),
+        (h, 0) => format!("{h} h"),
+        (h, m) => format!("{h} h {m} min"),
+    }
+}
+
 fn duration(ms: i64) -> String {
     let s = ms.max(0) / 1000;
     if s >= 60 { format!("{}m {:02}s", s / 60, s % 60) } else { format!("{s}s") }
@@ -2102,6 +2115,20 @@ fn Transcript(
     let stream_thinking = Memo::new(move |_| streaming.with(|s| s.thinking.clone()));
     let stream_status = Memo::new(move |_| streaming.with(|s| s.status.clone()));
     let show_thinking = crate::settings::show_thinking();
+    // When each entry's previous one was: days and long pauses are marked
+    // between entries.
+    let times = crate::settings::transcript_times();
+    let before = Memo::new(move |_| {
+        events.with(|evs| {
+            let mut m = HashMap::new();
+            let mut prev = None;
+            for e in evs {
+                m.insert(e.seq, prev);
+                prev = Some(e.ts);
+            }
+            m
+        })
+    });
     let has_text = Memo::new(move |_| stream_text.with(|t| !t.is_empty()));
     let has_thinking = Memo::new(move |_| show_thinking.get() && stream_thinking.with(|t| !t.is_empty()));
     // What arrives once the transcript is drawn fades in (not what it opens with).
@@ -2151,7 +2178,35 @@ fn Transcript(
                         };
                         // A reply's text was already showing as it streamed; its tool cards fade in themselves.
                         let arrive = if matches!(e.kind, EventKind::Assistant { .. }) { "" } else { Arrived::class() };
+                        // Its time: under your messages and what arrives on its own
+                        // (or every entry, as set), else when you point at it.
+                        let ts = e.ts;
+                        let arrives = matches!(&e.kind, EventKind::User { .. })
+                            || matches!(&e.kind, EventKind::BackgroundTask { state, .. } if state != "started");
+                        let captioned = move || match times.get() {
+                            c6_api::TranscriptTimes::All => true,
+                            c6_api::TranscriptTimes::Exchanges => arrives,
+                            c6_api::TranscriptTimes::Off => false,
+                        };
+                        let divider = move || {
+                            if times.get() == c6_api::TranscriptTimes::Off {
+                                return None;
+                            }
+                            let label = match before.with(|m| m.get(&seq).copied().flatten()) {
+                                Some(p) if crate::when::same_day(p, ts) && ts - p >= PAUSE_MS => format!("{} later", pause(ts - p)),
+                                Some(p) if crate::when::same_day(p, ts) => return None,
+                                _ => crate::when::heading(ts),
+                            };
+                            Some(view! {
+                                <div class="my-1 flex items-center gap-2 text-[10px] text-muted">
+                                    <span class="h-px flex-1 bg-zinc-200 dark:bg-zinc-800"></span>
+                                    <span title=crate::when::full(ts)>{label}</span>
+                                    <span class="h-px flex-1 bg-zinc-200 dark:bg-zinc-800"></span>
+                                </div>
+                            })
+                        };
                         view! {
+                            {divider}
                             <div
                                 id=format!("{}-e{seq}", id.get_value())
                                 class=move || format!("group relative {arrive} {} {} {}",
@@ -2180,6 +2235,19 @@ fn Transcript(
                                         }.into_any()
                                     }
                                     None => (!(side && matches!(e.kind, EventKind::Started { .. }))).then(|| render_event(&id.get_value(), &e, results, decided, streaming, usage)).into_any(),
+                                }}
+                                {move || if captioned() {
+                                    view! {
+                                        <p class=format!("mt-0.5 text-[10px] text-muted {}", if is_user { "text-right" } else { "" }) title=crate::when::full(ts)>
+                                            {crate::when::time(ts)}
+                                        </p>
+                                    }.into_any()
+                                } else {
+                                    view! {
+                                        <span class="pointer-events-none absolute right-0 top-0 z-10 rounded bg-white/90 px-1 text-[10px] text-muted opacity-0 shadow-sm transition group-hover:opacity-100 dark:bg-zinc-900/90">
+                                            {crate::when::full(ts)}
+                                        </span>
+                                    }.into_any()
                                 }}
                                 {anchorable.then(|| view! {
                                     <div class="absolute bottom-0 right-0 flex gap-1 opacity-0 transition group-hover:opacity-100">
@@ -4409,7 +4477,7 @@ fn ToolCard(
                             }>{crate::icons::rotate()}" its thread"</button>
                     }
                 })}
-                {move || result.get().map(|r| view! { <span class="shrink-0 whitespace-nowrap text-[11px] text-muted">{format!("{:.1}s", r.duration_ms as f64 / 1000.0)}</span> })}
+                {move || result.get().map(|r| view! { <span class="shrink-0 whitespace-nowrap text-[11px] text-muted">{if r.duration_ms >= 60_000 { duration(r.duration_ms as i64) } else { format!("{:.1}s", r.duration_ms as f64 / 1000.0) }}</span> })}
                 // Reserve its final phone/desktop height before the result
                 // gives us a destination. A title must not add a new row.
                 {made_session.map(|made| view! {
@@ -5677,6 +5745,13 @@ fn SecretCardView(card: SecretCard, on_dismiss: Callback<String>) -> impl IntoVi
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pauses_read_as_minutes_and_hours() {
+        assert_eq!(super::pause(45 * 60_000), "45 min");
+        assert_eq!(super::pause(2 * 3_600_000), "2 h");
+        assert_eq!(super::pause(3 * 3_600_000 + 20 * 60_000), "3 h 20 min");
+    }
+
     use super::*;
 
     #[cfg(not(target_arch = "wasm32"))]

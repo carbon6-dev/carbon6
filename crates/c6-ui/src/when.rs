@@ -107,6 +107,11 @@ pub fn quote(ms: i64) -> String {
     format!("{} at {}", day_of(&d, &WEEKDAY_YEAR), time_of(&d))
 }
 
+/// Whether two times fall on the same local calendar day.
+pub fn same_day(a: i64, b: i64) -> bool {
+    ymd(&date(a)) == ymd(&date(b))
+}
+
 /// Just the time: "3:41 PM" (a chat message's, under its day's heading).
 pub fn time(ms: i64) -> String {
     time_of(&date(ms))

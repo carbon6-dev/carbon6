@@ -25,6 +25,24 @@ pub struct TranscriptSettings {
     /// Hidden by default; when shown, thinking starts expanded.
     #[serde(default)]
     pub show_thinking: bool,
+    /// When transcript entries show their time (any entry's on hover).
+    #[serde(default)]
+    pub times: TranscriptTimes,
+}
+
+/// Which transcript entries show their time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub enum TranscriptTimes {
+    /// Your messages and what arrives on its own (notices, messages from
+    /// other sessions), with day and long-gap dividers.
+    #[default]
+    Exchanges,
+    /// Every entry.
+    All,
+    /// None (on hover only).
+    Off,
 }
 
 /// Non-destructive inspection of a background shell command, subagent or observed Claude Code task.

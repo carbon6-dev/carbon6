@@ -484,6 +484,7 @@ fn AppearanceSetting() -> impl IntoView {
 #[derive(Clone, Copy)]
 pub struct TranscriptDisplay {
     pub show_thinking: RwSignal<bool>,
+    pub times: RwSignal<c6_api::TranscriptTimes>,
     loaded: RwSignal<bool>,
     error: RwSignal<Option<String>>,
 }
@@ -492,6 +493,7 @@ impl TranscriptDisplay {
     pub fn load() -> Self {
         let display = Self {
             show_thinking: RwSignal::new(c6_api::TranscriptSettings::default().show_thinking),
+            times: RwSignal::new(c6_api::TranscriptTimes::default()),
             loaded: RwSignal::new(false),
             error: RwSignal::new(None),
         };
@@ -499,6 +501,7 @@ impl TranscriptDisplay {
             match api::transcript_settings().await {
                 Ok(settings) => {
                     display.show_thinking.set(settings.show_thinking);
+                    display.times.set(settings.times);
                     display.loaded.set(true);
                 }
                 Err(e) => display.error.set(Some(e)),
@@ -512,6 +515,11 @@ pub fn show_thinking() -> RwSignal<bool> {
     expect_context::<TranscriptDisplay>().show_thinking
 }
 
+/// Which transcript entries show their time.
+pub fn transcript_times() -> RwSignal<c6_api::TranscriptTimes> {
+    expect_context::<TranscriptDisplay>().times
+}
+
 #[component]
 fn TranscriptSetting() -> impl IntoView {
     let display = expect_context::<TranscriptDisplay>();
@@ -523,7 +531,8 @@ fn TranscriptSetting() -> impl IntoView {
         busy.set(true);
         display.error.set(None);
         spawn_local(async move {
-            if let Err(e) = api::put_transcript_settings(c6_api::TranscriptSettings { show_thinking }).await {
+            let times = display.times.get_untracked();
+            if let Err(e) = api::put_transcript_settings(c6_api::TranscriptSettings { show_thinking, times }).await {
                 display.show_thinking.set(previous);
                 display.error.set(Some(e));
             }
@@ -541,7 +550,35 @@ fn TranscriptSetting() -> impl IntoView {
                     <span class="block text-xs text-muted">"Show model reasoning expanded, labelled Thinking; otherwise hide it from transcripts."</span>
                 </span>
             </label>
-            <p class="text-xs text-muted">"Off by default. Kept in carbon6 across realms and devices; does not change what models receive."</p>
+            <label class="block space-y-1">
+                <span class="block text-sm font-medium">"Times"</span>
+                <select class=INPUT disabled=move || !display.loaded.get() || busy.get()
+                    on:change=move |ev| {
+                        let times = match event_target_value(&ev).as_str() {
+                            "all" => c6_api::TranscriptTimes::All,
+                            "off" => c6_api::TranscriptTimes::Off,
+                            _ => c6_api::TranscriptTimes::Exchanges,
+                        };
+                        let previous = display.times.get_untracked();
+                        display.times.set(times);
+                        busy.set(true);
+                        display.error.set(None);
+                        spawn_local(async move {
+                            let show_thinking = display.show_thinking.get_untracked();
+                            if let Err(e) = api::put_transcript_settings(c6_api::TranscriptSettings { show_thinking, times }).await {
+                                display.times.set(previous);
+                                display.error.set(Some(e));
+                            }
+                            busy.set(false);
+                        });
+                    }>
+                    <option value="exchanges" selected=move || display.times.get() == c6_api::TranscriptTimes::Exchanges>"On your messages and what arrives on its own"</option>
+                    <option value="all" selected=move || display.times.get() == c6_api::TranscriptTimes::All>"On every entry"</option>
+                    <option value="off" selected=move || display.times.get() == c6_api::TranscriptTimes::Off>"Off"</option>
+                </select>
+                <span class="block text-xs text-muted">"Days and long pauses are marked between entries; any entry shows its time when you point at it."</span>
+            </label>
+            <p class="text-xs text-muted">"Kept in carbon6 across realms and devices; does not change what models receive."</p>
             {move || display.error.get().map(|e| view! { <ErrorBox message=e /> })}
         </section>
     }
