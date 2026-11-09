@@ -944,6 +944,9 @@ impl SessionManager {
         let ssh = remote.then(|| Arc::new(c6_tools::remote::SshHost::new(&started.ssh_target, &started.home)));
         let session_tools = Arc::new(SessionTools::with_ssh(PathBuf::from(&started.cwd), ssh));
         session_tools.browser.set_profile(self.state_dir.join("browser").join(session_id));
+        // Shell commands outlive the worker, and its next run takes them up
+        // (docs/restarts.md §3).
+        session_tools.background.set_held_dir(self.state_dir.join("held").join(session_id));
         let mut hooks = None;
         let mut policies = None;
         // A subagent works with its parent's tool hooks and policies (held
@@ -1781,6 +1784,12 @@ impl Actor {
                         }
                     }
                     Some(ActorMsg::Lost { task_id, kind, description, notify, pgid, child, remote }) => {
+                        // A held shell command kept running: take it up again,
+                        // and its end reaches the agent as usual.
+                        if kind == "shell" && self.session_tools.background.adopt(&task_id) {
+                            info!(session = %self.writer.session_id, task = %task_id, "took up a background command after the restart");
+                            continue;
+                        }
                         // It may outlive the worker (its own process group):
                         // stop it, since nothing reads its output any more.
                         stop_orphan(pgid, &description);

@@ -254,3 +254,70 @@ async fn lost_journal_is_restored_from_the_head() {
     assert!(all.contains("remember the word pineapple") && all.contains("first answer"), "history restored: {all}");
     stop2.cancel();
 }
+
+/// A background command outlives a worker restart: the restarted worker
+/// takes it up, follows its output, and its end (exit code and all of its
+/// output) reaches the agent as usual (docs/restarts.md §3).
+#[tokio::test]
+async fn a_background_command_outlives_a_worker_restart() {
+    let env = Env::new().await;
+    let state = tempfile::tempdir().unwrap();
+    env.enroll(state.path()).await;
+    let (first, stop_first) = run_worker(state.path()).await;
+    let project = tempfile::tempdir().unwrap();
+    let gate = project.path().join("gate");
+    // Its output ("early-line", "late-line") differs from its text.
+    let command =
+        format!("printf 'early-%s\\n' line; while [ ! -f {} ]; do sleep 0.05; done; printf 'late-%s\\n' line; exit 3", gate.display());
+    env.mock.push(Reply::ToolCalls(vec![("bash".into(), json!({"command": command, "run_in_background": true}).to_string())]));
+    env.mock.push(Reply::Text("started it".into()));
+    let id = env.create(&first, project.path(), "run the long job").await;
+    let detail = env.idle_after(&id, 4).await;
+    let started = eventually("the command's first output", async || {
+        let held = state.path().join("held").join(&id);
+        let task = std::fs::read_dir(&held).ok()?.flatten().next()?.path();
+        std::fs::read_to_string(task.join("out")).ok().filter(|o| o.contains("early-line")).map(|_| task)
+    })
+    .await;
+
+    // The worker goes; the command doesn't.
+    stop_first.cancel();
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let meta: Value = serde_json::from_slice(&std::fs::read(started.join("meta.json")).unwrap()).unwrap();
+    let pgid = nix::unistd::Pid::from_raw(meta["pgid"].as_i64().unwrap() as i32);
+    assert!(nix::sys::signal::kill(pgid, None).is_ok(), "still running without its worker");
+    env.mock.push(Reply::Text("the job finished".into()));
+    let (second, stop_second) = run_worker(state.path()).await;
+
+    // It finishes under the new worker, and its end wakes the agent.
+    std::fs::write(&gate, "").unwrap();
+    let after = detail.session.last_seq;
+    let code = eventually("the command's end, reported", async || {
+        env.events(&id).await.into_iter().find_map(|e| match e.kind {
+            EventKind::BackgroundTask { state, exit_code, .. } if e.seq > after && state == "finished" => Some(exit_code),
+            _ => None,
+        })
+    })
+    .await;
+    assert_eq!(code, 3, "its exit code");
+    // The agent is told, with all of its output, from both workers' time.
+    eventually("the agent told of its end", async || {
+        env.mock
+            .requests()
+            .iter()
+            .any(|r| {
+                let m = r["messages"].to_string();
+                m.contains("early-line") && m.contains("late-line")
+            })
+            .then_some(())
+    })
+    .await;
+    assert!(
+        !env.events(&id).await.iter().any(|e| matches!(&e.kind, EventKind::BackgroundTask { state, .. } if state == "lost")),
+        "not lost"
+    );
+    eventually("its files cleared", async || (!started.exists()).then_some(())).await;
+    drop(second);
+    stop_second.cancel();
+}

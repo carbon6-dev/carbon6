@@ -217,6 +217,49 @@ pub struct Background {
     secrets: crate::Secrets,
     /// Commands run here, or on this SSH target.
     ssh: Option<Arc<crate::remote::SshHost>>,
+    /// Where shell commands keep their output and exit code, so they outlive
+    /// the worker and a restarted one takes them up again (docs/restarts.md
+    /// §3). None: through pipes, ending with the worker.
+    held: Mutex<Option<std::path::PathBuf>>,
+}
+
+/// What a held shell command records about itself (`meta.json`).
+#[derive(Serialize, Deserialize)]
+struct HeldMeta {
+    command: String,
+    notify: bool,
+    pgid: i32,
+}
+
+/// Follows a held command's output file as it grows, until its exit code is
+/// written (or its process group is gone), then reads what is left.
+fn follow(path: std::path::PathBuf, code: std::path::PathBuf, pgid: Option<Pid>, proc: Arc<BackgroundProc>, is_stderr: bool) {
+    std::thread::spawn(move || {
+        let Ok(mut f) = std::fs::File::open(&path) else {
+            proc.eof.fetch_add(1, Ordering::Release);
+            return;
+        };
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            match f.read(&mut buf) {
+                Ok(n) if n > 0 => proc.push_output(&buf[..n], is_stderr),
+                _ => {
+                    let gone = pgid.is_some_and(|g| nix::sys::signal::kill(g, None).is_err());
+                    if code.exists() || gone {
+                        while let Ok(n) = f.read(&mut buf) {
+                            if n == 0 {
+                                break;
+                            }
+                            proc.push_output(&buf[..n], is_stderr);
+                        }
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+        proc.eof.fetch_add(1, Ordering::Release);
+    });
 }
 
 #[derive(Default)]
@@ -276,6 +319,52 @@ fn emit(sink: &Mutex<Option<TaskSink>>, secrets: &crate::Secrets, id: &str, p: &
 impl Background {
     pub fn with_secrets(secrets: crate::Secrets, ssh: Option<Arc<crate::remote::SshHost>>) -> Self {
         Self { secrets, ssh, ..Default::default() }
+    }
+
+    /// Keeps shell commands' output and exit code in `dir`, so they outlive
+    /// the worker (docs/restarts.md §3).
+    pub fn set_held_dir(&self, dir: std::path::PathBuf) {
+        *self.held.lock().unwrap() = Some(dir);
+    }
+
+    /// Takes up a held shell command a previous worker started (`id` as it
+    /// was), following its output to its end. False: there is none to take
+    /// up (it wasn't held, or its files are gone).
+    pub fn adopt(&self, id: &str) -> bool {
+        let Some(dir) = self.held.lock().unwrap().clone().map(|d| d.join(id)) else { return false };
+        let Some(meta) = std::fs::read(dir.join("meta.json")).ok().and_then(|b| serde_json::from_slice::<HeldMeta>(&b).ok()) else {
+            return false;
+        };
+        let pgid = (meta.pgid > 0).then(|| Pid::from_raw(meta.pgid));
+        let proc = Arc::new(BackgroundProc::new(&meta.command, TaskKind::Shell, meta.notify, pgid, None));
+        let code = dir.join("code");
+        follow(dir.join("out"), code.clone(), pgid, proc.clone(), false);
+        follow(dir.join("err"), code.clone(), pgid, proc.clone(), true);
+        self.procs.lock().unwrap().insert(id.to_owned(), proc.clone());
+        let (sink, secrets, task_id) = (self.sink.clone(), self.secrets.clone(), id.to_owned());
+        tokio::spawn(async move {
+            // Not our child: its end shows as its exit code, or as its
+            // process group gone without one (stopped).
+            loop {
+                if code.exists() || pgid.is_none_or(|g| nix::sys::signal::kill(g, None).is_err()) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            for _ in 0..40 {
+                if proc.eof.load(Ordering::Acquire) == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            let exit = std::fs::read_to_string(&code).ok().and_then(|c| c.trim().parse::<i32>().ok()).unwrap_or(-1);
+            *proc.finished_elapsed.lock().unwrap() = Some(proc.started.elapsed());
+            *proc.status.lock().unwrap() = Some(exit);
+            let state = proc.stopped.lock().unwrap().unwrap_or(TaskState::Finished);
+            emit(&sink, &secrets, &task_id, &proc, state);
+            let _ = std::fs::remove_dir_all(dir);
+        });
+        true
     }
 
     /// Where task starts and ends are reported.
@@ -608,6 +697,10 @@ impl Background {
     /// Starts a shell command in the background; `notify`: tell the agent
     /// when it ends.
     pub fn spawn(&self, command: &str, cwd: &std::path::Path, notify: bool) -> std::io::Result<String> {
+        let held = self.held.lock().unwrap().clone();
+        if let (Some(held), None) = (held, &self.ssh) {
+            return self.spawn_held(&held, command, cwd, notify);
+        }
         let (stdout, stdout_writer) = std::io::pipe()?;
         let (stderr, stderr_writer) = std::io::pipe()?;
         let (mut child, remote_pidfile) = match &self.ssh {
@@ -684,6 +777,60 @@ impl Background {
             *proc.status.lock().unwrap() = Some(code);
             let state = proc.stopped.lock().unwrap().unwrap_or(TaskState::Finished);
             emit(&sink, &secrets, &task_id, &proc, state);
+        });
+        Ok(id)
+    }
+
+    /// `spawn`, held: detached from the worker (its own process group, not
+    /// killed when the worker goes), its output in files and its exit code
+    /// written when it ends, so a restarted worker takes it up (`adopt`).
+    fn spawn_held(&self, held: &std::path::Path, command: &str, cwd: &std::path::Path, notify: bool) -> std::io::Result<String> {
+        let id = self.new_id();
+        let dir = held.join(&id);
+        std::fs::create_dir_all(&dir)?;
+        let (out, err, code) = (dir.join("out"), dir.join("err"), dir.join("code"));
+        let shell = if std::path::Path::new("/bin/bash").exists() { "/bin/bash" } else { "/bin/sh" };
+        // The command in its own shell; this one writes its exit code.
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(r#""$0" -c "$1"; echo $? > "$2""#)
+            .arg(shell)
+            .arg(command)
+            .arg(&code)
+            .current_dir(cwd)
+            .env("PAGER", "cat")
+            .env("GIT_PAGER", "cat")
+            .env("NO_COLOR", "1")
+            .envs(self.secrets.env())
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(std::fs::File::create(&out)?))
+            .stderr(Stdio::from(std::fs::File::create(&err)?))
+            .process_group(0)
+            .spawn()?;
+        let pgid = child.id().map(|p| Pid::from_raw(p as i32));
+        let meta = HeldMeta { command: command.to_owned(), notify, pgid: pgid.map_or(0, |p| p.as_raw()) };
+        std::fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).unwrap_or_default())?;
+        let proc = Arc::new(BackgroundProc::new(command, TaskKind::Shell, notify, pgid, None));
+        follow(out, code.clone(), pgid, proc.clone(), false);
+        follow(err, code.clone(), pgid, proc.clone(), true);
+        self.procs.lock().unwrap().insert(id.clone(), proc.clone());
+        emit(&self.sink, &self.secrets, &id, &proc, TaskState::Started);
+        let (sink, secrets, task_id) = (self.sink.clone(), self.secrets.clone(), id.clone());
+        tokio::spawn(async move {
+            // Its exit code is in the file; none: it was stopped.
+            let _ = child.wait().await;
+            for _ in 0..40 {
+                if proc.eof.load(Ordering::Acquire) == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            let exit = std::fs::read_to_string(&code).ok().and_then(|c| c.trim().parse::<i32>().ok()).unwrap_or(-1);
+            *proc.finished_elapsed.lock().unwrap() = Some(proc.started.elapsed());
+            *proc.status.lock().unwrap() = Some(exit);
+            let state = proc.stopped.lock().unwrap().unwrap_or(TaskState::Finished);
+            emit(&sink, &secrets, &task_id, &proc, state);
+            let _ = std::fs::remove_dir_all(dir);
         });
         Ok(id)
     }
