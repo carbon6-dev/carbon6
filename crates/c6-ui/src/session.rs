@@ -2686,7 +2686,7 @@ fn Transcript(
                             c6_api::TranscriptTimes::Off => false,
                         };
                         let divider = move || {
-                            if times.get() == c6_api::TranscriptTimes::Off {
+                            if times.get() == c6_api::TranscriptTimes::Off || hidden() || (only_thinking && !show_thinking.get()) {
                                 return None;
                             }
                             let label = match before.with(|m| m.get(&seq).copied().flatten()) {
@@ -7149,6 +7149,18 @@ mod tests {
         assert!(queued.contains("aria-label=\"Take this back\""));
         assert!(queued.contains("with_agent.then") && queued.contains("api::send_queued_now"));
         assert!(!queued.contains("border-dashed") && !queued.contains("Edit"));
+    }
+
+    #[test]
+    fn transcript_dividers_follow_hidden_rows_without_changing_caption_settings() {
+        let source = include_str!("session.rs").split("#[cfg(test)]").next().unwrap();
+        let divider = source.split("let divider = move || {").nth(1).unwrap().split("let label =").next().unwrap();
+        assert!(divider.contains("times.get() == c6_api::TranscriptTimes::Off"));
+        assert!(divider.contains("hidden()"), "folded Rewind rows must not leave orphan dividers");
+        assert!(divider.contains("only_thinking && !show_thinking.get()"));
+        assert!(
+            source.contains("c6_api::TranscriptTimes::All => shows") && source.contains("c6_api::TranscriptTimes::Exchanges => arrives")
+        );
     }
 
     #[test]

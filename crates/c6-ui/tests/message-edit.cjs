@@ -442,11 +442,14 @@ async function checkQueued(browser, origin, phone, outcome) {
   let progress;
   const release = deferred(), recoveryRelease = deferred(), started = deferred(), recoveryStarted = deferred();
   const secondRelease = deferred(), secondStarted = deferred();
-  const calls = { takeBack: [], draft: [], send: [], now: [] }, mutations = [], feedReads = [];
-  const target = { command_id: 'queued-single', text: ownText, created_at: 1, rejected: null, with_agent: false };
+  const calls = { takeBack: [], draft: [], send: [], now: [], mentionables: [] }, mutations = [], feedReads = [];
+  const mentioning = outcome === 'queued-mentions';
+  const originalText = mentioning ? `${ownText} [@Original source](c6:item:original-source)` : ownText;
+  const mention = { reference: 'item:updated-source', title: 'Updated source', kind: 'email', detail: 'Session-scoped fixture result' };
+  const target = { command_id: 'queued-single', text: originalText, created_at: 1, rejected: null, with_agent: false };
   const second = { ...target, command_id: 'queued-second', text: 'Second returned message 🪁', created_at: 2 };
   const withAgent = { ...target, command_id: 'with-agent', text: 'Already handed to worker', with_agent: true };
-  const attachments = outcome === 'queued-attachments';
+  const attachments = outcome === 'queued-attachments' || mentioning;
   const failed = outcome.startsWith('queued-failure') || outcome === 'queued-stacking-failure';
   const edited = ['queued-failure-edited', 'queued-failure-reverted'].includes(outcome);
   const stacking = outcome.startsWith('queued-stacking');
@@ -477,6 +480,12 @@ async function checkQueued(browser, origin, phone, outcome) {
             capabilities: ['queue_ops', 'send_now'],
           }] }));
           socket.send(JSON.stringify({ type: 'marks', marks: {} }));
+        });
+        if (mentioning) await page.route('**/api/v1/assistant/mentionables?*', route => {
+          assert.equal(route.request().method(), 'GET');
+          const query = new URL(route.request().url()).searchParams;
+          calls.mentionables.push({ q: query.get('q'), session: query.get('session') });
+          return route.fulfill({ json: query.get('q') === 'updated' ? [mention] : [] });
         });
         await page.route('**/api/v1/sessions/parent/messages/*/draft', async route => {
           const cid = new URL(route.request().url()).pathname.split('/').at(-2);
@@ -582,9 +591,9 @@ async function checkQueued(browser, origin, phone, outcome) {
     f.phase = 'trusted × inserts immediately while take-back is gated';
     await row.getByRole('button', { name: 'Take this back', exact: true }).click();
     await row.waitFor({ state: 'hidden' });
-    const combined = base ? `${ownText}\n\n${base}` : ownText;
-    await sameComposer(composer, node, combined, ownText.length);
-    assert.deepEqual(await page.evaluate(() => __returnClicks[0]), { text: combined, focus: true, start: ownText.length, end: ownText.length }, 'synchronous trusted gesture value/focus/UTF-16 caret');
+    const combined = base ? `${originalText}\n\n${base}` : originalText;
+    await sameComposer(composer, node, combined, originalText.length);
+    assert.deepEqual(await page.evaluate(() => __returnClicks[0]), { text: combined, focus: true, start: originalText.length, end: originalText.length }, 'synchronous trusted gesture value/focus/UTF-16 caret');
     assert.equal(calls.send.length, 0, 'taking back never sends');
     if (attachments) {
       assert.deepEqual(calls.takeBack, [], 'recover attachment bytes before POST, not after losing them');
@@ -597,7 +606,7 @@ async function checkQueued(browser, origin, phone, outcome) {
       await queueRow(page, second.command_id).getByRole('button', { name: 'Take this back', exact: true }).click();
       await secondStarted.promise;
       await queueRow(page, second.command_id).waitFor({ state: 'hidden' });
-      const restored = `${ownText}\n\n${second.text}`;
+      const restored = `${originalText}\n\n${second.text}`;
       await sameComposer(composer, node, `${restored}\n\n${base}`, restored.length);
       const secondResponse = page.waitForResponse(r => r.url().endsWith(`/messages/${second.command_id}/take-back`));
       secondRelease.resolve();
@@ -643,18 +652,18 @@ async function checkQueued(browser, origin, phone, outcome) {
         await row.getByRole('button', { name: 'Take this back', exact: true }).click();
         assert.equal((await retry).status(), 204);
         await row.waitFor({ state: 'hidden' });
-        await sameComposer(composer, node, combined, ownText.length);
+        await sameComposer(composer, node, combined, originalText.length);
         assert.deepEqual(calls.takeBack, [target.command_id, target.command_id], 'only the user explicitly retries; insert original once');
         assert.equal(calls.send.length, 0);
       }
     } else if (taken) {
       assert.equal(result.status(), 409);
       await sameComposer(composer, node, combined);
-      const seq = f.send({ type: 'user', command_id: target.command_id, text: ownText, origin: { kind: 'human' } });
+      const seq = f.send({ type: 'user', command_id: target.command_id, text: originalText, origin: { kind: 'human' } });
       const durable = page.locator(`#parent-e${seq}`);
       await durable.waitFor();
       await page.getByText(tooLateNote, { exact: true }).waitFor();
-      assert.equal(await durable.getByText(ownText, { exact: true }).count(), 1, 'too-late delivery is an ordinary durable User, not a pretend withdrawn row');
+      assert.equal(await durable.getByText(originalText, { exact: true }).count(), 1, 'too-late delivery is an ordinary durable User, not a pretend withdrawn row');
       await readActions(durable, phone);
       assert.equal(await composer.inputValue(), combined, 'durable delivery never takes text back out of the box');
     } else {
@@ -666,6 +675,28 @@ async function checkQueued(browser, origin, phone, outcome) {
       if (stacking) assert.equal(await queueRow(page, second.command_id).count(), 0, 'stale snapshots cannot resurrect either successful retraction');
       assert.equal(await page.locator('[data-message-edit]').count(), 0, 'only the ordinary Composer exists');
       if (!stacking && outcome !== 'queued-layout') {
+        if (mentioning) {
+          f.phase = 'complete a session-scoped @mention in the returned original draft';
+          await sameComposer(composer, node, combined);
+          assert.equal(calls.send.length, 0, 'restoring a c6 reference and recovering attachments never sends or expands the editable text');
+          const found = page.waitForResponse(r => {
+            const url = new URL(r.url());
+            return url.pathname === '/api/v1/assistant/mentionables' && url.searchParams.get('q') === 'updated';
+          });
+          await composer.focus();
+          await composer.press('ControlOrMeta+End');
+          await composer.pressSequentially(' @updated');
+          assert.equal((await found).status(), 200);
+          await sameComposer(composer, node, `${combined} @updated`);
+          assert(calls.mentionables.some(query => query.q === 'updated'), 'native typing queries mentionables after the debounce');
+          assert(calls.mentionables.every(query => query.session === 'parent'), 'all mentionables queries use this parent session, not unscoped Ask');
+          assert.equal(calls.send.length, 0, 'typing an @query never sends');
+          await composerBox(composer).getByRole('button', { name: /Updated source/ }).click();
+          await sameComposer(composer, node, `${combined} [@${mention.title}](c6:${mention.reference}) `);
+          await composerBox(composer).getByText(upload.name, { exact: true }).waitFor();
+          await composerBox(composer).getByText(draftUpload.name, { exact: true }).waitFor();
+          assert.equal(calls.send.length, 0, 'selecting a mention only edits the same draft; explicit Send is still required');
+        }
         const text = await composer.inputValue();
         const send = async () => {
           const sent = page.waitForResponse(r => r.url().endsWith('/parent/messages'));
@@ -680,6 +711,7 @@ async function checkQueued(browser, origin, phone, outcome) {
         assert.equal((await send()).status(), 200, 'only explicit ordinary Send appends a fresh queue message');
         assert.equal(await composer.inputValue(), '');
         assert(calls.send.every(body => body.text === text));
+        if (mentioning) assert.equal(calls.send.length, 1, 'one explicit Send carries the updated reference and all restored/existing text');
         if (attachments) assert.deepEqual(calls.send.at(-1).attachments, [upload, draftUpload], 'ordinary Send retains recovered then existing attachments with exact bytes/name/MIME');
         f.stream({ type: 'queue', queued: [...tail, withAgent, { command_id: 'appended-message', text, created_at: 99, rejected: null, with_agent: false }] });
         await queueRow(page, 'appended-message').waitFor();
@@ -998,7 +1030,7 @@ async function main() {
       for (const phone of [false, true]) for (const outcome of [
         'rewind', 'rewind-cancel', 'rewind-early', 'rewind-reset-error', 'rewind-api-error', 'rewind-replay', 'rewind-attachments',
         'queued-ready', 'queued-empty', 'queued-taken-race', 'queued-failure', 'queued-failure-edited', 'queued-failure-reverted', 'queued-failure-retry',
-        'queued-attachments', 'queued-stacking', 'queued-stacking-failure', 'queued-send-error', 'queued-send-now', 'queued-layout', 'queued-response-lost',
+        'queued-attachments', 'queued-mentions', 'queued-stacking', 'queued-stacking-failure', 'queued-send-error', 'queued-send-now', 'queued-layout', 'queued-response-lost',
         'queued-attachments-edited-stacking', 'queued-send-failure-recovery',
         'waiting-short', 'waiting-empty', 'rejected', 'sent-during-turn-human', 'sent-during-turn-unknown', 'sent-during-turn-legacy',
       ]) {
