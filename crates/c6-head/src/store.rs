@@ -1713,7 +1713,7 @@ impl Store {
 
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let Some(row) =
-            sqlx::query("UPDATE commands SET state = 'rejected', error = ? WHERE id = ? AND worker_id = ? AND state = 'pending' RETURNING session_id, text, data")
+            sqlx::query("UPDATE commands SET state = 'rejected', error = ? WHERE id = ? AND worker_id = ? AND state = 'pending' RETURNING session_id, data")
                 .bind(reason)
                 .bind(id)
                 .bind(worker_id.to_string())
@@ -1732,7 +1732,9 @@ impl Store {
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
-        } else if row.get::<Option<String>, _>("text").is_none() {
+        } else if matches!(kind, Some(c6_proto::session_command::Kind::Create(_))) {
+            // Rewind and other controls also have no text. Only a rejected
+            // Create means the session could not start.
             let now = c6_core::now_ms();
             sqlx::query("UPDATE sessions SET status = 'failed', error = ?, updated_at = ?, turn_ended_at = ? WHERE id = ?")
                 .bind(reason)
@@ -2064,6 +2066,103 @@ pub(crate) mod tests {
         input.task_card_origin = TaskCardOrigin::Start as i32;
         assert!(store.ingest(worker, "s", &[replay]).await.unwrap().unwrap().events.is_empty());
         assert_eq!(store.events_after("s", 0, 10).await.unwrap(), vec![legacy]);
+    }
+
+    #[tokio::test]
+    async fn rejected_rewind_preserves_session_and_pending_inputs() {
+        use c6_proto::{Rewind, SessionCommand, UserInput, session_command};
+        use prost::Message;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("c6h.db")).await.unwrap();
+        let worker = WorkerId::new();
+        let mut s = session("a", worker);
+        s.status = "idle".into();
+        let input = |id: &'static str, text: &'static str| NewCommand {
+            id,
+            session_id: "a",
+            worker_id: worker,
+            data: SessionCommand {
+                command_id: id.into(),
+                session_id: "a".into(),
+                kind: Some(session_command::Kind::Input(UserInput { text: text.into(), ..Default::default() })),
+            }
+            .encode_to_vec(),
+            text: Some(text),
+        };
+        let rewind = NewCommand {
+            id: "rewind",
+            session_id: "a",
+            worker_id: worker,
+            data: SessionCommand {
+                command_id: "rewind".into(),
+                session_id: "a".into(),
+                kind: Some(session_command::Kind::Rewind(Rewind { to_seq: 3, restore_files: false })),
+            }
+            .encode_to_vec(),
+            text: None,
+        };
+        store.create_session(&s, &[input("before", "before rewind"), rewind, input("after", "after rewind")], false).await.unwrap();
+
+        assert_eq!(store.reject_command(worker, "rewind", "remote child has not stopped").await.unwrap().as_deref(), Some("a"));
+        let unchanged = store.session("a").await.unwrap().unwrap();
+        assert_eq!(unchanged.status, "idle");
+        assert!(unchanged.error.is_none(), "a rejected Rewind must not fail its session");
+        let rejected: (String, Option<String>) =
+            sqlx::query_as("SELECT state, error FROM commands WHERE id = 'rewind'").fetch_one(store.pool()).await.unwrap();
+        assert_eq!(rejected, ("rejected".into(), Some("remote child has not stopped".into())));
+        let pending = store.pending_commands(worker, 0).await.unwrap();
+        assert_eq!(pending.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["before", "after"]);
+        assert!(store.queued_inputs("a").await.unwrap().iter().all(|c| c.state == "pending" && c.error.is_none()));
+
+        store.enqueue_command(&input("later", "the session can continue")).await.unwrap();
+        assert!(store.reject_command(worker, "rewind", "redelivery").await.unwrap().is_none());
+        let pending = store.pending_commands(worker, 0).await.unwrap();
+        assert_eq!(pending.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["before", "after", "later"]);
+        assert_eq!(store.session("a").await.unwrap().unwrap().status, "idle");
+    }
+
+    #[tokio::test]
+    async fn rejected_command_only_fails_session_for_decoded_create() {
+        use c6_proto::{SessionCommand, session_command};
+        use prost::Message;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("c6h.db")).await.unwrap();
+        let worker = WorkerId::new();
+        for (id, kind, text, fails_session) in [
+            ("create", Some(session_command::Kind::Create(Default::default())), None, true),
+            ("create-with-text", Some(session_command::Kind::Create(Default::default())), Some("not a kind discriminator"), true),
+            ("control", Some(session_command::Kind::Rewind(Default::default())), None, false),
+            ("missing-kind", None, None, false),
+            ("malformed", None, None, false),
+        ] {
+            let data = if id == "malformed" {
+                vec![0xff]
+            } else {
+                SessionCommand { command_id: id.into(), session_id: id.into(), kind }.encode_to_vec()
+            };
+            let queued_id = format!("{id}-input");
+            store
+                .create_session(
+                    &session(id, worker),
+                    &[
+                        NewCommand { id, session_id: id, worker_id: worker, data, text },
+                        command(&queued_id, id, worker, Some("queued input")),
+                    ],
+                    false,
+                )
+                .await
+                .unwrap();
+            assert_eq!(store.reject_command(worker, id, "refused").await.unwrap().as_deref(), Some(id));
+            let s = store.session(id).await.unwrap().unwrap();
+            assert_eq!(s.status, if fails_session { "failed" } else { "starting" }, "{id}");
+            assert_eq!(s.error.as_deref(), fails_session.then_some("refused"), "{id}");
+            let queued = store.queued_inputs(id).await.unwrap();
+            let input = queued.iter().find(|c| c.id == queued_id).unwrap();
+            assert_eq!(input.state, if fails_session { "rejected" } else { "pending" }, "{id}");
+            assert_eq!(input.error.as_deref(), fails_session.then_some("session failed to start"), "{id}");
+        }
     }
 
     #[tokio::test]

@@ -49,6 +49,7 @@ if cutoff:
     history = history[:next(i + 1 for i, e in enumerate(history) if e['uuid'] == cutoff)]
     assert history[-1]['role'] == 'assistant'
 initialized = False
+holding, held_inputs = False, []
 for line in sys.stdin:
     v = json.loads(line)
     log('stdin', sid=sid, value=v)
@@ -64,6 +65,11 @@ for line in sys.stdin:
             emit(dict(type='control_response', response=dict(
                 subtype='error' if failed else 'success', request_id=v['request_id'],
                 error='fixture refuses reset' if failed else None)))
+        elif v['request']['subtype'] == 'interrupt' and holding:
+            log('interrupted-held-turn', sid=sid, queued=held_inputs)
+            holding = False
+            emit(dict(type='result', uuid=str(uuid.uuid4()),
+                      subtype='error_during_execution', is_error=True, usage={}))
         continue
     assert v['type'] == 'user', v
     # The normal stream's session_id is authoritative, not carbon6's initial ID.
@@ -71,11 +77,22 @@ for line in sys.stdin:
         sid = str(uuid.uuid4())
     text = v['message']['content']
     assert isinstance(text, str)
+    if holding:
+        # Written to the CLI, but not acknowledged/taken by its agent. Keep
+        # these in its native queue until this process is stopped by Rewind.
+        held_inputs.append(v)
+        log('held-input', sid=sid, value=v)
+        continue
     log('prompt', sid=sid, value=v, history=history)
     emit(dict(type='system', subtype='init'))
     emit(dict(type='user', uuid=v['uuid'], isReplay=True,
               message=dict(role='user', content=text), parent_tool_use_id=None))
     history.append(dict(uuid=v['uuid'], role='user', text=text))
+    if text == 'HOLD_TURN':
+        holding = True
+        save()
+        log('holding-turn', sid=sid, value=v)
+        continue
     if 'KEEP_TOOL' in text:
         tool_uuid = str(uuid.uuid4())
         emit(dict(type='assistant', uuid=tool_uuid, parent_tool_use_id=None,
@@ -172,14 +189,55 @@ impl Api {
         self.http.get(format!("{}/sessions/{id}/events", self.url)).send().await.unwrap().json().await.unwrap()
     }
 
+    async fn detail(&self, id: &str) -> SessionDetail {
+        self.http.get(format!("{}/sessions/{id}", self.url)).send().await.unwrap().json().await.unwrap()
+    }
+
+    async fn queued(&self, id: &str, text: &str) {
+        eventually("the blocked message to remain accepted in the queue", async || {
+            let detail = self.detail(id).await;
+            detail.queued.iter().any(|q| q.text == text && q.rejected.is_none()).then_some(())
+        })
+        .await;
+    }
+
+    async fn barrier(&self, id: &str) {
+        let count = |events: &[Event]| events.iter().filter(|e| matches!(e.kind, EventKind::SubagentModelSet { .. })).count();
+        let before = count(&self.events(id).await);
+        self.http
+            .put(format!("{}/sessions/{id}/subagent-model", self.url))
+            .json(&json!({"model": ""}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        eventually("the blocked actor to process its mailbox barrier", async || {
+            (count(&self.events(id).await) == before + 1).then_some(())
+        })
+        .await;
+    }
+
+    async fn cancel(&self, id: &str, command_id: &str) {
+        let response = self.http.delete(format!("{}/sessions/{id}/queue/{command_id}", self.url)).send().await.unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert!(status.is_success(), "cancel queued input {command_id}: {status}: {body}");
+    }
+
     async fn idle(&self, id: &str, turns: usize) -> Vec<Event> {
+        self.idle_allowing_errors(id, turns, 0).await
+    }
+
+    async fn idle_allowing_errors(&self, id: &str, turns: usize, expected_errors: usize) -> Vec<Event> {
         eventually("the completed turn and idle session", async || {
             let d: SessionDetail = self.http.get(format!("{}/sessions/{id}", self.url)).send().await.ok()?.json().await.ok()?;
             let events = self.events(id).await;
             let errors: Vec<_> = events.iter().filter(|e| matches!(e.kind, EventKind::Error { .. })).collect();
-            assert!(errors.is_empty(), "unexpected session error: {errors:?}");
+            assert!(errors.len() <= expected_errors, "unexpected session error: {errors:?}");
             let ended = events.iter().filter(|e| matches!(e.kind, EventKind::TurnEnded { .. })).count();
-            (ended == turns && d.session.status == SessionStatus::Idle && d.queued.is_empty()).then_some(events)
+            (ended == turns && errors.len() == expected_errors && d.session.status == SessionStatus::Idle && d.queued.is_empty())
+                .then_some(events)
         })
         .await
     }
@@ -209,6 +267,10 @@ fn records(dir: &Path, kind: &str) -> Vec<Value> {
     trace(dir).into_iter().filter(|v| v["kind"] == kind).collect()
 }
 
+fn initializations(dir: &Path) -> usize {
+    records(dir, "stdin").iter().filter(|v| v["value"]["request"]["subtype"] == "initialize").count()
+}
+
 fn rewinds(events: &[Event]) -> usize {
     events.iter().filter(|e| matches!(e.kind, EventKind::Rewound { .. })).count()
 }
@@ -234,6 +296,28 @@ async fn seed(api: &Api, dir: &Path) -> (String, u64) {
     }
     let to_seq = user_seq(&events, "DROP_PRIVATE");
     (id, to_seq)
+}
+
+/// Inject only while this fixture's worker is stopped. No real remote worker
+/// or child runs: its unconfirmable identity is enough to exercise preflight.
+async fn remote_child(journal: &c6_worker::journal::Journal, id: &str, child: &str) {
+    let (_, events) = journal.load_session(id).await.unwrap().unwrap();
+    journal
+        .append(
+            id,
+            &c6_proto::SessionEvent {
+                seq: events.last().unwrap().seq + 1,
+                ts_ms: c6_core::now_ms(),
+                kind: Some(c6_proto::session_event::Kind::SubagentSpawned(c6_proto::SubagentSpawned {
+                    child_session_id: child.into(),
+                    background_task_id: format!("remote-task-{child}"),
+                    remote: Some(Default::default()),
+                    ..Default::default()
+                })),
+            },
+        )
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -490,8 +574,206 @@ async fn claude_rewind_resets_native_history_before_acknowledging_and_fails_clos
     assert_eq!(after["history"], json!([]));
     assert!(after["value"]["message"]["content"].as_str().unwrap().contains("KEEP_TOOL"));
 
-    // Both reset attempts fail: Error, no Rewound, and no later input is
-    // delivered, including when the pending reset is recovered on restart.
+    // Crash after destructive reset began, while the fake is waiting for
+    // initialization acknowledgment. The socket is the barrier: no timer
+    // guesses whether the reset reached this point before runtime shutdown.
+    let crashed = tempfile::tempdir().unwrap();
+    let (crashed_id, crashed_to) = seed(&api, crashed.path()).await;
+    let gate = UnixListener::bind(crashed.path().join("init.sock")).unwrap();
+    api.rewind(&crashed_id, crashed_to).await;
+    let (mut pending, _) = within("the reset to initialize before worker shutdown", gate.accept()).await.unwrap();
+    let mut signal = [0; 13];
+    within("the crash fixture's initialization barrier", pending.read_exact(&mut signal)).await.unwrap();
+    assert_eq!(&signal, b"initializing\n");
+    let (reset, applied) = journal.claude_rewind(&crashed_id).await.unwrap().unwrap();
+    assert!(!reset.untouched, "reset must be durably destructive before initializing the replacement CLI");
+    assert!(reset.failure.is_empty(), "this fixture crashes during reset, not after a reported failure");
+    assert_eq!(applied, 0);
+    assert_eq!(initializations(crashed.path()), 1);
+    api.say(&crashed_id, "AFTER_CRASH_DURING_INITIALIZE").await;
+    api.queued(&crashed_id, "AFTER_CRASH_DURING_INITIALIZE").await;
+    assert_eq!(records(crashed.path(), "prompt").len(), 2, "queued input must not reach the unconfirmed CLI");
+    assert_eq!(rewinds(&api.events(&crashed_id).await), 0);
+
+    worker.stop().await;
+    let (durable, applied) = journal.claude_rewind(&crashed_id).await.unwrap().unwrap();
+    assert_eq!(durable.command_id, reset.command_id);
+    assert!(!durable.untouched, "runtime loss must not make a destructive reset cancelable");
+    assert!(durable.failure.is_empty());
+    assert_eq!(applied, 0);
+    assert_eq!(records(crashed.path(), "prompt").len(), 2);
+    std::fs::remove_file(crashed.path().join("init.sock")).unwrap();
+    drop(gate);
+    drop(pending);
+
+    let worker = WorkerProcess::start(state.path()).await;
+    let events = api.idle(&crashed_id, 3).await;
+    assert_eq!(rewinds(&events), 1, "restart must confirm the interrupted reset exactly once");
+    let confirmed = events.iter().find(|e| matches!(e.kind, EventKind::Rewound { .. })).unwrap().seq;
+    assert!(user_seq(&events, "AFTER_CRASH_DURING_INITIALIZE") > confirmed, "queued input must follow the recovered reset");
+    assert!(journal.is_applied(&reset.command_id).await.unwrap());
+    assert_eq!(initializations(crashed.path()), 2, "restart must initialize and confirm a replacement before resuming input");
+    let prompts = records(crashed.path(), "prompt");
+    assert_eq!(prompts.len(), 3);
+    let after = prompts.last().unwrap();
+    clean_context(after);
+    assert!(after["history"].to_string().contains("KEEP_TOOL"));
+
+    // A retained remote child is not affected by a conversation-only
+    // rewind. A child in the withdrawn suffix, however, must refuse it
+    // before loading/stopping the actor or initializing another CLI.
+    let retained_remote = tempfile::tempdir().unwrap();
+    let retained_id = api.create(retained_remote.path(), "KEEP_TOOL").await;
+    api.idle(&retained_id, 1).await;
+    let affected_remote = tempfile::tempdir().unwrap();
+    let (affected_id, affected_to) = seed(&api, affected_remote.path()).await;
+    let affected_trace = trace(affected_remote.path());
+    let affected_native_id = records(affected_remote.path(), "prompt").last().unwrap()["sid"].clone();
+    worker.stop().await;
+    remote_child(&journal, &retained_id, "retained-remote-child").await;
+    remote_child(&journal, &affected_id, "affected-remote-child").await;
+    let worker = WorkerProcess::start(state.path()).await;
+
+    api.say(&retained_id, "DROP_PRIVATE").await;
+    let events = api.idle(&retained_id, 2).await;
+    api.rewind(&retained_id, user_seq(&events, "DROP_PRIVATE")).await;
+    api.rewound(&retained_id, 1).await;
+    api.say(&retained_id, "AFTER_RETAINED_REMOTE_REWIND").await;
+    let retained_events = api.idle(&retained_id, 3).await;
+    clean_context(records(retained_remote.path(), "prompt").last().unwrap());
+
+    // File restoration affects even retained children. Refusing it must
+    // preserve the native mapping from the earlier confirmed rewind.
+    let retained_mapping = journal.claude_rewind(&retained_id).await.unwrap().unwrap();
+    let retained_trace = trace(retained_remote.path());
+    api.post(
+        &format!("/sessions/{retained_id}/rewind"),
+        json!({"to_seq": user_seq(&retained_events, "AFTER_RETAINED_REMOTE_REWIND"), "restore_files": true}),
+    )
+    .await;
+    eventually("file restore to refuse the retained remote writer", async || {
+        let rejected: Option<String> = sqlx::query_scalar(
+            "SELECT error FROM commands WHERE session_id = ? AND state = 'rejected' AND text IS NULL ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(&retained_id)
+        .fetch_optional(head.state.store.pool())
+        .await
+        .unwrap();
+        rejected.filter(|reason| reason.contains("retained-remote-child"))
+    })
+    .await;
+    assert_ne!(api.detail(&retained_id).await.session.status, SessionStatus::Failed, "a rejected Rewind is not a failed Create");
+    api.idle_allowing_errors(&retained_id, 3, 1).await;
+    assert_eq!(trace(retained_remote.path()), retained_trace, "refused file restore must not initialize another reset");
+    assert_eq!(
+        serde_json::to_value(journal.claude_rewind(&retained_id).await.unwrap().unwrap()).unwrap(),
+        serde_json::to_value(retained_mapping).unwrap(),
+        "preflight refusal must preserve the previous confirmed native mapping"
+    );
+    api.say(&retained_id, "AFTER_RESTORE_PREFLIGHT_REFUSAL").await;
+    let retained_events = api.idle_allowing_errors(&retained_id, 4, 1).await;
+    let after = records(retained_remote.path(), "prompt").pop().unwrap();
+    clean_context(&after);
+    assert!(after["history"].to_string().contains("AFTER_RETAINED_REMOTE_REWIND"));
+
+    api.rewind(&affected_id, affected_to).await;
+    let (rejected_id, reason): (String, String) = eventually("the affected remote child to reject preflight", async || {
+        sqlx::query_as(
+            "SELECT id, error FROM commands WHERE session_id = ? AND state = 'rejected' AND text IS NULL ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(&affected_id)
+        .fetch_optional(head.state.store.pool())
+        .await
+        .unwrap()
+    })
+    .await;
+    assert!(reason.contains("affected-remote-child"), "{reason}");
+    assert_ne!(api.detail(&affected_id).await.session.status, SessionStatus::Failed, "a rejected Rewind is not a failed Create");
+    assert_eq!(trace(affected_remote.path()), affected_trace, "preflight must not initialize or send a prompt");
+    assert!(journal.claude_rewind(&affected_id).await.unwrap().is_none(), "preflight must leave no pending reset");
+    let refused_events = api.idle_allowing_errors(&affected_id, 2, 1).await;
+    assert_eq!(rewinds(&refused_events), 0);
+    assert!(refused_events.iter().any(|e| matches!(&e.kind, EventKind::Error { message } if message.contains("affected-remote-child"))));
+
+    api.say(&affected_id, "AFTER_REMOTE_PREFLIGHT_REFUSAL").await;
+    api.idle_allowing_errors(&affected_id, 3, 1).await;
+    let after = records(affected_remote.path(), "prompt").pop().unwrap();
+    assert_eq!(after["sid"], affected_native_id);
+    assert!(after["history"].to_string().contains("DROP_PRIVATE"), "the refused rewind must retain the target input");
+    assert!(after["history"].to_string().contains("PRIVATE_WITHDRAWN_ANSWER"), "the refused rewind must retain the answer");
+
+    // Simulate a crash after dispatch prepared an untouched reset, with a
+    // previously confirmed native mapping to restore. This bypasses manager
+    // preflight and exercises actual durable intent rollback on actor load.
+    let prepared_to = user_seq(&retained_events, "AFTER_RESTORE_PREFLIGHT_REFUSAL");
+    let prepared_id = format!("prepared-rewind-{retained_id}");
+    let previous_mapping = journal.claude_rewind(&retained_id).await.unwrap().unwrap();
+    let prepared_initializations = initializations(retained_remote.path());
+    worker.stop().await;
+    remote_child(&journal, &retained_id, "prepared-remote-child").await;
+    journal
+        .prepare_claude_rewind(
+            &retained_id,
+            &c6_worker::claude_code::Reset {
+                command_id: prepared_id.clone(),
+                to_seq: prepared_to,
+                session_id: uuid::Uuid::now_v7().to_string(),
+                fresh: true,
+                withdrawn: previous_mapping.0.withdrawn.clone(),
+                untouched: true,
+                previous: Some(Box::new(previous_mapping.clone())),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let worker = WorkerProcess::start(state.path()).await;
+    api.say(&retained_id, "AFTER_PREPARED_PREFLIGHT_ROLLBACK").await;
+    let prepared_events = api.idle_allowing_errors(&retained_id, 5, 2).await;
+    assert_eq!(rewinds(&prepared_events), 1, "abandoning untouched intent must not append another Rewound");
+    assert_eq!(
+        serde_json::to_value(journal.claude_rewind(&retained_id).await.unwrap().unwrap()).unwrap(),
+        serde_json::to_value(&previous_mapping).unwrap(),
+        "prepared-intent rollback must restore the exact previous native mapping"
+    );
+    assert!(journal.is_applied(&prepared_id).await.unwrap(), "safe rollback must persist a terminal receipt");
+    assert!(journal.command_rejection(&prepared_id).await.unwrap().unwrap().contains("prepared-remote-child"));
+    assert_eq!(initializations(retained_remote.path()), prepared_initializations, "prepared preflight must not initialize a CLI reset");
+    let after = records(retained_remote.path(), "prompt").pop().unwrap();
+    clean_context(&after);
+    assert!(after["history"].to_string().contains("AFTER_RESTORE_PREFLIGHT_REFUSAL"), "canceled intent must retain its target message");
+
+    api.say(&affected_id, "AFTER_REMOTE_PREFLIGHT_RESTART").await;
+    let events = api.idle_allowing_errors(&affected_id, 4, 1).await;
+    assert_eq!(rewinds(&events), 0, "rejected preflight must not return as a pending reset after restart");
+    let prompts = records(affected_remote.path(), "prompt");
+    let after = prompts.last().unwrap();
+    assert_eq!(after["sid"], affected_native_id);
+    let history = after["history"].to_string();
+    assert!(history.contains("DROP_PRIVATE") && history.contains("PRIVATE_WITHDRAWN_ANSWER"));
+    assert!(history.contains("AFTER_REMOTE_PREFLIGHT_REFUSAL"));
+    assert!(
+        records(affected_remote.path(), "stdin").iter().all(|r| r["value"]["type"] != "control_request"),
+        "preflight refusal and restart must never initialize a reset"
+    );
+    let rejected_state: String =
+        sqlx::query_scalar("SELECT state FROM commands WHERE id = ?").bind(&rejected_id).fetch_one(head.state.store.pool()).await.unwrap();
+    assert_eq!(rejected_state, "rejected", "rejected preflight must not be replayed as a successful rewind");
+
+    worker.stop().await;
+    let worker = WorkerProcess::start(state.path()).await;
+    api.say(&retained_id, "AFTER_PREPARED_ROLLBACK_RESTART").await;
+    let events = api.idle_allowing_errors(&retained_id, 6, 2).await;
+    assert_eq!(rewinds(&events), 1, "recovered rollback must not replay the refused reset");
+    assert_eq!(initializations(retained_remote.path()), prepared_initializations);
+    let after = records(retained_remote.path(), "prompt").pop().unwrap();
+    clean_context(&after);
+    let history = after["history"].to_string();
+    assert!(history.contains("AFTER_RESTORE_PREFLIGHT_REFUSAL") && history.contains("AFTER_PREPARED_PREFLIGHT_ROLLBACK"));
+    assert!(journal.command_rejection(&prepared_id).await.unwrap().unwrap().contains("prepared-remote-child"));
+
+    // Both initialization strategies fail once. New messages and worker
+    // restarts must retain the failure, not initialize again automatically.
     let failed = tempfile::tempdir().unwrap();
     let (failed_id, failed_to) = seed(&api, failed.path()).await;
     std::fs::write(failed.path().join("fail-reset"), "").unwrap();
@@ -503,9 +785,16 @@ async fn claude_rewind_resets_native_history_before_acknowledging_and_fails_clos
             .filter(|e| matches!(&e.kind, EventKind::Error { message } if message.contains("Rewind could not be confirmed")))
             .count()
     };
-    eventually("the failed reset error", async || (errors().await >= 1).then_some(())).await;
+    eventually("the failed reset error", async || (errors().await == 1).then_some(())).await;
+    let failed_trace = trace(failed.path());
     api.say(&failed_id, "MUST_NOT_REACH_FAILED_RESET").await;
-    eventually("a later input to retry and refuse the pending reset", async || (errors().await >= 2).then_some(())).await;
+    api.queued(&failed_id, "MUST_NOT_REACH_FAILED_RESET").await;
+    let sentinel = tempfile::tempdir().unwrap();
+    let sentinel_id = api.create(sentinel.path(), "CHECK_BLOCKED_RESET").await;
+    api.idle(&sentinel_id, 1).await;
+    api.barrier(&failed_id).await;
+    assert_eq!(errors().await, 1, "ordinary input must not retry the failed reset");
+    assert_eq!(trace(failed.path()), failed_trace, "blocked input must send neither initialize nor a model prompt");
     assert_eq!(rewinds(&api.events(&failed_id).await), 0);
     assert_eq!(records(failed.path(), "prompt").len(), 2);
     let (reset, applied) = journal.claude_rewind(&failed_id).await.unwrap().unwrap();
@@ -514,9 +803,247 @@ async fn claude_rewind_resets_native_history_before_acknowledging_and_fails_clos
     worker.stop().await;
     let worker = WorkerProcess::start(state.path()).await;
     api.say(&failed_id, "MUST_NOT_LEAK_AFTER_RESTART").await;
-    eventually("the recovered reset to fail closed", async || (errors().await >= 3).then_some(())).await;
+    api.queued(&failed_id, "MUST_NOT_LEAK_AFTER_RESTART").await;
+    // A completed unrelated turn proves the restarted worker is attached
+    // and processing commands; queue acceptance alone only proves head work.
+    api.say(&sentinel_id, "CHECK_BLOCKED_RESET_AFTER_RESTART").await;
+    api.idle(&sentinel_id, 2).await;
+    api.barrier(&failed_id).await;
+    assert_eq!(errors().await, 1, "restart and redelivery must not retry the failed reset");
+    assert_eq!(trace(failed.path()), failed_trace, "restart must not initialize the failed reset again");
     assert_eq!(rewinds(&api.events(&failed_id).await), 0);
     assert_eq!(records(failed.path(), "prompt").len(), 2);
+
+    // A genuine retry B may fail while recovering the original intent A.
+    // Retire B durably without clearing A's destructive barrier: otherwise
+    // head redelivery mistakes B for another new, explicit retry of A.
+    let failed_initializations = initializations(failed.path());
+    api.rewind(&failed_id, failed_to).await;
+    let rejected_retry: String = sqlx::query_scalar("SELECT id FROM commands WHERE session_id = ? ORDER BY seq DESC LIMIT 1")
+        .bind(&failed_id)
+        .fetch_one(head.state.store.pool())
+        .await
+        .unwrap();
+    assert_ne!(rejected_retry, reset.command_id);
+    eventually("one failed explicit retry to report its recovery failure", async || (errors().await == 2).then_some(())).await;
+    eventually("the failed retry to have durable worker and head rejections", async || {
+        let rejection = journal.command_rejection(&rejected_retry).await.unwrap()?;
+        assert!(!rejection.is_empty());
+        let state: String = sqlx::query_scalar("SELECT state FROM commands WHERE id = ?")
+            .bind(&rejected_retry)
+            .fetch_one(head.state.store.pool())
+            .await
+            .unwrap();
+        (state == "rejected").then_some(())
+    })
+    .await;
+    assert!(journal.is_applied(&rejected_retry).await.unwrap(), "failed retry B needs a terminal receipt");
+    let (failed_again, applied) = journal.claude_rewind(&failed_id).await.unwrap().unwrap();
+    assert_eq!(failed_again.command_id, reset.command_id, "failed retry B must retain original intent A");
+    assert_eq!(applied, 0);
+    assert!(!failed_again.untouched && !failed_again.failure.is_empty(), "A must retain its destructive failure barrier");
+    assert!(!journal.is_applied(&reset.command_id).await.unwrap(), "A must not be acknowledged before reset succeeds");
+    assert_eq!(initializations(failed.path()), failed_initializations + 2, "one failed recovery tries fork and fresh once each");
+    let rejected_trace = trace(failed.path());
+    worker.stop().await;
+    let worker = WorkerProcess::start(state.path()).await;
+    api.say(&failed_id, "AFTER_FAILED_EXPLICIT_RETRY_RESTART").await;
+    api.queued(&failed_id, "AFTER_FAILED_EXPLICIT_RETRY_RESTART").await;
+    api.say(&sentinel_id, "CHECK_FAILED_EXPLICIT_RETRY_RESTART").await;
+    api.idle(&sentinel_id, 3).await;
+    api.barrier(&failed_id).await;
+    assert_eq!(errors().await, 2, "redelivery of rejected B must not retry A again");
+    assert_eq!(trace(failed.path()), rejected_trace, "restart and new input must not initialize after failed retry B");
+    assert_eq!(rewinds(&api.events(&failed_id).await), 0);
+    let (still_blocked, applied) = journal.claude_rewind(&failed_id).await.unwrap().unwrap();
+    assert_eq!(serde_json::to_value(still_blocked).unwrap(), serde_json::to_value(failed_again).unwrap());
+    assert_eq!(applied, 0);
+    assert!(journal.command_rejection(&rejected_retry).await.unwrap().is_some(), "B's rejection must survive restart");
+
+    // Another explicit retry can crash while recovering the same A. The
+    // initialization socket proves its authorization must already be durable;
+    // neither stopping the worker nor replaying A may lose the retry's ID.
+    let before_crashed_retry = initializations(failed.path());
+    let gate = UnixListener::bind(failed.path().join("init.sock")).unwrap();
+    api.rewind(&failed_id, failed_to).await;
+    let (mut pending, _) = within("the crash-during-retry initialization barrier", gate.accept()).await.unwrap();
+    let mut signal = [0; 13];
+    within("the explicit retry to reach initialization before crashing", pending.read_exact(&mut signal)).await.unwrap();
+    assert_eq!(&signal, b"initializing\n");
+    let crashed_retry: String = sqlx::query_scalar("SELECT id FROM commands WHERE session_id = ? ORDER BY seq DESC LIMIT 1")
+        .bind(&failed_id)
+        .fetch_one(head.state.store.pool())
+        .await
+        .unwrap();
+    assert_ne!(crashed_retry, reset.command_id);
+    assert_ne!(crashed_retry, rejected_retry);
+    let (initializing, applied) = journal.claude_rewind(&failed_id).await.unwrap().unwrap();
+    assert_eq!(initializing.command_id, reset.command_id);
+    assert_eq!(applied, 0);
+    assert!(!initializing.untouched && initializing.failure.is_empty());
+    assert_eq!(initializing.retries, std::slice::from_ref(&crashed_retry), "the explicit retry must survive an interrupted recovery of A");
+    api.rewind(&failed_id, failed_to).await;
+    let crashed_companion = eventually("a second retry to be authorized during the gated recovery before crashing", async || {
+        let (pending, applied) = journal.claude_rewind(&failed_id).await.unwrap().unwrap();
+        assert_eq!(pending.command_id, reset.command_id);
+        assert_eq!(applied, 0);
+        (pending.retries.len() == 2 && pending.retries.contains(&crashed_retry))
+            .then(|| pending.retries.into_iter().find(|id| id != &crashed_retry).unwrap())
+    })
+    .await;
+    assert_eq!(errors().await, 2, "initialization is still gated, not failed yet");
+    worker.stop().await;
+    std::fs::remove_file(failed.path().join("init.sock")).unwrap();
+    drop(gate);
+    drop(pending);
+    assert!(failed.path().join("fail-reset").exists(), "restarted recovery must still fail");
+    let worker = WorkerProcess::start(state.path()).await;
+    eventually("the interrupted explicit retry's resumed recovery to fail once", async || (errors().await == 3).then_some(())).await;
+    for rejected in [&crashed_retry, &crashed_companion] {
+        eventually("resumed recovery failure to reject both crashed retry authorizations durably", async || {
+            journal.command_rejection(rejected).await.unwrap()?;
+            let state: String = sqlx::query_scalar("SELECT state FROM commands WHERE id = ?")
+                .bind(rejected)
+                .fetch_one(head.state.store.pool())
+                .await
+                .unwrap();
+            (state == "rejected").then_some(())
+        })
+        .await;
+    }
+    api.barrier(&failed_id).await;
+    assert_eq!(errors().await, 3, "the resumed failure must consume its explicit retry authorization");
+    assert_eq!(initializations(failed.path()), before_crashed_retry + 3, "one gated initialization, then one fork/fresh recovery");
+    let (crash_failed, applied) = journal.claude_rewind(&failed_id).await.unwrap().unwrap();
+    assert_eq!(crash_failed.command_id, reset.command_id);
+    assert_eq!(applied, 0);
+    assert!(!crash_failed.untouched && !crash_failed.failure.is_empty());
+    assert!(crash_failed.retries.is_empty(), "failed recovery must consume all durable retry authorizations");
+    assert!(journal.is_applied(&crashed_retry).await.unwrap());
+    assert!(journal.is_applied(&crashed_companion).await.unwrap());
+    assert!(!journal.is_applied(&reset.command_id).await.unwrap());
+    let crash_failed_trace = trace(failed.path());
+    worker.stop().await;
+    let worker = WorkerProcess::start(state.path()).await;
+    api.say(&failed_id, "AFTER_CRASHED_RETRY_RESTART").await;
+    api.queued(&failed_id, "AFTER_CRASHED_RETRY_RESTART").await;
+    api.say(&sentinel_id, "CHECK_CRASHED_RETRY_RESTART").await;
+    api.idle(&sentinel_id, 4).await;
+    api.barrier(&failed_id).await;
+    assert_eq!(errors().await, 3);
+    assert_eq!(trace(failed.path()), crash_failed_trace, "the rejected crashed retry must not initialize on another restart or input");
+    assert_eq!(rewinds(&api.events(&failed_id).await), 0);
+    assert_eq!(records(failed.path(), "prompt").len(), 2);
+    assert!(journal.command_rejection(&crashed_retry).await.unwrap().is_some(), "the crashed retry's rejection must survive restart");
+    assert!(journal.command_rejection(&crashed_companion).await.unwrap().is_some(), "the companion retry's rejection must survive restart");
+
+    let queued_texts = [
+        "MUST_NOT_REACH_FAILED_RESET",
+        "MUST_NOT_LEAK_AFTER_RESTART",
+        "AFTER_FAILED_EXPLICIT_RETRY_RESTART",
+        "AFTER_CRASHED_RETRY_RESTART",
+    ];
+    // These inputs must already belong to Inbox before recovery begins.
+    // Inputs sent while initialization is gated would instead remain in rx,
+    // behind C, and miss the actor-exit race this regression must exercise.
+    api.barrier(&failed_id).await;
+    let queued = api.detail(&failed_id).await.queued;
+    assert_eq!(queued.len(), queued_texts.len());
+    assert!(queued.iter().all(|q| queued_texts.contains(&q.text.as_str()) && q.rejected.is_none()));
+
+    // B authorizes recovery of failed A; C is admitted while A initializes
+    // for B. All three receipts must be confirmed before releasing Inbox.
+    // Confirming A then separately resetting B used to lose durable C, start
+    // an Inbox turn, and exit when C found no pending intent to interrupt.
+    let gate = UnixListener::bind(failed.path().join("init.sock")).unwrap();
+    std::fs::remove_file(failed.path().join("fail-reset")).unwrap();
+    let before_overlapping_retries = initializations(failed.path());
+    api.rewind(&failed_id, failed_to).await;
+    let (mut pending, _) = within("B recovery to wait at initialization before admitting C", gate.accept()).await.unwrap();
+    let mut signal = [0; 13];
+    within("B recovery's initialization barrier", pending.read_exact(&mut signal)).await.unwrap();
+    assert_eq!(&signal, b"initializing\n");
+    let (recovering, applied) = journal.claude_rewind(&failed_id).await.unwrap().unwrap();
+    assert_eq!(recovering.command_id, reset.command_id);
+    assert_eq!(applied, 0);
+    assert_eq!(recovering.retries.len(), 1);
+    let retry_b = recovering.retries[0].clone();
+    api.rewind(&failed_id, failed_to).await;
+    let retry_c = eventually("C to be durably authorized while B recovery is still gated", async || {
+        let (pending, applied) = journal.claude_rewind(&failed_id).await.unwrap().unwrap();
+        assert_eq!(pending.command_id, reset.command_id);
+        assert_eq!(applied, 0);
+        (pending.retries.len() == 2 && pending.retries.contains(&retry_b))
+            .then(|| pending.retries.into_iter().find(|id| id != &retry_b).unwrap())
+    })
+    .await;
+    // An unrelated actor's barrier also proves the serialized manager has
+    // finished dispatching C into this actor's rx, not merely committed it.
+    api.barrier(&sentinel_id).await;
+    let overlap_ids = [reset.command_id.clone(), retry_b, retry_c];
+    for id in &overlap_ids {
+        assert!(!journal.is_applied(id).await.unwrap(), "receipt {id} must remain pending while initialization is gated");
+    }
+    assert_eq!(records(failed.path(), "prompt").len(), 2, "the pre-existing Inbox must remain blocked during initialization");
+    assert_eq!(rewinds(&api.events(&failed_id).await), 0);
+    std::fs::remove_file(failed.path().join("init.sock")).unwrap();
+    drop(gate);
+    pending.write_all(b"ok").await.unwrap();
+    api.rewound(&failed_id, 3).await;
+    for id in &overlap_ids {
+        assert!(journal.is_applied(id).await.unwrap(), "each overlapping rewind receipt must be durably confirmed");
+        assert!(journal.command_rejection(id).await.unwrap().is_none());
+        eventually("the head to retire every overlapping rewind receipt", async || {
+            let state: String =
+                sqlx::query_scalar("SELECT state FROM commands WHERE id = ?").bind(id).fetch_one(head.state.store.pool()).await.unwrap();
+            (state == "done").then_some(())
+        })
+        .await;
+    }
+    let raw = journal.events_after(&failed_id, 0, u32::MAX).await.unwrap();
+    let mut confirmed_ids: Vec<_> = raw
+        .iter()
+        .filter_map(|event| match &event.kind {
+            Some(c6_proto::session_event::Kind::Rewound(r)) => Some(r.command_id.clone()),
+            _ => None,
+        })
+        .collect();
+    confirmed_ids.sort();
+    let mut expected_ids = overlap_ids.to_vec();
+    expected_ids.sort();
+    assert_eq!(confirmed_ids, expected_ids, "A, B, and C each need their own confirmation event");
+    let recovered = eventually("all pre-existing Inbox inputs to be delivered exactly once after A, B, and C confirmations", async || {
+        let events = api.events(&failed_id).await;
+        let prompts = records(failed.path(), "prompt");
+        for text in queued_texts {
+            let users = events.iter().filter(|e| matches!(&e.kind, EventKind::User { text: t, .. } if t == text)).count();
+            let taken = prompts.iter().filter(|p| p["value"]["message"]["content"].as_str().is_some_and(|t| t.contains(text))).count();
+            assert!(users <= 1 && taken <= 1, "queued input {text} was delivered more than once");
+            if users != 1 || taken != 1 {
+                return None;
+            }
+        }
+        let detail = api.detail(&failed_id).await;
+        (detail.queued.is_empty() && detail.session.status == SessionStatus::Idle).then_some(events)
+    })
+    .await;
+    let confirmed = recovered.iter().rev().find(|e| matches!(e.kind, EventKind::Rewound { .. })).unwrap().seq;
+    for text in queued_texts {
+        assert!(user_seq(&recovered, text) > confirmed, "queued input must follow every overlapping retry confirmation");
+    }
+    assert_eq!(errors().await, 3, "successful overlapping retries must not repeat any rejected retry's failed attempt");
+    assert_eq!(initializations(failed.path()), before_overlapping_retries + 1, "A, B, and C must share one successful recovery");
+    assert_eq!(records(failed.path(), "prompt").len(), 6);
+    for prompt in &records(failed.path(), "prompt")[2..] {
+        clean_context(prompt);
+    }
+    api.barrier(&failed_id).await;
+    assert_eq!(errors().await, 3, "the actor must remain live after handling C and draining its Inbox");
+    for rejected in [&rejected_retry, &crashed_retry, &crashed_companion] {
+        let rejected_state: String =
+            sqlx::query_scalar("SELECT state FROM commands WHERE id = ?").bind(rejected).fetch_one(head.state.store.pool()).await.unwrap();
+        assert_eq!(rejected_state, "rejected", "successful retry C must not acknowledge any rejected retry");
+    }
 
     // A separate failed reset has no later inputs queued at the head: the
     // only recovery trigger here must be the explicit Rewind request.
@@ -601,6 +1128,124 @@ async fn claude_rewind_resets_native_history_before_acknowledging_and_fails_clos
     let last = prompts.last().unwrap();
     clean_context(last);
     assert!(last["history"].to_string().contains("AFTER_EXPLICIT_RETRY"), "confirmed receipts must not rewind future input");
+
+    // InputDelivered only means written to the native process, not taken by
+    // its agent. Rewind must recover these unconfirmed inputs before stopping
+    // that process, including when a failed reset's actor is later lost.
+    let mut worker = worker;
+    let mut delivered_dirs = Vec::new();
+    for restart in [false, true] {
+        let held = tempfile::tempdir().unwrap();
+        let (held_id, held_to) = seed(&api, held.path()).await;
+        api.say(&held_id, "HOLD_TURN").await;
+        eventually("the fake to hold the active turn before its result", async || {
+            (!records(held.path(), "holding-turn").is_empty()).then_some(())
+        })
+        .await;
+        let texts = ["DELIVERED_FIRST", "DELIVERED_CANCEL_ME", "DELIVERED_THIRD", "DELIVERED_FOURTH"];
+        for text in texts {
+            api.say(&held_id, text).await;
+        }
+        let delivered = eventually("all four inputs to be written but not taken by the native agent", async || {
+            let detail = api.detail(&held_id).await;
+            let queued: Vec<_> = detail.queued.into_iter().filter(|q| texts.contains(&q.text.as_str())).collect();
+            (queued.len() == texts.len()
+                && queued.iter().all(|q| q.with_agent && q.rejected.is_none())
+                && records(held.path(), "held-input").len() == texts.len())
+            .then_some(queued)
+        })
+        .await;
+        assert_eq!(delivered.iter().map(|q| q.text.as_str()).collect::<Vec<_>>(), texts);
+        let raw = journal.events_after(&held_id, 0, u32::MAX).await.unwrap();
+        for input in &delivered {
+            assert!(raw.iter().any(|e| matches!(&e.kind,
+                Some(c6_proto::session_event::Kind::InputDelivered(d)) if d.command_id == input.command_id)));
+            assert!(!raw.iter().any(|e| matches!(&e.kind,
+                Some(c6_proto::session_event::Kind::User(u)) if u.command_id == input.command_id)));
+        }
+
+        std::fs::write(held.path().join("fail-reset"), "").unwrap();
+        api.rewind(&held_id, held_to).await;
+        eventually("the held turn's reset to fail after interrupting its original input", async || {
+            let events = api.events(&held_id).await;
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::Error { message } if message.contains("Rewind could not be confirmed")))
+                .then_some(())
+        })
+        .await;
+        assert_eq!(records(held.path(), "interrupted-held-turn").len(), 1, "Rewind must interrupt the held turn without taking its queue");
+        assert_eq!(records(held.path(), "prompt").len(), 3, "none of the four delivered inputs may be taken before reset confirmation");
+        let failed_trace = trace(held.path());
+        if restart {
+            // This is the persisted shape of an already-stuck queue: head
+            // rows say with_agent, but the worker has only InputDelivered,
+            // no User receipt, and its previous actor/process has gone.
+            worker.stop().await;
+            worker = WorkerProcess::start(state.path()).await;
+        }
+        let sentinel = tempfile::tempdir().unwrap();
+        let sentinel_id = api.create(sentinel.path(), "DELIVERED_INPUT_RECOVERY_SENTINEL").await;
+        api.idle(&sentinel_id, 1).await;
+        assert_eq!(trace(held.path()), failed_trace, "neither actor reload nor queue replay may initialize a failed reset");
+        assert_eq!(rewinds(&api.events(&held_id).await), 0);
+
+        // Cancel the middle input, not a suffix. A stale InputDelivered
+        // marker must not make the recovered inbox answer permanent 409.
+        api.cancel(&held_id, &delivered[1].command_id).await;
+        eventually("cancellation to remove only the selected recovered input", async || {
+            let detail = api.detail(&held_id).await;
+            (detail.queued.len() == 3
+                && !detail.queued.iter().any(|q| q.command_id == delivered[1].command_id)
+                && [0, 2, 3].iter().all(|&i| detail.queued.iter().any(|q| q.command_id == delivered[i].command_id && q.rejected.is_none())))
+            .then_some(())
+        })
+        .await;
+        let blocked = api.events(&held_id).await;
+        assert!(!blocked.iter().any(|e| matches!(&e.kind, EventKind::User { command_id, .. }
+            if delivered.iter().any(|q| q.command_id == *command_id))));
+
+        std::fs::remove_file(held.path().join("fail-reset")).unwrap();
+        api.rewind(&held_id, held_to).await;
+        api.rewound(&held_id, 2).await;
+        let events = eventually("each remaining recovered input to be taken exactly once and leave the queue", async || {
+            let events = api.events(&held_id).await;
+            let errors = events.iter().filter(|e| matches!(e.kind, EventKind::Error { .. })).count();
+            assert_eq!(errors, 1, "queue recovery must not repeatedly retry the failed reset");
+            let prompts = records(held.path(), "prompt");
+            for i in [0, 2, 3] {
+                let users = events
+                    .iter()
+                    .filter(|e| {
+                        matches!(&e.kind, EventKind::User { command_id, .. }
+                    if command_id == &delivered[i].command_id)
+                    })
+                    .count();
+                let taken =
+                    prompts.iter().filter(|p| p["value"]["message"]["content"].as_str().is_some_and(|t| t.contains(texts[i]))).count();
+                assert!(users <= 1 && taken <= 1, "recovered input {} was delivered more than once", texts[i]);
+                if users != 1 || taken != 1 {
+                    return None;
+                }
+            }
+            let detail = api.detail(&held_id).await;
+            (detail.queued.is_empty() && detail.session.status == SessionStatus::Idle).then_some(events)
+        })
+        .await;
+        let confirmed = events.iter().rev().find(|e| matches!(e.kind, EventKind::Rewound { .. })).unwrap().seq;
+        for i in [0, 2, 3] {
+            assert!(user_seq(&events, texts[i]) > confirmed, "recovered input must follow both reset confirmations");
+        }
+        assert!(!events.iter().any(|e| matches!(&e.kind, EventKind::User { command_id, .. } if command_id == &delivered[1].command_id)));
+        let prompts = records(held.path(), "prompt");
+        assert_eq!(prompts.len(), 6);
+        for prompt in &prompts[3..] {
+            clean_context(prompt);
+            assert!(!prompt["value"]["message"]["content"].as_str().unwrap().contains("DELIVERED_CANCEL_ME"));
+            assert!(!prompt["history"].to_string().contains("DELIVERED_CANCEL_ME"));
+        }
+        delivered_dirs.extend([held, sentinel]);
+    }
 
     worker.stop().await;
     head.shutdown().await.unwrap();

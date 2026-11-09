@@ -148,18 +148,31 @@ cargo nextest run --locked -p c6-worker --test claude_code_rewind
 It checks final assistant UUID cutoffs after tools, returned session-ID adoption,
 the initialization barrier, fresh kept-history fallback, first-message rewind,
 worker restart, lost metadata, side-chat seeds, unsupported/disconnected workers,
-and a failed reset that blocks inputs even after restart. Worker unit regressions
-also check held native wake withdrawal and recursive child/background quiescence.
+and failed preflight that preserves the existing conversation across restart,
+retained versus withdrawn remote children, and a destructive reset failure that
+blocks inputs without implicit retries even after restart. The native-memory
+fixture also covers four inputs written to a held CLI turn
+without User receipts: a failed reset returns them to the cancellable inbox,
+one middle input is canceled, and the others are delivered exactly once after
+explicit retry, both live and after a real worker-runtime restart. A gated
+initialization crash verifies that recovery confirms reset before queued input.
+Overlapping retries during gated initialization must share one successful reset,
+atomically confirm every receipt before pre-existing Inbox inputs, and remain
+durable through a crash and subsequent failed recovery.
+Worker unit regressions also check held native wake withdrawal and recursive
+child/background quiescence.
 The `shell_writer_` worker regressions hold a shell's Started event outside the
-actor, fail rewind, reload empty tools, and verify that neither restore nor a
-Rewound receipt can bypass the live writer. They also cover surviving group
+actor, refuse rewind before interruption, reopen the journal with empty tools,
+and verify that neither restore nor a Rewound receipt can bypass the live writer.
+They also cover surviving group
 members after leader exit, unknown/SSH ownership, pending-root launch admission,
 late-notice suppression, and task-ID reservation. The tools regression cancels a
 context while its durable reservation is awaiting completion and verifies that
 no process starts. Old worker-turn contexts stay canceled after confirmation;
 actor exit cancels them too, while a later turn uses a new token.
-The worker-local journal migration is `0005_claude_rewind.sql`; the head needs no
-migration for native-memory reset.
+The worker-local journal migrations are `0005_claude_rewind.sql` for native-memory
+reset and `0006_rewind_rejections.sql` for durable failed receipts; the head needs
+no migration.
 
 The model-context regressions use synthetic append-only logs, a temporary head
 and mock model endpoints only; no real model or installed CLI is needed:

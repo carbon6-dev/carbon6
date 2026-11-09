@@ -84,9 +84,9 @@ pub struct Boundary {
     pub cutoff_uuid: String,
 }
 
-/// Durable reset intent. A failed or interrupted reset blocks further turns
-/// until it has been retried successfully; old session files are never removed.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+/// Durable reset intent. Only an untouched intent can be abandoned safely.
+/// Old session files are never removed.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Reset {
     pub command_id: String,
     pub to_seq: u64,
@@ -95,6 +95,21 @@ pub struct Reset {
     pub fresh: bool,
     #[serde(default)]
     pub withdrawn: Vec<String>,
+    /// Persisted before dispatch; cleared BEFORE stopping the old runtime.
+    /// Missing on older rows means potentially destructive, never untouched.
+    #[serde(default)]
+    pub untouched: bool,
+    /// Restore the last confirmed branch if preflight fails. Pending resets
+    /// never nest: only a confirmed mapping can become this snapshot.
+    #[serde(default)]
+    pub previous: Option<Box<(Reset, u64)>>,
+    /// A destructive failure waits for an explicit retry, not each new input.
+    #[serde(default)]
+    pub failure: String,
+    /// Explicit retry receipts authorizing this recovery. They must survive
+    /// a crash during initialization, and fail with it rather than retry again.
+    #[serde(default)]
+    pub retries: Vec<String>,
 }
 
 /// How long an idle process with no background tasks stays up, unless

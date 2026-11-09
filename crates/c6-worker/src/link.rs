@@ -111,6 +111,17 @@ impl HeadLink {
         self.local.get().is_some() || self.outbound.lock().unwrap().is_some()
     }
 
+    /// Best effort now; the journal's failed receipt repeats this rejection
+    /// when the head redelivers after a disconnect.
+    pub(crate) fn reject_command(&self, session_id: &str, command_id: &str, reason: &str) {
+        let tx = self.outbound.lock().unwrap().clone();
+        if let Some(tx) = tx {
+            let rejected =
+                c6_proto::CommandRejected { session_id: session_id.into(), command_id: command_id.into(), reason: reason.into() };
+            let _ = tx.try_send(WorkerMsg { msg: Some(worker_msg::Msg::Rejected(rejected)) });
+        }
+    }
+
     /// Automatic notice delivery waits for the head, particularly on
     /// startup when no model credentials have been cached yet.
     pub(crate) async fn wait_connected(&self) {

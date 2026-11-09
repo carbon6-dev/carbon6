@@ -200,13 +200,194 @@ impl Journal {
     }
 
     pub async fn prepare_claude_rewind(&self, session_id: &str, reset: &crate::claude_code::Reset) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut reset = reset.clone();
+        // An actor can be initializing while the manager admits an explicit
+        // retry. Its older snapshot must not erase that durable authorization.
+        if let Some(data) =
+            sqlx::query_scalar::<_, String>("SELECT data FROM claude_rewinds WHERE session_id = ? AND command_id = ? AND applied_seq = 0")
+                .bind(session_id)
+                .bind(&reset.command_id)
+                .fetch_optional(&mut *tx)
+                .await?
+        {
+            let current: crate::claude_code::Reset = serde_json::from_str(&data)?;
+            for id in current.retries {
+                if !reset.retries.contains(&id) {
+                    reset.retries.push(id);
+                }
+            }
+        }
         sqlx::query("INSERT OR REPLACE INTO claude_rewinds (session_id, command_id, data) VALUES (?, ?, ?)")
             .bind(session_id)
             .bind(&reset.command_id)
-            .bind(serde_json::to_string(reset)?)
-            .execute(&self.pool)
+            .bind(serde_json::to_string(&reset)?)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
+    }
+
+    /// False means the actor confirmed the old reset concurrently; dispatch
+    /// must reread its mapping and prepare a new intent instead.
+    pub async fn authorize_claude_rewind_retry(&self, session_id: &str, original: &str, retry: &str) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        // Dispatch's receipt check can race a failure committing on the
+        // actor. Never resurrect an authorization already consumed by it.
+        if let Some(rejection) = sqlx::query_scalar::<_, Option<String>>("SELECT rejection FROM applied_commands WHERE command_id = ?")
+            .bind(retry)
+            .fetch_optional(&mut *tx)
+            .await?
+        {
+            anyhow::bail!("{}", rejection.unwrap_or_else(|| "Rewind is already confirmed".into()));
+        }
+        let Some(data) =
+            sqlx::query_scalar::<_, String>("SELECT data FROM claude_rewinds WHERE session_id = ? AND command_id = ? AND applied_seq = 0")
+                .bind(session_id)
+                .bind(original)
+                .fetch_optional(&mut *tx)
+                .await?
+        else {
+            return Ok(false);
+        };
+        let mut reset: crate::claude_code::Reset = serde_json::from_str(&data)?;
+        if retry != original && !reset.retries.iter().any(|id| id == retry) {
+            reset.retries.push(retry.into());
+            sqlx::query("UPDATE claude_rewinds SET data = ? WHERE session_id = ?")
+                .bind(serde_json::to_string(&reset)?)
+                .bind(session_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// The error and recovery decision are atomic. A crash cannot leave a
+    /// reported preflight failure waiting to retry, or lose the prior branch.
+    pub async fn fail_claude_rewind(
+        &self,
+        session_id: &str,
+        command_id: &str,
+        event: &SessionEvent,
+        retries: &[String],
+    ) -> anyhow::Result<(bool, Vec<String>)> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let row = sqlx::query("SELECT data FROM claude_rewinds WHERE session_id = ? AND command_id = ? AND applied_seq = 0")
+            .bind(session_id)
+            .bind(command_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let pending = row.is_some();
+        let mut reset: crate::claude_code::Reset = match row {
+            Some(row) => serde_json::from_str(&row.get::<String, _>("data"))?,
+            None => crate::claude_code::Reset { untouched: true, ..Default::default() },
+        };
+        let Some(session_event::Kind::Error(error)) = &event.kind else { anyhow::bail!("Reset failure requires an error event") };
+        let mut rejected = std::mem::take(&mut reset.retries);
+        for retry in retries {
+            if !rejected.contains(retry) {
+                rejected.push(retry.clone());
+            }
+        }
+        let blocked = !reset.untouched;
+        if blocked {
+            reset.failure = error.message.clone();
+            sqlx::query("UPDATE claude_rewinds SET data = ? WHERE session_id = ?")
+                .bind(serde_json::to_string(&reset)?)
+                .bind(session_id)
+                .execute(&mut *tx)
+                .await?;
+        } else if pending {
+            sqlx::query("DELETE FROM claude_rewinds WHERE session_id = ?").bind(session_id).execute(&mut *tx).await?;
+        }
+        if !blocked && let Some(previous) = reset.previous {
+            let (reset, applied) = *previous;
+            anyhow::ensure!(applied != 0, "Cannot restore an unconfirmed branch");
+            sqlx::query("INSERT INTO claude_rewinds (session_id, command_id, data, applied_seq) VALUES (?, ?, ?, ?)")
+                .bind(session_id)
+                .bind(&reset.command_id)
+                .bind(serde_json::to_string(&reset)?)
+                .bind(applied as i64)
+                .execute(&mut *tx)
+                .await?;
+        }
+        // An explicit retry has a different head command ID. If recovery of
+        // the original fails again, retire that retry too; its redelivery is
+        // NOT another user action. Keep the original destructive barrier.
+        if !blocked {
+            rejected.push(command_id.into());
+        }
+        for id in &rejected {
+            sqlx::query("INSERT OR IGNORE INTO applied_commands (command_id, session_id, rejection) VALUES (?, ?, ?)")
+                .bind(id)
+                .bind(session_id)
+                .bind(&error.message)
+                .execute(&mut *tx)
+                .await?;
+        }
+        append_in(&mut tx, session_id, event).await?;
+        tx.commit().await?;
+        self.appended.notify_one();
+        Ok((blocked, rejected))
+    }
+
+    pub async fn command_rejection(&self, command_id: &str) -> anyhow::Result<Option<String>> {
+        Ok(sqlx::query_scalar("SELECT rejection FROM applied_commands WHERE command_id = ?")
+            .bind(command_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .flatten())
+    }
+
+    /// Confirm one reset and every retry authorized before its confirmation
+    /// atomically. A retry waiting in the actor's mailbox must not reset again
+    /// over resumed input, or lose its durable ownership to another retry.
+    /// Returns the number of consecutive events appended under the writer lock.
+    pub async fn append_rewind(&self, session_id: &str, event: &SessionEvent) -> anyhow::Result<u64> {
+        let Some(session_event::Kind::Rewound(rewound)) = &event.kind else { anyhow::bail!("Expected a rewind confirmation") };
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let data =
+            sqlx::query_scalar::<_, String>("SELECT data FROM claude_rewinds WHERE session_id = ? AND command_id = ? AND applied_seq = 0")
+                .bind(session_id)
+                .bind(&rewound.command_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let reset = data.map(|data| serde_json::from_str::<crate::claude_code::Reset>(&data)).transpose()?;
+        append_in(&mut tx, session_id, event).await?;
+        let mut count = 1;
+        if let Some(mut reset) = reset {
+            anyhow::ensure!(reset.to_seq == rewound.to_seq, "Rewind confirmation changed its target");
+            for command_id in std::mem::take(&mut reset.retries) {
+                if sqlx::query_scalar::<_, i64>("SELECT 1 FROM applied_commands WHERE command_id = ?")
+                    .bind(&command_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .is_some()
+                {
+                    continue;
+                }
+                let confirmation = SessionEvent {
+                    seq: event.seq + count,
+                    ts_ms: event.ts_ms,
+                    kind: Some(session_event::Kind::Rewound(c6_proto::Rewound { command_id, ..rewound.clone() })),
+                };
+                append_in(&mut tx, session_id, &confirmation).await?;
+                count += 1;
+            }
+            // All receipt markers describe this branch. Its highwater must
+            // cover the final one, or reload would discard the native mapping.
+            sqlx::query("UPDATE claude_rewinds SET data = ?, applied_seq = ? WHERE session_id = ? AND command_id = ?")
+                .bind(serde_json::to_string(&reset)?)
+                .bind((event.seq + count - 1) as i64)
+                .bind(session_id)
+                .bind(&rewound.command_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        self.appended.notify_one();
+        Ok(count)
     }
 
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
