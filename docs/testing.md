@@ -1690,7 +1690,11 @@ usable clear rectangle fits the measured box width and control minimum.
 Cases use Motion Off and assert settled geometry, not animated enter/exit
 stability. It checks one thread at a time,
 the separate thread/message menus and their SVGs, multiline replies with
-menus open, nearby Reply/Resolve and the quiet agent footer. Full-panel checks
+menus open, nearby Reply/Resolve and the quiet agent footer. The 320px phone
+case also narrows the real viewport to 240px to check both new-comment and
+reply action rows: Send to agent takes its own full-width line with an
+unbroken label, Cancel/Comment stay together below it, Send now wraps below
+the reply switch, and the controls remain reachable and operable. Full-panel checks
 cover recursive document order, independent and bulk collapse, per-document
 browser persistence, reply and own-edit drafts, quote jumps, collapsed new
 replies and one scrolling list with no nested thread scrollers. In margin-fit

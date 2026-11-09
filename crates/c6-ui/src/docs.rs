@@ -3203,12 +3203,14 @@ fn NewComment(block: String, done: Callback<()>) -> impl IntoView {
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             <textarea node_ref=writing rows="1" class=format!("{INPUT} {COMMENT_GROWS}") placeholder="Your comment" prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev))
                 on:keydown=move |ev| if ev.key() == "Escape" { ev.prevent_default(); done.run(()) } else if crate::util::sends(&ev) { ev.prevent_default(); post() } />
-            <div class="flex items-center gap-2">
-                <div class="flex-1">
+            <div class="flex flex-wrap items-center gap-2">
+                <div class="min-w-0 flex-1 basis-40">
                     <crate::components::Switch on=move || to_agent.get() on_change=move |v| to_agent.set(v) label="Send to agent" title="The session that last wrote it gets the thread (queued if busy), else the newest one of the document's work or project" />
                 </div>
-                <button class=BUTTON_QUIET on:click=move |_| done.run(())>"Cancel"</button>
-                <button class=BUTTON on:click=move |_| post()>"Comment"</button>
+                <div class="flex shrink-0 items-center gap-2">
+                    <button class=BUTTON_QUIET on:click=move |_| done.run(())>"Cancel"</button>
+                    <button class=BUTTON on:click=move |_| post()>"Comment"</button>
+                </div>
             </div>
         </div>
     }
@@ -3699,8 +3701,8 @@ fn Thread(id: String, about: bool) -> impl IntoView {
                     <button class="min-h-9 shrink-0 text-xs text-muted hover:underline" on:click=move |_| if !archived.get_untracked() { spawn_local(async move { done(api::doc_thread_resolve(doc.get_value(), tid.get_value()).await) }) }>"Resolve"</button>
                 })}
             </div>
-            <div class="flex shrink-0 items-center gap-2 text-xs text-muted">
-                <div class="min-w-0 flex-1 [&>button]:min-h-7 [&>button]:text-xs pointer-coarse:[&>button]:min-h-11"><crate::components::Switch on=move || to_agent.get() on_change=move |v| to_agent.set(v) label="Send to agent" title="Send the thread to an agent" /></div>
+            <div class="flex shrink-0 flex-wrap items-center gap-2 text-xs text-muted">
+                <div class="min-w-0 flex-1 basis-40 [&>button]:min-h-7 [&>button]:text-xs pointer-coarse:[&>button]:min-h-11"><crate::components::Switch on=move || to_agent.get() on_change=move |v| to_agent.set(v) label="Send to agent" title="Send the thread to an agent" /></div>
                 {move || t.with(|t| t.unsent).then(|| view! {
                     <button class="shrink-0 text-sky-700 hover:underline dark:text-sky-400" title="Your last comment here hasn't gone to an agent: send the thread now" on:click=send_unsent>"Send now"</button>
                 })}

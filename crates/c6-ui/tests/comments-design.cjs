@@ -185,7 +185,7 @@ async function check(browser, origin, engine, name, theme) {
     const capture = async (state, surface) => {
       f.phase = state;
       await settle(page);
-      const geometry = { state, anchor: await rect(anchor), tile: await rect(tile),
+      const geometry = { state, viewport: page.viewportSize(), anchor: await rect(anchor), tile: await rect(tile),
         surface: surface ? await rect(surface) : null,
         reading: await tile.locator(before ? 'main' : '[data-doc-reading]').first().evaluate(el => {
           const r = el.getBoundingClientRect(); return { x: r.x, y: r.y, width: r.width, height: r.height, right: r.right, bottom: r.bottom };
@@ -565,6 +565,47 @@ async function check(browser, origin, engine, name, theme) {
       assert.deepEqual(resolves.map(r => r.path), [`/api/v1/docs/${DOC}/threads/${LATER}/resolve`], 'only the user’s Resolve action sends a resolve request');
       await panel().getByRole('button', { name: 'Resolved', exact: true }).click();
       await row(LATER).waitFor(); await capture('panel-resolved', panel());
+      if (name === 'phone-small') {
+        // Use a real narrower viewport, not CSS overrides: both forms must
+        // wrap their actions instead of squeezing the switch's label.
+        await close(panel(), 'Close the comments');
+        await page.setViewportSize({ width: 240, height }); await settle(page);
+        await openBlock();
+        const wrappedActions = async names => {
+          const agent = pop().getByRole('switch', { name: 'Send to agent', exact: true });
+          const bounds = await rect(agent.locator('..').locator('..')), s = await rect(agent);
+          contained(s, bounds, 'narrow agent switch stays within its action row');
+          assert(Math.abs(s.x - bounds.x) < 1 && Math.abs(s.right - bounds.right) < 1,
+            'narrow agent switch takes its own full-width line');
+          const lines = await agent.locator('span').first().evaluate(el => {
+            const range = document.createRange(); range.selectNodeContents(el);
+            return range.getClientRects().length;
+          });
+          assert.equal(lines, 1, 'Send to agent label stays on one line');
+          const actions = [];
+          for (const name of names) {
+            const button = pop().getByRole('button', { name, exact: true }), b = await rect(button);
+            contained(b, bounds, `${name} stays within the wrapped action row`);
+            assert(b.y >= s.bottom - 1, `${name} wraps below the switch`);
+            actions.push(b);
+          }
+          if (actions.length === 2) {
+            assert(Math.abs(actions[0].y - actions[1].y) < 1, 'Cancel and Comment stay together');
+            assert(actions[0].right <= actions[1].x, 'Cancel and Comment do not overlap');
+          }
+          const was = await agent.getAttribute('aria-checked');
+          await agent.click();
+          assert.equal(await agent.getAttribute('aria-checked'), was === 'true' ? 'false' : 'true',
+            'wrapped agent switch remains operable');
+          await agent.click();
+          await reachablePopControls('narrow-actions');
+        };
+        await wrappedActions(['Send now']); await capture('narrow-thread-actions', pop());
+        await threadMenu('New thread on this block');
+        await pop().getByPlaceholder('Your comment').fill('A narrow comment keeps all its actions reachable');
+        await wrappedActions(['Cancel', 'Comment']); await capture('narrow-new-comment-actions', pop());
+        await pop().getByRole('button', { name: 'Cancel', exact: true }).click();
+      }
     }
     assert.equal(deferred.size, 0, 'all deferred API hooks received their intended requests');
     assert.equal(held.size, 0, 'all deferred API responses were explicitly released');
