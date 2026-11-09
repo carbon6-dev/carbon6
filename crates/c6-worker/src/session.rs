@@ -226,6 +226,9 @@ pub(crate) enum ActorMsg {
     RemoteReport(String, Box<c6_proto::DelegationEnded>),
     /// Deliver the held notices now, whatever the hourly limit (you asked).
     ReleaseNotices,
+    /// Its turn `.0` was cut short by a worker restart: it goes on
+    /// (docs/restarts.md §4).
+    Resume(u64),
     /// From the log, on reload (docs/background.md §5): when notices
     /// started turns in the last hour, the ids of every notice recorded,
     /// and those no turn took, to deliver again.
@@ -284,8 +287,15 @@ impl SessionManager {
     async fn bridge(&self) -> Option<Arc<crate::mcp_bridge::Bridge>> {
         self.bridge
             .get_or_init(|| async {
-                crate::mcp_bridge::Bridge::start()
+                // On the port it had before a restart: held Claude Code
+                // processes still call it there (docs/restarts.md §3).
+                let file = self.state_dir.join("mcp-bridge-port");
+                let port = std::fs::read_to_string(&file).ok().and_then(|p| p.trim().parse().ok());
+                crate::mcp_bridge::Bridge::start_at(port)
                     .await
+                    .inspect(|b| {
+                        let _ = std::fs::write(&file, b.port().to_string());
+                    })
                     .map(Arc::new)
                     .inspect_err(|e| warn!("the MCP bridge for Claude Code did not start: {e:#}"))
                     .ok()
@@ -391,11 +401,18 @@ impl SessionManager {
         // Claude Code processes the previous worker left go first: their
         // sessions resume their conversations in processes of their own.
         crate::claude_code::sweep_orphans(&self.claude_dir()).await;
+        let mut cut_short = Vec::new();
         for (session_id, last_seq, turn) in self.journal.open_turns().await? {
             warn!(session = %session_id, turn, "closing turn interrupted by worker restart");
             // A subagent the turn was waiting on: its call gets what it did.
             let mut seq = last_seq;
-            for result in self.lost_delegations(&session_id).await? {
+            let lost = self.lost_delegations(&session_id).await?;
+            // A turn that waited on a subagent working elsewhere is woken by
+            // its report; the others go on now (docs/restarts.md §4).
+            if !lost.iter().any(|r| r.output.contains("status=\"running\" on=")) {
+                cut_short.push((session_id.clone(), turn));
+            }
+            for result in lost {
                 seq += 1;
                 let ev = SessionEvent { seq, ts_ms: c6_core::now_ms(), kind: Some(session_event::Kind::ToolResult(result)) };
                 self.journal.append(&session_id, &ev).await?;
@@ -406,6 +423,25 @@ impl SessionManager {
                 kind: Some(session_event::Kind::TurnEnded(TurnEnded { turn, reason: TurnEndReason::WorkerRestarted as i32 })),
             };
             self.journal.append(&session_id, &ev).await?;
+        }
+        // Turns the restart cut short go on (docs/restarts.md §4): the agent
+        // carries on from its log. (One whose Claude Code process was held
+        // carries on by itself.)
+        for (session_id, turn) in cut_short {
+            match self.actor(&session_id).await {
+                Ok(Some(tx)) => {
+                    let _ = tx.send(ActorMsg::Resume(turn));
+                }
+                Ok(None) => {}
+                Err(e) => warn!(session = %session_id, "resuming its turn: {e:#}"),
+            }
+        }
+        // Claude Code processes the previous worker held went on: their
+        // sessions take them up (docs/restarts.md §3).
+        for session_id in crate::claude_code::Process::held_sessions(&self.claude_dir().join("held")) {
+            if let Err(e) = self.actor(&session_id).await {
+                warn!(session = %session_id, "taking up its Claude Code process: {e:#}");
+            }
         }
         // Background tasks died with the previous process: resuming those
         // sessions reports them as lost.
@@ -1528,6 +1564,7 @@ type TurnTask = tokio::task::JoinHandle<Option<(Conversation, Option<crate::clau
 
 impl Actor {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<ActorMsg>) {
+        self.take_up_held().await;
         let mut running: Option<(TurnTask, CancellationToken)> = None;
         // A rewind that waits for the running turn to stop.
         let mut rewind: Option<(String, u64, bool)> = None;
@@ -1780,6 +1817,24 @@ impl Actor {
                         let held = lost_native && self.after_stop(running.is_some());
                         if let Err(e) = self.task_event(record, notice, running.is_some() && !held, !held).await {
                             error!(session = %self.writer.session_id, "recording a background task: {e:#}");
+                            return;
+                        }
+                    }
+                    Some(ActorMsg::Resume(turn)) => {
+                        // A subagent's parent decides (its call got what it did);
+                        // a held Claude Code process carries on by itself.
+                        if self.spec.delegation.is_some() || (self.runs_claude_code() && self.claude.is_some()) {
+                            continue;
+                        }
+                        let text = spec_prompt(&self.spec, "session.resume_after_restart", c6_agent::RESUME_AFTER_RESTART);
+                        let input = PendingInput {
+                            command_id: format!("resume-after-restart-{turn}"),
+                            text,
+                            command: "task-notification".into(),
+                            ..Default::default()
+                        };
+                        if let Err(e) = self.notice(input, running.is_some(), true).await {
+                            error!(session = %self.writer.session_id, "resuming after a restart: {e:#}");
                             return;
                         }
                     }
@@ -2268,6 +2323,58 @@ impl Actor {
         Ok(())
     }
 
+    /// After a restart: the Claude Code process the previous worker held for
+    /// this session, taken up where it was (docs/restarts.md §3). What it
+    /// writes from here on comes in as it would have (a turn it carries on
+    /// shows as one it started by itself).
+    async fn take_up_held(&mut self) {
+        if !self.runs_claude_code() || self.claude.is_some() {
+            return;
+        }
+        let held = self.manager.claude_dir().join("held");
+        let Ok(events) = self.journal.events_after(&self.writer.session_id, 0, u32::MAX).await else { return };
+        let conversation = claude_conversation(&self.writer.session_id, &self.spec, &events).id;
+        let Some(token) = crate::claude_code::Process::held_token(&held, &conversation) else { return };
+        let bridge_tools = self.claude_code_subagent_tools();
+        let registration = match token {
+            Some(token) if !bridge_tools.is_empty() => self.manager.bridge().await.map(|b| {
+                b.register_as(
+                    token,
+                    crate::mcp_bridge::Entry {
+                        session_id: self.writer.session_id.clone(),
+                        session: self.session_tools.clone(),
+                        tools: bridge_tools,
+                        cancel: Mutex::default(),
+                        journal: self.journal.clone(),
+                        matched: Mutex::default(),
+                        policies: self.policies.clone(),
+                        instructions: CLAUDE_CODE_INTRO.into(),
+                        core: claude_code_core(&self.spec),
+                    },
+                )
+            }),
+            _ => None,
+        };
+        let observer = Arc::new(crate::claude_code::Observer {
+            tools: self.session_tools.clone(),
+            journal: self.journal.clone(),
+            link: self.link.clone(),
+            session_id: self.writer.session_id.clone(),
+            spec: self.spec.clone(),
+            started: self.started.clone(),
+        });
+        let model = self.spec.model.as_ref().map(|m| m.model.clone()).unwrap_or_default();
+        self.claude = crate::claude_code::Process::attach(
+            &held,
+            &conversation,
+            &self.session_tools.cwd(),
+            &model,
+            self.claude_stdin.clone(),
+            registration,
+            Some(observer),
+        );
+    }
+
     fn runs_claude_code(&self) -> bool {
         self.started.tool_profile == crate::claude_code::PROFILE
     }
@@ -2581,6 +2688,7 @@ impl Actor {
                 };
                 let process = claude.take();
                 let result = claude_turn(
+                    &writer.session_id,
                     turn,
                     process,
                     &conversation,
@@ -2635,6 +2743,7 @@ impl Actor {
 /// inbox.
 #[allow(clippy::too_many_arguments)]
 async fn claude_turn(
+    session: &str,
     turn: u64,
     mut process: Option<crate::claude_code::Process>,
     conversation: &crate::claude_code::ClaudeConversation,
@@ -2682,11 +2791,21 @@ async fn claude_turn(
             let Some(bin) = crate::claude_code::find_claude() else {
                 return failed("Claude Code (`claude`) is not installed on this worker, or not on its PATH. Install it and sign in with `claude auth login`, or set C6_CLAUDE_BIN.".into()).await;
             };
-            match Process::spawn(&bin, launch.clone(), conversation.resume, cwd, model, stdin.clone(), register(), Some(observer.clone())) {
-                Ok(mut p) => {
-                    p.record_in(claude_dir);
-                    (p, Some(bin))
-                }
+            // Held: it goes on if this worker restarts, and the next one
+            // takes it up (docs/restarts.md §3).
+            match Process::spawn_held(
+                &claude_dir.join("held"),
+                session,
+                &bin,
+                launch.clone(),
+                conversation.resume,
+                cwd,
+                model,
+                stdin.clone(),
+                register(),
+                Some(observer.clone()),
+            ) {
+                Ok(p) => (p, Some(bin)),
                 Err(e) => return failed(format!("failed to start Claude Code: {e}")).await,
             }
         }
@@ -2709,11 +2828,19 @@ async fn claude_turn(
         && let Some(bin) = &bin
     {
         drop(p);
-        p = match Process::spawn(bin, launch, false, cwd, model, stdin.clone(), register(), Some(observer)) {
-            Ok(mut p) => {
-                p.record_in(claude_dir);
-                p
-            }
+        p = match Process::spawn_held(
+            &claude_dir.join("held"),
+            session,
+            bin,
+            launch,
+            false,
+            cwd,
+            model,
+            stdin.clone(),
+            register(),
+            Some(observer),
+        ) {
+            Ok(p) => p,
             Err(e) => {
                 sink.append(session_event::Kind::Error(ErrorEvent { message: format!("failed to start Claude Code: {e}") })).await?;
                 sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: TurnEndReason::Error as i32 })).await?;

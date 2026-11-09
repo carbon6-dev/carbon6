@@ -84,7 +84,7 @@ const CLOSE_GRACE: Duration = Duration::from_secs(10);
 
 /// What a process was started with: a turn that needs something else
 /// starts a new one. The model is not here: it is switched in place.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Launch {
     /// The Claude Code conversation it runs.
     pub conversation: String,
@@ -220,7 +220,107 @@ fn unexpected(init: &Value, native: &[String]) -> Vec<String> {
 
 /// Where a session's process takes its input. Shared with the session's
 /// actor, which can stop a background task while a turn holds the process.
-pub type Stdin = Arc<tokio::sync::Mutex<Option<tokio::process::ChildStdin>>>;
+pub type Stdin = Arc<tokio::sync::Mutex<Option<ClaudeInput>>>;
+
+/// Where a process's input goes: its pipe, or the named pipe a held process
+/// reads (docs/restarts.md §3).
+pub enum ClaudeInput {
+    Pipe(tokio::process::ChildStdin),
+    Fifo(tokio::fs::File),
+}
+
+impl tokio::io::AsyncWrite for ClaudeInput {
+    fn poll_write(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            ClaudeInput::Pipe(p) => std::pin::Pin::new(p).poll_write(cx, buf),
+            ClaudeInput::Fifo(f) => std::pin::Pin::new(f).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ClaudeInput::Pipe(p) => std::pin::Pin::new(p).poll_flush(cx),
+            ClaudeInput::Fifo(f) => std::pin::Pin::new(f).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ClaudeInput::Pipe(p) => std::pin::Pin::new(p).poll_shutdown(cx),
+            ClaudeInput::Fifo(f) => std::pin::Pin::new(f).poll_shutdown(cx),
+        }
+    }
+}
+
+/// A held process (docs/restarts.md §3): it runs apart from the worker,
+/// reading a named pipe a keeper process holds open and writing to files,
+/// so it goes on when the worker restarts and the next worker takes it up.
+/// Its folder: `in` (the named pipe), `out`, `err`, `code` (its exit code,
+/// once it ends), `offset` (how far its output was taken) and `meta.json`.
+pub(crate) struct Held {
+    dir: PathBuf,
+    keeper: Pid,
+    offset: Arc<std::sync::atomic::AtomicU64>,
+    /// Stopped or closed on purpose: its folder goes with it.
+    done: bool,
+}
+
+/// What a held process records about itself.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HeldMeta {
+    session: String,
+    conversation: String,
+    pgid: i32,
+    keeper: i32,
+    output_root: Option<PathBuf>,
+    token: Option<String>,
+    #[serde(default)]
+    launch: Launch,
+}
+
+/// Follows a held process's output file from `offset`: each JSON line, with
+/// where it ends; closed once its exit code is written and all is read.
+fn follow_held(dir: PathBuf, offset: u64) -> tokio::sync::mpsc::UnboundedReceiver<(u64, Value)> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let Ok(mut f) = tokio::fs::File::open(dir.join("out")).await else { return };
+        if f.seek(std::io::SeekFrom::Start(offset)).await.is_err() {
+            return;
+        }
+        let (mut pos, mut partial, mut buf) = (offset, Vec::<u8>::new(), vec![0u8; 64 * 1024]);
+        let code = dir.join("code");
+        // Its exit code is written after its last output: one more read
+        // once it is there, then nothing more comes.
+        let mut last = false;
+        loop {
+            match f.read(&mut buf).await {
+                Ok(n) if n > 0 => {
+                    partial.extend_from_slice(&buf[..n]);
+                    while let Some(i) = partial.iter().position(|b| *b == b'\n') {
+                        let line: Vec<u8> = partial.drain(..=i).collect();
+                        pos += line.len() as u64;
+                        let text = String::from_utf8_lossy(&line);
+                        if text.trim().is_empty() {
+                            continue;
+                        }
+                        match serde_json::from_str::<Value>(text.trim()) {
+                            Ok(v) => {
+                                if tx.send((pos, v)).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(_) => warn!(line = %text.chars().take(200).collect::<String>(), "non-JSON output from claude"),
+                        }
+                    }
+                }
+                Ok(_) if last => return,
+                Ok(_) if code.exists() => last = true,
+                Ok(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+                Err(_) => return,
+            }
+        }
+    });
+    rx
+}
 
 /// Writes one stream-json line.
 async fn write_line(stdin: &Stdin, v: &Value) -> std::io::Result<()> {
@@ -277,10 +377,14 @@ pub struct TurnEnd {
 /// outlive the turn that started them, and a task that ends while the
 /// session is idle wakes the agent: the CLI starts a turn of its own.
 pub(crate) struct Process {
-    child: tokio::process::Child,
+    /// Its process, when this worker started it (a held one taken up after
+    /// a restart is no child of this worker's).
+    child: Option<tokio::process::Child>,
     stdin: Stdin,
-    /// Its stdout, a JSON value per line; closed when it exits.
-    lines: tokio::sync::mpsc::UnboundedReceiver<Value>,
+    /// Its stdout, a JSON value per line with where it ends in a held
+    /// process's output file; closed when it exits.
+    lines: tokio::sync::mpsc::UnboundedReceiver<(u64, Value)>,
+    held: Option<Held>,
     stderr: Option<tokio::task::JoinHandle<String>>,
     pgid: Option<Pid>,
     launch: Launch,
@@ -342,8 +446,13 @@ pub(crate) struct Process {
 
 impl Drop for Process {
     fn drop(&mut self) {
+        // A held one goes on without this worker; the next takes it up
+        // (docs/restarts.md §3).
+        if self.held.as_ref().is_some_and(|h| !h.done) {
+            return;
+        }
         // Its background tasks are in its process group: none outlive it.
-        if let (Ok(None), Some(pg)) = (self.child.try_wait(), self.pgid) {
+        if let (Some(Ok(None)), Some(pg)) = (self.child.as_mut().map(|c| c.try_wait()), self.pgid) {
             let _ = killpg(pg, Signal::SIGKILL);
         }
         if let Some(p) = &self.pidfile {
@@ -405,6 +514,39 @@ impl Process {
         mcp: Option<crate::mcp_bridge::Registration>,
         observer: Option<Arc<Observer>>,
     ) -> std::io::Result<Self> {
+        Self::spawn_with(bin, launch, resume, cwd, model, stdin, mcp, observer, None)
+    }
+
+    /// `spawn`, held in `dir` for session `session` (docs/restarts.md §3):
+    /// it outlives this worker, and the next one takes it up ([`Process::attach`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_held(
+        dir: &Path,
+        session: &str,
+        bin: &Path,
+        launch: Launch,
+        resume: bool,
+        cwd: &Path,
+        model: &str,
+        stdin: Stdin,
+        mcp: Option<crate::mcp_bridge::Registration>,
+        observer: Option<Arc<Observer>>,
+    ) -> std::io::Result<Self> {
+        Self::spawn_with(bin, launch, resume, cwd, model, stdin, mcp, observer, Some((dir, session)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_with(
+        bin: &Path,
+        launch: Launch,
+        resume: bool,
+        cwd: &Path,
+        model: &str,
+        stdin: Stdin,
+        mcp: Option<crate::mcp_bridge::Registration>,
+        observer: Option<Arc<Observer>>,
+        held_in: Option<(&Path, &str)>,
+    ) -> std::io::Result<Self> {
         let output_root = match OutputRoot::new() {
             Ok(root) => Some(root),
             Err(e) => {
@@ -460,33 +602,55 @@ impl Process {
         // no tasks, or when the worker is gone: then nobody reads it, so it
         // should not go on (docs/background.md §4).
         cmd.env("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", "5000");
-        cmd.current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0).kill_on_drop(true);
-        let mut child = cmd.spawn()?;
-        let pgid = child.id().map(|id| Pid::from_raw(id as i32));
-        *stdin.try_lock().map_err(|_| std::io::Error::other("the session's Claude Code input is busy"))? = child.stdin.take();
-        let mut stderr = child.stderr.take().expect("piped");
-        let stderr = tokio::spawn(async move {
-            let mut buf = String::new();
-            let _ = stderr.read_to_string(&mut buf).await;
-            buf
-        });
-        let (tx, lines) = tokio::sync::mpsc::unbounded_channel();
-        let mut out = BufReader::new(child.stdout.take().expect("piped")).lines();
-        tokio::spawn(async move {
-            while let Ok(Some(l)) = out.next_line().await {
-                if l.trim().is_empty() {
-                    continue;
+        let mut output_root = output_root;
+        let (child, lines, stderr, pgid, held) = match held_in {
+            Some((dir, session)) => {
+                let (child, held, pgid) =
+                    Self::start_held(&mut cmd, cwd, dir, session, &launch, &stdin, mcp.as_ref(), output_root.as_ref())?;
+                // Its folder (the guidance file) lives as long as it does.
+                if let Some(root) = output_root.take() {
+                    std::mem::forget(root);
                 }
-                match serde_json::from_str::<Value>(&l) {
-                    Ok(v) => {
-                        if tx.send(v).is_err() {
-                            break;
+                let lines = follow_held(held.dir.clone(), 0);
+                (Some(child), lines, None, pgid, Some(held))
+            }
+            None => {
+                cmd.current_dir(cwd)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .process_group(0)
+                    .kill_on_drop(true);
+                let mut child = cmd.spawn()?;
+                let pgid = child.id().map(|id| Pid::from_raw(id as i32));
+                *stdin.try_lock().map_err(|_| std::io::Error::other("the session's Claude Code input is busy"))? =
+                    child.stdin.take().map(ClaudeInput::Pipe);
+                let mut stderr = child.stderr.take().expect("piped");
+                let stderr = tokio::spawn(async move {
+                    let mut buf = String::new();
+                    let _ = stderr.read_to_string(&mut buf).await;
+                    buf
+                });
+                let (tx, lines) = tokio::sync::mpsc::unbounded_channel();
+                let mut out = BufReader::new(child.stdout.take().expect("piped")).lines();
+                tokio::spawn(async move {
+                    while let Ok(Some(l)) = out.next_line().await {
+                        if l.trim().is_empty() {
+                            continue;
+                        }
+                        match serde_json::from_str::<Value>(&l) {
+                            Ok(v) => {
+                                if tx.send((0u64, v)).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => warn!(line = %l.chars().take(200).collect::<String>(), "non-JSON output from claude"),
                         }
                     }
-                    Err(_) => warn!(line = %l.chars().take(200).collect::<String>(), "non-JSON output from claude"),
-                }
+                });
+                (Some(child), lines, Some(stderr), pgid, None)
             }
-        });
+        };
         let mapper = Mapper {
             turn: 0,
             scope: launch.conversation.clone(),
@@ -507,7 +671,8 @@ impl Process {
             child,
             stdin,
             lines,
-            stderr: Some(stderr),
+            held,
+            stderr,
             pgid,
             launch,
             resumed: resume,
@@ -542,12 +707,240 @@ impl Process {
     }
 
     /// Records its process group in `dir` while it runs.
-    pub fn record_in(&mut self, dir: &Path) {
-        let Some(pg) = self.pgid else { return };
-        let path = dir.join(format!("{}.pid", self.launch.conversation));
-        match std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, format!("{pg}\n{}\n", self.launch.conversation))) {
-            Ok(()) => self.pidfile = Some(path),
-            Err(e) => warn!(%e, "cannot record the Claude Code process"),
+    /// Starts `cmd` held in `dir`/<conversation> (see [`Held`]): through a
+    /// shell that writes its exit code, its input the named pipe (which a
+    /// keeper in its process group holds open), its output in files.
+    #[allow(clippy::too_many_arguments)]
+    fn start_held(
+        cmd: &mut tokio::process::Command,
+        cwd: &Path,
+        dir: &Path,
+        session: &str,
+        launch: &Launch,
+        stdin: &Stdin,
+        mcp: Option<&crate::mcp_bridge::Registration>,
+        output_root: Option<&OutputRoot>,
+    ) -> std::io::Result<(tokio::process::Child, Held, Option<Pid>)> {
+        let dir = dir.join(&launch.conversation);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let fifo = dir.join("in");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR).map_err(std::io::Error::from)?;
+        // The worker's end reads too, so opening it never waits; with it
+        // open, opening the process's end doesn't either.
+        let writer = std::fs::OpenOptions::new().read(true).write(true).open(&fifo)?;
+        let reader = std::fs::OpenOptions::new().read(true).open(&fifo)?;
+        let std_cmd = cmd.as_std();
+        let program = std_cmd.get_program().to_owned();
+        let args: Vec<std::ffi::OsString> = std_cmd.get_args().map(|a| a.to_owned()).collect();
+        let envs: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> =
+            std_cmd.get_envs().map(|(k, v)| (k.to_owned(), v.map(|v| v.to_owned()))).collect();
+        let mut wrapped = tokio::process::Command::new("/bin/sh");
+        wrapped.arg("-c").arg(r#""$@"; echo $? > "$C6_HELD_CODE""#).arg("sh").arg(&program).args(&args);
+        for (k, v) in envs {
+            match v {
+                Some(v) => wrapped.env(k, v),
+                None => wrapped.env_remove(k),
+            };
+        }
+        wrapped
+            .env("C6_HELD_CODE", dir.join("code"))
+            .current_dir(cwd)
+            .stdin(Stdio::from(reader))
+            .stdout(Stdio::from(std::fs::File::create(dir.join("out"))?))
+            .stderr(Stdio::from(std::fs::File::create(dir.join("err"))?))
+            .process_group(0);
+        let child = wrapped.spawn()?;
+        let pgid = child.id().map(|id| Pid::from_raw(id as i32));
+        // Holds the pipe open while no worker does, so the process never
+        // reads an end of its input by a restart; in its process group, so
+        // stopping it stops the keeper too.
+        let keeper = {
+            use std::os::unix::process::CommandExt;
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(r#"exec 3<>"$0"; exec sleep 2147483647"#)
+                .arg(&fifo)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(pgid.map_or(0, |p| p.as_raw()))
+                .spawn()?
+        };
+        let keeper = Pid::from_raw(keeper.id() as i32);
+        *stdin.try_lock().map_err(|_| std::io::Error::other("the session's Claude Code input is busy"))? =
+            Some(ClaudeInput::Fifo(tokio::fs::File::from_std(writer)));
+        let meta = HeldMeta {
+            session: session.to_owned(),
+            conversation: launch.conversation.clone(),
+            pgid: pgid.map_or(0, |p| p.as_raw()),
+            keeper: keeper.as_raw(),
+            output_root: output_root.map(|r| r.0.clone()),
+            token: mcp.map(|m| m.token().to_owned()),
+            launch: launch.clone(),
+        };
+        std::fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).unwrap_or_default())?;
+        std::fs::write(dir.join("offset"), "0")?;
+        Ok((child, Held { dir, keeper, offset: Arc::new(std::sync::atomic::AtomicU64::new(0)), done: false }, pgid))
+    }
+
+    /// Whether a previous worker left a held process for `conversation`,
+    /// and the bridge token it calls carbon6's tools with (to register it
+    /// again before [`Process::attach`]).
+    pub(crate) fn held_token(held: &Path, conversation: &str) -> Option<Option<String>> {
+        let meta: HeldMeta = serde_json::from_slice(&std::fs::read(held.join(conversation).join("meta.json")).ok()?).ok()?;
+        Some(meta.token)
+    }
+
+    /// The sessions previous workers left held processes for.
+    pub(crate) fn held_sessions(held: &Path) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(held) else { return Vec::new() };
+        entries
+            .flatten()
+            .filter_map(|e| serde_json::from_slice::<HeldMeta>(&std::fs::read(e.path().join("meta.json")).ok()?).ok())
+            .map(|m| m.session)
+            .collect()
+    }
+
+    /// Takes up the held process a previous worker left for `launch`'s
+    /// conversation, where it had read up to (docs/restarts.md §3). None:
+    /// there is none, or it has ended (its folder is cleared).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attach(
+        held: &Path,
+        conversation: &str,
+        cwd: &Path,
+        model: &str,
+        stdin: Stdin,
+        mcp: Option<crate::mcp_bridge::Registration>,
+        observer: Option<Arc<Observer>>,
+    ) -> Option<Self> {
+        let dir = held.join(conversation);
+        let meta: HeldMeta = serde_json::from_slice(&std::fs::read(dir.join("meta.json")).ok()?).ok()?;
+        let launch = meta.launch.clone();
+        let pg = Pid::from_raw(meta.pgid);
+        if meta.pgid <= 0 || dir.join("code").exists() || nix::sys::signal::kill(pg, None).is_err() {
+            let _ = nix::sys::signal::kill(Pid::from_raw(meta.keeper), Signal::SIGTERM);
+            let _ = std::fs::remove_dir_all(&dir);
+            if let Some(r) = &meta.output_root {
+                let _ = std::fs::remove_dir_all(r);
+            }
+            return None;
+        }
+        let writer = std::fs::OpenOptions::new().read(true).write(true).open(dir.join("in")).ok()?;
+        *stdin.try_lock().ok()? = Some(ClaudeInput::Fifo(tokio::fs::File::from_std(writer)));
+        let offset = std::fs::read_to_string(dir.join("offset")).ok().and_then(|o| o.trim().parse::<u64>().ok()).unwrap_or(0);
+        let lines = follow_held(dir.clone(), offset);
+        info!(conversation = %launch.conversation, offset, "took up a Claude Code process the previous worker held");
+        let mapper = Mapper {
+            turn: 0,
+            scope: launch.conversation.clone(),
+            output_root: meta.output_root.clone(),
+            saw_output: true,
+            result: None,
+            interrupted: false,
+            observer,
+            calls: HashMap::new(),
+            mcp_calls: HashSet::new(),
+            children: HashMap::new(),
+            backgrounded: HashSet::new(),
+            task_calls: HashMap::new(),
+            call_usage: HashMap::new(),
+            per_call: false,
+        };
+        Some(Self {
+            child: None,
+            stdin,
+            lines,
+            held: Some(Held {
+                dir,
+                keeper: Pid::from_raw(meta.keeper),
+                offset: Arc::new(std::sync::atomic::AtomicU64::new(offset)),
+                done: false,
+            }),
+            stderr: None,
+            pgid: Some(pg),
+            launch,
+            resumed: true,
+            model: model.to_owned(),
+            mapper,
+            unconfirmed: Default::default(),
+            pending: None,
+            notified: Vec::new(),
+            subagent_tasks: HashSet::new(),
+            unwoken: Vec::new(),
+            wake_due: None,
+            after_stop: None,
+            quiet: false,
+            unshown: false,
+            cwd: cwd.to_owned(),
+            transcripts: transcripts_root(),
+            last_uuid: None,
+            turn_tasks: Vec::new(),
+            stop_mark: None,
+            idle_since: tokio::time::Instant::now(),
+            send_now: None,
+            old_send_now: false,
+            checked_init: false,
+            registration: mcp,
+            pidfile: None,
+            _output_root: None,
+        })
+    }
+
+    /// A line was taken from a held process's output: a restarted worker
+    /// reads on from after it (deltas as they stream aren't saved one by
+    /// one: they're shown only while live).
+    fn consumed(&self, end: u64, v: &Value) {
+        if let Some(h) = &self.held
+            && end > 0
+        {
+            h.offset.store(end, std::sync::atomic::Ordering::SeqCst);
+            if v["type"] != "stream_event" {
+                let _ = std::fs::write(h.dir.join("offset"), end.to_string());
+            }
+        }
+    }
+
+    /// Waits for it to end: as this worker's child, or, held by a previous
+    /// worker, until its exit code is written or its process group is gone.
+    async fn wait_exit(&mut self) -> String {
+        if let Some(c) = self.child.as_mut() {
+            return c.wait().await.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string());
+        }
+        let Some(h) = &self.held else { return String::new() };
+        let code = h.dir.join("code");
+        loop {
+            if let Ok(c) = std::fs::read_to_string(&code) {
+                return format!("exit status: {}", c.trim());
+            }
+            if self.pgid.is_none_or(|g| nix::sys::signal::kill(g, None).is_err()) {
+                return "gone".into();
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// What it wrote to stderr: its pipe's, or a held process's file.
+    async fn stderr_text(&mut self) -> String {
+        if let Some(t) = self.stderr.take() {
+            return t.await.unwrap_or_default();
+        }
+        self.held.as_ref().and_then(|h| std::fs::read_to_string(h.dir.join("err")).ok()).unwrap_or_default()
+    }
+
+    /// It has ended (or is stopped on purpose): a held process's folder,
+    /// keeper and guidance go with it.
+    fn release_held(&mut self) {
+        if let Some(h) = &mut self.held
+            && !h.done
+        {
+            h.done = true;
+            let _ = nix::sys::signal::kill(h.keeper, Signal::SIGTERM);
+            let _ = std::fs::remove_dir_all(&h.dir);
+            if let Some(r) = &self.mapper.output_root {
+                let _ = std::fs::remove_dir_all(r);
+            }
         }
     }
 
@@ -575,7 +968,9 @@ impl Process {
     /// The next line it wrote (`None`: it exited). For a session's actor
     /// while no turn runs; pass the line to [`Process::idle_line`].
     pub async fn next_line(&mut self) -> Option<Value> {
-        self.lines.recv().await
+        let (end, v) = self.lines.recv().await?;
+        self.consumed(end, &v);
+        Some(v)
     }
 
     /// A line that came while no turn ran. Background-task updates and
@@ -978,7 +1373,10 @@ impl Process {
                         continue;
                     }
                     line = self.lines.recv() => match line {
-                        Some(v) => v,
+                        Some((end, v)) => {
+                            self.consumed(end, &v);
+                            v
+                        }
                         None => { alive = false; continue; }
                     },
                 },
@@ -1064,17 +1462,15 @@ impl Process {
         let interrupted = self.mapper.interrupted;
         self.mapper.close_children(if interrupted { TurnEndReason::Interrupted } else { TurnEndReason::Error }).await?;
         *self.stdin.lock().await = None;
-        let status = match tokio::time::timeout(CLOSE_GRACE, self.child.wait()).await {
-            Ok(s) => s.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string()),
+        let status = match tokio::time::timeout(CLOSE_GRACE, self.wait_exit()).await {
+            Ok(s) => s,
             Err(_) => {
                 self.kill().await;
                 "killed".into()
             }
         };
-        let stderr = match self.stderr.take() {
-            Some(t) => t.await.unwrap_or_default(),
-            None => String::new(),
-        };
+        let stderr = self.stderr_text().await;
+        self.release_held();
         if let Some(obs) = &self.mapper.observer {
             // Only an upstream notification can say how a task ended.
             obs.tools.background.close_native(&self.mapper.scope, c6_tools::TaskState::Lost);
@@ -1101,11 +1497,9 @@ impl Process {
         if let Err(e) = self.mapper.close_children(TurnEndReason::Error).await {
             warn!("closing Claude Code's subagents: {e:#}");
         }
-        let status = self.child.wait().await.map(|s| s.to_string()).unwrap_or_default();
-        let stderr = match self.stderr.take() {
-            Some(t) => t.await.unwrap_or_default(),
-            None => String::new(),
-        };
+        let status = self.wait_exit().await;
+        let stderr = self.stderr_text().await;
+        self.release_held();
         warn!(session = %self.launch.conversation, %status, stderr = %stderr.trim().lines().last().unwrap_or(""), "Claude Code exited between turns");
         *self.stdin.lock().await = None;
         self.take_unsent()
@@ -1114,9 +1508,14 @@ impl Process {
     /// Closes it: no more input, then it exits by itself (or is killed).
     pub async fn close(mut self) {
         *self.stdin.lock().await = None;
-        if tokio::time::timeout(CLOSE_GRACE, self.child.wait()).await.is_err() {
+        // A held one's input ends when its keeper lets go of the pipe too.
+        if let Some(h) = &self.held {
+            let _ = nix::sys::signal::kill(h.keeper, Signal::SIGTERM);
+        }
+        if tokio::time::timeout(CLOSE_GRACE, self.wait_exit()).await.is_err() {
             self.kill().await;
         }
+        self.release_held();
         let _ = self.mapper.close_children(TurnEndReason::Completed).await;
     }
 
@@ -1134,11 +1533,12 @@ impl Process {
         if let Some(pg) = self.pgid {
             // SIGINT lets Claude Code save its transcript; then make sure.
             let _ = killpg(pg, Signal::SIGINT);
-            if tokio::time::timeout(Duration::from_secs(3), self.child.wait()).await.is_err() {
+            if tokio::time::timeout(Duration::from_secs(3), self.wait_exit()).await.is_err() {
                 let _ = killpg(pg, Signal::SIGKILL);
             }
         }
-        let _ = self.child.wait().await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), self.wait_exit()).await;
+        self.release_held();
     }
 }
 
@@ -3150,18 +3550,27 @@ done
         let _ = stranger.wait();
     }
 
-    /// While it runs, a process is recorded; once it is gone, so is the record.
+    /// A held process has its folder while it runs, outlives the
+    /// `Process` that started it when that is merely dropped (a worker
+    /// going), is taken up again, and closing it ends it with its folder.
     #[tokio::test]
-    async fn a_running_process_is_recorded() {
+    async fn a_held_process_outlives_its_worker_and_is_taken_up() {
         let dir = tempfile::tempdir().unwrap();
-        let records = dir.path().join("claude");
+        let held = dir.path().join("held");
         let bin = live_claude(dir.path());
-        let mut p = spawn(&bin, dir.path(), "conv-9", false, None);
-        p.record_in(&records);
-        let line = std::fs::read_to_string(records.join("conv-9.pid")).unwrap();
-        assert!(line.ends_with("\nconv-9\n"), "{line:?}");
+        let launch = Launch { conversation: "conv-9".into(), ..Default::default() };
+        let p = Process::spawn_held(&held, "s-9", &bin, launch, false, dir.path(), "opus", Arc::default(), None, None).unwrap();
+        let meta: Value = serde_json::from_slice(&std::fs::read(held.join("conv-9").join("meta.json")).unwrap()).unwrap();
+        assert_eq!(meta["session"], "s-9");
+        let pg = Pid::from_raw(meta["pgid"].as_i64().unwrap() as i32);
+        drop(p);
+        assert!(nix::sys::signal::kill(pg, None).is_ok(), "dropped, it goes on");
+        assert_eq!(Process::held_sessions(&held), vec!["s-9".to_owned()]);
+        let p = Process::attach(&held, "conv-9", dir.path(), "opus", Arc::default(), None, None).expect("taken up");
         p.close().await;
-        assert!(!records.join("conv-9.pid").exists());
+        c6_testkit::eventually("it ends", async || nix::sys::signal::kill(pg, None).is_err().then_some(())).await;
+        assert!(!held.join("conv-9").exists(), "its folder goes with it");
+        assert!(Process::attach(&held, "conv-9", dir.path(), "opus", Arc::default(), None, None).is_none());
     }
 
     /// What Claude Code says under a call of one of carbon6's MCP tools (its

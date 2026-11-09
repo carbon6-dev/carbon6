@@ -83,8 +83,21 @@ impl Drop for Registration {
 
 impl Bridge {
     pub async fn start() -> anyhow::Result<Self> {
+        Self::start_at(None).await
+    }
+
+    /// `start`, on `port` if it is free (the port a previous worker served
+    /// on, which the Claude Code processes it held still call; docs/restarts.md
+    /// §3), else on any.
+    pub async fn start_at(port: Option<u16>) -> anyhow::Result<Self> {
         let entries: Entries = Arc::default();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let listener = match port {
+            Some(p) => match tokio::net::TcpListener::bind(("127.0.0.1", p)).await {
+                Ok(l) => l,
+                Err(_) => tokio::net::TcpListener::bind("127.0.0.1:0").await?,
+            },
+            None => tokio::net::TcpListener::bind("127.0.0.1:0").await?,
+        };
         let port = listener.local_addr()?.port();
         let state = entries.clone();
         let app =
@@ -99,13 +112,28 @@ impl Bridge {
     }
 
     pub fn register(&self, entry: Entry) -> Registration {
-        let token = format!("{:032x}", rand::random::<u128>());
+        self.register_as(format!("{:032x}", rand::random::<u128>()), entry)
+    }
+
+    /// The port it serves on.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// `register` under `token`: a held Claude Code process's, from before
+    /// a restart, so its calls reach this worker's tools.
+    pub fn register_as(&self, token: String, entry: Entry) -> Registration {
         self.entries.lock().unwrap().insert(token.clone(), Arc::new(entry));
         Registration { url: format!("http://127.0.0.1:{}/mcp/{token}", self.port), token, entries: self.entries.clone() }
     }
 }
 
 impl Registration {
+    /// Its secret path, kept with a held process (`register_as`).
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
     /// Calls from now on belong to the turn `cancel` stops.
     pub fn set_cancel(&self, cancel: &CancellationToken) {
         if let Some(e) = self.entries.lock().unwrap().get(&self.token) {

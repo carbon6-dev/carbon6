@@ -81,3 +81,48 @@ carbon6's own loop (every connection except Claude Code) keeps each turn's steps
 3. **Layer 3:** carbon6's turns and subagents resume from the journal after a restart.
 
 Each step is tested with a worker that really restarts mid-work (the chaos tests' way), waiting on conditions, not time (docs/testing.md).
+
+## 7. As built (2026-11-09)
+
+1. **Layer 1: wait for quiet.**
+   - **What holds an update.** `Sessions::holding` lists, per session, a running turn and every running background task whose end is awaited: shell commands, carbon6 subagents, and Claude Code's own (its tasks out of the foreground). The update waits until the list is empty.
+     - **Servers don't hold it.** Commands started with `notify: false` (the bash tool's existing flag for servers and watchers meant to keep running) don't count. That flag stands in for the design's `restartable`, so no new one was needed.
+   - **What you see.** The worker sends the list with its `waiting` status. The head turns it into "waiting on ‹session title›: ‹what›" on Settings → Updates.
+   - **Update now.** A machine that is waiting has an **Update now** button (`system.updates.now`, `POST /api/v1/system/updates/machines/{machine}/now`, `update.now` to the worker). It sets that update's deadline to now.
+   - **No draining.** Workers still start new background work while they wait. With held commands (2) that work isn't lost anyway, and the drain deadline and Update now cap the wait.
+2. **Layer 2: no runner daemon.**
+   - Each long-lived process is started detached from the worker in its own process group, with its output in files. The worker takes it up again after a restart, so there is no separate `c6-runner` to install, update or keep in step.
+   - **Shell commands** (`Background::spawn_held`, in `<state>/held/<session>/<task>/`):
+     - The command runs under `/bin/sh`, which writes its exit code to `code` when it ends. stdout and stderr go to `out` and `err`, and `meta.json` records it.
+     - On reload, a session adopts each task it had running (`Background::adopt`) instead of marking it lost. It follows the files to the end and reports the end as usual, with all the output from both workers' time.
+     - SSH sessions' commands are still run as before.
+   - **Claude Code** (`Process::spawn_held`, in `<state>/claude/held/<conversation>/`):
+     - **Input:** `claude` reads its input from a named pipe, `in`. A keeper process in its process group holds the pipe open, so no restart ever ends its input. The worker writes to the pipe.
+     - **Output:** its output goes to `out`, its exit code to `code`, and how far the worker has read to `offset`. The offset is saved for every line but streaming deltas.
+     - **The bridge:** the MCP bridge comes back on the port it had (`<state>/mcp-bridge-port`). The process's token is registered again, so carbon6's tools keep working for it.
+     - **After a restart,** the start-up reload loads every session with a held process. Its actor takes the process up again (`Process::attach`) and reads on from `offset`. The rest of the interrupted turn comes in the way a turn Claude Code starts by itself does, so the session shows it, without starting `claude` again.
+     - **Ending:** closing it ends the keeper, so `claude` reads the end of its input and exits. Stopping it kills its process group. Either way its folder goes.
+     - **Ask (head):** Ask's Claude Code on the head still runs as before (`Process::spawn`).
+   - **Stopping the worker.**
+     - systemd stops only `c6w` now (`KillMode=process` in `c6w@.service` and the user unit). launchd stops the worker's process group, which held processes have left.
+     - `c6w` exits for an update only after shutting down its async runtime. That ends its sessions' foreground commands (a dropped call kills its whole process group, `KillGroup`) and Claude Code processes it doesn't hold, and leaves held ones running.
+3. **Layer 3: turns that were cut short go on.**
+   - At start-up the worker still closes a turn that a restart cut short (`worker restarted`). It then wakes the session with a notice, so the agent carries on from its log.
+     - The notice is the editable prompt `session.resume_after_restart`.
+     - The agent also sees "Tool call did not complete (interrupted)" for any call that was running.
+   - A subagent's session isn't woken: its parent's call already got what it did, and the parent decides.
+   - A Claude Code session whose process was held isn't woken either: it carries on by itself.
+   - The reply that was streaming when the worker went is asked for again as part of the next turn.
+4. **Tests:**
+   - `updates::an_update_waits_for_background_work_and_says_on_what`
+   - `chaos::a_background_command_outlives_a_worker_restart`
+   - `chaos::worker_restart_mid_turn_then_continue`, which now checks that the session goes on by itself
+   - `bash::tests::a_dropped_call_kills_its_whole_command`
+   - `claude_code::tests::a_held_process_outlives_its_worker_and_is_taken_up`
+   - `claude_code_restart` (its own binary): a fake `claude` mid-turn through a real end of the first worker's runtime. It checks that the rest of the turn shows, that `claude` isn't started again, and that a follow-up message reaches the same process.
+
+   Each first worker runs in a tokio runtime of its own that the test ends, the way a worker's process ends.
+5. **Not done:**
+   - **Wait counts:** a foreground command cut short by Update now or the drain deadline is lost (stopped, as before). Remote subagents waiting on this worker don't count as holding the update.
+   - **Ask:** the head's Claude Code is not held.
+   - **Mixed output:** a held process's output from before and after a restart isn't merged into one turn in the transcript. The rest of the interrupted turn shows as a turn of its own.
