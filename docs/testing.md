@@ -2462,6 +2462,25 @@ only for `with_agent` and posts only to `/queue/{command_id}/now`, without
 changing the Composer. No take-back path may pull/cancel a tail, interrupt,
 rewind, create a side chat or send without explicit user action.
 
+`CASE=queued-mentions ENGINE=both` additionally checks a taken-back message
+with an original `c6:item:` reference on desktop and phone. The native box
+restores editable text, then offers session-scoped `@` results after further
+typing. Selecting a result and explicitly sending retains both existing and
+recovered attachment bytes, without an implicit send or expanded model-only
+prompt replacing the draft.
+
+The stored-input compatibility checks use literal bytes captured from the old
+fork schema, not current-type round trips. `c6-proto` tests cover legacy bool16,
+upstream prompt16, explicit canonical human18 (including false), merged inputs,
+unknown fields and malformed data. Head store, delivery and queue tests cover
+pending and done legacy commands, original uploads/model recovery, rejection,
+human/task provenance and old/new worker capabilities; worker queue tests keep
+model-only prompts separate from editable text. Run
+`python3 scripts/check-session-tags.py --self-test` as well: the sole fork
+history exception must not permit other tag reuse. The head-first/no-head-
+rollback constraint is documented in architecture.md §4; these tests do not
+claim reverse mixed-version live transport support.
+
 Read user rows expose always-visible icon-only **Rewind** and **Ask**, with those
 exact aria-labels and titles on desktop and phones; there is no Edit or user
 Message actions sheet. `phone-picker.cjs` also checks direct entry, cancellation
