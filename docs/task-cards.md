@@ -63,6 +63,13 @@ The new session is on its own from there: nothing it does is reported back to th
 
 The click sends your message to the proposing session: `Start session: task card #177 "Remove the dead retry module". session:<new-session-id>` It starts a turn or joins the current one and shows in the transcript when taken, like a typed message. The new session opens beside it (on a phone, you go to the new session). This does not report the new session's progress or result.
 
+New task-card starts label their first message **From a task card**. New button
+answers to the proposing session, including Do it here, say **Answer to a task
+card**. Both use the neutral sender card with the same Edit and Rewind
+eligibility as unknown input, not a guessed human identity. The label applies
+only to that message, never to later messages merely because the session has a
+`task-card` label. Already stored events retain their current presentation.
+
 ### 4.1 The other answers
 
 - **Do it here** sends the card's prompt to the session that proposed it, as a message from you ("Do the task you proposed here … (task card #N: title)"). The message explicitly says the card is already closed and the agent need not close or withdraw it. If the session is in a turn, the message waits for it, as yours do.
@@ -71,13 +78,13 @@ The click sends your message to the proposing session: `Start session: task card
 - **Save elsewhere… → an existing work item** files the same to-do, with its prompt and origin, into the chosen open work item, without moving the proposing session.
 - **Starting it later:** ▶ Start on the to-do opens the new-session form where the proposing session worked, with the card's prompt (by `work.todo`). The session joins the work and can tick the to-do off.
 
-Start session, the Save answers (including Save for later's new-work fallback), and Not now send text in your voice. What you see as your own right-aligned transcript message is exactly what the proposing agent gets:
+Start session, the Save answers (including Save for later's new-work fallback), and Not now send text in your voice. The task-card answer's transcript text is exactly what the proposing agent gets:
 
 - `Start session: task card #177 "Remove the dead retry module". session:<new-session-id>`
 - `Save for later: task card #177 "Remove the dead retry module" (to-do on "Cleanup").`
 - `Not now: task card #177 "Remove the dead retry module".`
 
-The Save text names the actual destination work, including Save elsewhere's destinations. Titles are quoted and newlines escaped, so the message stays one line. There is no separate system-note label or style. Do it here already sends the task as your message and gets no extra message. A failed answer sends no message.
+The Save text names the actual destination work, including Save elsewhere's destinations. Titles are quoted and newlines escaped, so the message stays one line. It is a real message, not a separate system note. Do it here already sends the task as a task-card answer and gets no extra message. A failed answer sends no message.
 
 Every button sends a real message: it starts a turn if the proposing session is idle and joins a running turn at its next step, exactly as if you typed it. Delivery uses the ordinary durable `SessionCommand.input` queue and worker command-id deduplication. The message appears once in the transcript when taken, and reaches the agent once, including after a head restart, worker reload or restoration of a trimmed session. Until taken it appears in the ordinary input queue, not as a held notice.
 
@@ -85,7 +92,18 @@ The `command: "card-answer"` marker distinguishes these user messages from typed
 
 Start session includes the new session's id as a clickable `session:<id>` mention in the answer message. After success, the UI opens it beside the current tile; on a phone it goes to the new session. Only card-answer messages gain mention rendering; ordinary user messages remain plain text. A failed answer keeps its error on the card.
 
-No schema migration or new wire field is needed. Older preview workers already understand ordinary `UserInput` messages and the command marker, so they receive and run these messages normally, without a capability gate. The unused quiet-note command, quiet queued-notice field, capability and synthetic transcript-arrival conversion have been removed.
+No database migration is needed. The head saves `UserInput.task_card_origin`
+(fresh protobuf tag 17) in its durable command and stamps
+`UserMessage.task_card_origin` (fresh tag 16) when that command's event arrives.
+The enum distinguishes start and answer. Older workers ignore the added field
+and still receive ordinary inputs with the existing command marker; the head
+recovers provenance by session and command id with one lookup per incoming
+batch containing command input, even after a restart. No worker
+change or capability gate is required. Old commands without metadata and stored
+events are not reclassified, including when replayed. An edited pending input
+instead records the replacement caller's provenance. The unused quiet-note
+command, quiet queued-notice field, capability and synthetic transcript-arrival
+conversion remain removed.
 
 An archived or stopped proposer cannot prevent the card's action: the save, dismissal or new session still succeeds, and the head logs why the proposing session could not receive the message.
 

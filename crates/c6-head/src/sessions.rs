@@ -89,7 +89,12 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
 
 /// Creates a session with server-authenticated provenance on its first input.
 pub async fn create_from(st: &HeadState, req: api::CreateSession, caller: &crate::realms::Caller) -> anyhow::Result<api::Session> {
-    create_linked_with_origin(st, req, "", None, caller.api_origin(), caller.human_origin(st.auth.required)).await
+    create_linked_with_origin(st, req, "", None, caller.api_origin(), caller.human_origin(st.auth.required), false).await
+}
+
+/// Only a task-card start records this provenance on its initial command.
+pub async fn create_from_task_card(st: &HeadState, req: api::CreateSession) -> anyhow::Result<api::Session> {
+    create_linked_with_origin(st, req, "", None, None, false, true).await
 }
 
 /// A session acting as an app instance in its realm (docs/apps.md §5.3),
@@ -114,7 +119,7 @@ pub struct Link {
 /// A session, linked to a parent's call when `link` is set: the parent's
 /// call waits on its first turn.
 pub async fn create_linked(st: &HeadState, req: api::CreateSession, instance: &str, link: Option<Link>) -> anyhow::Result<api::Session> {
-    create_linked_with_origin(st, req, instance, link, None, false).await
+    create_linked_with_origin(st, req, instance, link, None, false, false).await
 }
 
 /// The HTTP caller's provenance for the initial prompt, never request-body
@@ -126,6 +131,7 @@ async fn create_linked_with_origin(
     link: Option<Link>,
     api_origin: Option<c6_proto::ApiMessageOrigin>,
     human_origin: bool,
+    task_card: bool,
 ) -> anyhow::Result<api::Session> {
     let worker_id = WorkerId(req.worker_id);
     let worker = st.store.worker(worker_id).await?.ok_or_else(|| bad_request("no such worker"))?;
@@ -285,7 +291,14 @@ async fn create_linked_with_origin(
     if link.is_none() && named_by_first_line {
         crate::naming::expect(st, &row.id).await?;
     }
-    let first = prompt.map(|p| UserInput { text: p.to_owned(), attachments: files, api_origin, human_origin, ..Default::default() });
+    let first = prompt.map(|p| UserInput {
+        text: p.to_owned(),
+        attachments: files,
+        api_origin,
+        human_origin,
+        task_card_origin: if task_card { c6_proto::TaskCardOrigin::Start as i32 } else { 0 },
+        ..Default::default()
+    });
     insert(st, row, spec, first, input_id, Some(brief)).await
 }
 
@@ -1154,12 +1167,17 @@ pub async fn card_answer(st: &HeadState, session_id: &str, text: String) -> anyh
     if session.archived != 0 || session.status == "stopped" {
         return Err(bad_request("the proposing session is archived or stopped"));
     }
+    task_card_input(st, session_id, text, "card-answer").await
+}
+
+/// Includes "Do it here", whose task prompt keeps ordinary input rendering.
+pub async fn task_card_input(st: &HeadState, session_id: &str, text: String, command: &str) -> anyhow::Result<()> {
     send_input_with(
         st,
         session_id,
         &api::SendMessage { text, ..Default::default() },
         Uuid::now_v7().to_string(),
-        UserInput { command: "card-answer".into(), ..Default::default() },
+        UserInput { command: command.into(), task_card_origin: c6_proto::TaskCardOrigin::Answer as i32, ..Default::default() },
     )
     .await?;
     Ok(())
@@ -1339,6 +1357,7 @@ pub async fn edit_queued(
         // This caller wrote the replacement, not the original sender.
         input.api_origin = caller.api_origin();
         input.human_origin = caller.human_origin(st.auth.required);
+        input.task_card_origin = 0;
         input.attachments.retain(|a| !a.name.starts_with("@memex:"));
         input.command.clear();
         input.command_candidates_json.clear();
@@ -2204,12 +2223,25 @@ pub async fn publish_queue(st: &HeadState, session_id: &str) {
 
 /// Stores a batch from a worker and returns the cumulative ack, if any.
 pub async fn ingest(st: &HeadState, worker_id: WorkerId, mut batch: SessionEventBatch) -> anyhow::Result<Option<u64>> {
+    // At most one lookup per batch, and none for batches without command input.
+    let command_ids: Vec<&str> = batch
+        .events
+        .iter()
+        .filter_map(|ev| match &ev.kind {
+            Some(session_event::Kind::User(u)) if !u.command_id.is_empty() => Some(u.command_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let card_origins = st.store.task_card_origins(&batch.session_id, &command_ids).await?;
     // A new event from an older worker can lack provenance. Record that as
     // unknown, not as legacy/human input. Only incoming events are marked:
     // store.ingest ignores replayed sequences without rewriting saved history.
     for ev in &mut batch.events {
         if let Some(session_event::Kind::User(u)) = &mut ev.kind {
             u.origin_recorded = true;
+            // Workers need not understand task-card metadata. Only the
+            // head's saved command can assert it, scoped to this session.
+            u.task_card_origin = card_origins.get(&u.command_id).copied().unwrap_or_default();
         }
     }
     let Some(ing) = st.store.ingest(worker_id, &batch.session_id, &batch.events).await? else {

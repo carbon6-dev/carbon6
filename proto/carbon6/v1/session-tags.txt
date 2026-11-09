@@ -353,3 +353,6 @@ carbon6.v1.NoticeQueued 10 reserved -
 # UserInput.context retired with reserved 7 in d324c600.
 carbon6.v1.UserInput 7 string context
 carbon6.v1.UserInput 7 reserved -
+# Task-card provenance is authored and recovered by the head.
+carbon6.v1.UserInput 17 TaskCardOrigin task_card_origin
+carbon6.v1.UserMessage 16 TaskCardOrigin task_card_origin

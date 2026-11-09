@@ -2605,3 +2605,21 @@ running head. A focused run is:
 ENGINE=both THEMES=light,dark VIEWS=wide,narrow,phone-320,phone-390,phone-430 EXTRAS=0 \
   SCREENSHOTS=/tmp/item4-job-actions node crates/c6-ui/tests/session-sheet.cjs
 ```
+
+## Task-card message provenance
+
+`message-origin.cjs` covers new `task_card` / `task_card_answer` origins:
+**From a task card** / **Answer to a task card**, left-aligned with retained
+SVGs, and the same working Edit/correction and Rewind flows as unknown input.
+Its old `card-answer`/unknown fixture keeps the old label. Native renderer tests
+also check exact labels, escaping, clickable generated mentions and action
+context. No CSS classes or application-side HTML serialization were added.
+
+`store::tests::task_card_provenance_is_durable_scoped_and_not_inferred_from_old_commands`
+checks saved metadata after delivery and reopening the database, absent old
+metadata and session scoping. The task-card worker integration tests assert
+start/answer API provenance, including events from an old worker that echoes no
+new metadata. API and `convert` tests round-trip both additive API kinds and
+retain unknown provenance on an old `card-answer` event. No history backfill is
+run. Full UI builds, browser matrices and workspace checks should run on the
+combined change, not on a stale WASM artifact.

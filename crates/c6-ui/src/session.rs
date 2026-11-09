@@ -4092,18 +4092,20 @@ pub(crate) fn too_large(held: &[c6_api::AttachmentUpload], adding: &[c6_api::Att
 
 /// The person's actions are barred only by positive nonhuman provenance.
 /// Unknown input stays neutral in presentation, not locked against editing.
+/// Task-card attribution deliberately retains Unknown's action eligibility.
 fn own_message(kind: &EventKind) -> bool {
     matches!(kind, EventKind::User { command, from_session_id, delegated_by, origin, .. }
         if command != "task-notification" && command != "stop-hook"
             && from_session_id.is_empty() && delegated_by.is_empty()
-            && matches!(origin.as_deref(), None | Some(c6_api::MessageOrigin::Human | c6_api::MessageOrigin::Unknown)))
+            && matches!(origin.as_deref(), None | Some(c6_api::MessageOrigin::Human | c6_api::MessageOrigin::Unknown
+                | c6_api::MessageOrigin::TaskCard | c6_api::MessageOrigin::TaskCardAnswer)))
 }
 
 /// Human and legacy bubbles keep their existing presentation. Eligibility for
-/// Edit/Rewind must not invent a human identity for explicitly unknown input.
+/// Edit/Rewind must not invent a human identity for unknown or task-card input.
 fn person_bubble(kind: &EventKind) -> bool {
     own_message(kind)
-        && !matches!(kind, EventKind::User { origin, .. } if matches!(origin.as_deref(), Some(c6_api::MessageOrigin::Unknown)))
+        && matches!(kind, EventKind::User { origin, .. } if matches!(origin.as_deref(), None | Some(c6_api::MessageOrigin::Human)))
 }
 
 /// A message from another session's agent or automation: not a bubble of yours but a card
@@ -4135,6 +4137,8 @@ fn SessionMessage(
         Some(c6_api::MessageOrigin::Api { token_name }) if !token_name.is_empty() => format!("Sent via the API · token {token_name}"),
         Some(c6_api::MessageOrigin::Api { .. }) => "Sent via the API".to_owned(),
         _ if delegated => "From the agent that started it".to_owned(),
+        Some(c6_api::MessageOrigin::TaskCard) => "From a task card".to_owned(),
+        Some(c6_api::MessageOrigin::TaskCardAnswer) => "Answer to a task card".to_owned(),
         Some(c6_api::MessageOrigin::Unknown) => "Message · origin unknown".to_owned(),
         _ => "Message from another session".to_owned(),
     };
@@ -6953,10 +6957,12 @@ mod tests {
             serde_json::json!({"kind": "human"}),
             serde_json::json!({"kind": "api", "token_name": "c6-cli-zmbp"}),
             serde_json::json!({"kind": "unknown"}),
+            serde_json::json!({"kind": "task_card"}),
+            serde_json::json!({"kind": "task_card_answer"}),
             serde_json::json!({"kind": "session"}),
         ] {
             let human = origin["kind"] == "human";
-            let unknown = origin["kind"] == "unknown";
+            let unknown = matches!(origin["kind"].as_str(), Some("unknown" | "task_card" | "task_card_answer"));
             input["origin"] = origin;
             let kind: EventKind = serde_json::from_value(input.clone()).unwrap();
             assert_eq!(own_message(&kind), human || unknown);
@@ -7621,12 +7627,15 @@ mod tests {
                 marks: signal(c6_api::marks::Marks::new()).0,
                 attention: signal(0).0,
             });
-            for (command, delegated_by, label) in
-                [("card-answer", "", "Message · origin unknown"), ("", "parent-call", "From the agent that started it")]
-            {
+            for (origin, command, delegated_by, label) in [
+                ("unknown", "card-answer", "", "Message · origin unknown"),
+                ("task_card", "", "", "From a task card"),
+                ("task_card_answer", "card-answer", "", "Answer to a task card"),
+                ("unknown", "", "parent-call", "From the agent that started it"),
+            ] {
                 let e: Event = serde_json::from_value(serde_json::json!({
                     "seq": 17, "ts": 1234, "type": "user", "command_id": "answer-17",
-                    "origin": {"kind": "unknown"}, "command": command, "delegated_by": delegated_by,
+                    "origin": {"kind": origin}, "command": command, "delegated_by": delegated_by,
                     "text": format!("Start session: **Cleanup** <script>alert(1)</script>\nStarted session:{ID}.")
                 }))
                 .unwrap();

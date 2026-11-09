@@ -106,7 +106,13 @@ async fn agents_propose_tasks_you_start_with_one_click() {
     let done: Decision = serde_json::from_value(get(format!("decisions/{}", c.id)).await).unwrap();
     assert_eq!((done.state.as_str(), done.sessions.len()), ("answered", 1), "{done:?}");
     let task = done.sessions[0].clone();
-    ended(task.clone(), 1).await;
+    let task_events = ended(task.clone(), 1).await;
+    let first = task_events.iter().find(|e| matches!(e.kind, EventKind::User { .. })).unwrap();
+    assert!(
+        matches!(&first.kind, EventKind::User { origin, .. }
+        if matches!(origin.as_deref(), Some(c6_api::MessageOrigin::TaskCard))),
+        "{first:?}"
+    );
     ended(s1.id.clone(), 2).await;
     let detail = get(format!("sessions/{task}")).await;
     let s = &detail["session"];
@@ -347,7 +353,7 @@ impl Cards {
     }
 
     async fn recorded(&self, session: &str, text: &str) -> Event {
-        eventually("the card answer to show once as your message", async || {
+        let answer = eventually("the card answer to show once as a message", async || {
             let evs = self.events(session).await;
             let answers: Vec<_> = evs
                 .into_iter()
@@ -355,7 +361,13 @@ impl Cards {
                 .collect();
             (answers.len() == 1).then(|| answers[0].clone())
         })
-        .await
+        .await;
+        assert!(
+            matches!(&answer.kind, EventKind::User { origin, .. }
+            if matches!(origin.as_deref(), Some(c6_api::MessageOrigin::TaskCardAnswer))),
+            "{answer:?}"
+        );
+        answer
     }
 
     fn assert_agent_copy(&self, request: &Value, text: &str) {
@@ -780,6 +792,39 @@ async fn old_workers_receive_task_card_answers_as_ordinary_inputs() {
     let pending = t.head().store.pending_commands(t.worker.identity.meta.worker_id, 0).await.unwrap();
     assert_eq!(pending.len(), 2, "neither answer is skipped without a capability");
     assert!(commands.iter().all(|id| pending.iter().any(|c| &c.id == id)));
+    // An old worker need not echo any provenance. The head restores it
+    // from the durable command before publishing and saving the event.
+    let seq = events.last().unwrap().seq + 1;
+    for (i, id) in commands.iter().enumerate() {
+        c6_head::sessions::ingest(
+            t.head(),
+            t.worker.identity.meta.worker_id,
+            c6_proto::SessionEventBatch {
+                session_id: session.id.clone(),
+                events: vec![c6_proto::SessionEvent {
+                    seq: seq + i as u64,
+                    ts_ms: c6_core::now_ms(),
+                    kind: Some(c6_proto::session_event::Kind::User(c6_proto::UserMessage {
+                        command_id: id.clone(),
+                        text: "Old worker's answer".into(),
+                        command: "card-answer".into(),
+                        ..Default::default()
+                    })),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let recorded = t.events(&session.id).await;
+    assert_eq!(
+        recorded
+            .iter()
+            .filter(|e| matches!(&e.kind, EventKind::User { origin, .. }
+        if matches!(origin.as_deref(), Some(c6_api::MessageOrigin::TaskCardAnswer))))
+            .count(),
+        2
+    );
     tx.send(c6_proto::WorkerMsg { msg: Some(c6_proto::worker_msg::Msg::Ping(c6_proto::Ping::default())) }).await.unwrap();
     let reply = c6_testkit::within("the old worker's pong", inbound.message()).await.unwrap().unwrap();
     assert!(matches!(reply.msg, Some(c6_proto::head_msg::Msg::Pong(_))), "{reply:?}");

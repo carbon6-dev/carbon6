@@ -130,6 +130,8 @@ impl PendingInput {
             task_notice: self.task_notice.clone(),
             human_origin: self.human_origin,
             origin_recorded: true,
+            // The head restores task-card provenance from its durable command.
+            task_card_origin: 0,
         })
     }
 

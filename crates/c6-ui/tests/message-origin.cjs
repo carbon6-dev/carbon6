@@ -27,10 +27,12 @@ const messages = [
   { key: 'session', from_session_id: 'sender', from_title: 'Release helper', label: 'Message from another session' },
   { key: 'unknown-attachment-only', origin: { kind: 'unknown' }, label: 'Message · origin unknown', attachmentOnly: true },
   { key: 'card-answer', origin: { kind: 'unknown' }, command: 'card-answer', mention: true, label: 'Message · origin unknown' },
+  { key: 'task-card-start', origin: { kind: 'task_card' }, label: 'From a task card' },
+  { key: 'task-card-answer', origin: { kind: 'task_card_answer' }, command: 'card-answer', mention: true, label: 'Answer to a task card' },
   { key: 'delegated', origin: { kind: 'unknown' }, delegated_by: 'parent-call', label: 'From the agent that started it' },
 ].map((message, i) => ({ ...message, seq: 70 + i,
-  editable: !!message.own || (message.origin?.kind === 'unknown' && !message.delegated_by),
-  speaker: message.own ? 'You' : message.origin?.kind === 'unknown' && !message.delegated_by ? 'Message' : 'Sender',
+  editable: !!message.own || (['unknown', 'task_card', 'task_card_answer'].includes(message.origin?.kind) && !message.delegated_by),
+  speaker: message.own ? 'You' : ['unknown', 'task_card', 'task_card_answer'].includes(message.origin?.kind) && !message.delegated_by ? 'Message' : 'Sender',
   subject: message.attachmentOnly ? '' : message.mention ? `Started session:${mentionId}.` : `${message.key}: **plain text** & <origin-probe>`,
   rest: message.attachmentOnly || message.mention ? '' : `Second line for ${message.key}.\n\nLiteral <origin-rest> and **not Markdown**; session:${mentionId} stays plain.\n/tmp/${'unbrokenpath'.repeat(24)}/notes.txt`,
   prompt: `Exact model-facing context for ${message.key}.\n<origin-prompt> & **literal**`,
@@ -76,7 +78,8 @@ async function exercise(f, label, phone, theme, evidence) {
   };
   const save = suffix => page.screenshot({ path: path.join(shots, `${label}-${suffix}.png`) });
   await page.locator(`#parent-e${messages.at(-1).seq}`).waitFor();
-  assert.equal(await page.locator('.c6-message-card').count(), 7, 'API, unknown, delegated and existing session share the sender card');
+  assert.equal(await page.locator('.c6-message-card').count(), messages.filter(message => !message.own).length,
+    'API, unknown, task-card, delegated and existing session share the sender card');
   assert.equal(await page.locator('html').evaluate(el => el.classList.contains('dark')), theme === 'dark', 'actual app theme');
   assert.equal(await page.evaluate(() => matchMedia('(prefers-color-scheme: dark)').matches), theme === 'dark', 'OS theme fixture');
   if (phone) {
@@ -239,7 +242,7 @@ async function exercise(f, label, phone, theme, evidence) {
 
     // Both a human bubble and a neutral unknown card must really enter the
     // edit and rewind flows, not merely expose inert-looking action buttons.
-    if (message.key === 'human' || message.key === 'unknown') {
+    if (['human', 'unknown', 'task-card-start', 'task-card-answer'].includes(message.key)) {
       for (const action of ['Edit', 'Rewind']) {
         f.phase = `${message.key}: ${action} entry`;
         await row.scrollIntoViewIfNeeded();
@@ -257,7 +260,8 @@ async function exercise(f, label, phone, theme, evidence) {
           await editor.getByText('The agent has this message', { exact: true }).waitFor();
           assert.equal(await editor.locator('textarea').count(), 0, 'Edit does not attempt withdrawal or replace the draft');
           await activate(editor.getByRole('button', { name: 'Send correction', exact: true }));
-          assert.equal(await editor.locator('textarea').inputValue(), `${message.subject}\n\n${message.rest}`, 'eligible message retains its original text for correction');
+          assert.equal(await editor.locator('textarea').inputValue(), events.find(event => event.seq === message.seq).text,
+            'eligible message retains its original text for correction');
           await activate(editor.getByRole('button', { name: 'Discard draft', exact: true }));
           await editor.waitFor({ state: 'hidden' });
         } else {

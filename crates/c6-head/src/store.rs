@@ -1752,6 +1752,36 @@ impl Store {
         Ok(Some(session_id))
     }
 
+    /// Task-card provenance is retained even after delivery or a head restart.
+    /// No text/label heuristics: pre-change commands have no such metadata.
+    pub(crate) async fn task_card_origins(
+        &self,
+        session_id: &str,
+        command_ids: &[&str],
+    ) -> anyhow::Result<std::collections::HashMap<String, i32>> {
+        use c6_proto::{SessionCommand, session_command};
+        use prost::Message;
+        let mut origins = std::collections::HashMap::new();
+        if command_ids.is_empty() {
+            return Ok(origins);
+        }
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new("SELECT id, data FROM commands WHERE session_id = ");
+        query.push_bind(session_id).push(" AND id IN (");
+        let mut ids = query.separated(", ");
+        for id in command_ids {
+            ids.push_bind(id);
+        }
+        query.push(")");
+        for (id, data) in query.build_query_as::<(String, Vec<u8>)>().fetch_all(&self.pool).await? {
+            if let Some(session_command::Kind::Input(input)) = SessionCommand::decode(data.as_slice())?.kind
+                && input.task_card_origin != 0
+            {
+                origins.insert(id, input.task_card_origin);
+            }
+        }
+        Ok(origins)
+    }
+
     /// A pending input's text, creation time and encoded command.
     pub async fn pending_input(&self, command_id: &str) -> anyhow::Result<Option<(String, i64, Vec<u8>)>> {
         Ok(sqlx::query("SELECT text, created_at, data FROM commands WHERE id = ? AND state = 'pending'")
@@ -1989,6 +2019,51 @@ pub(crate) mod tests {
                 ..Default::default()
             })),
         }
+    }
+
+    #[tokio::test]
+    async fn task_card_provenance_is_durable_scoped_and_not_inferred_from_old_commands() {
+        use c6_proto::{SessionCommand, TaskCardOrigin, UserInput, session_command};
+        use prost::Message;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c6h.db");
+        let store = Store::open(&path).await.unwrap();
+        let worker = WorkerId::new();
+        store.create_session(&session("s", worker), &[], false).await.unwrap();
+        for (id, origin) in [("start", TaskCardOrigin::Start), ("answer", TaskCardOrigin::Answer), ("old", TaskCardOrigin::Unspecified)] {
+            let data = SessionCommand {
+                command_id: id.into(),
+                session_id: "s".into(),
+                kind: Some(session_command::Kind::Input(UserInput {
+                    text: "Start session: task card #1".into(),
+                    command: "card-answer".into(),
+                    task_card_origin: origin as i32,
+                    ..Default::default()
+                })),
+            }
+            .encode_to_vec();
+            store.enqueue_command(&NewCommand { id, session_id: "s", worker_id: worker, data, text: Some("card") }).await.unwrap();
+        }
+        // Delivery retires the command, not its provenance.
+        sqlx::query("UPDATE commands SET state = 'done' WHERE session_id = 's'").execute(&store.pool).await.unwrap();
+        let legacy = input_event(1, "start");
+        store.ingest(worker, "s", std::slice::from_ref(&legacy)).await.unwrap().unwrap();
+        store.pool.close().await;
+        let store = Store::open(&path).await.unwrap();
+        let origins = store.task_card_origins("s", &["start", "answer", "old", "missing"]).await.unwrap();
+        assert_eq!(origins["start"], TaskCardOrigin::Start as i32);
+        assert_eq!(origins["answer"], TaskCardOrigin::Answer as i32);
+        assert!(!origins.contains_key("old"), "text and command names cannot reclassify history");
+        assert!(!origins.contains_key("missing"));
+        assert!(store.task_card_origins("other", &["start"]).await.unwrap().is_empty());
+        assert!(store.task_card_origins("s", &[]).await.unwrap().is_empty());
+        // Even a replay stamped with new metadata cannot rewrite old history.
+        let mut replay = legacy.clone();
+        let Some(c6_proto::session_event::Kind::User(input)) = &mut replay.kind else { panic!("user event") };
+        input.task_card_origin = TaskCardOrigin::Start as i32;
+        assert!(store.ingest(worker, "s", &[replay]).await.unwrap().unwrap().events.is_empty());
+        assert_eq!(store.events_after("s", 0, 10).await.unwrap(), vec![legacy]);
     }
 
     #[tokio::test]

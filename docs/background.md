@@ -212,7 +212,9 @@ Built 2026-11-03 (design: carbon6 doc "Claude Code sessions: default-deny tool w
 ### Direct message attribution
 
 - The HTTP transcript's optional `origin` describes `human`, `api` (only
-  `token_name`, never a credential), `session`, or `unknown`. Catalog sends and
+  `token_name`, never a credential), `session`, `task_card`, `task_card_answer`, or
+  `unknown`. Task-card provenance is recorded only for new card starts/answers
+  (docs/task-cards.md §4), not inferred from historical text or session labels. Catalog sends and
   direct sends use the same authenticated caller, as do initial prompts for
   sessions, Ask and side chats; request bodies cannot supply provenance. Acting
   with the user's authority is not evidence they typed it.
@@ -225,6 +227,11 @@ Built 2026-11-03 (design: carbon6 doc "Claude Code sessions: default-deny tool w
   but is not relabelled human. Folded turns and catch-up summaries preserve the
   distinction too. Browser-page input keeps the user's bubble and actions with
   sign-in off or a valid sign-in cookie. The head and worker use the same rewind rule.
+- New task-card initial prompts say **From a task card**, and button answers
+  say **Answer to a task card**. Their Edit/Rewind eligibility remains exactly
+  that of unknown input, including the existing delegation and notice guards;
+  this attribution does not add an action restriction. Folded turns and catch-up
+  retain neutral automation attribution rather than calling these human input.
 - `UserMessage.origin_recorded` (15) distinguishes explicitly unknown input
   from legacy records. The head marks newly ingested old-worker messages, so
   missing origin is neutral during head-first upgrades. Already stored events

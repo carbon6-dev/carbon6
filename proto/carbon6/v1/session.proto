@@ -335,6 +335,15 @@ message UserMessage {
   // Distinguishes a newly recorded unknown/internal sender from a legacy
   // journal entry with no provenance. The head also marks new old-worker events.
   bool origin_recorded = 15;
+  // Stamped by the head from its durable input command, not inferred from
+  // session labels or message text. Historical events remain unchanged.
+  TaskCardOrigin task_card_origin = 16;
+}
+
+enum TaskCardOrigin {
+  TASK_CARD_ORIGIN_UNSPECIFIED = 0;
+  TASK_CARD_ORIGIN_START = 1;
+  TASK_CARD_ORIGIN_ANSWER = 2;
 }
 
 message ApiMessageOrigin {
@@ -834,6 +843,9 @@ message UserInput {
   // Tag 16 was used for this bool only in deployed carbon6 fork builds;
   // stored-command decoding upgrades those bytes before protobuf decoding.
   bool human_origin = 18;
+  // Head-authored task-card provenance. The head restores this onto the
+  // event from its saved command even when an old worker ignores this field.
+  TaskCardOrigin task_card_origin = 17;
 }
 
 message Interrupt {

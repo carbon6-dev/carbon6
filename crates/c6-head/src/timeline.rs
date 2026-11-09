@@ -61,7 +61,10 @@ pub(crate) fn who(kind: &EventKind) -> Option<Who> {
         ("agent", String::new(), words(text))
     } else if let Some(api::MessageOrigin::Api { token_name }) = origin.as_deref() {
         ("api", token_name.clone(), words(text))
-    } else if matches!(origin.as_deref(), Some(api::MessageOrigin::Unknown | api::MessageOrigin::Session)) {
+    } else if matches!(
+        origin.as_deref(),
+        Some(api::MessageOrigin::Unknown | api::MessageOrigin::Session | api::MessageOrigin::TaskCard | api::MessageOrigin::TaskCardAnswer)
+    ) {
         ("automation", String::new(), words(text))
     } else {
         ("you", String::new(), words(text))
@@ -323,6 +326,8 @@ mod tests {
         for (origin, by, from) in [
             (api::MessageOrigin::Api { token_name: "c6-cli-zmbp".into() }, "api", "c6-cli-zmbp"),
             (api::MessageOrigin::Unknown, "automation", ""),
+            (api::MessageOrigin::TaskCard, "automation", ""),
+            (api::MessageOrigin::TaskCardAnswer, "automation", ""),
         ] {
             let mut input = user("Status update");
             let EventKind::User { origin: saved, .. } = &mut input else { panic!("user event") };

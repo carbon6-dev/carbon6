@@ -502,7 +502,8 @@ pub(crate) fn condensed(events: &[Event]) -> String {
                 } else if yours(&e.kind) {
                     lines.push(format!("User: {}", clip(text, 300)));
                 } else if matches!(&e.kind, EventKind::User { origin, .. }
-                    if matches!(origin.as_deref(), Some(api::MessageOrigin::Api { .. } | api::MessageOrigin::Unknown)))
+                    if matches!(origin.as_deref(), Some(api::MessageOrigin::Api { .. } | api::MessageOrigin::Unknown
+                        | api::MessageOrigin::TaskCard | api::MessageOrigin::TaskCardAnswer)))
                 {
                     lines.push(format!("Automation message: {}", clip(text, 300)));
                 } else if command == "task-notification" {
@@ -730,7 +731,12 @@ pub(crate) mod tests {
 
     #[test]
     fn automation_does_not_reset_the_last_human_message_boundary() {
-        for origin in [api::MessageOrigin::Api { token_name: "c6-cli-zmbp".into() }, api::MessageOrigin::Unknown] {
+        for origin in [
+            api::MessageOrigin::Api { token_name: "c6-cli-zmbp".into() },
+            api::MessageOrigin::Unknown,
+            api::MessageOrigin::TaskCard,
+            api::MessageOrigin::TaskCardAnswer,
+        ] {
             let mut input = user("Status update");
             let EventKind::User { origin: saved, .. } = &mut input else { panic!("user event") };
             *saved = Some(Box::new(origin));

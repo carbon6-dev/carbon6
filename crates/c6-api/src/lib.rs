@@ -2255,9 +2255,40 @@ pub struct TaskNotice {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MessageOrigin {
     Human,
-    Api { token_name: String },
+    Api {
+        token_name: String,
+    },
     Session,
+    /// Initial prompt of a newly started task-card session.
+    TaskCard,
+    /// A task-card button's message to its proposing session.
+    TaskCardAnswer,
     Unknown,
+}
+
+#[cfg(test)]
+mod message_origin_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn task_card_origins_are_additive_and_do_not_reclassify_old_answers() {
+        for (origin, name) in [(MessageOrigin::TaskCard, "task_card"), (MessageOrigin::TaskCardAnswer, "task_card_answer")] {
+            let value = json!({"kind": name});
+            assert_eq!(serde_json::to_value(&origin).unwrap(), value);
+            assert_eq!(serde_json::from_value::<MessageOrigin>(value).unwrap(), origin);
+        }
+        for origin in [None, Some(json!({"kind": "unknown"}))] {
+            let mut value = json!({"type": "user", "command_id": "old", "command": "card-answer", "text": "Not now: task card #1"});
+            if let Some(origin) = origin {
+                value["origin"] = origin;
+            }
+            let event: EventKind = serde_json::from_value(value.clone()).unwrap();
+            let EventKind::User { origin, .. } = &event else { panic!("user event") };
+            assert!(matches!(origin.as_deref(), None | Some(MessageOrigin::Unknown)));
+            assert_eq!(serde_json::to_value(event).unwrap().get("origin"), value.get("origin"));
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

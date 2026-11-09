@@ -44,6 +44,10 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
                 Some(api::MessageOrigin::Api { token_name: origin.token_name.clone() })
             } else if u.human_origin {
                 Some(api::MessageOrigin::Human)
+            } else if u.task_card_origin == c6_proto::TaskCardOrigin::Start as i32 {
+                Some(api::MessageOrigin::TaskCard)
+            } else if u.task_card_origin == c6_proto::TaskCardOrigin::Answer as i32 {
+                Some(api::MessageOrigin::TaskCardAnswer)
             } else {
                 u.origin_recorded.then_some(api::MessageOrigin::Unknown)
             })
@@ -310,6 +314,18 @@ mod tests {
         let cases = [
             (c6_proto::UserMessage::default(), None),
             (c6_proto::UserMessage { origin_recorded: true, ..Default::default() }, Some(api::MessageOrigin::Unknown)),
+            (
+                c6_proto::UserMessage { task_card_origin: c6_proto::TaskCardOrigin::Start as i32, ..Default::default() },
+                Some(api::MessageOrigin::TaskCard),
+            ),
+            (
+                c6_proto::UserMessage { task_card_origin: c6_proto::TaskCardOrigin::Answer as i32, ..Default::default() },
+                Some(api::MessageOrigin::TaskCardAnswer),
+            ),
+            (
+                c6_proto::UserMessage { command: "card-answer".into(), origin_recorded: true, ..Default::default() },
+                Some(api::MessageOrigin::Unknown),
+            ),
             (c6_proto::UserMessage { human_origin: true, ..Default::default() }, Some(api::MessageOrigin::Human)),
             (
                 c6_proto::UserMessage {

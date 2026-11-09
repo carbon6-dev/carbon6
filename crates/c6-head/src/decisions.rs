@@ -866,7 +866,7 @@ async fn do_task_here(st: &HeadState, d: &api::Decision) -> anyhow::Result<()> {
         d.title,
         d.context["prompt"].as_str().unwrap_or("").trim()
     );
-    crate::sessions::send_input(st, session, &api::SendMessage { text, ..Default::default() }).await?;
+    crate::sessions::task_card_input(st, session, text, "").await?;
     info!(decision = d.id, %session, "task card done in its session");
     Ok(())
 }
@@ -929,7 +929,7 @@ async fn start_task(st: &HeadState, d: &api::Decision) -> anyhow::Result<String>
             Err(e) => warn!(decision = d.id, "planning its start: {e:#}"),
         }
     }
-    let session = crate::sessions::create(st, req).await?;
+    let session = crate::sessions::create_from_task_card(st, req).await?;
     // It joins that work only when it starts as the work does.
     if !planned {
         work = None;
