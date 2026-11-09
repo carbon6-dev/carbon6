@@ -2409,7 +2409,26 @@ rewind must wait, without inventing an event sequence. A late User while typing
 must preserve the same correction textarea/value; failed Send keeps both.
 Assertions reject any single-edit tail-pull/cancel request or mutation of later
 queued inputs. After building the combined UI, `CASE=queued- ENGINE=both`
-selects these 16 browser cases; the complete matrix has 52 cases.
+selects these 16 browser cases.
+
+`CASE=sent-during-turn- ENGINE=both` selects 12 additional desktop/phone cases
+for human, explicitly unknown, and legacy (absent) origins. Each actually fills
+the composer and clicks Send while the live session is working and its turn is
+unfinished. The accepted command first appears in the queue, becomes taken,
+then receives a matching durable `User` event with a distinct sequence. Before
+any reply to that message, turn completion, or subsequent queue snapshot, the
+row (phone: Message actions sheet) must offer **Edit**, **Rewind**, and **Ask**.
+Edit opens the taken choices without cancellation; Ask opens a side-chat draft without
+sending. The test then clicks the row/sheet's direct Rewind entry and confirms
+the separate warning: the recorded API body must use that actual `User.seq`,
+not the command ID, queue position, or turn sequence. HTTP enqueue alone leaves
+the warning open; a matching new durable `Rewound` closes it. No automatic
+replacement is sent. Unknown provenance keeps its neutral label rather than
+claiming a human identity, but does not hide these actions. A running turn is
+not a rewind blocker; the UI still requires a synced stream, and the head's
+existing subagent, positive nonhuman-provenance, runtime-handoff, and Claude
+Code worker-capability guards remain intact. The complete matrix has 64 cases.
+
 Textarea Send shortcuts use the existing input policy; Enter on Discard draft
 must close the draft without bubbling into Send.
 All waits use response/DOM conditions, not cancellation timing sleeps; browser

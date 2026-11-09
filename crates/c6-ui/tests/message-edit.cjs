@@ -534,8 +534,150 @@ async function checkQueued(browser, origin, phone, outcome) {
   } finally { cancelRelease.resolve(); await f.context.close(); }
 }
 
+// Unlike seeded transcript and cancellation-race cases, this starts with a
+// real composer Send while a turn is still running. Actions belong to the
+// durable User event, not the queue receipt, a reply, or a finished turn.
+async function checkSentDuringTurn(browser, origin, phone, outcome) {
+  const provenance = outcome.slice('sent-during-turn-'.length);
+  const text = `Composer message sent during a working turn (${provenance})`;
+  const receipt = { command_id: 'composer-during-turn', text, created_at: 1, rejected: null, with_agent: false };
+  const calls = { send: [], rewind: [] }, mutations = [];
+  let progress;
+  const f = await fixture(browser, origin, phone ? { width: 390, height: 844 } : { width: 1440, height: 1000 },
+    'dark', { choice: 'off', effective: 'off', os: 'reduce' }, p => { progress = p; }, {}, {
+      instrumentation: false,
+      setup: async ({ page }) => {
+        page.on('request', request => {
+          const path = new URL(request.url()).pathname;
+          if (/^(POST|PUT|DELETE)$/.test(request.method()) && path.startsWith('/api/v1/sessions/parent/') &&
+              !/\/(seen|viewed|catchup)$/.test(path)) mutations.push({ method: request.method(), path });
+        });
+        await page.route('**/api/v1/sessions/parent/messages', route => {
+          calls.send.push(route.request().postDataJSON());
+          return route.fulfill({ json: receipt });
+        });
+        await page.route('**/api/v1/sessions/parent/rewind', route => {
+          calls.rewind.push(route.request().postDataJSON());
+          return route.fulfill({ status: 202 });
+        });
+      },
+    }).catch(async error => { await progress?.context.close(); throw error; });
+  try {
+    const { page } = f;
+    f.phase = 'composer Send during a running turn';
+    await f.setState('working');
+    const turn = f.send({ type: 'turn_started', turn: 100 });
+    await page.locator(`#parent-e${turn}`).waitFor({ state: 'attached' });
+    const slot = page.locator('.c6-send-slot').first();
+    await slot.getByRole('button', { name: /^Stop/ }).waitFor();
+    const composer = page.locator('textarea').first();
+    await composer.fill(text);
+    const sent = page.waitForResponse(r => r.url().endsWith('/parent/messages'));
+    await slot.getByRole('button', { name: /^Send/ }).click();
+    assert.equal((await sent).status(), 200);
+    assert.equal(await composer.inputValue(), '', 'real composer Send clears the accepted draft');
+    assert.equal(calls.send.length, 1);
+    assert.equal(calls.send[0].text, text);
+    await slot.getByRole('button', { name: /^Stop/ }).waitFor();
+    f.stream({ type: 'queue', queued: [receipt] });
+    const waiting = page.locator(`[data-queued-command="${receipt.command_id}"]`);
+    await waiting.waitFor();
+    assert.equal(await page.locator('.c6-transcript-row').filter({ hasText: text }).count(), 0,
+      'HTTP receipt is queued, not a fabricated durable transcript event');
+    assert.deepEqual(calls.rewind, []);
+
+    f.phase = 'queue becomes taken, then the durable User arrives without ending the turn';
+    f.stream({ type: 'queue', queued: [{ ...receipt, with_agent: true }] });
+    await waiting.getByRole('button', { name: 'Send now', exact: true }).waitFor();
+    // Unrelated live events make the durable seq differ from the turn and any
+    // queue position. Neither is a valid substitute for this message's seq.
+    f.send({ type: 'assistant', turn: 100, blocks: [{ type: 'text', text: 'Still working before delivery' }], stop_reason: '' });
+    const actualSeq = f.send({ type: 'user', command_id: receipt.command_id, text,
+      ...(provenance === 'legacy' ? {} : { origin: { kind: provenance } }) });
+    const original = page.locator(`#parent-e${actualSeq}`);
+    f.phase = `waiting for durable User ${actualSeq}`;
+    await original.waitFor();
+    assert.equal(await slot.getByRole('button', { name: /^Stop/ }).isVisible(), true,
+      'the agent is still working when the durable User offers actions');
+    // A durable User must suffice even before the next queue snapshot arrives.
+    const sheet = page.getByRole('dialog', { name: 'Message actions', exact: true });
+    const action = async name => {
+      f.phase = `${name} on the delivered User while the turn is still running`;
+      await original.scrollIntoViewIfNeeded();
+      if (phone) {
+        await original.getByRole('button', { name: 'Message actions', exact: true }).tap();
+        await sheet.waitFor();
+        for (const label of ['Edit', 'Ask in a side chat', 'Rewind…']) {
+          const button = sheet.getByRole('button', { name: label, exact: true });
+          assert.equal(await button.isEnabled(), true,
+            `${label} is available on the durable User while working`);
+          assert.equal(await button.locator('svg').count(), 1, `${label} retains its drawn icon`);
+        }
+        assert.equal(await sheet.getByText(provenance === 'unknown' ? 'Message' : 'You', { exact: true }).count(), 1);
+        const label = name === 'Ask' ? 'Ask in a side chat' : name === 'Rewind' ? 'Rewind…' : name;
+        await sheet.getByRole('button', { name: label, exact: true }).tap();
+        await sheet.waitFor({ state: 'hidden' });
+      } else {
+        await original.hover();
+        for (const label of ['Edit', 'Rewind', 'Ask']) {
+          const button = original.getByRole('button', { name: label, exact: true });
+          assert.equal(await button.isEnabled(), true,
+            `${label} is available on the durable User while working`);
+          assert.equal(await button.locator('svg').count(), 1, `${label} retains its drawn icon`);
+        }
+        await original.getByRole('button', { name, exact: true }).click();
+      }
+    };
+    f.phase = 'checking durable User provenance';
+    if (provenance === 'unknown') await original.getByText('Message · origin unknown', { exact: true }).waitFor();
+    await action('Edit');
+    const edit = page.locator('[data-message-edit]');
+    await edit.getByText('The agent has this message', { exact: true }).waitFor();
+    assert.equal(await edit.locator('textarea').count(), 0, 'taken Edit never pretends it can withdraw the message');
+    assert.deepEqual(calls.rewind, [], 'opening Edit is not a rewind');
+    await edit.getByRole('button', { name: 'Close', exact: true }).click();
+    await edit.waitFor({ state: 'hidden' });
+    f.stream({ type: 'queue', queued: [] });
+    await waiting.waitFor({ state: 'hidden' });
+    await action('Ask');
+    const question = page.getByPlaceholder(/^Ask about this in a side chat/);
+    await question.waitFor();
+    await question.locator('..').getByRole('button', { name: 'Cancel', exact: true }).click();
+    await question.waitFor({ state: 'hidden' });
+
+    f.phase = 'explicit direct Rewind targets the actual delivered User sequence';
+    await action('Rewind');
+    const warning = page.getByText('Rewind the conversation to before this message? The messages after it stop counting (they stay visible, folded).', { exact: true });
+    await warning.waitFor();
+    const confirmation = warning.locator('..');
+    assert.equal(await confirmation.getByRole('checkbox').isChecked(), false);
+    assert.deepEqual(calls.rewind, [], 'Rewind entry still needs a separate confirmation');
+    assert.equal(await confirmation.getByRole('button', { name: 'Rewind', exact: true }).isEnabled(), true,
+      'a running turn is not a rewind blocker');
+    const accepted = page.waitForResponse(r => r.url().endsWith('/parent/rewind'));
+    await confirmation.getByRole('button', { name: 'Rewind', exact: true }).click();
+    assert.equal((await accepted).status(), 202);
+    assert.deepEqual(calls.rewind, [{ to_seq: actualSeq, restore_files: false }],
+      'the request uses the durable User seq, not a queue id, index, or turn seq');
+    assert.equal(await warning.isVisible(), true, 'HTTP enqueue alone cannot confirm rewind');
+    f.send({ type: 'rewound', to_seq: actualSeq, restored_files: false, restore_error: '' });
+    await warning.waitFor({ state: 'hidden' });
+    assert.equal(calls.send.length, 1, 'Edit, Ask cancellation, and confirmed rewind never resend');
+    assert.deepEqual(mutations, [
+      { method: 'POST', path: '/api/v1/sessions/parent/messages' },
+      { method: 'POST', path: '/api/v1/sessions/parent/rewind' },
+    ], 'no queue cancellation/pull, interrupt, side-chat creation, or implicit send');
+    assert(!f.requests.some(r => /^(PUT|POST|DELETE) .*\/settings\//.test(r)), 'no settings writes');
+    assert.deepEqual(f.errors, []);
+  } catch (error) {
+    console.error('SENT DURING TURN DIAGNOSTIC', JSON.stringify({ phase: f.phase, calls, mutations,
+      errors: f.errors, console: f.consoleMessages, requests: f.requests.slice(-12) }));
+    throw error;
+  } finally { await f.context.close(); }
+}
+
 async function main() {
-  const playwright = require(process.env.PLAYWRIGHT_CORE || '/home/zheilbron/.bun/install/cache/playwright-core@1.50.1@@@1');
+  const playwright = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
   const { server, origin } = await serve();
   try {
     const engine = process.env.ENGINE || 'chromium';
@@ -543,14 +685,20 @@ async function main() {
     let checked = 0;
     const failures = [];
     for (const name of engine === 'both' ? ['chromium', 'webkit'] : [engine]) {
-      for (const phone of [false, true]) for (const outcome of ['correction', 'correction-send-error', 'correction-discard', 'close', 'rewind', 'rewind-early', 'rewind-reset-error', 'rewind-api-error', 'rewind-replay', 'queued-ready', 'queued-taken-race', 'queued-unconfirmed', 'queued-pending']) {
+      for (const phone of [false, true]) for (const outcome of [
+        'correction', 'correction-send-error', 'correction-discard', 'close',
+        'rewind', 'rewind-early', 'rewind-reset-error', 'rewind-api-error', 'rewind-replay',
+        'queued-ready', 'queued-taken-race', 'queued-unconfirmed', 'queued-pending',
+        'sent-during-turn-human', 'sent-during-turn-unknown', 'sent-during-turn-legacy',
+      ]) {
         const label = `${name}/${phone ? 'phone' : 'desktop'}/${outcome}`;
         if (process.env.CASE_EXACT && label !== process.env.CASE_EXACT) continue;
         if (process.env.CASE && !label.includes(process.env.CASE)) continue;
         const browser = await launchBrowser(playwright, name);
         try {
           console.log(`RUN ${label}`);
-          await within(label, () => outcome.startsWith('queued-') ? checkQueued(browser, origin, phone, outcome) : check(browser, origin, phone, outcome));
+          await within(label, () => outcome.startsWith('sent-during-turn-') ? checkSentDuringTurn(browser, origin, phone, outcome)
+            : outcome.startsWith('queued-') ? checkQueued(browser, origin, phone, outcome) : check(browser, origin, phone, outcome));
           checked++;
           console.log(`PASS ${label}`);
         } catch (error) {
