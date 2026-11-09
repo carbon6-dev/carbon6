@@ -122,6 +122,9 @@ async fn run(ctx: &ToolCtx, command: &str, timeout: Duration) -> std::io::Result
         .kill_on_drop(true)
         .spawn()?;
     let pgid = child.id().map(|id| Pid::from_raw(id as i32));
+    // Dropped mid-run (the worker shuts down, or the call is abandoned): the
+    // whole command goes, not just its shell (docs/restarts.md).
+    let mut group = KillGroup(pgid);
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     // A thread, because the pipe is blocking and background children may hold
@@ -155,6 +158,8 @@ async fn run(ctx: &ToolCtx, command: &str, timeout: Duration) -> std::io::Result
         let _ = killpg(pgid, Signal::SIGKILL);
         let _ = child.wait().await;
     }
+    // It ended by itself: what it started in the background is its own.
+    group.0 = None;
     let grace = tokio::time::sleep(DRAIN_GRACE);
     tokio::pin!(grace);
     loop {
@@ -327,6 +332,18 @@ fn unique() -> u64 {
     N.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Kills a foreground command's process group when dropped, unless it
+/// ended (then `.0` is cleared).
+struct KillGroup(Option<Pid>);
+
+impl Drop for KillGroup {
+    fn drop(&mut self) {
+        if let Some(pg) = self.0 {
+            let _ = killpg(pg, Signal::SIGKILL);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -373,6 +390,25 @@ mod tests {
         let _ = std::fs::remove_file(path);
         // Short output is untouched.
         assert_eq!(Bash.call(&ctx, json!({"command": "echo hi"})).await.content, "hi\n");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_call_kills_its_whole_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(dir.path(), Default::default());
+        let marker = dir.path().join("started");
+        // The shell starts a child and waits on it: dropping the call must
+        // stop the child too, not only the shell.
+        let cmd = format!("sleep 300 & echo $! > {}; wait", marker.display());
+        let call = Bash.call(&ctx, json!({"command": cmd}));
+        let pid = tokio::select! {
+            _ = call => panic!("it ran to the end"),
+            pid = c6_testkit::eventually("its child started", async || {
+                std::fs::read_to_string(&marker).ok().and_then(|s| s.trim().parse::<i32>().ok())
+            }) => pid,
+        };
+        let child = Pid::from_raw(pid);
+        c6_testkit::eventually("the child gone", async || nix::sys::signal::kill(child, None).is_err().then_some(())).await;
     }
 
     #[tokio::test]

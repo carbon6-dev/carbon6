@@ -263,7 +263,11 @@ async fn a_background_command_outlives_a_worker_restart() {
     let env = Env::new().await;
     let state = tempfile::tempdir().unwrap();
     env.enroll(state.path()).await;
-    let (first, stop_first) = run_worker(state.path()).await;
+    // The first worker runs in a runtime of its own, ended below as a real
+    // worker's process ends: everything it was doing stops with it.
+    let first_rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let st = state.path().to_owned();
+    let (first, stop_first) = first_rt.spawn(async move { run_worker(&st).await }).await.unwrap();
     let project = tempfile::tempdir().unwrap();
     let gate = project.path().join("gate");
     // Its output ("early-line", "late-line") differs from its text.
@@ -280,10 +284,11 @@ async fn a_background_command_outlives_a_worker_restart() {
     })
     .await;
 
-    // The worker goes; the command doesn't.
+    // The worker goes; the command doesn't. (The next worker opens the
+    // state once this one lets go of it: `run_worker` waits for that.)
     stop_first.cancel();
     drop(first);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    first_rt.shutdown_background();
     let meta: Value = serde_json::from_slice(&std::fs::read(started.join("meta.json")).unwrap()).unwrap();
     let pgid = nix::unistd::Pid::from_raw(meta["pgid"].as_i64().unwrap() as i32);
     assert!(nix::sys::signal::kill(pgid, None).is_ok(), "still running without its worker");

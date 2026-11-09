@@ -48,8 +48,25 @@ enum Command {
     ClaudeGuard { allowed: Vec<String> },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Set when the worker exits to be started again (an update, or a version
+/// rolled back): it exits with the restart code once its runtime has shut
+/// down.
+static RESTART: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn main() -> anyhow::Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let r = rt.block_on(run());
+    // Shutting the runtime down drops what its sessions were doing:
+    // foreground commands and Claude Code processes it doesn't hold stop
+    // with it; held background commands go on (docs/restarts.md).
+    rt.shutdown_timeout(std::time::Duration::from_secs(10));
+    if RESTART.load(std::sync::atomic::Ordering::SeqCst) {
+        restart();
+    }
+    r
+}
+
+async fn run() -> anyhow::Result<()> {
     // The exact version this build is (docs/updates.md).
     c6_core::set_build(option_env!("C6_BUILD_VERSION"));
     let cli = Cli::parse();
@@ -89,13 +106,14 @@ async fn main() -> anyhow::Result<()> {
                 // This version was rolled back: the previous one runs after a restart.
                 Err(e) if e.is::<c6_worker::update::RolledBack>() => {
                     eprintln!("{e}");
-                    std::process::exit(c6_core::update::RESTART_CODE);
+                    RESTART.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return Ok(());
                 }
                 r => r?,
             }
             // Updated (docs/updates.md): the service manager starts the new version.
             if worker.update.restart_requested() {
-                restart();
+                RESTART.store(true, std::sync::atomic::Ordering::SeqCst);
             }
             Ok(())
         }
