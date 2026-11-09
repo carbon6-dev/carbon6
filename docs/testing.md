@@ -674,6 +674,12 @@ and retains all native reset barriers and fail-closed assertions. Head/worker
 tests cover legacy and unknown rewind eligibility; Watchers' policy matrix checks
 that only known human input, including auth-off page input, is a human correction.
 
+Waiting input is mounted just above the session composer, outside the scrolling
+transcript. The queue has its own 30dvh scroll limit; each input keeps Edit in
+the same action position, and only inputs with a queued tail offer Edit queue….
+`message-edit.cjs` checks this on desktop and phones, including growing streamed
+replies, many waiting inputs, single-edit cancellation, and the separate bulk path.
+
 After the build owner has produced this branch's UI (`env -u NO_COLOR make ui`), run:
 
 ```sh

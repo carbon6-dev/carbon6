@@ -309,7 +309,7 @@ function queued() {
 }
 
 async function checkQueued(browser, origin, phone, outcome) {
-  let progress, cancelRequest;
+  let progress, cancelRequest, liveSocket;
   const cancelStarted = deferred(), cancelRelease = deferred();
   const mutations = [], feedReads = [], calls = { takeBack: [], send: [], rewind: [] };
   const target = { command_id: 'queued-single', text: 'Original single queued draft; leave later messages alone',
@@ -341,6 +341,7 @@ async function checkQueued(browser, origin, phone, outcome) {
             socket.close();
             return;
           }
+          liveSocket = socket;
           socket.send(JSON.stringify({ type: 'sessions', sessions: [session()] }));
           socket.send(JSON.stringify({ type: 'workers', workers: [{
             id: session().worker_id, name: 'Queued edit fixture', hostname: 'fixture', os: 'linux', arch: 'x86_64',
@@ -383,6 +384,43 @@ async function checkQueued(browser, origin, phone, outcome) {
     f.stream({ type: 'queue', queued: [target, ...queued()] });
     const bubble = page.getByText(target.text, { exact: true });
     await bubble.waitFor();
+    if (outcome === 'queued-ready') {
+      const waiting = page.locator('[data-waiting-messages]');
+      liveSocket.send(JSON.stringify({ type: 'sessions', sessions: [session('parent', 'working')] }));
+      await settle(page);
+      const bounds = await waiting.boundingBox();
+      const composerBounds = await page.locator('textarea').first().boundingBox();
+      assert(bounds.x <= composerBounds.x && bounds.x + bounds.width <= composerBounds.x + composerBounds.width + 24,
+        'waiting input aligns with the reading column and composer, including beside a wide overview');
+      assert(await waiting.evaluate(el => {
+        for (let p = el.parentElement; p; p = p.parentElement) {
+          if (p.dataset.scrollBox !== undefined || (p.scrollHeight > p.clientHeight && getComputedStyle(p).overflowY === 'auto')) return false;
+        }
+        return true;
+      }), 'waiting input is outside the scrolling transcript');
+      f.stream({ type: 'text', turn: 100, seq: 9999, text: 'New streamed reply text.\n\n'.repeat(150) });
+      await page.locator('.md').filter({ hasText: 'New streamed reply text.' }).last().waitFor();
+      await settle(page);
+      assert.deepEqual(await waiting.boundingBox(), bounds, 'growing replies cannot move waiting input');
+      const last = page.locator('[data-queued-command="later-two"]');
+      assert.equal(await last.getByRole('button', { name: 'Edit queue…', exact: true }).count(), 0, 'last input has no tail to edit');
+      const actions = page.locator('[data-queued-command="queued-single"] [data-queue-actions]');
+      assert.deepEqual((await actions.getByRole('button').allTextContents()).map(s => s.trim()), ['Edit', 'Cancel', 'Edit queue…'], 'one consistent action row, Edit first');
+      const editPosition = await actions.getByRole('button', { name: 'Edit', exact: true }).boundingBox();
+      const lastEditPosition = await last.getByRole('button', { name: 'Edit', exact: true }).boundingBox();
+      assert.equal(editPosition.x, lastEditPosition.x, 'Edit stays in the same horizontal slot with or without a queued tail');
+      f.stream({ type: 'queue', queued: [target, ...Array.from({ length: 20 }, (_, i) => ({ ...target, command_id: `many-${i}`, text: `Waiting message ${i}` }))] });
+      await page.getByText('Waiting message 19', { exact: true }).waitFor({ state: 'attached' });
+      assert(await waiting.evaluate(el => el.scrollHeight > el.clientHeight && el.clientHeight <= innerHeight * .30 + 1), 'many waiting messages have their own bounded scroll');
+      f.stream({ type: 'queue', queued: [{ ...target, with_agent: true }, ...queued()] });
+      await page.locator('[data-queued-command="queued-single"]').getByRole('button', { name: 'Send now', exact: true }).waitFor();
+      assert.deepEqual((await page.locator('[data-queued-command="queued-single"] [data-queue-actions]').getByRole('button').allTextContents()).map(s => s.trim()), ['Send now', 'Edit'], 'with-agent input keeps Edit second and has no cancellable queue tail action');
+      assert.equal((await page.locator('[data-queued-command="queued-single"]').getByRole('button', { name: 'Edit', exact: true }).boundingBox()).x,
+        editPosition.x, 'Edit keeps its exact horizontal position when the agent takes this input');
+      f.stream({ type: 'queue', queued: [target, ...queued()] });
+      await page.locator('[data-queued-command="queued-single"]').getByRole('button', { name: 'Cancel', exact: true }).waitFor();
+      await bubble.waitFor();
+    }
     const row = bubble.locator('..');
     assert.equal(await row.getByRole('button', { name: 'Edit queue…', exact: true }).count(), 1, 'bulk queue Edit remains a separate action');
     const edit = row.getByRole('button', { name: 'Edit', exact: true });

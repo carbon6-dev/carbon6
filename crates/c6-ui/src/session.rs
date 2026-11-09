@@ -774,6 +774,9 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     });
     let waiting = Memo::new(move |_| waiting_shown.with(|items| events.with(|evs| waiting_on_you(&id_stored.get_value(), evs, items))));
     let find_root = root.clone();
+    // The transcript owns edit/rewind state, but waiting input belongs beside
+    // the composer, not in the scrolling stream of replies.
+    let waiting_mount = NodeRef::<leptos::html::Div>::new();
     // "New like this": a popup with the new-session form, filled in from
     // this session as it is now (its labels, its current model).
     let like_this = RwSignal::new(None::<sessions::SessionSeed>);
@@ -1074,7 +1077,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                 })}
             </Suspense>
             {move || detail.get().and_then(Result::ok).map(|d| view! {
-                <Transcript session=d.session feed running=Signal::derive(running) timeline chrome=chrome />
+                <Transcript session=d.session feed running=Signal::derive(running) timeline chrome=chrome waiting_mount />
             })}
         </div>
         <Show when=move || glance_present.get()>
@@ -1117,6 +1120,10 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             }
         })}
         </ScrollBox>
+            <div class=format!("{READING_ROW} shrink-0")>
+                <div node_ref=waiting_mount class=READING />
+                {glance_room(wide)}
+            </div>
             <div class="hidden md:contents"><SubagentWaiting chrome /></div>
             <PhoneStatus chrome streaming=feed.streaming latest=Signal::derive(move || feed.to.get().is_none()) />
             <Show when=move || own_session.with(Option::is_some) fallback=|| view! { <p class="px-3 py-2 text-xs text-muted">"Loading session…"</p> }>
@@ -2222,6 +2229,7 @@ fn Transcript(
     running: Signal<bool>,
     #[prop(optional)] timeline: Option<crate::timeline::Timeline>,
     #[prop(optional)] chrome: Option<SessionChrome>,
+    #[prop(optional)] waiting_mount: Option<NodeRef<leptos::html::Div>>,
 ) -> impl IntoView {
     let Feed { events, usage, spawns, streaming, queued, edit_open, edit_rows, secrets, from, to, .. } = feed;
     let id = StoredValue::new(session.id.clone());
@@ -2631,8 +2639,27 @@ fn Transcript(
             {move || editing.get().map(|(target, text)| view! {
                 <MessageEdit session=id.get_value() target text events ready=rewind_ready on_close=Callback::new(move |_| editing.set(None)) />
             })}
-            {move || edit_open.get().then(|| view! { <QueueEditBox rows=edit_rows session_id=id.get_value() on_close=Callback::new(move |_| { edit_open.set(false); edit_rows.update(Vec::clear); }) /> })}
-            {move || queued.get().into_iter().map(|q| view! { <Queued q session_id=id.get_value() worker_id=worker_id pull=pull edit=edit_queued events ready=rewind_ready edit_active /> }).collect_view()}
+            { {
+                let waiting = move || view! {
+                    <div class="max-h-[30dvh] space-y-2 overflow-y-auto px-4" data-waiting-messages="true">
+                        {move || edit_open.get().then(|| view! { <QueueEditBox rows=edit_rows session_id=id.get_value() on_close=Callback::new(move |_| { edit_open.set(false); edit_rows.update(Vec::clear); }) /> })}
+                        {move || {
+                            let rows = queued.get();
+                            let last_waiting = rows.iter().rposition(|q| !q.with_agent && q.rejected.is_none());
+                            rows.into_iter().enumerate().map(|(i, q)| {
+                                let has_tail = last_waiting.is_some_and(|last| i < last);
+                                view! { <Queued q session_id=id.get_value() worker_id=worker_id pull=pull edit=edit_queued events ready=rewind_ready edit_active has_tail /> }
+                            }).collect_view()
+                        }}
+                    </div>
+                };
+                match waiting_mount {
+                    Some(mount) => view! { {move || mount.get().map(move |mount| view! {
+                        <leptos::portal::Portal mount=web_sys::Element::from(mount)>{waiting()}</leptos::portal::Portal>
+                    })} }.into_any(),
+                    None => waiting().into_any(),
+                }
+            } }
             // One compact line in the reading column's existing bottom gutter:
             // status/usage/tasks never add height, even when they arrive apart.
             // Phones already combine their status outside the scroll box.
@@ -5515,6 +5542,7 @@ fn Queued(
     events: RwSignal<Vec<Event>>,
     ready: Signal<bool>,
     edit_active: Signal<bool>,
+    has_tail: bool,
 ) -> impl IntoView {
     let rejected = q.rejected.clone();
     let editable = rejected.is_none();
@@ -5570,42 +5598,21 @@ fn Queued(
             }>
                 {text.get_value()}
             </div>
-            {match rejected {
-                Some(reason) => view! {
-                    <span class="text-xs text-red-600">
-                        {format!("Not delivered: {reason}")} " "
-                        <button class="underline" on:click=move |_| { let id = session_id.get_value(); spawn_local(async move { let _ = api::dismiss_rejected(id).await; }); }>"Dismiss"</button>
-                    </span>
-                }.into_any(),
-                // With the agent already: it reads it at its next step; Send now
-                // gives it to the agent at once (docs/background.md §4).
-                None if with_agent => view! {
-                    <span class="flex items-center gap-2 text-xs text-muted">
-                        <button class=UBTN title="The agent gets this now, not at its next step (Claude Code moves what it waits on to the background; its background agents go on)"
-                            prop:disabled=move || busy.get() on:click=move |_| {
-                                busy.set(true);
-                                let (id, cid) = (session_id.get_value(), command_id.get_value());
-                                spawn_local(async move {
-                                    if let Err(e) = api::send_queued_now(id, cid).await { error.set(Some(e)); }
-                                    busy.set(false);
-                                });
-                            }>"Send now"</button>
-                    </span>
-                }.into_any(),
-                None => view! {
-                    <span class="flex items-center gap-2 text-xs text-muted">
-                        "queued"
-                        {move || queue_ops.get().then(|| view! {
-                            <button class=UBTN title="Edit this message and the ones queued after it, then send them again"
-                                prop:disabled=move || busy.get() on:click=move |_| do_pull()>{crate::icons::pencil()}" Edit queue…"</button>
-                            <button class=UBTN title="Remove this message from the queue"
-                                on:click=move |_| { let (id, cid) = (session_id.get_value(), command_id.get_value()); spawn_local(async move {
-                                    if let Err(e) = api::cancel_queued_input(id, cid).await { error.set(Some(e)); }
-                                }); }>{crate::icons::x()}" Cancel"</button>
-                        })}
-                    </span>
-                }.into_any(),
-            }}
+            // Reserve all four slots, even without Cancel or a queue tail:
+            // Edit must not move when this input is handed to the agent.
+            <div class="grid max-w-full grid-cols-[3.75rem_3.25rem_3.75rem_5.75rem] items-center gap-1 overflow-x-auto whitespace-nowrap text-xs text-muted *:min-h-11" data-queue-actions="true">
+            {(!with_agent && editable).then_some("queued")}
+            {with_agent.then(|| view! {
+                <button class=UBTN title="Give this message to the agent now"
+                    prop:disabled=move || busy.get() on:click=move |_| {
+                        busy.set(true);
+                        let (id, cid) = (session_id.get_value(), command_id.get_value());
+                        spawn_local(async move {
+                            if let Err(e) = api::send_queued_now(id, cid).await { error.set(Some(e)); }
+                            busy.set(false);
+                        });
+                    }>"Send now"</button>
+            })}
             {editable.then(|| message_edit_button(
                 "Edit only this message after worker-confirmed withdrawal",
                 UBTN.to_owned(),
@@ -5613,6 +5620,29 @@ fn Queued(
                 do_edit,
                 Some(edit_busy),
             ))}
+            {match rejected {
+                Some(reason) => view! {
+                    <span class="col-span-4 text-xs text-red-600">
+                        {format!("Not delivered: {reason}")} " "
+                        <button class="underline" on:click=move |_| { let id = session_id.get_value(); spawn_local(async move { let _ = api::dismiss_rejected(id).await; }); }>"Dismiss"</button>
+                    </span>
+                }.into_any(),
+                None if with_agent => ().into_any(),
+                None => view! {
+                        {move || queue_ops.get().then(|| view! {
+                            <button class=UBTN title="Remove this message from the queue"
+                                prop:disabled=move || busy.get()
+                                on:click=move |_| { let (id, cid) = (session_id.get_value(), command_id.get_value()); spawn_local(async move {
+                                    if let Err(e) = api::cancel_queued_input(id, cid).await { error.set(Some(e)); }
+                                }); }>{crate::icons::x()}" Cancel"</button>
+                        })}
+                }.into_any(),
+            }}
+            {move || (!with_agent && editable && has_tail && queue_ops.get()).then(|| view! {
+                <button class=UBTN title="Edit this message and the ones queued after it, then send them again"
+                    prop:disabled=move || edit_busy.get() on:click=move |_| do_pull()>{crate::icons::pencil()}" Edit queue…"</button>
+            })}
+            </div>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
         </div>
     }
