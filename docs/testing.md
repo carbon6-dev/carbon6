@@ -687,8 +687,11 @@ and retains all native reset barriers and fail-closed assertions. Head/worker
 tests cover legacy and unknown rewind eligibility; Watchers' policy matrix checks
 that only known human input, including auth-off page input, is a human correction.
 
-Waiting input is mounted just above the session composer, outside the scrolling
-transcript. The queue has its own 30dvh scroll limit. Each input has an icon-only
+Waiting input follows the last transcript item, including the streaming reply,
+in normal flow inside the transcript's scroller, with no separate queue scroller.
+In short or empty transcripts it stays directly after the content rather than
+against the composer. Scrolling up leaves it behind; following the latest keeps
+the trailing waiting rows in view while the reply grows. Each input has an icon-only
 **Take this back** (×); only `with_agent` inputs also offer the soft **Send now**
 action. There is no Edit or Edit queue entry. Taking one back immediately hides
 its row and restores its text into the existing Composer, ahead of any draft
@@ -2406,6 +2409,12 @@ and places a collapsed UTF-16 caret after the restored block. Existing draft
 text follows a blank line. Consecutive returns stack in click order, regardless
 of HTTP completion order. There is no separate edit panel or implicit Send.
 
+`CASE=waiting- ENGINE=both` checks short and empty transcripts on desktop and
+phones: the waiting row follows the last content high in the pane, stays after
+the streaming reply, follows repeated stream growth, scrolls out of view when
+reading earlier content, and returns with Latest. The queued-layout cases also
+cover many waiting rows without a nested scroller.
+
 `CASE=queued- ENGINE=both` selects 64 cases. The selected cancellation response
 is promise-gated to prove that insertion/hiding do not wait for HTTP. Attachment
 recovery is explicitly mocked as GET
@@ -2474,11 +2483,11 @@ is intentionally removed.
 `CASE=rejected ENGINE=both` checks rejected deliveries on desktop and phones
 (320/390px, including unbroken reason/input text). They render as error rows in
 the scrolling transcript after durable messages and before the streaming reply,
-not in the pinned waiting area. Growing replies must not move their transcript
+not among the trailing waiting rows. Growing replies must not move their transcript
 position. Original input stays recoverable, reasons wrap without horizontal
 scrolling, and the compact Dismiss button stays visible and hit-testable (44px
 target on touch only). Dismiss clears all rejections through the existing API,
-leaving queued/with-agent rows pinned; no queue actions appear on rejected rows.
+leaving queued/with-agent rows at the transcript's end; no queue actions appear on rejected rows.
 
 `CASE=sent-during-turn- ENGINE=both` selects 12 additional desktop/phone cases
 for human, explicitly unknown, and legacy (absent) origins. Each actually fills

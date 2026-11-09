@@ -898,9 +898,6 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     });
     let waiting = Memo::new(move |_| waiting_shown.with(|items| events.with(|evs| waiting_on_you(&id_stored.get_value(), evs, items))));
     let find_root = root.clone();
-    // The transcript owns edit/rewind state, but waiting input belongs beside
-    // the composer, not in the scrolling stream of replies.
-    let waiting_mount = NodeRef::<leptos::html::Div>::new();
     // "New like this": a popup with the new-session form, filled in from
     // this session as it is now (its labels, its current model).
     let like_this = RwSignal::new(None::<sessions::SessionSeed>);
@@ -1202,7 +1199,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                 })}
             </Suspense>
             {move || detail.get().and_then(Result::ok).map(|d| view! {
-                <Transcript session=d.session feed running=Signal::derive(running) timeline chrome=chrome waiting_mount />
+                <Transcript session=d.session feed running=Signal::derive(running) timeline chrome=chrome />
             })}
         </div>
         <Show when=move || glance_present.get()>
@@ -1245,10 +1242,6 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
             }
         })}
         </ScrollBox>
-            <div class=format!("{READING_ROW} shrink-0")>
-                <div node_ref=waiting_mount class=READING />
-                {glance_room(wide)}
-            </div>
             <div class="hidden md:contents"><SubagentWaiting chrome /></div>
             <PhoneStatus chrome streaming=feed.streaming latest=Signal::derive(move || feed.to.get().is_none()) />
             <Show when=move || own_session.with(Option::is_some) fallback=|| view! { <p class="px-3 py-2 text-xs text-muted">"Loading session…"</p> }>
@@ -2392,7 +2385,6 @@ fn Transcript(
     running: Signal<bool>,
     #[prop(optional)] timeline: Option<crate::timeline::Timeline>,
     #[prop(optional)] chrome: Option<SessionChrome>,
-    #[prop(optional)] waiting_mount: Option<NodeRef<leptos::html::Div>>,
 ) -> impl IntoView {
     let Feed { events, usage, spawns, streaming, queued, secrets, from, to, .. } = feed;
     let id = StoredValue::new(session.id.clone());
@@ -2856,36 +2848,28 @@ fn Transcript(
                     {move || has_text.get().then(|| view! { <div class="md" on:click=crate::mentions::link_clicks() inner_html=move || markdown::to_html(&stream_text.get())></div> })}
                 </div>
             })}
-            { {
-                let waiting = move || view! {
-                    <div class="max-h-[30dvh] space-y-2 overflow-y-auto px-4" class:py-2=move || queued.with(|rows| rows.iter().any(|q| q.rejected.is_none() && !withdrawn.with(|ids| ids.contains(&q.command_id)))) data-waiting-messages="true">
-                        {move || {
-                            let rows = queued.get().into_iter().filter(|q| q.rejected.is_none() && !withdrawn.with(|ids| ids.contains(&q.command_id))).collect::<Vec<_>>();
-                            rows.into_iter().map(|q| {
-                                use futures::FutureExt;
-                                if !draft_files.with_value(|m| m.contains_key(&q.command_id)) {
-                                    let files = api::message_draft(id.get_value(), q.command_id.clone()).boxed_local().shared();
-                                    draft_files.update_value(|m| { m.insert(q.command_id.clone(), files.clone()); });
-                                    spawn_local(async move { let _ = files.await; });
-                                }
-                                let command_id = StoredValue::new(q.command_id.clone());
-                                view! {
-                                    <Queued q session_id=id.get_value() take_back />
-                                    {move || withdrawal_notes.with(|notes| notes.get(&command_id.get_value()).cloned()).map(|note| view! {
-                                        <p class="text-right text-xs text-muted" role="status">{note}</p>
-                                    })}
-                                }
-                            }).collect_view()
-                        }}
-                    </div>
-                };
-                match waiting_mount {
-                    Some(mount) => view! { {move || mount.get().map(move |mount| view! {
-                        <leptos::portal::Portal mount=web_sys::Element::from(mount)>{waiting()}</leptos::portal::Portal>
-                    })} }.into_any(),
-                    None => waiting().into_any(),
-                }
-            } }
+            // Waiting input follows everything above, including the live reply,
+            // in the transcript's own scroll and follow-latest flow.
+            <div class="space-y-2" data-waiting-messages="true">
+                {move || {
+                    let rows = queued.get().into_iter().filter(|q| q.rejected.is_none() && !withdrawn.with(|ids| ids.contains(&q.command_id))).collect::<Vec<_>>();
+                    rows.into_iter().map(|q| {
+                        use futures::FutureExt;
+                        if !draft_files.with_value(|m| m.contains_key(&q.command_id)) {
+                            let files = api::message_draft(id.get_value(), q.command_id.clone()).boxed_local().shared();
+                            draft_files.update_value(|m| { m.insert(q.command_id.clone(), files.clone()); });
+                            spawn_local(async move { let _ = files.await; });
+                        }
+                        let command_id = StoredValue::new(q.command_id.clone());
+                        view! {
+                            <Queued q session_id=id.get_value() take_back />
+                            {move || withdrawal_notes.with(|notes| notes.get(&command_id.get_value()).cloned()).map(|note| view! {
+                                <p class="text-right text-xs text-muted" role="status">{note}</p>
+                            })}
+                        }
+                    }).collect_view()
+                }}
+            </div>
             // One compact line in the reading column's existing bottom gutter:
             // status/usage/tasks never add height, even when they arrive apart.
             // Phones already combine their status outside the scroll box.

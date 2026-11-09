@@ -22,6 +22,108 @@ const queueRow = (page, cid) => page.locator(`[data-queued-command="${cid}"]`);
 // the containing Composer box, not that immediate parent.
 const composerBox = composer => composer.locator('xpath=ancestor::div[.//input[@type="file"]][1]');
 
+async function waitingInFlow(waiting) {
+  assert(await waiting.evaluate(el => {
+    let scroller = el.parentElement;
+    while (scroller && getComputedStyle(scroller).overflowY !== 'auto') scroller = scroller.parentElement;
+    return !!el.closest('[data-follow-content]') && !!scroller &&
+      getComputedStyle(el).position === 'static' && getComputedStyle(el).overflowY === 'visible' &&
+      getComputedStyle(el).maxHeight === 'none';
+  }), 'waiting rows belong to the transcript scroller, in normal flow without an inner scroll limit');
+}
+
+async function waitingAtEnd(page) {
+  await page.waitForFunction(() => {
+    const el = document.querySelector('[data-waiting-messages]');
+    let scroller = el?.parentElement;
+    while (scroller && getComputedStyle(scroller).overflowY !== 'auto') scroller = scroller.parentElement;
+    if (!scroller) return false;
+    const row = el.lastElementChild?.getBoundingClientRect(), box = scroller.getBoundingClientRect();
+    return row && row.bottom <= box.bottom + 1 && row.bottom > box.top &&
+      scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= 1;
+  });
+}
+
+async function checkWaitingPlacement(browser, origin, phone, empty) {
+  let progress;
+  const connected = deferred();
+  const f = await fixture(browser, origin, phone ? { width: 390, height: 844 } : { width: 1440, height: 1000 },
+    'dark', { choice: 'off', effective: 'off', os: 'reduce' }, p => { progress = p; }, {}, {
+      instrumentation: false,
+      setup: async ({ page, context }) => {
+        await page.route('**/api/v1/sessions/parent/messages/*/draft', route => route.fulfill({ json: [] }));
+        await context.routeWebSocket(/\/sessions\/parent\/stream(?:\?|$)/, ws => {
+          if (!empty) ws.send(JSON.stringify({ type: 'event', event: { seq: 1, ts: 1, type: 'assistant', turn: 1,
+            blocks: [{ type: 'text', text: 'The only short reply.' }], stop_reason: 'end_turn' } }));
+          ws.send(JSON.stringify({ type: 'synced' }));
+          connected.resolve(ws);
+        });
+      },
+    }).catch(async error => { await progress?.context.close(); throw error; });
+  try {
+    const { page } = f;
+    const socket = await connected.promise;
+    socket.send(JSON.stringify({ type: 'queue', queued: [queued()[0]] }));
+    const waiting = page.locator('[data-waiting-messages]');
+    await queueRow(page, 'later-one').waitFor();
+    await settle(page);
+    await waitingInFlow(waiting);
+    assert(await waiting.evaluate((el, empty) => {
+      const previous = el.previousElementSibling;
+      const content = el.closest('[data-follow-content]').getBoundingClientRect();
+      const row = el.getBoundingClientRect();
+      const gap = parseFloat(getComputedStyle(el.parentElement).rowGap);
+      return row.top < content.top + 180 && (empty ||
+        (previous?.querySelector('.md')?.textContent.trim() === 'The only short reply.' &&
+          Math.abs(row.top - previous.getBoundingClientRect().bottom - gap) <= 1));
+    }, empty), 'short/empty transcript leaves waiting input high in the pane, directly after the last content');
+    await f.setState('working');
+    for (let i = 1; i <= 3; i++) {
+      const text = `Stream batch ${i}.\n\n` + 'Growing streamed reply.\n\n'.repeat(35);
+      socket.send(JSON.stringify({ type: 'text', turn: 2, seq: 2, text }));
+      await page.locator('.md').filter({ hasText: `Stream batch ${i}.` }).waitFor();
+      await waitingAtEnd(page);
+      assert(await waiting.evaluate(el => {
+        const previous = el.previousElementSibling;
+        const gap = parseFloat(getComputedStyle(el.parentElement).rowGap);
+        return previous?.textContent.includes('Growing streamed reply.') &&
+          Math.abs(el.getBoundingClientRect().top - previous.getBoundingClientRect().bottom - gap) <= 1;
+      }), 'waiting follows the growing streaming reply without reordering');
+    }
+    // Mobile WebKit cannot dispatch wheel input. Home exercises the real
+    // scroller's input/follow policy in both engines without writing scrollTop.
+    await waiting.evaluate(el => {
+      let scroller = el.parentElement;
+      while (getComputedStyle(scroller).overflowY !== 'auto') scroller = scroller.parentElement;
+      scroller.focus({ preventScroll: true });
+    });
+    await page.keyboard.press('Home');
+    await page.getByTitle('To the latest (End)', { exact: true }).waitFor();
+    assert(await waiting.evaluate(el => {
+      let scroller = el.parentElement;
+      while (getComputedStyle(scroller).overflowY !== 'auto') scroller = scroller.parentElement;
+      return el.getBoundingClientRect().top >= scroller.getBoundingClientRect().bottom;
+    }), 'scrolling up leaves waiting rows outside the transcript viewport');
+    socket.send(JSON.stringify({ type: 'text', turn: 2, seq: 2, text: 'Still writing while scrolled up.\n\n'.repeat(100) }));
+    await page.locator('.md').filter({ hasText: 'Still writing while scrolled up.' }).waitFor();
+    await settle(page);
+    assert(await waiting.evaluate(el => {
+      let scroller = el.parentElement;
+      while (getComputedStyle(scroller).overflowY !== 'auto') scroller = scroller.parentElement;
+      return el.getBoundingClientRect().top >= scroller.getBoundingClientRect().bottom;
+    }), 'continued streaming does not pull a reader back to the waiting rows');
+    await page.getByTitle('To the latest (End)', { exact: true }).click();
+    await waitingAtEnd(page);
+    socket.send(JSON.stringify({ type: 'event', event: { seq: 2, ts: 2, type: 'assistant', turn: 2,
+      blocks: [{ type: 'text', text: 'The completed streamed reply.' }], stop_reason: 'end_turn' } }));
+    await page.locator('.c6-transcript-row').filter({ hasText: 'The completed streamed reply.' }).waitFor();
+    await settle(page);
+    assert(await waiting.evaluate(el => el.previousElementSibling?.textContent.includes('The completed streamed reply.')),
+      'the completed reply replaces its stream before waiting input, keeping transcript order');
+    assert.deepEqual(f.errors, []);
+  } finally { await f.context.close(); }
+}
+
 function queued() {
   return ['First', 'Second'].map((name, n) => ({ command_id: n ? 'later-two' : 'later-one',
     text: `${name} later waiting message`, created_at: n + 1, rejected: null, with_agent: false }));
@@ -284,7 +386,8 @@ async function checkRejected(browser, origin, phone) {
     await settle(page);
     const waiting = page.locator('[data-waiting-messages]');
     assert.equal(await waiting.locator('[data-rejected-command]').count(), 0);
-    assert.equal(await waiting.locator('[data-queued-command]').count(), 3, 'waiting and with-agent rows remain pinned');
+    assert.equal(await waiting.locator('[data-queued-command]').count(), 3, 'waiting and with-agent rows remain at the transcript end');
+    await waitingInFlow(waiting);
     assert.equal(await rejected.getByText(rows[3].text, { exact: true }).count(), 1, 'original input remains recoverable');
     assert.deepEqual(await rejected.getByRole('button').allTextContents(), ['Dismiss'], 'rejections are not queue work');
     assert(await rejected.evaluate(el => {
@@ -439,17 +542,21 @@ async function checkQueued(browser, origin, phone, outcome) {
       const bounds = await row.boundingBox(), actionBounds = await row.locator('[data-queue-actions]').boundingBox();
       assert(actionBounds.x >= bounds.x - 1 && actionBounds.x + actionBounds.width <= bounds.x + bounds.width + 1, 'actions stay right-aligned inside their row');
       assert(Math.abs(actionBounds.x + actionBounds.width - bounds.x - bounds.width) <= 1, 'action row aligns to the waiting bubble edge');
-      assert(await waiting.evaluate(el => el.scrollWidth <= el.clientWidth + 1), 'waiting text wraps without horizontal overflow');
+      // The transparent touch target extends 8px into the reading gutter.
+      // Without the old padded inner scroller that counts in the group's
+      // scrollWidth, but is not overflowing text or a horizontal scroller.
+      assert(await waiting.evaluate(el => [...el.querySelectorAll('.whitespace-pre-wrap')]
+        .every(text => text.scrollWidth <= text.clientWidth + 1)), 'every waiting message wraps without horizontal text overflow');
       assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'no page overflow');
     }
     await actionTarget(queueRow(page, withAgent.command_id).getByRole('button', { name: 'Send now', exact: true }), phone, false);
-    assert(await waiting.evaluate(el => getComputedStyle(el).overflowY === 'auto' && el.clientHeight <= innerHeight * .3 + 1), 'waiting rows own the bounded 30dvh scroll area');
-    const before = await waiting.boundingBox();
+    await waitingInFlow(waiting);
     f.stream({ type: 'text', turn: 100, seq: 9999, text: 'Growing streamed reply.\n\n'.repeat(100) });
     await page.locator('.md').filter({ hasText: 'Growing streamed reply.' }).last().waitFor();
     await settle(page);
-    const after = await waiting.boundingBox();
-    assert(Math.abs(before.y - after.y) <= 1, 'stream growth cannot move the pinned waiting area');
+    await waitingAtEnd(page);
+    assert(await waiting.evaluate(el => el.previousElementSibling?.textContent.includes('Growing streamed reply.')),
+      'waiting rows follow the streaming reply in transcript order');
     if (outcome === 'queued-send-now') {
       const response = page.waitForResponse(r => r.url().endsWith('/queue/with-agent/now'));
       await queueRow(page, withAgent.command_id).getByRole('button', { name: 'Send now', exact: true }).click();
@@ -893,7 +1000,7 @@ async function main() {
         'queued-ready', 'queued-empty', 'queued-taken-race', 'queued-failure', 'queued-failure-edited', 'queued-failure-reverted', 'queued-failure-retry',
         'queued-attachments', 'queued-stacking', 'queued-stacking-failure', 'queued-send-error', 'queued-send-now', 'queued-layout', 'queued-response-lost',
         'queued-attachments-edited-stacking', 'queued-send-failure-recovery',
-        'rejected', 'sent-during-turn-human', 'sent-during-turn-unknown', 'sent-during-turn-legacy',
+        'waiting-short', 'waiting-empty', 'rejected', 'sent-during-turn-human', 'sent-during-turn-unknown', 'sent-during-turn-legacy',
       ]) {
         const label = `${name}/${phone ? 'phone' : 'desktop'}/${outcome}`;
         if (process.env.CASE_EXACT && label !== process.env.CASE_EXACT) continue;
@@ -902,6 +1009,7 @@ async function main() {
         try {
           console.log(`RUN ${label}`);
           await within(label, () => outcome === 'rejected' ? checkRejected(browser, origin, phone)
+            : outcome.startsWith('waiting-') ? checkWaitingPlacement(browser, origin, phone, outcome === 'waiting-empty')
             : outcome.startsWith('sent-during-turn-') ? checkSentDuringTurn(browser, origin, phone, outcome)
             : ['queued-attachments-edited-stacking', 'queued-send-failure-recovery'].includes(outcome) ? checkQueuedRecoveryRace(browser, origin, phone, outcome)
             : outcome.startsWith('queued-') ? checkQueued(browser, origin, phone, outcome) : checkRewind(browser, origin, phone, outcome));
