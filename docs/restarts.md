@@ -95,12 +95,15 @@ Each step is tested with a worker that really restarts mid-work (the chaos tests
    - **Shell commands** (`Background::spawn_held`, in `<state>/held/<session>/<task>/`):
      - The command runs under `/bin/sh`, which writes its exit code to `code` when it ends. stdout and stderr go to `out` and `err`, and `meta.json` records it.
      - On reload, a session adopts each task it had running (`Background::adopt`) instead of marking it lost. It follows the files to the end and reports the end as usual, with all the output from both workers' time.
+     - Detached launch retains Rewind's durable writer reservation and cancellation checks. Adoption reuses that ownership; completion or an exited leader is not proof that its process group stopped (docs/background.md §8).
      - SSH sessions' commands are still run as before.
    - **Claude Code** (`Process::spawn_held`, in `<state>/claude/held/<conversation>/`):
      - **Input:** `claude` reads its input from a named pipe, `in`. A keeper process in its process group holds the pipe open, so no restart ever ends its input. The worker writes to the pipe.
      - **Output:** its output goes to `out`, its exit code to `code`, and how far the worker has read to `offset`. The offset is saved for every line but streaming deltas.
      - **The bridge:** the MCP bridge comes back on the port it had (`<state>/mcp-bridge-port`). The process's token is registered again, so carbon6's tools keep working for it.
      - **After a restart,** the start-up reload loads every session with a held process. Its actor takes the process up again (`Process::attach`) and reads on from `offset`. The rest of the interrupted turn comes in the way a turn Claude Code starts by itself does, so the session shows it, without starting `claude` again.
+     - **Rewind:** adoption selects only the journal's confirmed kept-history branch, never the original discarded conversation or a pending reset. A pending reset owns and stops its old/reset-attempt keeper before the durable absence barrier. Unidentifiable ownership stays fail-closed, with the actor and cancellable inbox alive. Cleanup does not authorize retry: a failed destructive reset still needs a new explicit Rewind. Ordinary worker shutdown keeps held processes alive; explicit reset cleanup kills all descendants even if the leader has already exited.
+     - **Initialization window (option A).** Fork/reset initialization is non-held until the new branch is confirmed. If its worker dies in that window, Rewind fails closed and only a new explicit Rewind can retry it; startup cannot retry or resurrect discarded history. After confirmation, ordinary model work uses a held process for the confirmed branch. This narrow initialization window deliberately does not have ordinary held-process restart survival.
      - **Ending:** closing it ends the keeper, so `claude` reads the end of its input and exits. Stopping it kills its process group. Either way its folder goes.
      - **Ask (head):** Ask's Claude Code on the head still runs as before (`Process::spawn`).
    - **Stopping the worker.**
@@ -113,6 +116,7 @@ Each step is tested with a worker that really restarts mid-work (the chaos tests
    - A subagent's session isn't woken: its parent's call already got what it did, and the parent decides.
    - A turn that waited on a subagent running on another worker isn't woken: that subagent's report wakes it, as before.
    - A Claude Code session whose process was held isn't woken either: it carries on by itself.
+   - A pending or applied Rewind that supersedes the interrupted turn suppresses its automatic continuation, both during recovery and if a queued resume reaches the actor later. Restart recovery never counts as an explicit retry of a stuck Rewind.
    - The reply that was streaming when the worker went is asked for again as part of the next turn.
 4. **Tests:**
    - `updates::an_update_waits_for_background_work_and_says_on_what`
@@ -120,6 +124,9 @@ Each step is tested with a worker that really restarts mid-work (the chaos tests
    - `chaos::worker_restart_mid_turn_then_continue`, which now checks that the session goes on by itself
    - `bash::tests::a_dropped_call_kills_its_whole_command`
    - `claude_code::tests::a_held_process_outlives_its_worker_and_is_taken_up`
+   - `session::tests::confirmed_rewind_restart_adopts_only_the_fork_and_deduplicates_input` and `failed_pending_rewind_restart_cleans_keepers_without_retry_and_keeps_inbox`: real held runtimes, journal-selected adoption, no superseded Resume, and cancellable queued input after a failed reset.
+   - `claude_code::tests::rewind_cleanup_stops_owned_descendants_after_the_wrapper_exits` and `rewind_cleanup_does_not_signal_a_reused_held_process_id`: descendant absence and positive ownership, not just leader exit.
+   - `claude_code_rewind` (its own binary): the fork/reset initialization crash window fails closed, consumes old retry authorizations, and requires a new explicit Rewind before queued messages can proceed.
    - `claude_code_restart` (its own binary): a fake `claude` mid-turn through a real end of the first worker's runtime. It checks that the rest of the turn shows, that `claude` isn't started again, and that a follow-up message reaches the same process.
 
    Each first worker runs in a tokio runtime of its own that the test ends, the way a worker's process ends.

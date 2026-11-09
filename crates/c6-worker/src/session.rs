@@ -441,6 +441,11 @@ impl SessionManager {
         // carries on from its log. (One whose Claude Code process was held
         // carries on by itself.)
         for (session_id, turn) in cut_short {
+            let events = self.journal.events_after(&session_id, 0, u32::MAX).await?;
+            let pending = matches!(self.journal.claude_rewind(&session_id).await?, Some((_, 0)));
+            if resume_superseded(&events, turn, pending) {
+                continue;
+            }
             match self.actor(&session_id).await {
                 Ok(Some(tx)) => {
                     let _ = tx.send(ActorMsg::Resume(turn));
@@ -1611,6 +1616,23 @@ async fn journal_claude_conversation(
     Ok(conversation)
 }
 
+/// A restart must not continue a turn whose work a rewind superseded. Check
+/// both when recovering and when handling Resume: a rewind can land while
+/// that message is waiting in the actor's mailbox.
+fn resume_superseded(events: &[SessionEvent], turn: u64, pending: bool) -> bool {
+    if pending {
+        return true;
+    }
+    let Some(start) = events.iter().find(|e| matches!(&e.kind, Some(session_event::Kind::TurnStarted(t)) if t.turn == turn)) else {
+        return true;
+    };
+    let end = events
+        .iter()
+        .find(|e| e.seq > start.seq && matches!(&e.kind, Some(session_event::Kind::TurnEnded(t)) if t.turn == turn))
+        .map_or(u64::MAX, |e| e.seq);
+    events.iter().any(|e| e.seq > start.seq && matches!(&e.kind, Some(session_event::Kind::Rewound(r)) if r.to_seq <= end))
+}
+
 /// Retained children keep their conversation and may continue working, except
 /// when restoring files: even a retained writer can race the restored tree.
 fn rewind_affected_events(events: &[SessionEvent], to_seq: u64, restore_files: bool) -> Vec<SessionEvent> {
@@ -2084,15 +2106,49 @@ impl Actor {
                 return;
             }
         }
-        let reset = match self.journal.claude_rewind(&self.writer.session_id).await {
+        let mut reset = match self.journal.claude_rewind(&self.writer.session_id).await {
             Ok(reset) => reset,
             Err(e) => {
                 error!("loading Claude Code rewind: {e:#}");
                 return;
             }
         };
+        if let Some((r, 0)) = &reset
+            && !r.untouched
+            && r.failure.is_empty()
+        {
+            // This actor did not start the destructive attempt. Initialization
+            // was deliberately non-held, and neither a crash nor old retry
+            // receipts may authorize it to repeat the reset. A live attempt
+            // reaches this boundary only inside reset_claude, not startup.
+            let interrupted = anyhow::anyhow!("Worker restarted before Claude Code confirmed Rewind; explicitly retry Rewind");
+            if let Err(e) = self.rewind_failed(&r.command_id, &interrupted, &r.retries).await {
+                error!("recording an interrupted Claude Code rewind: {e:#}");
+                return;
+            }
+            reset = match self.journal.claude_rewind(&self.writer.session_id).await {
+                Ok(reset) => reset,
+                Err(e) => {
+                    error!("loading the interrupted Claude Code rewind: {e:#}");
+                    return;
+                }
+            };
+        }
         if let Some((r, _)) = &reset {
             self.withdrawn.extend(r.withdrawn.iter().cloned());
+        }
+        if let Some((r, 0)) = &reset
+            && !r.untouched
+            && !r.failure.is_empty()
+        {
+            // Cleanup does not authorize initialize or retry. Keep the actor
+            // and its cancellable inbox even if absence cannot yet be proved.
+            if let Err(e) =
+                crate::claude_code::stop_held_for_rewind(&self.manager.claude_dir().join("held"), &self.writer.session_id, &self.journal)
+                    .await
+            {
+                warn!(session = %self.writer.session_id, "cleaning up a failed Rewind's held process: {e:#}");
+            }
         }
         let mut running: Option<(TurnTask, CancellationToken)> = None;
         // Rewinds wait for the running turn to stop. Do not let a retry
@@ -2147,6 +2203,24 @@ impl Actor {
                     break;
                 }
                 rewind_blocked = false;
+            }
+            if !rewind_blocked
+                && running.is_none()
+                && let Err(e) = self.take_up_held().await
+            {
+                // Do not overwrite an unidentifiable held runtime or drop
+                // its actor/inbox. Explicit rewind/stop can settle ownership.
+                rewind_blocked = true;
+                if let Err(e) = self
+                    .writer
+                    .append(session_event::Kind::Error(ErrorEvent {
+                        message: format!("Claude Code could not be safely taken up; queued messages were not sent: {e:#}"),
+                    }))
+                    .await
+                {
+                    error!("recording Claude Code adoption failure: {e:#}");
+                    return;
+                }
             }
             let handoff_waits = running.is_none() && self.handoff_waits();
             if handoff_waits && !self.handoff_announced {
@@ -2400,6 +2474,16 @@ impl Actor {
                         }
                     }
                     Some(ActorMsg::Resume(turn)) => {
+                        let check = async {
+                            let events = self.journal.events_after(&self.writer.session_id, 0, u32::MAX).await?;
+                            let pending = matches!(self.journal.claude_rewind(&self.writer.session_id).await?, Some((_, 0)));
+                            anyhow::Ok(resume_superseded(&events, turn, pending))
+                        }.await;
+                        match check {
+                            Ok(true) => continue,
+                            Ok(false) => {},
+                            Err(e) => { error!("checking restart continuation: {e:#}"); return; }
+                        }
                         // A subagent's parent decides (its call got what it did);
                         // a held Claude Code process carries on by itself.
                         if self.spec.delegation.is_some() || (self.runs_claude_code() && self.claude.is_some()) {
@@ -3138,6 +3222,9 @@ impl Actor {
             self.inbox.lock().unwrap().requeue(p.take_unsent());
             p.stop_for_rewind().await?;
         }
+        // A keeper may have outlived the actor/worker, including a cancelled
+        // stop. It is cleanup-owned here, never attached as the active branch.
+        crate::claude_code::stop_held_for_rewind(&self.manager.claude_dir().join("held"), sid, &self.journal).await?;
         // A prior actor/worker or failed initialization may have lost its
         // leader while descendants survived. Missing Process is not proof.
         crate::claude_code::confirm_stopped(&self.journal, sid, std::time::Duration::from_secs(3)).await?;
@@ -3295,6 +3382,10 @@ impl Actor {
                 launch.conversation = reset.session_id.clone();
             }
             self.journal.prepare_claude_rewind(sid, &reset).await?;
+            // Until ready confirms the actual fork ID this runtime must not
+            // survive a worker restart or be ordinarily adopted. Startup
+            // rejects an interrupted destructive attempt; the next quiet
+            // turn promotes a confirmed branch to held transport.
             let mut p = match Process::spawn(
                 &bin,
                 launch,
@@ -3362,14 +3453,14 @@ impl Actor {
     /// this session, taken up where it was (docs/restarts.md §3). What it
     /// writes from here on comes in as it would have (a turn it carries on
     /// shows as one it started by itself).
-    async fn take_up_held(&mut self) {
+    async fn take_up_held(&mut self) -> anyhow::Result<()> {
         if !self.runs_claude_code() || self.claude.is_some() {
-            return;
+            return Ok(());
         }
         let held = self.manager.claude_dir().join("held");
-        let Ok(events) = self.journal.events_after(&self.writer.session_id, 0, u32::MAX).await else { return };
-        let conversation = claude_conversation(&self.writer.session_id, &self.spec, &events).id;
-        let Some(token) = crate::claude_code::Process::held_token(&held, &conversation) else { return };
+        let events = self.journal.events_after(&self.writer.session_id, 0, u32::MAX).await?;
+        let conversation = journal_claude_conversation(&self.journal, &self.writer.session_id, &self.spec, &events).await?.id;
+        let Some((record, token)) = crate::claude_code::Process::held_record(&held, &conversation)? else { return Ok(()) };
         let bridge_tools = self.claude_code_subagent_tools();
         let registration = match token {
             Some(token) if !bridge_tools.is_empty() => self.manager.bridge().await.map(|b| {
@@ -3407,7 +3498,13 @@ impl Actor {
             self.claude_stdin.clone(),
             registration,
             Some(observer),
+        )
+        .await;
+        anyhow::ensure!(
+            self.claude.is_some() || !record.join("meta.json").try_exists()?,
+            "Cannot confirm ownership of the held Claude Code runtime"
         );
+        Ok(())
     }
 
     fn runs_claude_code(&self) -> bool {
@@ -3811,9 +3908,14 @@ async fn claude_turn(
     // no tasks (a restart would end them; the next quiet turn does it), no
     // inputs it has not taken, no turn it has begun.
     let mut restarted = false;
-    if let Some(p) = process.take_if(|p| p.launch() != &launch && p.idle_until(std::time::Duration::ZERO).is_some()) {
+    let mut promoted = false;
+    if let Some(p) = process.take_if(|p| (p.launch() != &launch || !p.is_held()) && p.idle_until(std::time::Duration::ZERO).is_some()) {
+        // A reset initializes non-held until its branch is confirmed. Promote
+        // that quiet process to restart-surviving transport on its next turn;
+        // this alone is not a settings/worker change to announce.
+        restarted = p.launch() != &launch;
+        promoted = !p.is_held();
         p.close().await;
-        restarted = true;
     }
     let inputs = inbox.lock().unwrap().drain();
     if process.is_none() && inputs.is_empty() {
@@ -3843,7 +3945,7 @@ async fn claude_turn(
                 session,
                 &bin,
                 launch.clone(),
-                conversation.resume,
+                conversation.resume || promoted,
                 cwd,
                 model,
                 stdin.clone(),
@@ -3867,7 +3969,7 @@ async fn claude_turn(
     }
     // A new conversation gets the preamble first (also when a resume finds
     // none: the first turn may have failed before Claude Code saved it).
-    let preamble = p.needs_preamble().then_some(conversation.preamble.as_deref()).flatten();
+    let preamble = (p.needs_preamble() || (promoted && !conversation.resume)).then_some(conversation.preamble.as_deref()).flatten();
     let mut end = p.turn(turn, inputs.clone(), false, preamble, model, sink, &feed, &more, cancel).await?;
     if end.no_conversation
         && let Some(bin) = &bin
@@ -6211,6 +6313,245 @@ mod handoff_tests {
         let journal = Arc::new(Journal::open(&dir.path().join("journal.db")).await.unwrap());
         let manager = SessionManager::new(journal, Arc::new(HeadLink::default()), dir.path().join("worktrees"));
         (dir, manager)
+    }
+
+    async fn rewind_actor_barrier(manager: &SessionManager, id: &str) {
+        manager.actor("s").await.unwrap().unwrap().send(ActorMsg::SetSubagentModel { command_id: id.into(), model: None }).unwrap();
+        c6_testkit::eventually("rewind actor mailbox barrier", async || {
+            manager
+                .journal
+                .events_after("s", 0, u32::MAX)
+                .await
+                .unwrap()
+                .iter()
+                .any(|e| matches!(&e.kind, Some(session_event::Kind::SubagentModelSet(m)) if m.command_id == id))
+                .then_some(())
+        })
+        .await;
+    }
+
+    /// No global CLI override: an accidentally replaced/adopted wrong process
+    /// must fail this fixture, rather than quietly spawning another fake.
+    fn rewind_held_fixture(dir: &Path) -> (CreateSession, SessionStarted, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let spec = CreateSession {
+            model: Some(model("cc", "opus", "claude_code")),
+            claude_code: Some(c6_proto::ClaudeCodeToolChoice { automatic: false, tools: vec![], ..Default::default() }),
+            ..Default::default()
+        };
+        let started = SessionStarted {
+            cwd: dir.display().to_string(),
+            home: dir.display().to_string(),
+            tool_profile: crate::claude_code::PROFILE.into(),
+            model: spec.model.clone(),
+            ..Default::default()
+        };
+        let bin = dir.join("claude-rewind-held");
+        std::fs::write(&bin, r#"#!/usr/bin/env python3
+import json, sys
+args = sys.argv[1:]
+conversation = args[args.index('--resume') + 1] if '--resume' in args else args[args.index('--session-id') + 1]
+def trace(v):
+    with open('held-trace.jsonl', 'a') as f:
+        f.write(json.dumps(dict(conversation=conversation, **v)) + '\n')
+def emit(v):
+    print(json.dumps(v), flush=True)
+trace(dict(kind='spawn'))
+for line in sys.stdin:
+    v = json.loads(line)
+    trace(dict(kind='input', value=v))
+    if v['type'] == 'control_request':
+        emit(dict(type='control_response', response=dict(subtype='success', request_id=v['request_id'])))
+    elif v['type'] == 'user':
+        emit(dict(type='user', isReplay=True, uuid=v['uuid'], message=v['message'], parent_tool_use_id=None))
+        emit(dict(type='assistant', message=dict(content=[dict(type='text', text=conversation)], stop_reason='end_turn'), parent_tool_use_id=None))
+        emit(dict(type='result', subtype='success', is_error=False, usage={}))
+"#).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (spec, started, bin)
+    }
+
+    fn leave_rewind_held(manager: &SessionManager, spec: &CreateSession, bin: &Path, cwd: &Path, conversation: &str) {
+        let launch = crate::claude_code::Launch {
+            conversation: conversation.into(),
+            settings: Some(claude_code_settings(spec, None)),
+            worker: c6_core::build().to_owned(),
+            native: claude_code_native(spec),
+            ..Default::default()
+        };
+        drop(
+            crate::claude_code::Process::spawn_held(
+                &manager.claude_dir().join("held"),
+                "s",
+                bin,
+                launch,
+                true,
+                cwd,
+                "opus",
+                Arc::default(),
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+    }
+
+    fn held_trace(dir: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(dir.join("held-trace.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn confirmed_rewind_restart_adopts_only_the_fork_and_deduplicates_input() {
+        if !c6_testkit::have("python3") {
+            return;
+        }
+        let (dir, manager) = rewind_test_manager().await;
+        let _cleanup = crate::claude_code::tests::HeldFixtureCleanup(manager.claude_dir().join("held"));
+        let (spec, started, bin) = rewind_held_fixture(dir.path());
+        let events = [
+            ev(1, session_event::Kind::Started(started)),
+            user(2, "kept"),
+            user(3, "removed"),
+            ev(4, session_event::Kind::TurnStarted(TurnStarted { turn: 1, ..Default::default() })),
+            ev(5, session_event::Kind::TurnEnded(TurnEnded { turn: 1, reason: TurnEndReason::WorkerRestarted as i32 })),
+        ];
+        manager.journal.import("s", &spec, &events).await.unwrap();
+        let fork = uuid::Uuid::now_v7().to_string();
+        manager
+            .journal
+            .prepare_claude_rewind(
+                "s",
+                &crate::claude_code::Reset { command_id: "confirmed".into(), to_seq: 3, session_id: fork.clone(), ..Default::default() },
+            )
+            .await
+            .unwrap();
+        manager
+            .journal
+            .append("s", &ev(6, session_event::Kind::Rewound(Rewound { command_id: "confirmed".into(), to_seq: 3, ..Default::default() })))
+            .await
+            .unwrap();
+        leave_rewind_held(&manager, &spec, &bin, dir.path(), "s");
+        leave_rewind_held(&manager, &spec, &bin, dir.path(), &fork);
+        let reopened = Arc::new(Journal::open(&dir.path().join("journal.db")).await.unwrap());
+        let manager = SessionManager::new(reopened, Arc::default(), dir.path().join("worktrees"));
+        manager.recover().await.unwrap();
+        rewind_actor_barrier(&manager, "adopted").await;
+        manager.actor("s").await.unwrap().unwrap().send(ActorMsg::Resume(1)).unwrap();
+        rewind_actor_barrier(&manager, "stale-resume").await;
+        let command = || SessionCommand {
+            session_id: "s".into(),
+            command_id: "after-rewind".into(),
+            kind: Some(session_command::Kind::Input(c6_proto::UserInput {
+                text: "display-only".into(),
+                prompt: "model-only".into(),
+                human_origin: true,
+                ..Default::default()
+            })),
+        };
+        manager.handle(command()).await.unwrap();
+        c6_testkit::eventually("adopted fork completes a real input", async || {
+            let raw = manager.journal.events_after("s", 0, u32::MAX).await.unwrap();
+            let input = raw.iter().find(|e| matches!(&e.kind, Some(session_event::Kind::User(u)) if u.command_id == "after-rewind"))?;
+            raw.iter().any(|e| e.seq > input.seq && matches!(e.kind, Some(session_event::Kind::TurnEnded(_)))).then_some(())
+        })
+        .await;
+        manager.handle(command()).await.unwrap();
+        rewind_actor_barrier(&manager, "redelivered").await;
+        let raw = manager.journal.events_after("s", 0, u32::MAX).await.unwrap();
+        assert_eq!(
+            raw.iter().filter(|e| matches!(&e.kind, Some(session_event::Kind::User(u)) if u.command_id == "after-rewind")).count(),
+            1
+        );
+        assert!(
+            !raw.iter().any(|e| matches!(&e.kind, Some(session_event::Kind::NoticeQueued(n)) if n.command_id == "resume-after-restart-1"))
+        );
+        let trace = held_trace(dir.path());
+        let inputs = trace.iter().filter(|v| v["kind"] == "input").collect::<Vec<_>>();
+        assert_eq!(inputs.len(), 1, "no implicit Resume, initialize, or duplicate input");
+        assert_eq!(inputs[0]["conversation"].as_str(), Some(fork.as_str()));
+        assert!(inputs[0]["value"]["message"]["content"].to_string().contains("model-only"), "PendingInput.prompt reaches the CLI");
+        assert!(!inputs[0]["value"]["message"]["content"].to_string().contains("display-only"));
+        assert_eq!(trace.iter().filter(|v| v["kind"] == "spawn" && v["conversation"].as_str() == Some(fork.as_str())).count(), 1);
+        // Only fixture-owned records are in this private held root.
+        crate::claude_code::stop_held_for_rewind(&manager.claude_dir().join("held"), "s", &manager.journal).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_pending_rewind_restart_cleans_keepers_without_retry_and_keeps_inbox() {
+        if !c6_testkit::have("python3") {
+            return;
+        }
+        let (dir, manager) = rewind_test_manager().await;
+        let _cleanup = crate::claude_code::tests::HeldFixtureCleanup(manager.claude_dir().join("held"));
+        let (spec, started, bin) = rewind_held_fixture(dir.path());
+        manager
+            .journal
+            .import(
+                "s",
+                &spec,
+                &[
+                    ev(1, session_event::Kind::Started(started)),
+                    user(2, "target"),
+                    ev(3, session_event::Kind::TurnStarted(TurnStarted { turn: 1, ..Default::default() })),
+                ],
+            )
+            .await
+            .unwrap();
+        let reset = crate::claude_code::Reset {
+            command_id: "failed".into(),
+            to_seq: 2,
+            session_id: "reset-attempt".into(),
+            failure: "explicit new retry required".into(),
+            untouched: false,
+            ..Default::default()
+        };
+        manager.journal.prepare_claude_rewind("s", &reset).await.unwrap();
+        leave_rewind_held(&manager, &spec, &bin, dir.path(), "s");
+        leave_rewind_held(&manager, &spec, &bin, dir.path(), "reset-attempt");
+        let reopened = Arc::new(Journal::open(&dir.path().join("journal.db")).await.unwrap());
+        let manager = SessionManager::new(reopened, Arc::default(), dir.path().join("worktrees"));
+        manager.recover().await.unwrap();
+        let handle = manager.load("s").await.unwrap().unwrap();
+        rewind_actor_barrier(&manager, "failed-recovered").await;
+        handle.tx.send(ActorMsg::Resume(1)).unwrap();
+        manager
+            .handle(SessionCommand {
+                session_id: "s".into(),
+                command_id: "queued".into(),
+                kind: Some(session_command::Kind::Input(c6_proto::UserInput {
+                    text: "must wait".into(),
+                    human_origin: true,
+                    ..Default::default()
+                })),
+            })
+            .await
+            .unwrap();
+        let rejection = manager
+            .handle(SessionCommand {
+                session_id: "s".into(),
+                command_id: "failed".into(),
+                kind: Some(session_command::Kind::Rewind(c6_proto::Rewind { to_seq: 2, restore_files: false })),
+            })
+            .await
+            .unwrap_err();
+        assert!(rejection.contains("explicit") || rejection.contains("retry"), "{rejection}");
+        rewind_actor_barrier(&manager, "failed-redelivered").await;
+        assert!(!handle.tx.is_closed());
+        assert!(matches!(manager.queue_op("s", "queued", None), QueueOp::Cancelled));
+        assert!(matches!(manager.queue_op("s", "queued", None), QueueOp::Absent));
+        let (pending, applied) = manager.journal.claude_rewind("s").await.unwrap().unwrap();
+        assert_eq!(applied, 0);
+        assert_eq!(serde_json::to_value(pending).unwrap(), serde_json::to_value(reset).unwrap());
+        let raw = manager.journal.events_after("s", 0, u32::MAX).await.unwrap();
+        assert!(!raw.iter().any(|e| matches!(e.kind, Some(session_event::Kind::Rewound(_) | session_event::Kind::NoticeQueued(_)))));
+        assert!(!raw.iter().any(|e| matches!(&e.kind, Some(session_event::Kind::User(u)) if u.command_id == "queued")));
+        assert!(held_trace(dir.path()).iter().all(|v| v["kind"] == "spawn"), "cleanup must never initialize/send/retry");
+        assert!(crate::claude_code::Process::held_sessions(&manager.claude_dir().join("held")).is_empty());
+        assert!(manager.journal.claude_processes("s").await.unwrap().is_empty());
     }
 
     #[tokio::test]

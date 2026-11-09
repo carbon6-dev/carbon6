@@ -62,6 +62,10 @@ for line in sys.stdin:
                     gate.sendall(b'initializing\n')
                     assert gate.recv(2) == b'ok'
             failed = Path('fail-reset').exists()
+            if not failed:
+                # Initialization confirms a real persisted branch. Quiet
+                # promotion closes this process and resumes it before input.
+                save()
             emit(dict(type='control_response', response=dict(
                 subtype='error' if failed else 'success', request_id=v['request_id'],
                 error='fixture refuses reset' if failed else None)))
@@ -124,8 +128,8 @@ for line in sys.stdin:
 /// A separate runtime lets a restart drop every worker actor/process, not
 /// merely reconnect the same in-memory actor. The head remains alive.
 struct WorkerProcess {
-    stop: oneshot::Sender<()>,
-    thread: std::thread::JoinHandle<()>,
+    stop: Option<oneshot::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
     id: String,
 }
 
@@ -146,15 +150,58 @@ impl WorkerProcess {
                 let _ = stopped.await;
             });
             // Runtime drop cancels the connection and all its actors, and
-            // Process::drop kills each fake CLI's process group.
+            // Non-held initialization dies; ordinary held CLIs survive for
+            // the next worker to adopt, just as after a real worker death.
         });
         let id = within("the worker's ready signal", attached).await.unwrap();
-        Self { stop, thread, id }
+        Self { stop: Some(stop), thread: Some(thread), id }
     }
 
-    async fn stop(self) {
-        self.stop.send(()).unwrap();
-        within("the worker runtime to stop", tokio::task::spawn_blocking(move || self.thread.join().unwrap())).await.unwrap();
+    async fn stop(mut self) {
+        self.stop.take().unwrap().send(()).unwrap();
+        let thread = self.thread.take().unwrap();
+        within("the worker runtime to stop", tokio::task::spawn_blocking(move || thread.join().unwrap())).await.unwrap();
+    }
+}
+
+impl Drop for WorkerProcess {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Created before any workers, so panic unwinding stops their runtimes first.
+/// Cleanup uses the same fresh kernel ownership checks as production; saved
+/// fixture PIDs alone must never authorize a signal after they are reused.
+struct HeldFixtureCleanup(PathBuf);
+
+impl Drop for HeldFixtureCleanup {
+    fn drop(&mut self) {
+        let state = self.0.clone();
+        let _ = std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+            rt.block_on(async {
+                let held = state.join("claude/held");
+                let Ok(entries) = std::fs::read_dir(&held) else { return };
+                let sessions = entries
+                    .flatten()
+                    .filter_map(|entry| {
+                        let meta: Value = serde_json::from_slice(&std::fs::read(entry.path().join("meta.json")).ok()?).ok()?;
+                        Some(meta["session"].as_str()?.to_owned())
+                    })
+                    .collect::<std::collections::HashSet<_>>();
+                let Ok(journal) = c6_worker::journal::Journal::open(&state.join("journal.db")).await else { return };
+                for session in sessions {
+                    let _ = c6_worker::claude_code::stop_held_for_rewind(&held, &session, &journal).await;
+                }
+            });
+        })
+        .join();
     }
 }
 
@@ -346,6 +393,7 @@ async fn claude_rewind_resets_native_history_before_acknowledging_and_fails_clos
     .await
     .unwrap();
     let state = tempfile::tempdir().unwrap();
+    let _held_cleanup = HeldFixtureCleanup(state.path().to_owned());
     let enrollment = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
     enroll::enroll(&enrollment.token).await.unwrap().save(state.path()).unwrap();
     let worker = WorkerProcess::start(state.path()).await;
@@ -463,7 +511,7 @@ async fn claude_rewind_resets_native_history_before_acknowledging_and_fails_clos
     let confirmed = events.iter().find(|e| matches!(e.kind, EventKind::Rewound { .. })).unwrap().seq;
     assert!(user_seq(&events, "AFTER_A") > confirmed, "queued input comes after the confirmed reset");
     let launches = records(a.path(), "launch");
-    assert_eq!(launches.len(), 2, "A should use the supported native cutoff, not fresh fallback");
+    assert_eq!(launches.len(), 3, "old process, supported native cutoff, then quiet held promotion");
     let fork = &launches[1];
     assert_eq!(fork["resume"], kept["sid"]);
     assert_eq!(fork["cutoff"], kept["final_uuid"]);
@@ -507,12 +555,13 @@ async fn claude_rewind_resets_native_history_before_acknowledging_and_fails_clos
     api.rewound(&first_id, 1).await;
     api.say(&first_id, "FIRST_REPLACEMENT").await;
     api.idle(&first_id, 2).await;
-    assert_eq!(records(first.path(), "launch").len(), 2);
+    assert_eq!(records(first.path(), "launch").len(), 3, "old process, fresh reset, then quiet held promotion");
     assert!(records(first.path(), "launch")[1]["resume"].is_null());
     clean_context(&records(first.path(), "prompt").pop().unwrap());
 
     // A real worker-runtime restart must use the reset conversation, never
     // --resume the abandoned pre-rewind ID (both native A and fallback B).
+    let held_launches = [records(a.path(), "launch").len(), records(b.path(), "launch").len()];
     worker.stop().await;
     let worker_id = api.worker.parse().unwrap();
     eventually("the stopped worker to detach", async || head.state.registry.get(worker_id).is_none().then_some(())).await;
@@ -531,11 +580,12 @@ async fn claude_rewind_resets_native_history_before_acknowledging_and_fails_clos
     drop(legacy);
     let worker = WorkerProcess::start(state.path()).await;
     let mut fork_prompts = Vec::new();
-    for (dir, id, turns) in [(a.path(), a_id.as_str(), 4), (b.path(), b_id.as_str(), 4)] {
+    for ((dir, id, turns), launches_before) in [(a.path(), a_id.as_str(), 4), (b.path(), b_id.as_str(), 4)].into_iter().zip(held_launches) {
         let previous_sid = records(dir, "prompt").last().unwrap()["sid"].clone();
         api.say(id, "AFTER_RESTART").await;
         api.idle(id, turns).await;
         let launches = records(dir, "launch");
+        assert_eq!(launches.len(), launches_before, "restart must adopt the confirmed held branch, not spawn/resume abandoned history");
         assert_eq!(launches.last().unwrap()["resume"], previous_sid);
         clean_context(&records(dir, "prompt").pop().unwrap());
         // Side chats seed from the effective transcript, not the raw audit log.
@@ -579,6 +629,16 @@ async fn claude_rewind_resets_native_history_before_acknowledging_and_fails_clos
     // guesses whether the reset reached this point before runtime shutdown.
     let crashed = tempfile::tempdir().unwrap();
     let (crashed_id, crashed_to) = seed(&api, crashed.path()).await;
+    let held_root = state.path().join("claude/held");
+    assert!(
+        std::fs::read_dir(&held_root).unwrap().filter_map(Result::ok).any(|entry| {
+            std::fs::read(entry.path().join("meta.json"))
+                .ok()
+                .and_then(|data| serde_json::from_slice::<Value>(&data).ok())
+                .is_some_and(|meta| meta["session"].as_str() == Some(crashed_id.as_str()))
+        }),
+        "the interrupted-initialize fixture must actually start held"
+    );
     let gate = UnixListener::bind(crashed.path().join("init.sock")).unwrap();
     api.rewind(&crashed_id, crashed_to).await;
     let (mut pending, _) = within("the reset to initialize before worker shutdown", gate.accept()).await.unwrap();
@@ -589,6 +649,7 @@ async fn claude_rewind_resets_native_history_before_acknowledging_and_fails_clos
     assert!(!reset.untouched, "reset must be durably destructive before initializing the replacement CLI");
     assert!(reset.failure.is_empty(), "this fixture crashes during reset, not after a reported failure");
     assert_eq!(applied, 0);
+    assert!(!held_root.join(&reset.session_id).exists(), "unconfirmed initialization must not acquire a keeper");
     assert_eq!(initializations(crashed.path()), 1);
     api.say(&crashed_id, "AFTER_CRASH_DURING_INITIALIZE").await;
     api.queued(&crashed_id, "AFTER_CRASH_DURING_INITIALIZE").await;
@@ -607,12 +668,26 @@ async fn claude_rewind_resets_native_history_before_acknowledging_and_fails_clos
     drop(pending);
 
     let worker = WorkerProcess::start(state.path()).await;
-    let events = api.idle(&crashed_id, 3).await;
-    assert_eq!(rewinds(&events), 1, "restart must confirm the interrupted reset exactly once");
+    api.barrier(&crashed_id).await;
+    let (blocked, applied) = journal.claude_rewind(&crashed_id).await.unwrap().unwrap();
+    assert_eq!(applied, 0);
+    assert_eq!(blocked.command_id, reset.command_id);
+    assert!(blocked.failure.contains("Worker restarted before Claude Code confirmed Rewind"));
+    assert!(blocked.retries.is_empty());
+    assert_eq!(initializations(crashed.path()), 1, "restart must not automatically retry an interrupted initialization");
+    assert_eq!(records(crashed.path(), "prompt").len(), 2, "queued input must stay blocked after restart");
+    let blocked_events = api.events(&crashed_id).await;
+    assert_eq!(rewinds(&blocked_events), 0);
+    assert!(!blocked_events.iter().any(|e| matches!(&e.kind,
+        EventKind::NoticeQueued { command_id, .. } if command_id.starts_with("resume-after-restart-"))));
+    assert!(!journal.is_applied(&reset.command_id).await.unwrap());
+    api.rewind(&crashed_id, crashed_to).await;
+    let events = api.idle_allowing_errors(&crashed_id, 3, 1).await;
+    assert_eq!(rewinds(&events), 2, "a new explicit retry confirms both the original and retry receipts");
     let confirmed = events.iter().find(|e| matches!(e.kind, EventKind::Rewound { .. })).unwrap().seq;
     assert!(user_seq(&events, "AFTER_CRASH_DURING_INITIALIZE") > confirmed, "queued input must follow the recovered reset");
     assert!(journal.is_applied(&reset.command_id).await.unwrap());
-    assert_eq!(initializations(crashed.path()), 2, "restart must initialize and confirm a replacement before resuming input");
+    assert_eq!(initializations(crashed.path()), 2, "only the explicit retry may initialize a replacement");
     let prompts = records(crashed.path(), "prompt");
     assert_eq!(prompts.len(), 3);
     let after = prompts.last().unwrap();
@@ -861,8 +936,8 @@ async fn claude_rewind_resets_native_history_before_acknowledging_and_fails_clos
     assert!(journal.command_rejection(&rejected_retry).await.unwrap().is_some(), "B's rejection must survive restart");
 
     // Another explicit retry can crash while recovering the same A. The
-    // initialization socket proves its authorization must already be durable;
-    // neither stopping the worker nor replaying A may lose the retry's ID.
+    // non-held initialization must die with its worker; even durable retry
+    // receipts from before that crash cannot authorize another initialize.
     let before_crashed_retry = initializations(failed.path());
     let gate = UnixListener::bind(failed.path().join("init.sock")).unwrap();
     api.rewind(&failed_id, failed_to).await;
@@ -896,11 +971,11 @@ async fn claude_rewind_resets_native_history_before_acknowledging_and_fails_clos
     std::fs::remove_file(failed.path().join("init.sock")).unwrap();
     drop(gate);
     drop(pending);
-    assert!(failed.path().join("fail-reset").exists(), "restarted recovery must still fail");
+    assert!(failed.path().join("fail-reset").exists());
     let worker = WorkerProcess::start(state.path()).await;
-    eventually("the interrupted explicit retry's resumed recovery to fail once", async || (errors().await == 3).then_some(())).await;
+    eventually("interrupted initialization to acquire a durable fail-closed receipt", async || (errors().await == 3).then_some(())).await;
     for rejected in [&crashed_retry, &crashed_companion] {
-        eventually("resumed recovery failure to reject both crashed retry authorizations durably", async || {
+        eventually("interrupted initialization to reject both old retry authorizations durably", async || {
             journal.command_rejection(rejected).await.unwrap()?;
             let state: String = sqlx::query_scalar("SELECT state FROM commands WHERE id = ?")
                 .bind(rejected)
@@ -912,8 +987,8 @@ async fn claude_rewind_resets_native_history_before_acknowledging_and_fails_clos
         .await;
     }
     api.barrier(&failed_id).await;
-    assert_eq!(errors().await, 3, "the resumed failure must consume its explicit retry authorization");
-    assert_eq!(initializations(failed.path()), before_crashed_retry + 3, "one gated initialization, then one fork/fresh recovery");
+    assert_eq!(errors().await, 3, "the interrupted attempt must consume its old retry authorizations");
+    assert_eq!(initializations(failed.path()), before_crashed_retry + 1, "one gated initialization, never an automatic fork/fresh retry");
     let (crash_failed, applied) = journal.claude_rewind(&failed_id).await.unwrap().unwrap();
     assert_eq!(crash_failed.command_id, reset.command_id);
     assert_eq!(applied, 0);
