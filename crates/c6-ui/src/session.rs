@@ -192,11 +192,6 @@ pub(crate) struct Feed {
     spawns: Memo<usize>,
     pub(crate) streaming: RwSignal<Streaming>,
     queued: RwSignal<Vec<QueuedInput>>,
-    /// The queue-edit box is open (its messages are in `edit_rows`).
-    pub(crate) edit_open: RwSignal<bool>,
-    /// The messages pulled out of the queue, to be re-sent edited,
-    /// reordered or dropped (in send order), while the box is open.
-    pub(crate) edit_rows: RwSignal<Vec<QueueRow>>,
     activity: RwSignal<Option<bool>>,
     /// Secrets the assistant's operations returned, for you (shown while
     /// this page is open; never logged).
@@ -316,8 +311,6 @@ impl Feed {
             spawns: child_spawns(events),
             streaming: RwSignal::new(Streaming::default()),
             queued: RwSignal::new(Vec::new()),
-            edit_open: RwSignal::new(false),
-            edit_rows: RwSignal::new(Vec::new()),
             activity: RwSignal::new(None),
             secrets: RwSignal::new(Vec::new()),
             synced: RwSignal::new(false),
@@ -2270,26 +2263,8 @@ fn Transcript(
     #[prop(optional)] chrome: Option<SessionChrome>,
     #[prop(optional)] waiting_mount: Option<NodeRef<leptos::html::Div>>,
 ) -> impl IntoView {
-    let Feed { events, usage, spawns, streaming, queued, edit_open, edit_rows, secrets, from, to, .. } = feed;
+    let Feed { events, usage, spawns, streaming, queued, secrets, from, to, .. } = feed;
     let id = StoredValue::new(session.id.clone());
-    let worker_id = session.worker_id;
-    // Pulling a queued message (and the ones after it) into the edit box:
-    // it is canceled and returned, and the box opens or takes it in. The
-    // rows live in `edit_rows`, read by the box's list; the open flag is
-    // what the box's mount depends on. A second pull only appends to
-    // `edit_rows` (the flag is already open, so the box's body does not
-    // re-run), and your in-progress edits stay.
-    let pull = Callback::new(move |pulled: Vec<QueuedInput>| {
-        edit_rows.update(|all| {
-            let first = all.iter().map(|r| r.id).max().unwrap_or(0) + 1;
-            for (i, p) in pulled.iter().enumerate() {
-                all.push(QueueRow { id: first + i as u64, text: p.text.clone() });
-            }
-        });
-        if !edit_open.get_untracked() {
-            edit_open.set(true);
-        }
-    });
     // Find asking for an event before the window: load back to it.
     if let Some(Reach(reach)) = use_context::<Reach>() {
         Effect::new(move || {
@@ -2695,13 +2670,10 @@ fn Transcript(
             { {
                 let waiting = move || view! {
                     <div class="max-h-[30dvh] space-y-2 overflow-y-auto px-4" data-waiting-messages="true">
-                        {move || edit_open.get().then(|| view! { <QueueEditBox rows=edit_rows session_id=id.get_value() on_close=Callback::new(move |_| { edit_open.set(false); edit_rows.update(Vec::clear); }) /> })}
                         {move || {
                             let rows = queued.get().into_iter().filter(|q| q.rejected.is_none()).collect::<Vec<_>>();
-                            let last_waiting = rows.iter().rposition(|q| !q.with_agent);
-                            rows.into_iter().enumerate().map(|(i, q)| {
-                                let has_tail = last_waiting.is_some_and(|last| i < last);
-                                view! { <Queued q session_id=id.get_value() worker_id=worker_id pull=pull edit=edit_queued events ready=rewind_ready edit_active has_tail /> }
+                            rows.into_iter().map(|q| {
+                                view! { <Queued q session_id=id.get_value() edit=edit_queued events ready=rewind_ready edit_active /> }
                             }).collect_view()
                         }}
                     </div>
@@ -5593,13 +5565,10 @@ fn ToolBody(
 fn Queued(
     q: QueuedInput,
     session_id: String,
-    worker_id: c6_api::Uuid,
-    pull: Callback<Vec<QueuedInput>>,
     edit: Callback<(MessageEditTarget, String)>,
     events: RwSignal<Vec<Event>>,
     ready: Signal<bool>,
     edit_active: Signal<bool>,
-    has_tail: bool,
 ) -> impl IntoView {
     // The worker handed it to the agent: it reads it at its next step.
     let with_agent = q.with_agent;
@@ -5608,15 +5577,6 @@ fn Queued(
     let edit_busy = Signal::derive(move || busy.get() || edit_active.get());
     let error = RwSignal::new(None::<String>);
     let (session_id, command_id, text) = (StoredValue::new(session_id), StoredValue::new(q.command_id), StoredValue::new(text));
-    // Older connected workers cannot bulk-edit or cancel. Single Edit still
-    // opens a kept draft and explains an unconfirmed cancellation with choices.
-    let queue_ops = Signal::derive(move || {
-        !api::live().workers.with(|ws| {
-            ws.iter()
-                .find(|w| w.id == worker_id)
-                .is_some_and(|w| w.status == WorkerStatus::Online && !w.capabilities.iter().any(|c| c == "queue_ops"))
-        })
-    });
     let do_edit = Callback::new(move |_| {
         let target = MessageEditTarget::Queued(command_id.get_value());
         // A stale queue snapshot may already have its durable User event.
@@ -5624,39 +5584,19 @@ fn Queued(
         let seq = if ready.get_untracked() { events.with_untracked(|evs| message_edit_seq(&target, evs)) } else { None };
         edit.run((seq.map(MessageEditTarget::Transcript).unwrap_or(target), text.get_value()));
     });
-    // Pulls this message and the ones queued after it into the edit box
-    // (the head cancels them); the box opens or takes them in.
-    let do_pull = move || {
-        if busy.get_untracked() {
-            return;
-        }
-        busy.set(true);
-        error.set(None);
-        let (id, cid, pull) = (session_id.get_value(), command_id.get_value(), pull);
-        spawn_local(async move {
-            match api::pull_queued(id, cid).await {
-                Ok(pulled) => pull.run(pulled),
-                Err(e) => error.set(Some(e)),
-            }
-            busy.set(false);
-        });
-    };
     view! {
         <div class="flex flex-col items-end gap-1" data-queued-command=command_id.get_value()>
-            // Queued at the head: dashed; with the agent: solid, as good as sent.
-            <div class=if with_agent {
-                "max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm border border-zinc-300 px-4 py-2 text-sm text-zinc-700 dark:border-zinc-700 dark:text-zinc-300"
-            } else {
-                "max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm border border-dashed border-zinc-300 px-4 py-2 text-sm text-muted dark:border-zinc-700"
-            }>
+            <div class="max-w-[85%] whitespace-pre-wrap break-words rounded-2xl rounded-br-sm border border-zinc-300 px-4 py-2 text-sm text-zinc-700 dark:border-zinc-700 dark:text-zinc-300">
                 {text.get_value()}
             </div>
-            // Reserve all four slots, even without Cancel or a queue tail:
-            // Edit must not move when this input is handed to the agent.
-            <div class="grid max-w-full grid-cols-[3.75rem_3.25rem_3.75rem_5.75rem] items-center gap-1 overflow-x-auto whitespace-nowrap text-xs text-muted *:min-h-11" data-queue-actions="true">
-            {(!with_agent).then_some("queued")}
+            <div class="flex items-center justify-end gap-1 text-xs text-muted" data-queue-actions="true">
+            <button class="relative flex h-7 w-7 items-center justify-center rounded-md hover:bg-zinc-100 dark:hover:bg-zinc-800 [@media(pointer:coarse)]:after:absolute [@media(pointer:coarse)]:after:-inset-2"
+                title="Take this back" aria-label="Take this back" prop:disabled=move || edit_busy.get()
+                on:click=move |_| do_edit.run(())>{crate::icons::x()}</button>
+            // Send now only interrupts an input already handed to the worker;
+            // it cannot dispatch an input still held in the head's queue.
             {with_agent.then(|| view! {
-                <button class=UBTN title="Give this message to the agent now"
+                <button class="relative h-7 rounded-md bg-zinc-100 px-2 text-xs hover:bg-zinc-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 [@media(pointer:coarse)]:after:absolute [@media(pointer:coarse)]:after:-inset-y-2 [@media(pointer:coarse)]:after:inset-x-0" title="Send now"
                     prop:disabled=move || busy.get() on:click=move |_| {
                         busy.set(true);
                         let (id, cid) = (session_id.get_value(), command_id.get_value());
@@ -5665,26 +5605,6 @@ fn Queued(
                             busy.set(false);
                         });
                     }>"Send now"</button>
-            })}
-            {message_edit_button(
-                "Edit only this message after worker-confirmed withdrawal",
-                UBTN.to_owned(),
-                view! { {crate::icons::pencil()}" Edit" }.into_any(),
-                do_edit,
-                Some(edit_busy),
-            )}
-            {(!with_agent).then(|| view! {
-                        {move || queue_ops.get().then(|| view! {
-                            <button class=UBTN title="Remove this message from the queue"
-                                prop:disabled=move || busy.get()
-                                on:click=move |_| { let (id, cid) = (session_id.get_value(), command_id.get_value()); spawn_local(async move {
-                                    if let Err(e) = api::cancel_queued_input(id, cid).await { error.set(Some(e)); }
-                                }); }>{crate::icons::x()}" Cancel"</button>
-                        })}
-                })}
-            {move || (!with_agent && has_tail && queue_ops.get()).then(|| view! {
-                <button class=UBTN title="Edit this message and the ones queued after it, then send them again"
-                    prop:disabled=move || edit_busy.get() on:click=move |_| do_pull()>{crate::icons::pencil()}" Edit queue…"</button>
             })}
             </div>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
