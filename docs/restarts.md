@@ -111,6 +111,7 @@ Each step is tested with a worker that really restarts mid-work (the chaos tests
      - The notice is the editable prompt `session.resume_after_restart`.
      - The agent also sees "Tool call did not complete (interrupted)" for any call that was running.
    - A subagent's session isn't woken: its parent's call already got what it did, and the parent decides.
+   - A turn that waited on a subagent running on another worker isn't woken: that subagent's report wakes it, as before.
    - A Claude Code session whose process was held isn't woken either: it carries on by itself.
    - The reply that was streaming when the worker went is asked for again as part of the next turn.
 4. **Tests:**

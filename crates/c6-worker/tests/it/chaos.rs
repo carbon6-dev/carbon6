@@ -192,22 +192,32 @@ async fn worker_restart_mid_turn_then_continue() {
 
     // "Crash": the old process stops talking; a new one opens the same state
     // (once the old one has released the state directory lock).
+    env.mock.push(Reply::Text("carried on".into()));
     stop_first.cancel();
     drop(first);
-    tokio::time::sleep(Duration::from_millis(200)).await;
     let (second, stop_second) = run_worker(state.path()).await;
-    env.idle_after(&id, 4).await;
-    let events = env.events(&id).await;
-    assert!(
-        matches!(events.last().unwrap().kind, EventKind::TurnEnded { reason: TurnEndReason::WorkerRestarted, .. }),
-        "{:?}",
-        events.last()
-    );
 
-    // The session keeps working on the restarted worker.
+    // The turn the restart cut short is closed as such, and the session
+    // goes on by itself, told why (docs/restarts.md §4).
+    eventually("the session carrying on", async || {
+        let events = env.events(&id).await;
+        let cut = events.iter().position(|e| matches!(e.kind, EventKind::TurnEnded { reason: TurnEndReason::WorkerRestarted, .. }))?;
+        events[cut..]
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::Assistant { blocks, .. } if format!("{blocks:?}").contains("carried on")))
+            .then_some(())
+    })
+    .await;
+    assert!(
+        env.mock.requests().iter().any(|r| r["messages"].to_string().contains("worker restarted while you were working")),
+        "the agent is told its turn was cut short"
+    );
+    env.idle_after(&id, 0).await;
+
+    // And it keeps working on the restarted worker.
     env.mock.push(Reply::Text("back again".into()));
+    let last = env.events(&id).await.last().unwrap().seq;
     env.http.post(format!("{}/sessions/{id}/messages", env.api)).json(&json!({"text": "continue"})).send().await.unwrap();
-    let last = events.last().unwrap().seq;
     env.idle_after(&id, last + 4).await;
     let texts: Vec<String> = env
         .events(&id)

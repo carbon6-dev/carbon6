@@ -56,6 +56,11 @@ pub const DEFAULTS: &[Prompt] = &[
         default: c6_agent::SUBAGENT_TEMPLATES,
     },
     Prompt {
+        name: "session.resume_after_restart",
+        description: "What the agent is told when its worker restarted in the middle of its turn, which then goes on (docs/restarts.md §4).",
+        default: c6_agent::RESUME_AFTER_RESTART,
+    },
+    Prompt {
         name: "session.subagent_remote_reattach",
         description: "The result of a remote subagent's call when the parent's worker restarted while it waited.",
         default: c6_agent::SUBAGENT_REMOTE_REATTACH,

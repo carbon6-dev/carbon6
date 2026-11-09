@@ -57,6 +57,12 @@ see this conversation or your files; give it a complete prompt, and expect files
 pub const SUBAGENT_REMOTE_REATTACH: &str = "This worker restarted while you waited, but the subagent runs elsewhere and keeps \
 working: its report will arrive as a notice when it finishes. Carry on with other work, or wait for it.";
 
+/// What the agent is told when its worker restarted mid-turn and its turn
+/// goes on from the log (an editable prompt; docs/restarts.md §4).
+pub const RESUME_AFTER_RESTART: &str = "carbon6's worker restarted while you were working (an update, most likely), so your turn \
+was cut short where the conversation above ends. A command or subagent that was still running then was stopped; its result says \
+so. Carry on with the task from there, running again whatever you still need.";
+
 /// Where a session's events go. Durable appends are journaled before they
 /// return; ephemeral events are best-effort live updates.
 #[async_trait]
