@@ -125,11 +125,22 @@ impl Registry {
         params: serde_json::Value,
         timeout: std::time::Duration,
     ) -> Result<serde_json::Value, String> {
-        let (tx, waiters) = {
-            let conns = self.conns.lock().unwrap();
-            let c = conns.get(&worker_id).ok_or("worker is not connected")?;
-            (c.tx.clone(), c.rpc_waiters.clone())
-        };
+        self.call_with_params(worker_id, method, |_| params, timeout).await
+    }
+
+    /// Builds parameters for the same connection that sends the request and
+    /// owns its response waiter. The synchronous builder runs without the
+    /// registry lock; a replacement cannot change this call's target.
+    pub async fn call_with_params(
+        &self,
+        worker_id: WorkerId,
+        method: &str,
+        params: impl FnOnce(&LiveWorker) -> serde_json::Value + Send,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value, String> {
+        let live = self.get(worker_id).ok_or("worker is not connected")?;
+        let params = params(&live);
+        let (tx, waiters) = (live.tx, live.rpc_waiters);
         let id = self.next_conn.fetch_add(1, Ordering::Relaxed);
         let (done, wait) = oneshot::channel();
         waiters.lock().unwrap().insert(id, done);
@@ -224,5 +235,72 @@ mod tests {
         assert_eq!(reg.get(id).unwrap().conn_id, second.conn_id);
         drop(second);
         assert!(reg.get(id).is_none());
+    }
+
+    #[tokio::test]
+    async fn call_with_params_keeps_capabilities_sender_and_waiter_on_selected_connection_after_replacement() {
+        use base64::Engine;
+        use prost::Message;
+
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct ForkInput {
+            #[prost(bool, tag = "16")]
+            human_origin: bool,
+        }
+
+        for capable in [false, true] {
+            let reg = Registry::new(CancellationToken::new());
+            let id = WorkerId::new();
+            let (selected_tx, mut selected_rx) = mpsc::channel(1);
+            let (replacement_tx, mut replacement_rx) = mpsc::channel(1);
+            let capabilities = if capable { vec!["user_input_prompt_v1".into()] } else { vec![] };
+            let selected = reg.attach(id, 1, selected_tx, capabilities, "worker");
+            let replacement = Mutex::new(None);
+            let input = c6_proto::UserInput { text: "original".into(), prompt: "expanded mention".into(), ..Default::default() };
+            let call = reg.call_with_params(
+                id,
+                "session.queue_op",
+                |live| {
+                    assert_eq!(live.conn_id, selected.conn_id);
+                    // Replace after target selection but before encoding. This
+                    // also proves the builder does not hold the registry lock.
+                    let capabilities = if capable { vec![] } else { vec!["user_input_prompt_v1".into()] };
+                    *replacement.lock().unwrap() = Some(reg.attach(id, 2, replacement_tx, capabilities, "worker"));
+                    let mut wire_input = input.clone();
+                    crate::sessions::prepare_worker_input(&live.capabilities, &mut wire_input);
+                    let data = base64::engine::general_purpose::STANDARD.encode(wire_input.encode_to_vec());
+                    serde_json::json!({ "op": "update", "data": data })
+                },
+                std::time::Duration::from_secs(5),
+            );
+            let reply = async {
+                let message = selected_rx.recv().await.unwrap().unwrap();
+                let Some(head_msg::Msg::RpcRequest(request)) = message.msg else { panic!("queue RPC") };
+                assert!(selected.cancel.is_cancelled());
+                assert!(replacement_rx.try_recv().is_err(), "request must not follow the replacement connection");
+                let params: serde_json::Value = serde_json::from_slice(&request.params_json).unwrap();
+                let data = base64::engine::general_purpose::STANDARD.decode(params["data"].as_str().unwrap()).unwrap();
+                let delivered = c6_proto::UserInput::decode(data.as_slice()).unwrap();
+                assert_eq!(delivered.prompt, if capable { "expanded mention" } else { "" });
+                if !capable {
+                    ForkInput::decode(data.as_slice()).expect("selected old worker must not receive string tag 16");
+                }
+                // A replacement's response cannot settle the selected
+                // connection's waiter, even with the same request id.
+                replacement.lock().unwrap().as_ref().unwrap().rpc_response(c6_proto::RpcResponse {
+                    id: request.id,
+                    result_json: br#"{"connection":"replacement"}"#.to_vec(),
+                    error: String::new(),
+                });
+                selected.rpc_response(c6_proto::RpcResponse {
+                    id: request.id,
+                    result_json: br#"{"connection":"selected"}"#.to_vec(),
+                    error: String::new(),
+                });
+            };
+            let (result, ()) = tokio::join!(call, reply);
+            assert_eq!(result.unwrap()["connection"], "selected");
+            assert_eq!(input.prompt, "expanded mention", "wire gating must leave the saved input intact");
+        }
     }
 }

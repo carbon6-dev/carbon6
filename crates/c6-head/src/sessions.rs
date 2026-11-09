@@ -1373,19 +1373,18 @@ pub async fn edit_queued(
         let input = with_command(st, &session.realm, session.head_labels(), input).await?;
         UserInput { prompt: mentioned(st, &session, text).await, ..input }
     };
-    let data = {
-        use base64::Engine;
-        let mut wire_input = new_input.clone();
-        let capabilities = st.registry.get(worker_id).map(|live| live.capabilities).unwrap_or_default();
-        prepare_worker_input(&capabilities, &mut wire_input);
-        base64::engine::general_purpose::STANDARD.encode(wire_input.encode_to_vec())
-    };
     let call = st
         .registry
-        .call(
+        .call_with_params(
             worker_id,
             "session.queue_op",
-            serde_json::json!({ "session_id": session_id, "command_id": command_id, "op": "update", "data": data }),
+            |live| {
+                use base64::Engine;
+                let mut wire_input = new_input.clone();
+                prepare_worker_input(&live.capabilities, &mut wire_input);
+                let data = base64::engine::general_purpose::STANDARD.encode(wire_input.encode_to_vec());
+                serde_json::json!({ "session_id": session_id, "command_id": command_id, "op": "update", "data": data })
+            },
             std::time::Duration::from_secs(5),
         )
         .await;
