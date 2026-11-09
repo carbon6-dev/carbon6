@@ -182,6 +182,23 @@ async fn say(w: &Worker, version: &str, state: &str, detail: &str) {
     }
 }
 
+/// Says it waits, and on what: `holding` as (session, what) pairs.
+async fn say_holding(w: &Worker, version: &str, holding: &[(String, String)]) {
+    let list: Vec<serde_json::Value> = holding.iter().map(|(s, what)| json!({"session": s, "what": what})).collect();
+    let r = json!({"version": version, "state": "waiting", "method": exe_method(w).1.name(), "detail": "", "holding": list});
+    if let Err(e) = w.link.call("update.status", r).await {
+        warn!("telling the head how the update goes: {e:#}");
+    }
+}
+
+/// `update.now` from the head: stop waiting for work to finish.
+pub fn now(worker: &Worker) -> anyhow::Result<Value> {
+    let mut slot = worker.update.target.lock().unwrap();
+    let t = slot.as_mut().ok_or_else(|| anyhow::anyhow!("no update is waiting here"))?;
+    t.deadline = 1;
+    Ok(json!({"version": t.m.version}))
+}
+
 /// Updates to the newest target, once idle.
 async fn run(w: &Arc<Worker>) -> anyhow::Result<()> {
     let (exe, method) = exe_method(w);
@@ -190,16 +207,18 @@ async fn run(w: &Arc<Worker>) -> anyhow::Result<()> {
     }
     // Idle first: no session in the middle of a turn (or the deadline).
     // The head may name a newer release meanwhile.
-    let mut said = (String::new(), usize::MAX);
+    // Waits for all work a restart would cut short, background work
+    // included (docs/restarts.md §2), and says what it waits on.
+    let mut said = (String::new(), Vec::new());
     let t = loop {
         let t = current(w).ok_or_else(|| anyhow::anyhow!("no release to update to"))?;
-        let busy = w.sessions.running();
-        if busy == 0 || (t.deadline > 0 && now_ms() >= t.deadline) {
+        let holding = w.sessions.holding();
+        if holding.is_empty() || (t.deadline > 0 && now_ms() >= t.deadline) {
             break t;
         }
-        if (t.m.version.as_str(), busy) != (said.0.as_str(), said.1) {
-            say(w, &t.m.version, "waiting", &format!("{busy} session{} running", if busy == 1 { "" } else { "s" })).await;
-            said = (t.m.version.clone(), busy);
+        if (t.m.version.as_str(), &holding) != (said.0.as_str(), &said.1) {
+            say_holding(w, &t.m.version, &holding).await;
+            said = (t.m.version.clone(), holding);
         }
         tokio::time::sleep(Duration::from_secs(if cfg!(debug_assertions) { 1 } else { 15 })).await;
     };

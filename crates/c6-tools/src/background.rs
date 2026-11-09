@@ -250,6 +250,9 @@ pub struct TaskInfo {
     pub kind: TaskKind,
     pub description: String,
     pub running: bool,
+    /// Its end is to be told (false: a server or watcher meant to keep
+    /// running, which an update need not wait for).
+    pub notify: bool,
 }
 
 fn emit(sink: &Mutex<Option<TaskSink>>, secrets: &crate::Secrets, id: &str, p: &BackgroundProc, state: TaskState) {
@@ -837,6 +840,7 @@ impl Background {
                 kind: p.kind,
                 description: self.secrets.redact(&p.command),
                 running: p.status.lock().unwrap().is_none(),
+                notify: p.notify,
             })
             .collect();
         v.sort_by_key(|t| t.id[2..].parse::<u64>().unwrap_or(0));
@@ -844,7 +848,9 @@ impl Background {
             id: id.clone(),
             kind: TaskKind::ClaudeCode,
             description: self.secrets.redact(&t.description),
-            running: t.state == TaskState::Started,
+            // One that holds the turn is counted as the turn.
+            running: t.state == TaskState::Started && !t.foreground,
+            notify: true,
         }));
         v
     }

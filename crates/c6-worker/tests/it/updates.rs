@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::extract::{Path, State};
 use c6_head::HeadConfig;
-use c6_testkit::eventually;
+use c6_testkit::{Reply, eventually};
 use c6_worker::{ConnState, Identity, Worker, conn, enroll};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::{Value, json};
@@ -351,5 +351,122 @@ async fn a_worker_follows_the_edge_when_it_moves_on() {
     c6_testkit::within("the restart", stop.cancelled()).await;
     assert!(worker.update.restart_requested());
     assert_eq!(std::fs::read_to_string(&c6w).unwrap(), format!("c6w {second}"));
+    head.shutdown().await.unwrap();
+}
+
+/// An update waits for background work a restart would cut short, not only
+/// for turns, and says what it waits on; a server started not to be waited
+/// for doesn't hold it; Update now restarts it anyway (docs/restarts.md §2).
+#[tokio::test]
+async fn an_update_waits_for_background_work_and_says_on_what() {
+    let doc = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+    let key = Ed25519KeyPair::from_pkcs8(doc.as_ref()).unwrap();
+    let public: String = key.public_key().as_ref().iter().map(|b| format!("{b:02x}")).collect();
+    let v = "9.9.8+git20261109120000.ccccccc";
+    let body = tgz(&[("c6w", &format!("c6w {v}"))]);
+    let sum = c6_core::update::checksum(&body);
+    let names = [
+        format!("c6w-{v}-darwin-arm64.tar.gz"),
+        format!("c6w-{v}-darwin-x86_64.tar.gz"),
+        format!("carbon6-{v}-linux-amd64.tar.gz"),
+        format!("carbon6-{v}-linux-arm64.tar.gz"),
+    ];
+    let assets: serde_json::Map<String, Value> = names.iter().map(|n| (n.clone(), json!(sum))).collect();
+    let manifest = serde_json::to_string(&json!({"version": v, "assets": assets})).unwrap();
+    let sig = key.sign(manifest.as_bytes()).as_ref().to_vec();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let files = format!("http://{}", listener.local_addr().unwrap());
+    let app = axum::Router::new().route("/b/{name}", axum::routing::get(move || async move { body }));
+    tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let mock = c6_testkit::MockLlm::start().await;
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let state = tempfile::tempdir().unwrap();
+    let e = c6_head::api::new_enrollment(&head.state, Some("laptop")).await.unwrap();
+    enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
+    let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let c6w = bin.path().join("c6w");
+    std::fs::write(&c6w, "old c6w").unwrap();
+    *worker.overrides.lock().unwrap() = c6_worker::Overrides {
+        update_exe: Some(c6w.clone()),
+        update_keys: Some(vec![public]),
+        update_as_version: Some("9.9.7".into()),
+        ..Default::default()
+    };
+    let (tx, mut rx) = watch::channel(ConnState::Connecting);
+    let stop = CancellationToken::new();
+    c6_worker::update::on_start(&worker, &stop).unwrap();
+    tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
+    let wid = worker.identity.meta.worker_id.0.to_string();
+    let conn: Value = http
+        .post(format!("{api}/connections"))
+        .json(&json!({"name": "m", "base_url": mock.base_url()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // A build awaited, and a server not to be waited for; then the turn ends.
+    let (build, server) = (format!("sleep 6001 # {}", bin.path().display()), format!("sleep 6002 # {}", bin.path().display()));
+    mock.push(Reply::ToolCalls(vec![
+        ("bash".into(), json!({"command": build, "run_in_background": true}).to_string()),
+        ("bash".into(), json!({"command": server, "run_in_background": true, "notify": false}).to_string()),
+    ]));
+    mock.push(Reply::Text("Both started.".into()));
+    let s: Value = http
+        .post(format!("{api}/sessions"))
+        .json(&json!({"worker_id": wid, "cwd": "", "connection_id": conn["id"], "model": "m", "prompt": "build it and serve it", "title": "Nightly build"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sid = s["id"].as_str().unwrap().to_owned();
+    eventually("the turn to end", async || {
+        let d: Value = http.get(format!("{api}/sessions/{sid}")).send().await.ok()?.json().await.ok()?;
+        (d["session"]["status"] == "idle").then_some(())
+    })
+    .await;
+
+    // Its turn is over, but the build runs: the update waits, and says so.
+    let p = json!({"manifest": manifest, "signature": hex::encode(&sig), "base_url": format!("{files}/b/"), "deadline_ms": 0});
+    assert_eq!(c6_worker::update::apply(&worker, &p).await.unwrap()["started"], true);
+    let detail = eventually("the update to say what it waits on", async || {
+        let u: c6_api::Updates = http.get(format!("{api}/system/updates")).send().await.ok()?.json().await.ok()?;
+        let m = u.machines.into_iter().find(|m| m.machine == wid)?;
+        // Once the turn has wound down, the build alone holds it.
+        (m.state == "waiting" && m.detail.starts_with("waiting on") && m.detail.contains("sleep 6001") && !m.detail.contains("a turn"))
+            .then_some(m.detail)
+    })
+    .await;
+    assert!(detail.contains("Nightly build"), "by the session's title: {detail}");
+    assert!(!detail.contains("sleep 6002"), "a server started not to be waited for doesn't: {detail}");
+    assert!(!worker.update.restart_requested());
+
+    // Update now: it restarts, cutting the build short.
+    let r = http.post(format!("{api}/system/updates/machines/{wid}/now")).send().await.unwrap();
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    c6_testkit::within("the restart", stop.cancelled()).await;
+    assert!(worker.update.restart_requested());
+    assert_eq!(std::fs::read_to_string(&c6w).unwrap(), format!("c6w {v}"));
+    // The test's own processes (named by its folder) end with it.
+    let _ = std::process::Command::new("pkill").args(["-f", &bin.path().display().to_string()]).status();
     head.shutdown().await.unwrap();
 }

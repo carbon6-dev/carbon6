@@ -322,6 +322,26 @@ impl SessionManager {
         Some(Working { counts: self.working.clone(), root: root.to_owned() })
     }
 
+    /// What a restart now would cut short, per session: a turn under way,
+    /// or background work whose end is awaited (shell tasks, subagents,
+    /// Claude Code's own). Servers and watchers started not to be waited
+    /// for (`notify: false`) don't count (docs/restarts.md §2).
+    pub fn holding(&self) -> Vec<(String, String)> {
+        let actors: Vec<(String, Handle)> =
+            self.actors.lock().unwrap().iter().filter(|(_, a)| !a.tx.is_closed()).map(|(id, a)| (id.clone(), a.clone())).collect();
+        let mut out = Vec::new();
+        for (id, a) in actors {
+            if a.running.load(std::sync::atomic::Ordering::SeqCst) {
+                out.push((id.clone(), "a turn".to_owned()));
+            }
+            for t in a.tools.background.list().into_iter().filter(|t| t.running && t.notify) {
+                let what: String = t.description.chars().take(80).collect();
+                out.push((id.clone(), format!("{}: {what}", t.kind.as_str())));
+            }
+        }
+        out
+    }
+
     /// How many sessions are in the middle of a turn.
     pub fn running(&self) -> usize {
         self.actors.lock().unwrap().values().filter(|a| !a.tx.is_closed() && a.running.load(std::sync::atomic::Ordering::SeqCst)).count()

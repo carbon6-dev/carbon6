@@ -684,9 +684,32 @@ pub async fn worker_status(st: &HeadState, from: WorkerId, p: &Value) -> anyhow:
     if !matches!(state.as_str(), "waiting" | "downloading" | "installing" | "restarting" | "done" | "failed" | "rolled_back") {
         return Err(bad_request(format!("{state:?} is not an update state")));
     }
-    machine(st, &from.to_string(), &s("version"), &state, &s("method"), &s("detail")).await?;
+    // What a waiting worker waits on, by session title.
+    let mut detail = s("detail");
+    if let Some(holding) = p["holding"].as_array().filter(|h| !h.is_empty()) {
+        let mut parts = Vec::new();
+        for h in holding.iter().take(8) {
+            let sid = h["session"].as_str().unwrap_or_default();
+            let title = st.store.session(sid).await.ok().flatten().map(|r| r.title).filter(|t| !t.trim().is_empty());
+            let title: String = title.unwrap_or_else(|| sid.chars().take(8).collect()).chars().take(40).collect();
+            parts.push(format!("{title}: {}", h["what"].as_str().unwrap_or_default()));
+        }
+        if holding.len() > 8 {
+            parts.push(format!("and {} more", holding.len() - 8));
+        }
+        detail = format!("waiting on {}", parts.join("; "));
+    }
+    machine(st, &from.to_string(), &s("version"), &state, &s("method"), &detail).await?;
     st.updates.wake.notify_one();
     Ok(json!({}))
+}
+
+/// A worker waiting for its work to finish updates now, cutting it short.
+pub async fn now(st: &HeadState, machine: &str) -> anyhow::Result<()> {
+    let id: c6_core::WorkerId = machine.parse().map_err(|_| bad_request(format!("no machine {machine:?}")))?;
+    anyhow::ensure!(st.registry.get(id).is_some(), "that worker isn't connected");
+    st.registry.call(id, "update.now", json!({}), Duration::from_secs(30)).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
 }
 
 /// Settings → System → Updates.

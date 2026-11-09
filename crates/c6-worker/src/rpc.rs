@@ -123,6 +123,7 @@ pub async fn handle(worker: &Arc<Worker>, method: &str, params: Value) -> anyhow
         "kit.job" => kit_job(worker, &params).await,
         "session.queue_op" => session_queue_op(worker, &params).await,
         "update.apply" => crate::update::apply(worker, &params).await,
+        "update.now" => crate::update::now(worker),
         "pty.open" => Ok(serde_json::to_value(worker.terminals.open(serde_json::from_value(params)?)?)?),
         "pty.list" => Ok(serde_json::to_value(worker.terminals.list())?),
         "pty.close" => Ok(json!({ "closed": worker.terminals.close(params["terminal_id"].as_str().unwrap_or_default()) })),

@@ -1650,7 +1650,15 @@ fn UpdatesSetting() -> impl IntoView {
                                     <td class="font-mono text-xs">{m.running.clone()}</td>
                                     <td class="text-xs text-muted">{if m.method.is_empty() { "—".to_owned() } else { m.method.clone() }}</td>
                                     <td class="text-xs">{if m.state.is_empty() { String::new() } else { format!("{} {}", m.version, m.state.replace('_', " ")) }}
-                                        {(!m.detail.is_empty()).then(|| view! { <span class="ml-1 text-muted">{format!("({})", m.detail)}</span> })}</td>
+                                        {(!m.detail.is_empty()).then(|| view! { <span class="ml-1 text-muted">{format!("({})", m.detail)}</span> })}
+                                        {(m.state == "waiting" && m.machine != "head").then(|| {
+                                            let id = m.machine.clone();
+                                            view! {
+                                                <button class="ml-2 text-xs text-amber-700 hover:underline dark:text-amber-400" disabled=move || busy.get()
+                                                    title="Restart it now with the update, cutting short the work it waits on"
+                                                    on:click=move |_| act(Box::pin(api::update_machine_now(id.clone())))>"Update now"</button>
+                                            }
+                                        })}</td>
                                 </tr>
                             }).collect_view()}
                         </tbody>

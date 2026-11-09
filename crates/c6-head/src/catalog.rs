@@ -733,6 +733,7 @@ fn build() -> Vec<Op> {
         op!("system.updates.check", "system", "POST" "/api/v1/system/updates/check", Write, Input::None, "Looks at GitHub for a newer carbon6 release now."),
         op!("system.updates.apply", "system", "POST" "/api/v1/system/updates/{version}/apply", Write, Input::None, "Updates carbon6 to a release found: the head first, then each worker once its sessions are idle."),
         op!("system.updates.skip", "system", "POST" "/api/v1/system/updates/{version}/skip", Write, Input::None, "Never updates to that release."),
+        op!("system.updates.now", "system", "POST" "/api/v1/system/updates/machines/{machine}/now", Write, Input::None, "A worker waiting for its work to finish before it updates updates now, cutting that work short."),
         op!("system.updates.settings.get", "system", "GET" "/api/v1/settings/updates", Read, Input::None, "When carbon6 updates itself: off, notify, approve (a decision for each release) or auto (within a window, up to patch or minor)."),
         op!("system.updates.settings.put", "system", "PUT" "/api/v1/settings/updates", Write, Input::Body(schema::<api::UpdateSettings>), "Sets when carbon6 updates itself."),
         op!("watchers.list", "watchers", "GET" "/api/v1/watchers", Read, Input::None, "The watchers (docs/watchers.md): each one's definition (agenda prompt, scope, what wakes it, what it may do, budget, on or off), whether carbon6 ships it and you changed it, and today's wakes, skips and tokens."),

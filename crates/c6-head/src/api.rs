@@ -232,6 +232,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/system/updates/check", post(check_updates))
         .route("/api/v1/system/updates/{version}/apply", post(apply_update))
         .route("/api/v1/system/updates/{version}/skip", post(skip_update))
+        .route("/api/v1/system/updates/machines/{machine}/now", post(update_machine_now))
         .route("/api/v1/settings/updates", get(get_update_settings).put(put_update_settings))
         .route("/api/v1/realms", get(list_realms).post(create_realm))
         .route("/api/v1/realms/{id}", axum::routing::patch(update_realm).delete(delete_realm))
@@ -2454,6 +2455,11 @@ async fn check_updates(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::
 
 async fn apply_update(State(st): State<Arc<HeadState>>, Path(version): Path<String>) -> ApiResult<Json<api::Updates>> {
     crate::updates::apply(&st, &version).await?;
+    Ok(Json(crate::updates::status(&st).await?))
+}
+
+async fn update_machine_now(State(st): State<Arc<HeadState>>, Path(machine): Path<String>) -> ApiResult<Json<api::Updates>> {
+    crate::updates::now(&st, &machine).await?;
     Ok(Json(crate::updates::status(&st).await?))
 }
 

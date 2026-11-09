@@ -772,6 +772,11 @@ pub async fn update_release(version: String, what: &'static str) -> Result<c6_ap
     send_json(Request::post(&format!("/api/v1/system/updates/{version}/{what}")), &serde_json::json!({})).await
 }
 
+/// A worker waiting for its work to finish updates now.
+pub async fn update_machine_now(machine: String) -> Result<c6_api::Updates, String> {
+    send_json(Request::post(&format!("/api/v1/system/updates/machines/{machine}/now")), &serde_json::json!({})).await
+}
+
 pub async fn set_update_settings(s: c6_api::UpdateSettings) -> Result<(), String> {
     empty(Request::put("/api/v1/settings/updates").json(&s).map_err(|e| e.to_string())?.send().await).await
 }
