@@ -14,6 +14,12 @@ pub struct Store {
     pub(crate) realm_cache: std::sync::Arc<crate::brief_cache::BriefCache<bool>>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct InputOrigin {
+    pub human: bool,
+    pub task_card: i32,
+}
+
 #[derive(Clone, Debug, FromRow)]
 pub struct WorkerRow {
     pub id: String,
@@ -1538,7 +1544,6 @@ impl Store {
         since: i64,
     ) -> anyhow::Result<std::collections::HashMap<String, std::collections::VecDeque<i64>>> {
         use c6_proto::{SessionCommand, session_command};
-        use prost::Message;
 
         let rows = sqlx::query(
             "SELECT c.created_at, c.data, previous.data AS previous_data FROM commands c \
@@ -1551,7 +1556,7 @@ impl Store {
         let mut sent: std::collections::HashMap<String, std::collections::VecDeque<i64>> = Default::default();
         for row in rows {
             let data: Vec<u8> = row.get("data");
-            let Ok(SessionCommand { kind: Some(session_command::Kind::Input(input)), .. }) = SessionCommand::decode(data.as_slice()) else {
+            let Ok(SessionCommand { kind: Some(session_command::Kind::Input(input)), .. }) = c6_proto::decode_stored_command(&data) else {
                 continue;
             };
             if input.from_session_id.is_empty() {
@@ -1562,7 +1567,7 @@ impl Store {
             let previous: Option<Vec<u8>> = row.get("previous_data");
             if previous
                 .as_deref()
-                .and_then(|data| SessionCommand::decode(data).ok())
+                .and_then(|data| c6_proto::decode_stored_command(data).ok())
                 .is_some_and(|c| matches!(c.kind, Some(session_command::Kind::Restore(_))))
             {
                 continue;
@@ -1709,8 +1714,6 @@ impl Store {
     /// Marks a pending command rejected. A rejected `Create` fails the
     /// session and everything queued behind it. Returns the session id.
     pub async fn reject_command(&self, worker_id: WorkerId, id: &str, reason: &str) -> anyhow::Result<Option<String>> {
-        use prost::Message;
-
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let Some(row) =
             sqlx::query("UPDATE commands SET state = 'rejected', error = ? WHERE id = ? AND worker_id = ? AND state = 'pending' RETURNING session_id, data")
@@ -1723,7 +1726,7 @@ impl Store {
             return Ok(None);
         };
         let session_id: String = row.get("session_id");
-        let kind = c6_proto::SessionCommand::decode(row.get::<Vec<u8>, _>("data").as_slice()).ok().and_then(|c| c.kind);
+        let kind = c6_proto::decode_stored_command(&row.get::<Vec<u8>, _>("data")).ok().and_then(|c| c.kind);
         if let Some(c6_proto::session_command::Kind::DelegationEnded(d)) = kind {
             // A rejected report is not a failed Create. Keep its parent
             // usable and show the actual delivery failure in its queue.
@@ -1754,15 +1757,15 @@ impl Store {
         Ok(Some(session_id))
     }
 
-    /// Task-card provenance is retained even after delivery or a head restart.
+    /// Head-authored input provenance survives delivery and a head restart,
+    /// including old commands that encoded human_origin at fork-only tag 16.
     /// No text/label heuristics: pre-change commands have no such metadata.
-    pub(crate) async fn task_card_origins(
+    pub(crate) async fn input_origins(
         &self,
         session_id: &str,
         command_ids: &[&str],
-    ) -> anyhow::Result<std::collections::HashMap<String, i32>> {
-        use c6_proto::{SessionCommand, session_command};
-        use prost::Message;
+    ) -> anyhow::Result<std::collections::HashMap<String, InputOrigin>> {
+        use c6_proto::session_command;
         let mut origins = std::collections::HashMap::new();
         if command_ids.is_empty() {
             return Ok(origins);
@@ -1775,10 +1778,13 @@ impl Store {
         }
         query.push(")");
         for (id, data) in query.build_query_as::<(String, Vec<u8>)>().fetch_all(&self.pool).await? {
-            if let Some(session_command::Kind::Input(input)) = SessionCommand::decode(data.as_slice())?.kind
-                && input.task_card_origin != 0
+            let command = c6_proto::decode_stored_command(&data)?;
+            if command.session_id == session_id
+                && command.command_id == id
+                && let Some(session_command::Kind::Input(input)) = command.kind
+                && (input.human_origin || input.task_card_origin != 0)
             {
-                origins.insert(id, input.task_card_origin);
+                origins.insert(id, InputOrigin { human: input.human_origin, task_card: input.task_card_origin });
             }
         }
         Ok(origins)
@@ -1819,7 +1825,7 @@ impl Store {
         .fetch_optional(&mut *conn)
         .await?;
         let Some(row) = row else { return Ok(None) };
-        let source = row.get::<Option<Vec<u8>>, _>("data").map(|data| c6_proto::SessionCommand::decode(data.as_slice())).transpose()?;
+        let source = row.get::<Option<Vec<u8>>, _>("data").map(|data| c6_proto::decode_stored_command(&data)).transpose()?;
         let uploads = source.and_then(|c| {
             if c.session_id != session_id || c.command_id != command_id {
                 return None;
@@ -1969,6 +1975,23 @@ async fn input_recorded_on(
 pub(crate) mod tests {
     use super::*;
 
+    /// Actual fork wire bytes, not a new-schema input with a renamed field.
+    pub(crate) fn legacy_input_command(command_id: &str, session_id: &str, mut input: c6_proto::UserInput) -> Vec<u8> {
+        use prost::Message;
+
+        assert!(input.prompt.is_empty(), "the fork had no input prompt field");
+        let human = input.human_origin;
+        input.human_origin = false;
+        let mut payload = input.encode_to_vec();
+        if human {
+            payload.extend_from_slice(&[0x80, 0x01, 0x01]); // bool human_origin = 16
+        }
+        let mut data =
+            c6_proto::SessionCommand { command_id: command_id.into(), session_id: session_id.into(), kind: None }.encode_to_vec();
+        prost::encoding::bytes::encode(11, &payload, &mut data);
+        data
+    }
+
     /// A full raw conversation with a withdrawn turn (including a summary),
     /// a replacement, and a second rewind. Used by model-context readers.
     pub(crate) fn rewind_history() -> Vec<c6_proto::SessionEvent> {
@@ -2102,25 +2125,81 @@ pub(crate) mod tests {
             .encode_to_vec();
             store.enqueue_command(&NewCommand { id, session_id: "s", worker_id: worker, data, text: Some("card") }).await.unwrap();
         }
+        for (id, legacy) in [("fork-human", true), ("current-human", false)] {
+            let input = UserInput { text: "the person's input".into(), human_origin: true, ..Default::default() };
+            let data = if legacy {
+                legacy_input_command(id, "s", input)
+            } else {
+                SessionCommand { command_id: id.into(), session_id: "s".into(), kind: Some(session_command::Kind::Input(input)) }
+                    .encode_to_vec()
+            };
+            store.enqueue_command(&NewCommand { id, session_id: "s", worker_id: worker, data, text: Some("person") }).await.unwrap();
+        }
+        // The table's scope alone cannot authorize a mismatched envelope.
+        let data = legacy_input_command("another-id", "another-session", UserInput { human_origin: true, ..Default::default() });
+        store
+            .enqueue_command(&NewCommand { id: "mismatch", session_id: "s", worker_id: worker, data, text: Some("not evidence") })
+            .await
+            .unwrap();
         // Delivery retires the command, not its provenance.
         sqlx::query("UPDATE commands SET state = 'done' WHERE session_id = 's'").execute(&store.pool).await.unwrap();
         let legacy = input_event(1, "start");
         store.ingest(worker, "s", std::slice::from_ref(&legacy)).await.unwrap().unwrap();
         store.pool.close().await;
         let store = Store::open(&path).await.unwrap();
-        let origins = store.task_card_origins("s", &["start", "answer", "old", "missing"]).await.unwrap();
-        assert_eq!(origins["start"], TaskCardOrigin::Start as i32);
-        assert_eq!(origins["answer"], TaskCardOrigin::Answer as i32);
+        let origins =
+            store.input_origins("s", &["start", "answer", "old", "fork-human", "current-human", "mismatch", "missing"]).await.unwrap();
+        assert_eq!(origins["start"], InputOrigin { human: false, task_card: TaskCardOrigin::Start as i32 });
+        assert_eq!(origins["answer"], InputOrigin { human: false, task_card: TaskCardOrigin::Answer as i32 });
+        assert_eq!(origins["fork-human"], InputOrigin { human: true, task_card: 0 });
+        assert_eq!(origins["current-human"], InputOrigin { human: true, task_card: 0 });
         assert!(!origins.contains_key("old"), "text and command names cannot reclassify history");
+        assert!(!origins.contains_key("mismatch"));
         assert!(!origins.contains_key("missing"));
-        assert!(store.task_card_origins("other", &["start"]).await.unwrap().is_empty());
-        assert!(store.task_card_origins("s", &[]).await.unwrap().is_empty());
+        assert!(store.input_origins("other", &["start", "fork-human"]).await.unwrap().is_empty());
+        assert!(store.input_origins("s", &[]).await.unwrap().is_empty());
         // Even a replay stamped with new metadata cannot rewrite old history.
         let mut replay = legacy.clone();
         let Some(c6_proto::session_event::Kind::User(input)) = &mut replay.kind else { panic!("user event") };
         input.task_card_origin = TaskCardOrigin::Start as i32;
+        input.human_origin = true;
         assert!(store.ingest(worker, "s", &[replay]).await.unwrap().unwrap().events.is_empty());
         assert_eq!(store.events_after("s", 0, 10).await.unwrap(), vec![legacy]);
+    }
+
+    #[tokio::test]
+    async fn fork_inputs_keep_attachments_queue_rejection_and_take_back_ownership() {
+        use c6_proto::{Attachment, UserInput};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("head.db")).await.unwrap();
+        let worker = WorkerId::new();
+        store.create_session(&session("s", worker), &[], false).await.unwrap();
+        let attachment = Attachment { name: "original.txt".into(), mime: "text/plain".into(), data: b"original bytes".to_vec() };
+        for id in ["take", "reject", "delivered"] {
+            let input =
+                UserInput { text: "original text".into(), human_origin: true, attachments: vec![attachment.clone()], ..Default::default() };
+            let data = legacy_input_command(id, "s", input);
+            store.enqueue_command(&NewCommand { id, session_id: "s", worker_id: worker, data, text: Some("original text") }).await.unwrap();
+        }
+        assert_eq!(store.queued_inputs("s").await.unwrap().len(), 3);
+        assert_eq!(store.message_attachments("s", "take").await.unwrap(), Some(vec![attachment.clone()]));
+        assert_eq!(store.message_attachments("other", "take").await.unwrap(), None);
+        assert!(store.take_back_pending_input("s", "take").await.unwrap());
+        assert_eq!(store.reject_command(worker, "reject", "worker is unavailable").await.unwrap(), Some("s".into()));
+        assert_ne!(store.session("s").await.unwrap().unwrap().status, "failed");
+        let rows = store.queued_inputs("s").await.unwrap();
+        assert_eq!(rows.iter().find(|r| r.id == "reject").unwrap().state, "rejected");
+        assert!(!rows.iter().any(|r| r.id == "take"));
+        // Recover the original upload from the saved done command, not extra
+        // files a worker may have attached when resolving its own mentions.
+        let event = input_event(1, "delivered");
+        store.ingest(worker, "s", &[event]).await.unwrap().unwrap();
+        assert_eq!(store.message_attachments("s", "delivered").await.unwrap(), Some(vec![attachment]));
+        assert!(!store.take_back_pending_input("s", "delivered").await.unwrap());
+        let origins = store.input_origins("s", &["take", "reject", "delivered"]).await.unwrap();
+        assert_eq!(origins.len(), 3);
+        assert!(origins.values().all(|origin| origin.human));
     }
 
     #[tokio::test]
@@ -2374,8 +2453,7 @@ pub(crate) mod tests {
     }
 
     async fn recover_report_after_ingest(command: &str, delegated_by: &str, missing_parent: bool) {
-        use c6_proto::{SessionCommand, SessionEvent, TurnEndReason, content_block, session_command, session_event::Kind};
-        use prost::Message;
+        use c6_proto::{SessionEvent, TurnEndReason, content_block, session_command, session_event::Kind};
 
         let dir = tempfile::tempdir().unwrap();
         let config = || crate::HeadConfig {
@@ -2444,7 +2522,7 @@ pub(crate) mod tests {
         } else {
             let reports = head.state.store.pending_commands(w, 0).await.unwrap();
             assert_eq!(reports.len(), 1);
-            let Some(session_command::Kind::DelegationEnded(ended)) = SessionCommand::decode(reports[0].data.as_slice()).unwrap().kind
+            let Some(session_command::Kind::DelegationEnded(ended)) = c6_proto::decode_stored_command(&reports[0].data).unwrap().kind
             else {
                 panic!("a report")
             };

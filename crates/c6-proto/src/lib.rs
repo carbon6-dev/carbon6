@@ -1,10 +1,13 @@
 //! Generated wire-protocol types for the worker ↔ head connection.
 
+mod compat;
+
 #[allow(clippy::large_enum_variant)] // generated code
 pub mod v1 {
     tonic::include_proto!("carbon6.v1");
 }
 
+pub use compat::decode_stored_command;
 pub use v1::*;
 
 #[cfg(test)]

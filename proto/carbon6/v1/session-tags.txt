@@ -6,6 +6,8 @@
 # "reserved -" records a permanent numeric tombstone, not a field.
 # Multiple identities at a tag record a past mistake, NOT permission to reuse it:
 # every such tag must remain numerically reserved, with no current field.
+# Sole exception: UserInput:16 keeps upstream string prompt; deployed fork bool
+# human_origin is decoded from stored commands into its registered fresh tag 18.
 # This baseline covers every current field plus the known NoticeQueued:10
 # collision and UserInput:7 retirement; it is not a full pre-baseline audit.
 # Check with: python3 scripts/check-session-tags.py --self-test
@@ -327,6 +329,7 @@ carbon6.v1.UserInput 12 uint32 hops
 carbon6.v1.UserInput 13 ClaudeCodeToolChoice claude_code
 carbon6.v1.UserInput 14 bool send_now
 carbon6.v1.UserInput 15 ApiMessageOrigin api_origin
+# Deployed fork only; retain this historical row, never restore bool at tag 16.
 carbon6.v1.UserInput 16 bool human_origin
 carbon6.v1.Interrupt 1 string send_now
 carbon6.v1.CommandRejected 1 string command_id
@@ -356,3 +359,7 @@ carbon6.v1.UserInput 7 reserved -
 # Task-card provenance is authored and recovered by the head.
 carbon6.v1.UserInput 17 TaskCardOrigin task_card_origin
 carbon6.v1.UserMessage 16 TaskCardOrigin task_card_origin
+# Upstream owns prompt16; c6_proto::decode_stored_command upgrades fork bool16.
+# The guard permits only this exact history with canonical human18 registered.
+carbon6.v1.UserInput 16 string prompt
+carbon6.v1.UserInput 18 bool human_origin

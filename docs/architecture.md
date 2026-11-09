@@ -128,6 +128,33 @@ The worker then resends every journaled event with `seq > acked_seq`.
 
 **Flow control.** HTTP/2 window flow control carries the bytes. On top of it, the worker bounds the number of unacknowledged durable events it has in flight per session. Ephemeral messages are dropped under backpressure; durable ones never are.
 
+**Fork input compatibility (2026-11-09).** Upstream's `UserInput.prompt` keeps
+tag 16 (string); task-card provenance keeps `UserInput.task_card_origin` at 17
+and `UserMessage.task_card_origin` at 16. Deployed fork heads previously used
+`UserInput` tag 16 for the boolean `human_origin`, now at 18. The append-only
+`proto/carbon6/v1/session-tags.txt` records that exceptional history, and its
+guard permits only this exact, explicitly bridged conflict. No event fields or
+database migration numbers change.
+
+Every read of the head's stored `commands.data` uses
+`c6_proto::decode_stored_command`: inside an input it maps legacy varint 16 to
+18 before protobuf decoding, leaving upstream string 16 intact. Explicit tag
+18 wins even when false; malformed data is rejected. This covers completed
+commands as well as pending delivery, queue actions, rejected inputs, original
+attachment recovery and provenance lookup. Workers persist session specs and
+events, not raw `UserInput` bytes; their in-memory inbox and unconfirmed CLI
+inputs require no journal migration. Historical `UserMessage.human_origin`
+remains tag 13.
+
+Roll out the head **before** these workers, and do not roll it back while new
+workers are live. An old fork head sends boolean tag 16, which a new worker's
+live protobuf transport cannot decode. The head sends string `prompt` 16 only
+to workers advertising `user_input_prompt_v1`, including queue-edit RPCs;
+older workers temporarily receive the original text without mention expansion.
+The saved command retains the expansion and authenticated human provenance,
+which the head restores onto older workers' events just as it restores task-card
+origin. There is no custom live transport decoder and no event-history rewrite.
+
 ## 5. Session model and event log
 
 ### 5.1 Entities (head-owned metadata)

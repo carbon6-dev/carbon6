@@ -22,7 +22,6 @@ use c6_proto::{
     TurnEnded, TurnStarted, ephemeral_event, head_msg, session_command, session_event,
 };
 use c6_tools::{Concurrency, SessionTools, Tool, ToolCtx, ToolOutput};
-use prost::Message as _;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -96,7 +95,7 @@ pub async fn start(st: Arc<HeadState>, router: axum::Router) -> anyhow::Result<(
                             break;
                         }
                         for row in rows {
-                            match SessionCommand::decode(row.data.as_slice()) {
+                            match c6_proto::decode_stored_command(&row.data) {
                                 Ok(cmd) => dispatch(&st, cmd),
                                 Err(e) => warn!("assistant: a bad command: {e}"),
                             }
@@ -2091,6 +2090,7 @@ mod mention_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message;
 
     #[tokio::test]
     async fn list_removal_preview_uses_the_replacement_realm() {

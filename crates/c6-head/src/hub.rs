@@ -6,11 +6,10 @@ use std::time::{Duration, Instant};
 
 use c6_core::{WorkerId, now_ms, protocol_compatible};
 use c6_proto::{
-    EnrollRequest, EnrollResponse, EventAck, HeadMsg, Hello, Pong, PtyFrame, SessionCommand, SessionCursor, Welcome, WorkerMsg,
+    EnrollRequest, EnrollResponse, EventAck, HeadMsg, Hello, Pong, PtyFrame, SessionCursor, Welcome, WorkerMsg,
     enrollment_server::Enrollment, head_msg, pty_frame, worker_hub_server::WorkerHub, worker_msg,
 };
 use futures::Stream;
-use prost::Message;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
@@ -163,7 +162,7 @@ impl WorkerHub for HubSvc {
                 st.memex_feed.wake();
             }
             info!(worker = %worker_id, name = %row.name, version = %hello.version, "worker attached");
-            let reason = serve_worker(&st, &guard, &mut inbound, &tx).await;
+            let reason = serve_worker(&st, &guard, &mut inbound, &tx, &hello.capabilities).await;
             st.store.touch_worker(worker_id, now_ms()).await.ok();
             info!(worker = %worker_id, %reason, "worker detached");
         });
@@ -177,6 +176,7 @@ async fn serve_worker(
     guard: &crate::registry::ConnGuard<'_>,
     inbound: &mut Streaming<WorkerMsg>,
     tx: &mpsc::Sender<Result<HeadMsg, Status>>,
+    capabilities: &[String],
 ) -> String {
     let worker_id = guard.worker_id;
     // Highest command seq sent on this connection; a new connection starts
@@ -192,7 +192,7 @@ async fn serve_worker(
             }
             _ = tokio::time::sleep_until(deadline.into()) => return "idle timeout".into(),
             _ = guard.deliver.notified() => {
-                match deliver_pending(st, worker_id, &mut delivered, tx).await {
+                match deliver_pending(st, worker_id, &mut delivered, tx, capabilities).await {
                     Ok(true) => continue,
                     Ok(false) => return "response stream closed".into(),
                     Err(e) => {
@@ -269,6 +269,7 @@ async fn deliver_pending(
     worker_id: WorkerId,
     delivered: &mut i64,
     tx: &mpsc::Sender<Result<HeadMsg, Status>>,
+    capabilities: &[String],
 ) -> anyhow::Result<bool> {
     loop {
         let rows = st.store.pending_commands(worker_id, *delivered).await?;
@@ -276,7 +277,12 @@ async fn deliver_pending(
             return Ok(true);
         }
         for row in rows {
-            let cmd = SessionCommand::decode(row.data.as_slice())?;
+            let mut cmd = c6_proto::decode_stored_command(&row.data)?;
+            if let Some(c6_proto::session_command::Kind::Input(input)) = &mut cmd.kind {
+                // Use this connection's Hello, not a replacement connection's
+                // capabilities while the previous delivery task is exiting.
+                sessions::prepare_worker_input(capabilities, input);
+            }
             if tx.send(Ok(head(head_msg::Msg::Command(cmd)))).await.is_err() {
                 return Ok(false);
             }
@@ -292,4 +298,87 @@ fn head(msg: head_msg::Msg) -> HeadMsg {
 fn internal(e: anyhow::Error) -> Status {
     warn!("internal error: {e:#}");
     Status::internal("internal error")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use c6_proto::{UserInput, session_command};
+    use prost::Message;
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct ForkInput {
+        #[prost(bool, tag = "16")]
+        human_origin: bool,
+    }
+
+    #[tokio::test]
+    async fn stored_legacy_and_enriched_inputs_deliver_with_only_the_target_connections_prompt_capability() {
+        let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        for capable in [false, true] {
+            let worker = WorkerId::new();
+            let mut capabilities = vec!["queue_ops".into(), "send_now".into()];
+            if capable {
+                capabilities.push("user_input_prompt_v1".into());
+            }
+            for legacy in [true, false] {
+                let id = format!("{capable}-{legacy}");
+                let input = UserInput {
+                    text: "original [@Plan](c6:doc:d1)".into(),
+                    human_origin: true,
+                    prompt: if legacy { String::new() } else { "original text plus enriched document".into() },
+                    task_card_origin: c6_proto::TaskCardOrigin::Answer as i32,
+                    ..Default::default()
+                };
+                let data = if legacy {
+                    crate::store::tests::legacy_input_command(&id, "session", input)
+                } else {
+                    c6_proto::SessionCommand {
+                        command_id: id.clone(),
+                        session_id: "session".into(),
+                        kind: Some(session_command::Kind::Input(input)),
+                    }
+                    .encode_to_vec()
+                };
+                st.store
+                    .enqueue_command(&crate::store::NewCommand {
+                        id: &id,
+                        session_id: "session",
+                        worker_id: worker,
+                        data,
+                        text: Some("original"),
+                    })
+                    .await
+                    .unwrap();
+            }
+            let (tx, mut rx) = mpsc::channel(8);
+            // A replacing connection must not cause a prompt to be sent to
+            // the old connection whose own Hello did not advertise it.
+            let guard = st.registry.attach(worker, now_ms(), tx.clone(), vec!["user_input_prompt_v1".into()], "worker");
+            let mut delivered = 0;
+            assert!(deliver_pending(st, worker, &mut delivered, &tx, &capabilities).await.unwrap());
+            for legacy in [true, false] {
+                let message = rx.recv().await.unwrap().unwrap();
+                let Some(head_msg::Msg::Command(command)) = message.msg else { panic!("input command") };
+                assert_eq!(command.command_id, format!("{capable}-{legacy}"));
+                let Some(session_command::Kind::Input(input)) = command.kind else { panic!("input") };
+                assert_eq!(input.text, "original [@Plan](c6:doc:d1)");
+                assert!(input.human_origin);
+                assert_eq!(input.task_card_origin, c6_proto::TaskCardOrigin::Answer as i32);
+                assert_eq!(!input.prompt.is_empty(), capable && !legacy);
+                if !capable {
+                    ForkInput::decode(input.encode_to_vec().as_slice()).expect("old worker must not receive a string tag 16");
+                }
+                let stored = st.store.pending_input(&format!("{capable}-{legacy}")).await.unwrap().unwrap().2;
+                let Some(session_command::Kind::Input(saved)) = c6_proto::decode_stored_command(&stored).unwrap().kind else {
+                    panic!("saved input")
+                };
+                assert_eq!(!saved.prompt.is_empty(), !legacy, "wire downgrade must not erase saved enrichment");
+            }
+            assert!(rx.try_recv().is_err());
+            drop(guard);
+        }
+        head.shutdown().await.unwrap();
+    }
 }

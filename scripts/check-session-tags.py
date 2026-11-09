@@ -4,6 +4,8 @@
 New fields need new registry rows. Never edit/delete old rows: retire a field
 with a numeric reserved declaration and put its replacement on a fresh tag.
 This deliberately checks field identity, not just protobuf wire-type equality.
+Only UserInput:16 has an exact compatibility exception: upstream prompt16 and
+deployed fork human16, with the latter replaced by registered canonical human18.
 """
 
 import argparse
@@ -127,6 +129,24 @@ def violations(schema, registry):
     fields, reservations = parse_schema(schema)
     history = parse_registry(registry)
     errors = []
+    input16 = ("carbon6.v1.UserInput", 16)
+    human18 = (input16[0], 18)
+    # Not a general wire-type multiplexing exemption. Require both immutable
+    # historical identities, the upstream current field, and its exact fresh
+    # provenance replacement in both schema and registry. A missing historical
+    # row must fail too, even though the generic check would see no collision.
+    input_compat = (
+        history.get(input16) == {("bool", "human_origin"), ("string", "prompt")}
+        and fields.get(input16) == ("string", "prompt")
+        and fields.get(human18) == ("bool", "human_origin")
+        and history.get(human18) == {("bool", "human_origin")}
+    )
+    if (input16 in fields or input16 in history or human18 in fields or human18 in history) and not input_compat:
+        errors.append(
+            "carbon6.v1.UserInput:16: compatibility requires exact history "
+            "{bool human_origin, string prompt}, current string prompt16, "
+            "and current/registered bool human_origin18"
+        )
     for key in sorted(fields.keys() | history.keys()):
         message, tag = key
         where = f"{message}:{tag}"
@@ -136,7 +156,8 @@ def violations(schema, registry):
             if current:
                 errors.append(f"{where}: field uses a numerically reserved tag")
         elif ("reserved", "-") in past or len(past) > 1:
-            errors.append(f"{where}: historical retired/conflicting tag needs numeric reserved")
+            if key != input16 or not input_compat:
+                errors.append(f"{where}: historical retired/conflicting tag needs numeric reserved")
         elif past and current not in past:
             errors.append(f"{where}: historical {sorted(past)} changed or disappeared; reserve tag")
         if current and current not in past:
@@ -159,6 +180,12 @@ carbon6.v1.NoticeQueued 11 TaskNotice task_notice
 carbon6.v1.UserInput 7 string context
 carbon6.v1.UserInput 7 reserved -'''
 
+    compat_schema = '''syntax = "proto3"; package carbon6.v1;
+    message UserInput { string prompt = 16; bool human_origin = 18; }'''
+    compat_registry = '''carbon6.v1.UserInput 16 bool human_origin
+carbon6.v1.UserInput 16 string prompt
+carbon6.v1.UserInput 18 bool human_origin'''
+
     def rejects(self, old, new, diagnostic):
         self.assertIn(old, self.schema)
         errors = violations(self.schema.replace(old, new, 1), self.registry)
@@ -166,6 +193,80 @@ carbon6.v1.UserInput 7 reserved -'''
 
     def test_current_schema(self):
         self.assertEqual(violations(SCHEMA.read_text(), REGISTRY.read_text()), [])
+
+    def test_exact_user_input_compatibility_is_allowed(self):
+        self.assertEqual(violations(self.compat_schema, self.compat_registry), [])
+
+    def test_user_input_history_must_be_the_exact_approved_pair(self):
+        legacy = "carbon6.v1.UserInput 16 bool human_origin\n"
+        prompt = "carbon6.v1.UserInput 16 string prompt\n"
+        for registry in (
+            self.compat_registry.replace(legacy, ""),
+            self.compat_registry.replace(prompt, ""),
+            self.compat_registry.replace(legacy, legacy.replace("bool", "optional:bool")),
+            self.compat_registry.replace(prompt, prompt.replace("string", "bytes")),
+            self.compat_registry + "\ncarbon6.v1.UserInput 16 bool another",
+            self.compat_registry + "\ncarbon6.v1.UserInput 16 reserved -",
+        ):
+            with self.subTest(registry=registry):
+                errors = violations(self.compat_schema, registry)
+                self.assertTrue(any("UserInput:16" in e for e in errors), errors)
+        with self.assertRaises(ValueError):
+            violations(self.compat_schema, self.compat_registry + "\n" + legacy)
+
+    def test_user_input_replacement_cannot_be_omitted_or_renumbered(self):
+        replacement = "bool human_origin = 18;"
+        for field in ("", "bool human_origin = 19;", "uint32 human_origin = 18;",
+                      "optional bool human_origin = 18;", "bool renamed = 18;", "reserved 18;"):
+            with self.subTest(field=field):
+                schema = self.compat_schema.replace(replacement, field)
+                errors = violations(schema, self.compat_registry)
+                self.assertTrue(any("UserInput:16" in e for e in errors), errors)
+        # Registering the renumbering cannot legitimize it, even after removing
+        # the original replacement's history (which generic checks cannot see).
+        schema = self.compat_schema.replace(replacement, "bool human_origin = 19;")
+        registry = self.compat_registry.replace(" 18 ", " 19 ")
+        self.assertTrue(violations(schema, registry))
+
+    def test_user_input_replacement_registration_is_mandatory_and_exact(self):
+        row = "carbon6.v1.UserInput 18 bool human_origin"
+        for replacement in ("", row.replace(" 18 ", " 19 "), row.replace("bool", "uint32"),
+                            row.replace("human_origin", "renamed"), row + "\ncarbon6.v1.UserInput 18 reserved -"):
+            with self.subTest(replacement=replacement):
+                registry = self.compat_registry.replace(row, replacement)
+                errors = violations(self.compat_schema, registry)
+                self.assertTrue(any("UserInput:16" in e for e in errors), errors)
+
+    def test_user_input_current_prompt_is_required_and_legacy_bool_cannot_return(self):
+        for field in ("", "bytes prompt = 16;", "optional string prompt = 16;",
+                      "string renamed = 16;", "string prompt = 19;", "reserved 16;"):
+            with self.subTest(field=field):
+                schema = self.compat_schema.replace("string prompt = 16;", field)
+                errors = violations(schema, self.compat_registry)
+                self.assertTrue(any("UserInput:16" in e for e in errors), errors)
+        schema = '''syntax = "proto3"; package carbon6.v1;
+        message UserInput { bool human_origin = 16; }'''
+        # Also reject restoring the old schema with a history pruned to match.
+        for registry in (self.compat_registry, "carbon6.v1.UserInput 16 bool human_origin"):
+            self.assertTrue(violations(schema, registry))
+
+    def test_user_input_exception_does_not_allow_other_collisions(self):
+        for old, new in (("carbon6.v1", "other.v1"), ("UserInput", "OtherInput")):
+            with self.subTest(new=new):
+                self.assertTrue(violations(self.compat_schema.replace(old, new), self.compat_registry.replace(old, new)))
+        schema = self.compat_schema.replace(" = 16;", " = 15;")
+        registry = self.compat_registry.replace(" 16 ", " 15 ")
+        self.assertTrue(any("UserInput:15" in e for e in violations(schema, registry)))
+        schema = self.compat_schema.replace("string prompt", "bool changed = 17; string prompt")
+        registry = self.compat_registry + "\ncarbon6.v1.UserInput 17 string old\ncarbon6.v1.UserInput 17 bool changed"
+        self.assertTrue(any("UserInput:17" in e for e in violations(schema, registry)))
+
+    def test_user_input_exception_never_waives_numeric_reservations(self):
+        for tag in (16, 18):
+            with self.subTest(tag=tag):
+                schema = self.compat_schema.replace("message UserInput {", f"message UserInput {{ reserved {tag};")
+                errors = violations(schema, self.compat_registry)
+                self.assertTrue(any(f"UserInput:{tag}: field uses a numerically reserved tag" in e for e in errors), errors)
 
     def test_old_task_notice_reuse_even_when_registered(self):
         self.rejects("reserved 10;", "", "NoticeQueued:10")
