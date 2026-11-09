@@ -88,7 +88,9 @@ function historyFixture() {
       await page.route('**/api/v1/sessions/parent/side-chats', route => route.fulfill({
         status: 409, json: { error: 'Fixture Ask route reached' },
       }));
-      // Unwanted-request trap: transcript Edit must never attempt withdrawal.
+      // Recovery returns AttachmentUpload arrays, including the empty case.
+      await page.route('**/api/v1/sessions/parent/messages/*/draft', route => route.fulfill({ json: [] }));
+      // Unwanted-request trap: durable user actions never attempt withdrawal.
       await page.route('**/api/v1/sessions/parent/messages/picker-own/take-back', route => route.fulfill({
         status: 409, json: { error: 'The agent has this message' },
       }));
@@ -453,10 +455,74 @@ async function messageActions(f, phone, history, save) {
     const row = page.locator(`#parent-e${seq}`);
     await row.scrollIntoViewIfNeeded();
     const more = row.getByRole('button', { name: 'Message actions', exact: true });
+    if (own && !baseline) {
+      const actions = history.actionRequests.length;
+      const composer = page.locator('textarea').first(), composerNode = await composer.elementHandle();
+      const draft = await composer.inputValue();
+      assert.equal(await more.count(), 0, 'read user messages expose direct icons, not a phone sheet');
+      assert.equal(await row.getByRole('button', { name: 'Edit', exact: true }).count(), 0);
+      for (const name of ['Rewind', 'Ask']) {
+        const button = row.getByRole('button', { name, exact: true });
+        assert.equal(await button.getAttribute('title'), name);
+        assert.equal(await button.locator('svg').count(), 1);
+        assert.equal((await button.textContent()).trim(), '', 'read user actions are icon-only');
+        assert(await button.evaluate((el, touch) => {
+          for (let node = el; node; node = node.parentElement) {
+            const css = getComputedStyle(node);
+            if (css.visibility === 'hidden' || Number(css.opacity) === 0) return false;
+          }
+          const r = el.getBoundingClientRect(), after = getComputedStyle(el, '::after');
+          if (Math.abs(r.width - 28) > 1 || Math.abs(r.height - 28) > 1) return false;
+          const expanded = after.content !== 'none' && after.content !== 'normal' && after.position === 'absolute';
+          if (expanded !== touch) return false;
+          const insets = [after.top, after.right, after.bottom, after.left].map(parseFloat);
+          if (touch && !insets.every(n => Math.abs(n + 8) <= .5)) return false;
+          const margin = touch ? 8 : 0, x = r.x + r.width / 2, y = r.y + r.height / 2;
+          return [[r.left - margin + 1, y], [r.right + margin - 1, y],
+            [x, r.top - margin + 1], [x, r.bottom + margin - 1]].every(([x, y]) =>
+            x >= 0 && x < innerWidth && y >= 0 && y < innerHeight && el.contains(document.elementFromPoint(x, y)));
+        }, phone), 'direct icons keep 28px visible bounds; touch-only ::after expands to 44px with hit-testable edges');
+      }
+      await save('own-actions');
+      step(f, 'own message: direct Rewind requires confirmation');
+      await row.getByRole('button', { name: 'Rewind', exact: true }).click();
+      const warning = page.getByText(/^Rewind the conversation to before this message\?/);
+      await warning.waitFor();
+      const panel = warning.locator('..');
+      assert.equal(await panel.getByRole('checkbox').isChecked(), false);
+      assert.equal(history.actionRequests.length, actions, 'opening Rewind never mutates or sends');
+      assert.equal(await composer.inputValue(), draft, 'unconfirmed rewind leaves the existing draft alone');
+      await save('rewind-entry');
+      await panel.getByRole('button', { name: 'Cancel', exact: true }).click();
+      await warning.waitFor({ state: 'hidden' });
+      assert.equal(history.actionRequests.length, actions, 'cancelled Rewind has no side effect');
+      assert(await composer.evaluate((el, kept) => el === kept, composerNode), 'no second message editor');
+      assert.equal(await composer.inputValue(), draft);
+      step(f, 'own message: direct Ask hands focus to side-chat draft');
+      await row.getByRole('button', { name: 'Ask', exact: true }).click();
+      const prompt = page.getByPlaceholder(phone ? 'Ask about this in a side chat' : 'Ask about this in a side chat (Enter to send, Esc to cancel)', { exact: true });
+      await prompt.waitFor();
+      await settle(page);
+      assert(await prompt.evaluate(el => document.activeElement === el && !el.closest('[inert]')));
+      assert.equal(history.actionRequests.length, actions, 'opening Ask never sends');
+      await prompt.fill('Ask about my message');
+      const request = page.waitForRequest(r => new URL(r.url()).pathname === '/api/v1/sessions/parent/side-chats' && r.method() === 'POST');
+      const form = prompt.locator('..');
+      await form.getByRole('button', { name: 'Ask', exact: true }).click();
+      const sent = (await request).postDataJSON();
+      assert.equal(sent.anchor_seq, seq);
+      assert.equal(sent.prompt, 'Ask about my message');
+      await form.getByText('Fixture Ask route reached', { exact: true }).waitFor();
+      await save('own-ask-route');
+      await form.getByRole('button', { name: 'Cancel', exact: true }).click();
+      await prompt.waitFor({ state: 'hidden' });
+      assert.equal(await composer.inputValue(), draft, 'Ask does not overwrite the Composer');
+      continue;
+    }
     if (!phone || baseline) {
       if (!phone) {
         assert.equal(await more.count(), 0, 'desktop retains inline message actions, no phone more button');
-        assert.equal(await row.getByRole('button', { name: 'Edit', exact: true }).count(), own ? 1 : 0);
+        assert.equal(await row.getByRole('button', { name: 'Edit', exact: true }).count(), 0);
         assert.equal(await row.getByRole('button', { name: 'Rewind', exact: true }).count(), own ? 1 : 0);
         assert.equal(await row.getByRole('button', { name: 'Ask', exact: true }).count(), 1);
       }
@@ -514,7 +580,7 @@ async function messageActions(f, phone, history, save) {
     await open();
     step(f, `${who}: modal containment and dismissal`);
     await modalFocus(page, dialog, more, 'Message actions');
-    assert.equal(await dialog.getByRole('button', { name: 'Edit', exact: true }).count(), own ? 1 : 0);
+    assert.equal(await dialog.getByRole('button', { name: 'Edit', exact: true }).count(), 0, 'no Edit in the remaining non-user phone action sheet');
     assert.equal(await dialog.getByRole('button', { name: /^Rewind/ }).count(), own ? 1 : 0);
     assert.equal(await dialog.getByRole('button', { name: 'Ask in a side chat', exact: true }).count(), 1);
     await save(own ? 'own-actions' : 'agent-actions');
@@ -524,37 +590,6 @@ async function messageActions(f, phone, history, save) {
     await open();
     await close(() => page.touchscreen.tap(4, 4));
 
-    if (own) {
-      for (const edit of [true, false]) {
-        step(f, `${who}: ${edit ? 'Edit' : 'Rewind'} confirmation entry`);
-        const actions = history.actionRequests.length;
-        await open();
-        await dialog.getByRole('button', { name: edit ? 'Edit' : 'Rewind…', exact: true }).tap();
-        await dialog.waitFor({ state: 'hidden' });
-        if (edit) {
-          const panel = page.locator('[data-message-edit]');
-          await panel.getByText('The agent has this message', { exact: true }).waitFor();
-          assert.equal(await panel.locator('textarea').count(), 0, 'taken messages offer choices before opening the editor');
-          assert.deepEqual(await panel.getByRole('button').allTextContents(), ['Send correction', 'Rewind…', 'Close']);
-          assert.equal(history.actionRequests.length, actions, 'transcript Edit starts Taken without attempting withdrawal');
-          await panel.getByRole('button', { name: 'Send correction', exact: true }).tap();
-          assert.equal(await panel.locator('textarea').inputValue(), ownText, 'correction keeps the original draft');
-          assert.equal(history.actionRequests.length, actions, 'opening correction does not send, rewind, or withdraw');
-          await save('edit-entry');
-          await panel.getByRole('button', { name: 'Discard draft', exact: true }).tap();
-          continue;
-        }
-        const confirm = page.getByRole('button', { name: 'Rewind', exact: true });
-        await confirm.waitFor();
-        const panel = confirm.locator('..').locator('..');
-        assert.match(await panel.textContent(), /Rewind the conversation to before this message\?/);
-        assert.equal(await panel.getByRole('checkbox').isChecked(), false, 'file restoration is never selected automatically');
-        assert.equal(history.actionRequests.length, actions, 'Edit/Rewind entry requires a separate confirmation before any mutation');
-        await save(edit ? 'edit-entry' : 'rewind-entry');
-        await panel.getByRole('button', { name: 'Cancel', exact: true }).tap();
-        await confirm.waitFor({ state: 'hidden' });
-      }
-    }
     await open();
     step(f, `${who}: open side-chat form`);
     if (process.env.PICKER_DIAGNOSTICS) console.log(`  ASK TARGET ${who}: ${JSON.stringify(await dialog.getByRole('button', { name: 'Ask in a side chat', exact: true }).evaluate(el => {

@@ -1,6 +1,6 @@
 //! A session: streaming transcript, queued input, composer.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use c6_api::{ContentBlock, Event, EventKind, QueuedInput, Session, SessionStatus, StreamMsg, TurnEndReason};
 use leptos::prelude::*;
@@ -15,7 +15,7 @@ use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT, now_ms, storage_get, st
 use crate::workspace::{ColumnCtx, Go, ScrollBox, Target, View, below, use_column};
 use crate::{api, markdown, sessions};
 
-/// The small bordered action buttons on a message row (Edit, Rewind, Ask).
+/// Small bordered controls outside the quiet message-action row.
 const UBTN: &str = "rounded-md border border-zinc-200 bg-white px-1.5 py-0.5 text-[11px] text-muted shadow-sm hover:text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:hover:text-zinc-100";
 
 /// Live-only state, replaced by durable events as they arrive.
@@ -232,6 +232,7 @@ struct ComposerDraft {
     area: NodeRef<leptos::html::Textarea>,
     revision: RwSignal<u64>,
     loading: RwSignal<usize>,
+    note: RwSignal<Option<String>>,
     returned: StoredValue<ReturnedDrafts>,
 }
 
@@ -267,6 +268,10 @@ impl ComposerDraft {
             self.returned.update_value(|r| {
                 if let Some((_, _, uploads)) = r.parts.iter_mut().find(|(id, _, _)| *id == ticket) {
                     *uploads = files;
+                } else {
+                    // An edit followed by another retraction can make this
+                    // ticket part of the new base draft. Its files still return.
+                    r.files.extend(files);
                 }
             });
             self.write(false);
@@ -282,6 +287,26 @@ impl ComposerDraft {
             self.write(false);
         }
     }
+
+    fn failed_send(self, text: &str, files: Vec<c6_api::AttachmentUpload>) {
+        if self.unchanged() {
+            self.returned.update_value(|r| {
+                append_draft(&mut r.base, text);
+                r.files.extend(files);
+            });
+            self.write(false);
+        } else {
+            self.text.update(|current| append_draft(current, text));
+            self.files.update(|uploads| uploads.extend(files));
+        }
+    }
+}
+
+fn append_draft(current: &mut String, text: &str) {
+    if !current.is_empty() && !text.is_empty() {
+        current.push_str("\n\n");
+    }
+    current.push_str(text);
 }
 
 type MessageFiles = futures::future::Shared<futures::future::LocalBoxFuture<'static, Result<Vec<c6_api::AttachmentUpload>, String>>>;
@@ -2450,7 +2475,13 @@ fn Transcript(
     let withdrawal_notes = RwSignal::new(HashMap::<String, String>::new());
     // Kept outside disappearing rows, including the eagerly loaded files.
     let draft_files = StoredValue::new_local(HashMap::<String, MessageFiles>::new());
+    Effect::new(move || {
+        queued.with(|rows| draft_files.update_value(|files| files.retain(|id, _| rows.iter().any(|q| &q.command_id == id))));
+    });
     let take_back = Callback::new(move |q: QueuedInput| {
+        if withdrawn.with_untracked(|ids| ids.contains(&q.command_id)) {
+            return;
+        }
         let Some(draft) = feed.composer.get_untracked() else { return };
         let Some(files) = draft_files.with_value(|m| m.get(&q.command_id).cloned()) else { return };
         let ready_files = files.peek().and_then(|r| r.as_ref().ok()).cloned();
@@ -2478,26 +2509,28 @@ fn Transcript(
             }
             let result = match recovered {
                 Ok(_) => api::take_back(id.get_value(), q.command_id.clone()).await,
-                Err(e) => Err(e),
+                Err(e) => Err((e, true)),
             };
             if draft.text.is_disposed() {
                 return;
             }
+            draft_files.update_value(|m| {
+                m.remove(&q.command_id);
+            });
             let recorded = events.with_untracked(|evs| {
                 evs.iter().any(|e| matches!(&e.kind, EventKind::User { command_id, .. } if command_id == &q.command_id))
             });
-            if recorded || result.as_ref().is_err_and(|e| e == "The agent has this message") {
+            if recorded || result.as_ref().is_err_and(|(e, _)| e == "The agent has this message") {
                 withdrawal_notes.update(|notes| {
                     notes.insert(
                         q.command_id,
                         "The agent had already read this, so it wasn't taken back. Your text is still in the box.".into(),
                     );
                 });
-            } else if let Err(reason) = result {
-                draft.rollback(ticket);
-                draft_files.update_value(|m| {
-                    m.remove(&q.command_id);
-                });
+            } else if let Err((reason, refused)) = result {
+                if refused {
+                    draft.rollback(ticket);
+                }
                 withdrawal_notes.update(|notes| {
                     notes.insert(q.command_id.clone(), format!("This couldn't be taken back. {reason}"));
                 });
@@ -2623,7 +2656,6 @@ fn Transcript(
                         let only_thinking = thinking_only(&e.kind);
                         let anchorable = can_branch && can_anchor(&e.kind);
                         let task_notification = matches!(&e.kind, EventKind::User { command, .. } if command == "task-notification");
-                        let user_bubble = person_bubble(&e.kind);
                         let is_user = own_message(&e.kind);
                         let by = move || rewound.with(|(by, _)| by.get(&seq).copied());
                         let hidden = move || by().is_some_and(|r| !shown.with(|s| s.contains(&r)));
@@ -2684,7 +2716,7 @@ fn Transcript(
                                 id=format!("{}-e{seq}", id.get_value())
                                 class=move || format!("c6-transcript-row group relative {arrive} {} {} {}",
                                     if anchorable {
-                                        if user_bubble { "" }
+                                        if is_user { "" }
                                         else if task_notification { "min-h-11 pr-12 md:min-h-0 md:pr-0" }
                                         else { "min-h-11 pr-12 md:min-h-0 md:pr-0 md:pb-7" }
                                     } else { "" },
@@ -2729,7 +2761,7 @@ fn Transcript(
                                 {anchorable.then(|| view! {
                                     // Non-user transcript entries retain the phone picker.
                                     // Read messages expose their two quiet actions directly.
-                                    <div class=if user_bubble { "hidden" } else { "absolute right-0 top-0 md:hidden" }>
+                                    <div class=if is_user { "hidden" } else { "absolute right-0 top-0 md:hidden" }>
                                     <button type="button" class="flex size-11 items-center justify-center rounded-md text-muted hover:bg-zinc-100 focus-visible:ring-2 focus-visible:ring-sky-500/60 dark:hover:bg-zinc-800"
                                         aria-label="Message actions" title="Message actions" aria-haspopup="dialog"
                                         aria-expanded=move || (actions_open.get() && message_actions.get() == Some(seq)).to_string()
@@ -2750,8 +2782,8 @@ fn Transcript(
                                     </div>
                                     // A quiet notice may be narrower than its actions. Let
                                     // those wrap below it, never over its disclosure/icon.
-                                    <div class=if user_bubble {
-                                        "mt-1 flex justify-end gap-2 text-muted"
+                                    <div class=if is_user {
+                                        "mt-1 flex justify-end gap-4 text-muted [@media(pointer:coarse)]:pr-2"
                                     } else if task_notification {
                                         "mt-1 hidden flex-wrap justify-end gap-1 opacity-0 transition group-hover:opacity-100 md:flex"
                                     } else {
@@ -2762,8 +2794,8 @@ fn Transcript(
                                                 title="Rewind" aria-label="Rewind" prop:disabled=move || rewinding.with(Option::is_some)
                                                 on:click=move |_| rewinding.set(Some(seq))>{crate::icons::undo()}</button>
                                         })}
-                                        <button class="relative flex h-7 w-7 items-center justify-center rounded-md hover:bg-zinc-100 dark:hover:bg-zinc-800 [@media(pointer:coarse)]:after:absolute [@media(pointer:coarse)]:after:-inset-2"
-                                            title="Ask" aria-label="Ask" on:click=move |_| asking.set(Some(seq))>{crate::icons::corner_down_right()}</button>
+                                        <button class=if is_user { "relative flex h-7 w-7 items-center justify-center rounded-md hover:bg-zinc-100 dark:hover:bg-zinc-800 [@media(pointer:coarse)]:after:absolute [@media(pointer:coarse)]:after:-inset-2" } else { UBTN }
+                                            title=if is_user { "Ask" } else { "Ask about this in a side chat" } aria-label="Ask" on:click=move |_| asking.set(Some(seq))>{crate::icons::corner_down_right()}{(!is_user).then_some(" Ask")}</button>
                                     </div>
                                 })}
                             </div>
@@ -2775,7 +2807,7 @@ fn Transcript(
                                 <crate::catchup::YouWereHere session=id.get_value() at />
                             })}
                             {move || rewinding.get().filter(|s| *s == seq).map(|_| view! {
-                                <RewindPanel session=id.get_value() seq events ready=rewind_ready on_done=Callback::new(move |_| rewinding.set(None)) />
+                                <RewindPanel session=id.get_value() seq events ready=rewind_ready composer=feed.composer on_done=Callback::new(move |_| rewinding.set(None)) />
                             })}
                             <For
                                 each=move || child_list.with(|cs| cs.iter().filter(|c| c.fork_seq == Some(seq)).cloned().collect::<Vec<_>>())
@@ -2826,7 +2858,7 @@ fn Transcript(
             })}
             { {
                 let waiting = move || view! {
-                    <div class="max-h-[30dvh] space-y-2 overflow-y-auto px-4" data-waiting-messages="true">
+                    <div class="max-h-[30dvh] space-y-2 overflow-y-auto px-4" class:py-2=move || queued.with(|rows| rows.iter().any(|q| q.rejected.is_none() && !withdrawn.with(|ids| ids.contains(&q.command_id)))) data-waiting-messages="true">
                         {move || {
                             let rows = queued.get().into_iter().filter(|q| q.rejected.is_none() && !withdrawn.with(|ids| ids.contains(&q.command_id))).collect::<Vec<_>>();
                             rows.into_iter().map(|q| {
@@ -3309,7 +3341,34 @@ fn rewind_error(error: RwSignal<Option<String>>) -> AnyView {
 
 /// Explicit confirmation only; this panel never sends a replacement message.
 #[component]
-fn RewindPanel(session: String, seq: u64, events: RwSignal<Vec<Event>>, ready: Signal<bool>, on_done: Callback<bool>) -> AnyView {
+fn RewindPanel(
+    session: String,
+    seq: u64,
+    events: RwSignal<Vec<Event>>,
+    ready: Signal<bool>,
+    composer: RwSignal<Option<ComposerDraft>>,
+    on_done: Callback<bool>,
+) -> AnyView {
+    use futures::FutureExt;
+    let original = StoredValue::new(events.with_untracked(|evs| {
+        evs.iter().find_map(|e| match &e.kind {
+            EventKind::User { text, command_id, attachments, .. } if e.seq == seq => {
+                Some((text.clone(), command_id.clone(), !attachments.is_empty()))
+            }
+            _ => None,
+        })
+    }));
+    // Read ahead without changing the draft. Refusal, Cancel and old markers
+    // must not change either the message box or its attachment list.
+    let files: MessageFiles = match original.get_value() {
+        Some((_, command_id, true)) => api::message_draft(session.clone(), command_id).boxed_local().shared(),
+        _ => async { Ok(Vec::new()) }.boxed_local().shared(),
+    };
+    let prefetch = files.clone();
+    spawn_local(async move {
+        let _ = prefetch.await;
+    });
+    let files = StoredValue::new_local(files);
     let restore = RwSignal::new(false);
     let busy = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
@@ -3334,6 +3393,27 @@ fn RewindPanel(session: String, seq: u64, events: RwSignal<Vec<Event>>, ready: S
         match events.with(|evs| rewind_result(evs, seq, after)) {
             Some(Ok(())) if accepted.get_value() => {
                 pending.set(None);
+                if let Some(draft) = composer.get_untracked()
+                    && let Some((text, _, _)) = original.get_value()
+                {
+                    let files = files.get_value();
+                    let cached = files.peek().and_then(|r| r.as_ref().ok()).cloned();
+                    let ticket = draft.insert(text, cached.clone().unwrap_or_default());
+                    if cached.is_none() {
+                        draft.loading.update(|n| *n += 1);
+                        spawn_local(async move {
+                            let files = files.await;
+                            if draft.text.is_disposed() {
+                                return;
+                            }
+                            match files {
+                                Ok(files) => draft.attachments(ticket, files),
+                                Err(e) => draft.note.set(Some(format!("The conversation was rewound, but its attachments couldn't be restored. Your text is still in the box. {e}"))),
+                            }
+                            draft.loading.update(|n| *n -= 1);
+                        });
+                    }
+                }
                 on_done.run(true);
             }
             Some(Err(e)) => failed.run(e),
@@ -4122,7 +4202,7 @@ fn own_message(kind: &EventKind) -> bool {
 }
 
 /// Human and legacy bubbles keep their existing presentation. Eligibility for
-/// Edit/Rewind must not invent a human identity for unknown or task-card input.
+/// Rewind must not invent a human identity for unknown or task-card input.
 fn person_bubble(kind: &EventKind) -> bool {
     own_message(kind)
         && matches!(kind, EventKind::User { origin, .. } if matches!(origin.as_deref(), None | Some(c6_api::MessageOrigin::Human)))
@@ -5793,6 +5873,7 @@ fn Composer(
             area,
             revision,
             loading: restoring,
+            note: draft_note,
             returned: StoredValue::new(ReturnedDrafts::default()),
         }));
         on_cleanup(move || {
@@ -6104,6 +6185,13 @@ fn Composer(
         // Sent: the suggestion was for before this message.
         next.set(None);
         attachments.set(Vec::new());
+        if let Some(draft) = recovery.and_then(|r| r.get_untracked()) {
+            draft.returned.update_value(|r| {
+                r.parts.clear();
+                r.base.clear();
+                r.files.clear();
+            });
+        }
         draft_note.set(None);
         // Also clear a loss marker when no files survived restoration: the
         // empty attachment signal alone would not trigger a storage write.
@@ -6114,9 +6202,15 @@ fn Composer(
         spawn_local(async move {
             if let Err(e) = api::send_message_waking(id.get_value(), t.clone(), switch, uploads.clone(), waking, now).await {
                 error.set(Some(e));
-                text.set(t);
-                attachments.set(uploads);
-                draft_note.set(saved_note);
+                if let Some(draft) = recovery.and_then(|r| r.get_untracked()) {
+                    draft.failed_send(&t, uploads);
+                } else {
+                    text.update(|current| append_draft(current, &t));
+                    attachments.update(|current| current.extend(uploads));
+                }
+                if draft_note.get_untracked().is_none() {
+                    draft_note.set(saved_note);
+                }
             } else {
                 error.set(None);
             }
@@ -6203,7 +6297,7 @@ fn Composer(
                 <Show when=move || archived.get()>
                     <p class="text-xs text-muted" role="status">"This session is archived. Unarchive it to send messages."</p>
                 </Show>
-                {move || (!draft_ready.get()).then(|| view! { <p class="text-xs text-muted" role="status">"Restoring draft attachments…"</p> })}
+                {move || (!draft_ready.get() || restoring.get() > 0).then(|| view! { <p class="text-xs text-muted" role="status">"Restoring draft attachments…"</p> })}
                 {move || draft_note.get().map(|note| view! { <p class="text-xs text-muted" role="status">{note}</p> })}
                 // One box: what's attached, the text, and a toolbar along its
                 // bottom edge (📎, the chips, Send).
@@ -6515,7 +6609,7 @@ fn Composer(
                             <button class=move || format!("{SEND} {TAP_SEND} {} {}", if split_send.get() { "rounded-l-md rounded-r-none" } else { SEND_SHAPE }, if has_text.get() { SEND_READY } else { SEND_EMPTY })
                                 data-active=move || (!stop_shown.get()).to_string() inert=move || stop_shown.get()
                                 title=move || if running.get() { format!("{send_label}: the agent reads it at its next step") } else { send_label.to_owned() }
-                                aria-label=send_label prop:disabled=move || disabled.get() || !draft_ready.get() || restoring.get() > 0 || stop_shown.get()
+                                aria-label=send_label prop:disabled=move || disabled.get() || !draft_ready.get() || (restoring.get() > 0) || stop_shown.get()
                                 on:click=move |_| send()>{send_icon()}</button>
                             <button class=STOP data-active=move || stop_shown.get().to_string() inert=move || !stop_shown.get()
                                 title=move || if armed.get() { "Press Esc again to stop" } else { stop_label }
@@ -6968,8 +7062,8 @@ mod tests {
         assert!(!source.contains("fn MessageEdit(") && !source.contains("fn QueueEditBox("));
         assert!(!source.contains("Send correction") && !source.contains("Edit queue…"));
         assert!(source.contains("title=\"Rewind\" aria-label=\"Rewind\""));
-        assert!(source.contains("title=\"Ask\" aria-label=\"Ask\""));
-        assert!(source.contains("mt-1 flex justify-end gap-2 text-muted"));
+        assert!(source.contains("aria-label=\"Ask\"") && source.contains("title=if is_user { \"Ask\" }"));
+        assert!(source.contains("mt-1 flex justify-end gap-4 text-muted [@media(pointer:coarse)]:pr-2"));
         let rewind = source.split("fn RewindPanel(").nth(1).unwrap().split("struct ForceOpen").next().unwrap();
         assert!(rewind.contains("api::rewind"));
         assert!(!rewind.contains("api::send_message") && !rewind.contains("Resend"));
@@ -7012,6 +7106,51 @@ mod tests {
         assert_eq!(drafts.value().1, files, "a new recovery keeps all previously edited files");
     }
 
+    fn recovery_box() -> ComposerDraft {
+        ComposerDraft {
+            text: RwSignal::new(String::new()),
+            files: RwSignal::new(Vec::new()),
+            area: NodeRef::new(),
+            revision: RwSignal::new(0),
+            loading: RwSignal::new(0),
+            note: RwSignal::new(None),
+            returned: StoredValue::new(ReturnedDrafts::default()),
+        }
+    }
+
+    #[test]
+    fn delayed_files_survive_an_edit_and_another_return_that_replaced_the_ticket() {
+        Owner::new().with(|| {
+            let draft = recovery_box();
+            let a = draft.insert("A".into(), Vec::new());
+            draft.revision.update(|r| *r += 1);
+            draft.text.set("edited A".into());
+            let b = draft.insert("B".into(), Vec::new());
+            let file = c6_api::AttachmentUpload { name: "a.txt".into(), mime: "text/plain".into(), data: "YQ==".into() };
+            draft.attachments(a, vec![file.clone()]);
+            assert_eq!(draft.text.get_untracked(), "B\n\nedited A");
+            assert_eq!(draft.files.get_untracked(), vec![file.clone()]);
+            draft.rollback(b);
+            assert_eq!(draft.text.get_untracked(), "edited A");
+            assert_eq!(draft.files.get_untracked(), vec![file]);
+        });
+    }
+
+    #[test]
+    fn a_failed_send_cannot_overwrite_a_later_recovery_or_its_files() {
+        Owner::new().with(|| {
+            let draft = recovery_box();
+            let file = |name: &str| c6_api::AttachmentUpload { name: name.into(), mime: "text/plain".into(), data: "YQ==".into() };
+            let a = draft.insert("returned A".into(), vec![file("a.txt")]);
+            draft.failed_send("earlier S", vec![file("s.txt")]);
+            assert_eq!(draft.text.get_untracked(), "returned A\n\nearlier S");
+            assert_eq!(draft.files.get_untracked(), vec![file("a.txt"), file("s.txt")]);
+            draft.rollback(a);
+            assert_eq!(draft.text.get_untracked(), "earlier S");
+            assert_eq!(draft.files.get_untracked(), vec![file("s.txt")]);
+        });
+    }
+
     #[test]
     fn take_back_is_hoisted_outside_waiting_rows_and_never_pulls_a_tail() {
         let source = include_str!("session.rs").split("#[cfg(test)]").next().unwrap();
@@ -7039,8 +7178,8 @@ mod tests {
             .next()
             .unwrap();
         assert!(source.contains("min-h-11 pr-12 md:min-h-0 md:pr-0 md:pb-7"));
-        assert!(source.contains("if user_bubble { \"\" }"), "ordinary user text keeps its full width");
-        assert!(trigger.contains("if user_bubble { \"hidden\" }"), "ordinary user bubbles expose direct actions instead");
+        assert!(source.contains("if is_user { \"\" }"), "read messages keep their full width");
+        assert!(trigger.contains("if is_user { \"hidden\" }"), "read messages expose direct actions instead");
         assert!(trigger.contains("size-11") && trigger.contains("md:hidden"));
         assert!(trigger.contains("crate::icons::ellipsis()"));
         assert!(trigger.contains("message_actions.set(Some(seq))") && trigger.contains("actions_open.set(true)"));
@@ -7484,7 +7623,7 @@ mod tests {
                 }))
                 .unwrap();
                 assert!(!person_bubble(&e.kind), "recorded external input uses the sender renderer");
-                assert_eq!(own_message(&e.kind), delegated_by.is_empty(), "unknown alone cannot bar Edit/Rewind");
+                assert_eq!(own_message(&e.kind), delegated_by.is_empty(), "unknown alone cannot bar Rewind");
                 let html = sender_message("s1", &e).to_html();
                 assert!(html.contains("c6-message-card") && html.contains(label), "{html}");
                 assert!(!html.contains("rounded-br-sm"), "not the user's bubble: {html}");

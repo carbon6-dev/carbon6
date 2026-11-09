@@ -1829,7 +1829,7 @@ impl Store {
                 _ => None,
             }
         });
-        if row.get::<Option<String>, _>("state").as_deref() == Some("pending") && uploads.is_some() {
+        if matches!(row.get::<Option<String>, _>("state").as_deref(), Some("pending" | "held")) && uploads.is_some() {
             return Ok(uploads);
         }
         let mut rows = sqlx::query("SELECT data FROM events WHERE session_id = ? AND seq > ? AND seq <= ? ORDER BY seq")
@@ -2241,6 +2241,12 @@ pub(crate) mod tests {
             .encode_to_vec();
             store.enqueue_command(&cmd).await.unwrap();
         }
+        sqlx::query("UPDATE commands SET state = 'held' WHERE id = 'unrecorded'").execute(&store.pool).await.unwrap();
+        assert_eq!(
+            store.message_attachments("s", "unrecorded").await.unwrap(),
+            Some(files.clone()),
+            "held inputs also retain their uploads"
+        );
         store.ingest(worker, "s", &[input_event(2, "taken")]).await.unwrap().unwrap();
         sqlx::query("UPDATE commands SET state = 'done' WHERE id = 'unrecorded'").execute(&store.pool).await.unwrap();
         // Neither the historical prefix nor rows beyond the durable highwater

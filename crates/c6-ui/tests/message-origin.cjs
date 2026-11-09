@@ -26,6 +26,7 @@ const messages = [
   { key: 'legacy', own: true }, // Deliberately no origin property in historical JSON.
   { key: 'session', from_session_id: 'sender', from_title: 'Release helper', label: 'Message from another session' },
   { key: 'unknown-attachment-only', origin: { kind: 'unknown' }, label: 'Message · origin unknown', attachmentOnly: true },
+  { key: 'api-attachment-only', origin: { kind: 'api', token_name: '' }, label: 'Sent via the API', attachmentOnly: true },
   { key: 'card-answer', origin: { kind: 'unknown' }, command: 'card-answer', mention: true, label: 'Message · origin unknown' },
   { key: 'task-card-start', origin: { kind: 'task_card' }, label: 'From a task card' },
   { key: 'task-card-answer', origin: { kind: 'task_card_answer' }, command: 'card-answer', mention: true, label: 'Answer to a task card' },
@@ -69,6 +70,7 @@ async function icon(locator, label) {
 
 async function exercise(f, label, phone, theme, evidence) {
   const { page } = f;
+  const fixtureOrigin = new URL(page.url()).origin;
   const activate = async locator => {
     // Let the prior disclosure's resize/scroll observers finish before the
     // next native tap, rather than tapping a target while its column moves.
@@ -194,15 +196,71 @@ async function exercise(f, label, phone, theme, evidence) {
 
     f.phase = `${message.key}: actions and Ask`;
     // Unknown is neutral, not positively nonhuman. Only positive API/session/
-    // delegated provenance removes Edit/Rewind, including hidden controls.
+    // delegated provenance removes Rewind. No read message has an Edit flow.
     const edit = row.getByRole('button', { name: 'Edit', exact: true, includeHidden: true });
     const rewind = row.getByRole('button', { name: 'Rewind', exact: true, includeHidden: true });
-    assert.equal(await edit.count(), message.editable ? 1 : 0, 'only positive nonhuman provenance bars desktop Edit');
-    assert.equal(await rewind.count(), message.editable ? 1 : 0, 'only positive nonhuman provenance bars desktop Rewind');
+    assert.equal(await edit.count(), 0, 'read messages never expose Edit, even hidden');
+    assert.equal(await rewind.count(), message.editable ? 1 : 0, 'only positive nonhuman provenance bars Rewind');
     const inlineAsk = row.getByRole('button', { name: 'Ask', exact: true, includeHidden: true });
     assert.equal(await inlineAsk.count(), 1, 'every source remains askable');
-    if (phone) {
-      assert(!(await inlineAsk.isVisible()), 'phone uses the sheet, not overlapping inline actions');
+    const rowNode = await row.elementHandle();
+    const askNode = await inlineAsk.elementHandle();
+    const askIcon = await inlineAsk.locator('svg').elementHandle();
+    const rewindNode = message.editable ? await rewind.elementHandle() : null;
+    const rewindIcon = message.editable ? await rewind.locator('svg').elementHandle() : null;
+    const assertRetained = async () => {
+      assert(await row.evaluate((el, kept) => el === kept, rowNode), 'actions preserve the original transcript row');
+      assert(await inlineAsk.evaluate((el, kept) => el === kept, askNode), 'Ask button retains DOM identity');
+      assert(await inlineAsk.locator('svg').evaluate((el, kept) => el === kept, askIcon), 'Ask retains its original SVG');
+      if (message.editable) {
+        assert(await rewind.evaluate((el, kept) => el === kept, rewindNode), 'Rewind button retains DOM identity');
+        assert(await rewind.locator('svg').evaluate((el, kept) => el === kept, rewindIcon), 'Rewind retains its original SVG');
+      }
+      assert.equal(await page.locator('[data-message-edit]').count(), 0, 'opening actions never mounts MessageEdit');
+      assert.equal(await page.getByRole('button', { name: 'Send correction', exact: true, includeHidden: true }).count(), 0,
+        'read messages have no correction action');
+    };
+    await assertRetained();
+    if (message.editable) {
+      // own_message eligibility, not the bubble renderer, selects direct
+      // actions. Unknown/task-card input keeps its neutral card presentation.
+      await page.mouse.move(0, 0);
+      await settle(page);
+      assert.equal(await row.getByRole('button', { name: 'Message actions', exact: true }).count(), 0,
+        'eligible read messages never expose the phone sheet trigger');
+      for (const name of ['Rewind', 'Ask']) {
+        const button = row.getByRole('button', { name, exact: true });
+        await button.scrollIntoViewIfNeeded();
+        await settle(page);
+        assert(await button.isVisible(), `${name} is directly visible on phone and desktop`);
+        assert(await button.isEnabled(), `${name} is usable`);
+        assert.equal(await button.getAttribute('aria-label'), name, `${name} has an explicit accessible name`);
+        assert.equal(await button.getAttribute('title'), name, `${name} has a tooltip matching its accessible name`);
+        assert.equal((await button.textContent()).trim(), '', `${name} stays icon-only`);
+        await icon(button.locator('svg'), `${message.key} direct ${name} icon`);
+        const target = await button.evaluate(el => {
+          const r = el.getBoundingClientRect(), after = getComputedStyle(el, '::after');
+          const expanded = after.content !== 'none' && after.content !== 'normal' && after.position === 'absolute';
+          let visible = true;
+          for (let node = el; node; node = node.parentElement) {
+            const css = getComputedStyle(node);
+            if (css.visibility === 'hidden' || Number(css.opacity) === 0) visible = false;
+          }
+          return { visible, hit: el.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2)),
+            x: r.x, right: r.right, viewport: innerWidth, width: r.width, height: r.height,
+            targetWidth: r.width - (expanded ? parseFloat(after.left) + parseFloat(after.right) : 0),
+            targetHeight: r.height - (expanded ? parseFloat(after.top) + parseFloat(after.bottom) : 0) };
+        });
+        // The button intentionally overflows by 8px for its transparent touch
+        // target. The enclosing transcript row must still pass contained().
+        assert(target.x >= -1 && target.right <= target.viewport + 1, `${name} stays inside the viewport`);
+        assert(target.visible && target.hit, `${name} is painted and hit-testable without hover: ${JSON.stringify(target)}`);
+        assert(Math.abs(target.width - 28) <= 1 && Math.abs(target.height - 28) <= 1, `${name} keeps a quiet 28px icon button`);
+        if (phone) assert(target.targetWidth >= 44 && target.targetHeight >= 44, `${name} has a 44px touch target`);
+      }
+    }
+    if (phone && !message.editable) {
+      assert(!(await inlineAsk.isVisible()), 'positive nonhuman rows use the phone sheet, not overlapping inline actions');
       const opener = row.getByRole('button', { name: 'Message actions', exact: true });
       await contained(opener, `${message.key} action opener`);
       await icon(opener.locator('svg'), `${message.key} action icon`);
@@ -210,25 +268,31 @@ async function exercise(f, label, phone, theme, evidence) {
       const sheet = page.getByRole('dialog', { name: 'Message actions', exact: true });
       await sheet.waitFor();
       assert.match(await sheet.getAttribute('class'), /\bphone-message-actions\b/);
-      assert.equal(await sheet.getByText(message.speaker, { exact: true }).count(), 1, 'sheet preserves known-human, neutral and nonhuman attribution');
+      assert.equal(await sheet.getByText(message.speaker, { exact: true }).count(), 1, 'sheet preserves positive nonhuman attribution');
       for (const other of ['You', 'Message', 'Sender'].filter(speaker => speaker !== message.speaker)) {
         assert.equal(await sheet.getByText(other, { exact: true }).count(), 0, 'never invent a human identity for unknown input');
       }
       if (message.attachmentOnly) assert.equal(await sheet.getByText(message.file, { exact: true }).count(), 1, 'empty-text action context uses the attachment name');
-      assert.equal(await sheet.getByRole('button', { name: 'Edit', exact: true }).count(), message.editable ? 1 : 0);
-      assert.equal(await sheet.getByRole('button', { name: 'Rewind…', exact: true }).count(), message.editable ? 1 : 0);
+      assert.equal(await sheet.getByRole('button', { name: 'Edit', exact: true, includeHidden: true }).count(), 0,
+        'notice sheets never expose Edit');
+      assert.equal(await sheet.getByRole('button', { name: 'Rewind…', exact: true }).count(), 0,
+        'positive nonhuman provenance bars sheet Rewind');
       const ask = sheet.getByRole('button', { name: 'Ask in a side chat', exact: true });
       await icon(ask.locator('svg'), `${message.key} sheet Ask icon`);
       await contained(sheet, `${message.key} actions sheet`);
-      if (message.key === 'api-token' || message.key === 'human') await save(`${message.key}-actions`);
+      if (message.key === 'api-token') await save(`${message.key}-actions`);
       await ask.tap();
       await sheet.waitFor({ state: 'hidden' });
     } else {
-      await row.hover();
-      await settle(page);
-      assert(!(await row.getByRole('button', { name: 'Message actions', exact: true }).isVisible()), 'desktop retains inline actions');
+      if (!message.editable) {
+        await row.hover();
+        await settle(page);
+      }
+      assert.equal(await row.getByRole('button', { name: 'Message actions', exact: true }).count(), 0,
+        'direct actions do not expose the phone sheet trigger');
       await icon(inlineAsk.locator('svg'), `${message.key} inline Ask icon`);
-      await inlineAsk.click();
+      if (message.key === 'human') await save(`${message.key}-actions`);
+      await activate(inlineAsk);
     }
     const input = page.getByPlaceholder(phone ? 'Ask about this in a side chat' : 'Ask about this in a side chat (Enter to send, Esc to cancel)', { exact: true });
     await input.waitFor();
@@ -239,46 +303,28 @@ async function exercise(f, label, phone, theme, evidence) {
     if (message.key === 'api-token') await save('api-token-ask');
     await activate(input.locator('..').getByRole('button', { name: 'Cancel', exact: true }));
     await input.waitFor({ state: 'hidden' });
+    await assertRetained();
 
-    // Both a human bubble and a neutral unknown card must really enter the
-    // edit and rewind flows, not merely expose inert-looking action buttons.
-    if (['human', 'unknown', 'task-card-start', 'task-card-answer'].includes(message.key)) {
-      for (const action of ['Edit', 'Rewind']) {
-        f.phase = `${message.key}: ${action} entry`;
-        await row.scrollIntoViewIfNeeded();
-        if (phone) {
-          await activate(row.getByRole('button', { name: 'Message actions', exact: true }));
-          const sheet = page.getByRole('dialog', { name: 'Message actions', exact: true });
-          await activate(sheet.getByRole('button', { name: action === 'Edit' ? 'Edit' : 'Rewind…', exact: true }));
-          await sheet.waitFor({ state: 'hidden' });
-        } else {
-          await row.hover();
-          await activate(row.getByRole('button', { name: action, exact: true }));
-        }
-        if (action === 'Edit') {
-          const editor = page.locator('[data-message-edit]');
-          await editor.getByText('The agent has this message', { exact: true }).waitFor();
-          assert.equal(await editor.locator('textarea').count(), 0, 'Edit does not attempt withdrawal or replace the draft');
-          await activate(editor.getByRole('button', { name: 'Send correction', exact: true }));
-          assert.equal(await editor.locator('textarea').inputValue(), events.find(event => event.seq === message.seq).text,
-            'eligible message retains its original text for correction');
-          await activate(editor.getByRole('button', { name: 'Discard draft', exact: true }));
-          await editor.waitFor({ state: 'hidden' });
-        } else {
-          // RewindPanel is the transcript row's sibling, not inside the row.
-          const confirmation = page.getByText(/^Rewind the conversation to before this message\?/).locator('..');
-          await confirmation.waitFor();
-          assert.equal(await confirmation.getByRole('checkbox').isChecked(), false, 'restoring files still needs explicit consent');
-          assert.equal(await confirmation.getByRole('button', { name: 'Rewind', exact: true }).isEnabled(), true, 'rewind is available after the stream is ready');
-          await activate(confirmation.getByRole('button', { name: 'Cancel', exact: true }));
-          await confirmation.waitFor({ state: 'hidden' });
-        }
-      }
+    // Every eligible bubble and neutral notice must really enter Rewind,
+    // not merely expose an inert-looking action button.
+    if (message.editable) {
+      f.phase = `${message.key}: Rewind entry`;
+      await row.scrollIntoViewIfNeeded();
+      await activate(rewind);
+      // RewindPanel is the transcript row's sibling, not inside the row.
+      const confirmation = page.getByText(/^Rewind the conversation to before this message\?/).locator('..');
+      await confirmation.waitFor();
+      assert.equal(await confirmation.getByRole('checkbox').isChecked(), false, 'restoring files still needs explicit consent');
+      assert.equal(await confirmation.getByRole('button', { name: 'Rewind', exact: true }).isEnabled(), true, 'rewind is available after the stream is ready');
+      await assertRetained();
+      await activate(confirmation.getByRole('button', { name: 'Cancel', exact: true }));
+      await confirmation.waitFor({ state: 'hidden' });
+      await assertRetained();
     }
     // Read RPCs and transcript viewed/seen receipts also use POST. Only the
     // message-action endpoints would send, branch, interrupt or rewind here.
-    assert.deepEqual(f.requests.filter(request => /^(POST|PUT|PATCH|DELETE) .*\/(messages|side-chats|rewind|interrupt)$/.test(request)), [],
-      'opening/cancelling Ask, Edit and Rewind never sends or rewinds anything');
+    assert.deepEqual(f.requests.filter(request => /^(POST|PUT|PATCH|DELETE) .*\/(messages|side-chats|rewind|interrupt)(\/|$)/.test(request)), [],
+      'opening/cancelling Ask and Rewind never sends, edits, withdraws or rewinds anything');
   }
   f.phase = 'card-answer mention navigation';
   const answer = messages.find(message => message.mention);
@@ -289,6 +335,8 @@ async function exercise(f, label, phone, theme, evidence) {
   await navigation;
   await page.locator(`[id="${mentionId}-e1"]`).waitFor({ state: 'attached' });
   await save('card-answer-navigation');
+  assert.equal(page.frames().length, 1, 'message actions and mention navigation never create a frame');
+  assert.equal(new URL(page.url()).origin, fixtureOrigin, 'navigation stays in the fixture origin');
   assert.deepEqual(f.errors, [], 'no browser errors, crash reports or external requests');
 }
 

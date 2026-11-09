@@ -706,8 +706,21 @@ pub async fn dismiss_rejected(id: String) -> Result<(), String> {
 
 /// Withdraw exactly one queued command after worker confirmation, never a tail
 /// or an already-taken transcript event.
-pub async fn take_back(id: String, command_id: String) -> Result<(), String> {
-    empty(Request::post(&format!("/api/v1/sessions/{id}/messages/{}/take-back", enc(&command_id))).send().await).await
+pub async fn take_back(id: String, command_id: String) -> Result<(), (String, bool)> {
+    let response = Request::post(&format!("/api/v1/sessions/{id}/messages/{}/take-back", enc(&command_id))).send().await;
+    // A lost response may hide a successful withdrawal. In that case keep
+    // the text in the box even if untouched: it may now be the only copy.
+    let response = response.map_err(|e| (e.to_string(), false))?;
+    if response.ok() {
+        return Ok(());
+    }
+    if response.status() == 401 {
+        signed_out().set(true);
+    }
+    match response.json::<c6_api::ApiError>().await {
+        Ok(error) => Err((error.error, true)),
+        Err(_) => Err((response.status_text(), false)),
+    }
 }
 
 // --- Worker files, git, terminals ---------------------------------------------

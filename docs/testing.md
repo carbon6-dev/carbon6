@@ -688,10 +688,14 @@ tests cover legacy and unknown rewind eligibility; Watchers' policy matrix check
 that only known human input, including auth-off page input, is a human correction.
 
 Waiting input is mounted just above the session composer, outside the scrolling
-transcript. The queue has its own 30dvh scroll limit; each input keeps Edit in
-the same action position, and only inputs with a queued tail offer Edit queue….
-`message-edit.cjs` checks this on desktop and phones, including growing streamed
-replies, many waiting inputs, single-edit cancellation, and the separate bulk path.
+transcript. The queue has its own 30dvh scroll limit. Each input has an icon-only
+**Take this back** (×); only `with_agent` inputs also offer the soft **Send now**
+action. There is no Edit or Edit queue entry. Taking one back immediately hides
+its row and restores its text into the existing Composer, ahead of any draft
+with a blank line between them. Attachment recovery and the single-command
+take-back request run in the background; the gesture never sends or pulls a tail.
+`message-edit.cjs` checks this on desktop and 320/390px phones, including growing
+streamed replies, many waiting inputs, stacking, failure rollback and explicit Send.
 The status-row suite also clicks the background-task link: wide tiles return to
 Running now, scroll and focus its heading, and show a bounded static highlight
 without overriding reduced/off motion.
@@ -710,12 +714,13 @@ full-message expansion, attachment links and a separate received-prompt disclosu
 An attachment-only unknown message keeps its link despite an empty subject.
 An unknown-origin `card-answer` keeps its generated session mention and opens the
 mocked session; delegated unknown input says “From the agent that started it”.
-Unknown stays neutrally labelled “Message · origin unknown”, with Edit/Rewind
+Unknown stays neutrally labelled “Message · origin unknown”, with Rewind/Ask
 available but no invented human identity. Delegated, API and other-session input
 retain Ask-only actions. Human and legacy bubbles stay right-aligned and retain
-Edit/Rewind. Phone Message actions says Message for unknown, Sender for positive
-non-human sources, and You for human/legacy. Ask is opened, filled and cancelled without sending.
-Human and unknown inputs also enter Edit/correction and explicit Rewind
+direct Rewind/Ask icons, including on phones. The remaining non-user phone
+Message actions sheet uses Sender for positive non-human sources; no sheet
+offers Edit. Ask is opened, filled and cancelled without sending.
+Human and unknown inputs also enter explicit Rewind
 confirmation, then cancel without sending, withdrawing or rewinding anything.
 The test checks real icons, applied theme colors and horizontal containment.
 
@@ -1987,7 +1992,7 @@ clicks/taps verify both show/hide labels, retained message DOM and fold ownershi
 the undo icon, file-restoration status/error, no horizontal page overflow,
 no session mutation requests and no browser/dropped-closure errors. Waits are
 condition-based with the shared five-minute hang guard (`docs/testing.md` rules),
-not timed pauses. This covers only the marker, not the Edit/Rewind form.
+not timed pauses. This covers only the marker, not the Rewind confirmation.
 Use `ENGINE=chromium|webkit`, `WIDTH=1440|390|320` and `THEME=light|dark` to
 isolate an exact case; preserve any original failed cohort before rerunning.
 
@@ -2375,7 +2380,7 @@ that phase asserts desktop text is larger than 12px and saves the same views
 under `/tmp/q1-screenshots/model-before`. `VIEWPORT=desktop,phone,narrow`,
 `THEME=light,dark`, and browser path overrides work as in `motion.cjs`.
 
-## Transcript Edit: taken choices and confirmed explicit rewind (S4 part 2)
+## Waiting-message return to Composer and confirmed explicit Rewind
 
 Build the production UI, then run the loopback-only browser regression with
 Node 24 and the motion harness's installed-browser overrides:
@@ -2389,40 +2394,78 @@ ENGINE=both /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/te
 
 `message-edit.cjs` owns a fresh browser process/context per desktop/phone case,
 fake HTTP/WebSocket responses and a loopback origin. It never calls a model,
-real head or worker, or writes live settings. A transcript `User` is already
-taken: Edit immediately shows **The agent has this message**, without a
-take-back request or a fictitious pre-ownership transcript route. No tail pull,
-Send or Rewind request happens merely on Edit. The original draft survives with
-**Send correction** (keeps history) and **Rewind…** (separate confirmation).
-Correction sends normally, preserves the original reply, and retains edited
-text and the same textarea node on a failed Send. Original row and SVG node
-identity survive Edit entry and streamed delivery; bounding a view's root for
-WASM size must not reparse its live attributes. Explicit rewind never
-automatically resends. Its HTTP response only acknowledges enqueue: hold back
-the durable event and assert that the editor stays closed, then publish a
-`Rewound` with the requested `to_seq` and `seq` above the event highwater captured
-at the confirmation click. An older matching marker or a new marker for another
-target must not unlock the editor. HTTP rejection or a new durable `Error` keeps
-the draft and must not send a replacement. Only the matching new durable marker
-allows editing, followed by a separate ordinary Send. An unconfirmed queued
-cancellation must not claim withdrawal: retain the draft and offer the taken
-choices (rewind needs a resolved transcript sequence). Phone cases enter through the real Message actions sheet,
-which retains Edit. `phone-picker.cjs` also checks this taken-message entry.
-The ordinary-send form is shared with the queue editor in single-message mode,
-without Add/reorder/drop controls. Separate bulk-queue checks exercise the
-intentional tail pull, reorder/add/drop and discard controls without sending.
-Queued bubbles have two distinct entry points: **Edit** calls take-back for
-only that command; **Edit queue…** intentionally pulls its tail. The
-`queued-ready`, `queued-taken-race`, `queued-unconfirmed` and `queued-pending`
-browser cases run on desktop and phone. They gate cancellation, remove the
-selected queue row, and retain the Transcript-owned panel/draft across a
-matching `User` arriving. An unrelated User cannot provide rewind identity.
-Before that exact User exists, uncertainty offers correction and explains why
-rewind must wait, without inventing an event sequence. A late User while typing
-must preserve the same correction textarea/value; failed Send keeps both.
-Assertions reject any single-edit tail-pull/cancel request or mutation of later
-queued inputs. After building the combined UI, `CASE=queued- ENGINE=both`
-selects these 16 browser cases.
+real head or worker, or writes live settings. Waiting rows use
+`[data-queued-command="command-id"]` and `[data-queue-actions]`; their only
+actions are **Take this back** and, iff `with_agent`, **Send now**. A trusted ×
+gesture synchronously inserts text into the same Composer textarea, focuses it
+and places a collapsed UTF-16 caret after the restored block. Existing draft
+text follows a blank line. Consecutive returns stack in click order, regardless
+of HTTP completion order. There is no separate edit panel or implicit Send.
+
+`CASE=queued- ENGINE=both` selects 64 cases. The selected cancellation response
+is promise-gated to prove that insertion/hiding do not wait for HTTP. Attachment
+recovery is explicitly mocked as GET
+`/api/v1/sessions/parent/messages/{command_id}/draft`, returning a JSON array of
+`AttachmentUpload {name,mime,data}` (base64), including `[]` by default. A separate
+recovery gate proves POST `.../messages/{command_id}/take-back` waits for the
+bytes, while text and focus return immediately. Explicit ordinary Send retains
+recovered and pre-existing attachment bytes, appends a fresh message, and keeps
+the same draft/textarea after a failed Send. Stale queue snapshots must not
+resurrect successful returns. Structured head refusals (including HTTP 503)
+restore the waiting row and roll
+back only that inserted block, only if there has been no user edit; edit-and-revert
+also prevents rollback. Retry is explicit. A stacked failure leaves the other
+returned block intact. `queued-response-lost` instead aborts the gated take-back
+request to simulate losing its response after cancellation may have succeeded.
+The waiting row returns with a couldn't-take-back note, but even untouched
+combined text stays in the Composer, including after a subsequent empty server
+queue snapshot. There is no automatic retry or Send. The fixture observes only
+that exact POST's expected `requestfailed` event; it does not suppress browser
+errors or relax the shared error assertions. HTTP 409 **The agent has this message** instead keeps
+the draft, allows the ordinary durable User row and shows exactly:
+**The agent had already read this, so it wasn't taken back. Your text is still in the box.**
+
+Two additional promise-gated ownership races protect recovered attachments and
+concurrent draft edits. `queued-attachments-edited-stacking` takes back A while
+its attachment fetch is held, edits the Composer, takes back B, then releases
+A's files after B has replaced A's original batch ticket. B appears ahead of
+the edited base containing A; all original/returned files and edited text must
+survive both confirmations and the separate explicit Send, with exact uploaded
+bytes. `queued-send-failure-recovery` starts ordinary Send S with its own text
+and file and holds the failure response. While S is pending, it takes back A
+with recovered files and confirms cancellation, then releases S's HTTP 503.
+Current A text/files must remain first, with S restored after a blank line and
+its files retained rather than overwriting A. Exactly one Send request occurs:
+neither recovery nor failure retries or sends implicitly.
+
+The queue checks retain later inputs unchanged, bounded 30dvh scrolling,
+right-aligned actions and horizontal containment at 320/390px phone and
+800/1440px desktop widths. The visible × remains 28px; on coarse pointers a
+transparent absolute `::after` extends 8px beyond every edge to provide a 44px
+hit area. Tests inspect these computed edges and hit-test all four, including
+outside the painted button. Desktop retains its 28px target. Send now's hit
+area expands vertically only, without widening its painted button. **Send now** is offered
+only for `with_agent` and posts only to `/queue/{command_id}/now`, without
+changing the Composer. No take-back path may pull/cancel a tail, interrupt,
+rewind, create a side chat or send without explicit user action.
+
+Read user rows expose always-visible icon-only **Rewind** and **Ask**, with those
+exact aria-labels and titles on desktop and phones; there is no Edit or user
+Message actions sheet. `phone-picker.cjs` also checks direct entry, cancellation
+and natural Ask focus. Explicit Rewind opens a separate confirmation with file
+restoration unchecked. Cancelling leaves the Composer unchanged. Its HTTP
+response only acknowledges enqueue: the existing draft must stay unchanged
+until a matching durable `Rewound` has `seq` above the event highwater captured
+at the confirmation click. Older matching markers and fresh markers for other
+targets cannot restore text. Worker confirmation arriving before HTTP is retained
+but cannot restore until acknowledgment. HTTP refusal or a new durable `Error`
+keeps the draft unchanged; retry while the old response is held must use the new
+attempt's highwater. Disconnect/replay cannot confirm an interrupted attempt or
+retry automatically. Only a fresh matching result after explicit retry restores
+the original text and attachments into the existing Composer using the same
+combining rule. Rewind never automatically resends. The original transcript row
+and always-mounted Ask SVG retain their identity; the historical Rewind action
+is intentionally removed.
 
 `CASE=rejected ENGINE=both` checks rejected deliveries on desktop and phones
 (320/390px, including unbroken reason/input text). They render as error rows in
@@ -2439,9 +2482,9 @@ the composer and clicks Send while the live session is working and its turn is
 unfinished. The accepted command first appears in the queue, becomes taken,
 then receives a matching durable `User` event with a distinct sequence. Before
 any reply to that message, turn completion, or subsequent queue snapshot, the
-row (phone: Message actions sheet) must offer **Edit**, **Rewind**, and **Ask**.
-Edit opens the taken choices without cancellation; Ask opens a side-chat draft without
-sending. The test then clicks the row/sheet's direct Rewind entry and confirms
+row must offer direct **Rewind** and **Ask** icons, including on phones, without
+Edit. Ask opens a side-chat draft without sending. The test then clicks the
+row's direct Rewind entry and confirms
 the separate warning: the recorded API body must use that actual `User.seq`,
 not the command ID, queue position, or turn sequence. HTTP enqueue alone leaves
 the warning open; a matching new durable `Rewound` closes it. No automatic
@@ -2449,20 +2492,18 @@ replacement is sent. Unknown provenance keeps its neutral label rather than
 claiming a human identity, but does not hide these actions. A running turn is
 not a rewind blocker; the UI still requires a synced stream, and the head's
 existing subagent, positive nonhuman-provenance, runtime-handoff, and Claude
-Code worker-capability guards remain intact. The complete matrix has 64 cases.
+Code worker-capability guards remain intact. The complete matrix has 108 cases.
 
-Textarea Send shortcuts use the existing input policy; Enter on Discard draft
-must close the draft without bubbling into Send.
 All waits use response/DOM conditions, not cancellation timing sleeps; browser
 crashes fail the original run rather than being retried away.
 `ENGINE=chromium|webkit|both`, `ROOT` and browser overrides match `motion.cjs`;
-`CASE=phone/taken` selects one diagnostic case without hiding the original run.
+`CASE_EXACT=chromium/phone/queued-ready` selects one diagnostic case without hiding the original run.
 
 The corresponding head integration tests exercise real head/worker ownership,
 delivery winning cancellation, later messages left intact and ordinary Send
 without `Rewound`. These are separate from the browser's controlled API gates;
-neither uses real models. Transcript Edit must not reuse `pull_queued`, whose
-intentional queue-editor behavior includes later messages.
+neither uses real models. Returning a single waiting message must not reuse
+`pull_queued`, whose server-side bulk behavior includes later messages.
 
 ```sh
 set -euo pipefail
@@ -2609,19 +2650,21 @@ still runs every other modal, search, keyboard and action-menu assertion.
 Keyboard cases synthesize visual-viewport insets; this is not physical-device
 keyboard coverage or proof of Android Back-edge gestures.
 
-Own messages expose Edit / Ask in a side chat / Rewind…; agent replies expose
-Ask only. Both have always-visible 44px phone more targets and named
-`Message actions` dialogs with inert/Tab containment and focus restoration
-after Escape, Close and scrim dismissal. Own metadata has its own 44px row
-below the full-width bubble; the agent target stays in its reserved text
-gutter. Opening the portalled sheet must retain the row and its exact layout,
-and must not send, rewind or branch. Edit and Rewind open their existing
-confirmation panels, leave file restoration unchecked, and are cancelled
-without mutations. Own and agent Ask forms each submit a real fake-API
+Read user messages expose direct, always-visible icon-only Rewind and Ask
+buttons with matching aria-labels/titles. Their visible bounds remain 28px;
+coarse-pointer `::after` expansion supplies a 44px hit area whose outer edges
+are hit-tested. There is no Edit or user Message actions trigger. Direct Rewind opens
+a separate confirmation, leaves file restoration unchecked, and is cancelled
+without mutations or Composer changes. Agent replies retain the always-visible
+44px phone more target in their reserved text gutter and a named `Message actions`
+dialog, with Ask only (no Edit). This remaining sheet retains inert/Tab
+containment and focus restoration after Escape, Close and scrim dismissal.
+Opening it must retain the row and its exact layout, and must not send, rewind
+or branch. Own direct Ask and agent sheet Ask forms each submit a real fake-API
 `side-chats` request with the selected anchor; their existing autofocus must
 reach the textarea before any test `fill()` or focus action. A controlled JSON error
 acknowledges that route without inventing a running side chat. Desktop keeps
-its existing inline Edit/Rewind/Ask actions and has no phone more button or
+inline Rewind/Ask user icons and has no phone more button or
 Sessions drawer. Browser crashes, UI error reports, external requests, and
 unexpected settings mutations fail the run.
 
@@ -2651,7 +2694,8 @@ ENGINE=both THEMES=light,dark VIEWS=wide,narrow,phone-320,phone-390,phone-430 EX
 
 `message-origin.cjs` covers new `task_card` / `task_card_answer` origins:
 **From a task card** / **Answer to a task card**, left-aligned with retained
-SVGs, and the same working Edit/correction and Rewind flows as unknown input.
+SVGs, and the same direct Rewind/Ask actions and explicit Rewind confirmation
+as unknown input, without an Edit/correction panel.
 Its old `card-answer`/unknown fixture keeps the old label. Native renderer tests
 also check exact labels, escaping, clickable generated mentions and action
 context. No CSS classes or application-side HTML serialization were added.
