@@ -2183,8 +2183,24 @@ fn Transcript(
                         let ts = e.ts;
                         let arrives = matches!(&e.kind, EventKind::User { .. })
                             || matches!(&e.kind, EventKind::BackgroundTask { state, .. } if state != "started");
+                        // Every entry: those that show something (not turn bookkeeping,
+                        // usage, results drawn with their call, or hidden thinking).
+                        let shows = matches!(
+                            &e.kind,
+                            EventKind::User { .. }
+                                | EventKind::Assistant { .. }
+                                | EventKind::Error { .. }
+                                | EventKind::Notice { .. }
+                                | EventKind::Question { .. }
+                                | EventKind::Approval { .. }
+                                | EventKind::Output { .. }
+                                | EventKind::Memory { .. }
+                                | EventKind::SubagentSpawned { .. }
+                                | EventKind::ModelSwitched { .. }
+                                | EventKind::Compaction { .. }
+                        ) || arrives;
                         let captioned = move || match times.get() {
-                            c6_api::TranscriptTimes::All => true,
+                            c6_api::TranscriptTimes::All => shows && !(only_thinking && !show_thinking.get()),
                             c6_api::TranscriptTimes::Exchanges => arrives,
                             c6_api::TranscriptTimes::Off => false,
                         };
