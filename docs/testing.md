@@ -2424,6 +2424,15 @@ Assertions reject any single-edit tail-pull/cancel request or mutation of later
 queued inputs. After building the combined UI, `CASE=queued- ENGINE=both`
 selects these 16 browser cases.
 
+`CASE=rejected ENGINE=both` checks rejected deliveries on desktop and phones
+(320/390px, including unbroken reason/input text). They render as error rows in
+the scrolling transcript after durable messages and before the streaming reply,
+not in the pinned waiting area. Growing replies must not move their transcript
+position. Original input stays recoverable, reasons wrap without horizontal
+scrolling, and the compact Dismiss button stays visible and hit-testable (44px
+target on touch only). Dismiss clears all rejections through the existing API,
+leaving queued/with-agent rows pinned; no queue actions appear on rejected rows.
+
 `CASE=sent-during-turn- ENGINE=both` selects 12 additional desktop/phone cases
 for human, explicitly unknown, and legacy (absent) origins. Each actually fills
 the composer and clicks Send while the live session is working and its turn is

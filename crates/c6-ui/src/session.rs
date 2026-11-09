@@ -2667,6 +2667,20 @@ fn Transcript(
             })}
             <crate::decisions::SessionDecisions session=id.get_value() />
             {move || secrets.get().into_iter().map(|c| view! { <SecretCardView card=c on_dismiss=Callback::new(move |id: String| secrets.update(|s| s.retain(|x| x.call_id != id))) /> }).collect_view()}
+            // Failed deliveries belong to the transcript, before the growing
+            // reply so streaming cannot move them. Keep the input recoverable.
+            {move || queued.get().into_iter().filter_map(|q| q.rejected.map(|reason| view! {
+                <div class="min-w-0 space-y-2 rounded-md border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200" data-rejected-command=q.command_id>
+                    <div class="whitespace-pre-wrap">{q.text}</div>
+                    <div class="flex flex-wrap items-start gap-2">
+                        <span class="min-w-0 flex-1">{format!("Not delivered: {reason}")}</span>
+                        <button class=format!("{UBTN} shrink-0 pointer-coarse:min-h-11 pointer-coarse:min-w-11") on:click=move |_| {
+                            let id = id.get_value();
+                            spawn_local(async move { let _ = api::dismiss_rejected(id).await; });
+                        }>"Dismiss"</button>
+                    </div>
+                </div>
+            })).collect_view()}
             // What streams in: the same elements, their text growing (not
             // drawn again for every token).
             {move || (has_thinking.get() || has_text.get()).then(|| view! {
@@ -2683,8 +2697,8 @@ fn Transcript(
                     <div class="max-h-[30dvh] space-y-2 overflow-y-auto px-4" data-waiting-messages="true">
                         {move || edit_open.get().then(|| view! { <QueueEditBox rows=edit_rows session_id=id.get_value() on_close=Callback::new(move |_| { edit_open.set(false); edit_rows.update(Vec::clear); }) /> })}
                         {move || {
-                            let rows = queued.get();
-                            let last_waiting = rows.iter().rposition(|q| !q.with_agent && q.rejected.is_none());
+                            let rows = queued.get().into_iter().filter(|q| q.rejected.is_none()).collect::<Vec<_>>();
+                            let last_waiting = rows.iter().rposition(|q| !q.with_agent);
                             rows.into_iter().enumerate().map(|(i, q)| {
                                 let has_tail = last_waiting.is_some_and(|last| i < last);
                                 view! { <Queued q session_id=id.get_value() worker_id=worker_id pull=pull edit=edit_queued events ready=rewind_ready edit_active has_tail /> }
@@ -5587,8 +5601,6 @@ fn Queued(
     edit_active: Signal<bool>,
     has_tail: bool,
 ) -> impl IntoView {
-    let rejected = q.rejected.clone();
-    let editable = rejected.is_none();
     // The worker handed it to the agent: it reads it at its next step.
     let with_agent = q.with_agent;
     let text = q.text;
@@ -5632,9 +5644,7 @@ fn Queued(
     view! {
         <div class="flex flex-col items-end gap-1" data-queued-command=command_id.get_value()>
             // Queued at the head: dashed; with the agent: solid, as good as sent.
-            <div class=if rejected.is_some() {
-                "max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm border border-red-300 px-4 py-2 text-sm opacity-70 dark:border-red-900"
-            } else if with_agent {
+            <div class=if with_agent {
                 "max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm border border-zinc-300 px-4 py-2 text-sm text-zinc-700 dark:border-zinc-700 dark:text-zinc-300"
             } else {
                 "max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm border border-dashed border-zinc-300 px-4 py-2 text-sm text-muted dark:border-zinc-700"
@@ -5644,7 +5654,7 @@ fn Queued(
             // Reserve all four slots, even without Cancel or a queue tail:
             // Edit must not move when this input is handed to the agent.
             <div class="grid max-w-full grid-cols-[3.75rem_3.25rem_3.75rem_5.75rem] items-center gap-1 overflow-x-auto whitespace-nowrap text-xs text-muted *:min-h-11" data-queue-actions="true">
-            {(!with_agent && editable).then_some("queued")}
+            {(!with_agent).then_some("queued")}
             {with_agent.then(|| view! {
                 <button class=UBTN title="Give this message to the agent now"
                     prop:disabled=move || busy.get() on:click=move |_| {
@@ -5656,22 +5666,14 @@ fn Queued(
                         });
                     }>"Send now"</button>
             })}
-            {editable.then(|| message_edit_button(
+            {message_edit_button(
                 "Edit only this message after worker-confirmed withdrawal",
                 UBTN.to_owned(),
                 view! { {crate::icons::pencil()}" Edit" }.into_any(),
                 do_edit,
                 Some(edit_busy),
-            ))}
-            {match rejected {
-                Some(reason) => view! {
-                    <span class="col-span-4 text-xs text-red-600">
-                        {format!("Not delivered: {reason}")} " "
-                        <button class="underline" on:click=move |_| { let id = session_id.get_value(); spawn_local(async move { let _ = api::dismiss_rejected(id).await; }); }>"Dismiss"</button>
-                    </span>
-                }.into_any(),
-                None if with_agent => ().into_any(),
-                None => view! {
+            )}
+            {(!with_agent).then(|| view! {
                         {move || queue_ops.get().then(|| view! {
                             <button class=UBTN title="Remove this message from the queue"
                                 prop:disabled=move || busy.get()
@@ -5679,9 +5681,8 @@ fn Queued(
                                     if let Err(e) = api::cancel_queued_input(id, cid).await { error.set(Some(e)); }
                                 }); }>{crate::icons::x()}" Cancel"</button>
                         })}
-                }.into_any(),
-            }}
-            {move || (!with_agent && editable && has_tail && queue_ops.get()).then(|| view! {
+                })}
+            {move || (!with_agent && has_tail && queue_ops.get()).then(|| view! {
                 <button class=UBTN title="Edit this message and the ones queued after it, then send them again"
                     prop:disabled=move || edit_busy.get() on:click=move |_| do_pull()>{crate::icons::pencil()}" Edit queue…"</button>
             })}

@@ -308,6 +308,86 @@ function queued() {
     text: `${name} later waiting message`, created_at: n + 1, rejected: null, with_agent: false }));
 }
 
+async function checkRejected(browser, origin, phone) {
+  let progress, dismissed = 0;
+  const rows = [
+    ...queued(),
+    { ...queued()[0], command_id: 'with-agent', with_agent: true },
+    { command_id: 'rejected-own', text: `Recover my original message ${'unbroken'.repeat(40)}`,
+      rejected: `Delivery unavailable. ${'A long readable explanation. '.repeat(12)}${'unbroken'.repeat(40)}`, with_agent: false, created_at: 1 },
+    { command_id: 'rejected-report', text: 'Subagent report delivery failed…',
+      rejected: 'The parent is unavailable.', with_agent: false, created_at: 2 },
+  ];
+  const f = await fixture(browser, origin, phone ? { width: 320, height: 568 } : { width: 1440, height: 1000 },
+    'dark', { choice: 'off', effective: 'off', os: 'reduce' }, p => { progress = p; }, {}, {
+      instrumentation: false,
+      setup: async ({ page }) => {
+        await page.route('**/api/v1/sessions/parent/queue/rejected', async route => {
+          assert.equal(route.request().method(), 'DELETE');
+          dismissed++;
+          f.stream({ type: 'queue', queued: rows.filter(row => !row.rejected) });
+          await route.fulfill({ status: 204 });
+        });
+      },
+    }).catch(async error => { await progress?.context.close(); throw error; });
+  try {
+    const { page } = f;
+    f.stream({ type: 'queue', queued: rows });
+    const rejected = page.locator('[data-rejected-command="rejected-own"]');
+    await rejected.waitFor();
+    await settle(page);
+    const waiting = page.locator('[data-waiting-messages]');
+    assert.equal(await waiting.locator('[data-rejected-command]').count(), 0);
+    assert.equal(await waiting.locator('[data-queued-command]').count(), 3, 'waiting and with-agent rows remain pinned');
+    assert.equal(await rejected.getByText(rows[3].text, { exact: true }).count(), 1, 'original input remains recoverable');
+    assert.deepEqual(await rejected.getByRole('button').allTextContents(), ['Dismiss'], 'rejections are not queue work');
+    assert(await rejected.evaluate(el => {
+      const durable = document.querySelectorAll('.c6-transcript-row');
+      return durable.length && !!(durable[durable.length - 1].compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING);
+    }), 'rejection follows the durable transcript rows');
+    assert(await rejected.evaluate(el => {
+      for (let p = el.parentElement; p; p = p.parentElement) {
+        if (p.scrollHeight > p.clientHeight && getComputedStyle(p).overflowY === 'auto') return true;
+      }
+      return false;
+    }), 'rejection is inside the scrolling transcript');
+    const documentTop = () => rejected.evaluate(el => {
+      let p = el.parentElement;
+      while (p && !(p.scrollHeight > p.clientHeight && getComputedStyle(p).overflowY === 'auto')) p = p.parentElement;
+      return el.getBoundingClientRect().top - p.getBoundingClientRect().top + p.scrollTop;
+    });
+    const before = await documentTop();
+    f.stream({ type: 'text', turn: 100, seq: 9999, text: 'Growing streamed reply.\n\n'.repeat(100) });
+    const stream = page.locator('.md').filter({ hasText: 'Growing streamed reply.' }).last();
+    await stream.waitFor();
+    assert(await rejected.evaluate((el, reply) => !!(el.compareDocumentPosition(reply) & Node.DOCUMENT_POSITION_FOLLOWING),
+      await stream.elementHandle()), 'rejection precedes the growing streaming reply');
+    await settle(page);
+    assert(Math.abs(await documentTop() - before) <= 1, 'streaming after the rejection cannot move its transcript position');
+    for (const width of phone ? [320, 390] : [1440, 800]) {
+      await page.setViewportSize({ width, height: phone ? 568 : 1000 });
+      const dismiss = rejected.getByRole('button', { name: 'Dismiss', exact: true });
+      await dismiss.scrollIntoViewIfNeeded();
+      assert(await rejected.evaluate(el => [el, ...el.querySelectorAll('*')].every(node => node.scrollWidth <= node.clientWidth + 1)),
+        `reason and original text wrap without horizontal scrolling at ${width}px`);
+      assert(await dismiss.evaluate(el => {
+        const r = el.getBoundingClientRect();
+        return r.left >= 0 && r.right <= innerWidth && r.top >= 0 && r.bottom <= innerHeight &&
+          el.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2));
+      }), 'Dismiss stays on screen and hit-testable');
+      const bounds = await dismiss.boundingBox();
+      assert(phone ? bounds.height >= 44 && bounds.width >= 44 : bounds.height < 44, 'only touch gets the 44px target');
+      assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'no page overflow');
+    }
+    await rejected.getByRole('button', { name: 'Dismiss', exact: true }).click();
+    await rejected.waitFor({ state: 'hidden' });
+    assert.equal(await page.locator('[data-rejected-command]').count(), 0, 'Dismiss clears all rejected inputs');
+    assert.equal(dismissed, 1);
+    assert.equal(await waiting.locator('[data-queued-command]').count(), 3, 'Dismiss leaves waiting work intact');
+    assert.deepEqual(f.errors, []);
+  } finally { await f.context.close(); }
+}
+
 async function checkQueued(browser, origin, phone, outcome) {
   let progress, cancelRequest, liveSocket;
   const cancelStarted = deferred(), cancelRelease = deferred();
@@ -689,6 +769,7 @@ async function main() {
         'correction', 'correction-send-error', 'correction-discard', 'close',
         'rewind', 'rewind-early', 'rewind-reset-error', 'rewind-api-error', 'rewind-replay',
         'queued-ready', 'queued-taken-race', 'queued-unconfirmed', 'queued-pending',
+        'rejected',
         'sent-during-turn-human', 'sent-during-turn-unknown', 'sent-during-turn-legacy',
       ]) {
         const label = `${name}/${phone ? 'phone' : 'desktop'}/${outcome}`;
@@ -697,7 +778,8 @@ async function main() {
         const browser = await launchBrowser(playwright, name);
         try {
           console.log(`RUN ${label}`);
-          await within(label, () => outcome.startsWith('sent-during-turn-') ? checkSentDuringTurn(browser, origin, phone, outcome)
+          await within(label, () => outcome === 'rejected' ? checkRejected(browser, origin, phone)
+            : outcome.startsWith('sent-during-turn-') ? checkSentDuringTurn(browser, origin, phone, outcome)
             : outcome.startsWith('queued-') ? checkQueued(browser, origin, phone, outcome) : check(browser, origin, phone, outcome));
           checked++;
           console.log(`PASS ${label}`);
