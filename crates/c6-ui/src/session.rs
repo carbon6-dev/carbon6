@@ -1829,6 +1829,7 @@ fn BackgroundWork(chrome: SessionChrome, #[prop(into)] on_done: Callback<()>, #[
         }
     });
     let list = crate::tasks::job_list(chrome);
+    let stop_unavailable = Signal::derive(move || chrome.background_stale());
     let now = crate::util::clock();
     let running_heading = NodeRef::<leptos::html::H3>::new();
     let highlighted = RwSignal::new(false);
@@ -1902,7 +1903,7 @@ fn BackgroundWork(chrome: SessionChrome, #[prop(into)] on_done: Callback<()>, #[
                     {wide.then(|| view! { <crate::details::Glance chrome on_done /> })}
                     <h3 node_ref=running_heading tabindex="-1" class="text-xs font-semibold" class:c6-running-highlight=move || highlighted.get()
                         data-running-now="true">{move || match phone_background_count(chrome) { 0 => "Running now".into(), n => format!("Running now · {n}") }}</h3>
-                    <crate::tasks::JobRows list navigate />
+                    <crate::tasks::JobRows list navigate stop_unavailable />
                     {(!wide).then(|| view! {
                         <button class="order-2 flex min-h-11 w-full items-center gap-2 border-t border-zinc-200 text-left md:order-1 dark:border-zinc-700" on:click=move |ev| navigate.run((Page::Details, ev))>
                             <span class="min-w-0 flex-1">"Session details"<span class="block truncate text-xs text-muted">{move || chrome.detail.get().and_then(Result::ok).map(|d| d.worker_name)}{move || chrome.context_percent().map(|n| format!(" · Context {n}%"))}</span></span>{crate::icons::chevron_right()}
@@ -1923,7 +1924,7 @@ fn BackgroundWork(chrome: SessionChrome, #[prop(into)] on_done: Callback<()>, #[
             </Show>
             <Show when=move || history_visited.get()>
                 <div hidden=move || page.get() != Page::History inert=move || page.get() != Page::History>
-                    <crate::tasks::JobRows list navigate history=true />
+                    <crate::tasks::JobRows list navigate stop_unavailable history=true />
                 </div>
             </Show>
             <Show when=move || matches!(page.get(), Page::Inspect(_) | Page::Actions(_))><crate::tasks::JobDetail chrome list page navigate on_done /></Show>

@@ -77,6 +77,48 @@ async function landing(sheet) {
 }
 async function heading(sheet, name) { await sheet.getByRole('heading', { name, exact: true }).waitFor(); }
 
+// Wide live rows enter the same confirmation drill-in with Stop; ended rows
+// retain every action through Inspect. Return the exact path/opener for Back.
+async function jobActions(row, sheet) {
+  const overflow = row.getByRole('button', { name: /^Actions for / });
+  const stop = row.locator('.c6-job-direct').getByRole('button', { name: /^Stop / });
+  const inspect = row.locator('.c6-job-direct').getByRole('button', { name: /^Inspect / });
+  const direct = await overflow.isVisible() ? overflow : await stop.isVisible() && await stop.isEnabled() ? stop : inspect;
+  const opener = await direct.elementHandle();
+  await direct.click();
+  const depth = direct === inspect ? 2 : 1;
+  if (depth === 2) {
+    await heading(sheet, 'Inspect');
+    await sheet.getByRole('button', { name: 'Actions', exact: true }).click();
+  }
+  return { opener, depth };
+}
+async function backFromJobActions(sheet, navigation) {
+  for (let i = 0; i < navigation.depth; i++) await back(sheet);
+}
+
+async function jobControls(rows, touch) {
+  const controls = await rows.evaluateAll(nodes => nodes.map(row => {
+    const wide = row.parentElement.getBoundingClientRect().width >= 20 * parseFloat(getComputedStyle(document.documentElement).fontSize);
+    const visible = el => getComputedStyle(el).display !== 'none';
+    const direct = row.querySelector('.c6-job-direct');
+    const overflow = row.querySelector('.c6-job-overflow');
+    const buttons = [...(visible(direct) ? direct : overflow).querySelectorAll('button')];
+    return { wide, direct: visible(direct), overflow: visible(overflow), buttons: buttons.map(button => {
+      const r = button.getBoundingClientRect();
+      return { name: button.getAttribute('aria-label'), width: r.width, height: r.height, svg: !!button.querySelector('svg') };
+    }) };
+  }));
+  assert(controls.length > 0);
+  for (const control of controls) {
+    assert.equal(control.direct, control.wide, 'direct actions follow the job list width');
+    assert.equal(control.overflow, !control.wide, 'ellipsis appears only in a narrow list');
+    assert(control.buttons.every(button => button.svg), 'every row action preserves a drawn SVG icon');
+    if (touch) assert(control.buttons.every(button => button.width >= 43.5 && button.height >= 43.5),
+      `touch row actions are at least 44px in both dimensions: ${JSON.stringify(control.buttons)}`);
+  }
+}
+
 async function check(browser, origin, engine, theme, view) {
   const name = `${phase}-${engine}-${theme}-${view}`;
   console.log(`START ${name}`);
@@ -172,6 +214,23 @@ async function check(browser, origin, engine, theme, view) {
     const rows = sheet.locator('[data-background-job]:visible');
     assert.equal(await rows.count(), 3, 'two different child IDs + one command; continuation is not a fourth job');
     const initialIds = await ids(rows);
+    await jobControls(rows, view.startsWith('phone'));
+    if (view === 'narrow' || view === 'wide') {
+      // Cross both directions without changing the desktop viewport or tile:
+      // the list, not either ancestor, owns this breakpoint.
+      const list = rows.first().locator('..');
+      const originalWidth = await list.evaluate(el => el.style.width);
+      for (const width of [280, 360, 280]) {
+        await list.evaluate((el, width) => { el.style.width = `${width}px`; }, width);
+        await settle(page);
+        await jobControls(rows, false);
+        assert.equal(await page.evaluate(() => innerWidth), 1600);
+      }
+      await list.evaluate((el, width) => { el.style.width = width; }, originalWidth);
+      await settle(page);
+      await jobControls(rows, false);
+      assert.deepEqual(stops, [], 'resizing row controls never stops a job');
+    }
     assert.equal(new Set(initialIds).size, 3, 'identity is unique, not display title');
     const agentRows = rows.filter({ has: page.getByRole('button', { name: sharedTitle, exact: true }) });
     assert.equal(await agentRows.count(), 2, 'equal names with different IDs both survive');
@@ -223,6 +282,15 @@ async function check(browser, origin, engine, theme, view) {
     assert.deepEqual(await ids(rows), initialIds, 'live lifecycle refresh retains stable order');
 
     const command = rows.filter({ has: page.getByRole('button', { name: commandTitle, exact: true }) });
+    const inspectIcon = command.getByRole('button', { name: `Inspect ${commandTitle}`, exact: true });
+    if (await inspectIcon.isVisible()) {
+      await inspectIcon.click();
+      await heading(sheet, 'Inspect');
+      assert.deepEqual(stops, [], 'direct Inspect is read-only');
+      await sheet.getByRole('button', { name: 'Actions', exact: true }).click();
+      await heading(sheet, 'Background command');
+      await landing(sheet);
+    }
     await command.getByRole('button', { name: commandTitle, exact: true }).click();
     await heading(sheet, 'Inspect');
     await sheet.getByText('Snapshot for build-task', { exact: true }).waitFor();
@@ -231,12 +299,17 @@ async function check(browser, origin, engine, theme, view) {
     await capture('inspect-command');
     await back(sheet);
     assert.deepEqual(await ids(rows), initialIds);
-    await command.getByRole('button', { name: `Actions for ${commandTitle}`, exact: true }).click();
+    await jobActions(command, sheet);
     await heading(sheet, 'Background command');
+    assert.deepEqual(stops, [], 'row Stop opens confirmation without sending a request');
+    await sheet.getByText('Stop affects only this job. Choose Stop below to confirm, or Back to cancel.', { exact: true }).waitFor();
+    await back(sheet);
+    assert.deepEqual(stops, [], 'Back cancels Stop confirmation');
+    await jobActions(command, sheet);
     await sheet.getByRole('button', { name: 'Inspect', exact: true }).click();
     await heading(sheet, 'Inspect');
     await landing(sheet);
-    await command.getByRole('button', { name: `Actions for ${commandTitle}`, exact: true }).click();
+    await jobActions(command, sheet);
     await heading(sheet, 'Background command');
     await sheet.getByRole('button', { name: 'Stop this command', exact: true }).click();
     await within('selected command Stop request', async () => { while (!stops.length) await new Promise(r => setTimeout(r, 10)); });
@@ -256,9 +329,10 @@ async function check(browser, origin, engine, theme, view) {
     assert.doesNotMatch(attempts, /b-task/, 'similarly named sibling is not part of this job');
     await capture('inspect-agent');
     await back(sheet);
-    await continued.getByRole('button', { name: `Actions for ${sharedTitle}`, exact: true }).click();
+    await jobActions(continued, sheet);
     await heading(sheet, 'Background agent');
     await sheet.getByRole('button', { name: 'Inspect', exact: true }).waitFor();
+    await sheet.getByRole('button', { name: 'Open thread', exact: true }).waitFor();
     await capture('actions-agent');
     await sheet.getByRole('button', { name: 'Stop this agent', exact: true }).click();
     await within('selected child Stop request', async () => { while (stops.length < 2) await new Promise(r => setTimeout(r, 10)); });
@@ -280,9 +354,11 @@ async function check(browser, origin, engine, theme, view) {
     await heading(sheet, 'History');
     assert.equal(await filter('Failed').getAttribute('aria-pressed'), 'true', 'Inspect Back retains the selected History filter');
     assert.equal(await sheet.locator('[data-background-job]:visible').count(), 2);
-    await sheet.locator('[data-background-job]:visible').first().getByRole('button', { name: /^Actions for / }).click();
+    assert.equal(await sheet.locator('[data-background-job]:visible .c6-job-direct').getByRole('button', { name: /^Stop / }).count(), 0,
+      'ended jobs never offer a direct Stop');
+    const historyActions = await jobActions(sheet.locator('[data-background-job]:visible').first(), sheet);
     await sheet.getByRole('heading', { name: /^Background (agent|command)$/ }).waitFor();
-    await back(sheet);
+    await backFromJobActions(sheet, historyActions);
     assert.equal(await filter('Failed').getAttribute('aria-pressed'), 'true', 'Actions Back retains the selected History filter');
     await filter('Interrupted').click();
     await settle(page);
@@ -331,14 +407,12 @@ async function check(browser, origin, engine, theme, view) {
       assert(await scroller.evaluate(el => el.isConnected), 'History scroll container remains mounted');
       assert(Math.abs(await scroller.evaluate(el => el.scrollTop) - scrollBefore) < 2, 'Inspect Back restores History scroll position');
       assert(await inspectOpener.evaluate(el => document.activeElement === el), 'Inspect Back restores its exact title opener');
-      const actions = sheet.locator('[data-background-job]:visible').last().getByRole('button', { name: /^Actions for / });
-      const opener = await actions.elementHandle();
-      await actions.click();
+      const actions = await jobActions(sheet.locator('[data-background-job]:visible').last(), sheet);
       await sheet.getByRole('heading', { name: /^Background (agent|command)$/ }).waitFor();
-      await back(sheet);
+      await backFromJobActions(sheet, actions);
       assert.equal(await sheet.locator('[data-background-job]:visible').count(), historyTotal, 'Actions Back retains loaded History pagination');
       assert(Math.abs(await scroller.evaluate(el => el.scrollTop) - scrollBefore) < 2, 'Actions Back restores History scroll position');
-      assert(await opener.evaluate(el => document.activeElement === el), 'Back restores the actual row-action opener without scrolling it away');
+      assert(await actions.opener.evaluate(el => document.activeElement === el), 'Back restores the actual row-action opener without scrolling it away');
     } else {
       await sheet.getByRole('button', { name: /^(Next|Next page)( →)?$/ }).click();
       await settle(page);
@@ -398,10 +472,12 @@ async function check(browser, origin, engine, theme, view) {
     const nativeRuns = await sheet.locator('pre').filter({ hasText: linkedRun1 }).textContent();
     assert(nativeRuns.includes(linkedRun1) && nativeRuns.includes(linkedRun2));
     await back(sheet);
+    await heading(sheet, 'Session');
     emit(nativeSpawn(linkedRun2, 99000));
     await settle(page);
+    await rows.getByRole('button', { name: linkedTitle, exact: true }).waitFor();
     assert.deepEqual(await ids(rows), ['linked-native-mirror'], 'late native spawn link does not change the established child identity');
-    await rows.getByRole('button', { name: `Actions for ${linkedTitle}`, exact: true }).click();
+    await jobActions(rows.filter({ has: page.getByRole('button', { name: linkedTitle, exact: true }) }), sheet);
     await heading(sheet, 'Background agent');
     rejectStop = linkedRun2;
     const stopsBeforeError = stops.length;
@@ -556,8 +632,16 @@ async function restrictions(browser, origin, engine, variant) {
       const sheet = page.locator('[data-session-sheet]:visible');
       const stale = sheet.getByRole('status').filter({ hasText: 'known state may be stale' });
       await stale.waitFor();
-      await sheet.locator('[data-background-job]:visible').getByRole('button', { name: command, exact: true }).waitFor();
-      await sheet.getByRole('button', { name: `Actions for ${command}`, exact: true }).click();
+      const row = sheet.locator('[data-background-job]').first();
+      await row.getByRole('button', { name: command, exact: true }).waitFor();
+      const directStop = row.getByRole('button', { name: `Stop ${command}`, exact: true });
+      await directStop.waitFor();
+      assert(await directStop.isDisabled(), 'offline/missing detail disables the direct row Stop too');
+      assert.match(await directStop.getAttribute('title'), /Stop unavailable.*reconnect/);
+      await directStop.evaluate(el => el.click());
+      await heading(sheet, 'Session');
+      assert.deepEqual(stops, [], 'disabled row Stop cannot navigate or send a request');
+      await jobActions(row, sheet);
       await heading(sheet, 'Background command');
       await stale.waitFor();
       const stop = sheet.getByRole('button', { name: 'Stop this command', exact: true });
@@ -578,11 +662,14 @@ async function restrictions(browser, origin, engine, variant) {
         worker.status = 'online';
         live.send(JSON.stringify({ type: 'workers', workers: [worker] }));
         await stale.waitFor({ state: 'hidden' });
-        await sheet.getByRole('button', { name: `Actions for ${command}`, exact: true }).click();
+        assert(await directStop.isEnabled(), 'worker reconnect also enables the direct row Stop');
+        await jobActions(row, sheet);
         assert(await stop.isEnabled(), 'worker reconnect restores the actual Stop capability');
         disconnected = true; live.close();
         await stale.waitFor();
         assert(await stop.isDisabled(), 'head/live disconnection also fails closed even with a cached online worker');
+        await landing(sheet);
+        assert(await directStop.isDisabled(), 'head/live disconnection also disables the direct row Stop');
         assert.deepEqual(stops, []);
       }
     }

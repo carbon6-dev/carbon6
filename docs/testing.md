@@ -2583,3 +2583,25 @@ acknowledges that route without inventing a running side chat. Desktop keeps
 its existing inline Edit/Rewind/Ask actions and has no phone more button or
 Sessions drawer. Browser crashes, UI error reports, external requests, and
 unexpected settings mutations fail the run.
+
+## Container-responsive background job actions
+
+`crates/c6-ui/tests/session-sheet.cjs` crosses the job **list's** 20rem container
+breakpoint in both directions inside the unchanged 1600px viewport, including
+the narrow tile. It checks SVG Inspect/Stop versus ⋯, 44×44px phone action
+targets, no Stop for ended jobs, read-only direct Inspect, Actions reachability
+from Inspect, and row Stop opening confirmation without a request. Back cancels
+confirmation; only the confirmed Stop sends the selected-job request. The same
+assertions run on 320/390/430px phones in both themes and engines.
+The unavailable-session extras also require the direct row Stop to be disabled
+with an explanatory tooltip for offline workers or missing detail, to re-enable
+on worker reconnect, and to disable again on head/live disconnect. Inspect still
+reaches Actions while Stop is disabled, without a control request.
+
+Build production UI first; this uses the private mocked-head fixture, not a
+running head. A focused run is:
+
+```sh
+ENGINE=both THEMES=light,dark VIEWS=wide,narrow,phone-320,phone-390,phone-430 EXTRAS=0 \
+  SCREENSHOTS=/tmp/item4-job-actions node crates/c6-ui/tests/session-sheet.cjs
+```

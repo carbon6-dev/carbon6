@@ -181,6 +181,12 @@ pub(crate) struct Job {
     task_ids: Vec<String>,
 }
 
+impl Job {
+    fn can_stop(&self) -> bool {
+        self.task.can_stop() && (!self.task_ids.is_empty() || !self.child.as_ref().is_some_and(|s| s.observed))
+    }
+}
+
 fn native_identity(id: &str) -> Option<String> {
     let parts: Vec<serde_json::Value> = serde_json::from_str(id.strip_prefix("claude:")?).ok()?;
     Some(format!("claude:{}", serde_json::to_string(parts.get(..2)?).ok()?))
@@ -337,6 +343,7 @@ pub(crate) fn actions_label(list: &[Job], page: &Page) -> &'static str {
 pub(crate) fn JobRows(
     list: Memo<Vec<Job>>,
     navigate: Callback<(Page, web_sys::MouseEvent)>,
+    #[prop(into)] stop_unavailable: Signal<bool>,
     #[prop(default = false)] history: bool,
 ) -> impl IntoView {
     let now = clock();
@@ -374,21 +381,39 @@ pub(crate) fn JobRows(
             </div>
         })}
         <Show when=move || !rows.with(Vec::is_empty) fallback=move || view! { <p class="py-2 text-xs text-muted">{if history { "No matching history" } else { "Nothing running now" }}</p> }>
-            <div class="divide-y divide-zinc-100 dark:divide-zinc-800">
+            <div class="@container/job-rows divide-y divide-zinc-100 dark:divide-zinc-800">
                 {move || rows.get().into_iter().take(if history { limit.get() } else { usize::MAX }).map(|job| {
+                    let can_stop = job.can_stop();
                     let task = job.task;
                     let id = StoredValue::new(job.id);
                     let agent = task.kind == "agent" || task.native_type == "local_agent";
                     let kind = if agent { "Agent" } else if task.notify || task.kind == "claude_code" { "Command" } else { "Server / Watcher" };
                     let name = task.description.clone();
                     let actions = format!("Actions for {name}");
+                    let inspect = format!("Inspect {name}");
+                    let stop = format!("Stop {name}");
                     view! {
                         <div class="flex min-h-11 items-center gap-2 text-[13px]" data-background-job=id.get_value()>
                             <span role="img" aria-label=kind class="shrink-0 text-sky-600 dark:text-sky-400">{icon(if agent { Icon::Bot } else { Icon::SquareTerminal }, Size::S16)}</span>
                             <button class="min-h-11 min-w-0 flex-1 truncate text-left" on:click=move |ev| navigate.run((Page::Inspect(id.get_value()), ev))>{name}</button>
                             <span class="shrink-0 text-xs tabular-nums text-muted">{move || task.elapsed(now.get())}</span>
-                            <button class=crate::components::SESSION_BAR_BUTTON aria-label=actions
-                                on:click=move |ev| navigate.run((Page::Actions(id.get_value()), ev))>{crate::icons::ellipsis()}</button>
+                            <span class="c6-job-direct shrink-0">
+                                <button class=crate::components::SESSION_BAR_BUTTON aria-label=inspect.clone() title=inspect
+                                    on:click=move |ev| navigate.run((Page::Inspect(id.get_value()), ev))>{icon(Icon::Info, Size::S16)}</button>
+                                {can_stop.then(|| view! {
+                                    // The action drill-in is the confirmation: the row never stops a job itself.
+                                    <button class=crate::components::SESSION_BAR_BUTTON aria-label=stop.clone()
+                                        title=move || if stop_unavailable.get() { "Stop unavailable: reconnect and load the session's current state first.".into() } else { stop.clone() }
+                                        disabled=move || stop_unavailable.get()
+                                        on:click=move |ev| {
+                                            if !stop_unavailable.get_untracked() { navigate.run((Page::Actions(id.get_value()), ev)); }
+                                        }>{crate::icons::stop()}</button>
+                                })}
+                            </span>
+                            <span class="c6-job-overflow shrink-0">
+                                <button class=crate::components::SESSION_BAR_BUTTON aria-label=actions.clone() title=actions
+                                    on:click=move |ev| navigate.run((Page::Actions(id.get_value()), ev))>{crate::icons::ellipsis()}</button>
+                            </span>
                         </div>
                     }
                 }).collect_view()}
@@ -448,6 +473,9 @@ pub(crate) fn JobDetail(
             }
         })}
         <Show when=move || matches!(page.get(), Page::Actions(_)) fallback=move || view! {
+            <button class="flex min-h-11 w-full items-center gap-2 text-left" on:click=move |ev| {
+                if let Some(job) = selected.get_untracked() { navigate.run((Page::Actions(job.id), ev)); }
+            }>{crate::icons::ellipsis()}"Actions"{crate::icons::chevron_right()}</button>
             {move || selected.get().map(|job| {
                 if job.task_ids.is_empty() {
                     view! { <ChildSnapshot child=job.id /> }.into_any()
@@ -474,7 +502,8 @@ pub(crate) fn JobDetail(
             <button class="flex min-h-11 w-full items-center gap-2 text-left" on:click=move |ev| {
                 if let Some(job) = selected.get_untracked() { navigate.run((Page::Inspect(job.id), ev)); }
             }>{icon(Icon::Info, Size::S16)}"Inspect"{crate::icons::chevron_right()}</button>
-            <Show when=move || selected.with(|j| j.as_ref().is_some_and(|j| j.task.can_stop() && (!j.task_ids.is_empty() || !j.child.as_ref().is_some_and(|s| s.observed))))>
+            <Show when=move || selected.with(|j| j.as_ref().is_some_and(Job::can_stop))>
+                <p class="text-xs text-muted">"Stop affects only this job. Choose Stop below to confirm, or Back to cancel."</p>
                 <button class="flex min-h-11 w-full items-center gap-2 border-t border-zinc-200 text-left text-red-600 disabled:opacity-40 dark:border-zinc-700 dark:text-red-400"
                     disabled=move || offline.get() || stopping.get() on:click=move |_| {
                         if offline.get_untracked() {
@@ -851,6 +880,21 @@ mod tests {
         assert_eq!(tasks[0].notification(), "Claude Code handles completion");
         assert!(tasks[1].can_stop());
         assert!(!tasks[2].can_stop());
+    }
+
+    #[test]
+    fn job_stop_controls_require_a_live_controllable_target() {
+        let task = lifecycle(&[event(1, "shell", "started")]).remove(0);
+        let mut job = Job { id: "shell".into(), task, child: None, task_ids: vec!["shell".into()] };
+        assert!(job.can_stop(), "a live command has a real task target");
+        job.child = Some(child_session("mirror", "Read-only mirror", "running", true));
+        assert!(job.can_stop(), "a linked native task remains stoppable, not its mirror");
+        job.task_ids.clear();
+        assert!(!job.can_stop(), "an observed mirror without a task target is read-only");
+        job.child = Some(child_session("child", "Background agent", "running", false));
+        assert!(job.can_stop(), "a live child-only job can interrupt that child");
+        job.task.state = "finished".into();
+        assert!(!job.can_stop(), "ended jobs never offer Stop");
     }
 
     #[test]
