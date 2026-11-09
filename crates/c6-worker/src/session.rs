@@ -542,6 +542,7 @@ impl SessionManager {
                     hops: input.hops,
                     api_origin: input.api_origin,
                     send_now: input.send_now,
+                    prompt: input.prompt,
                     ..Default::default()
                 };
                 let choice =

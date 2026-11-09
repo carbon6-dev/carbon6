@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use c6_api::{Event, EventKind, Session};
 use c6_head::HeadConfig;
-use c6_testkit::{MockLlm, Reply, eventually_or};
+use c6_testkit::{MockLlm, Reply, eventually, eventually_or};
 use c6_worker::{ConnState, Worker, conn, enroll};
 use serde_json::{Value, json};
 use tokio::sync::watch;
@@ -139,6 +139,82 @@ async fn a_chat_takes_its_model_your_switch_and_what_you_mention() {
     // The transcript keeps your words as you wrote them.
     let events = env.events(&s.id).await;
     assert!(events.iter().any(|e| matches!(&e.kind, EventKind::User { text: t, .. } if t == &text)));
+}
+
+/// A session's message box offers and brings in what you @-mention too (a
+/// chat thread here), but only of the kinds its knowledge scope allows: one
+/// outside it is neither offered nor read for the model.
+#[tokio::test]
+async fn a_session_takes_what_you_mention_within_its_scope() {
+    let env = Env::new().await;
+    let state = tempfile::tempdir().unwrap();
+    let e = c6_head::api::new_enrollment(&env.head.state, None).await.unwrap();
+    enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
+    let (w, stop) = run_worker(state.path()).await;
+    let item = c6_api::MemexItemIn {
+        kind: "chat".into(),
+        source: "slack".into(),
+        external_id: "C1:1.2".into(),
+        title: "#deploys".into(),
+        text: "The deploy broke at 3pm because the cache was cold.".into(),
+        ..Default::default()
+    };
+    c6_head::memex::call(&env.head.state, "memex.ingest", json!(item)).await.unwrap();
+    // Ask (every kind) finds it: its reference.
+    let id = eventually("the chat message, found", async || {
+        let found: Vec<c6_api::Mentionable> =
+            env.http.get(format!("{}/assistant/mentionables?q=deploy&realm=home", env.api)).send().await.ok()?.json().await.ok()?;
+        found.into_iter().find(|m| m.kind == "chat").map(|m| m.reference)
+    })
+    .await;
+    env.mock.push(Reply::Text("Hello.".into()));
+    let project = tempfile::tempdir().unwrap();
+    let conns: Vec<Value> = env.http.get(format!("{}/connections", env.api)).send().await.unwrap().json().await.unwrap();
+    let conn = conns.iter().find(|c| c["name"] == "m").unwrap()["id"].clone();
+    let s: Value = env
+        .post(
+            "/sessions",
+            json!({"worker_id": w.identity.meta.worker_id.0, "cwd": project.path().display().to_string(), "connection_id": conn, "model": "m", "prompt": "hi"}),
+        )
+        .await;
+    let sid = s["id"].as_str().unwrap().to_owned();
+    env.turns(&sid, 1).await;
+    let offered = async || -> Vec<c6_api::Mentionable> {
+        env.http.get(format!("{}/assistant/mentionables?q=deploy&session={sid}", env.api)).send().await.unwrap().json().await.unwrap()
+    };
+    let mention = format!("Why did it break? [@#deploys](c6:{id})");
+    let ask = async |n: usize| -> String {
+        let r = env.http.post(format!("{}/sessions/{sid}/messages", env.api)).json(&json!({"text": mention})).send().await.unwrap();
+        assert!(r.status().is_success());
+        env.turns(&sid, n).await;
+        env.mock.requests().last().unwrap()["messages"].to_string()
+    };
+
+    // Chat isn't in this session's scope: not offered, not read.
+    assert!(!offered().await.iter().any(|m| m.kind == "chat"));
+    env.mock.push(Reply::Text("I can't see it.".into()));
+    let sent = ask(2).await;
+    assert!(!sent.contains("cache was cold"), "kept out: {sent}");
+    assert!(sent.contains("could not read it"), "{sent}");
+
+    // With chat in its scope: offered, and what it says goes to the model.
+    let r = env
+        .http
+        .put(format!("{}/settings/memex_scopes", env.api))
+        .json(&json!([{"name": "chat", "kinds": ["chat"]}]))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    assert!(offered().await.iter().any(|m| m.kind == "chat" && format!("c6:{}", m.reference) == format!("c6:{id}")));
+    env.mock.push(Reply::Text("The cache was cold.".into()));
+    let sent = ask(3).await;
+    assert!(sent.contains("The deploy broke at 3pm because the cache was cold."), "{sent}");
+    assert!(sent.contains("by=\\\"you\\\""), "marked as yours: {sent}");
+    // The transcript keeps your words as you wrote them.
+    let events = env.events(&sid).await;
+    assert!(events.iter().any(|e| matches!(&e.kind, EventKind::User { text, .. } if text == &mention)));
+    stop.cancel();
 }
 
 /// Work on a machine: c6_delegate offers the templates agents may start,

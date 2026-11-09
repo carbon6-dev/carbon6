@@ -655,6 +655,10 @@ async fn insert(
     let create =
         SessionCommand { command_id: create_id.clone(), session_id: session_id.clone(), kind: Some(session_command::Kind::Create(spec)) };
     let mut commands = vec![NewCommand { id: &create_id, session_id: &session_id, worker_id, data: create.encode_to_vec(), text: None }];
+    let first_prompt = match &first {
+        Some((text, _)) => mentioned(st, &row, text).await,
+        None => String::new(),
+    };
     if let Some((text, attachments)) = first {
         commands.push(NewCommand {
             id: &input_id,
@@ -663,7 +667,11 @@ async fn insert(
             data: input_command(
                 &input_id,
                 &session_id,
-                with_command(st, &realm, labels.clone(), UserInput { text: text.to_owned(), attachments, ..Default::default() }).await?,
+                UserInput {
+                    prompt: first_prompt,
+                    ..with_command(st, &realm, labels.clone(), UserInput { text: text.to_owned(), attachments, ..Default::default() })
+                        .await?
+                },
             ),
             text: Some(text),
         });
@@ -1038,6 +1046,25 @@ pub async fn send_input_as(
     send_input_with(st, session_id, req, id, UserInput { delegated_by: delegated_by.to_owned(), api_origin, ..Default::default() }).await
 }
 
+/// What the model gets for `text` in `session`: the text with what it
+/// @-mentions, within the session's knowledge scope ("": nothing mentioned,
+/// or an Ask conversation, which reads its own; docs/ask.md §4).
+// Boxed: reading what it mentions runs operations, which may start sessions.
+fn mentioned<'a>(
+    st: &'a HeadState,
+    session: &'a SessionRow,
+    text: &'a str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'a>> {
+    Box::pin(async move {
+        let on_head = st.assistant.head_id().is_some_and(|h| h.to_string() == session.worker_id);
+        if on_head || crate::assistant::mention_refs(text).is_empty() {
+            return String::new();
+        }
+        let scope = crate::fabric::session_scope(st, session).await.unwrap_or_default();
+        crate::assistant::with_mentions_in(st, &session.realm, text, Some(&scope)).await
+    })
+}
+
 async fn send_input_with(
     st: &HeadState,
     session_id: &str,
@@ -1077,6 +1104,7 @@ async fn send_input_with(
         UserInput { text: text.to_owned(), model, attachments: files, wake, send_now: req.send_now, ..input },
     )
     .await?;
+    let input = UserInput { prompt: mentioned(st, &session, text).await, ..input };
     // Send now to a connected worker that doesn't know it (an older one):
     // as before, the turn stops and this starts the next.
     if req.send_now && !sends_now(st, worker_id) {

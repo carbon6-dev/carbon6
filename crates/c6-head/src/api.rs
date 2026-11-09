@@ -3378,6 +3378,14 @@ async fn ask_mentionables(
     Extension(caller): Extension<Caller>,
     Query(q): Query<api::MentionQuery>,
 ) -> ApiResult<Json<Vec<api::Mentionable>>> {
+    // A session's message box: its realm and knowledge scope.
+    if let Some(row) = match q.session.as_deref().filter(|s| !s.is_empty()) {
+        Some(id) => st.store.session(id).await?.filter(|r| st.assistant.head_id().is_none_or(|h| h.to_string() != r.worker_id)),
+        None => None,
+    } {
+        let scope = crate::fabric::session_scope(&st, &row).await?;
+        return Ok(Json(crate::assistant::mentionables_in(&st, &row.realm, &q.q, Some(scope)).await?));
+    }
     let realm = caller.realm.clone().or(q.realm.filter(|r| !r.trim().is_empty())).unwrap_or_else(|| crate::realms::ROOT.to_owned());
     Ok(Json(crate::assistant::mentionables(&st, &realm, &q.q).await?))
 }

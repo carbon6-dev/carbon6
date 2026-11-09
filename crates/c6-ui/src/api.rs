@@ -1038,14 +1038,16 @@ pub async fn ask_claude() -> Result<c6_api::AskClaude, String> {
     json(Request::get("/api/v1/assistant/claude").send().await).await
 }
 
-/// What @ offers in an Ask conversation (docs/ask.md §4).
-pub async fn ask_mentionables(q: String) -> Result<Vec<c6_api::Mentionable>, String> {
+/// What @ offers in an Ask conversation, or in session `session`'s message
+/// box, within its knowledge scope (docs/ask.md §4).
+pub async fn ask_mentionables(q: String, session: Option<String>) -> Result<Vec<c6_api::Mentionable>, String> {
     let realm = realm().get_untracked();
     json(
         Request::get(&format!(
-            "/api/v1/assistant/mentionables?q={}&realm={}",
+            "/api/v1/assistant/mentionables?q={}&realm={}&session={}",
             js_sys::encode_uri_component(&q),
-            js_sys::encode_uri_component(&realm)
+            js_sys::encode_uri_component(&realm),
+            js_sys::encode_uri_component(session.as_deref().unwrap_or(""))
         ))
         .send()
         .await,

@@ -4830,12 +4830,15 @@ fn Composer(
             }
         }
     });
-    // In Ask: your projects, docs, work, and memex items of any kind.
+    // Your projects, docs, work, and the mail threads, chat messages and
+    // events that match: in Ask any kind; in a session, those its knowledge
+    // scope allows.
     let refs = LocalResource::new(move || {
-        let q = mention.get().map(|(_, q)| q).filter(|q| ask && q.chars().count() >= 2);
+        let q = mention.get().map(|(_, q)| q).filter(|q| q.chars().count() >= 2);
+        let session = (!ask).then(|| subagent_id.get_value());
         async move {
             match q {
-                Some(q) => api::ask_mentionables(q).await.unwrap_or_default(),
+                Some(q) => api::ask_mentionables(q, session).await.unwrap_or_default(),
                 None => Vec::new(),
             }
         }

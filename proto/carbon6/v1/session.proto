@@ -800,6 +800,10 @@ message UserInput {
   bool send_now = 14;
   // Present for HTTP API input, retained in UserMessage for remote reports.
   ApiMessageOrigin api_origin = 15;
+  // What the model gets instead of `text`, when set: the text with what it
+  // @-mentions (chat threads, mail, events, projects, docs, work), read by
+  // the head within the session's knowledge scope. The log shows `text`.
+  string prompt = 16;
 }
 
 message Interrupt {

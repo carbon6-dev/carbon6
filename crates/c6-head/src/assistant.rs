@@ -1748,13 +1748,19 @@ const MENTION_CHARS: usize = 8_000;
 /// `c6:<ref>` link read with your access, only that item; "" when it
 /// mentions nothing (the text goes as it is).
 pub async fn with_mentions(st: &HeadState, realm: &str, text: &str) -> String {
+    with_mentions_in(st, realm, text, None).await
+}
+
+/// `with_mentions` for a session: items only of the kinds its knowledge
+/// scope allows (`scope`; None: every kind, as you mentioned them in Ask).
+pub async fn with_mentions_in(st: &HeadState, realm: &str, text: &str, scope: Option<&[String]>) -> String {
     let refs = mention_refs(text);
     if refs.is_empty() {
         return String::new();
     }
     let mut out = text.to_owned();
     for r in refs {
-        let (kind, title, body) = match read_mention(st, realm, &r).await {
+        let (kind, title, body) = match read_mention(st, realm, &r, scope).await {
             Ok(x) => x,
             Err(e) => (String::new(), String::new(), format!("(could not read it: {e:#})")),
         };
@@ -1785,7 +1791,7 @@ pub fn mention_refs(text: &str) -> Vec<String> {
 }
 
 /// One mentioned thing: (kind, title, text).
-async fn read_mention(st: &HeadState, realm: &str, r: &str) -> anyhow::Result<(String, String, String)> {
+async fn read_mention(st: &HeadState, realm: &str, r: &str, scope: Option<&[String]>) -> anyhow::Result<(String, String, String)> {
     let (what, id) = r.split_once(':').ok_or_else(|| anyhow::anyhow!("not a reference"))?;
     let realm_arg = Some(realm).filter(|r| *r != crate::realms::ROOT);
     let run = async |op: &str, args: Value| -> anyhow::Result<Value> {
@@ -1796,8 +1802,14 @@ async fn read_mention(st: &HeadState, realm: &str, r: &str) -> anyhow::Result<(S
     match what {
         // Any kind: you mentioned it, so your mail, chat and calendar too.
         "item" => {
-            let all: Vec<String> = api::MEMEX_KINDS.iter().map(|k| k.to_string()).collect();
-            let v = crate::memex::SCOPE.scope(all, run("memex.get", json!({"id": id}))).await?;
+            let all: Vec<String> = match scope {
+                Some(s) => s.to_vec(),
+                None => api::MEMEX_KINDS.iter().map(|k| k.to_string()).collect(),
+            };
+            let v = crate::memex::SCOPE
+                .scope(all, run("memex.get", json!({"id": id})))
+                .await
+                .map_err(|e| anyhow::anyhow!("{e:#} (a session sees only the kinds its knowledge scope allows)"))?;
             let item = if v["item"].is_object() { &v["item"] } else { &v };
             let kind = str_at(item, "/kind");
             let title = [str_at(item, "/title"), str_at(item, "/subject"), str_at(item, "/name")]
@@ -1864,6 +1876,12 @@ async fn read_mention(st: &HeadState, realm: &str, r: &str) -> anyhow::Result<(S
 /// projects, docs and work by title, and the memex's items of any kind,
 /// your mail, chat and calendar included (you are the one asking).
 pub async fn mentionables(st: &HeadState, realm: &str, q: &str) -> anyhow::Result<Vec<api::Mentionable>> {
+    mentionables_in(st, realm, q, None).await
+}
+
+/// `mentionables` for a session: items only of the kinds its knowledge
+/// scope allows (None: every kind).
+pub async fn mentionables_in(st: &HeadState, realm: &str, q: &str, scope: Option<Vec<String>>) -> anyhow::Result<Vec<api::Mentionable>> {
     let q = q.trim();
     if q.chars().count() < 2 {
         return Ok(Vec::new());
@@ -1891,7 +1909,7 @@ pub async fn mentionables(st: &HeadState, realm: &str, q: &str) -> anyhow::Resul
             out.push(api::Mentionable { reference: format!("{what}:{id}"), title: title_of(x), kind, detail: String::new() });
         }
     }
-    let all: Vec<String> = api::MEMEX_KINDS.iter().map(|k| k.to_string()).collect();
+    let all: Vec<String> = scope.unwrap_or_else(|| api::MEMEX_KINDS.iter().map(|k| k.to_string()).collect());
     let found = crate::memex::SCOPE.scope(all, run("memex.search", json!({"q": q, "limit": 10}))).await;
     let hits = found
         .as_array()

@@ -2768,6 +2768,10 @@ pub struct MentionQuery {
     pub q: String,
     #[serde(default)]
     pub realm: Option<String>,
+    /// A session's message box: its realm, and items only of the kinds its
+    /// knowledge scope allows.
+    #[serde(default)]
+    pub session: Option<String>,
 }
 
 /// Something to @-mention in an Ask conversation (docs/ask.md §4): read
