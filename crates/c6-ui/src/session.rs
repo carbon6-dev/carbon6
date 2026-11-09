@@ -895,6 +895,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         wide,
         glance_at,
         sheet,
+        reveal_background: RwSignal::new(0),
         output_return_sheet,
         output_return_popover,
         details,
@@ -1303,6 +1304,8 @@ pub struct SessionChrome {
     glance_at: RwSignal<Option<(f64, f64)>>,
     /// The glance as a phone's bottom sheet, while open.
     sheet: RwSignal<bool>,
+    /// A wide status-link click returns the overview to its live list.
+    reveal_background: RwSignal<u64>,
     pub(crate) output_return_sheet: RwSignal<bool>,
     pub(crate) output_return_popover: RwSignal<Option<(f64, f64)>>,
     /// The session's details dialog is open.
@@ -1365,12 +1368,7 @@ impl SessionChrome {
     /// on a phone as a sheet from the bottom.
     fn toggle_glance(&self, anchor: Option<web_sys::Element>) {
         if self.wide.get_untracked() && !crate::util::phone() {
-            if let Some(el) = document()
-                .get_element_by_id(&format!("session-sheet-{}", self.token))
-                .and_then(|el| wasm_bindgen::JsCast::dyn_into::<web_sys::HtmlElement>(el).ok())
-            {
-                let _ = el.focus();
-            }
+            self.reveal_background.update(|n| *n += 1);
             return;
         }
         if self.glance_at.get_untracked().is_some() || self.sheet.get_untracked() {
@@ -1832,6 +1830,45 @@ fn BackgroundWork(chrome: SessionChrome, #[prop(into)] on_done: Callback<()>, #[
     });
     let list = crate::tasks::job_list(chrome);
     let now = crate::util::clock();
+    let running_heading = NodeRef::<leptos::html::H3>::new();
+    let highlighted = RwSignal::new(false);
+    let highlight_timer = StoredValue::new_local(None::<leptos::leptos_dom::helpers::TimeoutHandle>);
+    on_cleanup(move || {
+        if let Some(timer) = highlight_timer.try_update_value(Option::take).flatten() {
+            timer.clear();
+        }
+    });
+    Effect::new(move || {
+        if !wide || chrome.reveal_background.get() == 0 {
+            return;
+        }
+        // A narrow-to-wide remount must not replay an old click or take focus
+        // from the composer. The request belongs to this reveal, not the pane.
+        chrome.reveal_background.set(0);
+        page.set(Page::Landing);
+        if let Some(timer) = highlight_timer.try_update_value(Option::take).flatten() {
+            timer.clear();
+        }
+        highlighted.set(true);
+        // Let the landing page unhide before scrolling its heading. This is
+        // deliberately instant, with a static highlight, even in reduced/off.
+        request_animation_frame(move || {
+            if let Some(heading) = running_heading.try_get_untracked().flatten() {
+                heading.scroll_into_view_with_bool(true);
+                let options = web_sys::FocusOptions::new();
+                options.set_prevent_scroll(true);
+                let _ = heading.focus_with_options(&options);
+            }
+        });
+        let timer = set_timeout_with_handle(
+            move || {
+                highlighted.try_set(false);
+            },
+            std::time::Duration::from_millis(1200),
+        )
+        .ok();
+        highlight_timer.set_value(timer);
+    });
     view! {
         <section node_ref=section class="space-y-2 p-1 text-sm" data-session-sheet=if wide { "wide" } else { "compact" }
             id=wide.then(|| format!("session-sheet-{}", chrome.token)) tabindex="-1">
@@ -1863,7 +1900,8 @@ fn BackgroundWork(chrome: SessionChrome, #[prop(into)] on_done: Callback<()>, #[
                 </div>
                 <div class=if wide { "flex flex-col gap-2" } else { "flex max-h-[60dvh] flex-col gap-2 overflow-y-auto" } data-session-landing="true">
                     {wide.then(|| view! { <crate::details::Glance chrome on_done /> })}
-                    <h3 class="text-xs font-semibold">{move || match phone_background_count(chrome) { 0 => "Running now".into(), n => format!("Running now · {n}") }}</h3>
+                    <h3 node_ref=running_heading tabindex="-1" class="text-xs font-semibold" class:c6-running-highlight=move || highlighted.get()
+                        data-running-now="true">{move || match phone_background_count(chrome) { 0 => "Running now".into(), n => format!("Running now · {n}") }}</h3>
                     <crate::tasks::JobRows list navigate />
                     {(!wide).then(|| view! {
                         <button class="order-2 flex min-h-11 w-full items-center gap-2 border-t border-zinc-200 text-left md:order-1 dark:border-zinc-700" on:click=move |ev| navigate.run((Page::Details, ev))>

@@ -282,6 +282,10 @@ html.dark {
   position: relative;
   border-radius: 0.5rem;
 }
+/* An explicit status-link destination, not animated motion. Keep this feedback
+   visible for reduced/off motion too; its owner removes it after 1.2 seconds. */
+.c6-running-highlight { outline: 2px solid rgb(251 191 36 / .9); border-radius: 0.25rem; }
+[data-running-now] { scroll-margin-top: 3.5rem; }
 .c6-flash::after {
   content: "";
   position: absolute;

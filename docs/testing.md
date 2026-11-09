@@ -679,6 +679,9 @@ transcript. The queue has its own 30dvh scroll limit; each input keeps Edit in
 the same action position, and only inputs with a queued tail offer Edit queue….
 `message-edit.cjs` checks this on desktop and phones, including growing streamed
 replies, many waiting inputs, single-edit cancellation, and the separate bulk path.
+The status-row suite also clicks the background-task link: wide tiles return to
+Running now, scroll and focus its heading, and show a bounded static highlight
+without overriding reduced/off motion.
 
 After the build owner has produced this branch's UI (`env -u NO_COLOR make ui`), run:
 

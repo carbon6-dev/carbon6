@@ -167,6 +167,16 @@ async function check(browser, origin, engine, theme, view) {
       await page.waitForFunction(phone => !document.querySelector(phone ? '[data-phone-status]' : '[data-transcript-status]')?.querySelector('[data-turn-stats]'), phone);
       // The same opener works while idle; on phones its entire 44px surface is
       // the button, including the otherwise empty left side.
+      if (view === 'wide') {
+        // Put the destination outside the overview's visible region. Merely
+        // moving focus to the already-visible panel must not satisfy this.
+        await page.locator('[data-session-sheet="wide"]').evaluate(el => {
+          el.querySelector('[data-running-now]').style.marginTop = '1200px';
+          el.parentElement.scrollTop = 0;
+        });
+        const beforeClick = await page.locator('[data-session-sheet="wide"] [data-running-now]').boundingBox();
+        assert(beforeClick.y > views[view].height, 'Running now starts below the visible overview');
+      }
       const opener = row.getByRole('button');
       if (phone) {
         const bounds = await opener.boundingBox();
@@ -176,6 +186,29 @@ async function check(browser, origin, engine, theme, view) {
       } else await opener.click();
       if (phone) await page.getByRole('heading', { name: 'Session status', exact: true }).waitFor();
       else await page.locator('[data-session-sheet]:visible').waitFor();
+      if (view === 'wide') {
+        const running = page.locator('[data-session-sheet="wide"] [data-running-now]');
+        await page.waitForFunction(() => document.activeElement?.matches('[data-running-now].c6-running-highlight'));
+        const effect = await running.evaluate(el => {
+          const r = el.getBoundingClientRect();
+          return { top: r.top, bottom: r.bottom, outline: getComputedStyle(el).outlineWidth, animation: getComputedStyle(el).animationName,
+            uncovered: el.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2)) };
+        });
+        assert(effect.top >= 0 && effect.bottom <= views[view].height, 'status click scrolls Running now into view');
+        assert.equal(effect.outline, '2px', 'status click visibly highlights Running now, even with motion off');
+        assert.equal(effect.animation, 'none', 'highlight respects reduced/off motion');
+        assert(effect.uncovered, 'Running now is not hidden behind the sticky Session heading');
+        await page.waitForFunction(() => !document.querySelector('[data-session-sheet="wide"] [data-running-now]')?.classList.contains('c6-running-highlight'));
+        await page.setViewportSize({ width: 1000, height: views[view].height });
+        await page.locator('[data-session-sheet="wide"]').waitFor({ state: 'detached' });
+        const composer = await page.locator('textarea').first().elementHandle();
+        await composer.focus();
+        await page.setViewportSize(views[view]);
+        await page.locator('[data-session-sheet="wide"]').waitFor();
+        await settle(page);
+        assert(await composer.evaluate(el => el === document.activeElement), 'wide overview remount does not replay an old click and steal composer focus');
+        assert.equal(await page.locator('[data-session-sheet="wide"] .c6-running-highlight').count(), 0, 'highlight request is consumed, not replayed on remount');
+      }
       await page.keyboard.press('Escape');
     }
     assert.deepEqual(f.errors, [], `${name}: browser errors`);
