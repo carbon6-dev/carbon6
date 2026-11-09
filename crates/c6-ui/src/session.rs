@@ -174,14 +174,6 @@ fn turn_line(t: &TurnStats, now: Option<i64>) -> String {
     parts.join(" · ")
 }
 
-/// One message in the queue-edit box: a stable id (for reordering and
-/// deleting it) and its text.
-#[derive(Clone, PartialEq)]
-pub(crate) struct QueueRow {
-    id: u64,
-    text: String,
-}
-
 #[derive(Default)]
 struct ReturnedDrafts {
     next: u64,
@@ -2454,10 +2446,6 @@ fn Transcript(
     let side = session.fork_seq.is_some();
     let asking = RwSignal::new(None::<u64>);
     let rewinding = RwSignal::new(None::<u64>);
-    // Outside both event and queued rows: delivery can remove a queue row
-    // while cancellation is pending, but must not destroy its draft.
-    let editing = RwSignal::new(None::<(MessageEditTarget, String)>);
-    let edit_active = Signal::derive(move || editing.with(Option::is_some) || rewinding.get().is_some());
     let withdrawn = RwSignal::new(HashSet::<String>::new());
     let withdrawal_notes = RwSignal::new(HashMap::<String, String>::new());
     // Kept outside disappearing rows, including the eagerly loaded files.
@@ -2521,16 +2509,6 @@ fn Transcript(
                         rows.push(q);
                     }
                 });
-            }
-        });
-    });
-    let edit_message = Callback::new(move |seq| {
-        if edit_active.get_untracked() {
-            return;
-        }
-        events.with_untracked(|evs| {
-            if let Some(Event { kind: EventKind::User { text, .. }, .. }) = evs.iter().find(|e| e.seq == seq) {
-                editing.set(Some((MessageEditTarget::Transcript(seq), text.clone())));
             }
         });
     });
@@ -2706,7 +2684,7 @@ fn Transcript(
                                 id=format!("{}-e{seq}", id.get_value())
                                 class=move || format!("c6-transcript-row group relative {arrive} {} {} {}",
                                     if anchorable {
-                                        if user_bubble { "md:pb-7" }
+                                        if user_bubble { "" }
                                         else if task_notification { "min-h-11 pr-12 md:min-h-0 md:pr-0" }
                                         else { "min-h-11 pr-12 md:min-h-0 md:pr-0 md:pb-7" }
                                     } else { "" },
@@ -2749,10 +2727,9 @@ fn Transcript(
                                     }.into_any()
                                 }}
                                 {anchorable.then(|| view! {
-                                    // The fixed 44px metadata target has its own row below
-                                    // an ordinary user bubble, otherwise a reserved gutter.
-                                    // Neither changes size when the portalled sheet opens.
-                                    <div class=if user_bubble { "flex h-11 justify-end md:hidden" } else { "absolute right-0 top-0 md:hidden" }>
+                                    // Non-user transcript entries retain the phone picker.
+                                    // Read messages expose their two quiet actions directly.
+                                    <div class=if user_bubble { "hidden" } else { "absolute right-0 top-0 md:hidden" }>
                                     <button type="button" class="flex size-11 items-center justify-center rounded-md text-muted hover:bg-zinc-100 focus-visible:ring-2 focus-visible:ring-sky-500/60 dark:hover:bg-zinc-800"
                                         aria-label="Message actions" title="Message actions" aria-haspopup="dialog"
                                         aria-expanded=move || (actions_open.get() && message_actions.get() == Some(seq)).to_string()
@@ -2773,16 +2750,20 @@ fn Transcript(
                                     </div>
                                     // A quiet notice may be narrower than its actions. Let
                                     // those wrap below it, never over its disclosure/icon.
-                                    <div class=if task_notification {
+                                    <div class=if user_bubble {
+                                        "mt-1 flex justify-end gap-2 text-muted"
+                                    } else if task_notification {
                                         "mt-1 hidden flex-wrap justify-end gap-1 opacity-0 transition group-hover:opacity-100 md:flex"
                                     } else {
                                         "absolute bottom-0 right-0 hidden gap-1 opacity-0 transition group-hover:opacity-100 md:flex"
                                     }>
                                         {move || (can_rewind && is_user && by().is_none()).then(|| view! {
-                                            <button class=UBTN title="Send a correction or rewind to before this message" prop:disabled=move || editing.with(Option::is_some) || rewinding.with(Option::is_some) on:click=move |_| edit_message.run(seq)>{crate::icons::pencil()}" Edit"</button>
-                                            <button class=UBTN title="Rewind the conversation (and optionally files) to before this message" prop:disabled=move || editing.with(Option::is_some) on:click=move |_| rewinding.set(Some(seq))>{crate::icons::undo()}" Rewind"</button>
+                                            <button class="relative flex h-7 w-7 items-center justify-center rounded-md hover:bg-zinc-100 dark:hover:bg-zinc-800 [@media(pointer:coarse)]:after:absolute [@media(pointer:coarse)]:after:-inset-2"
+                                                title="Rewind" aria-label="Rewind" prop:disabled=move || rewinding.with(Option::is_some)
+                                                on:click=move |_| rewinding.set(Some(seq))>{crate::icons::undo()}</button>
                                         })}
-                                        <button class=UBTN title="Ask about this in a side chat" on:click=move |_| asking.set(Some(seq))>{crate::icons::corner_down_right()}" Ask"</button>
+                                        <button class="relative flex h-7 w-7 items-center justify-center rounded-md hover:bg-zinc-100 dark:hover:bg-zinc-800 [@media(pointer:coarse)]:after:absolute [@media(pointer:coarse)]:after:-inset-2"
+                                            title="Ask" aria-label="Ask" on:click=move |_| asking.set(Some(seq))>{crate::icons::corner_down_right()}</button>
                                     </div>
                                 })}
                             </div>
@@ -2842,9 +2823,6 @@ fn Transcript(
                     {move || has_thinking.get().then(|| view! { <Thinking text=stream_thinking show=show_thinking /> })}
                     {move || has_text.get().then(|| view! { <div class="md" on:click=crate::mentions::link_clicks() inner_html=move || markdown::to_html(&stream_text.get())></div> })}
                 </div>
-            })}
-            {move || editing.get().map(|(target, text)| view! {
-                <MessageEdit session=id.get_value() target text events ready=rewind_ready on_close=Callback::new(move |_| editing.set(None)) />
             })}
             { {
                 let waiting = move || view! {
@@ -2910,14 +2888,6 @@ fn Transcript(
                             <p class="text-xs font-medium text-muted">{move || actions_context.get().0}</p>
                             <p class="line-clamp-2 break-words text-sm text-muted">{move || actions_context.get().1}</p>
                         </div>
-                        {move || actions_can_rewind.get().then(|| view! {
-                            <button type="button" class="flex min-h-12 w-full items-center gap-3 rounded-md px-3 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
-                                prop:disabled=move || editing.with(Option::is_some) || rewinding.with(Option::is_some)
-                                on:click=move |_| {
-                                    actions_open.set(false);
-                                    if let Some(seq) = message_actions.get_untracked() { edit_message.run(seq); }
-                                }>{crate::icons::pencil()}"Edit"</button>
-                        })}
                         <button type="button" class="flex min-h-12 w-full items-center gap-3 rounded-md px-3 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
                             on:click=move |_| {
                                 actions_open.set(false);
@@ -2926,7 +2896,7 @@ fn Transcript(
                         {move || actions_can_rewind.get().then(|| view! {
                             <div class="mt-2 border-t border-zinc-200 pt-2 dark:border-zinc-700">
                                 <button type="button" class="flex min-h-12 w-full items-center gap-3 rounded-md px-3 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
-                                    prop:disabled=move || editing.with(Option::is_some)
+                                    prop:disabled=move || rewinding.with(Option::is_some)
                                     on:click=move |_| {
                                         actions_open.set(false);
                                         if let Some(seq) = message_actions.get_untracked() { rewinding.set(Some(seq)); }
@@ -3324,144 +3294,17 @@ fn on_sight(el: NodeRef<leptos::html::Div>, f: impl Fn() + Clone + 'static) {
     });
 }
 
-/// An event sequence is proof of ownership, never a cancellation identity.
-#[derive(Clone, Debug, PartialEq)]
-enum MessageEditTarget {
-    Transcript(u64),
-    Queued(String),
-}
-
-fn message_edit_seq(target: &MessageEditTarget, events: &[Event]) -> Option<u64> {
-    match target {
-        MessageEditTarget::Transcript(seq) => Some(*seq),
-        MessageEditTarget::Queued(id) => events.iter().find_map(|e| match &e.kind {
-            EventKind::User { command_id, .. } if command_id == id => Some(e.seq),
-            _ => None,
-        }),
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum MessageEditState {
-    Checking,
-    Taken,
-    Unconfirmed,
-    Ready,
-    Correction,
-    Rewind,
-}
-
-fn message_edit_result(result: Result<(), String>, recorded: bool) -> (MessageEditState, Option<String>) {
-    match result {
-        Ok(()) if !recorded => (MessageEditState::Ready, None),
-        Ok(()) => (MessageEditState::Taken, None),
-        Err(e) if e == "The agent has this message" => (MessageEditState::Taken, None),
-        Err(e) => (MessageEditState::Unconfirmed, Some(e)),
-    }
-}
-
-// Share the button view across these handlers instead of specializing its
-// attribute/event machinery for each state (the production WASM has a ceiling).
-fn message_edit_action(label: &'static str, action: Callback<()>, busy: Signal<bool>, quiet: bool, title: &'static str) -> AnyView {
-    message_edit_button(title, format!("{} text-xs", if quiet { BUTTON_QUIET } else { BUTTON }), label.into_any(), action, Some(busy))
-}
-
-fn message_edit_button(title: &'static str, class: String, content: AnyView, action: Callback<()>, busy: Option<Signal<bool>>) -> AnyView {
+// Share confirmation buttons' typed DOM/event machinery (the WASM is bounded).
+fn rewind_action(label: &'static str, action: Callback<()>, busy: Signal<bool>, quiet: bool) -> AnyView {
     view! {
-        <button title=title class=class prop:disabled=move || busy.is_some_and(|b| b.get())
-            on:click=move |_| action.run(())>{content}</button>
+        <button class=format!("{} text-xs", if quiet { BUTTON_QUIET } else { BUTTON }) prop:disabled=move || busy.get()
+            on:click=move |_| action.run(())>{label}</button>
     }
     .into_any()
 }
 
-fn message_edit_error(error: RwSignal<Option<String>>) -> AnyView {
+fn rewind_error(error: RwSignal<Option<String>>) -> AnyView {
     view! { {move || error.get().map(|e| view! { <ErrorBox message=e /> })} }.into_any()
-}
-
-/// Owned by Transcript, not the disappearing queued row. Only a queued command
-/// can request cancellation; a transcript event starts with taken choices.
-#[component]
-fn MessageEdit(
-    session: String,
-    target: MessageEditTarget,
-    text: String,
-    events: RwSignal<Vec<Event>>,
-    ready: Signal<bool>,
-    on_close: Callback<()>,
-) -> AnyView {
-    let session = StoredValue::new(session);
-    let initial = match &target {
-        MessageEditTarget::Transcript(_) => MessageEditState::Taken,
-        MessageEditTarget::Queued(_) => MessageEditState::Checking,
-    };
-    let target = StoredValue::new(target);
-    let seq = Memo::new(move |_| events.with(|evs| target.with_value(|target| message_edit_seq(target, evs))));
-    let panel = NodeRef::<leptos::html::Div>::new();
-    Effect::new(move || {
-        if let Some(el) = panel.get() {
-            el.scroll_into_view();
-        }
-    });
-    let rows = RwSignal::new(vec![QueueRow { id: 0, text }]);
-    let state = RwSignal::new(initial);
-    let error = RwSignal::new(None::<String>);
-    let busy = RwSignal::new(initial == MessageEditState::Checking);
-    if let MessageEditTarget::Queued(command_id) = target.get_value() {
-        spawn_local(async move {
-            let result = if seq.get_untracked().is_some() {
-                Err("The agent has this message".into())
-            } else {
-                api::take_back(session.get_value(), command_id).await
-            };
-            if state.try_get_untracked().is_none() {
-                return;
-            }
-            let (next, reason) = message_edit_result(result, seq.get_untracked().is_some());
-            error.set(reason);
-            busy.set(false);
-            state.set(next);
-        });
-    }
-    let correction = Callback::new(move |_| state.set(MessageEditState::Correction));
-    let rewind = Callback::new(move |_| {
-        if seq.get_untracked().is_some() {
-            state.set(MessageEditState::Rewind);
-        }
-    });
-    let choices = move || matches!(state.get(), MessageEditState::Taken | MessageEditState::Unconfirmed);
-    view! {
-        <div node_ref=panel data-message-edit="" class="space-y-2 rounded-lg border border-zinc-300 p-3 text-sm dark:border-zinc-700">
-            <p role="status">{move || match state.get() {
-                MessageEditState::Checking => "Checking whether the agent has taken this message…",
-                MessageEditState::Taken if seq.get().is_none() => "The agent has this message. Could not confirm withdrawal. Your draft is kept.",
-                MessageEditState::Taken | MessageEditState::Rewind => "The agent has this message",
-                MessageEditState::Unconfirmed => "Could not confirm withdrawal. Your draft is kept; send a correction or explicitly rewind once the message is in the transcript.",
-                MessageEditState::Ready => "Ready to edit. Send adds a new message.",
-                MessageEditState::Correction => "Send a correction as a new message. The original and its replies stay in history.",
-            }}</p>
-            {move || match state.get() {
-                MessageEditState::Ready | MessageEditState::Correction => Some(view! {
-                    <QueueEditBox rows session_id=session.get_value() on_close single=true />
-                }.into_any()),
-                MessageEditState::Rewind => seq.get().map(|seq| view! {
-                    <RewindPanel session=session.get_value() seq events ready on_done=Callback::new(move |rewound| state.set(if rewound { MessageEditState::Ready } else { MessageEditState::Taken })) />
-                }.into_any()),
-                _ => None,
-            }}
-            {move || {
-                if !choices() { return Vec::new() }
-                let mut actions = vec![("Send correction", correction, false)];
-                if seq.get().is_some() { actions.push(("Rewind…", rewind, true)); }
-                actions.push(("Close", on_close, true));
-                actions.into_iter().map(|(label, action, quiet)| message_edit_action(label, action, busy.into(), quiet, "")).collect::<Vec<_>>()
-            }}
-            {move || (choices() && seq.get().is_none()).then(|| view! {
-                <p class="text-xs text-muted">"Waiting for this message in the transcript before Rewind is available. You can send a correction now."</p>
-            })}
-            {message_edit_error(error)}
-        </div>
-    }
-    .into_any()
 }
 
 /// Explicit confirmation only; this panel never sends a replacement message.
@@ -3534,10 +3377,10 @@ fn RewindPanel(session: String, seq: u64, events: RwSignal<Vec<Event>>, ready: S
                     "Also restore files to before this message"
                 </label>
                 <span class="flex-1"></span>
-                {message_edit_action("Cancel", Callback::new(move |_| on_done.run(false)), busy.into(), true, "")}
-                {message_edit_action("Rewind", Callback::new(move |_| go()), blocked, false, "")}
+                {rewind_action("Cancel", Callback::new(move |_| on_done.run(false)), busy.into(), true)}
+                {rewind_action("Rewind", Callback::new(move |_| go()), blocked, false)}
             </div>
-            {message_edit_error(error)}
+            {rewind_error(error)}
         </div>
     }
     .into_any()
@@ -5789,121 +5632,6 @@ fn Queued(q: QueuedInput, session_id: String, take_back: Callback<QueuedInput>) 
     }
 }
 
-/// The queue-edit box: the messages pulled out of the queue, each a
-/// textarea — edited in place, moved up or down, dropped, or new ones
-/// added. Sending re-queues them, in order, as fresh messages; closing it
-/// discards them (they were pulled out of the queue, not held). Its rows
-/// are shared (`rows`): the box is opened by `edit_open`, so a second
-/// pull appends to it without re-running this body. Transcript Edit reuses
-/// only this ordinary-send form, in single mode: never its tail-pull operation.
-#[component]
-fn QueueEditBox(rows: RwSignal<Vec<QueueRow>>, session_id: String, on_close: Callback<()>, #[prop(optional)] single: bool) -> AnyView {
-    let session_id = StoredValue::new(session_id);
-    let busy = RwSignal::new(false);
-    let error = RwSignal::new(None::<String>);
-    let send = move || {
-        if busy.get_untracked() {
-            return;
-        }
-        let texts: Vec<(u64, String)> =
-            rows.with_untracked(|r| r.iter().map(|x| (x.id, x.text.trim().to_owned())).filter(|(_, t)| !t.is_empty()).collect());
-        if texts.is_empty() {
-            return;
-        }
-        busy.set(true);
-        error.set(None);
-        let id = session_id.get_value();
-        spawn_local(async move {
-            let mut sent = Vec::new();
-            for (row_id, text) in texts {
-                match api::send_message(id.clone(), text, None, Vec::new()).await {
-                    Ok(_) => sent.push(row_id),
-                    Err(e) => {
-                        error.set(Some(e));
-                        break;
-                    }
-                }
-            }
-            busy.set(false);
-            if error.get_untracked().is_none() {
-                on_close.run(());
-            } else {
-                // The ones that made it are in the queue again: drop them
-                // here, so sending again does not double them.
-                rows.update(|r| r.retain(|x| !sent.contains(&x.id)));
-            }
-        });
-    };
-    view! {
-        <div class=if single { "space-y-2" } else { "w-full rounded-xl border border-zinc-300 bg-white p-3 text-sm dark:border-zinc-700 dark:bg-zinc-900" }
-            on:keydown=move |ev| {
-                if single && event_target::<web_sys::Element>(&ev).tag_name() == "TEXTAREA" && crate::util::sends(&ev) {
-                    ev.prevent_default(); send();
-                }
-            }>
-            <div class="mb-2 flex items-center gap-2 text-xs text-muted">
-                {if single { "Edit this draft, then Send as a new message" } else { "Edit the queued messages, then send them again" }}
-                <span class="flex-1"></span>
-                {message_edit_action(if single { "Discard draft" } else { "Discard" }, on_close, busy.into(), true,
-                    if single { "Discard this draft" } else { "Discard these messages (they were pulled out of the queue)" })}
-            </div>
-            <fieldset disabled=move || busy.get() class="flex min-w-0 flex-col gap-2">
-                <For each=move || rows.get() key=|r| r.id let:row>
-                    <QueueEditRow id=row.id rows=rows single />
-                </For>
-            </fieldset>
-            <div class="mt-2 flex items-center gap-3">
-                {(!single).then(|| view! {
-                    <button class=format!("{BUTTON_QUIET} text-xs") prop:disabled=move || busy.get()
-                        on:click=move |_| rows.update(|r| {
-                            let next = r.iter().map(|x| x.id).max().unwrap_or(0) + 1;
-                            r.push(QueueRow { id: next, text: String::new() });
-                        })>{crate::icons::plus()}" Add a message"</button>
-                })}
-                <span class="flex-1"></span>
-                {(!single).then(|| view! { <span class="text-xs text-muted">"Closing this discards these messages"</span> })}
-                {message_edit_action("Send", Callback::new(move |_| send()), busy.into(), false, "")}
-            </div>
-            {message_edit_error(error)}
-        </div>
-    }
-    .into_any()
-}
-
-// Share only these three local buttons' DOM/event machinery, retaining their
-// SVGs and the textarea's typed, stable view (the production WASM is bounded).
-fn queue_edit_action(title: &'static str, image: AnyView, action: Callback<()>) -> AnyView {
-    message_edit_button(title, UBTN.to_owned(), image, action, None)
-}
-
-/// One message in the queue-edit box.
-#[component]
-fn QueueEditRow(id: u64, rows: RwSignal<Vec<QueueRow>>, #[prop(optional)] single: bool) -> AnyView {
-    view! {
-        <div class="flex items-start gap-1.5">
-            <textarea class=format!("{INPUT} min-h-[2.5rem] resize-y") rows=2
-                aria-label=if single { "Edit message" } else { "Queued message" }
-                prop:value=move || rows.with(|r| r.iter().find(|x| x.id == id).map(|x| x.text.clone()).unwrap_or_default())
-                on:input=move |ev| {
-                    let text = event_target_value(&ev);
-                    rows.update(|r| if let Some(x) = r.iter_mut().find(|x| x.id == id) { x.text = text; });
-                }></textarea>
-            {(!single).then(|| view! { <div class="flex flex-col gap-1">
-                {queue_edit_action("Move up", crate::icons::arrow_up().into_any(), Callback::new(move |_| {
-                    rows.update(|r| if let Some(i) = r.iter().position(|x| x.id == id) && i > 0 { r.swap(i - 1, i); });
-                }))}
-                {queue_edit_action("Move down", crate::icons::arrow_down().into_any(), Callback::new(move |_| {
-                    rows.update(|r| if let Some(i) = r.iter().position(|x| x.id == id) && i + 1 < r.len() { r.swap(i, i + 1); });
-                }))}
-                {queue_edit_action("Drop this message", crate::icons::x().into_any(), Callback::new(move |_| {
-                    rows.update(|r| r.retain(|x| x.id != id));
-                }))}
-            </div> })}
-        </div>
-    }
-    .into_any()
-}
-
 #[wasm_bindgen::prelude::wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_namespace = c6Files, js_name = has)]
@@ -7235,23 +6963,13 @@ mod tests {
     }
 
     #[test]
-    fn transcript_edit_starts_taken_without_cancellation_or_implicit_send() {
+    fn read_messages_have_only_explicit_rewind_and_ask_without_an_editor() {
         let source = include_str!("session.rs").split("#[cfg(test)]").next().unwrap();
-        let edit = source.split("fn MessageEdit(").nth(1).unwrap().split("fn RewindPanel(").next().unwrap();
-        assert!(edit.contains("MessageEditTarget::Transcript(_) => MessageEditState::Taken"));
-        assert!(edit.contains("if let MessageEditTarget::Queued(command_id)"));
-        assert!(edit.contains("api::take_back(session.get_value(), command_id)"));
-        assert!(!edit.contains("Retry withdrawal"));
-        assert!(!edit.contains("api::pull_queued") && !edit.contains("api::rewind"));
-        assert!(edit.contains("MessageEditState::Ready | MessageEditState::Correction"));
-        assert!(edit.contains("<QueueEditBox rows session_id=session.get_value() on_close single=true"));
-        assert!(edit.contains("The agent has this message") && edit.contains("Send correction") && edit.contains("Rewind…"));
-        let form = source.split("fn QueueEditBox(").nth(1).unwrap().split("fn QueueEditRow(").next().unwrap();
-        assert!(form.contains("api::send_message(id.clone(), text, None, Vec::new())"));
-        assert!(!form.contains("api::rewind") && !form.contains("api::pull_queued"));
-        assert!(form.contains("(!single).then") && form.contains("Add a message"));
-        let row = source.split("fn QueueEditRow(").nth(1).unwrap().split("#[wasm_bindgen").next().unwrap();
-        assert!(row.contains("(!single).then") && row.contains("Move up") && row.contains("Drop this message"));
+        assert!(!source.contains("fn MessageEdit(") && !source.contains("fn QueueEditBox("));
+        assert!(!source.contains("Send correction") && !source.contains("Edit queue…"));
+        assert!(source.contains("title=\"Rewind\" aria-label=\"Rewind\""));
+        assert!(source.contains("title=\"Ask\" aria-label=\"Ask\""));
+        assert!(source.contains("mt-1 flex justify-end gap-2 text-muted"));
         let rewind = source.split("fn RewindPanel(").nth(1).unwrap().split("struct ForceOpen").next().unwrap();
         assert!(rewind.contains("api::rewind"));
         assert!(!rewind.contains("api::send_message") && !rewind.contains("Resend"));
@@ -7295,62 +7013,34 @@ mod tests {
     }
 
     #[test]
-    fn only_confirmed_unrecorded_queued_cancellation_opens_the_single_editor() {
-        assert_eq!(message_edit_result(Ok(()), false), (MessageEditState::Ready, None));
-        assert_eq!(message_edit_result(Ok(()), true), (MessageEditState::Taken, None), "a delivery observed before the reply wins");
-        for recorded in [false, true] {
-            assert_eq!(message_edit_result(Err("The agent has this message".into()), recorded), (MessageEditState::Taken, None));
-            for reason in ["Worker is offline", "update this worker", "cancellation was not confirmed"] {
-                assert_eq!(message_edit_result(Err(reason.into()), recorded), (MessageEditState::Unconfirmed, Some(reason.into())));
-            }
-        }
-    }
-
-    #[test]
-    fn queued_rewind_identity_comes_only_from_its_actual_user_event() {
-        let target = MessageEditTarget::Queued("target".into());
-        let user = |seq, id| {
-            serde_json::from_value::<Event>(serde_json::json!({
-                "seq": seq, "ts": 1, "type": "user", "command_id": id, "text": "identical drafts",
-            }))
-            .unwrap()
-        };
-        let other = user(72, "other");
-        assert_eq!(message_edit_seq(&target, &[]), None);
-        assert_eq!(message_edit_seq(&target, std::slice::from_ref(&other)), None, "text is not identity");
-        assert_eq!(message_edit_seq(&target, &[other, user(105, "target")]), Some(105));
-        assert_eq!(message_edit_seq(&MessageEditTarget::Transcript(72), &[]), Some(72));
-    }
-
-    #[test]
-    fn queued_single_edit_is_hoisted_outside_the_queue_and_bulk_pull_stays_separate() {
+    fn take_back_is_hoisted_outside_waiting_rows_and_never_pulls_a_tail() {
         let source = include_str!("session.rs").split("#[cfg(test)]").next().unwrap();
-        let transcript = source.split("fn Transcript(").nth(1).unwrap().split("enum MessageEditTarget").next().unwrap();
-        assert!(transcript.contains("RwSignal::new(None::<(MessageEditTarget, String)>)"));
-        assert!(transcript.contains("editing.with(Option::is_some) || rewinding.get().is_some()"));
-        assert!(transcript.contains("if !edit_active.get_untracked()"));
-        assert!(transcript.contains("editing.get().map(|(target, text)|"));
-        assert!(transcript.contains("edit=edit_queued events ready=rewind_ready"));
-        let queued = source.split("fn Queued(").nth(1).unwrap().split("fn QueueEditBox(").next().unwrap();
-        let single = queued.split("let do_edit =").nth(1).unwrap().split("// Pulls").next().unwrap();
-        assert!(single.contains("edit.run") && single.contains("MessageEditTarget::Queued(command_id.get_value())"));
-        assert!(!single.contains("api::pull_queued") && !single.contains("api::rewind"));
-        assert!(queued.contains("Edit queue…") && queued.contains("api::pull_queued(id, cid)"));
-        assert!(queued.contains("busy.get() || edit_active.get()") && queued.contains("Some(edit_busy)"));
-        let edit = source.split("fn MessageEdit(").nth(1).unwrap().split("fn RewindPanel(").next().unwrap();
-        assert!(edit.contains("MessageEditState::Taken | MessageEditState::Unconfirmed"));
-        assert!(edit.contains("Could not confirm withdrawal. Your draft is kept"));
-        assert!(edit.contains("Waiting for this message in the transcript before Rewind is available"));
-        assert!(edit.contains("if seq.get().is_some()") && edit.contains("actions.push((\"Rewind…\""));
+        let transcript = source.split("fn Transcript(").nth(1).unwrap().split("fn phone_status_row(").next().unwrap();
+        let take_back = transcript.split("let take_back =").nth(1).unwrap().split("// One phone picker").next().unwrap();
+        assert!(take_back.find("draft.insert(").unwrap() < take_back.find("spawn_local(").unwrap());
+        assert!(take_back.find("let recovered = files.await").unwrap() < take_back.find("api::take_back(").unwrap());
+        assert!(take_back.contains("draft.rollback(ticket)"));
+        assert!(take_back.contains("The agent had already read this") && take_back.contains("Your text is still in the box."));
+        assert!(!source.contains("api::pull_queued") && !source.contains("api::cancel_queued_input"));
+        let queued = source.split("fn Queued(").nth(1).unwrap().split("#[wasm_bindgen").next().unwrap();
+        assert!(queued.contains("aria-label=\"Take this back\""));
+        assert!(queued.contains("with_agent.then") && queued.contains("api::send_queued_now"));
+        assert!(!queued.contains("border-dashed") && !queued.contains("Edit"));
     }
 
     #[test]
     fn phone_message_actions_keep_a_gutter_and_use_the_existing_action_paths() {
         let source = include_str!("session.rs").split("#[cfg(test)]").next().unwrap();
-        let trigger = source.split("// The fixed 44px metadata target").nth(1).unwrap().split("// A quiet notice").next().unwrap();
+        let trigger = source
+            .split("// Non-user transcript entries retain the phone picker.")
+            .nth(1)
+            .unwrap()
+            .split("// A quiet notice")
+            .next()
+            .unwrap();
         assert!(source.contains("min-h-11 pr-12 md:min-h-0 md:pr-0 md:pb-7"));
-        assert!(source.contains("if user_bubble { \"md:pb-7\" }"), "ordinary user text keeps its full width");
-        assert!(trigger.contains("flex h-11 justify-end md:hidden"), "ordinary user bubbles have a real metadata row");
+        assert!(source.contains("if user_bubble { \"\" }"), "ordinary user text keeps its full width");
+        assert!(trigger.contains("if user_bubble { \"hidden\" }"), "ordinary user bubbles expose direct actions instead");
         assert!(trigger.contains("size-11") && trigger.contains("md:hidden"));
         assert!(trigger.contains("crate::icons::ellipsis()"));
         assert!(trigger.contains("message_actions.set(Some(seq))") && trigger.contains("actions_open.set(true)"));
@@ -7360,9 +7050,9 @@ mod tests {
         assert!(sheet.contains("label=\"Message actions\"") && sheet.contains("class=\"phone-message-actions\""));
         assert!(sheet.contains("instant=true") && source.contains("class:phone-instant-scrim=instant"));
         assert!(sheet.contains("Ask in a side chat") && sheet.contains("Rewind…"));
-        assert!(sheet.contains("edit_message.run(seq)") && sheet.contains("rewinding.set(Some(seq))"));
+        assert!(!sheet.contains("Edit") && sheet.contains("rewinding.set(Some(seq))"));
         assert!(sheet.contains("asking.set(message_actions.get_untracked())"));
-        assert_eq!(sheet.matches("actions_can_rewind.get()").count(), 2, "Edit and Rewind share live eligibility");
+        assert_eq!(sheet.matches("actions_can_rewind.get()").count(), 1, "only explicit Rewind needs rewind eligibility");
         assert!(!sheet.contains("Copy") && !sheet.contains("inner_html"));
         assert!(source.contains("crate::util::modal(actions_open, actions_panel)"));
         assert!(source.contains("node_ref=panel data-pop=pop role=\"dialog\" aria-modal=\"true\" aria-label=label tabindex=tabindex"));
