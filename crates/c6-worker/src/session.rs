@@ -2154,6 +2154,7 @@ impl Actor {
         // Rewinds wait for the running turn to stop. Do not let a retry
         // replace the original receipt while cancellation is still pending.
         let mut rewind_blocked = matches!(&reset, Some((r, 0)) if !r.failure.is_empty());
+        let mut adoption_blocked = false;
         let mut rewinds = match reset {
             Some((r, 0)) if r.failure.is_empty() || !r.retries.is_empty() => {
                 let mut pending = VecDeque::from([(r.command_id, r.to_seq, r.restore_files)]);
@@ -2204,22 +2205,27 @@ impl Actor {
                 }
                 rewind_blocked = false;
             }
-            if !rewind_blocked
-                && running.is_none()
-                && let Err(e) = self.take_up_held().await
-            {
-                // Do not overwrite an unidentifiable held runtime or drop
-                // its actor/inbox. Explicit rewind/stop can settle ownership.
-                rewind_blocked = true;
-                if let Err(e) = self
-                    .writer
-                    .append(session_event::Kind::Error(ErrorEvent {
-                        message: format!("Claude Code could not be safely taken up; queued messages were not sent: {e:#}"),
-                    }))
-                    .await
-                {
-                    error!("recording Claude Code adoption failure: {e:#}");
-                    return;
+            if !rewind_blocked && running.is_none() {
+                match self.take_up_held().await {
+                    Ok(()) => adoption_blocked = false,
+                    Err(e) => {
+                        // Ownership uncertainty pauses input, not Rewind's
+                        // durable failure state. Recheck on the next mailbox
+                        // event: another session may simply be publishing or
+                        // removing its metadata. Never send until it succeeds.
+                        if !adoption_blocked
+                            && let Err(e) = self
+                                .writer
+                                .append(session_event::Kind::Error(ErrorEvent {
+                                    message: format!("Claude Code could not be safely taken up; queued messages were not sent: {e:#}"),
+                                }))
+                                .await
+                        {
+                            error!("recording Claude Code adoption failure: {e:#}");
+                            return;
+                        }
+                        adoption_blocked = true;
+                    }
                 }
             }
             let handoff_waits = running.is_none() && self.handoff_waits();
@@ -2233,7 +2239,7 @@ impl Actor {
                     return;
                 }
             }
-            if !rewind_blocked && running.is_none() && !handoff_waits && !self.inbox.lock().unwrap().queue.is_empty() {
+            if !rewind_blocked && !adoption_blocked && running.is_none() && !handoff_waits && !self.inbox.lock().unwrap().queue.is_empty() {
                 let switch = self.inbox.lock().unwrap().take_switch();
                 if switch.is_some() {
                     self.handoff_announced = false;
@@ -2250,9 +2256,10 @@ impl Actor {
             let idle_until = self.claude.as_ref().filter(|_| running.is_none()).and_then(|p| p.idle_until(self.claude_idle()));
             // Claude Code's tasks that ended while it waited, if it doesn't
             // start a turn for them by itself.
-            let wake_at = self.claude.as_ref().filter(|_| !rewind_blocked && running.is_none()).and_then(|p| p.wake_due());
+            let wake_at =
+                self.claude.as_ref().filter(|_| !rewind_blocked && !adoption_blocked && running.is_none()).and_then(|p| p.wake_due());
             // Notices the hourly limit held: once the hour allows.
-            let waiting_to_wake = !rewind_blocked && running.is_none() && self.deferred.iter().any(|(_, wake)| *wake);
+            let waiting_to_wake = !rewind_blocked && !adoption_blocked && running.is_none() && self.deferred.iter().any(|(_, wake)| *wake);
             let retry_at = (waiting_to_wake && self.link.is_connected()).then(|| self.next_auto_turn());
             tokio::select! {
                 msg = rx.recv() => match msg {
@@ -2658,7 +2665,7 @@ impl Actor {
                 },
                 // Claude Code wrote while no turn ran: a background task's
                 // progress, or a turn it starts by itself.
-                line = async { self.claude.as_mut().expect("checked").next_line().await }, if !rewind_blocked && running.is_none() && self.claude.is_some() => {
+                line = async { self.claude.as_mut().expect("checked").next_line().await }, if !rewind_blocked && !adoption_blocked && running.is_none() && self.claude.is_some() => {
                     match line {
                         None => {
                             let unsent = self.claude.take().expect("checked").exited().await;
@@ -3402,11 +3409,11 @@ impl Actor {
                     continue;
                 }
             };
+            p.record_in(&self.manager.claude_dir()).await?;
             match p.ready(&reset.session_id).await {
                 Ok(confirmed_id) => {
                     reset.session_id = confirmed_id;
                     self.journal.prepare_claude_rewind(sid, &reset).await?;
-                    p.record_in(&self.manager.claude_dir());
                     self.claude = Some(p);
                     return Ok(());
                 }
@@ -3460,7 +3467,10 @@ impl Actor {
         let held = self.manager.claude_dir().join("held");
         let events = self.journal.events_after(&self.writer.session_id, 0, u32::MAX).await?;
         let conversation = journal_claude_conversation(&self.journal, &self.writer.session_id, &self.spec, &events).await?.id;
-        let Some((record, token)) = crate::claude_code::Process::held_record(&held, &conversation)? else { return Ok(()) };
+        let Some((record, token)) = crate::claude_code::Process::held_record(&held, &conversation)? else {
+            crate::claude_code::confirm_stopped(&self.journal, &self.writer.session_id, std::time::Duration::ZERO).await?;
+            return Ok(());
+        };
         let bridge_tools = self.claude_code_subagent_tools();
         let registration = match token {
             Some(token) if !bridge_tools.is_empty() => self.manager.bridge().await.map(|b| {
@@ -6436,9 +6446,16 @@ for line in sys.stdin:
             .unwrap();
         leave_rewind_held(&manager, &spec, &bin, dir.path(), "s");
         leave_rewind_held(&manager, &spec, &bin, dir.path(), &fork);
+        let publishing = manager.claude_dir().join("held/another-session-publishing");
+        std::fs::create_dir(&publishing).unwrap();
         let reopened = Arc::new(Journal::open(&dir.path().join("journal.db")).await.unwrap());
         let manager = SessionManager::new(reopened, Arc::default(), dir.path().join("worktrees"));
         manager.recover().await.unwrap();
+        rewind_actor_barrier(&manager, "adoption-paused").await;
+        let paused = manager.journal.events_after("s", 0, u32::MAX).await.unwrap();
+        assert!(paused.iter().any(|e| matches!(&e.kind, Some(session_event::Kind::Error(e)) if e.message.contains("safely taken up"))));
+        assert!(!manager.actor("s").await.unwrap().unwrap().is_closed());
+        std::fs::remove_dir(&publishing).unwrap();
         rewind_actor_barrier(&manager, "adopted").await;
         manager.actor("s").await.unwrap().unwrap().send(ActorMsg::Resume(1)).unwrap();
         rewind_actor_barrier(&manager, "stale-resume").await;

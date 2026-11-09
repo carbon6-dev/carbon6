@@ -636,6 +636,38 @@ fn held_group_owned(meta: &HeldMeta, dir: &Path) -> bool {
         && (is_claude_for(meta.pgid, &meta.conversation) || keeper_holds_fifo(Pid::from_raw(meta.keeper), Pid::from_raw(meta.pgid), dir))
 }
 
+/// Retain an identified kernel group member across SIGINT grace. If the
+/// keeper has not opened its FIFO yet, wait before signaling anything. When
+/// only an identified leader remains, kill immediately rather than losing
+/// authority by first letting that leader exit during a grace period.
+async fn stop_held_group(pg: Pid, keeper: Pid, dir: &Path, conversation: &str) -> anyhow::Result<()> {
+    for _ in 0..100 {
+        if matches!(killpg(pg, None), Err(nix::errno::Errno::ESRCH)) {
+            return Ok(());
+        }
+        if keeper_holds_fifo(keeper, pg, dir) {
+            nix::sys::signal::kill(keeper, Signal::SIGSTOP)?;
+            anyhow::ensure!(keeper_holds_fifo(keeper, pg, dir), "Held Claude Code keeper ownership changed");
+            let _ = killpg(pg, Signal::SIGINT);
+            for _ in 0..30 {
+                if nix::sys::signal::kill(pg, None).is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            anyhow::ensure!(keeper_holds_fifo(keeper, pg, dir), "Held Claude Code keeper disappeared during stop");
+            let _ = killpg(pg, Signal::SIGKILL);
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    if is_claude_for(pg.as_raw(), conversation) {
+        let _ = killpg(pg, Signal::SIGKILL);
+        return Ok(());
+    }
+    anyhow::bail!("Cannot retain ownership of held Claude Code group {}; its cleanup record was kept", pg)
+}
+
 /// A persisted PGID may have been reused: never signal it here. Only ESRCH
 /// proves that an old group's writers (including orphaned children) are gone.
 /// Live groups, zombies and permission errors all keep the durable barrier.
@@ -677,9 +709,7 @@ pub async fn stop_held_for_rewind(held: &Path, session: &str, journal: &crate::j
         if !dir.is_dir() {
             continue;
         }
-        // A half-written/unreadable held record is not proof of absence.
-        let data = std::fs::read(dir.join("meta.json"))?;
-        let meta: HeldMeta = serde_json::from_slice(&data)?;
+        let meta: HeldMeta = serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?)?;
         if meta.session != session {
             continue;
         }
@@ -694,25 +724,7 @@ pub async fn stop_held_for_rewind(held: &Path, session: &str, journal: &crate::j
                     "Cannot prove ownership of held Claude Code process group {}; stop confirmation is required",
                     meta.pgid
                 );
-                let keeper = Pid::from_raw(meta.keeper);
-                if keeper_holds_fifo(keeper, pg, &dir) {
-                    // Keep a kernel-identified group member through the grace
-                    // period, even if SIGINT ends the wrapper/CLI first.
-                    let _ = nix::sys::signal::kill(keeper, Signal::SIGSTOP);
-                }
-                let _ = killpg(pg, Signal::SIGINT);
-                // Let the CLI save its transcript, but never equate its exit
-                // with the absence of descendants or the FIFO keeper.
-                for _ in 0..30 {
-                    if nix::sys::signal::kill(pg, None).is_err() {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                if !matches!(killpg(pg, None), Err(nix::errno::Errno::ESRCH)) {
-                    anyhow::ensure!(held_group_owned(&meta, &dir), "Held Claude Code ownership changed during cleanup");
-                    let _ = killpg(pg, Signal::SIGKILL);
-                }
+                stop_held_group(pg, Pid::from_raw(meta.keeper), &dir, &meta.conversation).await?;
             }
             Err(e) => anyhow::bail!("Cannot inspect held Claude Code process group {}: {e}", meta.pgid),
         }
@@ -1003,7 +1015,21 @@ impl Process {
         self.held.is_some()
     }
 
-    /// Records its process group in `dir` while it runs.
+    /// Cleanup-only recording for a non-held initialization. Track the PGID
+    /// durably before any initialize input, and retain the original launch
+    /// conversation in the orphan record: ready may confirm a different fork
+    /// ID, but ownership checks must match the process's actual argv.
+    pub async fn record_in(&mut self, dir: &Path) -> anyhow::Result<()> {
+        anyhow::ensure!(self.held.is_none(), "Held Claude Code already has its own process record");
+        self.track().await?;
+        let pg = self.pgid.ok_or_else(|| anyhow::anyhow!("Claude Code process group is unknown"))?;
+        let path = dir.join(format!("{}.pid", self.launch.conversation));
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(&path, format!("{pg}\n{}\n", self.launch.conversation))?;
+        self.pidfile = Some(path);
+        Ok(())
+    }
+
     /// Starts `cmd` held in `dir`/<conversation> (see [`Held`]): through a
     /// shell that writes its exit code, its input the named pipe (which a
     /// keeper in its process group holds open), its output in files.
@@ -1196,6 +1222,7 @@ impl Process {
             children: HashMap::new(),
             backgrounded: HashSet::new(),
             task_calls: HashMap::new(),
+            call_tasks: HashMap::new(),
             call_usage: HashMap::new(),
             per_call: false,
         };
@@ -1219,6 +1246,7 @@ impl Process {
             unconfirmed: Default::default(),
             pending: None,
             notified: Vec::new(),
+            task_labels: HashMap::new(),
             subagent_tasks: HashSet::new(),
             unwoken: Vec::new(),
             wake_due: None,
@@ -1310,15 +1338,15 @@ impl Process {
     /// It has ended (or is stopped on purpose): a held process's folder,
     /// keeper and guidance go with it.
     fn release_held(&mut self) {
+        if self.pgid.is_some_and(|pg| !matches!(killpg(pg, None), Err(nix::errno::Errno::ESRCH))) {
+            // Leader exit is not group absence. Keep cleanup authority and
+            // its durable barrier until every descendant/keeper is gone.
+            return;
+        }
         if let Some(h) = &mut self.held
             && !h.done
         {
             h.done = true;
-            if let Some(pg) = self.pgid
-                && keeper_holds_fifo(h.keeper, pg, &h.dir)
-            {
-                let _ = nix::sys::signal::kill(h.keeper, Signal::SIGTERM);
-            }
             let _ = std::fs::remove_dir_all(&h.dir);
             if let Some(r) = &self.mapper.output_root {
                 let _ = std::fs::remove_dir_all(r);
@@ -1926,14 +1954,7 @@ impl Process {
     /// Closes it: no more input, then it exits by itself (or is killed).
     pub async fn close(mut self) {
         *self.stdin.lock().await = None;
-        // A held one's input ends when its keeper lets go of the pipe too.
-        if let Some(h) = &self.held
-            && let Some(pg) = self.pgid
-            && keeper_holds_fifo(h.keeper, pg, &h.dir)
-        {
-            let _ = nix::sys::signal::kill(h.keeper, Signal::SIGTERM);
-        }
-        if tokio::time::timeout(CLOSE_GRACE, self.wait_exit()).await.is_err() {
+        if self.held.is_some() || tokio::time::timeout(CLOSE_GRACE, self.wait_exit()).await.is_err() {
             self.kill().await;
         }
         self.release_held();
@@ -1969,24 +1990,26 @@ impl Process {
         if let Some(pg) = self.pgid {
             if let Some(h) = &mut self.held {
                 h.stop_on_drop = true;
-                if keeper_holds_fifo(h.keeper, pg, &h.dir) {
-                    let _ = nix::sys::signal::kill(h.keeper, Signal::SIGSTOP);
+                if let Err(e) = stop_held_group(pg, h.keeper, &h.dir, &self.launch.conversation).await {
+                    warn!("stopping held Claude Code: {e:#}");
+                    return;
                 }
-            }
-            // SIGINT lets Claude Code save its transcript; then make sure.
-            let _ = killpg(pg, Signal::SIGINT);
-            let _ = tokio::time::timeout(Duration::from_secs(3), self.wait_exit()).await;
-            // The CLI may exit before a child that ignored SIGINT. Its
-            // surviving process-group members must not outlive the reset.
-            if self
-                .held
-                .as_ref()
-                .is_none_or(|h| keeper_holds_fifo(h.keeper, pg, &h.dir) || is_claude_for(pg.as_raw(), &self.launch.conversation))
-            {
+            } else {
+                // Non-held child ownership retains the existing stop path.
+                let _ = killpg(pg, Signal::SIGINT);
+                let _ = tokio::time::timeout(Duration::from_secs(3), self.wait_exit()).await;
                 let _ = killpg(pg, Signal::SIGKILL);
             }
         }
         let _ = tokio::time::timeout(Duration::from_secs(3), self.wait_exit()).await;
+        if let Some(pg) = self.pgid {
+            let absent = async {
+                while !matches!(killpg(pg, None), Err(nix::errno::Errno::ESRCH)) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            };
+            let _ = tokio::time::timeout(Duration::from_secs(1), absent).await;
+        }
         self.release_held();
     }
 }
@@ -3443,6 +3466,31 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
+    async fn nonheld_initialization_is_cleanup_recorded_before_handshake() {
+        if !c6_testkit::have("python3") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let bin = pgid_checking_claude(dir.path());
+        let observer = observer(dir.path(), Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()))).await;
+        let mut p = spawn(&bin, dir.path(), "launch-conversation", false, Some(observer.clone()));
+        let pgid = p.pgid.unwrap().as_raw();
+        let records = dir.path().join("claude");
+        p.record_in(&records).await.unwrap();
+        let path = records.join("launch-conversation.pid");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{pgid}\nlaunch-conversation\n"));
+        assert_eq!(observer.journal.claude_processes(&observer.session_id).await.unwrap(), [pgid]);
+        assert!(!dir.path().join("checked-inputs").exists(), "recording precedes initialize input");
+        assert!(!p.is_held(), "the cleanup record must not make initialization adoptable");
+        assert!(Process::held_record(&records.join("held"), "launch-conversation").unwrap().is_none());
+        assert!(p.ready(&uuid::Uuid::now_v7().to_string()).await.is_err());
+        p.stop_for_rewind().await.unwrap();
+        assert!(!path.exists());
+        assert_eq!(observer.journal.claude_processes(&observer.session_id).await.unwrap(), [pgid]);
+        confirm_stopped(&observer.journal, &observer.session_id, Duration::ZERO).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn pgid_is_durable_before_rejected_initialization() {
         if !c6_testkit::have("python3") {
             return;
@@ -4576,6 +4624,52 @@ done
         assert!(journal.claude_processes("s").await.unwrap().is_empty());
         assert!(killpg(other.pgid.unwrap(), None).is_ok(), "another session is untouched");
         other.close().await;
+    }
+
+    #[tokio::test]
+    async fn rewind_stop_without_a_ready_keeper_preserves_descendant_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        let _cleanup = HeldFixtureCleanup(held.clone());
+        let bin = live_claude(dir.path());
+        let p = Process::spawn_held(
+            &held,
+            "s",
+            &bin,
+            Launch { conversation: "fork".into(), ..Default::default() },
+            false,
+            dir.path(),
+            "opus",
+            Arc::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let pg = p.pgid.unwrap();
+        let keeper = p.held.as_ref().unwrap().keeper;
+        c6_testkit::eventually("owned fixture keeper readiness", async || keeper_holds_fifo(keeper, pg, &held.join("fork")).then_some(()))
+            .await;
+        let mut member = tokio::process::Command::new("sh")
+            .args(["-c", "trap '' INT; echo ready > member-ready; exec sleep 300"])
+            .current_dir(dir.path())
+            .process_group(pg.as_raw())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        c6_testkit::eventually("fixture descendant ignores SIGINT", async || dir.path().join("member-ready").exists().then_some(())).await;
+        // Only this fixture's verified keeper is stopped, never an arbitrary
+        // persisted PID. The live wrapper still proves group ownership.
+        nix::sys::signal::kill(keeper, Signal::SIGKILL).unwrap();
+        c6_testkit::eventually("fixture keeper to be reaped", async || nix::unistd::getpgid(Some(keeper)).is_err().then_some(())).await;
+        p.stop_for_rewind().await.unwrap();
+        if killpg(pg, None).is_ok() {
+            assert!(held.join("fork/meta.json").exists(), "live descendants/zombies retain cleanup metadata");
+        }
+        let status = c6_testkit::within("the SIGINT-ignoring fixture child to be killed", member.wait()).await.unwrap();
+        assert!(!status.success());
+        let journal = crate::journal::Journal::open(&dir.path().join("journal.db")).await.unwrap();
+        stop_held_for_rewind(&held, "s", &journal).await.unwrap();
+        assert_eq!(killpg(pg, None), Err(nix::errno::Errno::ESRCH));
     }
 
     #[tokio::test]
