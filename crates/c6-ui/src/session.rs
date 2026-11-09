@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use c6_api::{ContentBlock, Event, EventKind, QueuedInput, Session, SessionStatus, StreamMsg, TurnEndReason, WorkerStatus};
+use c6_api::{ContentBlock, Event, EventKind, QueuedInput, Session, SessionStatus, StreamMsg, TurnEndReason};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
@@ -182,6 +182,118 @@ pub(crate) struct QueueRow {
     text: String,
 }
 
+#[derive(Default)]
+struct ReturnedDrafts {
+    next: u64,
+    revision: u64,
+    base: String,
+    files: Vec<c6_api::AttachmentUpload>,
+    parts: Vec<(u64, String, Vec<c6_api::AttachmentUpload>)>,
+}
+
+impl ReturnedDrafts {
+    fn value(&self) -> (String, Vec<c6_api::AttachmentUpload>, u32) {
+        let mut text = self.parts.iter().map(|(_, text, _)| text.as_str()).filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n\n");
+        let caret = text.encode_utf16().count() as u32;
+        if !self.base.is_empty() {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&self.base);
+        }
+        let files = self.parts.iter().flat_map(|(_, _, files)| files.iter()).chain(&self.files).cloned().collect();
+        (text, files, caret)
+    }
+
+    fn unchanged(&self, text: &str, files: &[c6_api::AttachmentUpload], revision: u64) -> bool {
+        let (expected, uploads, _) = self.value();
+        self.revision == revision && text == expected && files == uploads
+    }
+
+    fn insert(
+        &mut self,
+        text: String,
+        files: Vec<c6_api::AttachmentUpload>,
+        current: String,
+        uploads: Vec<c6_api::AttachmentUpload>,
+        revision: u64,
+    ) -> u64 {
+        if !self.unchanged(&current, &uploads, revision) {
+            self.base = current;
+            self.files = uploads;
+            self.parts.clear();
+        }
+        self.revision = revision;
+        self.next += 1;
+        self.parts.push((self.next, text, files));
+        self.next
+    }
+}
+
+/// The live composer owns its ordinary persisted draft, not a second editor.
+/// Tickets let independent background confirmations undo only their own part,
+/// and only while no user edit (even edit-and-revert) has occurred.
+#[derive(Clone, Copy)]
+struct ComposerDraft {
+    text: RwSignal<String>,
+    files: RwSignal<Vec<c6_api::AttachmentUpload>>,
+    area: NodeRef<leptos::html::Textarea>,
+    revision: RwSignal<u64>,
+    loading: RwSignal<usize>,
+    returned: StoredValue<ReturnedDrafts>,
+}
+
+impl ComposerDraft {
+    fn write(self, focus: bool) {
+        let (text, files, caret) = self.returned.with_value(ReturnedDrafts::value);
+        self.text.set(text.clone());
+        self.files.set(files);
+        if focus && let Some(area) = self.area.get_untracked() {
+            // Set the DOM value before selection, including in a touch gesture.
+            area.set_value(&text);
+            let _ = area.focus();
+            let _ = area.set_selection_range(caret, caret);
+            crate::util::fit(&area);
+        }
+    }
+
+    fn insert(self, text: String, files: Vec<c6_api::AttachmentUpload>) -> u64 {
+        let mut ticket = 0;
+        self.returned.update_value(|r| {
+            ticket = r.insert(text, files, self.text.get_untracked(), self.files.get_untracked(), self.revision.get_untracked());
+        });
+        self.write(true);
+        ticket
+    }
+
+    fn unchanged(self) -> bool {
+        self.returned.with_value(|r| r.unchanged(&self.text.get_untracked(), &self.files.get_untracked(), self.revision.get_untracked()))
+    }
+
+    fn attachments(self, ticket: u64, files: Vec<c6_api::AttachmentUpload>) {
+        if self.unchanged() {
+            self.returned.update_value(|r| {
+                if let Some((_, _, uploads)) = r.parts.iter_mut().find(|(id, _, _)| *id == ticket) {
+                    *uploads = files;
+                }
+            });
+            self.write(false);
+        } else {
+            // Typing during recovery must not prevent the files coming back.
+            self.files.update(|uploads| uploads.extend(files));
+        }
+    }
+
+    fn rollback(self, ticket: u64) {
+        if self.unchanged() {
+            self.returned.update_value(|r| r.parts.retain(|(id, _, _)| *id != ticket));
+            self.write(false);
+        }
+    }
+}
+
+type MessageFiles = futures::future::Shared<futures::future::LocalBoxFuture<'static, Result<Vec<c6_api::AttachmentUpload>, String>>>;
+
 /// Live state of one session's log, fed by its stream.
 #[derive(Clone, Copy)]
 pub(crate) struct Feed {
@@ -192,6 +304,7 @@ pub(crate) struct Feed {
     spawns: Memo<usize>,
     pub(crate) streaming: RwSignal<Streaming>,
     queued: RwSignal<Vec<QueuedInput>>,
+    composer: RwSignal<Option<ComposerDraft>>,
     activity: RwSignal<Option<bool>>,
     /// Secrets the assistant's operations returned, for you (shown while
     /// this page is open; never logged).
@@ -311,6 +424,7 @@ impl Feed {
             spawns: child_spawns(events),
             streaming: RwSignal::new(Streaming::default()),
             queued: RwSignal::new(Vec::new()),
+            composer: RwSignal::new(None),
             activity: RwSignal::new(None),
             secrets: RwSignal::new(Vec::new()),
             synced: RwSignal::new(false),
@@ -1137,7 +1251,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                 });
                 match wake {
                     Some(w) => view! {
-                        <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) archived error files wake=w />
+                        <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) archived error files wake=w recovery=feed.composer />
                     }.into_any(),
                     None => {
                         let row = detail.get().and_then(|d| d.ok()).map(|d| d.session);
@@ -1148,7 +1262,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                         let start = row.map(|s| (s.subagent_connection_id, s.subagent_model, s.subagent_effort)).unwrap_or_default();
                         let subagents = SubagentChoice::follow(events, start, choice.current);
                         view! {
-                            <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) archived error model=choice files subagents no_claude_code ask />
+                            <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) archived error model=choice files subagents no_claude_code ask recovery=feed.composer />
                         }.into_any()
                     }
                 }
@@ -2344,10 +2458,71 @@ fn Transcript(
     // while cancellation is pending, but must not destroy its draft.
     let editing = RwSignal::new(None::<(MessageEditTarget, String)>);
     let edit_active = Signal::derive(move || editing.with(Option::is_some) || rewinding.get().is_some());
-    let edit_queued = Callback::new(move |draft| {
-        if !edit_active.get_untracked() {
-            editing.set(Some(draft));
+    let withdrawn = RwSignal::new(HashSet::<String>::new());
+    let withdrawal_notes = RwSignal::new(HashMap::<String, String>::new());
+    // Kept outside disappearing rows, including the eagerly loaded files.
+    let draft_files = StoredValue::new_local(HashMap::<String, MessageFiles>::new());
+    let take_back = Callback::new(move |q: QueuedInput| {
+        let Some(draft) = feed.composer.get_untracked() else { return };
+        let Some(files) = draft_files.with_value(|m| m.get(&q.command_id).cloned()) else { return };
+        let ready_files = files.peek().and_then(|r| r.as_ref().ok()).cloned();
+        let ticket = draft.insert(q.text.clone(), ready_files.clone().unwrap_or_default());
+        withdrawn.update(|ids| {
+            ids.insert(q.command_id.clone());
+        });
+        withdrawal_notes.update(|notes| {
+            notes.remove(&q.command_id);
+        });
+        if ready_files.is_none() {
+            draft.loading.update(|n| *n += 1);
         }
+        spawn_local(async move {
+            // Never retire the server's only copy before recovering its files.
+            let recovered = files.await;
+            if draft.text.is_disposed() {
+                return;
+            }
+            if ready_files.is_none() {
+                if let Ok(files) = &recovered {
+                    draft.attachments(ticket, files.clone());
+                }
+                draft.loading.update(|n| *n -= 1);
+            }
+            let result = match recovered {
+                Ok(_) => api::take_back(id.get_value(), q.command_id.clone()).await,
+                Err(e) => Err(e),
+            };
+            if draft.text.is_disposed() {
+                return;
+            }
+            let recorded = events.with_untracked(|evs| {
+                evs.iter().any(|e| matches!(&e.kind, EventKind::User { command_id, .. } if command_id == &q.command_id))
+            });
+            if recorded || result.as_ref().is_err_and(|e| e == "The agent has this message") {
+                withdrawal_notes.update(|notes| {
+                    notes.insert(
+                        q.command_id,
+                        "The agent had already read this, so it wasn't taken back. Your text is still in the box.".into(),
+                    );
+                });
+            } else if let Err(reason) = result {
+                draft.rollback(ticket);
+                draft_files.update_value(|m| {
+                    m.remove(&q.command_id);
+                });
+                withdrawal_notes.update(|notes| {
+                    notes.insert(q.command_id.clone(), format!("This couldn't be taken back. {reason}"));
+                });
+                withdrawn.update(|ids| {
+                    ids.remove(&q.command_id);
+                });
+                queued.update(|rows| {
+                    if !rows.iter().any(|row| row.command_id == q.command_id) {
+                        rows.push(q);
+                    }
+                });
+            }
+        });
     });
     let edit_message = Callback::new(move |seq| {
         if edit_active.get_untracked() {
@@ -2466,6 +2641,7 @@ fn Transcript(
                     },
                     crate::timeline::Piece::Event(e) => {
                         let seq = e.seq;
+                        let command_id = StoredValue::new(match &e.kind { EventKind::User { command_id, .. } => Some(command_id.clone()), _ => None });
                         let only_thinking = thinking_only(&e.kind);
                         let anchorable = can_branch && can_anchor(&e.kind);
                         let task_notification = matches!(&e.kind, EventKind::User { command, .. } if command == "task-notification");
@@ -2610,6 +2786,9 @@ fn Transcript(
                                     </div>
                                 })}
                             </div>
+                            {move || command_id.with_value(|id| id.as_ref().and_then(|id| withdrawal_notes.with(|notes| notes.get(id).cloned()))).map(|note| view! {
+                                <p class="text-right text-xs text-muted" role="status">{note}</p>
+                            })}
                             // Where you left off, while you catch up.
                             {move || here.get().filter(|(s, _)| *s == seq).map(|(_, at)| view! {
                                 <crate::catchup::YouWereHere session=id.get_value() at />
@@ -2671,9 +2850,21 @@ fn Transcript(
                 let waiting = move || view! {
                     <div class="max-h-[30dvh] space-y-2 overflow-y-auto px-4" data-waiting-messages="true">
                         {move || {
-                            let rows = queued.get().into_iter().filter(|q| q.rejected.is_none()).collect::<Vec<_>>();
+                            let rows = queued.get().into_iter().filter(|q| q.rejected.is_none() && !withdrawn.with(|ids| ids.contains(&q.command_id))).collect::<Vec<_>>();
                             rows.into_iter().map(|q| {
-                                view! { <Queued q session_id=id.get_value() edit=edit_queued events ready=rewind_ready edit_active /> }
+                                use futures::FutureExt;
+                                if !draft_files.with_value(|m| m.contains_key(&q.command_id)) {
+                                    let files = api::message_draft(id.get_value(), q.command_id.clone()).boxed_local().shared();
+                                    draft_files.update_value(|m| { m.insert(q.command_id.clone(), files.clone()); });
+                                    spawn_local(async move { let _ = files.await; });
+                                }
+                                let command_id = StoredValue::new(q.command_id.clone());
+                                view! {
+                                    <Queued q session_id=id.get_value() take_back />
+                                    {move || withdrawal_notes.with(|notes| notes.get(&command_id.get_value()).cloned()).map(|note| view! {
+                                        <p class="text-right text-xs text-muted" role="status">{note}</p>
+                                    })}
+                                }
                             }).collect_view()
                         }}
                     </div>
@@ -3431,7 +3622,7 @@ fn SideChatBody(session: Session, model_label: RwSignal<String>) -> impl IntoVie
     view! {
         <div class="space-y-3 pb-2 pt-1">
             <Transcript session feed running />
-            <Composer id running disabled=Signal::derive(|| false) error inline=true model=choice files=Signal::derive(move || Some(place.clone())) no_claude_code />
+            <Composer id running disabled=Signal::derive(|| false) error inline=true model=choice files=Signal::derive(move || Some(place.clone())) no_claude_code recovery=feed.composer />
         </div>
     }
 }
@@ -4961,7 +5152,7 @@ fn SubagentLive(id: String, row: Memo<Option<Session>>, open: RwSignal<bool>, to
                                 <button class=format!("{BUTTON} text-xs") title="Continue it where it stopped, with the resume prompt (Settings → Prompts)" on:click=resume>{crate::icons::rotate()}" Resume"</button>
                             })}
                         </div>
-                        <Composer id=sid.get_value() running disabled=Signal::derive(|| false) error inline=true wake />
+                        <Composer id=sid.get_value() running disabled=Signal::derive(|| false) error inline=true wake recovery=feed.composer />
                     </div>
                 }.into_any(),
                 None => view! { <p class="py-1 text-xs text-muted">"Starting…"</p> }.into_any(),
@@ -5562,37 +5753,23 @@ fn ToolBody(
 }
 
 #[component]
-fn Queued(
-    q: QueuedInput,
-    session_id: String,
-    edit: Callback<(MessageEditTarget, String)>,
-    events: RwSignal<Vec<Event>>,
-    ready: Signal<bool>,
-    edit_active: Signal<bool>,
-) -> impl IntoView {
+fn Queued(q: QueuedInput, session_id: String, take_back: Callback<QueuedInput>) -> impl IntoView {
     // The worker handed it to the agent: it reads it at its next step.
     let with_agent = q.with_agent;
-    let text = q.text;
+    let text = q.text.clone();
     let busy = RwSignal::new(false);
-    let edit_busy = Signal::derive(move || busy.get() || edit_active.get());
     let error = RwSignal::new(None::<String>);
-    let (session_id, command_id, text) = (StoredValue::new(session_id), StoredValue::new(q.command_id), StoredValue::new(text));
-    let do_edit = Callback::new(move |_| {
-        let target = MessageEditTarget::Queued(command_id.get_value());
-        // A stale queue snapshot may already have its durable User event.
-        // Never invent a rewind sequence from the queue's delivery order.
-        let seq = if ready.get_untracked() { events.with_untracked(|evs| message_edit_seq(&target, evs)) } else { None };
-        edit.run((seq.map(MessageEditTarget::Transcript).unwrap_or(target), text.get_value()));
-    });
+    let (session_id, command_id, text) = (StoredValue::new(session_id), StoredValue::new(q.command_id.clone()), StoredValue::new(text));
+    let q = StoredValue::new(q);
     view! {
         <div class="flex flex-col items-end gap-1" data-queued-command=command_id.get_value()>
-            <div class="max-w-[85%] whitespace-pre-wrap break-words rounded-2xl rounded-br-sm border border-zinc-300 px-4 py-2 text-sm text-zinc-700 dark:border-zinc-700 dark:text-zinc-300">
+            <div class="max-w-[85%] whitespace-pre-wrap break-words rounded-2xl rounded-br-sm bg-zinc-200 px-4 py-2 text-sm dark:bg-zinc-800">
                 {text.get_value()}
             </div>
-            <div class="flex items-center justify-end gap-1 text-xs text-muted" data-queue-actions="true">
+            <div class="flex items-center justify-end gap-2 text-xs text-muted" data-queue-actions="true">
             <button class="relative flex h-7 w-7 items-center justify-center rounded-md hover:bg-zinc-100 dark:hover:bg-zinc-800 [@media(pointer:coarse)]:after:absolute [@media(pointer:coarse)]:after:-inset-2"
-                title="Take this back" aria-label="Take this back" prop:disabled=move || edit_busy.get()
-                on:click=move |_| do_edit.run(())>{crate::icons::x()}</button>
+                title="Take this back" aria-label="Take this back"
+                on:click=move |_| take_back.run(q.get_value())>{crate::icons::x()}</button>
             // Send now only interrupts an input already handed to the worker;
             // it cannot dispatch an input still held in the head's queue.
             {with_agent.then(|| view! {
@@ -5800,6 +5977,7 @@ fn Composer(
     disabled: Signal<bool>,
     #[prop(optional, into)] archived: Option<Signal<bool>>,
     error: RwSignal<Option<String>>,
+    #[prop(optional)] recovery: Option<RwSignal<Option<ComposerDraft>>>,
     /// Inside a side chat instead of fixed at the bottom of the page.
     #[prop(optional)]
     inline: bool,
@@ -5878,6 +6056,21 @@ fn Composer(
     ));
     let id = StoredValue::new(id);
     let area = NodeRef::<leptos::html::Textarea>::new();
+    let revision = RwSignal::new(0u64);
+    let restoring = RwSignal::new(0usize);
+    if let Some(recovery) = recovery {
+        recovery.set(Some(ComposerDraft {
+            text,
+            files: attachments,
+            area,
+            revision,
+            loading: restoring,
+            returned: StoredValue::new(ReturnedDrafts::default()),
+        }));
+        on_cleanup(move || {
+            recovery.try_set(None);
+        });
+    }
     // A suggestion shown in the empty box is sized to show all of it (on a
     // phone it ran past two lines and was cut off); typing sizes to the text.
     crate::util::autosize_hint(
@@ -6110,7 +6303,11 @@ fn Composer(
         let t = text.get_untracked();
         let uploads = attachments.get_untracked();
         let saved_note = draft_note.get_untracked();
-        if (t.trim().is_empty() && uploads.is_empty()) || disabled.get_untracked() || !draft_ready.get_untracked() {
+        if (t.trim().is_empty() && uploads.is_empty())
+            || disabled.get_untracked()
+            || !draft_ready.get_untracked()
+            || restoring.get_untracked() > 0
+        {
             return;
         }
         // Commands the UI runs (unless a custom command took the name).
@@ -6384,6 +6581,7 @@ fn Composer(
                         prop:disabled=move || disabled.get()
                         prop:value=move || text.get()
                         on:input=move |ev| {
+                            revision.update(|r| *r += 1);
                             text.set(event_target_value(&ev));
                             update_mention();
                         }
@@ -6589,7 +6787,7 @@ fn Composer(
                             <button class=move || format!("{SEND} {TAP_SEND} {} {}", if split_send.get() { "rounded-l-md rounded-r-none" } else { SEND_SHAPE }, if has_text.get() { SEND_READY } else { SEND_EMPTY })
                                 data-active=move || (!stop_shown.get()).to_string() inert=move || stop_shown.get()
                                 title=move || if running.get() { format!("{send_label}: the agent reads it at its next step") } else { send_label.to_owned() }
-                                aria-label=send_label prop:disabled=move || disabled.get() || !draft_ready.get() || stop_shown.get()
+                                aria-label=send_label prop:disabled=move || disabled.get() || !draft_ready.get() || restoring.get() > 0 || stop_shown.get()
                                 on:click=move |_| send()>{send_icon()}</button>
                             <button class=STOP data-active=move || stop_shown.get().to_string() inert=move || !stop_shown.get()
                                 title=move || if armed.get() { "Press Esc again to stop" } else { stop_label }
@@ -7059,6 +7257,41 @@ mod tests {
         assert!(!rewind.contains("api::send_message") && !rewind.contains("Resend"));
         assert!(source.contains("feed.synced.get() && !feed.stream_failed.get()"));
         assert!(rewind.contains("!ready.get_untracked()") && rewind.contains("if !ready.get()"));
+    }
+
+    #[test]
+    fn returned_drafts_stack_in_click_order_before_the_existing_draft() {
+        let mut drafts = ReturnedDrafts::default();
+        let a = drafts.insert("first 😀".into(), Vec::new(), "already typing".into(), Vec::new(), 0);
+        let (text, files, caret) = drafts.value();
+        assert_eq!(text, "first 😀\n\nalready typing");
+        assert_eq!(caret, 8, "selection offsets count UTF-16, not bytes or scalar values");
+        let b = drafts.insert("second".into(), Vec::new(), text, files, 0);
+        assert_ne!(a, b);
+        assert_eq!(drafts.value().0, "first 😀\n\nsecond\n\nalready typing");
+        assert_eq!(drafts.value().2, 16);
+        // Independent confirmations can finish in either order, without
+        // rolling back a successful or still-pending neighboring insertion.
+        drafts.parts.retain(|(id, _, _)| *id != a);
+        assert_eq!(drafts.value().0, "second\n\nalready typing");
+        drafts.parts.retain(|(id, _, _)| *id != b);
+        assert_eq!(drafts.value().0, "already typing");
+    }
+
+    #[test]
+    fn returned_draft_rollback_requires_unchanged_text_files_and_edit_revision() {
+        let file = c6_api::AttachmentUpload { name: "notes.txt".into(), mime: "text/plain".into(), data: "aGk=".into() };
+        let mut drafts = ReturnedDrafts::default();
+        drafts.insert("returned".into(), vec![file.clone()], "draft".into(), vec![file.clone()], 3);
+        let (text, files, _) = drafts.value();
+        assert_eq!(files, vec![file.clone(), file]);
+        assert!(drafts.unchanged(&text, &files, 3));
+        assert!(!drafts.unchanged("user edited", &files, 3));
+        assert!(!drafts.unchanged(&text, &[], 3));
+        assert!(!drafts.unchanged(&text, &files, 4), "even edit-and-revert is a user change");
+        drafts.insert("next".into(), Vec::new(), "user edited".into(), files.clone(), 4);
+        assert_eq!(drafts.value().0, "next\n\nuser edited");
+        assert_eq!(drafts.value().1, files, "a new recovery keeps all previously edited files");
     }
 
     #[test]

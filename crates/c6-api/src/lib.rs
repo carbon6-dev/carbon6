@@ -2154,6 +2154,9 @@ pub struct AttachmentInfo {
 }
 
 /// An image or file sent with a message.
+/// Also returned as a JSON array by
+/// `GET /api/v1/sessions/{id}/messages/{command_id}/draft` (read-only;
+/// pending or recorded User message; generated `@memex:` context omitted).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AttachmentUpload {

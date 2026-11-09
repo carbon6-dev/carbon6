@@ -645,6 +645,11 @@ pub async fn send_queued_now(id: String, command_id: String) -> Result<(), Strin
     empty(Request::post(&format!("/api/v1/sessions/{id}/queue/{command_id}/now")).send().await).await
 }
 
+/// Original attachment bytes, recovered before withdrawing a waiting input.
+pub async fn message_draft(id: String, command_id: String) -> Result<Vec<c6_api::AttachmentUpload>, String> {
+    json(Request::get(&format!("/api/v1/sessions/{id}/messages/{}/draft", enc(&command_id))).send().await).await
+}
+
 /// Docs made by this session or its subagents, with reasons to keep each.
 pub use c6_api::docs_archive::ArchiveDocCandidate as SessionArchiveDoc;
 

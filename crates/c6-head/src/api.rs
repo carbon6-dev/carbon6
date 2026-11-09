@@ -83,6 +83,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/settings/agents", get(get_agents).put(put_agents))
         .route("/api/v1/commands", get(list_commands))
         .route("/api/v1/sessions/{id}/messages", post(send_message).layer(axum::extract::DefaultBodyLimit::max(ATTACHED_BODY)))
+        .route("/api/v1/sessions/{id}/messages/{command_id}/draft", get(message_draft))
         .route("/api/v1/sessions/{id}/messages/{command_id}/take-back", post(take_back_message))
         .route("/api/v1/sessions/{id}/seen", post(seen_session))
         .route("/api/v1/sessions/{id}/viewed", post(viewed_session))
@@ -3191,6 +3192,26 @@ async fn cancel_queued(State(st): State<Arc<HeadState>>, Path((id, command_id)):
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Read-only draft uploads, including when delivery won the prefetch race.
+/// Session ownership is enforced by the same realm middleware as its events.
+async fn message_draft(
+    State(st): State<Arc<HeadState>>,
+    Path((id, command_id)): Path<(String, String)>,
+) -> ApiResult<Json<Vec<api::AttachmentUpload>>> {
+    use base64::Engine;
+
+    let files = st.store.message_attachments(&id, &command_id).await?.ok_or_else(|| crate::not_found("no such message"))?;
+    Ok(Json(
+        files
+            .into_iter()
+            // These are generated context, not uploads; sending again resolves
+            // them from the draft's mentions, just like editing the queue.
+            .filter(|a| !a.name.starts_with("@memex:"))
+            .map(|a| api::AttachmentUpload { name: a.name, mime: a.mime, data: base64::engine::general_purpose::STANDARD.encode(a.data) })
+            .collect(),
+    ))
+}
+
 async fn take_back_message(State(st): State<Arc<HeadState>>, Path((id, command_id)): Path<(String, String)>) -> ApiResult<StatusCode> {
     crate::sessions::take_back_message(&st, &id, &command_id).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -4677,6 +4698,148 @@ async fn decision_session(State(st): State<Arc<HeadState>>, Path(id): Path<i64>)
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn message_draft_roundtrips_pending_and_durable_uploads_with_realm_scope() {
+        use base64::Engine;
+        use c6_proto::{Attachment, SessionCommand, SessionEvent, UserInput, UserMessage, session_command, session_event};
+        use prost::Message;
+
+        let dir = tempfile::tempdir().unwrap();
+        let head = crate::start(crate::HeadConfig {
+            data_dir: dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let st = &head.state;
+        crate::realms::create(st, &api::RealmIn { id: "lab".into(), name: "Lab".into(), ..Default::default() }, "you").await.unwrap();
+        let worker = WorkerId::new();
+        for (id, realm) in [("draft-home", "home"), ("draft-lab", "lab")] {
+            sqlx::query(
+                "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, realm) \
+                 VALUES (?, ?, 'Draft', '', 'c', 'm', 'idle', 0, 0, ?)",
+            )
+            .bind(id)
+            .bind(worker.to_string())
+            .bind(realm)
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+        }
+        let uploads = vec![
+            Attachment { name: "original image.png".into(), mime: "image/png".into(), data: vec![0, 255, 128, 1] },
+            Attachment { name: "notes ü.txt".into(), mime: "text/plain".into(), data: "original\ntext ü".as_bytes().to_vec() },
+        ];
+        let mut source = uploads.clone();
+        source.push(Attachment { name: "@memex:project:test".into(), mime: "text/markdown".into(), data: b"generated context".to_vec() });
+        for (id, files) in [("draft-input", source.clone()), ("empty-input", Vec::new())] {
+            st.store
+                .enqueue_command(&crate::store::NewCommand {
+                    id,
+                    session_id: "draft-lab",
+                    worker_id: worker,
+                    data: SessionCommand {
+                        command_id: id.into(),
+                        session_id: "draft-lab".into(),
+                        kind: Some(session_command::Kind::Input(UserInput {
+                            text: "draft".into(),
+                            attachments: files,
+                            ..Default::default()
+                        })),
+                    }
+                    .encode_to_vec(),
+                    text: Some("draft"),
+                })
+                .await
+                .unwrap();
+        }
+        let lab = st.store.create_api_token("lab", Some("lab")).await.unwrap().token.unwrap();
+        let home = st.store.create_api_token("home", Some("home")).await.unwrap().token.unwrap();
+        let root = st.store.create_api_token("root", None).await.unwrap().token.unwrap();
+        let url = format!("http://{}/api/v1/sessions", head.ui_addrs[0]);
+        let expected: Vec<_> = uploads
+            .iter()
+            .map(|a| json!({"name": a.name, "mime": a.mime, "data": base64::engine::general_purpose::STANDARD.encode(&a.data)}))
+            .collect();
+        let before = st.store.pending_input("draft-input").await.unwrap().unwrap();
+        // First pending, then taken: the same contract survives a late fetch.
+        for durable in [false, true] {
+            if durable {
+                let mut recorded = source.clone();
+                recorded.push(Attachment {
+                    name: "worker-mentioned.txt".into(),
+                    mime: "text/plain".into(),
+                    data: b"not an upload".to_vec(),
+                });
+                st.store
+                    .ingest(
+                        worker,
+                        "draft-lab",
+                        &[SessionEvent {
+                            seq: 1,
+                            ts_ms: now_ms(),
+                            kind: Some(session_event::Kind::User(UserMessage {
+                                command_id: "draft-input".into(),
+                                attachments: recorded,
+                                ..Default::default()
+                            })),
+                        }],
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(st.store.pending_input("draft-input").await.unwrap().is_none());
+            }
+            for token in [&lab, &root] {
+                let response = st.http.get(format!("{url}/draft-lab/messages/draft-input/draft")).bearer_auth(token).send().await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response.json::<serde_json::Value>().await.unwrap(), json!(expected));
+            }
+            for (token, session, command) in [
+                (&home, "draft-lab", "draft-input"),
+                (&lab, "draft-home", "draft-input"),
+                (&root, "draft-home", "draft-input"),
+                (&lab, "draft-lab", "missing"),
+                (&root, "missing", "draft-input"),
+            ] {
+                let response = st.http.get(format!("{url}/{session}/messages/{command}/draft")).bearer_auth(token).send().await.unwrap();
+                assert_eq!(response.status(), StatusCode::NOT_FOUND, "{session}/{command}");
+            }
+            let response = st.http.get(format!("{url}/draft-lab/messages/empty-input/draft")).bearer_auth(&lab).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.json::<serde_json::Value>().await.unwrap(), json!([]));
+        }
+        let stored: Vec<u8> =
+            sqlx::query_scalar("SELECT data FROM commands WHERE id = 'draft-input'").fetch_one(&st.store.pool).await.unwrap();
+        assert_eq!(stored, before.2, "reads preserve the original command and generated context");
+        // Old/imported events can have no retained source command at all.
+        st.store
+            .ingest(
+                worker,
+                "draft-lab",
+                &[SessionEvent {
+                    seq: 2,
+                    ts_ms: now_ms(),
+                    kind: Some(session_event::Kind::User(UserMessage {
+                        command_id: "source-less".into(),
+                        attachments: source,
+                        ..Default::default()
+                    })),
+                }],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let response = st.http.get(format!("{url}/draft-lab/messages/source-less/draft")).bearer_auth(&lab).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.json::<serde_json::Value>().await.unwrap(), json!(expected));
+        assert_eq!(st.store.events_after("draft-lab", 0, 10).await.unwrap().len(), 2, "draft reads never append or delete events");
+        head.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn decision_answer_attribution_uses_auth_origin_not_realm() {

@@ -1793,6 +1793,61 @@ impl Store {
             .map(|r| (r.get::<Option<String>, _>("text").unwrap_or_default(), r.get("created_at"), r.get::<Vec<u8>, _>("data"))))
     }
 
+    /// Original uploads for a pending input, or its already-recorded User.
+    /// Prefer the source command: workers may add mentioned files to User.
+    /// The fallback streams only the command's enqueue floor through a captured
+    /// highwater (legacy/imported messages without a command start at zero).
+    /// Nothing is retired or changed, and no write transaction holds the scan.
+    pub(crate) async fn message_attachments(
+        &self,
+        session_id: &str,
+        command_id: &str,
+    ) -> anyhow::Result<Option<Vec<c6_proto::Attachment>>> {
+        use futures::TryStreamExt;
+        use prost::Message;
+
+        if command_id.is_empty() {
+            return Ok(None);
+        }
+        let mut conn = self.pool.acquire().await?;
+        let row = sqlx::query(
+            "SELECT s.last_seq, c.data, c.state, c.enqueued_after_seq FROM sessions s \
+             LEFT JOIN commands c ON c.session_id = s.id AND c.id = ? WHERE s.id = ?",
+        )
+        .bind(command_id)
+        .bind(session_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        let source = row.get::<Option<Vec<u8>>, _>("data").map(|data| c6_proto::SessionCommand::decode(data.as_slice())).transpose()?;
+        let uploads = source.and_then(|c| {
+            if c.session_id != session_id || c.command_id != command_id {
+                return None;
+            }
+            match c.kind {
+                Some(c6_proto::session_command::Kind::Input(input)) => Some(input.attachments),
+                _ => None,
+            }
+        });
+        if row.get::<Option<String>, _>("state").as_deref() == Some("pending") && uploads.is_some() {
+            return Ok(uploads);
+        }
+        let mut rows = sqlx::query("SELECT data FROM events WHERE session_id = ? AND seq > ? AND seq <= ? ORDER BY seq")
+            .bind(session_id)
+            .bind(row.get::<Option<i64>, _>("enqueued_after_seq").unwrap_or(0))
+            .bind(row.get::<i64, _>("last_seq"))
+            .fetch(&mut *conn);
+        while let Some(row) = rows.try_next().await? {
+            let event = c6_proto::SessionEvent::decode(row.get::<Vec<u8>, _>("data").as_slice())?;
+            if let Some(c6_proto::session_event::Kind::User(user)) = event.kind
+                && user.command_id == command_id
+            {
+                return Ok(Some(uploads.unwrap_or(user.attachments)));
+            }
+        }
+        Ok(None)
+    }
+
     /// Retires a rejected input and queues a restore followed by a copy of it.
     pub async fn replace_with_restore(&self, old_id: &str, restore: &NewCommand<'_>, input: &NewCommand<'_>) -> anyhow::Result<()> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -2163,6 +2218,38 @@ pub(crate) mod tests {
             assert_eq!(input.state, if fails_session { "rejected" } else { "pending" }, "{id}");
             assert_eq!(input.error.as_deref(), fails_session.then_some("session failed to start"), "{id}");
         }
+    }
+
+    #[tokio::test]
+    async fn message_attachments_bounds_durable_scan_by_enqueue_floor_and_highwater() {
+        use c6_proto::{Attachment, SessionCommand, UserInput, session_command};
+        use prost::Message;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("c6h.db")).await.unwrap();
+        let worker = WorkerId::new();
+        store.create_session(&session("s", worker), &[], false).await.unwrap();
+        store.ingest(worker, "s", &[input_event(1, "old")]).await.unwrap().unwrap();
+        let files = vec![Attachment { name: "upload.txt".into(), mime: "text/plain".into(), data: b"original".to_vec() }];
+        for id in ["taken", "unrecorded"] {
+            let mut cmd = command(id, "s", worker, Some("draft"));
+            cmd.data = SessionCommand {
+                command_id: id.into(),
+                session_id: "s".into(),
+                kind: Some(session_command::Kind::Input(UserInput { attachments: files.clone(), ..Default::default() })),
+            }
+            .encode_to_vec();
+            store.enqueue_command(&cmd).await.unwrap();
+        }
+        store.ingest(worker, "s", &[input_event(2, "taken")]).await.unwrap().unwrap();
+        sqlx::query("UPDATE commands SET state = 'done' WHERE id = 'unrecorded'").execute(&store.pool).await.unwrap();
+        // Neither the historical prefix nor rows beyond the durable highwater
+        // may be decoded, even when no matching User is found in the window.
+        sqlx::query("UPDATE events SET data = X'FF' WHERE session_id = 's' AND seq = 1").execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO events (session_id, seq, ts, data) VALUES ('s', 3, 0, X'FF')").execute(&store.pool).await.unwrap();
+        let got = store.message_attachments("s", "taken").await.unwrap().unwrap();
+        assert_eq!(got, files);
+        assert!(store.message_attachments("s", "unrecorded").await.unwrap().is_none());
     }
 
     #[tokio::test]
