@@ -215,18 +215,24 @@ async fn a_worker_restart_keeps_the_subagents_log() {
     })
     .await;
 
+    // The parent goes on after the restart (docs/restarts.md §4): its reply.
+    env.mock.push(Reply::Text("Carried on.".into()));
     stop_first.cancel();
     drop(first);
     tokio::time::sleep(Duration::from_millis(200)).await;
     let (second, stop_second) = run_worker(state.path()).await;
+    // Both turns are closed as cut short, and the head has each log as the
+    // worker does (the parent then goes on by itself, docs/restarts.md §4,
+    // so they agree once it settles).
     for sid in [&id, &child_id] {
-        let ev = eventually("turn closed", async || {
+        eventually("turn closed, and head and worker agreeing", async || {
             let ev = env.events(sid).await;
-            (turn_end(&ev) == Some(TurnEndReason::WorkerRestarted)).then_some(ev)
+            let closed = ev.iter().any(|e| matches!(e.kind, EventKind::TurnEnded { reason: TurnEndReason::WorkerRestarted, .. }));
+            let idle = env.detail(sid).await?.session.status == SessionStatus::Idle;
+            let (_, journal) = second.journal.load_session(sid).await.ok()??;
+            (closed && idle && ev.len() == journal.len()).then_some(())
         })
         .await;
-        let (_, journal) = second.journal.load_session(sid).await.unwrap().unwrap();
-        assert_eq!(ev.len(), journal.len(), "head and worker agree on {sid}");
     }
     let ev = env.events(&child_id).await;
     assert!(ev.iter().any(|e| matches!(&e.kind, EventKind::ToolResult { output, .. } if output.contains("partial"))));
