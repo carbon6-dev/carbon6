@@ -310,6 +310,11 @@ async fn base_copies_send_what_changed_and_old_ones_go() {
     let c6h = s3.generations.iter().find(|g| g.database == "c6h.db").unwrap();
     assert!(!c6h.complete, "its changes didn't get there: {s3:?}");
     mock.set_down(false);
+    // Back to a real limit: at 0, any change the head writes between two
+    // passes (a busy head writes all the time) is "too far behind" again.
+    let mut s = backups::settings(&st).await;
+    s.spool_limit_mb = c6_api::BackupSettings::default().spool_limit_mb;
+    backups::put_settings(&st, s).await.unwrap();
     // Back: its next base copies catch it up (a forced pass, so as not to
     // wait out the retry delay after a base copy failed partway).
     backups::run(&st, true).await.unwrap();
