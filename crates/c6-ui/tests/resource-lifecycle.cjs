@@ -35,6 +35,8 @@ async function clickRpc(page, label, method, done) {
   await settle(page);
 }
 
+const holdNext = state => new Promise(resolve => { state.onHeld = resolve; state.hold = true; });
+
 async function chat(f, state, stale) {
   const { page } = f;
   const step = name => { f.phase = name; console.log(`  ${name}`); };
@@ -43,10 +45,9 @@ async function chat(f, state, stale) {
     // The baseline framework serializes fetches within this owner: the true
     // request starts only after false finishes. Preserve that behavior rather
     // than claiming stronger cancellation/concurrent stale-result guarantees.
-    state.hold = true;
-    const requested = page.waitForRequest(request => request.method() === 'POST' &&
-      new URL(request.url()).pathname === '/api/v1/memex/rpc' &&
-      request.postDataJSON().method === 'memex.chat.saved');
+    // Wait for the route itself to hold the request: a request event can
+    // reach the test before its route handler has run.
+    const requested = holdNext(state);
     await page.getByRole('button', { name: 'Saved', exact: true }).click();
     await requested;
     assert(state.held, 'old false response is held by the private route');
@@ -65,10 +66,7 @@ async function chat(f, state, stale) {
       'queued dependency recovers to Completed after the old error; no stronger transient/cancellation claim');
     await page.getByText('Nothing completed yet.', { exact: true }).waitFor();
     step('hold old owner false request across unmount/remount');
-    state.hold = true;
-    const nextFalse = page.waitForRequest(request => request.method() === 'POST' &&
-      new URL(request.url()).pathname === '/api/v1/memex/rpc' &&
-      request.postDataJSON().method === 'memex.chat.saved' && !request.postDataJSON().params.done);
+    const nextFalse = holdNext(state);
     await page.getByRole('button', { name: 'In progress', exact: true }).click();
     await nextFalse;
     assert(state.held, 'old owner has another held false query');
@@ -186,7 +184,7 @@ async function check(browser, origin, engine, theme, kind) {
                 case 'memex.chat.save': state.saves.push(body.params); json = {}; break;
                 case 'memex.chat.saved':
                   assert.equal(typeof body.params.done, 'boolean');
-                  if (state.hold && !body.params.done) { state.hold = false; state.held = route; return; }
+                  if (state.hold && !body.params.done) { state.hold = false; state.held = route; state.onHeld(); return; }
                   if (state.reject) { state.reject = false; return route.fulfill({ status: 500,
                     json: { error: 'Resource lifecycle fixture error' } }); }
                   json = body.params.done ? [] : [savedMessage(state.remount ? 'Fresh remounted saved resource' :
