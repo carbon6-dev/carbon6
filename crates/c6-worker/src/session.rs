@@ -265,6 +265,16 @@ const NOTICE_RECOVERY_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 const HANDOFF_REWIND: &str = "can only rewind to a message after the last switch between Claude Code and carbon6's agent: \
                               the other runtime's conversation cannot be taken back";
 
+/// An expected restore admission refusal, not a failed journal operation.
+#[derive(Debug)]
+struct RewindGuardRefused;
+
+impl std::fmt::Display for RewindGuardRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Descendant stop confirmation is required before restoring files")
+    }
+}
+
 impl SessionManager {
     pub fn new(journal: Arc<Journal>, link: Arc<HeadLink>, worktrees: PathBuf) -> Self {
         let state_dir = worktrees.parent().map(Path::to_path_buf).unwrap_or_else(|| worktrees.clone());
@@ -2220,7 +2230,7 @@ impl Actor {
                 }
                 if let Err(e) = self.rewind(command_id.clone(), to_seq, restore).await {
                     error!(session = %self.writer.session_id, "rewinding: {e:#}");
-                    if !self.runs_claude_code() {
+                    if !self.runs_claude_code() && !e.is::<RewindGuardRefused>() {
                         // No CLI reset intent to roll back. Preserve the
                         // native actor's existing fail-closed journal-error path.
                         let _ = self
@@ -2650,12 +2660,17 @@ impl Actor {
                             Ok(false) => {},
                             Err(e) => { error!("checking rewind receipt: {e:#}"); return; }
                         }
-                        if self.runs_claude_code() {
+                        if self.runs_claude_code() || restore_files {
                             // Dispatch preflight can race a newly started child.
-                            // Recheck before canceling the running turn as well.
+                            // Recheck before canceling the running turn, also
+                            // for a file restore on carbon6's own loop.
                             let check = async {
                                 let events = self.journal.events_after(&self.writer.session_id, 0, u32::MAX).await?;
-                                self.manager.rewind_preflight(&self.writer.session_id, &events, to_seq, restore_files).await
+                                if self.runs_claude_code() {
+                                    self.manager.rewind_preflight(&self.writer.session_id, &events, to_seq, restore_files).await
+                                } else {
+                                    self.manager.rewind_children_stopped(&events).await
+                                }
                             }.await;
                             if let Err(e) = check {
                                 let pending = self.journal.claude_rewind(&self.writer.session_id).await;
@@ -2669,6 +2684,8 @@ impl Actor {
                                 rewinds.clear();
                                 continue;
                             }
+                        }
+                        if self.runs_claude_code() {
                             if let Ok(Some((r, 0))) = self.journal.claude_rewind(&self.writer.session_id).await {
                                 // A NEW command is an explicit retry. Implicit
                                 // redelivery of a failed receipt never retries.
@@ -3156,6 +3173,12 @@ impl Actor {
         let mut restore_error = String::new();
         let mut restored = false;
         if restore_files {
+            // Check at the shared restore boundary, not only during Claude
+            // Code reset: an ancestor on carbon6's loop can also have a
+            // descendant CLI writing this tree. Raw history includes retained
+            // and previously withdrawn children. Conversation-only Rewind
+            // keeps its existing runtime-specific admission behavior.
+            self.manager.rewind_children_stopped(&events).await.map_err(|error| error.context(RewindGuardRefused))?;
             let effective = c6_agent::effective_events(&events);
             let commit = effective.iter().filter(|e| e.seq < to_seq).rev().find_map(|e| match &e.kind {
                 Some(session_event::Kind::Checkpoint(c)) if !c.commit.is_empty() => Some(c.commit.clone()),
@@ -7247,6 +7270,229 @@ for line in sys.stdin:
         manager.rewind_children_stopped(&links).await.unwrap();
     }
 
+    async fn rewind_file_restore_dispatch_refuses_held_descendant(claude_ancestor: bool) {
+        if !c6_testkit::have("python3") {
+            return;
+        }
+        let (state, manager) = rewind_test_manager().await;
+        let work = tempfile::tempdir().unwrap();
+        let _cleanup = crate::claude_code::tests::HeldFixtureCleanup(manager.claude_dir().join("held"));
+        let (child_spec, child_started, bin) = rewind_held_fixture(work.path());
+        let mut child = rewind_child_events();
+        child[0] = ev(1, session_event::Kind::Started(child_started.clone()));
+        manager.journal.import("s", &child_spec, &child).await.unwrap();
+        let spec = if claude_ancestor { child_spec.clone() } else { CreateSession::default() };
+        let started = if claude_ancestor {
+            child_started
+        } else {
+            SessionStarted { cwd: work.path().display().to_string(), tool_profile: "generic".into(), ..Default::default() }
+        };
+        let file = work.path().join("owned.txt");
+        std::fs::write(&file, "checkpoint").unwrap();
+        let checkpoint = Checkpoints::new(state.path(), "root", work.path()).snapshot().await.unwrap();
+        std::fs::write(&file, "unrestored").unwrap();
+        let mut link = rewind_child_link("s");
+        link.seq = 3;
+        let events = [
+            ev(1, session_event::Kind::Started(started)),
+            ev(2, session_event::Kind::Checkpoint(Checkpoint { commit: checkpoint, error: String::new() })),
+            link,
+            user(4, "target"),
+        ];
+        manager.journal.import("root", &spec, &events).await.unwrap();
+        leave_rewind_held(&manager, &child_spec, &bin, work.path(), "unselected-child-fork");
+        let (record, _) =
+            crate::claude_code::Process::held_record(&manager.claude_dir().join("held"), "unselected-child-fork").unwrap().unwrap();
+        let metadata = std::fs::read(record.join("meta.json")).unwrap();
+        let command = |id: &str, restore_files| SessionCommand {
+            session_id: "root".into(),
+            command_id: id.into(),
+            kind: Some(session_command::Kind::Rewind(c6_proto::Rewind { to_seq: 4, restore_files })),
+        };
+        let result = manager.handle(command("restore-refused", true)).await;
+        if claude_ancestor {
+            assert!(result.unwrap_err().contains("Subagent s"), "Claude Code dispatch must refuse before reset admission");
+        } else {
+            result.unwrap(); // carbon6's actor checks before cancellation and execution.
+        }
+        let rejection = c6_testkit::eventually("production file-restore refusal", async || {
+            manager.journal.command_rejection("restore-refused").await.unwrap()
+        })
+        .await;
+        assert!(rejection.contains("Subagent s") && rejection.contains("live or unconfirmed Claude Code runtime"), "{rejection}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "unrestored");
+        assert_eq!(std::fs::read(record.join("meta.json")).unwrap(), metadata);
+        assert!(!record.join("code").exists(), "refusing ancestor Rewind must not stop the child CLI");
+        assert!(manager.journal.claude_rewind("root").await.unwrap().is_none(), "refusal must not create a Claude reset intent");
+        let raw = manager.journal.events_after("root", 0, u32::MAX).await.unwrap();
+        assert!(!raw.iter().any(|event| matches!(event.kind, Some(session_event::Kind::Rewound(_)))));
+        let root = manager.actors.lock().unwrap().get("root").unwrap().clone();
+        assert!(!root.tx.is_closed(), "an expected guard refusal must preserve the actor");
+        root.tx.send(ActorMsg::SetSubagentModel { command_id: "after-refusal".into(), model: None }).unwrap();
+        c6_testkit::eventually("actor remains usable after restore refusal", async || {
+            manager.journal.events_after("root", 0, u32::MAX).await.unwrap().iter().any(
+                |event| matches!(&event.kind, Some(session_event::Kind::SubagentModelSet(model)) if model.command_id == "after-refusal"),
+            ).then_some(())
+        })
+        .await;
+
+        if claude_ancestor {
+            // Exercise real dispatch admission for the retained-conversation
+            // exemption, but capture the message instead of starting a real
+            // CLI reset. Refusal above used the real actor and its journal.
+            let admission = SessionManager::new(manager.journal.clone(), Arc::default(), state.path().join("worktrees"));
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            admission.actors.lock().unwrap().insert("root".into(), Handle { tx, ..root });
+            admission.handle(command("conversation-only", false)).await.unwrap();
+            assert!(matches!(rx.recv().await,
+                Some(ActorMsg::Rewind { command_id, to_seq: 4, restore_files: false }) if command_id == "conversation-only"));
+        } else {
+            // The ordinary-loop conversation-only path actually executes,
+            // despite the retained child's still-live held CLI.
+            manager.handle(command("conversation-only", false)).await.unwrap();
+            c6_testkit::eventually("ordinary retained-child conversation rewind", async || {
+                manager
+                    .journal
+                    .events_after("root", 0, u32::MAX)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|event| {
+                        matches!(&event.kind, Some(session_event::Kind::Rewound(rewound))
+                        if rewound.command_id == "conversation-only" && !rewound.restored_files)
+                    })
+                    .then_some(())
+            })
+            .await;
+            assert!(manager.journal.claude_rewind("root").await.unwrap().is_none(), "ordinary Rewind must not acquire a CLI reset intent");
+        }
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "unrestored");
+        assert!(!record.join("code").exists());
+        crate::claude_code::stop_held_for_rewind(&manager.claude_dir().join("held"), "s", &manager.journal).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rewind_file_restore_dispatch_claude_ancestor_refuses_live_held_descendant() {
+        rewind_file_restore_dispatch_refuses_held_descendant(true).await;
+    }
+
+    #[tokio::test]
+    async fn rewind_file_restore_dispatch_carbon6_ancestor_refuses_live_held_descendant() {
+        rewind_file_restore_dispatch_refuses_held_descendant(false).await;
+    }
+
+    #[tokio::test]
+    async fn rewind_file_restore_dispatch_late_descendant_refusal_preserves_actor_and_queued_input() {
+        let (state, manager) = rewind_test_manager().await;
+        let work = tempfile::tempdir().unwrap();
+        let file = work.path().join("owned.txt");
+        std::fs::write(&file, "checkpoint").unwrap();
+        let checkpoint = Checkpoints::new(state.path(), "root", work.path()).snapshot().await.unwrap();
+        std::fs::write(&file, "unrestored").unwrap();
+        let mut link = rewind_child_link("child");
+        link.seq = 3;
+        let events = [
+            ev(
+                1,
+                session_event::Kind::Started(SessionStarted {
+                    cwd: work.path().display().to_string(),
+                    tool_profile: "generic".into(),
+                    ..Default::default()
+                }),
+            ),
+            ev(2, session_event::Kind::Checkpoint(Checkpoint { commit: checkpoint, error: String::new() })),
+            link,
+            user(4, "target"),
+        ];
+        manager.journal.import("root", &CreateSession::default(), &events).await.unwrap();
+        let mut child = rewind_child_events();
+        child[0] =
+            ev(1, session_event::Kind::Started(SessionStarted { tool_profile: crate::claude_code::PROFILE.into(), ..Default::default() }));
+        manager.journal.import("child", &CreateSession::default(), &child).await.unwrap();
+        let mut cli = tokio::process::Command::new("sleep").arg("300").process_group(0).kill_on_drop(true).spawn().unwrap();
+        let pgid = cli.id().unwrap() as i32;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        manager.actors.lock().unwrap().insert(
+            "child".into(),
+            Handle {
+                tx,
+                tools: Arc::new(SessionTools::new(work.path().into())),
+                running: Arc::default(),
+                claude_code: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                inbox: Arc::default(),
+            },
+        );
+        manager
+            .handle(SessionCommand {
+                session_id: "root".into(),
+                command_id: "late-restore".into(),
+                kind: Some(session_command::Kind::Rewind(c6_proto::Rewind { to_seq: 4, restore_files: true })),
+            })
+            .await
+            .unwrap();
+        // The actor has already checked runtime ownership, but has not yet
+        // cancelled/queued the rewind. Publish a writer during its mailbox
+        // barrier; the execution-time guard must detect this new ownership.
+        let Some(ActorMsg::RewindIdle(idle)) = c6_testkit::within("first child admission barrier", rx.recv()).await else {
+            panic!("expected a child mailbox barrier")
+        };
+        manager.journal.track_claude_process("child", pgid).await.unwrap();
+        manager
+            .handle(SessionCommand {
+                session_id: "root".into(),
+                command_id: "queued-input".into(),
+                kind: Some(session_command::Kind::Input(c6_proto::UserInput {
+                    text: "preserve this queued input".into(),
+                    human_origin: true,
+                    ..Default::default()
+                })),
+            })
+            .await
+            .unwrap();
+        idle.send(true).unwrap();
+        let rejection = c6_testkit::eventually("execution-time descendant refusal", async || {
+            manager.journal.command_rejection("late-restore").await.unwrap()
+        })
+        .await;
+        assert!(rejection.contains("Descendant stop confirmation") && rejection.contains("Subagent child"), "{rejection}");
+        c6_testkit::eventually("queued input survives expected execution refusal", async || {
+            manager
+                .journal
+                .events_after("root", 0, u32::MAX)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| matches!(&event.kind, Some(session_event::Kind::User(input)) if input.command_id == "queued-input"))
+                .then_some(())
+        })
+        .await;
+        let root = manager.actors.lock().unwrap().get("root").unwrap().clone();
+        assert!(!root.tx.is_closed(), "late guard refusal must not terminate the actor");
+        root.tx.send(ActorMsg::SetSubagentModel { command_id: "still-usable".into(), model: None }).unwrap();
+        c6_testkit::eventually("actor handles commands after late refusal", async || {
+            manager
+                .journal
+                .events_after("root", 0, u32::MAX)
+                .await
+                .unwrap()
+                .iter()
+                .any(
+                    |event| matches!(&event.kind, Some(session_event::Kind::SubagentModelSet(model)) if model.command_id == "still-usable"),
+                )
+                .then_some(())
+        })
+        .await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "unrestored");
+        assert!(manager.journal.claude_rewind("root").await.unwrap().is_none());
+        let raw = manager.journal.events_after("root", 0, u32::MAX).await.unwrap();
+        assert!(!raw.iter().any(|event| matches!(event.kind, Some(session_event::Kind::Rewound(_)))));
+        assert!(cli.try_wait().unwrap().is_none(), "refusal must not stop the child process");
+        assert_eq!(manager.journal.claude_processes("child").await.unwrap(), [pgid]);
+        cli.kill().await.unwrap();
+    }
+
+    // Unit-level guard coverage below calls rewind_preflight directly. The
+    // rewind_file_restore_dispatch_* tests above cover production routing.
     #[tokio::test]
     async fn rewind_completed_child_with_live_claude_group_blocks_file_restore_but_not_retained_conversation() {
         let (dir, manager) = rewind_test_manager().await;
