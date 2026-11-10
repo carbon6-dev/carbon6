@@ -9,6 +9,7 @@ const os = require('node:os');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { performance } = require('node:perf_hooks');
+const { format } = require('node:util');
 const children = new Set();
 const cancellations = new WeakMap();
 
@@ -201,6 +202,117 @@ async function child(task, directory, environment, runStarted = performance.now(
   return result;
 }
 
+const usesLocalNative = task => task.engine === 'webkit' && task.suite === 'transcript-press';
+
+async function closeOwnedBrowser(browser, kill, deadlineMs) {
+  // Client Browser.close has no timeout (and no public kill method). Keep the
+  // pinned local server's kill handle, not a remote BrowserServer connection.
+  const bounded = async (action, name) => {
+    let timer;
+    try {
+      return await Promise.race([Promise.resolve().then(action), new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${name} deadline (${deadlineMs}ms)`)), deadlineMs);
+      })]);
+    } finally { clearTimeout(timer); }
+  };
+  try { await bounded(() => browser.close(), 'local browser close'); }
+  catch (error) {
+    try {
+      assert.equal(typeof kill, 'function', 'pinned local browser force-kill handle unavailable');
+      await bounded(kill, 'local browser kill');
+    } catch (killError) { throw new AggregateError([error, killError], 'Local browser cleanup failed'); }
+    throw error; // Successful escalation still records the cleanup failure.
+  }
+}
+
+async function localNative(task, directory, environment, runStarted = performance.now(), deadlineMs = 300000, dependencies = {}) {
+  const started = performance.now(), label = `${task.engine}/${task.suite}/${task.shard}`;
+  const io = dependencies.fs || fs;
+  const controller = new AbortController(), cleanupErrors = [];
+  let browser, kill, closing, pending, report, error, launchError, evidenceError, tail = '';
+  let timedOut = false, interrupted = false, launching = false;
+  const close = () => {
+    if (browser) closing ||= closeOwnedBrowser(browser, kill, dependencies.cleanupDeadlineMs || 5000)
+      .catch(error => { cleanupErrors.push(format(error)); });
+    return closing;
+  };
+  const stop = reason => {
+    if (!controller.signal.aborted) controller.abort(reason);
+    return close();
+  };
+  const interrupt = () => {
+    interrupted = true;
+    stop(dependencies.signal.reason || new Error('Browser invocation interrupted'));
+  };
+  const record = channel => (...args) => {
+    const text = format(...args) + '\n';
+    tail = (tail + text).slice(-12000);
+    try {
+      io.appendFileSync(path.join(directory, 'run.log'), text);
+      io.appendFileSync(path.join(directory, 'timeline.jsonl'), JSON.stringify({ ms: performance.now() - started, channel, text }) + '\n');
+    } catch (error) {
+      evidenceError ||= String(error);
+      stop(error); // Event-handler logging must not throw into another worker.
+    }
+  };
+  const log = { log: record('stdout'), error: record('stderr') };
+  const timer = setTimeout(() => {
+    timedOut = true;
+    stop(new Error(`local native worker deadline (${deadlineMs}ms)`));
+  }, deadlineMs);
+  dependencies.signal?.addEventListener('abort', interrupt, { once: true });
+  console.log(`RUN ${label} ${JSON.stringify(task.filters)} parent-local-launch`);
+  try {
+    io.mkdirSync(directory, { recursive: true });
+    io.writeFileSync(path.join(directory, 'run.log'), '');
+    io.writeFileSync(path.join(directory, 'timeline.jsonl'), '');
+    if (dependencies.signal?.aborted) interrupt();
+    controller.signal.throwIfAborted();
+    const playwright = dependencies.playwright || require(environment.PLAYWRIGHT_CORE || 'playwright-core');
+    const launchOptions = dependencies.launchOptions || require('./motion.cjs').launchOptions;
+    const suite = dependencies.suite || require('./transcript-press.cjs').runSuite;
+    const options = launchOptions(task.engine);
+    launching = true;
+    browser = await playwright[task.engine].launch({ ...options, timeout: Math.min(options.timeout || deadlineMs, deadlineMs) });
+    launching = false;
+    // Capture ownership synchronously, before observing cancellation or running
+    // suite code. Remote connections cannot provide this server object.
+    const process = browser._connection?.toImpl?.(browser)?.options?.browserProcess;
+    if (process?.kill) kill = process.kill.bind(process);
+    assert.equal(typeof kill, 'function', 'native WebKit requires pinned local launch with force-kill ownership');
+    controller.signal.throwIfAborted();
+    pending = Promise.resolve().then(() => {
+      controller.signal.throwIfAborted();
+      return suite({ browser, engine: task.engine,
+        origin: environment.BROWSER_TEST_ORIGIN, root: path.resolve(environment.ROOT || path.join(__dirname, '../dist')),
+        evidenceDirectory: directory, log, signal: controller.signal, stop,
+        selected: environment.PRESS_CASE?.split(','), timings: true });
+    });
+    report = await pending;
+    assert(Array.isArray(report?.results) && report.results.length, 'native suite returned no controls');
+    assert(report.results.every(result => typeof result?.passed === 'boolean'), 'native suite returned invalid controls');
+  } catch (caught) {
+    error = String(caught.stack || caught);
+    if (launching) launchError = error;
+    log.error(error);
+  } finally {
+    clearTimeout(timer);
+    await close();
+    // Do not release the pool slot, server, or lock with suite callbacks live.
+    await pending?.catch(() => {});
+    for (const error of cleanupErrors) log.error(error);
+    dependencies.signal?.removeEventListener('abort', interrupt);
+  }
+  const finished = performance.now();
+  const result = { ...task, execution: 'parent-local-launch', seconds: (finished - started) / 1000,
+    startedSeconds: (started - runStarted) / 1000, finishedSeconds: (finished - runStarted) / 1000,
+    status: error || evidenceError || timedOut || interrupted || cleanupErrors.length || report?.results.some(result => !result.passed) ? 1 : 0,
+    signal: null, timedOut, interrupted, launchError, error, evidenceError, cleanupErrors, directory };
+  console.log(`${result.status === 0 ? 'PASS' : 'FAIL'} ${label} ${result.seconds.toFixed(2)}s parent-local-launch`);
+  if (result.status !== 0) console.error(tail, `Evidence: ${directory}`);
+  return result;
+}
+
 async function run(env, dependencies = {}) {
   const config = configuration(env), tasks = plan(config, env);
   const output = path.resolve(env.BROWSER_TEST_OUTPUT || 'dist/browser-tests',
@@ -211,7 +323,9 @@ async function run(env, dependencies = {}) {
   const hash = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
   report.assets = fs.readdirSync(report.root, { recursive: true }).filter(file => /\.(wasm|js|css)$/.test(file))
     .map(file => ({ file, sha256: hash(path.join(report.root, file)) }));
-  report.tests = [...config.selected, 'motion', 'browser-runner', 'browser-navigation', 'browser-navigation.test', 'browser-lifecycle', 'browser-lifecycle.test', 'follow-press-unit'].filter((name, index, names) => names.indexOf(name) === index
+  report.tests = [...config.selected, 'motion', 'narrow-fixtures', 'browser-runner', 'browser-runner.test',
+    'browser-navigation', 'browser-navigation.test',
+    'browser-lifecycle', 'browser-lifecycle.test', 'follow-press-unit'].filter((name, index, names) => names.indexOf(name) === index
     && fs.existsSync(path.join(__dirname, `${name}.cjs`))).map(name => ({ name, sha256: hash(path.join(__dirname, `${name}.cjs`)) }));
   const save = () => {
     report.seconds = (performance.now() - started) / 1000;
@@ -226,15 +340,20 @@ async function run(env, dependencies = {}) {
     catch (error) { await browser.kill(); throw error; }
   };
   const { server, origin } = await serve(), servers = [];
+  const nativeController = new AbortController();
   const environment = { ...env, BROWSER_TEST_ORIGIN: origin, BROWSER_MATRIX: config.matrix,
     PERF: config.tier === 'perf' ? '1' : '0', BROWSER_CASE_TIMINGS: '1' };
   let failed = false;
   const interrupt = () => {
     report.interrupted = true;
+    nativeController.abort(new Error('Browser invocation interrupted'));
     for (const child of children) cancellations.get(child)?.();
   };
   const checkInterrupted = () => assert(!report.interrupted, 'Browser invocation interrupted; no further workers will start');
   const worker = async (task, directory) => {
+    if (usesLocalNative(task)) return localNative(task, directory, environment, started, config.workerDeadline * 1000,
+      { playwright, launchOptions, suite: dependencies.nativeSuite, signal: nativeController.signal,
+        cleanupDeadlineMs: dependencies.cleanupDeadlineMs });
     if (env.ISOLATE_BROWSER !== '1') return runChild(task, directory, environment, started, config.workerDeadline * 1000);
     // Playwright launches browsers in detached process groups. Never leave
     // their ownership in a child that our watchdog may have to SIGKILL.
@@ -262,7 +381,7 @@ async function run(env, dependencies = {}) {
     }
     for (const engine of config.engines) {
       checkInterrupted();
-      if (env.ISOLATE_BROWSER === '1' || !tasks.some(task => task.engine === engine)) continue;
+      if (env.ISOLATE_BROWSER === '1' || !tasks.some(task => task.engine === engine && !usesLocalNative(task))) continue;
       const browser = await playwright[engine].launchServer(launchOptions(engine));
       servers.push(browser);
       checkInterrupted();
@@ -308,5 +427,5 @@ async function main(env = process.env) {
   finally { release(); }
 }
 
-module.exports = { configuration, shards, plan, pool, acquireLock, supervise, run, child };
+module.exports = { configuration, shards, plan, pool, acquireLock, supervise, run, child, localNative, usesLocalNative };
 if (require.main === module) main().catch(error => { console.error(error); process.exitCode = 1; });

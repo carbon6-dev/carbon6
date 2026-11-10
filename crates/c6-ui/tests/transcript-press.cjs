@@ -10,9 +10,6 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { serve, fixture, settle, within, launchBrowser } = require('./motion.cjs');
-const playwright = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
-const root = path.resolve(process.env.ROOT || path.join(__dirname, '../dist'));
-const shots = path.join(process.env.SCREENSHOTS || path.join(require('node:os').homedir(), '.cache/c6-helper/transcript-press'), `${Date.now()}-${process.pid}`);
 const initial = 'The agent is writing';
 const chunk = ' The assistant continues writing words during the finger press.';
 const events = [{ seq: 70, ts: 70, type: 'user', command_id: 'press-target',
@@ -57,6 +54,8 @@ async function atEnd(page, seq = 70) {
 async function nativeTouch(f, engine) {
   // These internals are from the pinned Playwright-core 1.65.0 in-process
   // transport. Fail visibly on an incompatible driver; never use DOM events.
+  assert(engine === 'chromium' || typeof f.page._connection?.toImpl === 'function',
+    'native WebKit page-proxy input requires pinned in-process Playwright (use actual launch, not connect)');
   const session = engine === 'chromium'
     ? (f.touchSession ||= await f.context.newCDPSession(f.page))
     : f.page._connection.toImpl(f.page).delegate._pageProxySession;
@@ -98,7 +97,8 @@ async function resumes(f, previous, seq = 70) {
   return current;
 }
 
-async function checkLatest(browser, origin, engine, scenario, motion) {
+async function checkLatest(browser, origin, engine, scenario, motion, options) {
+  const { shots, log, runCase } = options;
   const label = `${engine}-${scenario}-${motion}`, seq = 1201, anchor = 'parent-e101';
   const rawTouch = scenario === 'latest-touch-position', mouse = engine === 'webkit' && !rawTouch;
   const evidence = { motion, nativeInput: mouse ? 'mouse' : 'touch', streams: [], pages: [] };
@@ -139,10 +139,10 @@ async function checkLatest(browser, origin, engine, scenario, motion) {
     back: [], forward: [], stack: 0, minimized: false }], focus: 0, next: 4, full: false };
   let f, progress, touch;
   try {
-    await within(label, async () => {
+    await runCase(label, async () => {
       f = await fixture(browser, origin, { width: 320, height: 568 }, 'light',
         { choice: motion, os: 'no-preference', effective: motion }, current => { progress = current; }, {}, {
-          layout, path: `/sessions/parent#${anchor}`, instrumentation: false,
+          layout, path: `/sessions/parent#${anchor}`, instrumentation: false, log,
           setup: async ({ page, context }) => {
             await context.addInitScript(observePress);
             await context.routeWebSocket('**/sessions/parent/stream?*', socket => {
@@ -167,13 +167,13 @@ async function checkLatest(browser, origin, engine, scenario, motion) {
             });
           },
         });
-      await Promise.race([(async () => {
+      const action = (async () => {
         const { page } = f;
         const saved = () => page.evaluate(() => JSON.parse(localStorage.getItem('c6.home.workspace.v2')).tiles[0]);
         f.phase = 'saved historical window, then real reload';
         await page.locator(`#${anchor}`).waitFor();
         assert.equal((await saved()).columns[0].view.target.anchor, anchor);
-        await page.reload({ waitUntil: 'domcontentloaded' });
+        await f.reload({ waitUntil: 'domcontentloaded' });
         await page.locator(`#${anchor}`).waitFor();
         await settle(page);
         assert.equal(await page.locator(`#parent-e${seq}`).count(), 0, 'the real current row is outside the retained historical drawing window');
@@ -299,13 +299,20 @@ async function checkLatest(browser, origin, engine, scenario, motion) {
           (navigator.maxTouchPoints > 0 || 'ontouchstart' in window)), 'native input preserves phone policy');
         assert.deepEqual(f.errors, []);
         assert.deepEqual(f.requests.filter(request => /^(POST|PUT|PATCH|DELETE) .*\/(messages|side-chats|rewind|interrupt)(\/|$)/.test(request)), []);
-      })(), f.crash]);
+      })();
+      try { await Promise.race([action, f.crash]); }
+      finally {
+        // A crash must not leave the losing action running into the next case.
+        // Closing the context interrupts its pending browser operations.
+        try { if (f.errors.length) await f.context.close(); }
+        finally { await action.catch(() => {}); }
+      }
     });
-    console.log(`PASS ${label}`);
+    log.log(`PASS ${label}`);
     return { label, passed: true, evidence };
   } catch (error) {
     await progress?.page.screenshot({ path: path.join(shots, `${label}-failure.png`) }).catch(() => {});
-    console.error(`FAIL ${label}: ${error.message}`);
+    log.error(`FAIL ${label}: ${error.message}`);
     return { label, passed: false, phase: progress?.phase, error: error.stack, evidence };
   } finally {
     if (progress) {
@@ -314,19 +321,22 @@ async function checkLatest(browser, origin, engine, scenario, motion) {
       evidence.events = await progress.page.evaluate(() => __transcriptPress.events).catch(() => []);
       evidence.errors = progress.errors;
       evidence.requests = progress.requests;
+      evidence.navigation = progress.navigation?.ledger;
+      evidence.rawPageErrors = progress.navigation?.rawPageErrors;
     }
     await touch?.cancel().catch(() => {});
     await progress?.context.close();
   }
 }
 
-async function check(browser, origin, engine, scenario, motion) {
+async function check(browser, origin, engine, scenario, motion, options) {
+  const { shots, log, runCase } = options;
   const label = `${engine}-${scenario}-${motion}`, evidence = { nativeInput: engine === 'webkit' && ['idle', 'stream'].includes(scenario) ? 'mouse' : 'touch', motion };
   let f, progress, touch;
   try {
-    await within(label, async () => {
+    await runCase(label, async () => {
       f = await fixture(browser, origin, { width: 320, height: 568 }, 'light', { choice: motion, os: 'no-preference', effective: motion },
-        current => { progress = current; }, {}, { events, instrumentation: false,
+        current => { progress = current; }, {}, { events, instrumentation: false, log,
           setup: async ({ context }) => context.addInitScript(observePress) });
       evidence.phonePolicy = await f.page.evaluate(() => ({ coarse: matchMedia('(pointer: coarse)').matches,
         points: navigator.maxTouchPoints, touchEvents: 'ontouchstart' in window }));
@@ -346,9 +356,9 @@ async function check(browser, origin, engine, scenario, motion) {
         ['running', 'pending'].includes(animation.playState) && animation.effect?.target?.matches?.('[data-follow-content]')));
       assert(before.gap < 4, 'starts at the actual Latest, not only a follow flag');
       assert(before.visible && before.hit, 'opener is fully visible and hit-tested before native input; no auto-scroll');
-      touch = await nativeTouch(f, engine);
       const point = { id: 1, x: before.x, y: before.y };
       const mouse = evidence.nativeInput === 'mouse';
+      if (!mouse && scenario !== 'tap') touch = await nativeTouch(f, engine);
       f.phase = scenario === 'tap' ? 'ordinary native tap control' : 'native press with one stream chunk';
       if (scenario === 'tap') await f.page.touchscreen.tap(point.x, point.y);
       else if (mouse) { await f.page.mouse.move(point.x, point.y); await f.page.mouse.down(); }
@@ -427,11 +437,11 @@ async function check(browser, origin, engine, scenario, motion) {
       assert.deepEqual(f.errors, [], 'no app errors or disposed-owner callbacks');
       assert.deepEqual(f.requests.filter(request => /^(POST|PUT|PATCH|DELETE) .*\/(messages|side-chats|rewind|interrupt)(\/|$)/.test(request)), [], 'press lifecycle never sends or rewinds');
     });
-    console.log(`PASS ${label}`);
+    log.log(`PASS ${label}`);
     return { label, passed: true, evidence };
   } catch (error) {
     await progress?.page.screenshot({ path: path.join(shots, `${label}-failure.png`) }).catch(() => {});
-    console.error(`FAIL ${label}: ${error.message}`);
+    log.error(`FAIL ${label}: ${error.message}`);
     return { label, passed: false, phase: progress?.phase, error: error.stack, evidence };
   } finally {
     if (progress) {
@@ -441,41 +451,93 @@ async function check(browser, origin, engine, scenario, motion) {
       if (down && up) evidence.pressMs = up.t - down.t;
       evidence.errors = progress.errors;
       evidence.requests = progress.requests;
+      evidence.navigation = progress.navigation?.ledger;
+      evidence.rawPageErrors = progress.navigation?.rawPageErrors;
     }
     await touch?.cancel().catch(() => {});
     await progress?.context.close();
   }
 }
 
-(async () => {
-  const engine = process.env.ENGINE || 'both';
-  assert(['chromium', 'webkit', 'both'].includes(engine), 'ENGINE=chromium,webkit,both');
-  const selected = process.env.PRESS_CASE?.split(',');
+function casesFor(engine, selected) {
+  assert(['chromium', 'webkit'].includes(engine), 'engine=chromium,webkit');
   for (const name of selected || []) assert(['idle', 'stream', 'cancel', 'multi-touch', 'scroll', 'unmount', 'touch-position', 'tap', 'latest-stream', 'latest-touch-position'].includes(name), `Unknown PRESS_CASE ${name}`);
+  return ['idle', 'stream', 'cancel', 'multi-touch', ...(engine === 'chromium' ? ['scroll', 'unmount'] : ['touch-position', 'tap']), 'latest-stream', ...(engine === 'webkit' ? ['latest-touch-position'] : [])]
+    .filter(scenario => !selected || selected.includes(scenario))
+    .flatMap(scenario => (['idle', 'stream', 'latest-stream'].includes(scenario) ? ['full', 'reduced', 'off'] : ['off'])
+      .map(motion => ({ scenario, motion })));
+}
+
+// The caller owns browser/server lifetime. stop() must close the owned browser
+// on a case deadline, so the losing action can be drained before any next case.
+async function runSuite({ browser, engine, origin, root, evidenceDirectory: shots, log = console,
+  signal, stop, selected, timings = true, previousResults = [] }, dependencies = {}) {
+  assert.equal(typeof stop, 'function', 'an owner-provided browser stop function is required');
+  const cases = casesFor(engine, selected);
+  assert(cases.length, 'PRESS_CASE selected no applicable cases');
   fs.mkdirSync(shots, { recursive: true });
   fs.copyFileSync(__filename, path.join(shots, 'transcript-press.cjs'));
   const sha = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
   const report = { root, testSha256: sha(__filename), wasm: fs.readdirSync(root).filter(file => file.endsWith('.wasm')).map(file => ({ file, sha256: sha(path.join(root, file)) })),
-    coverage: { chromium: 'native held touch and automatic compatibility click, including after real Latest; native pan and unmount', webkit: 'native held mouse activation, including after real Latest; separate native raw touch position/cancel and fresh ordinary tap activation, not held-touch compatibility-click or native pan/unmount coverage' }, results: [] };
+    coverage: { chromium: 'native held touch and automatic compatibility click, including after real Latest; native pan and unmount', webkit: 'native held mouse activation, including after real Latest; separate native raw touch position/cancel and fresh ordinary tap activation, not held-touch compatibility-click or native pan/unmount coverage' }, results: [...previousResults] };
+  const save = () => fs.writeFileSync(path.join(shots, 'results.json'), JSON.stringify(report, null, 2));
+  save();
+  let stopped;
+  const runCase = async (label, action) => {
+    let pending, settled = false;
+    try {
+      return await (dependencies.within || within)(label, () => {
+        pending = Promise.resolve().then(() => { signal?.throwIfAborted(); return action(); });
+        pending.then(() => { settled = true; }, () => { settled = true; });
+        return pending;
+      }, { evidenceDirectory: shots, timings });
+    } catch (error) {
+      if (pending && !settled) {
+        stopped = error;
+        try { await stop(error); }
+        finally { await pending.catch(() => {}); }
+      }
+      throw error;
+    }
+  };
+  for (const { scenario, motion } of cases) {
+    signal?.throwIfAborted();
+    const execute = scenario.startsWith('latest-') ? dependencies.checkLatest || checkLatest : dependencies.check || check;
+    const result = await execute(browser, origin, engine, scenario, motion, { shots, log, runCase });
+    result.browser = browser.version();
+    report.results.push(result);
+    save();
+    if (stopped) throw stopped;
+    signal?.throwIfAborted();
+  }
+  const failed = report.results.filter(result => !result.passed).length;
+  log.log(`${report.results.length - failed}/${report.results.length} passed; ${failed} failed; no retries. Evidence: ${shots}`);
+  return report;
+}
+
+async function main(env = process.env) {
+  const engine = env.ENGINE || 'both';
+  assert(['chromium', 'webkit', 'both'].includes(engine), 'ENGINE=chromium,webkit,both');
+  const playwright = require(env.PLAYWRIGHT_CORE || 'playwright-core');
+  const root = path.resolve(env.ROOT || path.join(__dirname, '../dist'));
+  const directory = env.SCREENSHOTS || path.join(require('node:os').homedir(), '.cache/c6-helper/transcript-press');
+  const shots = path.join(directory, `${Date.now()}-${process.pid}`);
   const { server, origin } = await serve();
+  let combined;
   try {
     for (const name of engine === 'both' ? ['chromium', 'webkit'] : [engine]) {
+      if (!casesFor(name, env.PRESS_CASE?.split(',')).length) continue;
       const browser = await launchBrowser(playwright, name);
       try {
-        for (const scenario of ['idle', 'stream', 'cancel', 'multi-touch', ...(name === 'chromium' ? ['scroll', 'unmount'] : ['touch-position', 'tap']), 'latest-stream', ...(name === 'webkit' ? ['latest-touch-position'] : [])]) {
-          if (selected && !selected.includes(scenario)) continue;
-          for (const motion of ['idle', 'stream', 'latest-stream'].includes(scenario) ? ['full', 'reduced', 'off'] : ['off']) {
-            const result = await (scenario.startsWith('latest-') ? checkLatest : check)(browser, origin, name, scenario, motion);
-            result.browser = browser.version();
-            report.results.push(result);
-            fs.writeFileSync(path.join(shots, 'results.json'), JSON.stringify(report, null, 2));
-          }
-        }
+        const report = await runSuite({ browser, engine: name, origin, root, evidenceDirectory: shots,
+          selected: env.PRESS_CASE?.split(','), previousResults: combined?.results, stop: () => browser.close() });
+        combined = report;
+        if (report.results.some(result => !result.passed)) process.exitCode = 1;
       } finally { await browser.close(); }
     }
   } finally { await new Promise(resolve => server.close(resolve)); }
-  assert(report.results.length, 'PRESS_CASE selected no applicable cases');
-  const failed = report.results.filter(result => !result.passed).length;
-  console.log(`${report.results.length - failed}/${report.results.length} passed; ${failed} failed; no retries. Evidence: ${shots}`);
-  if (failed) process.exitCode = 1;
-})().catch(error => { console.error(error.stack || error); process.exitCode = 1; });
+  assert(combined?.results.length, 'PRESS_CASE selected no applicable cases');
+}
+
+module.exports = { runSuite, casesFor, nativeTouch };
+if (require.main === module) main().catch(error => { console.error(error.stack || error); process.exitCode = 1; });
