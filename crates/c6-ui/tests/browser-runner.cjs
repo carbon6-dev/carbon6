@@ -24,8 +24,8 @@ function stopChild(child) {
   signal('SIGTERM');
   const timer = setTimeout(() => signal('SIGKILL'), 5000);
   timer.unref();
-  // The worker may exit before its standalone browser. Kill any remaining
-  // members before declaring this owned process group drained.
+  // A worker may leave non-browser descendants. Kill any remaining members
+  // before declaring this owned process group drained.
   return () => { clearTimeout(timer); signal('SIGKILL'); };
 }
 

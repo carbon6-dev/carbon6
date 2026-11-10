@@ -276,11 +276,10 @@ async function firstPaint(browser, origin, choice, os) {
   const gate = new Promise(resolve => { release = resolve; });
   await context.route('**/*.wasm', async route => { held = true; await gate; await route.abort().catch(() => {}); });
   await context.route('**/js/theme.js', async route => {
-    // Hold the parser-blocking script across actual rendering opportunities,
-    // not 300ms of guessed machine speed. A deferred-script regression would
-    // expose the unthemed body to this same first-rAF sampler before release.
-    await route.request().frame().page().evaluate(() => new Promise(resolve =>
-      requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    // Adversarial network latency, not a completion sleep: the bootstrap must
+    // remain parser-blocking while unavailable. Waiting for page rAF here
+    // can deadlock before the blocked document's first rendering opportunity.
+    await new Promise(resolve => setTimeout(resolve, Number(process.env.THEME_DELAY_MS || 300)));
     await route.continue();
   });
   await context.addInitScript(({ choice }) => {

@@ -376,6 +376,10 @@ there is no generic phrase/phase ignore or retry. Independently observed
 window errors and unhandled rejections are always fatal, even with exactly the
 native message/stack. Pending proof drains before navigation returns. Raw
 diagnostics and classifications remain in logs and per-case navigation JSON.
+This eligibility is specific to the current modelForms path, which does not
+change the baseline routes. Before reusing `f.navigate` with later route/unroute
+mutations, revoke eligibility and add an integrated custom-route negative
+control; the initial successful-response flag alone does not track them.
 
 `navigation-errors.cjs` keeps these positive/negative controls in the full
 regression gate, both directly runnable and compatible with shared servers.
@@ -1324,6 +1328,11 @@ test delays the real theme bootstrap fetch, holds WASM, and checks the first
 body frames before the application renders. It also tests three usable radio
 cards at 240/320/400/480/640px tile and phone widths, persistence, OS changes,
 and real cross-tab palette and selected-card updates.
+The 300ms bootstrap delay is retained **adversarial network input**, not a wait
+for UI completion. Waiting for rAF inside that parser-blocking route deadlocked
+the Chromium diagnostic before the bootstrap arrived; the
+discarded diagnostic cohort is retained in browser-fast evidence. Completion
+still waits for actual themed first frames, with WASM positively held.
 
 `theme.cjs --browser --workspace-radios` additionally checks one/five/six-tile
 workspaces and restored duplicate Settings tiles collapsing to one Appearance
