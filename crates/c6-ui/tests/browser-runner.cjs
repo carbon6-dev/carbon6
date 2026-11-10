@@ -61,9 +61,9 @@ function acquireLock(env) {
 }
 
 const suites = ['workspace-open', 'motion', 'comment-sheet', 'phone-picker', 'phone-bar', 'theme',
-  'settings-lists', 'resource-lifecycle', 'markdown-html', 'status-row', 'ring-render',
+  'settings-lists', 'resource-lifecycle', 'markdown-html', 'status-row', 'stale-transcript', 'ring-render',
   'transcript-press', 'transcript-times', 'message-edit', 'message-origin', 'comments-design', 'session-sheet', 'navigation-errors'];
-const quick = ['workspace-open', 'motion', 'settings-lists', 'markdown-html', 'transcript-press', 'transcript-times'];
+const quick = ['workspace-open', 'motion', 'settings-lists', 'markdown-html', 'transcript-press', 'transcript-times', 'stale-transcript'];
 const words = value => value.trim().split(/[\s,]+/).filter(Boolean);
 const positive = (name, value) => {
   assert(/^[1-9][0-9]*$/.test(value), `${name} must be a positive integer`);

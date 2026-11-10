@@ -27,7 +27,7 @@ test('correctness and perf invocations cannot overlap or steal each other\'s loc
 test('full selection retains both engines and independent acceptance suites', () => {
   const config = configuration({});
   assert.deepEqual(config.engines, ['chromium', 'webkit']);
-  for (const suite of ['message-edit', 'message-origin', 'comments-design', 'session-sheet', 'transcript-press', 'transcript-times', 'navigation-errors'])
+  for (const suite of ['message-edit', 'message-origin', 'comments-design', 'session-sheet', 'transcript-press', 'transcript-times', 'navigation-errors', 'stale-transcript'])
     assert(config.selected.includes(suite), suite);
   const tasks = plan(config, {});
   for (const suite of config.selected) for (const engine of config.engines)
@@ -68,6 +68,7 @@ test('invalid selection and accidental parallel benchmarks fail before launch', 
   assert.equal(configuration({ BROWSER_TIER: 'perf', BROWSER_JOBS: '8' }).jobs, 1);
   assert.deepEqual(configuration({ BROWSER_TIER: 'perf' }).engines, ['chromium']);
   assert(configuration({ BROWSER_TIER: 'quick' }).selected.length < configuration({}).selected.length);
+  assert(configuration({ BROWSER_TIER: 'quick' }).selected.includes('stale-transcript'));
 });
 
 test('pool is bounded and runs each task once without retries', async () => {

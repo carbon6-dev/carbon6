@@ -229,7 +229,7 @@ UI_BROWSER_PASSES=3 make ui-browser-test
 
 The runner covers workspace-open, motion, comment-sheet, phone-picker, phone-bar,
 theme (`--browser`), settings-lists, resource-lifecycle, markdown-html, status-row,
-transcript-press and transcript-times in each engine, plus Chromium ring-render.
+stale-transcript, transcript-press and transcript-times in each engine, plus Chromium ring-render.
 It also includes the previously separate message-edit, message-origin,
 comments-design and session-sheet acceptance gates. This is a curated list, not
 every standalone `.cjs` helper in the directory. **ring-render is Chromium-only**;
@@ -305,7 +305,7 @@ This is emulated phone/browser coverage, not a physical Android Chrome run.
 
 ```sh
 make ui-browser-test                 # all registered regression suites, representative matrix
-make ui-browser-quick                # everyday workspace/motion/lists/Markdown/press/timestamps
+make ui-browser-quick                # everyday workspace/motion/lists/Markdown/press/timestamps/Latest
 make ui-browser-perf                 # exclusive Chromium ring measurements, never parallel neighbours
 BROWSER_MATRIX=all make ui-browser-test # exhaustive correctness combinations, still no benchmark workload
 node --test crates/c6-ui/tests/browser-runner.test.cjs # scheduler/selection checks, no browser
@@ -346,8 +346,9 @@ replaced by a generic success/error example.
 | markdown-html | 12 → 12 | Both surfaces and themes; narration at both widths × both thinking settings, live/replay/historical Text and tool icons retained. |
 | status-row | 12 → 12 | Both themes × all six views; every count/state and wide highlight/scroll/remount check retained. |
 | ring-render | 6 → 2 correctness repetitions | One identical assertion pass per theme instead of three. All 96 live chunks, 12 durable Markdown items and snapshot/animation-identity checks per pass remain, as do compositor layers, shape/keyframes, state/preferences, task wording and once/theme raster seam/ink/easing galleries. Three repetitions/theme, 4× CPU throttle, 35ms producer pacing, profiles/traces/rAF/long-task timings, trace-qualified zero-ring-Paint, and the unchanged 600ms blocked-main-thread screencast/assertions move together to **perf**, not deletion. Optional `PHONE=1` matrix is unchanged and was never in the default runner. |
-| transcript-press | 10 → 10 | Idle/stream × Full/Reduced/Off plus cancellation/multitouch and engine-specific native controls; source-helper unit checks still run once. |
+| transcript-press | 10 → 13 Chromium / 14 WebKit | All original idle/stream × Full/Reduced/Off, cancellation/multitouch and engine-specific native controls remain. Integration adds seven post-Latest controls: held press through layout growth in all three policies/engine, plus WebKit raw-touch position/cancel/recovery and separate native tap. Source-helper unit checks still run once. |
 | transcript-times | 4 → 4 | Off/Exchanges/All and side-chat Off; exact empty-row assertions unchanged. |
+| stale-transcript | Newly integrated: 4 → 4 | Both phone/desktop × Latest/normal-return cases in each engine, now registered in full and quick. Historical target replay/reconnect, actual tail/pending decision, composer/draft/stream ownership, obsolete response cancellation and reload assertions are unchanged. |
 | message-edit | Separate gate → all 60 | All 30 outcomes × desktop/phone now in full; refused resets, response loss, attachment recovery, stacking/replay/durable-origin cases are **not** merged. |
 | message-origin | Separate gate → all 6 | Three viewports × both themes now in full. |
 | comments-design | Separate gate → all 10 | All five layouts × both themes now in full; unique margin-fit/Light deferred-save races remain. This does not replace comment-sheet. |
@@ -390,9 +391,10 @@ and cancellation evidence is retained under
 
 Fixed completion sleeps were not replaced with shorter sleeps. Ring correctness
 waits for each actual chunk/item and committed frames; perf retains deliberate
-35ms workload pacing. First-paint theme delivery is held across two actual
-rendering opportunities instead of a 300ms wall sleep, preserving the adverse
-parser-blocking/first-frame check. Session-sheet Stop waits for the exact mocked
+35ms workload pacing. First-paint theme delivery keeps its intentional 300ms
+adversarial network latency, not a completion sleep; a rAF-dependent release
+inside that parser-blocking route deadlocked the diagnostic and was discarded.
+All first-frame assertions remain. Session-sheet Stop waits for the exact mocked
 POST response instead of hand-written 10ms condition polling. Motion keeps
 finite-animation completion and controlled browser-clock boundaries.
 

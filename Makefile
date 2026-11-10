@@ -174,7 +174,7 @@ ui-browser-install: ## Install locked browser-test dependencies, matching Chromi
 ui-browser-test: ## Test the built production UI in parallel Chromium/WebKit (representative regression matrix; BROWSER_MATRIX=all is exhaustive)
 	bash scripts/ui-browser-tests.sh
 
-ui-browser-quick: ## Everyday browser smoke: workspace, motion, lists, Markdown and transcript press/timestamps in both engines
+ui-browser-quick: ## Everyday browser smoke: workspace, motion, lists, Markdown and transcript press/timestamps/Latest in both engines
 	BROWSER_TIER=quick bash scripts/ui-browser-tests.sh
 
 ui-browser-perf: ## Exclusive Chromium ring profiling, animation frames, paint traces and CPU-throttled measurements
