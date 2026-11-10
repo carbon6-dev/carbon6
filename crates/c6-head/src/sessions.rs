@@ -919,6 +919,56 @@ pub(crate) fn prepare_worker_input(capabilities: &[String], input: &mut UserInpu
     }
 }
 
+const CLAUDE_CODE_SUBAGENTS: &str = "claude_code_subagents_v1";
+const CLAUDE_CODE_SUBAGENTS_UNAVAILABLE: &str = "Claude Code subagents need a connected worker advertising claude_code_subagents_v1: update this session's worker and install/sign in to Claude Code, or pick an API connection for subagents";
+
+fn claude_code_subagents(capabilities: &[String]) -> bool {
+    capabilities.iter().any(|c| c == CLAUDE_CODE_SUBAGENTS)
+}
+
+/// Prepare only the wire copy, against the receiving connection's Hello.
+/// An old worker would run a Claude Code target in the wrong runtime: refuse
+/// an explicit target, never erase it or silently inherit another model.
+pub(crate) fn prepare_worker_subagents(capabilities: &[String], command: &mut SessionCommand) -> anyhow::Result<()> {
+    let spec = match &mut command.kind {
+        Some(session_command::Kind::Create(spec)) => Some(spec),
+        Some(session_command::Kind::Restore(restore)) => restore.spec.as_mut(),
+        Some(session_command::Kind::SetSubagentModel(change)) => {
+            check_worker_subagent_target(capabilities, change.model.as_ref())?;
+            None
+        }
+        _ => None,
+    };
+    if let Some(spec) = spec {
+        check_worker_subagent_target(capabilities, spec.subagent_target.as_ref())?;
+        if !claude_code_subagents(capabilities) && !spec.subagent_connections_json.is_empty() {
+            let mut connections: Vec<api::SubagentConnection> = serde_json::from_str(&spec.subagent_connections_json)?;
+            connections.retain(|c| c.kind != "claude_code");
+            spec.subagent_connections_json = serde_json::to_string(&connections)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_worker_subagent_target(capabilities: &[String], target: Option<&ModelSpec>) -> anyhow::Result<()> {
+    if !claude_code_subagents(capabilities) && target.is_some_and(|t| t.connection_kind == "claude_code") {
+        return Err(bad_request(CLAUDE_CODE_SUBAGENTS_UNAVAILABLE));
+    }
+    Ok(())
+}
+
+/// A refused restore or model-setting command must not let a later input
+/// run with the worker's previous default. The durable target stays saved.
+pub(crate) async fn check_worker_subagent_input(st: &HeadState, capabilities: &[String], session_id: &str) -> anyhow::Result<()> {
+    if !claude_code_subagents(capabilities)
+        && let Some(row) = st.store.session(session_id).await?
+    {
+        let connections = st.store.connections().await?;
+        check_worker_subagent_target(capabilities, subagent_target(&row, &connections).as_ref())?;
+    }
+    Ok(())
+}
+
 const MAX_ATTACHMENT: usize = 10 * 1024 * 1024;
 const MAX_ATTACHMENTS: usize = 20 * 1024 * 1024;
 

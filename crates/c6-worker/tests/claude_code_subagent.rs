@@ -67,6 +67,7 @@ async fn a_subagent_on_claude_code_runs_as_a_claude_code_session() {
     let stop = CancellationToken::new();
     tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
     c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
+    assert!(head.state.registry.get(worker.identity.meta.worker_id).unwrap().capabilities.iter().any(|c| c == "claude_code_subagents_v1"));
     let post = async |path: &str, body: Value| -> Value {
         http.post(format!("{api}{path}")).json(&body).send().await.unwrap().json().await.unwrap()
     };
