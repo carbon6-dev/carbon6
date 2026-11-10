@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
-const { configuration, shards, plan, pool, acquireLock, supervise, run } = require('./browser-runner.cjs');
+const { configuration, shards, plan, pool, acquireLock, supervise, run, child } = require('./browser-runner.cjs');
 
 test('correctness and perf invocations cannot overlap or steal each other\'s lock', () => {
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'browser-lock-'));
@@ -164,5 +164,62 @@ test('interruption during browser startup cannot schedule workers or report succ
     assert.equal(report.interrupted, true);
     assert.equal(report.passes.length, 0);
     assert.match(report.error, /interrupted/);
+  } finally { fs.rmSync(directory, { recursive: true }); }
+});
+
+test('a rejected server close still drains the other server and HTTP owner', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'browser-cleanup-'));
+  const closed = [];
+  try {
+    const engine = name => ({ launchServer: async () => {
+      if (name === 'webkit') process.emit('SIGINT');
+      return { wsEndpoint: () => 'unused', close: async () => {
+        closed.push(name);
+        if (name === 'chromium') throw new Error('close transport failed');
+      }, kill: async () => { closed.push(`${name}-kill`); } };
+    } });
+    await assert.rejects(run({ ROOT: directory, BROWSER_TEST_OUTPUT: directory, BROWSER_SUITES: 'settings-lists' }, {
+      fixture: { serve: async () => ({ origin: 'http://127.0.0.1:1234', server: {
+        close: done => { closed.push('http'); done(); },
+      } }), launchOptions: () => ({}) },
+      playwright: { chromium: engine('chromium'), webkit: engine('webkit') },
+    }), /Browser invocation interrupted/);
+    assert.deepEqual(closed, ['chromium', 'webkit', 'chromium-kill', 'http']);
+    const output = fs.readdirSync(directory).find(file => file.startsWith('full-'));
+    const report = JSON.parse(fs.readFileSync(path.join(directory, output, 'summary.json')));
+    assert.deepEqual(report.cleanupErrors, ['Error: close transport failed']);
+  } finally { fs.rmSync(directory, { recursive: true }); }
+});
+
+test('isolated workers connect only to fresh parent-owned servers closed after worker failure', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'browser-isolation-'));
+  const finished = [], closed = [];
+  try {
+    const engine = name => ({ launchServer: async () => ({ wsEndpoint: () => `owned-${name}`,
+      close: async () => { assert(finished.includes(name)); closed.push(name); } }) });
+    await assert.rejects(run({ ROOT: directory, BROWSER_TEST_OUTPUT: directory,
+      BROWSER_SUITES: 'settings-lists', ISOLATE_BROWSER: '1' }, {
+      fixture: { serve: async () => ({ origin: 'http://127.0.0.1:1234', server: { close: done => done() } }), launchOptions: () => ({}) },
+      playwright: { chromium: engine('chromium'), webkit: engine('webkit') },
+      child: async (task, _directory, env) => {
+        assert.equal(env.ISOLATE_BROWSER, '0');
+        assert.equal(env[`BROWSER_TEST_${task.engine.toUpperCase()}_ENDPOINT`], `owned-${task.engine}`);
+        finished.push(task.engine);
+        throw new Error('simulated worker failure');
+      },
+    }), /simulated worker failure/);
+    assert.deepEqual(closed.sort(), ['chromium', 'webkit']);
+  } finally { fs.rmSync(directory, { recursive: true }); }
+});
+
+test('asynchronous evidence-stream failure cancels and drains its worker instead of crashing the runner', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'browser-evidence-'));
+  fs.mkdirSync(path.join(directory, 'run.log')); // Async stream open will fail with EISDIR.
+  try {
+    const result = await child({ engine: 'unit', suite: 'follow-press-unit', shard: 1, filters: {} }, directory, process.env);
+    assert.equal(result.status, 1);
+    assert.match(result.evidenceError, /EISDIR/);
+    assert.equal(result.interrupted, true);
+    assert(fs.existsSync(path.join(directory, 'timeline.jsonl')), 'other evidence streams were drained');
   } finally { fs.rmSync(directory, { recursive: true }); }
 });

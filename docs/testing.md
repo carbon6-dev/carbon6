@@ -263,8 +263,11 @@ so an operation's failure handler can save evidence first. Explicit
 not a retry policy. A parent-side **300-second worker deadline**
 (`BROWSER_WORKER_DEADLINE_SECS`) also bounds evaluation/renderer hangs that do
 not honor Playwright operation timeouts. Timeout or interruption stops new
-workers, terminates only owned worker process groups (including standalone
-browsers), and reports failure even if a worker exits zero. The invocation
+workers, terminates only owned worker process groups, closes parent-owned
+browser servers, and reports failure even if a worker exits zero. Even
+`ISOLATE_BROWSER=1` uses a fresh **parent-owned server per shard**, so a
+hard-killed worker cannot orphan Playwright's separately detached browser.
+The invocation
 lock is held until active workers drain and owned browser servers close.
 Exceptions during worker setup also drain other active workers before teardown.
 `summary.json` includes interruption/timeout status and SHA-256 hashes of the

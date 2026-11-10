@@ -13,8 +13,8 @@ const children = new Set();
 const cancellations = new WeakMap();
 
 function stopChild(child) {
-  // Each worker starts its own process group. Only terminate descendants of
-  // that owned child, including standalone browsers in ISOLATE_BROWSER mode.
+  // Each worker starts its own process group. Browser processes are separately
+  // owned by the parent's BrowserServers, including isolated per-worker ones.
   const signal = name => {
     try {
       if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, name);
@@ -172,10 +172,14 @@ async function child(task, directory, environment, runStarted = performance.now(
   const log = fs.createWriteStream(path.join(directory, 'run.log'));
   const timeline = fs.createWriteStream(path.join(directory, 'timeline.jsonl'));
   console.log(`RUN ${label} ${JSON.stringify(task.filters)}`);
-  let tail = '', launchError;
+  let tail = '', launchError, evidenceError;
   const process = spawn(global.process.execPath, args, { env: { ...environment, ...task.filters, ENGINE: task.engine,
     SCREENSHOTS: directory, EVIDENCE: directory }, stdio: ['ignore', 'pipe', 'pipe'], detached: global.process.platform !== 'win32' });
   children.add(process);
+  for (const stream of [log, timeline]) stream.on('error', error => {
+    evidenceError ||= String(error);
+    cancellations.get(process)?.();
+  });
   const record = channel => chunk => {
     log.write(chunk);
     // Keep timestamps even for phases that predate the common within() helper.
@@ -190,7 +194,8 @@ async function child(task, directory, environment, runStarted = performance.now(
   await Promise.all([new Promise(resolve => log.end(resolve)), new Promise(resolve => timeline.end(resolve))]);
   const finished = performance.now();
   const result = { ...task, seconds: (finished - started) / 1000, startedSeconds: (started - runStarted) / 1000,
-    finishedSeconds: (finished - runStarted) / 1000, ...outcome, launchError, directory };
+    finishedSeconds: (finished - runStarted) / 1000, ...outcome,
+    ...(evidenceError ? { status: 1, evidenceError } : {}), launchError, directory };
   console.log(`${result.status === 0 ? 'PASS' : 'FAIL'} ${label} ${result.seconds.toFixed(2)}s`);
   if (result.status !== 0) console.error(tail, `Evidence: ${directory}`);
   return result;
@@ -215,6 +220,11 @@ async function run(env, dependencies = {}) {
   console.log(`Browser ${config.tier}: ${tasks.length} shards/pass, ${config.jobs} workers; evidence ${output}`);
   const { serve, launchOptions } = dependencies.fixture || require('./motion.cjs');
   const playwright = dependencies.playwright || require(env.PLAYWRIGHT_CORE || 'playwright-core');
+  const runChild = dependencies.child || child;
+  const closeBrowser = async browser => {
+    try { await browser.close(); }
+    catch (error) { await browser.kill(); throw error; }
+  };
   const { server, origin } = await serve(), servers = [];
   const environment = { ...env, BROWSER_TEST_ORIGIN: origin, BROWSER_MATRIX: config.matrix,
     PERF: config.tier === 'perf' ? '1' : '0', BROWSER_CASE_TIMINGS: '1' };
@@ -224,11 +234,22 @@ async function run(env, dependencies = {}) {
     for (const child of children) cancellations.get(child)?.();
   };
   const checkInterrupted = () => assert(!report.interrupted, 'Browser invocation interrupted; no further workers will start');
+  const worker = async (task, directory) => {
+    if (env.ISOLATE_BROWSER !== '1') return runChild(task, directory, environment, started, config.workerDeadline * 1000);
+    // Playwright launches browsers in detached process groups. Never leave
+    // their ownership in a child that our watchdog may have to SIGKILL.
+    const browser = await playwright[task.engine].launchServer(launchOptions(task.engine));
+    try {
+      checkInterrupted();
+      return await runChild(task, directory, { ...environment, ISOLATE_BROWSER: '0',
+        [`BROWSER_TEST_${task.engine.toUpperCase()}_ENDPOINT`]: browser.wsEndpoint() }, started, config.workerDeadline * 1000);
+    } finally { await closeBrowser(browser); }
+  };
   process.on('SIGINT', interrupt);
   process.on('SIGTERM', interrupt);
   try {
     if (config.selected.includes('transcript-press')) {
-      report.unit = await child({ engine: 'unit', suite: 'follow-press-unit', shard: 1, filters: {} }, path.join(output, 'follow-press-unit'), environment, started, config.workerDeadline * 1000);
+      report.unit = await runChild({ engine: 'unit', suite: 'follow-press-unit', shard: 1, filters: {} }, path.join(output, 'follow-press-unit'), environment, started, config.workerDeadline * 1000);
       assert.equal(report.unit.status, 0, 'production press helper checks failed; see retained run.log');
     }
     for (const engine of config.engines) {
@@ -242,8 +263,8 @@ async function run(env, dependencies = {}) {
     for (let pass = 1; pass <= config.passes; pass++) {
       checkInterrupted();
       const begin = performance.now();
-      const cohort = await pool(tasks, config.jobs, task => child(task,
-        path.join(output, `pass-${pass}`, task.engine, task.suite, `shard-${task.shard}`), environment, started, config.workerDeadline * 1000), () => report.interrupted);
+      const cohort = await pool(tasks, config.jobs, task => worker(task,
+        path.join(output, `pass-${pass}`, task.engine, task.suite, `shard-${task.shard}`)), () => report.interrupted);
       report.passes.push({ pass, seconds: (performance.now() - begin) / 1000, ...cohort });
       save();
       failed = report.interrupted || cohort.pending > 0 || cohort.results.some(result => result.status !== 0);
@@ -253,12 +274,19 @@ async function run(env, dependencies = {}) {
     report.error = error.stack || String(error);
     throw error;
   } finally {
-    await Promise.all(servers.map(browser => browser.close()));
-    server.closeAllConnections?.();
-    await new Promise(resolve => server.close(resolve));
-    process.off('SIGINT', interrupt);
-    process.off('SIGTERM', interrupt);
-    save();
+    const cleanup = await Promise.allSettled(servers.map(closeBrowser));
+    try {
+      server.closeAllConnections?.();
+      await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    } catch (error) { cleanup.push({ status: 'rejected', reason: error }); }
+    finally {
+      process.off('SIGINT', interrupt);
+      process.off('SIGTERM', interrupt);
+      report.cleanupErrors = cleanup.filter(result => result.status === 'rejected').map(result => String(result.reason));
+      save();
+    }
+    if (report.cleanupErrors.length && !report.error) throw new AggregateError(
+      cleanup.filter(result => result.status === 'rejected').map(result => result.reason), 'Browser infrastructure cleanup failed');
   }
   failed ||= report.interrupted;
   console.log(`${failed ? 'FAILED' : 'ALL PASS'} ${report.seconds.toFixed(2)}s; ${path.join(output, 'summary.json')}`);
@@ -272,5 +300,5 @@ async function main(env = process.env) {
   finally { release(); }
 }
 
-module.exports = { configuration, shards, plan, pool, acquireLock, supervise, run };
+module.exports = { configuration, shards, plan, pool, acquireLock, supervise, run, child };
 if (require.main === module) main().catch(error => { console.error(error); process.exitCode = 1; });
