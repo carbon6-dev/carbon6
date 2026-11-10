@@ -5,8 +5,13 @@
 // ROOT=/path/to/final/dist ENGINE=both node crates/c6-ui/tests/workspace-open.cjs
 // No UI build here: the combined-change build owner supplies ROOT.
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const { serve, fixture, settle, within, launchBrowser } = require('./motion.cjs');
 const playwright = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
+const SHOTS = process.env.SCREENSHOTS || process.env.EVIDENCE || path.join(os.homedir(), '.cache/c6-helper/browser-fast/workspace-open');
+const EVIDENCE = process.env.EVIDENCE || SHOTS;
 const KEY = 'c6.home.workspace.v2';
 const DOC = '00000000-0000-0000-0000-000000000042';
 const OTHER_DOC = '00000000-0000-0000-0000-000000000043';
@@ -36,22 +41,53 @@ const sessionColumns = (saved, id = 'parent') => liveColumns(saved).filter(c => 
 // Observe the real sockets without replacing the shared fixture's replay or
 // send path. /live is the head feed, not a transcript stream. Listener identity
 // includes capture, just as EventTarget does; our observer adds no listeners.
+// The historical DraftListeners name counts all window lifecycle listeners,
+// including follow-press owners, not just draft/autosize registrations.
 function observeSockets() {
   const Native = window.WebSocket;
   const draftListeners = window.__workspaceDraftListeners = [];
+  const followOwners = window.__workspaceFollowOwners = [];
+  let registeringFollow;
   const capture = options => typeof options === 'boolean' ? options : !!options?.capture;
   const addWindow = window.addEventListener.bind(window), removeWindow = window.removeEventListener.bind(window);
   window.addEventListener = (type, callback, options) => {
     if (['pagehide', 'visibilitychange'].includes(type) && callback && !draftListeners.some(l => l.type === type && l.callback === callback && l.capture === capture(options))) {
-      draftListeners.push({ type, callback, capture: capture(options) });
+      const listener = { type, callback, capture: capture(options), owner: registeringFollow };
+      draftListeners.push(listener);
+      registeringFollow?.listeners.push(listener);
     }
     return addWindow(type, callback, options);
   };
   window.removeEventListener = (type, callback, options) => {
     const i = draftListeners.findIndex(l => l.type === type && l.callback === callback && l.capture === capture(options));
-    if (i !== -1) draftListeners.splice(i, 1);
+    if (i !== -1) {
+      const [listener] = draftListeners.splice(i, 1);
+      listener.owner?.removed.push(listener);
+    }
     return removeWindow(type, callback, options);
   };
+  // Installed before external motion.js assigns this function. Attribute only
+  // registrations made synchronously by the real helper, never by callback
+  // names/source strings; forward its arguments, return value and disposer.
+  let followPress;
+  Object.defineProperty(window, 'c6FollowPress', { configurable: true,
+    get: () => followPress,
+    set: original => {
+      followPress = function (...args) {
+        const owner = { id: followOwners.length, element: args[0], listeners: [], removed: [], disposed: false };
+        followOwners.push(owner);
+        const previous = registeringFollow;
+        registeringFollow = owner;
+        let dispose;
+        try { dispose = original.apply(this, args); }
+        finally { registeringFollow = previous; }
+        return function (...disposeArgs) {
+          try { return dispose.apply(this, disposeArgs); }
+          finally { owner.disposed = true; }
+        };
+      };
+    },
+  });
   window.__workspaceSockets = [];
   window.WebSocket = new Proxy(Native, { construct(Target, args) {
     const socket = new Target(...args), listeners = [];
@@ -72,6 +108,13 @@ function observeSockets() {
     return socket;
   } });
 }
+const followState = page => page.evaluate(() => window.__workspaceFollowOwners.map(owner => {
+  const listeners = owner.listeners.filter(l => l.type === 'pagehide');
+  return { id: owner.id, connected: owner.element.isConnected, disposed: owner.disposed,
+    registered: listeners.length, removed: listeners.filter(l => owner.removed.includes(l)).length,
+    live: listeners.filter(l => window.__workspaceDraftListeners.some(active =>
+      active.type === l.type && active.callback === l.callback && active.capture === l.capture)).length };
+}));
 async function waitView(page, view, target, count) {
   try {
     await page.waitForFunction(({ key, view, target, count }) => {
@@ -79,7 +122,7 @@ async function waitView(page, view, target, count) {
       const c = t?.columns.find(c => c.key === t.active);
       return c?.view.view === view && (target === undefined || JSON.stringify(c.view.target) === JSON.stringify(target))
         && (count === undefined || l.tiles.length === count) && !t.minimized && t.columns[t.cursor].key === t.active;
-    }, { key: KEY, view, target, count }, { timeout: Number(process.env.C6_TEST_DEADLINE_SECS || 300) * 1000 });
+    }, { key: KEY, view, target, count }, { timeout: Number(process.env.C6_TEST_DEADLINE_SECS || 15) * 1000 });
   } catch (error) {
     console.error('WAIT VIEW DIAGNOSTICS', JSON.stringify(await page.evaluate(key => ({
       url: location.href, layout: JSON.parse(localStorage.getItem(key)),
@@ -730,8 +773,17 @@ async function check(browser, origin, viewport, label, platform) {
     await parent().locator('[id="parent-e20"]').waitFor({ state: 'attached' });
     await parent().locator('input[type="file"]').setInputFiles({ name: 'q10-draft.txt', mimeType: 'text/plain', buffer: Buffer.from('An unsent session attachment.') });
     await parent().getByText('q10-draft.txt', { exact: true }).waitFor();
+    // A source-row hover owns unrelated transient lifecycle listeners.
+    await page.mouse.move(0, 0);
+    const previewClose = page.getByRole('button', { name: 'Close session details', exact: true });
+    if (await previewClose.isVisible()) await previewClose.click();
+    await page.mouse.move(0, 0);
+    await settle(page);
     const draftListeners = await page.evaluate(() => window.__workspaceDraftListeners.length);
     const composerListeners = await page.evaluate(() => CSS.supports('field-sizing', 'content') ? 2 : 3);
+    const originalFollow = (await followState(page)).filter(owner => owner.live);
+    assert.equal(originalFollow.length, 1, 'one session view owns one live follow pagehide callback');
+    assert.deepEqual(originalFollow[0], { id: originalFollow[0].id, connected: true, disposed: false, registered: 1, removed: 0, live: 1 });
     await page.locator('[data-tile-motion="2"]').getByRole('button', { name: 'Actions', exact: true }).click();
     await page.getByRole('button', { name: 'Into its own tile', exact: true }).waitFor();
     const freshDraft = 'Typed and detached in one task, before the 250ms text save.';
@@ -752,7 +804,16 @@ async function check(browser, origin, viewport, label, platform) {
     assert.equal(await movedPane.locator('textarea').inputValue(), freshDraft, 'new composer must receive the fresh draft, not the last debounced storage value');
     await movedPane.getByText('q10-draft.txt', { exact: true }).waitFor();
     await oneStream('parent');
-    assert.equal(await page.evaluate(() => window.__workspaceDraftListeners.length), draftListeners, 'detach replaces, rather than leaks, draft lifecycle listeners');
+    await page.mouse.move(0, 0);
+    await settle(page);
+    const detachedFollows = await followState(page), movedFollow = detachedFollows.filter(owner => owner.live);
+    assert.deepEqual(detachedFollows.find(owner => owner.id === originalFollow[0].id),
+      { id: originalFollow[0].id, connected: false, disposed: true, registered: 1, removed: 1, live: 0 },
+      'detach disposes the old follow owner and removes its exact callback, without retaining it');
+    assert.equal(movedFollow.length, 1, 'detached session view owns exactly one live follow pagehide callback');
+    assert.notEqual(movedFollow[0].id, originalFollow[0].id, 'detach registers a new follow owner');
+    assert.deepEqual(movedFollow[0], { id: movedFollow[0].id, connected: true, disposed: false, registered: 1, removed: 0, live: 1 });
+    assert.equal(await page.evaluate(() => window.__workspaceDraftListeners.length), draftListeners, 'detach replaces, rather than leaks, draft/autosize and follow lifecycle listeners');
     await press('1');
     const detachedSessionSource = (await snapshot(page)).tiles[0];
     await press('[');
@@ -771,8 +832,15 @@ async function check(browser, origin, viewport, label, platform) {
     }
     await waitView(page, 'sessions', undefined, 1);
     await page.waitForFunction(() => window.__workspaceSockets.filter(s => s.path.endsWith('/sessions/parent/stream')).every(s => s.socket.readyState > 1 && !s.listeners.some(l => l.type === 'message')));
+    await page.mouse.move(0, 0);
+    await settle(page);
     assert.equal(sessionColumns(await snapshot(page)).length, 0);
-    assert.equal(await page.evaluate(() => window.__workspaceDraftListeners.length), draftListeners - composerListeners, 'closing removes the draft lifecycle and fallback autosize visibility listeners');
+    const closedFollows = await followState(page);
+    assert.deepEqual(closedFollows.filter(owner => owner.live), [], 'closing removes every follow pagehide callback');
+    assert.deepEqual(closedFollows.find(owner => owner.id === movedFollow[0].id),
+      { id: movedFollow[0].id, connected: false, disposed: true, registered: 1, removed: 1, live: 0 },
+      'closing disposes the detached owner and removes its exact follow callback');
+    assert.equal(await page.evaluate(() => window.__workspaceDraftListeners.length), draftListeners - composerListeners - 1, 'closing removes draft/autosize listeners plus exactly one follow pagehide listener');
 
     phase('Changes companions keep explicit-copy behavior without copying the transcript');
     await seed(layout(), '/sessions/parent');
@@ -903,14 +971,34 @@ async function check(browser, origin, viewport, label, platform) {
     assert.deepEqual(f.errors, [], `${label}: browser errors`);
     console.log(`PASS workspace-open ${label}`);
   } catch (error) {
+    let diagnostics = {};
     if (f) {
       console.error(`FAIL during ${f.phase}: ${error.message}`);
-      console.error('WORKSPACE FAILURE DIAGNOSTICS', JSON.stringify(await f.page.evaluate(key => ({
+      diagnostics = await f.page.evaluate(key => ({
         url: location.href, layout: JSON.parse(localStorage.getItem(key)),
         links: Array.from(document.querySelectorAll('[data-pane-motion] a[href]'), a => ({ href: a.getAttribute('href'), text: a.textContent })),
         sockets: window.__workspaceSockets?.map(({ socket, path, listeners }) => ({ path, state: socket.readyState, messages: listeners.filter(l => l.type === 'message').length })),
-      }), KEY).catch(diagnostic => ({ error: diagnostic.message }))));
+        listeners: window.__workspaceDraftListeners?.map(l => ({ type: l.type, capture: l.capture, followOwner: l.owner?.id })),
+      }), KEY).catch(diagnostic => ({ diagnosticError: diagnostic.message }));
+      diagnostics.followOwners = await followState(f.page).catch(diagnostic => ({ diagnosticError: diagnostic.message }));
+      console.error('WORKSPACE FAILURE DIAGNOSTICS', JSON.stringify(diagnostics));
       console.error('RECENT REQUESTS', JSON.stringify(f.requests.slice(-25)));
+    }
+    // Labels contain engine/viewport/platform slashes; keep each case's files
+    // together without accidentally creating subdirectories or colliding.
+    const filename = `${label.replace(/[^a-zA-Z0-9._-]/g, '-')}-FAIL`;
+    try {
+      fs.mkdirSync(SHOTS, { recursive: true });
+      fs.mkdirSync(EVIDENCE, { recursive: true });
+      const screenshot = path.join(SHOTS, `${filename}.png`);
+      const screenshotError = f ? await f.page.screenshot({ path: screenshot, timeout: 5000 }).then(() => null, failure => failure.message) : 'fixture not created';
+      const evidence = path.join(EVIDENCE, `${filename}.json`);
+      fs.writeFileSync(evidence, JSON.stringify({ label, phase: f?.phase, error: error.stack || String(error),
+        errors: f?.errors, console: f?.consoleMessages, requests: f?.requests,
+        screenshot, screenshotError, ...diagnostics }, null, 2));
+      console.error(`WORKSPACE FAILURE EVIDENCE ${evidence}${screenshotError ? ` (screenshot: ${screenshotError})` : ` ${screenshot}`}`);
+    } catch (failure) {
+      console.error(`Could not save workspace failure evidence: ${failure.message}`);
     }
     throw error;
   } finally { await f?.context?.close(); }
