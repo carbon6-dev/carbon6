@@ -354,6 +354,118 @@ window.c6ToolReveal = details => {
   };
 };
 
+// A native press owns its target through the compatibility click. Content can
+// keep streaming, but resize-follow must not move that target before dispatch.
+// This owner is independent of c6StopGlide's short-lived animation listeners.
+window.c6FollowPress = (element, change) => {
+  let held = false, disposed = false, timer, touches = 0, opener;
+  let pageLive = true, blurred = false;
+  const pointers = new Map();
+  // Bound the no-click case after release (e.g. a scroll/longpress), never
+  // expire a contact that is still down. Ordinary clicks finish sooner.
+  const clickWait = 500;
+  const available = () => pageLive && !blurred && !document.hidden;
+  const clearTimer = () => { clearTimeout(timer); timer = undefined; };
+  const finish = flush => {
+    clearTimer();
+    held = false;
+    pointers.clear();
+    touches = 0;
+    opener = undefined;
+    untrack();
+    // Logical completion must reach a live owner even while detached. Rust
+    // separately guards geometry; hide/pagehide discard, never flush old work.
+    if (!disposed) change(false, available(), flush);
+  };
+  const release = delay => {
+    clearTimer();
+    timer = setTimeout(() => finish(true), delay);
+  };
+  const begin = event => {
+    if (disposed || !available()) return false;
+    if (!held) {
+      if (event.type === 'pointerdown' && (event.button !== 0 || !event.isPrimary)) return false;
+      if (event.type === 'touchstart' && event.touches.length !== 1) return false;
+      const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+      const control = target?.closest('button, a[href], summary, input, textarea, select, label, [role="button"], [role="link"], [role="menuitem"], [contenteditable]:not([contenteditable="false"])');
+      if (!control || !element.contains(control) || control.matches(':disabled, [aria-disabled="true"]')) return false;
+      opener = control;
+    }
+    clearTimer();
+    if (!held) {
+      held = true;
+      track();
+      change(true, true, false);
+      // Give native anchoring back while intrinsic rows above the opener
+      // settle. This also freezes an active inverse at its displayed position.
+      c6StopGlide(element);
+    }
+    return true;
+  };
+  const down = event => { if (begin(event)) pointers.set(event.pointerId, event.pointerType); };
+  const up = event => {
+    if (!held) return;
+    pointers.delete(event.pointerId);
+    if (!pointers.size && !touches) release(event.type === 'pointercancel' ? 0 : clickWait);
+  };
+  // A mouse/pen released outside the window may next appear only as a hover.
+  const move = event => { if (event.pointerType !== 'touch' && event.buttons === 0 && pointers.has(event.pointerId)) up(event); };
+  const touch = event => {
+    if (event.type === 'touchstart' ? !begin(event) : !held) return;
+    touches = event.touches.length;
+    // Pointer cancellation can precede native scrolling. Touch events retain
+    // ownership until the last finger leaves, including fingers added outside.
+    if (!touches) for (const [id, type] of pointers) if (type === 'touch') pointers.delete(id);
+    if (!pointers.size && !touches) release(event.type === 'touchcancel' ? 0 : clickWait);
+  };
+  const click = event => {
+    // Capture sees even stopped clicks; the timer runs AFTER delegated/bubble
+    // handlers. Never flush at pointerup/touchend ahead of a delayed click.
+    if (held && !pointers.size && !touches && event.isTrusted && event.detail > 0 && opener?.contains(event.target)) release(0);
+  };
+  // Contextmenu is deliberately not a terminal event: the longpress contact
+  // may still be down. Its actual up/cancel uses the bounded no-click fallback.
+  const blur = () => { blurred = true; finish(false); };
+  const focus = () => { if (blurred) { blurred = false; finish(false); } };
+  const hide = () => { pageLive = false; finish(false); };
+  const show = () => { pageLive = true; finish(false); };
+  const visibility = () => finish(false);
+  const listeners = { pointerdown: down, pointerup: up, pointercancel: up, pointermove: move,
+    touchstart: touch, touchend: touch, touchcancel: touch, click };
+  const track = () => {
+    for (const [type, listener] of Object.entries(listeners)) document.addEventListener(type, listener, { capture: true, passive: true });
+    addEventListener('blur', blur);
+  };
+  const untrack = () => {
+    for (const [type, listener] of Object.entries(listeners)) document.removeEventListener(type, listener, true);
+    removeEventListener('blur', blur);
+  };
+  // Lifecycle suspension outlives a press: pagehide need not set hidden yet.
+  // A visible resume requests fresh geometry, never a saved correction target.
+  addEventListener('pagehide', hide);
+  addEventListener('pageshow', show);
+  addEventListener('focus', focus);
+  document.addEventListener('visibilitychange', visibility);
+  element.addEventListener('pointerdown', down, { capture: true, passive: true });
+  element.addEventListener('touchstart', touch, { capture: true, passive: true });
+  // Observer replacement can retain a suspended Rust owner; always handshake.
+  change(false, available(), false);
+  return () => {
+    disposed = true;
+    held = false;
+    pointers.clear();
+    clearTimer();
+    untrack();
+    removeEventListener('pagehide', hide);
+    removeEventListener('pageshow', show);
+    removeEventListener('focus', focus);
+    document.removeEventListener('visibilitychange', visibility);
+    element.removeEventListener('pointerdown', down, true);
+    element.removeEventListener('touchstart', touch, true);
+    c6StopGlide(element);
+  };
+};
+
 // Commit the real scroll range once, then translate the reading column back
 // to its previous picture. WAAPI glides that inverse away on the compositor;
 // there is no per-frame JS, scroll write, layout measurement or content scale.

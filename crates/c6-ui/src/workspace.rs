@@ -2169,10 +2169,17 @@ pub fn ScrollBox(
     let intent = StoredValue::new(None::<ScrollIntent>);
     let touch = StoredValue::new(None::<(i32, i32)>);
     if let Some(follow) = follow {
+        let pressed = StoredValue::new(false);
+        let pending = StoredValue::new(false);
+        let available = StoredValue::new(true);
         Effect::new(move || {
             let following = follow.get();
-            if !following && let Some(el) = node.get_untracked() {
-                stop_glide_to_end(&el);
+            if !following {
+                // A later false -> true must not revive an old press's work.
+                pending.set_value(false);
+                if let Some(el) = node.get_untracked() {
+                    stop_glide_to_end(&el);
+                }
             }
             if following || intent.get_value() == Some(ScrollIntent::Toward) {
                 // Opening / Latest explicitly follows; an anchor jump explicitly
@@ -2180,12 +2187,25 @@ pub fn ScrollBox(
                 intent.set_value(None);
             }
         });
-        type ResizeWatch = (web_sys::ResizeObserver, wasm_bindgen::closure::Closure<dyn Fn(js_sys::Array)>);
-        let observer = StoredValue::new_local(None::<ResizeWatch>);
+        #[wasm_bindgen::prelude::wasm_bindgen]
+        extern "C" {
+            #[wasm_bindgen(js_name = c6FollowPress)]
+            fn watch_press(element: &web_sys::Element, change: &js_sys::Function) -> js_sys::Function;
+        }
+        type FollowWatch = (
+            web_sys::ResizeObserver,
+            wasm_bindgen::closure::Closure<dyn Fn(js_sys::Array)>,
+            js_sys::Function,
+            wasm_bindgen::closure::Closure<dyn Fn(bool, bool, bool)>,
+        );
+        let observer = StoredValue::new_local(None::<FollowWatch>);
         let stop = move || {
+            pending.try_set_value(false);
+            pressed.try_set_value(false);
             observer.try_update_value(|o| {
                 if let Some(watch) = o.take() {
                     watch.0.disconnect();
+                    let _ = watch.2.call0(&wasm_bindgen::JsValue::NULL);
                 }
             });
         };
@@ -2193,18 +2213,28 @@ pub fn ScrollBox(
             let Some(el) = node.get() else { return };
             // One at a time: a box drawn anew isn't watched twice.
             stop();
-            let to_end = wasm_bindgen::closure::Closure::<dyn Fn(js_sys::Array)>::new(move |_: js_sys::Array| {
+            let observed = el.clone();
+            let correct = move || {
                 // Before paint, including shrink/clamp: commit the real end
                 // and compensate its picture with a compositor translation.
-                // Live stream updates are already batched by presentation frame.
+                // Press-held corrections are coalesced until after native click
+                // dispatch. Recheck permission here, not when they were queued.
                 // No scroll writes or measurements run during the animation.
                 if let Some(el) = node.try_get_untracked().flatten()
+                    && el.is_same_node(Some(&observed))
+                    && el.is_connected()
+                    && available.try_get_value() == Some(true)
                     && follow.try_get_untracked() == Some(true)
-                    && el.client_height() > 0
                 {
-                    glide_to_end(&el);
+                    if pressed.try_get_value() == Some(true) {
+                        pending.try_set_value(true);
+                    } else if el.client_height() > 0 {
+                        glide_to_end(&el);
+                    }
                 }
-            });
+            };
+            let resize = correct.clone();
+            let to_end = wasm_bindgen::closure::Closure::<dyn Fn(js_sys::Array)>::new(move |_: js_sys::Array| resize());
             if let Ok(obs) = web_sys::ResizeObserver::new(to_end.as_ref().unchecked_ref()) {
                 obs.observe(&el);
                 // The content: it grows as events arrive and render.
@@ -2214,7 +2244,29 @@ pub fn ScrollBox(
                         obs.observe(&child);
                     }
                 }
-                observer.set_value(Some((obs, to_end)));
+                // JS reports logical contact state, lifecycle availability,
+                // and whether this completion may flush deferred work.
+                let press = wasm_bindgen::closure::Closure::<dyn Fn(bool, bool, bool)>::new(move |held, ready, flush| {
+                    if pressed.try_update_value(|p| *p = held).is_none() {
+                        return;
+                    }
+                    let was_ready = available.try_update_value(|a| std::mem::replace(a, ready));
+                    if !ready {
+                        pending.try_set_value(false);
+                    } else if held {
+                        // Resume a paused glide even without another resize.
+                        pending.try_set_value(follow.try_get_untracked() == Some(true));
+                    } else {
+                        let queued = pending.try_update_value(std::mem::take) == Some(true);
+                        // Visible resume is a fresh request after discarding
+                        // hidden work; ordinary release consumes at most one bit.
+                        if was_ready == Some(false) || (flush && queued) {
+                            correct();
+                        }
+                    }
+                });
+                let dispose = watch_press(&el, press.as_ref().unchecked_ref());
+                observer.set_value(Some((obs, to_end, dispose, press)));
             }
         });
         on_cleanup(stop);
@@ -2941,6 +2993,33 @@ mod tests {
         let element = wasm_bindgen::JsValue::NULL.unchecked_into::<web_sys::Element>();
         glide_to_end(&element);
         stop_glide_to_end(&element);
+    }
+
+    #[test]
+    fn native_press_owns_resize_follow_independently_of_the_glide() {
+        let motion = include_str!("../js/motion.js");
+        let press = motion.split("window.c6FollowPress =").nth(1).unwrap().split("\n};").next().unwrap();
+        assert!(
+            press.contains("target?.closest(") && press.contains("element.contains(control)"),
+            "only transcript controls admit a new hold"
+        );
+        assert!(
+            press.contains("change(true, true, false)") && press.contains("c6StopGlide(element)"),
+            "press restores native anchoring before release"
+        );
+        assert!(press.contains("capture: true, passive: true"), "native activation and stopped child clicks remain intact");
+        assert!(press.contains("if (!pointers.size && !touches)"), "one finger cannot release another contact");
+        assert!(press.contains("clearTimer()") && press.contains("removeEventListener(type, listener, true)"));
+        for forbidden in ["preventDefault", "stopPropagation", "setPointerCapture", "requestAnimationFrame", "getBoundingClientRect"] {
+            assert!(!press.contains(forbidden), "press ownership must not use {forbidden}");
+        }
+        let source = include_str!("workspace.rs").split("#[cfg(test)]").next().unwrap();
+        let controller = source.split("pub fn ScrollBox(").nth(1).unwrap().split("let yours =").next().unwrap();
+        assert!(controller.contains("pending.set_value(false)"), "stopping follow invalidates deferred work");
+        assert!(controller.contains("pending.try_update_value(std::mem::take) == Some(true)"), "release consumes one correction");
+        assert!(controller.find("if pressed.try_get_value()").unwrap() < controller.find("else if el.client_height()").unwrap());
+        assert!(controller.contains("el.is_same_node(Some(&observed))") && controller.contains("el.is_connected()"));
+        assert!(controller.contains("available.try_get_value() == Some(true)"), "hidden/pagehide suspension also gates resize callbacks");
     }
 
     #[test]
