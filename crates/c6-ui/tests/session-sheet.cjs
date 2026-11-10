@@ -8,6 +8,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { serve, fixture, within, settle, session, launchBrowser } = require('./motion.cjs');
+const { browserLifecycle } = require('./browser-lifecycle.cjs');
 const before = process.env.BEFORE === '1';
 const shots = process.env.SCREENSHOTS || '/tmp/s3-sheet';
 const phase = before ? 'before' : 'after';
@@ -119,6 +120,62 @@ async function jobControls(rows, touch) {
   }
 }
 
+// Diagnostic IO must never replace the first operation failure. Write before
+// cleanup as well as afterward: a stuck cleanup must not lose the first state.
+function caseDiagnostics(browser, name, details) {
+  const lifecycle = browserLifecycle({ browser, label: name });
+  let f, firstError, file;
+  const writeFailure = () => {
+    try {
+      fs.writeFileSync(file + '.json', JSON.stringify({ error: firstError, ...details(),
+        lifecycle: lifecycle.snapshot() }, null, 2));
+    } catch (error) {
+      lifecycle.secondary('failure-json', error);
+      console.error(`DIAGNOSTIC WRITE FAILURE ${name}:`, error.stack || error);
+    }
+  };
+  const remember = (error, preferred) => {
+    lifecycle.firstError(error);
+    if (firstError === undefined) firstError = String(error?.stack ?? error);
+    if (!file) {
+      file = preferred || path.join(shots, `${name}-FAIL`);
+      if (fs.existsSync(file + '.json')) file += `-${Date.now()}`;
+    }
+  };
+  return {
+    started(progress) { f = progress; lifecycle.observe(progress); },
+    phase(value) { lifecycle.phase(value); },
+    async failure(error, preferred) {
+      remember(error, preferred); // Inventory is captured before any diagnostic/cleanup calls.
+      writeFailure();
+      lifecycle.phase('failure-screenshot');
+      if (f) try { await f.page.screenshot({ path: file + '.png' }); }
+      catch (secondary) { lifecycle.secondary('failure-screenshot', secondary); }
+      writeFailure();
+    },
+    async finish() {
+      let cleanupError, cleanupFailed = false;
+      const hadFailure = firstError !== undefined;
+      try {
+        lifecycle.phase('cleanup');
+        await f?.context.close();
+      } catch (error) {
+        lifecycle.secondary('context.close', error);
+        remember(error);
+        cleanupError = error;
+        cleanupFailed = true;
+      } finally {
+        lifecycle.dispose();
+        if (file) writeFailure();
+        else try {
+          fs.appendFileSync(path.join(shots, 'lifecycle.jsonl'), JSON.stringify(lifecycle.snapshot()) + '\n');
+        } catch (error) { console.error(`DIAGNOSTIC WRITE FAILURE ${name}:`, error.stack || error); }
+      }
+      if (cleanupFailed && !hadFailure) throw cleanupError;
+    },
+  };
+}
+
 async function check(browser, origin, engine, theme, view) {
   const name = `${phase}-${engine}-${theme}-${view}`;
   console.log(`START ${name}`);
@@ -127,10 +184,15 @@ async function check(browser, origin, engine, theme, view) {
   const replay = [...events];
   let rejectStop = null;
   let f;
+  const diagnostics = caseDiagnostics(browser, name, () => ({ errors: f?.errors,
+    console: f?.consoleMessages, requests: f?.requests, stops, snapshots, unexpected }));
   const emit = event => { replay.push(event); f.send(event); };
   const capture = async suffix => {
+    diagnostics.phase(`settle:${suffix}`);
     await settle(f.page);
+    diagnostics.phase(`screenshot:${suffix}`);
     await f.page.screenshot({ path: path.join(shots, `${name}-${suffix}.png`) });
+    diagnostics.phase('case');
   };
   const finishLive = async () => {
     descendants.filter(c => c.status === 'running').forEach(c => { c.status = 'idle'; c.end_reason = 'completed'; });
@@ -143,7 +205,7 @@ async function check(browser, origin, engine, theme, view) {
       // Playwright's SW-blocking init script reads navigator.serviceWorker in
       // sandboxed output iframes and itself throws SecurityError. Match the
       // existing outputs.cjs fixture; this is still a fresh private origin.
-      { choice: 'off', effective: 'off', os: 'reduce' }, progress => { f = progress; }, { serviceWorkers: 'allow' }, {
+      { choice: 'off', effective: 'off', os: 'reduce' }, progress => { f = progress; diagnostics.started(progress); }, { serviceWorkers: 'allow' }, {
         instrumentation: false, sessions: descendants, events: replay,
         setup: async ({ context }) => {
           await context.route('**/api/v1/sessions/**', async route => {
@@ -182,6 +244,7 @@ async function check(browser, origin, engine, theme, view) {
           });
         },
       });
+    diagnostics.phase('case');
     const { page } = f;
     if (view === 'narrow') {
       // Actual tile container width, while the viewport stays desktop-wide.
@@ -579,15 +642,9 @@ async function check(browser, origin, engine, theme, view) {
     console.log(`PASS ${name}`);
   } catch (error) {
     console.error(`FIRST FAILURE ${name}:`, error.stack || error);
-    if (f) {
-      let failure = path.join(shots, `${name}-FAIL`);
-      if (fs.existsSync(failure + '.json')) failure += `-${Date.now()}`;
-      await f.page.screenshot({ path: failure + '.png' }).catch(() => {});
-      fs.writeFileSync(failure + '.json', JSON.stringify({ error: String(error.stack || error),
-        errors: f.errors, console: f.consoleMessages, requests: f.requests, stops, snapshots, unexpected }, null, 2));
-    }
+    await diagnostics.failure(error);
     throw error;
-  } finally { await f?.context.close(); }
+  } finally { await diagnostics.finish(); }
 }
 
 async function restrictions(browser, origin, engine, variant) {
@@ -601,9 +658,11 @@ async function restrictions(browser, origin, engine, variant) {
     version: 'test', status: 'offline', enrolled_at: 1, last_seen: 1, connected_since: 1, rtt_us: 0 };
   const stops = [];
   let f, live, disconnected = false;
+  const diagnostics = caseDiagnostics(browser, name, () => ({ errors: f?.errors,
+    console: f?.consoleMessages, requests: f?.requests, stops }));
   try {
     f = await fixture(browser, origin, viewport, 'light', { choice: 'off', effective: 'off', os: 'reduce' },
-      progress => { f = progress; }, {}, {
+      progress => { f = progress; diagnostics.started(progress); }, {}, {
         instrumentation: false, ready: missing ? 'button[aria-label*="Open session sheet"]' : 'textarea',
         events: [task('restricted-task', command, 0)],
         setup: async ({ context }) => {
@@ -623,6 +682,7 @@ async function restrictions(browser, origin, engine, variant) {
             json: { error: 'Fixture snapshot unavailable' } }));
         },
       });
+    diagnostics.phase('case');
     const { page } = f;
     const ring = page.getByRole('button', { name: /Open session sheet/ });
     if (ssh) {
@@ -680,18 +740,14 @@ async function restrictions(browser, origin, engine, variant) {
       }
     }
     assert.deepEqual(f.errors, []);
+    diagnostics.phase('screenshot:restriction');
     await page.screenshot({ path: path.join(shots, `${name}.png`) });
     console.log(`PASS ${name}`);
   } catch (error) {
     console.error(`FIRST FAILURE ${name}:`, error.stack || error);
-    if (f) {
-      const file = path.join(shots, `${name}-FAIL-${Date.now()}`);
-      await f.page.screenshot({ path: file + '.png' }).catch(() => {});
-      fs.writeFileSync(file + '.json', JSON.stringify({ error: String(error.stack || error), errors: f.errors,
-        console: f.consoleMessages, requests: f.requests, stops }, null, 2));
-    }
+    await diagnostics.failure(error, path.join(shots, `${name}-FAIL-${Date.now()}`));
     throw error;
-  } finally { await f?.context.close(); }
+  } finally { await diagnostics.finish(); }
 }
 
 async function isolation(browser, origin, engine, theme, view) {
@@ -706,9 +762,11 @@ async function isolation(browser, origin, engine, theme, view) {
     { seq: 1003, ts: now, type: 'output', name: 'focus-report.html', title: 'Focus return report', mime: 'text/html', size: 42 },
   ];
   let f;
+  const diagnostics = caseDiagnostics(browser, name, () => ({ errors: f?.errors,
+    console: f?.consoleMessages, requests: f?.requests }));
   try {
     f = await fixture(browser, origin, views[view], theme,
-      { choice: 'off', effective: 'off', os: 'reduce' }, progress => { f = progress; }, { serviceWorkers: 'allow' }, {
+      { choice: 'off', effective: 'off', os: 'reduce' }, progress => { f = progress; diagnostics.started(progress); }, { serviceWorkers: 'allow' }, {
         instrumentation: false, sessions: [nested], events: rootEvents,
         layout: { tiles: [
           { key: 2, columns: [{ key: 3, view: { view: 'session', id: 'parent' } }], cursor: 0, active: 3, used: 3, back: [], forward: [], stack: 0, minimized: false },
@@ -733,6 +791,7 @@ async function isolation(browser, origin, engine, theme, view) {
             body: '<!doctype html><h1>Focus return output</h1>' }));
         },
       });
+    diagnostics.phase('case');
     const { page } = f;
     const parentTile = page.locator('[data-tile-motion="2"]');
     if (view === 'narrow') await page.addStyleTag({ content: '[data-tile-motion="2"] { width:600px !important; }' });
@@ -775,18 +834,14 @@ async function isolation(browser, origin, engine, theme, view) {
     await sheet.waitFor({ state: 'hidden' });
     assert(await ring.evaluate(el => document.activeElement === el), 'restored sheet dismissal focuses the originating ring');
     assert.deepEqual(f.errors, []);
+    diagnostics.phase('screenshot:isolation');
     await page.screenshot({ path: path.join(shots, `${name}.png`) });
     console.log(`PASS ${name}`);
   } catch (error) {
     console.error(`FIRST FAILURE ${name}:`, error.stack || error);
-    if (f) {
-      const file = path.join(shots, `${name}-FAIL-${Date.now()}`);
-      await f.page.screenshot({ path: file + '.png' }).catch(() => {});
-      fs.writeFileSync(file + '.json', JSON.stringify({ error: String(error.stack || error), errors: f.errors,
-        console: f.consoleMessages, requests: f.requests }, null, 2));
-    }
+    await diagnostics.failure(error, path.join(shots, `${name}-FAIL-${Date.now()}`));
     throw error;
-  } finally { await f?.context.close(); }
+  } finally { await diagnostics.finish(); }
 }
 
 async function main() {

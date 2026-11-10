@@ -211,7 +211,7 @@ async function run(env, dependencies = {}) {
   const hash = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
   report.assets = fs.readdirSync(report.root, { recursive: true }).filter(file => /\.(wasm|js|css)$/.test(file))
     .map(file => ({ file, sha256: hash(path.join(report.root, file)) }));
-  report.tests = [...config.selected, 'motion', 'browser-runner', 'browser-navigation', 'browser-navigation.test', 'follow-press-unit'].filter((name, index, names) => names.indexOf(name) === index
+  report.tests = [...config.selected, 'motion', 'browser-runner', 'browser-navigation', 'browser-navigation.test', 'browser-lifecycle', 'browser-lifecycle.test', 'follow-press-unit'].filter((name, index, names) => names.indexOf(name) === index
     && fs.existsSync(path.join(__dirname, `${name}.cjs`))).map(name => ({ name, sha256: hash(path.join(__dirname, `${name}.cjs`)) }));
   const save = () => {
     report.seconds = (performance.now() - started) / 1000;
@@ -251,6 +251,7 @@ async function run(env, dependencies = {}) {
     const units = [
       ...(config.selected.includes('transcript-press') ? ['follow-press-unit'] : []),
       ...(config.selected.some(suite => ['motion', 'navigation-errors'].includes(suite)) ? ['browser-navigation.test'] : []),
+      ...(config.selected.includes('session-sheet') ? ['browser-lifecycle.test'] : []),
     ];
     report.units = [];
     for (const suite of units) {
