@@ -4781,12 +4781,28 @@ enum Suggestion {
 }
 
 /// The `@` mention being typed at the caret: (where the @ is, the query).
+/// A space ends it, except in a quoted one, `@"words with spaces`, which
+/// goes on until its closing quote.
 fn mention_at(text: &str, caret: usize) -> Option<(usize, String)> {
     let before: String = text.chars().take(caret).collect();
+    if let Some(at) = before.rfind("@\"") {
+        let query = &before[at + 2..];
+        let starts_word = before[..at].chars().last().is_none_or(char::is_whitespace);
+        if starts_word && !query.contains('"') {
+            return Some((before[..at].chars().count(), query.to_owned()));
+        }
+    }
     let at = before.rfind('@')?;
     let query = &before[at + 1..];
     let starts_word = before[..at].chars().last().is_none_or(char::is_whitespace);
     (starts_word && !query.contains(char::is_whitespace)).then(|| (before[..at].chars().count(), query.to_owned()))
+}
+
+/// Where a mention being typed ends: its @, its query, and the quote a
+/// quoted one opens with.
+fn mention_end(chars: &[char], at: usize, query: &str) -> usize {
+    let quoted = chars.get(at + 1) == Some(&'"');
+    (at + 1 + usize::from(quoted) + query.chars().count()).min(chars.len())
 }
 
 #[component]
@@ -4996,7 +5012,7 @@ fn Composer(
         let Some((at, query)) = mention.get_untracked() else { return };
         let t = text.get_untracked();
         let chars: Vec<char> = t.chars().collect();
-        let end = (at + 1 + query.chars().count()).min(chars.len());
+        let end = mention_end(&chars, at, &query);
         let insert = format!("@{path}{} ", if dir { "/" } else { "" });
         let new: String = chars[..at].iter().collect::<String>() + &insert + &chars[end..].iter().collect::<String>();
         let caret = (at + insert.chars().count()) as u32;
@@ -5014,7 +5030,7 @@ fn Composer(
         let Some((at, query)) = mention.get_untracked() else { return };
         let t = text.get_untracked();
         let chars: Vec<char> = t.chars().collect();
-        let end = (at + 1 + query.chars().count()).min(chars.len());
+        let end = mention_end(&chars, at, &query);
         let insert = format!("[@{}](c6:{reference}) ", title.replace(['[', ']'], ""));
         let new: String = chars[..at].iter().collect::<String>() + &insert + &chars[end..].iter().collect::<String>();
         let caret = (at + insert.chars().count()) as u32;
@@ -5761,6 +5777,22 @@ fn SecretCardView(card: SecretCard, on_dismiss: Callback<String>) -> impl IntoVi
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_quoted_mention_takes_spaces_until_its_closing_quote() {
+        let at = |t: &str| super::mention_at(t, t.chars().count());
+        assert_eq!(at("see @deploy"), Some((4, "deploy".into())));
+        assert_eq!(at("see @deploy broke"), None, "a space ends a plain mention");
+        assert_eq!(at("see @\"deploy broke"), Some((4, "deploy broke".into())));
+        assert_eq!(at("see @\"deploy broke\""), None, "its closing quote ends it");
+        assert_eq!(at("see @\"deploy broke\" and"), None);
+        assert_eq!(at("me@\"x y"), None, "only at the start of a word");
+        // Picking one replaces what was typed, quote and all.
+        let t: Vec<char> = "see @\"deploy broke".chars().collect();
+        assert_eq!(super::mention_end(&t, 4, "deploy broke"), t.len());
+        let t: Vec<char> = "see @deploy now".chars().collect();
+        assert_eq!(super::mention_end(&t, 4, "deploy"), 11);
+    }
+
     #[test]
     fn pauses_read_as_minutes_and_hours() {
         assert_eq!(super::pause(45 * 60_000), "45 min");
