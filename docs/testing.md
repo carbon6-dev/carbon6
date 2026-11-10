@@ -413,14 +413,15 @@ All first-frame assertions remain. Session-sheet Stop waits for the exact mocked
 POST response instead of hand-written 10ms condition polling. Motion keeps
 finite-animation completion and controlled browser-clock boundaries.
 
-### Known browser-test failure: rare WebKit page crash
+### WebKit needs a current Mesa
 
-WebKit's page process has crashed once, during an ordinary viewport screenshot
-in session-sheet (`page.screenshot: Target crashed`), with no page errors and
-the browser still connected. It did not reproduce in about 400 further
-session-sheet runs, on a busy host and an idle one. A crash fails the run; there
-is no automatic rerun. If a full run fails this way, check the case's
-`lifecycle` record (a `crash` event before the first error), then rerun.
+Playwright's WebKit paints through the system's Mesa. On a machine whose GPU it
+can't use, that is Mesa's software driver, and Debian 12's Mesa 22.3.6
+segfaults in it now and then (`page.screenshot: Target crashed`, a `crash`
+event in the case's `lifecycle` record, a core in `swrast_dri.so`): about one
+full run in eight. Mesa 25 (Debian's bookworm-backports) ran 20 full runs
+without one. A crash fails the run; there is no automatic rerun. Check the
+system Mesa before suspecting the app.
 
 ### Phone single-bar production browser regression (S14)
 
