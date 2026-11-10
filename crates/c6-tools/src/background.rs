@@ -1522,7 +1522,7 @@ mod tests {
         });
         let meta: HeldMeta = serde_json::from_slice(&std::fs::read(held.join(&id).join("meta.json")).unwrap()).unwrap();
         assert!(meta.pgid > 0);
-        assert_eq!(*owner.reserved.lock().unwrap(), [id.clone()]);
+        assert_eq!(owner.reserved.lock().unwrap().as_slice(), std::slice::from_ref(&id));
         assert_eq!(*owner.launched.lock().unwrap(), [(id.clone(), Some(meta.pgid))]);
         assert!(owner.abandoned.lock().unwrap().is_empty());
         drop(first);
