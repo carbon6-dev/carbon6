@@ -881,7 +881,7 @@ impl Tool for Call {
         // As they are now: the conversation's switch for your mail, chat and
         // calendar can change between calls.
         let labels = self.env.labels_now().await;
-        let scope = crate::memex::scope_for(st, &labels).await;
+        let scope = crate::memex::scope_for(st, &self.env.realm, &labels).await;
         let mut ask: Option<(String, String)> = None;
         // What the approval shows (else the operation and its input).
         let mut asked: Option<String> = None;

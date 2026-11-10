@@ -107,7 +107,7 @@ async fn a_chat_takes_its_model_your_switch_and_what_you_mention() {
     assert_eq!(s.model, "mock-2");
     assert!(s.labels.iter().any(|l| l == c6_api::ASSISTANT_PERSONAL), "{:?}", s.labels);
     let row = env.head.state.store.session(&s.id).await.unwrap().unwrap();
-    let scope = c6_head::memex::scope_for(&env.head.state, &row.all_labels()).await;
+    let scope = c6_head::memex::scope_for(&env.head.state, &row.realm, &row.all_labels()).await;
     assert!(["email", "chat", "event"].iter().all(|k| scope.iter().any(|x| x == k)), "{scope:?}");
     env.turns(&s.id, 1).await;
     assert_eq!(env.mock.requests()[0]["model"], "mock-2");
@@ -117,7 +117,7 @@ async fn a_chat_takes_its_model_your_switch_and_what_you_mention() {
     let r = env.http.put(format!("{}/sessions/{}/labels", env.api, s.id)).json(&json!({"labels": labels})).send().await.unwrap();
     assert!(r.status().is_success());
     let row = env.head.state.store.session(&s.id).await.unwrap().unwrap();
-    assert!(!c6_head::memex::scope_for(&env.head.state, &row.all_labels()).await.iter().any(|k| k == "email"));
+    assert!(!c6_head::memex::scope_for(&env.head.state, &row.realm, &row.all_labels()).await.iter().any(|k| k == "email"));
 
     // @ offers the project; mentioning it brings it in.
     let found: Vec<c6_api::Mentionable> =

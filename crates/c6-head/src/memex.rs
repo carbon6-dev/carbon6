@@ -446,14 +446,23 @@ async fn accounts_by_realm(st: &HeadState) -> Value {
     Value::Object(out)
 }
 
-/// The kinds a session with `labels` may see.
-pub async fn scope_for(st: &HeadState, labels: &[String]) -> Vec<String> {
+/// The kinds a session in `realm` with `labels` may see: the scopes that
+/// realm uses (root's and its own), whichever realm the call comes from.
+pub async fn scope_for(st: &HeadState, realm: &str, labels: &[String]) -> Vec<String> {
     let mut kinds: Vec<String> = api::MEMEX_DEFAULT_SCOPE.iter().map(|k| k.to_string()).collect();
     // An Ask conversation you let read your mail, chat and calendar.
     if labels.iter().any(|l| l == api::ASSISTANT_PERSONAL) {
         kinds.extend(api::PERSONAL_KINDS.iter().map(|k| k.to_string()));
     }
-    for s in scopes(st).await.unwrap_or_default() {
+    // Root's own conversations use home's, where the list lives.
+    let realm = if realm == crate::realms::ROOT { crate::realms::HOME } else { realm };
+    let scopes: Vec<api::MemexScope> = crate::lists::effective(&st.store.pool, SCOPES, realm)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect();
+    for s in scopes {
         if s.enabled && api::labels::applies(&s.applies_to, labels) {
             for k in s.kinds {
                 if !kinds.contains(&k) {
@@ -480,7 +489,7 @@ pub async fn brief(st: &HeadState, realm: &str, labels: &[String], text: &str) -
     if chars == 0 {
         return String::new();
     }
-    let scope = scope_for(st, labels).await;
+    let scope = scope_for(st, realm, labels).await;
     let one = async |realm: &str| {
         let params = json!({"labels": labels, "text": text, "chars": chars, "scope": scope, "realm": realm});
         match call_within(st, "memex.brief", params, BRIEF_TIMEOUT).await {

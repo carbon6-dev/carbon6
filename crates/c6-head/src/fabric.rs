@@ -106,7 +106,7 @@ pub async fn session_scope(st: &HeadState, session: &crate::store::SessionRow) -
     if let Some(i) = crate::instances::of_session(&st.store.pool, &session.id).await? {
         return Ok(crate::instances::approved_reads(&st.store.pool, i.id).await?.items.kinds);
     }
-    Ok(crate::memex::scope_for(st, &session.all_labels()).await)
+    Ok(crate::memex::scope_for(st, &session.realm, &session.all_labels()).await)
 }
 
 pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Value) -> anyhow::Result<Value> {

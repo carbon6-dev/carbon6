@@ -327,3 +327,28 @@ async fn kit_jobs_run_only_where_their_realm_is_served() {
     drop(gvm);
     head.shutdown().await.unwrap();
 }
+
+/// A realm's knowledge scopes reach its sessions' memex calls, whichever
+/// realm the call comes from: a worker's call carries none, and a message
+/// sent from another realm's page carries that one.
+#[tokio::test]
+async fn a_realms_knowledge_scopes_reach_its_sessions() {
+    let (head, _dir) = head().await;
+    let (st, api) = (&head.state, Api::of(&head));
+    use reqwest::Method as M;
+    api.ok(M::POST, "realms", json!({"id": "work"})).await;
+    let w = worker(st, "w", &[]).await;
+    let c = connection(&api, "c", &[]).await;
+    let (theirs, mine) = (session(&api, w, &c, "work").await, session(&api, w, &c, "home").await);
+    let scope = json!([{"name": "Chat for all", "applies_to": [], "enabled": true, "kinds": ["chat"]}]);
+    c6_head::lists::write(st.store.pool(), c6_head::memex::SCOPES, "work", scope.as_array().unwrap(), "you").await.unwrap();
+    let scope_of = async |id: &str| {
+        let row = st.store.session(id).await.unwrap().unwrap();
+        c6_head::fabric::session_scope(st, &row).await.unwrap()
+    };
+    assert!(scope_of(&theirs).await.contains(&"chat".to_owned()), "its realm's scope, from a worker's call");
+    let from_home = c6_head::store::SETTINGS_REALM.scope("home".into(), scope_of(&theirs)).await;
+    assert!(from_home.contains(&"chat".to_owned()), "and from another realm's page");
+    assert!(!scope_of(&mine).await.contains(&"chat".to_owned()), "not another realm's");
+    head.shutdown().await.unwrap();
+}

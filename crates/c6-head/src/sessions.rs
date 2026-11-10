@@ -493,7 +493,7 @@ async fn with_builtin_policies(st: &HeadState, yours: String) -> String {
 
 async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Vec<SessionEvent>) -> anyhow::Result<CreateSession> {
     let memex = crate::memex::ready(st);
-    let scope = crate::memex::scope_for(st, &row.all_labels()).await;
+    let scope = crate::memex::scope_for(st, &row.realm, &row.all_labels()).await;
     let connection = st.store.connection(&row.connection_id).await?.ok_or_else(|| bad_request("no such connection"))?;
     let connections = st.store.connections().await?;
     let subagent_connections = subagent_connections(&connections, &row.realm, !row.ssh_target.is_empty());
