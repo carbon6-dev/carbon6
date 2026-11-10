@@ -2685,6 +2685,25 @@ fn Transcript(
                             c6_api::TranscriptTimes::Exchanges => arrives,
                             c6_api::TranscriptTimes::Off => false,
                         };
+                        // Hover time must not turn an otherwise empty bookkeeping
+                        // row into a message. Keep the extra visible render_event
+                        // cases without changing the caption settings above.
+                        let hover_time = match &e.kind {
+                            EventKind::Started { .. } => !side,
+                            EventKind::Rewound { .. } => true,
+                            EventKind::SubagentSpawned { .. } => false,
+                            _ => shows,
+                        };
+                        let ended = match &e.kind {
+                            EventKind::TurnEnded { reason, turn } => {
+                                Some((*turn, matches!(reason, TurnEndReason::Interrupted | TurnEndReason::WorkerRestarted)))
+                            }
+                            _ => None,
+                        };
+                        let hover_visible = move || {
+                            !(only_thinking && !show_thinking.get())
+                                && (hover_time || ended.is_some_and(|(turn, note)| note || usage.with(|u| u.turns.contains_key(&turn))))
+                        };
                         let divider = move || {
                             if times.get() == c6_api::TranscriptTimes::Off || hidden() || (only_thinking && !show_thinking.get()) {
                                 return None;
@@ -2743,12 +2762,14 @@ fn Transcript(
                                             {crate::when::time(ts)}
                                         </p>
                                     }.into_any()
-                                } else {
+                                } else if hover_visible() {
                                     view! {
                                         <span class="pointer-events-none absolute right-0 top-0 z-10 rounded bg-white/90 px-1 text-[10px] text-muted opacity-0 shadow-sm transition group-hover:opacity-100 dark:bg-zinc-900/90">
                                             {crate::when::full(ts)}
                                         </span>
                                     }.into_any()
+                                } else {
+                                    ().into_any()
                                 }}
                                 {anchorable.then(|| view! {
                                     // Non-user transcript entries retain the phone picker.
@@ -7161,6 +7182,21 @@ mod tests {
         assert!(
             source.contains("c6_api::TranscriptTimes::All => shows") && source.contains("c6_api::TranscriptTimes::Exchanges => arrives")
         );
+    }
+
+    #[test]
+    fn hover_times_keep_visible_special_rows_without_filling_empty_bookkeeping() {
+        let source = include_str!("session.rs").split("#[cfg(test)]").next().unwrap();
+        let hover = source.split("let hover_time =").nth(1).unwrap().split("let divider =").next().unwrap();
+        for visible in ["EventKind::Started { .. } => !side", "EventKind::Rewound { .. } => true", "_ => shows"] {
+            assert!(hover.contains(visible), "preserve visible timestamp: {visible}");
+        }
+        assert!(hover.contains("EventKind::SubagentSpawned { .. } => false"), "render_event has no standalone spawn body");
+        assert!(hover.contains("TurnEndReason::Interrupted | TurnEndReason::WorkerRestarted"));
+        assert!(hover.contains("usage.with(|u| u.turns.contains_key(&turn))"), "turn usage visibility remains reactive");
+        assert!(hover.contains("only_thinking && !show_thinking.get()"));
+        let timestamp = source.split("{move || if captioned()").nth(1).unwrap().split("{anchorable.then").next().unwrap();
+        assert!(timestamp.contains("else if hover_visible()") && timestamp.contains("().into_any()"));
     }
 
     #[test]
