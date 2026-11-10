@@ -1044,9 +1044,29 @@ impl Process {
         mcp: Option<&crate::mcp_bridge::Registration>,
         output_root: Option<&OutputRoot>,
     ) -> std::io::Result<(tokio::process::Child, Held, Option<Pid>)> {
+        // A finished leader/code file is not group absence. This also checks
+        // aliases whose authoritative stream ID differs from storage, and
+        // refuses corrupt/ambiguous records instead of overwriting them.
+        let record = Self::held_record(dir, &launch.conversation)?.map(|(path, _)| path);
         let dir = dir.join(&launch.conversation);
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir)?;
+        let mut prior = record.into_iter().collect::<Vec<_>>();
+        if dir.try_exists()? && !prior.contains(&dir) {
+            prior.push(dir.clone());
+        }
+        for path in prior {
+            let meta: HeldMeta = serde_json::from_slice(&std::fs::read(path.join("meta.json"))?).map_err(std::io::Error::other)?;
+            if meta.pgid <= 0 || !matches!(killpg(Pid::from_raw(meta.pgid), None), Err(nix::errno::Errno::ESRCH)) {
+                return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "Held Claude Code group has not confirmed absence"));
+            }
+            std::fs::remove_dir_all(&path)?;
+            if let Some(root) = meta.output_root {
+                let _ = std::fs::remove_dir_all(root);
+            }
+        }
+        std::fs::create_dir_all(dir.parent().expect("held runtime parent"))?;
+        // Reserve exclusively: another publisher after the absence check
+        // cannot have its record or FIFO silently replaced.
+        std::fs::create_dir(&dir)?;
         let fifo = dir.join("in");
         nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR).map_err(std::io::Error::from)?;
         // The worker's end reads too, so opening it never waits; with it
@@ -1959,6 +1979,24 @@ impl Process {
         }
         self.release_held();
         let _ = self.mapper.close_children(TurnEndReason::Completed).await;
+    }
+
+    /// Replacement may drain/send its inbox only after the old entire group
+    /// is absent. A failed stop retains held metadata and the durable PGID;
+    /// it is not permission to spawn another runtime over that authority.
+    pub async fn close_for_replacement(mut self) -> anyhow::Result<()> {
+        self.track().await?;
+        *self.stdin.lock().await = None;
+        self.kill().await;
+        let pg = self.pgid.ok_or_else(|| anyhow::anyhow!("Claude Code process group is unknown"))?;
+        anyhow::ensure!(
+            matches!(killpg(pg, None), Err(nix::errno::Errno::ESRCH)),
+            "Claude Code replacement is blocked until process group {} confirms absence",
+            pg
+        );
+        self.release_held();
+        let _ = self.mapper.close_children(TurnEndReason::Completed).await;
+        Ok(())
     }
 
     /// Stops it and its background tasks now.
@@ -4627,6 +4665,31 @@ done
     }
 
     #[tokio::test]
+    async fn held_replacement_requires_group_absence_and_preserves_live_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        let _cleanup = HeldFixtureCleanup(held.clone());
+        let bin = live_claude(dir.path());
+        let launch = || Launch { conversation: "fork".into(), ..Default::default() };
+        let p = Process::spawn_held(&held, "s", &bin, launch(), false, dir.path(), "opus", Arc::default(), None, None).unwrap();
+        let pg = p.pgid.unwrap();
+        let path = held.join("fork/meta.json");
+        let before = std::fs::read(&path).unwrap();
+        assert!(Process::spawn_held(&held, "s", &bin, launch(), true, dir.path(), "opus", Arc::default(), None, None).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before, "a live runtime's authority must not be overwritten");
+        assert!(killpg(pg, None).is_ok());
+        p.close_for_replacement().await.unwrap();
+        assert_eq!(killpg(pg, None), Err(nix::errno::Errno::ESRCH));
+        let unknown = held.join("fork");
+        std::fs::create_dir(&unknown).unwrap();
+        assert!(Process::spawn_held(&held, "s", &bin, launch(), true, dir.path(), "opus", Arc::default(), None, None).is_err());
+        assert!(unknown.exists(), "an unconfirmed/corrupt record must not be discarded either");
+        std::fs::remove_dir(unknown).unwrap();
+        let replacement = Process::spawn_held(&held, "s", &bin, launch(), true, dir.path(), "opus", Arc::default(), None, None).unwrap();
+        replacement.close_for_replacement().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn rewind_stop_without_a_ready_keeper_preserves_descendant_cleanup() {
         let dir = tempfile::tempdir().unwrap();
         let held = dir.path().join("held");
@@ -4732,16 +4795,17 @@ done
         p.stop_for_rewind().await.unwrap();
         let mut replacement = spawn(&bin, dir.path(), "after", false, None);
         assert_eq!(run(&mut replacement, 2, &waiting, &sink).await.reason, Some(TurnEndReason::Completed));
-        let events = vec_sink.0.lock().unwrap();
-        let users = events
-            .iter()
-            .filter_map(|e| match &e.kind {
-                Some(session_event::Kind::User(u)) => Some(u.command_id.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(users, ["confirmed", "waiting"]);
-        drop(events);
+        {
+            let events = vec_sink.0.lock().unwrap();
+            let users = events
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    Some(session_event::Kind::User(u)) => Some(u.command_id.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(users, ["confirmed", "waiting"]);
+        }
         replacement.close().await;
     }
 

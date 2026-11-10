@@ -2706,6 +2706,10 @@ impl Actor {
                 _ = tokio::time::sleep_until(retry_at.unwrap_or_else(tokio::time::Instant::now)), if retry_at.is_some() => {
                     self.release_held();
                 }
+                // A queued input must not require another command to recover
+                // after unrelated metadata publication/removal finishes. This
+                // wake only rechecks ownership; failed Rewinds never arm it.
+                _ = tokio::time::sleep(std::time::Duration::from_millis(250)), if adoption_blocked && !rewind_blocked && running.is_none() => {}
                 _ = self.link.wait_connected(), if waiting_to_wake && retry_at.is_none() => {}
                 // Idle long enough, with no background tasks: close it.
                 _ = tokio::time::sleep_until(idle_until.unwrap_or_else(tokio::time::Instant::now)), if running.is_none() && idle_until.is_some() => {
@@ -3925,7 +3929,7 @@ async fn claude_turn(
         // this alone is not a settings/worker change to announce.
         restarted = p.launch() != &launch;
         promoted = !p.is_held();
-        p.close().await;
+        p.close_for_replacement().await?;
     }
     let inputs = inbox.lock().unwrap().drain();
     if process.is_none() && inputs.is_empty() {
@@ -6455,8 +6459,6 @@ for line in sys.stdin:
         let paused = manager.journal.events_after("s", 0, u32::MAX).await.unwrap();
         assert!(paused.iter().any(|e| matches!(&e.kind, Some(session_event::Kind::Error(e)) if e.message.contains("safely taken up"))));
         assert!(!manager.actor("s").await.unwrap().unwrap().is_closed());
-        std::fs::remove_dir(&publishing).unwrap();
-        rewind_actor_barrier(&manager, "adopted").await;
         manager.actor("s").await.unwrap().unwrap().send(ActorMsg::Resume(1)).unwrap();
         rewind_actor_barrier(&manager, "stale-resume").await;
         let command = || SessionCommand {
@@ -6470,7 +6472,13 @@ for line in sys.stdin:
             })),
         };
         manager.handle(command()).await.unwrap();
-        c6_testkit::eventually("adopted fork completes a real input", async || {
+        rewind_actor_barrier(&manager, "queued-while-adoption-paused").await;
+        assert!(publishing.exists());
+        assert!(held_trace(dir.path()).iter().all(|v| v["kind"] == "spawn"));
+        std::fs::remove_dir(&publishing).unwrap();
+        // No command or mailbox barrier after removing the obstacle. The
+        // adoption-only retry wake must itself release the pre-existing queue.
+        c6_testkit::eventually("adoption retry wakes and completes the already queued input", async || {
             let raw = manager.journal.events_after("s", 0, u32::MAX).await.unwrap();
             let input = raw.iter().find(|e| matches!(&e.kind, Some(session_event::Kind::User(u)) if u.command_id == "after-rewind"))?;
             raw.iter().any(|e| e.seq > input.seq && matches!(e.kind, Some(session_event::Kind::TurnEnded(_)))).then_some(())
