@@ -143,7 +143,7 @@ async fn a_claude_code_child_owns_policies_and_surfaces_approval_to_its_loop_par
 
     // Fail as soon as an unguarded dispatch answers (or writes its marker),
     // rather than wasting the suite's default five-minute hang deadline.
-    let call = tokio::time::timeout(Duration::from_secs(20), async {
+    let call = c6_testkit::within("the Claude Code child's own policy approval", async {
         loop {
             if let Some(call) = events(&http, &api, &child.id).await.iter().find_map(|e| match &e.kind {
                 EventKind::Approval { call_id, state, policy, input, .. }
@@ -166,8 +166,7 @@ async fn a_claude_code_child_owns_policies_and_surfaces_approval_to_its_loop_par
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
-    .await
-    .expect("the Claude Code child's command must request approval within 20 seconds");
+    .await;
     assert_eq!(call, "toolu_ask");
     eventually("the child to show awaiting approval", async || {
         let d: SessionDetail = http.get(format!("{api}/sessions/{}", child.id)).send().await.ok()?.json().await.ok()?;
