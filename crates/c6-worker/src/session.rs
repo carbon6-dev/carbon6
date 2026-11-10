@@ -1018,6 +1018,22 @@ impl SessionManager {
             }
             let Some(id) = pending.pop() else { return Ok(()) };
             self.journal.confirm_shell_writers_stopped(&id).await?;
+            // A completed Claude Code turn does not stop its CLI: it can
+            // still write files or start work while the child actor is idle,
+            // or after that actor/worker has gone away. Check every owned
+            // runtime, including unselected forks, without adopting/stopping
+            // it. The caller's affected-event selection keeps retained
+            // children exempt only for conversation-only Rewind.
+            let claude_stopped = async {
+                crate::claude_code::confirm_held_stopped(&self.claude_dir().join("held"), &id)?;
+                crate::claude_code::confirm_stopped(&self.journal, &id, std::time::Duration::ZERO).await
+            }
+            .await;
+            if let Err(error) = claude_stopped {
+                anyhow::bail!(
+                    "Subagent {id} has a live or unconfirmed Claude Code runtime; stop confirmation is required before rewinding: {error:#}"
+                );
+            }
             let handle = self.actors.lock().unwrap().get(&id).filter(|h| !h.tx.is_closed()).cloned();
             let registry = if let Some(handle) = handle {
                 anyhow::ensure!(
@@ -7227,6 +7243,115 @@ for line in sys.stdin:
             .await
             .unwrap();
         manager.rewind_children_stopped(&links).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rewind_completed_child_with_live_claude_group_blocks_file_restore_but_not_retained_conversation() {
+        let (dir, manager) = rewind_test_manager().await;
+        manager.journal.import("child", &CreateSession::default(), &rewind_child_events()).await.unwrap();
+        let mut cli = tokio::process::Command::new("sleep").arg("300").process_group(0).kill_on_drop(true).spawn().unwrap();
+        let pgid = cli.id().unwrap() as i32;
+        manager.journal.track_claude_process("child", pgid).await.unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        manager.actors.lock().unwrap().insert(
+            "child".into(),
+            Handle {
+                tx,
+                tools: Arc::new(SessionTools::new(dir.path().into())),
+                running: Arc::default(),
+                claude_code: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                inbox: Arc::default(),
+            },
+        );
+        let events = [rewind_child_link("child"), user(5, "target")];
+        manager.rewind_preflight("root", &events, 5, false).await.unwrap();
+        for (to_seq, restore_files) in [(5, true), (3, false)] {
+            let error = manager.rewind_preflight("root", &events, to_seq, restore_files).await.unwrap_err().to_string();
+            assert!(error.contains("child") && error.contains("live or unconfirmed Claude Code runtime"), "{error}");
+            assert!(cli.try_wait().unwrap().is_none(), "preflight must not stop a descendant's CLI");
+            assert_eq!(manager.journal.claude_processes("child").await.unwrap(), [pgid]);
+        }
+        assert!(rx.try_recv().is_err(), "an idle mailbox is not proof that the CLI stopped");
+        cli.kill().await.unwrap();
+        let reply = tokio::spawn(async move {
+            let Some(ActorMsg::RewindIdle(reply)) = rx.recv().await else { panic!("expected a child mailbox barrier") };
+            reply.send(true).unwrap();
+        });
+        manager.rewind_preflight("root", &events, 5, true).await.unwrap();
+        reply.await.unwrap();
+        assert!(manager.journal.claude_processes("child").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rewind_nested_completed_child_with_unselected_held_claude_runtime_fails_closed() {
+        if !c6_testkit::have("python3") {
+            return;
+        }
+        let (dir, manager) = rewind_test_manager().await;
+        let _cleanup = crate::claude_code::tests::HeldFixtureCleanup(manager.claude_dir().join("held"));
+        let (spec, started, bin) = rewind_held_fixture(dir.path());
+        let mut child = rewind_child_events();
+        child.push(rewind_child_link("s"));
+        manager.journal.import("child", &CreateSession::default(), &child).await.unwrap();
+        let mut grandchild = rewind_child_events();
+        grandchild[0] = ev(1, session_event::Kind::Started(started));
+        manager.journal.import("s", &spec, &grandchild).await.unwrap();
+        // This runtime belongs to the descendant, but is not its selected
+        // conversation. Looking up only that conversation would miss it.
+        let conversation = journal_claude_conversation(&manager.journal, "s", &spec, &grandchild).await.unwrap();
+        assert_eq!(conversation.id, "s");
+        leave_rewind_held(&manager, &spec, &bin, dir.path(), "unselected-child-fork");
+        assert!(manager.journal.claude_processes("s").await.unwrap().is_empty(), "no actor/observer owns this held runtime");
+        let (record, _) =
+            crate::claude_code::Process::held_record(&manager.claude_dir().join("held"), "unselected-child-fork").unwrap().unwrap();
+        let before = std::fs::read(record.join("meta.json")).unwrap();
+        let events = [rewind_child_link("child"), user(5, "target")];
+        manager.rewind_preflight("root", &events, 5, false).await.unwrap();
+        for (to_seq, restore_files) in [(5, true), (3, false)] {
+            let error = manager.rewind_preflight("root", &events, to_seq, restore_files).await.unwrap_err().to_string();
+            assert!(error.contains("Subagent s") && error.contains("Held Claude Code process group"), "{error}");
+            assert_eq!(std::fs::read(record.join("meta.json")).unwrap(), before, "preflight must retain held ownership");
+            assert!(!record.join("code").exists(), "preflight must not stop the held runtime");
+        }
+        crate::claude_code::stop_held_for_rewind(&manager.claude_dir().join("held"), "s", &manager.journal).await.unwrap();
+        manager.rewind_preflight("root", &events, 5, true).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rewind_unknown_descendant_held_identity_fails_closed_without_cleanup() {
+        let (_dir, manager) = rewind_test_manager().await;
+        manager.journal.import("child", &CreateSession::default(), &rewind_child_events()).await.unwrap();
+        let events = [rewind_child_link("child"), user(5, "target")];
+        let record = manager.claude_dir().join("held/unknown-runtime");
+        std::fs::create_dir_all(&record).unwrap();
+        // Even absent metadata may be an interrupted publication, not proof
+        // that no runtime exists. A missing child identity is likewise unsafe.
+        let error = manager.rewind_preflight("root", &events, 5, true).await.unwrap_err().to_string();
+        assert!(error.contains("child") && error.contains("unconfirmed Claude Code runtime"), "{error}");
+        let meta = serde_json::json!({
+            "session": "child", "conversation": "old-fork", "pgid": 0,
+            "keeper": 0, "output_root": null, "token": null,
+            "launch": crate::claude_code::Launch::default(),
+        });
+        let mut empty_session = meta.clone();
+        empty_session["session"] = serde_json::json!("");
+        let mut missing_session = meta.clone();
+        missing_session.as_object_mut().unwrap().remove("session");
+        for bytes in [
+            b"not json".to_vec(),
+            serde_json::to_vec(&missing_session).unwrap(),
+            serde_json::to_vec(&empty_session).unwrap(),
+            serde_json::to_vec(&meta).unwrap(),
+        ] {
+            std::fs::write(record.join("meta.json"), &bytes).unwrap();
+            manager.rewind_preflight("root", &events, 5, false).await.unwrap();
+            let error = manager.rewind_preflight("root", &events, 5, true).await.unwrap_err().to_string();
+            assert!(error.contains("child") && error.contains("unconfirmed Claude Code runtime"), "{error}");
+            assert_eq!(std::fs::read(record.join("meta.json")).unwrap(), bytes);
+            assert!(manager.journal.claude_processes("child").await.unwrap().is_empty());
+        }
+        let error = manager.rewind_children_stopped(&[rewind_child_link("")]).await.unwrap_err().to_string();
+        assert!(error.contains("identity is unknown"), "{error}");
     }
 
     #[tokio::test]

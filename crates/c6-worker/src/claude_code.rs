@@ -787,6 +787,36 @@ pub(crate) async fn replacement_admission<'a>(
     Ok(Some(ownership))
 }
 
+/// A descendant's completed turn is not proof that its held CLI stopped.
+/// Inspect all runtimes owned by the session, not just its selected branch.
+/// Do not attach, signal, or remove records here: only ESRCH proves absence.
+/// Unreadable/unknown metadata fails closed, as it does for rewind cleanup.
+pub(crate) fn confirm_held_stopped(held: &Path, session: &str) -> anyhow::Result<()> {
+    let entries = match std::fs::read_dir(held) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries {
+        let dir = entry?.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let meta: HeldMeta = serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?)?;
+        anyhow::ensure!(!meta.session.is_empty(), "Held Claude Code session identity is unknown");
+        if meta.session != session {
+            continue;
+        }
+        anyhow::ensure!(meta.pgid > 0, "Held Claude Code process group is unknown");
+        anyhow::ensure!(
+            killpg(Pid::from_raw(meta.pgid), None) == Err(nix::errno::Errno::ESRCH),
+            "Held Claude Code process group {} has not confirmed that it stopped",
+            meta.pgid
+        );
+    }
+    Ok(())
+}
+
 /// Recover ownership for cleanup, never for model input. Pending rewinds may
 /// name neither the old branch nor an interrupted reset's launch identity.
 /// Stop all of this session's held runtimes before the durable PGID barrier.
