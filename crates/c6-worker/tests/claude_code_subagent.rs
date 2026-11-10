@@ -4,15 +4,16 @@
 //! tool list keeps it to those tools there too.
 //! A binary of its own: it sets C6_CLAUDE_BIN.
 
+#[path = "support/held_worker.rs"]
+mod held_worker;
+
 use std::path::Path;
 
 use c6_api::{Event, EventKind};
 use c6_head::HeadConfig;
 use c6_testkit::{MockLlm, Reply, eventually};
-use c6_worker::{ConnState, Identity, Worker, conn, enroll};
+use c6_worker::enroll;
 use serde_json::{Value, json};
-use tokio::sync::watch;
-use tokio_util::sync::CancellationToken;
 
 /// A `claude` that answers every message "Found it on Claude Code." and
 /// records each start's arguments, a line each.
@@ -62,12 +63,8 @@ async fn a_subagent_on_claude_code_runs_as_a_claude_code_session() {
     let http = reqwest::Client::new();
     let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
     enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
-    let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
-    let (tx, mut rx) = watch::channel(ConnState::Connecting);
-    let stop = CancellationToken::new();
-    tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
-    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
-    assert!(head.state.registry.get(worker.identity.meta.worker_id).unwrap().capabilities.iter().any(|c| c == "claude_code_subagents_v1"));
+    let worker = held_worker::HeldWorker::start(state.path()).await;
+    assert!(head.state.registry.get(worker.id.parse().unwrap()).unwrap().capabilities.iter().any(|c| c == "claude_code_subagents_v1"));
     let post = async |path: &str, body: Value| -> Value {
         http.post(format!("{api}{path}")).json(&body).send().await.unwrap().json().await.unwrap()
     };
@@ -92,7 +89,7 @@ async fn a_subagent_on_claude_code_runs_as_a_claude_code_session() {
     mock.push(Reply::Text("The subagent found it.".into()));
     let s = post(
         "/sessions",
-        json!({"worker_id": worker.identity.meta.worker_id.0, "cwd": project.path().display().to_string(),
+        json!({"worker_id": worker.id, "cwd": project.path().display().to_string(),
                "connection_id": m["id"], "model": "m", "prompt": "find the bug"}),
     )
     .await;
@@ -125,6 +122,6 @@ async fn a_subagent_on_claude_code_runs_as_a_claude_code_session() {
     let args = spawns.lines().next().expect("run by claude");
     assert!(args.contains("--tools Read,ToolSearch "), "{args}");
     assert!(!args.contains("--mcp-config"), "none of carbon6's tools, so no bridge: {args}");
-    stop.cancel();
+    worker.stop();
     head.shutdown().await.unwrap();
 }
