@@ -88,7 +88,7 @@ async function check(browser, origin, phone, theme, engine) {
     assert.deepEqual(command.value[0], { name: 'edited-tail', description: 'first', body: 'Preserved\nmultiline prompt',
       enabled: false, applies_to: ['repo:example', 'env:test'] });
     assert.equal(command.value[1].name, 'added');
-    await page.reload({ waitUntil: 'domcontentloaded' });
+    await f.reload({ waitUntil: 'domcontentloaded' });
     await names.first().waitFor();
     assert.equal(await names.first().inputValue(), 'edited-tail', 'remount loads saved data');
 
@@ -168,7 +168,7 @@ async function check(browser, origin, phone, theme, engine) {
     assert.deepEqual(JSON.parse(await json.inputValue()), mcp, 'a fresh owner reloads the saved JSON setting');
 
     step('routing');
-    await page.goto(origin + '/admin/settings/routing', { waitUntil: 'domcontentloaded' });
+    await f.navigate(origin + '/admin/settings/routing', { waitUntil: 'domcontentloaded' });
     const rule = page.getByPlaceholder('e.g. Ops on the cheap model');
     await rule.waitFor();
     assert.equal(await rule.inputValue(), 'root-rule');

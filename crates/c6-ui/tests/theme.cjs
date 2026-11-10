@@ -390,7 +390,7 @@ async function switching(browser, origin, layout, fixture, settle) {
     assert.equal(composer, rgb('#4a4b52'), 'Dark composer keeps its stronger border');
     if (process.env.SCREENSHOTS) await f.page.screenshot({ path: path.join(process.env.SCREENSHOTS, `dark-theme-session-${layout}.png`) });
     await f.page.evaluate(() => localStorage.removeItem('c6.home.workspace.v2'));
-    await f.page.goto(`${origin}/r/home/settings/appearance`, { waitUntil: 'domcontentloaded' });
+    await f.navigate(`${origin}/r/home/settings/appearance`, { waitUntil: 'domcontentloaded' });
     await f.page.locator('input[name|=theme]').first().waitFor();
     const radios = f.page.locator('input[name|=theme]');
     assert.equal(await radios.count(), 3);
@@ -420,6 +420,7 @@ async function switching(browser, origin, layout, fixture, settle) {
     // Both windows render the production Settings component. Real storage
     // events, not synthetic dispatches, must update palette AND selected card.
     const peer = await f.context.newPage();
+    await f.observePage(peer);
     await peer.goto(`${origin}/r/home/settings/appearance`, { waitUntil: 'domcontentloaded' });
     await peer.locator('input[name|=theme]').first().waitFor();
     await peer.evaluate(() => localStorage.setItem('c6.theme', 'soft'));
@@ -440,7 +441,7 @@ async function switching(browser, origin, layout, fixture, settle) {
     await assertTheme(f.page, 'dark', true);
     await f.page.emulateMedia({ colorScheme: 'light' });
     await assertTheme(f.page, 'dark');
-    await f.page.reload({ waitUntil: 'domcontentloaded' });
+    await f.reload({ waitUntil: 'domcontentloaded' });
     await f.page.locator('input[name|=theme]').nth(2).waitFor();
     assert(await f.page.locator('input[name|=theme]').nth(2).isChecked(), 'Dark survives reload');
     await assertTheme(f.page, 'dark');
@@ -468,7 +469,7 @@ async function workspaceRadios(browser, origin, fixture, settle) {
         localStorage.setItem('c6.theme', 'soft');
         localStorage.setItem('c6.motion', 'system');
       }, { count, repeated: !!repeated });
-      await page.goto(`${origin}/r/home/settings/appearance`, { waitUntil: 'domcontentloaded' });
+      await f.navigate(`${origin}/r/home/settings/appearance`, { waitUntil: 'domcontentloaded' });
       await page.getByRole('heading', { name: 'Theme', exact: true }).first().waitFor();
       const appearance = page.locator('[data-tile-motion="10"]');
       const check = async (phase, motion = 'system') => {
@@ -528,6 +529,7 @@ async function workspaceRadios(browser, origin, fixture, settle) {
       if (repeated) {
         const peer = await f.context.newPage();
         try {
+          await f.observePage(peer);
           await peer.goto(`${origin}/r/home/settings/appearance`, { waitUntil: 'domcontentloaded' });
           const peerAppearance = peer.locator('[data-tile-motion="10"]');
           await peerAppearance.getByRole('radio', { name: /^Full/ }).check();
@@ -545,7 +547,7 @@ async function workspaceRadios(browser, origin, fixture, settle) {
         await other.getByRole('button', { name: 'Defocus', exact: true }).click();
         await check('restored');
       }
-      await page.reload({ waitUntil: 'domcontentloaded' });
+      await f.reload({ waitUntil: 'domcontentloaded' });
       await page.getByRole('heading', { name: 'Theme', exact: true }).first().waitFor();
       await check('reload');
     }
@@ -559,23 +561,26 @@ async function workspaceChoices(browser, origin, fixture, settle) {
   const question = { seq: 66, ts: 66, type: 'question', call_id: 'retained-choice', state: 'asked',
     title: 'Choose a workspace verification approach', fields: [{ name: 'approach', label: 'Question approach',
       type: 'choice', required: true, choices: [{ value: 'first', label: 'Question first answer' }, { value: 'second', label: 'Question second answer' }] }] };
-  const f = await fixture(browser, origin, { width: 1600, height: 1000 }, 'dark',
-    { choice: 'system', effective: 'full', os: 'no-preference' }, () => {}, {}, { events: [question] });
+  let marks = {}, f;
+  f = await fixture(browser, origin, { width: 1600, height: 1000 }, 'dark',
+    { choice: 'system', effective: 'full', os: 'no-preference' }, () => {}, {}, {
+      events: [question], setup: async ({ context }) => {
+        await require('./narrow-fixtures.cjs').install(context, origin);
+        await context.route('**/api/**', async route => {
+          const p = new URL(route.request().url()).pathname;
+          if (p.endsWith('/settings/session_facets')) return route.fulfill({ json: { shown: ['worker', 'model'], tile_bars: true } });
+          if (!p.endsWith('/marks')) return route.fallback();
+          if (route.request().method() === 'PUT') {
+            const { key, mark } = route.request().postDataJSON();
+            marks = { ...marks, [key]: mark };
+            f.setMarks(marks);
+          }
+          return route.fulfill({ json: marks });
+        });
+      },
+    });
   const { page } = f;
   try {
-    await require('./narrow-fixtures.cjs').install(f.context);
-    let marks = {};
-    await f.context.route('**/api/**', async route => {
-      const p = new URL(route.request().url()).pathname;
-      if (p.endsWith('/settings/session_facets')) return route.fulfill({ json: { shown: ['worker', 'model'], tile_bars: true } });
-      if (!p.endsWith('/marks')) return route.fallback();
-      if (route.request().method() === 'PUT') {
-        const { key, mark } = route.request().postDataJSON();
-        marks = { ...marks, [key]: mark };
-        f.setMarks(marks);
-      }
-      return route.fulfill({ json: marks });
-    });
     await page.evaluate(() => {
       const views = [{ view: 'session', id: 'parent' }, { view: 'decisions' }, { view: 'workers' },
         { view: 'docs', id: '' }, { view: 'settings', section: 'appearance' }, { view: 'sessions' }];
@@ -584,7 +589,7 @@ async function workspaceChoices(browser, origin, fixture, settle) {
       localStorage.setItem('c6.home.workspace.v2', JSON.stringify({ tiles, focus: 0, next: 40, full: false }));
       localStorage.setItem('c6.theme', 'soft');
     });
-    await page.goto(`${origin}/r/home/sessions/parent`, { waitUntil: 'domcontentloaded' });
+    await f.navigate(`${origin}/r/home/sessions/parent`, { waitUntil: 'domcontentloaded' });
     const session = page.locator('[data-tile-motion="10"]');
     const questionGroup = session.getByRole('radiogroup', { includeHidden: true });
     const decisionGroup = page.locator('#decision-7103').getByRole('radiogroup', { includeHidden: true });
@@ -636,7 +641,7 @@ async function workspaceChoices(browser, origin, fixture, settle) {
     await other.getByRole('button', { name: 'Defocus', exact: true }).click();
     await session.getByRole('button', { name: 'Focus', exact: true }).click();
     await aspect('restored');
-    await page.reload({ waitUntil: 'domcontentloaded' });
+    await f.reload({ waitUntil: 'domcontentloaded' });
     await questionGroup.waitFor();
     assert.deepEqual(await checked(questionGroup), ['Question first answer'], 'reload reconstructs required question defaults, not an unsaved answer');
     await aspect('reload');

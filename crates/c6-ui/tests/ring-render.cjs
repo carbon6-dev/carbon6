@@ -365,7 +365,7 @@ async function run(browser, origin, theme, run) {
         active: i + 20, used: i + 20, back: [], forward: [], stack: i === 0 ? 0 : 1, minimized: false }));
       localStorage.setItem('c6.home.workspace.v2', JSON.stringify({ tiles, focus: 0, next: 40, full: false }));
     });
-    await page.reload();
+    await f.reload();
     await page.locator('textarea').first().waitFor();
     await page.getByText('Q3 item 1029', { exact: false }).first().waitFor();
     await page.waitForFunction(() => document.querySelectorAll('[data-tile-motion]').length === 3);

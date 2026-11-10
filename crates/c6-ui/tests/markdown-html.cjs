@@ -156,7 +156,7 @@ async function checkSummarizedUpdates(browser, origin, engine, theme, width, sho
     append({ type: 'turn_ended', turn: 101, reason: 'completed' });
     await page.getByText('Actual answer after the summary.', { exact: true }).waitFor();
 
-    await page.reload({ waitUntil: 'domcontentloaded' });
+    await f.reload({ waitUntil: 'domcontentloaded' });
     await page.locator(`#parent-e${live} [data-summarized-update]`).waitFor();
     assert.equal(await items.count(), 3, 'replay retains summary provenance');
     assert.equal(await items.getByText('Summarized update', { exact: true }).count(), 3);

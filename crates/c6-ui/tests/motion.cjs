@@ -42,7 +42,7 @@ function crashDiagnostic(engine, error, consoleMessages = []) {
   }
   return 'Browser failure; not classified as a WebKit/WASM trap';
 }
-async function within(label, action) {
+async function within(label, action, options = {}) {
   let timer, passed = false;
   const started = performance.now();
   try {
@@ -53,8 +53,9 @@ async function within(label, action) {
     return result;
   } finally {
     clearTimeout(timer);
-    if (process.env.BROWSER_CASE_TIMINGS === '1' && process.env.EVIDENCE) {
-      fs.appendFileSync(path.join(process.env.EVIDENCE, 'cases.jsonl'), JSON.stringify({ label, passed,
+    const directory = options.evidenceDirectory ?? process.env.EVIDENCE;
+    if ((options.timings ?? process.env.BROWSER_CASE_TIMINGS === '1') && directory) {
+      fs.appendFileSync(path.join(directory, 'cases.jsonl'), JSON.stringify({ label, passed,
         seconds: (performance.now() - started) / 1000 }) + '\n');
     }
   }
@@ -165,7 +166,8 @@ function instrumentation() {
 }
 
 async function fixture(browser, origin, viewport, theme, motion, started, contextOptions = {}, seed = {}) {
-  const debug = phase => { if (process.env.DEBUG_FIXTURE) console.log(`  FIXTURE ${phase}`); };
+  const log = seed.log || console;
+  const debug = phase => { if (process.env.DEBUG_FIXTURE) log.log(`  FIXTURE ${phase}`); };
   debug('new context');
   const context = await browser.newContext({ viewport, hasTouch: phoneViewport(viewport),
     isMobile: phoneViewport(viewport), reducedMotion: motion.os, colorScheme: theme, serviceWorkers: 'block', ...contextOptions });
@@ -181,19 +183,29 @@ async function fixture(browser, origin, viewport, theme, motion, started, contex
   const crash = new Promise((_, reject) => { fail = reject; });
   crash.catch(() => {}); // The fixture may still be wiring its awaited signals.
   const progress = { page, context, errors, requests, consoleMessages, motion, theme, viewport, crash, phase: 'configure' };
-  started(progress);
   let state = 'idle', sequence = 100, suggestion = null, marks = seed.marks || {};
-  let attentionMockProved = false;
   let sessionView = { catchup: true, fold: false }, deferredView;
   const fatal = error => {
-    errors.push(String(error.stack || error)); console.error('PAGEERROR', error.stack || error);
-    console.error('CRASH DIAGNOSTIC', crashDiagnostic(browser.browserType().name(), error, consoleMessages));
+    errors.push(String(error.stack || error)); log.error('PAGEERROR', error.stack || error);
+    log.error('CRASH DIAGNOSTIC', crashDiagnostic(browser.browserType().name(), error, consoleMessages));
     fail(new Error(`browser crash during ${progress.phase}: ${error.stack || error}`));
   };
-  const navigation = await navigationObserver({ page, engine: browser.browserType().name(), origin,
-    baselineAttention: () => !seed.setup && attentionMockProved, fatal });
-  Object.assign(progress, { navigate: navigation.navigate, navigation });
-  page.on('pageerror', navigation.pageError);
+  const navigationPages = [];
+  const observePage = async observed => {
+    observed.setDefaultTimeout(DEADLINE); observed.setDefaultNavigationTimeout(DEADLINE);
+    if (observed === page) started(progress);
+    const observer = await navigationObserver({ page: observed, engine: browser.browserType().name(), origin,
+      fatal, log: (...args) => log.error(...args) });
+    observed.on('pageerror', observer.pageError);
+    navigationPages.push(observer);
+    if (observed !== page) observed.on('console', message => {
+      if (['error', 'warning'].includes(message.type())) consoleMessages.push({ type: message.type(), text: message.text() });
+      if (/bad stream message|unreachable|panicked at|ResizeObserver loop/.test(message.text())) errors.push(message.text());
+    });
+    return observer;
+  };
+  const navigation = await observePage(page);
+  Object.assign(progress, { navigate: navigation.navigate, reload: navigation.reload, navigation, observePage, navigationPages });
   page.on('console', message => {
     if (['error', 'warning'].includes(message.type())) {
       consoleMessages.push({ type: message.type(), text: message.text() });
@@ -261,8 +273,7 @@ async function fixture(browser, origin, viewport, theme, motion, started, contex
     else if (p.endsWith('/git/status')) json = { branch: 'fixture', files: [], clean: true };
     else if (p.endsWith('/git/diff')) json = { diff: '' };
     else if (p.endsWith('/ui/error')) { errors.push(`UI crash report: ${request.postData()}`); json = {}; }
-    await route.fulfill({ json });
-    if (request.url() === origin + '/api/v1/attention' && !request.redirectedFrom()) attentionMockProved = true;
+    await route.fulfill({ status: 200, json });
   });
   await page.route('**/__seed', route => route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>fixture seed</title>' }));
   // Standalone production harnesses can start on their real page/layout and
@@ -286,7 +297,7 @@ async function fixture(browser, origin, viewport, theme, motion, started, contex
   await Promise.race([page.locator(seed.ready || 'textarea').first().waitFor(), crash]);
   progress.phase = 'initial animation completion';
   debug(progress.phase);
-  if (process.env.DEBUG_FIXTURE) console.log('  INITIAL EFFECTS', await page.evaluate(() => document.getAnimations().map(a => ({
+  if (process.env.DEBUG_FIXTURE) log.log('  INITIAL EFFECTS', await page.evaluate(() => document.getAnimations().map(a => ({
     name: a.animationName || a.transitionProperty, state: a.playState, duration: a.effect?.getTiming().duration,
     iterations: a.effect?.getTiming().iterations, end: a.effect?.getComputedTiming().endTime,
     classes: String(a.effect?.target?.className?.baseVal ?? a.effect?.target?.className),
@@ -395,7 +406,7 @@ async function policy(f) {
   f.phase = 'policy/appearance-hydration';
   const tab = await f.context.newPage();
   tab.setDefaultTimeout(DEADLINE);
-  tab.on('pageerror', error => f.errors.push(`Appearance tab: ${error.stack || error}`));
+  await f.observePage(tab);
   await tab.goto(new URL('/r/other/settings/appearance', page.url()).href, { waitUntil: 'domcontentloaded' });
   assert.equal(await tab.evaluate(() => c6Motion.get()), 'full', 'motion is not realm-scoped');
   await tab.getByRole('heading', { name: 'Motion', exact: true }).waitFor();
@@ -413,7 +424,7 @@ async function policy(f) {
   await page.emulateMedia({ reducedMotion: motion.os });
   await page.evaluate(choice => c6Motion.set(choice || 'system'), motion.choice);
   f.phase = 'policy/reload';
-  await page.reload();
+  await f.reload();
   await page.locator('textarea').first().waitFor();
   assert.equal(await page.evaluate(() => c6Motion.get()), motion.choice || 'system');
   assert.equal(await page.locator('html').getAttribute('data-motion'), motion.effective);

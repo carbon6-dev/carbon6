@@ -135,8 +135,23 @@ async function waitView(page, view, target, count) {
 async function check(browser, origin, viewport, label, platform) {
   console.log(`RUN workspace-open ${label}`);
   let f;
+  // Establish HTTP routing before the first app request proves attention. Later
+  // seed replacements must not rely on a grant from an older route revision.
+  const setup = async ({ context }) => context.route('**/api/**', async route => {
+    const p = new URL(route.request().url()).pathname;
+    if (p.endsWith('/sessions/secondary')) return route.fulfill({ json: {
+      session: secondary, worker_name: worker.name, worker_online: true, queued: [] } });
+    if (p.endsWith('/sessions/secondary/suggestion') || p.endsWith('/sessions/secondary/catchup')) return route.fulfill({ status: 204 });
+    if (p.endsWith('/sessions/secondary/view')) return route.fulfill({ json: {} });
+    if (p.endsWith(`/docs/${DOC}`)) return route.fulfill({ json: doc });
+    if (p.endsWith(`/docs/${OTHER_DOC}`)) return route.fulfill({ json: { ...doc, id: OTHER_DOC, title: 'Other workspace document' } });
+    if (p.endsWith('/docs')) return route.fulfill({ json: [{ ...doc, tabs: undefined }] });
+    if (p.endsWith('/search')) return route.fulfill({ json: { results: [], ignored: [], truncated: false } });
+    if (p.endsWith(`/docs/${DOC}/ops`)) return route.fulfill({ json: { id: DOC, rev: 1, ids: [], keys: {}, hashes: {} } });
+    return route.fallback();
+  });
   try {
-    f = await fixture(browser, origin, viewport, 'light', { choice: 'off', os: 'no-preference', effective: 'off' }, value => { f = value; });
+    f = await fixture(browser, origin, viewport, 'light', { choice: 'off', os: 'no-preference', effective: 'off' }, value => { f = value; }, {}, { setup });
     const { page, context } = f, lives = new Set(), liveWaiters = new Set();
     const command = platform.startsWith('Mac') ? 'Meta' : 'Control';
     const press = key => page.keyboard.press(`${command}+${key}`);
@@ -144,7 +159,7 @@ async function check(browser, origin, viewport, label, platform) {
     // real platform check, not just synthetic modifier flags, is covered.
     await context.addInitScript(platform => Object.defineProperty(navigator, 'platform', { get: () => platform }), platform);
     await context.addInitScript(observeSockets);
-    await page.reload({ waitUntil: 'domcontentloaded' });
+    await f.reload({ waitUntil: 'domcontentloaded' });
     await page.locator('textarea').first().waitFor();
     await settle(page);
     assert.equal(await page.evaluate(() => navigator.platform), platform);
@@ -160,30 +175,17 @@ async function check(browser, origin, viewport, label, platform) {
       for (const ready of liveWaiters) ready();
       liveWaiters.clear();
     });
-    await context.route('**/api/**', async route => {
-      const p = new URL(route.request().url()).pathname;
-      if (p.endsWith('/sessions/secondary')) return route.fulfill({ json: {
-        session: secondary, worker_name: worker.name, worker_online: true, queued: [] } });
-      if (p.endsWith('/sessions/secondary/suggestion') || p.endsWith('/sessions/secondary/catchup')) return route.fulfill({ status: 204 });
-      if (p.endsWith('/sessions/secondary/view')) return route.fulfill({ json: {} });
-      if (p.endsWith(`/docs/${DOC}`)) return route.fulfill({ json: doc });
-      if (p.endsWith(`/docs/${OTHER_DOC}`)) return route.fulfill({ json: { ...doc, id: OTHER_DOC, title: 'Other workspace document' } });
-      if (p.endsWith('/docs')) return route.fulfill({ json: [{ ...doc, tabs: undefined }] });
-      if (p.endsWith('/search')) return route.fulfill({ json: { results: [], ignored: [], truncated: false } });
-      if (p.endsWith(`/docs/${DOC}/ops`)) return route.fulfill({ json: { id: DOC, rev: 1, ids: [], keys: {}, hashes: {} } });
-      return route.fallback();
-    });
     const seed = async (saved, path, drafts = {}, beforeApp) => {
       // A same-URL/hash goto can be same-document navigation: WASM would
       // never restore the seeded layout. Stop the old app before seeding,
       // also preventing its reactive storage writer from racing this write.
-      await page.goto(origin + '/__seed', { waitUntil: 'domcontentloaded' });
+      await f.navigate(origin + '/__seed', { waitUntil: 'domcontentloaded' });
       await page.evaluate(({ key, saved, drafts }) => {
         localStorage.setItem(key, JSON.stringify(saved));
         for (const [id, text] of Object.entries(drafts)) localStorage.setItem(`c6.home.draft.${id}`, text);
       }, { key: KEY, saved, drafts });
       await beforeApp?.();
-      await page.goto(origin + '/r/home' + path, { waitUntil: 'domcontentloaded' });
+      await f.navigate(origin + '/r/home' + path, { waitUntil: 'domcontentloaded' });
       // DOMContentLoaded precedes WASM's keyboard handlers. A shortcut sent
       // here too early is lost; desktop eagerly mounts both sessions and
       // hid that fixture race, while a phone waits forever for the second.
@@ -995,6 +997,8 @@ async function check(browser, origin, viewport, label, platform) {
       const evidence = path.join(EVIDENCE, `${filename}.json`);
       fs.writeFileSync(evidence, JSON.stringify({ label, phase: f?.phase, error: error.stack || String(error),
         errors: f?.errors, console: f?.consoleMessages, requests: f?.requests,
+        navigation: f?.navigation?.ledger, rawPageErrors: f?.navigation?.rawPageErrors,
+        navigationPages: f?.navigationPages?.map(observer => ({ ledger: observer.ledger, rawPageErrors: observer.rawPageErrors })),
         screenshot, screenshotError, ...diagnostics }, null, 2));
       console.error(`WORKSPACE FAILURE EVIDENCE ${evidence}${screenshotError ? ` (screenshot: ${screenshotError})` : ` ${screenshot}`}`);
     } catch (failure) {

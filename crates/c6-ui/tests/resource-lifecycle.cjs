@@ -147,7 +147,8 @@ async function closed(f, state, kind) {
   assert.equal(state.closed, 1, 'turning off clears locally without another closed query');
   await turnOn();
   assert.equal(state.closed, 2, 'turning on again reruns the tracked resource');
-  await page.reload({ waitUntil: 'domcontentloaded' });
+  f.phase = 'closed-list cold reload';
+  await f.reload({ waitUntil: 'domcontentloaded' });
   await toggle.waitFor();
   await settle(page);
   assert.equal(await toggle.getAttribute('aria-checked'), 'false', 'fresh owner starts closed=false');
@@ -218,7 +219,8 @@ async function check(browser, origin, engine, theme, kind) {
   } finally {
     fs.writeFileSync(path.join(directory, 'evidence.json'), JSON.stringify({ calls: state.calls,
       saves: state.saves, closed: state.closed, phase: f?.phase,
-      errors: f?.errors, console: f?.consoleMessages, requests: f?.requests }, null, 2));
+      errors: f?.errors, console: f?.consoleMessages, requests: f?.requests,
+      navigation: f?.navigation?.ledger, rawPageErrors: f?.navigation?.rawPageErrors }, null, 2));
     await f?.context.close();
   }
 }

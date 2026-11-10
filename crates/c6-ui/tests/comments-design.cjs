@@ -226,7 +226,7 @@ async function check(browser, origin, engine, name, theme) {
       await panel().waitFor(); await settle(page);
     };
     const reloadClosed = async () => {
-      await page.reload({ waitUntil: 'domcontentloaded' }); await anchor.waitFor(); await settle(page);
+      await f.reload({ waitUntil: 'domcontentloaded' }); await anchor.waitFor(); await settle(page);
       assert.equal(await panel().count(), 0, 'document reload does not open the comments panel');
     };
     const readPrefs = async id => page.evaluate(({ doc, id }) => {
@@ -494,7 +494,7 @@ async function check(browser, origin, engine, name, theme) {
       // Reload is deliberate: api.rs receives Doc changes on /live, whereas
       // fixture.send targets the session /stream. Do not send a fake event to
       // the wrong channel and accidentally claim live invalidation coverage.
-      await page.reload({ waitUntil: 'domcontentloaded' }); await anchor.waitFor(); await settle(page); await openPanel();
+      await f.reload({ waitUntil: 'domcontentloaded' }); await anchor.waitFor(); await settle(page); await openPanel();
       assert.equal(await toggle(PRIMARY).getAttribute('aria-expanded'), 'true', 'primary expansion persists across browser reload');
       assert.equal(await toggle(SIBLING).getAttribute('aria-expanded'), 'true', 'second expansion persists independently');
       assert.equal(await toggle(LATER).getAttribute('aria-expanded'), 'false', 'unopened rows remain collapsed after reload');
@@ -509,7 +509,7 @@ async function check(browser, origin, engine, name, theme) {
       const changed = states.get(DOC).find(t => t.id === LATER);
       changed.comments.push({ id: 'new-agent-reply', by: 'session:parent', at: 40, text: 'A new reply arrived while this thread stayed collapsed.' });
       changed.needs_you = true;
-      await page.reload({ waitUntil: 'domcontentloaded' }); await anchor.waitFor(); await settle(page); await openPanel();
+      await f.reload({ waitUntil: 'domcontentloaded' }); await anchor.waitFor(); await settle(page); await openPanel();
       assert.equal(await toggle(LATER).getAttribute('aria-expanded'), 'false', 'new reply does not auto-expand a collapsed thread');
       const marker = row(LATER).locator('[data-new-reply]');
       await marker.waitFor(); await marker.scrollIntoViewIfNeeded(); await capture('new-reply-collapsed', panel());

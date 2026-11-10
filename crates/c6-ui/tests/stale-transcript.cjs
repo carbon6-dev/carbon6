@@ -98,13 +98,13 @@ async function check(browser, origin, phone, label, mode) {
       await picker.getByText(query, { exact: true }).waitFor();
       await picker.getByRole('button', { name: /Motion fixture parent/ }).click();
     } else {
-      await page.goto(`${origin}/r/home/sessions/parent?q=${query}#${anchor}`, { waitUntil: 'domcontentloaded' });
+      await f.navigate(`${origin}/r/home/sessions/parent?q=${query}#${anchor}`, { waitUntil: 'domcontentloaded' });
     }
     await page.locator(`[id="${anchor}"]`).waitFor();
     await settle(page);
     assert((await savedView(page)).target.anchor === anchor, 'a deliberate hit is saved as a historical target');
     step('reload saved historical tile');
-    await page.reload({ waitUntil: 'domcontentloaded' });
+    await f.reload({ waitUntil: 'domcontentloaded' });
     await page.locator(`[id="${anchor}"]`).waitFor();
     await settle(page);
     assert.equal(await end(page).count(), 0, 'the historical window, not the full suffix, is drawn');
@@ -204,7 +204,7 @@ async function check(browser, origin, phone, label, mode) {
       }
     }
     step('reload after Latest');
-    await page.reload({ waitUntil: 'domcontentloaded' });
+    await f.reload({ waitUntil: 'domcontentloaded' });
     await atEnd(page, endSeq);
     assert.equal(streams.at(-1).from, 1301, 'reload starts with the real tail, not the old anchor');
     assert.deepEqual(f.errors, []);

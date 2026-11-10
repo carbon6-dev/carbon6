@@ -179,16 +179,17 @@ function data(now) {
   return { summaries, docs, threads, work, projects, decisions, mailThreads, messages, calendars, realm, entries, refs };
 }
 
-async function install(context) {
-  // Capture only the fixture's already-open local origin. Do not intercept
-  // another origin: its existing guard must still see and reject the request.
-  const origins = new Set(context.pages().map(page => {
+async function install(context, origin) {
+  // Setup before first navigation may supply the fixture's declared loopback
+  // origin. Existing callers still capture their already-open local origin.
+  // Never intercept another origin: its external-request guard stays effective.
+  const origins = new Set((origin ? [origin] : context.pages().map(page => page.url())).map(value => {
     try {
-      const u = new URL(page.url());
+      const u = new URL(value);
       return ['127.0.0.1', 'localhost', '[::1]'].includes(u.hostname) ? u.origin : null;
     } catch { return null; }
   }).filter(Boolean));
-  if (!origins.size) throw new Error('narrow-fixtures.install requires an open loopback motion fixture');
+  if (!origins.size) throw new Error('narrow-fixtures.install requires a declared or open loopback motion fixture');
   const d = data(Date.now());
   await context.route('**/api/**', async route => {
     const request = route.request(), url = new URL(request.url()), p = url.pathname;
