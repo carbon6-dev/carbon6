@@ -10,7 +10,9 @@ const http = require('node:http');
 const path = require('node:path');
 
 const ROOT = path.resolve(process.env.ROOT || path.join(__dirname, '../dist'));
-const DEADLINE = Number(process.env.C6_TEST_DEADLINE_SECS || 300) * 1000;
+// Operation failures must reach the case's evidence handler before its watchdog.
+const DEADLINE = Number(process.env.C6_TEST_DEADLINE_SECS || 15) * 1000;
+const CASE_DEADLINE = Number(process.env.C6_TEST_CASE_DEADLINE_SECS || 90) * 1000;
 const SHOTS = process.env.SCREENSHOTS || '/tmp/m1-screenshots';
 const VIEWPORTS = [
   ['desktop', { width: 1440, height: 1000 }],
@@ -40,12 +42,21 @@ function crashDiagnostic(engine, error, consoleMessages = []) {
   return 'Browser failure; not classified as a WebKit/WASM trap';
 }
 async function within(label, action) {
-  let timer;
+  let timer, passed = false;
+  const started = performance.now();
   try {
-    return await Promise.race([action(), new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`${label}: hang deadline (${DEADLINE}ms)`)), DEADLINE);
+    const result = await Promise.race([action(), new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label}: hang deadline (${CASE_DEADLINE}ms)`)), CASE_DEADLINE);
     })]);
-  } finally { clearTimeout(timer); }
+    passed = true;
+    return result;
+  } finally {
+    clearTimeout(timer);
+    if (process.env.BROWSER_CASE_TIMINGS === '1' && process.env.EVIDENCE) {
+      fs.appendFileSync(path.join(process.env.EVIDENCE, 'cases.jsonl'), JSON.stringify({ label, passed,
+        seconds: (performance.now() - started) / 1000 }) + '\n');
+    }
+  }
 }
 const worker = {
   id: '00000000-0000-0000-0000-000000000000', name: 'Motion fixture',
@@ -75,6 +86,13 @@ function initialEvents() {
 }
 
 async function serve() {
+  // Only immutable files are shared. HTTP/WS mocks, storage and app owners
+  // remain in each fixture's fresh context, never in this server.
+  if (process.env.BROWSER_TEST_ORIGIN) {
+    const origin = new URL(process.env.BROWSER_TEST_ORIGIN);
+    assert.equal(origin.hostname, '127.0.0.1', 'shared test server must be loopback');
+    return { origin: origin.origin, server: { close: callback => callback?.() } };
+  }
   assert(fs.existsSync(path.join(ROOT, 'index.html')),
     `No built UI at ${ROOT}. Ask the build owner to run env -u NO_COLOR make ui, or set ROOT.`);
   const server = http.createServer((req, res) => {
@@ -1447,13 +1465,22 @@ async function tiles(f) {
   assert(await composer.evaluate(el => el.isConnected), 'closing another tile retains the original session');
 }
 
-function launchBrowser(playwright, name) {
+function launchOptions(name) {
   assert(['chromium', 'webkit'].includes(name), `unsupported browser: ${name}`);
   const libraries = process.env.CHROMIUM_LIBS;
-  return playwright[name].launch({ headless: true, timeout: DEADLINE,
+  return { headless: true, timeout: DEADLINE,
     executablePath: name === 'webkit' ? process.env.WEBKIT_EXECUTABLE : process.env.CHROMIUM,
     ...(name === 'chromium' && libraries ? { env: { ...process.env,
-      LD_LIBRARY_PATH: [libraries, process.env.LD_LIBRARY_PATH].filter(Boolean).join(':') } } : {}) });
+      LD_LIBRARY_PATH: [libraries, process.env.LD_LIBRARY_PATH].filter(Boolean).join(':') } } : {}) };
+}
+
+function launchBrowser(playwright, name) {
+  const options = launchOptions(name);
+  const endpoint = process.env[`BROWSER_TEST_${name.toUpperCase()}_ENDPOINT`];
+  // A connected client's close() closes its own contexts and disconnects,
+  // not the runner-owned BrowserServer or another suite's contexts.
+  if (endpoint && process.env.ISOLATE_BROWSER !== '1') return playwright[name].connect(endpoint, { timeout: DEADLINE });
+  return playwright[name].launch(options);
 }
 
 async function browserHelpers(playwright, engine) {
@@ -2122,5 +2149,5 @@ function bundleSizes() {
   console.log(JSON.stringify({ root: ROOT, compression: 'per-file gzip level 9 estimate; not head transfer measurements', totals, files }, null, 2));
 }
 
-module.exports = { serve, fixture, settle, within, launchBrowser, session };
+module.exports = { serve, fixture, settle, within, launchBrowser, launchOptions, session };
 if (require.main === module) main().catch(error => { console.error(error.stack || error); process.exitCode = 1; });

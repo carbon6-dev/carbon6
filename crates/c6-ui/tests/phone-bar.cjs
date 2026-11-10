@@ -12,10 +12,9 @@ const SHOTS = process.env.SCREENSHOTS || '/tmp/s14-bar';
 const BEFORE = process.env.BEFORE === '1';
 const PHASE = BEFORE ? 'before' : 'after';
 const MOTION = { choice: 'off', effective: 'off', os: 'no-preference' };
-// Fixture operations retain their usual 300s timeout (or the explicit env
-// override). Give that timeout's catch block time to save evidence before a
-// separate case watchdog closes the browser for a genuine harness hang.
-const CASE_WATCHDOG_MS = 2 * Number(process.env.C6_TEST_DEADLINE_SECS || 300) * 1000;
+// The operation deadline is shorter than this case watchdog, leaving the
+// failing operation's catch block time to save evidence before teardown.
+const CASE_WATCHDOG_MS = Number(process.env.C6_TEST_CASE_DEADLINE_SECS || 90) * 1000;
 async function caseWatchdog(label, run) {
   let timer;
   try {

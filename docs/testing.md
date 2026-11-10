@@ -229,20 +229,38 @@ UI_BROWSER_PASSES=3 make ui-browser-test
 
 The runner covers workspace-open, motion, comment-sheet, phone-picker, phone-bar,
 theme (`--browser`), settings-lists, resource-lifecycle, markdown-html, status-row,
-stale-transcript, transcript-press and transcript-times in each engine, plus ring-render in
-Chromium. **ring-render is Chromium-only**, because its layer/paint/blocked-main-thread assertions
-require CDP; `ENGINE=webkit` now fails explicitly instead of silently launching
-Chromium. Its full default three-run/two-theme workload remains enabled.
-The default motion matrix has 24 contexts per engine; phone-picker has 24.
-Each suite keeps its normal shared-process/context policy. `ISOLATE_BROWSER`
-is not enabled. `BROWSER_ENGINES=webkit` selects just that engine for a complete
-pass; `BROWSER_TEST_OUTPUT` changes the default `dist/browser-tests` output.
-`BROWSER_SUITES=motion` selects that entire suite without filtering its contexts
-or checks (space-separated names select several suites); the default still runs
-every suite. `UI_BROWSER_PASSES=3 BROWSER_SUITES=motion bash scripts/ui-browser-tests.sh`
-runs three full Motion matrices in both engines.
-Logs/screenshots/traces are separated by pass, engine and suite. A failed
-command stops the runner, keeps the evidence, and is never automatically retried.
+transcript-press and transcript-times in each engine, plus Chromium ring-render.
+It also includes the previously separate message-edit, message-origin,
+comments-design and session-sheet acceptance gates. This is a curated list, not
+every standalone `.cjs` helper in the directory. **ring-render is Chromium-only**;
+its layer/paint/blocked-main-thread assertions require CDP, not WebKit.
+
+The runner serves one immutable production build and owns a BrowserServer per
+engine. Eight bounded workers run independent suites/case shards in both engines
+concurrently. Every case still gets a **fresh browser context**, storage and its
+own fake HTTP/WebSocket head; only static bytes and browser processes are shared.
+Closing one worker disconnects its client and closes only its own contexts.
+`ISOLATE_BROWSER=1` preserves fresh-process diagnostics. `BROWSER_JOBS=1` runs
+correctness serially; `BROWSER_ENGINES=webkit` selects one engine.
+
+`BROWSER_SUITES=motion` selects a suite; space-separated names select several.
+Diagnostic case selectors are passed through without multiplying or overriding
+them. A new standalone suite (for example stale-transcript) works immediately
+with `BROWSER_SUITES=stale-transcript`; add its name once to `suites` in
+`browser-runner.cjs` to include it by default. There is no second shell allowlist.
+`UI_BROWSER_PASSES=3` runs three complete passes, with no retries.
+
+`BROWSER_TEST_OUTPUT` changes the default `dist/browser-tests` parent. Every
+invocation creates a unique child directory, so earlier failures are never
+overwritten. Logs/screenshots/traces are separated by pass, engine, suite and
+shard; `summary.json` records exact child/pass/wall times and selections,
+`timeline.jsonl` timestamps all output, and `cases.jsonl` times common case/phase
+boundaries. On failure no new jobs are started; already-running jobs retain
+their normal evidence handlers. No assertion is retried. Locator/navigation
+operations default to **15 seconds**, with a separate **90-second case watchdog**
+so an operation's failure handler can save evidence first. Explicit
+`C6_TEST_DEADLINE_SECS` / `C6_TEST_CASE_DEADLINE_SECS` overrides are diagnostic,
+not a retry policy.
 
 ### Latest and saved transcript windows
 
