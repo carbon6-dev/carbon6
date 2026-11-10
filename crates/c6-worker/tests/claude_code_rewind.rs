@@ -138,6 +138,7 @@ struct WorkerProcess {
     stop: Option<oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
     id: String,
+    sessions: c6_worker::session::SessionManager,
 }
 
 impl WorkerProcess {
@@ -150,18 +151,19 @@ impl WorkerProcess {
             rt.block_on(async {
                 let worker = Worker::open(&state, Identity::load(&state).unwrap()).await.unwrap();
                 let id = worker.identity.meta.worker_id.to_string();
+                let sessions = worker.sessions.clone();
                 let (tx, mut rx) = watch::channel(ConnState::Connecting);
                 tokio::spawn(conn::run(worker, tx, CancellationToken::new()));
                 within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
-                ready.send(id).unwrap();
+                assert!(ready.send((id, sessions)).is_ok());
                 let _ = stopped.await;
             });
             // Runtime drop cancels the connection and all its actors, and
             // Non-held initialization dies; ordinary held CLIs survive for
             // the next worker to adopt, just as after a real worker death.
         });
-        let id = within("the worker's ready signal", attached).await.unwrap();
-        Self { stop: Some(stop), thread: Some(thread), id }
+        let (id, sessions) = within("the worker's ready signal", attached).await.unwrap();
+        Self { stop: Some(stop), thread: Some(thread), id, sessions }
     }
 
     async fn stop(mut self) {
@@ -180,6 +182,58 @@ impl Drop for WorkerProcess {
             let _ = thread.join();
         }
     }
+}
+
+/// A directly owned, deliberately unreaped member makes group absence fail
+/// deterministically even after every runtime/keeper has been killed. Never
+/// use try_wait here: reaping is the explicit release barrier below.
+#[cfg(target_os = "linux")]
+struct ReplacementZombie(Option<std::process::Child>);
+
+#[cfg(target_os = "linux")]
+impl ReplacementZombie {
+    async fn in_group(pg: nix::unistd::Pid) -> Self {
+        use std::os::unix::process::CommandExt;
+        let child = std::process::Command::new("/bin/sh").args(["-c", "exit 0"]).process_group(pg.as_raw()).spawn().unwrap();
+        let pid = child.id();
+        let zombie = Self(Some(child));
+        eventually("the fixture-owned member to become an unreaped zombie", async || {
+            std::fs::read_to_string(format!("/proc/{pid}/status"))
+                .is_ok_and(|status| status.lines().any(|line| line.starts_with("State:") && line.split_whitespace().nth(1) == Some("Z")))
+                .then_some(())
+        })
+        .await;
+        assert_eq!(nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(pid as i32))).unwrap(), pg);
+        zombie
+    }
+
+    fn reap(mut self) {
+        assert!(self.0.take().unwrap().wait().unwrap().success());
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ReplacementZombie {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn replacement_paused(api: &Api, worker: &WorkerProcess, id: &str) {
+    eventually("replacement refusal to pause or expose a prematurely exited producer actor", async || {
+        let alive = worker.sessions.active().iter().any(|s| s == id);
+        let refused = api.events(id).await.iter().any(|e| {
+            matches!(&e.kind,
+            EventKind::Error { message, .. } if message.contains("replacement is blocked"))
+        });
+        (!alive || refused).then_some(())
+    })
+    .await;
+    assert!(worker.sessions.active().iter().any(|s| s == id), "replacement uncertainty must not exit the original producer actor");
 }
 
 /// Created before any workers, so panic unwinding stops their runtimes first.
@@ -566,6 +620,67 @@ async fn claude_rewind_resets_native_history_before_acknowledging_and_fails_clos
     assert!(records(first.path(), "launch")[1]["resume"].is_null());
     clean_context(&records(first.path(), "prompt").pop().unwrap());
 
+    #[cfg(target_os = "linux")]
+    if !matches!(std::env::var("C6_REPLACEMENT_LIVENESS_CASE").as_deref(), Ok("inline" | "rewind")) {
+        // Refusal before inbox drain must preserve both live take-back and
+        // quiet promotion's resume/preamble semantics after the barrier clears.
+        let replacing = tempfile::tempdir().unwrap();
+        let (id, to) = seed(&api, replacing.path()).await;
+        std::fs::write(replacing.path().join("unsupported-cutoff"), "").unwrap();
+        api.rewind(&id, to).await;
+        api.rewound(&id, 1).await;
+        let (fresh, applied) = journal.claude_rewind(&id).await.unwrap().unwrap();
+        assert!(fresh.fresh && applied != 0);
+        let launches = records(replacing.path(), "launch");
+        let pg = nix::unistd::Pid::from_raw(launches.last().unwrap()["pgid"].as_i64().unwrap() as i32);
+        let zombie = ReplacementZombie::in_group(pg).await;
+        let initialized = initializations(replacing.path());
+        let started = api.events(&id).await.iter().filter(|e| matches!(e.kind, EventKind::TurnStarted { .. })).count();
+        api.say(&id, "KEEP_AFTER_REPLACEMENT_BARRIER").await;
+        replacement_paused(&api, &worker, &id).await;
+        assert_eq!(records(replacing.path(), "launch").len(), launches.len(), "no replacement spawn before whole-group absence");
+        let paused = api.events(&id).await;
+        assert_eq!(paused.iter().filter(|e| matches!(e.kind, EventKind::TurnStarted { .. })).count(), started);
+        assert!(!paused.iter().any(|e| matches!(&e.kind,
+            EventKind::User { text, .. } if text == "KEEP_AFTER_REPLACEMENT_BARRIER")));
+        api.say(&id, "CANCEL_BEFORE_REPLACEMENT_DRAIN").await;
+        let canceled = eventually("an input retained in the original producer inbox", async || {
+            api.detail(&id).await.queued.into_iter().find(|q| q.text == "CANCEL_BEFORE_REPLACEMENT_DRAIN")
+        })
+        .await;
+        api.cancel(&id, &canceled.command_id).await;
+        api.barrier(&id).await;
+        assert!(worker.sessions.active().iter().any(|s| s == &id));
+        assert_eq!(records(replacing.path(), "launch").len(), launches.len());
+        assert_eq!(initializations(replacing.path()), initialized, "ordinary refusal must not replay Rewind initialization");
+        // This wait() is the only release. No mailbox command follows it.
+        zombie.reap();
+        let recovered = api.idle_allowing_errors(&id, 3, 1).await;
+        assert_eq!(rewinds(&recovered), 1);
+        assert_eq!(initializations(replacing.path()), initialized);
+        assert_eq!(records(replacing.path(), "launch").last().unwrap()["resume"].as_str(), Some(fresh.session_id.as_str()));
+        let prompts = records(replacing.path(), "prompt");
+        assert_eq!(prompts.len(), 3);
+        let last = prompts.last().unwrap();
+        assert!(
+            last["value"]["message"]["content"].as_str().unwrap().contains("KEEP_TOOL"),
+            "fresh promotion retains its kept-history preamble"
+        );
+        clean_context(last);
+        for text in ["KEEP_AFTER_REPLACEMENT_BARRIER", "CANCEL_BEFORE_REPLACEMENT_DRAIN"] {
+            let wanted = usize::from(text == "KEEP_AFTER_REPLACEMENT_BARRIER");
+            assert_eq!(recovered.iter().filter(|e| matches!(&e.kind, EventKind::User { text: t, .. } if t == text)).count(), wanted);
+            assert_eq!(
+                prompts.iter().filter(|p| p["value"]["message"]["content"].as_str().is_some_and(|t| t.contains(text))).count(),
+                wanted
+            );
+        }
+        assert!(
+            !serde_json::to_string(&prompts).unwrap().contains("CANCEL_BEFORE_REPLACEMENT_DRAIN"),
+            "cancelled input cannot reach prompt or saved history"
+        );
+    }
+
     // A confirmed fresh initialization need not have saved a native
     // transcript before its first prompt. Quiet promotion then encounters a
     // real held resume failure: the exited CLI leaves its keeper alive.
@@ -585,6 +700,18 @@ async fn claude_rewind_resets_native_history_before_acknowledging_and_fails_clos
     let mut signal = [0; 8];
     within("missing-resume gate readiness", pending.read_exact(&mut signal)).await.unwrap();
     assert_eq!(&signal, b"missing\n");
+    // The CLI's handshake can precede receipt delivery to the head. Wait
+    // for this exact original User and its subsequent TurnStarted, rather
+    // than accidentally capturing an older turn from an immediate snapshot.
+    let opened_turn = eventually("the original missing-resume User and its opened turn to reach the head", async || {
+        let events = api.events(&missing_id).await;
+        let user = events.iter().find(|e| matches!(&e.kind, EventKind::User { text, .. } if text == "MISSING_HISTORY_REPLACEMENT"))?;
+        events.iter().filter(|e| e.seq > user.seq).find_map(|e| match e.kind {
+            EventKind::TurnStarted { turn, .. } => Some(turn),
+            _ => None,
+        })
+    })
+    .await;
     let launches = records(missing.path(), "launch");
     let resumed = launches.last().unwrap();
     assert_eq!(resumed["resume"].as_str(), Some(fresh.session_id.as_str()));
@@ -594,6 +721,8 @@ async fn claude_rewind_resets_native_history_before_acknowledging_and_fails_clos
             .unwrap();
     assert_eq!(held_record["pgid"].as_i64(), Some(i64::from(pg.as_raw())));
     assert!(nix::sys::signal::killpg(pg, None).is_ok(), "this regression requires an actually held runtime");
+    #[cfg(target_os = "linux")]
+    let zombie = ReplacementZombie::in_group(pg).await;
     api.say(&missing_id, "JOIN_DURING_MISSING_RESUME").await;
     let joining = eventually("a late input to be written but unconfirmed before the resume failure", async || {
         api.detail(&missing_id).await.queued.into_iter().find(|q| q.text == "JOIN_DURING_MISSING_RESUME" && q.with_agent)
@@ -601,13 +730,65 @@ async fn claude_rewind_resets_native_history_before_acknowledging_and_fails_clos
     .await;
     assert!(!api.events(&missing_id).await.iter().any(|e| matches!(&e.kind,
         EventKind::User { command_id, .. } if command_id == &joining.command_id)));
+    #[cfg(target_os = "linux")]
+    let canceled = {
+        api.say(&missing_id, "CANCEL_AFTER_MISSING_RESUME").await;
+        eventually("another late input written but not confirmed by the missing resume", async || {
+            api.detail(&missing_id).await.queued.into_iter().find(|q| q.text == "CANCEL_AFTER_MISSING_RESUME" && q.with_agent)
+        })
+        .await
+    };
     pending.write_all(b"ok").await.unwrap();
     drop(pending);
     drop(gate);
     std::fs::remove_file(missing.path().join("missing-resume.sock")).unwrap();
+    let superseded = cfg!(target_os = "linux") && std::env::var("C6_REPLACEMENT_LIVENESS_CASE").as_deref() == Ok("rewind");
+    let initialized = initializations(missing.path());
+    #[cfg(target_os = "linux")]
+    {
+        replacement_paused(&api, &worker, &missing_id).await;
+        api.cancel(&missing_id, &canceled.command_id).await;
+        api.barrier(&missing_id).await;
+        assert!(worker.sessions.active().iter().any(|s| s == &missing_id));
+        assert_eq!(records(missing.path(), "launch").len(), launches.len(), "inline refusal must not spawn over a live group");
+        let paused = api.events(&missing_id).await;
+        assert_eq!(paused.iter().filter(|e| matches!(e.kind, EventKind::TurnStarted { turn, .. } if turn == opened_turn)).count(), 1);
+        assert!(
+            !paused.iter().any(|e| matches!(e.kind, EventKind::TurnEnded { turn, .. } if turn == opened_turn)),
+            "ordinary refusal retains the already-open turn"
+        );
+        assert_eq!(
+            paused
+                .iter()
+                .filter(|e| matches!(&e.kind,
+            EventKind::User { text, .. } if text == "MISSING_HISTORY_REPLACEMENT"))
+                .count(),
+            1
+        );
+        if superseded {
+            api.rewind(&missing_id, user_seq(&paused, "MISSING_HISTORY_REPLACEMENT")).await;
+            eventually("explicit Rewind intent durably published before the absence barrier is released", async || {
+                matches!(journal.claude_rewind(&missing_id).await.unwrap(), Some((_, 0))).then_some(())
+            })
+            .await;
+            api.barrier(&missing_id).await;
+            assert_eq!(initializations(missing.path()), initialized, "explicit reset still cannot initialize before absence");
+        }
+        assert!(!paused.iter().any(|e| matches!(&e.kind,
+            EventKind::User { text, .. } if text == "JOIN_DURING_MISSING_RESUME" || text == "CANCEL_AFTER_MISSING_RESUME")));
+        assert!(
+            records(missing.path(), "prompt")
+                .iter()
+                .all(|p| !p["value"]["message"]["content"].as_str().unwrap().contains("MISSING_HISTORY_REPLACEMENT"))
+        );
+        // Preserve the already-open original turn and late inbox inputs;
+        // waiting/reaping the fixture child is the only wake-up stimulus.
+        zombie.reap();
+    }
     let recovered = eventually("fresh fallback to take the original and late input exactly once", async || {
         let events = api.events(&missing_id).await;
-        assert!(!events.iter().any(|e| matches!(e.kind, EventKind::Error { .. })), "fallback must close the held keeper before spawning");
+        let errors = events.iter().filter(|e| matches!(e.kind, EventKind::Error { .. })).count();
+        assert_eq!(errors, usize::from(cfg!(target_os = "linux")), "ordinary refusal is reported once, without terminating the turn");
         for text in ["MISSING_HISTORY_REPLACEMENT", "JOIN_DURING_MISSING_RESUME"] {
             let count = events.iter().filter(|e| matches!(&e.kind, EventKind::User { text: t, .. } if t == text)).count();
             assert!(count <= 1, "{text} must not acquire duplicate User receipts");
@@ -619,12 +800,25 @@ async fn claude_rewind_resets_native_history_before_acknowledging_and_fails_clos
         (detail.queued.is_empty() && detail.session.status == SessionStatus::Idle).then_some(events)
     })
     .await;
-    assert_eq!(rewinds(&recovered), 1, "native transcript fallback must not replay Rewind");
+    assert_eq!(rewinds(&recovered), if superseded { 2 } else { 1 }, "only an explicit new Rewind may reset again");
+    assert_eq!(recovered.iter().filter(|e| matches!(e.kind, EventKind::TurnStarted { turn, .. } if turn == opened_turn)).count(), 1);
+    assert_eq!(recovered.iter().filter(|e| matches!(e.kind, EventKind::TurnEnded { turn, .. } if turn == opened_turn)).count(), 1);
+    assert_eq!(
+        initializations(missing.path()),
+        initialized + usize::from(superseded),
+        "one explicit initialization, never automatic reset retry"
+    );
+    assert!(!recovered.iter().any(|e| matches!(&e.kind, EventKind::User { text, .. } if text == "CANCEL_AFTER_MISSING_RESUME")));
     assert_eq!(nix::sys::signal::killpg(pg, None), Err(nix::errno::Errno::ESRCH), "the failed resume's keeper must be gone");
     let prompts = records(missing.path(), "prompt");
     for text in ["MISSING_HISTORY_REPLACEMENT", "JOIN_DURING_MISSING_RESUME"] {
-        assert_eq!(prompts.iter().filter(|p| p["value"]["message"]["content"].as_str().is_some_and(|t| t.contains(text))).count(), 1);
+        let wanted = usize::from(!superseded || text == "JOIN_DURING_MISSING_RESUME");
+        assert_eq!(prompts.iter().filter(|p| p["value"]["message"]["content"].as_str().is_some_and(|t| t.contains(text))).count(), wanted);
     }
+    assert!(
+        !serde_json::to_string(&prompts).unwrap().contains("CANCEL_AFTER_MISSING_RESUME"),
+        "cancelled input cannot reach prompt or saved history"
+    );
     for prompt in &prompts[1..] {
         clean_context(prompt);
     }

@@ -2481,6 +2481,20 @@ history exception must not permit other tag reuse. The head-first/no-head-
 rollback constraint is documented in architecture.md §4; these tests do not
 claim reverse mixed-version live transport support.
 
+Native replacement regressions run in the standalone `claude_code_rewind`
+binary. On Linux, a directly parent-owned, deliberately unreaped group member
+holds the absence barrier without depending on PID1. The default checks both
+pre-drain promotion and an already-open missing-conversation fallback;
+`C6_REPLACEMENT_LIVENESS_CASE=inline` selects the latter independently, and
+`C6_REPLACEMENT_LIVENESS_CASE=rewind` additionally publishes an explicit Rewind
+before reaping. Assertions cover take-back, no prompt before absence, automatic
+progress after reap without another mailbox command, exact turn receipts, and
+no replay of superseded input. `SessionManager::active()` is a session-liveness
+observation, not a public actor-generation identity probe. Process-level units
+separately cover live-owner retirement rejection, already-released metadata,
+fatal tracking errors, and a fixture-blocked initial write while Rewind
+publication is actively driven. None of these Linux runs qualifies macOS.
+
 Read user rows expose always-visible icon-only **Rewind** and **Ask**, with those
 exact aria-labels and titles on desktop and phones; there is no Edit or user
 Message actions sheet. `phone-picker.cjs` also checks direct entry, cancellation

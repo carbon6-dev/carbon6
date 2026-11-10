@@ -3906,7 +3906,7 @@ impl Actor {
             match result {
                 Ok(()) => Some((conv, claude)),
                 Err(e) => {
-                    // Only journal writes fail here.
+                    // Only durability writes fail here.
                     error!(session = %writer.session_id, "turn failed: {e:#}");
                     None
                 }
@@ -3940,6 +3940,21 @@ async fn claude_turn(
     cancel: &CancellationToken,
 ) -> anyhow::Result<Option<crate::claude_code::Process>> {
     use crate::claude_code::Process;
+    let journal = observer.journal.clone();
+    let retirement = async |error: anyhow::Error| -> anyhow::Result<()> {
+        if !error.is::<crate::claude_code::ReplacementBlocked>() {
+            return Err(error);
+        }
+        sink.append(session_event::Kind::Error(ErrorEvent {
+            message: format!("{error}; queued inputs remain available to take back while cleanup waits."),
+        }))
+        .await?;
+        // Holding this future's running slot prevents idle adoption/wakes of
+        // the retiring runtime. Keep original inputs, promotion and preamble
+        // in this same continuation, without replaying any User receipts.
+        crate::claude_code::wait_for_replacement(&journal, session).await?;
+        Ok(())
+    };
     // Started with other settings (carbon6's tools, guidance, hooks, effort,
     // worker): closed and started again, resuming its conversation, so a
     // running session takes them up. Only a process with nothing under way:
@@ -3947,13 +3962,20 @@ async fn claude_turn(
     // inputs it has not taken, no turn it has begun.
     let mut restarted = false;
     let mut promoted = false;
+    let mut admission = None;
     if let Some(p) = process.take_if(|p| (p.launch() != &launch || !p.is_held()) && p.idle_until(std::time::Duration::ZERO).is_some()) {
         // A reset initializes non-held until its branch is confirmed. Promote
         // that quiet process to restart-surviving transport on its next turn;
         // this alone is not a settings/worker change to announce.
         restarted = p.launch() != &launch;
         promoted = !p.is_held();
-        p.close_for_replacement().await?;
+        if let Err(e) = p.close_for_replacement().await {
+            retirement(e).await?;
+            admission = crate::claude_code::replacement_admission(&journal, session, cancel).await?;
+            if admission.is_none() {
+                return Ok(None);
+            }
+        }
     }
     let inputs = inbox.lock().unwrap().drain();
     if process.is_none() && inputs.is_empty() {
@@ -4008,7 +4030,7 @@ async fn claude_turn(
     // A new conversation gets the preamble first (also when a resume finds
     // none: the first turn may have failed before Claude Code saved it).
     let preamble = (p.needs_preamble() || (promoted && !conversation.resume)).then_some(conversation.preamble.as_deref()).flatten();
-    let mut end = p.turn(turn, inputs.clone(), false, preamble, model, sink, &feed, &more, cancel).await?;
+    let mut end = p.turn_admitted(turn, inputs.clone(), false, preamble, model, sink, &feed, &more, cancel, admission).await?;
     if end.no_conversation
         && let Some(bin) = &bin
     {
@@ -4016,7 +4038,17 @@ async fn claude_turn(
         // replayed below with opened=true. Only unrecorded joining inputs
         // return to the inbox, before fallible cleanup can consume Process.
         inbox.lock().unwrap().requeue(p.take_unsent());
-        p.close_for_replacement().await?;
+        let admission = if let Err(e) = p.close_for_replacement().await {
+            retirement(e).await?;
+            let admission = crate::claude_code::replacement_admission(&journal, session, cancel).await?;
+            if admission.is_none() {
+                sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: TurnEndReason::Interrupted as i32 })).await?;
+                return Ok(None);
+            }
+            admission
+        } else {
+            None
+        };
         p = match Process::spawn_held(
             &claude_dir.join("held"),
             session,
@@ -4037,7 +4069,7 @@ async fn claude_turn(
             }
         };
         p.set_turn_cancel(cancel);
-        end = p.turn(turn, inputs, true, conversation.preamble.as_deref(), model, sink, &feed, &more, cancel).await?;
+        end = p.turn_admitted(turn, inputs, true, conversation.preamble.as_deref(), model, sink, &feed, &more, cancel, admission).await?;
         if end.no_conversation {
             sink.append(session_event::Kind::Error(ErrorEvent {
                 message: "Claude Code could not find or create this conversation.".into(),

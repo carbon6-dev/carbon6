@@ -75,6 +75,19 @@ pub struct ClaudeConversation {
     pub preamble: Option<String>,
 }
 
+/// Tracking succeeded, but the old group has not confirmed whole-group
+/// absence. This is an ordinary retirement barrier, not a journal failure.
+#[derive(Debug)]
+pub(crate) struct ReplacementBlocked(Pid);
+
+impl std::fmt::Display for ReplacementBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Claude Code replacement is blocked until process group {} confirms absence", self.0)
+    }
+}
+
+impl std::error::Error for ReplacementBlocked {}
+
 /// Main-chain IDs, not API message IDs or the result event's UUID. A tool
 /// turn ends at its final assistant entry, not the tool-call entry.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -740,6 +753,40 @@ pub async fn confirm_stopped(journal: &crate::journal::Journal, session_id: &str
     }
 }
 
+/// While an ordinary replacement waits, keep its turn future (and any
+/// already-open inputs) alive. Never signal/adopt here; only ESRCH releases
+/// a tracked group. Database errors still abort the turn as journal failures.
+pub(crate) async fn wait_for_replacement(journal: &crate::journal::Journal, session_id: &str) -> anyhow::Result<()> {
+    loop {
+        let mut waiting = false;
+        for pg in journal.claude_processes(session_id).await? {
+            if matches!(killpg(Pid::from_raw(pg), None), Err(nix::errno::Errno::ESRCH)) {
+                journal.untrack_claude_process(session_id, pg).await?;
+            } else {
+                waiting = true;
+            }
+        }
+        if !waiting {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Serialize a resumed admission with durable Rewind publication. The caller
+/// carries this guard through its initial input writes, not the model reply.
+pub(crate) async fn replacement_admission<'a>(
+    journal: &'a crate::journal::Journal,
+    session_id: &str,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Option<tokio::sync::MutexGuard<'a, ()>>> {
+    let ownership = journal.claude_rewind_ownership.lock().await;
+    if cancel.is_cancelled() || matches!(journal.claude_rewind(session_id).await?, Some((_, 0))) {
+        return Ok(None);
+    }
+    Ok(Some(ownership))
+}
+
 /// Recover ownership for cleanup, never for model input. Pending rewinds may
 /// name neither the old branch nor an interrupted reset's launch identity.
 /// Stop all of this session's held runtimes before the durable PGID barrier.
@@ -1243,6 +1290,11 @@ impl Process {
             if let Some(r) = &meta.output_root {
                 let _ = std::fs::remove_dir_all(r);
             }
+            return None;
+        }
+        // A replacement has retired this runtime, even if a live keeper can
+        // still prove ownership. Its journal PGID is cleanup-only until ESRCH.
+        if dir.join("retiring").try_exists().ok()? {
             return None;
         }
         if !held_group_owned(&meta, &dir) {
@@ -1779,6 +1831,25 @@ impl Process {
         more: &tokio::sync::Notify,
         cancel: &CancellationToken,
     ) -> anyhow::Result<TurnEnd> {
+        self.turn_admitted(turn, inputs, opened, preamble, model, sink, feed, more, cancel, None).await
+    }
+
+    /// A resumed replacement holds Rewind publication out only until its
+    /// initial receipts and input writes finish. Ordinary turns need no guard.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn turn_admitted(
+        &mut self,
+        turn: u64,
+        inputs: Vec<PendingInput>,
+        opened: bool,
+        preamble: Option<&str>,
+        model: &str,
+        sink: &Arc<dyn EventSink>,
+        feed: &(dyn Fn() -> Joining + Send + Sync),
+        more: &tokio::sync::Notify,
+        cancel: &CancellationToken,
+        admission: Option<tokio::sync::MutexGuard<'_, ()>>,
+    ) -> anyhow::Result<TurnEnd> {
         self.track().await?;
         self.mapper.turn = turn;
         self.boundary = Boundary { session_id: self.launch.conversation.clone(), ..Default::default() };
@@ -1812,6 +1883,7 @@ impl Process {
         for (i, input) in inputs.into_iter().enumerate() {
             alive &= self.send(input, if i == 0 { preamble } else { None }, true).await.is_ok();
         }
+        drop(admission);
         // You had just stopped the agent: this turn stops as it begins. It
         // shows only if the model got to say something first.
         if quiet {
@@ -2040,16 +2112,22 @@ impl Process {
     /// it is not permission to spawn another runtime over that authority.
     pub async fn close_for_replacement(mut self) -> anyhow::Result<()> {
         self.track().await?;
-        if self.held.is_none() {
-            *self.stdin.lock().await = None;
-        }
-        self.kill().await;
         let pg = self.pgid.ok_or_else(|| anyhow::anyhow!("Claude Code process group is unknown"))?;
-        anyhow::ensure!(
-            matches!(killpg(pg, None), Err(nix::errno::Errno::ESRCH)),
-            "Claude Code replacement is blocked until process group {} confirms absence",
-            pg
-        );
+        if !matches!(killpg(pg, None), Err(nix::errno::Errno::ESRCH)) {
+            // turn() may already have released the held directory after
+            // observing absence. Only a still-present group needs retirement
+            // authority; a missing directory while live is still fatal.
+            if let Some(held) = &self.held {
+                std::fs::write(held.dir.join("retiring"), [])?;
+            }
+            if self.held.is_none() {
+                *self.stdin.lock().await = None;
+            }
+            self.kill().await;
+            if !matches!(killpg(pg, None), Err(nix::errno::Errno::ESRCH)) {
+                return Err(ReplacementBlocked(pg).into());
+            }
+        }
         *self.stdin.lock().await = None;
         self.release_held();
         let _ = self.mapper.close_children(TurnEndReason::Completed).await;
@@ -4814,6 +4892,204 @@ while True:
         assert!(journal.claude_processes("s").await.unwrap().is_empty());
         assert!(killpg(other.pgid.unwrap(), None).is_ok(), "another session is untouched");
         other.close().await;
+    }
+
+    #[tokio::test]
+    async fn replacement_accepts_an_already_released_absent_held_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        let _cleanup = HeldFixtureCleanup(held.clone());
+        let bin = live_claude(dir.path());
+        let mut p = Process::spawn_held(
+            &held,
+            "s",
+            &bin,
+            Launch { conversation: "already-released".into(), ..Default::default() },
+            false,
+            dir.path(),
+            "opus",
+            Arc::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let pg = p.pgid.unwrap();
+        let keeper = p.held.as_ref().unwrap().keeper;
+        c6_testkit::eventually("keeper ownership before ordinary runtime cleanup", async || {
+            keeper_holds_fifo(keeper, pg, &held.join("already-released")).then_some(())
+        })
+        .await;
+        // Reproduce turn()'s post-release state without an artificial zombie:
+        // the entire group is absent and release_held removed its directory.
+        p.kill().await;
+        assert_eq!(killpg(pg, None), Err(nix::errno::Errno::ESRCH));
+        assert!(p.held.as_ref().unwrap().done);
+        assert!(!held.join("already-released").exists());
+        p.close_for_replacement().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_retiring_held_record_is_cleanup_only_even_with_a_live_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        let _cleanup = HeldFixtureCleanup(held.clone());
+        let bin = live_claude(dir.path());
+        let p = Process::spawn_held(
+            &held,
+            "s",
+            &bin,
+            Launch { conversation: "retired".into(), ..Default::default() },
+            false,
+            dir.path(),
+            "opus",
+            Arc::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let pg = p.pgid.unwrap();
+        let keeper = p.held.as_ref().unwrap().keeper;
+        let record = held.join("retired");
+        c6_testkit::eventually("positive live keeper ownership before marking retirement", async || {
+            keeper_holds_fifo(keeper, pg, &record).then_some(())
+        })
+        .await;
+        drop(p);
+        assert!(!record.join("code").exists());
+        let meta: HeldMeta = serde_json::from_slice(&std::fs::read(record.join("meta.json")).unwrap()).unwrap();
+        assert!(held_group_owned(&meta, &record));
+        std::fs::write(record.join("retiring"), []).unwrap();
+        let adopted = Process::attach(&held, "retired", dir.path(), "opus", Arc::default(), None, None).await;
+        assert!(adopted.is_none(), "a valid live owner is still cleanup-only after replacement begins");
+        assert!(keeper_holds_fifo(keeper, pg, &record), "refusing adoption must not signal the keeper");
+        assert!(killpg(pg, None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn replacement_tracking_failure_remains_a_fatal_error_not_an_absence_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        let _cleanup = HeldFixtureCleanup(held.clone());
+        let obs = observer(dir.path(), Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()))).await;
+        let bin = live_claude(dir.path());
+        let p = Process::spawn_held(
+            &held,
+            &obs.session_id,
+            &bin,
+            Launch { conversation: "journal-failure".into(), ..Default::default() },
+            false,
+            dir.path(),
+            "opus",
+            Arc::default(),
+            None,
+            Some(obs.clone()),
+        )
+        .unwrap();
+        let pg = p.pgid.unwrap();
+        let record = held.join("journal-failure");
+        let metadata = std::fs::read(record.join("meta.json")).unwrap();
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", dir.path().join("journal.db").display())).await.unwrap();
+        sqlx::query("DROP TABLE claude_processes").execute(&pool).await.unwrap();
+        let error = p.close_for_replacement().await.unwrap_err();
+        assert!(format!("{error:#}").contains("claude_processes"));
+        assert!(!error.to_string().contains("replacement is blocked"), "database failure must not enter ordinary retirement waiting");
+        assert_eq!(std::fs::read(record.join("meta.json")).unwrap(), metadata);
+        assert!(!record.join("retiring").exists(), "durable tracking must precede retirement");
+        assert!(killpg(pg, None).is_ok(), "failed tracking must not signal the runtime");
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn replacement_admission_serializes_rewind_publication_through_initial_writes() {
+        for opened in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let obs = observer(dir.path(), Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()))).await;
+            let reset = Reset {
+                command_id: "explicit-rewind".into(),
+                to_seq: 1,
+                restore_files: false,
+                session_id: "replacement".into(),
+                fresh: true,
+                withdrawn: Vec::new(),
+                untouched: false,
+                previous: None,
+                failure: String::new(),
+                retries: Vec::new(),
+            };
+            let cancel = CancellationToken::new();
+            // Force publication into the FIFO mutex queue before admission.
+            let blocker = obs.journal.claude_rewind_ownership.lock().await;
+            let mut publication = std::pin::pin!(obs.journal.prepare_claude_rewind(&obs.session_id, &reset));
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(publication.as_mut(), cx))).await.is_pending()
+            );
+            let mut admission = std::pin::pin!(replacement_admission(&obs.journal, &obs.session_id, &cancel));
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(admission.as_mut(), cx))).await.is_pending()
+            );
+            drop(blocker);
+            publication.await.unwrap();
+            assert!(admission.await.unwrap().is_none(), "published Rewind must suppress stale resumed admission");
+
+            // The reverse ordering must hold publication out through the
+            // initial input writes, then release it BEFORE any model reply.
+            let other = tempfile::tempdir().unwrap();
+            let obs = observer(other.path(), Arc::new(c6_tools::SessionTools::new(other.path().to_owned()))).await;
+            let bin =
+                script(other.path(), "claude-admission", "#!/bin/sh\nwhile read -r line; do printf '%s\\n' \"$line\" >> admitted; done\n");
+            // No observer on the process: track() and VecSink appends are
+            // immediately ready, so its first poll reaches the held stdin
+            // lock deterministically, for both opened receipt variants.
+            let mut p = spawn(&bin, other.path(), "old-branch", false, None);
+            let guard = replacement_admission(&obs.journal, &obs.session_id, &cancel).await.unwrap().unwrap();
+            let mut publication = std::pin::pin!(obs.journal.prepare_claude_rewind(&obs.session_id, &reset));
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(publication.as_mut(), cx))).await.is_pending()
+            );
+            assert!(obs.journal.claude_rewind(&obs.session_id).await.unwrap().is_none());
+            let recorded = Arc::new(VecSink::default());
+            let sink: Arc<dyn EventSink> = recorded.clone();
+            let original = input("original", "REPLACEMENT_ADMISSION");
+            if opened {
+                sink.append(original.event()).await.unwrap();
+                sink.append(session_event::Kind::TurnStarted(TurnStarted { turn: 7, ..Default::default() })).await.unwrap();
+            }
+            let more = tokio::sync::Notify::new();
+            let feed = || Joining::default();
+            let blocked_stdin = p.stdin.clone();
+            let write_blocker = blocked_stdin.lock().await;
+            let mut turn = Box::pin(p.turn_admitted(7, vec![original], opened, None, "opus", &sink, &feed, &more, &cancel, Some(guard)));
+            assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(turn.as_mut(), cx))).await.is_pending());
+            // Actively drive publication while the initial CLI write is
+            // fixture-blocked. Dropping admission before send() would let
+            // this finish, even though the CLI has received no input yet.
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), publication.as_mut()).await.is_err(),
+                "Rewind publication must remain blocked until the initial input write completes"
+            );
+            assert!(obs.journal.claude_rewind(&obs.session_id).await.unwrap().is_none());
+            assert!(!other.path().join("admitted").exists());
+            drop(write_blocker);
+            tokio::select! {
+                result = &mut turn => panic!("no model response was emitted: {result:?}"),
+                _ = c6_testkit::eventually("initial input admitted before releasing Rewind publication", async || {
+                    std::fs::read_to_string(other.path().join("admitted")).ok().filter(|text| text.contains("REPLACEMENT_ADMISSION"))
+                }) => {}
+            }
+            tokio::select! {
+                result = &mut turn => panic!("the turn must not wait for model output while holding admission: {result:?}"),
+                result = tokio::time::timeout(Duration::from_secs(3), publication) => {
+                    result.expect("Rewind publication must not wait for the model response").unwrap();
+                },
+            }
+            assert!(matches!(obs.journal.claude_rewind(&obs.session_id).await.unwrap(), Some((_, 0))));
+            let events = recorded.0.lock().unwrap().clone();
+            assert_eq!(events.iter().filter(|e| matches!(&e.kind, Some(session_event::Kind::User(_)))).count(), 1);
+            assert_eq!(events.iter().filter(|e| matches!(&e.kind, Some(session_event::Kind::TurnStarted(t)) if t.turn == 7)).count(), 1);
+            assert!(!events.iter().any(|e| matches!(&e.kind, Some(session_event::Kind::TurnEnded(_)))));
+            drop(turn);
+            p.stop().await;
+        }
     }
 
     #[tokio::test]
