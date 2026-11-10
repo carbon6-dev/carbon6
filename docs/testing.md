@@ -229,7 +229,7 @@ UI_BROWSER_PASSES=3 make ui-browser-test
 
 The runner covers workspace-open, motion, comment-sheet, phone-picker, phone-bar,
 theme (`--browser`), settings-lists, resource-lifecycle, markdown-html, status-row,
-transcript-press and transcript-times in each engine, plus ring-render in
+stale-transcript, transcript-press and transcript-times in each engine, plus ring-render in
 Chromium. **ring-render is Chromium-only**, because its layer/paint/blocked-main-thread assertions
 require CDP; `ENGINE=webkit` now fails explicitly instead of silently launching
 Chromium. Its full default three-run/two-theme workload remains enabled.
@@ -243,6 +243,34 @@ every suite. `UI_BROWSER_PASSES=3 BROWSER_SUITES=motion bash scripts/ui-browser-
 runs three full Motion matrices in both engines.
 Logs/screenshots/traces are separated by pass, engine and suite. A failed
 command stops the runner, keeps the evidence, and is never automatically retried.
+
+### Latest and saved transcript windows
+
+`stale-transcript.cjs` runs phone (390px) and desktop (1440px) cases in both
+pinned engines, using production WASM and a private fake head. A 1,200-event
+session opens normally at its tail, then at a deliberate saved-message hit
+(the phone uses the Sessions picker). It reloads the actual saved tile and
+reissues an in-session Find jump before clicking the floating Latest button.
+The separate return cases select that historical session normally through the
+phone picker or a desktop transcript link. Both paths must show the real end,
+consume the historical address without adding Back history, and retain the
+composer/draft and stream. Genuine search hits and message links still jump.
+
+The stream fixture implements the head's real contract: `at` changes the
+beginning of replay, **not its end**. It sends the entire suffix, preserves a
+deliberate historical window across an empty reconnect, then reconnects with
+400 missed events using `after=<last received seq>`. Tests check a gap-free
+rendered tail, the pending decision after the actual end, and a second reload
+using the current tail rather than the old saved target. Find/outline requests
+are one-shot; Latest cancels pending historical paging/reveals and closes Find.
+Only the initial replay applies an opening target's drawing cutoff. Waiting
+messages retain their existing transcript placement and actions.
+
+```sh
+BROWSER_SUITES=stale-transcript bash scripts/ui-browser-tests.sh
+```
+
+This is emulated phone/browser coverage, not a physical Android Chrome run.
 
 ### Phone single-bar production browser regression (S14)
 
@@ -2282,8 +2310,11 @@ Session turn targets and document block targets reuse the destination and
 record target changes in the destination tile's Back/Forward history, keeping
 pane keys. A session target deliberately remounts its transcript owner to
 revisit the turn; header controls and menus are keyed to that registration,
-and queued old layout effects tolerate its disposal. Untargeted links only focus: they do not reset the reading target,
-add history, or discard Forward. Documents accept `/docs/<id>#<block>` and
+and queued old layout effects tolerate its disposal. Untargeted document links
+only focus: they do not reset the reading target, add history, or discard
+Forward. Untargeted session links and picker selections instead return to
+Latest in place, consuming the old target without losing the composer, draft
+or stream; consuming that target does not remount its owner. Documents accept `/docs/<id>#<block>` and
 `/docs/<id>?block=<block>` (a nonempty hash wins); the address bar uses the hash.
 The same targets work on `doc:<id>` Markdown links. In-app links retain their
 query and hash, including inside document blocks. A document block jump uses

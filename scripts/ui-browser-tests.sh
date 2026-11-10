@@ -5,11 +5,11 @@ cd "$(dirname "$0")/.."
 ulimit -n 65536
 passes=${UI_BROWSER_PASSES:-1}
 [[ "$passes" =~ ^[1-9][0-9]*$ ]] || { echo 'UI_BROWSER_PASSES must be a positive integer' >&2; exit 1; }
-suites=${BROWSER_SUITES:-workspace-open motion comment-sheet phone-picker phone-bar theme settings-lists resource-lifecycle markdown-html status-row ring-render transcript-press transcript-times}
+suites=${BROWSER_SUITES:-workspace-open motion comment-sheet phone-picker phone-bar theme settings-lists resource-lifecycle markdown-html status-row stale-transcript ring-render transcript-press transcript-times}
 [[ "$suites" =~ [^[:space:]] ]] || { echo 'BROWSER_SUITES must select at least one suite' >&2; exit 1; }
 for suite in $suites; do
   case "$suite" in
-    workspace-open|motion|comment-sheet|phone-picker|phone-bar|theme|settings-lists|resource-lifecycle|markdown-html|status-row|ring-render|transcript-press|transcript-times) ;;
+    workspace-open|motion|comment-sheet|phone-picker|phone-bar|theme|settings-lists|resource-lifecycle|markdown-html|status-row|stale-transcript|ring-render|transcript-press|transcript-times) ;;
     *) echo "Unknown suite: $suite" >&2; exit 1 ;;
   esac
 done

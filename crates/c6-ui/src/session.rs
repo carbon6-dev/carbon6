@@ -337,6 +337,8 @@ pub(crate) struct Feed {
     /// later ones as you scroll down. None: to the end.
     pub(crate) to: RwSignal<Option<u64>>,
     loading: RwSignal<bool>,
+    /// Latest cancels historical paging and reveals still in flight.
+    navigation: RwSignal<u64>,
     id: StoredValue<String>,
 }
 
@@ -449,6 +451,7 @@ impl Feed {
             from: RwSignal::new(0),
             to: RwSignal::new(None),
             loading: RwSignal::new(false),
+            navigation: RwSignal::new(0),
             id: StoredValue::new(id.clone()),
         };
         let Feed { events, streaming, queued, activity, secrets, synced, stream_failed, from, to, .. } = feed;
@@ -500,7 +503,10 @@ impl Feed {
             StreamMsg::Synced => {
                 let r = replay.try_update_value(std::mem::take).unwrap_or_default();
                 // Opened at a place: drawn from there, not to the end.
-                if let Window::At(at) = window {
+                if !synced.get_untracked()
+                    && feed.navigation.get_untracked() == 0
+                    && let Window::At(at) = window
+                {
                     to.set(bound(&r, at));
                 }
                 // Missed while away: what streamed for it goes, and
@@ -604,10 +610,17 @@ impl Feed {
             return;
         }
         self.loading.set(true);
+        let navigation = self.navigation.get_untracked();
         spawn_local(async move {
             let page = api::session_events_before(self.id.get_value(), before, TAIL, at).await;
-            self.loading.set(false);
-            let Ok(page) = page else { return };
+            if self.navigation.try_get_untracked() != Some(navigation) {
+                self.loading.try_set(false);
+                return;
+            }
+            let Ok(page) = page else {
+                self.loading.set(false);
+                return;
+            };
             let start = page.first().map_or(1, |e| e.seq);
             // In place of the summary's events from there.
             self.events.update(|evs| {
@@ -621,7 +634,12 @@ impl Feed {
                 self.to.set(to);
             }
             self.from.set(start);
-            request_animation_frame(then);
+            self.loading.set(false);
+            request_animation_frame(move || {
+                if self.navigation.try_get_untracked() == Some(navigation) {
+                    then();
+                }
+            });
         });
     }
 
@@ -634,6 +652,7 @@ impl Feed {
 
     /// Back to the end: the last [`TAIL`] events or so.
     pub(crate) fn latest(self) {
+        self.navigation.update(|n| *n = n.wrapping_add(1));
         self.cut(0);
         self.to.set(None);
     }
@@ -785,6 +804,28 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     let reach = RwSignal::new(HashMap::new());
     provide_context(Reach(reach));
     provide_context(Follow(stick));
+    provide_context(FeedNavigation(feed.navigation));
+    let find_open = RwSignal::new(!target.q.trim().is_empty());
+    let go_latest = Callback::new(move |()| {
+        // Find/outline requests are one-shot jumps, not a standing constraint
+        // on the drawing window. Nor may a pending older page undo Latest.
+        reach.update(HashMap::clear);
+        find_open.set(false);
+        feed.latest();
+        stick.set(true);
+        far.set(false);
+        if let Some(col) = col {
+            col.replace(View::session(feed.id.get_value()));
+        }
+        request_animation_frame(move || {
+            if stick.try_get_untracked() == Some(true)
+                && let Some(el) = scroller.try_get_untracked().flatten()
+            {
+                crate::workspace::stop_glide_to_end(&el);
+                el.set_scroll_top(el.scroll_height());
+            }
+        });
+    });
     // Drawn only part way (after a jump back): its last event isn't the
     // end, so it isn't followed.
     Effect::new(move || {
@@ -793,7 +834,6 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         }
     });
     // Find in session: open when arriving from search (or via Find).
-    let find_open = RwSignal::new(!target.q.trim().is_empty());
     let find_q = target.q.clone();
     if let Some(anchor) = target.anchor.clone() {
         let terms = serde_json::to_string(&crate::search::terms(&target.q)).unwrap_or_else(|_| "[]".into());
@@ -804,7 +844,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                 let session = id.clone();
                 let done = RwSignal::new(false);
                 Effect::new(move || {
-                    if done.get_untracked() {
+                    if done.get_untracked() || feed.navigation.get() != 0 {
                         return;
                     }
                     // A tool result shows in its call's card.
@@ -817,24 +857,24 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                     let Some(el) = el else { return };
                     done.set(true);
                     timeline.pin(seq);
-                    reveal_when_rendered(root.clone(), el, terms.clone(), 0);
+                    reveal_when_rendered(root.clone(), el, terms.clone(), feed.navigation);
                 });
             }
             None if anchor.starts_with(&format!("waiting-{id}-")) => {
                 let call = anchor.strip_prefix(&format!("waiting-{id}-")).unwrap_or_default().to_owned();
                 let done = RwSignal::new(false);
                 Effect::new(move || {
-                    if done.get_untracked() {
+                    if done.get_untracked() || feed.navigation.get() != 0 {
                         return;
                     }
                     let seq = events.with(|evs| waiting_call_seq(evs, &call));
                     let Some(seq) = seq else { return };
                     done.set(true);
                     timeline.pin(seq);
-                    reveal_when_rendered(root.clone(), anchor.clone(), terms.clone(), 0);
+                    reveal_when_rendered(root.clone(), anchor.clone(), terms.clone(), feed.navigation);
                 });
             }
-            None => reveal_when_rendered(root, anchor, terms, 0),
+            None => reveal_when_rendered(root, anchor, terms, feed.navigation),
         }
     }
     Effect::new(move || {
@@ -967,7 +1007,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
     });
     let jump = Callback::new(move |(seq, el): (u64, String)| {
         reach_to.run(seq);
-        reveal_when_rendered(meta_root.get_value(), el, "[]".into(), 0);
+        reveal_when_rendered(meta_root.get_value(), el, "[]".into(), feed.navigation);
     });
     // Its catch-up, where it isn't the glance column's first section: a
     // popover from the pill over the transcript, or a phone's sheet.
@@ -1023,6 +1063,8 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         view_settings,
         timeline,
         reach_to,
+        go_latest,
+        navigation: feed.navigation,
     };
     let output_seen = StoredValue::new(false);
     Effect::new(move || {
@@ -1223,17 +1265,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                     <div class=format!("flex justify-center px-4 {READING}")>
                     <button class="pointer-events-auto rounded-full border border-zinc-300 bg-white/95 px-3 py-1 text-xs font-medium shadow-md hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-900/95 dark:hover:bg-zinc-800"
                         title="To the latest (End)"
-                        on:click=move |_| {
-                            if feed.to.get_untracked().is_some() {
-                                feed.latest();
-                            }
-                            stick.set(true);
-                            far.set(false);
-                            if let Some(el) = scroller.get_untracked() {
-                                crate::workspace::stop_glide_to_end(&el);
-                                el.set_scroll_top(el.scroll_height());
-                            }
-                        }>
+                        on:click=move |_| go_latest.run(())>
                         {if fresh > 0 { format!("{fresh} newer") } else { "Latest".to_owned() }}" "{icon(Icon::ArrowDownToLine, Size::S14)}
                     </button>
                     </div>
@@ -1434,6 +1466,8 @@ pub struct SessionChrome {
     pub(crate) timeline: crate::timeline::Timeline,
     /// To an event in the transcript: loaded back to it, its turn open.
     reach_to: Callback<u64>,
+    pub(crate) go_latest: Callback<()>,
+    navigation: RwSignal<u64>,
 }
 
 impl SessionChrome {
@@ -1531,7 +1565,8 @@ impl SessionChrome {
     pub(crate) fn go_waiting(&self, waiting: Waiting) {
         match waiting.target {
             WaitingTarget::Decision(id) => {
-                reveal_when_rendered(self.root.get_value(), crate::decisions::card_id(id), "[]".into(), 0);
+                self.go_latest.run(());
+                reveal_when_rendered(self.root.get_value(), crate::decisions::card_id(id), "[]".into(), self.navigation);
             }
             WaitingTarget::Call { session, call, seq } => {
                 let anchor = waiting_card_id(&session, &call);
@@ -1549,7 +1584,7 @@ impl SessionChrome {
                     if let Some(seq) = seq {
                         self.timeline.pin(seq);
                     }
-                    reveal_or(self.root.get_value(), vec![anchor], 0, elsewhere);
+                    reveal_or(self.root.get_value(), vec![anchor], self.navigation, elsewhere);
                 } else {
                     self.subagents.go_to(session, Some(anchor), elsewhere);
                 }
@@ -1581,7 +1616,7 @@ impl SessionChrome {
                 });
                 row.clone().into_iter().chain(first.flatten().map(|seq| format!("{id}-e{seq}"))).collect()
             },
-            0,
+            self.navigation,
         );
     }
 }
@@ -2206,6 +2241,7 @@ pub(crate) struct SubagentTree {
     /// thread under a folded turn's call opens it).
     events: RwSignal<Vec<Event>>,
     timeline: crate::timeline::Timeline,
+    navigation: RwSignal<u64>,
 }
 
 impl SubagentTree {
@@ -2253,7 +2289,7 @@ impl SubagentTree {
                 })
                 .collect::<Vec<_>>()
         });
-        Self { list, session, root, force_open, events, timeline }
+        Self { list, session, root, force_open, events, timeline, navigation: feed.navigation }
     }
 
     /// Its subagents, each with its depth below the session.
@@ -2300,7 +2336,7 @@ impl SubagentTree {
             self.timeline.pin(seq);
         }
         self.force_open.0.update(|ids| ids.extend(chain));
-        reveal_or(self.root.get_value(), anchors, 0, elsewhere);
+        reveal_or(self.root.get_value(), anchors, self.navigation, elsewhere);
     }
 }
 
@@ -2389,12 +2425,21 @@ fn Transcript(
     let Feed { events, usage, spawns, streaming, queued, secrets, from, to, .. } = feed;
     let id = StoredValue::new(session.id.clone());
     // Find asking for an event before the window: load back to it.
-    if let Some(Reach(reach)) = use_context::<Reach>() {
+    let reach = use_context::<Reach>();
+    if let Some(Reach(reach)) = reach {
         Effect::new(move || {
             let Some(seq) = reach.with(|r| r.get(&id.get_value()).copied()) else { return };
-            if seq < from.get() {
+            // Wait until replay/paging has made the requested place available.
+            // Consume it once reached, so trimming the window cannot jump back.
+            if !feed.synced.get() || feed.loading.get() {
+                return;
+            }
+            reach.update(|r| {
+                r.remove(&id.get_value());
+            });
+            if seq < from.get_untracked() {
                 feed.older(Some(seq), || ());
-            } else if to.get().is_some_and(|t| seq >= t) {
+            } else if to.get_untracked().is_some_and(|t| seq >= t) {
                 to.set(events.with_untracked(|evs| bound(evs, seq)));
             }
         });
@@ -2840,12 +2885,19 @@ fn Transcript(
                 <div node_ref=bottom class="flex justify-center gap-3">
                     <button class="text-xs text-muted underline" on:click=move |_| feed.later()>"Later messages"</button>
                     <button class="text-xs text-muted underline" on:click=move |_| {
-                        feed.latest();
-                        if let Some(Follow(f)) = follow { f.set(true) }
+                        if let Some(chrome) = chrome {
+                            chrome.go_latest.run(());
+                        } else {
+                            if let Some(Reach(reach)) = reach { reach.update(|r| { r.remove(&id.get_value()); }); }
+                            feed.latest();
+                            if let Some(Follow(f)) = follow { f.set(true) }
+                        }
                     }>"Latest "{icon(Icon::ArrowDownToLine, Size::S14)}</button>
                 </div>
             })}
-            <crate::decisions::SessionDecisions session=id.get_value() />
+            <Show when=move || to.get().is_none()>
+                <crate::decisions::SessionDecisions session=id.get_value() />
+            </Show>
             {move || secrets.get().into_iter().map(|c| view! { <SecretCardView card=c on_dismiss=Callback::new(move |id: String| secrets.update(|s| s.retain(|x| x.call_id != id))) /> }).collect_view()}
             // Failed deliveries belong to the transcript, before the growing
             // reply so streaming cannot move them. Keep the input recoverable.
@@ -3924,6 +3976,7 @@ extern "C" {
 #[component]
 fn FindBar(session: String, initial: String, open: RwSignal<bool>, force_open: ForceOpen, root: String) -> impl IntoView {
     let col = use_column();
+    let FeedNavigation(navigation) = expect_context::<FeedNavigation>();
     let root = StoredValue::new(root);
     let text = RwSignal::new(initial.clone());
     let applied = RwSignal::new(initial);
@@ -3963,7 +4016,7 @@ fn FindBar(session: String, initial: String, open: RwSignal<bool>, force_open: F
             tl.pin(hit.at);
         }
         force_open.0.update(|ids| ids.extend(hit.open.iter().filter(|o| !ids.contains(o)).cloned().collect::<Vec<_>>()));
-        reveal_when_rendered(root.get_value(), hit.anchor, serde_json::to_string(&m.terms).unwrap_or_else(|_| "[]".into()), 0);
+        reveal_when_rendered(root.get_value(), hit.anchor, serde_json::to_string(&m.terms).unwrap_or_else(|_| "[]".into()), navigation);
     };
     let step = move |delta: isize| {
         let n = found.with_untracked(|m| m.as_ref().map_or(0, |m| m.matches.len()));
@@ -4094,6 +4147,10 @@ fn anchor_seq(anchor: &str, session: &str) -> Option<u64> {
 #[derive(Clone, Copy)]
 struct Reach(RwSignal<HashMap<String, u64>>);
 
+/// Cancels delayed historical reveals when Latest supersedes them.
+#[derive(Clone, Copy)]
+struct FeedNavigation(RwSignal<u64>);
+
 /// The page follows the end of the transcript (you haven't scrolled up).
 #[derive(Clone, Copy)]
 struct Follow(RwSignal<bool>);
@@ -4112,47 +4169,62 @@ impl Arrived {
 }
 
 /// Reveals a search hit once its element exists (events render in batches).
-fn reveal_when_rendered(root: String, id: String, terms: String, tries: u32) {
-    set_timeout(
-        move || {
-            // Nested side chats load their events one after another.
-            if !js_reveal(&root, &id, &terms) && tries < 200 {
-                reveal_when_rendered(root, id, terms, tries + 1);
-            }
-        },
-        std::time::Duration::from_millis(50),
-    );
+fn reveal_when_rendered(root: String, id: String, terms: String, navigation: RwSignal<u64>) {
+    fn attempt(root: String, id: String, terms: String, navigation: RwSignal<u64>, visit: u64, tries: u32) {
+        set_timeout(
+            move || {
+                if navigation.try_get_untracked() != Some(visit) {
+                    return;
+                }
+                // Nested side chats load their events one after another.
+                if !js_reveal(&root, &id, &terms) && tries < 200 {
+                    attempt(root, id, terms, navigation, visit, tries + 1);
+                }
+            },
+            std::time::Duration::from_millis(50),
+        );
+    }
+    attempt(root, id, terms, navigation, navigation.get_untracked(), 0);
 }
 
 /// Reveals the first of `ids` that exists, trying for about a second and a
 /// half (a thread opens, a turn unfolds), else does `elsewhere`.
-fn reveal_or(root: String, ids: Vec<String>, tries: u32, elsewhere: impl FnOnce() + 'static) {
-    set_timeout(
-        move || {
-            if ids.iter().any(|id| js_reveal(&root, id, "[]")) {
-                return;
-            }
-            if tries < 30 {
-                reveal_or(root, ids, tries + 1, elsewhere);
-            } else {
-                elsewhere();
-            }
-        },
-        std::time::Duration::from_millis(50),
-    );
+fn reveal_or(root: String, ids: Vec<String>, navigation: RwSignal<u64>, elsewhere: impl FnOnce() + 'static) {
+    fn attempt(root: String, ids: Vec<String>, navigation: RwSignal<u64>, visit: u64, tries: u32, elsewhere: impl FnOnce() + 'static) {
+        set_timeout(
+            move || {
+                if navigation.try_get_untracked() != Some(visit) || ids.iter().any(|id| js_reveal(&root, id, "[]")) {
+                    return;
+                }
+                if tries < 30 {
+                    attempt(root, ids, navigation, visit, tries + 1, elsewhere);
+                } else {
+                    elsewhere();
+                }
+            },
+            std::time::Duration::from_millis(50),
+        );
+    }
+    attempt(root, ids, navigation, navigation.get_untracked(), 0, elsewhere);
 }
 
 /// Reveals the first of the elements `pick` names (asked again each try:
 /// what they are may be known only once events load) that exists.
-fn reveal_picked(root: String, pick: impl Fn() -> Vec<String> + 'static, tries: u32) {
-    set_timeout(
-        move || {
-            if !pick().iter().any(|id| js_reveal(&root, id, "[]")) && tries < 200 {
-                reveal_picked(root, pick, tries + 1);
-            }
-        },
-        std::time::Duration::from_millis(50),
-    );
+fn reveal_picked(root: String, pick: impl Fn() -> Vec<String> + 'static, navigation: RwSignal<u64>) {
+    fn attempt(root: String, pick: impl Fn() -> Vec<String> + 'static, navigation: RwSignal<u64>, visit: u64, tries: u32) {
+        set_timeout(
+            move || {
+                if navigation.try_get_untracked() != Some(visit) {
+                    return;
+                }
+                if !pick().iter().any(|id| js_reveal(&root, id, "[]")) && tries < 200 {
+                    attempt(root, pick, navigation, visit, tries + 1);
+                }
+            },
+            std::time::Duration::from_millis(50),
+        );
+    }
+    attempt(root, pick, navigation, navigation.get_untracked(), 0);
 }
 
 pub(crate) fn tokens(n: u64) -> String {

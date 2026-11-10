@@ -235,6 +235,19 @@ async function check(browser, origin, viewport, label, platform) {
       await parent().locator('textarea').waitFor();
     }
 
+    phase('empty Back and Forward retain the session owner');
+    await oneStream('parent');
+    await settle(page);
+    const boundaryComposer = await parent().locator('textarea').elementHandle();
+    const boundarySockets = await streamState(), boundaryLayout = await snapshot(page);
+    for (const key of ['[', ']']) {
+      await press(key);
+      await settle(page);
+      assert(await parent().locator('textarea').evaluate((el, kept) => el === kept, boundaryComposer), 'history boundaries do not remount the composer');
+      assert.deepEqual(await streamState(), boundarySockets, 'history boundaries do not reconnect the stream');
+      assert.deepEqual(await snapshot(page), boundaryLayout, 'history boundaries do not change the saved layout');
+    }
+
     // Isolate session replacement before mounting any Docs. The old unkeyed
     // content boundary tried to rebuild live attributes from a disposed
     // SessionView owner (StoredValue panics, then Tachys class::rebuild).
@@ -442,13 +455,18 @@ async function check(browser, origin, viewport, label, platform) {
     const sameSession = await snapshot(page);
     // Both a targeted link and a mention use the production Markdown handler.
     // Targeted sessions deliberately remount to revisit the turn. Untargeted
-    // mentions only reveal, retaining the composer, stream and reading target.
+    // mentions go to Latest in place, retaining the composer and stream.
     for (const selector of ['a[href$="#e20"]', 'a[data-ref="session:parent"]']) {
       const sameSockets = await streamState(), sameRequests = f.requests.length;
       await parent().locator('textarea').evaluate(el => { window.__sessionComposer = el; });
       await parent().locator(selector).last().click({ modifiers: [command] });
-      await waitView(page, 'session', turnTarget, 2);
-      assert.deepEqual((await snapshot(page)).tiles.map(t => [t.key, t.columns, t.back, t.forward]), sameSession.tiles.map(t => [t.key, t.columns, t.back, t.forward]), 'repeat/untargeted session opens neither copy nor history');
+      const untargeted = selector.includes('data-ref');
+      await waitView(page, 'session', untargeted ? null : turnTarget, 2);
+      const expected = structuredClone(sameSession);
+      if (untargeted) for (const tile of expected.tiles) for (const col of tile.columns) {
+        if (col.view.view === 'session' && col.view.id === 'parent') col.view.target = null;
+      }
+      assert.deepEqual((await snapshot(page)).tiles.map(t => [t.key, t.columns, t.back, t.forward]), expected.tiles.map(t => [t.key, t.columns, t.back, t.forward]), 'repeat/untargeted session opens neither copy nor history; Latest consumes only its address');
       await parent().locator('[id="parent-e20"]').waitFor({ state: 'attached' });
       assert.equal(await parent().locator('textarea').inputValue(), parentDraft);
       await oneStream('parent');
@@ -461,7 +479,7 @@ async function check(browser, origin, viewport, label, platform) {
         await links();
       }
     }
-    phase('target remount while a composer model popup is open cleans its owner');
+    phase('history remount while a composer model popup is open cleans its owner');
     const lifecycleListeners = await page.evaluate(() => window.__workspaceDraftListeners.length);
     await parent().getByRole('button', { name: /^Model: .*change it/ }).click();
     await page.getByPlaceholder('model id', { exact: true }).waitFor();
@@ -477,7 +495,7 @@ async function check(browser, origin, viewport, label, platform) {
     await oneStream('parent');
     assert.equal(await page.evaluate(() => window.__workspaceDraftListeners.length), lifecycleListeners, 'open-popup teardown replaces all composer listeners without retaining the old owner');
     await press(']');
-    await waitView(page, 'session', turnTarget, 2);
+    await waitView(page, 'session', null, 2);
     assert.equal(await parent().locator('textarea').inputValue(), parentDraft);
     await oneStream('parent');
 
@@ -521,7 +539,7 @@ async function check(browser, origin, viewport, label, platform) {
       await press('4');
       await page.locator(`#col-${listKey} a[href$="/sessions/${id}"]`).first().click({ modifiers: [command] });
       phase(`Sessions list reuse ${id}: wait for existing session in four tiles`);
-      await waitView(page, 'session', id === 'parent' ? turnTarget : undefined, 4);
+      await waitView(page, 'session', null, 4);
       const after = await snapshot(page);
       assert.equal(sessionColumns(after, id).length, 1);
       assert.equal(after.tiles[after.focus].key, id === 'parent' ? 2 : secondaryTile.key);
@@ -543,7 +561,7 @@ async function check(browser, origin, viewport, label, platform) {
       assert.equal(await parentRow.count(), 1);
       assert.equal(await secondaryRow.count(), 1);
       await parentRow.click();
-      await waitView(page, 'session', turnTarget, 4);
+      await waitView(page, 'session', null, 4);
       const afterPicker = await snapshot(page);
       assert.deepEqual(afterPicker.tiles.map(t => [t.key, t.columns, t.back, t.forward]), beforePicker.tiles.map(t => [t.key, t.columns, t.back, t.forward]));
       assert.equal(await parent().locator('textarea').inputValue(), parentDraft);
@@ -560,7 +578,7 @@ async function check(browser, origin, viewport, label, platform) {
     legacy.tiles[0].forward = [[{ key: 21, view: { view: 'search', q: 'loser-forward', kind: '', worker: '' } }]];
     legacy.tiles[1].back = [[{ key: 22, view: { view: 'workers' } }]];
     legacy.next = 23;
-    await seed(legacy, '/sessions/parent', { parent: parentDraft, secondary: secondaryDraft });
+    await seed(legacy, '/sessions/parent#e30', { parent: parentDraft, secondary: secondaryDraft });
     await waitView(page, 'session', focusedTarget, 2);
     const focusedSession = await snapshot(page);
     assert.deepEqual(sessionColumns(focusedSession).map(c => c.key), [9]);
@@ -760,7 +778,9 @@ async function check(browser, origin, viewport, label, platform) {
     await seed(layout(), '/sessions/parent');
     for (const count of [3, 4]) {
       await press('1');
-      await page.locator('[data-tile-motion="2"]').getByRole('button', { name: /Open session sheet/ }).click();
+      // Desktop has the Changes toolbar action already; opening the ring's
+      // popover first would put its scrim over that same action.
+      if (viewport.width < 768) await page.locator('[data-tile-motion="2"]').getByRole('button', { name: /Open session sheet/ }).click();
       await page.getByRole('button', { name: 'Changes', exact: true }).last().click({ modifiers: [command] });
       await waitView(page, 'session_changes', undefined, count);
       const companions = await snapshot(page);
