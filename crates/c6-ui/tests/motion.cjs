@@ -8,6 +8,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
+const { navigationObserver } = require('./browser-navigation.cjs');
 
 const ROOT = path.resolve(process.env.ROOT || path.join(__dirname, '../dist'));
 // Operation failures must reach the case's evidence handler before its watchdog.
@@ -180,12 +181,17 @@ async function fixture(browser, origin, viewport, theme, motion, started, contex
   const progress = { page, context, errors, requests, consoleMessages, motion, theme, viewport, crash, phase: 'configure' };
   started(progress);
   let state = 'idle', sequence = 100, suggestion = null, marks = seed.marks || {};
+  let attentionMockProved = false;
   let sessionView = { catchup: true, fold: false }, deferredView;
-  page.on('pageerror', error => {
+  const fatal = error => {
     errors.push(String(error.stack || error)); console.error('PAGEERROR', error.stack || error);
     console.error('CRASH DIAGNOSTIC', crashDiagnostic(browser.browserType().name(), error, consoleMessages));
     fail(new Error(`browser crash during ${progress.phase}: ${error.stack || error}`));
-  });
+  };
+  const navigation = await navigationObserver({ page, engine: browser.browserType().name(), origin,
+    baselineAttention: () => !seed.setup && attentionMockProved, fatal });
+  Object.assign(progress, { navigate: navigation.navigate, navigation });
+  page.on('pageerror', navigation.pageError);
   page.on('console', message => {
     if (['error', 'warning'].includes(message.type())) {
       consoleMessages.push({ type: message.type(), text: message.text() });
@@ -254,6 +260,7 @@ async function fixture(browser, origin, viewport, theme, motion, started, contex
     else if (p.endsWith('/git/diff')) json = { diff: '' };
     else if (p.endsWith('/ui/error')) { errors.push(`UI crash report: ${request.postData()}`); json = {}; }
     await route.fulfill({ json });
+    if (request.url() === origin + '/api/v1/attention' && !request.redirectedFrom()) attentionMockProved = true;
   });
   await page.route('**/__seed', route => route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>fixture seed</title>' }));
   // Standalone production harnesses can start on their real page/layout and
@@ -963,7 +970,7 @@ async function modelForms(f) {
       await page.evaluate(next => localStorage.setItem('c6.home.workspace.v2', JSON.stringify(next)), {
         ...layout, tiles: [{ ...layout.tiles[0], columns: [{ key: 3, view: { view: name === 'ask' ? 'chats' : 'sessions' } }] }],
       });
-      await page.goto(new URL(`/r/home${pathname}`, page.url()).href, { waitUntil: 'domcontentloaded' });
+      await f.navigate(new URL(`/r/home${pathname}`, page.url()).href, { waitUntil: 'domcontentloaded' });
     } else if (pathname === '/ask') {
       await page.keyboard.press('Control+j');
       await page.getByRole('dialog', { name: 'Ask carbon6', exact: true }).getByRole('button', { name: /^Your conversations/ }).click();
@@ -1610,9 +1617,11 @@ async function main() {
                   console.log(`  ${test}`); await within(`${label}/${test}`, () => Promise.race([check(f), f.crash]));
                 }
                 await assertMotion(f);
+                await f.navigation.drain();
                 assert.deepEqual(f.errors, [], 'no browser crashes, invalid stream messages, or external requests');
                 await f.page.screenshot({ path: path.join(SHOTS, `${label}.png`) });
                 assert.deepEqual(f.errors, [], 'no errors while capturing the final frame');
+                fs.writeFileSync(path.join(SHOTS, `${label}-navigation.json`), JSON.stringify(f.navigation.ledger, null, 2));
                 console.log(`PASS ${label}`); count++;
               } catch (error) {
                 if (f) {
@@ -1620,7 +1629,8 @@ async function main() {
                   const diagnostics = await f.page.evaluate(() => ({ motion: document.documentElement.dataset.motion,
                     effects: window.__motionTest?.effects, html: document.body.innerHTML })).catch(() => ({}));
                   fs.writeFileSync(path.join(SHOTS, `${label}-FAIL.json`), JSON.stringify({ error: error.stack, phase: f.phase,
-                    errors: f.errors, console: f.consoleMessages, requests: f.requests, ...diagnostics }, null, 2));
+                    errors: f.errors, console: f.consoleMessages, requests: f.requests,
+                    navigation: f.navigation?.ledger, ...diagnostics }, null, 2));
                 }
                 throw new Error(`${label}: ${error.stack || error}`);
               } finally {
