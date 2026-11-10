@@ -48,10 +48,12 @@ ordinary commands above. Do not pool them with old full-mode single trials.
 `SCENARIOS=live` selects a separately labelled live-only ablation. Repeated
 children use `MEASURE_ONLY=1`, skipping post-measure behavioral assertions, not
 the 200-key/final-stream-tail/error checks. Run full mode against the final build
-as well to verify behavior. Never compile, test, or run another browser alongside
-timed trials.
+as well to verify behavior. Isolated microbenchmark comparisons require a
+controlled host-load protocol; busy-host correctness qualification is separate.
+Record its shared load rather than claiming isolated latency measurements.
 
-For the final S15 exclusive timing slot, sample `vmstat 1 31` before each batch,
+For the final S15 exclusive timing slot (not a browser qualification prerequisite),
+sample `vmstat 1 31` before each batch,
 discard its first since-boot row, and require all 30 one-second samples to show
 at least 95% idle CPU and a run queue no greater than four. The coordinator
 amended the original ceiling of two before any isolated ablation trial, after
@@ -235,13 +237,22 @@ comments-design and session-sheet acceptance gates. This is a curated list, not
 every standalone `.cjs` helper in the directory. **ring-render is Chromium-only**;
 its layer/paint/blocked-main-thread assertions require CDP, not WebKit.
 
-The runner serves one immutable production build and owns a BrowserServer per
-engine. Eight bounded workers run independent suites/case shards in both engines
+The runner serves one immutable production build and normally owns a BrowserServer
+per engine. Eight bounded workers run independent suites/case shards in both engines
 concurrently. Every case still gets a **fresh browser context**, storage and its
 own fake HTTP/WebSocket head; only static bytes and browser processes are shared.
 Closing one worker disconnects its client and closes only its own contexts.
 `ISOLATE_BROWSER=1` preserves fresh-process diagnostics. `BROWSER_JOBS=1` runs
 correctness serially; `BROWSER_ENGINES=webkit` selects one engine.
+
+WebKit transcript-press is the native-input exception: the parent launches a
+local browser and runs the exported suite in-process, retaining all 14 controls.
+Pinned Playwright's raw page-proxy input requires its local implementation, not
+a remote BrowserServer connection. It consumes one normal pool slot; unsupported
+native input fails instead of skipping or substituting DOM touch events.
+Chromium retains all 13 controls on the normal child path. The local browser has
+bounded close/owned-kill escalation; cleanup errors remain failures. This
+exception also applies with `ISOLATE_BROWSER=1`.
 
 `BROWSER_SUITES=motion` selects a suite; space-separated names select several.
 Diagnostic case selectors are passed through without multiplying or overriding
@@ -272,6 +283,15 @@ lock is held until active workers drain and owned browser servers close.
 Exceptions during worker setup also drain other active workers before teardown.
 `summary.json` includes interruption/timeout status and SHA-256 hashes of the
 production JS/CSS/WASM and selected test helpers, in addition to phase offsets.
+
+Session-sheet alone enables the reusable passive `browser-lifecycle.cjs`
+observer: timestamped page close/crash, context close, browser disconnect,
+intentional close callsites and an immutable first-error connection/page
+inventory. Failure JSON is saved before cleanup and updated afterward, retaining
+the primary error and secondary diagnostic errors. Passing records are in
+`lifecycle.jsonl`. It does not change assertions, selectors, deadlines or retries.
+The runner gates selected press, motion/navigation and session-sheet suites on
+their respective follow-press, navigation-policy and lifecycle unit checks.
 
 ### Latest and saved transcript windows
 
@@ -306,7 +326,7 @@ This is emulated phone/browser coverage, not a physical Android Chrome run.
 ```sh
 make ui-browser-test                 # all registered regression suites, representative matrix
 make ui-browser-quick                # everyday workspace/motion/lists/Markdown/press/timestamps/Latest
-make ui-browser-perf                 # exclusive Chromium ring measurements, never parallel neighbours
+make ui-browser-perf                 # Chromium ring measurements; one runner worker
 BROWSER_MATRIX=all make ui-browser-test # exhaustive correctness combinations, still no benchmark workload
 node --test crates/c6-ui/tests/browser-runner.test.cjs # scheduler/selection checks, no browser
 ```
@@ -316,8 +336,7 @@ comment-sheet, phone-picker, phone-bar, theme, resource-lifecycle, status-row,
 ring-render, message-edit, message-origin, comments-design, session-sheet and
 navigation-errors (the navigation policy unit checks still run with motion).
 It uses the same assertions/isolation as full, not simplified assertions. Perf
-forces one worker and only Chromium ring-render; do not run another browser,
-compiler or test alongside timing trials. Full/quick have no CPU-throttled or
+forces one worker and only Chromium ring-render. Full/quick have no CPU-throttled or
 main-thread-blocking benchmark workloads. Motion's frame-by-frame geometry,
 FLIP batching, focus, duration/keyframe, first-frame interaction and controlled
 clock interruption/disposal assertions remain **correctness**, not FPS budgets.
@@ -325,8 +344,15 @@ All runner tiers take an exclusive invocation lock at
 `~/.cache/carbon6/browser-tests.lock` (`BROWSER_TEST_LOCK` overrides it); a second
 runner fails immediately, without waiting or stealing ownership. A killed
 process's stale lock requires explicit inspection/cleanup. Standalone suite
-commands and compilers do not take this lock: the timing operator must still
-verify the host is idle before measurements.
+commands and compilers do not take this lock. It neither proves an idle host nor
+excludes differently configured runners or unrelated sessions' jobs.
+
+Browser-fast qualification explicitly permits unrelated host builds: there is
+no idle gate. Keep this task's invocations sequential, record start/end load and
+heavy processes, and label all timings shared-host throughput. Failures and
+unstarted shards remain visible, not retried away as load artifacts. Perf's
+single worker is not evidence of host-wide isolation; clean microbenchmark
+comparisons need a separately controlled protocol.
 
 Counts below are **per engine**, except Chromium-only ring-render. Removed
 crossings are recoverable with `BROWSER_MATRIX=all` or the unchanged standalone
@@ -353,41 +379,30 @@ replaced by a generic success/error example.
 | message-origin | Separate gate → all 6 | Three viewports × both themes now in full. |
 | comments-design | Separate gate → all 10 | All five layouts × both themes now in full; unique margin-fit/Light deferred-save races remain. This does not replace comment-sheet. |
 | session-sheet | Separate gate → all 18 | Core, nested/focus and SSH/stale/offline capability cases now in full; no matrix reduction. |
-| navigation-errors | New: Chromium 9 + WebKit 22 | Held native-refusal positive plus genuine JS throw/rejection (including exact native message and stack), live/outside-window, identity/lifecycle/endpoint/origin/signature, console/Rust/WASM and real CORS/redirect negatives. WebKit-only provisional-document controls are not claimed as Chromium passes. Policy/race unit tests run once before any motion/navigation workers. |
+| navigation-errors | New: 4 Chromium + 4 WebKit | Exact message outside the navigation window, different message inside, and different URL inside must remain fatal. A real cold reload with attention HTTP fetch in flight must hydrate with zero unclassified errors; native diagnostic counts are informational. Deterministic units replay the exact saved real error inside/outside the window and test the three negatives. |
 
-### WebKit native navigation diagnostic attribution
+### WebKit attention diagnostic during owned cold navigation
 
-The historical motion failure was a native attention-fetch diagnostic during
-replacement of the old document, not a WASM trap. Controlled app-free native
-fetches reproduced its exact stack while the fetch rejection was handled and
-neither `window.error` nor `unhandledrejection` occurred. Existing in-flight
-cancellation did **not** reproduce it: the refused *new* load did not even reach
-the mock request handler. A naive beforeunload flag is not a safe app fix:
-cancelled confirmation or `window.stop()` can leave a live page with the flag
-stuck; pagehide is too late. This harness change adds **no app code or WASM**.
+`browser-navigation.cjs` intentionally uses a simple arrival-window policy.
+Only WebKit pageerrors whose complete first stack line exactly equals
+`Fetch API cannot load <owned-origin>/api/v1/attention due to access control checks.`
+are tolerated, and only between a harness-initiated goto/reload and destination
+load. The entire line and owned endpoint must match. Outside-window errors,
+different messages/URLs and every Chromium pageerror remain fatal. This is
+arrival timing, not causal proof: no route provenance, epochs, revocation or
+document-identity machinery is used. Raw diagnostics and classifications remain
+visible. No application code or WASM changes implement this policy.
 
-`browser-navigation.cjs` classifies only the exact original WebKit stack first
-line for the owned same-origin `/api/v1/attention`, after a known successful
-nonredirected baseline mock and inside modelForms' explicit cold replacement.
-It requires an observed destination request, prior beforeunload telemetry,
-retained old-document identity/URL/token, no commit/pagehide/other navigation,
-and a second old-context proof without DOM failures. Every `seed.setup`
-override disables eligibility. Missing or destroyed evidence remains fatal;
-there is no generic phrase/phase ignore or retry. Independently observed
-window errors and unhandled rejections are always fatal, even with exactly the
-native message/stack. Pending proof drains before navigation returns. Raw
-diagnostics and classifications remain in logs and per-case navigation JSON.
-This eligibility is specific to the current modelForms path, which does not
-change the baseline routes. Before reusing `f.navigate` with later route/unroute
-mutations, revoke eligibility and add an integrated custom-route negative
-control; the initial successful-response flag alone does not track them.
+Fixture `f.navigate`/`f.reload` and registered peer-page observers cover explicit
+cold replacements. Foreign destinations and overlapping replacements fail.
+Even DOMContentLoaded callers wait for load; then two task turns drain before
+final error assertions. Page close or operation failure also closes tolerance.
 
-`navigation-errors.cjs` keeps these positive/negative controls in the full
-regression gate, both directly runnable and compatible with shared servers.
-The focused production compatibility run emitted no native diagnostic, so it
-is not claimed as a natural-flake reproduction. Detailed native source/runtime
-and cancellation evidence is retained under
-`~/.cache/c6-helper/browser-fast/webkit-navigation/`.
+`navigation-errors.cjs` runs four controls per engine. Its real in-flight-fetch
+reload checks completion, hydration and zero unclassified errors, without
+requiring timing-dependent native noise. The classifier itself is checked
+deterministically using the exact stack/name/message retained from an earlier
+real failed run. Those historical failures are not retrospectively passed.
 
 Fixed completion sleeps were not replaced with shorter sleeps. Ring correctness
 waits for each actual chunk/item and committed frames; perf retains deliberate
@@ -397,6 +412,42 @@ inside that parser-blocking route deadlocked the diagnostic and was discarded.
 All first-frame assertions remain. Session-sheet Stop waits for the exact mocked
 POST response instead of hand-written 10ms condition polling. Motion keeps
 finite-animation completion and controlled browser-clock boundaries.
+
+### Browser-fast qualification results (November 10, 2026)
+
+**Not qualified: only one of the final three full runs passed.** All times below
+are external make wall seconds on a shared busy host, not isolated speedups.
+Test source is `e34de0958bae96bac273391b48a6137f7dfc6a6b`; UI/check/test and
+immutable assets are from `72eac0cf57e9327791aa2b3cf4edf45f40c5b67d`.
+The authorized reuse diff is exactly `browser-navigation.test.cjs` and
+`navigation-errors.cjs`, both under `crates/c6-ui/tests/`. No new UI build at
+e34de095 is claimed; release gates remain for the coordinator's release build.
+
+| Final invocation | Result | Observed/planned shards | Wall seconds | Failure |
+|---|---|---|---:|---|
+| full-1 | FAIL | 68/95 | 177.325 | WebKit session-sheet page crash |
+| full-2 | FAIL | 64/95 | 124.360 | Chromium resource-lifecycle dark/stale assertion |
+| full-3 | PASS | 95/95 | 255.883 | — |
+| quick-1 | PASS | 40/40 | 85.162 | — |
+| perf-1 | PASS | 1/1 | 99.347 | — |
+
+Original and second failed sequences remain retained and failed. Short partial
+runs, quick/perf passes and later diagnostic nonreproductions do not qualify the
+gate. The instrumented crash preceded the screenshot error and local cleanup;
+its initiating cause remains unknown. Forty-eight separate WebKit cases at caps
+5/2/1 all passed (peak owned WebProcess RSS sums 2609.7/1062.2/738.9 MiB), so no
+cap or application/browser blame is established. The historical mixed workload
+was different; its RSS cannot be reconstructed. Chromium dark/stale passed
+20 isolated plus 20 controlled CPU-load attempts. A request-event/route-state
+timing assumption remains plausible but unconfirmed; no test/app fix is claimed.
+
+Observer self-wall across 108 passing records was 49.521 ms / 438.884 s
+(0.011283%), excluding wrapper dispatch, serialization and file IO—not total
+instrumentation overhead. The initial diagnostic's mismatched WebKit wrapper
+caused one setup failure and 15 unstarted slots; no on/off comparison completed.
+All evidence, 15 invocation results, per-suite/engine timings, host records and
+the full coverage ledger are in
+`~/.cache/c6-helper/browser-fast/qualification-final/final/browser-fast-final-report.md`.
 
 ### Phone single-bar production browser regression (S14)
 
