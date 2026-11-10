@@ -7,8 +7,31 @@ const os = require('node:os');
 const path = require('node:path');
 const { diagnostic, exactDiagnostic, navigationObserver } = require('./browser-navigation.cjs');
 const { fixture, within } = require('./motion.cjs');
-const origin = 'http://127.0.0.1:1234';
-const error = (text = diagnostic(origin)) => ({ stack: text + '\nfetch@[native code]', message: text });
+const origin = 'http://127.0.0.1:37655';
+// Literal stack/name/message from rawPageErrors[0] of the earlier FAILED WebKit run:
+// ~/.cache/c6-helper/browser-fast/evidence/cold-native-scope-repair-integration-20261110T100100Z-g0huHO/
+// runs/full-2026-11-10T10-01-40-724Z-2390590/pass-1/webkit/resource-lifecycle/shard-1/webkit-light-projects/evidence.json
+// Source SHA-256: 184855fa130b62c16a6d1f5dd9abe1277b9e209eaeb67171c465a9e1f89087a3
+// Replayed policy input only; this does not reclassify or pass that historical run.
+const savedError = {
+  stack: `Fetch API cannot load http://127.0.0.1:37655/api/v1/attention due to access control checks.
+    at __wbg_fetch_9b478faef8cda538 (http://127.0.0.1:37655/c6-ui-e40c7bd8a090685e.js:549:30)
+    at .wasm-function[5864] ([wasm code]:0:0)
+    at .wasm-function[5985] ([wasm code]:0:0)
+    at .wasm-function[38938] ([wasm code]:0:0)
+    at .wasm-function[3083] ([wasm code]:0:0)
+    at .wasm-function[1029] ([wasm code]:0:0)
+    at .wasm-function[34295] ([wasm code]:0:0)
+    at .wasm-function[5592] ([wasm code]:0:0)
+    at .wasm-function[15770] ([wasm code]:0:0)
+    at .wasm-function[24176] ([wasm code]:0:0)
+    at wasm_bindgen_542dc48063100ff5___convert__closures_____invoke___wasm_bindgen_542dc48063100ff5___JsValue__core_9b3796e30d99ddb7___result__Result_____wasm_bindgen_542dc48063100ff5___JsError___true_ (http://127.0.0.1:37655/c6-ui-e40c7bd8a090685e.js:1967:216)
+    at real (http://127.0.0.1:37655/c6-ui-e40c7bd8a090685e.js:2176:21)`,
+  name: 'Fetch API cannot load http',
+  message: '/127.0.0.1:37655/api/v1/attention due to access control checks.',
+};
+const error = text => text === undefined ? { ...savedError } :
+  { ...savedError, stack: text + savedError.stack.slice(savedError.stack.indexOf('\n')), message: text };
 
 async function harness(engine = 'webkit') {
   const fatal = [], calls = [], rawLog = [], response = {};
@@ -26,9 +49,9 @@ async function harness(engine = 'webkit') {
 }
 
 test('exact native predicate uses the complete original line and exact endpoint', () => {
-  assert(exactDiagnostic({ name: 'Fetch API cannot load http', message: 'colon-split', stack: diagnostic(origin) }, origin));
+  assert(exactDiagnostic(error(), origin));
   for (const text of [diagnostic(origin) + ' extra', 'Error: ' + diagnostic(origin),
-    diagnostic(origin).replace('/attention', '/attention?extra=1'), diagnostic(origin).replace(':1234', ':4321')]) {
+    diagnostic(origin).replace('/attention', '/attention?extra=1'), diagnostic(origin).replace(':37655', ':4321')]) {
     assert(!exactDiagnostic(error(text), origin));
   }
   assert(!exactDiagnostic({ message: diagnostic(origin) }, origin));
@@ -65,6 +88,9 @@ for (const engine of ['webkit', 'chromium']) for (const operation of ['navigate'
     assert.equal(h.observer.ledger.filter(row => row.kind === 'classified-native').length, engine === 'webkit' ? 1 : 0);
     assert(h.rawLog.some(row => row[0] === 'PAGEERROR'));
     assert.equal(h.observer.rawPageErrors.length, 1);
+    assert.equal(h.observer.rawPageErrors[0].stack, savedError.stack);
+    assert.equal(h.observer.rawPageErrors[0].name, savedError.name);
+    assert.equal(h.observer.rawPageErrors[0].message, savedError.message);
   });
 }
 
