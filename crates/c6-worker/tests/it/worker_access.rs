@@ -106,11 +106,10 @@ async fn credentials_go_only_to_what_a_workers_session_uses() {
     // Another worker's session.
     assert_eq!(ask(st, b, &mine, &home_only).await.error, "no such session on this worker");
     // A connection the session doesn't use: one its subagents may run on
-    // (any its realm may use but Claude Code, docs/subagents.md) is given;
-    // Claude Code isn't.
+    // (any its realm may use, Claude Code too, docs/subagents.md) is given.
     assert_eq!(ask(st, a, &mine, &shared).await.error, "");
     let (cc, cc2) = (claude_code(&api, "cc").await, claude_code(&api, "cc2").await);
-    assert!(ask(st, a, &mine, &cc).await.error.contains("does not use"));
+    assert_eq!(ask(st, a, &mine, &cc).await.error, "");
     // A mach5-agents session asking for a home-only connection: it can't
     // switch to it, nor have it.
     let switch = json!({"text": "go", "connection_id": home_only, "model": "m"});
@@ -118,8 +117,10 @@ async fn credentials_go_only_to_what_a_workers_session_uses() {
     assert!(e.contains("not available to realm mach5-agents"), "{e}");
     assert!(!ask(st, a, &agents, &home_only).await.error.is_empty());
     // A model switch the worker hasn't reported yet: the new connection
-    // (Claude Code to Claude Code, which only the switch gives).
-    let on_cc = session(&api, a, &cc, "home").await;
+    // (Claude Code to Claude Code over SSH, whose subagents can't run on
+    // it, so only the switch gives it).
+    let body = json!({"worker_id": a.0, "cwd": "", "connection_id": cc, "model": "m", "realm": "home", "ssh": "dev@box"});
+    let on_cc = api.ok(M::POST, "sessions", body).await["id"].as_str().unwrap().to_owned();
     assert!(ask(st, a, &on_cc, &cc2).await.error.contains("does not use"));
     api.ok(M::POST, &format!("sessions/{on_cc}/messages"), json!({"text": "go", "connection_id": cc2, "model": "m"})).await;
     assert_eq!(ask(st, a, &on_cc, &cc2).await.error, "");
@@ -171,9 +172,9 @@ async fn an_older_worker_still_gets_what_its_sessions_use() {
     // A model switch it hasn't reported yet.
     api.ok(M::POST, &format!("sessions/{s}/messages"), json!({"text": "go", "connection_id": next, "model": "m"})).await;
     assert_eq!(older(&next).await.bearer, "key-next");
-    // One its subagents may run on; not Claude Code it doesn't use.
+    // One its subagents may run on, Claude Code too.
     assert_eq!(older(&other).await.bearer, "key-other");
-    assert!(older(&claude_code(&api, "cc").await).await.error.contains("no session on this worker may use"));
+    assert_eq!(older(&claude_code(&api, "cc").await).await.error, "");
     // Its sessions' secrets, asked for as such workers ask.
     api.ok(M::PUT, "settings/secrets/DEPLOY_KEY", json!({"value": "dk-1"})).await;
     assert_eq!(older(&format!("secret:DEPLOY_KEY@{s}")).await.bearer, "dk-1");

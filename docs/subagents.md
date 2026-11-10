@@ -292,7 +292,7 @@ Native stdin and separate stdout/stderr are unavailable. When the CLI supplies a
 
 For a subagent on another worker, folder or repository, started from a template, see docs/remote-subagents.md.
 
-A subagent may run on another connection and model than its parent: a cheap model for searches, or a GPT model under a Claude session. carbon6 runs it in its own loop whatever the parent runs on (never by starting another CLI), so it works for every main model, Claude Code included.
+A subagent may run on another connection and model than its parent: a cheap model for searches, or a GPT model under a Claude session. carbon6 runs it in its own loop whatever the parent runs on, so it works for every main model, Claude Code included. One on a Claude Code connection is the exception: it runs as a Claude Code session of its own (see "On Claude Code" below).
 
 ### Choosing
 
@@ -308,11 +308,23 @@ The effort carries over only while the subagent stays on the same connection. It
 
 ### What may be used
 
-The head sends each session the connections its realm may use (`CreateSession.subagent_connections_json`), without Claude Code ones, since running a Claude Code connection would start the CLI. The worker refuses anything else with an error that lists the available connections. The parent's own connection is always allowed, unless it is Claude Code. A worker gets a connection's credentials only if some realm it serves may use that connection.
+The head sends each session the connections its realm may use (`CreateSession.subagent_connections_json`), Claude Code ones included, except for SSH sessions, which can't start the CLI on their host. The worker refuses anything else with an error that lists the available connections. The parent's own connection is always allowed. A worker gets a connection's credentials only if some realm it serves may use that connection.
+
+Until 2026-11-09 Claude Code was left out. A Claude Code session's agent then named the API connection for its subagents to run at all, which billed every one per call instead of on the Claude Code plan. Claude Code sessions are now told their subagents run on Claude Code unless the user asks for another model (`CLAUDE_CODE_NOTE`).
 
 ### Tools and prompt
 
 Where the subagent's model takes the parent's tool profile, it shares the parent's tools as before. Otherwise (a GPT subagent under a Claude parent, or any subagent of a Claude Code session) it gets tools of its own in its model's profile, with the inherited routing rule's tool list, then the same filters: the named agent's tools, the depth limit, no task cards. Its system prompt is the parent's with the skills index renamed for the profile, shown only if the skill loader is present. Under Claude Code, whose prompt is its own, it gets the prompt a carbon6 session would have. `SessionStarted.tool_profile`, `tools` and `context_window` are the subagent's own, so a reload rebuilds the same set.
+
+### On Claude Code
+
+A subagent on a Claude Code connection is a Claude Code session of its own, a child like any other (`SubagentSpawned`, its report back to the `Task` call, `SendMessage` to continue it). It has Claude Code's prompt and tool profile, and carbon6's tools reach it over the MCP bridge. A named agent's instructions go ahead of its task, since the prompt is Claude Code's.
+
+Its tools are narrowed as `filter_tools` narrows others:
+- **Its named agent's list** travels in its delegation (`subagent::agent_tools`). It narrows both Claude Code's own tools (`claude_code_native`, even where Settings keeps all of them) and carbon6's on the bridge, `Task` and documents included.
+- **The parent's limits** go into its tool list: a named parent's list, and in carbon6's own loop the parent's tools. A combination that leaves no tool is refused.
+- **No hosted search** where the parent has none: Settings' "all of Claude Code's tools" doesn't apply to it then.
+- **The depth limit** applies to the bridge's `Task` as to any Claude Code session.
 
 ### Tool lists from routing rules
 

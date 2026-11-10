@@ -68,9 +68,9 @@ const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 /// The connection, model and effort a subagent runs on. In order, each
 /// overriding the one before: its parent's model, the session's default
 /// for subagents, a named agent's model, and what the `Task` call asks for.
-/// Only `connections` (those the session's realm may use, never Claude
-/// Code) or the parent's own may be used: a subagent runs in carbon6's own
-/// loop.
+/// Only `connections` (those the session's realm may use) or the parent's
+/// own may be used. One on Claude Code runs as a Claude Code session of its
+/// own; any other in carbon6's own loop.
 pub fn resolve_model(
     parent: &ModelSpec,
     default: &SubagentDefault,
@@ -139,13 +139,8 @@ pub fn resolve_model(
     }
     match connections.iter().find(|c| c.id == m.connection_id) {
         Some(c) => m.connection_kind = c.kind.clone(),
-        None if m.connection_id == parent.connection_id && m.connection_kind != "claude_code" => {}
-        None if m.connection_kind == "claude_code" || m.connection_id == parent.connection_id => {
-            return Err(format!(
-                "subagents run in carbon6's own loop, not on Claude Code: name a connection to run this one on ({}), or set the session's subagent model",
-                names()
-            ));
-        }
+        // The parent's own (a Claude Code parent's subagents run on Claude Code too).
+        None if m.connection_id == parent.connection_id => {}
         None => return Err(format!("that connection is not available to this session's subagents; available: {}", names())),
     }
     if m.model.trim().is_empty() {
@@ -205,6 +200,25 @@ fn filter_tools(
         .collect()
 }
 
+/// The tools a subagent's named agent may use (`None`: any), from its
+/// delegation. A Claude Code session narrows its own tools and carbon6's
+/// by it, as `filter_tools` does in carbon6's own loop.
+pub(crate) fn agent_tools(spec: &CreateSession) -> Option<Vec<String>> {
+    let d = spec.delegation.as_ref()?;
+    serde_json::from_str::<AgentJson>(&d.agent_json).ok().map(|a| a.tools).filter(|t| !t.is_empty())
+}
+
+/// Both lists' tools (an empty list allows any); `None` when no tool is
+/// left.
+fn both(a: &[String], b: &[String]) -> Option<Vec<String>> {
+    let out: Vec<String> = match (a.is_empty(), b.is_empty()) {
+        (true, _) => b.to_vec(),
+        (_, true) => a.to_vec(),
+        _ => a.iter().filter(|t| c6_tools::tool_allowed(b, t)).cloned().collect(),
+    };
+    (out.is_empty() == (a.is_empty() && b.is_empty())).then_some(out)
+}
+
 /// A provider's hosted search is subject to the same lists as other tools.
 fn web_search_allowed(spec: &CreateSession, started: &SessionStarted, agent: Option<&AgentDef>) -> bool {
     let parent_agent = spec.delegation.as_ref().and_then(|d| serde_json::from_str::<AgentJson>(&d.agent_json).ok());
@@ -234,6 +248,9 @@ impl Subagents for Runner {
         let parent_model = p.spec.model.clone().unwrap_or_default();
         let connections = crate::session::subagent_connections(&p.spec);
         let model_spec = resolve_model(&parent_model, &default, agent.map_or("", |a| a.model.as_str()), choice, &connections)?;
+        // On Claude Code: a Claude Code session of its own, with Claude Code's
+        // tools and prompt (carbon6's tools reach it over the bridge).
+        let on_claude_code = model_spec.connection_kind == "claude_code";
         let _working = self.permit(&root)?;
         let provider = Provider::from_kind(&model_spec.connection_kind).unwrap_or(Provider::OpenAiChat);
         let info = model_info(provider, &model_spec.model);
@@ -251,7 +268,7 @@ impl Subagents for Runner {
         };
         // Subagents start fresh: a side chat's seed is not theirs. Their
         // own subagents get the same default.
-        let spec = CreateSession {
+        let mut spec = CreateSession {
             seed: Vec::new(),
             model: Some(model_spec.clone()),
             delegation: Some(delegation),
@@ -261,10 +278,32 @@ impl Subagents for Runner {
         };
         let claude_code_parent = p.started.tool_profile == crate::claude_code::PROFILE;
         let search_allowed = web_search_allowed(&p.spec, &p.started, agent);
+        if on_claude_code {
+            // Its own agent's list narrows it through its delegation. What
+            // narrows the parent goes into its tool list: a named parent's
+            // list, and (in carbon6's own loop) the parent's tools, as
+            // `filter_tools` keeps a child to them. No hosted search where
+            // the parent has none.
+            let mut parent: Vec<String> = Vec::new();
+            if !claude_code_parent {
+                parent = self.tools.iter().map(|t| t.spec().name).collect();
+                if search_allowed {
+                    parent.push("web_search".into());
+                }
+            }
+            let none = || "its parent may use no tool it could have on Claude Code".to_owned();
+            spec.tools = both(&spec.tools, &agent_tools(&p.spec).unwrap_or_default()).ok_or_else(none)?;
+            spec.tools = both(&spec.tools, &parent).ok_or_else(none)?;
+            if !search_allowed && let Some(c) = spec.claude_code.as_mut() {
+                c.native_all = false;
+            }
+        }
         // The parent's tools where its model takes the same profile; else
         // (another model family, or a Claude Code parent, whose tools
         // carbon6 does not run) tools of its own in its model's profile.
-        let (tools, skills) = if p.started.tool_profile == profile.as_str() {
+        let (tools, skills) = if on_claude_code {
+            (Vec::new(), None)
+        } else if p.started.tool_profile == profile.as_str() {
             (filter_tools(&p.spec, self.tools.clone(), None, agent, depth), None)
         } else {
             let built = p.manager.session_tool_set(&child_id, &spec, &p.started, profile).await;
@@ -313,7 +352,11 @@ impl Subagents for Runner {
                 time::OffsetDateTime::now_utc().date()
             );
         }
-        system_prompt = crate::session::prompt_for_tools(&spec, &system_prompt, &tools, profile);
+        if on_claude_code {
+            system_prompt = crate::claude_code::SYSTEM_PROMPT.to_owned();
+        } else {
+            system_prompt = crate::session::prompt_for_tools(&spec, &system_prompt, &tools, profile);
+        }
         let started = SessionStarted {
             title: match agent {
                 Some(a) => format!("{description} ({})", a.name),
@@ -325,7 +368,7 @@ impl Subagents for Runner {
             hosted_search_off: !search_allowed,
             system_prompt,
             model: Some(model_spec.clone()),
-            tool_profile: profile.as_str().to_owned(),
+            tool_profile: if on_claude_code { crate::claude_code::PROFILE.to_owned() } else { profile.as_str().to_owned() },
             context_window,
             agent: agent.map(|a| a.name.clone()).unwrap_or_default(),
             depth,
@@ -349,10 +392,16 @@ impl Subagents for Runner {
         info!(parent = %p.session_id, child = %child_id, %description, "subagent started");
 
         let note = crate::session::spec_prompt(&p.spec, "session.subagent", c6_agent::SUBAGENT_NOTE);
+        // A named agent's instructions: its system prompt in carbon6's own
+        // loop; on Claude Code (whose prompt is its own), ahead of the task.
+        let instructions = match agent {
+            Some(a) if on_claude_code && !a.prompt.trim().is_empty() => format!("{}\n\n---\n", a.prompt.trim()),
+            _ => String::new(),
+        };
         let input = PendingInput {
             command_id: format!("delegation:{}", uuid::Uuid::now_v7()),
             text: prompt.to_owned(),
-            prompt: format!("{prompt}\n\n---\n{note}"),
+            prompt: format!("{instructions}{prompt}\n\n---\n{note}"),
             delegated_by: parent_call_id.to_owned(),
             ..Default::default()
         };
@@ -954,6 +1003,18 @@ mod tests {
         ModelChoice { connection: connection.into(), model: model.into(), effort: effort.into() }
     }
 
+    /// Tool lists combine as both allow, and a combination that allows
+    /// nothing says so (an empty list would allow everything).
+    #[test]
+    fn tool_lists_combine_as_both_allow() {
+        let v = |t: &[&str]| t.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(both(&v(&[]), &v(&[])), Some(v(&[])));
+        assert_eq!(both(&v(&["Read"]), &v(&[])), Some(v(&["Read"])));
+        assert_eq!(both(&v(&[]), &v(&["shell"])), Some(v(&["shell"])));
+        assert_eq!(both(&v(&["Read", "Bash"]), &v(&["shell", "read_file"])), Some(v(&["Read", "Bash"])));
+        assert_eq!(both(&v(&["Read"]), &v(&["shell"])), None);
+    }
+
     #[test]
     fn hosted_search_respects_parent_and_named_agent_tools() {
         let mut parent = CreateSession::default();
@@ -1064,9 +1125,10 @@ mod tests {
         assert!(resolve_model(&parent, &none, "", &choice("", "", "huge"), &conns).unwrap_err().contains("effort"));
         let gone = SubagentDefault { target: Some(spec("c9", "openai", "gpt-5", "")), model: String::new() };
         assert!(resolve_model(&parent, &gone, "", &no, &conns).unwrap_err().contains("not available"));
-        // A Claude Code parent: its subagents need a connection of their own.
+        // A Claude Code parent: its subagents run on Claude Code too, unless
+        // another connection is named.
         let cc = spec("cc", "claude_code", "opus", "");
-        assert!(resolve_model(&cc, &none, "", &no, &conns).unwrap_err().contains("not on Claude Code"));
+        assert_eq!(resolve_model(&cc, &none, "", &no, &conns).unwrap(), cc);
         assert_eq!(
             resolve_model(&cc, &none, "", &choice("work", "", ""), &conns).unwrap(),
             spec("c1", "anthropic", "claude-sonnet-5-5", "")

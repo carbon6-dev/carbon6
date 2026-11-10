@@ -111,12 +111,12 @@ async fn claude_code_writes_documents_through_mcp() {
     let read = |f: &str| -> Value { serde_json::from_str(&std::fs::read_to_string(project.path().join(f)).unwrap()).unwrap() };
     let tools = read("tools.json");
     let names: Vec<&str> = tools["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    // With no connection for subagents: documents first, then carbon6's
-    // other tools the session has (automatic), messages to other sessions
-    // among them (docs/background.md §6).
-    assert_eq!(names[0], "doc");
+    // Its subagent tools (they may run on Claude Code, as it does), then
+    // documents, then carbon6's other tools the session has (automatic),
+    // messages to other sessions among them (docs/background.md §6).
+    assert_eq!(names[..5], ["Task", "SendMessage", "TaskOutput", "TaskStop", "doc"]);
     assert!(names.contains(&"MessageSession") && names.contains(&"ListSessions") && names.contains(&"TaskPropose"), "{names:?}");
-    assert!(tools["result"]["tools"][0]["inputSchema"]["properties"]["action"]["enum"].to_string().contains("create"));
+    assert!(tools["result"]["tools"][4]["inputSchema"]["properties"]["action"]["enum"].to_string().contains("create"));
     let created = read("create.out");
     assert_eq!(created["result"]["isError"], false, "{created}");
     let made: Value = serde_json::from_str(created["result"]["content"][0]["text"].as_str().unwrap()).unwrap();

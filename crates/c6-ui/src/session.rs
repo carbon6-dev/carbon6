@@ -5495,7 +5495,7 @@ fn Composer(
                                             <Switch on=same on_change=flip label="Same as the session" title="Run them on the session's own model, or turn off to choose theirs" />
                                             {move || (!same.get()).then(|| view! {
                                                 <div class="flex flex-wrap items-center gap-2">
-                                                    <ModelPicker connection=s.connection model=s.model effort=s.effort no_claude_code=true />
+                                                    <ModelPicker connection=s.connection model=s.model effort=s.effort no_claude_code=no_claude_code />
                                                     {move || s.change().map(|req| view! {
                                                         <button class="rounded-md bg-violet-600 px-2 py-1 text-white hover:bg-violet-700" on:click=move |_| set(req.clone())>"Set"</button>
                                                     })}

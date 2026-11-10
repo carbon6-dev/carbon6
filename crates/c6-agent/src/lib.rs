@@ -37,7 +37,9 @@ Check its changes before relying on them.";
 pub const CLAUDE_CODE_NOTE: &str = "You are working in a carbon6 session. carbon6 gives you tools of its own over MCP, named \
 `mcp__carbon6__<Name>`: subagents on other models, its documents, the work this session serves, memory, task cards, and, where they \
 are on, its memex, mail, chat, calendar and apps. Some are loaded already; when a task needs one that isn't, find it with tool \
-search. For carbon6's own things (its documents, work, memory, cards), use its tools rather than files.";
+search. For carbon6's own things (its documents, work, memory, cards), use its tools rather than files. Subagents you start with \
+carbon6's Task run on Claude Code, as you do, unless the user asks for another model: don't name another connection on your own \
+(API connections are billed per call). For a quick helper that needs nothing of carbon6's, your own Agent tool is fine too.";
 
 pub const SESSION_MESSAGE_NOTE: &str = "This message is from the agent of another session, not from the user. Act on it as part of your work if it is relevant. Reply with the message-session tool (to: its id) only when it asks for something or needs an answer; do not reply just to acknowledge it.";
 

@@ -336,9 +336,10 @@ async fn a_routing_rule_puts_subagents_on_another_connection() {
     assert_eq!(env.other.requests()[0]["model"], "tiny");
     let child = env.children(&s.id).await.remove(0);
     assert_eq!(child.effort.as_deref(), Some("medium"));
-    // The subagents' list leaves Claude Code out.
+    // The subagents' list has Claude Code too: they run there as Claude
+    // Code sessions.
     let task = env.main.requests()[0]["tools"].as_array().unwrap().iter().find(|t| t["function"]["name"] == "task").unwrap().clone();
-    assert_eq!(task["function"]["parameters"]["properties"]["connection"]["enum"], json!(["main", "other"]));
+    assert_eq!(task["function"]["parameters"]["properties"]["connection"]["enum"], json!(["cc", "main", "other"]));
     stop.cancel();
 }
 

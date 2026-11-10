@@ -496,7 +496,7 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
     let scope = crate::memex::scope_for(st, &row.all_labels()).await;
     let connection = st.store.connection(&row.connection_id).await?.ok_or_else(|| bad_request("no such connection"))?;
     let connections = st.store.connections().await?;
-    let subagent_connections = subagent_connections(&connections, &row.realm);
+    let subagent_connections = subagent_connections(&connections, &row.realm, !row.ssh_target.is_empty());
     let limits = subagent_limits(st, Some(&row.realm)).await?;
     // carbon6's prompts as the session's realm has them (docs/os.md §4.6).
     let base = crate::prompts::get(st, "session.base", &row.realm).await;
@@ -551,12 +551,13 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
 }
 
 /// The connections subagents in `realm` may run on: those the realm may use,
-/// but not Claude Code (a subagent runs in carbon6's own loop) or a pool
-/// (only for what runs in the head).
-fn subagent_connections(connections: &[crate::store::ConnectionRow], realm: &str) -> Vec<api::SubagentConnection> {
+/// but not a pool (only for what runs in the head), nor Claude Code for a
+/// session on an SSH target (Claude Code runs on the worker's machine). A
+/// subagent on Claude Code runs as a Claude Code session of its own.
+fn subagent_connections(connections: &[crate::store::ConnectionRow], realm: &str, ssh: bool) -> Vec<api::SubagentConnection> {
     connections
         .iter()
-        .filter(|c| c.kind != "claude_code" && c.kind != crate::pools::KIND && crate::realms::available(&c.realms, realm))
+        .filter(|c| c.kind != crate::pools::KIND && !(ssh && c.kind == "claude_code") && crate::realms::available(&c.realms, realm))
         .map(|c| api::SubagentConnection {
             id: c.id.clone(),
             name: c.name.clone(),
@@ -2400,7 +2401,7 @@ async fn may_use(st: &HeadState, worker_id: WorkerId, session_id: &str, conn: &c
         warn!("connections of session {session_id}: {e:#}");
         "internal error".to_owned()
     })?;
-    if !used.contains(&conn.id) && subagent_connections(std::slice::from_ref(conn), &s.realm).is_empty() {
+    if !used.contains(&conn.id) && subagent_connections(std::slice::from_ref(conn), &s.realm, !s.ssh_target.is_empty()).is_empty() {
         return Err(format!("session {session_id} does not use the connection {}, and its subagents may not run on it", conn.name));
     }
     if !crate::realms::available(&conn.realms, &s.realm) {

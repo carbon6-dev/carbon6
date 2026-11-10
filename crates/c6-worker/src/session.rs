@@ -2487,6 +2487,9 @@ impl Actor {
         // except the subagent tools and documents, which it never did.
         let choice = claude_code_choice(&self.spec);
         let chosen = |name: &str| choice.as_ref().is_none_or(|c| is_chosen(c, name));
+        // A subagent's named agent narrows all of them.
+        let agent = crate::subagent::agent_tools(&self.spec).unwrap_or_default();
+        let chosen = |name: &str| chosen(name) && c6_tools::tool_allowed(&agent, name);
         let narrowed = |name: &str| matches!(name, "doc") || c6_tools::tool_allowed(&self.spec.tools, name);
         let mut tools: Vec<Arc<dyn Tool>> = vec![
             // carbon6's documents, as mcp__carbon6__doc (docs/docs.md §9).
@@ -3329,13 +3332,16 @@ pub const CLAUDE_CODE_NATIVE_TOOLS: &[&str] = &["Bash", "Read", "Write", "Edit",
 /// them (the escape hatch), else the coding tools a routing rule's tool
 /// list allows (its tool search always: it only finds carbon6's tools).
 pub(crate) fn claude_code_native(spec: &CreateSession) -> Option<Vec<String>> {
-    if spec.claude_code.as_ref().is_some_and(|c| c.native_all) {
+    // A subagent's named agent keeps it to its list (and so to these).
+    let agent = crate::subagent::agent_tools(spec);
+    if agent.is_none() && spec.claude_code.as_ref().is_some_and(|c| c.native_all) {
         return None;
     }
+    let agent = agent.unwrap_or_default();
     Some(
         CLAUDE_CODE_NATIVE_TOOLS
             .iter()
-            .filter(|t| **t == "ToolSearch" || c6_tools::tool_allowed(&spec.tools, t))
+            .filter(|t| **t == "ToolSearch" || (c6_tools::tool_allowed(&spec.tools, t) && c6_tools::tool_allowed(&agent, t)))
             .map(|t| (*t).to_owned())
             .collect(),
     )
@@ -4363,6 +4369,13 @@ mod claude_code_tools_tests {
         assert_eq!(native(&["shell", "apply_patch"], false).unwrap(), ["Bash", "Edit", "ToolSearch"]);
         assert_eq!(native(&[], true), None);
         assert_eq!(native(&["read_file"], true), None, "all is all");
+        // A subagent's named agent keeps it to its list, even with all.
+        let reader = CreateSession {
+            delegation: Some(c6_proto::Delegation { agent_json: r#"{"name":"r","tools":["Read","Grep"]}"#.into(), ..Default::default() }),
+            claude_code: Some(c6_proto::ClaudeCodeToolChoice { automatic: true, native_all: true, ..Default::default() }),
+            ..Default::default()
+        };
+        assert_eq!(claude_code_native(&reader).unwrap(), ["Read", "ToolSearch"]);
     }
 
     /// With Claude Code's web tools off, carbon6's come over MCP: fetch
