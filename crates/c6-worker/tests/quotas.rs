@@ -5,6 +5,9 @@
 //! Header diagnostics are bounded, with no header values or account data.
 //! A binary of its own: it sets C6_CLAUDE_BIN.
 
+#[path = "support/held_worker.rs"]
+mod held_worker;
+
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -12,11 +15,9 @@ use axum::http::HeaderMap;
 use c6_api::{ConnectionQuota, EventKind};
 use c6_head::HeadConfig;
 use c6_testkit::eventually;
-use c6_worker::{ConnState, Identity, Worker, conn, enroll};
+use c6_worker::enroll;
 use futures::StreamExt;
 use serde_json::{Value, json};
-use tokio::sync::watch;
-use tokio_util::sync::CancellationToken;
 use tracing::instrument::WithSubscriber;
 
 struct LogCapture(Arc<Mutex<Vec<u8>>>);
@@ -288,11 +289,7 @@ async fn plan_limits_from_claude_code_and_chatgpt() {
     // Claude Code: its sessions' turns bring its subscription's windows.
     let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
     enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
-    let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
-    let (tx, mut rx) = watch::channel(ConnState::Connecting);
-    let stop = CancellationToken::new();
-    tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
-    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
+    let worker = held_worker::HeldWorker::start(state.path()).await;
     let cc: Value = http
         .post(format!("{api}/connections"))
         .json(&json!({"kind": "claude_code", "name": "cc", "base_url": ""}))
@@ -305,7 +302,7 @@ async fn plan_limits_from_claude_code_and_chatgpt() {
     let cc_id = cc["id"].as_str().unwrap().to_owned();
     let s: Value = http
         .post(format!("{api}/sessions"))
-        .json(&json!({"worker_id": worker.identity.meta.worker_id.0, "cwd": project.path(), "connection_id": cc_id, "model": "opus", "prompt": "hi"}))
+        .json(&json!({"worker_id": worker.id, "cwd": project.path(), "connection_id": cc_id, "model": "opus", "prompt": "hi"}))
         .send()
         .await
         .unwrap()
@@ -356,6 +353,6 @@ async fn plan_limits_from_claude_code_and_chatgpt() {
     // Nothing of it in the session's own stream or log.
     let events: Vec<c6_api::Event> = http.get(format!("{api}/sessions/{sid}/events")).send().await.unwrap().json().await.unwrap();
     assert!(!format!("{events:?}").contains("rate_limit"));
-    stop.cancel();
+    worker.stop();
     head.shutdown().await.unwrap();
 }
