@@ -309,6 +309,12 @@ compiler or test alongside timing trials. Full/quick have no CPU-throttled or
 main-thread-blocking benchmark workloads. Motion's frame-by-frame geometry,
 FLIP batching, focus, duration/keyframe, first-frame interaction and controlled
 clock interruption/disposal assertions remain **correctness**, not FPS budgets.
+All runner tiers take an exclusive invocation lock at
+`~/.cache/carbon6/browser-tests.lock` (`BROWSER_TEST_LOCK` overrides it); a second
+runner fails immediately, without waiting or stealing ownership. A killed
+process's stale lock requires explicit inspection/cleanup. Standalone suite
+commands and compilers do not take this lock: the timing operator must still
+verify the host is idle before measurements.
 
 Counts below are **per engine**, except Chromium-only ring-render. Removed
 crossings are recoverable with `BROWSER_MATRIX=all` or the unchanged standalone

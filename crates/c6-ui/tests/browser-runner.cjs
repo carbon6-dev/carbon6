@@ -5,9 +5,26 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const os = require('node:os');
 const { spawn } = require('node:child_process');
 const { performance } = require('node:perf_hooks');
 const children = new Set();
+
+function acquireLock(env) {
+  const directory = env.BROWSER_TEST_LOCK || path.join(os.homedir(), '.cache/carbon6/browser-tests.lock');
+  fs.mkdirSync(path.dirname(directory), { recursive: true });
+  try { fs.mkdirSync(directory); }
+  catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    throw new Error(`Another browser runner owns ${directory}. Do not overlap correctness/perf invocations; inspect its owner.json (stale locks require explicit cleanup).`);
+  }
+  const token = `${process.pid}-${process.hrtime.bigint()}`;
+  fs.writeFileSync(path.join(directory, 'owner.json'), JSON.stringify({ token, pid: process.pid, host: os.hostname(), started: new Date().toISOString() }));
+  return () => {
+    // Never remove a lock someone replaced, and never guess ownership by PID.
+    if (JSON.parse(fs.readFileSync(path.join(directory, 'owner.json'))).token === token) fs.rmSync(directory, { recursive: true });
+  };
+}
 
 const suites = ['workspace-open', 'motion', 'comment-sheet', 'phone-picker', 'phone-bar', 'theme',
   'settings-lists', 'resource-lifecycle', 'markdown-html', 'status-row', 'ring-render',
@@ -136,7 +153,7 @@ async function child(task, directory, environment) {
   return result;
 }
 
-async function main(env = process.env) {
+async function run(env) {
   const config = configuration(env), tasks = plan(config, env);
   const output = path.resolve(env.BROWSER_TEST_OUTPUT || 'dist/browser-tests',
     `${config.tier}-${new Date().toISOString().replace(/[:.]/g, '-')}-${process.pid}`);
@@ -191,5 +208,12 @@ async function main(env = process.env) {
   if (failed) process.exitCode = 1;
 }
 
-module.exports = { configuration, shards, plan, pool };
+async function main(env = process.env) {
+  configuration(env); // Reject invalid options without creating a lock.
+  const release = acquireLock(env);
+  try { await run(env); }
+  finally { release(); }
+}
+
+module.exports = { configuration, shards, plan, pool, acquireLock };
 if (require.main === module) main().catch(error => { console.error(error); process.exitCode = 1; });

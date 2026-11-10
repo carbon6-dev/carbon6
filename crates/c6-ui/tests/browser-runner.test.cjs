@@ -1,7 +1,27 @@
 'use strict';
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
-const { configuration, shards, plan, pool } = require('./browser-runner.cjs');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { configuration, shards, plan, pool, acquireLock } = require('./browser-runner.cjs');
+
+test('correctness and perf invocations cannot overlap or steal each other\'s lock', () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'browser-lock-'));
+  const env = { BROWSER_TEST_LOCK: path.join(parent, 'lock') };
+  try {
+    const release = acquireLock(env);
+    assert.throws(() => acquireLock(env), /Another browser runner/);
+    const owner = JSON.parse(fs.readFileSync(path.join(env.BROWSER_TEST_LOCK, 'owner.json')));
+    fs.writeFileSync(path.join(env.BROWSER_TEST_LOCK, 'owner.json'), JSON.stringify({ ...owner, token: 'different-owner' }));
+    release();
+    assert(fs.existsSync(env.BROWSER_TEST_LOCK), 'a replaced lock is not ours to remove');
+    fs.writeFileSync(path.join(env.BROWSER_TEST_LOCK, 'owner.json'), JSON.stringify(owner));
+    release();
+    assert(!fs.existsSync(env.BROWSER_TEST_LOCK));
+    acquireLock(env)();
+  } finally { fs.rmSync(parent, { recursive: true }); }
+});
 
 test('full selection retains both engines and independent acceptance suites', () => {
   const config = configuration({});
