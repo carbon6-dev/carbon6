@@ -1288,8 +1288,10 @@ impl SessionManager {
         // calls wait in the parent), publisher, memory, notices and way to
         // the head. Without its parent here (it was trimmed), its own. A
         // Claude Code parent's hooks run in its CLI, not in carbon6: a
-        // subagent of one runs the head's hooks and policies itself, but
-        // what it publishes, remembers and notifies is still its parent's.
+        // subagent of one runs the head's hooks and policies itself. A
+        // Claude Code child also needs its own CLI hooks and MCP policies,
+        // even when its parent runs carbon6's loop. What it publishes,
+        // remembers and notifies is still its parent's.
         let (parent, parent_claude_code) = match &delegation {
             Some(d) => match self.parent_tools(&d.parent_session_id).await {
                 Ok(Some((tools, claude_code))) => (Some(tools), claude_code),
@@ -1312,7 +1314,7 @@ impl SessionManager {
         } else {
             session_tools.set_head(Some(Arc::new(SessionHead { link: self.link.clone(), session_id: on_behalf_of.clone() })));
         }
-        if parent.is_none() || parent_claude_code {
+        if parent.is_none() || parent_claude_code || started.tool_profile == crate::claude_code::PROFILE {
             hooks = crate::hooks::HookRunner::new(session_id, &local, &spec.hooks_json, &labels).map(Arc::new);
             // Policies first (a denial wins), then your hooks; installed
             // only while carbon6's loop runs the tools (`own_loop_hooks`).
