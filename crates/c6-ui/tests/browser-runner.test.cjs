@@ -27,7 +27,7 @@ test('correctness and perf invocations cannot overlap or steal each other\'s loc
 test('full selection retains both engines and independent acceptance suites', () => {
   const config = configuration({});
   assert.deepEqual(config.engines, ['chromium', 'webkit']);
-  for (const suite of ['message-edit', 'message-origin', 'comments-design', 'session-sheet', 'transcript-press', 'transcript-times'])
+  for (const suite of ['message-edit', 'message-origin', 'comments-design', 'session-sheet', 'transcript-press', 'transcript-times', 'navigation-errors'])
     assert(config.selected.includes(suite), suite);
   const tasks = plan(config, {});
   for (const suite of config.selected) for (const engine of config.engines)

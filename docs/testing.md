@@ -313,7 +313,8 @@ node --test crates/c6-ui/tests/browser-runner.test.cjs # scheduler/selection che
 
 The quick tier is intentionally **not release qualification**: it omits
 comment-sheet, phone-picker, phone-bar, theme, resource-lifecycle, status-row,
-ring-render, message-edit, message-origin, comments-design and session-sheet.
+ring-render, message-edit, message-origin, comments-design, session-sheet and
+navigation-errors (the navigation policy unit checks still run with motion).
 It uses the same assertions/isolation as full, not simplified assertions. Perf
 forces one worker and only Chromium ring-render; do not run another browser,
 compiler or test alongside timing trials. Full/quick have no CPU-throttled or
@@ -351,6 +352,37 @@ replaced by a generic success/error example.
 | message-origin | Separate gate → all 6 | Three viewports × both themes now in full. |
 | comments-design | Separate gate → all 10 | All five layouts × both themes now in full; unique margin-fit/Light deferred-save races remain. This does not replace comment-sheet. |
 | session-sheet | Separate gate → all 18 | Core, nested/focus and SSH/stale/offline capability cases now in full; no matrix reduction. |
+| navigation-errors | New: Chromium 9 + WebKit 22 | Held native-refusal positive plus genuine JS throw/rejection (including exact native message and stack), live/outside-window, identity/lifecycle/endpoint/origin/signature, console/Rust/WASM and real CORS/redirect negatives. WebKit-only provisional-document controls are not claimed as Chromium passes. Policy/race unit tests run once before any motion/navigation workers. |
+
+### WebKit native navigation diagnostic attribution
+
+The historical motion failure was a native attention-fetch diagnostic during
+replacement of the old document, not a WASM trap. Controlled app-free native
+fetches reproduced its exact stack while the fetch rejection was handled and
+neither `window.error` nor `unhandledrejection` occurred. Existing in-flight
+cancellation did **not** reproduce it: the refused *new* load did not even reach
+the mock request handler. A naive beforeunload flag is not a safe app fix:
+cancelled confirmation or `window.stop()` can leave a live page with the flag
+stuck; pagehide is too late. This harness change adds **no app code or WASM**.
+
+`browser-navigation.cjs` classifies only the exact original WebKit stack first
+line for the owned same-origin `/api/v1/attention`, after a known successful
+nonredirected baseline mock and inside modelForms' explicit cold replacement.
+It requires an observed destination request, prior beforeunload telemetry,
+retained old-document identity/URL/token, no commit/pagehide/other navigation,
+and a second old-context proof without DOM failures. Every `seed.setup`
+override disables eligibility. Missing or destroyed evidence remains fatal;
+there is no generic phrase/phase ignore or retry. Independently observed
+window errors and unhandled rejections are always fatal, even with exactly the
+native message/stack. Pending proof drains before navigation returns. Raw
+diagnostics and classifications remain in logs and per-case navigation JSON.
+
+`navigation-errors.cjs` keeps these positive/negative controls in the full
+regression gate, both directly runnable and compatible with shared servers.
+The focused production compatibility run emitted no native diagnostic, so it
+is not claimed as a natural-flake reproduction. Detailed native source/runtime
+and cancellation evidence is retained under
+`~/.cache/c6-helper/browser-fast/webkit-navigation/`.
 
 Fixed completion sleeps were not replaced with shorter sleeps. Ring correctness
 waits for each actual chunk/item and committed frames; perf retains deliberate

@@ -62,7 +62,7 @@ function acquireLock(env) {
 
 const suites = ['workspace-open', 'motion', 'comment-sheet', 'phone-picker', 'phone-bar', 'theme',
   'settings-lists', 'resource-lifecycle', 'markdown-html', 'status-row', 'ring-render',
-  'transcript-press', 'transcript-times', 'message-edit', 'message-origin', 'comments-design', 'session-sheet'];
+  'transcript-press', 'transcript-times', 'message-edit', 'message-origin', 'comments-design', 'session-sheet', 'navigation-errors'];
 const quick = ['workspace-open', 'motion', 'settings-lists', 'markdown-html', 'transcript-press', 'transcript-times'];
 const words = value => value.trim().split(/[\s,]+/).filter(Boolean);
 const positive = (name, value) => {
@@ -211,7 +211,7 @@ async function run(env, dependencies = {}) {
   const hash = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
   report.assets = fs.readdirSync(report.root, { recursive: true }).filter(file => /\.(wasm|js|css)$/.test(file))
     .map(file => ({ file, sha256: hash(path.join(report.root, file)) }));
-  report.tests = [...config.selected, 'motion', 'browser-runner', 'browser-navigation'].filter((name, index, names) => names.indexOf(name) === index
+  report.tests = [...config.selected, 'motion', 'browser-runner', 'browser-navigation', 'browser-navigation.test', 'follow-press-unit'].filter((name, index, names) => names.indexOf(name) === index
     && fs.existsSync(path.join(__dirname, `${name}.cjs`))).map(name => ({ name, sha256: hash(path.join(__dirname, `${name}.cjs`)) }));
   const save = () => {
     report.seconds = (performance.now() - started) / 1000;
@@ -248,9 +248,16 @@ async function run(env, dependencies = {}) {
   process.on('SIGINT', interrupt);
   process.on('SIGTERM', interrupt);
   try {
-    if (config.selected.includes('transcript-press')) {
-      report.unit = await runChild({ engine: 'unit', suite: 'follow-press-unit', shard: 1, filters: {} }, path.join(output, 'follow-press-unit'), environment, started, config.workerDeadline * 1000);
-      assert.equal(report.unit.status, 0, 'production press helper checks failed; see retained run.log');
+    const units = [
+      ...(config.selected.includes('transcript-press') ? ['follow-press-unit'] : []),
+      ...(config.selected.some(suite => ['motion', 'navigation-errors'].includes(suite)) ? ['browser-navigation.test'] : []),
+    ];
+    report.units = [];
+    for (const suite of units) {
+      checkInterrupted();
+      const result = await runChild({ engine: 'unit', suite, shard: 1, filters: {} }, path.join(output, suite), environment, started, config.workerDeadline * 1000);
+      report.units.push(result);
+      assert.equal(result.status, 0, `${suite} checks failed; see retained run.log`);
     }
     for (const engine of config.engines) {
       checkInterrupted();
