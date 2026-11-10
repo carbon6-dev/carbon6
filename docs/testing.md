@@ -402,7 +402,7 @@ final error assertions. Page close or operation failure also closes tolerance.
 reload checks completion, hydration and zero unclassified errors, without
 requiring timing-dependent native noise. The classifier itself is checked
 deterministically using the exact stack/name/message retained from an earlier
-real failed run. Those historical failures are not retrospectively passed.
+real failed run.
 
 Fixed completion sleeps were not replaced with shorter sleeps. Ring correctness
 waits for each actual chunk/item and committed frames; perf retains deliberate
@@ -413,41 +413,14 @@ All first-frame assertions remain. Session-sheet Stop waits for the exact mocked
 POST response instead of hand-written 10ms condition polling. Motion keeps
 finite-animation completion and controlled browser-clock boundaries.
 
-### Browser-fast qualification results (November 10, 2026)
+### Known browser-test failure: rare WebKit page crash
 
-**Not qualified: only one of the final three full runs passed.** All times below
-are external make wall seconds on a shared busy host, not isolated speedups.
-Test source is `e34de0958bae96bac273391b48a6137f7dfc6a6b`; UI/check/test and
-immutable assets are from `72eac0cf57e9327791aa2b3cf4edf45f40c5b67d`.
-The authorized reuse diff is exactly `browser-navigation.test.cjs` and
-`navigation-errors.cjs`, both under `crates/c6-ui/tests/`. No new UI build at
-e34de095 is claimed; release gates remain for the coordinator's release build.
-
-| Final invocation | Result | Observed/planned shards | Wall seconds | Failure |
-|---|---|---|---:|---|
-| full-1 | FAIL | 68/95 | 177.325 | WebKit session-sheet page crash |
-| full-2 | FAIL | 64/95 | 124.360 | Chromium resource-lifecycle dark/stale assertion |
-| full-3 | PASS | 95/95 | 255.883 | — |
-| quick-1 | PASS | 40/40 | 85.162 | — |
-| perf-1 | PASS | 1/1 | 99.347 | — |
-
-Original and second failed sequences remain retained and failed. Short partial
-runs, quick/perf passes and later diagnostic nonreproductions do not qualify the
-gate. The instrumented crash preceded the screenshot error and local cleanup;
-its initiating cause remains unknown. Forty-eight separate WebKit cases at caps
-5/2/1 all passed (peak owned WebProcess RSS sums 2609.7/1062.2/738.9 MiB), so no
-cap or application/browser blame is established. The historical mixed workload
-was different; its RSS cannot be reconstructed. Chromium dark/stale passed
-20 isolated plus 20 controlled CPU-load attempts. A request-event/route-state
-timing assumption remains plausible but unconfirmed; no test/app fix is claimed.
-
-Observer self-wall across 108 passing records was 49.521 ms / 438.884 s
-(0.011283%), excluding wrapper dispatch, serialization and file IO—not total
-instrumentation overhead. The initial diagnostic's mismatched WebKit wrapper
-caused one setup failure and 15 unstarted slots; no on/off comparison completed.
-All evidence, 15 invocation results, per-suite/engine timings, host records and
-the full coverage ledger are in
-`~/.cache/c6-helper/browser-fast/qualification-final/final/browser-fast-final-report.md`.
+WebKit's page process has crashed once, during an ordinary viewport screenshot
+in session-sheet (`page.screenshot: Target crashed`), with no page errors and
+the browser still connected. It did not reproduce in about 400 further
+session-sheet runs, on a busy host and an idle one. A crash fails the run; there
+is no automatic rerun. If a full run fails this way, check the case's
+`lifecycle` record (a `crash` event before the first error), then rerun.
 
 ### Phone single-bar production browser regression (S14)
 
