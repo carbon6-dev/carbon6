@@ -228,7 +228,8 @@ UI_BROWSER_PASSES=3 make ui-browser-test
 ```
 
 The runner covers workspace-open, motion, comment-sheet, phone-picker, phone-bar,
-theme (`--browser`), settings-lists, resource-lifecycle, markdown-html and status-row in each engine, plus ring-render in
+theme (`--browser`), settings-lists, resource-lifecycle, markdown-html, status-row,
+transcript-press and transcript-times in each engine, plus ring-render in
 Chromium. **ring-render is Chromium-only**, because its layer/paint/blocked-main-thread assertions
 require CDP; `ENGINE=webkit` now fails explicitly instead of silently launching
 Chromium. Its full default three-run/two-theme workload remains enabled.
@@ -734,6 +735,63 @@ creates a new evidence subdirectory, with screenshots, per-case failures and
 count and produce a nonzero exit, including hydration traps. Diagnostic subset
 runs are not substitutes for a failed full matrix. No real head or credentials
 are used, and this browser test does not prove the server's attribution policy.
+
+### Transcript control presses while following
+
+`transcript-press.cjs` independently covers control presses while following at
+320px. It never changes the historical navigation, assertions or native taps in
+`message-origin.cjs`; that original suite remains a separate acceptance gate.
+The new suite starts at the actual end (gap <4px), hit-tests a fully visible
+Message actions control without locator auto-scroll, then delivers one stream
+chunk between native down/up. It records press duration rather than imposing a
+machine-speed threshold, requires the real row action to open, and checks that
+following resumes. It uses the shared condition/deadline convention
+(`C6_TEST_DEADLINE_SECS`), not a shorter hard-coded dialog deadline.
+Idle/stream activation runs in Full, Reduced and Off; lifecycle cases use Off.
+The Full stream case also records whether the initial stream's inverse glide is
+still active when the press begins, without imposing an animation-speed gate.
+
+Chromium uses native held touch and its automatic compatibility click. Pinned
+WPE WebKit 2388 raw touch dispatch produces trusted touch/pointer lifecycle but
+does **not** synthesize compatibility click or native panning. WebKit therefore
+has separate native held-mouse activation, raw-touch position/cancel/multi-touch
+and follow-resumption cases, plus an ordinary native tap activation control.
+None is claimed as same-press held-touch-to-click coverage. Native press-to-pan
+and owner-unmount cases run in Chromium only. No DOM event or click is fabricated.
+
+The suite is in the browser runner's default and allowlist. The runner also
+executes `follow-press-unit.cjs` against the actual source
+helper: deterministic contact/timer/lifecycle checks with a fake DOM, not
+native hit-testing or a model of Rust's follow permission. It needs only Node.
+To run the press suite alone:
+
+```sh
+BROWSER_SUITES=transcript-press bash scripts/ui-browser-tests.sh
+```
+
+Or use `ENGINE=both node crates/c6-ui/tests/transcript-press.cjs` with the usual
+`ROOT`, `SCREENSHOTS` and browser overrides. `PRESS_CASE=stream` isolates a case;
+the default runs ten Chromium and ten WebKit cases once, with every failure
+retained in `results.json`, including source/artifact hashes and native events.
+
+### Transcript timestamps and empty bookkeeping rows
+
+`transcript-times.cjs` runs eight production-WASM/CSS cases: Chromium and
+WebKit, each at 320×568/light with Off, Exchanges and All timestamps plus
+an Off side-chat setup case. It checks real row DOM, `:empty`, display and
+flex gaps; visible setup/rewind/end-note timestamps; matching zero-usage turn
+summaries; thinking and folded rows; and the existing SubagentSpawned caption
+policy. It does not claim physical-device hovering or server pagination proof.
+
+Same-node reactive summary membership is tested by deliberately inconsistent
+mock history substitutions through production history loading: one response
+omits an earlier TurnStarted and another restores it. This is an isolated
+reactivity fixture, not a claim that immutable real history moves or loses
+turn starts. Normal events and the live append still use the production feed.
+
+Run it alone with `BROWSER_SUITES=transcript-times bash scripts/ui-browser-tests.sh`
+or `ENGINE=both node crates/c6-ui/tests/transcript-times.cjs`, using the usual
+`ROOT` and `SCREENSHOTS` overrides. Every case runs once and retains failures.
 
 ## Working ring and transcript rendering
 
