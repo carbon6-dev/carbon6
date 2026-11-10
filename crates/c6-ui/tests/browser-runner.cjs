@@ -6,9 +6,43 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
+const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { performance } = require('node:perf_hooks');
 const children = new Set();
+const cancellations = new WeakMap();
+
+function stopChild(child) {
+  // Each worker starts its own process group. Only terminate descendants of
+  // that owned child, including standalone browsers in ISOLATE_BROWSER mode.
+  const signal = name => {
+    try {
+      if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, name);
+      else child.kill(name);
+    } catch (error) { if (error.code !== 'ESRCH') throw error; }
+  };
+  signal('SIGTERM');
+  const timer = setTimeout(() => signal('SIGKILL'), 5000);
+  timer.unref();
+  // The worker may exit before its standalone browser. Kill any remaining
+  // members before declaring this owned process group drained.
+  return () => { clearTimeout(timer); signal('SIGKILL'); };
+}
+
+async function supervise(child, deadlineMs, terminate = stopChild) {
+  let timedOut = false, interrupted = false, clearKill;
+  const stop = () => { clearKill ||= terminate(child); };
+  cancellations.set(child, () => { interrupted = true; stop(); });
+  const timer = setTimeout(() => { timedOut = true; stop(); }, deadlineMs);
+  try {
+    const [code, signal] = await new Promise(resolve => child.once('close', (...args) => resolve(args)));
+    return { status: timedOut || interrupted ? 1 : code ?? 1, signal, timedOut, interrupted };
+  } finally {
+    clearTimeout(timer);
+    clearKill?.();
+    cancellations.delete(child);
+  }
+}
 
 function acquireLock(env) {
   const directory = env.BROWSER_TEST_LOCK || path.join(os.homedir(), '.cache/carbon6/browser-tests.lock');
@@ -56,6 +90,7 @@ function configuration(env) {
   assert(tier !== 'perf' || selected.every(suite => suite === 'ring-render'), 'The perf tier runs only ring-render, without correctness neighbours');
   assert(!env.PERF || env.PERF === '0' || tier === 'perf', 'Use make ui-browser-perf for exclusive PERF=1 measurements');
   return { tier, matrix, selected, engines, jobs: tier === 'perf' ? 1 : jobs,
+    workerDeadline: positive('BROWSER_WORKER_DEADLINE_SECS', env.BROWSER_WORKER_DEADLINE_SECS || '300'),
     passes: positive('UI_BROWSER_PASSES', env.UI_BROWSER_PASSES || '1') };
 }
 
@@ -109,21 +144,27 @@ function plan(config, env) {
   return tasks.sort((a, b) => (weight[b.suite] || 20) - (weight[a.suite] || 20));
 }
 
-async function pool(tasks, jobs, run) {
+async function pool(tasks, jobs, run, cancelled = () => false) {
   const results = [];
-  let cursor = 0, failed = false;
+  let cursor = 0, failed = false, failure;
   await Promise.all(Array.from({ length: Math.min(tasks.length, jobs) }, async () => {
-    while (!failed && cursor < tasks.length) {
+    while (!failed && !cancelled() && cursor < tasks.length) {
       const task = tasks[cursor++];
-      const result = await run(task);
-      results.push(result);
-      if (result.status !== 0) failed = true;
+      try {
+        const result = await run(task);
+        results.push(result);
+        if (result.status !== 0) failed = true;
+      } catch (error) {
+        failed = true;
+        failure ||= error;
+      }
     }
   }));
+  if (failure) throw failure; // Other active workers have now saved/closed.
   return { results, pending: tasks.length - cursor };
 }
 
-async function child(task, directory, environment) {
+async function child(task, directory, environment, runStarted = performance.now(), deadlineMs = 300000) {
   fs.mkdirSync(directory, { recursive: true });
   const label = `${task.engine}/${task.suite}/${task.shard}`;
   const args = [path.join(__dirname, `${task.suite}.cjs`), ...(task.suite === 'theme' ? ['--browser'] : [])];
@@ -133,7 +174,7 @@ async function child(task, directory, environment) {
   console.log(`RUN ${label} ${JSON.stringify(task.filters)}`);
   let tail = '', launchError;
   const process = spawn(global.process.execPath, args, { env: { ...environment, ...task.filters, ENGINE: task.engine,
-    SCREENSHOTS: directory, EVIDENCE: directory }, stdio: ['ignore', 'pipe', 'pipe'] });
+    SCREENSHOTS: directory, EVIDENCE: directory }, stdio: ['ignore', 'pipe', 'pipe'], detached: global.process.platform !== 'win32' });
   children.add(process);
   const record = channel => chunk => {
     log.write(chunk);
@@ -144,58 +185,73 @@ async function child(task, directory, environment) {
   process.stdout.on('data', record('stdout'));
   process.stderr.on('data', record('stderr'));
   process.on('error', error => { launchError = error.message; });
-  const [code, signal] = await new Promise(resolve => process.on('close', (...args) => resolve(args)));
+  const outcome = await supervise(process, deadlineMs);
   children.delete(process);
   await Promise.all([new Promise(resolve => log.end(resolve)), new Promise(resolve => timeline.end(resolve))]);
-  const result = { ...task, seconds: (performance.now() - started) / 1000, status: code ?? 1, signal, launchError, directory };
+  const finished = performance.now();
+  const result = { ...task, seconds: (finished - started) / 1000, startedSeconds: (started - runStarted) / 1000,
+    finishedSeconds: (finished - runStarted) / 1000, ...outcome, launchError, directory };
   console.log(`${result.status === 0 ? 'PASS' : 'FAIL'} ${label} ${result.seconds.toFixed(2)}s`);
   if (result.status !== 0) console.error(tail, `Evidence: ${directory}`);
   return result;
 }
 
-async function run(env) {
+async function run(env, dependencies = {}) {
   const config = configuration(env), tasks = plan(config, env);
   const output = path.resolve(env.BROWSER_TEST_OUTPUT || 'dist/browser-tests',
     `${config.tier}-${new Date().toISOString().replace(/[:.]/g, '-')}-${process.pid}`);
   fs.mkdirSync(output, { recursive: true });
   const started = performance.now(), report = { config, output, root: path.resolve(env.ROOT || path.join(__dirname, '../dist')), passes: [] };
+  report.node = process.version;
+  const hash = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+  report.assets = fs.readdirSync(report.root, { recursive: true }).filter(file => /\.(wasm|js|css)$/.test(file))
+    .map(file => ({ file, sha256: hash(path.join(report.root, file)) }));
+  report.tests = [...config.selected, 'motion', 'browser-runner', 'browser-navigation'].filter((name, index, names) => names.indexOf(name) === index
+    && fs.existsSync(path.join(__dirname, `${name}.cjs`))).map(name => ({ name, sha256: hash(path.join(__dirname, `${name}.cjs`)) }));
   const save = () => {
     report.seconds = (performance.now() - started) / 1000;
     fs.writeFileSync(path.join(output, 'summary.json'), JSON.stringify(report, null, 2));
   };
   console.log(`Browser ${config.tier}: ${tasks.length} shards/pass, ${config.jobs} workers; evidence ${output}`);
-  const { serve, launchOptions } = require('./motion.cjs');
-  const playwright = require(env.PLAYWRIGHT_CORE || 'playwright-core');
+  const { serve, launchOptions } = dependencies.fixture || require('./motion.cjs');
+  const playwright = dependencies.playwright || require(env.PLAYWRIGHT_CORE || 'playwright-core');
   const { server, origin } = await serve(), servers = [];
   const environment = { ...env, BROWSER_TEST_ORIGIN: origin, BROWSER_MATRIX: config.matrix,
     PERF: config.tier === 'perf' ? '1' : '0', BROWSER_CASE_TIMINGS: '1' };
   let failed = false;
   const interrupt = () => {
     report.interrupted = true;
-    for (const child of children) child.kill('SIGTERM');
+    for (const child of children) cancellations.get(child)?.();
   };
+  const checkInterrupted = () => assert(!report.interrupted, 'Browser invocation interrupted; no further workers will start');
   process.on('SIGINT', interrupt);
   process.on('SIGTERM', interrupt);
   try {
     if (config.selected.includes('transcript-press')) {
-      report.unit = await child({ engine: 'unit', suite: 'follow-press-unit', shard: 1, filters: {} }, path.join(output, 'follow-press-unit'), environment);
+      report.unit = await child({ engine: 'unit', suite: 'follow-press-unit', shard: 1, filters: {} }, path.join(output, 'follow-press-unit'), environment, started, config.workerDeadline * 1000);
       assert.equal(report.unit.status, 0, 'production press helper checks failed; see retained run.log');
     }
     for (const engine of config.engines) {
+      checkInterrupted();
       if (env.ISOLATE_BROWSER === '1' || !tasks.some(task => task.engine === engine)) continue;
       const browser = await playwright[engine].launchServer(launchOptions(engine));
       servers.push(browser);
+      checkInterrupted();
       environment[`BROWSER_TEST_${engine.toUpperCase()}_ENDPOINT`] = browser.wsEndpoint();
     }
     for (let pass = 1; pass <= config.passes; pass++) {
+      checkInterrupted();
       const begin = performance.now();
       const cohort = await pool(tasks, config.jobs, task => child(task,
-        path.join(output, `pass-${pass}`, task.engine, task.suite, `shard-${task.shard}`), environment));
+        path.join(output, `pass-${pass}`, task.engine, task.suite, `shard-${task.shard}`), environment, started, config.workerDeadline * 1000), () => report.interrupted);
       report.passes.push({ pass, seconds: (performance.now() - begin) / 1000, ...cohort });
       save();
-      failed = cohort.pending > 0 || cohort.results.some(result => result.status !== 0);
+      failed = report.interrupted || cohort.pending > 0 || cohort.results.some(result => result.status !== 0);
       if (failed) break; // Never retry or hide an earlier failed cohort.
     }
+  } catch (error) {
+    report.error = error.stack || String(error);
+    throw error;
   } finally {
     await Promise.all(servers.map(browser => browser.close()));
     server.closeAllConnections?.();
@@ -204,6 +260,7 @@ async function run(env) {
     process.off('SIGTERM', interrupt);
     save();
   }
+  failed ||= report.interrupted;
   console.log(`${failed ? 'FAILED' : 'ALL PASS'} ${report.seconds.toFixed(2)}s; ${path.join(output, 'summary.json')}`);
   if (failed) process.exitCode = 1;
 }
@@ -215,5 +272,5 @@ async function main(env = process.env) {
   finally { release(); }
 }
 
-module.exports = { configuration, shards, plan, pool, acquireLock };
+module.exports = { configuration, shards, plan, pool, acquireLock, supervise, run };
 if (require.main === module) main().catch(error => { console.error(error); process.exitCode = 1; });

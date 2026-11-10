@@ -4,7 +4,8 @@ const { test } = require('node:test');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { configuration, shards, plan, pool, acquireLock } = require('./browser-runner.cjs');
+const { spawn } = require('node:child_process');
+const { configuration, shards, plan, pool, acquireLock, supervise, run } = require('./browser-runner.cjs');
 
 test('correctness and perf invocations cannot overlap or steal each other\'s lock', () => {
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'browser-lock-'));
@@ -61,7 +62,7 @@ test('diagnostic selectors do not multiply or override caller-selected cases', (
 test('invalid selection and accidental parallel benchmarks fail before launch', () => {
   for (const env of [{ BROWSER_SUITES: '' }, { BROWSER_SUITES: '../motion' }, { BROWSER_SUITES: 'no-such-suite' },
     { BROWSER_ENGINES: '' }, { BROWSER_ENGINES: 'firefox' }, { BROWSER_JOBS: '0' }, { BROWSER_JOBS: '2.5' },
-    { BROWSER_JOBS: '33' }, { UI_BROWSER_PASSES: '0' }, { BROWSER_SUITES: 'motion motion' }, { PERF: '1' },
+    { BROWSER_JOBS: '33' }, { UI_BROWSER_PASSES: '0' }, { BROWSER_WORKER_DEADLINE_SECS: '0' }, { BROWSER_SUITES: 'motion motion' }, { PERF: '1' },
     { BROWSER_TIER: 'perf', BROWSER_SUITES: 'motion' }, { BROWSER_MATRIX: 'none' }]) assert.throws(() => configuration(env), JSON.stringify(env));
   assert.throws(() => plan(configuration({ BROWSER_SUITES: 'ring-render', BROWSER_ENGINES: 'webkit' }), {}), /Chromium-only/);
   assert.equal(configuration({ BROWSER_TIER: 'perf', BROWSER_JOBS: '8' }).jobs, 1);
@@ -95,4 +96,73 @@ test('first failure prevents new jobs while in-flight jobs keep their evidence',
   assert.deepEqual(seen, [0, 1]);
   assert.equal(result.pending, 2);
   assert.equal(result.results.length, 2);
+});
+
+test('a worker setup error drains active workers before browser teardown', async () => {
+  const finished = [], seen = [];
+  await assert.rejects(pool([0, 1, 2], 2, async task => {
+    seen.push(task);
+    await new Promise(resolve => setImmediate(resolve));
+    if (task === 0) throw new Error('cannot create evidence directory');
+    finished.push(task);
+    return { status: 0 };
+  }), /cannot create evidence directory/);
+  assert.deepEqual(seen, [0, 1]);
+  assert.deepEqual(finished, [1]);
+});
+
+test('cancellation stops scheduling even when every active worker exits zero', async () => {
+  let cancelled = false;
+  const seen = [];
+  const result = await pool([0, 1, 2], 2, async task => {
+    seen.push(task);
+    cancelled = true;
+    return { status: 0 };
+  }, () => cancelled);
+  assert.deepEqual(seen, [0]);
+  assert.equal(result.pending, 2);
+});
+
+test('worker watchdog terminates a wedged owned child before releasing its lock', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'browser-watchdog-'));
+  const env = { BROWSER_TEST_LOCK: path.join(directory, 'lock') };
+  const release = acquireLock(env);
+  try {
+    const worker = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+      stdio: 'ignore', detached: process.platform !== 'win32',
+    });
+    const finished = supervise(worker, 20);
+    assert.throws(() => acquireLock(env), /Another browser runner/);
+    const result = await finished;
+    assert.equal(result.status, 1);
+    assert.equal(result.timedOut, true);
+    assert(worker.signalCode, 'child exit was observed, not just requested');
+    assert.throws(() => acquireLock(env), /Another browser runner/);
+    release();
+    acquireLock(env)();
+  } finally { if (fs.existsSync(env.BROWSER_TEST_LOCK)) release(); fs.rmSync(directory, { recursive: true }); }
+});
+
+test('interruption during browser startup cannot schedule workers or report success', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'browser-interrupt-'));
+  let closed = 0, serverClosed = 0;
+  try {
+    await assert.rejects(run({ ROOT: directory, BROWSER_TEST_OUTPUT: directory,
+      BROWSER_SUITES: 'settings-lists', BROWSER_ENGINES: 'chromium' }, {
+      fixture: { serve: async () => ({ origin: 'http://127.0.0.1:1234', server: {
+        close: done => { serverClosed++; done(); },
+      } }), launchOptions: () => ({}) },
+      playwright: { chromium: { launchServer: async () => {
+        process.emit('SIGTERM');
+        return { close: async () => { closed++; }, wsEndpoint: () => { throw new Error('must not use interrupted server'); } };
+      } } },
+    }), /Browser invocation interrupted/);
+    assert.equal(closed, 1);
+    assert.equal(serverClosed, 1);
+    const output = fs.readdirSync(directory).find(file => file.startsWith('full-'));
+    const report = JSON.parse(fs.readFileSync(path.join(directory, output, 'summary.json')));
+    assert.equal(report.interrupted, true);
+    assert.equal(report.passes.length, 0);
+    assert.match(report.error, /interrupted/);
+  } finally { fs.rmSync(directory, { recursive: true }); }
 });

@@ -650,7 +650,16 @@ async function check(browser, origin, theme, viewportName, viewport, test, deskt
 }
 
 async function main() {
+  for (const [key, allowed] of [['THEME', ['light', 'dark']],
+    ['VIEWPORT', [...VIEWPORTS.map(([name]) => name), 'desktop-wide', 'desktop-narrow']],
+    ['CASE', CASES.map(test => test.name)]]) {
+    assert(!process.env[key] || process.env[key].split(',').every(value => allowed.includes(value)),
+      `phone-bar ${key} must select from ${allowed.join(',')}`);
+  }
+  assert(!process.env.VIEWPORT || process.env.VIEWPORT.split(',').some(name => !name.startsWith('desktop-')) || selected('CASE', 'session-doc-session'),
+    'phone-bar desktop controls require CASE=session-doc-session');
   fs.mkdirSync(SHOTS, { recursive: true });
+  let executed = 0;
   const { server, origin } = await serve();
   const playwright = require(process.env.PLAYWRIGHT_CORE || 'playwright-core');
   const engines = process.env.ENGINE === 'both' ? ['chromium', 'webkit'] : [process.env.ENGINE || 'chromium'];
@@ -663,19 +672,24 @@ async function main() {
           for (const [name, viewport] of VIEWPORTS.filter(([name]) => selected('VIEWPORT', name))) {
             for (const test of CASES.filter(t => selected('CASE', t.name))) {
               await caseWatchdog(`${engine}/${theme}/${name}/${test.name}`, () => check(browser, origin, theme, name, viewport, test));
+              executed++;
             }
           }
           // Deliberately separate desktop and narrow-desktop controls from the
           // complete phone matrix; each still has its own fresh context.
           if (!process.env.VIEWPORT || process.env.VIEWPORT.split(',').some(v => v.startsWith('desktop-'))) {
             for (const name of ['desktop-wide', 'desktop-narrow'].filter(n => selected('VIEWPORT', n))) {
-              if (selected('CASE', 'session-doc-session')) await caseWatchdog(`${engine}/${theme}/${name}`, () => check(browser, origin, theme, name,
-                { width: 1440, height: 1000 }, CASES.find(t => t.name === 'session-doc-session'), true));
+              if (selected('CASE', 'session-doc-session')) {
+                await caseWatchdog(`${engine}/${theme}/${name}`, () => check(browser, origin, theme, name,
+                  { width: 1440, height: 1000 }, CASES.find(t => t.name === 'session-doc-session'), true));
+                executed++;
+              }
             }
           }
         }
       } finally { await browser.close(); }
     }
+    assert(executed > 0, 'phone-bar selection executed no cases');
   } finally { await new Promise(resolve => server.close(resolve)); }
 }
 

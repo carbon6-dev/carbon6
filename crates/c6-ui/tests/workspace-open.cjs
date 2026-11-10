@@ -1005,7 +1005,10 @@ async function check(browser, origin, viewport, label, platform) {
 }
 
 async function main() {
+  assert(!process.env.VIEWPORT || ['desktop', 'narrow'].includes(process.env.VIEWPORT), 'workspace-open VIEWPORT must be desktop or narrow');
+  assert(!process.env.PLATFORM || ['Linux x86_64', 'MacIntel'].includes(process.env.PLATFORM), 'workspace-open PLATFORM must be Linux x86_64 or MacIntel');
   const { server, origin } = await serve();
+  let executed = 0;
   try {
     const engines = process.env.ENGINE === 'both' ? ['chromium', 'webkit'] : (process.env.ENGINE || 'chromium').split(',');
     for (const engine of engines) {
@@ -1017,10 +1020,12 @@ async function main() {
             if (process.env.PLATFORM && process.env.PLATFORM !== platform) continue;
             const label = `${engine}/${name}/${platform}`;
             await within(`workspace-open ${label}`, () => check(browser, origin, viewport, label, platform));
+            executed++;
           }
         }
       } finally { await browser.close(); }
     }
+    assert(executed > 0, 'workspace-open selection executed no cases');
   } finally { await new Promise(resolve => server.close(resolve)); }
 }
 if (require.main === module) main().catch(error => { console.error(error.stack || error); process.exitCode = 1; });

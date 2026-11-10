@@ -260,7 +260,15 @@ their normal evidence handlers. No assertion is retried. Locator/navigation
 operations default to **15 seconds**, with a separate **90-second case watchdog**
 so an operation's failure handler can save evidence first. Explicit
 `C6_TEST_DEADLINE_SECS` / `C6_TEST_CASE_DEADLINE_SECS` overrides are diagnostic,
-not a retry policy.
+not a retry policy. A parent-side **300-second worker deadline**
+(`BROWSER_WORKER_DEADLINE_SECS`) also bounds evaluation/renderer hangs that do
+not honor Playwright operation timeouts. Timeout or interruption stops new
+workers, terminates only owned worker process groups (including standalone
+browsers), and reports failure even if a worker exits zero. The invocation
+lock is held until active workers drain and owned browser servers close.
+Exceptions during worker setup also drain other active workers before teardown.
+`summary.json` includes interruption/timeout status and SHA-256 hashes of the
+production JS/CSS/WASM and selected test helpers, in addition to phase offsets.
 
 ### Latest and saved transcript windows
 
@@ -407,9 +415,10 @@ geometry/error JSON; failures retain a screenshot and request/error diagnostic.
 comma-separated exact names for separately labelled focused diagnostics (for
 example `THEME=dark VIEWPORT=portrait-320 CASE=session-doc-doc`). These are
 subsets, not full-matrix qualification. `C6_TEST_DEADLINE_SECS` sets each
-operation's timeout (default 300 seconds), not the entire matrix's duration.
-A separate per-context hang watchdog uses twice that timeout so an operation
-failure can save its screenshot/JSON before the browser closes.
+operation's timeout (default 15 seconds), not the entire matrix's duration.
+The separate per-context watchdog defaults to 90 seconds
+(`C6_TEST_CASE_DEADLINE_SECS`) so an operation failure can save its screenshot/JSON
+before the browser closes.
 
 Final S14 size revision plus desktop rename blur guard: the production build is
 **10,653,175 bytes raw / 2,657,897 Brotli**, SHA-256
@@ -716,7 +725,10 @@ the untouched `7035ec6b` bundle. This is preserved as a separate baseline
 failure, not a passing extra suite or an explanation for modelForms; the
 runner never reached phone-picker. Logs are
 `dist/s11-final-verification/{popup-regressions,workspace-isolated,workspace-exact-base}.log`.
-Its source-level cause remains uninvestigated in this change.
+That historical failure was later traced to fixture setup: desktop opened the
+intentional ring popover/scrim before trying its toolbar Changes button. The
+browser-fast fixture reuses the stale-transcript fix's phone-only sheet opener;
+it does not bypass the scrim, force a click or change the product.
 
 `env -u NO_COLOR make ui` passed. `make check` passed formatting, native/wasm
 Clippy without warnings and test-lint, then failed only the already-exceeded
@@ -1490,7 +1502,7 @@ just a fresh context. This is useful when diagnosing old WPE WebKit process
 reuse: it does not retry or suppress an error, and shared-process failures
 should still be reported with the isolated result rather than discarded.
 
-By default each engine runs 1440×1000 desktop and 390×844 phone, light and dark, with
+The standalone exhaustive suite runs 1440×1000 desktop and 390×844 phone, light and dark, with
 System (OS normal/reduced), Full (OS normal/reduced), Reduced and Off. For a
 focused rerun, filters accept comma-separated values:
 
@@ -2809,8 +2821,10 @@ ROOT=/path/to/coordinator/crates/c6-ui/dist "$NODE" crates/c6-ui/tests/phone-pic
 ENGINE=both ROOT=/path/to/coordinator/crates/c6-ui/dist "$NODE" crates/c6-ui/tests/phone-picker.cjs
 ```
 
-The default matrix is 320×568, 390×844, 430×932 and 1440×1000, light/dark,
+The standalone exhaustive matrix is 320×568, 390×844, 430×932 and 1440×1000, light/dark,
 Full/Reduced/Off: 24 Chromium contexts, or 48 with `ENGINE=both`.
+The default runner selects the eight representative tuples in the coverage
+ledger; `BROWSER_MATRIX=all` restores this complete matrix in the runner.
 `VIEWPORT=narrow,phone,wide,desktop`, `THEME=light,dark`, and
 `MOTION_CASE=full,reduced,off` select cases without changing their assertions.
 `PLAYWRIGHT_CORE`, `CHROMIUM`, `CHROMIUM_LIBS` and `WEBKIT_EXECUTABLE` use the
