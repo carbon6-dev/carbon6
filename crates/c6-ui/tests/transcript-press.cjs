@@ -31,9 +31,9 @@ function observePress() {
   }
 }
 
-async function metric(page) {
-  return page.evaluate(() => {
-    const row = document.querySelector('#parent-e70'), button = row?.querySelector('[aria-label="Message actions"]');
+async function metric(page, seq = 70) {
+  return page.evaluate(seq => {
+    const row = document.querySelector(`#parent-e${seq}`), button = row?.querySelector('[aria-label="Message actions"]');
     let box = row;
     while (box && !box.classList.contains('overflow-y-auto')) box = box.parentElement;
     if (!box || !button) return null;
@@ -43,15 +43,15 @@ async function metric(page) {
       gap: box.scrollHeight - box.scrollTop - box.clientHeight,
       visible: rect.width > 0 && rect.top >= Math.max(0, bounds.top) && rect.bottom <= Math.min(innerHeight, bounds.bottom),
       hit: button.contains(document.elementFromPoint(x, y)), expanded: button.getAttribute('aria-expanded') };
-  });
+  }, seq);
 }
 
-async function atEnd(page) {
-  await page.waitForFunction(() => {
-    let box = document.querySelector('#parent-e70');
+async function atEnd(page, seq = 70) {
+  await page.waitForFunction(seq => {
+    let box = document.querySelector(`#parent-e${seq}`);
     while (box && !box.classList.contains('overflow-y-auto')) box = box.parentElement;
     return box && box.scrollHeight - box.scrollTop - box.clientHeight < 4;
-  });
+  }, seq);
 }
 
 async function nativeTouch(f, engine) {
@@ -89,13 +89,177 @@ async function text(f, value) {
   await frame(f.page); await frame(f.page);
 }
 
-async function resumes(f, previous) {
+async function resumes(f, previous, seq = 70) {
   await text(f, initial + chunk + chunk);
-  await atEnd(f.page);
-  const current = await metric(f.page);
+  await atEnd(f.page, seq);
+  const current = await metric(f.page, seq);
   assert(current.height > previous.height, 'a subsequent real stream update changes layout');
   assert(current.gap < 4, 'following resumes at the new actual end');
   return current;
+}
+
+async function checkLatest(browser, origin, engine, scenario, motion) {
+  const label = `${engine}-${scenario}-${motion}`, seq = 1201, anchor = 'parent-e101';
+  const rawTouch = scenario === 'latest-touch-position', mouse = engine === 'webkit' && !rawTouch;
+  const evidence = { motion, nativeInput: mouse ? 'mouse' : 'touch', streams: [], pages: [] };
+  const sockets = new Set();
+  const history = Array.from({ length: seq }, (_, i) => {
+    const n = i + 1;
+    if (n === 1) return { seq: n, ts: n, type: 'started', connection_id: 'test', model: 'test',
+      cwd: '/fixture', system_prompt: '', tools: [], context_window: 128000 };
+    if (n === seq) return { ...events[0], seq: n, ts: n };
+    if (n % 10 === 1) return { seq: n, ts: n, type: 'user', command_id: `latest-${n}`, text: `Question ${n}` };
+    return { seq: n, ts: n, type: 'assistant', turn: n,
+      blocks: [{ type: 'text', text: `Reply ${n}. ${'Long readable transcript. '.repeat(12)}` }], stop_reason: 'end_turn' };
+  });
+  const layout = { tiles: [{ key: 2, columns: [{ key: 3, view: { view: 'session', id: 'parent',
+    target: { anchor, at: 101, q: '', open: [] } } }], cursor: 0, active: 3, used: 3,
+    back: [], forward: [], stack: 0, minimized: false }], focus: 0, next: 4, full: false };
+  let f, progress, touch;
+  try {
+    await within(label, async () => {
+      f = await fixture(browser, origin, { width: 320, height: 568 }, 'light',
+        { choice: motion, os: 'no-preference', effective: motion }, current => { progress = current; }, {}, {
+          layout, path: `/sessions/parent#${anchor}`, instrumentation: false,
+          setup: async ({ page, context }) => {
+            await context.addInitScript(observePress);
+            await context.routeWebSocket('**/sessions/parent/stream?*', socket => {
+              sockets.add(socket);
+              socket.onClose(() => sockets.delete(socket));
+              const q = new URL(socket.url()).searchParams, after = Number(q.get('after'));
+              const from = after ? after + 1 : Math.min(seq - 299, Number(q.get('at') || Infinity));
+              evidence.streams.push({ after, from, end: seq });
+              if (!after) {
+                socket.send(JSON.stringify({ type: 'window', from }));
+                socket.send(JSON.stringify({ type: 'event', event: history[0] }));
+              }
+              // Like the real head, at changes the beginning, never the end.
+              for (const event of history.filter(e => e.seq >= from)) socket.send(JSON.stringify({ type: 'event', event }));
+              socket.send(JSON.stringify({ type: 'synced' }));
+            });
+            await page.route('**/api/v1/sessions/parent/events?*', route => {
+              const q = new URL(route.request().url()).searchParams, before = Number(q.get('before'));
+              const from = Math.max(1, Math.min(before - Number(q.get('limit') || 300), Number(q.get('at') || Infinity)));
+              evidence.pages.push(Object.fromEntries(q));
+              return route.fulfill({ json: history.filter(e => e.seq >= from && e.seq < before) });
+            });
+          },
+        });
+      await Promise.race([(async () => {
+        const { page } = f;
+        const saved = () => page.evaluate(() => JSON.parse(localStorage.getItem('c6.home.workspace.v2')).tiles[0]);
+        f.phase = 'saved historical window, then real reload';
+        await page.locator(`#${anchor}`).waitFor();
+        assert.equal((await saved()).columns[0].view.target.anchor, anchor);
+        await page.reload({ waitUntil: 'domcontentloaded' });
+        await page.locator(`#${anchor}`).waitFor();
+        await settle(page);
+        assert.equal(await page.locator(`#parent-e${seq}`).count(), 0, 'the real current row is outside the retained historical drawing window');
+        assert.equal(evidence.streams.at(-1).from, 101);
+        assert.equal(evidence.streams.at(-1).end, seq, 'the complete suffix was delivered despite the historical cutoff');
+        const composer = page.locator('textarea').first(), kept = await composer.elementHandle();
+        const draft = 'Keep this draft through Latest and native activation';
+        await composer.fill(draft);
+        const previous = evidence.historical = await saved(), streamCount = evidence.streams.length;
+        assert.equal(previous.columns[0].view.target?.anchor, anchor, 'the reloaded historical address is still retained until Latest');
+        f.phase = 'native Latest control consumes the retained target';
+        const latest = page.getByTitle('To the latest (End)', { exact: true });
+        await latest.waitFor();
+        const latestPoint = evidence.latestPoint = await latest.evaluate(el => {
+          const r = el.getBoundingClientRect(), x = Math.round(r.x + r.width / 2), y = Math.round(r.y + r.height / 2);
+          return { x, y, visible: r.width > 0 && r.left >= 0 && r.right <= innerWidth && r.top >= 0 && r.bottom <= innerHeight,
+            hit: el.contains(document.elementFromPoint(x, y)) };
+        });
+        assert(latestPoint.visible && latestPoint.hit, 'the real floating Latest control is visible and hit-tested without locator scrolling');
+        await page.touchscreen.tap(latestPoint.x, latestPoint.y);
+        await page.locator(`#parent-e${seq}`).waitFor();
+        await atEnd(page, seq); await settle(page);
+        await page.waitForFunction(() => !JSON.parse(localStorage.getItem('c6.home.workspace.v2')).tiles[0].columns[0].view.target && !location.hash);
+        const current = evidence.latest = await saved();
+        assert.deepEqual([current.back, current.forward], [previous.back, previous.forward], 'Latest consumes the address without adding history');
+        assert(await composer.evaluate((el, old) => el === old && old.isConnected, kept), 'Latest keeps the mounted composer');
+        assert.equal(await composer.inputValue(), draft);
+        assert.equal(evidence.streams.length, streamCount, 'Latest retains the session stream');
+        assert.equal(await page.locator(`#${anchor}`).count(), 0, 'Latest really trims the old window');
+        const transport = { page, stream: message => {
+          assert(sockets.size, 'the production transcript stream is connected');
+          for (const socket of sockets) socket.send(JSON.stringify({ ...message, turn: 2000 }));
+        } };
+        await f.setState('working', { last_seq: seq });
+        await text(transport, initial);
+        await page.locator('.md').filter({ hasText: initial }).last().waitFor();
+        await atEnd(page, seq); await settle(page);
+        evidence.phonePolicy = await page.evaluate(() => ({ coarse: matchMedia('(pointer: coarse)').matches,
+          points: navigator.maxTouchPoints, touchEvents: 'ontouchstart' in window }));
+        assert(evidence.phonePolicy.coarse && (evidence.phonePolicy.points > 0 || evidence.phonePolicy.touchEvents));
+        const before = evidence.before = await metric(page, seq);
+        assert(before.gap < 4 && before.visible && before.button.left >= 0 && before.button.right <= 320 && before.hit,
+          'after real Latest the API control is at the end, fully visible and hit-tested, without auto-scroll');
+        evidence.inputStart = await page.evaluate(() => __transcriptPress.events.length);
+        f.phase = 'one real stream chunk during the post-Latest native hold';
+        if (mouse) { await page.mouse.move(before.x, before.y); await page.mouse.down(); }
+        else { touch = await nativeTouch(f, engine); await touch.start({ id: 1, x: before.x, y: before.y }); }
+        await text(transport, initial + chunk);
+        const during = evidence.during = await metric(page, seq);
+        assert(during.height >= before.height + 22, 'layout actually grows during the native hold after Latest');
+        assert(Math.abs(during.button.y - before.button.y) <= 1, 'automatic follow correction must preserve the held target after Latest');
+        const held = await page.evaluate(start => __transcriptPress.events.slice(start), evidence.inputStart);
+        assert(held.some(e => e.type === (mouse ? 'mousedown' : 'touchstart') && e.trusted && e.action && e.row === `parent-e${seq}`));
+        assert(!held.some(e => ['mouseup', 'touchend', 'touchcancel', 'pointercancel'].includes(e.type)), 'the stream grows before the original contact releases');
+        const dialog = page.getByRole('dialog', { name: 'Message actions', exact: true });
+        assert.equal(await dialog.isVisible(), false, 'holding never activates the action prematurely');
+        let activationStart = evidence.inputStart;
+        if (rawTouch) {
+          // WebKit raw touch has no compatibility click: cancellation/recovery
+          // and the subsequent fresh native tap are explicitly separate phases.
+          await touch.cancel(); await settle(page);
+          const canceled = await page.evaluate(start => __transcriptPress.events.slice(start), evidence.inputStart);
+          assert(canceled.some(e => e.type === 'touchcancel' && e.trusted));
+          assert(!canceled.some(e => e.type === 'click'), 'raw WebKit cancellation is not activation');
+          evidence.rawTouchMs = canceled.find(e => e.type === 'touchcancel').t - canceled.find(e => e.type === 'touchstart').t;
+          assert.equal(await dialog.isVisible(), false);
+          evidence.resumed = await resumes(transport, during, seq);
+          const target = await metric(page, seq);
+          assert(target.visible && target.hit, 'raw-touch recovery leaves the action usable');
+          f.phase = 'separate fresh WebKit native tap after post-Latest raw-touch recovery';
+          activationStart = evidence.freshTapStart = await page.evaluate(() => __transcriptPress.events.length);
+          await page.touchscreen.tap(target.x, target.y);
+        } else if (mouse) await page.mouse.up();
+        else await touch.end();
+        await dialog.waitFor();
+        assert.equal(await page.locator(`#parent-e${seq} [aria-label="Message actions"]`).getAttribute('aria-expanded'), 'true');
+        const inputs = await page.evaluate(start => __transcriptPress.events.slice(start), activationStart);
+        const down = inputs.find(e => e.type === (mouse ? 'mousedown' : 'touchstart'));
+        const up = inputs.find(e => e.type === (mouse ? 'mouseup' : 'touchend'));
+        const click = inputs.find(e => e.type === 'click');
+        evidence.pressMs = up?.t - down?.t;
+        assert(down?.trusted && up?.trusted && click?.trusted && click.action && click.row === `parent-e${seq}`, 'trusted native activation opens the original post-Latest row action');
+        if (!rawTouch) evidence.resumed = await resumes(transport, during, seq);
+        assert.equal(evidence.streams.length, streamCount);
+        assert(!(await saved()).columns[0].view.target);
+        assert.equal(await page.locator(`#${anchor}`).count(), 0, 'activation never reinstates the old historical window');
+        assert.equal(await composer.inputValue(), draft);
+        assert(await page.evaluate(() => matchMedia('(pointer: coarse)').matches &&
+          (navigator.maxTouchPoints > 0 || 'ontouchstart' in window)), 'native input preserves phone policy');
+        assert.deepEqual(f.errors, []);
+        assert.deepEqual(f.requests.filter(request => /^(POST|PUT|PATCH|DELETE) .*\/(messages|side-chats|rewind|interrupt)(\/|$)/.test(request)), []);
+      })(), f.crash]);
+    });
+    console.log(`PASS ${label}`);
+    return { label, passed: true, evidence };
+  } catch (error) {
+    await progress?.page.screenshot({ path: path.join(shots, `${label}-failure.png`) }).catch(() => {});
+    console.error(`FAIL ${label}: ${error.message}`);
+    return { label, passed: false, phase: progress?.phase, error: error.stack, evidence };
+  } finally {
+    if (progress) {
+      evidence.events = await progress.page.evaluate(() => __transcriptPress.events).catch(() => []);
+      evidence.errors = progress.errors;
+      evidence.requests = progress.requests;
+    }
+    await touch?.cancel().catch(() => {});
+    await progress?.context.close();
+  }
 }
 
 async function check(browser, origin, engine, scenario, motion) {
@@ -229,21 +393,21 @@ async function check(browser, origin, engine, scenario, motion) {
   const engine = process.env.ENGINE || 'both';
   assert(['chromium', 'webkit', 'both'].includes(engine), 'ENGINE=chromium,webkit,both');
   const selected = process.env.PRESS_CASE?.split(',');
-  for (const name of selected || []) assert(['idle', 'stream', 'cancel', 'multi-touch', 'scroll', 'unmount', 'touch-position', 'tap'].includes(name), `Unknown PRESS_CASE ${name}`);
+  for (const name of selected || []) assert(['idle', 'stream', 'cancel', 'multi-touch', 'scroll', 'unmount', 'touch-position', 'tap', 'latest-stream', 'latest-touch-position'].includes(name), `Unknown PRESS_CASE ${name}`);
   fs.mkdirSync(shots, { recursive: true });
   fs.copyFileSync(__filename, path.join(shots, 'transcript-press.cjs'));
   const sha = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
   const report = { root, testSha256: sha(__filename), wasm: fs.readdirSync(root).filter(file => file.endsWith('.wasm')).map(file => ({ file, sha256: sha(path.join(root, file)) })),
-    coverage: { chromium: 'native held touch and automatic compatibility click; native pan and unmount', webkit: 'native held mouse activation; separate native raw touch position/cancel and ordinary tap activation, not held-touch compatibility-click or native pan/unmount coverage' }, results: [] };
+    coverage: { chromium: 'native held touch and automatic compatibility click, including after real Latest; native pan and unmount', webkit: 'native held mouse activation, including after real Latest; separate native raw touch position/cancel and fresh ordinary tap activation, not held-touch compatibility-click or native pan/unmount coverage' }, results: [] };
   const { server, origin } = await serve();
   try {
     for (const name of engine === 'both' ? ['chromium', 'webkit'] : [engine]) {
       const browser = await launchBrowser(playwright, name);
       try {
-        for (const scenario of ['idle', 'stream', 'cancel', 'multi-touch', ...(name === 'chromium' ? ['scroll', 'unmount'] : ['touch-position', 'tap'])]) {
+        for (const scenario of ['idle', 'stream', 'cancel', 'multi-touch', ...(name === 'chromium' ? ['scroll', 'unmount'] : ['touch-position', 'tap']), 'latest-stream', ...(name === 'webkit' ? ['latest-touch-position'] : [])]) {
           if (selected && !selected.includes(scenario)) continue;
-          for (const motion of ['idle', 'stream'].includes(scenario) ? ['full', 'reduced', 'off'] : ['off']) {
-            const result = await check(browser, origin, name, scenario, motion);
+          for (const motion of ['idle', 'stream', 'latest-stream'].includes(scenario) ? ['full', 'reduced', 'off'] : ['off']) {
+            const result = await (scenario.startsWith('latest-') ? checkLatest : check)(browser, origin, name, scenario, motion);
             result.browser = browser.version();
             report.results.push(result);
             fs.writeFileSync(path.join(shots, 'results.json'), JSON.stringify(report, null, 2));

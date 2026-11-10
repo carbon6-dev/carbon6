@@ -799,8 +799,17 @@ BROWSER_SUITES=transcript-press bash scripts/ui-browser-tests.sh
 
 Or use `ENGINE=both node crates/c6-ui/tests/transcript-press.cjs` with the usual
 `ROOT`, `SCREENSHOTS` and browser overrides. `PRESS_CASE=stream` isolates a case;
-the default runs ten Chromium and ten WebKit cases once, with every failure
+the default runs thirteen Chromium and fourteen WebKit cases once, with every failure
 retained in `results.json`, including source/artifact hashes and native events.
+
+Seven cases first reload a retained historical target, activate the real visible
+Latest button, and verify it consumes the target while preserving the composer,
+draft and stream. They then hold a hit-tested action through one layout-growing
+stream chunk, require activation of the original row and resumed following,
+and verify that the historical target does not return. Full/Reduced/Off run
+with Chromium held touch and WebKit held mouse; an additional WebKit raw-touch
+case checks geometry/cancel/recovery followed by a separate fresh native tap.
+It does not claim same-press WebKit held-touch compatibility activation.
 
 ### Transcript timestamps and empty bookkeeping rows
 
