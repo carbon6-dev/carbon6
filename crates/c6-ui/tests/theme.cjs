@@ -276,7 +276,11 @@ async function firstPaint(browser, origin, choice, os) {
   const gate = new Promise(resolve => { release = resolve; });
   await context.route('**/*.wasm', async route => { held = true; await gate; await route.abort().catch(() => {}); });
   await context.route('**/js/theme.js', async route => {
-    await new Promise(resolve => setTimeout(resolve, Number(process.env.THEME_DELAY_MS || 300)));
+    // Hold the parser-blocking script across actual rendering opportunities,
+    // not 300ms of guessed machine speed. A deferred-script regression would
+    // expose the unthemed body to this same first-rAF sampler before release.
+    await route.request().frame().page().evaluate(() => new Promise(resolve =>
+      requestAnimationFrame(() => requestAnimationFrame(resolve))));
     await route.continue();
   });
   await context.addInitScript(({ choice }) => {
@@ -394,7 +398,10 @@ async function switching(browser, origin, layout, fixture, settle) {
       if (layout === 'phone') await f.page.setViewportSize({ width, height: 844 });
       else await f.page.locator('[data-tile-motion]').first().evaluate((el, width) => { el.style.width = `${width + 8}px`; }, width);
       await settle(f.page);
-      for (const choice of themes) {
+      // Card geometry is independent of palette. Keep every width in Dark,
+      // and all policy choices at 320px; standalone/all mode is exhaustive.
+      const choices = process.env.BROWSER_MATRIX === 'sample' && !process.env.THEMES && !process.env.WIDTHS && width !== 320 ? ['dark'] : themes;
+      for (const choice of choices) {
         const index = ['system', 'light', 'dark'].indexOf(choice);
         assert(index >= 0, `unknown THEMES choice ${choice}`);
         await radios.nth(index).check();

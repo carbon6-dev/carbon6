@@ -22,6 +22,8 @@ const positive = (name, value) => {
 function configuration(env) {
   const tier = env.BROWSER_TIER || 'full';
   assert(['full', 'quick', 'perf'].includes(tier), `Unknown BROWSER_TIER: ${tier}`);
+  const matrix = env.BROWSER_MATRIX || 'sample';
+  assert(['sample', 'all'].includes(matrix), 'BROWSER_MATRIX must be sample or all');
   const selected = env.BROWSER_SUITES === undefined ? tier === 'quick' ? quick : tier === 'perf' ? ['ring-render'] : suites : words(env.BROWSER_SUITES);
   assert(selected.length, 'BROWSER_SUITES must select at least one suite');
   for (const suite of selected) {
@@ -36,7 +38,7 @@ function configuration(env) {
   // Performance trials are exclusive, even if the caller exported BROWSER_JOBS.
   assert(tier !== 'perf' || selected.every(suite => suite === 'ring-render'), 'The perf tier runs only ring-render, without correctness neighbours');
   assert(!env.PERF || env.PERF === '0' || tier === 'perf', 'Use make ui-browser-perf for exclusive PERF=1 measurements');
-  return { tier, selected, engines, jobs: tier === 'perf' ? 1 : jobs,
+  return { tier, matrix, selected, engines, jobs: tier === 'perf' ? 1 : jobs,
     passes: positive('UI_BROWSER_PASSES', env.UI_BROWSER_PASSES || '1') };
 }
 
@@ -50,14 +52,31 @@ function shards(suite, env) {
     return ['desktop', 'narrow'].flatMap(VIEWPORT => ['Linux x86_64', 'MacIntel'].map(PLATFORM => ({ VIEWPORT, PLATFORM })));
   }
   if (suite === 'motion' && !explicit(['VIEWPORT', 'THEME', 'MOTION_CASE', 'ONLY'])) {
+    if (env.BROWSER_MATRIX !== 'all') {
+      const interaction = ['desktop', 'phone'].flatMap(VIEWPORT => [
+        { VIEWPORT, THEME: 'light', MOTION_CASE: 'full' },
+        ...[['light', 'reduced'], ['light', 'off'], ['dark', 'full']].map(([THEME, MOTION_CASE]) => ({ VIEWPORT, THEME, MOTION_CASE,
+          ONLY: 'policy,menu,modelPicker,drawer,sheet,sessionsPicker,phone,tiles,tool,sendStop' })),
+      ]);
+      return [...interaction, ...['system', 'system-reduce', 'full-reduce'].map(MOTION_CASE => ({
+        VIEWPORT: 'desktop', THEME: 'light', MOTION_CASE, ONLY: 'policy',
+      }))];
+    }
     return ['desktop', 'phone'].flatMap(VIEWPORT => ['light', 'dark'].map(THEME => ({ VIEWPORT, THEME })));
   }
   if (suite === 'phone-picker' && !explicit(['VIEWPORT', 'THEME', 'MOTION_CASE'])) {
+    if (env.BROWSER_MATRIX !== 'all') return [
+      ['narrow', 'light', 'full'], ['narrow', 'dark', 'off'],
+      ['phone', 'dark', 'full'], ['phone', 'light', 'reduced'],
+      ['wide', 'light', 'full'], ['wide', 'dark', 'reduced'],
+      ['desktop', 'dark', 'full'], ['desktop', 'light', 'off'],
+    ].map(([VIEWPORT, THEME, MOTION_CASE]) => ({ VIEWPORT, THEME, MOTION_CASE }));
     return ['narrow', 'phone', 'wide', 'desktop'].flatMap(VIEWPORT => ['light', 'dark'].map(THEME => ({ VIEWPORT, THEME })));
   }
   if (suite === 'phone-bar' && !explicit(['VIEWPORT', 'THEME', 'CASE'])) {
     return ['portrait-320', 'portrait-390', 'portrait-430', 'landscape-900', 'landscape-430', 'desktop-wide', 'desktop-narrow']
-      .flatMap(VIEWPORT => ['light', 'dark'].map(THEME => ({ VIEWPORT, THEME })));
+      .flatMap(VIEWPORT => ['light', 'dark'].filter(THEME => env.BROWSER_MATRIX === 'all' || THEME === 'light'
+        || VIEWPORT === 'portrait-320' || VIEWPORT.startsWith('desktop-')).map(THEME => ({ VIEWPORT, THEME })));
   }
   return [{}];
 }
@@ -65,7 +84,7 @@ function plan(config, env) {
   const tasks = [];
   for (const engine of config.engines) for (const suite of config.selected) {
     if (suite === 'ring-render' && engine !== 'chromium') continue;
-    for (const [index, filters] of shards(suite, env).entries()) tasks.push({ engine, suite, shard: index + 1, filters });
+    for (const [index, filters] of shards(suite, { ...env, BROWSER_MATRIX: config.matrix }).entries()) tasks.push({ engine, suite, shard: index + 1, filters });
   }
   assert(tasks.length, 'No applicable suite/engine pairs selected (ring-render is Chromium-only)');
   // Start long jobs first so the end of the run isn't one unsharded tail.
@@ -131,7 +150,8 @@ async function main(env = process.env) {
   const { serve, launchOptions } = require('./motion.cjs');
   const playwright = require(env.PLAYWRIGHT_CORE || 'playwright-core');
   const { server, origin } = await serve(), servers = [];
-  const environment = { ...env, BROWSER_TEST_ORIGIN: origin, PERF: config.tier === 'perf' ? '1' : '0', BROWSER_CASE_TIMINGS: '1' };
+  const environment = { ...env, BROWSER_TEST_ORIGIN: origin, BROWSER_MATRIX: config.matrix,
+    PERF: config.tier === 'perf' ? '1' : '0', BROWSER_CASE_TIMINGS: '1' };
   let failed = false;
   const interrupt = () => {
     report.interrupted = true;

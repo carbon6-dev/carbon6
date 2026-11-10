@@ -12,9 +12,24 @@ test('full selection retains both engines and independent acceptance suites', ()
   for (const suite of config.selected) for (const engine of config.engines)
     assert.equal(tasks.some(task => task.suite === suite && task.engine === engine), suite !== 'ring-render' || engine === 'chromium');
   assert.equal(shards('workspace-open', {}).length, 4, 'both widths and real platform modifiers');
-  assert.equal(shards('motion', {}).length, 4, 'complete Cartesian matrix before sampling');
+  assert.equal(shards('motion', { BROWSER_MATRIX: 'all' }).length, 4, 'exhaustive Cartesian mode remains available');
   assert.equal(shards('phone-picker', {}).length, 8);
-  assert.equal(shards('phone-bar', {}).length, 14);
+  assert.equal(shards('phone-bar', { BROWSER_MATRIX: 'all' }).length, 14);
+});
+
+test('representative matrices retain the named responsive, policy and theme branches', () => {
+  const motion = shards('motion', {});
+  assert.equal(motion.length, 11);
+  assert.equal(motion.filter(task => task.ONLY === 'policy').length, 3);
+  assert.equal(motion.filter(task => !task.ONLY).length, 2, 'all four modelForms paths on desktop and phone');
+  for (const VIEWPORT of ['desktop', 'phone']) for (const MOTION_CASE of ['full', 'reduced', 'off'])
+    assert(motion.some(task => task.VIEWPORT === VIEWPORT && task.THEME === 'light' && task.MOTION_CASE === MOTION_CASE));
+  for (const MOTION_CASE of ['system', 'system-reduce', 'full-reduce']) assert(motion.some(task => task.MOTION_CASE === MOTION_CASE && task.ONLY === 'policy'));
+  assert.equal(shards('phone-bar', {}).reduce((count, task) => count + (task.VIEWPORT.startsWith('desktop-') ? 1 : 8), 0), 52);
+  assert.deepEqual(shards('phone-picker', {}), [
+    ['narrow', 'light', 'full'], ['narrow', 'dark', 'off'], ['phone', 'dark', 'full'], ['phone', 'light', 'reduced'],
+    ['wide', 'light', 'full'], ['wide', 'dark', 'reduced'], ['desktop', 'dark', 'full'], ['desktop', 'light', 'off'],
+  ].map(([VIEWPORT, THEME, MOTION_CASE]) => ({ VIEWPORT, THEME, MOTION_CASE })));
 });
 
 test('diagnostic selectors do not multiply or override caller-selected cases', () => {
@@ -27,7 +42,7 @@ test('invalid selection and accidental parallel benchmarks fail before launch', 
   for (const env of [{ BROWSER_SUITES: '' }, { BROWSER_SUITES: '../motion' }, { BROWSER_SUITES: 'no-such-suite' },
     { BROWSER_ENGINES: '' }, { BROWSER_ENGINES: 'firefox' }, { BROWSER_JOBS: '0' }, { BROWSER_JOBS: '2.5' },
     { BROWSER_JOBS: '33' }, { UI_BROWSER_PASSES: '0' }, { BROWSER_SUITES: 'motion motion' }, { PERF: '1' },
-    { BROWSER_TIER: 'perf', BROWSER_SUITES: 'motion' }]) assert.throws(() => configuration(env), JSON.stringify(env));
+    { BROWSER_TIER: 'perf', BROWSER_SUITES: 'motion' }, { BROWSER_MATRIX: 'none' }]) assert.throws(() => configuration(env), JSON.stringify(env));
   assert.throws(() => plan(configuration({ BROWSER_SUITES: 'ring-render', BROWSER_ENGINES: 'webkit' }), {}), /Chromium-only/);
   assert.equal(configuration({ BROWSER_TIER: 'perf', BROWSER_JOBS: '8' }).jobs, 1);
   assert.deepEqual(configuration({ BROWSER_TIER: 'perf' }).engines, ['chromium']);

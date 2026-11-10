@@ -52,7 +52,7 @@ DEB_ARGS      = --build-arg UBUNTU=$(UBUNTU) --build-arg DEB_VERSION=$(DEB_VERSI
 
 .PHONY: help docker-build docker-build-all docker-test docker-lint-image docker-check docker-fmt docker-images docker-head docker-head-stop docker-token docker-login-link \
         docker-deb docker-deb-all docker-deb-test deb deb-test deb-smoke brew-dist brew brew-install brew-test release release-notes \
-        ui ui-browser-install ui-browser-test build print-version test test-under-load check dev-head dev-token dev-login-link dev-worker clean \
+        ui ui-browser-install ui-browser-test ui-browser-quick ui-browser-perf build print-version test test-under-load check dev-head dev-token dev-login-link dev-worker clean \
         site site-serve site-check site-publish
 
 help: ## Show this help
@@ -171,8 +171,14 @@ ui-browser-install: ## Install locked browser-test dependencies, matching Chromi
 	npm ci --prefix crates/c6-ui/tests
 	node crates/c6-ui/tests/node_modules/playwright-core/cli.js install --with-deps chromium webkit
 
-ui-browser-test: ## Test the built production UI in pinned Chromium/WebKit (build with make ui first; UI_BROWSER_PASSES=3 for repeated full matrices)
+ui-browser-test: ## Test the built production UI in parallel Chromium/WebKit (representative regression matrix; BROWSER_MATRIX=all is exhaustive)
 	bash scripts/ui-browser-tests.sh
+
+ui-browser-quick: ## Everyday browser smoke: workspace, motion, lists, Markdown and transcript press/timestamps in both engines
+	BROWSER_TIER=quick bash scripts/ui-browser-tests.sh
+
+ui-browser-perf: ## Exclusive Chromium ring profiling, animation frames, paint traces and CPU-throttled measurements
+	BROWSER_TIER=perf bash scripts/ui-browser-tests.sh
 
 build: ui ## Build release binaries (c6h, c6w, c6) into target/release, knowing their exact version (C6_BUILD_VERSION: the release, or <release>+git<commit time>.<commit> between releases)
 	C6_BUILD_VERSION=$(DEB_VERSION) cargo build --release --locked -p c6h -p c6w -p c6

@@ -290,6 +290,59 @@ BROWSER_SUITES=stale-transcript bash scripts/ui-browser-tests.sh
 
 This is emulated phone/browser coverage, not a physical Android Chrome run.
 
+### Browser tiers and coverage ledger
+
+```sh
+make ui-browser-test                 # all registered regression suites, representative matrix
+make ui-browser-quick                # everyday workspace/motion/lists/Markdown/press/timestamps
+make ui-browser-perf                 # exclusive Chromium ring measurements, never parallel neighbours
+BROWSER_MATRIX=all make ui-browser-test # exhaustive correctness combinations, still no benchmark workload
+node --test crates/c6-ui/tests/browser-runner.test.cjs # scheduler/selection checks, no browser
+```
+
+The quick tier is intentionally **not release qualification**: it omits
+comment-sheet, phone-picker, phone-bar, theme, resource-lifecycle, status-row,
+ring-render, message-edit, message-origin, comments-design and session-sheet.
+It uses the same assertions/isolation as full, not simplified assertions. Perf
+forces one worker and only Chromium ring-render; do not run another browser,
+compiler or test alongside timing trials. Full/quick have no CPU-throttled or
+main-thread-blocking benchmark workloads. Motion's frame-by-frame geometry,
+FLIP batching, focus, duration/keyframe, first-frame interaction and controlled
+clock interruption/disposal assertions remain **correctness**, not FPS budgets.
+
+Counts below are **per engine**, except Chromium-only ring-render. Removed
+crossings are recoverable with `BROWSER_MATRIX=all` or the unchanged standalone
+suite selectors. Nothing is retried, and no distinct refusal/race/state case is
+replaced by a generic success/error example.
+
+| Suite | Previous → default selection | Kept, moved or sampled—and why |
+|---|---|---|
+| workspace-open | 4 → 4 | Desktop/narrow × Linux/Mac; real modifier/shortcut, history, owner and stream checks all retained. |
+| motion | 24 → 11 contexts | Eight complete interaction contexts: desktop/phone × Light Full/Reduced/Off and Dark Full. Three additional desktop/Light policy-only contexts: System, System+OS Reduce, Full+OS Reduce. All six policy choices remain; policy itself checks live OS/explicit overrides, storage, another tab/realm and reload. Full four-path `modelForms` runs in desktop/Light/Full and phone/Light/Full, not the other nine contexts. System variants have the same effective component behavior as explicit Full/Reduced; repeated dark/static and policy × component traversals are sampled, not distinct gesture branches. All native drawer/picker, disclosure native/fallback, layout, tool, send/stop, focus/follow and interruption assertions run for their retained component cases. |
+| phone-picker | 24 → 8 | Exact retained `(viewport,theme,motion)` tuples: narrow/Light/Full, narrow/Dark/Off; phone/Dark/Full, phone/Light/Reduced; wide/Light/Full, wide/Dark/Reduced; desktop/Dark/Full, desktop/Light/Off. All other tuples in the old four-width × two-theme × three-motion product are sampled out. Every width keeps both themes and Full; every phone effective policy remains, including narrow Off+OS Reduce. Desktop Reduced has no distinct assertion branch. Full-only interrupted percentage entrance remains at **every phone width**; all search/stale/retry, focus/inert, bell/Ask, cleanup and routing cases remain in each selected tuple. WebKit still does not claim native swipe. |
+| phone-bar | 84 → 52 | All eight states at **all five phone viewports in Light**, all eight again at 320px in Dark, and both desktop controls in both themes. Only Dark × {390px portrait,430px portrait,900px landscape,430px landscape} × all eight states (32 contexts) is sampled out. No state, viewport, short-height breakpoint, wide-search-row branch or desktop control is removed. |
+| theme | All first-paint/retained contexts kept; switching checks 15 → 7 per layout | All ten choice × OS first paints, all retained Settings/Choices layouts, legacy migration, native radio isolation, cross-tab/OS/reload checks stay. Tile and phone each check Dark at 240/320/400/480/640px, plus Light/System at 320px. Only Light/System × {240,400,480,640}px are sampled out: card fitting is palette-independent. |
+| comment-sheet | 8 → 8 | Both themes at all four layouts; small-phone and short desktop paths retained. |
+| settings-lists | 4 → 4 | Both themes × desktop/phone; every list type, focus/key, failed/successful save and realm switch retained. |
+| resource-lifecycle | 8 → 8 | Both themes × chat/stale/work/projects; all cancellation and owner lifetimes retained. |
+| markdown-html | 12 → 12 | Both surfaces and themes; narration at both widths × both thinking settings, live/replay/historical Text and tool icons retained. |
+| status-row | 12 → 12 | Both themes × all six views; every count/state and wide highlight/scroll/remount check retained. |
+| ring-render | 6 → 2 correctness repetitions | One identical assertion pass per theme instead of three. All 96 live chunks, 12 durable Markdown items and snapshot/animation-identity checks per pass remain, as do compositor layers, shape/keyframes, state/preferences, task wording and once/theme raster seam/ink/easing galleries. Three repetitions/theme, 4× CPU throttle, 35ms producer pacing, profiles/traces/rAF/long-task timings, trace-qualified zero-ring-Paint, and the unchanged 600ms blocked-main-thread screencast/assertions move together to **perf**, not deletion. Optional `PHONE=1` matrix is unchanged and was never in the default runner. |
+| transcript-press | 10 → 10 | Idle/stream × Full/Reduced/Off plus cancellation/multitouch and engine-specific native controls; source-helper unit checks still run once. |
+| transcript-times | 4 → 4 | Off/Exchanges/All and side-chat Off; exact empty-row assertions unchanged. |
+| message-edit | Separate gate → all 60 | All 30 outcomes × desktop/phone now in full; refused resets, response loss, attachment recovery, stacking/replay/durable-origin cases are **not** merged. |
+| message-origin | Separate gate → all 6 | Three viewports × both themes now in full. |
+| comments-design | Separate gate → all 10 | All five layouts × both themes now in full; unique margin-fit/Light deferred-save races remain. This does not replace comment-sheet. |
+| session-sheet | Separate gate → all 18 | Core, nested/focus and SSH/stale/offline capability cases now in full; no matrix reduction. |
+
+Fixed completion sleeps were not replaced with shorter sleeps. Ring correctness
+waits for each actual chunk/item and committed frames; perf retains deliberate
+35ms workload pacing. First-paint theme delivery is held across two actual
+rendering opportunities instead of a 300ms wall sleep, preserving the adverse
+parser-blocking/first-frame check. Session-sheet Stop waits for the exact mocked
+POST response instead of hand-written 10ms condition polling. Motion keeps
+finite-animation completion and controlled browser-clock boundaries.
+
 ### Phone single-bar production browser regression (S14)
 
 `phone-bar.cjs` reuses Motion's built-production fixture, private loopback
@@ -302,6 +355,8 @@ Four additional contexts check wide and narrow-tile desktop chrome, for
 has no context filters or retries. APIs, document updates and terminal PTY
 traffic are local fixtures; real bundled xterm mounts without starting a shell.
 
+The standalone exhaustive suite still has the matrix above; the default runner
+uses the 52-context representative selection in the coverage ledger.
 The phone checks measure the sole `[data-tile-bar]` through to the actual pane
 body, including the session's inner content wrapper: total chrome is at most
 44px, with no visible column header, session strip or sticky document toolbar.
@@ -873,13 +928,15 @@ After `env -u NO_COLOR make ui`, run the production Chromium regression with
 the same Node/Playwright/browser overrides as `motion.cjs`:
 
 ```sh
-/home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/ring-render.cjs
-PARAGRAPHS=180 LABEL=after-heavy /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/ring-render.cjs
+node crates/c6-ui/tests/ring-render.cjs # correctness, one run/theme
+make ui-browser-perf # three measurement runs/theme, exclusive
+PERF=1 PARAGRAPHS=180 LABEL=after-heavy node crates/c6-ui/tests/ring-render.cjs
 ```
 
-The private loopback fixture has three tiles and 93 historical replies. At 4×
-CPU throttling it streams eight chunks before each of twelve new Markdown
-items, in both themes. It checks retained rim/context nodes and both running
+The private loopback fixture has three tiles and 93 historical replies. It
+streams eight chunks before each of twelve new Markdown items, in both themes.
+Correctness is unthrottled and waits for actual DOM/frame conditions;
+`PERF=1` uses the original 4× CPU-throttled, paced workload. Both check retained rim/context nodes and both running
 animation identities across item arrivals and changing session snapshots. The
 1.4s spin belongs to the HTML wrapper; a clipped outer SVG sweeps over 2.8s to
 grow/shrink the arc from 8 to 30 units. Both must have their own active-transform
@@ -894,8 +951,10 @@ blue ink and angular continuity, and saves all-state Full/Reduced/Off galleries.
 DSF-2 gallery PNGs have twice the physical resolution. CDP screencasts can
 instead return CSS-pixel images; their own viewport metadata determines crops.
 
-Evidence goes to `/tmp/q3-ring/` (`EVIDENCE` overrides it): JSON timing and
-main-thread rAF gaps, long tasks, screenshots, and a trace/CPU profile on the
+Standalone evidence goes to `/tmp/q3-ring/` (`EVIDENCE` overrides it); the runner
+always supplies its own unique evidence directory. Correctness saves screenshots,
+shape/identity/snapshot results and the raster galleries. **Only `PERF=1`** adds
+JSON timing, main-thread rAF gaps, long tasks and a trace/CPU profile on the
 first of three runs. Runs 1 and 2 are unprofiled. Timings and frame counts have
 **no pass/fail budget**. A separate 600ms deliberately blocked-main-thread
 screencast follows the first run's natural workload. Its blue-pixel area checks
