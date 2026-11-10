@@ -103,6 +103,28 @@ async function checkLatest(browser, origin, engine, scenario, motion) {
   const rawTouch = scenario === 'latest-touch-position', mouse = engine === 'webkit' && !rawTouch;
   const evidence = { motion, nativeInput: mouse ? 'mouse' : 'touch', streams: [], pages: [] };
   const sockets = new Set();
+  const scrollSnapshot = page => page.evaluate(() => {
+    const content = document.querySelector('[data-follow-content]');
+    let box = content;
+    while (box && !box.classList.contains('overflow-y-auto')) box = box.parentElement;
+    if (!box) return null;
+    const gap = box.scrollHeight - box.scrollTop - box.clientHeight;
+    return { top: box.scrollTop, height: box.scrollHeight, viewport: box.clientHeight, gap,
+      farByGeometry: gap > box.clientHeight,
+      latestRendered: !!document.querySelector('[title="To the latest (End)"]'), hash: location.hash };
+  });
+  const scrollSettled = page => page.locator('[data-follow-content]').evaluate(el => new Promise(resolve => {
+    let box = el;
+    while (box && !box.classList.contains('overflow-y-auto')) box = box.parentElement;
+    let previous = box.scrollTop, stable = 0;
+    const tick = () => {
+      const top = box.scrollTop;
+      stable = top === previous ? stable + 1 : 0;
+      previous = top;
+      if (stable >= 8) resolve(); else requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }));
   const history = Array.from({ length: seq }, (_, i) => {
     const n = i + 1;
     if (n === 1) return { seq: n, ts: n, type: 'started', connection_id: 'test', model: 'test',
@@ -162,9 +184,41 @@ async function checkLatest(browser, origin, engine, scenario, motion) {
         await composer.fill(draft);
         const previous = evidence.historical = await saved(), streamCount = evidence.streams.length;
         assert.equal(previous.columns[0].view.target?.anchor, anchor, 'the reloaded historical address is still retained until Latest');
-        f.phase = 'native Latest control consumes the retained target';
+        f.phase = 'native PageDown scrolls within the already historical window';
+        const readingAway = evidence.readingAway = { before: await scrollSnapshot(page) };
+        await page.locator('[data-follow-content]').evaluate(el => {
+          let box = el;
+          while (box && !box.classList.contains('overflow-y-auto')) box = box.parentElement;
+          const log = window.__latestReadingAway = [];
+          for (const type of ['keydown', 'scroll']) box.addEventListener(type, event => {
+            log.push({ type, trusted: event.isTrusted, key: event.key, top: box.scrollTop,
+              height: box.scrollHeight, viewport: box.clientHeight });
+          }, { passive: true });
+          box.focus({ preventScroll: true });
+        });
+        // Historical anchor reveal can start at scrollTop=0 without a scroll
+        // event, leaving the floating control's far flag false. A native
+        // PageDown within this already-away window delivers that event without
+        // paging older history at the top. Never assign offsets or scroll a
+        // locator/control into view, and let the native scroll finish.
+        await page.keyboard.press('PageDown');
+        await scrollSettled(page);
+        readingAway.afterPageDown = await scrollSnapshot(page);
+        assert(readingAway.afterPageDown.top > readingAway.before.top, 'native PageDown moves within the historical window');
+        readingAway.events = await page.evaluate(() => window.__latestReadingAway);
+        assert(readingAway.afterPageDown.farByGeometry, 'the historical window retains more than a viewport below, the floating Latest precondition');
+        assert(readingAway.events.some(e => e.type === 'keydown' && e.key === 'PageDown' && e.trusted), 'the historical scroll uses trusted native keyboard intent');
+        assert(readingAway.events.some(e => e.type === 'scroll' && e.trusted), 'the browser delivers real scroll events');
+        const away = await saved();
+        assert.deepEqual([away.columns[0].view.target, away.back, away.forward],
+          [previous.columns[0].view.target, previous.back, previous.forward], 'native reading-away preserves the retained target and history');
+        assert.equal(readingAway.afterPageDown.hash, `#${anchor}`);
+        assert.equal(await page.locator(`#parent-e${seq}`).count(), 0, 'reading-away does not bypass Latest or its historical drawing window');
+        assert.equal(evidence.streams.length, streamCount, 'reading-away retains the historical stream');
+        f.phase = 'floating Latest visibility after verified native reading-away';
         const latest = page.getByTitle('To the latest (End)', { exact: true });
         await latest.waitFor();
+        f.phase = 'native Latest hit-test and activation consumes the retained target';
         const latestPoint = evidence.latestPoint = await latest.evaluate(el => {
           const r = el.getBoundingClientRect(), x = Math.round(r.x + r.width / 2), y = Math.round(r.y + r.height / 2);
           return { x, y, visible: r.width > 0 && r.left >= 0 && r.right <= innerWidth && r.top >= 0 && r.bottom <= innerHeight,
@@ -181,6 +235,7 @@ async function checkLatest(browser, origin, engine, scenario, motion) {
         assert.equal(await composer.inputValue(), draft);
         assert.equal(evidence.streams.length, streamCount, 'Latest retains the session stream');
         assert.equal(await page.locator(`#${anchor}`).count(), 0, 'Latest really trims the old window');
+        f.phase = 'post-Latest stream setup and visible initial markdown';
         const transport = { page, stream: message => {
           assert(sockets.size, 'the production transcript stream is connected');
           for (const socket of sockets) socket.send(JSON.stringify({ ...message, turn: 2000 }));
@@ -188,6 +243,7 @@ async function checkLatest(browser, origin, engine, scenario, motion) {
         await f.setState('working', { last_seq: seq });
         await text(transport, initial);
         await page.locator('.md').filter({ hasText: initial }).last().waitFor();
+        f.phase = 'post-Latest initial stream reaches the actual end';
         await atEnd(page, seq); await settle(page);
         evidence.phonePolicy = await page.evaluate(() => ({ coarse: matchMedia('(pointer: coarse)').matches,
           points: navigator.maxTouchPoints, touchEvents: 'ontouchstart' in window }));
@@ -208,10 +264,10 @@ async function checkLatest(browser, origin, engine, scenario, motion) {
         assert(!held.some(e => ['mouseup', 'touchend', 'touchcancel', 'pointercancel'].includes(e.type)), 'the stream grows before the original contact releases');
         const dialog = page.getByRole('dialog', { name: 'Message actions', exact: true });
         assert.equal(await dialog.isVisible(), false, 'holding never activates the action prematurely');
-        let activationStart = evidence.inputStart;
         if (rawTouch) {
-          // WebKit raw touch has no compatibility click: cancellation/recovery
-          // and the subsequent fresh native tap are explicitly separate phases.
+          // WebKit raw touch has no compatibility click. Keep this as the
+          // post-Latest geometry/cancel/recovery case; ordinary native tap is
+          // independently covered by the original fresh-context tap case.
           await touch.cancel(); await settle(page);
           const canceled = await page.evaluate(start => __transcriptPress.events.slice(start), evidence.inputStart);
           assert(canceled.some(e => e.type === 'touchcancel' && e.trusted));
@@ -221,23 +277,23 @@ async function checkLatest(browser, origin, engine, scenario, motion) {
           evidence.resumed = await resumes(transport, during, seq);
           const target = await metric(page, seq);
           assert(target.visible && target.hit, 'raw-touch recovery leaves the action usable');
-          f.phase = 'separate fresh WebKit native tap after post-Latest raw-touch recovery';
-          activationStart = evidence.freshTapStart = await page.evaluate(() => __transcriptPress.events.length);
-          await page.touchscreen.tap(target.x, target.y);
-        } else if (mouse) await page.mouse.up();
-        else await touch.end();
-        await dialog.waitFor();
-        assert.equal(await page.locator(`#parent-e${seq} [aria-label="Message actions"]`).getAttribute('aria-expanded'), 'true');
-        const inputs = await page.evaluate(start => __transcriptPress.events.slice(start), activationStart);
-        const down = inputs.find(e => e.type === (mouse ? 'mousedown' : 'touchstart'));
-        const up = inputs.find(e => e.type === (mouse ? 'mouseup' : 'touchend'));
-        const click = inputs.find(e => e.type === 'click');
-        evidence.pressMs = up?.t - down?.t;
-        assert(down?.trusted && up?.trusted && click?.trusted && click.action && click.row === `parent-e${seq}`, 'trusted native activation opens the original post-Latest row action');
-        if (!rawTouch) evidence.resumed = await resumes(transport, during, seq);
+          assert.equal(await dialog.isVisible(), false, 'raw-touch cancel/recovery never activates actions');
+        } else {
+          if (mouse) await page.mouse.up();
+          else await touch.end();
+          await dialog.waitFor();
+          assert.equal(await page.locator(`#parent-e${seq} [aria-label="Message actions"]`).getAttribute('aria-expanded'), 'true');
+          const inputs = await page.evaluate(start => __transcriptPress.events.slice(start), evidence.inputStart);
+          const down = inputs.find(e => e.type === (mouse ? 'mousedown' : 'touchstart'));
+          const up = inputs.find(e => e.type === (mouse ? 'mouseup' : 'touchend'));
+          const click = inputs.find(e => e.type === 'click');
+          evidence.pressMs = up?.t - down?.t;
+          assert(down?.trusted && up?.trusted && click?.trusted && click.action && click.row === `parent-e${seq}`, 'trusted native activation opens the original post-Latest row action');
+          evidence.resumed = await resumes(transport, during, seq);
+        }
         assert.equal(evidence.streams.length, streamCount);
         assert(!(await saved()).columns[0].view.target);
-        assert.equal(await page.locator(`#${anchor}`).count(), 0, 'activation never reinstates the old historical window');
+        assert.equal(await page.locator(`#${anchor}`).count(), 0, 'native input never reinstates the old historical window');
         assert.equal(await composer.inputValue(), draft);
         assert(await page.evaluate(() => matchMedia('(pointer: coarse)').matches &&
           (navigator.maxTouchPoints > 0 || 'ontouchstart' in window)), 'native input preserves phone policy');
@@ -253,6 +309,8 @@ async function checkLatest(browser, origin, engine, scenario, motion) {
     return { label, passed: false, phase: progress?.phase, error: error.stack, evidence };
   } finally {
     if (progress) {
+      evidence.finalScroll = await scrollSnapshot(progress.page).catch(() => null);
+      evidence.readingAwayEvents = await progress.page.evaluate(() => window.__latestReadingAway || []).catch(() => []);
       evidence.events = await progress.page.evaluate(() => __transcriptPress.events).catch(() => []);
       evidence.errors = progress.errors;
       evidence.requests = progress.requests;

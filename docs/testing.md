@@ -808,8 +808,9 @@ draft and stream. They then hold a hit-tested action through one layout-growing
 stream chunk, require activation of the original row and resumed following,
 and verify that the historical target does not return. Full/Reduced/Off run
 with Chromium held touch and WebKit held mouse; an additional WebKit raw-touch
-case checks geometry/cancel/recovery followed by a separate fresh native tap.
-It does not claim same-press WebKit held-touch compatibility activation.
+case checks geometry/cancel/recovery. Ordinary native tap remains independently
+covered in the original fresh-context case. The suite does not claim same-press
+WebKit held-touch compatibility activation or a click after raw-touch cancel.
 
 ### Transcript timestamps and empty bookkeeping rows
 
