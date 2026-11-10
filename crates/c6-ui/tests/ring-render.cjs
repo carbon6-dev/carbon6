@@ -13,10 +13,14 @@
 // Both modes are Chromium-only: layers() requires CDP. CHROMIUM selects a
 // browser binary (the pinned Playwright revision by default); this is not a
 // WebKit/Firefox touch proof. Reject ENGINE=webkit rather than mislabel coverage.
+// C6_TEST_CASE_DEADLINE_SECS defaults to 90 per desktop run, phone startup and
+// phone width case, including page.evaluate/rAF work. For heavy perf workloads,
+// explicitly allow more time, e.g. PERF=1 PARAGRAPHS=180
+// C6_TEST_CASE_DEADLINE_SECS=300 node crates/c6-ui/tests/ring-render.cjs.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { serve, fixture, settle, launchBrowser } = require('./motion.cjs');
+const { serve, fixture, settle, within, launchBrowser } = require('./motion.cjs');
 const phone = process.env.PHONE === '1';
 const perf = process.env.PERF === '1';
 const output = process.env.EVIDENCE || (phone ? '/tmp/q11-ring/row-link' : '/tmp/q3-ring');
@@ -349,10 +353,11 @@ async function run(browser, origin, theme, run) {
   const motion = { choice: 'full', os: 'no-preference', effective: 'full' };
   const events = Array.from({ length: 30 }, (_, i) => ({ seq: i + 66, ts: i + 66, type: 'assistant', turn: i + 66,
     blocks: [{ type: 'text', text: prose(i + 1000, 12) }], stop_reason: 'end_turn' }));
-  const f = await fixture(browser, origin, { width: 1600, height: 1000 }, theme, motion, () => {}, { deviceScaleFactor: scale },
-    { events, instrumentation: perf }); // The fixture's animation/rAF sampler is unused by ring correctness.
-  const { page, context } = f;
-  try {
+  let f;
+  const check = async () => {
+    f = await fixture(browser, origin, { width: 1600, height: 1000 }, theme, motion, partial => { f = partial; }, { deviceScaleFactor: scale },
+      { events, instrumentation: perf }); // The fixture's animation/rAF sampler is unused by ring correctness.
+    const { page, context } = f;
     await context.addInitScript(instrument, { perf });
     await page.evaluate(() => {
       const views = [{ view: 'session', id: 'parent' }, { view: 'sessions' }, { view: 'workers' }];
@@ -547,10 +552,13 @@ async function run(browser, origin, theme, run) {
     // workload, CPU profile, natural trace window or compositor challenge.
     if (!baseline) await desktopTaskWords(f, `${phase}-${theme}-${run}`);
     assert.deepEqual(f.errors, [], 'no crashes, invalid streams or external requests');
+  };
+  try {
+    await within(`${phase}-${theme}-${run}`, check);
   } catch (error) {
-    await page.screenshot({ path: path.join(output, `${phase}-${theme}-${run}-FAIL.png`), timeout: 5000 }).catch(() => {});
+    await f?.page.screenshot({ path: path.join(output, `${phase}-${theme}-${run}-FAIL.png`), timeout: 5000 }).catch(() => {});
     throw error;
-  } finally { await context.close(); }
+  } finally { await f?.context.close(); }
 }
 
 async function desktopTaskWords(f, name) {
@@ -856,31 +864,10 @@ async function runPhone(browser, origin, theme, choice, deviceScaleFactor) {
     columns: [{ key: i * 2 + 3, view: i ? { view: 'search', q: `Q11 hidden page ${i}`, kind: '', worker: '' } : { view: 'session', id: 'parent' } }],
     cursor: 0, active: i * 2 + 3, used: i * 2 + 3, back: [], forward: [], stack: 0, minimized: i > 0 }));
   let waiting = [];
-  const f = await fixture(browser, origin, { width: widths[0], height: 844 }, theme, motion, () => {},
-    { deviceScaleFactor }, { instrumentation: false, layout: { tiles, focus: 0, next: 30, full: false },
-      events: [{ seq: 66, ts: 66, type: 'usage', model: 'test', input_tokens: 25600, output_tokens: 0,
-        cache_read_tokens: 0, cache_write_tokens: 0, reasoning_tokens: 0, context_window: 128000 }],
-      setup: async ({ page, context }) => {
-        await page.addInitScript(() => {
-          window.__phoneSnapshots = 0;
-          const NativeSocket = window.WebSocket;
-          window.WebSocket = class extends NativeSocket {
-            constructor(...args) {
-              super(...args);
-              this.addEventListener('message', message => {
-                if (JSON.parse(message.data).type === 'sessions') window.__phoneSnapshots++;
-              });
-            }
-          };
-        });
-        await context.route('**/api/v1/sessions/parent/waiting', route => route.fulfill({ json: waiting }));
-      } });
-  const { page, context } = f;
+  let f, page, context, ring, row;
   const records = [];
-  let label;
+  let label = `phone-${theme}-${choice}-dsf${deviceScaleFactor}-startup`;
   const step = name => { f.phase = `${label || 'phone startup'}: ${name}`; if (process.env.DEBUG_FIXTURE) console.log(`  PHONE ${f.phase}`); };
-  const ring = page.getByRole('button', { name: /Open session sheet/ }).first();
-  const row = page.locator('[data-phone-status]');
   const state = async (next, patch = {}) => {
     step(`live state ${next}/${patch.status || 'default'}`);
     const snapshots = await page.evaluate(() => __phoneSnapshots);
@@ -896,7 +883,29 @@ async function runPhone(browser, origin, theme, choice, deviceScaleFactor) {
   const task = (i, state) => f.send({ type: 'background_task', task_id: `q11-task-${i}`, kind: 'shell',
     description: `Q11 real background fixture ${i}`, state, exit_code: 0, elapsed_ms: 0, notify: false,
     native_type: '', foreground: false });
-  try {
+  const start = async () => {
+    f = await fixture(browser, origin, { width: widths[0], height: 844 }, theme, motion, partial => { f = partial; },
+      { deviceScaleFactor }, { instrumentation: false, layout: { tiles, focus: 0, next: 30, full: false },
+        events: [{ seq: 66, ts: 66, type: 'usage', model: 'test', input_tokens: 25600, output_tokens: 0,
+          cache_read_tokens: 0, cache_write_tokens: 0, reasoning_tokens: 0, context_window: 128000 }],
+        setup: async ({ page, context }) => {
+          await page.addInitScript(() => {
+            window.__phoneSnapshots = 0;
+            const NativeSocket = window.WebSocket;
+            window.WebSocket = class extends NativeSocket {
+              constructor(...args) {
+                super(...args);
+                this.addEventListener('message', message => {
+                  if (JSON.parse(message.data).type === 'sessions') window.__phoneSnapshots++;
+                });
+              }
+            };
+          });
+          await context.route('**/api/v1/sessions/parent/waiting', route => route.fulfill({ json: waiting }));
+        } });
+    ({ page, context } = f);
+    ring = page.getByRole('button', { name: /Open session sheet/ }).first();
+    row = page.locator('[data-phone-status]');
     await state('idle');
     step('long title');
     // Follow the visible ring to its own bar, not an unrelated page title.
@@ -945,8 +954,11 @@ async function runPhone(browser, origin, theme, choice, deviceScaleFactor) {
     });
     await named('Idle');
     assert(await page.evaluate(() => !!__contextArc), 'fixture supplies a real, visible 20% context arc');
-    const cdp = await context.newCDPSession(page);
-    for (const width of widths) {
+    return context.newCDPSession(page);
+  };
+  try {
+    const cdp = await within(label, start);
+    const check = async width => {
       label = `phone-${theme}-${choice}-${width}-dsf${deviceScaleFactor}`;
       f.phase = label;
       await page.setViewportSize({ width, height: 844 });
@@ -1116,11 +1128,12 @@ async function runPhone(browser, origin, theme, choice, deviceScaleFactor) {
       fs.writeFileSync(path.join(output, `phone-${theme}-${choice}-dsf${deviceScaleFactor}.json`), JSON.stringify(records, null, 2));
       assert.deepEqual(f.errors, [], 'no crashes, invalid streams or external requests');
       console.log(`PASS ${label}`);
-    }
+    };
+    for (const width of widths) await within(`phone-${theme}-${choice}-${width}-dsf${deviceScaleFactor}`, () => check(width));
   } catch (error) {
-    if (label) await page.screenshot({ path: path.join(output, `${label}-FAIL.png`), timeout: 5000 }).catch(() => {});
+    await f?.page.screenshot({ path: path.join(output, `${label}-FAIL.png`), timeout: 5000 }).catch(() => {});
     throw new Error(`${label || 'phone startup'}: ${error.stack || error}`);
-  } finally { await context.close(); }
+  } finally { await f?.context.close(); }
 }
 
 (async () => {

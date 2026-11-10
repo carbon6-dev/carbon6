@@ -311,10 +311,11 @@ async function check(browser, origin, engine, theme, view) {
     await landing(sheet);
     await jobActions(command, sheet);
     await heading(sheet, 'Background command');
-    const stoppedCommand = page.waitForResponse(response => response.request().method() === 'POST'
-      && new URL(response.url()).pathname === '/api/v1/sessions/parent/tasks/build-task/stop');
-    await sheet.getByRole('button', { name: 'Stop this command', exact: true }).click();
-    await stoppedCommand;
+    await Promise.all([
+      page.waitForResponse(response => response.request().method() === 'POST'
+        && new URL(response.url()).pathname === '/api/v1/sessions/parent/tasks/build-task/stop'),
+      sheet.getByRole('button', { name: 'Stop this command', exact: true }).click(),
+    ]);
     assert.deepEqual(stops, ['/api/v1/sessions/parent/tasks/build-task/stop']);
     // Back is available if the actions surface remains open after successful Stop.
     if (await sheet.getByRole('button', { name: 'Back', exact: true }).count()) await back(sheet);
@@ -336,10 +337,11 @@ async function check(browser, origin, engine, theme, view) {
     await sheet.getByRole('button', { name: 'Inspect', exact: true }).waitFor();
     await sheet.getByRole('button', { name: 'Open thread', exact: true }).waitFor();
     await capture('actions-agent');
-    const stoppedChild = page.waitForResponse(response => response.request().method() === 'POST'
-      && ['/api/v1/sessions/parent/tasks/a-continuation/stop', '/api/v1/sessions/child-a/interrupt'].includes(new URL(response.url()).pathname));
-    await sheet.getByRole('button', { name: 'Stop this agent', exact: true }).click();
-    await stoppedChild;
+    await Promise.all([
+      page.waitForResponse(response => response.request().method() === 'POST'
+        && ['/api/v1/sessions/parent/tasks/a-continuation/stop', '/api/v1/sessions/child-a/interrupt'].includes(new URL(response.url()).pathname)),
+      sheet.getByRole('button', { name: 'Stop this agent', exact: true }).click(),
+    ]);
     assert(['/api/v1/sessions/parent/tasks/a-continuation/stop', '/api/v1/sessions/child-a/interrupt'].includes(stops[1]),
       `Stop only current continuation or its child: ${JSON.stringify(stops)}`);
     assert.equal(stops.length, 2, 'one request per Stop, never stop parent or similarly named sibling');
