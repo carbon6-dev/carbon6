@@ -17,6 +17,11 @@ use tokio::sync::Notify;
 
 pub struct Journal {
     pool: SqlitePool,
+    /// Serialize reset publication/retry authorization with exceptional
+    /// metadata-loss cleanup. Acquire before any SQLite transaction; cleanup
+    /// holds no database transaction while awaiting process-group absence.
+    /// The worker's manager and actors share this Journal through one Arc.
+    pub(crate) claude_rewind_ownership: tokio::sync::Mutex<()>,
     /// Signalled after every append. Single consumer (the uploader), so
     /// `notify_one` keeps a permit when it is busy and nothing is missed.
     pub appended: Notify,
@@ -200,6 +205,7 @@ impl Journal {
     }
 
     pub async fn prepare_claude_rewind(&self, session_id: &str, reset: &crate::claude_code::Reset) -> anyhow::Result<()> {
+        let _ownership = self.claude_rewind_ownership.lock().await;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let mut reset = reset.clone();
         // An actor can be initializing while the manager admits an explicit
@@ -231,6 +237,7 @@ impl Journal {
     /// False means the actor confirmed the old reset concurrently; dispatch
     /// must reread its mapping and prepare a new intent instead.
     pub async fn authorize_claude_rewind_retry(&self, session_id: &str, original: &str, retry: &str) -> anyhow::Result<bool> {
+        let _ownership = self.claude_rewind_ownership.lock().await;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         // Dispatch's receipt check can race a failure committing on the
         // actor. Never resurrect an authorization already consumed by it.
@@ -403,7 +410,7 @@ impl Journal {
         let pool =
             SqlitePoolOptions::new().max_connections(4).connect_with(opts).await.with_context(|| format!("opening {}", path.display()))?;
         sqlx::migrate!("./migrations").run(&pool).await.context("journal migrations")?;
-        Ok(Self { pool, appended: Notify::new() })
+        Ok(Self { pool, claude_rewind_ownership: tokio::sync::Mutex::new(()), appended: Notify::new() })
     }
 
     pub async fn is_applied(&self, command_id: &str) -> anyhow::Result<bool> {

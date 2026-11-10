@@ -1973,9 +1973,16 @@ impl Process {
 
     /// Closes it: no more input, then it exits by itself (or is killed).
     pub async fn close(mut self) {
-        *self.stdin.lock().await = None;
-        if self.held.is_some() || tokio::time::timeout(CLOSE_GRACE, self.wait_exit()).await.is_err() {
+        if self.held.is_some() {
+            // Keep the FIFO writer until ownership-preserving cleanup: EOF
+            // could otherwise retire the only provably owned group leader.
             self.kill().await;
+            *self.stdin.lock().await = None;
+        } else {
+            *self.stdin.lock().await = None;
+            if tokio::time::timeout(CLOSE_GRACE, self.wait_exit()).await.is_err() {
+                self.kill().await;
+            }
         }
         self.release_held();
         let _ = self.mapper.close_children(TurnEndReason::Completed).await;
@@ -1986,7 +1993,9 @@ impl Process {
     /// it is not permission to spawn another runtime over that authority.
     pub async fn close_for_replacement(mut self) -> anyhow::Result<()> {
         self.track().await?;
-        *self.stdin.lock().await = None;
+        if self.held.is_none() {
+            *self.stdin.lock().await = None;
+        }
         self.kill().await;
         let pg = self.pgid.ok_or_else(|| anyhow::anyhow!("Claude Code process group is unknown"))?;
         anyhow::ensure!(
@@ -1994,6 +2003,7 @@ impl Process {
             "Claude Code replacement is blocked until process group {} confirms absence",
             pg
         );
+        *self.stdin.lock().await = None;
         self.release_held();
         let _ = self.mapper.close_children(TurnEndReason::Completed).await;
         Ok(())
@@ -2001,8 +2011,11 @@ impl Process {
 
     /// Stops it and its background tasks now.
     pub async fn stop(mut self) {
-        *self.stdin.lock().await = None;
+        if self.held.is_none() {
+            *self.stdin.lock().await = None;
+        }
         self.kill().await;
+        *self.stdin.lock().await = None;
         if let Some(obs) = &self.mapper.observer {
             obs.tools.background.close_native(&self.mapper.scope, c6_tools::TaskState::Lost);
         }

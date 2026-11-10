@@ -409,6 +409,29 @@ impl SessionManager {
         self.state_dir.join("claude")
     }
 
+    /// Only for a completed public rewind whose selected branch has no held
+    /// record. Unselected runtimes may be stopped, never adopted. Publication
+    /// of a new untouched intent must not race this destructive cleanup.
+    async fn stop_unmapped_claude(&self, session: &str, events: &[SessionEvent]) -> anyhow::Result<()> {
+        let handoff = events.iter().rev().find(|e| handoff_of(e).is_some()).map_or(0, |e| e.seq);
+        let rewound = events.iter().rev().find(|e| matches!(e.kind, Some(session_event::Kind::Rewound(_)))).map_or(0, |e| e.seq);
+        if rewound <= handoff {
+            return Ok(());
+        }
+        let _ownership = self.journal.claude_rewind_ownership.lock().await;
+        // Branch selection can precede a newly published pending intent.
+        // Recheck under the same gate as publication, before any signals.
+        let reset = self.journal.claude_rewind(session).await?;
+        anyhow::ensure!(!matches!(&reset, Some((_, 0))), "Claude Code rewind is not confirmed; retry Rewind before sending more input");
+        if !matches!(reset, Some((_, applied)) if applied > handoff && applied >= rewound) {
+            // Reconstruction of completed history, not reset initialization
+            // or retry. Cleanup performs journal writes, but never prepares
+            // a reset and never holds a database transaction across waits.
+            crate::claude_code::stop_held_for_rewind(&self.claude_dir().join("held"), session, &self.journal).await?;
+        }
+        Ok(())
+    }
+
     /// Closes turns left open by a crash or kill.
     pub async fn recover(&self) -> anyhow::Result<()> {
         // Claude Code processes the previous worker left go first: their
@@ -3472,6 +3495,7 @@ impl Actor {
         let events = self.journal.events_after(&self.writer.session_id, 0, u32::MAX).await?;
         let conversation = journal_claude_conversation(&self.journal, &self.writer.session_id, &self.spec, &events).await?.id;
         let Some((record, token)) = crate::claude_code::Process::held_record(&held, &conversation)? else {
+            self.manager.stop_unmapped_claude(&self.writer.session_id, &events).await?;
             crate::claude_code::confirm_stopped(&self.journal, &self.writer.session_id, std::time::Duration::ZERO).await?;
             return Ok(());
         };
@@ -3988,7 +4012,11 @@ async fn claude_turn(
     if end.no_conversation
         && let Some(bin) = &bin
     {
-        drop(p);
+        // The initial inputs already have User/TurnStarted receipts and are
+        // replayed below with opened=true. Only unrecorded joining inputs
+        // return to the inbox, before fallible cleanup can consume Process.
+        inbox.lock().unwrap().requeue(p.take_unsent());
+        p.close_for_replacement().await?;
         p = match Process::spawn_held(
             &claude_dir.join("held"),
             session,
@@ -6416,6 +6444,101 @@ for line in sys.stdin:
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn metadata_loss_cleanup_serializes_pending_publication_and_retry_authorization() {
+        if !c6_testkit::have("python3") {
+            return;
+        }
+        for publication_first in [true, false] {
+            let (dir, manager) = rewind_test_manager().await;
+            let held = manager.claude_dir().join("held");
+            let _cleanup = crate::claude_code::tests::HeldFixtureCleanup(held.clone());
+            let (spec, started, bin) = rewind_held_fixture(dir.path());
+            let events = [
+                ev(1, session_event::Kind::Started(started)),
+                user(2, "kept"),
+                user(3, "removed"),
+                ev(4, session_event::Kind::Rewound(Rewound { command_id: "completed".into(), to_seq: 3, ..Default::default() })),
+            ];
+            manager.journal.import("s", &spec, &events).await.unwrap();
+            leave_rewind_held(&manager, &spec, &bin, dir.path(), "s");
+            c6_testkit::eventually("the unselected held fixture to start", async || {
+                held_trace(dir.path()).iter().any(|v| v["kind"] == "spawn").then_some(())
+            })
+            .await;
+            let meta_path = held.join("s/meta.json");
+            let meta_before = std::fs::read(&meta_path).unwrap();
+            let meta: serde_json::Value = serde_json::from_slice(&meta_before).unwrap();
+            let pg = nix::unistd::Pid::from_raw(meta["pgid"].as_i64().unwrap() as i32);
+            assert!(nix::sys::signal::killpg(pg, None).is_ok());
+            // Exactly the stale selection that previously authorized cleanup:
+            // public Rewound, missing mapping, and no selected held record.
+            let selected = journal_claude_conversation(&manager.journal, "s", &spec, &events).await.unwrap();
+            assert!(!selected.resume);
+            assert!(crate::claude_code::Process::held_record(&held, &selected.id).unwrap().is_none());
+            let reset = crate::claude_code::Reset {
+                command_id: "new-pending".into(),
+                to_seq: 2,
+                session_id: "never-initialized".into(),
+                untouched: true,
+                ..Default::default()
+            };
+            let ownership = manager.journal.claude_rewind_ownership.lock().await;
+            let publish = async {
+                manager.journal.prepare_claude_rewind("s", &reset).await?;
+                if !publication_first {
+                    assert_eq!(
+                        nix::sys::signal::killpg(pg, None),
+                        Err(nix::errno::Errno::ESRCH),
+                        "a new untouched intent must not publish until destructive cleanup confirms absence"
+                    );
+                }
+                Ok::<(), anyhow::Error>(())
+            };
+            let authorize = manager.journal.authorize_claude_rewind_retry("s", "new-pending", "retry");
+            let cleanup = manager.stop_unmapped_claude("s", &events);
+            tokio::pin!(publish, authorize, cleanup);
+            // Poll once while the gate is held to enqueue these real paths in
+            // a deterministic FIFO order, without sleeps or a global hook.
+            std::future::poll_fn(|cx| {
+                if !publication_first {
+                    assert!(std::future::Future::poll(cleanup.as_mut(), cx).is_pending());
+                }
+                assert!(std::future::Future::poll(publish.as_mut(), cx).is_pending());
+                assert!(std::future::Future::poll(authorize.as_mut(), cx).is_pending());
+                if publication_first {
+                    assert!(std::future::Future::poll(cleanup.as_mut(), cx).is_pending());
+                }
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert!(manager.journal.claude_rewind("s").await.unwrap().is_none());
+            assert_eq!(std::fs::read(&meta_path).unwrap(), meta_before);
+            drop(ownership);
+            let (published, authorized, cleaned) = tokio::join!(publish, authorize, cleanup);
+            published.unwrap();
+            assert!(authorized.unwrap());
+            if publication_first {
+                assert!(cleaned.unwrap_err().to_string().contains("not confirmed"));
+                assert!(nix::sys::signal::killpg(pg, None).is_ok(), "untouched pending intent must preserve the owned runtime");
+                assert_eq!(std::fs::read(&meta_path).unwrap(), meta_before, "no destructive cleanup beneath an untouched intent");
+                assert!(manager.journal.claude_processes("s").await.unwrap().is_empty(), "cleanup must not even track/signal the group");
+            } else {
+                cleaned.unwrap();
+                assert_eq!(nix::sys::signal::killpg(pg, None), Err(nix::errno::Errno::ESRCH));
+                assert!(!meta_path.exists(), "cleanup must finish before pending publication can proceed");
+            }
+            let (pending, applied) = manager.journal.claude_rewind("s").await.unwrap().unwrap();
+            assert_eq!(applied, 0);
+            let mut expected = reset.clone();
+            expected.retries.push("retry".into());
+            assert_eq!(serde_json::to_value(pending).unwrap(), serde_json::to_value(expected).unwrap());
+            assert_eq!(manager.journal.events_after("s", 0, u32::MAX).await.unwrap().len(), events.len());
+            assert!(held_trace(dir.path()).iter().all(|v| v["kind"] == "spawn"), "neither ordering may initialize/send/retry");
+            crate::claude_code::stop_held_for_rewind(&held, "s", &manager.journal).await.unwrap();
+        }
     }
 
     #[tokio::test]

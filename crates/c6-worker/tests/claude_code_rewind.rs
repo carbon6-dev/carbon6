@@ -20,7 +20,7 @@ fn fake_claude(dir: &Path) -> PathBuf {
     std::fs::write(
         &path,
         r#"#!/usr/bin/env python3
-import json, socket, sys, uuid
+import json, os, socket, sys, uuid
 from pathlib import Path
 if '--version' in sys.argv:
     print('fake Claude rewind CLI'); sys.exit(0)
@@ -40,9 +40,16 @@ def save():
     history_file(sid).write_text(json.dumps(history))
 resume, chosen, cutoff = arg('--resume'), arg('--session-id'), arg('--resume-session-at')
 sid = chosen or resume
-log('launch', args=args, sid=sid, resume=resume, cutoff=cutoff)
+log('launch', args=args, sid=sid, resume=resume, cutoff=cutoff, pgid=os.getpgrp())
 if cutoff and Path('unsupported-cutoff').exists():
     print('unknown option --resume-session-at', file=sys.stderr); sys.exit(2)
+if resume and not history_file(resume).exists():
+    if Path('missing-resume.sock').exists():
+        with socket.socket(socket.AF_UNIX) as gate:
+            gate.connect('missing-resume.sock')
+            gate.sendall(b'missing\n')
+            assert gate.recv(2) == b'ok'
+    print('No conversation found with session ID', file=sys.stderr); sys.exit(1)
 history = load(resume) if resume else []
 if cutoff:
     assert '--fork-session' in args and chosen and chosen != resume
@@ -559,6 +566,69 @@ async fn claude_rewind_resets_native_history_before_acknowledging_and_fails_clos
     assert!(records(first.path(), "launch")[1]["resume"].is_null());
     clean_context(&records(first.path(), "prompt").pop().unwrap());
 
+    // A confirmed fresh initialization need not have saved a native
+    // transcript before its first prompt. Quiet promotion then encounters a
+    // real held resume failure: the exited CLI leaves its keeper alive.
+    // Inline fallback must close that entire group, not merely drop Process,
+    // and must preserve late, unrecorded inputs without duplicating receipts.
+    let missing = tempfile::tempdir().unwrap();
+    let missing_id = api.create(missing.path(), "DROP_PRIVATE").await;
+    let events = api.idle(&missing_id, 1).await;
+    api.rewind(&missing_id, user_seq(&events, "DROP_PRIVATE")).await;
+    api.rewound(&missing_id, 1).await;
+    let (fresh, applied) = journal.claude_rewind(&missing_id).await.unwrap().unwrap();
+    assert!(fresh.fresh && applied != 0);
+    std::fs::remove_file(missing.path().join(format!(".fake-history-{}.json", fresh.session_id))).unwrap();
+    let gate = UnixListener::bind(missing.path().join("missing-resume.sock")).unwrap();
+    api.say(&missing_id, "MISSING_HISTORY_REPLACEMENT").await;
+    let (mut pending, _) = within("held resume to discover its missing native transcript", gate.accept()).await.unwrap();
+    let mut signal = [0; 8];
+    within("missing-resume gate readiness", pending.read_exact(&mut signal)).await.unwrap();
+    assert_eq!(&signal, b"missing\n");
+    let launches = records(missing.path(), "launch");
+    let resumed = launches.last().unwrap();
+    assert_eq!(resumed["resume"].as_str(), Some(fresh.session_id.as_str()));
+    let pg = nix::unistd::Pid::from_raw(resumed["pgid"].as_i64().unwrap() as i32);
+    let held_record: Value =
+        serde_json::from_slice(&std::fs::read(state.path().join("claude/held").join(&fresh.session_id).join("meta.json")).unwrap())
+            .unwrap();
+    assert_eq!(held_record["pgid"].as_i64(), Some(i64::from(pg.as_raw())));
+    assert!(nix::sys::signal::killpg(pg, None).is_ok(), "this regression requires an actually held runtime");
+    api.say(&missing_id, "JOIN_DURING_MISSING_RESUME").await;
+    let joining = eventually("a late input to be written but unconfirmed before the resume failure", async || {
+        api.detail(&missing_id).await.queued.into_iter().find(|q| q.text == "JOIN_DURING_MISSING_RESUME" && q.with_agent)
+    })
+    .await;
+    assert!(!api.events(&missing_id).await.iter().any(|e| matches!(&e.kind,
+        EventKind::User { command_id, .. } if command_id == &joining.command_id)));
+    pending.write_all(b"ok").await.unwrap();
+    drop(pending);
+    drop(gate);
+    std::fs::remove_file(missing.path().join("missing-resume.sock")).unwrap();
+    let recovered = eventually("fresh fallback to take the original and late input exactly once", async || {
+        let events = api.events(&missing_id).await;
+        assert!(!events.iter().any(|e| matches!(e.kind, EventKind::Error { .. })), "fallback must close the held keeper before spawning");
+        for text in ["MISSING_HISTORY_REPLACEMENT", "JOIN_DURING_MISSING_RESUME"] {
+            let count = events.iter().filter(|e| matches!(&e.kind, EventKind::User { text: t, .. } if t == text)).count();
+            assert!(count <= 1, "{text} must not acquire duplicate User receipts");
+            if count == 0 {
+                return None;
+            }
+        }
+        let detail = api.detail(&missing_id).await;
+        (detail.queued.is_empty() && detail.session.status == SessionStatus::Idle).then_some(events)
+    })
+    .await;
+    assert_eq!(rewinds(&recovered), 1, "native transcript fallback must not replay Rewind");
+    assert_eq!(nix::sys::signal::killpg(pg, None), Err(nix::errno::Errno::ESRCH), "the failed resume's keeper must be gone");
+    let prompts = records(missing.path(), "prompt");
+    for text in ["MISSING_HISTORY_REPLACEMENT", "JOIN_DURING_MISSING_RESUME"] {
+        assert_eq!(prompts.iter().filter(|p| p["value"]["message"]["content"].as_str().is_some_and(|t| t.contains(text))).count(), 1);
+    }
+    for prompt in &prompts[1..] {
+        clean_context(prompt);
+    }
+
     // A real worker-runtime restart must use the reset conversation, never
     // --resume the abandoned pre-rewind ID (both native A and fallback B).
     let held_launches = [records(a.path(), "launch").len(), records(b.path(), "launch").len()];
@@ -608,7 +678,21 @@ async fn claude_rewind_resets_native_history_before_acknowledging_and_fails_clos
     // Restored public events may outlive the local chain metadata. A
     // historical Rewound must never be treated as permission to resume the
     // original session ID: use a fresh kept-history handoff instead.
+    let unselected = std::fs::read_dir(state.path().join("claude/held"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let meta: Value = serde_json::from_slice(&std::fs::read(entry.path().join("meta.json")).ok()?).ok()?;
+            (meta["session"].as_str() == Some(a_id.as_str())).then(|| nix::unistd::Pid::from_raw(meta["pgid"].as_i64().unwrap() as i32))
+        })
+        .collect::<Vec<_>>();
+    assert!(!unselected.is_empty(), "metadata-loss reconstruction must face an actually surviving held runtime");
+    let rewinds_before_loss = rewinds(&api.events(&a_id).await);
     worker.stop().await;
+    assert!(
+        unselected.iter().all(|pg| nix::sys::signal::killpg(*pg, None).is_ok()),
+        "held runtimes survive the worker, not just the actor"
+    );
     let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", state.path().join("journal.db").display())).await.unwrap();
     for sql in ["DELETE FROM claude_turns WHERE session_id = ?", "DELETE FROM claude_rewinds WHERE session_id = ?"] {
         sqlx::query(sql).bind(&a_id).execute(&pool).await.unwrap();
@@ -616,7 +700,12 @@ async fn claude_rewind_resets_native_history_before_acknowledging_and_fails_clos
     pool.close().await;
     let worker = WorkerProcess::start(state.path()).await;
     api.say(&a_id, "AFTER_METADATA_LOSS").await;
-    api.idle(&a_id, 5).await;
+    let reconstructed = api.idle(&a_id, 5).await;
+    assert_eq!(rewinds(&reconstructed), rewinds_before_loss, "reconstruction must not replay the completed Rewind");
+    assert!(
+        unselected.iter().all(|pg| nix::sys::signal::killpg(*pg, None) == Err(nix::errno::Errno::ESRCH)),
+        "unselected runtimes must be stopped before fresh kept-history input"
+    );
     let fresh = records(a.path(), "launch").pop().unwrap();
     assert!(fresh["resume"].is_null(), "missing chain metadata requires conservative fresh fallback: {fresh}");
     let after = records(a.path(), "prompt").pop().unwrap();
