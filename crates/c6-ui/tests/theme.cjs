@@ -272,6 +272,9 @@ function unitTests() {
 
 async function firstPaint(browser, origin, choice, os) {
   const context = await browser.newContext({ colorScheme: os, serviceWorkers: 'block' });
+  const deadline = Number(process.env.C6_TEST_DEADLINE_SECS || 15) * 1000;
+  context.setDefaultTimeout(deadline);
+  context.setDefaultNavigationTimeout(deadline);
   let release, held = false;
   const gate = new Promise(resolve => { release = resolve; });
   await context.route('**/*.wasm', async route => { held = true; await gate; await route.abort().catch(() => {}); });

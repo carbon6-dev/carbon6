@@ -169,6 +169,8 @@ async function fixture(browser, origin, viewport, theme, motion, started, contex
   debug('new context');
   const context = await browser.newContext({ viewport, hasTouch: phoneViewport(viewport),
     isMobile: phoneViewport(viewport), reducedMotion: motion.os, colorScheme: theme, serviceWorkers: 'block', ...contextOptions });
+  context.setDefaultTimeout(DEADLINE);
+  context.setDefaultNavigationTimeout(DEADLINE);
   debug('new page');
   const page = await context.newPage();
   debug('configure');
