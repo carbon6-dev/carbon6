@@ -15,6 +15,20 @@ use sqlx::Row;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous};
 use tokio::sync::Notify;
 
+/// A known live writer or missing stop/identity confirmation, not a storage
+/// or decoding failure. Callers may refuse an operation without stopping its
+/// actor only for this classified ownership barrier.
+#[derive(Debug)]
+pub(crate) struct StopUnconfirmed(pub(crate) String);
+
+impl std::fmt::Display for StopUnconfirmed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StopUnconfirmed {}
+
 pub struct Journal {
     pool: SqlitePool,
     /// Serialize reset publication/retry authorization with exceptional
@@ -128,11 +142,13 @@ impl Journal {
             let task: String = row.get("task_id");
             let pgid: Option<i32> = row.try_get("pgid")?;
             let Some(pgid) = pgid else {
-                anyhow::bail!("Background shell {task} has unknown writer identity (incomplete launch or SSH); cannot confirm it stopped");
+                anyhow::bail!(StopUnconfirmed(format!(
+                    "Background shell {task} has unknown writer identity (incomplete launch or SSH); cannot confirm it stopped"
+                )));
             };
             anyhow::ensure!(
                 nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), None) == Err(nix::errno::Errno::ESRCH),
-                "Background shell {task} process group {pgid} has not confirmed that it stopped"
+                StopUnconfirmed(format!("Background shell {task} process group {pgid} has not confirmed that it stopped"))
             );
             sqlx::query("UPDATE shell_writers SET absent = 1 WHERE writer_id = ?")
                 .bind(row.get::<String, _>("writer_id"))
@@ -160,8 +176,9 @@ impl Journal {
         groups
             .into_iter()
             .map(|pgid| {
-                let pgid = i32::try_from(pgid)?;
-                anyhow::ensure!(pgid > 0, "Claude Code process group is unknown");
+                let pgid = i32::try_from(pgid)
+                    .map_err(|error| anyhow::Error::new(error).context(StopUnconfirmed("Claude Code process group is unknown".into())))?;
+                anyhow::ensure!(pgid > 0, StopUnconfirmed("Claude Code process group is unknown".into()));
                 Ok(pgid)
             })
             .collect()

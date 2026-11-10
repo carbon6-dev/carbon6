@@ -21,6 +21,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::journal::StopUnconfirmed;
+
 /// Tool profile recorded for Claude Code sessions.
 pub const PROFILE: &str = "claude_code";
 
@@ -739,7 +741,10 @@ pub async fn confirm_stopped(journal: &crate::journal::Journal, session_id: &str
             match killpg(Pid::from_raw(pgid), None) {
                 Err(nix::errno::Errno::ESRCH) => journal.untrack_claude_process(session_id, pgid).await?,
                 Ok(()) => pending.push(pgid),
-                Err(e) => anyhow::bail!("Cannot confirm Claude Code process group {pgid} stopped: {e}"),
+                Err(error) => {
+                    return Err(anyhow::Error::new(error)
+                        .context(StopUnconfirmed(format!("Cannot confirm Claude Code process group {pgid} stopped"))));
+                }
             }
         }
         if pending.is_empty() {
@@ -747,7 +752,7 @@ pub async fn confirm_stopped(journal: &crate::journal::Journal, session_id: &str
         }
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
-            "Claude Code process groups have not confirmed that they stopped: {pending:?}"
+            StopUnconfirmed(format!("Claude Code process groups have not confirmed that they stopped: {pending:?}"))
         );
         tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + Duration::from_millis(25))).await;
     }
@@ -802,16 +807,22 @@ pub(crate) fn confirm_held_stopped(held: &Path, session: &str) -> anyhow::Result
         if !dir.is_dir() {
             continue;
         }
-        let meta: HeldMeta = serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?)?;
-        anyhow::ensure!(!meta.session.is_empty(), "Held Claude Code session identity is unknown");
+        let data = std::fs::read(dir.join("meta.json")).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                anyhow::Error::new(error).context(StopUnconfirmed("Held Claude Code session identity is unknown (missing metadata)".into()))
+            } else {
+                error.into()
+            }
+        })?;
+        let meta: HeldMeta = serde_json::from_slice(&data)?;
+        anyhow::ensure!(!meta.session.is_empty(), StopUnconfirmed("Held Claude Code session identity is unknown".into()));
         if meta.session != session {
             continue;
         }
-        anyhow::ensure!(meta.pgid > 0, "Held Claude Code process group is unknown");
+        anyhow::ensure!(meta.pgid > 0, StopUnconfirmed("Held Claude Code process group is unknown".into()));
         anyhow::ensure!(
             killpg(Pid::from_raw(meta.pgid), None) == Err(nix::errno::Errno::ESRCH),
-            "Held Claude Code process group {} has not confirmed that it stopped",
-            meta.pgid
+            StopUnconfirmed(format!("Held Claude Code process group {} has not confirmed that it stopped", meta.pgid))
         );
     }
     Ok(())

@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::checkpoint::Checkpoints;
-use crate::journal::Journal;
+use crate::journal::{Journal, StopUnconfirmed};
 use crate::link::HeadLink;
 
 /// Cheap to clone: a session's actor holds one to start its subagents.
@@ -264,16 +264,6 @@ const NOTICE_RECOVERY_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 /// Why a rewind may not go back past a handoff (the head says the same).
 const HANDOFF_REWIND: &str = "can only rewind to a message after the last switch between Claude Code and carbon6's agent: \
                               the other runtime's conversation cannot be taken back";
-
-/// An expected restore admission refusal, not a failed journal operation.
-#[derive(Debug)]
-struct RewindGuardRefused;
-
-impl std::fmt::Display for RewindGuardRefused {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Descendant stop confirmation is required before restoring files")
-    }
-}
 
 impl SessionManager {
     pub fn new(journal: Arc<Journal>, link: Arc<HeadLink>, worktrees: PathBuf) -> Self {
@@ -1017,10 +1007,15 @@ impl SessionManager {
                 if let Some(session_event::Kind::SubagentSpawned(child)) = &event.kind {
                     anyhow::ensure!(
                         child.remote.is_none(),
-                        "Remote subagent {} cannot confirm quiescence; stop confirmation is required before rewinding",
-                        child.child_session_id
+                        StopUnconfirmed(format!(
+                            "Remote subagent {} cannot confirm quiescence; stop confirmation is required before rewinding",
+                            child.child_session_id
+                        ))
                     );
-                    anyhow::ensure!(!child.child_session_id.is_empty(), "A subagent's identity is unknown; cannot confirm it stopped");
+                    anyhow::ensure!(
+                        !child.child_session_id.is_empty(),
+                        StopUnconfirmed("A subagent's identity is unknown; cannot confirm it stopped".into())
+                    );
                     if seen.insert(child.child_session_id.clone()) {
                         pending.push(child.child_session_id.clone());
                     }
@@ -1040,9 +1035,9 @@ impl SessionManager {
             }
             .await;
             if let Err(error) = claude_stopped {
-                anyhow::bail!(
-                    "Subagent {id} has a live or unconfirmed Claude Code runtime; stop confirmation is required before rewinding: {error:#}"
-                );
+                return Err(error.context(format!(
+                    "Subagent {id} has a live or unconfirmed Claude Code runtime; stop confirmation is required before rewinding"
+                )));
             }
             let handle = self.actors.lock().unwrap().get(&id).filter(|h| !h.tx.is_closed()).cloned();
             let registry = if let Some(handle) = handle {
@@ -1050,17 +1045,23 @@ impl SessionManager {
                     !handle.running.load(std::sync::atomic::Ordering::SeqCst)
                         && handle.inbox.lock().unwrap().queue.is_empty()
                         && !handle.tools.background.list().iter().any(|t| t.running),
-                    "Subagent {id} is still working; stop or wait for it before retrying Rewind"
+                    StopUnconfirmed(format!("Subagent {id} is still working; stop or wait for it before retrying Rewind"))
                 );
                 // A mailbox barrier also covers inputs/notices not yet moved
                 // into Inbox and notices held on the actor's hourly timer.
                 let (reply, idle) = tokio::sync::oneshot::channel();
-                handle.tx.send(ActorMsg::RewindIdle(reply)).map_err(|_| anyhow::anyhow!("Subagent {id} stopped before confirming idle"))?;
+                handle
+                    .tx
+                    .send(ActorMsg::RewindIdle(reply))
+                    .map_err(|_| StopUnconfirmed(format!("Subagent {id} stopped before confirming idle")))?;
                 let idle = tokio::time::timeout(std::time::Duration::from_secs(5), idle)
                     .await
-                    .map_err(|_| anyhow::anyhow!("Subagent {id} did not confirm idle"))?
-                    .map_err(|_| anyhow::anyhow!("Subagent {id} stopped before confirming idle"))?;
-                anyhow::ensure!(idle, "Subagent {id} has pending work; stop or wait for it before retrying Rewind");
+                    .map_err(|_| StopUnconfirmed(format!("Subagent {id} did not confirm idle")))?
+                    .map_err(|_| StopUnconfirmed(format!("Subagent {id} stopped before confirming idle")))?;
+                anyhow::ensure!(
+                    idle,
+                    StopUnconfirmed(format!("Subagent {id} has pending work; stop or wait for it before retrying Rewind"))
+                );
                 if seal_contexts {
                     handle.tools.background.cancel_shell_contexts();
                 }
@@ -1069,7 +1070,7 @@ impl SessionManager {
                 Vec::new()
             };
             let Some((_, events)) = self.journal.load_session(&id).await? else {
-                anyhow::bail!("Subagent {id} has no local history; cannot confirm it stopped");
+                anyhow::bail!(StopUnconfirmed(format!("Subagent {id} has no local history; cannot confirm it stopped")));
             };
             rewind_child_history_stopped(&id, &events, &registry)?;
             descendants = events;
@@ -1723,7 +1724,7 @@ fn withdrawn_input(sources: &HashSet<String>, input: &PendingInput) -> bool {
 /// A missing actor after restart is not evidence that its work stopped.
 /// Require a durable turn boundary, no pending notices, and closed raw tasks.
 fn rewind_child_history_stopped(id: &str, events: &[SessionEvent], registry: &[c6_tools::TaskInfo]) -> anyhow::Result<()> {
-    anyhow::ensure!(!registry.iter().any(|t| t.running), "Subagent {id} has running background tasks");
+    anyhow::ensure!(!registry.iter().any(|t| t.running), StopUnconfirmed(format!("Subagent {id} has running background tasks")));
     let last_work = events.iter().rev().find_map(|event| match &event.kind {
         Some(kind @ (session_event::Kind::User(_) | session_event::Kind::TurnStarted(_) | session_event::Kind::TurnEnded(_))) => Some(kind),
         _ => None,
@@ -1732,9 +1733,9 @@ fn rewind_child_history_stopped(id: &str, events: &[SessionEvent], registry: &[c
         matches!(last_work, Some(session_event::Kind::TurnEnded(end))
             if matches!(TurnEndReason::try_from(end.reason),
                 Ok(TurnEndReason::Completed | TurnEndReason::Interrupted | TurnEndReason::Error))),
-        "Subagent {id} has no confirmed terminal turn boundary"
+        StopUnconfirmed(format!("Subagent {id} has no confirmed terminal turn boundary"))
     );
-    anyhow::ensure!(notices_of(events).2.is_empty(), "Subagent {id} has pending notices");
+    anyhow::ensure!(notices_of(events).2.is_empty(), StopUnconfirmed(format!("Subagent {id} has pending notices")));
     let mut tasks = HashMap::new();
     for event in events {
         if let Some(session_event::Kind::BackgroundTask(task)) = &event.kind {
@@ -1744,8 +1745,7 @@ fn rewind_child_history_stopped(id: &str, events: &[SessionEvent], registry: &[c
     for task in tasks.values() {
         anyhow::ensure!(
             matches!(task.state.as_str(), "finished" | "failed" | "lost" | "stopped" | "stopped_by_user"),
-            "Subagent {id} has an unclosed background task {}",
-            task.task_id
+            StopUnconfirmed(format!("Subagent {id} has an unclosed background task {}", task.task_id))
         );
         if task.state == "lost" && task.kind != "agent" {
             let pgid = events.iter().find_map(|event| match &event.kind {
@@ -1758,15 +1758,13 @@ fn rewind_child_history_stopped(id: &str, events: &[SessionEvent], registry: &[c
                 pgid.is_some_and(
                     |pgid| pgid > 0 && nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), None) == Err(nix::errno::Errno::ESRCH)
                 ),
-                "Subagent {id} lost background task {} without confirming its process stopped",
-                task.task_id
+                StopUnconfirmed(format!("Subagent {id} lost background task {} without confirming its process stopped", task.task_id))
             );
         } else if task.state == "lost" {
             anyhow::ensure!(
                 events.iter().any(|event| matches!(&event.kind,
                     Some(session_event::Kind::SubagentSpawned(child)) if child.background_task_id == task.task_id)),
-                "Subagent {id} lost background task {} without a known child",
-                task.task_id
+                StopUnconfirmed(format!("Subagent {id} lost background task {} without a known child", task.task_id))
             );
         }
     }
@@ -2230,7 +2228,7 @@ impl Actor {
                 }
                 if let Err(e) = self.rewind(command_id.clone(), to_seq, restore).await {
                     error!(session = %self.writer.session_id, "rewinding: {e:#}");
-                    if !self.runs_claude_code() && !e.is::<RewindGuardRefused>() {
+                    if !self.runs_claude_code() && !e.is::<StopUnconfirmed>() {
                         // No CLI reset intent to roll back. Preserve the
                         // native actor's existing fail-closed journal-error path.
                         let _ = self
@@ -2243,7 +2241,11 @@ impl Actor {
                             .await;
                         return;
                     }
-                    let retries: Vec<_> = rewinds.iter().map(|(id, _, _)| id.clone()).filter(|id| id != &command_id).collect();
+                    let retries: Vec<_> = if self.runs_claude_code() {
+                        rewinds.iter().map(|(id, _, _)| id.clone()).filter(|id| id != &command_id).collect()
+                    } else {
+                        Vec::new()
+                    };
                     match self.rewind_failed(&command_id, &e, &retries).await {
                         Ok(blocked) => rewind_blocked = blocked,
                         Err(e) => {
@@ -2251,8 +2253,14 @@ impl Actor {
                             return;
                         }
                     }
-                    rewinds.clear();
-                    break;
+                    if self.runs_claude_code() {
+                        rewinds.clear();
+                        break;
+                    }
+                    // Ordinary Rewinds are independent commands, not CLI
+                    // reset retries. A refused restore must not reject a
+                    // queued, exempt conversation-only Rewind.
+                    continue;
                 }
                 rewind_blocked = false;
             }
@@ -2673,6 +2681,23 @@ impl Actor {
                                 }
                             }.await;
                             if let Err(e) = check {
+                                if !self.runs_claude_code() {
+                                    if !e.is::<StopUnconfirmed>() {
+                                        let _ = self.writer.append(session_event::Kind::Error(ErrorEvent {
+                                            message: format!(
+                                                "Rewind could not be confirmed; no further messages were sent. Retry Rewind after resolving this: {e:#}"
+                                            ),
+                                        })).await;
+                                        return;
+                                    }
+                                    match self.rewind_failed(&command_id, &e, &[]).await {
+                                        Ok(blocked) => rewind_blocked = blocked,
+                                        Err(e) => { error!("recording Rewind refusal: {e:#}"); return; }
+                                    }
+                                    // Do not apply Claude retry grouping to
+                                    // independent ordinary-loop commands.
+                                    continue;
+                                }
                                 let pending = self.journal.claude_rewind(&self.writer.session_id).await;
                                 let id = match &pending { Ok(Some((r, 0))) => r.command_id.as_str(), _ => &command_id };
                                 let mut retries: Vec<_> = rewinds.iter().map(|(id, _, _)| id.clone()).filter(|queued| queued != id).collect();
@@ -3178,7 +3203,7 @@ impl Actor {
             // descendant CLI writing this tree. Raw history includes retained
             // and previously withdrawn children. Conversation-only Rewind
             // keeps its existing runtime-specific admission behavior.
-            self.manager.rewind_children_stopped(&events).await.map_err(|error| error.context(RewindGuardRefused))?;
+            self.manager.rewind_children_stopped(&events).await?;
             let effective = c6_agent::effective_events(&events);
             let commit = effective.iter().filter(|e| e.seq < to_seq).rev().find_map(|e| match &e.kind {
                 Some(session_event::Kind::Checkpoint(c)) if !c.commit.is_empty() => Some(c.commit.clone()),
@@ -7454,7 +7479,7 @@ for line in sys.stdin:
             manager.journal.command_rejection("late-restore").await.unwrap()
         })
         .await;
-        assert!(rejection.contains("Descendant stop confirmation") && rejection.contains("Subagent child"), "{rejection}");
+        assert!(rejection.contains("live or unconfirmed Claude Code runtime") && rejection.contains("Subagent child"), "{rejection}");
         c6_testkit::eventually("queued input survives expected execution refusal", async || {
             manager
                 .journal
@@ -7489,6 +7514,173 @@ for line in sys.stdin:
         assert!(cli.try_wait().unwrap().is_none(), "refusal must not stop the child process");
         assert_eq!(manager.journal.claude_processes("child").await.unwrap(), [pgid]);
         cli.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rewind_file_restore_dispatch_refusal_preserves_already_queued_conversation_rewind() {
+        let (state, manager) = rewind_test_manager().await;
+        let work = tempfile::tempdir().unwrap();
+        let file = work.path().join("owned.txt");
+        std::fs::write(&file, "checkpoint").unwrap();
+        let checkpoint = Checkpoints::new(state.path(), "root", work.path()).snapshot().await.unwrap();
+        std::fs::write(&file, "unrestored").unwrap();
+        let mut link = rewind_child_link("child");
+        link.seq = 3;
+        let events = [
+            ev(
+                1,
+                session_event::Kind::Started(SessionStarted {
+                    cwd: work.path().display().to_string(),
+                    tool_profile: "generic".into(),
+                    ..Default::default()
+                }),
+            ),
+            ev(2, session_event::Kind::Checkpoint(Checkpoint { commit: checkpoint, error: String::new() })),
+            link,
+            user(4, "target"),
+        ];
+        manager.journal.import("root", &CreateSession::default(), &events).await.unwrap();
+        manager.journal.import("child", &CreateSession::default(), &rewind_child_events()).await.unwrap();
+        let (outbound, mut messages) = mpsc::channel(128);
+        manager.link.connected(outbound);
+        manager
+            .handle(SessionCommand {
+                session_id: "root".into(),
+                command_id: "running-input".into(),
+                kind: Some(session_command::Kind::Input(c6_proto::UserInput {
+                    text: "wait for credentials".into(),
+                    human_origin: true,
+                    ..Default::default()
+                })),
+            })
+            .await
+            .unwrap();
+        // Hold the real turn in credential acquisition. Cancellation does
+        // not complete that acquisition, so Rewinds really remain queued.
+        c6_testkit::within("turn waiting for credentials", async {
+            loop {
+                let message = messages.recv().await.unwrap();
+                if matches!(message.msg, Some(c6_proto::worker_msg::Msg::CredentialRequest(_))) {
+                    break;
+                }
+            }
+        })
+        .await;
+        let command = |id: &str, restore_files| SessionCommand {
+            session_id: "root".into(),
+            command_id: id.into(),
+            kind: Some(session_command::Kind::Rewind(c6_proto::Rewind { to_seq: 4, restore_files })),
+        };
+        manager.handle(command("queued-conversation", false)).await.unwrap();
+        let root = manager.actors.lock().unwrap().get("root").unwrap().clone();
+        root.tx.send(ActorMsg::SetSubagentModel { command_id: "conversation-is-queued".into(), model: None }).unwrap();
+        c6_testkit::eventually("conversation Rewind already processed into the actor queue", async || {
+            manager.journal.events_after("root", 0, u32::MAX).await.unwrap().iter().any(
+                |event| matches!(&event.kind, Some(session_event::Kind::SubagentModelSet(model)) if model.command_id == "conversation-is-queued"),
+            ).then_some(())
+        }).await;
+        assert!(root.running.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!manager.journal.is_applied("queued-conversation").await.unwrap());
+        let mut cli = tokio::process::Command::new("sleep").arg("300").process_group(0).kill_on_drop(true).spawn().unwrap();
+        manager.journal.track_claude_process("child", cli.id().unwrap() as i32).await.unwrap();
+        manager.handle(command("refused-file-restore", true)).await.unwrap();
+        let rejection = c6_testkit::eventually("file restore alone receives rejection", async || {
+            manager.journal.command_rejection("refused-file-restore").await.unwrap()
+        })
+        .await;
+        assert!(rejection.contains("Subagent child"), "{rejection}");
+        assert!(manager.journal.command_rejection("queued-conversation").await.unwrap().is_none());
+        assert!(
+            !manager.journal.is_applied("queued-conversation").await.unwrap(),
+            "the older conversation command is still queued, not rejected"
+        );
+        manager.link.disconnected(); // Release the cancelled turn without model/network access.
+        c6_testkit::eventually("previously queued conversation Rewind executes after restore refusal", async || {
+            manager.journal.events_after("root", 0, u32::MAX).await.unwrap().iter().any(
+                |event| matches!(&event.kind, Some(session_event::Kind::Rewound(rewound)) if rewound.command_id == "queued-conversation"),
+            ).then_some(())
+        })
+        .await;
+        assert!(manager.journal.command_rejection("queued-conversation").await.unwrap().is_none());
+        assert!(manager.journal.claude_rewind("root").await.unwrap().is_none());
+        assert!(!root.tx.is_closed());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "unrestored");
+        assert!(cli.try_wait().unwrap().is_none());
+        cli.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rewind_file_restore_dispatch_internal_descendant_decode_failure_remains_terminal() {
+        let (state, manager) = rewind_test_manager().await;
+        let work = tempfile::tempdir().unwrap();
+        let file = work.path().join("owned.txt");
+        std::fs::write(&file, "checkpoint").unwrap();
+        let checkpoint = Checkpoints::new(state.path(), "root", work.path()).snapshot().await.unwrap();
+        std::fs::write(&file, "unrestored").unwrap();
+        let mut link = rewind_child_link("child");
+        link.seq = 3;
+        let events = [
+            ev(
+                1,
+                session_event::Kind::Started(SessionStarted {
+                    cwd: work.path().display().to_string(),
+                    tool_profile: "generic".into(),
+                    ..Default::default()
+                }),
+            ),
+            ev(2, session_event::Kind::Checkpoint(Checkpoint { commit: checkpoint, error: String::new() })),
+            link,
+            user(4, "target"),
+        ];
+        manager.journal.import("root", &CreateSession::default(), &events).await.unwrap();
+        manager.journal.import("child", &CreateSession::default(), &rewind_child_events()).await.unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        manager.actors.lock().unwrap().insert(
+            "child".into(),
+            Handle {
+                tx,
+                tools: Arc::new(SessionTools::new(work.path().into())),
+                running: Arc::default(),
+                claude_code: Arc::default(),
+                inbox: Arc::default(),
+            },
+        );
+        manager
+            .handle(SessionCommand {
+                session_id: "root".into(),
+                command_id: "decode-file-restore".into(),
+                kind: Some(session_command::Kind::Rewind(c6_proto::Rewind { to_seq: 4, restore_files: true })),
+            })
+            .await
+            .unwrap();
+        let Some(ActorMsg::RewindIdle(admission)) = c6_testkit::within("valid admission child barrier", rx.recv()).await else {
+            panic!("expected admission child barrier")
+        };
+        admission.send(true).unwrap();
+        let Some(ActorMsg::RewindIdle(execution)) = c6_testkit::within("execution child barrier", rx.recv()).await else {
+            panic!("expected execution child barrier")
+        };
+        // Admission read a valid child history. Corrupt only its journal
+        // event now, so the final restore guard encounters a genuine decode
+        // failure after its mailbox barrier, not a protective refusal.
+        let db = sqlx::SqlitePool::connect(&format!("sqlite:{}", state.path().join("journal.db").display())).await.unwrap();
+        sqlx::query("UPDATE events SET data = ? WHERE session_id = 'child' AND seq = 1").bind(vec![0xffu8]).execute(&db).await.unwrap();
+        db.close().await;
+        execution.send(true).unwrap();
+        let root = manager.actors.lock().unwrap().get("root").unwrap().clone();
+        c6_testkit::eventually("internal guard failure retains terminal actor behavior", async || root.tx.is_closed().then_some(())).await;
+        let raw = manager.journal.events_after("root", 0, u32::MAX).await.unwrap();
+        assert!(raw.iter().any(|event| matches!(&event.kind, Some(session_event::Kind::Error(error))
+            if error.message.contains("no further messages were sent") && error.message.contains("decode"))));
+        assert!(!raw.iter().any(|event| matches!(event.kind, Some(session_event::Kind::Rewound(_)))));
+        assert!(
+            manager.journal.command_rejection("decode-file-restore").await.unwrap().is_none(),
+            "internal failure must not become a recoverable refusal receipt"
+        );
+        assert!(manager.journal.claude_rewind("root").await.unwrap().is_none());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "unrestored");
+        let error = manager.journal.events_after("child", 0, u32::MAX).await.unwrap_err();
+        assert!(error.is::<prost::DecodeError>() && !error.is::<StopUnconfirmed>(), "{error:#}");
     }
 
     // Unit-level guard coverage below calls rewind_preflight directly. The
@@ -7556,7 +7748,7 @@ for line in sys.stdin:
         let events = [rewind_child_link("child"), user(5, "target")];
         manager.rewind_preflight("root", &events, 5, false).await.unwrap();
         for (to_seq, restore_files) in [(5, true), (3, false)] {
-            let error = manager.rewind_preflight("root", &events, to_seq, restore_files).await.unwrap_err().to_string();
+            let error = format!("{:#}", manager.rewind_preflight("root", &events, to_seq, restore_files).await.unwrap_err());
             assert!(error.contains("Subagent s") && error.contains("Held Claude Code process group"), "{error}");
             assert_eq!(std::fs::read(record.join("meta.json")).unwrap(), before, "preflight must retain held ownership");
             assert!(!record.join("code").exists(), "preflight must not stop the held runtime");
