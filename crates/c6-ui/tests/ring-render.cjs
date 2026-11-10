@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 'use strict';
 
-// Production UI, private fake head. BASELINE=1 records the old inner-SVG
+// Production UI, private fake head. Default: one correctness run per theme.
+// PERF=1 keeps three runs per theme, the paced workload, CPU throttling, timing
+// samples, profiles/traces and the blocked-main-thread compositor challenge.
+// RUNS overrides either repetition count. BASELINE=1 records the old inner-SVG
 // animation without asserting the new compositor invariant. Timings are evidence,
 // never pass/fail thresholds: shared machines do not have a fixed frame budget.
 // PHONE=1 instead checks 320/360/390/430px, light/dark, Full/Reduced/Off,
@@ -15,6 +18,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { serve, fixture, settle, launchBrowser } = require('./motion.cjs');
 const phone = process.env.PHONE === '1';
+const perf = process.env.PERF === '1';
 const output = process.env.EVIDENCE || (phone ? '/tmp/q11-ring/row-link' : '/tmp/q3-ring');
 const baseline = process.env.BASELINE === '1';
 const phase = process.env.LABEL || (baseline ? 'before' : 'after');
@@ -27,7 +31,7 @@ const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const prose = (i, count = paragraphs) => `Q3 item ${i}\n\n` + ('A **rendered** paragraph with `inline code`, a [local link](/r/home/sessions/parent), and some ordinary transcript text.\n\n'.repeat(count)) +
   '\n```rust\nfn main() {\n    println!("a highlighted code block");\n}\n```\n\n| Column | Value |\n| --- | --- |\n| entry | measured |\n';
 
-function instrument() {
+function instrument({ perf }) {
   const NativeSocket = window.WebSocket;
   window.WebSocket = class extends NativeSocket {
     constructor(...args) {
@@ -35,6 +39,7 @@ function instrument() {
       this.addEventListener('message', message => {
         const data = JSON.parse(message.data);
         if (data.type === 'sessions' && window.__q3) __q3.snapshots++;
+        if (!perf) return;
         const text = data.type === 'event' && data.event.type === 'assistant' && data.event.blocks.find(b => b.type === 'text')?.text;
         const match = text && /^Q3 item (\d+)/.exec(text);
         if (!match || !window.__q3?.measuring) return;
@@ -44,7 +49,10 @@ function instrument() {
       });
     }
   };
-  window.__q3 = { tasks: [], frames: [], renders: [], snapshots: 0, measuring: false, pending: null };
+  // Snapshot arrival is a correctness signal even without timing observers.
+  window.__q3 = { snapshots: 0 };
+  if (!perf) return;
+  Object.assign(__q3, { tasks: [], frames: [], renders: [], measuring: false, pending: null });
   new PerformanceObserver(list => __q3.tasks.push(...list.getEntries().map(e => ({ start: e.startTime, duration: e.duration })))).observe({ type: 'longtask' });
   new MutationObserver(records => {
     const p = __q3.pending;
@@ -341,10 +349,11 @@ async function run(browser, origin, theme, run) {
   const motion = { choice: 'full', os: 'no-preference', effective: 'full' };
   const events = Array.from({ length: 30 }, (_, i) => ({ seq: i + 66, ts: i + 66, type: 'assistant', turn: i + 66,
     blocks: [{ type: 'text', text: prose(i + 1000, 12) }], stop_reason: 'end_turn' }));
-  const f = await fixture(browser, origin, { width: 1600, height: 1000 }, theme, motion, () => {}, { deviceScaleFactor: scale }, { events });
+  const f = await fixture(browser, origin, { width: 1600, height: 1000 }, theme, motion, () => {}, { deviceScaleFactor: scale },
+    { events, instrumentation: perf }); // The fixture's animation/rAF sampler is unused by ring correctness.
   const { page, context } = f;
   try {
-    await context.addInitScript(instrument);
+    await context.addInitScript(instrument, { perf });
     await page.evaluate(() => {
       const views = [{ view: 'session', id: 'parent' }, { view: 'sessions' }, { view: 'workers' }];
       const tiles = views.map((view, i) => ({ key: i + 10, columns: [{ key: i + 20, view }], cursor: 0,
@@ -382,7 +391,7 @@ async function run(browser, origin, theme, run) {
       retainedChecks.push(await page.evaluate(() => assertRing()));
     }
     const cdp = await context.newCDPSession(page);
-    await cdp.send('Emulation.setCPUThrottlingRate', { rate: Number(process.env.CPU || 4) });
+    if (perf) await cdp.send('Emulation.setCPUThrottlingRate', { rate: Number(process.env.CPU || 4) });
     const compositor = await layers(cdp, page);
     const shape = await page.evaluate(() => {
       const animations = el => el ? el.getAnimations().map(a => ({ name: a.animationName,
@@ -432,30 +441,41 @@ async function run(browser, origin, theme, run) {
       }
       assert.notEqual(compositor.spin.backendNodeId, compositor.sweep.backendNodeId, 'independent moving nodes');
     }
-    if (run === 0) {
+    if (perf && run === 0) {
       await cdp.send('Profiler.enable');
       await cdp.send('Profiler.start');
       await cdp.send('Tracing.start', { categories: 'devtools.timeline,blink.animations,blink.user_timing,cc,benchmark,viz,disabled-by-default-devtools.timeline,disabled-by-default-devtools.timeline.frame', transferMode: 'ReturnAsStream' });
     }
-    await page.evaluate(() => { __q3.measuring = true; __q3.start = performance.now(); performance.mark('q3-start'); });
+    if (perf) await page.evaluate(() => { __q3.measuring = true; __q3.start = performance.now(); performance.mark('q3-start'); });
     for (let i = 0; i < 12; i++) {
       // Actual WS deltas: grow Markdown, then commit a new durable transcript item.
+      // Keep all 12 x 8 updates in correctness, but observe each visible chunk
+      // and committed frame instead of using the benchmark's 35ms pacing.
       const turn = 200 + i;
       for (let chunk = 0; chunk < 8; chunk++) {
         f.stream({ type: 'text', turn, seq: 0, text: `Streaming ${i}/${chunk}. **Live** text and code. ` });
-        await delay(35); // Workload pacing, not a test completion condition.
+        if (perf) await delay(35); // Workload pacing, not a test completion condition.
+        else {
+          await page.locator('.md').filter({ hasText: `Streaming ${i}/${chunk}.` }).first().waitFor();
+          await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+        }
       }
       await page.locator('.md').filter({ hasText: `Streaming ${i}/7.` }).first().waitFor();
       f.send({ type: 'assistant', turn, blocks: [{ type: 'text', text: prose(i) }], stop_reason: 'end_turn' });
-      await page.waitForFunction(id => __q3.renders.some(r => r.id === id), i);
+      if (perf) await page.waitForFunction(id => __q3.renders.some(r => r.id === id), i);
+      else {
+        await page.locator('.md').getByText(`Q3 item ${i}`, { exact: true }).first().waitFor();
+        await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+      }
       const snapshots = await page.evaluate(() => __q3.snapshots);
       await f.setState('working', { last_seq: 100 + i, updated_at: 100 + i });
       await page.waitForFunction(count => __q3.snapshots > count, snapshots);
+      if (!perf) await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
       retainedChecks.push(await page.evaluate(() => assertRing()));
     }
-    await page.evaluate(() => { __q3.end = performance.now(); __q3.measuring = false; performance.mark('q3-end'); });
+    if (perf) await page.evaluate(() => { __q3.end = performance.now(); __q3.measuring = false; performance.mark('q3-end'); });
     let blocked, paint;
-    if (run === 0) {
+    if (perf && run === 0) {
       const { profile } = await cdp.send('Profiler.stop');
       fs.writeFileSync(path.join(output, `${phase}-${theme}-${run}.cpuprofile`), JSON.stringify(profile));
       blocked = await blockedFrames(cdp, page, `${phase}-${theme}`);
@@ -465,20 +485,23 @@ async function run(browser, origin, theme, run) {
       fs.writeFileSync(path.join(output, `${phase}-${theme}-paints.json`), JSON.stringify(paint, null, 2));
     }
     const data = await page.evaluate(() => ({ ...__q3, nodes: document.querySelectorAll('*').length }));
-    data.tasks = data.tasks.filter(t => t.start >= data.start && t.start <= data.end);
-    const sorted = data.frames.map(f => f.gap).sort((a, b) => a - b);
-    const result = { phase, theme, run, scale, chromium: browser.version(), cpu: Number(process.env.CPU || 4), paragraphs,
-      compositor, shape, retainedChecks, blocked, paint, ...data, summary: { elapsed: data.end - data.start, frames: sorted.length,
-        missedRafSlots: data.frames.reduce((n, f) => n + Math.max(0, Math.round(f.gap / (1000 / 60)) - 1), 0),
-        rafP95: sorted[Math.floor(sorted.length * .95)], rafMax: sorted.at(-1), longTasks: data.tasks.length,
-        longTaskMs: data.tasks.reduce((n, t) => n + t.duration, 0), renderMs: data.renders.map(r => r.dom - r.start),
-        renderFrameMs: data.renders.map(r => r.frame - r.start) } };
+    const result = { phase, theme, run, scale, perf, chromium: browser.version(), paragraphs, compositor, shape, retainedChecks, ...data };
+    if (perf) {
+      data.tasks = data.tasks.filter(t => t.start >= data.start && t.start <= data.end);
+      const sorted = data.frames.map(f => f.gap).sort((a, b) => a - b);
+      Object.assign(result, { cpu: Number(process.env.CPU || 4), blocked, paint, tasks: data.tasks,
+        summary: { elapsed: data.end - data.start, frames: sorted.length,
+          missedRafSlots: data.frames.reduce((n, f) => n + Math.max(0, Math.round(f.gap / (1000 / 60)) - 1), 0),
+          rafP95: sorted[Math.floor(sorted.length * .95)], rafMax: sorted.at(-1), longTasks: data.tasks.length,
+          longTaskMs: data.tasks.reduce((n, t) => n + t.duration, 0), renderMs: data.renders.map(r => r.dom - r.start),
+          renderFrameMs: data.renders.map(r => r.frame - r.start) } });
+    }
     fs.writeFileSync(path.join(output, `${phase}-${theme}-${run}.json`), JSON.stringify(result, null, 2));
-    console.log(JSON.stringify({ phase, theme, run, ...result.summary }));
+    console.log(JSON.stringify({ phase, theme, run, perf, ...(perf ? result.summary : { snapshots: data.snapshots }) }));
     if (!baseline) {
       assert(retainedChecks.every(Boolean), 'idle -> working, new items and live snapshots retain BOTH moving nodes and animation identities');
-      if (paint) assert.equal(paint.ringPaints, 0, `no ring-specific Paint in the natural Q3 window: ${JSON.stringify(paint.events)}`);
-      if (blocked) {
+      if (perf && paint) assert.equal(paint.ringPaints, 0, `no ring-specific Paint in the natural Q3 window: ${JSON.stringify(paint.events)}`);
+      if (perf && blocked) {
         assert(blocked.frames.length >= 3, `at least three interior compositor frames during the busy main thread (got ${blocked.frames.length})`);
         assert(blocked.frames.every(frame => frame.bluePixels > 0), 'every interior frame contains the blue arc');
         assert(blocked.centroidDegrees > 60, `blue centroid keeps moving during the block (${blocked.centroidDegrees.toFixed(1)}deg)`);
@@ -524,6 +547,9 @@ async function run(browser, origin, theme, run) {
     // workload, CPU profile, natural trace window or compositor challenge.
     if (!baseline) await desktopTaskWords(f, `${phase}-${theme}-${run}`);
     assert.deepEqual(f.errors, [], 'no crashes, invalid streams or external requests');
+  } catch (error) {
+    await page.screenshot({ path: path.join(output, `${phase}-${theme}-${run}-FAIL.png`), timeout: 5000 }).catch(() => {});
+    throw error;
   } finally { await context.close(); }
 }
 
@@ -1109,7 +1135,7 @@ async function runPhone(browser, origin, theme, choice, deviceScaleFactor) {
           assert(['full', 'reduced', 'off'].includes(choice), 'phone MOTION: full,reduced,off');
           for (const dsf of process.env.SCALE ? [scale] : [1, 2]) await runPhone(browser, origin, theme, choice, dsf);
         }
-      } else for (let runIndex = 0; runIndex < Number(process.env.RUNS || 3); runIndex++) await run(browser, origin, theme, runIndex);
+      } else for (let runIndex = 0; runIndex < Number(process.env.RUNS || (perf ? 3 : 1)); runIndex++) await run(browser, origin, theme, runIndex);
     }
   } finally { await browser.close(); await new Promise(resolve => server.close(resolve)); }
 })().catch(error => { console.error(error.stack || error); process.exitCode = 1; });
