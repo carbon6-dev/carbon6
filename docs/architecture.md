@@ -148,7 +148,10 @@ remains tag 13.
 
 Roll out the head **before** these workers, and do not roll it back while new
 workers are live. An old fork head sends boolean tag 16, which a new worker's
-live protobuf transport cannot decode. The head sends string `prompt` 16 only
+live protobuf transport cannot decode. Downgrading workers alone also does not
+make newly stored string-16 commands readable by the old fork head: head/data
+rollback requires a compatible decoder or a coordinated compatible snapshot.
+The head sends string `prompt` 16 only
 to workers advertising `user_input_prompt_v1`, including queue-edit RPCs;
 older workers temporarily receive the original text without mention expansion.
 The saved command retains the expansion and authenticated human provenance,

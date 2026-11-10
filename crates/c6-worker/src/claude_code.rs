@@ -636,6 +636,43 @@ fn held_group_owned(meta: &HeldMeta, dir: &Path) -> bool {
         && (is_claude_for(meta.pgid, &meta.conversation) || keeper_holds_fifo(Pid::from_raw(meta.keeper), Pid::from_raw(meta.pgid), dir))
 }
 
+/// SIGSTOP delivery is asynchronous. Observe the stopped state before the
+/// group's interrupt; Linux's distinct tracing-stop state is not sufficient.
+fn keeper_stopped(keeper: Pid) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string(format!("/proc/{}/status", keeper.as_raw())).is_ok_and(|status| {
+            status.lines().find_map(|line| line.strip_prefix("State:")).and_then(|state| state.split_whitespace().next()) == Some("T")
+        })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("/bin/ps")
+            .args(["-o", "stat=", "-p", &keeper.to_string()])
+            .output()
+            .is_ok_and(|out| out.status.success() && String::from_utf8_lossy(&out.stdout).trim().starts_with('T'))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = keeper;
+        false
+    }
+}
+
+async fn pin_held_keeper(keeper: Pid, pg: Pid, dir: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(keeper_holds_fifo(keeper, pg, dir), "Held Claude Code keeper ownership changed");
+    nix::sys::signal::kill(keeper, Signal::SIGSTOP)?;
+    for _ in 0..100 {
+        anyhow::ensure!(keeper_holds_fifo(keeper, pg, dir), "Held Claude Code keeper ownership changed");
+        if keeper_stopped(keeper) {
+            anyhow::ensure!(keeper_holds_fifo(keeper, pg, dir), "Held Claude Code keeper ownership changed");
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    anyhow::bail!("Held Claude Code keeper did not confirm that it stopped")
+}
+
 /// Retain an identified kernel group member across SIGINT grace. If the
 /// keeper has not opened its FIFO yet, wait before signaling anything. When
 /// only an identified leader remains, kill immediately rather than losing
@@ -646,8 +683,12 @@ async fn stop_held_group(pg: Pid, keeper: Pid, dir: &Path, conversation: &str) -
             return Ok(());
         }
         if keeper_holds_fifo(keeper, pg, dir) {
-            nix::sys::signal::kill(keeper, Signal::SIGSTOP)?;
-            anyhow::ensure!(keeper_holds_fifo(keeper, pg, dir), "Held Claude Code keeper ownership changed");
+            if let Err(e) = pin_held_keeper(keeper, pg, dir).await {
+                if matches!(killpg(pg, None), Err(nix::errno::Errno::ESRCH)) {
+                    return Ok(());
+                }
+                return Err(e);
+            }
             let _ = killpg(pg, Signal::SIGINT);
             for _ in 0..30 {
                 if nix::sys::signal::kill(pg, None).is_err() {
@@ -655,7 +696,13 @@ async fn stop_held_group(pg: Pid, keeper: Pid, dir: &Path, conversation: &str) -
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            anyhow::ensure!(keeper_holds_fifo(keeper, pg, dir), "Held Claude Code keeper disappeared during stop");
+            if !keeper_holds_fifo(keeper, pg, dir) {
+                anyhow::ensure!(
+                    matches!(killpg(pg, None), Err(nix::errno::Errno::ESRCH)),
+                    "Held Claude Code keeper disappeared during stop"
+                );
+                return Ok(());
+            }
             let _ = killpg(pg, Signal::SIGKILL);
             return Ok(());
         }
@@ -4625,6 +4672,98 @@ done
         assert!(claude_args_for(&["node", "/opt/claude-code/cli.js", "--session-id", "fork"], "fork"));
         assert!(!claude_args_for(&["sleep", "/tmp/claude-notes", "--resume", "fork"], "fork"));
         assert!(!claude_args_for(&["sh", "-c", "echo claude --resume fork"], "fork"));
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn held_cleanup_confirms_keeper_stop_and_accepts_already_absent_group() {
+        if !c6_testkit::have("python3") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        let _cleanup = HeldFixtureCleanup(held.clone());
+        let bin = script(
+            dir.path(),
+            "claude-pin",
+            r#"#!/usr/bin/env python3
+import signal
+from pathlib import Path
+def interrupted(signum, frame):
+    keeper = Path('keeper-pid').read_text()
+    status = Path('/proc/' + keeper + '/status').read_text()
+    state = next(line.split()[1] for line in status.splitlines() if line.startswith('State:'))
+    Path('interrupted-state.tmp').write_text(state)
+    Path('interrupted-state.tmp').replace('interrupted-state')
+    raise SystemExit(0)
+signal.signal(signal.SIGINT, interrupted)
+Path('cli-ready').touch()
+while True:
+    signal.pause()
+"#,
+        );
+        let mut p = Process::spawn_held(
+            &held,
+            "s",
+            &bin,
+            Launch { conversation: "fork".into(), ..Default::default() },
+            false,
+            dir.path(),
+            "opus",
+            Arc::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let pg = p.pgid.unwrap();
+        let keeper = p.held.as_ref().unwrap().keeper;
+        let record = held.join("fork");
+        std::fs::write(dir.path().join("keeper-pid"), keeper.to_string()).unwrap();
+        c6_testkit::eventually("fixture CLI and FIFO keeper readiness", async || {
+            (dir.path().join("cli-ready").exists() && keeper_holds_fifo(keeper, pg, &record)).then_some(())
+        })
+        .await;
+        assert!(!keeper_stopped(keeper), "an open FIFO alone is not an observed stop");
+        pin_held_keeper(keeper, pg, &record).await.unwrap();
+        assert!(keeper_stopped(keeper) && keeper_holds_fifo(keeper, pg, &record));
+        // Freeze only the freshly verified fixture wrapper, not its group.
+        // Its CLI can handle SIGINT, but the wrapper cannot exit during the
+        // first poll of cleanup. Reuse the stopped-state reader for its PID.
+        assert!(is_claude_for(pg.as_raw(), "fork"));
+        nix::sys::signal::kill(pg, Signal::SIGSTOP).unwrap();
+        c6_testkit::eventually("the owned fixture wrapper to confirm its stop", async || {
+            (keeper_stopped(pg) && is_claude_for(pg.as_raw(), "fork")).then_some(())
+        })
+        .await;
+        let stop = stop_held_group(pg, keeper, &record, "fork");
+        tokio::pin!(stop);
+        // Keeper already stopped, wrapper confirmed alive and frozen: this
+        // single poll sends SIGINT and waits in grace. Do not poll cleanup
+        // again until fixture teardown proves whole-group absence.
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(stop.as_mut(), cx).is_pending(), "cleanup must wait while the owned wrapper is frozen");
+            std::task::Poll::Ready(())
+        })
+        .await;
+        c6_testkit::eventually("the CLI to observe the group interrupt", async || {
+            dir.path().join("interrupted-state").exists().then_some(())
+        })
+        .await;
+        assert_eq!(std::fs::read_to_string(dir.path().join("interrupted-state")).unwrap(), "T");
+        // Let the wrapper reap its CLI and reap the owned wrapper ourselves;
+        // only the fixture's stopped keeper remains to be killed and reaped.
+        assert!(keeper_stopped(pg) && is_claude_for(pg.as_raw(), "fork"));
+        nix::sys::signal::kill(pg, Signal::SIGCONT).unwrap();
+        c6_testkit::within("the fixture wrapper to exit after its CLI", p.child.as_mut().unwrap().wait()).await.unwrap();
+        assert!(keeper_stopped(keeper) && keeper_holds_fifo(keeper, pg, &record));
+        // Fresh FIFO proof, not saved IDs, authorizes this fixture-only kill.
+        killpg(pg, Signal::SIGKILL).unwrap();
+        c6_testkit::eventually("the fixture's entire group to be reaped", async || {
+            matches!(killpg(pg, None), Err(nix::errno::Errno::ESRCH)).then_some(())
+        })
+        .await;
+        assert!(!keeper_holds_fifo(keeper, pg, &record));
+        stop.await.unwrap();
     }
 
     #[tokio::test]
