@@ -629,6 +629,125 @@ fn darwin_procargs(data: &[u8]) -> Option<Vec<&str>> {
     Some(args)
 }
 
+/// Signal-zero probe, with Darwin's zombie-only groups treated as stopped.
+/// EPERM alone is never absence: it can also mean inaccessible live members.
+/// This does not confer ownership or authorize any signal to a saved PGID.
+fn group_probe(pg: Pid) -> nix::Result<()> {
+    let result = killpg(pg, None);
+    #[cfg(target_os = "macos")]
+    if pg.as_raw() > 0 {
+        return darwin_group_probe(result, || darwin_group_stopped(pg.as_raw()));
+    }
+    result
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn darwin_group_probe(result: nix::Result<()>, stopped: impl FnOnce() -> bool) -> nix::Result<()> {
+    if result == Err(nix::errno::Errno::EPERM) && stopped() { Err(nix::errno::Errno::ESRCH) } else { result }
+}
+
+// XNU's listpids allocates min(nprocs + 20, supplied slots) *before* taking
+// proc_list_lock. Supplying at most 20 slots guarantees that a short response
+// is complete even if the global process count grows before that lock. A full
+// buffer is ambiguous and must retain the barrier, even for all-zombie groups.
+#[cfg(any(target_os = "macos", test))]
+const DARWIN_GROUP_SLOTS: usize = 20;
+#[cfg(any(target_os = "macos", test))]
+const DARWIN_BSDINFO_SIZE: i32 = 136;
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DarwinGroupMember {
+    pid: u32,
+    pgid: u32,
+    status: u32,
+    start_sec: u64,
+    start_usec: u64,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn darwin_group_pids(returned: i32, error: i32, buffer: &[i32]) -> Option<Vec<i32>> {
+    let bytes = usize::try_from(returned).ok()?;
+    let width = std::mem::size_of::<i32>();
+    // libproc maps syscall failures to zero, just like an empty successful
+    // response. Its caller must clear and capture errno around every call.
+    if error != 0 || buffer.len() != DARWIN_GROUP_SLOTS || bytes >= std::mem::size_of_val(buffer) || bytes % width != 0 {
+        return None;
+    }
+    let mut pids = buffer[..bytes / width].to_vec();
+    pids.sort_unstable();
+    if pids.iter().any(|pid| *pid <= 0) || pids.windows(2).any(|pair| pair[0] == pair[1]) {
+        return None;
+    }
+    Some(pids)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn darwin_zombie_member(returned: i32, pid: i32, pg: i32, member: DarwinGroupMember) -> Option<DarwinGroupMember> {
+    const SZOMB: u32 = 5;
+    (returned == DARWIN_BSDINFO_SIZE
+        && pid > 0
+        && pg > 0
+        && member.pid == pid as u32
+        && member.pgid == pg as u32
+        && member.status == SZOMB
+        && member.start_sec > 0
+        && member.start_usec < 1_000_000)
+        .then_some(member)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn darwin_group_snapshots_stopped(
+    mut list: impl FnMut() -> Option<Vec<i32>>,
+    mut member: impl FnMut(i32) -> Option<DarwinGroupMember>,
+) -> bool {
+    let mut snapshot = || list()?.into_iter().map(&mut member).collect::<Option<Vec<_>>>();
+    let Some(first) = snapshot() else { return false };
+    // A live member could fork after enumeration and then become a zombie.
+    // Repeat the complete enumeration and status/identity checks; a changed
+    // membership, PID reuse, lookup error, or live member keeps the barrier.
+    snapshot().is_some_and(|second| first == second)
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_group_stopped(pg: i32) -> bool {
+    use nix::libc;
+    const PROC_PGRP_ONLY: u32 = 2;
+    const _: () = assert!(std::mem::size_of::<libc::proc_bsdinfo>() == DARWIN_BSDINFO_SIZE as usize);
+    const _: () = assert!(libc::SZOMB == 5);
+    darwin_group_snapshots_stopped(
+        || {
+            let mut pids = [0i32; DARWIN_GROUP_SLOTS];
+            nix::errno::Errno::clear();
+            // SAFETY: pids is aligned writable storage of the supplied size.
+            let returned =
+                unsafe { libc::proc_listpids(PROC_PGRP_ONLY, pg as u32, pids.as_mut_ptr().cast(), std::mem::size_of_val(&pids) as i32) };
+            let error = nix::errno::Errno::last_raw();
+            darwin_group_pids(returned, error, &pids)
+        },
+        |pid| {
+            // SAFETY: proc_bsdinfo contains only integers and byte arrays.
+            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+            // Nonzero arg explicitly enables zombie lookup in PROC_PIDTBSDINFO.
+            // SAFETY: info has the exact ABI size asserted above and is writable.
+            let returned =
+                unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 1, std::ptr::from_mut(&mut info).cast(), DARWIN_BSDINFO_SIZE) };
+            darwin_zombie_member(
+                returned,
+                pid,
+                pg,
+                DarwinGroupMember {
+                    pid: info.pbi_pid,
+                    pgid: info.pbi_pgid,
+                    status: info.pbi_status,
+                    start_sec: info.pbi_start_tvsec,
+                    start_usec: info.pbi_start_tvusec,
+                },
+            )
+        },
+    )
+}
+
 fn claude_args_for(args: &[&str], conversation: &str) -> bool {
     let claude_program = |arg: &str| {
         let path = Path::new(arg);
@@ -811,12 +930,12 @@ async fn pin_held_keeper(keeper: Pid, pg: Pid, dir: &Path) -> anyhow::Result<()>
 /// authority by first letting that leader exit during a grace period.
 async fn stop_held_group(pg: Pid, keeper: Pid, dir: &Path, conversation: &str) -> anyhow::Result<()> {
     for _ in 0..100 {
-        if matches!(killpg(pg, None), Err(nix::errno::Errno::ESRCH)) {
+        if matches!(group_probe(pg), Err(nix::errno::Errno::ESRCH)) {
             return Ok(());
         }
         if keeper_holds_fifo(keeper, pg, dir) {
             if let Err(e) = pin_held_keeper(keeper, pg, dir).await {
-                if matches!(killpg(pg, None), Err(nix::errno::Errno::ESRCH)) {
+                if matches!(group_probe(pg), Err(nix::errno::Errno::ESRCH)) {
                     return Ok(());
                 }
                 return Err(e);
@@ -830,7 +949,7 @@ async fn stop_held_group(pg: Pid, keeper: Pid, dir: &Path, conversation: &str) -
             }
             if !keeper_holds_fifo(keeper, pg, dir) {
                 anyhow::ensure!(
-                    matches!(killpg(pg, None), Err(nix::errno::Errno::ESRCH)),
+                    matches!(group_probe(pg), Err(nix::errno::Errno::ESRCH)),
                     "Held Claude Code keeper disappeared during stop"
                 );
                 return Ok(());
@@ -847,15 +966,16 @@ async fn stop_held_group(pg: Pid, keeper: Pid, dir: &Path, conversation: &str) -
     anyhow::bail!("Cannot retain ownership of held Claude Code group {}; its cleanup record was kept", pg)
 }
 
-/// A persisted PGID may have been reused: never signal it here. Only ESRCH
+/// A persisted PGID may have been reused: never signal it here. Only absence
 /// proves that an old group's writers (including orphaned children) are gone.
-/// Live groups, zombies and permission errors all keep the durable barrier.
+/// Live groups and permission errors keep the durable barrier. Linux zombies
+/// do too; Darwin zombie-only groups require the extra proof in group_probe.
 pub async fn confirm_stopped(journal: &crate::journal::Journal, session_id: &str, wait: Duration) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + wait;
     loop {
         let mut pending = Vec::new();
         for pgid in journal.claude_processes(session_id).await? {
-            match killpg(Pid::from_raw(pgid), None) {
+            match group_probe(Pid::from_raw(pgid)) {
                 Err(nix::errno::Errno::ESRCH) => journal.untrack_claude_process(session_id, pgid).await?,
                 Ok(()) => pending.push(pgid),
                 Err(error) => {
@@ -876,13 +996,13 @@ pub async fn confirm_stopped(journal: &crate::journal::Journal, session_id: &str
 }
 
 /// While an ordinary replacement waits, keep its turn future (and any
-/// already-open inputs) alive. Never signal/adopt here; only ESRCH releases
+/// already-open inputs) alive. Never signal/adopt here; only proven absence releases
 /// a tracked group. Database errors still abort the turn as journal failures.
 pub(crate) async fn wait_for_replacement(journal: &crate::journal::Journal, session_id: &str) -> anyhow::Result<()> {
     loop {
         let mut waiting = false;
         for pg in journal.claude_processes(session_id).await? {
-            if matches!(killpg(Pid::from_raw(pg), None), Err(nix::errno::Errno::ESRCH)) {
+            if matches!(group_probe(Pid::from_raw(pg)), Err(nix::errno::Errno::ESRCH)) {
                 journal.untrack_claude_process(session_id, pg).await?;
             } else {
                 waiting = true;
@@ -911,7 +1031,7 @@ pub(crate) async fn replacement_admission<'a>(
 
 /// A descendant's completed turn is not proof that its held CLI stopped.
 /// Inspect all runtimes owned by the session, not just its selected branch.
-/// Do not attach, signal, or remove records here: only ESRCH proves absence.
+/// Do not attach, signal, or remove records here: require proven group absence.
 /// Unreadable/unknown metadata fails closed, as it does for rewind cleanup.
 pub(crate) fn confirm_held_stopped(held: &Path, session: &str) -> anyhow::Result<()> {
     let entries = match std::fs::read_dir(held) {
@@ -938,7 +1058,7 @@ pub(crate) fn confirm_held_stopped(held: &Path, session: &str) -> anyhow::Result
         }
         anyhow::ensure!(meta.pgid > 0, StopUnconfirmed("Held Claude Code process group is unknown".into()));
         anyhow::ensure!(
-            killpg(Pid::from_raw(meta.pgid), None) == Err(nix::errno::Errno::ESRCH),
+            group_probe(Pid::from_raw(meta.pgid)) == Err(nix::errno::Errno::ESRCH),
             StopUnconfirmed(format!("Held Claude Code process group {} has not confirmed that it stopped", meta.pgid))
         );
     }
@@ -968,7 +1088,7 @@ pub async fn stop_held_for_rewind(held: &Path, session: &str, journal: &crate::j
         anyhow::ensure!(meta.pgid > 0, "Held Claude Code process group is unknown");
         journal.track_claude_process(session, meta.pgid).await?;
         let pg = Pid::from_raw(meta.pgid);
-        match killpg(pg, None) {
+        match group_probe(pg) {
             Err(nix::errno::Errno::ESRCH) => {}
             Ok(()) => {
                 anyhow::ensure!(
@@ -1307,7 +1427,7 @@ impl Process {
         }
         for path in prior {
             let meta: HeldMeta = serde_json::from_slice(&std::fs::read(path.join("meta.json"))?).map_err(std::io::Error::other)?;
-            if meta.pgid <= 0 || !matches!(killpg(Pid::from_raw(meta.pgid), None), Err(nix::errno::Errno::ESRCH)) {
+            if meta.pgid <= 0 || !matches!(group_probe(Pid::from_raw(meta.pgid)), Err(nix::errno::Errno::ESRCH)) {
                 return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "Held Claude Code group has not confirmed absence"));
             }
             std::fs::remove_dir_all(&path)?;
@@ -1443,7 +1563,7 @@ impl Process {
         if meta.pgid <= 0 {
             return None;
         }
-        if matches!(killpg(pg, None), Err(nix::errno::Errno::ESRCH)) {
+        if matches!(group_probe(pg), Err(nix::errno::Errno::ESRCH)) {
             let _ = std::fs::remove_dir_all(&dir);
             if let Some(r) = &meta.output_root {
                 let _ = std::fs::remove_dir_all(r);
@@ -1451,7 +1571,7 @@ impl Process {
             return None;
         }
         // A replacement has retired this runtime, even if a live keeper can
-        // still prove ownership. Its journal PGID is cleanup-only until ESRCH.
+        // still prove ownership. Its journal PGID is cleanup-only until absence.
         if dir.join("retiring").try_exists().ok()? {
             return None;
         }
@@ -1465,7 +1585,7 @@ impl Process {
             let _ = killpg(pg, Signal::SIGKILL);
             let absent = async {
                 loop {
-                    match killpg(pg, None) {
+                    match group_probe(pg) {
                         Err(nix::errno::Errno::ESRCH) => break,
                         Ok(()) => tokio::time::sleep(Duration::from_millis(25)).await,
                         Err(_) => return false,
@@ -1615,7 +1735,7 @@ impl Process {
     /// It has ended (or is stopped on purpose): a held process's folder,
     /// keeper and guidance go with it.
     fn release_held(&mut self) {
-        if self.pgid.is_some_and(|pg| !matches!(killpg(pg, None), Err(nix::errno::Errno::ESRCH))) {
+        if self.pgid.is_some_and(|pg| !matches!(group_probe(pg), Err(nix::errno::Errno::ESRCH))) {
             // Leader exit is not group absence. Keep cleanup authority and
             // its durable barrier until every descendant/keeper is gone.
             return;
@@ -2271,7 +2391,7 @@ impl Process {
     pub async fn close_for_replacement(mut self) -> anyhow::Result<()> {
         self.track().await?;
         let pg = self.pgid.ok_or_else(|| anyhow::anyhow!("Claude Code process group is unknown"))?;
-        if !matches!(killpg(pg, None), Err(nix::errno::Errno::ESRCH)) {
+        if !matches!(group_probe(pg), Err(nix::errno::Errno::ESRCH)) {
             // turn() may already have released the held directory after
             // observing absence. Only a still-present group needs retirement
             // authority; a missing directory while live is still fatal.
@@ -2282,7 +2402,7 @@ impl Process {
                 *self.stdin.lock().await = None;
             }
             self.kill().await;
-            if !matches!(killpg(pg, None), Err(nix::errno::Errno::ESRCH)) {
+            if !matches!(group_probe(pg), Err(nix::errno::Errno::ESRCH)) {
                 return Err(ReplacementBlocked(pg).into());
             }
         }
@@ -2338,7 +2458,7 @@ impl Process {
         let _ = tokio::time::timeout(Duration::from_secs(3), self.wait_exit()).await;
         if let Some(pg) = self.pgid {
             let absent = async {
-                while !matches!(killpg(pg, None), Err(nix::errno::Errno::ESRCH)) {
+                while !matches!(group_probe(pg), Err(nix::errno::Errno::ESRCH)) {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             };
@@ -3861,7 +3981,7 @@ for line in sys.stdin:
         assert_eq!(observer.journal.claude_processes(&observer.session_id).await.unwrap(), [pgid]);
         assert!(observer.journal.claude_processes("cli-conversation-not-owner").await.unwrap().is_empty());
         // Failed initialize attempts have no pidfile, but stopping/Drop must
-        // not retire their durable barrier without a separate ESRCH check.
+        // not retire their durable barrier without a separate absence check.
         assert!(p.pidfile.is_none());
         p.stop_for_rewind().await.unwrap();
         assert_eq!(observer.journal.claude_processes(&observer.session_id).await.unwrap(), [pgid]);
@@ -4928,6 +5048,90 @@ done
     }
 
     #[test]
+    fn darwin_group_probe_never_accepts_unproven_permission_errors() {
+        use nix::errno::Errno;
+        assert_eq!(darwin_group_probe(Err(Errno::EPERM), || false), Err(Errno::EPERM));
+        assert_eq!(darwin_group_probe(Err(Errno::EPERM), || true), Err(Errno::ESRCH));
+        for result in [Ok(()), Err(Errno::ESRCH), Err(Errno::EACCES), Err(Errno::EINVAL), Err(Errno::EIO)] {
+            assert_eq!(darwin_group_probe(result, || panic!("only EPERM may request enumeration")), result);
+        }
+    }
+
+    #[test]
+    fn darwin_group_enumeration_requires_a_complete_successful_pid_list() {
+        let mut buffer = [0; DARWIN_GROUP_SLOTS];
+        buffer[..3].copy_from_slice(&[43, 41, 42]);
+        assert_eq!(darwin_group_pids(12, 0, &buffer), Some(vec![41, 42, 43]));
+        assert_eq!(darwin_group_pids(0, 0, &buffer), Some(vec![]));
+        for returned in [-1, 1, 3, 13, 79, 80, 84] {
+            assert!(darwin_group_pids(returned, 0, &buffer).is_none(), "malformed or saturated response {returned}");
+        }
+        for error in [1, 3, 5, 12, 22] {
+            assert!(darwin_group_pids(0, error, &buffer).is_none(), "zero bytes with errno {error} is not absence");
+            assert!(darwin_group_pids(12, error, &buffer).is_none());
+        }
+        assert!(darwin_group_pids(0, 0, &buffer[..19]).is_none(), "the capacity proof depends on the exact supplied buffer");
+        for invalid in [[41, 0, 42], [41, -1, 42], [41, 42, 41]] {
+            buffer[..3].copy_from_slice(&invalid);
+            assert!(darwin_group_pids(12, 0, &buffer).is_none(), "invalid/duplicate PID {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn darwin_group_status_requires_an_exact_zombie_identity() {
+        let zombie = DarwinGroupMember { pid: 42, pgid: 41, status: 5, start_sec: 100, start_usec: 10 };
+        assert_eq!(darwin_zombie_member(136, 42, 41, zombie.clone()), Some(zombie.clone()));
+        for returned in [-1, 0, 135, 137] {
+            assert!(darwin_zombie_member(returned, 42, 41, zombie.clone()).is_none(), "BSD info size {returned}");
+        }
+        for status in [0, 1, 2, 3, 4, 6, u32::MAX] {
+            assert!(darwin_zombie_member(136, 42, 41, DarwinGroupMember { status, ..zombie.clone() }).is_none());
+        }
+        for member in [
+            DarwinGroupMember { pid: 43, ..zombie.clone() },
+            DarwinGroupMember { pgid: 43, ..zombie.clone() },
+            DarwinGroupMember { start_sec: 0, ..zombie.clone() },
+            DarwinGroupMember { start_usec: 1_000_000, ..zombie.clone() },
+        ] {
+            assert!(darwin_zombie_member(136, 42, 41, member).is_none());
+        }
+        assert!(darwin_zombie_member(136, -1, 41, zombie.clone()).is_none());
+        assert!(darwin_zombie_member(136, 42, -1, zombie).is_none());
+    }
+
+    #[test]
+    fn darwin_group_absence_requires_matching_complete_zombie_snapshots() {
+        let zombie = DarwinGroupMember { pid: 42, pgid: 41, status: 5, start_sec: 100, start_usec: 10 };
+        assert!(darwin_group_snapshots_stopped(|| Some(vec![]), |_| panic!("empty group has no member lookup")));
+        assert!(darwin_group_snapshots_stopped(|| Some(vec![42]), |_| Some(zombie.clone())));
+        assert!(!darwin_group_snapshots_stopped(|| None, |_| panic!("list errors cannot authorize member lookup")));
+        assert!(!darwin_group_snapshots_stopped(|| Some(vec![42]), |_| None), "member errors cannot mean dead");
+        for changed in [None, Some(vec![]), Some(vec![42, 43]), Some(vec![43])] {
+            let mut lists = [Some(vec![42]), changed].into_iter();
+            assert!(
+                !darwin_group_snapshots_stopped(
+                    || lists.next().unwrap(),
+                    |pid| Some(DarwinGroupMember { pid: pid as u32, ..zombie.clone() })
+                ),
+                "fork, exit, failed second list or changed membership cannot prove a stable zombie-only group"
+            );
+        }
+        for changed in [
+            None,
+            Some(DarwinGroupMember { start_sec: 101, ..zombie.clone() }),
+            Some(DarwinGroupMember { start_usec: 11, ..zombie.clone() }),
+        ] {
+            let mut members = [Some(zombie.clone()), changed].into_iter();
+            assert!(
+                !darwin_group_snapshots_stopped(|| Some(vec![42]), |_| members.next().unwrap()),
+                "PID reuse/lookup failure must fail closed"
+            );
+        }
+        let mut members = [Some(zombie.clone()), None].into_iter();
+        assert!(!darwin_group_snapshots_stopped(|| Some(vec![42, 43]), |_| members.next().unwrap()), "every enumerated member needs proof");
+    }
+
+    #[test]
     fn darwin_process_identity_preserves_argument_boundaries_and_excludes_environment() {
         let encode = |args: &[&str]| {
             let mut data = (args.len() as i32).to_ne_bytes().to_vec();
@@ -5042,7 +5246,7 @@ done
             .await;
         assert!(!is_claude_for(pg.as_raw(), "for"));
         p.close_for_replacement().await.unwrap();
-        assert_eq!(killpg(pg, None), Err(nix::errno::Errno::ESRCH));
+        assert_eq!(group_probe(pg), Err(nix::errno::Errno::ESRCH));
     }
 
     #[tokio::test]
@@ -5130,7 +5334,7 @@ while True:
         // Fresh FIFO proof, not saved IDs, authorizes this fixture-only kill.
         killpg(pg, Signal::SIGKILL).unwrap();
         c6_testkit::eventually("the fixture's entire group to be reaped", async || {
-            matches!(killpg(pg, None), Err(nix::errno::Errno::ESRCH)).then_some(())
+            matches!(group_probe(pg), Err(nix::errno::Errno::ESRCH)).then_some(())
         })
         .await;
         assert!(!keeper_holds_fifo(keeper, pg, &record));
@@ -5180,7 +5384,7 @@ while True:
         drop(old);
         assert!(killpg(pg, None).is_ok(), "the keeper/CLI still own the group");
         stop_held_for_rewind(&held, "s", &journal).await.unwrap();
-        assert_eq!(killpg(pg, None), Err(nix::errno::Errno::ESRCH));
+        assert_eq!(group_probe(pg), Err(nix::errno::Errno::ESRCH));
         assert!(!held.join("old").exists());
         assert!(journal.claude_processes("s").await.unwrap().is_empty());
         assert!(killpg(other.pgid.unwrap(), None).is_ok(), "another session is untouched");
@@ -5215,7 +5419,7 @@ while True:
         // Reproduce turn()'s post-release state without an artificial zombie:
         // the entire group is absent and release_held removed its directory.
         p.kill().await;
-        assert_eq!(killpg(pg, None), Err(nix::errno::Errno::ESRCH));
+        assert_eq!(group_probe(pg), Err(nix::errno::Errno::ESRCH));
         assert!(p.held.as_ref().unwrap().done);
         assert!(!held.join("already-released").exists());
         p.close_for_replacement().await.unwrap();
@@ -5400,7 +5604,7 @@ while True:
         assert_eq!(std::fs::read(&path).unwrap(), before, "a live runtime's authority must not be overwritten");
         assert!(killpg(pg, None).is_ok());
         p.close_for_replacement().await.unwrap();
-        assert_eq!(killpg(pg, None), Err(nix::errno::Errno::ESRCH));
+        assert_eq!(group_probe(pg), Err(nix::errno::Errno::ESRCH));
         let unknown = held.join("fork");
         std::fs::create_dir(&unknown).unwrap();
         assert!(Process::spawn_held(&held, "s", &bin, launch(), true, dir.path(), "opus", Arc::default(), None, None).is_err());
@@ -5453,7 +5657,7 @@ while True:
         assert!(!status.success());
         let journal = crate::journal::Journal::open(&dir.path().join("journal.db")).await.unwrap();
         stop_held_for_rewind(&held, "s", &journal).await.unwrap();
-        assert_eq!(killpg(pg, None), Err(nix::errno::Errno::ESRCH));
+        assert_eq!(group_probe(pg), Err(nix::errno::Errno::ESRCH));
     }
 
     #[tokio::test]

@@ -179,6 +179,11 @@ and a replaced regular file. `darwin_vnode_path_` checks raw pathname bytes
 without assuming UTF-8 or display escaping.
 The held-process tests exercise this proof with the real keeper on macOS;
 it must still belong to the recorded process group before it authorizes cleanup.
+Linux requires whole-group ESRCH even for unreaped zombies. Darwin can return
+EPERM for a zombie-only group: that is accepted as stopped only after two
+complete, identical libproc snapshots prove every member is SZOMB (or both
+are empty). Errors, live/unreadable members, changing identities and truncated
+enumerations retain the barrier; EPERM alone never releases it.
 The `shell_writer_` worker regressions hold a shell's Started event outside the
 actor, refuse rewind before interruption, reopen the journal with empty tools,
 and verify that neither restore nor a Rewound receipt can bypass the live writer.
