@@ -666,11 +666,27 @@ fn keeper_holds_fifo(keeper: Pid, pgid: Pid, dir: &Path) -> bool {
     }
     #[cfg(target_os = "macos")]
     {
-        let Ok(out) = std::process::Command::new("/usr/sbin/lsof").args(["-a", "-p", &keeper.to_string(), "-d", "3", "-F0fin"]).output()
-        else {
-            return false;
+        use nix::libc;
+        const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2; // <sys/proc_info.h>
+        // SAFETY: these repr(C) records contain only integers and arrays of
+        // integers, including libc's vnode_info_path; all-zero is valid.
+        let mut info: DarwinVnodeFdInfoWithPath = unsafe { std::mem::zeroed() };
+        // SAFETY: info is aligned, writable storage of precisely the size
+        // required by PROC_PIDFDVNODEPATHINFO. Never trust a short/error reply.
+        let returned = unsafe {
+            libc::proc_pidfdinfo(
+                keeper.as_raw(),
+                3,
+                PROC_PIDFDVNODEPATHINFO,
+                std::ptr::from_mut(&mut info).cast(),
+                std::mem::size_of::<DarwinVnodeFdInfoWithPath>() as libc::c_int,
+            )
         };
-        out.status.success() && std::str::from_utf8(&out.stdout).is_ok_and(|text| darwin_lsof_fifo(text, &dir.join("in")))
+        let stat = &info.pvip.vip_vi.vi_stat;
+        // libc represents char[MAXPATHLEN] as [[c_char; 32]; 32]. Preserve
+        // raw pathname bytes rather than assuming UTF-8 or display escaping.
+        let path = info.pvip.vip_path.map(|row| row.map(|b| b as u8));
+        darwin_vnode_fifo(returned, stat.vst_dev, stat.vst_ino, stat.vst_mode, path.as_flattened(), &dir.join("in"))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -679,35 +695,72 @@ fn keeper_holds_fifo(keeper: Pid, pgid: Pid, dir: &Path) -> bool {
     }
 }
 
+// libc exposes the function and inner vnode records, but not these two
+// enclosing records. Layout: Apple's <sys/proc_info.h> proc_fileinfo and
+// vnode_fdinfowithpath (also unchanged in Sonoma's xnu-10063.121.3).
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct DarwinProcFileInfo {
+    fi_openflags: u32,
+    fi_status: u32,
+    fi_offset: nix::libc::off_t,
+    fi_type: i32,
+    fi_guardflags: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct DarwinVnodeFdInfoWithPath {
+    pfi: DarwinProcFileInfo,
+    pvip: nix::libc::vnode_info_path,
+}
+
 #[cfg(any(target_os = "macos", test))]
-fn darwin_lsof_fifo(text: &str, fifo: &Path) -> bool {
+const DARWIN_VNODE_FDINFO_SIZE: usize = 1200;
+#[cfg(any(target_os = "macos", test))]
+const DARWIN_VNODE_PATH_SIZE: usize = 1024;
+
+#[cfg(target_os = "macos")]
+const _: () = {
+    assert!(std::mem::size_of::<DarwinProcFileInfo>() == 24);
+    assert!(std::mem::offset_of!(DarwinVnodeFdInfoWithPath, pvip) == 24);
+    assert!(std::mem::size_of::<DarwinVnodeFdInfoWithPath>() == DARWIN_VNODE_FDINFO_SIZE);
+    assert!(nix::libc::MAXPATHLEN as usize == DARWIN_VNODE_PATH_SIZE);
+};
+
+/// Decode the kernel's fixed-size C pathname without losing non-UTF-8 bytes.
+#[cfg(any(target_os = "macos", test))]
+fn darwin_vnode_path(path: &[u8]) -> Option<&Path> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    if path.len() != DARWIN_VNODE_PATH_SIZE {
+        return None;
+    }
+    let end = path.iter().position(|b| *b == 0)?;
+    let path = Path::new(OsStr::from_bytes(&path[..end]));
+    path.is_absolute().then_some(path)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn darwin_vnode_fifo(returned: i32, dev: u32, ino: u64, mode: u16, path: &[u8], fifo: &Path) -> bool {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
-    let Ok(expected) = std::fs::metadata(fifo) else { return false };
-    if !expected.file_type().is_fifo() {
+    if usize::try_from(returned).ok() != Some(DARWIN_VNODE_FDINFO_SIZE) {
         return false;
     }
-    let (mut fd, mut inode, mut name) = (None, None, None);
-    for field in text.split('\0').map(|f| f.trim_start_matches('\n')) {
-        let slot = match field.as_bytes().first() {
-            Some(b'f') => &mut fd,
-            Some(b'i') => &mut inode,
-            Some(b'n') => &mut name,
-            _ => continue,
-        };
-        // -d 3 selects one descriptor; never combine proof from two records.
-        if slot.replace(&field[1..]).is_some() {
-            return false;
-        }
+    let Ok(expected) = std::fs::metadata(fifo) else { return false };
+    // Device/inode/type are from the open descriptor's vnode, not a stat of
+    // its reported path. Darwin dev_t is 32-bit; compare its bits regardless
+    // of MetadataExt's widening of the signed st_dev to u64.
+    if !expected.file_type().is_fifo()
+        || dev != expected.dev() as u32
+        || ino != expected.ino()
+        || u64::from(mode) & u64::from(nix::libc::S_IFMT) != u64::from(nix::libc::S_IFIFO)
+    {
+        return false;
     }
-    let Some(name) = name else { return false };
-    let Ok(open) = std::fs::metadata(name) else { return false };
-    // Darwin lsof deliberately omits D (device) for FIFOs. Stat its reported
-    // path for the device, retaining its open-file inode proof. This also
-    // accepts /var vs /private/var (or another symlink to the same FIFO).
-    fd == Some("3")
-        && inode.and_then(|i| i.parse::<u64>().ok()) == Some(expected.ino())
-        && open.file_type().is_fifo()
-        && (open.dev(), open.ino()) == (expected.dev(), expected.ino())
+    let Some(path) = darwin_vnode_path(path) else { return false };
+    let (Ok(open_path), Ok(expected_path)) = (std::fs::canonicalize(path), std::fs::canonicalize(fifo)) else { return false };
+    open_path == expected_path
 }
 
 fn held_group_owned(meta: &HeldMeta, dir: &Path) -> bool {
@@ -4886,29 +4939,66 @@ done
     }
 
     #[test]
-    fn darwin_fifo_identity_accepts_missing_device_and_path_alias_but_not_another_file() {
+    fn darwin_fifo_identity_requires_open_vnode_device_inode_type_and_path() {
+        use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::{MetadataExt, symlink};
         let dir = tempfile::tempdir().unwrap();
-        let runtime = dir.path().join("runtime with a space");
+        let runtime = dir.path().join("runtime with\na newline");
         std::fs::create_dir(&runtime).unwrap();
         let fifo = runtime.join("in");
         nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR).unwrap();
         let alias = dir.path().join("alias");
         symlink(&runtime, &alias).unwrap();
-        let inode = std::fs::metadata(&fifo).unwrap().ino();
-        let record = |fd: &str, inode: u64, name: &Path| format!("p123\0\nf{fd}\0i{inode}\0n{}\0\n", name.display());
-        let valid = record("3", inode, &alias.join("in"));
-        assert!(darwin_lsof_fifo(&valid, &fifo), "Darwin FIFO has no D field; paths may be aliases");
-        assert!(!darwin_lsof_fifo(&record("4", inode, &fifo), &fifo));
-        assert!(!darwin_lsof_fifo(&record("3", inode + 1, &fifo), &fifo));
-        assert!(!darwin_lsof_fifo(&valid.replace(&format!("i{inode}\0"), ""), &fifo));
-        assert!(!darwin_lsof_fifo(&format!("{valid}f3\0"), &fifo), "do not mix descriptor records");
+        let stat = std::fs::metadata(&fifo).unwrap();
+        let (dev, ino, mode) = (stat.dev() as u32, stat.ino(), stat.mode() as u16);
+        let size = DARWIN_VNODE_FDINFO_SIZE as i32;
+        let path = |name: &Path| {
+            let mut buffer = [0; DARWIN_VNODE_PATH_SIZE];
+            let bytes = name.as_os_str().as_bytes();
+            assert!(bytes.len() < buffer.len());
+            buffer[..bytes.len()].copy_from_slice(bytes);
+            buffer
+        };
+        let valid = path(&fifo);
+        assert!(darwin_vnode_fifo(size, dev, ino, mode, &valid, &fifo));
+        assert!(darwin_vnode_fifo(size, dev, ino, mode, &path(&alias.join("in")), &fifo), "canonical path accepts symlink aliases");
+        assert!(darwin_vnode_fifo(size, dev, ino, mode, &valid, &alias.join("in")), "the expected path may be an alias too");
+        assert!(darwin_vnode_fifo(size, dev, ino, mode & !0o777, &valid, &fifo), "FIFO type, not permissions, is authority");
+        assert!(
+            !darwin_vnode_fifo(size, dev.wrapping_add(1), ino, mode, &valid, &fifo),
+            "same inode/path on a different open-vnode device is not authority"
+        );
+        assert!(!darwin_vnode_fifo(size, dev, ino.wrapping_add(1), mode, &valid, &fifo));
+        assert!(!darwin_vnode_fifo(size, dev, ino, 0, &valid, &fifo), "open-vnode mode must prove FIFO type");
         let other = runtime.join("other");
         nix::unistd::mkfifo(&other, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR).unwrap();
-        assert!(!darwin_lsof_fifo(&record("3", inode, &other), &fifo), "the path must resolve to the expected device/inode too");
+        assert!(!darwin_vnode_fifo(size, dev, ino, mode, &path(&other), &fifo), "matching vnode numbers still require the expected path");
+        assert!(!darwin_vnode_fifo(size, dev, ino, mode, &path(&runtime.join("missing")), &fifo));
+        for returned in [-1, 0, size - 1, size + 1] {
+            assert!(!darwin_vnode_fifo(returned, dev, ino, mode, &valid, &fifo), "malformed response size {returned}");
+        }
+        for malformed in [&valid[..valid.len() - 1], &[0; DARWIN_VNODE_PATH_SIZE], &[b'/'; DARWIN_VNODE_PATH_SIZE]] {
+            assert!(!darwin_vnode_fifo(size, dev, ino, mode, malformed, &fifo), "malformed kernel pathname");
+        }
         std::fs::remove_file(&fifo).unwrap();
         std::fs::write(&fifo, []).unwrap();
-        assert!(!darwin_lsof_fifo(&valid, &fifo), "a replaced non-FIFO is not authority");
+        assert!(!darwin_vnode_fifo(size, dev, ino, mode, &valid, &fifo), "a replaced non-FIFO is not authority");
+    }
+
+    #[test]
+    fn darwin_vnode_path_preserves_bytes_and_rejects_malformed_paths() {
+        use std::os::unix::ffi::OsStrExt;
+        // No filesystem operation: non-UTF-8 path bytes can be checked even
+        // on a filesystem that refuses to create such filenames.
+        let raw = b"/runtime\xff/with\na newline/in";
+        let mut path = [0; DARWIN_VNODE_PATH_SIZE];
+        path[..raw.len()].copy_from_slice(raw);
+        assert_eq!(darwin_vnode_path(&path).unwrap().as_os_str().as_bytes(), raw);
+        assert!(darwin_vnode_path(&path[..path.len() - 1]).is_none());
+        assert!(darwin_vnode_path(&[0; DARWIN_VNODE_PATH_SIZE]).is_none());
+        assert!(darwin_vnode_path(&[b'/'; DARWIN_VNODE_PATH_SIZE]).is_none());
+        path[0] = b'r';
+        assert!(darwin_vnode_path(&path).is_none(), "kernel path must be absolute");
     }
 
     #[tokio::test]
