@@ -195,6 +195,12 @@ absence: only a later complete proof releases the barrier. Unflagged live
 members and hard errors refuse immediately; a zero deadline never sleeps or
 re-observes. The `darwin_group_progress_` and `darwin_group_inexit_` tests
 inject these transitions using paused time.
+Replacement's final Mac proof uses only the time remaining in kill's existing
+one-second absence phase, never a new budget or a cached absence result. Early
+ownership-cleanup failure supplies no grace. `darwin_group_replacement_`
+tests cover that deadline, fresh proofs, immediate refusals, typed errors and
+the ordinary error display used by the session. Every raw Darwin signal-zero
+disposition has same-observation diagnostics, including Ok/live and hard errors.
 Darwin's keeper also ignores SIGINT before exec: unlike Linux, a default-fatal
 SIGINT can kill a SIGSTOPped process. The cross-platform
 `held_keeper_retains_fifo_ownership_through_group_interrupt` regression waits

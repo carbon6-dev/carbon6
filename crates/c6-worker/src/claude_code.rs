@@ -668,10 +668,13 @@ struct DarwinGroupObservation {
 #[cfg(target_os = "macos")]
 fn darwin_group_observation(pg: Pid) -> DarwinGroupObservation {
     let result = killpg(pg, None);
-    if pg.as_raw() > 0 {
-        return darwin_group_observe(result, || darwin_group_stopped_with_detail(pg.as_raw()));
-    }
-    DarwinGroupObservation { result, detail: None, failure: DarwinGroupFailure::Refusal }
+    darwin_group_observe(result, || {
+        if pg.as_raw() > 0 {
+            darwin_group_stopped_with_detail(pg.as_raw())
+        } else {
+            (false, DarwinGroupFailure::Refusal, vec![format!("nonpositive PGID {pg}; no absence proof attempted")])
+        }
+    })
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -698,12 +701,15 @@ fn darwin_group_probe_with_detail(
     result: nix::Result<()>,
     stopped: impl FnOnce() -> (bool, Vec<String>),
 ) -> (nix::Result<()>, Option<String>) {
-    let mut detail = None;
+    let raw = match result {
+        Ok(()) => "Darwin group signal-zero: Ok/live".to_owned(),
+        Err(error) => format!("Darwin group signal-zero: Err({error:?}) errno={}", error as i32),
+    };
+    let mut detail = Some(raw.clone());
     let result = darwin_group_probe(result, || {
         let (stopped, observations) = stopped();
-        if !stopped {
-            detail = Some(format!("Darwin group absence proof refused: {}", observations.join("; ")));
-        }
+        let disposition = if stopped { "confirmed" } else { "refused" };
+        detail = Some(format!("{raw}; Darwin group absence proof {disposition}: {}", observations.join("; ")));
         stopped
     });
     (result, detail)
@@ -1260,6 +1266,22 @@ async fn darwin_confirm_group_stopped(
             Ok(()) => Err(StopUnconfirmed(format!("{message}: signal-zero probe reports a live group")).into()),
         };
     }
+}
+
+/// Replacement gets only the remainder of kill's original absence phase.
+/// Early cleanup failure supplies no grace, but still requires a fresh proof.
+#[cfg(any(target_os = "macos", test))]
+async fn darwin_confirm_replacement_stopped(
+    pg: Pid,
+    deadline: Option<tokio::time::Instant>,
+    probe: impl FnMut() -> DarwinGroupObservation,
+) -> anyhow::Result<()> {
+    darwin_confirm_group_stopped(pg.as_raw(), deadline.unwrap_or_else(tokio::time::Instant::now), probe).await.map_err(|error| {
+        // The session's Error event uses ordinary Display, not {error:#}.
+        // Keep that display complete without losing either typed marker.
+        let message = format!("{}: {error:#}", ReplacementBlocked(pg));
+        error.context(ReplacementBlocked(pg)).context(message)
+    })
 }
 
 /// While an ordinary replacement waits, keep its turn future (and any
@@ -2676,13 +2698,21 @@ impl Process {
             if self.held.is_none() {
                 *self.stdin.lock().await = None;
             }
-            self.kill().await;
-            let (result, detail) = group_probe_with_detail(pg);
-            if !matches!(result, Err(nix::errno::Errno::ESRCH)) {
-                if let Some(detail) = detail {
-                    return Err(anyhow::Error::new(ReplacementBlocked(pg)).context(format!("{}: {detail}", ReplacementBlocked(pg))));
+            #[cfg(not(target_os = "macos"))]
+            {
+                self.kill().await;
+                let (result, detail) = group_probe_with_detail(pg);
+                if !matches!(result, Err(nix::errno::Errno::ESRCH)) {
+                    if let Some(detail) = detail {
+                        return Err(anyhow::Error::new(ReplacementBlocked(pg)).context(format!("{}: {detail}", ReplacementBlocked(pg))));
+                    }
+                    return Err(ReplacementBlocked(pg).into());
                 }
-                return Err(ReplacementBlocked(pg).into());
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let deadline = self.kill_with_deadline().await;
+                darwin_confirm_replacement_stopped(pg, deadline, || darwin_group_observation(pg)).await?;
             }
         }
         *self.stdin.lock().await = None;
@@ -2719,6 +2749,7 @@ impl Process {
         .map_err(|_| anyhow::anyhow!("Claude Code did not stop within the rewind cleanup limit"))?
     }
 
+    #[cfg(not(target_os = "macos"))]
     async fn kill(&mut self) {
         if let Some(pg) = self.pgid {
             if let Some(h) = &mut self.held {
@@ -2744,6 +2775,44 @@ impl Process {
             let _ = tokio::time::timeout(Duration::from_secs(1), absent).await;
         }
         self.release_held();
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn kill(&mut self) {
+        let _ = self.kill_with_deadline().await;
+    }
+
+    /// The deadline is timing information only, never ownership or absence.
+    #[cfg(target_os = "macos")]
+    async fn kill_with_deadline(&mut self) -> Option<tokio::time::Instant> {
+        if let Some(pg) = self.pgid {
+            if let Some(h) = &mut self.held {
+                h.stop_on_drop = true;
+                if let Err(e) = stop_held_group(pg, h.keeper, &h.dir, &self.launch.conversation).await {
+                    warn!("stopping held Claude Code: {e:#}");
+                    return None;
+                }
+            } else {
+                let _ = killpg(pg, Signal::SIGINT);
+                let _ = tokio::time::timeout(Duration::from_secs(3), self.wait_exit()).await;
+                let _ = killpg(pg, Signal::SIGKILL);
+            }
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(3), self.wait_exit()).await;
+        let deadline = if let Some(pg) = self.pgid {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            let absent = async {
+                while !matches!(group_probe(pg), Err(nix::errno::Errno::ESRCH)) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            };
+            let _ = tokio::time::timeout_at(deadline, absent).await;
+            Some(deadline)
+        } else {
+            None
+        };
+        self.release_held();
+        deadline
     }
 }
 
@@ -5620,12 +5689,15 @@ done
         assert_eq!(calls, 1);
         assert_eq!(observed.result, Err(Errno::EPERM));
         assert_eq!(observed.failure, DarwinGroupFailure::Progress);
-        assert_eq!(observed.detail.as_deref(), Some("Darwin group absence proof refused: listed member reaped"));
+        assert_eq!(
+            observed.detail.as_deref(),
+            Some("Darwin group signal-zero: Err(EPERM) errno=1; Darwin group absence proof refused: listed member reaped")
+        );
         for result in [Ok(()), Err(Errno::ESRCH), Err(Errno::EACCES), Err(Errno::EIO)] {
             let observed = darwin_group_observe(result, || panic!("non-EPERM must not collect another observation"));
             assert_eq!(observed.result, result);
             assert_eq!(observed.failure, DarwinGroupFailure::Refusal);
-            assert!(observed.detail.is_none());
+            assert!(observed.detail.as_deref().unwrap().contains("Darwin group signal-zero:"));
         }
     }
 
@@ -5840,9 +5912,18 @@ done
                 });
                 assert_eq!(observed, darwin_group_probe(result, || stopped));
                 assert_eq!(calls, usize::from(result == Err(Errno::EPERM)));
-                assert_eq!(detail.is_some(), result == Err(Errno::EPERM) && !stopped);
-                if let Some(detail) = detail {
-                    assert_eq!(detail, "Darwin group absence proof refused: original observation");
+                let detail = detail.expect("every raw disposition needs a same-observation transcript");
+                assert!(detail.contains("Darwin group signal-zero:"));
+                if result == Err(Errno::EPERM) {
+                    let disposition = if stopped { "confirmed" } else { "refused" };
+                    assert!(detail.contains(&format!("Darwin group absence proof {disposition}: original observation")));
+                } else {
+                    assert!(!detail.contains("absence proof"), "non-EPERM must not invoke the fallback");
+                    if let Err(error) = result {
+                        assert!(detail.contains(&format!("Err({error:?}) errno={}", error as i32)));
+                    } else {
+                        assert!(detail.contains("Ok/live"));
+                    }
                 }
             }
         }
@@ -5872,7 +5953,130 @@ done
         assert_eq!(result, Err(Errno::EPERM));
         assert_eq!(lists, 2, "reporting must not repeat enumeration");
         assert_eq!(lookups, 1, "a failed second enumeration must not repeat member lookup");
-        assert_eq!(detail.as_deref(), Some("Darwin group absence proof refused: list 1; member 42; list 2"));
+        assert_eq!(
+            detail.as_deref(),
+            Some("Darwin group signal-zero: Err(EPERM) errno=1; Darwin group absence proof refused: list 1; member 42; list 2")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn darwin_group_replacement_uses_only_the_remaining_kill_deadline() {
+        use nix::errno::Errno;
+        let start = tokio::time::Instant::now();
+        let deadline = start + Duration::from_secs(1);
+        tokio::time::advance(Duration::from_millis(940)).await;
+        let mut calls = 0;
+        let error = darwin_confirm_replacement_stopped(Pid::from_raw(41), Some(deadline), || {
+            calls += 1;
+            darwin_group_observe(Err(Errno::EPERM), || {
+                (false, DarwinGroupFailure::Progress, vec![format!("full last flags=4 observation {calls}")])
+            })
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls, 3, "only 940/965/990 ms, not a fresh one-second budget");
+        assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(1));
+        let event = format!("{error}; queued inputs remain pending");
+        assert!(event.contains("replacement is blocked"));
+        assert!(event.contains("full last flags=4 observation 3"));
+        assert!(event.contains("Err(EPERM) errno=1"));
+        assert!(error.downcast_ref::<ReplacementBlocked>().is_some());
+        assert!(error.downcast_ref::<StopUnconfirmed>().is_some());
+        assert_eq!(error.downcast_ref::<Errno>(), Some(&Errno::EPERM));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn darwin_group_replacement_without_remaining_grace_observes_once() {
+        use nix::errno::Errno;
+        for deadline in [None, Some(tokio::time::Instant::now())] {
+            let start = tokio::time::Instant::now();
+            let mut calls = 0;
+            let error = darwin_confirm_replacement_stopped(Pid::from_raw(41), deadline, || {
+                calls += 1;
+                darwin_group_observe(Err(Errno::EPERM), || (false, DarwinGroupFailure::Progress, vec!["no remaining grace".into()]))
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(calls, 1, "early ownership failure or expired phase must not gain grace");
+            assert_eq!(tokio::time::Instant::now(), start);
+            assert!(format!("{error}; queued inputs remain pending").contains("no remaining grace"));
+            assert!(error.downcast_ref::<ReplacementBlocked>().is_some());
+            assert_eq!(error.downcast_ref::<Errno>(), Some(&Errno::EPERM));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn darwin_group_replacement_live_and_hard_errors_keep_display_and_typed_refusals() {
+        use nix::errno::Errno;
+        for terminal in [Ok(()), Err(Errno::EIO), Err(Errno::EACCES), Err(Errno::EPERM)] {
+            let start = tokio::time::Instant::now();
+            let mut calls = 0;
+            let error = darwin_confirm_replacement_stopped(Pid::from_raw(41), Some(start + Duration::from_secs(1)), || {
+                calls += 1;
+                if calls == 1 {
+                    darwin_group_observe(Err(Errno::EPERM), || (false, DarwinGroupFailure::Progress, vec!["exiting flags=4".into()]))
+                } else {
+                    assert_eq!(calls, 2, "live and hard errors must refuse immediately");
+                    darwin_group_observe(terminal, || {
+                        assert_eq!(terminal, Err(Errno::EPERM), "other dispositions must not enumerate");
+                        (false, DarwinGroupFailure::Refusal, vec!["unflagged live member flags=0".into()])
+                    })
+                }
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(calls, 2);
+            assert_eq!(tokio::time::Instant::now() - start, Duration::from_millis(25));
+            let event = format!("{error}; queued inputs remain pending");
+            assert!(event.contains("Darwin group signal-zero:"));
+            assert!(error.downcast_ref::<ReplacementBlocked>().is_some());
+            assert!(error.downcast_ref::<StopUnconfirmed>().is_some());
+            if let Err(errno) = terminal {
+                assert!(event.contains(&format!("Err({errno:?}) errno={}", errno as i32)));
+                assert_eq!(error.downcast_ref::<Errno>(), Some(&errno));
+                if errno == Errno::EPERM {
+                    assert!(event.contains("unflagged live member flags=0"));
+                }
+            } else {
+                assert!(event.contains("Ok/live"));
+                assert!(error.downcast_ref::<Errno>().is_none());
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn darwin_group_replacement_always_requires_a_fresh_complete_proof() {
+        use nix::errno::Errno;
+        for grace in [None, Some(Duration::ZERO), Some(Duration::from_millis(60))] {
+            let start = tokio::time::Instant::now();
+            let deadline = grace.map(|duration| start + duration);
+            let mut calls = 0;
+            let mut enumerations = 0;
+            darwin_confirm_replacement_stopped(Pid::from_raw(41), deadline, || {
+                calls += 1;
+                if grace == Some(Duration::from_millis(60)) && calls == 1 {
+                    return darwin_group_observe(Err(Errno::EPERM), || {
+                        (false, DarwinGroupFailure::Progress, vec!["prior observation is not absence".into()])
+                    });
+                }
+                darwin_group_observe(Err(Errno::EPERM), || {
+                    let stopped = darwin_group_snapshots_stopped(
+                        || {
+                            enumerations += 1;
+                            Some(Vec::new())
+                        },
+                        |_| panic!("empty complete group has no member lookups"),
+                    );
+                    (stopped, DarwinGroupFailure::Refusal, vec!["fresh identical complete empty snapshots".into()])
+                })
+            })
+            .await
+            .unwrap();
+            let waits = usize::from(grace == Some(Duration::from_millis(60)));
+            assert_eq!(calls, 1 + waits);
+            assert_eq!(enumerations, 2, "no cached stopped result may authorize replacement");
+            assert_eq!(tokio::time::Instant::now() - start, Duration::from_millis(25 * waits as u64));
+        }
     }
 
     #[test]
