@@ -18,12 +18,13 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 /// A `claude` that records its arguments and first message in the session folder,
-/// then edits a file and says which model it ran.
+/// then says which model it ran and exits (unlike the persistent real CLI).
 fn fake_claude(dir: &Path) -> std::path::PathBuf {
     let script = r#"#!/bin/sh
 read -r prompt
 printf '%s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >> claude-calls.log
 printf '%s\n=====\n' "$prompt" >> claude-prompts.log
+printf '%s\n' "$PPID" >> claude-wrappers.log
 model=default; prev=""
 for a in "$@"; do [ "$prev" = "--model" ] && model="$a"; prev="$a"; done
 cat <<EOF
@@ -38,6 +39,34 @@ EOF
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
+}
+
+/// Use production's fresh ownership checks to clean up even after a panic.
+struct HeldFixtureCleanup(std::path::PathBuf);
+
+impl Drop for HeldFixtureCleanup {
+    fn drop(&mut self) {
+        let state = self.0.clone();
+        let _ = std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+            rt.block_on(async {
+                let held = state.join("claude/held");
+                let Ok(entries) = std::fs::read_dir(&held) else { return };
+                let sessions = entries
+                    .flatten()
+                    .filter_map(|entry| {
+                        let meta: Value = serde_json::from_slice(&std::fs::read(entry.path().join("meta.json")).ok()?).ok()?;
+                        Some(meta["session"].as_str()?.to_owned())
+                    })
+                    .collect::<std::collections::HashSet<_>>();
+                let Ok(journal) = c6_worker::journal::Journal::open(&state.join("journal.db")).await else { return };
+                for session in sessions {
+                    let _ = c6_worker::claude_code::stop_held_for_rewind(&held, &session, &journal).await;
+                }
+            });
+        })
+        .join();
+    }
 }
 
 async fn run_worker(state: &Path) -> (Arc<Worker>, CancellationToken) {
@@ -81,6 +110,37 @@ impl Env {
         })
         .await
     }
+
+    /// A result ends a turn, not the CLI process. This one-shot stand-in
+    /// must also have been retired before another message may start a CLI.
+    async fn claude_idle(&self, id: &str, turns: usize, project: &Path) -> Vec<Event> {
+        let evs = self.idle(id, turns).await;
+        assert!(matches!(
+            evs.iter().rev().find_map(|e| match &e.kind {
+                EventKind::TurnEnded { reason, .. } => Some(reason),
+                _ => None,
+            }),
+            Some(c6_api::TurnEndReason::Completed)
+        ));
+        let wrappers = std::fs::read_to_string(project.join("claude-wrappers.log")).unwrap();
+        let wrapper: i32 = wrappers.lines().last().unwrap().parse().unwrap();
+        assert!(wrapper > 0);
+        // The held shell writes the exit code after the fake exits, so it
+        // cannot exec the fake. Its PID remains (even as a zombie) until
+        // Process::exited waits for it, after the actor takes self.claude.
+        // Tokio only reaps an owned child when polled, not on SIGCHLD alone.
+        // Merely seeing the exit-code file would still race actor retirement;
+        // waiting for the group to vanish would include its surviving keeper.
+        eventually("the one-shot Claude fixture's wrapper to be reaped", async || {
+            match nix::sys::signal::kill(nix::unistd::Pid::from_raw(wrapper), None) {
+                Err(nix::errno::Errno::ESRCH) => Some(()),
+                Ok(()) => None,
+                Err(e) => panic!("probing Claude fixture wrapper {wrapper}: {e}"),
+            }
+        })
+        .await;
+        evs
+    }
 }
 
 /// The handoffs in a log: (model, runtime).
@@ -122,6 +182,7 @@ async fn sessions_hand_over_between_claude_code_and_carbon6s_loop() {
     unsafe { std::env::set_var("C6_CLAUDE_BIN", &claude) };
     let mock = MockLlm::start().await;
     let (head_dir, state, project) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let _cleanup = HeldFixtureCleanup(state.path().to_owned());
     let head = c6_head::start(HeadConfig {
         data_dir: head_dir.path().to_owned(),
         bind: vec!["127.0.0.1".parse().unwrap()],
@@ -163,7 +224,7 @@ async fn sessions_hand_over_between_claude_code_and_carbon6s_loop() {
     // 2. Ordinary → Claude Code: a new Claude Code conversation (not the
     // session's id), started with the marked transcript, then the message.
     env.ok::<Value>(&format!("/sessions/{sid}/messages"), say("continue in claude", Some((&cc.id, "opus")))).await;
-    let evs = env.idle(&sid, 2).await;
+    let evs = env.claude_idle(&sid, 2, project.path()).await;
     assert_eq!(handoffs(&evs), [("opus".to_owned(), "claude_code".to_owned())]);
     let switched = evs.iter().position(|e| matches!(&e.kind, EventKind::ModelSwitched { handoff: Some(_), .. })).unwrap();
     let next = evs[switched + 1..].iter().find(|e| !matches!(e.kind, EventKind::Checkpoint { .. })).unwrap();
@@ -188,7 +249,7 @@ async fn sessions_hand_over_between_claude_code_and_carbon6s_loop() {
 
     // 3. The next turn resumes that conversation, with no transcript.
     env.ok::<Value>(&format!("/sessions/{sid}/messages"), say("and the tests?", None)).await;
-    env.idle(&sid, 3).await;
+    env.claude_idle(&sid, 3, project.path()).await;
     let (calls, prompts) = claude_runs(project.path());
     assert_eq!(arg(&calls[1], "--resume"), Some(conversation.as_str()), "{calls:?}");
     assert_eq!(prompts[1], "Message sent by an automation, not typed by the user:\nand the tests?");
@@ -200,14 +261,14 @@ async fn sessions_hand_over_between_claude_code_and_carbon6s_loop() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let (worker, stop) = run_worker(state.path()).await;
     env.ok::<Value>(&format!("/sessions/{sid}/messages"), say("still there?", None)).await;
-    env.idle(&sid, 4).await;
+    env.claude_idle(&sid, 4, project.path()).await;
     let (calls, _) = claude_runs(project.path());
     assert_eq!(arg(&calls[2], "--resume"), Some(conversation.as_str()), "reloaded on Claude Code: {calls:?}");
     assert_eq!(mock.requests().len(), 2);
 
     // 5. A switch within Claude Code keeps its conversation.
     env.ok::<Value>(&format!("/sessions/{sid}/messages"), say("quicker now", Some((&cc.id, "sonnet")))).await;
-    let evs = env.idle(&sid, 5).await;
+    let evs = env.claude_idle(&sid, 5, project.path()).await;
     assert_eq!(handoffs(&evs).len(), 1, "no handoff within a runtime");
     assert!(evs.iter().any(|e| matches!(&e.kind, EventKind::ModelSwitched { model, handoff: None, .. } if model == "sonnet")));
     let (calls, _) = claude_runs(project.path());
