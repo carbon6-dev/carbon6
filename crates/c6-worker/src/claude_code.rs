@@ -666,28 +666,48 @@ fn keeper_holds_fifo(keeper: Pid, pgid: Pid, dir: &Path) -> bool {
     }
     #[cfg(target_os = "macos")]
     {
-        use std::os::unix::fs::{FileTypeExt, MetadataExt};
-        let Ok(fifo) = std::fs::metadata(dir.join("in")) else { return false };
-        if !fifo.file_type().is_fifo() {
-            return false;
-        }
-        let Ok(out) = std::process::Command::new("/usr/sbin/lsof").args(["-a", "-p", &keeper.to_string(), "-d", "3", "-FfniD"]).output()
+        let Ok(out) = std::process::Command::new("/usr/sbin/lsof").args(["-a", "-p", &keeper.to_string(), "-d", "3", "-F0fin"]).output()
         else {
             return false;
         };
-        let text = String::from_utf8_lossy(&out.stdout);
-        let lines = text.lines().collect::<Vec<_>>();
-        out.status.success()
-            && lines.contains(&"f3")
-            && lines.iter().any(|line| line.strip_prefix('n').is_some_and(|p| Path::new(p) == dir.join("in")))
-            && lines.iter().any(|line| line.strip_prefix('i').and_then(|n| n.parse::<u64>().ok()) == Some(fifo.ino()))
-            && lines.iter().any(|line| line.strip_prefix("D0x").and_then(|n| u64::from_str_radix(n, 16).ok()) == Some(fifo.dev()))
+        out.status.success() && std::str::from_utf8(&out.stdout).is_ok_and(|text| darwin_lsof_fifo(text, &dir.join("in")))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = dir;
         false
     }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn darwin_lsof_fifo(text: &str, fifo: &Path) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let Ok(expected) = std::fs::metadata(fifo) else { return false };
+    if !expected.file_type().is_fifo() {
+        return false;
+    }
+    let (mut fd, mut inode, mut name) = (None, None, None);
+    for field in text.split('\0').map(|f| f.trim_start_matches('\n')) {
+        let slot = match field.as_bytes().first() {
+            Some(b'f') => &mut fd,
+            Some(b'i') => &mut inode,
+            Some(b'n') => &mut name,
+            _ => continue,
+        };
+        // -d 3 selects one descriptor; never combine proof from two records.
+        if slot.replace(&field[1..]).is_some() {
+            return false;
+        }
+    }
+    let Some(name) = name else { return false };
+    let Ok(open) = std::fs::metadata(name) else { return false };
+    // Darwin lsof deliberately omits D (device) for FIFOs. Stat its reported
+    // path for the device, retaining its open-file inode proof. This also
+    // accepts /var vs /private/var (or another symlink to the same FIFO).
+    fd == Some("3")
+        && inode.and_then(|i| i.parse::<u64>().ok()) == Some(expected.ino())
+        && open.file_type().is_fifo()
+        && (open.dev(), open.ino()) == (expected.dev(), expected.ino())
 }
 
 fn held_group_owned(meta: &HeldMeta, dir: &Path) -> bool {
@@ -4863,6 +4883,32 @@ done
         }
         assert!(darwin_procargs(&0i32.to_ne_bytes()).is_none());
         assert!(darwin_procargs(&(-1i32).to_ne_bytes()).is_none());
+    }
+
+    #[test]
+    fn darwin_fifo_identity_accepts_missing_device_and_path_alias_but_not_another_file() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime with a space");
+        std::fs::create_dir(&runtime).unwrap();
+        let fifo = runtime.join("in");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR).unwrap();
+        let alias = dir.path().join("alias");
+        symlink(&runtime, &alias).unwrap();
+        let inode = std::fs::metadata(&fifo).unwrap().ino();
+        let record = |fd: &str, inode: u64, name: &Path| format!("p123\0\nf{fd}\0i{inode}\0n{}\0\n", name.display());
+        let valid = record("3", inode, &alias.join("in"));
+        assert!(darwin_lsof_fifo(&valid, &fifo), "Darwin FIFO has no D field; paths may be aliases");
+        assert!(!darwin_lsof_fifo(&record("4", inode, &fifo), &fifo));
+        assert!(!darwin_lsof_fifo(&record("3", inode + 1, &fifo), &fifo));
+        assert!(!darwin_lsof_fifo(&valid.replace(&format!("i{inode}\0"), ""), &fifo));
+        assert!(!darwin_lsof_fifo(&format!("{valid}f3\0"), &fifo), "do not mix descriptor records");
+        let other = runtime.join("other");
+        nix::unistd::mkfifo(&other, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR).unwrap();
+        assert!(!darwin_lsof_fifo(&record("3", inode, &other), &fifo), "the path must resolve to the expected device/inode too");
+        std::fs::remove_file(&fifo).unwrap();
+        std::fs::write(&fifo, []).unwrap();
+        assert!(!darwin_lsof_fifo(&valid, &fifo), "a replaced non-FIFO is not authority");
     }
 
     #[tokio::test]

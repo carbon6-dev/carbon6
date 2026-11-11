@@ -170,6 +170,12 @@ truncated records; `held_wrapper_process_identity_survives_spaces_in_the_program
 also exercises the live wrapper and requires the whole process group to vanish.
 These tests must also run on macOS: Linux parser coverage cannot qualify the
 Darwin syscall or process-group behavior.
+Darwin's `lsof` omits the device field for a FIFO. The
+`darwin_fifo_identity_` regression checks fd/inode output plus filesystem
+device/inode identity through a path alias, and rejects another descriptor,
+another inode, mixed records, another FIFO, or a replaced regular file.
+The held-process tests exercise this proof with the real keeper on macOS;
+it must still belong to the recorded process group before it authorizes cleanup.
 The `shell_writer_` worker regressions hold a shell's Started event outside the
 actor, refuse rewind before interruption, reopen the journal with empty tools,
 and verify that neither restore nor a Rewound receipt can bypass the live writer.
