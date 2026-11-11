@@ -184,6 +184,11 @@ EPERM for a zombie-only group: that is accepted as stopped only after two
 complete, identical libproc snapshots prove every member is SZOMB (or both
 are empty). Errors, live/unreadable members, changing identities and truncated
 enumerations retain the barrier; EPERM alone never releases it.
+Darwin's keeper also ignores SIGINT before exec: unlike Linux, a default-fatal
+SIGINT can kill a SIGSTOPped process. The cross-platform
+`held_keeper_retains_fifo_ownership_through_group_interrupt` regression waits
+for the CLI to acknowledge that interrupt and its wrapper to exit, then proves
+the stopped keeper still owns the FIFO before completing whole-group cleanup.
 The `shell_writer_` worker regressions hold a shell's Started event outside the
 actor, refuse rewind before interruption, reopen the journal with empty tools,
 and verify that neither restore nor a Rewound receipt can bypass the live writer.

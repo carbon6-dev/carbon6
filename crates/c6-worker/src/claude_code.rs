@@ -1471,9 +1471,17 @@ impl Process {
         // reads an end of its input by a restart; in its process group, so
         // stopping it stops the keeper too.
         let mut keeper = {
+            // Darwin delivers default-fatal SIGINT even to a stopped process.
+            // Ignore it in the keeper (and across exec) so its pinned FIFO
+            // remains authority throughout the CLI's grace period. SIGKILL
+            // still ends the keeper and the whole freshly verified group.
+            #[cfg(target_os = "macos")]
+            let program = r#"trap '' INT; exec 3<>"$0"; exec sleep 2147483647"#;
+            #[cfg(not(target_os = "macos"))]
+            let program = r#"exec 3<>"$0"; exec sleep 2147483647"#;
             tokio::process::Command::new("/bin/sh")
                 .arg("-c")
-                .arg(r#"exec 3<>"$0"; exec sleep 2147483647"#)
+                .arg(program)
                 .arg(&fifo)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -5339,6 +5347,49 @@ while True:
         .await;
         assert!(!keeper_holds_fifo(keeper, pg, &record));
         stop.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn held_keeper_retains_fifo_ownership_through_group_interrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        let _cleanup = HeldFixtureCleanup(held.clone());
+        let bin = script(
+            dir.path(),
+            "claude-interrupt",
+            "#!/bin/sh\ntrap 'printf interrupted > interrupted; exit 0' INT\nprintf ready > ready\nwhile :; do read -r line || exit 0; done\n",
+        );
+        let mut p = Process::spawn_held(
+            &held,
+            "s",
+            &bin,
+            Launch { conversation: "fork".into(), ..Default::default() },
+            false,
+            dir.path(),
+            "opus",
+            Arc::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let pg = p.pgid.unwrap();
+        let keeper = p.held.as_ref().unwrap().keeper;
+        let record = held.join("fork");
+        c6_testkit::eventually("the CLI trap and FIFO keeper to be ready", async || {
+            (dir.path().join("ready").exists() && keeper_holds_fifo(keeper, pg, &record)).then_some(())
+        })
+        .await;
+        pin_held_keeper(keeper, pg, &record).await.unwrap();
+        killpg(pg, Signal::SIGINT).unwrap();
+        c6_testkit::eventually("the CLI to acknowledge the group interrupt", async || {
+            dir.path().join("interrupted").exists().then_some(())
+        })
+        .await;
+        c6_testkit::within("the interrupted CLI wrapper to exit", p.child.as_mut().unwrap().wait()).await.unwrap();
+        assert!(keeper_stopped(keeper), "the keeper must remain pinned after the group interrupt");
+        assert!(keeper_holds_fifo(keeper, pg, &record), "the pinned keeper must retain live FIFO authority after the leader exits");
+        p.close_for_replacement().await.unwrap();
+        assert_eq!(group_probe(pg), Err(nix::errno::Errno::ESRCH));
     }
 
     #[tokio::test]
