@@ -717,6 +717,10 @@ fn darwin_group_probe_with_detail(
 const DARWIN_GROUP_SLOTS: usize = 20;
 #[cfg(any(target_os = "macos", test))]
 const DARWIN_BSDINFO_SIZE: i32 = 136;
+// XNU bsd/sys/proc_info.h: PROC_FLAG_INEXIT. libc exports pbi_flags but
+// does not expose this constant (checked against the pinned libc 0.2.190).
+#[cfg(any(target_os = "macos", test))]
+const DARWIN_PROC_FLAG_INEXIT: u32 = 4;
 
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -724,6 +728,7 @@ struct DarwinGroupMember {
     pid: u32,
     pgid: u32,
     status: u32,
+    flags: u32,
     start_sec: u64,
     start_usec: u64,
 }
@@ -742,11 +747,17 @@ fn darwin_group_missing_member(returned: i32, error: i32) -> DarwinGroupSnapshot
 }
 
 /// Progress is only permission for another observation, never absence proof.
-/// Complete snapshots contain only members accepted by darwin_zombie_member.
+/// Complete snapshots contain only validated zombies or INEXIT members.
 #[cfg(any(target_os = "macos", test))]
 fn darwin_group_failure(snapshots: &[DarwinGroupSnapshot]) -> DarwinGroupFailure {
     use DarwinGroupSnapshot::{Complete, Reaped};
     match snapshots {
+        [Complete(members)]
+            if members.iter().any(|member| member.status != 5)
+                && members.iter().all(|member| member.status == 5 || darwin_member_exiting(member)) =>
+        {
+            DarwinGroupFailure::Progress
+        }
         [Reaped] | [Complete(_), Reaped] => DarwinGroupFailure::Progress,
         [Complete(first), Complete(second)] if second.len() < first.len() && second.iter().all(|member| first.contains(member)) => {
             DarwinGroupFailure::Progress
@@ -787,16 +798,72 @@ fn darwin_zombie_member(returned: i32, pid: i32, pg: i32, member: DarwinGroupMem
 }
 
 #[cfg(any(target_os = "macos", test))]
+fn darwin_member_exiting(member: &DarwinGroupMember) -> bool {
+    (1..5).contains(&member.status) && member.flags & DARWIN_PROC_FLAG_INEXIT != 0
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn darwin_observed_member(returned: i32, error: i32, pid: i32, pg: i32, member: DarwinGroupMember) -> Option<DarwinGroupMember> {
+    if error != 0 {
+        return None;
+    }
+    if member.status == 5 {
+        return darwin_zombie_member(returned, pid, pg, member);
+    }
+    (returned == DARWIN_BSDINFO_SIZE
+        && pid > 0
+        && pg > 0
+        && member.pid == pid as u32
+        && member.pgid == pg as u32
+        && member.start_sec > 0
+        && member.start_usec < 1_000_000
+        && darwin_member_exiting(&member))
+    .then_some(member)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn darwin_group_record_member(snapshot: &mut DarwinGroupSnapshot, returned: i32, error: i32, parsed: &Option<DarwinGroupMember>) {
+    if let Some(member) = parsed {
+        if let DarwinGroupSnapshot::Complete(members) = snapshot {
+            members.push(member.clone());
+        }
+    } else if matches!(snapshot, DarwinGroupSnapshot::Refused)
+        || matches!(darwin_group_missing_member(returned, error), DarwinGroupSnapshot::Refused)
+    {
+        *snapshot = DarwinGroupSnapshot::Refused;
+    } else {
+        *snapshot = DarwinGroupSnapshot::Reaped;
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
 fn darwin_group_snapshots_stopped(
     mut list: impl FnMut() -> Option<Vec<i32>>,
     mut member: impl FnMut(i32) -> Option<DarwinGroupMember>,
 ) -> bool {
-    let mut snapshot = || list()?.into_iter().map(&mut member).collect::<Option<Vec<_>>>();
+    let mut snapshot = || {
+        let pids = list()?;
+        let mut members = Vec::with_capacity(pids.len());
+        let mut complete = true;
+        // Do not let INEXIT or a reaped member hide another live member or
+        // hard error later in this complete PID list. Refusal dominates.
+        for pid in pids {
+            if let Some(observed) = member(pid) {
+                members.push(observed);
+            } else {
+                complete = false;
+            }
+        }
+        complete.then_some(members)
+    };
     let Some(first) = snapshot() else { return false };
+    if first.iter().any(|member| member.status != 5) {
+        return false;
+    }
     // A live member could fork after enumeration and then become a zombie.
     // Repeat the complete enumeration and status/identity checks; a changed
     // membership, PID reuse, lookup error, or live member keeps the barrier.
-    snapshot().is_some_and(|second| first == second)
+    snapshot().is_some_and(|second| second.iter().all(|member| member.status == 5) && first == second)
 }
 
 #[cfg(target_os = "macos")]
@@ -840,16 +907,17 @@ fn darwin_group_stopped_with_detail(pg: i32) -> (bool, DarwinGroupFailure, Vec<S
                 pid: info.pbi_pid,
                 pgid: info.pbi_pgid,
                 status: info.pbi_status,
+                flags: info.pbi_flags,
                 start_sec: info.pbi_start_tvsec,
                 start_usec: info.pbi_start_tvusec,
             };
-            let parsed = darwin_zombie_member(returned, pid, pg, raw.clone());
-            let refusal = if returned != DARWIN_BSDINFO_SIZE {
+            let parsed = darwin_observed_member(returned, error, pid, pg, raw.clone());
+            let refusal = if error != 0 || returned != DARWIN_BSDINFO_SIZE {
                 "unreadable/incorrect BSD info size"
             } else if raw.pid != pid as u32 || raw.pgid != pg as u32 {
                 "PID/PGID identity mismatch"
-            } else if raw.status != 5 {
-                "non-zombie/live status"
+            } else if raw.status != 5 && !darwin_member_exiting(&raw) {
+                "non-zombie/live status without valid INEXIT"
             } else if raw.start_sec == 0 || raw.start_usec >= 1_000_000 {
                 "invalid start identity"
             } else {
@@ -857,17 +925,14 @@ fn darwin_group_stopped_with_detail(pg: i32) -> (bool, DarwinGroupFailure, Vec<S
             };
             let mut snapshots = snapshots.borrow_mut();
             observations.borrow_mut().push(format!(
-                "snapshot {} member: requested_pid={pid} expected_pgid={pg} bytes={returned}/{DARWIN_BSDINFO_SIZE} errno={error} ({}) raw={raw:?} accepted={} refusal={refusal}",
+                "snapshot {} member: requested_pid={pid} expected_pgid={pg} bytes={returned}/{DARWIN_BSDINFO_SIZE} errno={error} ({}) raw={raw:?} flags={} accepted={} refusal={refusal}",
                 snapshots.len(),
                 nix::errno::Errno::from_raw(error),
+                raw.flags,
                 parsed.is_some()
             ));
             if let Some(snapshot) = snapshots.last_mut() {
-                if let (DarwinGroupSnapshot::Complete(members), Some(member)) = (&mut *snapshot, parsed.as_ref()) {
-                    members.push(member.clone());
-                } else {
-                    *snapshot = darwin_group_missing_member(returned, error);
-                }
+                darwin_group_record_member(snapshot, returned, error, &parsed);
             }
             parsed
         },
@@ -884,6 +949,7 @@ fn darwin_group_stopped_with_detail(pg: i32) -> (bool, DarwinGroupFailure, Vec<S
             [DarwinGroupSnapshot::Complete(first), DarwinGroupSnapshot::Complete(second)] => {
                 format!("snapshot identities/membership differ (possible reap or PID reuse): first={first:?} second={second:?}")
             }
+            [DarwinGroupSnapshot::Complete(members)] => format!("complete group contains INEXIT members, never absence: {members:?}"),
             [DarwinGroupSnapshot::Reaped] | [DarwinGroupSnapshot::Complete(_), DarwinGroupSnapshot::Reaped] => {
                 "listed member lookup returned zero bytes with ESRCH; no absence proof".into()
             }
@@ -5261,6 +5327,246 @@ done
     }
 
     #[test]
+    fn darwin_group_inexit_requires_exact_identity_and_never_proves_absence() {
+        use nix::errno::Errno;
+        let exiting = DarwinGroupMember { pid: 42, pgid: 41, status: 2, flags: DARWIN_PROC_FLAG_INEXIT, start_sec: 100, start_usec: 10 };
+        for status in 1..5 {
+            let member = DarwinGroupMember { status, ..exiting.clone() };
+            assert!(darwin_observed_member(136, 0, 42, 41, member.clone()).is_some());
+            assert!(darwin_zombie_member(136, 42, 41, member).is_none());
+        }
+        for bytes in [-1, 0, 135, 137] {
+            assert!(darwin_observed_member(bytes, 0, 42, 41, exiting.clone()).is_none());
+        }
+        for error in [Errno::ESRCH, Errno::EPERM, Errno::EACCES, Errno::EIO] {
+            assert!(darwin_observed_member(136, error as i32, 42, 41, exiting.clone()).is_none());
+        }
+        for invalid in [
+            DarwinGroupMember { flags: 0, ..exiting.clone() },
+            DarwinGroupMember { flags: 8, ..exiting.clone() },
+            DarwinGroupMember { pid: 43, ..exiting.clone() },
+            DarwinGroupMember { pgid: 43, ..exiting.clone() },
+            DarwinGroupMember { status: 0, ..exiting.clone() },
+            DarwinGroupMember { status: 6, ..exiting.clone() },
+            DarwinGroupMember { start_sec: 0, ..exiting.clone() },
+            DarwinGroupMember { start_usec: 1_000_000, ..exiting.clone() },
+        ] {
+            assert!(darwin_observed_member(136, 0, 42, 41, invalid).is_none());
+        }
+        let mut lookups = 0;
+        assert!(!darwin_group_snapshots_stopped(
+            || Some(vec![42]),
+            |_| {
+                lookups += 1;
+                Some(exiting.clone())
+            }
+        ));
+        assert_eq!(lookups, 1, "a complete INEXIT scan is progress, never even a candidate absence proof");
+        let zombie = DarwinGroupMember { status: 5, ..exiting };
+        assert!(darwin_observed_member(136, 0, 42, 41, zombie.clone()).is_some());
+        lookups = 0;
+        assert!(darwin_group_snapshots_stopped(
+            || Some(vec![42]),
+            |_| {
+                lookups += 1;
+                Some(zombie.clone())
+            }
+        ));
+        assert_eq!(lookups, 2, "INEXIT flags on SZOMB must not weaken the two-snapshot proof");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn darwin_group_inexit_scans_the_complete_group_before_bounded_reobservation() {
+        use nix::errno::Errno;
+        use std::cell::RefCell;
+        use std::collections::VecDeque;
+        type ListReply = (i32, i32, Vec<i32>);
+        type MemberReply = (i32, i32, i32, DarwinGroupMember);
+
+        fn observe(lists: Vec<ListReply>, members: Vec<MemberReply>, counts: &mut (usize, usize)) -> (DarwinGroupObservation, bool) {
+            let lists = RefCell::new(VecDeque::from(lists));
+            let members = RefCell::new(VecDeque::from(members));
+            let snapshots = RefCell::new(Vec::new());
+            let transcript = RefCell::new(Vec::new());
+            let mut stopped = false;
+            let observation = darwin_group_observe(Err(Errno::EPERM), || {
+                stopped = darwin_group_snapshots_stopped(
+                    || {
+                        counts.0 += 1;
+                        let (bytes, error, pids) = lists.borrow_mut().pop_front().expect("unexpected list probe");
+                        let mut buffer = [0; DARWIN_GROUP_SLOTS];
+                        buffer[..pids.len()].copy_from_slice(&pids);
+                        let parsed = darwin_group_pids(bytes, error, &buffer);
+                        snapshots.borrow_mut().push(if parsed.is_some() {
+                            DarwinGroupSnapshot::Complete(Vec::new())
+                        } else {
+                            DarwinGroupSnapshot::Refused
+                        });
+                        transcript.borrow_mut().push(format!("list bytes={bytes} errno={error} pids={pids:?}"));
+                        parsed
+                    },
+                    |pid| {
+                        counts.1 += 1;
+                        let (expected, bytes, error, raw) = members.borrow_mut().pop_front().expect("unexpected member probe");
+                        assert_eq!(pid, expected);
+                        let parsed = darwin_observed_member(bytes, error, pid, 41, raw.clone());
+                        transcript.borrow_mut().push(format!("pid={pid} bytes={bytes} errno={error} raw={raw:?}"));
+                        darwin_group_record_member(snapshots.borrow_mut().last_mut().unwrap(), bytes, error, &parsed);
+                        parsed
+                    },
+                );
+                let failure = darwin_group_failure(&snapshots.into_inner());
+                (stopped, failure, transcript.into_inner())
+            });
+            assert!(lists.borrow().is_empty());
+            assert!(members.borrow().is_empty(), "a complete enumeration must check every listed PID before progress");
+            (observation, stopped)
+        }
+
+        let exiting = DarwinGroupMember { pid: 42, pgid: 41, status: 2, flags: DARWIN_PROC_FLAG_INEXIT, start_sec: 100, start_usec: 10 };
+        let zombie = DarwinGroupMember { pid: 43, status: 5, ..exiting.clone() };
+        let live = DarwinGroupMember { pid: 43, flags: 0, ..exiting.clone() };
+        let reply = |member: DarwinGroupMember| (member.pid as i32, DARWIN_BSDINFO_SIZE, 0, member);
+        let full = |pids: Vec<i32>| ((pids.len() * 4) as i32, 0, pids);
+        struct Case {
+            name: &'static str,
+            lists: Vec<ListReply>,
+            members: Vec<MemberReply>,
+            progress: bool,
+            wait: Duration,
+            lookups: usize,
+        }
+        let budget = Duration::from_secs(3);
+        for case in [
+            Case {
+                name: "exiting",
+                lists: vec![full(vec![42])],
+                members: vec![reply(exiting.clone())],
+                progress: true,
+                wait: budget,
+                lookups: 1,
+            },
+            Case {
+                name: "exiting plus zombie",
+                lists: vec![full(vec![42, 43])],
+                members: vec![reply(exiting.clone()), reply(zombie.clone())],
+                progress: true,
+                wait: budget,
+                lookups: 2,
+            },
+            Case {
+                name: "hidden live",
+                lists: vec![full(vec![42, 43])],
+                members: vec![reply(exiting.clone()), reply(live.clone())],
+                progress: false,
+                wait: budget,
+                lookups: 2,
+            },
+            Case {
+                name: "live then exiting",
+                lists: vec![full(vec![42, 43])],
+                members: vec![
+                    reply(DarwinGroupMember { pid: 42, ..live.clone() }),
+                    reply(DarwinGroupMember { pid: 43, ..exiting.clone() }),
+                ],
+                progress: false,
+                wait: budget,
+                lookups: 2,
+            },
+            Case {
+                name: "hard error",
+                lists: vec![full(vec![42, 43])],
+                members: vec![reply(exiting.clone()), (43, 0, Errno::EIO as i32, zombie.clone())],
+                progress: false,
+                wait: budget,
+                lookups: 2,
+            },
+            Case {
+                name: "short response",
+                lists: vec![full(vec![42, 43])],
+                members: vec![reply(exiting.clone()), (43, 135, 0, zombie.clone())],
+                progress: false,
+                wait: budget,
+                lookups: 2,
+            },
+            Case {
+                name: "identity mismatch",
+                lists: vec![full(vec![42, 43])],
+                members: vec![reply(exiting.clone()), (43, 136, 0, DarwinGroupMember { pgid: 99, ..zombie.clone() })],
+                progress: false,
+                wait: budget,
+                lookups: 2,
+            },
+            Case {
+                name: "reaped cannot hide live",
+                lists: vec![full(vec![42, 43, 44])],
+                members: vec![
+                    reply(exiting.clone()),
+                    (43, 0, Errno::ESRCH as i32, zombie.clone()),
+                    (44, 136, 0, DarwinGroupMember { pid: 44, ..live.clone() }),
+                ],
+                progress: false,
+                wait: budget,
+                lookups: 3,
+            },
+            Case {
+                name: "live then reaped",
+                lists: vec![full(vec![42, 43])],
+                members: vec![reply(DarwinGroupMember { pid: 42, ..live.clone() }), (43, 0, Errno::ESRCH as i32, zombie.clone())],
+                progress: false,
+                wait: budget,
+                lookups: 2,
+            },
+            Case { name: "saturated", lists: vec![full((42..62).collect())], members: vec![], progress: false, wait: budget, lookups: 0 },
+            Case {
+                name: "zero deadline",
+                lists: vec![full(vec![42, 43])],
+                members: vec![reply(exiting.clone()), reply(zombie.clone())],
+                progress: true,
+                wait: Duration::ZERO,
+                lookups: 2,
+            },
+        ] {
+            let start = tokio::time::Instant::now();
+            let mut first = Some((case.lists, case.members));
+            let mut history = Vec::new();
+            let result = darwin_confirm_group_stopped(41, start + case.wait, || {
+                let mut counts = (0, 0);
+                let (observation, stopped) = if let Some((lists, members)) = first.take() {
+                    observe(lists, members, &mut counts)
+                } else {
+                    assert_eq!(history.len(), 1, "only one later complete proof is needed");
+                    // The next independent observation sees this former SRUN
+                    // member as SZOMB twice; never inject raw ESRCH success.
+                    let former_exiting = DarwinGroupMember { status: 5, ..exiting.clone() };
+                    observe(vec![full(vec![42]), full(vec![42])], vec![reply(former_exiting.clone()), reply(former_exiting)], &mut counts)
+                };
+                history.push((observation.result, observation.failure, stopped, counts));
+                observation
+            })
+            .await;
+            assert_eq!(history[0].0, Err(Errno::EPERM), "{}: exiting is never absent", case.name);
+            assert!(!history[0].2);
+            assert_eq!(history[0].1 == DarwinGroupFailure::Progress, case.progress, "{}", case.name);
+            assert_eq!(history[0].3, (1, case.lookups), "{}", case.name);
+            if case.progress && !case.wait.is_zero() {
+                result.unwrap();
+                assert_eq!(history.len(), 2);
+                assert_eq!(history[1].0, Err(Errno::ESRCH));
+                assert!(history[1].2);
+                assert_eq!(history[1].3, (2, 2));
+                assert_eq!(tokio::time::Instant::now() - start, Duration::from_millis(25));
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(history.len(), 1, "{}: must not retry", case.name);
+                assert_eq!(tokio::time::Instant::now(), start);
+                assert_eq!(error.downcast_ref::<Errno>(), Some(&Errno::EPERM));
+                assert!(error.to_string().contains("list bytes="));
+            }
+        }
+    }
+
+    #[test]
     fn darwin_group_progress_requires_a_zero_byte_esrch_member_lookup() {
         use nix::errno::Errno;
         for returned in [-1, 0, 1, 135, 136, 137] {
@@ -5276,7 +5582,7 @@ done
     #[test]
     fn darwin_group_progress_requires_a_strict_subset_of_exact_zombie_identities() {
         use DarwinGroupSnapshot::{Complete, Reaped, Refused};
-        let first = DarwinGroupMember { pid: 42, pgid: 41, status: 5, start_sec: 100, start_usec: 10 };
+        let first = DarwinGroupMember { pid: 42, pgid: 41, status: 5, flags: 0, start_sec: 100, start_usec: 10 };
         let second = DarwinGroupMember { pid: 43, ..first.clone() };
         for snapshots in [
             vec![Reaped],
@@ -5380,18 +5686,14 @@ done
                             let (expected_pid, bytes, error, status) = members.borrow_mut().pop_front().expect("unexpected member lookup");
                             assert_eq!(pid, expected_pid);
                             let raw = if bytes == DARWIN_BSDINFO_SIZE {
-                                DarwinGroupMember { pid: pid as u32, pgid: 41, status, start_sec: 100, start_usec: 10 }
+                                DarwinGroupMember { pid: pid as u32, pgid: 41, status, flags: 0, start_sec: 100, start_usec: 10 }
                             } else {
-                                DarwinGroupMember { pid: 0, pgid: 0, status: 0, start_sec: 0, start_usec: 0 }
+                                DarwinGroupMember { pid: 0, pgid: 0, status: 0, flags: 0, start_sec: 0, start_usec: 0 }
                             };
                             let parsed = darwin_zombie_member(bytes, pid, 41, raw);
                             let mut snapshots = snapshots.borrow_mut();
                             let snapshot = snapshots.last_mut().expect("member lookup requires prior enumeration");
-                            if let (DarwinGroupSnapshot::Complete(accepted), Some(member)) = (&mut *snapshot, parsed.as_ref()) {
-                                accepted.push(member.clone());
-                            } else {
-                                *snapshot = darwin_group_missing_member(bytes, error);
-                            }
+                            darwin_group_record_member(snapshot, bytes, error, &parsed);
                             parsed
                         },
                     );
@@ -5562,7 +5864,7 @@ done
                 |pid| {
                     lookups += 1;
                     observations.borrow_mut().push(format!("member {pid}"));
-                    Some(DarwinGroupMember { pid: pid as u32, pgid: 41, status: 5, start_sec: 100, start_usec: 10 })
+                    Some(DarwinGroupMember { pid: pid as u32, pgid: 41, status: 5, flags: 0, start_sec: 100, start_usec: 10 })
                 },
             );
             (stopped, observations.into_inner())
@@ -5605,7 +5907,7 @@ done
 
     #[test]
     fn darwin_group_status_requires_an_exact_zombie_identity() {
-        let zombie = DarwinGroupMember { pid: 42, pgid: 41, status: 5, start_sec: 100, start_usec: 10 };
+        let zombie = DarwinGroupMember { pid: 42, pgid: 41, status: 5, flags: 0, start_sec: 100, start_usec: 10 };
         assert_eq!(darwin_zombie_member(136, 42, 41, zombie.clone()), Some(zombie.clone()));
         for returned in [-1, 0, 135, 137] {
             assert!(darwin_zombie_member(returned, 42, 41, zombie.clone()).is_none(), "BSD info size {returned}");
@@ -5627,7 +5929,7 @@ done
 
     #[test]
     fn darwin_group_absence_requires_matching_complete_zombie_snapshots() {
-        let zombie = DarwinGroupMember { pid: 42, pgid: 41, status: 5, start_sec: 100, start_usec: 10 };
+        let zombie = DarwinGroupMember { pid: 42, pgid: 41, status: 5, flags: 0, start_sec: 100, start_usec: 10 };
         assert!(darwin_group_snapshots_stopped(|| Some(vec![]), |_| panic!("empty group has no member lookup")));
         assert!(darwin_group_snapshots_stopped(|| Some(vec![42]), |_| Some(zombie.clone())));
         assert!(!darwin_group_snapshots_stopped(|| None, |_| panic!("list errors cannot authorize member lookup")));
