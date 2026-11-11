@@ -633,17 +633,39 @@ fn darwin_procargs(data: &[u8]) -> Option<Vec<&str>> {
 /// EPERM alone is never absence: it can also mean inaccessible live members.
 /// This does not confer ownership or authorize any signal to a saved PGID.
 fn group_probe(pg: Pid) -> nix::Result<()> {
+    group_probe_with_detail(pg).0
+}
+
+/// Keep the disposition and diagnostics from the same observation together.
+/// In particular, an error reporter must not repeat a racy absence proof.
+fn group_probe_with_detail(pg: Pid) -> (nix::Result<()>, Option<String>) {
     let result = killpg(pg, None);
     #[cfg(target_os = "macos")]
     if pg.as_raw() > 0 {
-        return darwin_group_probe(result, || darwin_group_stopped(pg.as_raw()));
+        return darwin_group_probe_with_detail(result, || darwin_group_stopped_with_detail(pg.as_raw()));
     }
-    result
+    (result, None)
 }
 
 #[cfg(any(target_os = "macos", test))]
 fn darwin_group_probe(result: nix::Result<()>, stopped: impl FnOnce() -> bool) -> nix::Result<()> {
     if result == Err(nix::errno::Errno::EPERM) && stopped() { Err(nix::errno::Errno::ESRCH) } else { result }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn darwin_group_probe_with_detail(
+    result: nix::Result<()>,
+    stopped: impl FnOnce() -> (bool, Vec<String>),
+) -> (nix::Result<()>, Option<String>) {
+    let mut detail = None;
+    let result = darwin_group_probe(result, || {
+        let (stopped, observations) = stopped();
+        if !stopped {
+            detail = Some(format!("Darwin group absence proof refused: {}", observations.join("; ")));
+        }
+        stopped
+    });
+    (result, detail)
 }
 
 // XNU's listpids allocates min(nprocs + 20, supplied slots) *before* taking
@@ -710,12 +732,14 @@ fn darwin_group_snapshots_stopped(
 }
 
 #[cfg(target_os = "macos")]
-fn darwin_group_stopped(pg: i32) -> bool {
+fn darwin_group_stopped_with_detail(pg: i32) -> (bool, Vec<String>) {
     use nix::libc;
     const PROC_PGRP_ONLY: u32 = 2;
     const _: () = assert!(std::mem::size_of::<libc::proc_bsdinfo>() == DARWIN_BSDINFO_SIZE as usize);
     const _: () = assert!(libc::SZOMB == 5);
-    darwin_group_snapshots_stopped(
+    let observations = std::cell::RefCell::new(Vec::new());
+    let snapshots: std::cell::RefCell<Vec<Option<Vec<DarwinGroupMember>>>> = std::cell::RefCell::new(Vec::new());
+    let stopped = darwin_group_snapshots_stopped(
         || {
             let mut pids = [0i32; DARWIN_GROUP_SLOTS];
             nix::errno::Errno::clear();
@@ -723,29 +747,75 @@ fn darwin_group_stopped(pg: i32) -> bool {
             let returned =
                 unsafe { libc::proc_listpids(PROC_PGRP_ONLY, pg as u32, pids.as_mut_ptr().cast(), std::mem::size_of_val(&pids) as i32) };
             let error = nix::errno::Errno::last_raw();
-            darwin_group_pids(returned, error, &pids)
+            let parsed = darwin_group_pids(returned, error, &pids);
+            let mut snapshots = snapshots.borrow_mut();
+            snapshots.push(parsed.as_ref().map(|_| Vec::new()));
+            observations.borrow_mut().push(format!(
+                "snapshot {} list: pgid={pg} bytes={returned}/{} errno={error} ({}) raw_pids={pids:?} parsed={parsed:?}{}",
+                snapshots.len(),
+                std::mem::size_of_val(&pids),
+                nix::errno::Errno::from_raw(error),
+                if returned >= std::mem::size_of_val(&pids) as i32 { " saturated/truncation unknown" } else { "" }
+            ));
+            parsed
         },
         |pid| {
             // SAFETY: proc_bsdinfo contains only integers and byte arrays.
             let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
             // Nonzero arg explicitly enables zombie lookup in PROC_PIDTBSDINFO.
+            nix::errno::Errno::clear();
             // SAFETY: info has the exact ABI size asserted above and is writable.
             let returned =
                 unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 1, std::ptr::from_mut(&mut info).cast(), DARWIN_BSDINFO_SIZE) };
-            darwin_zombie_member(
-                returned,
-                pid,
-                pg,
-                DarwinGroupMember {
-                    pid: info.pbi_pid,
-                    pgid: info.pbi_pgid,
-                    status: info.pbi_status,
-                    start_sec: info.pbi_start_tvsec,
-                    start_usec: info.pbi_start_tvusec,
-                },
-            )
+            let error = nix::errno::Errno::last_raw();
+            let raw = DarwinGroupMember {
+                pid: info.pbi_pid,
+                pgid: info.pbi_pgid,
+                status: info.pbi_status,
+                start_sec: info.pbi_start_tvsec,
+                start_usec: info.pbi_start_tvusec,
+            };
+            let parsed = darwin_zombie_member(returned, pid, pg, raw.clone());
+            let refusal = if returned != DARWIN_BSDINFO_SIZE {
+                "unreadable/incorrect BSD info size"
+            } else if raw.pid != pid as u32 || raw.pgid != pg as u32 {
+                "PID/PGID identity mismatch"
+            } else if raw.status != 5 {
+                "non-zombie/live status"
+            } else if raw.start_sec == 0 || raw.start_usec >= 1_000_000 {
+                "invalid start identity"
+            } else {
+                "none"
+            };
+            let mut snapshots = snapshots.borrow_mut();
+            observations.borrow_mut().push(format!(
+                "snapshot {} member: requested_pid={pid} expected_pgid={pg} bytes={returned}/{DARWIN_BSDINFO_SIZE} errno={error} ({}) raw={raw:?} accepted={} refusal={refusal}",
+                snapshots.len(),
+                nix::errno::Errno::from_raw(error),
+                parsed.is_some()
+            ));
+            if let Some(snapshot) = snapshots.last_mut() {
+                if let (Some(members), Some(member)) = (snapshot.as_mut(), parsed.as_ref()) {
+                    members.push(member.clone());
+                } else {
+                    *snapshot = None;
+                }
+            }
+            parsed
         },
-    )
+    );
+    let mut observations = observations.into_inner();
+    if !stopped {
+        observations.push(match snapshots.into_inner().as_slice() {
+            [None, ..] => "first snapshot rejected: enumeration or member response above".into(),
+            [Some(_), None] => "second snapshot rejected: enumeration or member response above".into(),
+            [Some(first), Some(second)] => {
+                format!("snapshot identities/membership differ (possible reap or PID reuse): first={first:?} second={second:?}")
+            }
+            _ => "incomplete snapshot observations".into(),
+        });
+    }
+    (stopped, observations)
 }
 
 fn claude_args_for(args: &[&str], conversation: &str) -> bool {
@@ -975,12 +1045,17 @@ pub async fn confirm_stopped(journal: &crate::journal::Journal, session_id: &str
     loop {
         let mut pending = Vec::new();
         for pgid in journal.claude_processes(session_id).await? {
-            match group_probe(Pid::from_raw(pgid)) {
+            let (result, detail) = group_probe_with_detail(Pid::from_raw(pgid));
+            match result {
                 Err(nix::errno::Errno::ESRCH) => journal.untrack_claude_process(session_id, pgid).await?,
                 Ok(()) => pending.push(pgid),
                 Err(error) => {
-                    return Err(anyhow::Error::new(error)
-                        .context(StopUnconfirmed(format!("Cannot confirm Claude Code process group {pgid} stopped"))));
+                    let mut message = format!("Cannot confirm Claude Code process group {pgid} stopped");
+                    if let Some(detail) = detail {
+                        message.push_str(": ");
+                        message.push_str(&detail);
+                    }
+                    return Err(anyhow::Error::new(error).context(StopUnconfirmed(message)));
                 }
             }
         }
@@ -2410,7 +2485,11 @@ impl Process {
                 *self.stdin.lock().await = None;
             }
             self.kill().await;
-            if !matches!(group_probe(pg), Err(nix::errno::Errno::ESRCH)) {
+            let (result, detail) = group_probe_with_detail(pg);
+            if !matches!(result, Err(nix::errno::Errno::ESRCH)) {
+                if let Some(detail) = detail {
+                    return Err(anyhow::Error::new(ReplacementBlocked(pg)).context(format!("{}: {detail}", ReplacementBlocked(pg))));
+                }
                 return Err(ReplacementBlocked(pg).into());
             }
         }
@@ -5053,6 +5132,53 @@ done
         assert!(claude_args_for(&["node", "/opt/claude-code/cli.js", "--session-id", "fork"], "fork"));
         assert!(!claude_args_for(&["sleep", "/tmp/claude-notes", "--resume", "fork"], "fork"));
         assert!(!claude_args_for(&["sh", "-c", "echo claude --resume fork"], "fork"));
+    }
+
+    #[test]
+    fn darwin_group_probe_diagnostics_preserve_dispositions_without_reprobing() {
+        use nix::errno::Errno;
+        for result in [Ok(()), Err(Errno::EPERM), Err(Errno::ESRCH), Err(Errno::EACCES), Err(Errno::EINVAL), Err(Errno::EIO)] {
+            for stopped in [false, true] {
+                let mut calls = 0;
+                let (observed, detail) = darwin_group_probe_with_detail(result, || {
+                    calls += 1;
+                    (stopped, vec!["original observation".into()])
+                });
+                assert_eq!(observed, darwin_group_probe(result, || stopped));
+                assert_eq!(calls, usize::from(result == Err(Errno::EPERM)));
+                assert_eq!(detail.is_some(), result == Err(Errno::EPERM) && !stopped);
+                if let Some(detail) = detail {
+                    assert_eq!(detail, "Darwin group absence proof refused: original observation");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn darwin_group_probe_diagnostics_retain_the_failed_second_snapshot() {
+        use nix::errno::Errno;
+        let mut lists = 0;
+        let mut lookups = 0;
+        let (result, detail) = darwin_group_probe_with_detail(Err(Errno::EPERM), || {
+            let observations = std::cell::RefCell::new(Vec::new());
+            let stopped = darwin_group_snapshots_stopped(
+                || {
+                    lists += 1;
+                    observations.borrow_mut().push(format!("list {lists}"));
+                    if lists == 1 { Some(vec![42]) } else { None }
+                },
+                |pid| {
+                    lookups += 1;
+                    observations.borrow_mut().push(format!("member {pid}"));
+                    Some(DarwinGroupMember { pid: pid as u32, pgid: 41, status: 5, start_sec: 100, start_usec: 10 })
+                },
+            );
+            (stopped, observations.into_inner())
+        });
+        assert_eq!(result, Err(Errno::EPERM));
+        assert_eq!(lists, 2, "reporting must not repeat enumeration");
+        assert_eq!(lookups, 1, "a failed second enumeration must not repeat member lookup");
+        assert_eq!(detail.as_deref(), Some("Darwin group absence proof refused: list 1; member 42; list 2"));
     }
 
     #[test]
