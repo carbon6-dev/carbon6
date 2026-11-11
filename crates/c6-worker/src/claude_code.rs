@@ -3676,10 +3676,31 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"usage":{}}
 
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
-        std::fs::write(&path, body).unwrap();
+        // A concurrent fork can inherit even a CLOEXEC writer until exec,
+        // causing ETXTBSY after this thread closes it. Keep the writable fd
+        // out of the shared test process altogether; wait for its owner to
+        // exit before executing the fixture. No spawn retry is necessary.
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", r#"printf '%s' "$2" > "$1""#, "fixture-writer"])
+            .arg(&path)
+            .arg(body)
+            .status()
+            .unwrap();
+        assert!(status.success(), "fixture writer failed: {status}");
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    #[test]
+    fn fixture_program_publisher_preserves_literal_path_and_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = "#!/bin/sh\nprintf '%s' 'literal $variables `commands` and \"quotes\"'\n";
+        let bin = script(dir.path(), "fixture 'with $literal `characters`", body);
+        assert_eq!(std::fs::read_to_string(&bin).unwrap(), body);
+        let out = std::process::Command::new(&bin).output().unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"literal $variables `commands` and \"quotes\"");
     }
 
     async fn observer(dir: &Path, tools: Arc<c6_tools::SessionTools>) -> Arc<Observer> {
@@ -4138,7 +4159,7 @@ EOF
 
     /// A stand-in `claude` whose turn runs a subagent (that runs its own).
     fn fake_claude_with_subagents(dir: &Path) -> PathBuf {
-        let script = r#"#!/bin/sh
+        let body = r#"#!/bin/sh
 read -r line
 cat <<'JSON'
 {"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_9","name":"Task","input":{"description":"look around","prompt":"List files.","subagent_type":"explorer"}}],"stop_reason":"tool_use"},"parent_tool_use_id":null}
@@ -4155,11 +4176,7 @@ cat <<'JSON'
 {"type":"result","subtype":"success","is_error":false,"result":"Done.","usage":{"input_tokens":5,"output_tokens":20},"modelUsage":{"claude-opus-5-5":{}}}
 JSON
 "#;
-        let path = dir.join("claude-sub");
-        std::fs::write(&path, script).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
+        script(dir, "claude-sub", body)
     }
 
     fn kind(e: &SessionEvent) -> &'static str {
