@@ -1795,6 +1795,32 @@ A line that must break a rule says why: `// test-lint: allow (<reason>)`. Today 
 
 The suite is also run with every CPU core kept busy by other processes, to surface timing assumptions a lint can't see (rule 2). A failure there is a bug in the test or the product, never "just load".
 
+### Held process identity and bounded cleanup
+
+`held_wrapper_process_identity_survives_spaces_in_the_program_path` proves wrapper
+ownership recognition with a spaced program path and exact conversation-option
+matching.
+Its teardown runs the normal ownership-checked `kill`, then waits with the shared
+`eventually` hang deadline for **whole-group absence** before asking for
+replacement. A returned cleanup future, a reaped leader or an exit-code file is
+not that condition. If cleanup never stops the group, the test must still fail.
+
+The macOS cleanup phase uses a one-second deadline for group absence after child
+cleanup. That is a best-effort production budget, not an assertion about kernel
+exit/reaping latency. Replacement remains fail-closed when a fresh probe reports
+a live group, including after that budget expires; no timeout or live observation
+proves absence. `darwin_group_live_after_kill_budget_blocks_until_fresh_absence`
+injects a group that stays live for 1,025 ms under paused time, drives the actual
+one-second cleanup phase, checks the raw Ok/live replacement refusal, and admits
+replacement only after a fresh ESRCH observation. This reproduces the timing
+contract deterministically, not the kernel scheduling of a particular CI run.
+The macOS replacement error also preserves whether cleanup reached that phase
+or failed earlier, including the original keeper-stop/ownership error. The
+`darwin_group_replacement_preserves_early_cleanup_failure_without_grace` test
+checks that an early failure grants no waiting budget and still needs a fresh
+absence proof. A raw Ok/live error alone cannot distinguish the two paths.
+No production budget, ownership check, signal or Linux cleanup behavior changes.
+
 ## Production image-preview browser regression
 
 `crates/c6-ui/tests/image-preview.cjs` runs the actual production WASM, not
