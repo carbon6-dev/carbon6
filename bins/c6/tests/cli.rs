@@ -18,6 +18,8 @@ async fn c6(home: &std::path::Path, args: &[&str]) -> Out {
     let o = tokio::process::Command::new(env!("CARGO_BIN_EXE_c6"))
         .args(args)
         .env("HOME", home)
+        // CI sets this independently of HOME; don't share another test's login.
+        .env_remove("XDG_CONFIG_HOME")
         .env_remove("C6_URL")
         .env_remove("C6_TOKEN")
         .stdin(std::process::Stdio::null())
@@ -55,6 +57,7 @@ async fn list_settings_target_the_requested_realm() {
     };
     let login = c6(home.path(), &["login", &url, "--token", &token]).await;
     assert_eq!(login.code, 0, "{}", login.stderr);
+    assert!(login.stderr.contains(&format!("saved to {}", home.path().display())), "{}", login.stderr);
 
     for (list, default_realm, entry) in [
         ("templates", "home", json!({"name": "unrelated", "prompt": "Keep me"})),
