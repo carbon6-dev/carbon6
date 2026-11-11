@@ -1268,18 +1268,37 @@ async fn darwin_confirm_group_stopped(
     }
 }
 
+/// Bounded best-effort cleanup, not an absence guarantee. A live group may
+/// outlast this phase; replacement must still obtain its own fresh proof.
+#[cfg(any(target_os = "macos", test))]
+async fn darwin_wait_group_absence(mut probe: impl FnMut() -> nix::Result<()>) -> tokio::time::Instant {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let absent = async {
+        while !matches!(probe(), Err(nix::errno::Errno::ESRCH)) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    let _ = tokio::time::timeout_at(deadline, absent).await;
+    deadline
+}
+
 /// Replacement gets only the remainder of kill's original absence phase.
 /// Early cleanup failure supplies no grace, but still requires a fresh proof.
 #[cfg(any(target_os = "macos", test))]
 async fn darwin_confirm_replacement_stopped(
     pg: Pid,
-    deadline: Option<tokio::time::Instant>,
+    cleanup: anyhow::Result<Option<tokio::time::Instant>>,
     probe: impl FnMut() -> DarwinGroupObservation,
 ) -> anyhow::Result<()> {
+    let (deadline, phase) = match cleanup {
+        Ok(Some(deadline)) => (Some(deadline), "kill reached its bounded absence phase".to_owned()),
+        Ok(None) => (None, "kill had no process group".to_owned()),
+        Err(error) => (None, format!("held cleanup failed before the absence phase: {error:#}")),
+    };
     darwin_confirm_group_stopped(pg.as_raw(), deadline.unwrap_or_else(tokio::time::Instant::now), probe).await.map_err(|error| {
         // The session's Error event uses ordinary Display, not {error:#}.
         // Keep that display complete without losing either typed marker.
-        let message = format!("{}: {error:#}", ReplacementBlocked(pg));
+        let message = format!("{}: {error:#}; {phase}", ReplacementBlocked(pg));
         error.context(ReplacementBlocked(pg)).context(message)
     })
 }
@@ -2711,8 +2730,8 @@ impl Process {
             }
             #[cfg(target_os = "macos")]
             {
-                let deadline = self.kill_with_deadline().await;
-                darwin_confirm_replacement_stopped(pg, deadline, || darwin_group_observation(pg)).await?;
+                let cleanup = self.kill_with_deadline().await;
+                darwin_confirm_replacement_stopped(pg, cleanup, || darwin_group_observation(pg)).await?;
             }
         }
         *self.stdin.lock().await = None;
@@ -2783,14 +2802,16 @@ impl Process {
     }
 
     /// The deadline is timing information only, never ownership or absence.
+    /// Preserve an early failure so replacement can distinguish it from a
+    /// group that remained live after the bounded absence phase.
     #[cfg(target_os = "macos")]
-    async fn kill_with_deadline(&mut self) -> Option<tokio::time::Instant> {
+    async fn kill_with_deadline(&mut self) -> anyhow::Result<Option<tokio::time::Instant>> {
         if let Some(pg) = self.pgid {
             if let Some(h) = &mut self.held {
                 h.stop_on_drop = true;
                 if let Err(e) = stop_held_group(pg, h.keeper, &h.dir, &self.launch.conversation).await {
                     warn!("stopping held Claude Code: {e:#}");
-                    return None;
+                    return Err(e);
                 }
             } else {
                 let _ = killpg(pg, Signal::SIGINT);
@@ -2799,20 +2820,9 @@ impl Process {
             }
         }
         let _ = tokio::time::timeout(Duration::from_secs(3), self.wait_exit()).await;
-        let deadline = if let Some(pg) = self.pgid {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-            let absent = async {
-                while !matches!(group_probe(pg), Err(nix::errno::Errno::ESRCH)) {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            };
-            let _ = tokio::time::timeout_at(deadline, absent).await;
-            Some(deadline)
-        } else {
-            None
-        };
+        let deadline = if let Some(pg) = self.pgid { Some(darwin_wait_group_absence(|| group_probe(pg)).await) } else { None };
         self.release_held();
-        deadline
+        Ok(deadline)
     }
 }
 
@@ -5960,13 +5970,44 @@ done
     }
 
     #[tokio::test(start_paused = true)]
+    async fn darwin_group_live_after_kill_budget_blocks_until_fresh_absence() {
+        use nix::errno::Errno;
+        let start = tokio::time::Instant::now();
+        let live_until = start + Duration::from_millis(1025);
+        // Inject delayed kernel exit, not a zombie/EPERM transition. Drive
+        // the actual bounded kill phase with virtual time so this does not
+        // depend on making a CI process slow enough to outlive SIGKILL.
+        let probe = || if tokio::time::Instant::now() < live_until { Ok(()) } else { Err(Errno::ESRCH) };
+        let deadline = darwin_wait_group_absence(probe).await;
+        assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(1));
+        assert_eq!(deadline, tokio::time::Instant::now());
+        let mut observations = 0;
+        let mut observe = || {
+            observations += 1;
+            darwin_group_observe(probe(), || panic!("raw live/ESRCH must not enumerate"))
+        };
+        let error = darwin_confirm_replacement_stopped(Pid::from_raw(41), Ok(Some(deadline)), &mut observe).await.unwrap_err();
+        assert!(error.to_string().contains("Darwin group signal-zero: Ok/live: signal-zero probe reports a live group"));
+        assert!(error.to_string().contains("kill reached its bounded absence phase"));
+        assert!(error.downcast_ref::<ReplacementBlocked>().is_some());
+        assert!(error.downcast_ref::<StopUnconfirmed>().is_some());
+        assert_eq!(tokio::time::Instant::now(), deadline, "live refusal must not add grace");
+        // Fixture teardown can wait beyond cleanup's production budget.
+        // Even with that expired deadline, only a fresh absence proof may
+        // admit replacement; elapsed time itself is never authority.
+        tokio::time::advance(Duration::from_millis(25)).await;
+        darwin_confirm_replacement_stopped(Pid::from_raw(41), Ok(Some(deadline)), &mut observe).await.unwrap();
+        assert_eq!(observations, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn darwin_group_replacement_uses_only_the_remaining_kill_deadline() {
         use nix::errno::Errno;
         let start = tokio::time::Instant::now();
         let deadline = start + Duration::from_secs(1);
         tokio::time::advance(Duration::from_millis(940)).await;
         let mut calls = 0;
-        let error = darwin_confirm_replacement_stopped(Pid::from_raw(41), Some(deadline), || {
+        let error = darwin_confirm_replacement_stopped(Pid::from_raw(41), Ok(Some(deadline)), || {
             calls += 1;
             darwin_group_observe(Err(Errno::EPERM), || {
                 (false, DarwinGroupFailure::Progress, vec![format!("full last flags=4 observation {calls}")])
@@ -5986,12 +6027,45 @@ done
     }
 
     #[tokio::test(start_paused = true)]
+    async fn darwin_group_replacement_preserves_early_cleanup_failure_without_grace() {
+        use nix::errno::Errno;
+        for terminal in [Ok(()), Err(Errno::EPERM), Err(Errno::ESRCH)] {
+            let start = tokio::time::Instant::now();
+            let cleanup = Err(anyhow::anyhow!("keeper did not confirm that it stopped").context("pinning the FIFO keeper"));
+            let mut calls = 0;
+            let result = darwin_confirm_replacement_stopped(Pid::from_raw(41), cleanup, || {
+                calls += 1;
+                darwin_group_observe(terminal, || (false, DarwinGroupFailure::Progress, vec!["reaping progress".into()]))
+            })
+            .await;
+            assert_eq!(calls, 1, "a cleanup failure must not invent an absence phase");
+            assert_eq!(tokio::time::Instant::now(), start);
+            if terminal == Err(Errno::ESRCH) {
+                result.unwrap(); // Fresh absence still suffices, never a cached failure/success.
+            } else {
+                let error = result.unwrap_err();
+                let event = error.to_string();
+                assert!(event.contains("held cleanup failed before the absence phase: pinning the FIFO keeper: keeper did not confirm"));
+                assert!(!event.contains("kill reached its bounded absence phase"));
+                assert!(event.contains("Darwin group signal-zero:"));
+                assert!(error.downcast_ref::<ReplacementBlocked>().is_some());
+                assert!(error.downcast_ref::<StopUnconfirmed>().is_some());
+                if terminal == Err(Errno::EPERM) {
+                    assert_eq!(error.downcast_ref::<Errno>(), Some(&Errno::EPERM));
+                } else {
+                    assert!(event.contains("Ok/live: signal-zero probe reports a live group"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn darwin_group_replacement_without_remaining_grace_observes_once() {
         use nix::errno::Errno;
         for deadline in [None, Some(tokio::time::Instant::now())] {
             let start = tokio::time::Instant::now();
             let mut calls = 0;
-            let error = darwin_confirm_replacement_stopped(Pid::from_raw(41), deadline, || {
+            let error = darwin_confirm_replacement_stopped(Pid::from_raw(41), Ok(deadline), || {
                 calls += 1;
                 darwin_group_observe(Err(Errno::EPERM), || (false, DarwinGroupFailure::Progress, vec!["no remaining grace".into()]))
             })
@@ -6011,7 +6085,7 @@ done
         for terminal in [Ok(()), Err(Errno::EIO), Err(Errno::EACCES), Err(Errno::EPERM)] {
             let start = tokio::time::Instant::now();
             let mut calls = 0;
-            let error = darwin_confirm_replacement_stopped(Pid::from_raw(41), Some(start + Duration::from_secs(1)), || {
+            let error = darwin_confirm_replacement_stopped(Pid::from_raw(41), Ok(Some(start + Duration::from_secs(1))), || {
                 calls += 1;
                 if calls == 1 {
                     darwin_group_observe(Err(Errno::EPERM), || (false, DarwinGroupFailure::Progress, vec!["exiting flags=4".into()]))
@@ -6052,7 +6126,7 @@ done
             let deadline = grace.map(|duration| start + duration);
             let mut calls = 0;
             let mut enumerations = 0;
-            darwin_confirm_replacement_stopped(Pid::from_raw(41), deadline, || {
+            darwin_confirm_replacement_stopped(Pid::from_raw(41), Ok(deadline), || {
                 calls += 1;
                 if grace == Some(Duration::from_millis(60)) && calls == 1 {
                     return darwin_group_observe(Err(Errno::EPERM), || {
@@ -6260,7 +6334,7 @@ done
         let held = dir.path().join("held");
         let _cleanup = HeldFixtureCleanup(held.clone());
         let bin = live_claude(dir.path());
-        let p = Process::spawn_held(
+        let mut p = Process::spawn_held(
             &held,
             "s",
             &bin,
@@ -6277,6 +6351,16 @@ done
         c6_testkit::eventually("the wrapper's exact argv to prove ownership", async || is_claude_for(pg.as_raw(), "fork").then_some(()))
             .await;
         assert!(!is_claude_for(pg.as_raw(), "for"));
+        // This tests argv ownership, not the bounded production stop's
+        // latency. Keep its ownership-checked cleanup, but wait for the
+        // entire group's death before replacement. A live member after
+        // kill's one-second phase must still block it; a group that was
+        // never stopped will still fail the fixture's shared hang deadline.
+        p.kill().await;
+        c6_testkit::eventually("the identity fixture's whole group to confirm absence", async || {
+            matches!(group_probe(pg), Err(nix::errno::Errno::ESRCH)).then_some(())
+        })
+        .await;
         p.close_for_replacement().await.unwrap();
         assert_eq!(group_probe(pg), Err(nix::errno::Errno::ESRCH));
     }
