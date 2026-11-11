@@ -184,6 +184,12 @@ EPERM for a zombie-only group: that is accepted as stopped only after two
 complete, identical libproc snapshots prove every member is SZOMB (or both
 are empty). Errors, live/unreadable members, changing identities and truncated
 enumerations retain the barrier; EPERM alone never releases it.
+When a listed PID is reaped before its BSD lookup, or the second complete
+zombie snapshot is a strict subset of the first, Mac stop confirmation may
+re-observe within the caller's existing deadline. Progress is not absence:
+only a later complete proof releases the barrier. Live members and hard
+errors refuse immediately; a zero deadline never sleeps or re-observes.
+The `darwin_group_progress_` tests inject these transitions using paused time.
 Darwin's keeper also ignores SIGINT before exec: unlike Linux, a default-fatal
 SIGINT can kill a SIGSTOPped process. The cross-platform
 `held_keeper_retains_fifo_ownership_through_group_interrupt` regression waits

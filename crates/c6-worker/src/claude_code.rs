@@ -639,12 +639,53 @@ fn group_probe(pg: Pid) -> nix::Result<()> {
 /// Keep the disposition and diagnostics from the same observation together.
 /// In particular, an error reporter must not repeat a racy absence proof.
 fn group_probe_with_detail(pg: Pid) -> (nix::Result<()>, Option<String>) {
-    let result = killpg(pg, None);
     #[cfg(target_os = "macos")]
-    if pg.as_raw() > 0 {
-        return darwin_group_probe_with_detail(result, || darwin_group_stopped_with_detail(pg.as_raw()));
+    {
+        let observation = darwin_group_observation(pg);
+        (observation.result, observation.detail)
     }
-    (result, None)
+    #[cfg(not(target_os = "macos"))]
+    {
+        (killpg(pg, None), None)
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DarwinGroupFailure {
+    Progress,
+    Refusal,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Debug)]
+struct DarwinGroupObservation {
+    result: nix::Result<()>,
+    detail: Option<String>,
+    failure: DarwinGroupFailure,
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_group_observation(pg: Pid) -> DarwinGroupObservation {
+    let result = killpg(pg, None);
+    if pg.as_raw() > 0 {
+        return darwin_group_observe(result, || darwin_group_stopped_with_detail(pg.as_raw()));
+    }
+    DarwinGroupObservation { result, detail: None, failure: DarwinGroupFailure::Refusal }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn darwin_group_observe(
+    result: nix::Result<()>,
+    proof: impl FnOnce() -> (bool, DarwinGroupFailure, Vec<String>),
+) -> DarwinGroupObservation {
+    let mut failure = DarwinGroupFailure::Refusal;
+    let (result, detail) = darwin_group_probe_with_detail(result, || {
+        let (stopped, observed_failure, observations) = proof();
+        failure = observed_failure;
+        (stopped, observations)
+    });
+    DarwinGroupObservation { result, detail, failure }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -685,6 +726,33 @@ struct DarwinGroupMember {
     status: u32,
     start_sec: u64,
     start_usec: u64,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug)]
+enum DarwinGroupSnapshot {
+    Complete(Vec<DarwinGroupMember>),
+    Reaped,
+    Refused,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn darwin_group_missing_member(returned: i32, error: i32) -> DarwinGroupSnapshot {
+    if returned == 0 && error == nix::errno::Errno::ESRCH as i32 { DarwinGroupSnapshot::Reaped } else { DarwinGroupSnapshot::Refused }
+}
+
+/// Progress is only permission for another observation, never absence proof.
+/// Complete snapshots contain only members accepted by darwin_zombie_member.
+#[cfg(any(target_os = "macos", test))]
+fn darwin_group_failure(snapshots: &[DarwinGroupSnapshot]) -> DarwinGroupFailure {
+    use DarwinGroupSnapshot::{Complete, Reaped};
+    match snapshots {
+        [Reaped] | [Complete(_), Reaped] => DarwinGroupFailure::Progress,
+        [Complete(first), Complete(second)] if second.len() < first.len() && second.iter().all(|member| first.contains(member)) => {
+            DarwinGroupFailure::Progress
+        }
+        _ => DarwinGroupFailure::Refusal,
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -732,13 +800,13 @@ fn darwin_group_snapshots_stopped(
 }
 
 #[cfg(target_os = "macos")]
-fn darwin_group_stopped_with_detail(pg: i32) -> (bool, Vec<String>) {
+fn darwin_group_stopped_with_detail(pg: i32) -> (bool, DarwinGroupFailure, Vec<String>) {
     use nix::libc;
     const PROC_PGRP_ONLY: u32 = 2;
     const _: () = assert!(std::mem::size_of::<libc::proc_bsdinfo>() == DARWIN_BSDINFO_SIZE as usize);
     const _: () = assert!(libc::SZOMB == 5);
     let observations = std::cell::RefCell::new(Vec::new());
-    let snapshots: std::cell::RefCell<Vec<Option<Vec<DarwinGroupMember>>>> = std::cell::RefCell::new(Vec::new());
+    let snapshots = std::cell::RefCell::new(Vec::new());
     let stopped = darwin_group_snapshots_stopped(
         || {
             let mut pids = [0i32; DARWIN_GROUP_SLOTS];
@@ -749,7 +817,7 @@ fn darwin_group_stopped_with_detail(pg: i32) -> (bool, Vec<String>) {
             let error = nix::errno::Errno::last_raw();
             let parsed = darwin_group_pids(returned, error, &pids);
             let mut snapshots = snapshots.borrow_mut();
-            snapshots.push(parsed.as_ref().map(|_| Vec::new()));
+            snapshots.push(if parsed.is_some() { DarwinGroupSnapshot::Complete(Vec::new()) } else { DarwinGroupSnapshot::Refused });
             observations.borrow_mut().push(format!(
                 "snapshot {} list: pgid={pg} bytes={returned}/{} errno={error} ({}) raw_pids={pids:?} parsed={parsed:?}{}",
                 snapshots.len(),
@@ -795,27 +863,35 @@ fn darwin_group_stopped_with_detail(pg: i32) -> (bool, Vec<String>) {
                 parsed.is_some()
             ));
             if let Some(snapshot) = snapshots.last_mut() {
-                if let (Some(members), Some(member)) = (snapshot.as_mut(), parsed.as_ref()) {
+                if let (DarwinGroupSnapshot::Complete(members), Some(member)) = (&mut *snapshot, parsed.as_ref()) {
                     members.push(member.clone());
                 } else {
-                    *snapshot = None;
+                    *snapshot = darwin_group_missing_member(returned, error);
                 }
             }
             parsed
         },
     );
     let mut observations = observations.into_inner();
+    let snapshots = snapshots.into_inner();
+    let failure = darwin_group_failure(&snapshots);
     if !stopped {
-        observations.push(match snapshots.into_inner().as_slice() {
-            [None, ..] => "first snapshot rejected: enumeration or member response above".into(),
-            [Some(_), None] => "second snapshot rejected: enumeration or member response above".into(),
-            [Some(first), Some(second)] => {
+        observations.push(match snapshots.as_slice() {
+            [DarwinGroupSnapshot::Refused, ..] => "first snapshot rejected: enumeration or member response above".into(),
+            [DarwinGroupSnapshot::Complete(_), DarwinGroupSnapshot::Refused] => {
+                "second snapshot rejected: enumeration or member response above".into()
+            }
+            [DarwinGroupSnapshot::Complete(first), DarwinGroupSnapshot::Complete(second)] => {
                 format!("snapshot identities/membership differ (possible reap or PID reuse): first={first:?} second={second:?}")
+            }
+            [DarwinGroupSnapshot::Reaped] | [DarwinGroupSnapshot::Complete(_), DarwinGroupSnapshot::Reaped] => {
+                "listed member lookup returned zero bytes with ESRCH; no absence proof".into()
             }
             _ => "incomplete snapshot observations".into(),
         });
+        observations.push(format!("classification={failure:?}; stopped=false"));
     }
-    (stopped, observations)
+    (stopped, failure, observations)
 }
 
 fn claude_args_for(args: &[&str], conversation: &str) -> bool {
@@ -1040,6 +1116,7 @@ async fn stop_held_group(pg: Pid, keeper: Pid, dir: &Path, conversation: &str) -
 /// proves that an old group's writers (including orphaned children) are gone.
 /// Live groups and permission errors keep the durable barrier. Linux zombies
 /// do too; Darwin zombie-only groups require the extra proof in group_probe.
+#[cfg(not(target_os = "macos"))]
 pub async fn confirm_stopped(journal: &crate::journal::Journal, session_id: &str, wait: Duration) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + wait;
     loop {
@@ -1067,6 +1144,55 @@ pub async fn confirm_stopped(journal: &crate::journal::Journal, session_id: &str
             StopUnconfirmed(format!("Claude Code process groups have not confirmed that they stopped: {pending:?}"))
         );
         tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + Duration::from_millis(25))).await;
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub async fn confirm_stopped(journal: &crate::journal::Journal, session_id: &str, wait: Duration) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let groups = journal.claude_processes(session_id).await?;
+        if groups.is_empty() {
+            return Ok(());
+        }
+        for pgid in groups {
+            darwin_confirm_group_stopped(pgid, deadline, || darwin_group_observation(Pid::from_raw(pgid))).await?;
+            journal.untrack_claude_process(session_id, pgid).await?;
+        }
+    }
+}
+
+/// Keep one supplied deadline across progress observations. In particular,
+/// ZERO still performs one probe, but neither sleeps nor grants a retry.
+#[cfg(any(target_os = "macos", test))]
+async fn darwin_confirm_group_stopped(
+    pgid: i32,
+    deadline: tokio::time::Instant,
+    mut probe: impl FnMut() -> DarwinGroupObservation,
+) -> anyhow::Result<()> {
+    loop {
+        let observation = probe();
+        if observation.result == Err(nix::errno::Errno::ESRCH) {
+            return Ok(());
+        }
+        if observation.result == Err(nix::errno::Errno::EPERM)
+            && observation.failure == DarwinGroupFailure::Progress
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + Duration::from_millis(25))).await;
+            if tokio::time::Instant::now() < deadline {
+                continue;
+            }
+        }
+        let mut message = format!("Cannot confirm Claude Code process group {pgid} stopped");
+        if let Some(detail) = observation.detail {
+            message.push_str(": ");
+            message.push_str(&detail);
+        }
+        return match observation.result {
+            Err(error) => Err(anyhow::Error::new(error).context(StopUnconfirmed(message))),
+            Ok(()) => Err(StopUnconfirmed(format!("{message}: signal-zero probe reports a live group")).into()),
+        };
     }
 }
 
@@ -5132,6 +5258,272 @@ done
         assert!(claude_args_for(&["node", "/opt/claude-code/cli.js", "--session-id", "fork"], "fork"));
         assert!(!claude_args_for(&["sleep", "/tmp/claude-notes", "--resume", "fork"], "fork"));
         assert!(!claude_args_for(&["sh", "-c", "echo claude --resume fork"], "fork"));
+    }
+
+    #[test]
+    fn darwin_group_progress_requires_a_zero_byte_esrch_member_lookup() {
+        use nix::errno::Errno;
+        for returned in [-1, 0, 1, 135, 136, 137] {
+            for error in [0, Errno::ESRCH as i32, Errno::EPERM as i32, Errno::EACCES as i32, Errno::EIO as i32] {
+                let snapshot = darwin_group_missing_member(returned, error);
+                assert_eq!(matches!(snapshot, DarwinGroupSnapshot::Reaped), returned == 0 && error == Errno::ESRCH as i32);
+                let failure = darwin_group_failure(&[snapshot]);
+                assert_eq!(failure == DarwinGroupFailure::Progress, returned == 0 && error == Errno::ESRCH as i32);
+            }
+        }
+    }
+
+    #[test]
+    fn darwin_group_progress_requires_a_strict_subset_of_exact_zombie_identities() {
+        use DarwinGroupSnapshot::{Complete, Reaped, Refused};
+        let first = DarwinGroupMember { pid: 42, pgid: 41, status: 5, start_sec: 100, start_usec: 10 };
+        let second = DarwinGroupMember { pid: 43, ..first.clone() };
+        for snapshots in [
+            vec![Reaped],
+            vec![Complete(vec![first.clone()]), Reaped],
+            vec![Complete(vec![first.clone()]), Complete(vec![])],
+            vec![Complete(vec![first.clone(), second.clone()]), Complete(vec![second.clone()])],
+        ] {
+            assert_eq!(darwin_group_failure(&snapshots), DarwinGroupFailure::Progress, "{snapshots:?}");
+        }
+        for snapshots in [
+            vec![],
+            vec![Refused],
+            vec![Complete(vec![first.clone()]), Refused],
+            vec![Complete(vec![first.clone()])],
+            vec![Complete(vec![]), Complete(vec![first.clone()])],
+            vec![Complete(vec![first.clone()]), Complete(vec![first.clone()])],
+            vec![Complete(vec![first.clone()]), Complete(vec![second.clone()])],
+            vec![Complete(vec![first.clone()]), Complete(vec![first.clone(), second.clone()])],
+            vec![Complete(vec![first.clone(), second.clone()]), Complete(vec![DarwinGroupMember { start_sec: 101, ..first.clone() }])],
+            vec![Complete(vec![first.clone(), second.clone()]), Complete(vec![DarwinGroupMember { start_usec: 11, ..first.clone() }])],
+            vec![Complete(vec![first.clone(), second.clone()]), Complete(vec![DarwinGroupMember { pgid: 44, ..first.clone() }])],
+        ] {
+            assert_eq!(darwin_group_failure(&snapshots), DarwinGroupFailure::Refusal, "{snapshots:?}");
+        }
+    }
+
+    #[test]
+    fn darwin_group_progress_is_not_absence_and_comes_from_the_same_observation() {
+        use nix::errno::Errno;
+        let mut calls = 0;
+        let observed = darwin_group_observe(Err(Errno::EPERM), || {
+            calls += 1;
+            (false, DarwinGroupFailure::Progress, vec!["listed member reaped".into()])
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(observed.result, Err(Errno::EPERM));
+        assert_eq!(observed.failure, DarwinGroupFailure::Progress);
+        assert_eq!(observed.detail.as_deref(), Some("Darwin group absence proof refused: listed member reaped"));
+        for result in [Ok(()), Err(Errno::ESRCH), Err(Errno::EACCES), Err(Errno::EIO)] {
+            let observed = darwin_group_observe(result, || panic!("non-EPERM must not collect another observation"));
+            assert_eq!(observed.result, result);
+            assert_eq!(observed.failure, DarwinGroupFailure::Refusal);
+            assert!(observed.detail.is_none());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn darwin_group_progress_transitions_need_a_later_complete_proof() {
+        use nix::errno::Errno;
+        use std::cell::RefCell;
+        use std::collections::VecDeque;
+
+        #[derive(Clone, Copy, Debug)]
+        enum Transition {
+            ListedThenReaped,
+            StrictSubset,
+            Empty,
+            Live,
+        }
+        // Requested PID, BSD bytes, errno, raw status. These are injected
+        // kernel replies, not preclassified progress/stopped observations.
+        type MemberReply = (i32, i32, i32, u32);
+        for transition in [Transition::ListedThenReaped, Transition::StrictSubset, Transition::Empty, Transition::Live] {
+            let start = tokio::time::Instant::now();
+            let mut history = Vec::new();
+            let result = darwin_confirm_group_stopped(41, start + Duration::from_secs(3), || {
+                let attempt = history.len() + 1;
+                let zombie = |pid| (pid, DARWIN_BSDINFO_SIZE, 0, 5);
+                let (lists, members): (Vec<Vec<i32>>, Vec<MemberReply>) = match (attempt, transition) {
+                    (1, Transition::ListedThenReaped) => (vec![vec![42]], vec![(42, 0, Errno::ESRCH as i32, 0)]),
+                    (1, Transition::StrictSubset) => (vec![vec![42, 43], vec![43]], vec![zombie(42), zombie(43), zombie(43)]),
+                    (1, Transition::Empty) => (vec![vec![42], vec![]], vec![zombie(42)]),
+                    (1, Transition::Live) => (vec![vec![42], vec![42]], vec![zombie(42), (42, DARWIN_BSDINFO_SIZE, 0, 2)]),
+                    (2, Transition::StrictSubset) => (vec![vec![43], vec![43]], vec![zombie(43), zombie(43)]),
+                    (2, Transition::ListedThenReaped | Transition::Empty) => (vec![vec![], vec![]], vec![]),
+                    _ => panic!("unexpected observation {attempt} for {transition:?}"),
+                };
+                let lists = RefCell::new(VecDeque::from(lists));
+                let members = RefCell::new(VecDeque::from(members));
+                let snapshots = RefCell::new(Vec::new());
+                let mut list_calls = 0;
+                let mut member_calls = 0;
+                let mut stopped = false;
+                let observed = darwin_group_observe(Err(Errno::EPERM), || {
+                    stopped = darwin_group_snapshots_stopped(
+                        || {
+                            list_calls += 1;
+                            let pids = lists.borrow_mut().pop_front().expect("unexpected enumeration");
+                            let mut buffer = [0; DARWIN_GROUP_SLOTS];
+                            buffer[..pids.len()].copy_from_slice(&pids);
+                            let parsed = darwin_group_pids((pids.len() * std::mem::size_of::<i32>()) as i32, 0, &buffer);
+                            snapshots.borrow_mut().push(if parsed.is_some() {
+                                DarwinGroupSnapshot::Complete(Vec::new())
+                            } else {
+                                DarwinGroupSnapshot::Refused
+                            });
+                            parsed
+                        },
+                        |pid| {
+                            member_calls += 1;
+                            let (expected_pid, bytes, error, status) = members.borrow_mut().pop_front().expect("unexpected member lookup");
+                            assert_eq!(pid, expected_pid);
+                            let raw = if bytes == DARWIN_BSDINFO_SIZE {
+                                DarwinGroupMember { pid: pid as u32, pgid: 41, status, start_sec: 100, start_usec: 10 }
+                            } else {
+                                DarwinGroupMember { pid: 0, pgid: 0, status: 0, start_sec: 0, start_usec: 0 }
+                            };
+                            let parsed = darwin_zombie_member(bytes, pid, 41, raw);
+                            let mut snapshots = snapshots.borrow_mut();
+                            let snapshot = snapshots.last_mut().expect("member lookup requires prior enumeration");
+                            if let (DarwinGroupSnapshot::Complete(accepted), Some(member)) = (&mut *snapshot, parsed.as_ref()) {
+                                accepted.push(member.clone());
+                            } else {
+                                *snapshot = darwin_group_missing_member(bytes, error);
+                            }
+                            parsed
+                        },
+                    );
+                    let snapshots = snapshots.into_inner();
+                    (stopped, darwin_group_failure(&snapshots), vec![format!("{transition:?} attempt {attempt}: {snapshots:?}")])
+                });
+                assert!(lists.borrow().is_empty(), "the proof must consume exactly the injected enumerations");
+                assert!(members.borrow().is_empty(), "the proof must consume exactly the injected member replies");
+                history.push((observed.result, observed.failure, stopped, list_calls, member_calls));
+                observed
+            })
+            .await;
+            let first = history[0];
+            assert_eq!(first.0, Err(Errno::EPERM), "the transition itself must never prove absence");
+            assert!(!first.2, "a partial/mismatched snapshot is never a complete proof");
+            if matches!(transition, Transition::Live) {
+                let error = result.unwrap_err();
+                assert_eq!(first.1, DarwinGroupFailure::Refusal);
+                assert_eq!((first.3, first.4), (2, 2));
+                assert_eq!(history.len(), 1, "a live second snapshot must not be retried");
+                assert_eq!(tokio::time::Instant::now(), start, "live refusal must not consume any wait budget");
+                assert_eq!(error.downcast_ref::<Errno>(), Some(&Errno::EPERM));
+                assert!(error.to_string().contains("Live attempt 1"));
+            } else {
+                result.unwrap();
+                assert_eq!(first.1, DarwinGroupFailure::Progress);
+                let expected_calls = match transition {
+                    Transition::ListedThenReaped => (1, 1),
+                    Transition::StrictSubset => (2, 3),
+                    Transition::Empty => (2, 1),
+                    Transition::Live => unreachable!(),
+                };
+                assert_eq!((first.3, first.4), expected_calls);
+                assert_eq!(history.len(), 2, "progress requires a later independent complete proof");
+                assert_eq!(tokio::time::Instant::now() - start, Duration::from_millis(25));
+                let last = history[1];
+                assert_eq!(last.0, Err(Errno::ESRCH), "only the later stable snapshots normalize initial EPERM");
+                assert!(last.2);
+                assert_eq!(last.3, 2, "the successful observation must enumerate both snapshots");
+                assert_eq!(last.4, if matches!(transition, Transition::StrictSubset) { 2 } else { 0 });
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn darwin_group_progress_zero_deadline_never_retries_or_sleeps() {
+        use nix::errno::Errno;
+        for (result, failure) in [
+            (Err(Errno::EPERM), DarwinGroupFailure::Progress),
+            (Err(Errno::EPERM), DarwinGroupFailure::Refusal),
+            (Err(Errno::EIO), DarwinGroupFailure::Progress),
+            (Ok(()), DarwinGroupFailure::Refusal),
+        ] {
+            let start = tokio::time::Instant::now();
+            let mut calls = 0;
+            let error = darwin_confirm_group_stopped(41, start, || {
+                calls += 1;
+                DarwinGroupObservation { result, detail: Some("last observation".into()), failure }
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(calls, 1);
+            assert_eq!(tokio::time::Instant::now(), start);
+            assert!(error.to_string().contains("last observation"));
+        }
+        let now = tokio::time::Instant::now();
+        let mut calls = 0;
+        darwin_confirm_group_stopped(41, now, || {
+            calls += 1;
+            DarwinGroupObservation { result: Err(Errno::ESRCH), detail: None, failure: DarwinGroupFailure::Refusal }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls, 1, "a complete absence proof still succeeds with ZERO budget");
+        assert_eq!(tokio::time::Instant::now(), now);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn darwin_group_progress_reobserves_until_stopped_or_immediate_refusal() {
+        use nix::errno::Errno;
+        for terminal in [Err(Errno::ESRCH), Ok(()), Err(Errno::EPERM), Err(Errno::EIO)] {
+            let start = tokio::time::Instant::now();
+            let mut calls = 0;
+            let result = darwin_confirm_group_stopped(41, start + Duration::from_secs(3), || {
+                calls += 1;
+                if calls == 1 {
+                    DarwinGroupObservation {
+                        result: Err(Errno::EPERM),
+                        detail: Some("progress".into()),
+                        failure: DarwinGroupFailure::Progress,
+                    }
+                } else {
+                    DarwinGroupObservation {
+                        result: terminal,
+                        detail: Some("terminal observation".into()),
+                        failure: DarwinGroupFailure::Refusal,
+                    }
+                }
+            })
+            .await;
+            assert_eq!(calls, 2);
+            assert_eq!(tokio::time::Instant::now() - start, Duration::from_millis(25));
+            assert_eq!(result.is_ok(), terminal == Err(Errno::ESRCH));
+            if let Err(error) = result {
+                assert!(error.to_string().contains("terminal observation"));
+                if let Err(errno) = terminal {
+                    assert_eq!(error.downcast_ref::<Errno>(), Some(&errno));
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn darwin_group_progress_deadline_keeps_last_diagnostics_without_extending_budget() {
+        use nix::errno::Errno;
+        let start = tokio::time::Instant::now();
+        let mut calls = 0;
+        let error = darwin_confirm_group_stopped(41, start + Duration::from_millis(60), || {
+            calls += 1;
+            DarwinGroupObservation {
+                result: Err(Errno::EPERM),
+                detail: Some(format!("full last observation {calls}")),
+                failure: DarwinGroupFailure::Progress,
+            }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls, 3, "observations at 0/25/50 ms only; no extra deadline probe");
+        assert_eq!(tokio::time::Instant::now() - start, Duration::from_millis(60));
+        assert!(error.to_string().contains("full last observation 3"));
+        assert_eq!(error.downcast_ref::<Errno>(), Some(&Errno::EPERM));
+        assert!(error.downcast_ref::<StopUnconfirmed>().is_some());
     }
 
     #[test]
