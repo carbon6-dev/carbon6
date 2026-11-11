@@ -1,5 +1,5 @@
 //! Keeping track of many sessions: the dock (desktop), the inbox, mission
-//! control, and the phone's bottom bar.
+//! control, and the phone's Sessions picker.
 
 use c6_api::{ContentBlock, EventKind, Session, SessionStatus};
 use leptos::prelude::*;
@@ -67,7 +67,7 @@ pub fn Dock() -> impl IntoView {
     });
     // ⌘\ (Ctrl+\) hides it or keeps it open.
     let keys = window_event_listener(leptos::ev::keydown, move |ev| {
-        if (ev.meta_key() || ev.ctrl_key()) && !ev.alt_key() && ev.key() == "\\" {
+        if ev.key() == "\\" && crate::util::app_shortcut(&ev) {
             ev.prevent_default();
             toggle.try_run(());
         }
@@ -81,7 +81,7 @@ pub fn Dock() -> impl IntoView {
                 <button class="absolute inset-0 border-r border-zinc-200 bg-zinc-50 hover:bg-zinc-200 dark:border-zinc-800 dark:bg-zinc-950 dark:hover:bg-zinc-800"
                     title="Show the sidebar (⌘\\ keeps it open)" aria-label="Show the sidebar" on:click=move |_| toggle.run(())></button>
             })}
-            <aside class=move || {
+            <aside data-open=move || (kept.get() || peek.get()).to_string() inert=move || !kept.get() && !peek.get() class=move || {
                 let at = if kept.get() {
                     "w-full"
                 } else if peek.get() {
@@ -89,7 +89,7 @@ pub fn Dock() -> impl IntoView {
                 } else {
                     "pointer-events-none invisible absolute inset-y-0 left-0 w-60 -translate-x-full"
                 };
-                format!("flex flex-col border-r border-zinc-200 bg-zinc-50 transition-[translate,visibility] duration-150 ease-out motion-reduce:transition-none dark:border-zinc-800 dark:bg-zinc-950 {at}")
+                format!("c6-sidebar flex flex-col border-r border-zinc-200 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 {at}")
             }>
                 <div class=move || if !activity.get() { "flex shrink-0 flex-col" } else if sessions.get() { "flex max-h-[45%] min-h-0 shrink-0 flex-col" } else { "flex min-h-0 flex-1 flex-col" }>
                     <DockActivity open=activity fold kept toggle />
@@ -132,7 +132,7 @@ fn DockActivity(open: RwSignal<bool>, fold: &'static str, kept: RwSignal<bool>, 
             <div class="flex items-center justify-between pb-1 pl-1.5 pr-3 pt-3 text-[11px] font-semibold uppercase tracking-wide text-muted">
                 <span class="flex items-center gap-1.5">
                     <button class=fold title=move || if open.get() { "Fold" } else { "Unfold" } on:click=move |_| open.update(|o| *o = !*o)>
-                        {move || if open.get() { crate::icons::chevron_down().into_any() } else { crate::icons::chevron_right().into_any() }}
+                        {move || if open.get() { crate::icons::chevron_down() } else { crate::icons::chevron_right() }}
                     </button>
                     "Activity"
                     {move || (!open.get() && !items.with(Vec::is_empty)).then(|| view! {
@@ -144,7 +144,7 @@ fn DockActivity(open: RwSignal<bool>, fold: &'static str, kept: RwSignal<bool>, 
                     <button class="font-normal normal-case tracking-normal hover:text-zinc-900 dark:hover:text-zinc-100"
                         title=move || if kept.get() { "Hide the sidebar: it slides out when you point at the left edge (⌘\\)" } else { "Keep the sidebar open (⌘\\)" }
                         on:click=move |_| toggle.run(())>
-                        {move || if kept.get() { "«" } else { "»" }}
+                        {move || crate::icons::icon(if kept.get() { crate::icons::Icon::PanelLeftClose } else { crate::icons::Icon::PanelLeftOpen }, crate::icons::Size::S16)}
                     </button>
                 </span>
             </div>
@@ -210,7 +210,11 @@ fn MinimizedItem(key: u64, n: usize, views: Vec<View>) -> impl IntoView {
     let ws = use_workspace();
     let live = api::live();
     let views = StoredValue::new(views);
-    let label = move || views.with_value(|vs| vs.iter().map(|v| v.label(&live)).collect::<Vec<_>>().join("  ›  "));
+    let label = move || {
+        views.with_value(|vs| {
+            if vs.is_empty() { "History".to_owned() } else { vs.iter().map(|v| v.label(&live)).collect::<Vec<_>>().join("  ›  ") }
+        })
+    };
     let session = Memo::new(move |_| {
         views.with_value(|vs| match vs.last() {
             Some(View::Session { id, .. }) => live.sessions.with(|ss| ss.iter().find(|s| &s.id == id).cloned()),
@@ -274,7 +278,7 @@ fn DockItem(s: Session, t: Tracked) -> impl IntoView {
         <div class="group flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-zinc-200/60 dark:hover:bg-zinc-800/60">
             <span class="h-6 w-1 shrink-0 rounded-sm" style=crate::marks::fill(&crate::marks::of(&s)) title="Its mark"></span>
             <span class=dot(s.display_status(), t)></span>
-            <Go to=View::session(s.id.clone()) class="min-w-0 flex-1" title="Open (⌘-click: new tile)">
+            <Go to=View::session(s.id.clone()) class="min-w-0 flex-1" title="Open (⌘/Ctrl-click: new tile if not already open)">
                 <div class="flex items-center gap-1.5">
                     <span class="min-w-0 flex-1 truncate text-sm">{s.title.clone()}</span>
                     <span class="flex shrink-0 items-center gap-0.5"><crate::aspects::AspectGlyphs s=s.clone() /></span>
@@ -356,7 +360,7 @@ fn InboxRow(s: Session, t: Tracked) -> impl IntoView {
                 <div class="truncate font-medium">{s.title.clone()}</div>
                 <div title=s.on_head.then_some(api::HEAD_TITLE) class="truncate text-xs text-muted">{format!("{} · {} · {}", what(s.display_status(), t), worker, ago(now_ms() - s.updated_at))}</div>
                 {(!s.labels.is_empty() || !crate::labels::shown_auto(&s.auto_labels).is_empty()).then(|| view! {
-                    <div class="mt-1 flex flex-wrap gap-1">
+                    <div class="mt-1 flex flex-wrap gap-1 [overflow-wrap:anywhere]">
                         {crate::labels::shown_auto(&s.auto_labels).into_iter().map(|l| view! { <crate::labels::LabelChip label=l auto=true stay=true /> }).collect_view()}
                         {s.labels.iter().cloned().map(|l| view! { <crate::labels::LabelChip label=l stay=true /> }).collect_view()}
                     </div>
@@ -386,7 +390,7 @@ pub fn MissionPage() -> impl IntoView {
             return tracked;
         }
         let mut recent: Vec<Session> = live.sessions.get().into_iter().filter(|s| crate::labels::matches(s, &f)).collect();
-        recent.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+        crate::sessions::sort_by_activity(&mut recent);
         recent.into_iter().take(6).map(|s| s.id).collect()
     });
     view! {
@@ -394,7 +398,7 @@ pub fn MissionPage() -> impl IntoView {
             <p class="text-xs text-muted">"Running, finished-unseen and pinned sessions (or your most recent), live. Reply from a card, or open it beside this view."</p>
             <crate::labels::LabelFilterBar />
             {move || ids.with(Vec::is_empty).then(|| view! { <p class="text-sm text-muted">"No sessions with these labels."</p> })}
-            <div class="grid gap-3 [grid-template-columns:repeat(auto-fill,minmax(20rem,1fr))]">
+            <div class="grid gap-3 [grid-template-columns:repeat(auto-fill,minmax(min(20rem,100%),1fr))]">
                 <For each=move || ids.get() key=|id| id.clone() let:id>
                     <MissionCard id />
                 </For>
@@ -499,13 +503,13 @@ fn MissionCard(id: String) -> impl IntoView {
     };
     let open_id = id.clone();
     view! {
-        <div class="flex h-48 flex-col rounded-lg border sm:h-64 border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
-            <div class="group flex items-center gap-2 border-b border-zinc-100 px-3 py-2 dark:border-zinc-800">
+        <div class="flex h-48 min-w-0 flex-col rounded-lg border @sm/view:h-64 border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
+            <div class="group flex flex-wrap items-center gap-2 border-b border-zinc-100 px-3 py-2 dark:border-zinc-800">
                 {move || session.get().map(|s| view! { <span class=dot(s.display_status(), tracked())></span> })}
-                <Go to=View::session(open_id.clone()) class="min-w-0 flex-1 truncate text-sm font-medium hover:underline" title="Open (⌘-click: new tile)">
+                <Go to=View::session(open_id.clone()) class="min-w-0 flex-1 basis-1/2 truncate text-sm font-medium hover:underline" title="Open (⌘/Ctrl-click: new tile if not already open)">
                     {move || session.get().map(|s| s.title).unwrap_or_else(|| "Session".into())}
                 </Go>
-                <span class="shrink-0 text-[11px] text-muted">
+                <span class="max-w-full truncate text-[11px] text-muted">
                     {move || session.get().map(|s| format!("{} · {}", live.session_worker(&s), ago(now_ms() - s.updated_at)))}
                 </span>
                 <crate::sessions::SessionMenu id=open_id.clone() />
@@ -535,505 +539,286 @@ fn MissionCard(id: String) -> impl IntoView {
     }
 }
 
-/// How long a press on a phone's tab lifts it (to drag, or for its menu).
-const LONG_PRESS: std::time::Duration = std::time::Duration::from_millis(500);
-/// How far a press may move and still be one (further, it's a swipe).
-const PRESS_SLOP: f64 = 8.0;
-/// How near the strip's ends a lifted tab scrolls it, and how fast.
-const EDGE: f64 = 32.0;
-const EDGE_STEP: i32 = 6;
-
-/// Whether a press moved off where it began (then it's no long press, or a
-/// lifted tab is being dragged).
-fn moved_off(from: (f64, f64), to: (f64, f64)) -> bool {
-    (to.0 - from.0).hypot(to.1 - from.1) > PRESS_SLOP
-}
-
-/// The gap a dragged tab would land in, with the pointer at `x` (`mids`:
-/// the tabs' middles, in order): before the first tab whose middle is past
-/// it (0: before them all), else after the last.
-fn drop_slot(x: f64, mids: &[f64]) -> usize {
-    mids.iter().position(|&m| x < m).unwrap_or(mids.len())
-}
-
-/// How many places the tab at `i` moves to land in gap `slot`: none for
-/// the gaps either side of it.
-fn slot_step(i: usize, slot: usize) -> isize {
-    if slot > i { (slot - i - 1) as isize } else { slot as isize - i as isize }
-}
-
-/// How far to scroll the strip (`left` to `right`) with a lifted tab at
-/// `x`: towards an end it is near.
-fn edge_scroll(x: f64, left: f64, right: f64) -> i32 {
-    if x < left + EDGE {
-        -EDGE_STEP
-    } else if x > right - EDGE {
-        EDGE_STEP
-    } else {
-        0
-    }
-}
-
-/// A press on a tab, from pointer down to up.
-#[derive(Clone, Copy)]
-struct Press {
-    key: u64,
-    pointer: i32,
-    from: (f64, f64),
-    /// Where the pointer is now.
-    at: (f64, f64),
-    /// Until it lifts the tab.
-    timer: Option<TimeoutHandle>,
-    /// Lifted (held long enough), and dragged since.
-    lifted: bool,
-    dragged: bool,
-}
-
-/// Phones: switch tiles, add one, and every tile in a sheet (▸, with the
-/// sessions you viewed lately). The current tab's × closes
-/// its tile. A long press lifts a tab: drag it and a line marks where it
-/// will land (it stays put until let go), or let go where it is for its
-/// menu.
+/// The phone's frequent switcher: every open session or page, not a footer.
 #[component]
-pub fn MobileBar() -> impl IntoView {
+pub fn SessionsPicker() -> impl IntoView {
     let ws = use_workspace();
-    let live = api::live();
-    // The tiles shown, in reading order, as ⌘1–9 and the dock number them.
-    let tiles = Memo::new(move |_| {
-        ws.layout.with(|l| {
-            l.reading_order()
-                .into_iter()
-                .filter(|&i| !l.tiles[i].minimized)
-                .map(|i| {
-                    let t = &l.tiles[i];
-                    (t.key, t.columns.get(t.cursor).map(|c| c.view.label(&live)).unwrap_or_default(), i == l.focus)
-                })
-                .collect::<Vec<_>>()
-        })
+    let open = RwSignal::new(false);
+    let present = crate::util::presence(move || open.get());
+    let button = NodeRef::<leptos::html::Button>::new();
+    let count = move || ws.layout.with(|l| l.tiles.len());
+    let close = Callback::new(move |()| {
+        open.set(false);
+        if let Some(el) = button.get_untracked() {
+            let _ = el.focus();
+        }
     });
-    // Only the tabs scroll, and their edges fade where more is hidden that
-    // way, so it reads as a strip to swipe; the current tab is brought
-    // into view whenever it changes.
-    let strip = NodeRef::<leptos::html::Div>::new();
-    let edges = RwSignal::new((false, false));
-    let measure = move || {
-        if let Some(el) = strip.try_get_untracked().flatten() {
-            let (left, max) = (el.scroll_left(), el.scroll_width() - el.client_width());
-            let _ = edges.try_set((left > 2, left < max - 2));
-        }
-    };
-    Effect::new(move || {
-        let focused = tiles.with(|t| t.iter().position(|(_, _, f)| *f));
-        request_animation_frame(move || {
-            if let (Some(el), Some(i)) = (strip.try_get_untracked().flatten(), focused)
-                && let Some(tab) = el.children().item(i as u32)
-            {
-                let (box_, tab) = (el.get_bounding_client_rect(), tab.get_bounding_client_rect());
-                if tab.left() < box_.left() {
-                    el.set_scroll_left(el.scroll_left() - (box_.left() - tab.left()) as i32 - 16);
-                } else if tab.right() > box_.right() {
-                    el.set_scroll_left(el.scroll_left() + (tab.right() - box_.right()) as i32 + 16);
-                }
-            }
-            measure();
-        });
-    });
-    let fade = move || match edges.get() {
-        (true, true) => "[mask-image:linear-gradient(to_right,transparent,black_24px,black_calc(100%-24px),transparent)]",
-        (true, false) => "[mask-image:linear-gradient(to_right,transparent,black_24px)]",
-        (false, true) => "[mask-image:linear-gradient(to_left,transparent,black_24px)]",
-        (false, false) => "",
-    };
-    // The press under way, the tab it lifted (for its look, and so the
-    // strip stops scrolling under the finger), and whether a press lifted
-    // a tab (the click that ends it is no tap).
-    let press = StoredValue::new(None::<Press>);
-    let lifted = RwSignal::new(None::<u64>);
-    // The gap a lifted tab would land in, when that would move it.
-    let line = RwSignal::new(None::<usize>);
-    let pressed = StoredValue::new(false);
-    // While a tab is lifted: what keeps the strip scrolling near its ends.
-    let scrolling = StoredValue::new(None::<IntervalHandle>);
-    // The tab whose menu is open, and where (its left, its top).
-    let menu = RwSignal::new(None::<(u64, f64, f64)>);
-    let tab_of = move |key: u64| -> Option<web_sys::Element> {
-        let el = strip.try_get_untracked().flatten()?;
-        let i = tiles.try_with_untracked(|t| t.iter().position(|(k, ..)| *k == key)).flatten()?;
-        el.children().item(i as u32)
-    };
-    // Ends a press (and a lift); what it was.
-    let end = move || -> Option<Press> {
-        let p = press.try_update_value(Option::take).flatten()?;
-        if let Some(t) = p.timer {
-            t.clear();
-        }
-        if p.lifted {
-            if let Some(h) = scrolling.try_update_value(Option::take).flatten() {
-                h.clear();
-            }
-            if let Some(el) = strip.try_get_untracked().flatten() {
-                let _ = el.release_pointer_capture(p.pointer);
-            }
-            let _ = lifted.try_set(None);
-            let _ = line.try_set(None);
-        }
-        Some(p)
-    };
-    // A lifted tab stays put while the line follows the pointer, to the gap
-    // nearest it; near an end of the strip, the strip scrolls.
-    let follow = move || {
-        let (Some(p), Some(el)) = (press.try_get_value().flatten(), strip.try_get_untracked().flatten()) else { return };
-        if !p.lifted {
-            return;
-        }
-        let r = el.get_bounding_client_rect();
-        let by = edge_scroll(p.at.0, r.left(), r.right());
-        if by != 0 {
-            el.set_scroll_left(el.scroll_left() + by);
-        }
-        let Some(i) = tiles.try_with_untracked(|t| t.iter().position(|(k, ..)| *k == p.key)).flatten() else { return };
-        let tabs = el.children();
-        let mids: Vec<f64> = (0..tabs.length())
-            .filter_map(|j| tabs.item(j))
-            .map(|t| {
-                let r = t.get_bounding_client_rect();
-                r.left() + r.width() / 2.0
-            })
-            .collect();
-        let slot = drop_slot(p.at.0, &mids);
-        let at = (p.dragged && slot_step(i, slot) != 0).then_some(slot);
-        if line.get_untracked() != at {
-            let _ = line.try_set(at);
-        }
-    };
-    let down = move |ev: web_sys::PointerEvent| {
-        end();
-        pressed.set_value(false);
-        if ev.button() != 0 {
-            return;
-        }
-        // Which tab (the × keeps its press to itself).
-        let key = ev
-            .target()
-            .and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok())
-            .and_then(|t| t.closest("[data-tile]").ok().flatten())
-            .and_then(|t| t.get_attribute("data-tile"))
-            .and_then(|k| k.parse::<u64>().ok());
-        let Some(key) = key else { return };
-        let (pointer, from) = (ev.pointer_id(), (f64::from(ev.client_x()), f64::from(ev.client_y())));
-        let lift = move || {
-            let Some(Some(p)) = press.try_update_value(|p| {
-                p.as_mut().filter(|p| p.key == key && !p.lifted).map(|p| {
-                    p.lifted = true;
-                    p.timer = None;
-                    *p
-                })
-            }) else {
-                return;
-            };
-            let _ = pressed.try_set_value(true);
-            let _ = lifted.try_set(Some(key));
-            // Every move of this pointer comes here now, wherever it goes.
-            if let Some(el) = strip.try_get_untracked().flatten() {
-                let _ = el.set_pointer_capture(p.pointer);
-            }
-            let nav = window().navigator();
-            if js_sys::Reflect::has(&nav, &"vibrate".into()).unwrap_or(false) {
-                let _ = nav.vibrate_with_duration(10);
-            }
-            let h = set_interval_with_handle(follow, std::time::Duration::from_millis(30)).ok();
-            let _ = scrolling.try_set_value(h);
-        };
-        let timer = set_timeout_with_handle(lift, LONG_PRESS).ok();
-        press.set_value(Some(Press { key, pointer, from, at: from, timer, lifted: false, dragged: false }));
-    };
-    let moving = move |ev: web_sys::PointerEvent| {
-        let at = (f64::from(ev.client_x()), f64::from(ev.client_y()));
-        let Some(p) = press.get_value() else { return };
-        if p.pointer != ev.pointer_id() {
-            return;
-        }
-        if !p.lifted {
-            // Moving before it lifts: a swipe of the strip.
-            if moved_off(p.from, at) {
-                end();
-            }
-            return;
-        }
-        press.update_value(|p| {
-            if let Some(p) = p {
-                p.at = at;
-                p.dragged |= moved_off(p.from, at);
-            }
-        });
-        follow();
-    };
-    // Let go: a tab lifted and not dragged shows its menu; a dragged one
-    // moves to the line, if there is one.
-    let up = move |ev: web_sys::PointerEvent| {
-        if press.with_value(|p| p.is_none_or(|p| p.pointer != ev.pointer_id())) {
-            return;
-        }
-        let slot = line.get_untracked();
-        let Some(p) = end() else { return };
-        if !p.lifted {
-            return;
-        }
-        if p.dragged {
-            let i = tiles.with_untracked(|t| t.iter().position(|(k, ..)| *k == p.key));
-            if let (Some(i), Some(slot)) = (i, slot) {
-                ws.step_tile(p.key, slot_step(i, slot));
-            }
-        } else if let Some(tab) = tab_of(p.key) {
-            let r = tab.get_bounding_client_rect();
-            menu.set(Some((p.key, r.left(), r.top())));
-        }
-    };
-    // The sheet of tiles and recently viewed sessions.
-    let sheet = RwSignal::new(false);
     let keys = window_event_listener(leptos::ev::keydown, move |ev| {
-        if ev.key() == "Escape" && menu.get_untracked().is_some() {
-            menu.set(None);
-        } else if ev.key() == "Escape" && sheet.get_untracked() {
-            sheet.set(false);
+        if ev.key().eq_ignore_ascii_case("k")
+            && crate::util::app_shortcut(&ev)
+            && button.get_untracked().is_some_and(|el| el.get_bounding_client_rect().width() > 0.0)
+        {
+            ev.prevent_default();
+            open.set(true);
         }
     });
-    on_cleanup(move || {
-        keys.remove();
-        end();
-    });
+    on_cleanup(move || keys.remove());
     view! {
-        <nav class="relative flex shrink-0 items-center gap-1 border-t border-zinc-200 bg-zinc-50 px-2 py-1 md:hidden dark:border-zinc-800 dark:bg-zinc-950">
-            // Padded so the current tab's × (taller than the tabs, for a
-            // finger) fits without the strip scrolling up and down. While a
-            // tab is lifted, the finger drags it rather than the strip.
-            <div node_ref=strip
-                class=move || format!("flex min-w-0 flex-1 gap-1 overflow-x-auto py-0.5 [scrollbar-width:none] {} {}", fade(), if lifted.get().is_some() { "touch-none" } else { "" })
-                on:scroll=move |_| measure()
-                on:pointerdown=down
-                on:pointermove=moving
-                on:pointerup=up
-                on:pointercancel=move |_| { end(); }
-                on:pointerleave=move |_| if press.with_value(|p| p.is_some_and(|p| !p.lifted)) { end(); }
-                on:touchmove=move |ev| if lifted.get_untracked().is_some() { ev.prevent_default() }
-                on:contextmenu=move |ev| ev.prevent_default()>
-                {move || {
-                    let tabs = tiles.get();
-                    let n = tabs.len();
-                    tabs.into_iter().enumerate().map(|(j, (key, label, focused))| view! {
-                    <div data-tile=key.to_string()
-                        class=if focused { "relative flex max-w-44 shrink-0 select-none items-center rounded-md bg-zinc-200 [-webkit-touch-callout:none] dark:bg-zinc-800" } else { "relative flex max-w-36 shrink-0 select-none items-center rounded-md [-webkit-touch-callout:none]" }
-                        class=("opacity-50", move || lifted.get() == Some(key))
-                        class=("outline-dashed", move || lifted.get() == Some(key))
-                        class=("outline-1", move || lifted.get() == Some(key))
-                        class=("outline-sky-400", move || lifted.get() == Some(key))
-                    >
-                        // Where the lifted tab will land: the gap before this
-                        // tab, or after it if it is the last.
-                        {move || {
-                            let side = match line.get() {
-                                Some(s) if s == j && j == 0 => "left-0",
-                                Some(s) if s == j => "-left-[3px]",
-                                Some(s) if s == n && j + 1 == n => "right-0",
-                                _ => return None,
-                            };
-                            Some(view! { <span class=format!("pointer-events-none absolute inset-y-1 w-0.5 rounded-full bg-sky-400 {side}")></span> })
-                        }}
-                        <button
-                            class=if focused { "min-w-0 truncate py-1.5 pl-2.5 text-xs font-medium" } else { "min-w-0 truncate px-2.5 py-1.5 text-xs text-zinc-600 dark:text-zinc-400" }
-                            on:click=move |_| if !pressed.try_update_value(std::mem::take).unwrap_or(false) { ws.show_tile(key) }
-                        >{label}</button>
-                        {focused.then(|| view! {
-                            <button class="-my-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-sm text-muted hover:text-zinc-900 dark:hover:text-zinc-100"
-                                title="Close this tile" aria-label="Close this tile"
-                                on:pointerdown=move |ev| ev.stop_propagation()
-                                on:click=move |_| ws.close_tile(key)>"×"</button>
-                        })}
-                    </div>
-                }).collect_view()
-                }}
-            </div>
-            {move || lifted.get().is_some().then(|| view! {
-                <div class="pointer-events-none absolute inset-x-0 bottom-full flex justify-center pb-1">
-                    <span class="rounded-full bg-zinc-50/90 px-2 py-0.5 text-[11px] text-muted dark:bg-zinc-950/90">"Drag to move · let go to drop"</span>
-                </div>
-            })}
-            <button class="shrink-0 rounded-md px-2.5 py-1.5 text-xs text-muted" title="New tile" on:click=move |_| ws.new_tile()>"+"</button>
-            <button class="shrink-0 rounded-md px-2.5 py-1.5 text-xs tabular-nums text-zinc-600 dark:text-zinc-400"
-                title="Your tiles, and the sessions you viewed lately" aria-haspopup="dialog" aria-expanded=move || sheet.get().to_string()
-                on:click=move |_| sheet.set(true)>{crate::icons::chevron_right()}" "{move || sheet_label(tiles.with(Vec::len))}</button>
-            <Show when=move || sheet.get()>
-                <TabSheet close=Callback::new(move |()| sheet.set(false)) />
-            </Show>
-            {move || menu.get().map(|(key, left, top)| {
-                let alone = tiles.with(Vec::len) <= 1;
-                let close = Callback::new(move |()| menu.set(None));
-                let pick = Callback::new(move |what: TabAction| {
-                    menu.set(None);
-                    match what {
-                        TabAction::Close => ws.close_tile(key),
-                        TabAction::Minimize => ws.minimize(key),
-                    }
-                });
-                view! { <TabMenu at={(left, top)} alone pick close pressed /> }
-            })}
-        </nav>
+        <button node_ref=button class="relative flex h-11 w-11 shrink-0 items-center justify-center rounded-md text-zinc-600 hover:bg-zinc-200/60 md:hidden dark:text-zinc-300 dark:hover:bg-zinc-800"
+            title="Sessions" aria-label=move || picker_label(count()) aria-haspopup="dialog" aria-expanded=move || open.get().to_string()
+            on:click=move |_| {
+                // Tapped buttons do not receive focus in every browser.
+                // Capture the actual opener before the background goes inert.
+                if let Some(el) = button.get_untracked() { let _ = el.focus(); }
+                open.update(|o| *o = !*o)
+            }>
+            {crate::icons::icon(crate::icons::Icon::List, crate::icons::Size::S16)}
+            <span data-phone-pages="true" class="absolute right-1 top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-zinc-200 px-1 text-[10px] leading-none tabular-nums dark:bg-zinc-700"><crate::util::MotionCount value=Signal::derive(count) /></span>
+        </button>
+        <Show when=move || present.get()>
+            <leptos::portal::Portal><SessionsSheet close open /></leptos::portal::Portal>
+        </Show>
     }
 }
 
-/// What a tab's menu does.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TabAction {
-    Close,
-    Minimize,
+fn picker_label(open: usize) -> String {
+    format!("Switch sessions and pages, {open} open")
 }
 
-/// A tab's menu, just above it (`at`: the tab's left and top): close its
-/// tile, or minimize it (not the last one shown). A tap outside or Esc
-/// closes it.
-#[component]
-fn TabMenu(at: (f64, f64), alone: bool, pick: Callback<TabAction>, close: Callback<()>, pressed: StoredValue<bool>) -> impl IntoView {
-    let size = |v: Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>| v.ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let (width, height) = (size(window().inner_width()), size(window().inner_height()));
-    // On screen, however near the edge the tab is.
-    let style = format!("left:{}px;bottom:{}px", at.0.min(width - 168.0).max(8.0), height - at.1 + 6.0);
-    let item = move |what: TabAction, label: &'static str, off: bool| {
-        view! {
-            <button role="menuitem" class="block w-full rounded-md px-3 py-2 text-left hover:bg-zinc-100 disabled:text-zinc-400 disabled:hover:bg-transparent dark:hover:bg-zinc-800 dark:disabled:text-zinc-600"
-                disabled=off on:click=move |_| pick.run(what)>{label}</button>
-        }
-    };
-    view! {
-        // The press that opened it ends over this: that's no tap outside.
-        <div class="fixed inset-0 z-40" on:pointerdown=move |_| pressed.set_value(false)
-            on:click=move |_| if !pressed.try_update_value(std::mem::take).unwrap_or(false) { close.run(()) }></div>
-        <div role="menu" style=style class="fixed z-50 w-40 rounded-lg border border-zinc-200 bg-white p-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
-            {item(TabAction::Close, "Close", false)}
-            {item(TabAction::Minimize, "Minimize", alone)}
-        </div>
-    }
-}
-
-/// The phone bar's sheet button: how many tiles are shown, beside its icon.
-fn sheet_label(open: usize) -> String {
-    open.to_string()
-}
-
-/// How far down a sheet's handle is swiped to close it.
-const SWIPE_CLOSE: f64 = 40.0;
-
-/// Whether a press on a sheet's handle went far enough down to close it.
-fn swiped_down(from: f64, to: f64) -> bool {
-    to - from > SWIPE_CLOSE
-}
-
-/// A tile, as the phone's sheet lists it.
+/// A single-copy destination, including minimized pages.
 #[derive(Clone, Debug, PartialEq)]
 struct SheetTile {
     key: u64,
-    /// In reading order, as ⌘1–9 and the dock number it.
-    number: usize,
     /// The session it shows, if it shows one.
     session: Option<String>,
     label: String,
     focused: bool,
     minimized: bool,
+    icon: crate::icons::Icon,
 }
 
-/// A phone's tiles, from the bottom (as what needs you is): those shown in
-/// reading order (the current one marked), each to show or close; the
-/// minimized; the sessions you viewed lately that no tile holds; then all
-/// sessions, and a new tile. Swipe the handle down, tap outside or Esc to
-/// close it.
+fn page_icon(view: &View) -> crate::icons::Icon {
+    use crate::icons::Icon;
+    match view {
+        View::Inbox => Icon::Bell,
+        View::Sessions => Icon::List,
+        View::Docs { .. } => Icon::FileText,
+        View::Settings { .. } => Icon::Settings,
+        View::Search { .. } => Icon::Search,
+        _ => Icon::PanelsTopLeft,
+    }
+}
+
+fn title_matches(title: &str, q: &str) -> bool {
+    let title = title.to_lowercase();
+    let terms = crate::search::terms(q);
+    if terms.is_empty() { title.contains(&q.trim().to_lowercase()) } else { terms.iter().all(|term| title.contains(&term.to_lowercase())) }
+}
+
+/// The right-edge phone switcher. Header/search stay fixed while matches
+/// scroll; local titles stay available while saved-message search loads.
 #[component]
-fn TabSheet(close: Callback<()>) -> impl IntoView {
+fn SessionsSheet(close: Callback<()>, open: RwSignal<bool>) -> impl IntoView {
     let (ws, live) = (use_workspace(), api::live());
-    let now = RwSignal::new(now_ms());
+    let pop = crate::util::escapable(move || open.get(), move || close.run(()));
+    let drawer = NodeRef::<leptos::html::Div>::new();
+    crate::util::drawer_gesture(open, drawer, close);
+    crate::util::modal(open, drawer);
+    let query = RwSignal::new(String::new());
+    let results = RwSignal::new(None::<Result<c6_api::SearchResponse, String>>);
+    let retry = RwSignal::new(0_u32);
+    let generation = StoredValue::new(0_u64);
+    Effect::new(move || {
+        let q = query.get().trim().to_owned();
+        retry.track();
+        api::realm().track();
+        generation.update_value(|n| *n += 1);
+        let request = generation.get_value();
+        results.set(None);
+        if !open.get() || crate::search::terms(&q).is_empty() {
+            return;
+        }
+        let timer = set_timeout_with_handle(
+            move || {
+                spawn_local(async move {
+                    let found = api::search(q, String::new(), String::new(), Vec::new()).await;
+                    if generation.try_get_value() == Some(request) && open.try_get_untracked() == Some(true) {
+                        results.try_set(Some(found));
+                    }
+                });
+            },
+            std::time::Duration::from_millis(200),
+        )
+        .ok();
+        on_cleanup(move || {
+            if let Some(timer) = timer {
+                timer.clear();
+            }
+        });
+    });
     let tiles = Memo::new(move |_| {
         ws.layout.with(|l| {
             l.reading_order()
                 .into_iter()
-                .enumerate()
-                .map(|(n, i)| {
+                .map(|i| {
                     let t = &l.tiles[i];
                     let view = t.columns.get(t.cursor).map(|c| &c.view);
                     SheetTile {
                         key: t.key,
-                        number: n + 1,
                         session: view.and_then(|v| match v {
                             View::Session { id, .. } => Some(id.clone()),
                             _ => None,
                         }),
-                        label: view.map(|v| v.label(&live)).unwrap_or_default(),
+                        label: view.map(|v| v.label(&live)).unwrap_or_else(|| "History".to_owned()),
                         focused: i == l.focus,
                         minimized: t.minimized,
+                        icon: view.map(page_icon).unwrap_or(crate::icons::Icon::PanelsTopLeft),
                     }
                 })
                 .collect::<Vec<_>>()
         })
     });
     let recent = crate::sessions::use_recent(6, move |id| ws.tile_number(id).is_some());
-    let swipe = StoredValue::new(None::<f64>);
     let row = move |t: SheetTile| {
-        let fill = t.session.as_deref().and_then(crate::marks::of_id).map(|m| crate::marks::fill(&m)).unwrap_or_default();
         let key = t.key;
         view! {
             <div class=if t.focused { "flex items-center gap-2 rounded-md bg-zinc-100 pl-2 dark:bg-zinc-800" } else { "flex items-center gap-2 rounded-md pl-2" }>
-                <span class="w-4 shrink-0 text-right font-mono text-[11px] tabular-nums text-muted">{t.number}</span>
-                <span class="h-2.5 w-2.5 shrink-0 rounded-full" style=fill></span>
-                <button class="min-w-0 flex-1 truncate py-2 text-left" class:font-medium=t.focused
-                    on:click=move |_| { ws.show_tile(key); close.run(()) }>{t.label}</button>
-                <button class="flex h-9 w-9 shrink-0 items-center justify-center text-muted hover:text-zinc-900 dark:hover:text-zinc-100"
-                    title="Close this tile" aria-label="Close this tile" on:click=move |_| ws.close_tile(key)>"×"</button>
+                <span class="shrink-0 text-muted">{crate::icons::icon(t.icon, crate::icons::Size::S16)}</span>
+                <button class="min-h-11 min-w-0 flex-1 truncate py-2 text-left" class:font-medium=t.focused
+                    on:click=move |_| { ws.show_tile(key); close.run(()) } aria-current=t.focused.then_some("page")>{t.label}{t.minimized.then(|| view! { <span class="ml-1 text-xs text-muted">"(hidden)"</span> })}</button>
+                <button class="flex h-11 w-11 shrink-0 items-center justify-center text-muted hover:text-zinc-900 dark:hover:text-zinc-100"
+                    title="Close this session or page" aria-label="Close this session or page" on:click=move |_| ws.close_tile(key)>{crate::icons::x()}</button>
             </div>
         }
     };
-    let link = "block w-full rounded-md px-2 py-2 text-left text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800";
+    let link =
+        "block min-h-11 w-full rounded-md px-2 py-2 text-left text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800";
     view! {
-        <div class="fixed inset-0 z-40 bg-black/30" on:click=move |_| close.run(())></div>
-        <div role="dialog" aria-label="Tiles"
-            class="fixed inset-x-0 bottom-0 z-50 flex max-h-[80dvh] flex-col rounded-t-xl border border-zinc-200 bg-white text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
-            // Its handle: swiped down, the sheet goes.
-            <div class="flex shrink-0 touch-none justify-center pb-1 pt-2"
-                on:pointerdown=move |ev: web_sys::PointerEvent| {
-                    swipe.set_value(Some(f64::from(ev.client_y())));
-                    if let Some(el) = ev.current_target().and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok()) {
-                        let _ = el.set_pointer_capture(ev.pointer_id());
-                    }
-                }
-                on:pointermove=move |ev: web_sys::PointerEvent| {
-                    if swipe.get_value().is_some_and(|from| swiped_down(from, f64::from(ev.client_y()))) {
-                        swipe.set_value(None);
-                        close.run(());
-                    }
-                }
-                on:pointerup=move |_| swipe.set_value(None)
-                on:pointercancel=move |_| swipe.set_value(None)>
-                <span class="h-1 w-10 rounded-full bg-zinc-300 dark:bg-zinc-600"></span>
-            </div>
-            <div class="min-h-0 overflow-y-auto p-1 pb-4">
+        <div class="c6-presence c6-scrim phone-instant-scrim fixed inset-0 z-40 bg-black/30" data-open=move || open.get().to_string() inert=move || !open.get() on:click=move |_| close.run(())></div>
+        <div node_ref=drawer role="dialog" tabindex="-1" aria-modal="true" aria-label="Sessions" data-pop=pop data-drawer-side="right" data-open=move || open.get().to_string() inert=move || !open.get()
+            class="c6-presence c6-sheet phone-drawer phone-picker fixed right-0 z-50 flex flex-col border-l border-zinc-200 bg-white text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
+                <div class="flex h-11 shrink-0 items-center gap-1 px-2">
+                    <h2 class="flex-1 font-semibold">"Sessions"</h2>
+                    <crate::assistant::AskButton touch=true />
+                    <crate::needs::NeedsYou touch=true />
+                </div>
+                <div class="shrink-0 px-2 pb-1">
+                    <label class="flex min-h-11 items-center gap-2 rounded-md border border-zinc-300 px-2 dark:border-zinc-700">
+                        <span class="shrink-0 text-muted">{crate::icons::icon(crate::icons::Icon::Search, crate::icons::Size::S16)}</span>
+                        <input type="search" enterkeyhint="search" aria-label="Search" placeholder="Search" class="min-h-11 min-w-0 flex-1 bg-transparent outline-none"
+                            prop:value=move || query.get() on:input=move |ev| query.set(event_target_value(&ev))
+                            on:keydown=move |ev| { if ev.key() == "Enter" {
+                                let _ = event_target::<web_sys::HtmlInputElement>(&ev).blur();
+                                if let Some(el) = drawer.get_untracked() { let _ = el.focus(); }
+                            } } />
+                    </label>
+                </div>
+            <div class="min-h-0 flex-1 overflow-y-auto p-1 pb-4">
                 {move || {
-                    let (shown, hidden): (Vec<SheetTile>, Vec<SheetTile>) = tiles.get().into_iter().partition(|t| !t.minimized);
+                    let q = query.get().trim().to_owned();
+                    let found = results.get().and_then(Result::ok).map(|r| r.results).unwrap_or_default();
+                    let tiles = tiles.get();
+                    let recent = recent.get();
+                    let mut seen = std::collections::HashSet::new();
+                    let mut groups: Vec<(&str, Vec<PickerSession>)> = vec![("Open sessions", Vec::new()), ("Recently viewed", Vec::new()), ("Other session matches", Vec::new())];
+                    let mut add = |s: Session, group: usize, tile: Option<SheetTile>| {
+                        if !seen.insert(s.id.clone()) { return; }
+                        let hit = found.iter().find(|r| r.session.id == s.id).cloned();
+                        if q.is_empty() || title_matches(&s.title, &q) || hit.is_some() {
+                            groups[group].1.push(PickerSession { s, hit, tile });
+                        }
+                    };
+                    for t in tiles.iter().filter(|t| t.session.is_some()) {
+                        if let Some(s) = t.session.as_deref().and_then(|id| live.session(id)) { add(s, 0, Some(t.clone())); }
+                    }
+                    for (s, _) in recent { add(s, 1, None); }
+                    if !q.is_empty() {
+                        for r in &found { add(r.session.clone(), 2, None); }
+                        for s in live.sessions.get() { add(s, 2, None); }
+                    }
+                    let pages: Vec<_> = tiles.into_iter().filter(|t| t.session.is_none() && (q.is_empty() || title_matches(&t.label, &q))).collect();
+                    let empty = groups.iter().all(|(_, rows)| rows.is_empty()) && pages.is_empty();
+                    // Empty: pages before recents. Searching: all matching
+                    // sessions (open/recent/history) before matching pages.
+                    if q.is_empty() { groups.insert(1, ("Other open pages", Vec::new())); }
+                    else { groups.push(("Other open pages", Vec::new())); }
                     view! {
-                        <crate::needs::Heading text=format!("Open tiles · {}", shown.len()) />
-                        {shown.into_iter().map(row).collect_view()}
-                        {(!hidden.is_empty()).then(|| view! {
-                            <crate::needs::Heading text="Minimized".to_owned() />
-                            {hidden.into_iter().map(row).collect_view()}
-                        })}
+                        {groups.into_iter().filter(|(title, rows)| !rows.is_empty() || (*title == "Other open pages" && !pages.is_empty())).map(|(title, rows)| view! {
+                            <crate::needs::Heading text=title.to_owned() />
+                            {rows.into_iter().map(|entry| view! { <PickerSessionRow entry q=q.clone() close /> }).collect_view()}
+                            {(title == "Other open pages").then(|| pages.iter().cloned().map(row).collect_view())}
+                        }).collect_view()}
+                        {(empty && !q.is_empty()).then(|| view! { <p class="px-2 py-2 text-muted">"No title matches."</p> })}
                     }
                 }}
-                {move || {
-                    let rows = recent.get();
-                    (!rows.is_empty()).then(|| view! {
-                        <crate::needs::Heading text="Recently viewed".to_owned() />
-                        {rows.into_iter().map(|(s, at)| view! { <crate::sessions::RecentRow s at now close /> }).collect_view()}
-                    })
-                }}
+                {move || (!query.with(|q| q.trim().is_empty())).then(|| {
+                    if crate::search::terms(&query.get()).is_empty() {
+                        return view! { <p class="px-2 py-2 text-xs text-muted">"Title matches only. Use words of 3+ characters to search saved messages."</p> }.into_any();
+                    }
+                    match results.get() {
+                        None => view! { <p role="status" class="px-2 py-2 text-xs text-muted">"Searching saved messages…"</p> }.into_any(),
+                        Some(Err(error)) => view! { <div class="px-2 py-2"><ErrorBox message=error /><button class=link on:click=move |_| retry.update(|n| *n += 1)>"Retry search"</button></div> }.into_any(),
+                        Some(Ok(r)) => view! {
+                            <crate::search::Ignored words=r.ignored />
+                            {r.results.is_empty().then(|| view! { <p class="px-2 py-2 text-xs text-muted">"No saved-message matches."</p> })}
+                            {r.truncated.then(|| view! { <p class="px-2 py-2 text-xs text-muted">"Best matches; add words to narrow."</p> })}
+                        }.into_any(),
+                    }
+                })}
                 <div class="my-1 border-t border-zinc-200 dark:border-zinc-800"></div>
-                <button class=link on:click=move |_| { ws.open(None, View::Sessions, How::OwnTile); close.run(()) }>"All sessions "{crate::icons::arrow_right()}</button>
-                <button class=link on:click=move |_| { ws.new_tile(); close.run(()) }>"+ New tile"</button>
+                <button class=link on:click=move |_| {
+                    let q = query.get_untracked().trim().to_owned();
+                    let view = if q.is_empty() { View::Sessions } else { View::Search { q, kind: String::new(), worker: String::new() } };
+                    ws.open(None, view, How::OwnTile); close.run(())
+                }>"All sessions "{crate::icons::arrow_up_right()}</button>
+                <button class=link on:click=move |_| { ws.new_tile(); close.run(()) }>{crate::icons::plus()}" New session or page"</button>
             </div>
+        </div>
+    }
+}
+
+#[derive(Clone)]
+struct PickerSession {
+    s: Session,
+    hit: Option<c6_api::SearchResult>,
+    tile: Option<SheetTile>,
+}
+
+#[component]
+fn PickerSessionRow(entry: PickerSession, q: String, close: Callback<()>) -> impl IntoView {
+    let (ws, live) = (use_workspace(), api::live());
+    let PickerSession { s, hit, tile } = entry;
+    let focused = tile.as_ref().is_some_and(|t| t.focused);
+    let hidden = tile.as_ref().is_some_and(|t| t.minimized);
+    let worker = hit.as_ref().map(|r| r.worker_name.clone()).filter(|name| !name.is_empty()).unwrap_or_else(|| live.session_worker(&s));
+    let parent = hit.as_ref().and_then(|r| r.open_in.as_ref()).map(|o| o.title.clone());
+    let preview = hit.as_ref().and_then(|r| r.hits.first()).cloned();
+    let (id, expanded) = hit
+        .as_ref()
+        .and_then(|r| r.open_in.as_ref())
+        .map(|o| (o.session_id.clone(), o.side_chats.clone()))
+        .unwrap_or_else(|| (s.id.clone(), Vec::new()));
+    let target = preview.as_ref().map(|h| crate::workspace::Target {
+        q: q.clone(),
+        anchor: Some(h.anchor.clone()),
+        at: expanded.is_empty().then_some(h.seq),
+        open: expanded,
+    });
+    let to = StoredValue::new(View::Session { id, target });
+    view! {
+        <div class="flex items-start gap-1 rounded-md" class:bg-zinc-100=focused class:dark:bg-zinc-800=focused>
+            <button class="flex min-h-14 min-w-0 flex-1 items-start gap-2 px-2 py-2 text-left" aria-current=focused.then_some("page")
+                on:click=move |_| { ws.open(None, to.get_value(), How::OwnTile); close.run(()); }>
+                <span class="mt-1.5 h-2.5 w-2.5 shrink-0 rounded-full" style=crate::marks::fill(&crate::marks::of(&s))></span>
+                <span class="min-w-0 flex-1">
+                    <span class="block truncate" class:font-medium=focused>{s.title.clone()}</span>
+                    <span class="block truncate text-xs text-muted">{format!("{} · {}{}", crate::sessions::recent_state(&s).1, worker, if hidden { " · hidden" } else { "" })}</span>
+                    {parent.map(|p| view! { <span class="block truncate text-xs text-muted">{format!("in “{p}”")}</span> })}
+                    {preview.map(|h| view! { <span class="mt-1 block text-xs [overflow-wrap:anywhere]"><span class="mr-1 text-muted">{crate::search::kind_label(&h.kind).to_owned()}</span>{crate::search::snippet(h.snippet)}</span> })}
+                    {(!q.is_empty() && hit.is_none()).then(|| view! { <span class="block text-xs text-muted">"Title match"</span> })}
+                </span>
+            </button>
+            {tile.map(|t| view! { <button class="flex h-11 w-11 shrink-0 items-center justify-center text-muted" aria-label="Close this session or page" title="Close this session or page" on:click=move |_| ws.close_tile(t.key)>{crate::icons::x()}</button> })}
         </div>
     }
 }
@@ -1050,7 +835,7 @@ fn MailNeedsReply() -> impl IntoView {
                 <h2 class="text-sm font-semibold text-muted">"Mail that needs a reply"</h2>
                 <div class="divide-y divide-zinc-200 rounded-lg border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
                     {t.into_iter().map(|x| view! {
-                        <crate::workspace::Go to=crate::workspace::View::Mail class="block px-3 py-2 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900">
+                        <crate::workspace::Go to=crate::workspace::View::Mail class="block px-3 py-2 text-sm [overflow-wrap:anywhere] hover:bg-zinc-50 dark:hover:bg-zinc-900">
                             <span class="font-medium">{x.people.join(", ")}</span>
                             <span class="ml-2 text-zinc-600 dark:text-zinc-400">{x.subject.clone()}</span>
                         </crate::workspace::Go>
@@ -1066,38 +851,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_press_that_moves_is_a_swipe() {
-        assert!(!moved_off((10.0, 10.0), (15.0, 15.0)), "a finger's wobble");
-        assert!(moved_off((10.0, 10.0), (19.0, 10.0)));
-        assert!(moved_off((10.0, 10.0), (10.0, 1.0)));
-    }
-
-    #[test]
-    fn a_dragged_tab_lands_in_the_gap_nearest_the_finger() {
-        let mids = [40.0, 90.0, 140.0];
-        assert_eq!(drop_slot(10.0, &mids), 0, "before them all");
-        assert_eq!(drop_slot(60.0, &mids), 1);
-        assert_eq!(drop_slot(200.0, &mids), 3, "after them all");
-        assert_eq!(slot_step(1, 1), 0, "the gap before it: where it is");
-        assert_eq!(slot_step(1, 2), 0, "the gap after it: where it is");
-        assert_eq!(slot_step(1, 0), -1);
-        assert_eq!(slot_step(1, 3), 1);
-        assert_eq!(slot_step(0, 3), 2);
-        assert_eq!(slot_step(2, 0), -2);
-    }
-
-    #[test]
-    fn a_lifted_tab_near_an_end_scrolls_the_strip() {
-        assert_eq!(edge_scroll(10.0, 0.0, 300.0), -EDGE_STEP);
-        assert_eq!(edge_scroll(150.0, 0.0, 300.0), 0);
-        assert_eq!(edge_scroll(290.0, 0.0, 300.0), EDGE_STEP);
-    }
-
-    #[test]
-    fn the_sheet_says_how_many_tiles_and_goes_when_swiped_down() {
-        assert_eq!(sheet_label(3), "3");
-        assert!(swiped_down(100.0, 150.0));
-        assert!(!swiped_down(100.0, 120.0), "a nudge");
-        assert!(!swiped_down(100.0, 20.0), "up");
+    fn the_sessions_picker_names_every_open_page() {
+        assert_eq!(picker_label(3), "Switch sessions and pages, 3 open");
+        assert_eq!(picker_label(30), "Switch sessions and pages, 30 open");
+        assert!(title_matches("Phone picker", "ph"));
+        assert!(title_matches("Phone session picker", "phone picker"));
+        assert!(!title_matches("Other page", "phone"));
     }
 }

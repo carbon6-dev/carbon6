@@ -408,14 +408,15 @@ async fn phases_move_on_when_you_say_and_sessions_know_their_project() {
     // 8. A realm that turns the context off: sessions get only what they're given.
     ok(send(M::PUT, "settings/work".into(), settings(false)).await);
     ok(send(M::POST, "sessions".into(), start("Send the invites", invited["id"].as_str().unwrap())).await);
+    let expected = "Message sent by an automation, not typed by the user:\nSend the invites";
     let first = eventually("the third session's first turn", async || {
         mock.requests()
             .into_iter()
             .filter_map(|r| r["messages"].as_array()?.last()?["content"].as_str().map(str::to_owned))
-            .find(|m| m.starts_with("Send the invites"))
+            .find(|m| m.starts_with(expected))
     })
     .await;
-    assert_eq!(first, "Send the invites", "only what it was given");
+    assert_eq!(first, expected, "only what it was given, labelled with its provenance");
     stop.cancel();
 }
 

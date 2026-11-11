@@ -101,7 +101,8 @@ async fn slash_commands_compact_and_export() {
     http.post(format!("{api}/sessions/{}/messages", s.id)).json(&json!({"text": "/compact the greeting"})).send().await.unwrap();
     let evs = ended(2).await;
     let req = mock.requests()[1]["messages"].to_string();
-    assert!(req.contains("The user asked to compact") && req.contains("focus on: the greeting"), "{req}");
+    assert!(req.contains("Compaction was requested") && req.contains("requested focus for the summary is: the greeting"), "{req}");
+    assert!(!req.contains("The user asked to compact"), "automation must not be described as a human request: {req}");
     assert!(req.contains(citation), "display cleanup must not change model history: {req}");
     assert!(evs.iter().any(|e| matches!(&e.kind, EventKind::Compaction { summary, .. } if summary == "SUMMARY: greeted Ada.")));
 

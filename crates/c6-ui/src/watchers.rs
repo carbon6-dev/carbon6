@@ -87,11 +87,9 @@ fn Row(w: Watcher, save: Callback<WatcherDef>, reset: Callback<String>, run: Cal
     view! {
         <div class="space-y-1 px-4 py-3">
             <div class="flex flex-wrap items-center gap-2">
-                <label class="flex items-center gap-2 text-sm font-medium">
-                    <input type="checkbox" prop:checked=w.def.enabled
-                        on:change=move |ev| { let on = event_target_checked(&ev); with(&|d| d.enabled = on) } />
-                    {if w.def.title.is_empty() { w.def.name.clone() } else { w.def.title.clone() }}
-                </label>
+                <crate::components::Switch on=Signal::stored(w.def.enabled)
+                    on_change=move |on| with(&|d| d.enabled = on)
+                    label=if w.def.title.is_empty() { w.def.name.clone() } else { w.def.title.clone() } />
                 <span class="text-xs text-muted">{format!("{} · follows {scope}", w.def.name)}</span>
                 {w.edited.then(|| view! {
                     <button class=BUTTON_QUIET title="Back to carbon6's version" on:click=move |_| reset.run(reset_name.clone())>"Reset"</button>
@@ -120,11 +118,9 @@ fn Row(w: Watcher, save: Callback<WatcherDef>, reset: Callback<String>, run: Cal
                         on:change=move |ev| { if let Ok(n) = event_target_value(&ev).trim().parse::<u64>() { with(&|d| d.daily_tokens = n) } } />
                 </label>
                 {(!all).then(|| view! {
-                    <label class="flex items-center gap-1" title="Findings go to you (marks, cards), never to the agent">
-                        <input type="checkbox" prop:checked=w.def.to_you
-                            on:change=move |ev| { let on = event_target_checked(&ev); with(&|d| d.to_you = on) } />
-                        "Everything to me"
-                    </label>
+                    <crate::components::Switch on=Signal::stored(w.def.to_you)
+                        on_change=move |on| with(&|d| d.to_you = on)
+                        label="Everything to me" title="Findings go to you (marks, cards), never to the agent" />
                     <label class="flex items-center gap-1">
                         "Notes to the agent from"
                         <select class=format!("{INPUT} w-auto! py-0.5") prop:value=w.def.note_severity.clone()
@@ -170,15 +166,19 @@ pub fn SessionWatchers(session_id: String, moved: Signal<String>) -> impl IntoVi
             return None;
         }
         let last = w.findings.first().cloned();
-        Some(view! {
-            <span class="inline-flex flex-wrap items-baseline gap-x-2">
-                {w.watchers.into_iter().map(|(name, sid)| view! {
-                    <Go to=View::Session { id: sid, target: None } class="text-violet-700 hover:underline dark:text-violet-400" title="Its session">
-                        {name}
-                    </Go>
-                }).collect_view()}
-                {last.map(|f| view! { <span class="text-muted" title=f.text.clone()>{format!("· {}: {}", f.kind, f.text.chars().take(80).collect::<String>())}</span> })}
-            </span>
-        })
+        Some(crate::details::line(
+            "Watchers",
+            view! {
+                <span class="inline-flex flex-wrap items-baseline gap-x-2">
+                    {w.watchers.into_iter().map(|(name, sid)| view! {
+                        <Go to=View::Session { id: sid, target: None } class="text-violet-700 hover:underline dark:text-violet-400" title="Its session">
+                            {name}
+                        </Go>
+                    }).collect_view()}
+                    {last.map(|f| view! { <span class="text-muted" title=f.text.clone()>{format!("· {}: {}", f.kind, f.text.chars().take(80).collect::<String>())}</span> })}
+                </span>
+            },
+            None,
+        ))
     }
 }

@@ -1,5 +1,6 @@
 //! Rebuilds the model conversation from a session's event log.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 use c6_llm::{Block, Message, Role};
@@ -14,7 +15,7 @@ pub fn history_from_events(events: &[SessionEvent]) -> Vec<Message> {
             // `/compact` itself is not part of the conversation.
             Some(session_event::Kind::User(u)) if u.command == "compact" || !u.blocked.is_empty() => {}
             Some(session_event::Kind::User(u)) => {
-                for b in user_blocks(model_text(u), &u.attachments) {
+                for b in user_blocks(&attributed_message_text(u), &u.attachments) {
                     push_user_block(&mut msgs, b);
                 }
             }
@@ -58,14 +59,39 @@ pub fn context_tokens_from_events(events: &[SessionEvent]) -> u64 {
         .unwrap_or(0)
 }
 
-/// A user message as model blocks: its text, then each attachment (images
-/// as images; anything else as a file in text).
 /// What the model got for a user message: its text, or the expansion of
 /// the slash command it invoked.
 pub fn model_text(u: &c6_proto::UserMessage) -> &str {
     if u.prompt.is_empty() { &u.text } else { &u.prompt }
 }
 
+/// Provenance is server-derived, never inferred from the text. Another
+/// session's existing wrapper takes precedence, then API, then known human.
+/// Missing provenance (including old logs) is never presented as human.
+pub(crate) fn attributed_input_text<'a>(
+    text: &'a str,
+    from_session_id: &str,
+    api_origin: Option<&c6_proto::ApiMessageOrigin>,
+    human_origin: bool,
+) -> Cow<'a, str> {
+    if !from_session_id.is_empty() {
+        Cow::Borrowed(text)
+    } else if let Some(origin) = api_origin {
+        let token = if origin.token_name.is_empty() { String::new() } else { format!(" (token {:?})", origin.token_name) };
+        Cow::Owned(format!("Message sent via the API{token}, not typed by the user:\n{text}"))
+    } else if human_origin {
+        Cow::Borrowed(text)
+    } else {
+        Cow::Owned(format!("Message sent by an automation, not typed by the user:\n{text}"))
+    }
+}
+
+fn attributed_message_text(message: &c6_proto::UserMessage) -> Cow<'_, str> {
+    attributed_input_text(model_text(message), &message.from_session_id, message.api_origin.as_ref(), message.human_origin)
+}
+
+/// A message as model blocks: its attributed text, then each attachment
+/// (images as images; anything else as a file in text).
 pub fn user_blocks(text: &str, attachments: &[c6_proto::Attachment]) -> Vec<Block> {
     let mut out = vec![Block::Text(text.to_owned())];
     for a in attachments {
@@ -124,7 +150,12 @@ pub fn portable_events(events: &[SessionEvent]) -> Vec<SessionEvent> {
         .cloned()
         .map(|mut ev| {
             if let Some(session_event::Kind::Assistant(a)) = &mut ev.kind {
-                a.blocks.retain(|b| matches!(b.block, Some(content_block::Block::Text(_)) | Some(content_block::Block::ToolUse(_))));
+                a.blocks.retain(|b| {
+                    matches!(
+                        b.block,
+                        Some(content_block::Block::Text(_) | content_block::Block::Narration(_) | content_block::Block::ToolUse(_))
+                    )
+                });
             }
             ev
         })
@@ -151,20 +182,25 @@ pub fn portable_messages(msgs: Vec<Message>) -> Vec<Message> {
 }
 
 /// A plain-text rendering of a conversation, for backends that cannot be
-/// given a history (Claude Code). Long tool output is shortened.
+/// given a history (Claude Code). Rewinds and compactions apply, including
+/// separately numbered ancestor segments. Long tool output is shortened.
 pub fn transcript_text(events: &[SessionEvent]) -> String {
     fn clip(s: &str, max: usize) -> String {
         if s.chars().count() <= max { s.to_owned() } else { format!("{}… (shortened)", s.chars().take(max).collect::<String>()) }
     }
     let mut out = String::new();
-    for ev in events {
+    for ev in &effective_events(events) {
         match &ev.kind {
             Some(session_event::Kind::User(u)) if !u.blocked.is_empty() => {}
-            Some(session_event::Kind::User(u)) => out.push_str(&format!("\n## User\n{}\n", user_text(model_text(u), &u.attachments))),
+            Some(session_event::Kind::User(u)) => {
+                let heading = if u.human_origin && u.api_origin.is_none() && u.from_session_id.is_empty() { "User" } else { "Message" };
+                out.push_str(&format!("\n## {heading}\n{}\n", user_text(&attributed_message_text(u), &u.attachments)));
+            }
             Some(session_event::Kind::Assistant(a)) => {
                 for b in &a.blocks {
                     match &b.block {
                         Some(content_block::Block::Text(t)) => out.push_str(&format!("\n## Assistant\n{t}\n")),
+                        Some(content_block::Block::Narration(t)) => out.push_str(&format!("\n## Assistant (summarized update)\n{t}\n")),
                         Some(content_block::Block::ToolUse(u)) => {
                             out.push_str(&format!("\n[tool call {}: {}]\n", u.name, clip(&u.input_json, 2000)))
                         }
@@ -192,6 +228,16 @@ pub const HANDOFF_BUDGET: usize = 120_000;
 /// behind. `from` names the runtime it leaves. Within `budget` characters,
 /// keeping the most recent steps.
 pub fn handoff_context(events: &[SessionEvent], from: &str, budget: usize) -> String {
+    history_context(events, &format!("This session was handed over to you from {from} at this point."), from, budget)
+}
+
+/// Fresh-runtime rewind fallback: only the kept transcript, never a claim
+/// that a runtime switch or deletion of files/logs happened.
+pub fn rewind_context(events: &[SessionEvent], budget: usize) -> String {
+    history_context(events, "The user rewound this conversation. Continue from only the kept history below.", "kept history", budget)
+}
+
+fn history_context(events: &[SessionEvent], introduction: &str, from: &str, budget: usize) -> String {
     let mut transcript = transcript_text(&effective_events(events));
     let total = transcript.chars().count();
     if total > budget {
@@ -206,7 +252,7 @@ pub fn handoff_context(events: &[SessionEvent], from: &str, budget: usize) -> St
     let transcript = if transcript.is_empty() { "(nothing yet)" } else { transcript };
     format!(
         "<carbon6-handoff from=\"{from}\">\n\
-         This session was handed over to you from {from} at this point. You did not take part in the conversation below and have \
+         {introduction} You did not take part in the conversation below and have \
          none of its native state: it is a transcript carbon6 rebuilt from the session's log, for context only.\n\
          - Tool calls in it were made by the earlier runtime with its own tools; their results are as recorded (long ones shortened).\n\
          - Its hidden reasoning, provider-side state and any unfinished tool calls did not carry over.\n\
@@ -218,22 +264,23 @@ pub fn handoff_context(events: &[SessionEvent], from: &str, budget: usize) -> St
 
 /// A plain-text digest of an in-memory conversation within about `budget`
 /// characters: the most recent steps in full (long tool input and output
-/// shortened), and before them only what the user asked.
+/// shortened), and before them the earlier requests and notices.
 pub(crate) fn messages_digest(msgs: &[Message], budget: usize) -> String {
     fn clip(s: &str, max: usize) -> String {
         if s.chars().count() <= max { s.to_owned() } else { format!("{}… (shortened)", s.chars().take(max).collect::<String>()) }
     }
-    // One chunk per message, and whether it is something the user wrote.
+    // One chunk per message, and whether it contains input text. Provider
+    // Role::User also carries automation and tool results, not just humans.
     let chunks: Vec<(String, bool)> = msgs
         .iter()
         .map(|m| {
             let mut out = String::new();
-            let mut typed = false;
+            let mut has_input = false;
             for b in &m.blocks {
                 match (m.role, b) {
                     (Role::User, Block::Text(t) | Block::AnnotatedText { text: t, .. }) => {
-                        typed = true;
-                        out.push_str(&format!("\n## User\n{}\n", clip(t, 4000)));
+                        has_input = true;
+                        out.push_str(&format!("\n## Message\n{}\n", clip(t, 4000)));
                     }
                     (Role::User, Block::Image { .. }) => out.push_str("[image]\n"),
                     (_, Block::ToolResult { content, is_error, .. }) => {
@@ -248,7 +295,7 @@ pub(crate) fn messages_digest(msgs: &[Message], budget: usize) -> String {
                     _ => {}
                 }
             }
-            (out, typed)
+            (out, has_input)
         })
         .collect();
     // Recent steps, newest first, while they fit.
@@ -260,8 +307,8 @@ pub(crate) fn messages_digest(msgs: &[Message], budget: usize) -> String {
     }
     let mut out = String::new();
     if start > 0 {
-        out.push_str(&format!("# Earlier ({start} messages, shortened to what the user wrote)\n"));
-        for (c, _) in chunks[..start].iter().filter(|(_, typed)| *typed) {
+        out.push_str(&format!("# Earlier ({start} messages, shortened to input text with its recorded attribution)\n"));
+        for (c, _) in chunks[..start].iter().filter(|(_, has_input)| *has_input) {
             if used + c.len() > budget + budget / 4 {
                 break;
             }
@@ -292,6 +339,9 @@ pub(crate) fn block_from_proto(b: &c6_proto::ContentBlock) -> Option<Block> {
             Block::AnnotatedText { text: t.clone(), annotations_json: b.annotations_json.clone() }
         }),
         content_block::Block::Thinking(t) => Some(Block::Thinking(t.clone())),
+        // Display provenance must not drop visible context on a handoff to
+        // another model. The Claude CLI owns replay of its original blocks.
+        content_block::Block::Narration(t) => Some(Block::Text(t.clone())),
         content_block::Block::ToolUse(u) => {
             Some(Block::ToolUse { id: u.id.clone(), name: u.name.clone(), input_json: u.input_json.clone() })
         }
@@ -477,6 +527,7 @@ mod tests {
         msgs.push(Message::user_text("now flip the blade"));
         let d = messages_digest(&msgs, 5000);
         assert!(d.contains("# Earlier") && d.contains("build the card") && d.contains("now flip the blade"), "{d}");
+        assert!(!d.contains("what the user wrote") && !d.contains("## User"), "provider roles alone do not prove human input: {d}");
         assert!(d.contains("output 19") && !d.contains("output 0 "), "{d}");
         assert!(d.contains("(shortened)"));
         assert!(d.len() < 8000, "{}", d.len());
@@ -486,6 +537,84 @@ mod tests {
 
     fn ev(kind: session_event::Kind) -> SessionEvent {
         SessionEvent { seq: 0, ts_ms: 0, kind: Some(kind) }
+    }
+
+    #[test]
+    fn initial_joining_and_replayed_inputs_share_server_derived_attribution() {
+        use crate::PendingInput;
+
+        for (api_origin, human_origin, from_session_id, label) in [
+            (None, true, "", ""),
+            (None, false, "", "Message sent by an automation, not typed by the user:\n"),
+            (Some(c6_proto::ApiMessageOrigin::default()), false, "", "Message sent via the API, not typed by the user:\n"),
+            (
+                Some(c6_proto::ApiMessageOrigin { token_name: "ops-controller".into() }),
+                false,
+                "",
+                "Message sent via the API (token \"ops-controller\"), not typed by the user:\n",
+            ),
+            (
+                Some(c6_proto::ApiMessageOrigin { token_name: "ops-controller".into() }),
+                true,
+                "",
+                "Message sent via the API (token \"ops-controller\"), not typed by the user:\n",
+            ),
+            (Some(c6_proto::ApiMessageOrigin { token_name: "ignored".into() }), true, "other-session", ""),
+        ] {
+            let input = PendingInput {
+                text: "Original raw message".into(),
+                prompt: "Expanded command".into(),
+                attachments: vec![
+                    c6_proto::Attachment { name: "note.txt".into(), mime: "text/plain".into(), data: b"Attached text".to_vec() },
+                    c6_proto::Attachment { name: "image.png".into(), mime: "image/png".into(), data: vec![1, 2, 3] },
+                ],
+                api_origin,
+                human_origin,
+                from_session_id: from_session_id.into(),
+                ..Default::default()
+            };
+            // Both initial and mid-turn native delivery consume blocks().
+            let blocks = input.blocks();
+            assert_eq!(blocks[0], Block::Text(format!("{label}Expanded command")));
+            assert!(matches!(&blocks[1], Block::Text(t) if t.contains("Attached text")));
+            assert!(matches!(&blocks[2], Block::Image { data, .. } if data == &[1, 2, 3]));
+            let event = input.event();
+            let session_event::Kind::User(message) = &event else { panic!("input event") };
+            assert!(message.origin_recorded);
+            assert_eq!(message.text, "Original raw message");
+            assert_eq!(message.prompt, "Expanded command");
+            assert_eq!(history_from_events(&[ev(event)])[0].blocks, blocks);
+        }
+    }
+
+    #[test]
+    fn transcript_and_compaction_do_not_promote_automation_or_legacy_input_to_user() {
+        let api = UserMessage {
+            text: "API request".into(),
+            api_origin: Some(c6_proto::ApiMessageOrigin { token_name: "ops-controller".into() }),
+            human_origin: true, // An inconsistent old flag must not win.
+            origin_recorded: true,
+            ..Default::default()
+        };
+        let unknown = UserMessage { text: "Legacy request".into(), ..Default::default() };
+        let session = UserMessage {
+            text: "<session-message>Existing attribution</session-message>".into(),
+            from_session_id: "other-session".into(),
+            ..Default::default()
+        };
+        let automated = [api, unknown, session].map(|u| ev(session_event::Kind::User(u)));
+        let transcript = transcript_text(&automated);
+        assert!(!transcript.contains("## User"), "{transcript}");
+        assert!(
+            transcript.contains("## Message\nMessage sent via the API (token \"ops-controller\"), not typed by the user:\nAPI request")
+        );
+        assert!(transcript.contains("## Message\nMessage sent by an automation, not typed by the user:\nLegacy request"));
+        assert!(transcript.contains("## Message\n<session-message>Existing attribution</session-message>"));
+        let digest = messages_digest(&history_from_events(&automated), 100_000);
+        assert!(!digest.contains("## User"), "{digest}");
+        assert!(digest.contains("not typed by the user:\nAPI request") && digest.contains("not typed by the user:\nLegacy request"));
+        let human = ev(session_event::Kind::User(UserMessage { text: "Human request".into(), human_origin: true, ..Default::default() }));
+        assert_eq!(transcript_text(&[human]), "\n## User\nHuman request\n");
     }
 
     #[test]
@@ -540,9 +669,37 @@ mod tests {
     }
 
     #[test]
+    fn narration_is_kept_in_handoff_context_without_becoming_private_reasoning() {
+        let block = ContentBlock { block: Some(content_block::Block::Narration("Visible summary".into())), ..Default::default() };
+        assert_eq!(block_from_proto(&block), Some(Block::Text("Visible summary".into())));
+        let events = vec![ev(session_event::Kind::Assistant(c6_proto::AssistantMessage {
+            blocks: vec![
+                block,
+                ContentBlock { block: Some(content_block::Block::Thinking("Private reasoning".into())), ..Default::default() },
+            ],
+            ..Default::default()
+        }))];
+        let text = transcript_text(&events);
+        assert!(text.contains("## Assistant (summarized update)\nVisible summary"), "{text}");
+        let portable = portable_events(&events);
+        assert!(
+            matches!(&events[0].kind, Some(session_event::Kind::Assistant(a)) if a.blocks.len() == 2),
+            "the original transcript remains intact"
+        );
+        let history = history_from_events(&portable);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].blocks, vec![Block::Text("Visible summary".into())], "cross-model side chats keep summaries, not reasoning");
+    }
+
+    #[test]
     fn repairs_missing_results_and_keeps_order() {
         let events = vec![
-            ev(session_event::Kind::User(UserMessage { command_id: "c1".into(), text: "go".into(), ..Default::default() })),
+            ev(session_event::Kind::User(UserMessage {
+                command_id: "c1".into(),
+                text: "go".into(),
+                human_origin: true,
+                ..Default::default()
+            })),
             ev(session_event::Kind::Assistant(AssistantMessage {
                 turn: 1,
                 blocks: vec![tool_use("a"), tool_use("b")],
@@ -555,7 +712,12 @@ mod tests {
                 ..Default::default()
             })),
             // Crash before b's result; then the user spoke again.
-            ev(session_event::Kind::User(UserMessage { command_id: "c2".into(), text: "again".into(), ..Default::default() })),
+            ev(session_event::Kind::User(UserMessage {
+                command_id: "c2".into(),
+                text: "again".into(),
+                human_origin: true,
+                ..Default::default()
+            })),
         ];
         let msgs = history_from_events(&events);
         assert_eq!(msgs.len(), 3);
@@ -570,9 +732,39 @@ mod tests {
     }
 
     #[test]
+    fn text_transcripts_apply_rewinds_before_compactions_in_each_seed_segment() {
+        let user = |text: &str| session_event::Kind::User(UserMessage { text: text.into(), ..Default::default() });
+        let mut events = vec![
+            ev(session_event::Kind::Started(Default::default())),
+            ev(user("KEEP_PARENT")),
+            ev(user("DROP_PRIVATE")),
+            ev(session_event::Kind::Compaction(c6_proto::Compaction { summary: "PRIVATE_SUMMARY".into(), ..Default::default() })),
+            ev(session_event::Kind::Rewound(c6_proto::Rewound { to_seq: 3, ..Default::default() })),
+            ev(user("KEEP_REPLACEMENT")),
+        ];
+        for (i, e) in events.iter_mut().enumerate() {
+            e.seq = i as u64 + 1;
+        }
+        let mut own = vec![
+            ev(session_event::Kind::Started(Default::default())),
+            ev(user("KEEP_CHILD")),
+            ev(user("PRIVATE_CHILD")),
+            ev(session_event::Kind::Rewound(c6_proto::Rewound { to_seq: 3, ..Default::default() })),
+        ];
+        for (i, e) in own.iter_mut().enumerate() {
+            e.seq = i as u64 + 1;
+        }
+        events.extend(own);
+        for text in [transcript_text(&events), handoff_context(&events, "Claude Code", HANDOFF_BUDGET)] {
+            assert!(text.contains("KEEP_PARENT") && text.contains("KEEP_REPLACEMENT") && text.contains("KEEP_CHILD"), "{text}");
+            assert!(!text.contains("PRIVATE"), "{text}");
+        }
+    }
+
+    #[test]
     fn rewinds_drop_their_own_session_events() {
         let at = |seq: u64, kind: session_event::Kind| SessionEvent { seq, ts_ms: 0, kind: Some(kind) };
-        let user = |t: &str| session_event::Kind::User(UserMessage { command_id: String::new(), text: t.into(), ..Default::default() });
+        let user = |t: &str| session_event::Kind::User(UserMessage { text: t.into(), human_origin: true, ..Default::default() });
         let started = || session_event::Kind::Started(Default::default());
         let rewound = |to: u64| session_event::Kind::Rewound(c6_proto::Rewound { to_seq: to, ..Default::default() });
         // A side chat: its parent's events (seed), then its own.
@@ -600,7 +792,7 @@ mod tests {
     #[test]
     fn a_handoff_is_a_marked_transcript_without_native_state() {
         let at = |seq: u64, kind: session_event::Kind| SessionEvent { seq, ts_ms: 0, kind: Some(kind) };
-        let user = |t: &str| session_event::Kind::User(UserMessage { command_id: String::new(), text: t.into(), ..Default::default() });
+        let user = |t: &str| session_event::Kind::User(UserMessage { text: t.into(), human_origin: true, ..Default::default() });
         let events = vec![
             at(1, session_event::Kind::Started(Default::default())),
             at(2, user("fix the cache")),

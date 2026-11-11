@@ -4,9 +4,114 @@
 use c6_api::AttachmentUpload;
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::{Rc, Weak};
 use wasm_bindgen::prelude::*;
 
 const LIMIT: usize = 20 * 1024 * 1024;
+const SAVE_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
+#[derive(Default)]
+struct TextSave {
+    last: String,
+    pending: Option<String>,
+    timer: Option<leptos::leptos_dom::helpers::TimeoutHandle>,
+    forgotten: bool,
+}
+
+impl TextSave {
+    fn change(&mut self, text: &str) -> bool {
+        if self.last == text {
+            return false;
+        }
+        self.last = text.to_owned();
+        self.pending = Some(text.to_owned());
+        self.forgotten = false;
+        true
+    }
+
+    fn cancel(&mut self) {
+        if let Some(timer) = self.timer.take() {
+            timer.clear();
+        }
+    }
+
+    fn forget(&mut self) {
+        self.cancel();
+        self.pending = None;
+        self.forgotten = true;
+    }
+
+    fn flush(&mut self, key: &str) {
+        self.cancel();
+        if let Some(text) = self.pending.take() {
+            if text.is_empty() {
+                super::storage_remove_global(key);
+            } else {
+                super::storage_set_global(key, &text);
+            }
+        }
+    }
+}
+
+thread_local! {
+    // Forget must cancel a queued write, not let teardown resurrect a sent
+    // draft. Weak references don't keep departed composers alive.
+    static TEXT_SAVES: RefCell<HashMap<String, Vec<Weak<RefCell<TextSave>>>>> = RefCell::new(HashMap::new());
+}
+
+pub(super) fn text(key: &str) -> RwSignal<String> {
+    let key = super::placed_key(&format!("c6.draft.{key}"));
+    let initial = super::storage_get_global(&key).unwrap_or_default();
+    let text = RwSignal::new(initial.clone());
+    let save = Rc::new(RefCell::new(TextSave { last: initial, ..Default::default() }));
+    TEXT_SAVES.with_borrow_mut(|saves| {
+        saves.retain(|_, saves| {
+            saves.retain(|save| save.strong_count() > 0);
+            !saves.is_empty()
+        });
+        saves.entry(key.clone()).or_default().push(Rc::downgrade(&save));
+    });
+    let save = StoredValue::new_local(save);
+    let save_key = key.clone();
+    Effect::new(move || {
+        text.with(|t| {
+            let save = save.get_value();
+            if !save.borrow_mut().change(t) {
+                return;
+            }
+            save.borrow_mut().cancel();
+            let pending = save.clone();
+            let key = save_key.clone();
+            save.borrow_mut().timer = set_timeout_with_handle(move || pending.borrow_mut().flush(&key), SAVE_DELAY).ok();
+        })
+    });
+    let flush_key = StoredValue::new(key);
+    let flush = move || {
+        save.with_value(|s| {
+            let mut s = s.borrow_mut();
+            // Include an edit made in this task, before the reactive save
+            // effect ran. Forget must still win over teardown/pagehide.
+            if !s.forgotten {
+                text.try_with_untracked(|t| s.change(t));
+            }
+            s.flush(&flush_key.get_value());
+        });
+    };
+    let page = window_event_listener_untyped("pagehide", move |_| flush());
+    let hidden = window_event_listener_untyped("visibilitychange", move |_| {
+        if window().document().is_some_and(|d| d.hidden()) {
+            flush();
+        }
+    });
+    on_cleanup(move || {
+        page.remove();
+        hidden.remove();
+        flush();
+    });
+    text
+}
 
 // Keep IDB event/transaction lifetimes in JS. Updates run the Rust policy
 // synchronously inside getAll's success handler, while the transaction is
@@ -234,6 +339,14 @@ pub fn attachments(key: Option<&str>) -> (RwSignal<Vec<AttachmentUpload>>, RwSig
 
 pub(super) fn forget(key: &str) {
     let key = super::placed_key(&format!("c6.draft.{key}"));
+    TEXT_SAVES.with_borrow(|saves| {
+        if let Some(saves) = saves.get(&key) {
+            for save in saves.iter().filter_map(Weak::upgrade) {
+                save.borrow_mut().forget();
+            }
+        }
+    });
+    super::storage_remove_global(&key);
     super::storage_remove_global(&format!("{key}.attachments"));
     leptos::task::spawn_local(async move {
         let _ = write(record(key, Vec::new(), 0)).await;
@@ -243,6 +356,25 @@ pub(super) fn forget(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_save_coalesces_edits_and_forgetting_prevents_teardown_resurrection() {
+        let mut save = TextSave { last: "restored".into(), ..Default::default() };
+        assert!(!save.change("restored"), "restoring isn't an edit or a write");
+        assert!(save.pending.is_none());
+        assert!(save.change("a"));
+        assert!(save.change("ab"));
+        assert!(!save.change("ab"), "unchanged text doesn't restart the timer");
+        assert_eq!(save.pending.as_deref(), Some("ab"), "only the latest edit is flushed");
+        save.forget();
+        assert!(save.pending.is_none() && save.forgotten, "sending cancels pending persistence");
+        assert!(!save.change("ab"), "teardown of an unchanged form must not resurrect a sent draft");
+        assert!(save.forgotten);
+        assert!(save.change("new draft"));
+        assert!(!save.forgotten, "a subsequent actual edit can be saved");
+        assert!(save.change(""));
+        assert_eq!(save.pending.as_deref(), Some(""), "clearing removes rather than restores text");
+    }
 
     fn file(name: &str) -> AttachmentUpload {
         AttachmentUpload { name: name.into(), mime: "image/png".into(), data: "aGVsbG8=".into() }

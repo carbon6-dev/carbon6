@@ -336,10 +336,14 @@ async fn a_routing_rule_puts_subagents_on_another_connection() {
     assert_eq!(env.other.requests()[0]["model"], "tiny");
     let child = env.children(&s.id).await.remove(0);
     assert_eq!(child.effort.as_deref(), Some("medium"));
-    // The subagents' list has Claude Code too: they run there as Claude
-    // Code sessions.
+    // Claude Code is offered only when this receiving worker advertised
+    // native subagent support. Merely configuring a connection does not
+    // install the CLI; this routing test also runs on workers without it.
+    let capabilities = env.head.state.registry.get(worker.identity.meta.worker_id).unwrap().capabilities;
+    let native_subagents = capabilities.iter().any(|c| c == "claude_code") && capabilities.iter().any(|c| c == "claude_code_subagents_v1");
     let task = env.main.requests()[0]["tools"].as_array().unwrap().iter().find(|t| t["function"]["name"] == "task").unwrap().clone();
-    assert_eq!(task["function"]["parameters"]["properties"]["connection"]["enum"], json!(["cc", "main", "other"]));
+    let choices = if native_subagents { json!(["cc", "main", "other"]) } else { json!(["main", "other"]) };
+    assert_eq!(task["function"]["parameters"]["properties"]["connection"]["enum"], choices);
     stop.cancel();
 }
 

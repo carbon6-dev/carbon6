@@ -5,7 +5,10 @@
     <!-- The keyboard shrinks the page (rather than panning it), so the
          message box stays above it and the header in view. -->
     <meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content" />
-    <meta name="theme-color" content="#141417" />
+    <meta name="theme-color" content="#1c1d21" />
+    <!-- Resolve the browser-local theme before CSS can paint. Keep this
+         parser-blocking: defer permits a light flash while the script loads. -->
+    <script src="/js/theme.js"></script>
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <meta name="apple-mobile-web-app-title" content="carbon6" />
@@ -19,17 +22,15 @@
     <link data-trunk rel="tailwind-css" href="style/input.css" />
     <link data-trunk rel="copy-dir" href="vendor" />
     <link data-trunk rel="copy-dir" href="js" />
-    <link rel="stylesheet" href="/vendor/xterm.css" />
-    <script src="/js/crash.js"></script>
-    <script src="/js/theme.js"></script>
-    <script src="/vendor/xterm.js"></script>
-    <script src="/vendor/addon-fit.js"></script>
-    <script src="/js/terminal.js"></script>
-    <script src="/js/passkey.js"></script>
-    <script src="/js/search.js"></script>
-    <script src="/js/files.js"></script>
-    <script src="/js/push.js"></script>
-    <link data-trunk rel="rust" data-wasm-opt="z" />
+    <script defer src="/js/crash.js"></script>
+    <script defer src="/js/motion.js"></script>
+    <script defer src="/js/header.js"></script>
+    <script defer src="/js/terminal.js"></script>
+    <script defer src="/js/passkey.js"></script>
+    <script defer src="/js/search.js"></script>
+    <script defer src="/js/files.js"></script>
+    <script defer src="/js/push.js"></script>
+    <link data-trunk rel="rust" data-cargo-profile-release="ui-release" data-wasm-opt="z" />
   </head>
   <body class="bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100 antialiased"></body>
 </html>

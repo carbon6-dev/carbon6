@@ -9,6 +9,7 @@
 //! changes settle (nothing new for a few seconds), `doc.changed` fires for
 //! triggers, with who wrote it.
 
+pub mod archive;
 pub mod bring;
 pub mod comments;
 pub mod export;
@@ -39,15 +40,19 @@ const SNAPSHOT_EVERY: i64 = 50;
 /// A document's changes have settled after this long without one.
 const SETTLE_MS: u64 = 3000;
 
+type WriteLocks = HashMap<(String, String), std::sync::Weak<tokio::sync::Mutex<()>>>;
+
 /// Documents' changes as they happen, and those not yet settled.
 pub struct Docs {
     pub live: tokio::sync::broadcast::Sender<DocChange>,
     settling: Mutex<HashMap<(String, String), Settling>>,
+    /// Covers mutations and mirror enqueueing, including external exports.
+    writes: Mutex<WriteLocks>,
 }
 
 impl Default for Docs {
     fn default() -> Self {
-        Self { live: tokio::sync::broadcast::channel(256).0, settling: Default::default() }
+        Self { live: tokio::sync::broadcast::channel(256).0, settling: Default::default(), writes: Default::default() }
     }
 }
 
@@ -103,6 +108,7 @@ struct Head {
     created_at: i64,
     updated_by: String,
     updated_at: i64,
+    archived_at: Option<i64>,
 }
 
 /// A document as stored, and its version.
@@ -145,6 +151,7 @@ async fn load(conn: &mut sqlx::SqliteConnection, id: &str) -> anyhow::Result<Hea
         created_at: r.get("created_at"),
         updated_by: r.get("updated_by"),
         updated_at: r.get("updated_at"),
+        archived_at: r.get("archived_at"),
     })
 }
 
@@ -280,6 +287,7 @@ fn summary_of(realm: &str, id: &str, h: &Head) -> DocSummary {
         created_at: h.created_at,
         updated_by: h.updated_by.clone(),
         updated_at: h.updated_at,
+        archived_at: h.archived_at,
         pending: pending.len() as u32,
         writers,
     }
@@ -378,13 +386,14 @@ pub async fn list(st: &HeadState, realm: &str, q: &DocQuery) -> anyhow::Result<V
         "SELECT id FROM docs WHERE deleted_at IS NULL AND (?1 IS NULL OR kind = ?1) \
          AND (?2 IS NULL OR EXISTS (SELECT 1 FROM json_each(docs.labels) WHERE value = ?2)) \
          AND (?3 IS NULL OR EXISTS (SELECT 1 FROM doc_ops o WHERE o.doc_id = docs.id AND (o.by = ?3 OR (?3 = 'session' AND o.by LIKE 'session:%')))) \
-         AND (?4 IS NULL OR title LIKE '%' || ?4 || '%') ORDER BY updated_at DESC LIMIT ?5",
+         AND (?4 IS NULL OR title LIKE '%' || ?4 || '%') AND (?6 OR archived_at IS NULL) ORDER BY updated_at DESC LIMIT ?5",
     )
     .bind(q.kind.as_deref().filter(|k| !k.is_empty()))
     .bind(q.label.as_deref().filter(|k| !k.is_empty()))
     .bind(q.by.as_deref().filter(|k| !k.is_empty()))
     .bind(q.q.as_deref().map(str::trim).filter(|k| !k.is_empty()))
     .bind(limit)
+    .bind(q.archived)
     .fetch_all(&pool)
     .await?;
     let mut out = Vec::new();
@@ -392,7 +401,10 @@ pub async fn list(st: &HeadState, realm: &str, q: &DocQuery) -> anyhow::Result<V
     for r in rows {
         let id: String = r.get("id");
         let h = load(&mut conn, &id).await?;
-        out.push(summary_of(realm, &id, &h));
+        // An archive may have committed since the ids were selected.
+        if q.archived || h.archived_at.is_none() {
+            out.push(summary_of(realm, &id, &h));
+        }
     }
     Ok(out)
 }
@@ -402,6 +414,59 @@ pub async fn get(st: &HeadState, realm: &str, id: &str) -> anyhow::Result<Doc> {
     let mut conn = pool.acquire().await?;
     let h = load(&mut conn, id).await?;
     Ok(doc_of(realm, id, &h))
+}
+
+/// Serializes writes and mirror enqueueing for a document. Weak entries do
+/// not keep locks alive after their last user finishes.
+async fn write_lock(st: &HeadState, realm: &str, id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    let lock = {
+        let mut writes = st.docs.writes.lock().unwrap();
+        writes.retain(|_, lock| lock.strong_count() != 0);
+        let entry = writes.entry((realm.to_owned(), id.to_owned())).or_default();
+        let lock = entry.upgrade().unwrap_or_else(|| std::sync::Arc::new(tokio::sync::Mutex::new(())));
+        *entry = std::sync::Arc::downgrade(&lock);
+        lock
+    };
+    lock.lock_owned().await
+}
+
+fn check_writable(archived_at: Option<i64>) -> anyhow::Result<()> {
+    if archived_at.is_some() {
+        return Err(crate::conflict("This document is archived. Unarchive it first to make changes."));
+    }
+    Ok(())
+}
+
+/// Refuses writes to archived documents; reads and existing links still work.
+pub async fn ensure_writable(st: &HeadState, realm: &str, id: &str) -> anyhow::Result<()> {
+    let pool = pool(st, realm).await?;
+    let archived_at: Option<i64> = sqlx::query_scalar("SELECT archived_at FROM docs WHERE id = ? AND deleted_at IS NULL")
+        .bind(id)
+        .fetch_optional(&pool)
+        .await?
+        .ok_or_else(|| not_found(format!("no document {id}")))?;
+    check_writable(archived_at)
+}
+
+/// Holds the document's write lock until the entire mutation (including
+/// external side effects) finishes. Versioned mutations also check in their
+/// transaction, so another database writer cannot slip past the archive flag.
+async fn writable(st: &HeadState, realm: &str, id: &str) -> anyhow::Result<tokio::sync::OwnedMutexGuard<()>> {
+    let guard = write_lock(st, realm, id).await;
+    ensure_writable(st, realm, id).await?;
+    Ok(guard)
+}
+
+/// An archive timestamp for refs without loading the document's content.
+pub async fn archived_at(st: &HeadState, realm: &str, id: &str) -> Option<i64> {
+    let pool = pool(st, realm).await.ok()?;
+    sqlx::query_scalar("SELECT archived_at FROM docs WHERE id = ? AND deleted_at IS NULL")
+        .bind(id)
+        .fetch_optional(&pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten()
 }
 
 /// A document's title, kind and when it last changed (for refs).
@@ -417,6 +482,26 @@ pub async fn title_of(st: &HeadState, realm: &str, id: &str) -> Option<(String, 
 }
 
 pub async fn patch(st: &HeadState, realm: &str, id: &str, p: &DocPatch, by: &str) -> anyhow::Result<Doc> {
+    Ok(patch_inner(st, realm, id, p, by).await?.0)
+}
+
+/// Changes archive state without changing document content or history.
+/// Returns whether the state actually changed (repeated calls are harmless).
+pub async fn set_archived(st: &HeadState, realm: &str, id: &str, archived: bool) -> anyhow::Result<bool> {
+    let by = crate::agent_ops::actor().unwrap_or_else(|| "you".to_owned());
+    Ok(patch_inner(st, realm, id, &DocPatch { archived: Some(archived), ..Default::default() }, &by).await?.1)
+}
+
+async fn patch_inner(st: &HeadState, realm: &str, id: &str, p: &DocPatch, by: &str) -> anyhow::Result<(Doc, bool)> {
+    let _guard = write_lock(st, realm, id).await;
+    let pool = pool(st, realm).await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let h = load(&mut tx, id).await?;
+    if p.archived.is_none() || p.title.is_some() || p.labels.is_some() {
+        check_writable(h.archived_at)?;
+    }
+    let mut after = h.state.clone();
+    let mut changed_rev = None;
     if let Some(t) = &p.title {
         let op = d::DocOp::Set {
             title: Some(t.clone()),
@@ -429,23 +514,49 @@ pub async fn patch(st: &HeadState, realm: &str, id: &str, p: &DocPatch, by: &str
             chip: None,
             value: None,
         };
-        apply(st, realm, id, &DocBatch { ops: vec![op], answering: String::new() }, by, None).await?;
+        let rev = h.rev + 1;
+        after.apply(std::slice::from_ref(&op), by, rev)?;
+        if !model::is_empty(&model::changes(&h.state, &after)) {
+            store(&mut tx, id, &h.state, &after, rev, &json!([op]), by, None, "").await?;
+            changed_rev = Some(rev);
+        }
     }
     if let Some(l) = &p.labels {
         let labels = crate::sessions::check_labels(l)?;
-        let pool = pool(st, realm).await?;
-        let n = sqlx::query("UPDATE docs SET labels = ? WHERE id = ? AND deleted_at IS NULL")
+        sqlx::query("UPDATE docs SET labels = ? WHERE id = ? AND deleted_at IS NULL AND archived_at IS NULL")
             .bind(serde_json::to_string(&labels)?)
             .bind(id)
-            .execute(&pool)
-            .await?
-            .rows_affected();
-        if n == 0 {
-            return Err(not_found(format!("no document {id}")));
-        }
+            .execute(&mut *tx)
+            .await?;
+    }
+    let archive_changed = p.archived.is_some_and(|a| a != h.archived_at.is_some());
+    if archive_changed {
+        sqlx::query("UPDATE docs SET archived_at = ? WHERE id = ? AND deleted_at IS NULL")
+            .bind(if p.archived == Some(true) { Some(now_ms()) } else { None })
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    let doc = doc_of(realm, id, &load(&mut tx, id).await?);
+    tx.commit().await?;
+    if let Some(rev) = changed_rev {
+        changed(st, realm, id, rev, by, "changed");
+    } else if p.labels.is_some() || archive_changed {
         changed(st, realm, id, 0, by, "changed");
     }
-    get(st, realm, id).await
+    if archive_changed {
+        st.attention.changed();
+        if doc.summary.archived_at.is_some() {
+            unmirror(st, realm, &doc).await;
+        } else {
+            mirror_locked(st, realm, &doc).await;
+        }
+        crate::work::moved_ref(st, &format!("doc:{id}")).await;
+        for p in crate::projects::holding_doc(st, realm, id).await {
+            crate::projects::refresh(st, &p);
+        }
+    }
+    Ok((doc, archive_changed))
 }
 
 /// Deletes a document (its history goes with it from view).
@@ -469,12 +580,14 @@ pub async fn delete(st: &HeadState, realm: &str, id: &str, by: &str) -> anyhow::
 
 /// Applies a batch of operations as `by` (for a session, in `turn`).
 pub async fn apply(st: &HeadState, realm: &str, id: &str, batch: &DocBatch, by: &str, turn: Option<i64>) -> anyhow::Result<DocApplied> {
+    let _guard = writable(st, realm, id).await?;
     if batch.ops.is_empty() {
         return Err(bad_request("a batch needs at least one operation"));
     }
     let pool = pool(st, realm).await?;
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let h = load(&mut tx, id).await?;
+    check_writable(h.archived_at)?;
     let rev = h.rev + 1;
     let mut after = h.state.clone();
     let applied = after.apply(&batch.ops, by, rev)?;
@@ -506,10 +619,12 @@ fn touched(state: &State, changes: &Value) -> Map<String, Value> {
 
 /// A version, or one block or slide of it, back as a new change.
 pub async fn restore(st: &HeadState, realm: &str, id: &str, r: &DocRestore, by: &str) -> anyhow::Result<DocApplied> {
+    let _guard = writable(st, realm, id).await?;
     let pool = pool(st, realm).await?;
     let old = state_at(&pool, id, r.rev).await?;
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let h = load(&mut tx, id).await?;
+    check_writable(h.archived_at)?;
     if r.rev > h.rev {
         return Err(bad_request(format!("document {id} has no version {}", r.rev)));
     }
@@ -844,6 +959,18 @@ pub const MIRROR_SOURCE: &str = "docs";
 /// the Brief and agents find it: each tab an item of kind doc or deck,
 /// rewritten when a change settles, not on every op.
 async fn mirror(st: &HeadState, realm: &str, doc: &Doc) {
+    let _guard = write_lock(st, realm, &doc.summary.id).await;
+    // A settling task may have loaded the document before it was archived.
+    // Re-read under the same lock archive transitions hold through enqueueing.
+    if let Ok(current) = get(st, realm, &doc.summary.id).await {
+        mirror_locked(st, realm, &current).await;
+    }
+}
+
+async fn mirror_locked(st: &HeadState, realm: &str, doc: &Doc) {
+    if doc.summary.archived_at.is_some() {
+        return;
+    }
     if !crate::memex::has_memex(realm) {
         return;
     }
@@ -879,8 +1006,36 @@ async fn unmirror(st: &HeadState, realm: &str, doc: &Doc) {
     if !crate::memex::has_memex(realm) {
         return;
     }
-    for t in &doc.tabs {
-        let params = json!({"source": MIRROR_SOURCE, "external_id": format!("{}#{}", doc.summary.id, t.id)});
+    let mut external_ids: BTreeSet<String> = doc.tabs.iter().map(|t| format!("{}#{}", doc.summary.id, t.id)).collect();
+    // Include tabs removed after their mirror was queued. Read the outbox
+    // before the items: a delivery in between then appears in the second
+    // query, rather than falling through the gap between the two stores.
+    if let Ok(ids) = sqlx::query_scalar::<_, String>(
+        "SELECT json_extract(params, '$.external_id') FROM memex_outbox WHERE method = 'memex.ingest' \
+         AND json_extract(params, '$.realm') = ? AND json_extract(params, '$.source') = ? \
+         AND json_extract(params, '$.meta.doc') = ?",
+    )
+    .bind(realm)
+    .bind(MIRROR_SOURCE)
+    .bind(&doc.summary.id)
+    .fetch_all(&st.store.pool)
+    .await
+    {
+        external_ids.extend(ids);
+    }
+    // Include mirrors for tabs removed since the previous settled version.
+    if let Ok(pool) = pool(st, realm).await
+        && let Ok(ids) =
+            sqlx::query_scalar::<_, String>("SELECT external_id FROM items WHERE source = ? AND json_extract(meta, '$.doc') = ?")
+                .bind(MIRROR_SOURCE)
+                .bind(&doc.summary.id)
+                .fetch_all(&pool)
+                .await
+    {
+        external_ids.extend(ids);
+    }
+    for external_id in external_ids {
+        let params = json!({"source": MIRROR_SOURCE, "external_id": external_id});
         crate::memex::enqueue(st, "memex.delete", crate::memex::in_realm(params, realm)).await;
     }
 }
@@ -893,4 +1048,201 @@ pub fn settling(st: &HeadState) -> bool {
 /// Whether the caller may see a live change.
 pub fn visible_to(caller: &Caller, c: &DocChange) -> bool {
     caller.sees(&c.realm)
+}
+
+#[cfg(test)]
+mod archive_tests {
+    use super::*;
+    use base64::Engine as _;
+    use d::{Anchor, CommentEdit, CommentNew, DocFileIn, GoogleExportIn, ThreadNew};
+
+    async fn head(dir: &std::path::Path) -> crate::Head {
+        crate::start(crate::HeadConfig {
+            data_dir: dir.to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            auth: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+    }
+
+    fn refused<T: std::fmt::Debug>(result: anyhow::Result<T>) {
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("archived") && error.contains("Unarchive it first"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn archive_preserves_reads_refuses_writes_and_unarchives_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = head(dir.path()).await;
+        let st = &head.state;
+        let (doc, _) = create(
+            st,
+            "home",
+            &DocNew { title: "Living plan".into(), markdown: "# Plan\n\nKeep this.".into(), ..Default::default() },
+            "you",
+        )
+        .await
+        .unwrap();
+        let id = &doc.summary.id;
+        let thread = comments::create(
+            st,
+            "home",
+            id,
+            &ThreadNew { anchor: Anchor::default(), text: "Please review".into(), to: String::new() },
+            "you",
+        )
+        .await
+        .unwrap();
+        let answer =
+            comments::reply(st, "home", id, &thread.id, &CommentNew { text: "Reviewed".into(), to: String::new() }, "session:agent")
+                .await
+                .unwrap();
+        assert_eq!(comments::answered(st, "home", id).await, 1);
+        assert_eq!(comments::answered_in(st, "home", 20).await.unwrap().len(), 1);
+        let upload = DocFileIn {
+            name: "note.txt".into(),
+            mime: "text/plain".into(),
+            content: base64::engine::general_purpose::STANDARD.encode(b"attached"),
+        };
+        let file = files::add(st, "home", id, &upload, "you").await.unwrap();
+        let export = export::export(st, "home", id, "md", "you").await.unwrap();
+        let p = pool(st, "home").await.unwrap();
+        sqlx::query("INSERT INTO doc_google (doc_id, file_id, url, account, rev, modified, by, at) VALUES (?, 'google-id', 'https://example.test/file', 'me', 1, 'v1', 'you', 1)")
+            .bind(id).execute(&p).await.unwrap();
+        let before_google = google::of_doc(st, "home", id).await.unwrap().file;
+        let before_history = history(st, "home", id, 100).await.unwrap();
+        let memex = crate::knowledge::get(st).unwrap().of_realm("home").await.unwrap();
+        let external_id = format!("{id}#{}", doc.tabs[0].id);
+        c6_testkit::eventually("the document mirrored", async || memex.store.id_of(MIRROR_SOURCE, &external_id).await.unwrap()).await;
+        let old_tab = format!("{id}#removed-tab");
+        crate::memex::enqueue(
+            st,
+            "memex.ingest",
+            crate::memex::in_realm(
+                json!({"kind": "doc", "source": MIRROR_SOURCE, "external_id": old_tab,
+                "title": "Old tab", "text": "Former content", "meta": {"doc": id}}),
+                "home",
+            ),
+        )
+        .await;
+        let mut changes = st.docs.live.subscribe();
+
+        assert!(set_archived(st, "home", id, true).await.unwrap());
+        let event = changes.recv().await.unwrap();
+        assert_eq!((&event.id, event.what.as_str()), (id, "changed"));
+        let archived = get(st, "home", id).await.unwrap();
+        assert!(archived.summary.archived_at.is_some());
+        assert_eq!(archived_at(st, "home", id).await, archived.summary.archived_at);
+        assert!(!set_archived(st, "home", id, true).await.unwrap());
+        assert_eq!(get(st, "home", id).await.unwrap(), archived, "archive is idempotent");
+        assert_eq!(archived.tabs, doc.tabs);
+        assert_eq!(archived.summary.rev, doc.summary.rev);
+        assert_eq!(history(st, "home", id, 100).await.unwrap(), before_history);
+        assert!(title_of(st, "home", id).await.is_some());
+        assert!(list(st, "home", &DocQuery::default()).await.unwrap().is_empty());
+        assert!(list(st, "home", &DocQuery { q: Some("Living".into()), ..Default::default() }).await.unwrap().is_empty());
+        assert_eq!(list(st, "home", &DocQuery { archived: true, ..Default::default() }).await.unwrap(), vec![archived.summary]);
+        assert_eq!(comments::list(st, "home", id).await.unwrap(), vec![answer]);
+        assert_eq!(comments::answered(st, "home", id).await, 0);
+        assert!(comments::answered_in(st, "home", 20).await.unwrap().is_empty());
+        assert_eq!(files::get(st, "home", id, &file.blob).await.unwrap().2, b"attached");
+        assert!(!export::file(st, "home", id, &export.id).await.unwrap().2.is_empty());
+        assert_eq!(export::list(st, "home", id).await.unwrap(), vec![export]);
+        assert_eq!(google::of_doc(st, "home", id).await.unwrap().file, before_google);
+        assert!(memex.store.keyword("Keep", &["doc".into()], &[], 10).await.unwrap().is_empty());
+        c6_testkit::eventually("the archived document unmirrored", async || {
+            let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM memex_outbox").fetch_one(&st.store.pool).await.unwrap();
+            (pending == 0
+                && memex.store.id_of(MIRROR_SOURCE, &external_id).await.unwrap().is_none()
+                && memex.store.id_of(MIRROR_SOURCE, &old_tab).await.unwrap().is_none())
+            .then_some(())
+        })
+        .await;
+        assert!(read(st, "home", id, &DocRead { view: "markdown".into(), ..Default::default() }).await.is_ok());
+
+        refused(ensure_writable(st, "home", id).await);
+        refused(patch(st, "home", id, &DocPatch::default(), "you").await);
+        refused(patch(st, "home", id, &DocPatch { title: Some("No".into()), ..Default::default() }, "you").await);
+        refused(patch(st, "home", id, &DocPatch { labels: Some(vec!["topic:no".into()]), ..Default::default() }, "you").await);
+        refused(
+            patch(st, "home", id, &DocPatch { archived: Some(false), title: Some("No bypass".into()), ..Default::default() }, "you").await,
+        );
+        refused(apply(st, "home", id, &DocBatch::default(), "you", None).await);
+        refused(restore(st, "home", id, &DocRestore { rev: 1, block: None }, "you").await);
+        refused(comments::create(st, "home", id, &ThreadNew { text: "No".into(), ..Default::default() }, "you").await);
+        refused(comments::reply(st, "home", id, &thread.id, &CommentNew { text: "No".into(), ..Default::default() }, "you").await);
+        refused(comments::edit(st, "home", id, &thread.id, &thread.comments[0].id, &CommentEdit { text: "No".into() }, "you").await);
+        refused(comments::delete(st, "home", id, &thread.id, &thread.comments[0].id, "you").await);
+        refused(comments::resolve(st, "home", id, &thread.id, "you").await);
+        refused(comments::send_many(st, "home", id, &[], "you").await);
+        refused(files::add(st, "home", id, &upload, "you").await);
+        refused(export::export(st, "home", id, "md", "you").await);
+        refused(export::keep(st, "home", &doc, "md", b"stale render".to_vec(), "you").await);
+        refused(google::export(st, "home", id, &GoogleExportIn::default(), "you").await);
+        assert!(archived_at(st, "home", id).await.is_some(), "mixed unarchive/rename did not sneak through");
+
+        assert!(set_archived(st, "home", id, false).await.unwrap());
+        assert!(!set_archived(st, "home", id, false).await.unwrap());
+        assert_eq!(get(st, "home", id).await.unwrap(), doc);
+        c6_testkit::eventually("the unarchived document mirrored again", async || {
+            memex.store.id_of(MIRROR_SOURCE, &external_id).await.unwrap()
+        })
+        .await;
+        assert_eq!(comments::answered(st, "home", id).await, 1);
+        patch(st, "home", id, &DocPatch { labels: Some(vec!["topic:live".into()]), ..Default::default() }, "you").await.unwrap();
+        // Deleting an archived document remains the existing delete operation.
+        set_archived(st, "home", id, true).await.unwrap();
+        delete(st, "home", id, "you").await.unwrap();
+        assert!(get(st, "home", id).await.is_err());
+        assert!(list(st, "home", &DocQuery { archived: true, ..Default::default() }).await.unwrap().is_empty());
+        assert_eq!(archived_at(st, "home", id).await, None);
+        head.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn archive_waits_for_writers_and_stale_mirrors_cannot_reinsert_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = head(dir.path()).await;
+        let st = head.state.clone();
+        let (doc, _) = create(&st, "home", &DocNew { title: "Locked".into(), markdown: "Original".into(), ..Default::default() }, "you")
+            .await
+            .unwrap();
+        let id = &doc.summary.id;
+        let guard = writable(&st, "home", id).await.unwrap();
+        let transition = set_archived(&st, "home", id, true);
+        tokio::pin!(transition);
+        assert!(futures::poll!(&mut transition).is_pending());
+        assert_eq!(archived_at(&st, "home", id).await, None);
+        drop(guard);
+        assert!(c6_testkit::within("archive to finish after the writer releases its lock", transition).await.unwrap());
+        // Mirrors may have captured this old, active summary before archive.
+        // Calling with it must still consult current state under the write lock.
+        // AUTOINCREMENT persists even if the outbox is drained meanwhile.
+        let before: i64 =
+            sqlx::query_scalar("SELECT seq FROM sqlite_sequence WHERE name = 'memex_outbox'").fetch_one(&st.store.pool).await.unwrap();
+        mirror(&st, "home", &doc).await;
+        let after: i64 =
+            sqlx::query_scalar("SELECT seq FROM sqlite_sequence WHERE name = 'memex_outbox'").fetch_one(&st.store.pool).await.unwrap();
+        assert_eq!(after, before, "a stale mirror must enqueue no ingestion after archive");
+        refused(writable(&st, "home", id).await);
+        set_archived(&st, "home", id, false).await.unwrap();
+        // Title + invalid labels is one atomic patch, not a partial rename.
+        assert!(
+            patch(
+                &st,
+                "home",
+                id,
+                &DocPatch { title: Some("Partial".into()), labels: Some(vec!["not a label".into()]), ..Default::default() },
+                "you"
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(get(&st, "home", id).await.unwrap().summary.title, "Locked");
+        head.shutdown().await.unwrap();
+    }
 }

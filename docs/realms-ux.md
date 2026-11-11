@@ -6,20 +6,22 @@ Status: built (2026-10-24). Decided:
 - a realm page shows only a count of what waits in other realms;
 - the app opens on the last realm you used.
 
+**Realms organise; they don't isolate.** The head enforces the API scopes described here, not a security boundary around an agent. See §8 for what this does and doesn't provide.
+
 ## 1. Why realms don't work today
 
-docs/os.md §3 makes realms a boundary, and the head enforces it for realm tokens and the assistant. The UI doesn't use that boundary:
+docs/os.md §3 gives realms their own data and settings, and the head enforces API scopes for realm tokens and the assistant. The UI didn't consistently use those scopes:
 
 - **Your browser is root.** A signed-in browser sees every realm. The realm picker only adds `?realm=` to some requests: 34 of the UI's ~179 API calls.
 - **So the picker is a filter that many pages ignore.** The live session list, the activity dock, the inbox, mission control, search, usage, analytics and the memex show all realms, or mix them.
 - **Your browser's state is shared across realms.** Tiles, history, pinned sessions, finished-unseen sessions and the label filter stay the same when you switch. Pages change partly.
 - **"All realms" mixes administration into everything.** Workers, connections and sign-in sit next to one realm's skills and secrets in the same Settings.
 
-Fixing each call site doesn't last: every new page is another place to forget the realm. The boundary has to be the default, enforced where the data is.
+Fixing each call site doesn't last: every new page is another place to forget the realm. Realm-scoped API requests have to be the default, enforced by the head.
 
 ## 2. The model: two places
 
-**A realm** (`/r/<realm>/…`): everything you do in one realm. That covers its sessions, inbox, decisions, mission control, analytics, collections, views, memex, mail, assistant and its own settings. You can't reach another realm's data from there. You can switch realm, or go to the console.
+**A realm** (`/r/<realm>/…`): everything you do in one realm. That covers its sessions, inbox, decisions, mission control, analytics, collections, views, memex, mail, assistant and its own settings. Its API requests are realm-scoped; grants allow specific cross-realm access. This does not limit what a session can reach through files or delegation (§8). You can switch realm, or go to the console.
 
 **The console** (`/admin/…`): carbon6 itself. It manages realms, grants, workers, connections and routing, the defaults every realm inherits, spending across realms, apps and packages, sign-in and tokens, updates, upgrades and backups, and the administration assistant. It shows no realm's sessions or knowledge, only counts and totals.
 
@@ -43,6 +45,21 @@ Fixing each call site doesn't last: every new page is another place to forget th
   `realms::admit` reads the scope from the catalog instead of its hand-kept list. Every route must have a catalog op (the API reference test already checks this), so every route has a scope.
 - **Realm tokens and the assistant don't change.** They already use this caller; they just get the fuller list.
 - **`?realm=` stays for root tokens and the CLI,** which can address any realm. The UI stops using it.
+
+The head reuses successful browser-session, API-token and realm-existence
+checks for at most two seconds (bounded in-memory caches, shared by the
+head's store clones). Session expiry is still checked on every cache hit;
+credentials are keyed by their hashes, not their secrets. Logout, browser
+session/token revocation and realm deletion invalidate the affected caches
+before returning success, preventing cache fills from reads already in flight.
+The durable revocation and invalidation finish in an owned task even if the
+requesting HTTP stream is cancelled while SQLite is writing.
+Realm deletion records its memex cleanup in the same transaction.
+Invalid credentials and missing realms are not cached. Object ownership, worker
+availability, operation scopes and grants are **not** cached: every request
+still checks its realm's access against current state. Direct database edits
+outside the head are not an invalidation interface; restart the head after
+such maintenance rather than relying on the two-second expiry.
 
 ### 3.1 Operations by scope
 
@@ -74,11 +91,11 @@ Fixing each call site doesn't last: every new page is another place to forget th
 - **Settings** has what the realm owns, plus the user's display preferences:
   - its lists, with root's inherited entries shown read-only above its own;
   - its toggles;
-  - Appearance (theme in this browser; Show thinking is the user's preference across realms and devices).
+  - Appearance (theme and Motion in this browser; Show thinking is the user's preference across realms and devices).
 
   System pages move to the console.
 - **The live feed** (`WS /api/v1/live`) sends only the realm's sessions, and only the workers it may use. So the dock, inbox, mission control and the session list are right by construction.
-- **This browser's state is kept per realm:** the workspace (tiles and history), finished and pinned sessions, the label filter, analytics and grouping choices. Keys become `c6.<realm>.…`. The theme stays one per browser.
+- **This browser's state is kept per realm:** the workspace (tiles and history), finished and pinned sessions, the label filter, analytics and grouping choices. Keys become `c6.<realm>.…`. Theme and Motion stay one per browser (`c6.theme`, `c6.motion`), including the console.
 - **The assistant** is the realm's, as built (os §3.6).
 
 ## 5. The console
@@ -88,7 +105,7 @@ The same shell, with its own nav:
 - Workers;
 - Connections and routing;
 - Defaults: root's skills, agents, commands, hooks, MCP servers, policies, prompts and secrets, which realms inherit;
-- Spending: prices, the overall cap, usage and analytics across realms;
+- Usage: prices, the overall cap, usage and analytics across realms;
 - Apps and packages;
 - Grants and commons review;
 - Sign-in and tokens; Notifications (the public URL);
@@ -99,17 +116,21 @@ The same shell, with its own nav:
 
 `GET /api/v1/elsewhere` (scope: device) returns, for each other realm, how many things wait on you there: approvals, open questions and decisions. It returns no titles or content. The header shows the total, and its menu lists the realms with a count each, each linking to that realm's inbox. Browser notifications are per realm already (their links carry the realm).
 
-## 7. Tests (they fail iff the boundary breaks)
+## 7. Tests of API scoping
 
 1. **Every operation has a scope:** the catalog test fails on an op without one.
-2. **Realm isolation over every list:** a head with two realms gets objects of each kind in both. For every realm-scoped list op, a realm-A browser caller gets none of B's objects. Asked for one of B's by id, it gets "not found".
+2. **Realm scoping over every list:** a head with two realms gets objects of each kind in both. For every realm-scoped list op, a realm-A browser caller gets none of B's objects. Asked for one of B's by id, it gets "not found".
 3. **Admin stays admin:** every admin op, called as a realm browser caller, returns 403. A browser request with no `X-C6-Realm` is refused.
 4. **The live feed and usage are narrowed:** a realm-A live connection never carries a B session; analytics for A count only A's turns.
 5. **Old links redirect** to the object's realm.
 
-## 8. Limits
+## 8. What realms provide and don't
 
-- **A shared worker shares its disk.** Two realms that may use the same worker can both browse its files and open terminals on it. To keep a realm's files apart, dedicate a worker to it (os §3.2).
+**Realms organise your work. They aren't a security boundary.**
+
+- **What they provide:** realm-scoped lists of sessions, work, decisions and data; each realm's own settings, with root's defaults; and per-realm secret lookup (a session gets its realm's value, falling back to root's). Browser state such as tiles and history is kept per realm. Realm-scoped API tokens and session tools have enforced scopes, with grants for specific cross-realm API access. These are API and organisation rules, not agent isolation.
+- **Shared workers share access.** Commands run as the worker's OS user, not as a realm-specific user or in a realm sandbox. On a worker serving several realms, a session's shell can read other realms' files that user can read: journals and transcripts, worktrees, credentials and config. A worker's empty `realms: []` list means it serves every realm; a non-empty list limits availability, not OS permissions.
+- **A one-realm worker isn't enough.** An agent can message another session or delegate through subagents, task cards, templates or the head-run assistant. If the receiving agent has wider worker or tool access, it can use that access on the caller's behalf. Same-realm messaging checks, template worker grants and assistant approvals still apply; they do not make delegation a security boundary. Do not rely on realm membership or a dedicated worker to contain an untrusted agent or package.
 - **Imports' realm rules are administration.** They decide which realm a Claude Code or Codex session lands in.
 
 ## 9. As built
@@ -117,7 +138,7 @@ The same shell, with its own nav:
 - **Realm toggles are each realm's, root's by default:** suggestions, web search, the assistant's settings and subagent limits. Root's (set in the console) applies to a realm until its page changes it; the realm's own is kept as `<key>@<realm>`. The page says which, with **Use root's** to go back (`GET`/`DELETE /api/v1/settings/own/{name}`). Prompts work the same way, per prompt. Sessions read the value for their realm. The memex's settings stay the console's: the memex is one service.
 - **Inherited list entries:** a realm's list pages (skills, agents, commands, hooks, MCP servers, policies, budgets…) show root's entries in use there, read-only ("Also in use, from root"); its own entry of the same name replaces one.
 - **The console's lists are root's:** in the console, Settings' list pages (skills, policies, budgets, secrets…) edit root's entries, the defaults every realm inherits. Pages that are each realm's alone (memory, memex folders and scopes, mail, views, triggers, workflows) aren't in the console.
-- **Saved browser state** lives under `c6.<realm>.…` and `c6.admin.…`. Home starts from what was saved before (`c6.…`). The theme and the last place (`c6.place`) are per browser.
+- **Saved browser state** lives under `c6.<realm>.…` and `c6.admin.…`. Home starts from what was saved before (`c6.…`). Theme, Motion and the last place (`c6.place`) are per browser.
 - **Old addresses:** `/` goes to the last place. `/sessions/<id>` asks the head for its realm (root's go to the console). Console settings pages go to the console, anything else to the last place.
 
 ## 10. Steps

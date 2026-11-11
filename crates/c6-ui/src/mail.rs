@@ -8,6 +8,7 @@ use leptos::task::spawn_local;
 use serde_json::json;
 
 use crate::api;
+use crate::icons::{Icon, Size, icon};
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT};
 
 const VIEWS: [(&str, &str); 12] = [
@@ -133,8 +134,8 @@ pub fn MailPage() -> impl IntoView {
     let compose = RwSignal::new(None::<Draft>);
     let status = RwSignal::new(None::<Result<String, String>>);
     view! {
-        <main class="mx-auto flex max-w-6xl flex-col gap-3 px-3 py-3 sm:flex-row">
-            <nav class="flex shrink-0 gap-1 overflow-x-auto text-sm sm:w-44 sm:flex-col">
+        <main class="mx-auto flex max-w-6xl flex-col gap-3 px-3 py-3 @min-[40rem]/view:flex-row">
+            <nav class="flex min-w-0 shrink-0 gap-1 overflow-x-auto text-sm @min-[40rem]/view:w-44 @min-[40rem]/view:flex-col">
                 <button class=format!("{BUTTON} mb-1 shrink-0") on:click=move |_| compose.set(Some(Draft::default()))>"Compose"</button>
                 {VIEWS.iter().map(|(v, label)| {
                     let v = v.to_string();
@@ -145,7 +146,7 @@ pub fn MailPage() -> impl IntoView {
                     }
                 }).collect_view()}
                 {move || labels.get().and_then(Result::ok).filter(|l| !l.is_empty()).map(|ls| view! {
-                    <p class="mt-2 hidden px-2 text-[10px] uppercase tracking-wide text-muted sm:block">"Labels"</p>
+                    <p class="mt-2 hidden px-2 text-[10px] uppercase tracking-wide text-muted @min-[40rem]/view:block">"Labels"</p>
                     {ls.into_iter().map(|(_, id, name)| {
                         let key = format!("label:{id}");
                         let k2 = key.clone();
@@ -262,7 +263,7 @@ fn Sorting(target: String, refresh: RwSignal<u32>, in_brief: bool) -> impl IntoV
                         }).collect_view()}
                     </select>
                     {move || (!category.get().is_empty()).then(|| view! {
-                        <input class=format!("{INPUT} w-56 py-1 text-xs") placeholder="Why (the sorting learns from it)"
+                        <input class=format!("{INPUT} min-w-0 max-w-full w-56 py-1 text-xs") placeholder="Why (the sorting learns from it)"
                             prop:value=move || note.get() on:input=move |ev| note.set(event_target_value(&ev)) />
                         <button class=BUTTON_QUIET on:click=move |_| {
                             act("memex.triage.set", json!({"target": target.get_value(), "category": category.get_untracked(), "note": note.get_untracked()}));
@@ -291,7 +292,7 @@ fn RequestActions(id: i64, in_brief: bool, refresh: impl Fn() + Copy + Send + Sy
         });
     };
     view! {
-        <span class="flex w-full flex-wrap items-center gap-1 sm:w-auto">
+        <span class="flex w-full flex-wrap items-center gap-1 @sm/view:w-auto">
             <span class="text-xs text-muted">"Request:"</span>
             <button class=BUTTON_QUIET on:click=move |_| act(Settle::Done)>"Done"</button>
             <button class=BUTTON_QUIET on:click=move |_| act(Settle::Tomorrow)>"Tomorrow"</button>
@@ -468,7 +469,7 @@ pub(crate) fn Thread(
                     }
                     view! {
                         <div class="flex flex-wrap items-baseline justify-between gap-x-2">
-                            <h1 class="min-w-0 text-lg font-semibold">{subject}</h1>
+                            <h1 class="min-w-0 text-lg font-semibold [overflow-wrap:anywhere]">{subject}</h1>
                             {link.map(|link| view! { <crate::util::OpenIn link /> })}
                         </div>
                         {senders.into_iter().take(2).map(|a| view! { <crate::understanding::Cards params=serde_json::json!({"address": a}) /> }).collect_view()}
@@ -589,7 +590,7 @@ fn Message(m: MailMessage) -> impl IntoView {
     let (pictures, files): (Vec<_>, Vec<_>) =
         attachments.into_iter().partition(|a| a.mime.starts_with("image/") && !a.mime.contains("svg"));
     view! {
-        <article class="space-y-2 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
+        <article class="min-w-0 space-y-2 rounded-lg border border-zinc-200 p-3 [overflow-wrap:anywhere] dark:border-zinc-800">
             <div class="flex flex-wrap items-baseline gap-2 text-sm">
                 <crate::people::Person class="font-medium" label=if m.from_name.is_empty() { m.from.clone() } else { m.from_name.clone() }
                     name=if m.from_name.is_empty() { m.from.clone() } else { m.from_name.clone() } address=m.from.clone() />
@@ -656,10 +657,29 @@ pub(crate) fn FileChip(name: String, mime: String, size: u64, href: String) -> i
     }
 }
 
-/// A file icon and a short name for a file's kind. The name and type,
-/// rather than a pictogram, distinguish its format.
+/// A format-specific icon and a short name for a file's kind. Prefer its
+/// MIME type, falling back to the extension for generic/unknown types.
 pub(crate) fn file_kind(mime: &str, name: &str) -> (AnyView, String) {
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_uppercase()).unwrap_or_default();
+    let mark = match mime {
+        "application/pdf" => Icon::FileText,
+        m if m.starts_with("image/") => Icon::Image,
+        m if m.starts_with("video/") => Icon::Film,
+        m if m.starts_with("audio/") => Icon::Music,
+        m if m.contains("spreadsheet") || m.contains("excel") || m == "text/csv" => Icon::Sheet,
+        m if m.contains("presentation") || m.contains("powerpoint") => Icon::Presentation,
+        m if m.contains("zip") || m.contains("compressed") || m.contains("tar") => Icon::FileArchive,
+        _ => match ext.as_str() {
+            "PDF" => Icon::FileText,
+            "PNG" | "JPG" | "JPEG" | "GIF" | "WEBP" | "SVG" | "HEIC" | "AVIF" => Icon::Image,
+            "MP4" | "MOV" | "WEBM" | "MKV" | "AVI" => Icon::Film,
+            "MP3" | "WAV" | "M4A" | "OGG" | "FLAC" | "AAC" => Icon::Music,
+            "CSV" | "TSV" | "XLS" | "XLSX" | "ODS" => Icon::Sheet,
+            "PPT" | "PPTX" | "ODP" => Icon::Presentation,
+            "ZIP" | "TAR" | "GZ" | "TGZ" | "BZ2" | "XZ" | "7Z" | "RAR" | "ZST" => Icon::FileArchive,
+            _ => Icon::File,
+        },
+    };
     let kind = if mime == "application/pdf" {
         "PDF".into()
     } else if ext.is_empty() {
@@ -676,7 +696,7 @@ pub(crate) fn file_kind(mime: &str, name: &str) -> (AnyView, String) {
     } else {
         ext
     };
-    (crate::icons::file().into_any(), kind)
+    (icon(mark, Size::S16), kind)
 }
 
 /// "230 KB", "1.4 MB".
@@ -732,15 +752,15 @@ pub(crate) fn Compose(
     };
     view! {
         <section class="space-y-2 rounded-lg border border-zinc-300 p-3 shadow-sm dark:border-zinc-700">
-            <div class="grid gap-2 sm:grid-cols-2">
-                <select class=format!("{INPUT} py-1 text-sm") prop:value=move || account.get() on:change=move |ev| account.set(event_target_value(&ev))>
+            <div class="grid gap-2 @sm/view:grid-cols-2">
+                <select class=format!("{INPUT} min-w-0 py-1 text-sm") prop:value=move || account.get() on:change=move |ev| account.set(event_target_value(&ev))>
                     <option value="">"From…"</option>
                     {move || accounts.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|a| view! { <option value=a.email.clone()>{a.email.clone()}</option> }).collect_view()}
                 </select>
                 <input class=format!("{INPUT} py-1 text-sm") placeholder="Send later (e.g. 2026-10-14 08:00)" prop:value=move || later.get() on:input=move |ev| later.set(event_target_value(&ev)) />
-                <input class=format!("{INPUT} py-1 text-sm sm:col-span-2") placeholder="To" prop:value=move || to.get() on:input=move |ev| to.set(event_target_value(&ev)) />
-                <input class=format!("{INPUT} py-1 text-sm sm:col-span-2") placeholder="Cc" prop:value=move || cc.get() on:input=move |ev| cc.set(event_target_value(&ev)) />
-                <input class=format!("{INPUT} py-1 text-sm sm:col-span-2") placeholder="Subject" prop:value=move || subject.get() on:input=move |ev| subject.set(event_target_value(&ev)) />
+                <input class=format!("{INPUT} py-1 text-sm @sm/view:col-span-2") placeholder="To" prop:value=move || to.get() on:input=move |ev| to.set(event_target_value(&ev)) />
+                <input class=format!("{INPUT} py-1 text-sm @sm/view:col-span-2") placeholder="Cc" prop:value=move || cc.get() on:input=move |ev| cc.set(event_target_value(&ev)) />
+                <input class=format!("{INPUT} py-1 text-sm @sm/view:col-span-2") placeholder="Subject" prop:value=move || subject.get() on:input=move |ev| subject.set(event_target_value(&ev)) />
             </div>
             <textarea class=format!("{INPUT} min-h-48 text-sm") placeholder="Write (Markdown)" prop:value=move || body.get() on:input=move |ev| body.set(event_target_value(&ev))></textarea>
             <div class="flex flex-wrap items-center justify-end gap-2">
@@ -837,7 +857,7 @@ pub fn GoogleSettings() -> impl IntoView {
                     <p class="text-xs text-muted">"Using root's client (set in the console). Saving one here gives this realm its own."</p>
                 })}
             })}
-            <div class="grid gap-2 sm:grid-cols-2">
+            <div class="grid gap-2 @sm/view:grid-cols-2">
                 <input class=format!("{INPUT} py-1 font-mono text-xs") placeholder="Client ID" prop:value=move || id.get() on:input=move |ev| id.set(event_target_value(&ev)) />
                 <input class=format!("{INPUT} py-1 font-mono text-xs") type="password"
                     placeholder=move || if client.get().and_then(Result::ok).is_some_and(|c| c.has_secret) { "Client secret (saved; type to replace)" } else { "Client secret" }
@@ -890,23 +910,33 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn file_chips_draw_one_icon_and_keep_the_formats_in_words() {
+    fn file_chips_draw_their_type_icon_and_keep_the_formats_in_words() {
         let owner = Owner::new();
         owner.with(|| {
-            for (mime, name, kind) in [
-                ("application/pdf", "report", "PDF"),
-                ("image/png", "picture", "Image"),
-                ("video/mp4", "movie", "Video"),
-                ("audio/mpeg", "recording", "Audio"),
-                ("text/csv", "table", "Spreadsheet"),
-                ("application/vnd.ms-powerpoint", "deck", "Slides"),
-                ("application/zip", "archive", "Archive"),
-                ("text/plain", "notes", "File"),
-                ("image/png", "picture.png", "PNG"),
+            for (mime, name, kind, expected) in [
+                ("application/pdf", "report", "PDF", Icon::FileText),
+                ("image/png", "picture", "Image", Icon::Image),
+                ("video/mp4", "movie", "Video", Icon::Film),
+                ("audio/mpeg", "recording", "Audio", Icon::Music),
+                ("text/csv", "table", "Spreadsheet", Icon::Sheet),
+                ("application/vnd.ms-powerpoint", "deck", "Slides", Icon::Presentation),
+                ("application/zip", "archive", "Archive", Icon::FileArchive),
+                ("text/plain", "notes", "File", Icon::File),
+                ("image/png", "picture.png", "PNG", Icon::Image),
+                ("application/octet-stream", "picture.jpg", "JPG", Icon::Image),
+                ("application/octet-stream", "report.PDF", "PDF", Icon::FileText),
+                ("application/octet-stream", "movie.mp4", "MP4", Icon::Film),
+                ("application/octet-stream", "recording.mp3", "MP3", Icon::Music),
+                ("application/octet-stream", "table.xlsx", "XLSX", Icon::Sheet),
+                ("application/octet-stream", "deck.pptx", "PPTX", Icon::Presentation),
+                ("application/octet-stream", "archive.tar.gz", "GZ", Icon::FileArchive),
+                ("application/octet-stream", "unknown.bin", "BIN", Icon::File),
+                ("image/png", "odd-name.pdf", "PDF", Icon::Image),
             ] {
                 assert_eq!(file_kind(mime, name).1, kind);
+                assert_eq!(file_kind(mime, name).0.to_html(), icon(expected, Size::S16).to_html(), "{mime}/{name}");
                 let html = view! { <FileChip name=name.into() mime=mime.into() size=42 href="/file".into() /> }.to_html();
-                assert!(html.contains("<svg"), "{html}");
+                assert_eq!(html.matches("<svg").count(), 1, "keep the type icon: {html}");
                 assert!(html.contains(kind), "{html}");
                 crate::icons::tests::assert_no_icon_glyphs(&html);
             }

@@ -5,10 +5,12 @@ pub mod agent_ops;
 pub mod analytics;
 pub mod api;
 pub mod apps;
+mod assets;
 pub mod assistant;
 pub mod attention;
 pub mod auth;
 pub mod backups;
+mod brief_cache;
 pub mod catalog;
 pub mod catchup;
 pub mod claims;
@@ -38,6 +40,7 @@ pub mod lists;
 pub mod marks;
 pub mod memex;
 pub mod memory;
+mod models;
 pub mod naming;
 pub mod notify;
 pub mod oauth;
@@ -147,6 +150,7 @@ pub struct HeadState {
     pub secrets: secrets::Secrets,
     pub hub: sessions::LiveHub,
     pub oauth: oauth::OAuth,
+    pub(crate) models: models::Cache,
     pub terminals: terminals::Attaches,
     pub auth: auth::Auth,
     /// The web UI's certificate authority, when the head issues its own
@@ -310,6 +314,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         secrets,
         hub: Default::default(),
         oauth: Default::default(),
+        models: Default::default(),
         terminals: Default::default(),
         auth: auth::Auth::new(&cfg),
         ui_ca: ui_tls.as_ref().and_then(|t| t.ca.clone()),
@@ -372,6 +377,10 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
     if let Err(e) = apps::offer_moves(&state).await {
         tracing::warn!("offering to move apps out of their own realms: {e:#}");
     }
+
+    // Reports whose child events committed before the previous head
+    // stopped, but whose delivery hook did not finish.
+    remote::recover(&state).await?;
 
     // Scheduled automations.
     triggers::spawn_scheduler(state.clone());

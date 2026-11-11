@@ -37,7 +37,7 @@ fn url_of(doc: &str, blob: &str) -> String {
 
 /// Keeps a picture or file for a document.
 pub async fn add(st: &HeadState, realm: &str, doc: &str, f: &DocFileIn, by: &str) -> anyhow::Result<DocFile> {
-    super::get(st, realm, doc).await?;
+    let _guard = super::writable(st, realm, doc).await?;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(f.content.trim())
         .map_err(|e| bad_request(format!("content is the file in base64: {e}")))?;

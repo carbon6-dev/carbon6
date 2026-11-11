@@ -14,6 +14,7 @@ mod catchup;
 mod chat;
 mod chats;
 mod collections;
+mod components;
 mod compose;
 mod contacts;
 mod decisions;
@@ -44,8 +45,11 @@ mod place;
 mod projects;
 mod push;
 mod quota;
+mod resources;
 mod search;
 mod session;
+mod session_archive;
+mod session_ring;
 mod sessions;
 mod settings;
 mod tasks;
@@ -67,9 +71,15 @@ use workspace::{Go, View};
 
 #[wasm_bindgen::prelude::wasm_bindgen]
 extern "C" {
-    /// js/crash.js: the banner that offers a reload.
+    /// js/crash.js: the reload banner; captures a JS stack while the panic's
+    /// app-level Wasm callers are still on it (before the subsequent trap).
     #[wasm_bindgen(catch, js_name = c6Crashed)]
     fn js_crashed(message: &str) -> Result<(), wasm_bindgen::JsValue>;
+
+    /// Measure only on size/content changes, before paint; returns cleanup.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = c6HeaderFit)]
+    fn header_fit(header: &web_sys::Element) -> js_sys::Function;
 }
 
 fn main() {
@@ -112,10 +122,14 @@ fn App() -> impl IntoView {
 fn Main() -> impl IntoView {
     let live = api::LiveFeed::connect();
     provide_context(live);
+    util::watch_visible_viewport();
+    resources::provide();
     provide_context(labels::LabelFilter::restored());
     provide_context(sessions::Grouping::load());
     provide_context(aspects::Facets::load());
     provide_context(settings::TranscriptDisplay::load());
+    provide_context(settings::SessionBarDisplay::load());
+    provide_context(assistant::AskState(RwSignal::new(false)));
     // Plan limits per connection, beside every connection picker.
     quota::provide();
     // A signed-in browser opening a login link (to sign in again).
@@ -129,6 +143,9 @@ fn Main() -> impl IntoView {
     }
     // A deck presented full screen, or its presenter view (docs/docs.md §5).
     let here = place::strip(&window().location().pathname().unwrap_or_default());
+    if here == "/dev/components" {
+        return view! { <components::Gallery /> }.into_any();
+    }
     if let Some(id) = here.strip_prefix("/docs/").and_then(|r| r.strip_suffix("/present")) {
         let presenter = window().location().search().unwrap_or_default().contains("presenter=1");
         return view! { <deck::Present id=id.to_owned() presenter /> }.into_any();
@@ -136,75 +153,33 @@ fn Main() -> impl IntoView {
     let ws = workspace::Workspace::restore();
     provide_context(ws);
     util::Notice::provide();
+    session_archive::SessionArchive::provide();
     ws.watch(live);
     notify::watch_sessions(live, ws, labels::use_filter());
     // Needing attention, as the label filter shows it.
     let filter = labels::use_filter().0;
     let counts = Memo::new(move |_| labels::attention_counts(ws, live, &filter.get()));
-    let attention = move || counts.get().0;
-    let tiles = move || ws.layout.with(|l| l.tiles.len());
     let console = place::is_console();
+    let tick = decisions::ticking();
+    let places = LocalResource::new(move || {
+        api::realms_changed().track();
+        live.attention.track();
+        live.sessions.track();
+        tick.track();
+        api::elsewhere()
+    });
+    provide_context(PhoneWaiting(Signal::derive(move || {
+        places.get().and_then(Result::ok).map_or(0, |ps| ps.iter().map(|p| p.waiting).sum())
+    })));
     view! {
         // The page itself never scrolls: its parts do (a phone panned the
         // whole page, header gone and the right edge cut off).
-        <div class="flex h-dvh flex-col overflow-hidden">
+        <div class="c6-app flex h-dvh flex-col overflow-hidden">
             <util::NoticeHost />
+            <assistant::AskHost />
+            <session_archive::ArchiveHost />
             <mentions::Peek />
-            <header class="flex h-11 shrink-0 items-center gap-2 border-b border-zinc-200 bg-zinc-50 px-3 dark:border-zinc-800 dark:bg-zinc-950">
-                <Brand />
-                <MobileMenu attention=Signal::derive(attention) />
-                <PlaceMenu />
-                {if console {
-                    view! {
-                        <nav class="hidden min-w-0 items-center gap-0.5 text-sm md:flex">
-                            <NavLink to=View::Realms label="Realms" />
-                            <decisions::DecisionLink class=NAV />
-                            <NavLink to=View::Workers label="Workers" />
-                            <NavLink to=View::Analytics label="Analytics" />
-                            <NavLink to=View::Activity label="Activity" />
-                            <NavLink to=View::Usage label="Spending" />
-                            <NavLink to=View::Settings { note: None, section: String::new() } label="Settings" />
-                        </nav>
-                        <span class="flex-1"></span>
-                        <monitor::ActivityBadge />
-                        <needs::NeedsYou />
-                        <assistant::AskButton />
-                    }.into_any()
-                } else {
-                    view! {
-                        <nav class="hidden min-w-0 items-center gap-0.5 text-sm md:flex">
-                            <NavLink to=View::Sessions label="Sessions" />
-                            <Go to=View::Inbox class=NAV>
-                                <span title=move || { let (s, h) = counts.get(); labels::attention_title(s, h) }>
-                                    "Inbox"
-                                    {move || (attention() > 0).then(|| view! { <span class="ml-1 rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white">{attention()}</span> })}
-                                </span>
-                            </Go>
-                            <decisions::DecisionLink class=NAV />
-                            <projects::ProjectsLink class=NAV />
-                            <work::WorkLink class=NAV />
-                            <docs::DocsLink class=NAV />
-                            <NavLink to=View::Analytics label="Analytics" />
-                            <span class="hidden xl:contents"><NavLink to=View::Mission label="Mission" /></span>
-                            <span class="hidden xl:contents"><NavLink to=View::Collections { name: String::new() } label="Collections" /></span>
-                            <span class="hidden xl:contents"><NavLink to=View::Workers label="Workers" /></span>
-                            <span class="hidden xl:contents"><AppsMenu /></span>
-                            <NavLink to=View::Settings { note: None, section: String::new() } label="Settings" />
-                        </nav>
-                        <span class="flex-1"></span>
-                        <span class="hidden xl:contents"><views::ViewsMenu class=NAV /></span>
-                        <monitor::ActivityBadge />
-                        <needs::NeedsYou />
-                        <assistant::AskButton />
-                        <span class="hidden md:contents"><search::SearchBox /></span>
-                    }.into_any()
-                }}
-                <button class="hidden rounded-md px-2 py-1 text-xs text-muted hover:bg-zinc-200/60 hover:text-zinc-900 xl:inline dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
-                    title=move || format!("New tile (or ⌘-click any link): {} open · ⌘1–9 switch tiles · ⌘[ ⌘] back and forward", tiles())
-                    on:click=move |_| ws.new_tile()>"+ Tile"</button>
-                {(!console).then(|| view! { <notify::NotifyToggle /> })}
-                <ConnBadge connected=live.connected />
-            </header>
+            <DesktopHeader counts />
             <UpdatedBanner />
             <MissingRealm />
             <div class="flex min-h-0 flex-1">
@@ -212,10 +187,96 @@ fn Main() -> impl IntoView {
                 {(!console).then(|| view! { <div class=move || if ws.is_full() { "contents md:hidden" } else { "contents" }><activity::Dock /></div> })}
                 <workspace::Tiles />
             </div>
-            {(!console).then(|| view! { <activity::MobileBar /> })}
         </div>
     }
     .into_any()
+}
+
+/// Content, not a screen breakpoint, decides what fits. Quick navigation and
+/// attention stay longest; administration, saved views and build details yield
+/// first. The phone drawer remains the complete navigation at small widths.
+#[component]
+fn DesktopHeader(counts: Memo<(usize, usize)>) -> impl IntoView {
+    let node = NodeRef::<leptos::html::Header>::new();
+    #[cfg(target_arch = "wasm32")]
+    Effect::new(move || {
+        if let Some(el) = node.get() {
+            let dispose = send_wrapper::SendWrapper::new(header_fit(&el));
+            on_cleanup(move || {
+                let _ = dispose.call0(&wasm_bindgen::JsValue::NULL);
+            });
+        }
+    });
+    let ws = workspace::use_workspace();
+    let live = api::live();
+    let console = place::is_console();
+    let attention = Signal::derive(move || counts.get().0);
+    let v = versions();
+    view! {
+        <header node_ref=node class="c6-header hidden h-11 shrink-0 items-center gap-0.5 border-b border-zinc-200 bg-zinc-50 px-3 md:flex dark:border-zinc-800 dark:bg-zinc-950">
+            <span data-header-fixed class="shrink-0"><Brand /></span>
+            <MobileMenu desktop=true desktop_attention=attention />
+            <span data-header-fixed class="shrink-0"><PlaceMenu /></span>
+            <HeaderItem name="build" priority=0>
+                {move || v.now.get().map(|full| view! {
+                    <span class="rounded bg-zinc-200/70 px-1.5 py-0.5 font-mono text-[10px] text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400" title=format!("carbon6 {full}")>{short_version(&full)}</span>
+                })}
+            </HeaderItem>
+            <nav class="contents" aria-label="Main navigation">
+                {if console {
+                    view! {
+                        <HeaderItem name="realms" priority=110><NavLink to=View::Realms label="Realms" /></HeaderItem>
+                        <HeaderItem name="decisions" priority=100><decisions::DecisionLink class=NAV /></HeaderItem>
+                        <HeaderItem name="workers" priority=30><NavLink to=View::Workers label="Workers" /></HeaderItem>
+                        <HeaderItem name="analytics" priority=40><NavLink to=View::Analytics label="Analytics" /></HeaderItem>
+                        <HeaderItem name="activity" priority=60><NavLink to=View::Activity label="Activity" /></HeaderItem>
+                        <HeaderItem name="usage" priority=35><NavLink to=View::Usage label="Usage" /></HeaderItem>
+                        <HeaderItem name="settings" priority=10><NavLink to=View::Settings { note: None, section: String::new() } label="Settings" /></HeaderItem>
+                    }.into_any()
+                } else {
+                    view! {
+                        <HeaderItem name="sessions" priority=110><NavLink to=View::Sessions label="Sessions" /></HeaderItem>
+                        <HeaderItem name="inbox" priority=110>
+                            <Go to=View::Inbox class=NAV>
+                                <span title=move || { let (s, h) = counts.get(); labels::attention_title(s, h) }>
+                                    "Inbox"
+                                    {move || (attention.get() > 0).then(|| view! { <span data-header-count class="ml-1 rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white">{attention}</span> })}
+                                </span>
+                            </Go>
+                        </HeaderItem>
+                        <HeaderItem name="decisions" priority=100><decisions::DecisionLink class=NAV /></HeaderItem>
+                        <HeaderItem name="projects" priority=80><projects::ProjectsLink class=NAV /></HeaderItem>
+                        <HeaderItem name="work" priority=90><work::WorkLink class=NAV /></HeaderItem>
+                        <HeaderItem name="docs" priority=90><docs::DocsLink class=NAV /></HeaderItem>
+                        <HeaderItem name="analytics" priority=40><NavLink to=View::Analytics label="Analytics" /></HeaderItem>
+                        <HeaderItem name="mission" priority=20><NavLink to=View::Mission label="Mission" /></HeaderItem>
+                        <HeaderItem name="collections" priority=30><NavLink to=View::Collections { name: String::new() } label="Collections" /></HeaderItem>
+                        <HeaderItem name="workers" priority=30><NavLink to=View::Workers label="Workers" /></HeaderItem>
+                        <HeaderItem name="apps" priority=35><AppsMenu /></HeaderItem>
+                        <HeaderItem name="settings" priority=10><NavLink to=View::Settings { note: None, section: String::new() } label="Settings" /></HeaderItem>
+                    }.into_any()
+                }}
+            </nav>
+            <span class="flex-1"></span>
+            {(!console).then(|| view! { <HeaderItem name="views" priority=25><views::ViewsMenu class=NAV /></HeaderItem> })}
+            <HeaderItem name="monitor" priority=60><monitor::ActivityBadge /></HeaderItem>
+            <span data-header-fixed class="shrink-0"><needs::NeedsYou /></span>
+            <span data-header-fixed class="shrink-0"><assistant::AskButton /></span>
+            {(!console).then(|| view! { <HeaderItem name="search" priority=105><search::SearchBox /></HeaderItem> })}
+            <HeaderItem name="tile" priority=15>
+                <button class="rounded-md px-2 py-1 text-xs text-muted hover:bg-zinc-200/60 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+                    title=move || format!("Open Home starter (or reveal it): {} tiles open · ⌘1–9 switch tiles · ⌘[ ⌘] back and forward", ws.layout.with(|l| l.tiles.len()))
+                    on:click=move |_| ws.new_tile()>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" Tile"</button>
+            </HeaderItem>
+            {(!console).then(|| view! { <span data-header-fixed class="shrink-0"><notify::NotifyToggle /></span> })}
+            <HeaderItem name="connection" priority=5><ConnBadge connected=live.connected /></HeaderItem>
+        </header>
+    }
+}
+
+#[component]
+fn HeaderItem(name: &'static str, priority: u8, children: Children) -> impl IntoView {
+    view! { <span data-header-item=name data-header-priority=priority class="inline-flex shrink-0 items-center whitespace-nowrap text-sm">{children()}</span> }
 }
 
 /// Mail, Chat, Calendar and Contacts are apps: what an app feeds in this
@@ -248,7 +309,7 @@ fn AppsMenu() -> impl IntoView {
     view! {
         <details node_ref=menu data-pop=pop on:toggle=toggled class="relative shrink-0">
             <summary class=format!("{NAV} cursor-pointer list-none whitespace-nowrap")>"Apps "{crate::icons::chevron_down()}</summary>
-            <div class="absolute left-0 top-8 z-40 flex w-48 flex-col rounded-lg border border-zinc-200 bg-white p-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900" on:click=close>
+            <div class="c6-pop absolute left-0 top-8 z-40 flex w-48 flex-col rounded-lg border border-zinc-200 bg-white p-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900" style="--pop-origin: top left" on:click=close>
                 {move || feeds.get().and_then(Result::ok).map(|f| view! {
                     {(f["mail"] == true).then(|| view! { <Go to=View::Mail class=item own=true>"Mail"</Go> })}
                     {(f["mail"] == true || f["chat"] == true).then(|| view! { <Go to=View::Brief class=item own=true>"Brief"</Go> })}
@@ -263,11 +324,63 @@ fn AppsMenu() -> impl IntoView {
     }
 }
 
-/// Phones and narrower windows: the nav, views and search in a menu.
+/// Waiting across every realm and the console, independent of list filters.
+#[derive(Clone, Copy)]
+struct PhoneWaiting(Signal<u64>);
+
+/// Phones and narrower windows: app navigation (session search is in its picker).
 #[component]
-fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
-    let menu = NodeRef::<leptos::html::Details>::new();
-    let (pop, toggled) = util::details_pop(menu);
+fn MobileMenu(#[prop(optional)] desktop: bool, #[prop(optional, into)] desktop_attention: Option<Signal<usize>>) -> impl IntoView {
+    let ws = workspace::use_workspace();
+    let attention = expect_context::<PhoneWaiting>().0;
+    let connected = api::live().connected;
+    let version = versions();
+    let open = RwSignal::new(false);
+    let drawer = NodeRef::<leptos::html::Div>::new();
+    util::drawer_gesture(
+        open,
+        drawer,
+        Callback::new(move |()| {
+            open.try_set(false);
+        }),
+    );
+    let pop = util::dismissable(
+        move || open.get(),
+        move || {
+            open.try_set(false);
+        },
+    );
+    let drawer_id = format!("c6-drawer-{pop}");
+    let controls = drawer_id.clone();
+    // A measured-away search must not take the command while inert. Open its
+    // drawer and focus that live input instead, using the same platform rules
+    // as every other app command. One RAF lets the open/inert effects settle.
+    let keys = window_event_listener(leptos::ev::keydown, move |ev| {
+        if desktop
+            && ev.key().eq_ignore_ascii_case("k")
+            && util::app_shortcut(&ev)
+            && let Some(el) = drawer.try_get_untracked().flatten()
+            && let Some(header) = el.closest("header").ok().flatten()
+            && header.client_width() > 0
+            && header.query_selector("[data-header-item=search][inert]").ok().flatten().is_some()
+        {
+            ev.prevent_default();
+            open.set(true);
+            request_animation_frame(move || {
+                use wasm_bindgen::JsCast;
+                if let Some(input) = drawer
+                    .try_get_untracked()
+                    .flatten()
+                    .and_then(|el| el.query_selector("input[type=search]").ok().flatten())
+                    .and_then(|el| el.dyn_into::<web_sys::HtmlInputElement>().ok())
+                {
+                    let _ = input.focus();
+                    input.select();
+                }
+            });
+        }
+    });
+    on_cleanup(move || keys.remove());
     let feeds = feeds();
     // Close after choosing something (not on opening the Views drop-down in it).
     let close = move |ev: web_sys::MouseEvent| {
@@ -275,41 +388,52 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
         if target.is_some_and(|t| t.closest("summary").ok().flatten().is_some()) {
             return;
         }
-        if let Some(d) = menu.get_untracked() {
-            d.set_open(false);
-        }
+        open.set(false);
     };
     view! {
-        <details node_ref=menu data-pop=pop on:toggle=toggled class="relative xl:hidden">
-            <summary class="cursor-pointer list-none rounded-md px-2 py-1 text-sm text-zinc-600 dark:text-zinc-400" aria-label="Menu">
+        <div data-pop=pop.clone() data-header-menu=desktop.then_some("") class="relative shrink-0">
+            <button data-pop=pop.clone() class="relative flex h-11 w-11 cursor-pointer items-center justify-center rounded-md text-sm text-zinc-600 md:block md:h-auto md:w-auto md:px-2 md:py-1 dark:text-zinc-400"
+                aria-controls=controls aria-expanded=move || open.get().to_string() on:click=move |_| open.update(|o| *o = !*o)
+                aria-describedby=desktop.then_some("c6-header-overflow-state")
+                aria-label=move || format!("Menu, {} waiting across the app{}", attention.get(), if connected.get() { "" } else { ", reconnecting" })>
                 {crate::icons::menu()}
-                {move || (attention.get() > 0).then(|| view! { <span class="ml-1 rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white">{attention.get()}</span> })}
-            </summary>
-            <div class="fixed inset-x-2 top-12 z-40 max-h-[80dvh] space-y-1 overflow-y-auto rounded-lg border border-zinc-200 bg-white p-2 shadow-lg sm:absolute sm:inset-x-auto sm:left-0 sm:top-9 sm:w-64 dark:border-zinc-700 dark:bg-zinc-900" on:click=close>
+                {move || (attention.get() > 0).then(|| view! { <span data-phone-waiting="true" class="absolute right-1 top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-amber-500 px-1 text-[10px] font-semibold leading-none text-white md:hidden">{attention.get()}</span> })}
+                {desktop.then(|| view! {
+                    <span data-header-overflow-badge aria-hidden="true" class="c6-header-overflow-badge absolute right-1 top-1 size-1.5 rounded-full bg-amber-500"></span>
+                    <span id="c6-header-overflow-state" data-header-overflow-note data-header-feedback class="sr-only"></span>
+                })}
+                <Show when=move || !connected.get()>
+                    <span class="absolute bottom-1 right-1 size-2 rounded-full bg-amber-500 md:hidden" title="Reconnecting"></span>
+                </Show>
+            </button>
+            <div class="c6-presence c6-scrim fixed inset-0 z-30 bg-black/30 md:hidden" data-open=move || open.get().to_string() inert=move || !open.get() on:click=move |_| open.set(false)></div>
+            <div node_ref=drawer id=drawer_id class="c6-sheet c6-pane c6-presence phone-drawer fixed left-0 z-40 w-72 max-w-full space-y-1 overflow-y-auto rounded-r-lg border border-zinc-200 bg-white p-2 shadow-lg md:absolute md:top-11 dark:border-zinc-700 dark:bg-zinc-900"
+                data-open=move || open.get().to_string() inert=move || !open.get() on:click=close>
+                <PlaceMenu drawer=true />
                 {place::is_console().then(|| view! {
                     <div class="flex flex-col text-sm">
                         <Go to=View::Realms class=MENU>"Realms"</Go>
-                        <decisions::DecisionLink class=MENU />
+                        <span data-header-destination="decisions" class="contents"><decisions::DecisionLink class=MENU /></span>
                         <Go to=View::Workers class=MENU>"Workers"</Go>
                         <Go to=View::Analytics class=MENU>"Analytics"</Go>
                         <Go to=View::Activity class=MENU>"Activity"</Go>
-                        <Go to=View::Usage class=MENU>"Spending"</Go>
+                        <Go to=View::Usage class=MENU>"Usage"</Go>
                         <Go to=View::Settings { note: None, section: String::new() } class=MENU>"Settings"</Go>
                     </div>
                 })}
-                <div class:hidden=place::is_console() on:click=|ev| ev.stop_propagation()><search::SearchBox /></div>
+                {desktop.then(|| view! { <div class:hidden=place::is_console() on:click=|ev| ev.stop_propagation()><search::SearchBox /></div> })}
                 <div class="flex flex-col text-sm" class:hidden=place::is_console()>
                     <Go to=View::Sessions class=MENU>"Sessions"</Go>
-                    <Go to=View::Inbox class=MENU>"Inbox"</Go>
-                    <decisions::DecisionLink class=MENU />
+                    <span data-header-destination="inbox" class="contents"><Go to=View::Inbox class=MENU>"Inbox"
+                        {move || desktop_attention.map(|n| n.get()).filter(|n| *n > 0).map(|n| view! { <span data-header-count class="ml-1 rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white">{n}</span> })}
+                    </Go></span>
+                    <span data-header-destination="decisions" class="contents"><decisions::DecisionLink class=MENU /></span>
                     <chats::ChatLink class=MENU />
-                    <projects::ProjectsLink class=MENU />
-                    <work::WorkLink class=MENU />
+                    <span data-header-destination="projects" class="contents"><projects::ProjectsLink class=MENU /></span>
+                    <span data-header-destination="work" class="contents"><work::WorkLink class=MENU /></span>
                     <docs::DocsLink class=MENU />
-                    <Go to=View::Mission class=MENU>"Mission control"</Go>
-                    <Go to=View::Workers class=MENU>"Workers"</Go>
-                    <Go to=View::Collections { name: String::new() } class=MENU>"Collections"</Go>
-                    <views::ViewsMenu class=MENU />
+                    <div class="my-1 border-t border-zinc-200 dark:border-zinc-800"></div>
+                    <span class="px-2 pt-1 text-xs font-medium text-muted">"Apps"</span>
                     // Only what an app feeds in this realm (or it holds).
                     {move || feeds.get().and_then(Result::ok).map(|f| view! {
                         {(f["mail"] == true).then(|| view! { <Go to=View::Mail class=MENU>"Mail"</Go> })}
@@ -320,13 +444,25 @@ fn MobileMenu(attention: Signal<usize>) -> impl IntoView {
                     })}
                     <Go to=View::Photos class=MENU>"Photos"</Go>
                     <Go to=View::Memex class=MENU>"Memex"</Go>
+                    <div class="my-1 border-t border-zinc-200 dark:border-zinc-800"></div>
+                    <Go to=View::Mission class=MENU>"Mission control"</Go>
+                    <Go to=View::Workers class=MENU>"Workers"</Go>
+                    <Go to=View::Collections { name: String::new() } class=MENU>"Collections"</Go>
+                    <views::ViewsMenu class=MENU />
+                    <div class="flex items-center"><Go to=View::Activity class=MENU>"Activity"</Go><monitor::ActivityBadge /></div>
                     <Go to=View::Analytics class=MENU>"Analytics"</Go>
-                    <Go to=View::Usage class=MENU>"Usage and budgets"</Go>
+                    <Go to=View::Usage class=MENU>"Usage"</Go>
                     <Go to=View::Settings { note: None, section: String::new() } class=MENU>"Settings"</Go>
                 </div>
-                <PlaceLinks />
+                <button class=MENU on:click=move |_| ws.new_tile()>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" New tile"</button>
+                <div class="space-y-2 border-t border-zinc-200 px-2 pt-2 text-xs text-muted dark:border-zinc-800">
+                    <div on:click=|ev| ev.stop_propagation()><needs::NeedsYou labelled=true /></div>
+                    <div on:click=|ev| ev.stop_propagation()><notify::NotifyToggle /></div>
+                    <ConnBadge connected />
+                    <span class="block font-mono">{move || version.now.get().map(|v| format!("carbon6 {v}"))}</span>
+                </div>
             </div>
-        </details>
+        </div>
     }
 }
 
@@ -346,7 +482,7 @@ fn ConnBadge(connected: ReadSignal<bool>) -> impl IntoView {
             <span class=move || {
                 if connected.get() { "h-2 w-2 rounded-full bg-emerald-500" } else { "h-2 w-2 animate-pulse rounded-full bg-amber-500" }
             }></span>
-            <span class="hidden sm:inline">{move || if connected.get() { "live" } else { "reconnecting…" }}</span>
+            <span>{move || if connected.get() { "live" } else { "reconnecting…" }}</span>
         </span>
     }
 }
@@ -364,7 +500,7 @@ fn RealmGlyph(#[prop(into)] id: String) -> impl IntoView {
 /// tab. Links to a place are `rel="external"`: a place is fixed when the
 /// page loads, so the router must not handle them in the page.
 #[component]
-fn PlaceMenu() -> impl IntoView {
+fn PlaceMenu(#[prop(optional)] drawer: bool) -> impl IntoView {
     // Loaded again as things change, like the Decisions count: an update
     // offer, say, waits in the console while you're in a realm.
     let (live, tick) = (api::live(), decisions::ticking());
@@ -400,15 +536,16 @@ fn PlaceMenu() -> impl IntoView {
             None => "Console".into(),
         }
     };
+    let full_name = name.clone();
     view! {
         <details node_ref=menu data-pop=pop on:toggle=toggled class="relative">
-            <summary class="flex cursor-pointer list-none items-center gap-1.5 rounded-md border border-zinc-300 px-2 py-0.5 text-sm dark:border-zinc-700"
+            <summary class=if drawer { "flex min-h-9 cursor-pointer list-none items-center gap-1.5 rounded-md bg-zinc-100 px-2 text-sm dark:bg-zinc-800" } else { "flex max-w-[min(28rem,36vw)] cursor-pointer list-none items-center gap-1.5 rounded-md border border-zinc-300 px-2 py-0.5 text-sm dark:border-zinc-700" }
                 title="Where you are: a realm, or the console">
                 {match here.clone() {
                     Some(r) => view! { <RealmGlyph id=r /> }.into_any(),
                     None => view! { <span class="h-2.5 w-2.5 shrink-0 rounded-full bg-zinc-900 dark:bg-zinc-100"></span> }.into_any(),
                 }}
-                <span class="max-w-32 truncate font-medium">{name}</span>
+                <span class="min-w-0 truncate font-medium" title=full_name>{name}</span>
                 {move || (elsewhere() > 0).then(|| view! {
                     <span class="rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white" title="Waiting on you in other realms">{elsewhere()}</span>
                 })}
@@ -416,17 +553,17 @@ fn PlaceMenu() -> impl IntoView {
             </summary>
             // On a phone, the width of the screen (anchored at the chip, it
             // would run off its edge).
-            <div class="fixed inset-x-2 top-12 z-40 rounded-lg border border-zinc-200 bg-white p-1 text-sm shadow-lg sm:absolute sm:inset-x-auto sm:left-0 sm:top-9 sm:w-64 dark:border-zinc-700 dark:bg-zinc-900">
+            <div class=if drawer { "c6-pop mt-1 rounded-lg border border-zinc-200 bg-white p-1 text-sm dark:border-zinc-700 dark:bg-zinc-900" } else { "c6-pop absolute left-0 top-9 z-40 w-64 rounded-lg border border-zinc-200 bg-white p-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900" } style="--pop-origin: top left">
                 <div class="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-muted">"Realms"</div>
                 {move || places.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|p| p.id != "root").map(|p| {
                     let current = here.as_deref() == Some(p.id.as_str());
                     view! {
                         <a rel="external" href=place::url_of(&place::Place::Realm(p.id.clone()))
-                            class=format!("flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 {}", if current { "font-medium" } else { "" })>
+                            class=format!("flex min-h-9 items-center gap-2 rounded-md px-2 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 {}", if current { "bg-zinc-100 font-medium dark:bg-zinc-800" } else { "" })>
                             <RealmGlyph id=p.id.clone() />
                             <span class="min-w-0 flex-1 truncate">{p.name.clone()}</span>
                             {(p.waiting > 0).then(|| view! { <span class="rounded-full bg-amber-500 px-1.5 text-[10px] font-semibold text-white" title="Waiting on you">{p.waiting}</span> })}
-                            {current.then(|| view! { <span class="text-muted">{crate::icons::check()}</span> })}
+                            {(current && !drawer).then(|| view! { <span class="text-muted">{crate::icons::check()}</span> })}
                         </a>
                     }
                 }).collect_view()}
@@ -552,19 +689,13 @@ fn versions() -> Versions {
     }
 }
 
-/// The mark, the name and the version, always whole.
+/// The mark and name, always whole. The separate build tag yields before links.
 #[component]
 fn Brand() -> impl IntoView {
-    let v = versions();
     view! {
         <Go to=View::Sessions class="mr-2 flex shrink-0 items-center gap-2 whitespace-nowrap">
             <span class="shrink-0" inner_html=MARK></span>
             <span class="hidden font-semibold tracking-tight sm:inline">"carbon6"</span>
-            {move || v.now.get().map(|full| view! {
-                <span class="hidden rounded bg-zinc-200/70 px-1.5 py-0.5 font-mono text-[10px] text-zinc-600 sm:inline dark:bg-zinc-800 dark:text-zinc-400" title=format!("carbon6 {full}")>
-                    {short_version(&full)}
-                </span>
-            })}
         </Go>
     }
 }

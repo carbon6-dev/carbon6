@@ -35,7 +35,9 @@ pub const SETTING: &str = "work";
 pub const ROUTE_LABEL: &str = "task:work";
 const MAX_TITLE: usize = 200;
 const MAX_ATTACHED: usize = 200;
-const MAX_TODOS: usize = 50;
+const MAX_OPEN_TODOS: usize = 50;
+/// Bounds the live checklist, including ticked entries; work bypasses the generic record-size limit.
+const MAX_TOTAL_TODOS: usize = 500;
 const MAX_TODO_TEXT: usize = 300;
 const MAX_TODO_PROMPT: usize = 20_000;
 /// What a note's model call reads at most (about 8,000 tokens).
@@ -667,6 +669,7 @@ pub async fn merge(st: &HeadState, id: &str, from: &str, caller: &Caller) -> any
         return Err(bad_request("work merges only within a realm"));
     }
     modify(st, id, &crate::agent_ops::by("you"), None, |f| {
+        check_todo_capacity(f, other.fields.todos.iter().filter(|t| t.done_at.is_none()).count(), other.fields.todos.len())?;
         let new: Vec<Attached> =
             other.fields.attached.iter().filter(|a| !f.attached.iter().any(|x| x.reference == a.reference)).cloned().collect();
         f.attached.extend(new);
@@ -716,14 +719,29 @@ fn check_todo_prompt(p: &str) -> anyhow::Result<String> {
     Ok(p.to_owned())
 }
 
+/// Checks only increases, so legacy over-limit lists can still be edited or reduced.
+/// For existing work, call inside modify's writer lock, before changing the checklist.
+fn check_todo_capacity(f: &WorkFields, added_open: usize, added_total: usize) -> anyhow::Result<()> {
+    if added_total > 0 && f.todos.len() + added_total > MAX_TOTAL_TODOS {
+        return Err(bad_request(format!(
+            "A work item can have at most {MAX_TOTAL_TODOS} to-dos in total, including ticked ones. \
+             Remove old to-dos or choose another work item."
+        )));
+    }
+    if added_open > 0 && f.todos.iter().filter(|t| t.done_at.is_none()).count() + added_open > MAX_OPEN_TODOS {
+        return Err(bad_request(format!(
+            "A work item can have at most {MAX_OPEN_TODOS} open to-dos. Tick off or remove open to-dos, or choose another work item."
+        )));
+    }
+    Ok(())
+}
+
 /// Adds a to-do; one with the same text still open is that one.
 fn add_todo_to(f: &mut WorkFields, t: Todo) -> anyhow::Result<bool> {
     if f.todos.iter().any(|x| x.done_at.is_none() && x.text.eq_ignore_ascii_case(&t.text)) {
         return Ok(false);
     }
-    if f.todos.len() >= MAX_TODOS {
-        return Err(bad_request(format!("a piece of work holds at most {MAX_TODOS} to-dos")));
-    }
+    check_todo_capacity(f, usize::from(t.done_at.is_none()), 1)?;
     f.todos.push(t);
     f.moved_at = now_ms();
     Ok(true)
@@ -761,6 +779,9 @@ pub async fn todo_edit(st: &HeadState, id: &str, todo: &str, p: &TodoPatch, call
     let prompt = p.prompt.as_deref().map(check_todo_prompt).transpose()?;
     let mut ticked = false;
     modify(st, id, &crate::agent_ops::by("you"), None, |f| {
+        if p.done == Some(false) && todo_mut(f, todo)?.done_at.is_some() {
+            check_todo_capacity(f, 1, 0)?;
+        }
         let t = todo_mut(f, todo)?;
         if let Some(text) = text {
             t.text = text;
@@ -958,7 +979,9 @@ async fn live_of(st: &HeadState, realm: &str, a: &Attached, requests: &HashMap<(
         match crate::docs::title_of(st, realm, id).await {
             Some((title, _, at)) => {
                 // An agent answered a comment on it: your move.
-                if crate::docs::comments::answered(st, realm, id).await > 0 {
+                if crate::docs::archived_at(st, realm, id).await.is_some() {
+                    l.state = "archived".into();
+                } else if crate::docs::comments::answered(st, realm, id).await > 0 {
                     l.state = "needs_you".into();
                 }
                 l.title = title;
@@ -1189,10 +1212,17 @@ pub async fn on_new_session(st: &HeadState, s: &api::Session, work: Option<&str>
 
 /// A task card kept as a to-do (docs/task-cards.md §4.1): added to the
 /// work its session belongs to (`into_session_work`), else to new work
-/// named after it. An explicit target must be open and in the card's realm
+/// named after it (or with the explicitly confirmed `new_title`). An explicit
+/// target must be open and in the card's realm
 /// (the answer endpoint already checks the caller can see that realm).
 /// Returns the work item's id.
-pub async fn keep_todo(st: &HeadState, d: &api::Decision, into_session_work: bool, destination: Option<&str>) -> anyhow::Result<String> {
+pub async fn keep_todo(
+    st: &HeadState,
+    d: &api::Decision,
+    into_session_work: bool,
+    destination: Option<&str>,
+    new_title: Option<&str>,
+) -> anyhow::Result<String> {
     let origin = d.context["session"].as_str().unwrap_or("").to_owned();
     let mut target = match destination {
         Some(id) => {
@@ -1230,7 +1260,7 @@ pub async fn keep_todo(st: &HeadState, d: &api::Decision, into_session_work: boo
             id
         }
         None => {
-            let mut f = WorkFields { title: check_title(&d.title)?, status: "open".into(), ..Default::default() };
+            let mut f = WorkFields { title: check_title(new_title.unwrap_or(&d.title))?, status: "open".into(), ..Default::default() };
             add_todo_to(&mut f, todo)?;
             insert(st, &d.realm, &f, &[], &crate::agent_ops::by("you")).await?
         }
@@ -1794,7 +1824,7 @@ pub async fn propose(st: &HeadState, caller: &Caller) -> anyhow::Result<Vec<Work
         let title: String = s.get("title");
         let first = st
             .store
-            .events_after(&id, 0, 20)
+            .effective_events(&id)
             .await
             .unwrap_or_default()
             .into_iter()
@@ -2147,6 +2177,64 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn note_evidence_excludes_withdrawn_exchanges() {
+        let (_dir, head, _mock, id) = routing_fixture().await;
+        let st = &head.state;
+        let events = crate::store::tests::rewind_history();
+        crate::store::tests::insert_events(&st.store, "session", &events).await;
+        sqlx::query("UPDATE sessions SET last_seq = ? WHERE id = 'session'")
+            .bind(events.last().unwrap().seq as i64)
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+        let item = get(st, &id, &Caller::root()).await.unwrap();
+        let evidence = described(st, &item).await.unwrap();
+        assert!(evidence.contains("KEEP original user question"), "{evidence}");
+        assert!(evidence.contains("KEEP_REPLACEMENT_ANSWER"), "{evidence}");
+        assert!(!evidence.contains("PRIVATE"), "{evidence}");
+        assert!(!evidence.contains("DROP"), "{evidence}");
+        assert_eq!(st.store.events_after("session", 0, i64::MAX).await.unwrap(), events);
+        head.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn proposals_read_the_first_effective_message_after_the_raw_prefix() {
+        use c6_proto::{SessionEvent, session_event::Kind};
+        let (_dir, head, mock, _id) = routing_fixture().await;
+        let st = &head.state;
+        let mut events = crate::store::tests::rewind_history();
+        events.extend([
+            SessionEvent { seq: 20, kind: Some(Kind::Notice(Default::default())), ..Default::default() },
+            SessionEvent {
+                seq: 21,
+                kind: Some(Kind::Rewound(c6_proto::Rewound { to_seq: 2, ..Default::default() })),
+                ..Default::default()
+            },
+            SessionEvent {
+                seq: 22,
+                kind: Some(Kind::User(c6_proto::UserMessage { text: "CURRENT_FIRST_MESSAGE".into(), ..Default::default() })),
+                ..Default::default()
+            },
+        ]);
+        crate::store::tests::insert_events(&st.store, "session", &events).await;
+        // Root keeps no memex requests; only the session contributes here.
+        sqlx::query("UPDATE sessions SET realm = ?, updated_at = ? WHERE id = 'session'")
+            .bind(crate::realms::ROOT)
+            .bind(now_ms())
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+        note_routes(st, &[(ROUTE_LABEL, "small")]).await;
+        mock.push(c6_testkit::Reply::Text(json!({"work": []}).to_string()));
+        assert!(propose(st, &Caller::in_realm(crate::realms::ROOT)).await.unwrap().is_empty());
+        let request = mock.requests().last().unwrap()["messages"].to_string();
+        assert!(request.contains("CURRENT_FIRST_MESSAGE"), "{request}");
+        assert!(!request.contains("KEEP original"), "{request}");
+        assert!(!request.contains("PRIVATE"), "{request}");
+        head.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn note_suggest_fallback_accepts_shared_task_rules_and_skips_unaskable_choices() {
         let (_dir, head, mock, _id) = routing_fixture().await;
         let st = &head.state;
@@ -2209,6 +2297,90 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn task_card_new_work_name_is_structured_validated_and_optional() {
+        let (_dir, head, _mock, original) = routing_fixture().await;
+        let st = &head.state;
+        let card_title = "Review \"quoted\" cards: \\ <config> & 日本語";
+        let card = crate::decisions::task_card(
+            st,
+            "session",
+            "task_propose",
+            &json!({"title": card_title, "prompt": "Review the config safely."}),
+        )
+        .await
+        .unwrap();
+        let id = card["id"].as_i64().unwrap();
+        let url = format!("http://127.0.0.1:{}/api/v1/decisions/{id}/answer", head.ui_addrs[0].port());
+        let http = reqwest::Client::new();
+        let initial = rows(st, Some(crate::realms::HOME), false).await.unwrap().len();
+        for value in [json!(null), json!(false), json!({"title": "bad"}), json!("  "), json!("x".repeat(MAX_TITLE + 1))] {
+            let response =
+                http.post(&url).json(&json!({"option": "Add as new work", "values": {"work_title": value}})).send().await.unwrap();
+            assert!(response.status().is_client_error(), "{}", response.text().await.unwrap());
+            assert_eq!(crate::decisions::get(st, id).await.unwrap().unwrap().state, "open");
+            assert_eq!(rows(st, Some(crate::realms::HOME), false).await.unwrap().len(), initial);
+        }
+        // This reserved field is accepted only for task-card New work.
+        let response =
+            http.post(&url).json(&json!({"option": "Add to this work", "values": {"work_title": "not allowed"}})).send().await.unwrap();
+        assert!(response.status().is_client_error());
+        let name = "My \"work\": \\ <script> & 日本語\nsecond line";
+        let response = http.post(&url).json(&json!({"option": "Add as new work", "values": {"work_title": name}})).send().await.unwrap();
+        assert!(response.status().is_success(), "{}", response.text().await.unwrap());
+        let saved = rows(st, Some(crate::realms::HOME), false).await.unwrap().into_iter().find(|w| w.fields.title == name).unwrap();
+        assert_eq!(saved.fields.todos.len(), 1);
+        let todo = &saved.fields.todos[0];
+        assert_eq!(todo.text, card_title, "the work name must not rename the selected card's to-do");
+        assert_eq!(todo.prompt, "Review the config safely.");
+        assert_eq!(todo.origin, "session");
+        assert_eq!(todo.from, format!("decision:{id}"));
+        assert!(load(st, &original).await.unwrap().unwrap().fields.todos.is_empty());
+        let answered = crate::decisions::get(st, id).await.unwrap().unwrap();
+        assert_eq!(answered.answer.unwrap()["values"]["work_title"], name);
+
+        // Old clients retain the existing option and card-title fallback.
+        let card = crate::decisions::task_card(st, "session", "task_propose", &json!({"title": "Legacy card", "prompt": "Keep it"}))
+            .await
+            .unwrap();
+        crate::decisions::answer(
+            st,
+            card["id"].as_i64().unwrap(),
+            &api::DecisionAnswer { option: Some(crate::decisions::TASK_TO_NEW_WORK.into()), ..Default::default() },
+            "test",
+        )
+        .await
+        .unwrap();
+        assert!(rows(st, Some(crate::realms::HOME), false).await.unwrap().iter().any(|w| w.fields.title == "Legacy card"));
+        let question = crate::decisions::open(
+            st,
+            &api::DecisionIn {
+                title: "Not a task".into(),
+                options: vec![api::DecisionOption { label: crate::decisions::TASK_TO_NEW_WORK.into(), ..Default::default() }],
+                ..Default::default()
+            },
+            crate::realms::HOME,
+            "",
+        )
+        .await
+        .unwrap();
+        assert!(
+            crate::decisions::answer(
+                st,
+                question.id,
+                &api::DecisionAnswer {
+                    option: Some(crate::decisions::TASK_TO_NEW_WORK.into()),
+                    values: serde_json::from_value(json!({"work_title": name})).unwrap(),
+                    ..Default::default()
+                },
+                "test"
+            )
+            .await
+            .is_err()
+        );
+        head.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn task_card_saves_elsewhere_only_to_open_work_in_its_realm() {
         let (_dir, head, _mock, original) = routing_fixture().await;
         let st = &head.state;
@@ -2265,6 +2437,169 @@ pub(crate) mod tests {
         )
         .await;
         assert!(result.is_err());
+        head.shutdown().await.unwrap();
+    }
+
+    fn todo_list(open: usize, done: usize) -> WorkFields {
+        let todos = (0..open + done)
+            .map(|i| {
+                let mut t = new_todo(&format!("Step {i}"), "", "you").unwrap();
+                if i >= open {
+                    tick(&mut t, true, "session:test", "Verified");
+                }
+                t
+            })
+            .collect();
+        WorkFields { title: "Checklist".into(), status: "open".into(), todos, ..Default::default() }
+    }
+
+    #[test]
+    fn todo_limit_counts_open_not_ticked_entries() {
+        let mut f = todo_list(49, 60);
+        let completed = f.todos[49..].to_vec();
+        assert!(add_todo_to(&mut f, new_todo("Next step", "", "you").unwrap()).unwrap());
+        assert_eq!(&f.todos[49..109], completed);
+        assert!(!add_todo_to(&mut f, new_todo("next STEP", "", "you").unwrap()).unwrap(), "duplicates need no slot");
+        let before = f.clone();
+        let error = add_todo_to(&mut f, new_todo("One too many", "", "you").unwrap()).unwrap_err().to_string();
+        assert_eq!(error, "A work item can have at most 50 open to-dos. Tick off or remove open to-dos, or choose another work item.");
+        assert_eq!(f, before);
+    }
+
+    #[test]
+    fn todo_total_ceiling_retains_history_and_allows_removal() {
+        let mut f = todo_list(0, 499);
+        assert!(add_todo_to(&mut f, new_todo("Next step", "", "you").unwrap()).unwrap());
+        assert!(!add_todo_to(&mut f, new_todo("Next step", "", "you").unwrap()).unwrap());
+        let before = f.clone();
+        let error = add_todo_to(&mut f, new_todo("One too many", "", "you").unwrap()).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "A work item can have at most 500 to-dos in total, including ticked ones. Remove old to-dos or choose another work item."
+        );
+        assert_eq!(f, before);
+        f.todos.remove(0);
+        assert!(add_todo_to(&mut f, new_todo("One too many", "", "you").unwrap()).unwrap());
+    }
+
+    #[tokio::test]
+    async fn todo_reopen_checks_open_capacity_without_changing_history() {
+        let (_dir, head, _mock, _) = routing_fixture().await;
+        let st = &head.state;
+        let fields = todo_list(50, 1);
+        let todo = fields.todos.last().unwrap().id.clone();
+        let id = insert(st, crate::realms::HOME, &fields, &[], "you").await.unwrap();
+        let before = load(st, &id).await.unwrap().unwrap();
+        let patch = TodoPatch { done: Some(false), text: Some("Changed while reopening".into()), ..Default::default() };
+        let error = todo_edit(st, &id, &todo, &patch, &Caller::root()).await.map(|_| ()).unwrap_err().to_string();
+        assert_eq!(error, "A work item can have at most 50 open to-dos. Tick off or remove open to-dos, or choose another work item.");
+        let after = load(st, &id).await.unwrap().unwrap();
+        assert_eq!((after.fields, after.version), (before.fields, before.version));
+
+        // Editing an existing open entry (including done:false) needs no slot.
+        let first = &fields.todos[0].id;
+        todo_edit(st, &id, first, &TodoPatch { done: Some(false), ..Default::default() }, &Caller::root()).await.unwrap();
+        todo_edit(st, &id, first, &TodoPatch { done: Some(true), ..Default::default() }, &Caller::root()).await.unwrap();
+        let reopened = todo_edit(st, &id, &todo, &patch, &Caller::root()).await.unwrap();
+        let t = reopened.fields.todos.last().unwrap();
+        assert_eq!(t.text, "Changed while reopening");
+        assert!(t.done_at.is_none() && t.done_by.is_empty() && t.evidence.is_empty());
+        assert_eq!(reopened.fields.todos.iter().filter(|t| t.done_at.is_none()).count(), 50);
+
+        // Reopening does not add history, even at the total ceiling.
+        let history = todo_list(0, 500);
+        let id = insert(st, crate::realms::HOME, &history, &[], "you").await.unwrap();
+        let reopened = todo_edit(st, &id, &history.todos[0].id, &TodoPatch { done: Some(false), ..Default::default() }, &Caller::root())
+            .await
+            .unwrap();
+        assert_eq!(reopened.fields.todos.len(), 500);
+        assert!(reopened.fields.todos[0].done_at.is_none());
+        head.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn todo_merge_enforces_open_and_total_limits_without_losing_either_work() {
+        let (_dir, head, _mock, _) = routing_fixture().await;
+        let st = &head.state;
+        for (left, right, succeeds, reason) in [
+            (todo_list(25, 30), todo_list(25, 30), true, ""),
+            (todo_list(26, 0), todo_list(25, 0), false, "50 open to-dos"),
+            (todo_list(0, 250), todo_list(0, 250), true, ""),
+            (todo_list(0, 250), todo_list(0, 251), false, "500 to-dos in total"),
+        ] {
+            let into = insert(st, crate::realms::HOME, &left, &[], "you").await.unwrap();
+            let from = insert(st, crate::realms::HOME, &right, &[], "you").await.unwrap();
+            let result = merge(st, &into, &from, &Caller::root()).await;
+            if succeeds {
+                let merged = result.unwrap();
+                let expected: Vec<_> = left.todos.into_iter().chain(right.todos).collect();
+                assert_eq!(merged.fields.todos, expected, "preserve completed entries and same-text entries with distinct ids");
+                assert!(load(st, &from).await.unwrap().is_none());
+            } else {
+                let error = result.map(|_| ()).unwrap_err().to_string();
+                assert!(error.contains(reason), "{error}");
+                for (id, fields) in [(&into, left), (&from, right)] {
+                    let saved = load(st, id).await.unwrap().unwrap();
+                    assert_eq!((saved.fields, saved.version), (fields, 1));
+                }
+            }
+        }
+        head.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn todo_task_card_accepts_fifteen_open_and_thirty_five_ticked() {
+        let (_dir, head, _mock, _) = routing_fixture().await;
+        let st = &head.state;
+        let fields = todo_list(15, 35);
+        let work = insert(st, crate::realms::HOME, &fields, &[], "you").await.unwrap();
+        let card = crate::decisions::task_card(st, "session", "task_propose", &json!({"title": "Next step", "prompt": "Check next step"}))
+            .await
+            .unwrap();
+        let id = card["id"].as_i64().unwrap();
+        let url = format!("http://{}/api/v1/decisions/{id}/answer", head.ui_addrs[0]);
+        let response = reqwest::Client::new().post(&url).json(&json!({"option": format!("Add to work:{work}")})).send().await.unwrap();
+        assert!(response.status().is_success(), "{}", response.text().await.unwrap());
+        let saved = load(st, &work).await.unwrap().unwrap();
+        assert_eq!(&saved.fields.todos[..50], fields.todos);
+        assert_eq!(saved.fields.todos.len(), 51);
+        assert_eq!(saved.fields.todos.iter().filter(|t| t.done_at.is_none()).count(), 16);
+        assert_eq!(crate::decisions::get(st, id).await.unwrap().unwrap().state, "answered");
+        head.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn todo_task_card_limit_is_actionable_and_leaves_card_open() {
+        let (_dir, head, _mock, _) = routing_fixture().await;
+        let st = &head.state;
+        let fields = todo_list(50, 0);
+        let work = insert(st, crate::realms::HOME, &fields, &[], "you").await.unwrap();
+        let card = crate::decisions::task_card(st, "session", "task_propose", &json!({"title": "Next step", "prompt": "Check next step"}))
+            .await
+            .unwrap();
+        let id = card["id"].as_i64().unwrap();
+        let http = reqwest::Client::new();
+        let url = format!("http://{}/api/v1/decisions/{id}/answer", head.ui_addrs[0]);
+        let answer = json!({"option": format!("Add to work:{work}")});
+        let response = http.post(&url).json(&answer).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.json::<api::ApiError>().await.unwrap().error,
+            "A work item can have at most 50 open to-dos. Tick off or remove open to-dos, or choose another work item."
+        );
+        assert_eq!(crate::decisions::get(st, id).await.unwrap().unwrap().state, "open");
+        assert_eq!(load(st, &work).await.unwrap().unwrap().fields, fields);
+
+        // Once there is a slot, the same card can be saved with its provenance intact.
+        todo_edit(st, &work, &fields.todos[0].id, &TodoPatch { done: Some(true), ..Default::default() }, &Caller::root()).await.unwrap();
+        let response = http.post(&url).json(&answer).send().await.unwrap();
+        assert!(response.status().is_success(), "{}", response.text().await.unwrap());
+        let saved = load(st, &work).await.unwrap().unwrap();
+        assert_eq!(saved.fields.todos.len(), 51);
+        let t = saved.fields.todos.last().unwrap();
+        assert_eq!((t.text.as_str(), t.prompt.as_str(), t.origin.as_str()), ("Next step", "Check next step", "session"));
+        assert_eq!(t.from, format!("decision:{id}"));
+        assert_eq!(crate::decisions::get(st, id).await.unwrap().unwrap().state, "answered");
         head.shutdown().await.unwrap();
     }
 

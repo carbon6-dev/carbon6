@@ -2,6 +2,8 @@
 #
 # docker-* targets need only Docker (with buildx); everything else needs a
 # local Rust toolchain with the wasm32-unknown-unknown target and Trunk.
+# Browser tests additionally use Node 24/npm; ui-browser-install provisions
+# their locked JS dependency, matching browsers and OS libraries.
 
 .DEFAULT_GOAL := help
 SHELL := /bin/bash
@@ -50,7 +52,7 @@ DEB_ARGS      = --build-arg UBUNTU=$(UBUNTU) --build-arg DEB_VERSION=$(DEB_VERSI
 
 .PHONY: help docker-build docker-build-all docker-test docker-lint-image docker-check docker-fmt docker-images docker-head docker-head-stop docker-token docker-login-link \
         docker-deb docker-deb-all docker-deb-test deb deb-test deb-smoke brew-dist brew brew-install brew-test release release-notes \
-        ui build print-version test test-under-load check dev-head dev-token dev-login-link dev-worker clean \
+        ui ui-browser-install ui-browser-test ui-browser-quick ui-browser-perf build print-version test test-under-load check dev-head dev-token dev-login-link dev-worker clean \
         site site-serve site-check site-publish
 
 help: ## Show this help
@@ -165,6 +167,19 @@ release-notes: ## Print the CHANGELOG.md section the next release would add
 ui: ## Build the web UI into crates/c6-ui/dist (embedded into c6h)
 	cd crates/c6-ui && trunk build --release
 
+ui-browser-install: ## Install locked browser-test dependencies, matching Chromium/WebKit and OS libraries (Linux needs sudo)
+	npm ci --prefix crates/c6-ui/tests
+	node crates/c6-ui/tests/node_modules/playwright-core/cli.js install --with-deps chromium webkit
+
+ui-browser-test: ## Test the built production UI in parallel Chromium/WebKit (representative regression matrix; BROWSER_MATRIX=all is exhaustive)
+	bash scripts/ui-browser-tests.sh
+
+ui-browser-quick: ## Everyday browser smoke: workspace, motion, lists, Markdown and transcript press/timestamps/Latest in both engines
+	BROWSER_TIER=quick bash scripts/ui-browser-tests.sh
+
+ui-browser-perf: ## Exclusive Chromium ring profiling, animation frames, paint traces and CPU-throttled measurements
+	BROWSER_TIER=perf bash scripts/ui-browser-tests.sh
+
 build: ui ## Build release binaries (c6h, c6w, c6) into target/release, knowing their exact version (C6_BUILD_VERSION: the release, or <release>+git<commit time>.<commit> between releases)
 	C6_BUILD_VERSION=$(DEB_VERSION) cargo build --release --locked -p c6h -p c6w -p c6
 
@@ -178,7 +193,8 @@ test: ## Run the test suite: every test at once with cargo nextest when it's ins
 test-under-load: ## Run the test suite with every CPU core kept busy (RUNS=1; NEXTEST=1 for cargo nextest); it must pass as it does otherwise (docs/testing.md)
 	NEXTEST=$(NEXTEST) scripts/test-under-load.sh $(or $(RUNS),1)
 
-check: ## Check formatting (cargo fmt), clippy every target (libraries, binaries, tests, examples; the web UI for wasm), fail on any warning, and lint the tests (docs/testing.md)
+check: ## Check formatting, clippy every target (including wasm), lint tests and ratchet built UI size (docs/testing.md)
+	@python3 scripts/check-session-tags.py --self-test
 	@cargo fmt --all --check || { echo "check: unformatted code; run cargo fmt --all" >&2; exit 1; }
 	@for args in "--workspace --all-targets" "-p c6-ui --target wasm32-unknown-unknown"; do \
 		if cargo clippy --locked $$args --message-format short 2>&1 | tee /dev/stderr | grep -vE '^warning: spurious network' | grep -qE '^(warning|error)'; then \
@@ -186,6 +202,7 @@ check: ## Check formatting (cargo fmt), clippy every target (libraries, binaries
 		fi; \
 	done; echo "check: no warnings"
 	@scripts/test-lint.sh
+	@scripts/ui-size.sh
 
 dev-head: ui ## Run the dev head on all interfaces (dev/c6h.toml; state in the standard data directory)
 	cargo run -p c6h -- --config dev/c6h.toml

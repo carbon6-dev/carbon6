@@ -39,6 +39,12 @@ const TOUCH_MS: i64 = 10 * 60 * 1000;
 /// The one user's WebAuthn user handle (stable per head).
 const USER_ID_KEY: &str = "auth.user_id";
 
+#[derive(Clone)]
+pub(crate) enum CachedAuth {
+    Session { expires_at: i64 },
+    Token(crate::realms::Caller),
+}
+
 /// Marks a request that arrived over TLS (set by the UI server).
 #[derive(Clone, Copy)]
 pub struct Tls;
@@ -210,12 +216,20 @@ impl Store {
     async fn check_auth_session(&self, token: &str) -> anyhow::Result<bool> {
         let hash = sha256_hex(token);
         let now = now_ms();
-        let row = sqlx::query("SELECT last_seen_at FROM auth_sessions WHERE token_hash = ? AND expires_at > ?")
+        let key = format!("session:{hash}");
+        let (generation, cached) = self.auth_cache.get(&key);
+        if let Some(CachedAuth::Session { expires_at }) = cached
+            && expires_at > now
+        {
+            return Ok(true);
+        }
+        let row = sqlx::query("SELECT last_seen_at, expires_at FROM auth_sessions WHERE token_hash = ? AND expires_at > ?")
             .bind(&hash)
             .bind(now)
             .fetch_optional(&self.pool)
             .await?;
         let Some(row) = row else { return Ok(false) };
+        let mut expires_at = row.get("expires_at");
         if now - row.get::<i64, _>("last_seen_at") > TOUCH_MS {
             sqlx::query("UPDATE auth_sessions SET last_seen_at = ?, expires_at = ? WHERE token_hash = ?")
                 .bind(now)
@@ -223,7 +237,9 @@ impl Store {
                 .bind(&hash)
                 .execute(&self.pool)
                 .await?;
+            expires_at = now + SESSION_MS;
         }
+        self.auth_cache.insert(generation, key, CachedAuth::Session { expires_at });
         Ok(true)
     }
 
@@ -255,6 +271,11 @@ impl Store {
     /// Who a token speaks for: `None` if it is not a valid token.
     async fn check_api_token(&self, token: &str) -> anyhow::Result<Option<crate::realms::Caller>> {
         let hash = sha256_hex(token);
+        let key = format!("token:{hash}");
+        let (generation, cached) = self.auth_cache.get(&key);
+        if let Some(CachedAuth::Token(caller)) = cached {
+            return Ok(Some(caller));
+        }
         let now = now_ms();
         let Some(row) = sqlx::query("SELECT last_used_at, realm, name FROM api_tokens WHERE token_hash = ?")
             .bind(&hash)
@@ -266,7 +287,9 @@ impl Store {
         if now - row.get::<Option<i64>, _>("last_used_at").unwrap_or(0) > TOUCH_MS {
             sqlx::query("UPDATE api_tokens SET last_used_at = ? WHERE token_hash = ?").bind(now).bind(&hash).execute(&self.pool).await?;
         }
-        Ok(Some(crate::realms::Caller { realm: row.get("realm"), api_token_name: Some(row.get("name")), ..Default::default() }))
+        let caller = crate::realms::Caller { realm: row.get("realm"), api_token_name: Some(row.get("name")), ..Default::default() };
+        self.auth_cache.insert(generation, key, CachedAuth::Token(caller.clone()));
+        Ok(Some(caller))
     }
 
     async fn api_tokens(&self) -> anyhow::Result<Vec<api::ApiToken>> {
@@ -287,8 +310,27 @@ impl Store {
     }
 
     async fn delete_auth_session(&self, id_prefix: &str) -> anyhow::Result<()> {
-        sqlx::query("DELETE FROM auth_sessions WHERE substr(token_hash, 1, 16) = ?").bind(id_prefix).execute(&self.pool).await?;
-        Ok(())
+        let store = self.clone();
+        let id_prefix = id_prefix.to_owned();
+        // SQLite can finish a queued statement after its caller is dropped
+        // (for example an HTTP/2 stream reset). Keep invalidation with it.
+        tokio::spawn(async move {
+            sqlx::query("DELETE FROM auth_sessions WHERE substr(token_hash, 1, 16) = ?").bind(id_prefix).execute(&store.pool).await?;
+            store.auth_cache.invalidate();
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?
+    }
+
+    async fn delete_api_token(&self, id: &str) -> anyhow::Result<()> {
+        let store = self.clone();
+        let id = id.to_owned();
+        tokio::spawn(async move {
+            sqlx::query("DELETE FROM api_tokens WHERE id = ?").bind(id).execute(&store.pool).await?;
+            store.auth_cache.invalidate();
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?
     }
 
     async fn auth_sessions(&self) -> anyhow::Result<Vec<(String, api::AuthSession)>> {
@@ -361,12 +403,18 @@ pub async fn require(State(st): State<Arc<HeadState>>, mut req: Request, next: N
     // The head calling itself (the assistant, as you), within the realm
     // its conversation works in: there, as that realm's token would.
     if let Some(call) = req.extensions().get::<crate::assistant::InternalCall>().cloned() {
-        if let Some(realm) = call.realm {
-            let caller = Caller { console: call.console, ..Caller::in_realm(&realm) };
-            if let Err((status, error)) = crate::realms::admit(&st, &caller, req.method(), req.uri().path()).await {
-                return (status, Json(api::ApiError { error })).into_response();
-            }
-            req.extensions_mut().insert(caller);
+        let caller = call.caller;
+        // Forwarding a token through the catalog is not browser sign-in.
+        // Keep the same account-management restriction as direct API calls.
+        if caller.api_token_name.is_some() && req.uri().path().starts_with("/api/v1/auth/") && !PUBLIC.contains(&req.uri().path()) {
+            return (StatusCode::UNAUTHORIZED, Json(api::ApiError { error: "invalid API token".into() })).into_response();
+        }
+        if let Err((status, error)) = crate::realms::admit(&st, &caller, req.method(), req.uri().path()).await {
+            return (status, Json(api::ApiError { error })).into_response();
+        }
+        let realm = caller.realm.clone();
+        req.extensions_mut().insert(caller);
+        if let Some(realm) = realm {
             // Its settings are the realm's own, as a realm's page's are.
             return crate::store::SETTINGS_REALM.scope(realm, next.run(req)).await;
         }
@@ -414,12 +462,6 @@ pub async fn require(State(st): State<Arc<HeadState>>, mut req: Request, next: N
         }
     }
     let place = browser_place(&req);
-    if !st.auth.required {
-        return match place {
-            Some(place) => in_place(&st, place, req, next).await,
-            None => next.run(req).await,
-        };
-    }
     let ok = match cookie_token(req.headers()) {
         Some(t) => st.store.check_auth_session(&t).await.unwrap_or_else(|e| {
             tracing::warn!("checking session: {e:#}");
@@ -427,11 +469,17 @@ pub async fn require(State(st): State<Arc<HeadState>>, mut req: Request, next: N
         }),
         None => false,
     };
+    if !st.auth.required {
+        return match place {
+            Some(place) => in_place(&st, place, ok, req, next).await,
+            None => next.run(req).await,
+        };
+    }
     if !ok {
         return (StatusCode::UNAUTHORIZED, Json(api::ApiError { error: "sign in required".into() })).into_response();
     }
     match place {
-        Some(place) => in_place(&st, place, req, next).await,
+        Some(place) => in_place(&st, place, ok, req, next).await,
         // A page that doesn't say where it is gets nothing but this
         // browser's own business: a mistake fails closed.
         None if crate::catalog::route_scope(req.method().as_str(), &path) == crate::catalog::Scope::Device => next.run(req).await,
@@ -456,10 +504,10 @@ fn browser_place(req: &Request) -> Option<String> {
 /// Runs a browser's request where it comes from: the console as root, a
 /// realm's page as that realm (like its API token), with its settings
 /// lists being the realm's own.
-async fn in_place(st: &Arc<HeadState>, place: String, mut req: Request, next: Next) -> Response {
+async fn in_place(st: &Arc<HeadState>, place: String, authenticated_browser: bool, mut req: Request, next: Next) -> Response {
     use crate::realms::Caller;
     if place == ADMIN_PLACE {
-        req.extensions_mut().insert(Caller { browser: true, ..Caller::root() });
+        req.extensions_mut().insert(Caller { browser: true, authenticated_browser, ..Caller::root() });
         return next.run(req).await;
     }
     let refuse = |status: StatusCode, error: String| (status, Json(api::ApiError { error })).into_response();
@@ -468,7 +516,7 @@ async fn in_place(st: &Arc<HeadState>, place: String, mut req: Request, next: Ne
         Ok(_) => return refuse(StatusCode::BAD_REQUEST, format!("no realm {place:?}")),
         Err(e) => return refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
-    let caller = Caller { browser: true, ..Caller::in_realm(&place) };
+    let caller = Caller { browser: true, authenticated_browser, ..Caller::in_realm(&place) };
     if let Err((status, error)) = crate::realms::admit(st, &caller, req.method(), req.uri().path()).await {
         return refuse(status, error);
     }
@@ -799,7 +847,7 @@ async fn create_token(State(st): State<Arc<HeadState>>, Json(req): Json<api::Cre
 }
 
 async fn delete_token(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> Res<StatusCode> {
-    sqlx::query("DELETE FROM api_tokens WHERE id = ?").bind(&id).execute(&st.store.pool).await.map_err(anyhow::Error::from)?;
+    st.store.delete_api_token(&id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -809,6 +857,130 @@ mod tests {
     use serde_json::{Value, json};
 
     use crate::webauthn::{self, tests::SoftKey};
+
+    #[tokio::test]
+    async fn brief_auth_cache_hits_keep_scope_and_revocations_are_shared_by_store_clones() {
+        use super::*;
+        use futures::FutureExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("head.db")).await.unwrap();
+        let clone = store.clone();
+        let session = store.create_auth_session("link", None).await.unwrap();
+        let root = store.create_api_token("root", None).await.unwrap();
+        let scoped = store.create_api_token("lab", Some("lab")).await.unwrap();
+        let root_secret = root.token.as_deref().unwrap();
+        let scoped_secret = scoped.token.as_deref().unwrap();
+        assert!(store.check_auth_session(&session).await.unwrap());
+        let session_key = format!("session:{}", sha256_hex(&session));
+        let session_loaded = store.auth_cache.get(&session_key).1.expect("a successful session check populates the cache");
+        let root_caller = store.check_api_token(root_secret).await.unwrap().unwrap();
+        assert!(root_caller.realm.is_none());
+        assert!(matches!(store.auth_cache.get(&format!("token:{}", sha256_hex(root_secret))).1, Some(CachedAuth::Token(_))));
+        let scoped_caller = store.check_api_token(scoped_secret).await.unwrap().unwrap();
+        assert_eq!(scoped_caller.realm.as_deref(), Some("lab"));
+        assert!(matches!(store.auth_cache.get(&format!("token:{}", sha256_hex(scoped_secret))).1, Some(CachedAuth::Token(_))));
+
+        // Exhaust the pool: warm checks must not perform a database read or
+        // touch write, and cached root/scoped callers must stay distinct.
+        let mut connections = Vec::new();
+        for _ in 0..8 {
+            connections.push(store.pool.acquire().await.unwrap());
+        }
+        // Refresh the entries synchronously after the async pool setup, so
+        // setup on a loaded runner cannot consume the product's short TTL.
+        let generation = store.auth_cache.get("").0;
+        store.auth_cache.insert(generation, session_key, session_loaded);
+        store.auth_cache.insert(generation, format!("token:{}", sha256_hex(root_secret)), CachedAuth::Token(root_caller));
+        store.auth_cache.insert(generation, format!("token:{}", sha256_hex(scoped_secret)), CachedAuth::Token(scoped_caller));
+        async {
+            assert!(clone.check_auth_session(&session).await.unwrap());
+            assert!(clone.check_api_token(root_secret).await.unwrap().unwrap().realm.is_none());
+            assert_eq!(clone.check_api_token(scoped_secret).await.unwrap().unwrap().realm.as_deref(), Some("lab"));
+        }
+        .now_or_never()
+        .expect("warm auth checks must not wait for a database connection");
+        drop(connections);
+
+        let key = format!("token:{}", sha256_hex(scoped_secret));
+        let (generation, loaded) = clone.auth_cache.get(&key);
+        store.delete_api_token(&scoped.id).await.unwrap();
+        clone.auth_cache.insert(generation, key, loaded.unwrap());
+        assert!(clone.check_api_token(scoped_secret).await.unwrap().is_none());
+        assert!(clone.check_api_token(root_secret).await.unwrap().is_some());
+        store.delete_auth_session(&sha256_hex(&session)[..16]).await.unwrap();
+        assert!(!clone.check_auth_session(&session).await.unwrap());
+        assert!(clone.auth_cache.get(&format!("session:{}", sha256_hex(&session))).1.is_none());
+        assert!(clone.auth_cache.get(&format!("token:{}", sha256_hex(scoped_secret))).1.is_none());
+    }
+
+    #[tokio::test]
+    async fn brief_session_cache_respects_expiry_and_still_touches_old_sessions() {
+        use super::*;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("head.db")).await.unwrap();
+        let session = store.create_auth_session("link", None).await.unwrap();
+        let hash = sha256_hex(&session);
+        sqlx::query("UPDATE auth_sessions SET last_seen_at = ?, expires_at = ? WHERE token_hash = ?")
+            .bind(now_ms() - TOUCH_MS - 1)
+            .bind(now_ms() + SESSION_MS / 2)
+            .bind(&hash)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let before = now_ms();
+        assert!(store.check_auth_session(&session).await.unwrap());
+        let expires: i64 = sqlx::query_scalar("SELECT expires_at FROM auth_sessions WHERE token_hash = ?")
+            .bind(&hash)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert!(expires >= before + SESSION_MS);
+
+        // A cached session's wall-clock expiry is checked even before the
+        // cache's monotonic TTL elapses; no sleeps are needed for this edge.
+        let key = format!("session:{hash}");
+        let generation = store.auth_cache.get(&key).0;
+        store.auth_cache.insert(generation, key, CachedAuth::Session { expires_at: now_ms() - 1 });
+        sqlx::query("UPDATE auth_sessions SET expires_at = 0 WHERE token_hash = ?").bind(&hash).execute(&store.pool).await.unwrap();
+        assert!(!store.check_auth_session(&session).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn brief_auth_cache_revocations_finish_invalidation_after_request_cancellation() {
+        use super::*;
+        use futures::FutureExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("head.db")).await.unwrap();
+        let token = store.create_api_token("revoked", None).await.unwrap();
+        let secret = token.token.as_deref().unwrap();
+        assert!(store.check_api_token(secret).await.unwrap().is_some());
+        let generation = store.auth_cache.get("").0;
+        let writer = store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        // Poll once to hand off the mutation, then drop the awaiting request.
+        // The writer lock ensures it cannot have completed before that drop.
+        assert!(store.delete_api_token(&token.id).now_or_never().is_none());
+        writer.commit().await.unwrap();
+        c6_testkit::eventually("cancelled token revocation invalidates its cache", async || {
+            (store.auth_cache.get("").0 != generation).then_some(())
+        })
+        .await;
+        assert!(store.check_api_token(secret).await.unwrap().is_none());
+
+        let session = store.create_auth_session("link", None).await.unwrap();
+        assert!(store.check_auth_session(&session).await.unwrap());
+        let generation = store.auth_cache.get("").0;
+        let writer = store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert!(store.delete_auth_session(&sha256_hex(&session)[..16]).now_or_never().is_none());
+        writer.commit().await.unwrap();
+        c6_testkit::eventually("cancelled browser revocation invalidates its cache", async || {
+            (store.auth_cache.get("").0 != generation).then_some(())
+        })
+        .await;
+        assert!(!store.check_auth_session(&session).await.unwrap());
+    }
 
     /// The session cookie a response set.
     fn cookie(r: &reqwest::Response) -> String {

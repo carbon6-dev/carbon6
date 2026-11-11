@@ -352,3 +352,115 @@ async fn a_realms_knowledge_scopes_reach_its_sessions() {
     assert!(!scope_of(&mine).await.contains(&"chat".to_owned()), "not another realm's");
     head.shutdown().await.unwrap();
 }
+
+/// An approved app kit, without building an image or running a container.
+async fn secret_kit(api: &Api) {
+    use base64::Engine;
+    use reqwest::Method as M;
+    api.ok(
+        M::POST,
+        "packages",
+        json!({"manifest": {"package": "scoped-kit", "version": "1.0.0",
+            "permissions": {"secrets": ["KIT_CREDENTIAL"]},
+            "kit": {"tools": [{"name": "run", "command": ["true"]}]}},
+            "files": {"Dockerfile": base64::engine::general_purpose::STANDARD.encode("FROM scratch\n")}}),
+    )
+    .await;
+    api.ok(
+        M::POST,
+        "packages",
+        json!({"manifest": {"package": "scoped-app", "version": "1.0.0", "requires": {"scoped-kit": "^1"},
+            "operations": [{"name": "run", "kit": {"kit": "scoped-kit", "tool": "run"}}]}}),
+    )
+    .await;
+    let install = api.ok(M::POST, "installs", json!({"package": "scoped-app"})).await;
+    api.ok(M::POST, &format!("decisions/{}/answer", install["decision"]), json!({"option": "Install"})).await;
+}
+
+async fn run_secret_kit(st: &HeadState) -> anyhow::Result<Value> {
+    c6_head::kitjobs::for_instance(st, "home", "scoped-app", "scoped-kit", "run", Default::default(), Default::default(), "test", &[], None)
+        .await
+}
+
+#[tokio::test]
+async fn kit_jobs_refuse_worker_scoped_secrets_on_the_head() {
+    let (head, _dir) = head().await;
+    let st = &head.state;
+    secret_kit(&Api::of(&head)).await;
+    let value = uuid::Uuid::now_v7().to_string();
+    st.store.put_secret("root", "KIT_CREDENTIAL", Some(st.secrets.encrypt(&value).unwrap()), "", &["worker:allowed".into()]).await.unwrap();
+    let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = called.clone();
+    let delivered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let received = delivered.clone();
+    c6_head::kitjobs::run_locally_in(
+        &st.data_dir,
+        "scoped-kit",
+        std::sync::Arc::new(move |run| {
+            seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            received.store(run.env.iter().any(|(name, _)| name == "KIT_CREDENTIAL"), std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(c6_head::kitjobs::Output { exit: Some(0), ..Default::default() }) })
+        }),
+    );
+    let result = run_secret_kit(st).await;
+    assert!(!delivered.load(std::sync::atomic::Ordering::SeqCst), "a worker-scoped credential reached the head's kit runner");
+    assert!(result.is_err(), "a worker-scoped secret must not reach a kit on the head");
+    assert!(result.unwrap_err().to_string().contains("not for this worker"));
+    assert!(!called.load(std::sync::atomic::Ordering::SeqCst), "refuse before invoking the kit");
+    st.store.put_secret("root", "KIT_CREDENTIAL", None, "", &[]).await.unwrap();
+    assert!(run_secret_kit(st).await.is_ok(), "unscoped secrets still work in a local kit");
+    assert!(called.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(delivered.load(std::sync::atomic::Ordering::SeqCst));
+    head.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn kit_jobs_apply_secret_scopes_to_the_selected_worker() {
+    let (head, _dir) = head().await;
+    let st = &head.state;
+    secret_kit(&Api::of(&head)).await;
+    let (allowed, other) = (worker(st, "allowed", &[]).await, worker(st, "other", &[]).await);
+    // The default target is the oldest connected worker, not the scoped one.
+    let (guard, mut inbox) = attach(st, other, 1, &["kits"]);
+    let (allowed_guard, mut allowed_inbox) = attach(st, allowed, 2, &["kits"]);
+    let value = uuid::Uuid::now_v7().to_string();
+    for (realm, scopes, permitted) in [
+        ("root", vec!["worker:allowed"], false),
+        ("root", vec!["worker:allowed", "worker:other"], true),
+        ("home", vec!["worker:allowed"], false),
+        ("home", vec!["worker:other"], true),
+        ("home", vec!["app:scoped-app"], true),
+        ("home", vec![], true),
+    ] {
+        let scopes = scopes.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        st.store.put_secret(realm, "KIT_CREDENTIAL", Some(st.secrets.encrypt(&value).unwrap()), "", &scopes).await.unwrap();
+        let run = run_secret_kit(st);
+        tokio::pin!(run);
+        let result = c6_testkit::within("the kit's scope check or RPC", async {
+            tokio::select! {
+                result = &mut run => result,
+                message = inbox.recv() => {
+                    let Some(head_msg::Msg::RpcRequest(request)) = message.unwrap().unwrap().msg else {
+                        panic!("expected a kit RPC");
+                    };
+                    assert_eq!(request.method, "kit.job");
+                    let params: Value = serde_json::from_slice(&request.params_json).unwrap();
+                    // Never print the environment or credential, even on a failure.
+                    assert!(params["env"].as_array().unwrap().iter().any(|e| e[0] == "KIT_CREDENTIAL" && e[1].as_str() == Some(&value)));
+                    guard.rpc_response(c6_proto::RpcResponse {
+                        id: request.id, result_json: br#"{"exit": 0}"#.to_vec(), error: String::new(),
+                    });
+                    run.await
+                }
+            }
+        })
+        .await;
+        assert_eq!(result.is_ok(), permitted, "kit delivery must obey worker scopes");
+        if !permitted {
+            assert!(result.unwrap_err().to_string().contains("not for this worker"));
+        }
+        assert!(allowed_inbox.try_recv().is_err(), "a refused job must not be moved to another worker");
+    }
+    drop((guard, allowed_guard));
+    head.shutdown().await.unwrap();
+}

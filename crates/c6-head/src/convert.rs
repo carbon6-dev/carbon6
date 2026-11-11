@@ -38,6 +38,29 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
             wake: u.wake,
             from_session_id: u.from_session_id.clone(),
             from_title: u.from_title.clone(),
+            origin: (if !u.from_session_id.is_empty() {
+                Some(api::MessageOrigin::Session)
+            } else if let Some(origin) = &u.api_origin {
+                Some(api::MessageOrigin::Api { token_name: origin.token_name.clone() })
+            } else if u.human_origin {
+                Some(api::MessageOrigin::Human)
+            } else if u.task_card_origin == c6_proto::TaskCardOrigin::Start as i32 {
+                Some(api::MessageOrigin::TaskCard)
+            } else if u.task_card_origin == c6_proto::TaskCardOrigin::Answer as i32 {
+                Some(api::MessageOrigin::TaskCardAnswer)
+            } else {
+                u.origin_recorded.then_some(api::MessageOrigin::Unknown)
+            })
+            .map(Box::new),
+            task_notice: u.task_notice.as_ref().map(|n| {
+                Box::new(api::TaskNotice {
+                    kind: n.kind.clone(),
+                    title: n.title.clone(),
+                    session_id: n.session_id.clone(),
+                    status: n.status.clone(),
+                    markdown: n.markdown.clone(),
+                })
+            }),
         },
         Kind::SubagentSpawned(s) => api::EventKind::SubagentSpawned {
             call_id: s.call_id.clone(),
@@ -72,6 +95,7 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
                             api::ContentBlock::Text { text: t.clone(), citations: api::citations::annotations(&b.annotations_json) }
                         }
                         content_block::Block::Thinking(t) => api::ContentBlock::Thinking { text: t.clone() },
+                        content_block::Block::Narration(t) => api::ContentBlock::Narration { text: t.clone() },
                         content_block::Block::ToolUse(u) => {
                             api::ContentBlock::ToolUse { id: u.id.clone(), name: u.name.clone(), input_json: u.input_json.clone() }
                         }
@@ -221,6 +245,7 @@ pub fn session(r: &SessionRow, head: Option<WorkerId>) -> api::Session {
             "failed" => api::SessionStatus::Failed,
             _ => api::SessionStatus::Starting,
         },
+        archived: r.archived != 0,
         error: r.error.clone(),
         effort: r.effort.clone(),
         parent_id: r.parent_id.clone(),
@@ -285,6 +310,76 @@ mod tests {
     use super::*;
 
     #[test]
+    fn message_origins_are_additive_and_missing_legacy_provenance_stays_absent() {
+        let cases = [
+            (c6_proto::UserMessage::default(), None),
+            (c6_proto::UserMessage { origin_recorded: true, ..Default::default() }, Some(api::MessageOrigin::Unknown)),
+            (
+                c6_proto::UserMessage { task_card_origin: c6_proto::TaskCardOrigin::Start as i32, ..Default::default() },
+                Some(api::MessageOrigin::TaskCard),
+            ),
+            (
+                c6_proto::UserMessage { task_card_origin: c6_proto::TaskCardOrigin::Answer as i32, ..Default::default() },
+                Some(api::MessageOrigin::TaskCardAnswer),
+            ),
+            (
+                c6_proto::UserMessage { command: "card-answer".into(), origin_recorded: true, ..Default::default() },
+                Some(api::MessageOrigin::Unknown),
+            ),
+            (c6_proto::UserMessage { human_origin: true, ..Default::default() }, Some(api::MessageOrigin::Human)),
+            (
+                c6_proto::UserMessage {
+                    api_origin: Some(c6_proto::ApiMessageOrigin { token_name: "c6-cli-zmbp".into() }),
+                    human_origin: true,
+                    ..Default::default()
+                },
+                Some(api::MessageOrigin::Api { token_name: "c6-cli-zmbp".into() }),
+            ),
+            (
+                c6_proto::UserMessage { from_session_id: "ops".into(), human_origin: true, ..Default::default() },
+                Some(api::MessageOrigin::Session),
+            ),
+        ];
+        for (input, expected) in cases {
+            let shown = event(&SessionEvent { kind: Some(session_event::Kind::User(input)), ..Default::default() }).unwrap();
+            let api::EventKind::User { origin, .. } = &shown.kind else { panic!("user event") };
+            assert_eq!(origin.as_deref(), expected.as_ref());
+            let json = serde_json::to_value(&shown).unwrap();
+            assert_eq!(json.get("origin").is_some(), expected.is_some());
+            assert_eq!(serde_json::from_value::<api::Event>(json).unwrap(), shown);
+        }
+    }
+
+    #[test]
+    fn task_notice_metadata_reaches_the_browser_without_changing_the_agent_text() {
+        let raw = "Sent via the API.\n<subagent id=\"ops\">Report: exact raw text</subagent>";
+        let metadata = c6_proto::TaskNotice {
+            kind: "subagent".into(),
+            title: "zmbp ops".into(),
+            session_id: "ops".into(),
+            status: "completed".into(),
+            markdown: "## Checks passed\n\nAll **done**.".into(),
+        };
+        let input = SessionEvent {
+            seq: 2,
+            ts_ms: 3,
+            kind: Some(session_event::Kind::User(c6_proto::UserMessage {
+                text: raw.into(),
+                command: "task-notification".into(),
+                task_notice: Some(metadata.clone()),
+                ..Default::default()
+            })),
+        };
+        let shown = event(&input).unwrap();
+        let api::EventKind::User { text, task_notice: Some(n), .. } = shown.kind else { panic!("structured task notice") };
+        assert_eq!(text, raw);
+        assert_eq!(
+            (n.kind, n.title, n.session_id, n.status, n.markdown),
+            (metadata.kind, metadata.title, metadata.session_id, metadata.status, metadata.markdown)
+        );
+    }
+
+    #[test]
     fn a_card_answer_is_an_ordinary_user_event() {
         let id = "test";
         let text = "Not now: task card #185 \"Cleanup\".";
@@ -302,6 +397,35 @@ mod tests {
         assert_eq!((shown.seq, shown.ts), (17, 1234));
         assert!(matches!(shown.kind, api::EventKind::User { command_id, text: s, command, prompt, wake: false, .. }
             if command_id == id && s == text && command == "card-answer" && prompt.is_empty()));
+    }
+
+    #[test]
+    fn narration_reaches_the_api_without_reclassifying_old_text_or_thinking() {
+        let saved = SessionEvent {
+            kind: Some(session_event::Kind::Assistant(c6_proto::AssistantMessage {
+                turn: 1112,
+                blocks: vec![
+                    c6_proto::ContentBlock { block: Some(content_block::Block::Narration("Summary".into())), ..Default::default() },
+                    c6_proto::ContentBlock { block: Some(content_block::Block::Text("Old reply".into())), ..Default::default() },
+                    c6_proto::ContentBlock { block: Some(content_block::Block::Thinking("Reasoning".into())), ..Default::default() },
+                ],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let shown = event(&saved).unwrap();
+        let json = serde_json::to_value(&shown).unwrap();
+        assert_eq!(json["blocks"][0], serde_json::json!({"type": "narration", "text": "Summary"}));
+        let decoded: api::Event = serde_json::from_value(json).unwrap();
+        let api::EventKind::Assistant { blocks, .. } = decoded.kind else { panic!("not an assistant event") };
+        assert_eq!(
+            blocks,
+            vec![
+                api::ContentBlock::Narration { text: "Summary".into() },
+                api::ContentBlock::Text { text: "Old reply".into(), citations: vec![] },
+                api::ContentBlock::Thinking { text: "Reasoning".into() },
+            ]
+        );
     }
 
     #[test]

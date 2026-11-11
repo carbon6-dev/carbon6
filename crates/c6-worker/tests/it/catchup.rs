@@ -22,13 +22,28 @@ async fn catching_up_on_a_session_and_its_timeline() {
         bind: vec!["127.0.0.1".parse().unwrap()],
         ui_port: 0,
         worker_port: 0,
-        auth: false,
+        auth: true,
         ..Default::default()
     })
     .await
     .unwrap();
     let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
-    let http = reqwest::Client::new();
+    // This exercises your catch-up boundary, so messages must come from
+    // an authenticated browser, not from an origin-less API client.
+    let login = head.state.store.create_login_link().await.unwrap();
+    let signed_in = reqwest::Client::new().post(format!("{api}/auth/link")).json(&json!({"token": login})).send().await.unwrap();
+    let cookie = signed_in.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap();
+    let http = reqwest::Client::builder()
+        .default_headers(
+            [
+                (reqwest::header::COOKIE, cookie.parse().unwrap()),
+                (reqwest::header::HeaderName::from_static("x-c6-realm"), "admin".parse().unwrap()),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .build()
+        .unwrap();
     let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
     enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
     let worker = crate::open_worker(state.path()).await;

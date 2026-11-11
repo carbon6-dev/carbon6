@@ -25,8 +25,8 @@ pub fn FileBrowser(worker_id: String, #[prop(optional)] root: Option<String>) ->
     });
 
     view! {
-        <div class="grid gap-3 lg:grid-cols-[minmax(16rem,1fr)_2fr]">
-            <div class="space-y-2">
+        <div class="grid gap-3 @min-[40rem]/view:grid-cols-[minmax(16rem,1fr)_2fr]">
+            <div class="min-w-0 space-y-2">
                 <div class="flex gap-2">
                     <button class="rounded-md border border-zinc-300 px-2 text-sm dark:border-zinc-700" title="Up"
                         on:click=move |_| {
@@ -34,14 +34,11 @@ pub fn FileBrowser(worker_id: String, #[prop(optional)] root: Option<String>) ->
                             let parent = cur.rsplit_once('/').map(|(p, _)| if p.is_empty() { "/".to_owned() } else { p.to_owned() }).unwrap_or(cur);
                             dir.set(parent);
                         }>{crate::icons::arrow_up()}</button>
-                    <input class=format!("{INPUT} font-mono text-xs") prop:value=move || path_input.get()
+                    <input class=format!("{INPUT} min-w-0 font-mono text-xs") prop:value=move || path_input.get()
                         on:input=move |ev| path_input.set(event_target_value(&ev))
                         on:keydown=move |ev| if ev.key() == "Enter" { dir.set(path_input.get_untracked()) } />
                 </div>
-                <label class="flex items-center gap-1.5 text-xs text-muted">
-                    <input type="checkbox" prop:checked=move || hidden.get() on:change=move |ev| hidden.set(event_target_checked(&ev)) />
-                    "Show hidden files"
-                </label>
+                <crate::components::Switch on=move || hidden.get() on_change=move |v| hidden.set(v) label="Show hidden files" />
                 <div class="max-h-[70vh] overflow-auto rounded-md border border-zinc-200 dark:border-zinc-800">
                     <Suspense fallback=|| view! { <p class="p-3 text-sm text-muted">"Loading…"</p> }>
                         {move || listing.get().map(|r| match r {
@@ -62,8 +59,8 @@ pub fn FileBrowser(worker_id: String, #[prop(optional)] root: Option<String>) ->
                                                 <li class=move || if open_file.get().as_deref() == Some(full2.as_str()) { "bg-zinc-200 dark:bg-zinc-800" } else { "" }>
                                                     <button class="flex w-full items-center gap-2 px-2 py-1 text-left hover:bg-zinc-100 dark:hover:bg-zinc-900"
                                                         on:click=move |_| if is_dir { dir.set(full.clone()) } else { open_file.set(Some(full.clone())) }>
-                                                        <span class="w-4 text-muted">{if is_dir { crate::icons::chevron_right().into_any() } else { ().into_any() }}</span>
-                                                        <span class=if is_dir { "flex-1 truncate font-medium" } else { "flex-1 truncate" }>{name}</span>
+                                                        <span class="w-4 text-muted">{if is_dir { crate::icons::chevron_right() } else { ().into_any() }}</span>
+                                                        <span class=if is_dir { "min-w-0 flex-1 truncate font-medium" } else { "min-w-0 flex-1 truncate" }>{name}</span>
                                                         <span class="shrink-0 text-[11px] text-muted">{mtime.map(|t| ago(now - t)).unwrap_or_default()}</span>
                                                     </button>
                                                 </li>
@@ -88,7 +85,7 @@ pub fn FileBrowser(worker_id: String, #[prop(optional)] root: Option<String>) ->
 
 #[component]
 fn FileViewer(worker_id: String, path: String) -> impl IntoView {
-    let file = LocalResource::new({
+    let file = crate::resources::local({
         let (w, p) = (worker_id.clone(), path.clone());
         move || api::fs_read(w.clone(), p.clone())
     });
@@ -144,8 +141,8 @@ fn CodeView(text: String) -> impl IntoView {
 #[component]
 pub fn Changes(worker_id: String, path: String) -> impl IntoView {
     let (w1, p1, w2, p2) = (worker_id.clone(), path.clone(), worker_id, path);
-    let status = LocalResource::new(move || api::git_status(w1.clone(), p1.clone()));
-    let diff = LocalResource::new(move || api::git_diff(w2.clone(), p2.clone()));
+    let status = crate::resources::local(move || api::git_status(w1.clone(), p1.clone()));
+    let diff = crate::resources::local(move || api::git_diff(w2.clone(), p2.clone()));
     let refresh = move |_| {
         status.refetch();
         diff.refetch();
@@ -193,7 +190,7 @@ fn StatusSummary(s: Value) -> impl IntoView {
                 {s["upstream"].as_str().map(|u| view! { <span class="text-xs text-muted">{crate::icons::arrow_right()}" "{format!("Upstream {u} · {ahead} ahead, {behind} behind")}</span> })}
                 <span class="text-xs text-muted">{format!("{} changed file{}", files.len(), if files.len() == 1 { "" } else { "s" })}</span>
             </div>
-            <ul class="mt-2 grid gap-x-4 font-mono text-xs sm:grid-cols-2">
+            <ul class="mt-2 grid gap-x-4 font-mono text-xs @sm/view:grid-cols-2">
                 {files.into_iter().map(|f| {
                     let code = format!("{}{}", f["index"].as_str().unwrap_or(" "), f["worktree"].as_str().unwrap_or(" "));
                     let cls = match code.as_str() { "??" => "text-emerald-600", c if c.contains('D') => "text-red-600", _ => "text-amber-600" };
@@ -303,7 +300,8 @@ pub fn FolderPicker(
     };
 
     view! {
-        <div class="fixed inset-0 z-30 flex items-center justify-center bg-black/40 px-4" on:click=move |_| on_cancel.run(())>
+        <leptos::portal::Portal>
+        <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4 text-sm text-zinc-900 dark:text-zinc-100" on:click=move |_| on_cancel.run(())>
             <div class="flex max-h-[85vh] w-full max-w-2xl flex-col gap-3 rounded-lg bg-white p-4 shadow-xl dark:bg-zinc-900" on:click=|ev| ev.stop_propagation()>
                 <h2 class="font-medium">"Choose a working directory"</h2>
                 // Breadcrumbs: each segment is clickable.
@@ -368,10 +366,7 @@ pub fn FolderPicker(
                 {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
                 <div class="flex flex-wrap items-center gap-2">
                     <button class=crate::util::BUTTON_QUIET on:click=move |_| { error.set(None); new_name.set(Some(String::new())) }>"New folder"</button>
-                    <label class="flex items-center gap-1.5 text-xs text-muted">
-                        <input type="checkbox" prop:checked=move || hidden.get() on:change=move |ev| hidden.set(event_target_checked(&ev)) />
-                        "Show hidden"
-                    </label>
+                    <crate::components::Switch on=move || hidden.get() on_change=move |v| hidden.set(v) label="Show hidden" />
                     <span class="flex-1"></span>
                     <button class=crate::util::BUTTON_QUIET on:click=move |_| on_cancel.run(())>"Cancel"</button>
                     <button class=crate::util::BUTTON disabled=move || current.get().is_none()
@@ -381,6 +376,7 @@ pub fn FolderPicker(
                 </div>
             </div>
         </div>
+        </leptos::portal::Portal>
     }
 }
 
@@ -492,10 +488,11 @@ pub fn FilePicker(
             }
         });
     };
-    let accept = extensions.join(",");
+    let accept = StoredValue::new(extensions.join(","));
     let tab = "rounded-md px-2.5 py-1 text-sm";
     view! {
-        <div class="fixed inset-0 z-30 flex items-center justify-center bg-black/40 px-4" on:click=move |_| on_cancel.run(())>
+        <leptos::portal::Portal>
+        <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4 text-sm text-zinc-900 dark:text-zinc-100" on:click=move |_| on_cancel.run(())>
             <div class="flex max-h-[85vh] w-full max-w-2xl flex-col gap-3 rounded-lg bg-white p-4 shadow-xl dark:bg-zinc-900" on:click=|ev| ev.stop_propagation()>
                 <h2 class="font-medium">{title}</h2>
                 <div class="flex flex-wrap gap-1">
@@ -516,7 +513,7 @@ pub fn FilePicker(
                         <div class="flex min-h-48 flex-col items-center justify-center gap-2 rounded-md border border-dashed border-zinc-300 p-6 text-sm text-muted dark:border-zinc-700">
                             <p>"A file on the device you are using now."</p>
                             <button class=crate::util::BUTTON on:click=move |_| if let Some(i) = device_input.get_untracked() { i.click(); }>"Choose a file…"</button>
-                            <input node_ref=device_input type="file" accept=accept.clone() class="hidden" on:change=from_device />
+                            <input node_ref=device_input type="file" accept=accept.get_value() class="hidden" on:change=from_device />
                         </div>
                     }.into_any()
                 } else {
@@ -560,7 +557,7 @@ pub fn FilePicker(
                                                     view! {
                                                         <li><button class="flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
                                                             on:click=move |_| if is_dir { dir.set(full.clone()) } else { read(full.clone(), name.clone()) }>
-                                                            <span class="w-3 text-muted">{if is_dir { crate::icons::chevron_right().into_any() } else { ().into_any() }}</span>
+                                                            <span class="w-3 text-muted">{if is_dir { crate::icons::chevron_right() } else { ().into_any() }}</span>
                                                             <span class=if is_dir { "truncate" } else { "truncate font-mono text-xs" }>{shown}</span>
                                                         </button></li>
                                                     }
@@ -576,14 +573,9 @@ pub fn FilePicker(
                 {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
                 <div class="flex flex-wrap items-center gap-3">
                     {move || (source.get() != Source::Device).then(|| view! {
-                        <label class="flex items-center gap-1.5 text-xs text-muted">
-                            <input type="checkbox" prop:checked=move || all.get() on:change=move |ev| all.set(event_target_checked(&ev)) />
-                            {format!("All files (not only {})", extensions.join(", "))}
-                        </label>
-                        <label class="flex items-center gap-1.5 text-xs text-muted">
-                            <input type="checkbox" prop:checked=move || hidden.get() on:change=move |ev| hidden.set(event_target_checked(&ev)) />
-                            "Show hidden"
-                        </label>
+                        <crate::components::Switch on=move || all.get() on_change=move |v| all.set(v)
+                            label=format!("All files (not only {})", extensions.join(", ")) />
+                        <crate::components::Switch on=move || hidden.get() on_change=move |v| hidden.set(v) label="Show hidden" />
                     })}
                     <span class="flex-1"></span>
                     {move || busy.get().then(|| view! { <span class="text-xs text-muted">"Reading…"</span> })}
@@ -591,5 +583,6 @@ pub fn FilePicker(
                 </div>
             </div>
         </div>
+        </leptos::portal::Portal>
     }
 }

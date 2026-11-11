@@ -230,15 +230,18 @@ records_tool!(
      each with one edit. action read: id, view (outline, block with block=<id>, slide, search with q, since with rev, markdown). \
      action edit: id, ops [{op: insert|replace|delete|move|table|set|add_tab|delete_tab, ...}]; replace a whole block (markdown) or \
      delete one with ifRev and ifHash from your read; replace words with find and with. A refused guard means someone else changed it: \
-     read again. action comment: op list, create, reply or resolve threads (a thread sent to you says what to do). action look: pictures of slides (first, last; a doc's pages) to check them by eye. action export: a file (format md, html, pdf, docx, odt, pptx, odp, png), kept with the document; format google: to Google Docs or Slides, updating its Google file (new: true for another). action list: documents of your work first (q, kind). action history and restore (id, rev, block). The documents \
+     read again. action comment: op list, create, reply or resolve threads (a thread sent to you says what to do). action look: pictures of slides (first, last; a doc's pages) to check them by eye. action export: a file (format md, html, pdf, docx, odt, pptx, odp, png), kept with the document; format google: to Google Docs or Slides, updating its Google file (new: true for another). action list: documents of your work first (q, kind; archived: true includes archived docs). action history and restore (id, rev, block). action archive or unarchive: id; your own docs are free, others ask once per document, even your work's. action archive_many: ids and reason; one approval for that exact selection if any isn't yours, no future permission. For cleanup, use archive_many instead of one archive call per doc. Skips gone/already archived docs and reports per-document failures. The documents \
      you made and your work's you edit freely; others need the user's OK once.",
     json!({"type": "object", "properties": {
-        "action": {"type": "string", "enum": ["guide", "list", "create", "read", "edit", "comment", "look", "export", "history", "restore"]},
+        "action": {"type": "string", "enum": ["guide", "list", "create", "read", "edit", "comment", "look", "export", "history", "restore", "archive", "unarchive", "archive_many"]},
         "op": {"type": "string", "description": "comment: list, create (block, quote, text), reply (thread, text), resolve (thread; only threads you began)"},
         "thread": {"type": "string"},
         "text": {"type": "string", "description": "comment create and reply: what you say"},
         "quote": {"type": "string", "description": "comment create: a few words of the block"},
         "id": {"type": "string", "description": "The document (its id, or doc:<id>)"},
+        "ids": {"type": "array", "items": {"type": "string"}, "description": "archive_many: exact document ids to archive, never expanded"},
+        "reason": {"type": "string", "description": "archive_many: why this selection should be archived"},
+        "archived": {"type": "boolean", "description": "list: include archived documents (default false)"},
         "kind": {"type": "string", "enum": ["doc", "deck"]},
         "title": {"type": "string"},
         "markdown": {"type": "string"},
@@ -311,5 +314,25 @@ async fn doc_call(ctx: &ToolCtx, input: Value) -> ToolOutput {
             out
         }
         Err(e) => ToolOutput::err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn doc_tool_exposes_archive_selection_and_archived_list_for_both_names() {
+        for claude in [false, true] {
+            let spec = Doc::new(claude).spec();
+            let properties = &spec.parameters["properties"];
+            for action in ["archive", "unarchive", "archive_many"] {
+                assert!(properties["action"]["enum"].as_array().unwrap().contains(&json!(action)));
+            }
+            assert_eq!(properties["ids"]["items"]["type"], "string");
+            assert_eq!(properties["reason"]["type"], "string");
+            assert_eq!(properties["archived"]["type"], "boolean");
+            assert_eq!(spec.parameters["additionalProperties"], false);
+        }
     }
 }

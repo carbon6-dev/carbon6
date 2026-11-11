@@ -204,9 +204,19 @@ pub fn CatchupBody(
     #[prop(optional, into)] on_done: Option<Callback<()>>,
 ) -> impl IntoView {
     let Some(ws) = use_context::<crate::workspace::Workspace>() else { return ().into_any() };
+    let class = StoredValue::new(class);
     let cards = ws.catchups;
     let id = StoredValue::new(session);
     let card = Memo::new(move |_| cards.with(|m| m.get(&id.get_value()).cloned()));
+    let open = Memo::new(move |_| card.with(|c| c.as_ref().is_some_and(|c| c.open)));
+    let present = crate::util::presence(move || open.get());
+    // Caught up removes the card from shared state immediately. Keep its
+    // last visible content while the rise/sheet exits, not an empty shell.
+    let retained = Memo::new(move |previous: Option<&Option<Card>>| card.get().filter(|c| c.open).or_else(|| previous.cloned().flatten()));
+    let summary =
+        Memo::new(move |_| retained.with(|c| c.as_ref().map(|c| c6_api::citations::clean(&c.c.summary).into_owned()).unwrap_or_default()));
+    let pending = Memo::new(move |_| retained.with(|c| c.as_ref().is_some_and(|c| c.pending && c.c.summary.is_empty())));
+    let pending_present = crate::util::presence(move || pending.get());
     Effect::new(move || {
         if card.with(|c| c.as_ref().is_some_and(|c| c.open && !c.asked)) {
             ask_summary(cards, id.get_value());
@@ -219,13 +229,12 @@ pub fn CatchupBody(
     };
     let expanded = RwSignal::new(HashSet::<String>::new());
     view! {
-        {move || card.get().filter(|c| c.open).map(|card| {
-            let c = card.c.clone();
-            let since = since_text(c.since_at);
-            let rows = c.rows.clone();
+        <Show when=move || present.get()>
+        <div class="c6-rise c6-presence" style="--rise:-8px;--leave:-6px" data-open=move || open.get().to_string() inert=move || !open.get()>
+        <div class=format!("space-y-2 text-sm {}", class.get_value())>
+        {move || retained.get().map(|card| {
+            let since = since_text(card.c.since_at);
             view! {
-                <div class=format!("space-y-2 text-sm {class}")>
-                    {view! {
                         <div class="flex items-center gap-2">
                             // The glance's sections are in capitals; the time isn't.
                             <span class=if caps { "flex-1 text-[10px] font-medium tracking-wide text-muted" } else { "flex-1 font-medium" }>
@@ -234,14 +243,25 @@ pub fn CatchupBody(
                             <button class=crate::icons::BAR_BUTTON title="Put it away" aria-label="Close"
                                 on:click=move |_| { put_away(ws, &id.get_value()); done() }>{crate::icons::x()}</button>
                         </div>
-                    }}
-                    {if !c.summary.is_empty() {
-                        view! { <p class="leading-snug">{c6_api::citations::clean(&c.summary).into_owned()}</p> }.into_any()
-                    } else if card.pending {
-                        view! { <p class="animate-pulse text-xs text-muted">"Summing up…"</p> }.into_any()
-                    } else {
-                        ().into_any()
-                    }}
+            }
+        })}
+        <Show when=move || pending_present.get() || summary.with(|s| !s.is_empty())>
+            // One grid slot: the plain pending label fades out over the
+            // incoming paragraph, while the bounded parent resizes once.
+            <div class="grid">
+                <Show when=move || pending_present.get()>
+                    <p class=move || if pending.get() { "col-start-1 row-start-1 text-xs text-muted" } else { "c6-crossfade-out col-start-1 row-start-1 text-xs text-muted" }
+                        aria-hidden=move || (!pending.get()).to_string()>"Summing up…"</p>
+                </Show>
+                {move || Some(summary.get()).filter(|s| !s.is_empty()).map(|text| view! {
+                    <p class="c6-crossfade col-start-1 row-start-1 leading-snug">{text}</p>
+                })}
+            </div>
+        </Show>
+        {move || retained.get().map(|card| {
+            let c = card.c;
+            let rows = c.rows.clone();
+            view! {
                     <ul class="space-y-px">
                         {rows.into_iter().map(|r| {
                             let kind = r.kind.clone();
@@ -255,7 +275,7 @@ pub fn CatchupBody(
                                         aria-expanded={let o = is_open.clone(); move || o().to_string()} on:click=toggle>
                                         <span class=format!("size-1.5 shrink-0 rounded-full {}", tone(&kind))></span>
                                         <span class=format!("min-w-0 flex-1 {strong}")>{r.text.clone()}</span>
-                                        <span class="shrink-0 text-muted">{let o = is_open.clone(); move || if o() { crate::icons::chevron_down().into_any() } else { crate::icons::chevron_right().into_any() }}</span>
+                                        <span class="shrink-0 text-muted">{let o = is_open.clone(); move || if o() { crate::icons::chevron_down() } else { crate::icons::chevron_right() }}</span>
                                     </button>
                                     <Show when=is_open.clone()>
                                         <ul class="mb-1 ml-5 space-y-px">
@@ -291,9 +311,11 @@ pub fn CatchupBody(
                         <button class=crate::util::BUTTON title="Mark it all seen and put the card away"
                             on:click=move |_| { caught_up(ws, id.get_value()); done() }>"Caught up "{crate::icons::check()}</button>
                     </div>
-                </div>
             }
         })}
+        </div>
+        </div>
+        </Show>
     }
     .into_any()
 }
@@ -310,23 +332,24 @@ pub fn YouWereHere(session: String, at: i64) -> impl IntoView {
     }
 }
 
-/// The catch-up on a phone: a sheet from the bottom, closed by a tap
-/// outside it, or as you act.
-#[component]
-pub fn CatchupSheet(session: String, jump: Callback<(u64, String)>, open: RwSignal<bool>) -> impl IntoView {
-    let close = move || open.set(false);
-    view! {
-        <div class="fixed inset-0 z-40 bg-black/30" on:click=move |ev| { ev.stop_propagation(); close() }></div>
-        <div class="fixed inset-x-0 bottom-0 z-50 max-h-[70dvh] overflow-y-auto rounded-t-xl border-t border-zinc-200 bg-white px-4 pb-6 pt-4 shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
-            on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); close() }>
-            <CatchupBody session jump on_done=move |()| close() />
-        </div>
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dismissing_a_catchup_retains_its_summary_not_an_empty_sheet() {
+        let source = include_str!("catchup.rs");
+        let body = source.split("pub fn CatchupBody(").nth(1).unwrap().split("pub fn YouWereHere(").next().unwrap();
+        assert!(body.contains("let present = crate::util::presence(move || open.get())"));
+        assert!(body.contains("previous.cloned().flatten()"), "removing the shared card must not discard the exiting content");
+        assert!(body.contains("<Show when=move || present.get()>"));
+        assert!(body.contains("{move || retained.get().map(|card|"));
+        assert!(body.contains("data-open=move || open.get().to_string() inert=move || !open.get()"));
+        assert!(body.contains("--rise:-8px;--leave:-6px"), "catch-up exits fade upwards");
+        assert!(body.contains("<Show when=move || pending_present.get()>"), "retain the outgoing pending label for its crossfade");
+        assert!(body.contains("c6-crossfade col-start-1 row-start-1 leading-snug"));
+        assert!(!body.contains("animate-pulse"), "pending is plain text, not a pulsing placeholder");
+    }
 
     #[test]
     fn keeps_the_latest_times_on_screen() {

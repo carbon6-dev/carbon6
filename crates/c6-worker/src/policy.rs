@@ -103,7 +103,7 @@ impl Policies {
         let text = input.to_string();
         self.rules.iter().find(|r| {
             (r.tools.is_empty() || names.iter().any(|n| crate::hooks::matches(&r.tools, n)))
-                && r.pattern.as_ref().is_none_or(|p| p.is_match(&text))
+                && r.pattern.as_ref().is_none_or(|p| p.is_match(&text) || any_string_matches(p, input))
         })
     }
 
@@ -230,6 +230,18 @@ impl c6_tools::Hooks for Chain {
     }
 }
 
+/// Whether a pattern matches a string in a call's input as the text it is.
+/// JSON writes a line break as `\n`, so over the JSON alone `\bgit` misses a
+/// command that starts a line of a script.
+fn any_string_matches(pattern: &Regex, value: &Value) -> bool {
+    match value {
+        Value::String(s) => pattern.is_match(s),
+        Value::Array(items) => items.iter().any(|v| any_string_matches(pattern, v)),
+        Value::Object(fields) => fields.values().any(|v| any_string_matches(pattern, v)),
+        _ => false,
+    }
+}
+
 /// An `app_call` naming no instance and no operation only lists what can
 /// be called: it changes nothing, so it never waits for your approval (a
 /// rule that denies app calls still does).
@@ -284,6 +296,32 @@ mod tests {
         let _ = wait.await;
         assert_eq!(rx.recv().await.unwrap().state, "expired");
         assert!(!p.decide("c5", true), "nothing waits for it any more");
+    }
+
+    #[tokio::test]
+    async fn patterns_see_commands_on_their_own_lines() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let json = json!([
+            {"name": "no push", "tools": "Bash", "pattern": "\\bgit\\s+push\\b|\\bgh\\s+pr\\s+create\\b", "action": "deny"},
+            {"name": "no etc", "tools": "Edit", "pattern": "\"path\":\"/etc/", "action": "deny"}
+        ])
+        .to_string();
+        let p = Policies::new(&json, &[], tx).unwrap();
+        for command in [
+            json!("git push origin x"),
+            json!("cd repo && git push origin x"),
+            json!("set -e\ngit push origin x"),
+            json!(["bash", "-lc", "set -e\n\tgit push origin x"]),
+            json!(["bash", "-lc", "T=$(cat f)\ngh pr create -R a/b"]),
+        ] {
+            let d = p.pre_tool_use("c", "shell", &json!({"command": command})).await;
+            assert!(d.is_some_and(|d| d.contains("no push")), "{command} is a push");
+        }
+        for command in ["git status\nls", "echo digit pushes\nexit 0"] {
+            assert_eq!(p.pre_tool_use("c", "shell", &json!({"command": command})).await, None, "{command} is not");
+        }
+        // A pattern written against the JSON still works.
+        assert!(p.pre_tool_use("c", "edit", &json!({"path": "/etc/x"})).await.is_some());
     }
 
     #[tokio::test]

@@ -54,7 +54,7 @@ tokio-stream = "0.1.19"
 tokio-util = "0.7.20"
 toml = "1.1.8"
 tonic = { version = "0.14.6", features = ["tls-ring"] }
-tower-http = { version = "0.7.1", features = ["trace"] }
+tower-http = { version = "0.7.1", features = ["trace", "compression-br", "compression-gzip"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry"] }
 url = "2.5.8"

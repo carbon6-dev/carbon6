@@ -2,6 +2,11 @@
 target = "index.html"
 dist = "dist"
 
+[[hooks]]
+stage = "post_build"
+command = "sh"
+command_arguments = ["../../scripts/precompress-ui.sh"]
+
 [tools]
 tailwindcss = "4.1.14"
 

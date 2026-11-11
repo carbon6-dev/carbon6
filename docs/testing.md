@@ -1,6 +1,1708 @@
 # Tests that fail only when something is wrong
 
+## Background work and typing benchmark (S15)
+
+`crates/c6-ui/tests/background-work.cjs` serves production WASM on a private
+loopback origin with fake head HTTP/WebSockets. It never touches a live head,
+browser profile or settings. See `docs/background-work.md` for the complete
+baseline inventory, protocol, measurements and caveats. No runtime change
+qualified in the bounded S15 release investigation; production remains exact
+`8a5ac826`. The new file is an audit/benchmark, not a performance fix.
+
+Build with `set -euo pipefail; ulimit -n 65536; env -u NO_COLOR make ui`.
+Using Node 24 and the same pinned Chromium/Playwright setup as `motion.cjs`:
+
+```sh
+EVIDENCE=/tmp/s15-bg LABEL=after node crates/c6-ui/tests/background-work.cjs
+EVIDENCE=/tmp/s15-bg LABEL=after-live STREAMING=1 node crates/c6-ui/tests/background-work.cjs
+# Independently saved baseline production dist, same benchmark:
+ROOT=/tmp/s15-bg/before-dist LABEL=before BASELINE=1 node crates/c6-ui/tests/background-work.cjs
+ROOT=/tmp/s15-bg/before-dist LABEL=before-live BASELINE=1 STREAMING=1 node crates/c6-ui/tests/background-work.cjs
+# Controlled repeats against immutable production builds: five pairs for each
+# scenario, alternating order, fresh serial browsers, no idle extrapolation.
+EVIDENCE=/tmp/background-repeat LABEL=repeat PAIRS=5 \
+  BASE_ROOT=/path/to/pinned-baseline/dist FINAL_ROOT=/path/to/candidate/dist \
+  node crates/c6-ui/tests/background-work.cjs
+```
+
+Each run warms up for 15 s, measures a real 60 s idle window, then types 200
+characters with 40 ms pacing under 4x CDP CPU throttling. The live control also
+delivers exactly 200 chunks at 20 Hz after a rich-Markdown prefix and waits for
+the trailing final chunk to render. The producer starts inside the measured
+typing window, and live Markdown mutations are a positive control for the
+observer used to assert that quiet draft input does not rewrite history.
+Playwright waits for each key's acknowledgements; 40 ms is the requested hold,
+not an independent fixed arrival schedule. Keep measured wall time and raw key
+timestamps alongside latency, and do not interpret the proxy as hardware INP.
+The saved JSON has request paths, timer
+callbacks, long tasks, approximate key-to-render latency and CDP task/script
+time. CPU profiles and a DevTools timeline are saved beside it. These durations
+are measurement windows, not sleeps used as correctness completion barriers.
+
+`PAIRS` requires at least five and defaults to both quiet/live scenarios. Six
+pairs balance which build goes first. The driver hashes both WASM builds, records
+trial order/host/load/status, and reports per-build medians/ranges and within-pair
+differences. Repeats use the same 15 s warmup and typing/stream workload but omit
+the full-minute idle phase (`TYPING_ONLY=1`); measure idle separately with the
+ordinary commands above. Do not pool them with old full-mode single trials.
+`SCENARIOS=live` selects a separately labelled live-only ablation. Repeated
+children use `MEASURE_ONLY=1`, skipping post-measure behavioral assertions, not
+the 200-key/final-stream-tail/error checks. Run full mode against the final build
+as well to verify behavior. Isolated microbenchmark comparisons require a
+controlled host-load protocol; busy-host correctness qualification is separate.
+Record its shared load rather than claiming isolated latency measurements.
+
+For the final S15 exclusive timing slot (not a browser qualification prerequisite),
+sample `vmstat 1 31` before each batch,
+discard its first since-boot row, and require all 30 one-second samples to show
+at least 95% idle CPU and a run queue no greater than four. The coordinator
+amended the original ceiling of two before any isolated ablation trial, after
+eight rejected windows established a normal host-service floor of three/four;
+the original cohorts and rejected windows retain their original classification.
+The amendment, scripts and accepted windows are under `/tmp/s15-bg/ablation/`.
+Inspect `ps -e` across
+all users for compilers, tests and browsers before sampling. Retain failed gate
+windows as well as the accepted one. Record load averages too, but do not call
+an elevated, slowly decaying load average proof of current CPU contention.
+This is a measurement-environment gate, not an application performance threshold.
+
+The committed harness reports timings without performance pass/fail thresholds;
+the external bounded release screen uses its separately documented, predeclared
+retention rule. Default behavioral controls cover no
+ordinary-key mention/suggestion/model/message calls, no quiet transcript Markdown
+mutations, complete draft retention, all 200 stream chunks/final text and no
+browser errors. `EXPERIMENTAL_POLICIES=visible-counters` additionally checks
+the discarded candidate's counter invalidation/sharing and visible-owned
+fallback/pane-transition policy against its pinned artifact; those policies
+are not required of baseline production and this mode is off by default.
+Work still has duplicate resources and broad snapshot invalidation. Its
+event/shared-query experiment and extended editor-race regression remain in
+discarded patches/artifacts, not the baseline suite.
+Document visibility state is injected for the deterministic
+scheduling regression; it is not a real Android backgrounding or browser
+timer-throttling measurement. Pane checks use real workspace controls and viewport
+changes. Existing workspace/phone regressions exercise navigation separately.
+
 Status: rules in force (2026-10-19); `make check` enforces what a pattern can catch (`scripts/test-lint.sh`).
+
+## Safe HTML in UI Markdown
+
+`crates/c6-ui/src/markdown.rs` is shared by transcripts, documents, comments,
+and the other UI Markdown views. Both pulldown-cmark `Html` blocks and
+`InlineHtml` events (including table cells) use the same sanitizer, before
+trusted mention/citation markup is added. It rebuilds only `br`, `ul`, `ol`,
+`li`, `b`, `strong`, `i`, `em`, `code`, `sub`, `sup`, `p`, and `kbd`, with no
+attributes. Tag names are case-insensitive; `br` also accepts `/>`. No HTML
+dependency, URL policy change, or change to code fences/backticks is needed.
+
+Other tags, comments, malformed tags and incomplete trees remain escaped,
+visible text. Encoded tags are never decoded into markup. Paired tags must
+close in order at the same Markdown nesting depth, before the current
+container ends; an incomplete streamed list cannot reach the next cell or
+paragraph. Lists contain only `li` children (apart from whitespace); nested
+lists and paragraphs can appear in `li`, not in formatting tags or another
+paragraph. Nesting is capped at 32. Rejected tags and their still-pending
+wrappers stay text rather than relying on browser repair; independently
+balanced fragments can render after a rejected tag. Rejected raw-text/RCDATA
+bodies (`script`, `style`, `iframe`, `textarea`, `title`, `xmp`, `noembed`,
+`noframes`, `noscript`, `plaintext`) and comments stay literal, including any
+allowlisted-looking strings inside them. Markdown paragraph wrappers around
+valid block tags are omitted to avoid invalid `<p><ul>` nesting. HTML blocks keep their
+existing literal text/entity handling; inline Markdown keeps its usual parser.
+This policy is for UI Markdown, not the separate HTML-slide/export sanitizer.
+
+```sh
+set -euo pipefail
+ulimit -n 65536
+cargo nextest run --locked -p c6-ui -E 'test(markdown::tests::)'
+env -u NO_COLOR make ui
+# After make ui-browser-install; private loopback head, no live configuration:
+node crates/c6-ui/tests/markdown-html.cjs
+```
+
+The browser regression checks real list/break DOM in both transcript and doc,
+in Light and Dark, in pinned Chromium and WebKit. It also checks nested lists,
+attribute removal, escaped XSS strings, cross-cell containment, block HTML,
+ordinary paragraphs, and intact following content. Screenshots default to
+`/tmp/s9-markdown-html` (`SCREENSHOTS` overrides); no retries are performed.
+
+The same suite also checks narration on desktop and 320px phones in both
+themes and with **Show thinking** on/off: separate quiet **Summarized update**
+items, Markdown, live thinking-to-narration replacement, replay, unchanged
+historical Text and neighboring tool icons, and wrapping without page overflow.
+The worker's real-log regression is
+`claude_code::tests::recorded_coordinator_summary_keeps_narration_provenance`;
+protocol, head conversion and UI render tests cover the new Narration block
+without reclassifying historical Text/Thinking. No database migration or
+full-text request action is part of this display change.
+
+## Effective conversation projections after rewind
+
+The native-memory reset regression runs a fake stream-JSON CLI with its own
+independent history. It uses no installed Claude or real model:
+
+```sh
+set -euo pipefail
+ulimit -n 65536
+cargo nextest run --locked -p c6-worker --test claude_code_rewind
+```
+
+It checks final assistant UUID cutoffs after tools, returned session-ID adoption,
+the initialization barrier, fresh kept-history fallback, first-message rewind,
+worker restart, lost metadata, side-chat seeds, unsupported/disconnected workers,
+and failed preflight that preserves the existing conversation across restart,
+retained versus withdrawn remote children, and a destructive reset failure that
+blocks inputs without implicit retries even after restart. The native-memory
+fixture also covers four inputs written to a held CLI turn
+without User receipts: a failed reset returns them to the cancellable inbox,
+one middle input is canceled, and the others are delivered exactly once after
+explicit retry, both live and after a real worker-runtime restart. A gated
+initialization crash verifies that recovery confirms reset before queued input.
+Overlapping retries during gated initialization must share one successful reset,
+atomically confirm every receipt before pre-existing Inbox inputs, and remain
+durable through a crash and subsequent failed recovery.
+Worker unit regressions also check held native wake withdrawal and recursive
+child/background quiescence.
+On macOS, held-runtime ownership reads exact argument boundaries from
+`KERN_PROCARGS2`, not the flattened `ps` display. The portable
+`darwin_process_identity_` parser regression excludes environment strings and
+truncated records; `held_wrapper_process_identity_survives_spaces_in_the_program_path`
+also exercises the live wrapper and requires the whole process group to vanish.
+These tests must also run on macOS: Linux parser coverage cannot qualify the
+Darwin syscall or process-group behavior.
+Darwin's `lsof` omits the device field for a FIFO, so keeper ownership reads
+fd 3 directly with `proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)`. The
+`darwin_fifo_identity_` regression requires the open vnode's device, inode and
+FIFO type, plus a matching canonical path. It accepts path aliases but rejects
+wrong-device/same-inode records, other inodes/types/paths, malformed replies,
+and a replaced regular file. `darwin_vnode_path_` checks raw pathname bytes
+without assuming UTF-8 or display escaping.
+The held-process tests exercise this proof with the real keeper on macOS;
+it must still belong to the recorded process group before it authorizes cleanup.
+Linux requires whole-group ESRCH even for unreaped zombies. Darwin can return
+EPERM for a zombie-only group: that is accepted as stopped only after two
+complete, identical libproc snapshots prove every member is SZOMB (or both
+are empty). Errors, live/unreadable members, changing identities and truncated
+enumerations retain the barrier; EPERM alone never releases it.
+When a listed PID is reaped before its BSD lookup, the second complete
+zombie snapshot is a strict subset of the first, or a complete enumeration
+finds only zombies and non-zombies carrying `PROC_FLAG_INEXIT`, Mac stop
+confirmation may re-observe within the caller's existing deadline. Exiting
+members can still report SRUN before SZOMB; their flags are included in the
+transcript. Every enumerated member is checked: an exiting/reaped member
+cannot hide an unflagged live member or a later lookup error. Progress is not
+absence: only a later complete proof releases the barrier. Unflagged live
+members and hard errors refuse immediately; a zero deadline never sleeps or
+re-observes. The `darwin_group_progress_` and `darwin_group_inexit_` tests
+inject these transitions using paused time.
+Replacement's final Mac proof uses only the time remaining in kill's existing
+one-second absence phase, never a new budget or a cached absence result. Early
+ownership-cleanup failure supplies no grace. `darwin_group_replacement_`
+tests cover that deadline, fresh proofs, immediate refusals, typed errors and
+the ordinary error display used by the session. Every raw Darwin signal-zero
+disposition has same-observation diagnostics, including Ok/live and hard errors.
+Darwin's keeper also ignores SIGINT before exec: unlike Linux, a default-fatal
+SIGINT can kill a SIGSTOPped process. The cross-platform
+`held_keeper_retains_fifo_ownership_through_group_interrupt` regression waits
+for the CLI to acknowledge that interrupt and its wrapper to exit, then proves
+the stopped keeper still owns the FIFO before completing whole-group cleanup.
+The `shell_writer_` worker regressions hold a shell's Started event outside the
+actor, refuse rewind before interruption, reopen the journal with empty tools,
+and verify that neither restore nor a Rewound receipt can bypass the live writer.
+They also cover surviving group
+members after leader exit, unknown/SSH ownership, pending-root launch admission,
+late-notice suppression, and task-ID reservation. The tools regression cancels a
+context while its durable reservation is awaiting completion and verifies that
+no process starts. Old worker-turn contexts stay canceled after confirmation;
+actor exit cancels them too, while a later turn uses a new token.
+The worker-local journal migrations are `0005_claude_rewind.sql` for native-memory
+reset and `0006_rewind_rejections.sql` for durable failed receipts; the head needs
+no migration.
+
+The model-context regressions use synthetic append-only logs, a temporary head
+and mock model endpoints only; no real model or installed CLI is needed:
+
+```sh
+set -euo pipefail
+ulimit -n 65536
+cargo nextest run --locked -p c6-agent -p c6-head --lib \
+  -E 'test(history::tests::) | test(effective_context_tests::) | test(rewind) | test(withdrawn) | test(names_read_the_effective) | test(proposals_read_the_first_effective)'
+```
+
+The shared head fixture has two rewinds, a withdrawn user message, reply, tool
+result and compaction, plus surviving original/replacement turns. It checks
+nested side-chat seeds with overlapping sequence numbers; the shared text and
+handoff renderers; catch-up windows whose rewind marker is outside the requested
+window; naming that stops after its opening replies; cached timeline turns;
+suggestion/work-note evidence; work grouping; workflow replies; watcher digest
+windows; and exported memex digests. These are projections of the full effective
+log **before** any prefix/window/budget is selected. Raw event evidence remains
+available and tests assert that projection does not rewrite it. Previously
+published notes/documents and another session's already-delivered context are
+not retroactively erased by these tests or by a rewind.
+
+## Browser installation and pinned engines (S2)
+
+Use Node 24 and npm on PATH. The browser suites have a private npm manifest and
+lockfile in `crates/c6-ui/tests`, pinning **playwright-core 1.65.0**. Install once
+per checkout (and again after changing the lockfile):
+
+```sh
+make ui-browser-install
+```
+
+This runs `npm ci --prefix crates/c6-ui/tests` and the **installed package's**
+`cli.js install --with-deps chromium webkit`. On Linux the latter installs OS
+libraries through apt (sudo required); on macOS no Linux library wrapper is
+needed. It downloads the matching browsers to Playwright's normal user cache
+(`~/.cache/ms-playwright` on Linux), or `PLAYWRIGHT_BROWSERS_PATH` if set for both
+installation and execution. Do not use an unpinned `npx playwright` download.
+The package pins WebKit **2388 (27.2)** and Chromium/headless-shell **1254
+(158.0.8127.18)** on this Linux host. Playwright's platform overrides still
+apply (for example WebKit on macOS 14); these are Playwright builds, not branded
+Safari. No test dependency, browser binary or library defaults to `/tmp` or a
+hard-coded developer-specific home path. Screenshot/evidence output may still use `/tmp`.
+
+```sh
+set -euo pipefail
+ulimit -n 65536
+env -u NO_COLOR make ui
+make ui-browser-test
+# Three complete passes, no retries or assertion changes:
+UI_BROWSER_PASSES=3 make ui-browser-test
+```
+
+The runner covers workspace-open, motion, comment-sheet, phone-picker, phone-bar,
+theme (`--browser`), settings-lists, resource-lifecycle, markdown-html, status-row,
+stale-transcript, transcript-press and transcript-times in each engine, plus Chromium ring-render.
+It also includes the previously separate message-edit, message-origin,
+comments-design and session-sheet acceptance gates. This is a curated list, not
+every standalone `.cjs` helper in the directory. **ring-render is Chromium-only**;
+its layer/paint/blocked-main-thread assertions require CDP, not WebKit.
+
+The runner serves one immutable production build and normally owns a BrowserServer
+per engine. Eight bounded workers run independent suites/case shards in both engines
+concurrently. Every case still gets a **fresh browser context**, storage and its
+own fake HTTP/WebSocket head; only static bytes and browser processes are shared.
+Closing one worker disconnects its client and closes only its own contexts.
+`ISOLATE_BROWSER=1` preserves fresh-process diagnostics. `BROWSER_JOBS=1` runs
+correctness serially; `BROWSER_ENGINES=webkit` selects one engine.
+
+WebKit transcript-press is the native-input exception: the parent launches a
+local browser and runs the exported suite in-process, retaining all 14 controls.
+Pinned Playwright's raw page-proxy input requires its local implementation, not
+a remote BrowserServer connection. It consumes one normal pool slot; unsupported
+native input fails instead of skipping or substituting DOM touch events.
+Chromium retains all 13 controls on the normal child path. The local browser has
+bounded close/owned-kill escalation; cleanup errors remain failures. This
+exception also applies with `ISOLATE_BROWSER=1`.
+
+`BROWSER_SUITES=motion` selects a suite; space-separated names select several.
+Diagnostic case selectors are passed through without multiplying or overriding
+them. A new standalone suite (for example stale-transcript) works immediately
+with `BROWSER_SUITES=stale-transcript`; add its name once to `suites` in
+`browser-runner.cjs` to include it by default. There is no second shell allowlist.
+`UI_BROWSER_PASSES=3` runs three complete passes, with no retries.
+
+`BROWSER_TEST_OUTPUT` changes the default `dist/browser-tests` parent. Every
+invocation creates a unique child directory, so earlier failures are never
+overwritten. Logs/screenshots/traces are separated by pass, engine, suite and
+shard; `summary.json` records exact child/pass/wall times and selections,
+`timeline.jsonl` timestamps all output, and `cases.jsonl` times common case/phase
+boundaries. On failure no new jobs are started; already-running jobs retain
+their normal evidence handlers. No assertion is retried. Locator/navigation
+operations default to **15 seconds**, with a separate **90-second case watchdog**
+so an operation's failure handler can save evidence first. Explicit
+`C6_TEST_DEADLINE_SECS` / `C6_TEST_CASE_DEADLINE_SECS` overrides are diagnostic,
+not a retry policy. A parent-side **300-second worker deadline**
+(`BROWSER_WORKER_DEADLINE_SECS`) also bounds evaluation/renderer hangs that do
+not honor Playwright operation timeouts. Timeout or interruption stops new
+workers, terminates only owned worker process groups, closes parent-owned
+browser servers, and reports failure even if a worker exits zero. Even
+`ISOLATE_BROWSER=1` uses a fresh **parent-owned server per shard**, so a
+hard-killed worker cannot orphan Playwright's separately detached browser.
+The invocation
+lock is held until active workers drain and owned browser servers close.
+Exceptions during worker setup also drain other active workers before teardown.
+`summary.json` includes interruption/timeout status and SHA-256 hashes of the
+production JS/CSS/WASM and selected test helpers, in addition to phase offsets.
+
+Session-sheet alone enables the reusable passive `browser-lifecycle.cjs`
+observer: timestamped page close/crash, context close, browser disconnect,
+intentional close callsites and an immutable first-error connection/page
+inventory. Failure JSON is saved before cleanup and updated afterward, retaining
+the primary error and secondary diagnostic errors. Passing records are in
+`lifecycle.jsonl`. It does not change assertions, selectors, deadlines or retries.
+The runner gates selected press, motion/navigation and session-sheet suites on
+their respective follow-press, navigation-policy and lifecycle unit checks.
+
+### Latest and saved transcript windows
+
+`stale-transcript.cjs` runs phone (390px) and desktop (1440px) cases in both
+pinned engines, using production WASM and a private fake head. A 1,200-event
+session opens normally at its tail, then at a deliberate saved-message hit
+(the phone uses the Sessions picker). It reloads the actual saved tile and
+reissues an in-session Find jump before clicking the floating Latest button.
+The separate return cases select that historical session normally through the
+phone picker or a desktop transcript link. Both paths must show the real end,
+consume the historical address without adding Back history, and retain the
+composer/draft and stream. Genuine search hits and message links still jump.
+
+The stream fixture implements the head's real contract: `at` changes the
+beginning of replay, **not its end**. It sends the entire suffix, preserves a
+deliberate historical window across an empty reconnect, then reconnects with
+400 missed events using `after=<last received seq>`. Tests check a gap-free
+rendered tail, the pending decision after the actual end, and a second reload
+using the current tail rather than the old saved target. Find/outline requests
+are one-shot; Latest cancels pending historical paging/reveals and closes Find.
+Only the initial replay applies an opening target's drawing cutoff. Waiting
+messages retain their existing transcript placement and actions.
+
+```sh
+BROWSER_SUITES=stale-transcript bash scripts/ui-browser-tests.sh
+```
+
+This is emulated phone/browser coverage, not a physical Android Chrome run.
+
+### Browser tiers and coverage ledger
+
+```sh
+make ui-browser-test                 # all registered regression suites, representative matrix
+make ui-browser-quick                # everyday workspace/motion/lists/Markdown/press/timestamps/Latest
+make ui-browser-perf                 # Chromium ring measurements; one runner worker
+BROWSER_MATRIX=all make ui-browser-test # exhaustive correctness combinations, still no benchmark workload
+node --test crates/c6-ui/tests/browser-runner.test.cjs # scheduler/selection checks, no browser
+```
+
+The quick tier is intentionally **not release qualification**: it omits
+comment-sheet, phone-picker, phone-bar, theme, resource-lifecycle, status-row,
+ring-render, message-edit, message-origin, comments-design, session-sheet and
+navigation-errors (the navigation policy unit checks still run with motion).
+It uses the same assertions/isolation as full, not simplified assertions. Perf
+forces one worker and only Chromium ring-render. Full/quick have no CPU-throttled or
+main-thread-blocking benchmark workloads. Motion's frame-by-frame geometry,
+FLIP batching, focus, duration/keyframe, first-frame interaction and controlled
+clock interruption/disposal assertions remain **correctness**, not FPS budgets.
+All runner tiers take an exclusive invocation lock at
+`~/.cache/carbon6/browser-tests.lock` (`BROWSER_TEST_LOCK` overrides it); a second
+runner fails immediately, without waiting or stealing ownership. A killed
+process's stale lock requires explicit inspection/cleanup. Standalone suite
+commands and compilers do not take this lock. It neither proves an idle host nor
+excludes differently configured runners or unrelated sessions' jobs.
+
+Browser-fast qualification explicitly permits unrelated host builds: there is
+no idle gate. Keep this task's invocations sequential, record start/end load and
+heavy processes, and label all timings shared-host throughput. Failures and
+unstarted shards remain visible, not retried away as load artifacts. Perf's
+single worker is not evidence of host-wide isolation; clean microbenchmark
+comparisons need a separately controlled protocol.
+
+Counts below are **per engine**, except Chromium-only ring-render. Removed
+crossings are recoverable with `BROWSER_MATRIX=all` or the unchanged standalone
+suite selectors. Nothing is retried, and no distinct refusal/race/state case is
+replaced by a generic success/error example.
+
+| Suite | Previous → default selection | Kept, moved or sampled—and why |
+|---|---|---|
+| workspace-open | 4 → 4 | Desktop/narrow × Linux/Mac; real modifier/shortcut, history, owner and stream checks all retained. |
+| motion | 24 → 11 contexts | Eight complete interaction contexts: desktop/phone × Light Full/Reduced/Off and Dark Full. Three additional desktop/Light policy-only contexts: System, System+OS Reduce, Full+OS Reduce. All six policy choices remain; policy itself checks live OS/explicit overrides, storage, another tab/realm and reload. Full four-path `modelForms` runs in desktop/Light/Full and phone/Light/Full, not the other nine contexts. System variants have the same effective component behavior as explicit Full/Reduced; repeated dark/static and policy × component traversals are sampled, not distinct gesture branches. All native drawer/picker, disclosure native/fallback, layout, tool, send/stop, focus/follow and interruption assertions run for their retained component cases. |
+| phone-picker | 24 → 8 | Exact retained `(viewport,theme,motion)` tuples: narrow/Light/Full, narrow/Dark/Off; phone/Dark/Full, phone/Light/Reduced; wide/Light/Full, wide/Dark/Reduced; desktop/Dark/Full, desktop/Light/Off. All other tuples in the old four-width × two-theme × three-motion product are sampled out. Every width keeps both themes and Full; every phone effective policy remains, including narrow Off+OS Reduce. Desktop Reduced has no distinct assertion branch. Full-only interrupted percentage entrance remains at **every phone width**; all search/stale/retry, focus/inert, bell/Ask, cleanup and routing cases remain in each selected tuple. WebKit still does not claim native swipe. |
+| phone-bar | 84 → 52 | All eight states at **all five phone viewports in Light**, all eight again at 320px in Dark, and both desktop controls in both themes. Only Dark × {390px portrait,430px portrait,900px landscape,430px landscape} × all eight states (32 contexts) is sampled out. No state, viewport, short-height breakpoint, wide-search-row branch or desktop control is removed. |
+| theme | All first-paint/retained contexts kept; switching checks 15 → 7 per layout | All ten choice × OS first paints, all retained Settings/Choices layouts, legacy migration, native radio isolation, cross-tab/OS/reload checks stay. Tile and phone each check Dark at 240/320/400/480/640px, plus Light/System at 320px. Only Light/System × {240,400,480,640}px are sampled out: card fitting is palette-independent. |
+| comment-sheet | 8 → 8 | Both themes at all four layouts; small-phone and short desktop paths retained. |
+| settings-lists | 4 → 4 | Both themes × desktop/phone; every list type, focus/key, failed/successful save and realm switch retained. |
+| resource-lifecycle | 8 → 8 | Both themes × chat/stale/work/projects; all cancellation and owner lifetimes retained. |
+| markdown-html | 12 → 12 | Both surfaces and themes; narration at both widths × both thinking settings, live/replay/historical Text and tool icons retained. |
+| status-row | 12 → 12 | Both themes × all six views; every count/state and wide highlight/scroll/remount check retained. |
+| ring-render | 6 → 2 correctness repetitions | One identical assertion pass per theme instead of three. All 96 live chunks, 12 durable Markdown items and snapshot/animation-identity checks per pass remain, as do compositor layers, shape/keyframes, state/preferences, task wording and once/theme raster seam/ink/easing galleries. Three repetitions/theme, 4× CPU throttle, 35ms producer pacing, profiles/traces/rAF/long-task timings, trace-qualified zero-ring-Paint, and the unchanged 600ms blocked-main-thread screencast/assertions move together to **perf**, not deletion. Optional `PHONE=1` matrix is unchanged and was never in the default runner. |
+| transcript-press | 10 → 13 Chromium / 14 WebKit | All original idle/stream × Full/Reduced/Off, cancellation/multitouch and engine-specific native controls remain. Integration adds seven post-Latest controls: held press through layout growth in all three policies/engine, plus WebKit raw-touch position/cancel/recovery and separate native tap. Source-helper unit checks still run once. |
+| transcript-times | 4 → 4 | Off/Exchanges/All and side-chat Off; exact empty-row assertions unchanged. |
+| stale-transcript | Newly integrated: 4 → 4 | Both phone/desktop × Latest/normal-return cases in each engine, now registered in full and quick. Historical target replay/reconnect, actual tail/pending decision, composer/draft/stream ownership, obsolete response cancellation and reload assertions are unchanged. |
+| message-edit | Separate gate → all 60 | All 30 outcomes × desktop/phone now in full; refused resets, response loss, attachment recovery, stacking/replay/durable-origin cases are **not** merged. |
+| message-origin | Separate gate → all 6 | Three viewports × both themes now in full. |
+| comments-design | Separate gate → all 10 | All five layouts × both themes now in full; unique margin-fit/Light deferred-save races remain. This does not replace comment-sheet. |
+| session-sheet | Separate gate → all 18 | Core, nested/focus and SSH/stale/offline capability cases now in full; no matrix reduction. |
+| navigation-errors | New: 4 Chromium + 4 WebKit | Exact message outside the navigation window, different message inside, and different URL inside must remain fatal. A real cold reload with attention HTTP fetch in flight must hydrate with zero unclassified errors; native diagnostic counts are informational. Deterministic units replay the exact saved real error inside/outside the window and test the three negatives. |
+
+### WebKit attention diagnostic during owned cold navigation
+
+`browser-navigation.cjs` intentionally uses a simple arrival-window policy.
+Only WebKit pageerrors whose complete first stack line exactly equals
+`Fetch API cannot load <owned-origin>/api/v1/attention due to access control checks.`
+are tolerated, and only between a harness-initiated goto/reload and destination
+load. The entire line and owned endpoint must match. Outside-window errors,
+different messages/URLs and every Chromium pageerror remain fatal. This is
+arrival timing, not causal proof: no route provenance, epochs, revocation or
+document-identity machinery is used. Raw diagnostics and classifications remain
+visible. No application code or WASM changes implement this policy.
+
+Fixture `f.navigate`/`f.reload` and registered peer-page observers cover explicit
+cold replacements. Foreign destinations and overlapping replacements fail.
+Even DOMContentLoaded callers wait for load; then two task turns drain before
+final error assertions. Page close or operation failure also closes tolerance.
+
+`navigation-errors.cjs` runs four controls per engine. Its real in-flight-fetch
+reload checks completion, hydration and zero unclassified errors, without
+requiring timing-dependent native noise. The classifier itself is checked
+deterministically using the exact stack/name/message retained from an earlier
+real failed run.
+
+Fixed completion sleeps were not replaced with shorter sleeps. Ring correctness
+waits for each actual chunk/item and committed frames; perf retains deliberate
+35ms workload pacing. First-paint theme delivery keeps its intentional 300ms
+adversarial network latency, not a completion sleep; a rAF-dependent release
+inside that parser-blocking route deadlocked the diagnostic and was discarded.
+All first-frame assertions remain. Session-sheet Stop waits for the exact mocked
+POST response instead of hand-written 10ms condition polling. Motion keeps
+finite-animation completion and controlled browser-clock boundaries.
+
+### WebKit needs a current Mesa
+
+Playwright's WebKit paints through the system's Mesa. On a machine whose GPU it
+can't use, that is Mesa's software driver, and Debian 12's Mesa 22.3.6
+segfaults in it now and then (`page.screenshot: Target crashed`, a `crash`
+event in the case's `lifecycle` record, a core in `swrast_dri.so`): about one
+full run in eight. Mesa 25 (Debian's bookworm-backports) ran 20 full runs
+without one. A crash fails the run; there is no automatic rerun. Check the
+system Mesa before suspecting the app.
+
+### Phone single-bar production browser regression (S14)
+
+`phone-bar.cjs` reuses Motion's built-production fixture, private loopback
+origin and pinned browser launcher. It runs **80 phone contexts per engine**:
+light/dark at 320×568, 390×844 and 430×932 portrait, plus 900×430 and 430×320
+short landscape, in eight states (session alone, session+doc with either pane
+shown, session+Changes, session+Terminal, standalone doc, Settings and Sessions).
+Four additional contexts check wide and narrow-tile desktop chrome, for
+**84 fresh contexts per engine** in total. The default
+has no context filters or retries. APIs, document updates and terminal PTY
+traffic are local fixtures; real bundled xterm mounts without starting a shell.
+
+The standalone exhaustive suite still has the matrix above; the default runner
+uses the 52-context representative selection in the coverage ledger.
+The phone checks measure the sole `[data-tile-bar]` through to the actual pane
+body, including the session's inner content wrapper: total chrome is at most
+44px, with no visible column header, session strip or sticky document toolbar.
+They also check 44px phone control targets, 320px control collisions, selected-pane titles, two-way title
+switching, the back button, a session ring even over a document, session pin/
+unpin, close-pane/close-tile actions, ring-opened Changes/Terminal, Files,
+session details and Find. Catch-up switches and native Copy feedback must
+retain the open Actions menu; ordinary navigation still dismisses it.
+Document Actions exercise Escape cancellation and Enter rename, comments, edit,
+history, export, archive/unarchive and opening the owning session. A standalone
+document's Used in link opens real work, dismisses Actions, retains the document
+DOM and returns through tile history. Generic tile
+Back/Forward, detach and minimize are exercised too. Wide desktop also checks
+document rename through Enter and blur with exactly one PATCH per save, plus
+Escape cancellation with no PATCH and no cancelled draft on reopening.
+Runtime browser errors,
+including WASM traps, are always fatal. Console errors are fatal except for
+exactly `Viewport argument key "interactive-widget" not recognized and ignored.`
+from WebKit, at most once per page. This unsupported-key engine diagnostic was
+observed on the pristine baseline, not classified as an application failure.
+Its raw message and named classification remain in every capture's evidence;
+the same message in Chromium, duplicates, and all other console errors fail.
+
+```sh
+# Build once, owned by the caller; never race a second build with a capture.
+env -u NO_COLOR make ui
+ENGINE=chromium node crates/c6-ui/tests/phone-bar.cjs
+ENGINE=webkit node crates/c6-ui/tests/phone-bar.cjs
+BROWSER_SUITES=phone-bar BROWSER_TEST_OUTPUT=/tmp/s14-bar/matrix bash scripts/ui-browser-tests.sh
+
+# Run against the pristine build before replacing it, then against the new one.
+# BEFORE captures initial screenshots/geometries; it does not assert the new
+# header/control contract, but browser errors remain fatal.
+BEFORE=1 ENGINE=chromium SCREENSHOTS=/tmp/s14-bar node crates/c6-ui/tests/phone-bar.cjs
+ENGINE=chromium SCREENSHOTS=/tmp/s14-bar node crates/c6-ui/tests/phone-bar.cjs
+```
+
+`SCREENSHOTS` defaults to `/tmp/s14-bar`; names begin with `before-` or `after-`
+and include engine/theme/viewport/state. Each capture saves a screenshot and
+geometry/error JSON; failures retain a screenshot and request/error diagnostic.
+`ENGINE=both` selects both engines. `THEME`, `VIEWPORT` and `CASE` accept
+comma-separated exact names for separately labelled focused diagnostics (for
+example `THEME=dark VIEWPORT=portrait-320 CASE=session-doc-doc`). These are
+subsets, not full-matrix qualification. `C6_TEST_DEADLINE_SECS` sets each
+operation's timeout (default 15 seconds), not the entire matrix's duration.
+The separate per-context watchdog defaults to 90 seconds
+(`C6_TEST_CASE_DEADLINE_SECS`) so an operation failure can save its screenshot/JSON
+before the browser closes.
+
+Final S14 size revision plus desktop rename blur guard: the production build is
+**10,653,175 bytes raw / 2,657,897 Brotli**, SHA-256
+`2ddccdbfe330c49c17c879084677fc136be6496aacbe4f830249abe9b32d64f7`.
+Against exact `8a5ac826` (10,594,434 / 2,643,871 bytes), that is
+**+58,741 raw / +14,026 Brotli**; it saves **21,586 raw / 4,811 Brotli** versus
+the initial `4f6169b6` implementation. Unchanged ceilings (10,724,780 /
+2,667,328) leave **71,605 raw / 9,431 Brotli bytes**. The approximate +25KB raw /
++6KB Brotli reduction goal was not met; the coordinator selected the smallest
+measured Brotli candidate rather than continuing size experiments. That Small1
+source was recovered and its compiler bytes reproduced exactly at 10,653,136 /
+2,656,211; the separately approved blur guard changes that by +39 raw / +1,686
+Brotli. No icon, typed-view or budget exemption was used. The `w-70` and
+height-aware `md:flex`, `md:block` and `md:hidden` utilities are present.
+
+The final unfiltered Chromium/WebKit cohort completed **168 contexts** (160
+phone, 8 desktop); all 160 initial phone screenshots and geometry were independently
+validated, with bar and total top chrome **44px** throughout. The 390px
+session+document/session-visible capture fell from **132px to 44px**. The
+separately labelled guard smoke passed 8 contexts. With `set -euo pipefail;
+ulimit -n 65536`, the required `env -u NO_COLOR make ui`, `make check`, `make test`
+sequence passed: warning-free Clippy, test lint and size guards, and **1,271
+tests passed, 2 skipped**. Logs `ui-guard-final.log`, `check-guard-final.log`,
+`test-guard-final.log`, `after-browser-small-final.log`, the independent
+`size-final-browser-summary.json`, artifact manifest `guard-final-artifacts.sha256`,
+before captures and final `size-final/` screenshots are under `/tmp/s14-bar/`.
+Physical Android/iOS hardware was not exercised; combined-branch size is unmeasured.
+
+Affected suites passed on the same final artifact: comment-sheet 16 contexts,
+image-preview phone 8 cases, comments-design phone 8 contexts, session-sheet 36
+contexts, document ownership 22 contexts per engine, and full phone-picker 48
+contexts (`compat-guard-final/`). These are not combined into a context total:
+an image-preview case can exercise multiple fixtures.
+The ownership test scrolls the deck's real nested sorter when the outer page
+fits; positive scrolling, fixed-header geometry, owning-session mark fallback,
+navigation dismissal and retained document assertions remain mandatory. Earlier
+failed owner-navigation and ancestor-only deck-scroll cohorts remain labelled
+in `/tmp/s14-bar/report.md`; they were not counted as passes or silently retried.
+The pre-guard desktop smoke's duplicate Enter PATCH failure also remains there;
+the exact-once assertion was retained and Escape coverage added. A pre-guard
+full test run had one unrelated worker handoff fixture failure under concurrent
+load (1,269 passed, 1 failed, 2 skipped); its one exact isolated rerun passed.
+The final guard full test run above passed without retries. The coordinator's
+known workspace-open Changes/presence-scrim timeout reproduces on `8a5ac826`;
+it is recorded, not fixed here or claimed as a passing suite for this change.
+
+`settings-lists.cjs` covers the production list editors in light/dark and
+desktop/phone: keyed-row and focus retention during live updates, adding and
+removing, all field kinds, rejected/successful saves, reload and same-page
+section remounts, and the console's root/realm routing selector. It mocks only
+private loopback APIs; no live settings are read or written. To run it alone:
+`ENGINE=both node crates/c6-ui/tests/settings-lists.cjs`.
+
+`resource-lifecycle.cjs` covers caller-owned resources in 16 desktop contexts
+(Chromium/WebKit, light/dark): Saved's synchronous `done` dependency, action-tick
+refetch without remount, error/recovery, fresh pane remounts, and the conditional
+Work/Projects closed-list queries. Held Saved responses preserve the baseline
+framework's serial same-owner fetch policy: the newer query runs after the old
+one completes. A separate held response from a disposed owner is released only
+after fresh remounted content renders, with a distinct error to detect a stale
+replacement. This does not assert stronger cancellation or absence of transient
+old results within the same owner. All APIs are private loopback mocks. Run:
+`ENGINE=both node crates/c6-ui/tests/resource-lifecycle.cjs`.
+For separately labelled diagnostics, `RESOURCE_CASE=chat|stale|work|projects` and
+`THEME=light|dark` select one case/theme (comma-separated lists are also accepted).
+
+Existing CI workflows are unchanged: these standalone browser suites were not
+previously CI jobs. A browser runner on Ubuntu 24.04 needs Node 24, npm, the
+existing Rust/Trunk/Brotli setup, `make ui-browser-install` (including sudo apt),
+`env -u NO_COLOR make ui`, then `make ui-browser-test`; preserve
+`dist/browser-tests` on failure. Do not treat the historical S2 results below
+as a passing combined browser run; the independent fields-panel fix and its
+qualification are recorded under S11.
+Downloads/apt are installation steps, not network access by the tests: the
+fixtures still serve only private loopback origins. Rust test jobs are unchanged.
+
+### Fixed-place status row (S12)
+
+`status-row.cjs` checks option A: the working state and live `turn_line` stay on
+the left; background tasks stay on the right, including while idle. The idle
+left side is empty. Desktop retains its 24px bottom gutter; the phone reserves
+the same 44px slot in every state, including idle with no tasks. Stats ellipsize
+before the nonwrapping task label; their full text remains available on hover
+and focus (the whole-row opener exposes it on phones). The existing waiting,
+failure and approval/answer actions are not replaced with new controls.
+
+The production-browser matrix covers light/dark, a wide desktop, a 338px tile
+in a desktop viewport, and 320/360/390/430px phones. Each transitions through
+working/idle with 0, 1 and 12 background jobs. It compares exact task x/y/size,
+row bounds, composer bounds and transcript viewport/scroll position, samples
+rendered transition frames, checks a single baseline and ellipsis, and exercises
+the desktop link and phone's full 44px opener. Long stream status and elapsed
+ticks must retain task placement and opener focus. Without tasks, the narrow
+phone's stats use the available width rather than an elapsed-only cap. All APIs
+are private loopback mocks, not live settings. Ticking stats stay outside the
+state/task live regions so screen readers are not interrupted every second.
+Run with:
+
+```sh
+BROWSER_SUITES=status-row BROWSER_TEST_OUTPUT=/tmp/s12-row/browser bash scripts/ui-browser-tests.sh
+```
+
+Each case saves working/idle screenshots and measured geometry. `BEFORE=1`
+captures identical inputs against the base build without applying the new
+layout assertions; it is a separately labelled comparison, not a passing test.
+
+Measured against the exact `c6/next` base `8874366d`: production WASM is
+10,594,434 raw / 2,643,871 Brotli bytes, **+3,332 / +2,207 bytes**. The unchanged
+ceilings retain 130,346 raw / 23,457 Brotli bytes of headroom. Both new arbitrary
+Tailwind classes (`max-w-[60%]`, `max-[360px]:max-w-[calc(4ch+1px)]`) are present in the
+built CSS. Baseline screenshots reproduce a 144.5px desktop task-link jump in
+the narrow tile and an 8px vertical task-line jump on the 320px phone; the new
+regression requires zero movement and a fixed slot, including idle with no jobs.
+
+### Why change WebKit?
+
+The approved N7 cold-load comparison alternated the same production WASM for
+60 rounds per arm. The old Playwright 1.50.1/WebKit 2123 failed **12/231 loads**
+(10 out-of-bounds, one unreachable, one disposed-value panic); Playwright
+1.65.0/WebKit 2388 failed **0/240** (Fisher p≈0.0002). Original commands are
+`/tmp/n7-webkit/run.sh` and `repeat-any.cjs`; raw results are under
+`/tmp/n5-webkit/n7/`. Those are historical evidence locations, **not runtime
+dependencies**. This supports replacing the old test engine, not a claim that
+a particular WebKit source bug was identified, all application lifetime errors
+were repaired, or real Safari was tested. The S2 verification results below
+record the new full-suite cohorts separately from that cold-load experiment.
+
+### S2 verification: November 7, 2026
+
+Branch base: `c6/next` at `5384d8e2`, Linux x86-64/Debian 12, Node 24.16.0.
+The installer and both smoke launches succeeded using the standard cache and
+OS libraries, with no browser/core/library overrides for qualification.
+Production WASM: **10,713,719 bytes**, Brotli **2,665,834 bytes**, SHA-256
+`8dc5d6b0d6d7b2f526aa0a802e1b556ee4ec99bd2ad11bd450f934a743fb3001`.
+The production source, optimization and size ratchet were not changed.
+
+The required command sequence ran with `set -euo pipefail; ulimit -n 65536`:
+`env -u NO_COLOR make ui; make check; make test`. All succeeded: clippy had no
+warnings, test lint and size checks passed, and nextest reported **1,167 passed,
+2 skipped** (two slow tests passed). A final `make check` also passed.
+
+Three full invocations per engine are recorded for workspace-open and the
+comment-sheet/phone-picker/theme matrices, and three full default Chromium
+ring-render invocations. Motion qualification remains blocked, as explained
+below; this is **not three green passes of the combined browser runner**.
+
+| Suite | WebKit 2388 | Chromium 1254 / 158.0.8127.18 |
+| --- | --- | --- |
+| workspace-open | 3 complete passes, 12 viewport/platform scenarios | 3 complete passes, 12 scenarios |
+| comment-sheet | 3 complete passes, 24 cases | 3 complete passes, 24 cases |
+| phone-picker | 3 complete passes, 72 contexts | 3 complete passes, 72 contexts |
+| theme `--browser` | 3 complete passes, 276 reported PASS checks | 3 complete passes, 276 reported PASS checks |
+| ring-render | Not applicable: requires CDP; no WebKit result claimed | 3 complete passes, 18 default theme/workload runs, including tracing, blocked-main-thread and raster assertions |
+| motion | **0/3 complete passes**: failed after 6, 9 and 1 passing contexts respectively; 3 failing contexts retained | **0/3 complete passes**: each stopped on the first context's fields-panel invariant |
+
+**Observed WASM traps: zero** in these repeated cohorts and in the failed
+Motion/initial harness runs. This is an observed count, not a proof of universal
+engine reliability or a passing result for the independent failed assertions.
+
+The first runs exposed two stale harness assumptions, retained in the logs:
+workspace-open matched the secondary Sessions row's title as its entire
+accessible name, omitting its status/worker subtitle; motion dereferenced a
+lazy tool body before its native toggle mounted it. The exact row name now
+includes the subtitle (the count must still be one), and the geometry wait
+waits for the body before applying its unchanged expanded-height predicate.
+The tool failure reproduced alone; the corrected check passed in both engines.
+
+Additional tile-marks coverage initially timed out twice because Actions was
+looked up beneath the tile after its popover had moved into a body portal.
+The test now identifies exactly one newly mounted `data-pop` identity after
+clicking the intended tile's Actions, keeps that identity for Escape, and
+retains all availability/icon/resize/geometry/retained-node assertions. The
+complete four-case Chromium/WebKit light/dark matrix then passed.
+
+**S2's unresolved Motion interaction, not a WASM trap (fixed in S11 below):** choosing an offered model
+can hide New Session's where/how fields before effort can be used. A diagnostic
+trace records native pointerdown/mousedown/mouseup/click on the intended
+`fixture-model-32` button, nested in both `data-pop` regions, followed by the
+fields becoming hidden and their opener changing from expanded to collapsed.
+The saved failure diagnostics have empty browser-error arrays. The same
+panel-open failure reproduced with the old **Playwright 1.50.1 / Chromium
+133.0.6943.16** as an explicitly labelled control against the same production
+WASM; it is not introduced solely by Chromium 158. WebKit also recorded
+fields/list-reopen and effort-selection hangs in the full runs. Isolated
+modelForms reruns of all three failed WebKit cases (dark/System,
+dark/Full-reduce and light/System-reduce) passed; those diagnostic reruns do
+not erase the failed full cohorts. No production fix or claim of a
+source-level cause is made here.
+
+The harness now explicitly requires the fields to remain expanded after both
+model and effort selection, rather than concealing dismissal behind a
+five-minute hidden-control wait. It never reopens the panel for the test,
+selects a hidden control, forces a click, retries a failed case, or filters
+modelForms out of the normal matrix. The requested three-green-full-pass
+qualification cannot be claimed while that independent failure remains.
+
+Supporting checks: motion VM/launcher **13 passed**, theme VM **12 passed**,
+crash VM **8 passed, 1 browser-only test skipped**, real-DOM motion helpers
+**6 passed**, plus syntax checks for all CJS files and the Bash runner. A
+stubbed runner check verified 33 suite invocations for three two-engine passes,
+the theme browser flag, Chromium-only ring selection, retained failure logs,
+and immediate propagation of a simulated exit 7 without retry.
+
+Raw evidence is local to the S2 worktree under `dist/s2-verification/`
+(installation, provenance, required/final checks, initial failures, isolated
+reruns and event diagnostic), `dist/s2-workspace/`,
+`dist/s2-{chromium,webkit}-additional/`, and `dist/s2-motion-blocker/`.
+Pass/engine/suite subdirectories preserve distinct cohorts. The earlier
+`dist/s2-{chromium,webkit}*` fail-fast runs are retained too, not overwritten
+or counted as clean passes. Explicit old-engine paths occur only in that
+labelled control command, never in the checked-in default setup.
+
+### S11: New Session fields and passive session previews
+
+This was a product bug, not a stale expectation that inline fields should
+disappear. Selecting an offered model removed the list and exposed a session
+row beneath the stationary pointer. The resulting native mouseover opened its
+hover preview, whose registration displaced the unrelated fields panel in the
+shared popup stack. The model click reached the right button and selected the
+model; no overlay interception, lost model state or model-picker portal was
+needed to reproduce the failure.
+
+An untouched `7035ec6b` production build reproduced the original strict
+model-selection failure in Chromium. Its event trace kept the pointer at
+`(1250, 782)`: model click at 1167.1ms, session-row mouseover at 1182.1ms,
+fields collapsed at 1183.6ms, and input focus lost afterward. These are
+observations, not timing requirements in the regression test.
+
+Passive session-list/rail hover now checks the popup registry before opening.
+It may replace another passive preview (including rail-to-list handoff) but
+cannot displace an explicit panel or a pinned preview. Clicking Session
+details is still explicit and may replace another popup. Preview-to-preview
+opening treats rail and list cards as alternatives, even where their component
+owners are ancestors; otherwise both cards could remain visible. The strict
+model/effort assertions remain, with deterministic row-hover coverage, model
+list reopening, two-level Escape/focus restoration, retained input/model/effort,
+phone outside-tap dismissal and desktop inline-field dismissal checks added.
+Desktop outside clicks intentionally leave inline fields open; Change/Done or
+Escape closes them. The phone sheet also closes on an outside tap.
+
+For an interactive browser check, use both themes on desktop, a narrow
+workspace tile and a phone: open New Session's fields, type a custom model,
+choose an offered model and High effort, reopen the list, and press Escape
+twice. Only the list closes first, then the fields, with focus back on the
+opener. Reopen and verify both selections remain. A pointer crossing a session
+row while the fields are open must not show its passive preview; after closing
+the fields, hovering still works and clicking Session details still opens it.
+On a phone also dismiss via the scrim and Done, without starting a session.
+
+Initial targeted authoring probes are retained separately: one was stopped
+at an outside-click target whose heading is intentionally hidden in a narrow
+tile (the check now clicks the visible search box); the next and its isolated
+diagnostic exposed the two-preview ownership case above. No assertion was
+removed, no click is forced, and these partial probes are not qualification
+passes. The handoff check keeps the old unpinned card focused so its hide timer
+cannot make a blocked handoff pass, then requires exactly one replacement card.
+
+Final verification used Playwright 1.65.0 with Chromium **158.0.8127.18**
+(revision 1254) and WebKit **27.2** (revision 2388). The focused System-motion
+modelForms run passed **8/8 contexts** (both engines, themes and viewport
+classes); the isolated desktop handoff check passed separately. Scripted
+exploratory checks passed **12/12** engine × theme × layout cases: a
+1,152px-wide desktop tile, a measured 387.33px-wide tile in a three-column
+workspace, and a 390px phone viewport. They checked model/effort selection,
+Escape/focus/state retention, desktop outside-click behavior, and phone
+scrim/footer-Done dismissal, with no browser errors. These are real headless
+browser interactions and screenshots, not human visual or physical-device QA;
+interactive signoff using the checklist above remains outstanding.
+
+The requested full qualification used
+`UI_BROWSER_PASSES=3 BROWSER_SUITES=motion bash scripts/ui-browser-tests.sh`,
+without context/test filters, isolated-browser mode or retries:
+
+| Full motion pass | Chromium | WebKit |
+| --- | --- | --- |
+| 1 | 24/24 passed | 24/24 passed |
+| 2 | 24/24 passed | 24/24 passed |
+| 3 | 24/24 passed | 24/24 passed |
+
+That is **72/72 per engine, 144/144 contexts total**, with no browser errors
+or WASM traps. Each matrix includes modelForms, both themes, desktop/phone,
+and all six motion policies. The focused and exploratory runs above are
+separate evidence, not substitutes for any full cohort. Logs/screenshots
+remain under `dist/s11-motion/pass-{1,2,3}/{chromium,webkit}/motion/`;
+`dist/s11-final-verification/motion-counts.json` verifies the 24 distinct
+expected context labels and completion marker in each log.
+
+The first external exploratory harness seeded its alleged narrow tiles into
+one stack, leaving them full-width, and matched both phone Done buttons. That
+partial run is preserved, not counted as narrow coverage. Corrected setup
+requires the measured narrow width and targets the actual phone-sheet footer;
+the failed phone case passed in isolation before the fresh 12-case matrix.
+Both engines also confirmed on the untouched base that the desktop summary
+Done and phone footer Done are simultaneously visible at 390px. This separate
+responsive-display issue is unchanged and remains a follow-up, not a reason
+to weaken the modelForms assertions.
+
+An additional, non-required `workspace-open phone-picker` runner attempt
+stopped in the first Chromium desktop/Linux workspace context: the Changes
+companion check's `.last()` Changes click was intercepted by an open
+`c6-presence fixed inset-0 z-40` layer until the 300-second deadline. The exact
+workspace case failed the same way in isolation on the final bundle and on
+the untouched `7035ec6b` bundle. This is preserved as a separate baseline
+failure, not a passing extra suite or an explanation for modelForms; the
+runner never reached phone-picker. Logs are
+`dist/s11-final-verification/{popup-regressions,workspace-isolated,workspace-exact-base}.log`.
+That historical failure was later traced to fixture setup: desktop opened the
+intentional ring popover/scrim before trying its toolbar Changes button. The
+browser-fast fixture reuses the stale-transcript fix's phone-only sheet opener;
+it does not bypass the scrim, force a click or change the product.
+
+`env -u NO_COLOR make ui` passed. `make check` passed formatting, native/wasm
+Clippy without warnings and test-lint, then failed only the already-exceeded
+raw size guard below; the Brotli guard passed. `make test` passed **1,257/1,257
+tests**, with **2 skipped**. The motion VM/launcher checks passed **13 tests**;
+JavaScript/Bash syntax, whitespace, and runner-stub checks also passed. The
+runner checks cover the default suite set, three motion-only passes, rejected
+suite names/whitespace-only selections, and immediate exit-7 propagation
+without retry.
+
+Local evidence is under `dist/s11-final-verification/` (build/check/test,
+versions, size/source hashes, focused and exploratory logs),
+`dist/s11-exploratory/` (12-case results and screenshots), and
+`dist/s11-model-forms-targeted-final/`. Initial exploratory evidence remains
+under `dist/s11-exploratory-initial-layout-and-done/`; the corrected isolated
+phone run is under `dist/s11-exploratory-phone-correction/`. No diagnostic
+rerun replaces a failed or stopped cohort.
+
+The final production build is **10,789,584 bytes raw / 2,663,888 Brotli**,
+versus the untouched base's **10,789,325 / 2,664,768**: **+259 bytes raw,
+−880 Brotli**. The raw ceiling remains **10,724,780**, already exceeded by
+the untouched base; Brotli remains below its **2,667,328** ceiling. No budget,
+optimization setting, icon or rendered-view representation was changed.
+Final WASM SHA-256:
+`0d838456a2b8a55cc4333783ccfbfd1693cb86977c515d501af607343c6362ab`.
+
+## Browser crashes: preserve the first failure (N5, updated S2)
+
+The shared production-browser fixture identifies a WebKit/WASM trap as a fatal
+failure and notes the old/new comparison above, not a proven source defect. It still
+rejects its crash promise, records every browser error, and fails every existing
+assertion. There is no expected-failure allowance or automatic successful retry.
+An `unreachable` trap can follow a Rust panic; inspect earlier console messages
+and `/api/v1/ui/error` reports before attributing it to WebKit. A later disposed
+value or null DOM error after an initial memory trap is not independent proof of
+its cause. A clean isolated rerun is evidence about intermittency, not a pass for
+the failed run. Preserve both logs and the exact WASM SHA-256.
+
+The panic hook now captures its JavaScript/WASM stack synchronously, rather than
+letting the subsequent abort trap replace it. Crash reports prefix that stack
+with bounded mounted tile/pane keys, static view kinds, and browser user agent.
+The snapshot reads neither view payloads, message text, titles, nor saved layout.
+`pending` distinguishes an unmounted pane shell; retained hidden panes still
+count as mounted. The existing head endpoint's 2,000-character stack cap applies.
+
+```sh
+node --test crates/c6-ui/tests/crash.cjs
+node crates/c6-ui/tests/motion.cjs --unit
+# Actual restore/dedupe, target visits, tile closure, menus, and draft retention:
+ENGINE=both node crates/c6-ui/tests/workspace-open.cjs
+```
+
+Browser executable and `ROOT` overrides are the same as `motion.cjs`. On Linux,
+setting `navigator.platform` to `MacIntel` in a test does **not** run Safari or
+macOS WebKit. Disabling BBQ/LLInt is an investigation control, not the production
+test configuration or an application workaround. See the N5 investigation in
+`docs/ui-responsiveness.md` for observations and remaining limits.
+
+## Message origin: production-WASM browser regression
+
+Origin is server-only attribution, never a field trusted from a send request.
+Historical event JSON without `origin` remains backward compatible (the existing
+right-aligned bubble); that absence is not proof of a human sender. Newly received
+old-worker input without provenance is recorded as `unknown`, not guessed human.
+Existing `from_session_id` / `from_title` still identify another session.
+The browser's own request path supplies `X-C6-Realm` (or `c6_realm=` for requests
+without headers). It records human input with sign-in off; sign-in on additionally
+requires a verified cookie. Tokens keep their API origin even beside page context
+and cookies. Body fields and internal execution cannot impersonate the person.
+
+`assistant::auth_off_browser_path_is_human_but_tokens_and_body_cannot_claim_it`
+and its auth-on counterpart exercise real HTTP sends, creation, catalog dispatch,
+side chats and internal calls. `claude_code_rewind` uses the same page marker,
+asserts human origin, checks token precedence/rejected rewind with sign-in off,
+and retains all native reset barriers and fail-closed assertions. Head/worker
+tests cover legacy and unknown rewind eligibility; Watchers' policy matrix checks
+that only known human input, including auth-off page input, is a human correction.
+
+Waiting input follows the last transcript item, including the streaming reply,
+in normal flow inside the transcript's scroller, with no separate queue scroller.
+In short or empty transcripts it stays directly after the content rather than
+against the composer. Scrolling up leaves it behind; following the latest keeps
+the trailing waiting rows in view while the reply grows. Each input has an icon-only
+**Take this back** (×); only `with_agent` inputs also offer the soft **Send now**
+action. There is no Edit or Edit queue entry. Taking one back immediately hides
+its row and restores its text into the existing Composer, ahead of any draft
+with a blank line between them. Attachment recovery and the single-command
+take-back request run in the background; the gesture never sends or pulls a tail.
+`message-edit.cjs` checks this on desktop and 320/390px phones, including growing
+streamed replies, many waiting inputs, stacking, failure rollback and explicit Send.
+The status-row suite also clicks the background-task link: wide tiles return to
+Running now, scroll and focus its heading, and show a bounded static highlight
+without overriding reduced/off motion.
+
+After the build owner has produced this branch's UI (`env -u NO_COLOR make ui`), run:
+
+```sh
+ENGINE=both SCREENSHOTS=/tmp/s5-api-message-label \
+  node crates/c6-ui/tests/message-origin.cjs
+```
+
+The private `motion.cjs` fixture checks Chromium and WebKit, desktop and 390/320px
+phones, in light/dark (12 cases). Named/unnamed API tokens and unknown input
+use the existing sender card with exact attribution, a plain first-line subject,
+full-message expansion, attachment links and a separate received-prompt disclosure.
+An attachment-only unknown message keeps its link despite an empty subject.
+An unknown-origin `card-answer` keeps its generated session mention and opens the
+mocked session; delegated unknown input says “From the agent that started it”.
+Unknown stays neutrally labelled “Message · origin unknown”, with Rewind/Ask
+available but no invented human identity. Delegated, API and other-session input
+retain Ask-only actions. Human and legacy bubbles stay right-aligned and retain
+direct Rewind/Ask icons, including on phones. The remaining non-user phone
+Message actions sheet uses Sender for positive non-human sources; no sheet
+offers Edit. Ask is opened, filled and cancelled without sending.
+Human and unknown inputs also enter explicit Rewind
+confirmation, then cancel without sending, withdrawing or rewinding anything.
+The test checks real icons, applied theme colors and horizontal containment.
+
+`ENGINE`, `VIEWPORT=desktop,phone,phone-small`, `THEME`, `ROOT`, `PLAYWRIGHT_CORE` and
+browser executable overrides use the shared motion harness conventions. Each run
+creates a new evidence subdirectory, with screenshots, per-case failures and
+`results.json` including WASM SHA-256s. Cases run once; all failures remain in the
+count and produce a nonzero exit, including hydration traps. Diagnostic subset
+runs are not substitutes for a failed full matrix. No real head or credentials
+are used, and this browser test does not prove the server's attribution policy.
+
+### Transcript control presses while following
+
+`transcript-press.cjs` independently covers control presses while following at
+320px. It never changes the historical navigation, assertions or native taps in
+`message-origin.cjs`; that original suite remains a separate acceptance gate.
+The new suite starts at the actual end (gap <4px), hit-tests a fully visible
+Message actions control without locator auto-scroll, then delivers one stream
+chunk between native down/up. It records press duration rather than imposing a
+machine-speed threshold, requires the real row action to open, and checks that
+following resumes. It uses the shared condition/deadline convention
+(`C6_TEST_DEADLINE_SECS`), not a shorter hard-coded dialog deadline.
+Idle/stream activation runs in Full, Reduced and Off; lifecycle cases use Off.
+The Full stream case also records whether the initial stream's inverse glide is
+still active when the press begins, without imposing an animation-speed gate.
+
+Chromium uses native held touch and its automatic compatibility click. Pinned
+WPE WebKit 2388 raw touch dispatch produces trusted touch/pointer lifecycle but
+does **not** synthesize compatibility click or native panning. WebKit therefore
+has separate native held-mouse activation, raw-touch position/cancel/multi-touch
+and follow-resumption cases, plus an ordinary native tap activation control.
+None is claimed as same-press held-touch-to-click coverage. Native press-to-pan
+and owner-unmount cases run in Chromium only. No DOM event or click is fabricated.
+
+The suite is in the browser runner's default and allowlist. The runner also
+executes `follow-press-unit.cjs` against the actual source
+helper: deterministic contact/timer/lifecycle checks with a fake DOM, not
+native hit-testing or a model of Rust's follow permission. It needs only Node.
+To run the press suite alone:
+
+```sh
+BROWSER_SUITES=transcript-press bash scripts/ui-browser-tests.sh
+```
+
+Or use `ENGINE=both node crates/c6-ui/tests/transcript-press.cjs` with the usual
+`ROOT`, `SCREENSHOTS` and browser overrides. `PRESS_CASE=stream` isolates a case;
+the default runs thirteen Chromium and fourteen WebKit cases once, with every failure
+retained in `results.json`, including source/artifact hashes and native events.
+
+Seven cases first reload a retained historical target, activate the real visible
+Latest button, and verify it consumes the target while preserving the composer,
+draft and stream. They then hold a hit-tested action through one layout-growing
+stream chunk, require activation of the original row and resumed following,
+and verify that the historical target does not return. Full/Reduced/Off run
+with Chromium held touch and WebKit held mouse; an additional WebKit raw-touch
+case checks geometry/cancel/recovery. Ordinary native tap remains independently
+covered in the original fresh-context case. The suite does not claim same-press
+WebKit held-touch compatibility activation or a click after raw-touch cancel.
+
+### Transcript timestamps and empty bookkeeping rows
+
+`transcript-times.cjs` runs eight production-WASM/CSS cases: Chromium and
+WebKit, each at 320×568/light with Off, Exchanges and All timestamps plus
+an Off side-chat setup case. It checks real row DOM, `:empty`, display and
+flex gaps; visible setup/rewind/end-note timestamps; matching zero-usage turn
+summaries; thinking and folded rows; and the existing SubagentSpawned caption
+policy. It does not claim physical-device hovering or server pagination proof.
+
+Same-node reactive summary membership is tested by deliberately inconsistent
+mock history substitutions through production history loading: one response
+omits an earlier TurnStarted and another restores it. This is an isolated
+reactivity fixture, not a claim that immutable real history moves or loses
+turn starts. Normal events and the live append still use the production feed.
+
+Run it alone with `BROWSER_SUITES=transcript-times bash scripts/ui-browser-tests.sh`
+or `ENGINE=both node crates/c6-ui/tests/transcript-times.cjs`, using the usual
+`ROOT` and `SCREENSHOTS` overrides. Every case runs once and retains failures.
+
+## Working ring and transcript rendering
+
+### Background-notice descriptions
+
+After building the UI, run the production-WASM regression (Node and browser
+overrides are the same as `motion.cjs`):
+
+```sh
+ENGINE=both SCREENSHOTS=/tmp/q5-told node crates/c6-ui/tests/task-notices.cjs
+```
+
+It checks light/dark themes on desktop, four narrow tiles, and 390/320px phones.
+Closed notices stay one line and retain their icon; subagent names/statuses and
+command descriptions come from metadata. Expanded reports render Markdown and
+link to their session, with the exact model-facing text folded separately. Old
+events without metadata keep a neutral fallback and their original text. Browser
+errors fail the run. `BEFORE=1 ROOT=/path/to/base/dist` captures the old closed and
+expanded rows with identical fixtures, without asserting the new presentation.
+Screenshot names begin `before-`/`after-`, so both sets coexist.
+
+After `env -u NO_COLOR make ui`, run the production Chromium regression with
+the same Node/Playwright/browser overrides as `motion.cjs`:
+
+```sh
+node crates/c6-ui/tests/ring-render.cjs # correctness, one run/theme
+make ui-browser-perf # three measurement runs/theme, exclusive
+PERF=1 PARAGRAPHS=180 LABEL=after-heavy node crates/c6-ui/tests/ring-render.cjs
+```
+
+The private loopback fixture has three tiles and 93 historical replies. It
+streams eight chunks before each of twelve new Markdown items, in both themes.
+Correctness is unthrottled and waits for actual DOM/frame conditions;
+`PERF=1` uses the original 4× CPU-throttled, paced workload. Both check retained rim/context nodes and both running
+animation identities across item arrivals and changing session snapshots. The
+1.4s spin belongs to the HTML wrapper; a clipped outer SVG sweeps over 2.8s to
+grow/shrink the arc from 8 to 30 units. Both must have their own active-transform
+compositor layers, transform-only keyframes, and no motion on the independently
+drawn context. All four states and the unchanged static Reduced/Off working rim
+are checked too. Run with `SCALE=2 LABEL=after-retina` for Retina-sized output;
+the default scale is 1. Use distinct labels to preserve both sets of evidence.
+The first run also saves a paused nine-phase full-cycle comparison against the
+original dashed circle: 16/20/24px, integer/quarter/half-pixel placement, both
+growth and shrink, and the cycle boundary. It checks arc length/easing, weighted
+blue ink and angular continuity, and saves all-state Full/Reduced/Off galleries.
+DSF-2 gallery PNGs have twice the physical resolution. CDP screencasts can
+instead return CSS-pixel images; their own viewport metadata determines crops.
+
+Standalone evidence goes to `/tmp/q3-ring/` (`EVIDENCE` overrides it); the runner
+always supplies its own unique evidence directory. Correctness saves screenshots,
+shape/identity/snapshot results and the raster galleries. **Only `PERF=1`** adds
+JSON timing, main-thread rAF gaps, long tasks and a trace/CPU profile on the
+first of three runs. Runs 1 and 2 are unprofiled. Timings and frame counts have
+**no pass/fail budget**. A separate 600ms deliberately blocked-main-thread
+screencast follows the first run's natural workload. Its blue-pixel area checks
+arc-length change independently of the centroid's angular movement: spinning a
+fixed arc alone cannot satisfy the breathing check. The natural trace window
+must contain zero ring-specific Paint records. The separate blocked-main-thread
+challenge is not a measured transcript long task or a global FPS benchmark.
+
+`BASELINE=1 ROOT=/path/to/pinned/dist` records the old implementation without
+enforcing the new compositor/retention invariants. `LABEL`, `THEME`, `RUNS`,
+`CPU`, `SCALE`, and `PARAGRAPHS` select evidence names/workloads. Compare identical
+workloads and separate traced from untraced runs. The recorded DOM-update and
+next-rAF latencies are **not presentation times**; use the trace's layout,
+paint and compositor events for attribution. See the Q3 section of
+`docs/ui-responsiveness.md` for measured findings and limitations.
+
+For the shared phone/desktop header ring, run:
+
+```sh
+PHONE=1 EVIDENCE=/tmp/q11-ring/row-link /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/ring-render.cjs
+```
+
+This mode checks 320/360/390/430px, both themes, Full/Reduced/Off and DSF 1/2.
+It uses twelve open pages, a long session title, and real background-task events
+for counts 0/1/2/12/123. It checks 44px bar/targets, title ellipsis, no badge
+collision or header movement throughout count transitions, retained icons,
+ring-to-sheet touch navigation, state cues and the two Full compositor layers.
+It also checks all seven visible composer-status variants and quiet, the single
+full-width 44px opener, full task wording, chevron and visible keyboard focus,
+Enter/Space/Escape and taps on each part of the row. Geometry and native PageUp
+checks preserve the draft, composer, transcript viewport and reader position
+between visible states. Real approval/question cards keep their Allow/Deny and
+Send/Cancel actions and send the expected mocked API payloads.
+Screenshots and geometry JSON go to `/tmp/q11-ring/row-link/` by default. `THEME`,
+`MOTION`, `WIDTHS` and `SCALE` can select a smaller diagnostic matrix.
+After its measured workload, the normal desktop mode checks wide and narrow
+tile containers independently of the desktop viewport. The wide Running now
+list must match merged task/server identities and suppress the duplicate
+composer link. The narrow link counts every merged job, including servers,
+with singular/plural background-task wording. Its nonzero drawn status icon
+and chevron must remain mounted throughout those updates (an hourglass does
+not need a CSS spin animation). Phone sheet navigation checks only Changes
+and Terminal and closes through the named **Close Session** handle, not a top X.
+
+## Session sheet: merged background work
+
+`crates/c6-ui/tests/session-sheet.cjs` uses the shared production-WASM browser
+fixture (`motion.cjs`), a private loopback origin and mocked HTTP/WebSocket
+head. Build first; the fixture does not start a real head or change settings.
+
+```sh
+ENGINE=both SCREENSHOTS=/tmp/s3-sheet \
+  /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/session-sheet.cjs
+```
+
+The matrix covers Chromium and WebKit, light/dark, a wide desktop tile, a
+338px tile inside the same 1600px desktop window, and 320/390/430px phones.
+The seeded `/sessions/parent/children?tree=1` descendants and real spawn/task
+lifecycle records include a resumed child linked to two task IDs, two child
+IDs with the same title, a background command, a foreground-only native task,
+two native run IDs with one scope/task identity and its read-only mirror,
+failed/interrupted latest outcomes and enough completed commands to paginate.
+Assertions cover unique live identities, current-run stable ordering, count
+agreement, title-to-Inspect, labelled agent/command action surfaces and exact
+selected-job Stop requests (never the parent or same-named sibling). History
+counts deduplicate child/task records and exclude a resumed child's earlier
+failure. All/Failed/Interrupted filters, bounded non-duplicating history chunks,
+and Back retaining the chosen filter, loaded rows, scroll position and action
+opener focus are checked, alongside wide expanded details, compact Details
+drill-in and quiet History.
+With no Usage event, expanded Context must say **Not measured yet**, not 0%.
+Only phones get Changes/Terminal sheet buttons; Files/Outputs and duplicate
+desktop pane controls are forbidden. Busy/idle and drill-in screenshots use
+`after-<engine>-<theme>-<view>-<state>.png` names.
+
+After the core checks, each case adds a producer-shaped observed native child:
+an initially unlinked spawn followed by spawn updates linking two encoded
+`[scope, task, "run", run_id]` IDs to that same child. It must remain one job
+with both attempts inspectable. A rejected Stop must show its error and stay
+actionable; a later end while actions are open must remove Stop without
+another request. Details checks empty outputs/Work/Labels, retained assignment
+and raw-label editors, and a live four-output publication: only the newest
+three previews plus Show all, which opens the actual Outputs pane with all four.
+The pane's real Back control must restore the retained compact Details body
+(not the landing page); selecting an individual recent output must also open
+that output and return to Details. Wide desktop closes the side pane to
+restore its expanded glance.
+
+Additional narrow/phone cases render a real nested transcript on its own feed:
+it must not inherit the parent's SessionChrome/background link or phone status
+button, even as hidden DOM. The root retains exactly one correctly named
+opener for its desktop/phone surface. With Outputs
+front, focusing another tile must not reopen the origin sheet; the deferred
+return survives until the actual Back control restores Details, whose eventual
+dismissal focuses its ring. Files remains in session Actions rather than the
+sheet; SSH hides Files and disables Changes without disabling Terminal.
+Offline workers, disconnected live feeds and failed session-detail reads keep
+known rows inspectable, show the stale notice on every sheet page, and disable
+Stop without submitting it. The default cohort has 36 cases: 20 core layouts,
+eight nested/focus-return cases and eight SSH/stale-capability cases.
+
+Capture the pinned old UI **only after its build has finished**:
+
+```sh
+BEFORE=1 ROOT=/tmp/s3-sheet/before-dist SCREENSHOTS=/tmp/s3-sheet ENGINE=both \
+  /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/session-sheet.cjs
+```
+
+Baseline mode uses the old ring's `Open session sheet` accessible name,
+`Session` heading and wide `Glance` aside. It records identical busy/idle inputs
+without enforcing the new attributes or presentation; `before-` names preserve
+both sets. `THEMES` and `VIEWS` select comma-separated cases; `ENGINE`, `ROOT`,
+`PLAYWRIGHT_CORE`, `CHROMIUM` and `WEBKIT_EXECUTABLE` follow `motion.cjs`.
+`EXTRAS=0` selects only the core matrix; `EXTRAS=only` selects the additional
+cases (their narrow/phone variants follow `VIEWS`, restrictions run once per
+engine). Baseline mode never runs the new-UI-only extra assertions.
+Failures save a `-FAIL.png` and JSON with the first error, console, requests,
+snapshots and Stop targets. WebKit hydration/WASM traps remain failures, not
+retries or ignored cases; report a failed cohort alongside any later rerun.
+The shared `motion.cjs` sheet regression now targets the **Session** dialog
+and **Close Session** handle. Its overlay/resized keyboard bounds, interrupted
+exit node retention, cancellation and timed-disposal assertions are unchanged.
+
+## Published files: root replay, loading and versions
+
+After building, `node crates/c6-ui/tests/outputs.cjs` checks independent
+transcript/Outputs feeds of the same root session in light/dark desktop,
+narrow-tile and phone layouts. It withholds the Outputs feed's `Synced` while
+the transcript already has its Published row: pending replay must say loading,
+not “Nothing published yet”. After replay, republishing an old filename must
+bring it to the top and make it the default preview; older titles and content
+remain selectable as versions. Long version titles must not widen the control
+past its pane; the two-column layout follows the pane's container width, not
+the desktop window. A live root publication must also appear.
+`BEFORE=1 ROOT=/path/to/base/dist` reproduces the old false-empty message and
+first-publication ordering. `ENGINE=webkit`, `THEMES`, `VIEWS` and `SCREENSHOTS`
+select the browser, cases and private evidence directory.
+
+The worker integration test
+`subagents::normal_subagent_publication_replays_to_independent_root_subscribers`
+uses a real task/publish flow and two head WebSockets to check that a normal
+subagent publishes into the root log, not its child log, and that old Output
+events survive tail summaries. No child aggregation is needed. These are
+confirmed UI replay/order cases, not a claim to have diagnosed a particular
+live session's missing deliverable; that original incident remains unconfirmed.
+
+## Usage navigation naming
+
+`node crates/c6-ui/tests/usage-name.cjs` checks that the console header and
+console/realm menus all say **Usage**, including wide and 320px desktop tiles
+and 320/390px phones in both themes. It follows the real menu link and checks
+the console's Prices help uses the same name. Clipboard, session-details Usage
+and the model quota popup are not changed by this naming pass. Screenshots and
+control geometry go to `/tmp/n3-ui/item7`; `SCREENSHOTS` and `ENGINE` use the
+shared production browser harness's overrides.
+
+`BEFORE=1 ROOT=/tmp/n3-ui/item2/pristine-235fae5c-dist` captures the same
+matrix with the old console/realm names and Prices help. Filenames have
+`before-`/`after-` prefixes so neither phase overwrites the other.
+
+The naming pass does not fix two inherited desktop-menu behaviours: its
+opener is hidden when all measured header items fit (the fixture resizes to
+1024px to open it), and `max-w-full` constrains its drawer to the narrow opener
+wrapper. Geometry JSON and logs record that existing desktop link overflow;
+phone link containment remains an assertion. Do not report those screenshots
+as proof that the unrelated desktop drawer layout was repaired.
+
+## Content-fitted desktop header
+
+The desktop header uses measured item widths, not an `xl` navigation cutoff.
+Sessions/Inbox, search, Decisions, Work and Docs take precedence over Projects,
+analytics, apps/collections/workers, saved views, tile creation, administration,
+connection text and the build tag. The realm and quick attention/Ask controls
+have reserved space. Exceptionally long realm names are bounded to 36vw/28rem,
+with their full name on hover, rather than being squeezed by navigation.
+Overflowed links remain inert and measurable offscreen; the existing menu
+contains their live links and badges. An amber dot on the menu, with a numeric
+screen-reader description, reports counts on overflowed links. Notifications
+remain icon-only, with state in matching title and aria-label.
+
+`header-fit.cjs` uses the production browser fixture below, both engines and
+themes, short labels/zero counts and a long realm/build tag with five-digit
+Decisions and three-digit Projects/Work counts. It resizes **the same mounted
+header** through 768, 1024, 1200, 1280, 1600 and 2000px, asserts pairwise control
+rectangles never intersect or escape the header, and repeats with focused
+search. It also checks readable realm space, menu badge preservation, its
+accessible count indication, ample-space restoration, and no settled attribute
+feedback loop. ResizeObserver watches intrinsic widths; MutationObserver only
+watches content (including equal-width count changes), not its own attribute
+outputs. There is no polling, per-frame loop, DOM reparenting or duplicate
+measurement tree. Initial fitting runs before the header is made visible.
+
+```sh
+set -euo pipefail
+env -u NO_COLOR make ui
+ENGINE=both SCREENSHOTS=/tmp/q2-screenshots \
+  /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/header-fit.cjs
+```
+
+`BEFORE=1 ROOT=/path/to/pinned/dist` captures the baseline without enforcing the
+new invariants. PNGs and per-case geometry JSON go to `SCREENSHOTS` (default
+`/tmp/q2-screenshots`). `THEME=light,dark` and `COUNTS=short|large` select a
+diagnostic subset; browser paths and `ROOT` use the motion harness overrides.
+Every scenario owns a fresh browser process. Missing browsers fail explicitly.
+
+For the full parallel Rust suite, raise a low per-shell descriptor limit first
+(`ulimit -n 65536` on this Linux worker; the inherited soft limit is 1024), then
+run `make check` and `make test` with `set -euo pipefail`. This affects only the
+verification shell, not services or persisted machine settings.
+
+## Narrow desktop tiles
+
+Tile-bar mouse slots follow the tile's content width: 36px at 40rem and
+above, 32px at 30–40rem, and 28px below 30rem. Phone/coarse-pointer slots
+remain 44px. Optional marks yield below 40rem, before Changes, Terminal and
+Pin move into Actions below 30rem. Icons and the trailing Actions, Maximize,
+Close order are unchanged. `tests/tile-marks.cjs` checks resize boundaries,
+retained controls, title room and both themes at 240–960px; `BEFORE=1` uses
+the old fixed 28px assertions against a pinned baseline `ROOT`.
+`SCREENSHOTS=/tmp/q1-screenshots/after` selects its screenshot directory.
+
+`crates/c6-ui/tests/narrow-tiles.cjs` reuses the loopback production-browser
+fixture below. It keeps the desktop window at 1600×1000 and resizes the actual
+tile to 240, 320, 400, 480 and 640px, in both themes. It records screenshots
+and element geometry in `/tmp/p3-screenshots/`, checks radio/text overlap and
+elements escaping the tile, and checks 320px, 390px and landscape phones.
+Run after building, with the same browser overrides as `motion.cjs`:
+
+```sh
+/home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/narrow-tiles.cjs
+```
+
+`BEFORE=1 ROOT=/path/to/pinned/dist` records baseline screenshots without
+enforcing the new layout invariants; `VIEWS` selects comma-separated view
+paths. This deliberately tests pane width independently of window width.
+`ISOLATE_BROWSER=1` uses a fresh browser process for each desktop, split,
+phone or coarse-pointer fixture group. As with the motion harness, report
+shared-process failures alongside isolated results; isolation is not a retry.
+The workspace gives each pane a named `@container/view`; view layout uses
+named container breakpoints, while global phone navigation still follows the
+viewport and pointer. Settings adds `@container/settings` to its content
+column, so cards also adapt when its wide-screen side menu is present.
+The populated fixtures cover list and detail views, cleanup decisions,
+comments and open forms. Real two-pane layouts check each pane independently
+and the retained single-pane/back navigation below 40rem. Coarse-pointer bars
+are also checked down to 132px; natural four-column layouts verify there is
+no horizontal canvas scroll at 1600, 1024 and 768px window widths.
+
+Tables, code and other deliberately scrollable data regions are not a
+workspace scrollbar. Calendar's seven-column month and the Workers table
+still have their existing dense/data-table designs; don't mistake overflow
+containment for a redesigned narrow version of those views.
+
+## Same-tile session panes
+
+`node crates/c6-ui/tests/session-panes.cjs` uses the same production fixture
+and browser overrides as `motion.cjs`. It clicks Changes, Terminal, Files
+and Outputs at 1200, 800, 640, 480, 320 and 240px tile widths, plus 320/390px
+phones, in both themes. It asserts unchanged tile count, retained transcript,
+single-pane Back/reopening, the phone sheet route and explicit ⌘-click to
+a separate tile. Screenshots default to `/tmp/q1-screenshots/panes/`.
+
+## Browser-local themes
+
+### Session identity
+
+`node crates/c6-ui/tests/session-identity.cjs` checks the production session
+glance, details and shared desktop/phone Actions menu in both themes, wide and
+320px desktop tiles, and 320/390px phones. The ID shows eight characters with
+the full value on hover; clicking copies the full ID. Actions offers **Copy
+session ID** and **Copy session link** (including the realm). The fixture
+records clipboard writes and checks denied writes never report success.
+Screenshots go to `/tmp/n3-ui/item6` (`SCREENSHOTS` overrides it). It uses the
+motion harness's browser paths and `ENGINE` override, with no live head.
+
+`BEFORE=1 ROOT=/tmp/n3-ui/item2/pristine-235fae5c-dist` captures the same
+glance/menu/details matrix without expecting the new ID controls. It records
+their absence explicitly in JSON and prefixes screenshots with `before-`.
+
+### Sticky document ownership
+
+`node crates/c6-ui/tests/doc-owner.cjs` uses the production browser fixture
+with real docs and decks, long titles and enough content to scroll. Both
+themes cover 1200/320px desktop tiles and 320/390px phones. It asserts the
+creator's dot stays beside the single-line title and remains in the sticky
+header, names the session on hover and for screen readers, follows live
+name/pattern changes, and opens the same retained destination as **⋯ → Open
+the session that made it**. It also checks a creator outside the live feed
+and the absence of ownership controls for user/token-created documents even
+when a session last edited them. Existing title/action SVGs remain present.
+
+Screenshots and geometry go to `/tmp/n3-ui/item8` (`SCREENSHOTS` overrides it).
+`BEFORE=1 ROOT=/tmp/n3-ui/item2/pristine-235fae5c-dist` records the same matrix
+and explicitly records absent header marks/menu entries, without applying the
+new assertions to the pristine build. `ENGINE=webkit` selects WebKit; cases
+own separate browser processes; `CASE` selects a diagnostic name fragment.
+The pristine 390px phone deck emits one startup ResizeObserver delivery error,
+also reproduced after the change. Both modes record it explicitly in JSON and
+the log while checking the layout/navigation; AFTER rejects repeated delivery
+errors, errors after startup and all other browser errors. Neither mode changes
+a live head or settings.
+
+`crates/c6-ui/tests/theme.cjs` checks System, Light and Dark, including migration
+of the former browser-local Soft preview (and legacy Dim) to Dark before paint:
+
+```sh
+node --test crates/c6-ui/tests/theme.cjs
+SCREENSHOTS=/tmp/q6-dark/after node crates/c6-ui/tests/theme.cjs --browser
+ENGINE=webkit THEME_DELAY_MS=1000 node crates/c6-ui/tests/theme.cjs --browser
+```
+
+Use Node 24 and the same browser overrides as the motion harness. The browser
+test delays the real theme bootstrap fetch, holds WASM, and checks the first
+body frames before the application renders. It also tests three usable radio
+cards at 240/320/400/480/640px tile and phone widths, persistence, OS changes,
+and real cross-tab palette and selected-card updates.
+The 300ms bootstrap delay is retained **adversarial network input**, not a wait
+for UI completion. Waiting for rAF inside that parser-blocking route deadlocked
+the Chromium diagnostic before the bootstrap arrived; the
+discarded diagnostic cohort is retained in browser-fast evidence. Completion
+still waits for actual themed first frames, with WASM positively held.
+
+`theme.cjs --browser --workspace-radios` additionally checks one/five/six-tile
+workspaces and restored duplicate Settings tiles collapsing to one Appearance
+view with its selection intact: actual native `.checked`
+properties, selected-card paint, Dark/System persistence through maximizing
+another tile, restore and reload, and same-document/cross-tab motion-choice
+synchronization. Navigating away from Appearance and back verifies that Dark
+and the selected motion survive a remount, with fresh, distinct native group
+names. Native group names are per mounted instance; hidden views
+still participate in document-wide groups. Inert cloned radios participate
+too, which is another reason tile motion must not clone outgoing content.
+The saved-duplicate cases respect Settings' single-copy restore policy rather
+than waiting for an intentionally removed second Appearance tile.
+The suite also exercises both custom `Choices` callers (session questions and
+decision forms), optional clearing, and the actual session aspect palette
+through that lifecycle. `--workspace-choices` runs the custom-control audit
+independently of the native-radio cases.
+Unsent forms reconstruct their existing defaults after reload; saved aspect
+marks persist. These checks do not add persistence to unsent forms.
+
+Dark now uses the former Soft page/panel/chip greys `#1c1d21`, `#25262b`,
+`#33343a`, with `#4a4b52` for stronger borders. Dark-only red-400 `#ff7476`
+replaces `#ff6467`: the latter measured only 4.294:1 on the lighter chip.
+Light's palette is unchanged. The contrast tests assert the unrounded 4.5:1
+threshold for muted, red, white, blue, amber and green text on all three
+backgrounds, and print measured ratios from both exact swatches and the built
+Tailwind tokens (resolved by the browser to sRGB8). SVG text fills and the
+muted utility are checked too; shape/border colours are not text colours.
+Saved `soft` is rewritten to `dark` by the parser-blocking bootstrap, including
+cross-tab updates, so there is no obsolete fourth radio or unselected choice.
+
+Dark contrast reference (sRGB8, page / panel / chip; rounded here, never for
+the assertions):
+
+| Text | Colour | Page | Panel | Chip |
+| --- | --- | ---: | ---: | ---: |
+| Muted / zinc-400 | `#9f9fa9` | 6.420 | 5.757 | 4.729 |
+| Red-400 | `#ff7476` | 6.424 | 5.761 | 4.732 |
+| White | `#ffffff` | 16.839 | 15.099 | 12.404 |
+| Blue-400 | `#51a2ff` | 6.385 | 5.725 | 4.703 |
+| Sky-400 | `#00bcff` | 7.728 | 6.929 | 5.692 |
+| Amber-400 | `#ffb900` | 9.776 | 8.766 | 7.201 |
+| Emerald-400 | `#00d492` | 8.686 | 7.789 | 6.398 |
+
+The accompanying grey-text audit adds dark-only zinc-400 text to Ask and
+aspect popovers and readable fills to the grant graph and two-hop diagram
+labels; icons keep their colours. Zinc-500 is too weak for dark text, but
+remains a shape/border colour. Document charts' zinc-300 axis labels at 0.6
+opacity still pass on their actual page/panel backgrounds (4.94 / 4.65).
+Authored SVG diagrams are isolated images with their own palettes, not CSS
+text that the parent theme can universally recolour.
+
+This is not a blanket claim about every inherited text treatment: bare
+`text-red-600` errors/removal actions (for example `settings.rs`, `push.rs`,
+`memex.rs` and `session.rs`) remain below 4.5 on Dark page/panel/chip
+(3.53 / 3.17 / 2.60). They need per-text-site dark variants, not a global
+red-600 token lift: white on solid red-600 buttons still passes at 4.77.
+Selected autocomplete notes in `chat/composer.rs` and `chat/mod.rs` also have
+a pre-existing opacity-60 shortfall (~3.12 on sky-700). These are separate
+text-site accessibility follow-ups, not a reason to lighten button backgrounds.
+The browser contrast check additionally asserts red-200/300 on red-950,
+rose-300 on zinc-800 and rose-900/40 status chips, and white on red-600.
+
+## Motion: production browser regression
+
+`crates/c6-ui/tests/composer-popovers.cjs` checks the running-task, model and
+Send menus in both themes on desktop, in a narrow/short tile, and on a phone
+with an overlay keyboard. It asserts visible tile/viewport bounds and real
+pointer hit-testing, scrolls to the last Stop/Inspect/model choice, opens the
+inspector, sends a message, and resizes a retained model picker. The `+` control
+opens the native file chooser, not a web popover. Run after `make ui`, with the
+same Node/browser overrides as the motion harness. `BEFORE=1 ROOT=...` records
+the old build without enforcing the corrected geometry; `SCREENSHOTS` defaults
+to `/tmp/n3-ui/item1`. Every fixture uses its own loopback head and browser.
+
+### Transcript pointer and keyboard focus
+
+```sh
+ENGINE=both SCREENSHOTS=/tmp/n3-ui/item5 node crates/c6-ui/tests/transcript-focus.cjs
+```
+
+Build the production UI first (`env -u NO_COLOR make ui`); Node 24, browser
+paths and `ROOT` use the motion harness overrides below. The owned loopback
+fixture checks both themes on desktop, a four-tile workspace (under 400px per
+tile), and 390/320px DSF-2 phones. Mouse/touch on transcript text and returning
+from the composer must not create a transcript outline. Clicking an already
+keyboard-focused transcript can retain the browser's native keyboard cue;
+that mixed-input state is captured separately. Moving pointer focus away and
+back must clear it. Phone status open/close (Close, outside tap and Escape)
+and session-sheet open/close must not focus-outline the transcript either.
+Native Shift+Tab traversal, Home, PageDown, PageUp and End retain a painted
+keyboard cue and working keyboard scrolling, including across background-task
+updates.
+Screenshots and computed focus/outline JSON distinguish these input modes;
+`ENGINE`, `THEME` and `VIEWPORT` can select a diagnostic subset.
+Each scenario owns a fresh browser process as well as its context; startup
+errors fail rather than being retried or suppressed.
+
+The white outline in the Q11 `phone-dark-reduced-390-dsf2-background-12.png`
+capture is inherited keyboard-test focus, not a touch/status interaction:
+`ring-render.cjs`'s `phoneStatusRow` ends by explicitly focusing its transcript
+and pressing End, then the same page is resized for the next width's captures.
+Do not remove the scroll container's native keyboard focus indicator to hide
+that test state. No production focus or styling change is needed for it.
+
+### Transcript layout steps
+
+After `env -u NO_COLOR make ui`, run the owned loopback production fixture:
+
+```sh
+/home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/transcript-steps.cjs
+```
+
+It sends through the real composer, presents a long transcript, starts a turn,
+updates usage, runs a tool call/result, starts a background task, queues a second
+message, streams a reply, and finishes the reply/turn/task/queue in a burst.
+Both themes, a 400px desktop tile and a phone are checked in Full/Reduced/Off.
+Per-frame scrollTop, scrollHeight, viewport, unchanged-message position and
+estimated native thumb geometry are saved alongside DOM mutations and row
+ResizeObserver records. It counts distinct scroll corrections for the whole
+send-and-finish scenario, requires no usage/task-status height change, checks
+bounded translation-only Full effects (none in Reduced/Off), and asserts that
+upward input prevents later messages moving the reader. The narrow tile also
+exercises rows leaving the live tail after a width change; their measured
+height must not revert to an older intrinsic-size cache, including after an
+upward pause, a 400→520px width change and native End to resume. Composer focus must
+not pan the fixed app shell. It does not treat smoothly translated pixels as
+additional logical scroll corrections. Thumb geometry is estimated from the
+scroll range, not a measurement of a platform's native scrollbar raster.
+The light desktop Off case also holds a pending frame, hides the document,
+and requires the whole wire-ordered queue to flush and cancel that handle.
+Hidden delivery and a failed visible frame registration must both make progress
+without a subsequent animation frame.
+
+`EVIDENCE` chooses the output directory (default `/tmp/q8-steps/after`);
+`ROOT` selects an independently built baseline; `BEFORE=1` records that baseline
+without asserting the new layout/animation invariants. `THEMES`, `VIEWS`
+(`desktop,tile,phone`) and `MOTIONS` select cases. Chromium-only diagnostics
+`CPU_RATE=4 TRACE=1` save a DevTools trace and active reading-column compositor
+reasons. These are measurements, not machine-speed pass/fail thresholds.
+`BLOCK_MS=300` diagnostic saves timestamped compositor frames during a busy
+main-thread interval and the effect's entry clock; `BLOCK_PHASE=text` selects
+overlapping queue/text corrections instead of the default tool-call phase.
+The shared fixture's per-frame animation scanner is deliberately disabled here:
+this harness observes production effects at creation and samples only its
+unchanged anchor, rather than materializing every off-screen event. No live
+head, settings, services or browser profile are used.
+
+`ONLY=sessionsPicker` smoke-checks the phone Sessions right drawer's header
+alignment, retained SVG icons, absence of a redundant top X/handle, and
+tap-outside/Escape dismissal. Include
+`VIEWPORT=narrow,phone,landscape THEME=light,dark` for the 320px, 390px and
+short-height phone layouts. The dedicated `phone-picker.cjs` regression below
+adds native right swipes, search, keyboard/focus containment and message actions.
+
+`ONLY=modelPicker` checks the composer chip's bottom sheet on those phone
+layouts and its unchanged desktop popover: arbitrary model ids, the last item
+in a long offered list with an overlay keyboard, effort, all dismissal paths,
+and one prefetched model-list request across repeated openings. It also checks
+that the phone label, field and list span the sheet's normal padding, with a
+close handle but no redundant top X. Phone model
+screenshots end in `-model-picker.png` and `-model-picker-keyboard.png`.
+`ONLY=modelForms` checks the other inline `ModelPicker` users in Ask and the
+new-session form on both warm navigation and cold page loads, including
+arbitrary text, retained input/focus during list loading, offered-model/effort
+selection and cache reuse.
+
+`crates/c6-ui/tests/motion.cjs` serves the built production UI on an owned
+loopback port, with fake HTTP and WebSocket head responses. It does not connect
+to your head or use your browser profile. Install the pinned browsers above and build first
+(coordinate the build when sharing a worktree), then run with Node 24:
+
+```sh
+env -u NO_COLOR make ui
+/home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/motion.cjs --unit
+ENGINE=both /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/motion.cjs
+ENGINE=both /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/motion.cjs --helpers
+```
+
+Defaults resolve the locked test-local `playwright-core` and its matching
+installed browsers. `PLAYWRIGHT_CORE`, `CHROMIUM`, `WEBKIT_EXECUTABLE`, and
+`CHROMIUM_LIBS` remain explicit **diagnostic overrides**; do not use them for
+the pinned-engine qualification or CI. `ROOT` overrides `crates/c6-ui/dist`. Missing browsers or
+motion hooks fail explicitly; this standalone opt-in harness does not silently
+skip coverage. `--unit` needs only Node and reads the actual `js/motion.js` into
+isolated VM contexts: default/invalid choices, OS changes, explicit Full,
+cross-tab notification, cancellation, and denied/quota-failed storage.
+VM checks also distinguish JavaScript/transition cancellation from preserved CSS keyframes;
+a source regression requires Off to hide outgoing count/notice decorations.
+The notice source guard also keeps the retained last content, immediate inert
+closed state, Undo action and non-ticking timeout (no visual countdown).
+Production list-FLIP VM checks exercise inserted keys, inert removal ghosts,
+interrupted frame cancellation, Full/Reduced/Off keyframes, and absence of
+per-animation-frame geometry reads. They do not mount the comments UI.
+`--helpers` additionally loads the built production helper into a real DOM in
+fresh browser processes: Full/Reduced/Off in each selected engine (six cases
+with `ENGINE=both`). A read-only adapter observes the helper's private WeakMap.
+Native completion must both detach the inert removal ghost and empty the
+state's retained-ghost array; DOM removal alone is not sufficient. Off must
+create neither a ghost nor a timed effect. This still does not mount comments.
+Bounded resize-FLIP checks cover growth interrupted mid-scale, replacement
+animation ownership, and fade-only Reduced/Off behavior without mounting catch-up.
+The glide VM regression checks its shared 200ms deadline, same-target
+deduplication, interruption from displayed position, immediate input/snap
+cancellation, preference changes, detached nodes, and three geometry reads per
+invocation with none in animation frames.
+`CHROMIUM_LIBS`, if explicitly set, augments the inherited `LD_LIBRARY_PATH`;
+the default uses the OS libraries installed by Playwright, with no wrapper.
+`ISOLATE_BROWSER=1` additionally owns a fresh browser process per case, not
+just a fresh context. This is useful when diagnosing old WPE WebKit process
+reuse: it does not retry or suppress an error, and shared-process failures
+should still be reported with the isolated result rather than discarded.
+
+The standalone exhaustive suite runs 1440×1000 desktop and 390×844 phone, light and dark, with
+System (OS normal/reduced), Full (OS normal/reduced), Reduced and Off. For a
+focused rerun, filters accept comma-separated values:
+
+```sh
+ENGINE=webkit VIEWPORT=phone THEME=dark MOTION_CASE=full-reduce ONLY=menu,sheet,tool,sendStop \
+  /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/motion.cjs
+
+# Opt-in corners: 16 cases total with both engines and both themes.
+ISOLATE_BROWSER=1 ENGINE=both VIEWPORT=narrow,landscape MOTION_CASE=full,reduced \
+  ONLY=menu,sheet,phone,tool,sendStop SCREENSHOTS=/tmp/m1-screenshots/corners \
+  /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/motion.cjs
+```
+
+`VIEWPORT=narrow` selects 320×568; `VIEWPORT=landscape` selects 900×480.
+Neither is included in the default matrix. Both use phone checks, including
+the drawer: the fixture uses the product's width < 768 **or** height < 512
+condition, rather than a width-only phone assumption. Labels include the view
+name so corner artifacts do not overwrite the ordinary 390px phone cases.
+
+Checks cover pre-hydration policy and persistence, cross-tab/realm preferences,
+first-frame menu focus/hit-testing/action, phone sheets and scrims, interrupted
+exits and presence disposal, overlay/offset and resized keyboards, desktop tile
+open/close/reorder, phone-row composer position and transcript following,
+native tool disclosure, D2 live/result output height and node identity, and
+first-frame Send/Stop interactivity. Off audits actual computed CSS durations
+and captured effects; Reduced rejects travel, spin/pulse and long effects.
+Native details height interpolation is checked at 160ms when the engine
+supports it; otherwise Full requires a captured 160ms body-reveal fallback.
+The actual open/closed geometry is checked in both cases. The harness prints
+the engine capability, captured timing and whether an intermediate frame was
+observed (the last is diagnostic, not a frame-rate-dependent assertion).
+The Actions menu's real Catch-up switch is toggled off and back on. Its fake
+server holds each response while the test checks the exact PUT payload and
+unchanged `aria-checked`, then acknowledges success and requires the new state.
+Phone checks keep soft-wrapped and explicitly multiline drafts focused across working/idle cycles and
+require a settled absolute end gap below one CSS pixel. They sample after
+additional animation frames, not just the first successful ResizeObserver
+snap: redundant textarea `height:auto` measurement can briefly expand the
+transcript, clamp its end, then leave a gap when the measured height returns.
+Separate checks retain real text-growth and width-change autosizing and verify
+that an empty multiline suggestion grows the box and disappears on working.
+Both draft inputs must reach and retain the true transcript end without a
+test-authored scroll snap before the working/idle cycles begin.
+
+Waits use DOM state, request completion, animation completion, or animation
+frames—not fixed real-time pauses. The browser clock is explicitly advanced
+across the product's 299/301ms Full presence boundary (79/81ms for Reduced),
+and to interrupt an exit before disposal; host load cannot accidentally miss
+the interruption. `C6_TEST_DEADLINE_SECS` controls the generous hang deadline,
+not a performance threshold. FLIP guards record production root geometry
+reads by frame and reject layout-property keyframes; they are not a substitute
+for an engine performance trace proving compositor-only rendering. Synthetic
+native drag events exercise production handlers, not OS drag gesture fidelity;
+emulated visual viewports do not replace a physical keyboard/accessibility
+review. Visual spring quality and interrupted-animation velocity still need
+human review.
+
+Tile contents never scale, including opening/closing, maximize/restore, pane
+changes and neighbours growing back. Size changes commit the destination at
+once: an empty surface-coloured veil fades away in 100ms (80ms Reduced), while
+the actual tile and background remain opaque. No outgoing text/form clone is
+inserted over the destination. Only same-size moves translate; Off is instant.
+`node crates/c6-ui/tests/tile-motion.cjs` exercises six long-content tiles in
+three- and four-column arrangements with System/full, Reduced and Off. It
+pauses native WAAPI effects at 0/25/50/75/100% for frame captures under
+`/tmp/m2-screenshots/` (`SCREENSHOTS` overrides), asserts scale remains 1 and
+root opacity remains 1, and records LayoutShift sources in a separate unpaused
+normal-speed maximize/restore run. `ROOT` selects another production build;
+`BEFORE=1` records baseline frames without enforcing the fixed invariants.
+Notice rise/update/dismiss/Undo, catch-up pending-to-summary growth, and the
+mounted comments list are not browser-covered here; notice source guards and
+the shared list helper's VM/real-DOM tests are narrower checks, not integration coverage.
+
+Screenshots (including `-actions-open`, `-menu-open`, `-sheet-open`, `-status-working` and open
+tools) and failure JSON containing effects,
+requests, errors and DOM are saved to `/tmp/m1-screenshots`, overridden with
+`SCREENSHOTS`. These are diagnostic artifacts, not pixel baselines.
+For a before/after bundle comparison, build a clean `git archive` of the base
+commit outside the shared worktree with the same toolchain/flags, then run
+`ROOT=/path/to/base/crates/c6-ui/dist node crates/c6-ui/tests/motion.cjs --sizes`
+and the same command with the current `ROOT`. This emits a **directory
+inventory** of per-file and per-extension HTML/JS/CSS/WASM byte totals, raw and
+reproducible gzip level 9. Both before/after dist directories must be clean:
+Trunk can leave orphan snippet files that inflate an inventory. This command
+does not trace reachable imports or measure network transfer; gzip totals are
+compression estimates, not measured head transfer sizes.
 
 A test is a claim: *this invariant holds*. It must fail **if and only if** the invariant is broken. A slow machine, a busy CI runner, another test running beside it, or the order tests run in must never fail it. The test suite runs on GitHub's runners (`ubuntu-24.04`, `macos-15`), which are shared, small and sometimes slow, and it must hold there.
 
@@ -9,6 +1711,41 @@ A test is a claim: *this invariant holds*. It must fail **if and only if** the i
 `make test` enables panic backtraces (`RUST_BACKTRACE=1` unless already set, for both nextest and its `cargo test` fallback). Use `RUST_BACKTRACE=full make test` for every stack frame.
 
 `.config/nextest.toml` shows each failure's complete captured stdout and stderr both immediately and at the end of the run (`failure-output = "immediate-final"`, `final-status-level = "fail"`). The final status list alone does not include that output: nextest's default only prints it immediately, where a long parallel run can bury it. Keep capture enabled so concurrent tests' diagnostics stay together.
+
+### Background-subagent recovery fixtures
+
+The failed-subagent recovery regressions keep their model scripts apart from
+automatic naming: the opening has more than three words, and the fixture waits
+for its `session_naming:<id>` setting to disappear before queuing later scoped
+replies. A naming prompt quotes the opening conversation, so an ordinary
+`MockLlm::push_about` marker can match it too. A reply consumed by naming is not
+evidence that the real parent's report was lost.
+
+A delivered failure notice is not an acknowledgement barrier: its `User` event
+is persisted before the new `TurnStarted`. Wait for a `TurnEnded` **after that
+notice**, not the previous turn's end, before sending the resume input. Otherwise
+the resume can join the acknowledgement turn, changing both the scripted request
+order and the opening read by deferred naming. Final completion failures show
+the model trace and both parent and child event histories, including model errors.
+
+### Google mail import completion
+
+`google_mail_calendar_contacts` waits for two boundaries before asserting mail
+views: the Gmail connector round has ended, **then** `memex.status.extracting` is
+zero. Kit ingestion uses `wait:false`, so a round can finish after queuing raw
+mail but before the mail rows exist. Extraction jobs remain counted while their
+messages are stored and their `mail.received` events are emitted. Read the round
+first: an empty queue sampled before the round finishes enqueuing is not a
+completion signal.
+
+The fixture disables scheduled Gmail runs and observes progress from the current
+round before this wait (for Carol's import, Alice's new automation and inbox
+message). An old round's end alone does not identify a newly requested sync.
+There is no Memex understanding model in this fixture, so queue drain is the
+missing import boundary, not a general model-triage barrier. The `needs_reply`
+assertion still runs once after completion: failed ingestion or incorrect
+classification must fail it, rather than being polled until it changes. Failures
+include the mail views, extraction status, connector activity and model trace.
 
 ## Rules
 
@@ -29,12 +1766,14 @@ A test is a claim: *this invariant holds*. It must fail **if and only if** the i
    - Prefer waiting for a sign that the thing was considered and declined.
 5. **Tests share nothing they don't own.**
    - **Environment:** a test in a shared process (the `it` binaries, any crate's unit tests) never changes the environment. Other tests read it concurrently, which is undefined behaviour on Linux. Set what the code under test reads on that code instead: the worker's `Overrides`, `SshHost::with_program`, the head's `HeadConfig`. A standalone test binary with one test may set the environment before it starts anything.
+   - **CLI configuration:** setting a child's `HOME` is not enough on Linux: an inherited `XDG_CONFIG_HOME` takes precedence. Clear it on the child command (not in the shared test process) so parallel CLI tests use their own login files. The CLI realm-list test also asserts where login saved its configuration.
    - **Ports:** bind port 0. A server that must come back on the same port (a head restarting while its workers keep its address) takes `c6_testkit::port()`. Those ports come from a range below every OS's ephemeral range, so no test binding port 0 is ever handed one, and each is held by a file lock for the life of its test process, so tests in other processes (nextest runs each test as its own) never share one. Never pick a free port, release it, and bind it later: another test can take it in between.
    - **Files:** each test works in its own temporary folders, never `$HOME` or the repository.
-   - **Programs it writes:** a script a test writes and then runs can fail with "Text file busy" while a process another test just started still holds it open for writing. Wait with `c6_testkit::runnable(path, args)` before using it.
+   - **Programs it writes:** a script a test writes and then runs can fail with "Text file busy" while a process another test just started still holds it open for writing. Wait with `c6_testkit::runnable(path, args)` before using it. Shared-process fixtures can instead publish through a separate writer process and wait for its exit: the shared parent must never open the executable inode for writing, so concurrent children cannot inherit its writer. The Claude Code unit fixtures use this boundary without retrying their actual launch.
    - **Child processes:** own and clean up the whole process group, including on a panic. Killing just a shell leaves its children holding nextest's output handles open (`LEAK`), even after the test returns.
 6. **What a test needs from the machine, CI has.**
    - A test that needs Chrome, git or a shell says so with `c6_testkit::need(what, present)` or `have(tool)`. On a laptop without it, the test skips. In CI (`GITHUB_ACTIONS`) a missing tool fails, so coverage never disappears quietly.
+   - A small-window compaction fixture pins its allowed tools and asserts that list. Optional tools such as Browser change the fixed prompt size; the Ollama detection regression needs room for a summary, not the host's entire tool catalog. Exercise it with and without browser discovery when changing this fixture.
    - Tests that build container images (`C6_TEST_KITS`) are opt-in and don't run in CI.
 7. **Only loopback.** Providers, GitHub and OAuth are fakes on `127.0.0.1` (`c6_testkit::MockLlm`, small axum servers). No test reaches the internet.
 8. **The product's own time limits must not fail a test either.** Where the code under test waits (a browser starting, a credential, an RPC), its limit is generous enough for a loaded machine. For example, the browser now gets 60 seconds and says why it didn't start.
@@ -55,6 +1794,90 @@ A line that must break a rule says why: `// test-lint: allow (<reason>)`. Today 
 ## Checked under load
 
 The suite is also run with every CPU core kept busy by other processes, to surface timing assumptions a lint can't see (rule 2). A failure there is a bug in the test or the product, never "just load".
+
+## Production image-preview browser regression
+
+`crates/c6-ui/tests/image-preview.cjs` runs the actual production WASM, not
+recreated markup. It reuses `motion.cjs`'s private, port-0 loopback HTTP/WS
+fixture and browser launcher. It never starts a head/worker or changes a live
+account. All API replies, transcript attachment bytes, pending upload bytes,
+and the document's SVG drawing are local fixtures. Each case gets private
+browser storage and a fresh browser process.
+
+Build in the worktree being tested, then run with Node 24 and Playwright Core
+1.65.0 from the locked install above. No npm install or UI rebuild occurs in
+the harness. The build requires Trunk, the WASM Rust target, Tailwind and
+`brotli` on PATH. Do not pipe `make ui` through `tail` without `pipefail`: a
+failed build must not silently test an older `dist`.
+
+```sh
+set -euo pipefail
+env -u NO_COLOR make ui
+ENGINE=both node crates/c6-ui/tests/image-preview.cjs
+```
+
+On thalassa, Node 24 is at
+`/home/zheilbron/.nvm/versions/node/v24.16.0/bin/node`. Browser/library defaults
+come from `motion.cjs`; other machines can set `PLAYWRIGHT_CORE`, `CHROMIUM`,
+`CHROMIUM_LIBS`, and `WEBKIT_EXECUTABLE`. `ROOT` selects an existing production
+dist, `ENGINE=chromium|webkit|both` selects the browser (default Chromium),
+`VIEWPORT=desktop-wide,desktop-narrow,phone,phone-narrow` filters cases, and
+`THEME=light,dark` filters themes. The desktop cases use a 1440×1000 window
+with one or three real workspace tiles; phones use 390×844 and 320×568.
+
+The three real entry points are exercised in every case:
+
+- a received transcript image (`TranscriptImage` → `FullImage`);
+- a file added through the composer's real file input, then its thumbnail;
+- a document `diagram` block (`Expandable`, with `fill=true` → `FullImage`).
+
+Checks cover full-window scrim bounds and four-corner hit testing, absence of
+tile ancestors, image fit, explicit 14px captions/12px actions, image/caption
+clicks staying open, Escape/Close/outside dismissal, opener focus return, and
+attachment removal's composer-focus fallback. Drawing preview must not enter
+document editing and also opens with Enter/Space. Geometry, decoded-image
+readiness and DOM state are the completion conditions; there are no fixed
+sleeps or external requests.
+
+Screenshots and JSON ancestry/geometry measurements go to
+`/tmp/q2-screenshots/` (`SCREENSHOTS` overrides it), named
+`after-<engine>-<viewport>-<theme>-<caller>.png`. For baseline diagnosis:
+
+```sh
+ROOT=/tmp/q2-baseline-dist BEFORE=1 ENGINE=both \
+  node crates/c6-ui/tests/image-preview.cjs
+```
+
+`BEFORE=1` records `before-*` screenshots and proves the baseline transcript
+preview is row-constrained. It temporarily resets one ancestor CSS property
+at a time, waits for rendering, records the geometry change and restores the
+original styles. Against `8d0079b9`, removing only the transcript row's
+`content-visibility:auto` makes Chromium's fixed preview fill the window;
+WebKit changes its origin but retains the measured row size in this live-style
+experiment. Both reproduce row-constrained previews in wide tiles too.
+Composer and document previews fill the window at rest in the tested
+browsers, but all three previously remained under tile/pane ancestors, which
+can also contain fixed children during transforms. The fix portals the
+complete shared preview, not just its image or an individual caller, without
+removing transcript virtualization or tile clipping.
+
+The accompanying source guard retains the model picker's typography checks
+and additionally guards the image portal, all three callers, explicit image
+action sizing and the audited viewport-overlay boundaries. The same escape
+is applied to the shared workspace/session popovers, session overview/catch-up
+phone sheets, session-preview cards, row menus,
+person cards, session details, file/folder pickers and Add Worker dialog.
+Existing task/decision/archive/Ask/needs-you dialogs already escape via a
+component or caller Portal. Absolute document comment popovers and anchored
+composer menus remain tile-local. The responsive new-session fields panel
+(static on desktop) and stop confirmation (absolute dialog with a fixed click
+catcher) are mixed anchored layouts, not blindly moved to `body` as a pair.
+The browser harness also opens tile Actions, Session details and phone document
+Comments as representative audited surfaces and checks their ancestry and
+bounds. Document Comments and Sessions' Filter, sort and group now deliberately
+portal to the owning tile's surface, with both sheet and scrim contained there
+(see the sheet regressions below); image previews and the other viewport
+overlays still escape.
 
 Use `NEXTEST=1 make test-under-load RUNS=5` for repeated workspace runs. Do not rebuild test binaries in the same target directory while nextest is running: Cargo can remove binaries nextest has listed but not yet started.
 
@@ -79,15 +1902,146 @@ After building with `env -u NO_COLOR make ui`, check arbitrary Tailwind utilitie
 used by changed markup against the generated CSS, not merely the source class
 strings. The shared SVGs use ordinary size/alignment utilities.
 
+## Icons and components: browser check
+
+Native tests in `icons.rs` keep the chrome-glyph and no-browser-SSR guards,
+check every vendored icon at 14/16/20px (one outer SVG, 1.5px absolute stroke),
+and compare the markup helpers with the same path source. `components.rs`
+checks accessible names and trailing switches, bans local switch markup/SELECT
+constants, and requires the shared class on native checkboxes. The ad hoc
+button-class guard waits for the deferred button migration; existing buttons
+are not silently exempted by a growing allow-list.
+
+After `make ui`, open the signed-in `/dev/components` specimen. Repeat in light
+and dark, at desktop and phone widths, with fine and coarse pointer media:
+
+1. Icons are visible, inherit their colour and keep their weight at all three
+   sizes. There are no nested SVGs; filled stars and Stop stay filled.
+2. Check primary/secondary/quiet/danger buttons, small/default sizes, disabled
+   and keyboard-focus states. On coarse pointers buttons are at least 40px;
+   inputs/selects are at least 40px with 16px text. The select has one chevron.
+3. Toggle the specimen's switch by label, track, Space and Enter. The disabled
+   one never changes. Inspect Settings → Appearance, Suggestions and Work:
+   labels/descriptions remain left, tracks align right, saving/error/disabled
+   behaviour is unchanged. Form choices that need Save remain checkboxes.
+4. In a session's ⋯ menu, toggle Catch-up (and Fold finished turns when the
+   timeline feature is shown). The menu stays open; switch rows have the same
+   shape as Settings and at least 44px touch targets. Find's key hint is a keycap.
+5. Open Settings → Realms → Explore. Kind marks retain their original colours,
+   with the approved Lucide shapes. Follow an in-app link and inspect a new-tab
+   link: their trailing 14px arrows differ. Notifications has only its bell,
+   with on/filtered/off state in its title and accessible name.
+6. Watch the browser console and crash reporter through all of these: no
+   browser `.to_html()` calls, disposed-signal panics or horizontal overflow.
+   Check newly added arbitrary Tailwind selectors in the generated CSS too.
+
+## Sessions filters: placement browser check
+
+Build once with source unchanged during the build, then run the production
+loopback fixture with Node 24 (the browser/`ROOT` overrides match `motion.cjs`):
+
+```sh
+set -euo pipefail
+ulimit -n 65536
+env -u NO_COLOR make ui
+scripts/ui-size.sh
+node crates/c6-ui/tests/sessions-sheet.cjs
+ENGINE=webkit node crates/c6-ui/tests/sessions-sheet.cjs
+```
+
+Both themes cover the desktop Sort popover, a narrow desktop tile's Filter,
+sort and group sheet, and a phone with an overlay keyboard. The sheet and scrim
+must belong to their own tile, stay within its bounds and above the keyboard,
+and close through Done, Escape and the scrim. The body remains independently
+scrollable. Browser errors fail the run. `SCREENSHOTS` defaults to
+`/tmp/n3-ui/item4`; `BEFORE=1 ROOT=/path/to/baseline/dist` captures baseline
+geometry/screenshots without enforcing the corrected bounds or dismissal checks.
+The native `viewport_portals_escape_tiles_and_keep_their_own_typography` guard
+keeps the document and Sessions sheets tile-local without weakening the guards
+for viewport overlays.
+
 ## Doc comments: placement browser check
 
-`cargo test -p c6-ui` checks the pure popover placement with offset tile bounds,
-above/below anchors, oversized threads and 320px/390px/desktop widths. In a
+`reply-recovery.cjs` holds reply A's request until draft B is typed, then
+fails A. It checks that B is unchanged, A is separately recoverable after a
+real reload, and Restore reply cannot replace a nonempty draft. Desktop,
+narrow desktop tiles and phones run in both themes in Chromium:
+
+```sh
+env -u NO_COLOR make ui
+/home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/reply-recovery.cjs
+```
+
+Screenshots go to `/tmp/n3-ui/item3` (`EVIDENCE` overrides it).
+`BEFORE=1 ROOT=/path/to/baseline/dist` asserts the original overwrite and
+captures before evidence. `ENGINES=chromium,webkit` additionally runs WebKit;
+startup traps fail explicitly rather than being retried or hidden.
+
+`reply-recovery.cjs --responses` checks the shared HTTP decoder against
+malformed successful JSON, a structured 503, non-JSON status-text fallback,
+a rejected response-body read, and a 401 arriving after the workspace mounts
+(which must replace it with sign-in). Every case owns its mocked responses
+and browser context. Use `ENGINES=chromium,webkit` for both engines; no live
+head or settings are touched. The normal mode above still covers deferred
+mutation failure and draft preservation.
+
+After `env -u NO_COLOR make ui`, run both production regressions:
+
+```sh
+ENGINE=both /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/comments-design.cjs
+ENGINE=both /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/comment-sheet.cjs
+```
+
+`comments-design.cjs` checks margin-fit and tight wide tiles, four narrow
+tiles and 390px/320px phones, in both themes and engines. Geometry asserts
+unchanged block positions/sizes across opening, containment, placement beside
+the reading column when its margin fits, and no anchor overlap whenever a
+usable clear rectangle fits the measured box width and control minimum.
+Cases use Motion Off and assert settled geometry, not animated enter/exit
+stability. It checks one thread at a time,
+the separate thread/message menus and their SVGs, multiline replies with
+menus open, nearby Reply/Resolve and the quiet agent footer. The 320px phone
+case also narrows the real viewport to 240px to check both new-comment and
+reply action rows: Send to agent takes its own full-width line with an
+unbroken label, Cancel/Comment stay together below it, Send now wraps below
+the reply switch, and the controls remain reachable and operable. Full-panel checks
+cover recursive document order, independent and bulk collapse, per-document
+browser persistence, reply and own-edit drafts, quote jumps, collapsed new
+replies and one scrolling list with no nested thread scrollers. In margin-fit
+light, deferred POST/GET responses check that a successful reply retains its
+thread and textarea, and a late edit-save cannot erase a newer draft after
+collapse/remount/reload. Unread updates are tested via reload with changed
+mocked data; this does not claim coverage of the document's `/live` transport.
+Before/after PNGs and JSON go to `/tmp/q9-comments/`; `BEFORE=1 ROOT=...`
+records the original design without enforcing the new assertions. `VIEWPORT`,
+`THEME`, `ENGINE`, `EVIDENCE` and the motion harness's browser overrides apply.
+Failures, including WebKit startup traps, fail the run; there is no retry loop
+or browser-tier override.
+
+`comment-sheet.cjs` uses `motion.cjs`'s owned loopback fixture and launcher, without a head,
+services, live settings or external requests. Four narrow tiles in a wide
+window (also a short window), and 390px/320px phones, exercise new comments,
+long existing threads and the comments panel in both themes. It checks sheet
+and scrim containment, a real click/typing/Escape in another tile, independent
+sheets in two documents, final-block visibility, scrollable short-tile controls,
+focus return (including switching blocks without unmounting), draft retention,
+the All comments handoff, resize, keyboard maximize/restore, tile removal and
+a position-only move of the retained tile. Phone
+sheets keep the full width and follow a visual-viewport-only keyboard change.
+Evidence is saved under `/tmp/q7-sheet/`; `EVIDENCE`, `THEME`, `VIEWPORT`,
+`ENGINE` and the motion harness's browser/`ROOT` overrides are supported.
+`BEFORE=1 ROOT=/path/to/baseline/dist` records unchanged baseline screenshots
+and geometry without enforcing the new tile-local assertions.
+
+`cargo test -p c6-ui` checks margin and four-strip thread placement, reduced
+widths, offscreen/hidden tiles, containment, recursive thread ordering, and
+the generic panel popover's offset bounds and 320px/390px/desktop widths. In a
 browser, repeat at those widths (with touch on phones):
 
-1. Open a long doc, also with its comments panel beside it on a wide desktop
-   tile. Start a comment on a block near the bottom of the visible tile. The
-   popover flips above; the text box, Cancel and Comment remain reachable.
+1. Open a long doc and start a comment near the bottom of a wide tile. The
+   box uses its margin, or shrinks and avoids the block above/below when
+   possible, without moving the document. Reply, Resolve, Cancel and Comment
+   remain reachable in their respective forms.
 2. Type a long draft, scroll the doc, resize the tile/window and open an existing
    long thread. The box stays inside the visible tile, scrolling its contents
    when necessary, without losing the draft or focus. Cancel, posting, outside
@@ -99,6 +2053,83 @@ browser, repeat at those widths (with touch on phones):
 4. Check the floating comments panel in a short desktop tile too. Chip editors
    and comment ellipsis actions remain in normal flow, not clipped floating
    menus; ref chips still open their destination.
+
+## Session preview marks: manual browser check
+
+On desktop, hover a sidebar session or activate its drawn **Session details**
+button with Tab and Enter/Space. On a touch phone, open **Sessions** and tap
+the row's **Session details** button (the list uses the same preview card).
+The card initially has one swatch, not the palette. Open it and pick a plain
+colour and a pattern; the card must stay open and the saved mark must update.
+Repeat with a session whose own colour is empty: its id-derived swatch must
+still show. Move the pointer away with keyboard focus inside the card; it must
+remain usable. Escape and the close button dismiss it. Open near the bottom
+and right viewport edges, also at 320px and 390px phone widths: expanding the
+palette must not push the card or its controls off screen, or require horizontal
+scrolling. Tall cards scroll within the viewport.
+
+## Archived session tiles: manual browser check
+
+On desktop and a touch phone, type a draft in a session tile, then archive the
+session from another client or its own actions menu. The tile must remain open,
+with its real title/status/mark and a visible **Archived** marker and drawn
+**Unarchive** action. The composer must explain why it cannot send, retain the
+draft and disable sending. Reload, then open the archived session by its direct
+URL in a fresh workspace: both must resolve the same metadata without needing
+the non-archived list. Activate Unarchive by keyboard and touch: it must not
+send the draft; sending afterward works normally. Check an Unarchive failure
+is visible and leaves the session archived. New sends from a stale client are
+also rejected clearly by the head, without queueing input.
+
+## Initial tile loading: manual browser check
+
+On a restored workspace, only the focused tile starts its pane loads first.
+Other visible tiles start after the focused panes have drawn (for a session,
+after its detail response and either the feed's initial `Synced` or a stream's
+reconnecting notice, then a paint).
+Non-session panes use their mounted shell as readiness, not completion of all
+their background requests. Minimized tiles, tiles hidden by focus mode, and
+phone tabs/panes not currently shown wait for their first reveal. Once a pane
+has mounted, hiding it keeps its DOM, stream, draft and scroll state alive.
+Restored headers share this initial budget and join a pending pane detail read.
+After the focused paint, headers missing from the live list (including archived
+or minimized sessions) may resolve by id without mounting their hidden panes;
+an old cached answer must not suppress a fresh omission check or failed-read retry.
+
+A failed detail response releases loading after drawing the error. A stream
+that closes or fails to open before `Synced` draws a reconnecting notice and
+also releases loading, while continuing its normal retries. A successful
+replay clears the notice. There is no timer that declares an undrawn transcript
+ready: a connection that remains open but never sends `Synced` still waits
+until it syncs, disconnects, or the user changes focus/closes its tile.
+
+The workspace native regressions cover mount eligibility, sticky mounts,
+split-pane readiness and changes of focus while loading. In a browser, use
+request gates rather than sleeps:
+
+1. Restore several session tiles with a non-first tile focused. Hold that
+   session's detail response and feed replay independently. Neither releasing
+   detail alone nor replay alone may start another session tile's requests.
+   Release both: confirm the focused transcript is in the DOM before another
+   tile's first request (observe animation frames and the request log).
+2. Restore a split focused tile with a list beside a session. Drawing the list
+   must not release other tiles before the session's replay. Repeat with an
+   empty session and a failed detail response (the error also releases loading).
+3. Minimize a never-loaded tile or restore in focus mode: it makes no pane
+   requests until revealed. On a phone, repeat for inactive tabs and a hidden
+   list pane; resize to desktop and check newly visible panes load.
+4. Hide an already-loaded session, stream a reply, and show it again. Keep DOM
+   handles for its transcript and draft textarea: both remain connected and
+   retain their contents/scroll choices. Switching away while the initial feed
+   is gated, or closing its tile, must let the newly focused tile load and draw.
+5. Run the first-click checks below, including a nonfocused split-pane close.
+   Keep all icons; this scheduling must not recreate header controls on focus.
+6. Resolve the focused session's detail, but close its stream before `Synced`.
+   Confirm its reconnecting notice is drawn before other visible tiles start
+   loading. Observe a new stream connection without switching focus; finish
+   that retry's replay and check the notice clears and its transcript appears.
+   Repeat with detail still gated when the stream closes: other tiles must
+   wait for detail too, rather than treating failure as an unconditional bypass.
 
 ## Tile focus and first click: manual browser check
 
@@ -147,12 +2178,149 @@ In a desktop browser (also check touch-capable desktop/tablet native dragging):
    must follow the same rules. Dropping a tile over a message box still moves
    the tile; dropping a file still attaches it, not moves a tile. End/cancel a
    drag and check that all feedback disappears.
-6. On a phone, long-press a bottom tab and drag it across several tabs (also
-   with minimized tiles present). The insertion line and final reading order
-   must agree. This uses `step_tile`/the switcher's pointer handlers, not the
-   desktop `Drop` zones; a long press without movement still opens its menu.
+6. On a phone there is no reorder footer. Open **Sessions**, check one flat
+   reading-order list including hidden tiles, switch and close each kind of
+   page, and check its current highlight and positive count. Desktop dragging
+   above remains the reordering route.
+
+## Phone session header and desktop ring: browser check
+
+Use Chromium and WebKit, light and dark. Test 320px and 390px portraits and a
+short landscape viewport, with the keyboard closed, a resized viewport and an
+overlay/offset visual viewport. Check one 44px top bar and no footer. Open
+the app menu (realm, search, Activity, notifications, connection/version),
+Sessions (Ask, bell, close/switch/new), Actions (Find/details/history), and the
+shared state/context ring (the only phone route to Changes/Terminal/Files/Outputs).
+Sheets and dialogs must stay within the visible viewport and scroll.
+
+Drive idle, main-working, waiting, last-turn failure and background-only
+states. The idle slot is empty, never “0 background tasks”; working must not follow aggregate child
+status. Deduplicate linked task/subagent records and exclude foreground native
+work and mirrors. The whole 44px status row, with its chevron and visible inset
+focus, must expose cards, errors, Inspect/Stop and history. Its task count reads
+“1 background task” / “2 background tasks”, matching desktop without “running”.
+Waiting-card Show navigation and real approval/answer actions stay intact.
+Every status variant uses one line in the same 44px slot, including quiet idle,
+without resizing the transcript viewport when switching between them. Working
+and live turn stats stay left; background tasks stay right. On narrow phones,
+stats ellipsize to elapsed time before the task label can wrap.
+Hold a draft and focused composer element across these transitions: it must
+stay mounted and at the same bottom position; the transcript height never changes.
+Following remains at the bottom, while a scrolled-up reader stays put.
+
+At desktop height, exercise actual 240/320/400/480/640px tiles, not just the
+bar width. The transcript and bar must share the same actual tile width.
+Fine-pointer controls use 28px slots; coarse pointers keep 44px targets.
+Verify narrow bars move secondary controls into Actions with their icons,
+truncate the title, and never require a horizontally scrolling workspace.
+Also test a list and item in a split tile. Inspect all four rim states,
+neutral context arc, dashed waiting, failed cross, positive-only badge, worded
+accessible name/tooltip, and stripe-default/Dot-only Appearance preference.
+Keep screenshots for both themes; validate new arbitrary utilities in built
+CSS as well as geometry. Emulated keyboard tests do not replace a physical
+phone keyboard/accessibility review.
+
+### Opt-in tile aspect marks
+
+After `env -u NO_COLOR make ui`, run the loopback production regression:
+
+```sh
+ENGINE=both SCREENSHOTS=/tmp/z2-screenshots \
+  /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/tile-marks.cjs
+```
+
+Like `motion.cjs`, it uses the local Playwright/browser paths (or their environment
+overrides), an owned ephemeral port, fake HTTP/WebSockets and fresh contexts.
+Check both themes with several wide tiles: old-head/default off,
+opt-in on, the selected shapes, 400ms resting spotlight and cancellation,
+clicking a card and its palette, setting save/reload, and live off/on changes
+without replacing controls or composers. Fixed controls keep their width-dependent
+28/32/36px fine-pointer or 44px coarse-pointer slots and coordinates. Marks sit
+8px after the intrinsic title with 8px gaps and clearance from controls; long
+titles shrink rather than pushing marks against controls. `MARKS_BEFORE=1`
+checks the old right-aligned geometry against a pre-fix dist. Resize actual
+tile content through 720/640/639/480/479/320/240px: marks
+yield below 640px, before secondary controls move into Actions below 480px;
+the ring, Actions, Focus and Close stay ordered and reachable. Widening restores
+the same nodes and geometry. Resize the viewport to 320/390px and short
+landscape: no strips, pending dimming or popovers, even with the setting on.
+Keep off/on/card/phone screenshots and reject console/crash-reporter errors.
+
+## Composer latency and draft persistence
+
+Textareas managed by `autosize` use CSS `field-sizing: content` when available.
+The fallback coalesces text, width and visibility changes into one pending
+animation-frame fit, canceled on unmount. Composer input handlers never fit
+synchronously. Native tests cover completion parsing and text-save coalescing,
+including forget-before-teardown; browser checks exercise actual layout/storage:
+
+1. In Chromium (native sizing) and WebKit (fallback when unsupported), type,
+   paste, clear and restore a multiline draft, resize/hide/reveal the tile and
+   show a long suggested placeholder. It grows up to its cap then scrolls,
+   shrinks when cleared, and remains usable at 320px, 390px and desktop widths.
+   Instrument textarea geometry reads: none on the native path, none during
+   input dispatch on the fallback; multiple edits in one frame yield one fit.
+2. Instrument fetch signals and hold mention responses behind an explicit
+   gate. Type `@ab`, wait for its request, then type `@abc`: the first request
+   must abort, not merely have its result ignored. File, memex and Ask reference
+   requests share the 120ms debounce and cancellation. Release the old response:
+   it must never replace the newer suggestions. Moving/clicking the caret
+   without changing a query must not issue requests or reset selection. Escape,
+   completion, removing `@`, and closing the box cancel pending/in-flight work.
+3. Observe localStorage writes while dispatching a burst of edits in one task:
+   there is no synchronous write per edit. The latest text is saved after the
+   250ms debounce; navigate away before it fires and it is flushed on teardown.
+   `pagehide` and becoming hidden flush too. Reload immediately after typing
+   (in the same JS task, within the debounce window), including with restored
+   attachments; the last edit and attachments must return. Send/start a session during that window and return:
+   the forgotten draft must stay gone, not be resurrected by a late save.
+4. Restore a draft with ordered image/file attachments from IndexedDB. Edit text
+   and immediately navigate away; reopen and check text, attachment metadata and
+   ordering. Send and reopen again: neither returns. The attachment transaction
+   queue and restore-ready gate remain unchanged; typing doesn't rewrite payloads.
+   Repeat a failed send (draft stays), storage denial (quiet note), and pasting
+   an attachment before the database opens (restored and new files both stay).
+
+## Rewound marker: conversation counts and disclosure
+
+`cargo test --locked -p c6-ui rewind` checks the marker's pure counting and
+wording helpers. Count your message bubbles (including attachment-only messages)
+and Assistant entries with nonempty text, once per entry even if there are
+several text blocks. Several text replies in one turn remain separate replies.
+Tool-only/think-only entries, empty interrupted responses, task notifications,
+stop-hook notices, incoming agent messages, usage, errors and turn metadata do
+not inflate the count. The marker says "1 message and its reply", "2 messages,
+3 replies", or "1 message, 0 replies", with singular/plural variants. The
+membership map is unchanged: all rewound activity still folds, checkpoints
+retain their existing policy, and nested/repeated rewinds never recount entries
+already owned by an earlier marker.
+
+After `make ui`, run `ENGINE=both node crates/c6-ui/tests/rewind-marker.cjs`
+against that dist (or set `ROOT` to a coordinator's built dist). The script
+reuses `motion.cjs`'s installed Playwright/browser overrides and owned loopback
+HTTP/WebSocket fixtures; it never starts a real head, worker or model or uses
+live settings. Desktop 1440px and touch phone 390px/320px, in Light and Dark,
+cover a four-entry interrupted turn, an unanswered message, multiple messages
+and text replies mixed with tools/notices/usage, and nested rewinds. Real
+clicks/taps verify both show/hide labels, retained message DOM and fold ownership,
+the undo icon, file-restoration status/error, no horizontal page overflow,
+no session mutation requests and no browser/dropped-closure errors. Waits are
+condition-based with the shared five-minute hang guard (`docs/testing.md` rules),
+not timed pauses. This covers only the marker, not the Rewind confirmation.
+Use `ENGINE=chromium|webkit`, `WIDTH=1440|390|320` and `THEME=light|dark` to
+isolate an exact case; preserve any original failed cohort before rerunning.
 
 ## Transcript follow: manual browser check
+
+The native `child_lists_invalidate_on_spawn_not_tool_results_or_task_reports`
+checks the shared membership memo's downstream invalidation. In a browser,
+count `/children` and `/children?tree=1` requests while ordinary tool calls finish:
+they must not refetch for each result. Spawn a subagent: both lists refresh.
+Existing live working-count, attention/reconnect and explicit side-chat creation
+refreshes remain intact; verify a child finishing and a newly created side chat.
+Usage statistics are shared per feed between the header/details/transcript, not
+incrementally summarized. The shown event window already borrows with `.with`
+and must not be changed to `.get` (which would clone the whole retained log).
 
 The `c6-ui` workspace unit tests cover input direction and stop/resume decisions. In a browser, use a long session with a streaming reply:
 
@@ -170,9 +2338,26 @@ The native `session::tests::tool_output_keeps_one_bounded_area_before_and_after_
 In a browser, repeat at 320px, 390px and desktop widths:
 
 1. Start a shell call that emits several lines before finishing. Its summary appears immediately; it stays collapsed throughout. Open it while running: the output scrolls within a fixed-height area, which remains the same height when the result replaces the live text. An error must behave the same way. Plans start open and retain that choice.
-2. Retain DOM handles for the card, its `details`, and its output `pre`. Deliver output chunks, its result, and another assistant event: all three handles must remain connected and refer to the same nodes. A user-opened card stays open; a user-closed card stays closed.
+2. Before first opening, the collapsed card has no output `pre` or detail body. Open it and retain DOM handles for the card, its `details`, and its output `pre`. Deliver output chunks, its result, and another assistant event: all three handles must remain connected and refer to the same nodes. A user-opened card stays open; a user-closed card stays closed. Closing unmounts the body; reopening shows the latest result immediately in the same bounded area, not a growing fill-in box.
 3. Create a session and a document with long titles. Their pending link areas must already occupy the completed card's height, with the input title when known. The result activates the destination without adding a row or horizontal overflow. Keep all status, document/deck and navigation icons.
 4. With a long transcript following the bottom, repeat through completion: it stays at the bottom without a transient expansion/collapse. Scroll up deliberately before a result arrives: the viewport stays at that position. Repeat on a touch viewport and with reduced motion.
+
+### Off-screen transcript rows and lazy bodies
+
+`collapsed_tool_body_does_not_read_or_render_output` checks that closed bodies
+neither render nor read their output; the bounded-output regression above still
+covers pending, live, completed and error states. Thinking starts expanded when
+enabled, but collapsing it removes its Markdown body until reopened.
+
+In Chromium and WebKit, use a transcript spanning several screens (include tool
+results and thinking). Inspect `.c6-transcript-row`: browsers supporting
+`content-visibility: auto` skip off-screen layout and remember measured sizes.
+Scroll slowly and fling in both directions; Latest must still glide/follow to
+the real end as rows materialize. Open Find and jump to a hit in an off-screen
+tool body, a folded turn, and an event outside the loaded window. Each unfolds,
+mounts the body before highlighting/measuring, and centers the actual hit.
+Repeat while streaming, with following off and reduced motion enabled. No
+result-arrival fill-in jump, missing icons, or empty first jump is acceptable.
 
 ### Observer lifetime regression
 
@@ -181,6 +2366,18 @@ callbacks alongside the observer, disconnect before dropping either on replaceme
 or unmount, and never `forget()` the closure. The message box uses the same
 ownership pattern. The transcript's on-sight IntersectionObserver retains its
 callback until cleanup too (as the glance outline already does).
+
+Transcript-follow resize delivery commits the real end synchronously before
+paint, with one native inverse-translation trajectory rather than a queued
+scroll-animation frame. Deliver its callback twice without changing geometry:
+the second invocation must not write scrollTop or restart the native effect.
+Scroll away and deliver again: it must recheck following and leave the reading
+position alone. Close the tile: cleanup must disconnect the observer before
+dropping its callback, with no late reads or dropped-closure errors. The helper's
+row-height observers also disconnect when following stops or the root detaches.
+With normal-motion WebKit and many tall contained rows, stream and resize at
+phone and desktop widths; no ResizeObserver loop warning is acceptable (also
+repeat with reduced motion and in Chromium).
 
 In browser automation, wrap the native observers before loading the app and
 record each callback and its observed elements. Open and close session tiles
@@ -191,13 +2388,681 @@ not call a leaked Rust closure. While mounted, resize the tile, append a streame
 reply and scroll: width measurement, transcript following and visibility still
 work, without callbacks or reactive reads after disposal.
 
+## Shared page data: connection and session panes
+
+`cargo test -p c6-ui resources::tests` checks that connection consumers use
+one page-owned resource, sessions share their detail request, closing a tile
+cannot dispose another tile's data, and a new page does not inherit another
+page's cache. These tests inspect resource identities, not rendered HTML.
+
+In a browser, filter Network to `connections` and open several session tiles,
+their model pickers, New session, Usage and Settings. There should be one
+connections-list GET per signed-in page, not one per picker or tile. Rename,
+add or remove a connection, sign in with ChatGPT, and change a connection's
+realm availability: after the successful save the shared list refreshes and
+every picker reflects the confirmed result. Failed saves must not change it.
+
+Open a transcript's Changes, Files and Terminal. They share its session-detail
+request and use the actual folder from Started (including a worktree), not
+the requested folder. With the transcript already loaded they need no first-
+event fetch. Opening a pane directly still loads detail and the first event
+in parallel; starting sessions retain the unavailable note until Started.
+SSH sessions still refuse local Changes/Files and open remote terminals.
+Close the transcript while keeping a pane open, then reopen it: the pane
+must keep working and the transcript must refresh its detail.
+
+### Shared model lists
+
+`cargo test -p c6-head --lib models::tests` checks one cold request per
+connection, ten-minute freshness, stale-while-refresh, refresh failures,
+bounded eviction, and invalidation racing a provider reply or an old
+connection-row read. Time is supplied to cache lookups; tests do not wait
+ten minutes. The loopback HTTP test checks that connection edits and deletion
+invalidate lists, while **Test connection** (including the saved connection's
+`GET /models?fresh=true` and pool members) always contacts the provider and
+does not populate the cache. Pools share their members' cached lists and
+compute the union directly, avoiding a second ten-minute freshness window.
+Editing any connection clears cached member lists too.
+The head keeps at most 128 entries; failed refreshes retain the last successful
+list and back off for 30 seconds. It never caches a cold failure.
+
+`resources::tests` also checks the UI's shared pending model resources,
+refresh coalescing and 128-entry bound. An evicted or invalidated entry cannot
+dispose a list still used by an open picker. A confirmed connections reload
+clears the page cache; late replies cannot reinsert old entries.
+
+In Network, open several message boxes before opening any model dropdown:
+their mount should warm each connection's list only once per page. Open the
+all-connections picker: requests run in parallel, grouped in the same order
+as before, with per-connection errors and free-text model entry unchanged.
+Open a second picker or close/reopen a box: it shares both pending and ready
+lists. Save a connection edit and repeat; lists must refresh only after the
+save succeeds. Test a saved connection while its list is cached: the provider
+must still be contacted. Repeat with an unavailable provider after the head's
+ten-minute freshness window: the previous successful list remains usable
+while one refresh runs. All pickers retain native controls and drawn icons.
+
 ## Task card actions: manual phone check
+
+`task-work-name.cjs` is the production browser regression for Save elsewhere's
+New work confirmation. It checks the selected title seed, safe structured
+submission of quotes/backslashes/Unicode/markup-like text, Enter and button
+confirmation, empty-name prevention, Escape cancellation, reseeding on reopen,
+and unchanged existing-work actions. Run after `env -u NO_COLOR make ui`:
+
+```sh
+/home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/task-work-name.cjs
+```
+
+Both themes cover desktop, a narrow desktop tile and a phone. Evidence goes to
+`/tmp/n3-ui/item9` (`EVIDENCE` overrides it). `BEFORE=1 ROOT=...` asserts the
+old immediate submission and captures before screenshots; `ENGINES=webkit`
+selects the additional WebKit check. The head regression
+`work::tests::task_card_new_work_name_is_structured_validated_and_optional`
+checks the HTTP answer, validation without creating work, unchanged to-do
+contents, and compatibility with old unnamed answers.
 
 Check both a session transcript and Decisions, with a coarse pointer at 320px and 390px widths, and on desktop. Use a realm with several open work items and a closed one.
 
 1. The actions read **Start session**, **Do it here**, **Save for later**, **Not now** in that order. Only Start session is filled; the next two have identical visible outlines and heights. They share one wrapping row, with no split arrow or stray divider. Coarse-pointer targets are at least 44px tall; desktop buttons remain compact.
 2. Save for later's tooltip names the proposing session's work. Clicking it sends `Add to this work`, without a picker. With no work, it creates new work. Do it here's tooltip names the proposing session.
 3. **Save elsewhere…** opens over the workspace, not inside the card. Scroll the transcript so the card is directly above the message box, then open it again: the whole dialog remains visible, with a scrolling list rather than content clipped by the composer. Try light/dark mode and the phone keyboard.
-4. The chooser offers **New work** once and open work only in the card's realm. Search is case-insensitive. A nonmatching search shows an empty-state message but keeps New work available. The New work choice sends `Add as new work`; an existing work item sends `Add to work:<id>` and receives the card's title, prompt and origin as a to-do.
+4. The chooser offers **New work** once and open work only in the card's realm. Search is case-insensitive. A nonmatching search shows an empty-state message but keeps New work available. New work opens a focused, editable name seeded from the selected card title, without submitting. Enter or **Create work** sends `Add as new work` with `values.work_title`; Cancel or Escape sends nothing. An existing work item sends `Add to work:<id>` and receives the card's title, prompt and origin as a to-do.
 5. Close, outside click and Escape dismiss the chooser; Escape must not stop the session. Focus returns to Save elsewhere. A failed save leaves the card open with an error; all action buttons disable while a save is pending. Check the chooser with a long list and a long work title.
 6. With only task cards open, the transcript shows **Suggested tasks (N)** without an empty **Waiting for you** heading. Add a question or approval: Waiting for you returns. Answer the last non-task decision: its heading disappears while Suggested tasks stays.
+
+## Workspace destination reuse and explicit copies
+
+All opens (`Beside`, `OwnTile`, `Instead`, `NewTile`) first look for a live matching
+destination in either pane, including minimized tiles. They focus that exact
+pane, restore its tile, and reveal it even if another tile fills the workspace.
+If explicit live copies exist, the origin tile wins, then the focused tile,
+then the first matching tile in saved order. `NewTile` (⌘-click on Mac,
+Ctrl-click elsewhere) creates a new tile only for a destination not already
+open, except explicit session companion panes, which retain copies. Sessions
+themselves always reveal their existing transcript, including from mentions,
+lists and the phone picker; companion destinations remain distinct.
+Ordinary “New tile” link actions use `OwnTile`; the pane's “Into its own tile”
+action detaches its existing pane, without copying it. Home's New tile command
+requests the Sessions starter and reveals it if already live. Sessions and
+Realms starters each have only one live copy, also from an empty workspace. Opening a
+destination found only in history does not steal or rewrite that history entry.
+
+Saved-layout restore collapses current single-copy page duplicates (including
+Docs indexes, sessions, Sessions and Realms starters, but not companion copies),
+retaining the focused copy/active pane or the first in saved order, with its
+exact reading target and key. Only duplicate single-copy panes are
+removed; their companion panes and history stacks stay. A duplicate-only tile
+without history disappears. One with history traverses Back, then Forward, to
+its nearest useful page, preserving skipped snapshots and the opposite stack.
+If all its history is already-open pages, Home retains both stacks and the
+outgoing page in Forward, provided Home is not already live. Otherwise a
+labelled history-only tile retains those stacks without mounting any page.
+Back/Forward reveals a live destination or mounts it after its owner closes.
+This may retain an extra navigation tile:
+deleting it or grafting its independent history onto the winner would lose or
+change navigation. Restore is idempotent and makes no rendering-to-HTML calls.
+
+Back/Forward collisions also reveal/navigate the existing single-copy page (including
+minimized tiles) rather than recreating a copy. The source panes and both
+stacks remain untouched, so even a mixed historical snapshot remains available
+instead of being destructively rewritten. Its other panes are not restored on
+that collision click. Old same-tile copies in a history snapshot collapse only
+when that snapshot becomes current; stored history is not pruned.
+
+Fixed pages (Inbox, Decisions, Sessions, Docs list, Work list, Projects list,
+Ask, workers list, Brief, Usage, Activity, Memex, Mail, Chat, Calendar, Contacts,
+Photos, Analytics, Mission, Realms) reuse one matching live view. Documents,
+sessions, workers, work, projects and collections match by their identifier;
+lists remain separate destinations from their items. Settings is one page:
+opening a different section navigates that same pane. Session Outputs likewise
+navigates output selection in its existing pane. Searches match the complete
+query/kind/worker, and explorer/app routes match their section/object/record,
+so different investigations can stay side by side. In-place `replace` also
+reveals an existing single-copy destination rather than duplicating it.
+Selected-parent detail
+opens (`open_after`, including Glance's worker and started sessions) also reuse
+existing destinations; new details keep the selected parent rather than its
+list. Session companion actions (Changes/Files/Terminal/Outputs) retain their
+deliberate same-tile placement contract rather than searching globally for a
+companion elsewhere in `open_after`.
+
+Session turn targets and document block targets reuse the destination and
+record target changes in the destination tile's Back/Forward history, keeping
+pane keys. A session target deliberately remounts its transcript owner to
+revisit the turn; header controls and menus are keyed to that registration,
+and queued old layout effects tolerate its disposal. Untargeted document links
+only focus: they do not reset the reading target, add history, or discard
+Forward. Untargeted session links and picker selections instead return to
+Latest in place, consuming the old target without losing the composer, draft
+or stream; consuming that target does not remount its owner. Documents accept `/docs/<id>#<block>` and
+`/docs/<id>?block=<block>` (a nonempty hash wins); the address bar uses the hash.
+The same targets work on `doc:<id>` Markdown links. In-app links retain their
+query and hash, including inside document blocks. A document block jump uses
+the existing comment-reveal callback to select its tab/slide and flash/scroll
+to it without remounting DocPage or losing its block/comment drafts. Clicking
+the same target again explicitly revisits it; focus alone does not.
+
+Run `cargo test -p c6-ui workspace::tests` for the real pure `Layout::open`
+path (every view and opening mode, either pane, minimize/maximize, duplicates,
+targets, history and legacy saved documents, sessions and starters). `cargo test -p c6-ui` also covers
+Markdown target preservation and document tab/slide reveal selection.
+
+After building the final combined UI **once**, run:
+
+```sh
+ROOT=/path/to/dist ENGINE=chromium,webkit node crates/c6-ui/tests/workspace-open.cjs
+```
+
+The standalone harness reuses motion.cjs's private loopback server, Playwright
+launcher, session/live fixtures and bounded condition waits. It checks desktop
+and 320×568: actual doc links/mentions, links inside a document, query-targeted
+tab selection, incoming session-created documents, pane key/DOM/editor identity,
+target Back/Forward, minimized docs under a maximized session, modifier reuse
+of open documents/sessions/pages and new tiles for unopened destinations,
+explicit companion copies, focused/first duplicate collapse on restore, retained companion
+panes and history-only navigation shells, pane detaching, Back/Forward and
+in-place route collisions, Home's New tile, and real drag/drop without copying
+panes. Session cases check independent per-session composer drafts, stream
+cleanup and no transient duplicate transcript mount during restore. Pop-up
+bookkeeping holds weak owners: a closed dismiss effect or an open menu must
+not retain a departed transcript's stream, timers or draft listeners. A focused
+history-only tile also releases initial loading after reload. Both
+`MacIntel` (⌘-click) and `Linux x86_64` (Ctrl-click) browser platform
+identities are tested; native Mac Ctrl-click remains a context click.
+Set `VIEWPORT=desktop|narrow` or `PLATFORM=MacIntel|Linux x86_64` to focus a case.
+The draft-retention
+case dispatches a real link click without pointer blur, since normal editor
+blur intentionally saves/closes it; it does not call workspace internals or
+replace production navigation helpers.
+
+`ONLY=autoDocs` isolates two real mounted session fixtures and one shared doc.
+Session-authored `created` events use `OwnTile`, including repeated notifications
+from either writer. Real `changed` events (head edits emit this value) refresh
+the existing document, retaining DOM/editor drafts without opening or focusing
+it, changing pane/tile keys, or adding/clearing history. Repeated edits by both
+sessions are checked while focus stays on the chosen session. This deliberately
+preserves the existing creation-only auto-open policy: streaming block edits
+must not steal focus. Comments/deletes/other authors do not auto-open either.
+
+Opener audit: `Go` (`own`/outside-column included), Markdown/mentions, doc chips,
+Search, and attention all reach the shared destination policy. “Used in” opens
+the referring Work/Project through `Go`, not another doc. The sessions hover
+“New tile”, new-session dialog, and work resume now use `OwnTile`; genuine
+modifier clicks and session companion modifiers retain `NewTile`. The workspace
+blank-tile command opens or reveals its one Home starter (Sessions, or Realms
+in the console). Workspace drag/drop only
+moves existing tiles; there is no document `text/uri-list` drop opener to patch.
+
+`ONLY=sessionTarget` isolates session query/turn targets, target Back/Forward,
+and an identical repeated target (also with the tile Actions menu open) before
+any Docs are mounted. These operations
+must be panic-free: session targets need a keyed content replacement with a
+fresh owner and DOM, not an unkeyed rebuild against disposed reactive attributes.
+Doc targets deliberately keep the same content key to retain editors. The full
+test prints each phase and checks browser errors both before and after the
+session/doc boundary; its live fixture accepts the live socket's query string
+and waits for readiness rather than depending on connection timing.
+
+## Global shortcuts: platform modifier and terminal focus
+
+`cargo test -p c6-ui util::tests::app_shortcuts` checks browser platform
+classification and every Meta/Ctrl/Alt/Shift combination without rendering
+app views. Workspace 1–9 and [ / ], sidebar \, Search K and Ask J use Meta
+only on macOS (`navigator.platform` starts with `Mac`), Ctrl only elsewhere.
+The opposite modifier, both together, Alt/Shift variants, composing events
+and events already prevented by a child must not trigger an app command.
+
+Run `ENGINE=both node crates/c6-ui/tests/keyboard-shortcuts.cjs` against the
+coordinator's final dist (`ROOT`, `PLAYWRIGHT_CORE`, `CHROMIUM` and
+`WEBKIT_EXECUTABLE` work as in `motion.cjs`; this script does not build the UI).
+It overrides `navigator.platform` before app startup to `MacIntel`, then
+`Linux x86_64` and `Win32`. With multiple tiles, send cancelable bubbling
+keydown events using each platform's modifier: 1–9 focus the numbered tile,
+[ / ] go back/forward in its history, \ toggles the sidebar, K focuses Search
+and J opens Ask. Verify the other modifier and the variants above leave
+the workspace and focus unchanged and are not prevented by these handlers.
+Repeat with focus on `.xterm-helper-textarea` inside `.xterm`: none of those
+commands may move tiles, toggle the sidebar, steal focus or prevent the event;
+terminal Ctrl+J, Ctrl+K, Ctrl+[ and Ctrl+\ must remain terminal input. Test both
+an event targeted at the textarea and one dispatched on `window` while the
+terminal stays focused, especially Ctrl+[ on macOS. The fixture uses a real
+focusable terminal-shaped DOM subtree without xterm's own key handlers, so the
+events actually bubble to the production window listeners. After leaving the
+terminal, shortcuts must work again. Normal Search and message inputs still
+allow these explicit app commands. Retained but hidden Search inputs must not
+claim K before the visible header input; the fixture checks actual visible focus.
+
+### Phone app drawer: left swipe from inside (fix6)
+
+`node crates/c6-ui/tests/motion.cjs --unit` exercises the production
+`c6DrawerSwipe` helper without a UI build: touch-only direction locking,
+tap slop and click preservation/suppression, short reversal after crossing
+the threshold, long release, cancellation, motion/viewport changes and
+listener cleanup. No app views are rendered to HTML.
+
+After the coordinator's **combined** `make ui` (do not build each worktree),
+run against that production dist:
+
+```sh
+ROOT=/path/to/coordinator/crates/c6-ui/dist ENGINE=chromium \
+  ONLY=drawer THEME=light VIEWPORT=phone,narrow,landscape \
+  MOTION_CASE=full,full-reduce,reduced,off \
+  node crates/c6-ui/tests/motion.cjs
+```
+
+The existing fake-head fixture uses Chromium CDP **emulated touch**, not a
+physical Android device. It checks actual native touch/pointer cancellation
+and compatibility clicks: a normal nested-menu tap; a drag starting well
+inside the drawer (no Android Back-edge dependency); finger tracking; a long
+pull reversed to a short release with snap-back; long release with inert
+retained exit; and real nested vertical scrolling without dismissal. Outside
+tap and Escape still close. It checks the shared 280/200ms Full tokens,
+80/80ms Reduced tokens, 0/0ms Off tokens and zero travel outside Full, including
+explicit Full overriding an OS reduced-motion preference. Gesture recognition
+is identical in each setting; only Full translates during the finger drag.
+Physical Android Back-edge interaction remains a manual follow-up.
+
+The drawer opener still uses **one** native Playwright tap, then waits for
+the retained panel's `data-open="true"`, settles animations and asserts it
+remains open. No sleeps, retries or JS clicks: a missed tap must time out and
+an unintended subsequent close must fail. The nested scroll test registers
+`scrollend` before its gesture and awaits native completion before removing
+the fixture. The long-close gesture ends with slowing native touch moves,
+testing a deliberate distance-based pull/release rather than a 115px
+one-step flick. Fast-release diagnostic traces showed native opener down/up
+with no subsequent click; native scroll completion and a one-frame trusted
+press did not cure it. Those failures must remain reported separately, not
+be described as an app-side dismissal or as solved by the state wait.
+
+## Composer model picker typography across portals
+
+Run `cargo test -p c6-ui composer_model_portals_keep_their_own_typography` for
+the native source guard (no app-view rendering). The desktop model/subagent
+popover must carry `text-xs` and its light/dark text colors across the portal;
+the phone BottomSheet keeps its own `text-sm`. Commit `8c7a4307` moved only
+this desktop popover: its text colors were already explicit, and the phone
+portal/sheet was unchanged. No other newly portaled popovers need correction.
+Against the coordinator's final combined production build, run
+`ROOT=/path/to/dist ENGINE=both node crates/c6-ui/tests/model-typography.cjs`.
+This standalone helper reuses `motion.cjs` without changing it or building the
+UI. It asserts computed 12px desktop headings/helper copy, 14px phone sheet
+copy, 16px phone input fields (the anti-iOS-zoom override), 12px offered-model
+rows, retained colors/icons, model/effort selection, and keyboard-bounded phone
+geometry at 390×844 and 320×568 in light/dark Chromium and WebKit. PNGs and
+computed-style JSON go to `/tmp/q1-screenshots/model-after` (`SCREENSHOTS`
+overrides it). Capture the regressed snapshot with
+`BEFORE=1 ROOT=/tmp/q1-four-fixes-dist ENGINE=both node crates/c6-ui/tests/model-typography.cjs`;
+that phase asserts desktop text is larger than 12px and saves the same views
+under `/tmp/q1-screenshots/model-before`. `VIEWPORT=desktop,phone,narrow`,
+`THEME=light,dark`, and browser path overrides work as in `motion.cjs`.
+
+## Waiting-message return to Composer and confirmed explicit Rewind
+
+Build the production UI, then run the loopback-only browser regression with
+Node 24 and the motion harness's installed-browser overrides:
+
+```sh
+set -euo pipefail
+ulimit -n 65536
+env -u NO_COLOR make ui
+ENGINE=both /home/zheilbron/.nvm/versions/node/v24.16.0/bin/node crates/c6-ui/tests/message-edit.cjs
+```
+
+`message-edit.cjs` owns a fresh browser process/context per desktop/phone case,
+fake HTTP/WebSocket responses and a loopback origin. It never calls a model,
+real head or worker, or writes live settings. Waiting rows use
+`[data-queued-command="command-id"]` and `[data-queue-actions]`; their only
+actions are **Take this back** and, iff `with_agent`, **Send now**. A trusted ×
+gesture synchronously inserts text into the same Composer textarea, focuses it
+and places a collapsed UTF-16 caret after the restored block. Existing draft
+text follows a blank line. Consecutive returns stack in click order, regardless
+of HTTP completion order. There is no separate edit panel or implicit Send.
+
+`CASE=waiting- ENGINE=both` checks short and empty transcripts on desktop and
+phones: the waiting row follows the last content high in the pane, stays after
+the streaming reply, follows repeated stream growth, scrolls out of view when
+reading earlier content, and returns with Latest. The queued-layout cases also
+cover many waiting rows without a nested scroller.
+
+`CASE=queued- ENGINE=both` selects 64 cases. The selected cancellation response
+is promise-gated to prove that insertion/hiding do not wait for HTTP. Attachment
+recovery is explicitly mocked as GET
+`/api/v1/sessions/parent/messages/{command_id}/draft`, returning a JSON array of
+`AttachmentUpload {name,mime,data}` (base64), including `[]` by default. A separate
+recovery gate proves POST `.../messages/{command_id}/take-back` waits for the
+bytes, while text and focus return immediately. Explicit ordinary Send retains
+recovered and pre-existing attachment bytes, appends a fresh message, and keeps
+the same draft/textarea after a failed Send. Stale queue snapshots must not
+resurrect successful returns. Structured head refusals (including HTTP 503)
+restore the waiting row and roll
+back only that inserted block, only if there has been no user edit; edit-and-revert
+also prevents rollback. Retry is explicit. A stacked failure leaves the other
+returned block intact. `queued-response-lost` instead aborts the gated take-back
+request to simulate losing its response after cancellation may have succeeded.
+The waiting row returns with a couldn't-take-back note, but even untouched
+combined text stays in the Composer, including after a subsequent empty server
+queue snapshot. There is no automatic retry or Send. The fixture observes only
+that exact POST's expected `requestfailed` event; it does not suppress browser
+errors or relax the shared error assertions. HTTP 409 **The agent has this message** instead keeps
+the draft, allows the ordinary durable User row and shows exactly:
+**The agent had already read this, so it wasn't taken back. Your text is still in the box.**
+
+Two additional promise-gated ownership races protect recovered attachments and
+concurrent draft edits. `queued-attachments-edited-stacking` takes back A while
+its attachment fetch is held, edits the Composer, takes back B, then releases
+A's files after B has replaced A's original batch ticket. B appears ahead of
+the edited base containing A; all original/returned files and edited text must
+survive both confirmations and the separate explicit Send, with exact uploaded
+bytes. `queued-send-failure-recovery` starts ordinary Send S with its own text
+and file and holds the failure response. While S is pending, it takes back A
+with recovered files and confirms cancellation, then releases S's HTTP 503.
+Current A text/files must remain first, with S restored after a blank line and
+its files retained rather than overwriting A. Exactly one Send request occurs:
+neither recovery nor failure retries or sends implicitly.
+
+The queue checks retain later inputs unchanged, bounded 30dvh scrolling,
+right-aligned actions and horizontal containment at 320/390px phone and
+800/1440px desktop widths. The visible × remains 28px; on coarse pointers a
+transparent absolute `::after` extends 8px beyond every edge to provide a 44px
+hit area. Tests inspect these computed edges and hit-test all four, including
+outside the painted button. Desktop retains its 28px target. Send now's hit
+area expands vertically only, without widening its painted button. **Send now** is offered
+only for `with_agent` and posts only to `/queue/{command_id}/now`, without
+changing the Composer. No take-back path may pull/cancel a tail, interrupt,
+rewind, create a side chat or send without explicit user action.
+
+`CASE=queued-mentions ENGINE=both` additionally checks a taken-back message
+with an original `c6:item:` reference on desktop and phone. The native box
+restores editable text, then offers session-scoped `@` results after further
+typing. Selecting a result and explicitly sending retains both existing and
+recovered attachment bytes, without an implicit send or expanded model-only
+prompt replacing the draft.
+
+The stored-input compatibility checks use literal bytes captured from the old
+fork schema, not current-type round trips. `c6-proto` tests cover legacy bool16,
+upstream prompt16, explicit canonical human18 (including false), merged inputs,
+unknown fields and malformed data. Head store, delivery and queue tests cover
+pending and done legacy commands, original uploads/model recovery, rejection,
+human/task provenance and old/new worker capabilities; worker queue tests keep
+model-only prompts separate from editable text. Run
+`python3 scripts/check-session-tags.py --self-test` as well: the sole fork
+history exception must not permit other tag reuse. The head-first/no-head-
+rollback constraint is documented in architecture.md §4; these tests do not
+claim reverse mixed-version live transport support.
+
+Native replacement regressions run in the standalone `claude_code_rewind`
+binary. On Linux, a directly parent-owned, deliberately unreaped group member
+holds the absence barrier without depending on PID1. The default checks both
+pre-drain promotion and an already-open missing-conversation fallback;
+`C6_REPLACEMENT_LIVENESS_CASE=inline` selects the latter independently, and
+`C6_REPLACEMENT_LIVENESS_CASE=rewind` additionally publishes an explicit Rewind
+before reaping. Assertions cover take-back, no prompt before absence, automatic
+progress after reap without another mailbox command, exact turn receipts, and
+no replay of superseded input. `SessionManager::active()` is a session-liveness
+observation, not a public actor-generation identity probe. Process-level units
+separately cover live-owner retirement rejection, already-released metadata,
+fatal tracking errors, and a fixture-blocked initial write while Rewind
+publication is actively driven. None of these Linux runs qualifies macOS.
+
+Read user rows expose always-visible icon-only **Rewind** and **Ask**, with those
+exact aria-labels and titles on desktop and phones; there is no Edit or user
+Message actions sheet. `phone-picker.cjs` also checks direct entry, cancellation
+and natural Ask focus. Explicit Rewind opens a separate confirmation with file
+restoration unchecked. Cancelling leaves the Composer unchanged. Its HTTP
+response only acknowledges enqueue: the existing draft must stay unchanged
+until a matching durable `Rewound` has `seq` above the event highwater captured
+at the confirmation click. Older matching markers and fresh markers for other
+targets cannot restore text. Worker confirmation arriving before HTTP is retained
+but cannot restore until acknowledgment. HTTP refusal or a new durable `Error`
+keeps the draft unchanged; retry while the old response is held must use the new
+attempt's highwater. Disconnect/replay cannot confirm an interrupted attempt or
+retry automatically. Only a fresh matching result after explicit retry restores
+the original text and attachments into the existing Composer using the same
+combining rule. Rewind never automatically resends. The original transcript row
+and always-mounted Ask SVG retain their identity; the historical Rewind action
+is intentionally removed.
+
+`CASE=rejected ENGINE=both` checks rejected deliveries on desktop and phones
+(320/390px, including unbroken reason/input text). They render as error rows in
+the scrolling transcript after durable messages and before the streaming reply,
+not among the trailing waiting rows. Growing replies must not move their transcript
+position. Original input stays recoverable, reasons wrap without horizontal
+scrolling, and the compact Dismiss button stays visible and hit-testable (44px
+target on touch only). Dismiss clears all rejections through the existing API,
+leaving queued/with-agent rows at the transcript's end; no queue actions appear on rejected rows.
+
+`CASE=sent-during-turn- ENGINE=both` selects 12 additional desktop/phone cases
+for human, explicitly unknown, and legacy (absent) origins. Each actually fills
+the composer and clicks Send while the live session is working and its turn is
+unfinished. The accepted command first appears in the queue, becomes taken,
+then receives a matching durable `User` event with a distinct sequence. Before
+any reply to that message, turn completion, or subsequent queue snapshot, the
+row must offer direct **Rewind** and **Ask** icons, including on phones, without
+Edit. Ask opens a side-chat draft without sending. The test then clicks the
+row's direct Rewind entry and confirms
+the separate warning: the recorded API body must use that actual `User.seq`,
+not the command ID, queue position, or turn sequence. HTTP enqueue alone leaves
+the warning open; a matching new durable `Rewound` closes it. No automatic
+replacement is sent. Unknown provenance keeps its neutral label rather than
+claiming a human identity, but does not hide these actions. A running turn is
+not a rewind blocker; the UI still requires a synced stream, and the head's
+existing subagent, positive nonhuman-provenance, runtime-handoff, and Claude
+Code worker-capability guards remain intact. The complete matrix has 108 cases.
+
+All waits use response/DOM conditions, not cancellation timing sleeps; browser
+crashes fail the original run rather than being retried away.
+`ENGINE=chromium|webkit|both`, `ROOT` and browser overrides match `motion.cjs`;
+`CASE_EXACT=chromium/phone/queued-ready` selects one diagnostic case without hiding the original run.
+
+The corresponding head integration tests exercise real head/worker ownership,
+delivery winning cancellation, later messages left intact and ordinary Send
+without `Rewound`. These are separate from the browser's controlled API gates;
+neither uses real models. Returning a single waiting message must not reuse
+`pull_queued`, whose server-side bulk behavior includes later messages.
+
+```sh
+set -euo pipefail
+ulimit -n 65536
+cargo nextest run --locked -p c6-worker --test it -E 'test(take_back::)'
+```
+
+Unconfirmed `pending` answers must return 409 with exactly
+`The agent has this message`, not 503 or success. The HTTP queued-cancel and
+bulk-pull regressions give the anchor that answer, assert target and later rows
+are untouched, and fail if any later cancellation RPC is sent. This does not
+change the bulk editor's intentional tail semantics on confirmed cancellations.
+The tests also refuse unsupported/head workers, bad RPC replies, offline or
+disconnected workers, stale pending rows over a recorded `UserMessage`,
+cross-session/non-input IDs and cross-realm tokens. Stale-row fixtures enqueue
+the command **before** appending its `UserMessage`, then reset it to pending;
+enqueueing a new command after a fabricated prior delivery would put the event
+below its legitimate scan floor.
+
+The authoritative scan is bounded by persisted `commands.enqueued_after_seq`
+and a captured `sessions.last_seq`, and reads/decodes outside `BEGIN IMMEDIATE`.
+Legacy rows get floor 0 from migration, so they retain the conservative scan
+from the start of the log. The short retirement transaction rechecks pending
+state, session/floor and the captured highwater, failing closed with the same
+exact 409 if concurrent changes invalidate the scan. Ownership checks must not
+depend on the asynchronously maintained activity index or an event-sequence
+pre-ownership endpoint.
+
+The store regression builds 100,000 valid historical events, enqueues the
+target at that durable highwater, and appends 32 more events. It reports 25
+outside-scan and retirement samples, with no flaky wall-time threshold:
+
+```sh
+set -euo pipefail
+ulimit -n 65536
+cargo test --locked -p c6-head --lib 'store::tests::take_back_' -- --nocapture
+```
+
+Retirement timing includes pool acquisition, `BEGIN IMMEDIATE`, the conditional
+update and commit: an upper bound on the lock-held interval, not an exact
+SQLite lock profiler. Assertions check the 100000..100032 scan bounds, skip a
+poisoned historical prefix, preserve the floor across held-command release,
+and refuse changes between the outside read and retirement. A separate legacy
+row omits the new column to verify its conservative default.
+
+Replacement is deliberately **not** a connection-generation failure. The
+scripted replacement test accepts 204 after the original worker confirms
+cancellation, then explicitly ingests delivery from a snapshot selected before
+retirement. It demonstrates the inherited restart gap, not a real replacement
+actor: `Inbox.seen` suppresses late duplicates only in its own process. A new
+process can deliver an already selected command after the old process's
+successful cancellation; there is no cross-restart guarantee. The test also
+checks that no cancellation or resend is guessed for the replacement and later
+input stays untouched.
+Worker `User` events are appended only after an input leaves the inbox, so
+all transcript messages are already taken and enter correction/rewind choices
+without attempting withdrawal. The command-id endpoint is for queued input,
+not a way to remove a delivered transcript event from the agent's history.
+
+## Phone Sessions right drawer and message actions (N4)
+
+Use the coordinator's **combined production UI build**; this script never
+builds the UI. It reuses `serve`, `fixture`, `settle`, `within`, `launchBrowser`
+and the fake session factory from `motion.cjs`, with an owned loopback origin,
+fake HTTP/WebSocket responses and a fresh browser context for every case. No
+live settings, services, credentials, browser profile or npm install are used.
+
+```sh
+NODE=/home/zheilbron/.nvm/versions/node/v24.16.0/bin/node
+# Preserve/copy the baseline dist before the coordinator replaces it.
+BASELINE=1 ROOT=/tmp/n4-picker/before-dist MOTION_CASE=full "$NODE" crates/c6-ui/tests/phone-picker.cjs
+# Run only after the coordinator reports the combined build is ready.
+ROOT=/path/to/coordinator/crates/c6-ui/dist "$NODE" crates/c6-ui/tests/phone-picker.cjs
+# Optional additional WebKit modal/search/menu coverage; native swipes remain Chromium-only.
+ENGINE=both ROOT=/path/to/coordinator/crates/c6-ui/dist "$NODE" crates/c6-ui/tests/phone-picker.cjs
+```
+
+The standalone exhaustive matrix is 320×568, 390×844, 430×932 and 1440×1000, light/dark,
+Full/Reduced/Off: 24 Chromium contexts, or 48 with `ENGINE=both`.
+The default runner selects the eight representative tuples in the coverage
+ledger; `BROWSER_MATRIX=all` restores this complete matrix in the runner.
+`VIEWPORT=narrow,phone,wide,desktop`, `THEME=light,dark`, and
+`MOTION_CASE=full,reduced,off` select cases without changing their assertions.
+`PLAYWRIGHT_CORE`, `CHROMIUM`, `CHROMIUM_LIBS` and `WEBKIT_EXECUTABLE` use the
+same installed-browser overrides as `motion.cjs`; Node and Playwright must
+already be available. `C6_TEST_DEADLINE_SECS` changes the hang guard, not a
+rendering-speed threshold. Screenshots default to `/tmp/n4-picker/`
+(`SCREENSHOTS` overrides it), with `before-`/`after-` prefixes so evidence
+coexists. `BASELINE=1` records the old Sessions sheet and hovered inline message
+actions, rather than asserting the new phone presentation.
+`PICKER_DIAGNOSTICS=1` additionally saves desktop message/action bounds,
+hover/display/opacity JSON and phone Ask focus/DOM evidence. Assertions do not
+change; hover screenshots always await animation completion before capture.
+Each engine normally reuses one browser process with a fresh context per
+case. To investigate a runtime trap, select one viewport/theme/motion case
+per invocation for a fresh browser process. Preserve the original failed
+run separately from any isolated-case cohort; a passing rerun does not make
+the shared-process run a clean pass or establish the cause of a WASM trap.
+
+The fixed-build checks require the named list opener and `Sessions` dialog,
+right-side shared `phone-drawer`, no top X/handle, keyboard-bounded geometry,
+an exactly 44px header row with actual 44px Ask/bell/row-close touch targets,
+and centered 20px visual Ask/bell pills (also under coarse-pointer CSS),
+no Search autofocus, native inert background, a complete forward/backward Tab
+cycle, and focus return after Escape, scrim and swipe close. Search keeps local
+title results available while the fake saved-history response is held, uses a
+200ms debounce, blurs on Enter without losing the query, separates open
+sessions/open pages/history, rejects a late older response and retries an
+explicit failed request. A dedicated opt-in recent-session seed leaves the
+shared fixture's defaults unchanged: empty search must order Open sessions →
+Other open pages → Recently viewed; typing must put all matching session
+groups (including saved history) before matching pages. Real saved hits retain highlighted snippets,
+surrounding context, entry-kind and worker metadata. A short local query must
+label an on-head session as `head`; a saved on-head hit with an empty worker
+name must use the same identity fallback. An `open_in` side-chat
+result routes to its parent session, retaining the query, anchor and expansion
+chain in the workspace target and URL. Response gates and animation completion
+are awaited; there are no sleeps or action retries to hide missed taps.
+The nested bell loads two real fake-attention links plus Mark all seen. It
+must contain forward/backward Tab, make the parent picker inert, reject focus
+back into its Search, and consume the first Escape without closing Sessions.
+Escape returns focus to the actual tapped bell and restores only the picker,
+not the still-modal app background. The retained Ask button must open its
+existing usable assistant form. Resizing an open picker to desktop must close
+it and release native inert, without resurrecting the modal on returning to phone.
+
+Chromium CDP supplies **native emulated touch**, including cancellation and
+compatibility-click behavior. The fixture retains one CDP session until its
+browser context closes: detaching mid-case resets Chromium touch emulation.
+Gesture helpers assert coarse pointer capability and nonzero touch points
+afterward, so later form checks still exercise the phone policy.
+Small/wrong-way/vertical starts and cancellation
+must not dismiss; an outward pull reversed to a short release must snap back;
+a long right release must close and restore focus. Full alone finger-tracks;
+Reduced/Off retain gesture semantics without travel and their phone overlays
+open/close instantly (zero duration, not the generic 80ms Reduced token).
+Full Chromium also pauses the actual entrance at its `transitionrun` signal,
+requires a real percentage `translate`, then uses native touch to pick it up:
+35px finger movement must add exactly 35px to the displayed position without
+a jump. The shared `motion.cjs --unit` swipe test separately checks percentage
+and pixel pickup on both drawer sides at two widths, and ensures an existing
+entrance offset does not count toward the finger-release threshold.
+WebKit has no equivalent
+Playwright native drag API, so its run explicitly reports no swipe proof; it
+still runs every other modal, search, keyboard and action-menu assertion.
+Keyboard cases synthesize visual-viewport insets; this is not physical-device
+keyboard coverage or proof of Android Back-edge gestures.
+
+Read user messages expose direct, always-visible icon-only Rewind and Ask
+buttons with matching aria-labels/titles. Their visible bounds remain 28px;
+coarse-pointer `::after` expansion supplies a 44px hit area whose outer edges
+are hit-tested. There is no Edit or user Message actions trigger. Direct Rewind opens
+a separate confirmation, leaves file restoration unchecked, and is cancelled
+without mutations or Composer changes. Agent replies retain the always-visible
+44px phone more target in their reserved text gutter and a named `Message actions`
+dialog, with Ask only (no Edit). This remaining sheet retains inert/Tab
+containment and focus restoration after Escape, Close and scrim dismissal.
+Opening it must retain the row and its exact layout, and must not send, rewind
+or branch. Own direct Ask and agent sheet Ask forms each submit a real fake-API
+`side-chats` request with the selected anchor; their existing autofocus must
+reach the textarea before any test `fill()` or focus action. A controlled JSON error
+acknowledges that route without inventing a running side chat. Desktop keeps
+inline Rewind/Ask user icons and has no phone more button or
+Sessions drawer. Browser crashes, UI error reports, external requests, and
+unexpected settings mutations fail the run.
+
+## Container-responsive background job actions
+
+`crates/c6-ui/tests/session-sheet.cjs` crosses the job **list's** 20rem container
+breakpoint in both directions inside the unchanged 1600px viewport, including
+the narrow tile. It checks SVG Inspect/Stop versus ⋯, 44×44px phone action
+targets, no Stop for ended jobs, read-only direct Inspect, Actions reachability
+from Inspect, and row Stop opening confirmation without a request. Back cancels
+confirmation; only the confirmed Stop sends the selected-job request. The same
+assertions run on 320/390/430px phones in both themes and engines.
+The unavailable-session extras also require the direct row Stop to be disabled
+with an explanatory tooltip for offline workers or missing detail, to re-enable
+on worker reconnect, and to disable again on head/live disconnect. Inspect still
+reaches Actions while Stop is disabled, without a control request.
+
+Build production UI first; this uses the private mocked-head fixture, not a
+running head. A focused run is:
+
+```sh
+ENGINE=both THEMES=light,dark VIEWS=wide,narrow,phone-320,phone-390,phone-430 EXTRAS=0 \
+  SCREENSHOTS=/tmp/item4-job-actions node crates/c6-ui/tests/session-sheet.cjs
+```
+
+## Task-card message provenance
+
+`message-origin.cjs` covers new `task_card` / `task_card_answer` origins:
+**From a task card** / **Answer to a task card**, left-aligned with retained
+SVGs, and the same direct Rewind/Ask actions and explicit Rewind confirmation
+as unknown input, without an Edit/correction panel.
+Its old `card-answer`/unknown fixture keeps the old label. Native renderer tests
+also check exact labels, escaping, clickable generated mentions and action
+context. No CSS classes or application-side HTML serialization were added.
+
+`store::tests::task_card_provenance_is_durable_scoped_and_not_inferred_from_old_commands`
+checks saved metadata after delivery and reopening the database, absent old
+metadata and session scoping. The task-card worker integration tests assert
+start/answer API provenance, including events from an old worker that echoes no
+new metadata. API and `convert` tests round-trip both additive API kinds and
+retain unknown provenance on an old `card-answer` event. No history backfill is
+run. Full UI builds, browser matrices and workspace checks should run on the
+combined change, not on a stale WASM artifact.

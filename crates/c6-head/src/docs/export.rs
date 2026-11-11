@@ -249,6 +249,7 @@ fn file_name(title: &str, format: &str) -> String {
 /// Exports a document; the file is kept as a blob, listed with the version
 /// it was made from.
 pub async fn export(st: &HeadState, realm: &str, id: &str, format: &str, by: &str) -> anyhow::Result<DocExport> {
+    super::ensure_writable(st, realm, id).await?;
     let doc = super::get(st, realm, id).await?;
     let bytes = render(st, realm, &doc, format).await?;
     keep(st, realm, &doc, format, bytes, by).await
@@ -357,6 +358,7 @@ fn crc32(data: &[u8]) -> u32 {
 }
 
 pub(crate) async fn keep(st: &HeadState, realm: &str, doc: &Doc, format: &str, bytes: Vec<u8>, by: &str) -> anyhow::Result<DocExport> {
+    let _guard = super::writable(st, realm, &doc.summary.id).await?;
     let m = crate::knowledge::get(st).ok_or_else(|| anyhow::anyhow!("the knowledge store is not open"))?;
     let rm = m.of_realm(realm).await?;
     let blob = rm.put_blob(&bytes).await?;

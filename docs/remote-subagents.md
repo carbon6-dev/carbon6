@@ -152,12 +152,42 @@ All six steps are built. Where the build differs from the plan above:
 - **Permission (§4).** *Agents may start it* counts as the grant directly: `templates::targets` lets a session reach the template's workers, hosts and SSH targets when the template has `agents` and is in the session's realm. No grant row is written or revoked. Templates without it still need a `workers`/`start` grant, both for `Task` and `template_start`. Templates are taken from the parent's realm only (and its apps' layers); cross-realm subagent templates are not offered.
 - **Prompt.** `Template.prompt` is optional in JSON. Saving a template without one is refused unless `agents` is set. `templates::subagent_prompt` fills `{{input}}` with the task, appends the task when there is no `{{input}}`, and uses the task alone when the prompt is empty. A template with `worktree` needs a folder.
 - **Head.** The link is `sessions.remote_template` plus the `remote_delegations` table (migration 0056). `sessions::create_linked` creates the child with `parent_id`, `parent_call_id`, `root_id`, the parent's colour, `remote_template` and `CreateSession.depth`, and records the delegation for the first input before the commands are queued, so a fast turn cannot finish first. The worker calls `session.subagent_start`, `_message`, `_interrupt`, `_state` and `_peek` (`remote.rs`). An agent may reach only its own remote children. `remote::turn_ended` runs at ingest for every `TurnEnded`. It reads the events since the previous turn (the inputs a turn takes are logged before its `TurnStarted`), settles the waiting delegations whose inputs that turn took, or, for a turn of yours, sends `DelegationEnded` with no call. A rejected input, or a child that failed to start, reports `failed`. Restoring a child keeps its depth and renames its delegation to the new input id.
-- **Delivery.** `DelegationEnded` is an ordinary durable command for the parent's session. The parent writes `SubagentReported` (a receipt, hidden from the transcript), which marks the command done. The receipt is written after the report is handed over, so a crash in between delivers it again, as a notice.
+- **Delivery (hardened 2026-11-07).** Every parent input records a `remote_delegations` obligation, including a steer of a running child (empty `call_id`: no waiting tool). Ingest also records a per-turn obligation atomically with each remote `TurnEnded`, so a child resumed by its own notices cannot fall through a no-waiter shortcut. Only inputs consumed by that turn are settled; a queued steer for the next turn remains waiting. Report commands have stable child/end-sequence/call IDs. Queuing `DelegationEnded` and retiring its obligations are one transaction. Startup replays outstanding obligations from committed child events, including the crash gap between ingest and its relay hook, and committed input rejections. No migration is needed; this uses the existing delegation and command tables.
+- **Receipts and waking.** `DelegationEnded` is an ordinary durable command for the recorded parent's session, retained while its worker is offline. The parent writes `SubagentReported` (hidden from the transcript), which marks the command done. A waking fallback notice is recorded before its receipt; a waiting call's receipt waits for its durable tool result/background notice, not merely a successful oneshot send. Replayed commands deduplicate by their stable notice IDs. Without a waiter, parent steers and child task-notification turns wake the parent, even after the original background task failed/stopped or either worker restarted. Direct user messages still honor `wake`; held-notice limits are unchanged. Delivery remains at-least-once across crashes.
+- **Visible failures.** If the parent is missing or report queuing fails, the child's queue shows **Subagent report delivery failed**, the obligation stays pending, and configured failure channels are notified. Successful retry clears that queue failure. If a worker cannot record a report, it returns a command rejection instead of merely logging the actor failure. The parent's queue shows that delivery error; rejection does not incorrectly mark the parent failed as though its Create was rejected.
 - **Digest.** It is built from `c6_worker::digest_text`, which the head already links, instead of a new shared crate. The head leaves out `by`; the parent adds `by="user"` when the stop did not come from its own call.
 - **Worker.** `Subagents::run_template` is a new runner method; `SendMessage`, `bash_output` and `running` look at `SubagentSpawned.remote`. Waits are registered by `<session>/<call>` in the session manager before the head is asked. A stopped call whose subagent's worker is not connected returns at once ("could not be stopped"), and its report comes later as a notice. A remote child gets no `Delegation`: it is a session of its own, with `CreateSession.depth` (and `SessionStarted.depth`) for the limit, and loses `Task`/`SendMessage` at the depth limit. The running limit is checked on the head when a remote subagent starts, counting every running subagent in the tree; local starts still count only their own worker's.
 - **Prompts.** `session.subagent_templates` introduces the list in `Task`'s description; `session.subagent_remote_reattach` is the result written after a restart (and the notice for a background one).
 - **UI.** Settings → Templates has **Title**, **Effort**, **New git worktree** and **Agents may start it**. **Save as template** is in the session header, next to *New like this*. A remote thread's header shows `▣ template` and `worker:folder · connection · model` (`Session.remote_template`).
 - **Tests.** `crates/c6-worker/tests/it/remote_subagents.rs`, with two real workers: a template's subagent on the other worker with its folder, prompt, report and `SendMessage`, and a refused template; stopping the parent, then your message waking it; the parent's worker restarting while the report arrives.
+
+### Lost-report regression evidence (2026-11-07)
+
+Child `01a1b3d2-ae73-760e-abcb-6715a83673a8` belonged to Coordinator
+`01a18fb7-0306-73ca-8b1c-46a8b5f2116b`. Its compaction error/turn end were
+events 638–639. Queued shell completions (641–642) immediately started turn 2
+(643). Parent background task `bg181` had already finished with exit code 1
+(18818); its later `SendMessage` returned “Sent … is running” (18823–18825).
+That running classification was accurate, not proof of a stale running flag.
+The old message path registered no delegation for a steer, while relay skipped
+turns with neither a waiting delegation nor an undelegated user input. Thus the
+child's completed final report (875, turn end 877) had no report owner after
+the original task ended. A later status reply (881) assumed that earlier report
+had reached the parent. The fix makes ownership durable and turn-based rather
+than dependent on the lifetime of that first background wait.
+
+A second live case confirmed the same distinction on November 7, 2026:
+`01a1b4bb-38b4-77e9-95d8-db76903d7a09` failed at event 280
+(07:08:16.776 UTC), consumed its queued `bg2` completion at 282 and started
+turn 2 at 283 (07:08:17.755 UTC). The parent's continuation was consumed at
+289 (07:08:25.667 UTC), while that new turn really was running. This observation
+establishes the resumption route, not yet the outcome of that live final report.
+
+The regression covers a failed background child, an independently resumed
+running turn, a parent steer consumed by the following turn, and a final report
+that wakes the actual parent, for both local and template children. Head store
+tests restart after event ingest but before the relay hook, including a child's
+own task-notification turn, and check idempotent delivery and visible failures.
 
 ## 13. Open questions (recommendations in bold)
 

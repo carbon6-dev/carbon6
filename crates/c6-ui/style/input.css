@@ -1,4 +1,130 @@
 @import "tailwindcss";
+
+/* Fit before the first visible frame. Removed navigation stays measurable:
+   display:none would make resizing depend on its own previous decisions. */
+.c6-header:not([data-header-ready]) { visibility: hidden; }
+.c6-header [data-header-overflow],
+.c6-header [data-header-empty],
+.c6-header [data-header-menu-hidden] {
+  position: fixed;
+  top: -10000px;
+  left: 0;
+  width: max-content;
+  visibility: hidden;
+  pointer-events: none;
+}
+.c6-header-overflow-badge { display: none; }
+[data-header-counted] .c6-header-overflow-badge { display: block; }
+/* Reserve search's resting width, including while focused. Its global focus
+   expansion is useful in pages, but mustn't push neighboring header actions. */
+.c6-header input[type="search"], .c6-header input[type="search"]:focus {
+  width: 11rem;
+  transition: none;
+}
+
+/* Motion is resolved before paint by js/motion.js. Full intentionally wins
+   over an OS request; System follows changes without a page reload. */
+@theme {
+  --ease-out: cubic-bezier(0.2, 0, 0, 1);
+  --ease-in: cubic-bezier(0.4, 0, 1, 1);
+  --ease-move: cubic-bezier(0.3, 0, 0, 1);
+  --ease-spring: linear(0, 0.35 8%, 0.75 20%, 0.97 32%, 1.035 44%, 1.02 58%, 1.003 76%, 1);
+  --default-transition-duration: var(--dur-small);
+  --default-transition-timing-function: var(--ease-out);
+  --animate-spin: spin 1.4s linear infinite;
+  --animate-pulse: c6-breathe 2.4s ease-in-out infinite;
+  @keyframes c6-breathe { 50% { opacity: .55; } }
+}
+:root {
+  --dur-quick: 100ms;
+  --dur-small: 160ms;
+  --dur-medium: 220ms;
+  --dur-large: 280ms;
+  --dur-exit: 150ms;
+  --dur-sheet-exit: 200ms;
+  --dur-arrive: 200ms;
+  --travel: 1;
+}
+:root[data-motion="reduced"] {
+  --dur-quick: 80ms;
+  --dur-small: 80ms;
+  --dur-medium: 80ms;
+  --dur-large: 80ms;
+  --dur-exit: 80ms;
+  --dur-sheet-exit: 80ms;
+  --dur-arrive: 80ms;
+  --travel: 0;
+  --ease-spring: var(--ease-out);
+}
+:root[data-motion="off"] {
+  --dur-quick: 0ms;
+  --dur-small: 0ms;
+  --dur-medium: 0ms;
+  --dur-large: 0ms;
+  --dur-exit: 0ms;
+  --dur-sheet-exit: 0ms;
+  --dur-arrive: 0ms;
+  --travel: 0;
+}
+@utility duration-quick { transition-duration: var(--dur-quick); }
+@utility duration-small { transition-duration: var(--dur-small); }
+@utility duration-medium { transition-duration: var(--dur-medium); }
+@utility duration-large { transition-duration: var(--dur-large); }
+/* Colour-only hover/track changes are quick; geometry keeps the small tier. */
+.transition-colors { transition-duration: var(--dur-quick); }
+
+/* The shell must not scroll, even programmatically on composer/button focus.
+   hidden clips paint but still permits focus scrolling its overflow; clip
+   does not create that second scroll container around the real scroll boxes. */
+.c6-app { overflow: clip; }
+
+/* One phone bar, no footer. Keyboard visibility changes the transcript's
+   viewport, never swaps or recreates the composer. No motion. */
+@media (width < 48rem), (height < 32rem) {
+  .c6-app {
+    position: fixed;
+    inset-inline: 0;
+    top: var(--c6-visible-top, 0px);
+    height: var(--c6-visible-height, 100dvh);
+  }
+  .phone-sheet {
+    bottom: var(--c6-keyboard-inset, 0px);
+    max-height: calc(var(--c6-visible-height, 100dvh) * .8);
+  }
+  .phone-drawer {
+    --sheet-x: -100%;
+    --sheet-y: 0px;
+    touch-action: pan-y pinch-zoom;
+    top: calc(var(--c6-visible-top, 0px) + 44px);
+    max-height: calc(var(--c6-visible-height, 100dvh) - 44px);
+  }
+  .c6-sheet.phone-picker {
+    --sheet-x: 100%;
+    --sheet-y: 0px;
+    /* A full-height edge must not overshoot and expose a strip behind it. */
+    --ease-spring: var(--ease-out);
+    top: var(--c6-visible-top, 0px);
+    width: min(24rem, calc(100vw - 44px));
+    height: var(--c6-visible-height, 100dvh);
+    max-height: var(--c6-visible-height, 100dvh);
+    margin-bottom: 0;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  /* The compact Ask pill still gets the header's full 44px target; the
+     shared coarse-pointer .btn minimum is only 40px. */
+  .phone-picker > :first-child > .btn { height: 100%; }
+  .phone-dialog {
+    top: var(--c6-visible-top, 0px);
+    bottom: var(--c6-keyboard-inset, 0px);
+    padding-top: 8px;
+    padding-bottom: 8px;
+  }
+  .phone-dialog > [role="dialog"] { max-height: 100%; }
+  .phone-popover {
+    top: clamp(calc(var(--c6-visible-top, 0px) + 48px), var(--c6-pop-y), calc(var(--c6-visible-top, 0px) + var(--c6-visible-height, 100dvh) - 56px)) !important;
+    max-height: calc(var(--c6-visible-height, 100dvh) - 60px);
+  }
+}
 @source "../src/**/*.rs";
 
 /* Dark mode follows the html element's class (js/theme.js: the OS, or
@@ -7,8 +133,8 @@
 
 /* Grey text that reads on either theme: text-muted for secondary text
    (zinc-500 on white, zinc-400 on the dark greys), text-soft a step
-   stronger (zinc-600 / zinc-300). Bare zinc-500 on zinc-900 is about
-   3.7:1, below AA's 4.5:1. */
+   stronger (zinc-600 / zinc-300). Bare zinc-500 on the dark chip is
+   below AA's 4.5:1; keep it for shapes, not dark text. */
 :root {
   --c6-muted: var(--color-zinc-500);
   --c6-soft: var(--color-zinc-600);
@@ -24,20 +150,55 @@
 
 /* The desktop layout (tiles side by side, the header's nav, the sidebar)
    needs height as well as width: a phone on its side is wide but short,
-   so it keeps the phone's layout (one tile, the bottom bar, the ☰ menu).
+   so it keeps the phone's layout (one tile, the Sessions picker, the ☰ menu).
    sm stays width-only: it sets spacing and type, not the layout. */
 @custom-variant md (@media (width >= 48rem) and (height >= 32rem));
 @custom-variant lg (@media (width >= 64rem) and (height >= 32rem));
 @custom-variant xl (@media (width >= 80rem) and (height >= 32rem));
 
-/* Dark mode's three background greys, page, panels and chips, a step
-   softer than Tailwind's zinc-950/900/800 (the near-black read as too
-   dark); text and accents are unchanged and keep 4.5:1 or more on them.
-   Unlayered, so they win over the theme's own values. */
+/* Mouse targets relax as the tile (not the window) gains room. These only
+   feed the fine-pointer utility: phone/coarse targets remain 44px. The Changes
+   count can grow beyond the same minimum without squeezing its icon. */
+.c6-session-slot { --tile-bar-slot: 1.75rem; }
+@container tile (width >= 30rem) {
+  .c6-session-slot { --tile-bar-slot: 2rem; }
+}
+@container tile (width >= 40rem) {
+  .c6-session-slot { --tile-bar-slot: 2.25rem; }
+}
+
+/* Optional marks yield before the bar's secondary controls. Keep an explicit
+   narrow rule: Blink can retain the wide display value on this portal mount
+   after crossing the container breakpoint with only a min-width utility. */
+@container tile (width < 40rem) {
+  [data-tile-aspects] { display: none; }
+}
+
+/* Jobs use their list's room, not the viewport or the enclosing tile: the
+   desktop glance, ring popover and phone sheet have different inner widths. */
+.c6-job-direct { display: none; }
+.c6-job-overflow { display: flex; }
+@container job-rows (width >= 20rem) {
+  .c6-job-direct { display: flex; }
+  .c6-job-overflow { display: none; }
+}
+@container job-rows (width < 20rem) {
+  .c6-job-direct { display: none; }
+  .c6-job-overflow { display: flex; }
+}
+
+/* Dark uses the former Soft preview's page / panel / chip greys (including
+   SVG figures), with zinc-700 for stronger borders. Muted zinc-400, white,
+   sky/blue-400, amber-400 and emerald-400 keep >=4.5:1 on all three;
+   red-400 needs the dark-only lift below (4.73:1 on the chip, versus 4.29).
+   tests/theme.cjs checks exact swatches and actual built text tokens.
+   Unlayered, so these win over the theme's own values; Light is unchanged. */
 html.dark {
-  --color-zinc-950: #141417;
-  --color-zinc-900: #1c1c20;
-  --color-zinc-800: #2a2a2f;
+  --color-zinc-950: #1c1d21;
+  --color-zinc-900: #25262b;
+  --color-zinc-800: #33343a;
+  --color-zinc-700: #4a4b52;
+  --color-red-400: #ff7476;
 }
 
 /* Phones: iOS zooms into fields with text under 16px when they get
@@ -46,7 +207,25 @@ html.dark {
   input, textarea, select { font-size: 16px !important; }
 }
 
+/* Native content sizing handles typing, placeholders and tile resizes without
+   forcing layout from an input handler. Older browsers use one queued rAF fit. */
+@supports (field-sizing: content) {
+  textarea.grows, textarea[data-c6-autosize] { field-sizing: content; }
+}
+
 @layer components {
+  .btn {
+    @apply inline-flex min-h-8 items-center justify-center gap-1.5 rounded-md px-3 py-1 text-sm font-medium outline-none focus-visible:ring-2 focus-visible:ring-sky-500/60 disabled:opacity-50;
+  }
+  /* Minimum touch target wins even when a caller adds BTN_SM utilities. */
+  @media (pointer: coarse) { .btn { min-height: 2.5rem !important; } }
+  .c6-select {
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2371717b' stroke-width='2.25' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-position: right .5rem center;
+    background-repeat: no-repeat;
+    background-size: 1rem;
+  }
   /* At least one line plus padding/borders, even after a bad measurement.
      Components, not utilities: a box's explicit larger min-height still wins. */
   .grows { min-height: calc(1lh + 1.25rem); }
@@ -54,6 +233,8 @@ html.dark {
   /* Rendered markdown from model output. */
   /* Long words and inline code wrap rather than widen the transcript. */
   .md { @apply text-sm leading-relaxed; overflow-wrap: anywhere; }
+  /* A server summary stays visible but is quieter than the actual reply. */
+  .summarized-update .md { @apply text-xs; }
   .md > * + * { @apply mt-3; }
   .md h1 { @apply text-lg font-semibold; }
   .md h2 { @apply text-base font-semibold; }
@@ -107,12 +288,25 @@ html.dark {
   color: inherit;
 }
 @keyframes c6-flash {
-  from { box-shadow: 0 0 0 3px rgb(251 191 36 / 0.9); }
-  to { box-shadow: 0 0 0 3px rgb(251 191 36 / 0); }
+  from { opacity: 1; }
+  to { opacity: 0; }
 }
 .c6-flash {
+  position: relative;
   border-radius: 0.5rem;
-  animation: c6-flash 2.5s ease-out;
+}
+/* An explicit status-link destination, not animated motion. Keep this feedback
+   visible for reduced/off motion too; its owner removes it after 1.2 seconds. */
+.c6-running-highlight { outline: 2px solid rgb(251 191 36 / .9); border-radius: 0.25rem; }
+[data-running-now] { scroll-margin-top: 3.5rem; }
+.c6-flash::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  outline: 3px solid rgb(251 191 36 / .9);
+  pointer-events: none;
+  animation: c6-flash 1.2s var(--ease-out) both;
 }
 
 /* A folded turn's row in a transcript (timeline.rs): folded turns one
@@ -123,12 +317,30 @@ html.dark {
 /* What arrives in a running session's transcript: a short fade up, so
    new tool calls and messages settle in rather than pop. */
 @keyframes c6-arrive {
-  from { opacity: 0; transform: translateY(4px); }
+  from { opacity: 0; transform: translateY(calc(6px * var(--travel))); }
   to { opacity: 1; transform: none; }
 }
-.c6-arrive { animation: c6-arrive 180ms ease-out; }
-@media (prefers-reduced-motion: reduce) {
-  .c6-arrive { animation: none; }
+.c6-arrive { animation: c6-arrive var(--dur-arrive) var(--ease-out); }
+
+/* Keep off-screen event rows in the DOM (anchors/search/selection still
+   work), but let the browser skip their layout and paint. Remember measured
+   heights so revisiting a tool result doesn't fill in a new output area. */
+.c6-transcript-row {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 6rem;
+}
+/* Usage, turn-start and tool-result records update existing UI, not a blank
+   message. Leptos's placeholder comments do not make an element nonempty.
+   Keep their ids as targets, without a speculative 6rem height or a gap. */
+.c6-transcript-row:empty,
+.c6-transcript-notices:empty { display: none; }
+/* The live tail must have its real height BEFORE following it. A guessed
+   6rem row, followed a frame later by its measured height, moves both content
+   and scrollbar twice. Older rows still skip off-screen work and remember
+   their measured sizes; this is not a virtual-list spacer. */
+.c6-transcript-row:nth-last-child(-n + 16 of .c6-transcript-row) {
+  content-visibility: visible;
+  contain-intrinsic-size: none;
 }
 
 /* Chart series (the dataviz reference palette's first slots, stepped
@@ -157,3 +369,179 @@ html.dark {
 
 /* Clear of a phone's rounded corners and home indicator. */
 .notice-safe { padding-bottom: max(1rem, env(safe-area-inset-bottom)); }
+
+/* Presence never gates input: entering views are live from the first frame;
+   closed views are inert immediately. Visibility alone waits for the exit.
+   Heavy bodies may unmount after it; reversing only changes data-open. */
+.c6-presence:not(.c6-sheet, .c6-rise, .c6-pane, .c6-scrim, .c6-pop) {
+  transition: visibility 0s;
+}
+.c6-presence[data-open="false"] {
+  visibility: hidden;
+  pointer-events: none;
+}
+.c6-presence[data-open="false"]:not(.c6-sheet, .c6-rise, .c6-pane, .c6-scrim, .c6-pop) {
+  transition: visibility 0s var(--dur-large);
+}
+.c6-pop {
+  transform-origin: var(--pop-origin, top right);
+  transition: opacity var(--dur-small) var(--ease-out), scale var(--dur-small) var(--ease-out);
+  @starting-style { opacity: 0; scale: calc(1 - .04 * var(--travel)); }
+}
+.c6-pop[data-open="false"] { opacity: 0; transition: opacity var(--dur-quick) var(--ease-in), visibility 0s var(--dur-quick); }
+.c6-rise {
+  transition: opacity var(--dur-medium) var(--ease-out), translate var(--dur-medium) var(--ease-out), visibility 0s;
+  @starting-style { opacity: 0; translate: 0 calc(var(--rise, 12px) * var(--travel)); }
+}
+.c6-rise[data-open="false"], [data-open="false"] > .c6-rise {
+  opacity: 0;
+  translate: 0 calc(var(--leave, 6px) * var(--travel));
+  transition: opacity var(--dur-exit) var(--ease-in), translate var(--dur-exit) var(--ease-in), visibility 0s var(--dur-exit);
+}
+.c6-sheet {
+  transition: translate var(--dur-large) var(--ease-spring), opacity var(--dur-medium) var(--ease-out), visibility 0s;
+  @starting-style { translate: calc(var(--sheet-x, 0px) * var(--travel)) calc(var(--sheet-y, 100%) * var(--travel)); opacity: 0; }
+}
+@media (width < 48rem), (height < 32rem) {
+  /* Cover the ~4% phone overshoot without adding padding to desktop panes. */
+  .c6-sheet {
+    --sheet-tail: max(8px, 4dvh);
+    padding-bottom: calc(env(safe-area-inset-bottom) + var(--sheet-tail));
+    margin-bottom: calc(-1 * var(--sheet-tail));
+  }
+}
+.c6-sheet[data-open="false"], [data-open="false"] > .c6-sheet {
+  translate: calc(var(--sheet-x, 0px) * var(--travel)) calc(var(--sheet-y, 100%) * var(--travel));
+  opacity: 0;
+  transition: translate var(--dur-sheet-exit) var(--ease-in), opacity var(--dur-sheet-exit) var(--ease-in), visibility 0s var(--dur-sheet-exit);
+}
+@media (width < 48rem), (height < 32rem) {
+  .phone-drawer[data-open="true"][data-dragging] {
+    translate: calc(var(--drawer-pull, 0px) * var(--travel)) 0px;
+    transition: none;
+  }
+}
+.c6-scrim {
+  transition: opacity var(--dur-medium) var(--ease-out), visibility 0s;
+  @starting-style { opacity: 0; }
+}
+.c6-scrim[data-open="false"], [data-open="false"] > .c6-scrim { opacity: 0; transition: opacity var(--dur-sheet-exit) var(--ease-in), visibility 0s var(--dur-sheet-exit); }
+/* These phone overlays are immediate for Reduced as well as Off. Keep the
+   shared full-motion edge translations; never scale the drawer's contents. */
+:root:not([data-motion="full"]) :is(.phone-picker, .phone-message-actions, .phone-instant-scrim) {
+  --dur-large: 0ms;
+  --dur-medium: 0ms;
+  --dur-sheet-exit: 0ms;
+}
+.c6-pane:not(.c6-sheet) {
+  transition: opacity var(--dur-medium) var(--ease-out), translate var(--dur-medium) var(--ease-out), visibility 0s;
+  @starting-style { opacity: 0; translate: calc(40px * var(--travel)) 0; }
+}
+.c6-pane:not(.c6-sheet)[data-open="false"], [data-open="false"] > .c6-pane:not(.c6-sheet) {
+  opacity: 0;
+  translate: calc(40px * var(--travel)) 0;
+  transition: opacity var(--dur-exit) var(--ease-in), translate var(--dur-exit) var(--ease-in), visibility 0s var(--dur-exit);
+}
+@media (width >= 48rem) and (height >= 32rem) {
+  .c6-sheet.c6-pane {
+    margin-bottom: 0;
+    transition: opacity var(--dur-medium) var(--ease-out), translate var(--dur-medium) var(--ease-out), visibility 0s;
+    @starting-style { translate: calc(40px * var(--travel)) 0; }
+  }
+  [data-open="false"] > .c6-sheet.c6-pane, .c6-sheet.c6-pane[data-open="false"] {
+    translate: calc(40px * var(--travel)) 0;
+    transition: opacity var(--dur-exit) var(--ease-in), translate var(--dur-exit) var(--ease-in), visibility 0s var(--dur-exit);
+  }
+}
+
+.c6-send { transition: background-color var(--dur-quick) var(--ease-out), color var(--dur-quick) var(--ease-out), scale var(--dur-quick) var(--ease-out); }
+.c6-send:active { scale: calc(1 - .05 * var(--travel)); }
+.c6-send-slot { display: grid; width: 22px; height: 22px; }
+.c6-send-slot > * {
+  grid-area: 1 / 1;
+  width: 22px;
+  height: 22px;
+  transition: opacity var(--dur-small) var(--ease-out), scale var(--dur-small) var(--ease-out), background-color var(--dur-quick) var(--ease-out), color var(--dur-quick) var(--ease-out);
+}
+.c6-send-slot > :active { transition-duration: var(--dur-quick); }
+.c6-send-slot > [data-active="false"] {
+  opacity: 0;
+  scale: calc(1 - .15 * var(--travel));
+  pointer-events: none;
+  transition-timing-function: var(--ease-in);
+}
+@media (pointer: coarse) { .c6-send-slot, .c6-send-slot > * { width: 36px; height: 36px; } }
+
+/* Small counters opt in. Both numbers share a slot; no width/height tween. */
+.c6-count { display: inline-grid; overflow: clip; vertical-align: bottom; }
+.c6-count > * { grid-area: 1 / 1; }
+@keyframes c6-count-in { from { opacity: 0; transform: translateY(calc(100% * var(--travel))); } }
+@keyframes c6-count-out { to { opacity: 0; transform: translateY(calc(-100% * var(--travel))); } }
+.c6-count-in { animation: c6-count-in var(--dur-small) var(--ease-out); }
+.c6-count-out { animation: c6-count-out var(--dur-small) var(--ease-in) both; }
+@keyframes c6-crossfade { from { opacity: 0; } }
+@keyframes c6-crossfade-out { to { opacity: 0; } }
+.c6-crossfade { animation: c6-crossfade var(--dur-small) var(--ease-out); }
+.c6-crossfade-out { animation: c6-crossfade-out var(--dur-small) var(--ease-in) both; }
+.c6-ring-badge {
+  transition: opacity var(--dur-small) var(--ease-out), scale var(--dur-small) var(--ease-out);
+  @starting-style { opacity: 0; scale: calc(1 - .1 * var(--travel)); }
+}
+[data-open="false"] > .c6-ring-badge { opacity: 0; scale: calc(1 - .1 * var(--travel)); transition-duration: var(--dur-quick); }
+
+/* The 8..30-unit arc never reaches 180deg. One lower-half clip over a rotating
+   semicircle gives the old breathing shape without a seam between two pieces.
+   Only whole-box transforms animate: spin the wrapper, sweep the outer SVG.
+   The separate context/state drawings never move; static motion keeps the rim. */
+.c6-ring-motion { display: none; position: absolute; inset: 0; }
+.c6-ring-working { display: block; transform-origin: center; will-change: transform; animation: spin 1.4s linear infinite; }
+.c6-ring-clip { position: absolute; top: 50%; right: 0; bottom: 0; left: 0; overflow: hidden; }
+.c6-ring-sweep { position: absolute; bottom: 0; left: 0; width: 100%; height: 200%; transform-origin: center; }
+.c6-ring-working .c6-ring-sweep { will-change: transform; animation: c6-ring-sweep 2.8s ease-in-out infinite; }
+.c6-ring-working + .c6-ring-rim { visibility: hidden; }
+@keyframes c6-ring-sweep {
+  0%, 100% { transform: rotate(-136.35deg); }
+  50% { transform: rotate(-16.3deg); }
+}
+
+/* Native details keep keyboard/search semantics. Only their bounded tool
+   body reveals: output updates don't restart it or change its final height.
+   motion.js supplies the opening reveal when native interpolation is absent. */
+.c6-tool-details { interpolate-size: allow-keywords; }
+.c6-tool-details::details-content {
+  block-size: 0;
+  overflow: clip;
+  transition: block-size var(--dur-small) var(--ease-out), content-visibility var(--dur-small) allow-discrete;
+}
+.c6-tool-details[open]::details-content { block-size: auto; }
+
+.c6-sidebar { transition: translate var(--dur-medium) var(--ease-out), opacity var(--dur-medium) var(--ease-out), visibility 0s; }
+.c6-sidebar[data-open="false"] {
+  opacity: 0;
+  transition-duration: var(--dur-small), var(--dur-small), 0s;
+  transition-timing-function: var(--ease-in);
+  transition-delay: 0s, 0s, var(--dur-small);
+}
+:root[data-motion="reduced"] .animate-spin,
+:root[data-motion="reduced"] .animate-pulse,
+:root[data-motion="reduced"] .c6-ring-working { animation: none; }
+:root[data-motion="reduced"] .c6-ring-working,
+:root[data-motion="off"] .c6-ring-working { will-change: auto; }
+:root[data-motion="reduced"] .c6-ring-sweep,
+:root[data-motion="off"] .c6-ring-sweep { animation: none; will-change: auto; }
+:root[data-motion="reduced"] .c6-ring-motion,
+:root[data-motion="off"] .c6-ring-motion { display: none; }
+:root[data-motion="reduced"] .c6-ring-rim,
+:root[data-motion="off"] .c6-ring-rim { visibility: visible; }
+:root[data-motion="reduced"] .c6-sidebar { translate: 0; }
+:root[data-motion="reduced"] .transition-transform,
+:root[data-motion="reduced"] .transition-\[width\] { transition: none; }
+:root[data-motion="reduced"] .c6-tool-details::details-content { transition: none; }
+:root[data-motion="off"] .c6-flash::after { opacity: 0; }
+:root[data-motion="off"] .c6-count-out, :root[data-motion="off"] .c6-crossfade-out { display: none; }
+:root[data-motion="off"] *, :root[data-motion="off"] *::before, :root[data-motion="off"] *::after,
+:root[data-motion="off"] ::details-content {
+  animation: none !important;
+  transition: none !important;
+  scroll-behavior: auto !important;
+}

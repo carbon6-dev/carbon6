@@ -8,6 +8,7 @@ use leptos::prelude::*;
 use serde_json::Value;
 
 use crate::api;
+use crate::icons::{Icon, Size, icon};
 use crate::util::{ErrorBox, INPUT, ago, now_ms};
 use crate::workspace::{Go, View};
 
@@ -22,23 +23,23 @@ fn when(at: Option<i64>) -> String {
 /// A kind's mark and color.
 fn badge(kind: &str) -> (AnyView, &'static str) {
     match kind {
-        "collection" => (crate::icons::folder().into_any(), "text-sky-600"),
-        "record" => (crate::icons::file().into_any(), "text-sky-500"),
-        "series" => (crate::icons::chart().into_any(), "text-cyan-600"),
-        "thing" => (crate::icons::diamond().into_any(), "text-violet-600"),
-        "item" => (crate::icons::mail().into_any(), "text-violet-500"),
-        "fact" => (crate::icons::check().into_any(), "text-emerald-600"),
-        "session" => (crate::icons::play().into_any(), "text-amber-600"),
-        "decision" => (crate::icons::help().into_any(), "text-rose-600"),
-        "trigger" => (crate::icons::zap().into_any(), "text-orange-600"),
-        "grant" => (crate::icons::arrows_left_right().into_any(), "text-teal-600"),
-        "view" => (crate::icons::maximize().into_any(), "text-indigo-600"),
-        "entry" => (crate::icons::square_terminal().into_any(), "text-muted"),
-        "secret" => (crate::icons::lock().into_any(), "text-muted"),
-        "realm" => (crate::icons::circle().into_any(), "text-zinc-700"),
-        "template" => (crate::icons::pencil().into_any(), "text-amber-700"),
-        "event" => (crate::icons::diamond().into_any(), "text-muted"),
-        _ => (crate::icons::circle().into_any(), "text-muted"),
+        "collection" => (icon(Icon::Layers, Size::S16), "text-sky-600"),
+        "record" => (icon(Icon::FileText, Size::S16), "text-sky-500"),
+        "series" => (icon(Icon::ChartLine, Size::S16), "text-cyan-600"),
+        "thing" => (icon(Icon::Box, Size::S16), "text-violet-600"),
+        "item" => (icon(Icon::Mail, Size::S16), "text-violet-500"),
+        "fact" => (icon(Icon::Check, Size::S16), "text-emerald-600"),
+        "session" => (icon(Icon::Bot, Size::S16), "text-amber-600"),
+        "decision" => (crate::icons::help(), "text-rose-600"),
+        "trigger" => (icon(Icon::Zap, Size::S16), "text-orange-600"),
+        "grant" => (icon(Icon::ShieldCheck, Size::S16), "text-teal-600"),
+        "view" => (icon(Icon::LayoutPanelLeft, Size::S16), "text-indigo-600"),
+        "entry" => (icon(Icon::Settings, Size::S16), "text-muted"),
+        "secret" => (icon(Icon::Lock, Size::S16), "text-muted"),
+        "realm" => (icon(Icon::Globe, Size::S16), "text-zinc-700"),
+        "template" => (icon(Icon::LayoutTemplate, Size::S16), "text-amber-700"),
+        "event" => (icon(Icon::CalendarClock, Size::S16), "text-muted"),
+        _ => (icon(Icon::Dot, Size::S16), "text-muted"),
     }
 }
 
@@ -123,7 +124,7 @@ pub fn RealmsMap() -> impl IntoView {
         <main class="mx-auto max-w-6xl space-y-4 px-4 py-6">
             <div>
                 <h1 class="text-lg font-semibold">"Realms"</h1>
-                <p class="text-sm text-muted">"Each realm keeps an app or a project apart. Open one to explore what it holds; the arrows are grants, the only way data crosses."</p>
+                <p class="text-sm text-muted">"Realms organise apps and projects; they aren't a security boundary. Open one to explore what it holds; the arrows are grants for cross-realm API access, not every way data can move."</p>
             </div>
             {move || map.get().map(|r| match r {
                 Err(e) => view! { <ErrorBox message=e /> }.into_any(),
@@ -132,7 +133,7 @@ pub fn RealmsMap() -> impl IntoView {
                     let grants = m["grants"].as_array().cloned().unwrap_or_default();
                     view! {
                         <GrantGraph realms=realms.clone() grants=grants.clone() />
-                        <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                        <div class="grid gap-3 @md/view:grid-cols-2 @min-[64rem]/view:grid-cols-3">
                             {realms.into_iter().map(|c| {
                                 let id = c["realm"]["id"].as_str().unwrap_or("").to_owned();
                                 let n = |k: &str| c["counts"][k].as_i64().unwrap_or(0);
@@ -141,7 +142,7 @@ pub fn RealmsMap() -> impl IntoView {
                                 let health = c["health"].as_i64().unwrap_or(0);
                                 view! {
                                     <Ex to=explore(&id, "", "", "") class="block space-y-2 rounded-lg border border-zinc-200 p-3 hover:border-zinc-400 dark:border-zinc-800 dark:hover:border-zinc-600">
-                                        <div class="flex items-baseline gap-2">
+                                        <div class="flex flex-wrap items-baseline gap-2 [overflow-wrap:anywhere]">
                                             <span class="font-medium">{c["realm"]["name"].as_str().unwrap_or("").to_owned()}</span>
                                             <span class="font-mono text-xs text-muted">{id.clone()}</span>
                                             <span class="flex-1"></span>
@@ -159,7 +160,7 @@ pub fn RealmsMap() -> impl IntoView {
                                                             } else {
                                                                 let _ = window().location().set_href(&to);
                                                             }
-                                                        }>"Open "{crate::icons::arrow_up_right()}</span>
+                                                        }>"Open "{icon(Icon::ArrowUpRight, Size::S14)}</span>
                                                 }
                                             })}
                                         </div>
@@ -208,7 +209,7 @@ fn GrantGraph(realms: Vec<Value>, grants: Vec<Value>) -> impl IntoView {
                 Some(view! {
                     <g>
                         <line x1=format!("{:.0}", a.0) y1=format!("{:.0}", a.1) x2=format!("{x2:.0}") y2=format!("{y2:.0}") class="stroke-teal-600" stroke-width="1.5" stroke-dasharray=if dashed { "4 3" } else { "" } marker-end="url(#arrow)" />
-                        <text x=format!("{:.0}", (a.0 + b.0) / 2.0) y=format!("{:.0}", (a.1 + b.1) / 2.0 - 4.0) text-anchor="middle" class="fill-zinc-500 text-[10px]">{label}</text>
+                        <text x=format!("{:.0}", (a.0 + b.0) / 2.0) y=format!("{:.0}", (a.1 + b.1) / 2.0 - 4.0) text-anchor="middle" class="fill-zinc-500 text-[10px] dark:fill-zinc-400">{label}</text>
                     </g>
                 })
             }).collect_view()}
@@ -246,14 +247,14 @@ pub fn ExplorePage(realm: String, section: String, kind: String, id: String) -> 
     let has_object = !kind.is_empty();
     let (rr, sec) = (realm.clone(), section.clone());
     view! {
-        <main class="flex h-full min-h-0 flex-col gap-3 px-3 py-3 lg:flex-row">
-            <aside class=format!("shrink-0 space-y-3 overflow-y-auto lg:w-64 {}", if has_object || !section.is_empty() { "hidden lg:block" } else { "" })>
+        <main class="flex h-full min-h-0 flex-col gap-3 px-3 py-3 @min-[64rem]/view:flex-row">
+            <aside class=format!("shrink-0 space-y-3 overflow-y-auto @min-[64rem]/view:w-64 {}", if has_object || !section.is_empty() { "hidden @min-[64rem]/view:block" } else { "" })>
                 {move || summary.get().map(|r| match r {
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
                     Ok(s) => view! { <Inventory summary=s realm=rr.clone() section=sec.clone() /> }.into_any(),
                 })}
             </aside>
-            <section class=format!("min-w-0 flex-1 overflow-y-auto {}", if has_object { "hidden lg:block" } else { "" })>
+            <section class=format!("min-w-0 flex-1 overflow-y-auto {}", if has_object { "hidden @min-[64rem]/view:block" } else { "" })>
                 {if section.is_empty() {
                     let r2 = realm.clone();
                     view! { {move || summary.get().map(|r| match r {
@@ -265,7 +266,7 @@ pub fn ExplorePage(realm: String, section: String, kind: String, id: String) -> 
                 }}
             </section>
             {has_object.then(|| view! {
-                <section class="min-w-0 overflow-y-auto rounded-lg border border-zinc-200 p-3 lg:w-[30rem] lg:shrink-0 dark:border-zinc-800">
+                <section class="min-w-0 overflow-y-auto rounded-lg border border-zinc-200 p-3 @min-[64rem]/view:w-[30rem] @min-[64rem]/view:shrink-0 dark:border-zinc-800">
                     <ObjectPane realm=realm.clone() section=section.clone() kind=kind.clone() id=id.clone() />
                 </section>
             })}
@@ -303,7 +304,7 @@ fn Inventory(summary: RealmSummary, realm: String, section: String) -> impl Into
                             <span class="text-xs text-muted" title=tip>{count}</span>
                         };
                         match &e.link {
-                            Some(l) => view! { <Go to=View::from_path(l) class=class>{inner}<span class="text-xs text-muted">{crate::icons::square_arrow_out()}</span></Go> }.into_any(),
+                            Some(l) => view! { <Go to=View::from_path(l) class=class>{inner}<span class="text-xs text-muted">{icon(Icon::ArrowUpRight, Size::S14)}</span></Go> }.into_any(),
                             None => view! { <Ex to=explore(&realm, &e.section, "", "") class=class>{inner}</Ex> }.into_any(),
                         }
                     }).collect_view()}
@@ -531,8 +532,8 @@ fn SearchResults(realm: String, q: String, selected: String) -> impl IntoView {
     let section = format!("search:{q}");
     view! {
         <div class="space-y-3">
-            <div class="flex items-center gap-2">
-                <Ex to=explore(&realm, "", "", "") class="text-sm text-muted hover:underline lg:hidden">{crate::icons::arrow_left()}" Overview"</Ex>
+            <div class="flex flex-wrap items-center gap-2 [overflow-wrap:anywhere]">
+                <Ex to=explore(&realm, "", "", "") class="text-sm text-muted hover:underline @min-[64rem]/view:hidden">{crate::icons::arrow_left()}" Overview"</Ex>
                 <h2 class="font-medium">{format!("“{q}”")}</h2>
             </div>
             {move || found.get().map(|r| match r {
@@ -570,11 +571,11 @@ fn SectionList(realm: String, section: String, selected: String) -> impl IntoVie
     view! {
         <div class="space-y-2">
             <div class="flex flex-wrap items-center gap-2">
-                <Ex to=explore(&realm, "", "", "") class="text-sm text-muted hover:underline lg:hidden">{crate::icons::arrow_left()}" Overview"</Ex>
-                <h2 class="font-medium">{title}</h2>
+                <Ex to=explore(&realm, "", "", "") class="text-sm text-muted hover:underline @min-[64rem]/view:hidden">{crate::icons::arrow_left()}" Overview"</Ex>
+                <h2 class="min-w-0 max-w-full font-medium [overflow-wrap:anywhere]">{title}</h2>
                 {(what == "collection").then(|| view! { <Ex to=explore(&realm, &section, "collection", &arg) class="text-xs text-muted underline">"about this collection"</Ex> })}
                 <span class="flex-1"></span>
-                <input class=format!("{INPUT} w-48 py-1 text-sm") placeholder="Filter" prop:value=move || q.get() on:input=move |ev| q.set(event_target_value(&ev)) />
+                <input class=format!("{INPUT} min-w-0 max-w-full w-48 py-1 text-sm") placeholder="Filter" prop:value=move || q.get() on:input=move |ev| q.set(event_target_value(&ev)) />
             </div>
             {move || list.get().map(|r| match r {
                 Err(e) => view! { <ErrorBox message=e /> }.into_any(),
@@ -611,16 +612,16 @@ fn ObjectPane(realm: String, section: String, kind: String, id: String) -> impl 
                 view! {
                     <div class="space-y-3">
                         <div class="flex items-start gap-2">
-                            <Ex to=back.clone() class="text-sm text-muted hover:underline lg:hidden" title="Back to the overview">{crate::icons::chevron_left()}</Ex>
+                            <Ex to=back.clone() class="text-sm text-muted hover:underline @min-[64rem]/view:hidden" title="Back to the overview">{crate::icons::chevron_left()}</Ex>
                             <span class=format!("text-lg {color}")>{mark}</span>
-                            <div class="min-w-0 flex-1">
+                            <div class="min-w-0 flex-1 [overflow-wrap:anywhere]">
                                 <h2 class="break-words font-medium">{o.title.clone()}</h2>
                                 <p class="text-xs text-muted">{format!("{} · {}", o.kind, o.sub)}</p>
                             </div>
-                            {o.open.clone().map(|p| view! { <Go to=View::from_path(&p) class="shrink-0 text-xs text-muted underline" title="Edit it where it lives">"Open "{crate::icons::arrow_up_right()}</Go> })}
+                            {o.open.clone().map(|p| view! { <Go to=View::from_path(&p) class="shrink-0 text-xs text-muted underline" title="Edit it where it lives">"Open "{icon(Icon::ArrowUpRight, Size::S14)}</Go> })}
                         </div>
                         {(!o.fields.is_empty()).then(|| view! {
-                            <dl class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-sm">
+                            <dl class="grid grid-cols-1 gap-x-3 gap-y-0.5 text-sm [overflow-wrap:anywhere] @sm/view:grid-cols-[auto_minmax(0,1fr)]">
                                 {o.fields.iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| view! { <dt class="text-muted">{k.clone()}</dt><dd class="whitespace-pre-wrap break-words">{v.clone()}</dd> }).collect_view()}
                             </dl>
                         })}
@@ -655,7 +656,7 @@ fn ObjectPane(realm: String, section: String, kind: String, id: String) -> impl 
 fn Neighborhood(realm: String, section: String, object: ExObject) -> impl IntoView {
     let nav = nav();
     let (r1, k1, i1) = (realm.clone(), object.kind.clone(), object.id.clone());
-    let data = LocalResource::new(move || api::realm_neighborhood(r1.clone(), k1.clone(), i1.clone()));
+    let data = crate::resources::local(move || api::realm_neighborhood(r1.clone(), k1.clone(), i1.clone()));
     let short = |s: &str| {
         let t: String = s.chars().take(16).collect();
         if s.chars().count() > 16 { format!("{t}…") } else { t }
@@ -711,7 +712,7 @@ fn Neighborhood(realm: String, section: String, object: ExObject) -> impl IntoVi
                             view! {
                                 <a href=href on:click={ let nav = nav.clone(); move |ev: web_sys::MouseEvent| follow(ev, to.clone(), &nav) }>
                                     <title>{format!("{} {}: {}", r.kind, r.title, r.sub)}</title>
-                                    {diagram_label(x, y, &r.kind, short(&r.title), format!("fill-current {size}"))}
+                                    {diagram_label(x, y, &r.kind, short(&r.title), format!("fill-current dark:fill-zinc-200 {size}"))}
                                 </a>
                             }
                         }).collect_view()}
@@ -726,6 +727,36 @@ fn Neighborhood(realm: String, section: String, object: ExObject) -> impl IntoVi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn explorer_kinds_use_the_approved_icons_and_keep_their_colours() {
+        for (kind, expected, colour) in [
+            ("collection", Icon::Layers, "text-sky-600"),
+            ("record", Icon::FileText, "text-sky-500"),
+            ("series", Icon::ChartLine, "text-cyan-600"),
+            ("thing", Icon::Box, "text-violet-600"),
+            ("item", Icon::Mail, "text-violet-500"),
+            ("fact", Icon::Check, "text-emerald-600"),
+            ("session", Icon::Bot, "text-amber-600"),
+            ("trigger", Icon::Zap, "text-orange-600"),
+            ("grant", Icon::ShieldCheck, "text-teal-600"),
+            ("view", Icon::LayoutPanelLeft, "text-indigo-600"),
+            ("entry", Icon::Settings, "text-muted"),
+            ("secret", Icon::Lock, "text-muted"),
+            ("realm", Icon::Globe, "text-zinc-700"),
+            ("template", Icon::LayoutTemplate, "text-amber-700"),
+            ("event", Icon::CalendarClock, "text-muted"),
+            ("other", Icon::Dot, "text-muted"),
+        ] {
+            let (mark, actual_colour) = badge(kind);
+            assert_eq!(actual_colour, colour, "{kind}");
+            assert_eq!(mark.to_html(), icon(expected, Size::S16).to_html(), "{kind}");
+        }
+        let (decision, colour) = badge("decision");
+        assert_eq!(colour, "text-rose-600");
+        assert_eq!(decision.to_html(), crate::icons::help().to_html());
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]

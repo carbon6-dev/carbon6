@@ -6,12 +6,14 @@
 //! A tile has at most two panes: a list (or whatever it was opened on) and
 //! the item opened from it. One rule: a click inside a tile opens in that
 //! tile's right pane; the header's navigation opens a tile of its own (the
-//! one already showing it, else a new one); ⌘/Ctrl-click (or a tile's ⧉)
-//! makes a new tile. Each tile keeps its own
+//! one already showing it, else a new one). An existing destination is
+//! focused in either pane, even on ⌘/Ctrl-click. Only explicit session
+//! companion panes allow live copies; a session itself is single-copy.
+//! Each tile keeps its own
 //! back and forward history (⌘[ and ⌘]).
 //!
-//! On a phone one tile shows at a time (a switcher at the bottom) and one
-//! pane of it, with back in its header.
+//! On a phone one tile and one pane show at a time, with a single bar for
+//! navigation, the shown pane's actions and the Sessions picker.
 //!
 //! The layout is saved in the browser; the URL shows the focused column.
 //! It also tracks attention: sessions that finished or failed while not
@@ -35,7 +37,7 @@ pub const COLUMNS: usize = 4;
 const MAX_ATTENTION: usize = 20;
 
 /// What a column shows.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "view", rename_all = "snake_case")]
 pub enum View {
     Sessions,
@@ -117,6 +119,9 @@ pub enum View {
     Docs {
         #[serde(default)]
         id: String,
+        /// A block to reveal, without replacing the document's editor.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
     },
     /// Collections; one by name, or (empty) the list.
     Collections {
@@ -145,7 +150,7 @@ pub enum View {
 
 /// A place in a session: the transcript element to reveal, the side chats
 /// to expand on the way, and the query to highlight.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Target {
     pub q: String,
     #[serde(default)]
@@ -158,10 +163,49 @@ pub struct Target {
 }
 
 fn enc(s: &str) -> String {
-    js_sys::encode_uri_component(s).as_string().unwrap_or_default()
+    encode(s)
 }
 
 impl View {
+    /// Crash diagnostics: enum type only, never any of the view's payload.
+    /// Keep js/crash.js's allowlist in sync.
+    fn crash_kind(&self) -> &'static str {
+        match self {
+            Self::Sessions => "sessions",
+            Self::Session { .. } => "session",
+            Self::SessionChanges { .. } => "session_changes",
+            Self::SessionTerminal { .. } => "session_terminal",
+            Self::SessionFiles { .. } => "session_files",
+            Self::SessionOutputs { .. } => "session_outputs",
+            Self::Search { .. } => "search",
+            Self::Workers => "workers",
+            Self::Worker { .. } => "worker",
+            Self::Settings { .. } => "settings",
+            Self::Inbox => "inbox",
+            Self::Mission => "mission",
+            Self::Usage => "usage",
+            Self::Chats => "chats",
+            Self::Analytics => "analytics",
+            Self::Activity => "activity",
+            Self::Memex => "memex",
+            Self::Mail => "mail",
+            Self::Chat => "chat",
+            Self::Conversation { .. } => "conversation",
+            Self::Brief => "brief",
+            Self::Calendar => "calendar",
+            Self::Contacts => "contacts",
+            Self::Photos => "photos",
+            Self::Decisions => "decisions",
+            Self::Work { .. } => "work",
+            Self::Projects { .. } => "projects",
+            Self::Docs { .. } => "docs",
+            Self::Collections { .. } => "collections",
+            Self::Realms => "realms",
+            Self::Explore { .. } => "explore",
+            Self::App { .. } => "app",
+        }
+    }
+
     pub fn session(id: impl Into<String>) -> Self {
         View::Session { id: id.into(), target: None }
     }
@@ -187,7 +231,7 @@ impl View {
                     p.push_str(&format!("&open={}", enc(&t.open.join(","))));
                 }
                 if let Some(a) = &t.anchor {
-                    p.push_str(&format!("#{a}"));
+                    p.push_str(&format!("#{}", enc(a)));
                 }
                 p
             }
@@ -229,8 +273,9 @@ impl View {
             View::Work { id } => format!("/work/{id}"),
             View::Projects { id } if id.is_empty() => "/projects".into(),
             View::Projects { id } => format!("/projects/{id}"),
-            View::Docs { id } if id.is_empty() => "/docs".into(),
-            View::Docs { id } => format!("/docs/{id}"),
+            View::Docs { id, .. } if id.is_empty() => "/docs".into(),
+            View::Docs { id, target: None } => format!("/docs/{id}"),
+            View::Docs { id, target: Some(block) } => format!("/docs/{id}#{}", enc(block)),
             View::Collections { name } if name.is_empty() => "/collections".into(),
             View::Collections { name } => format!("/collections/{name}"),
             View::Realms => "/realms".into(),
@@ -253,7 +298,7 @@ impl View {
             .ok()
             .map(|p| {
                 let mut m = HashMap::new();
-                for key in ["q", "kind", "worker", "open", "output", "signed_in", "signed_in_with_link"] {
+                for key in ["q", "kind", "worker", "open", "output", "block", "signed_in", "signed_in_with_link"] {
                     if let Some(v) = p.get(key) {
                         m.insert(key.to_owned(), v);
                     }
@@ -267,20 +312,21 @@ impl View {
 
     /// The view at a path of carbon6 (e.g. a link the head gives).
     pub fn from_path(href: &str) -> Self {
+        let (href, hash) = href.split_once('#').unwrap_or((href, ""));
         let (path, q) = href.split_once('?').unwrap_or((href, ""));
         let query: HashMap<String, String> =
             q.split('&').filter_map(|p| p.split_once('=')).map(|(k, v)| (k.to_owned(), decode(v))).collect();
-        Self::parse(path, &query, "")
+        Self::parse(&crate::place::strip(path), &query, hash)
     }
 
     fn parse(path: &str, query: &HashMap<String, String>, hash: &str) -> Self {
-        let hash = hash.to_owned();
+        let hash = decode_fragment(hash.trim_start_matches('#'));
         let get = |k: &str| query.get(k).cloned().unwrap_or_default();
         let parts: Vec<String> = path.trim_matches('/').split('/').map(decode).collect();
         let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
         match parts.as_slice() {
             ["sessions", id] => {
-                let target = (query.contains_key("q") || !hash.is_empty()).then(|| Target {
+                let target = (query.contains_key("q") || query.contains_key("open") || !hash.is_empty()).then(|| Target {
                     q: get("q"),
                     anchor: Some(hash).filter(|h| !h.is_empty()),
                     open: query
@@ -335,8 +381,11 @@ impl View {
             ["work", id] => View::Work { id: (*id).to_owned() },
             ["projects"] => View::Projects { id: String::new() },
             ["projects", id] => View::Projects { id: (*id).to_owned() },
-            ["docs"] => View::Docs { id: String::new() },
-            ["docs", id] => View::Docs { id: (*id).to_owned() },
+            ["docs"] => View::Docs { id: String::new(), target: None },
+            ["docs", id] => View::Docs {
+                id: (*id).to_owned(),
+                target: Some(if hash.is_empty() { get("block") } else { hash }).filter(|b| !b.is_empty()),
+            },
             ["collections"] => View::Collections { name: String::new() },
             ["collections", name] => View::Collections { name: (*name).to_owned() },
             ["views", name] => View::App { name: (*name).to_owned(), record: String::new() },
@@ -359,13 +408,11 @@ impl View {
     pub fn label(&self, live: &LiveFeed) -> String {
         match self {
             View::Sessions => "Sessions".into(),
-            View::Session { id, .. } => {
-                live.sessions.with(|ss| ss.iter().find(|s| &s.id == id).map(|s| s.title.clone())).unwrap_or_else(|| "Session".into())
-            }
+            View::Session { id, .. } => live.session(id).map(|s| s.title).unwrap_or_else(|| "Session".into()),
             // Its name, and the session's.
             View::SessionChanges { id } | View::SessionTerminal { id } | View::SessionFiles { id } | View::SessionOutputs { id, .. } => {
                 let name = self.session_pane().map_or("", |(p, _)| p.name());
-                match live.sessions.with(|ss| ss.iter().find(|s| &s.id == id).map(|s| s.title.clone())) {
+                match live.session(id).map(|s| s.title) {
                     Some(t) => format!("{name} · {t}"),
                     None => name.to_owned(),
                 }
@@ -399,8 +446,8 @@ impl View {
             View::Work { .. } => "Work item".into(),
             View::Projects { id } if id.is_empty() => "Projects".into(),
             View::Projects { .. } => "Project".into(),
-            View::Docs { id } if id.is_empty() => "Docs".into(),
-            View::Docs { id } => crate::docs::title_of(id).unwrap_or_else(|| "Document".into()),
+            View::Docs { id, .. } if id.is_empty() => "Docs".into(),
+            View::Docs { id, .. } => crate::docs::title_of(id).unwrap_or_else(|| "Document".into()),
             View::Collections { name } if name.is_empty() => "Collections".into(),
             View::Collections { name } => format!("Collection · {name}"),
             View::Realms => "Realms".into(),
@@ -418,7 +465,7 @@ impl View {
             && self.session_pane().is_none()
             && !matches!(self, View::Collections { name } if !name.is_empty())
             && !matches!(self, View::Work { id } if !id.is_empty())
-            && !matches!(self, View::Docs { id } if !id.is_empty())
+            && !matches!(self, View::Docs { id, .. } if !id.is_empty())
             && !matches!(self, View::Projects { id } if !id.is_empty())
             && !matches!(self, View::App { record, .. } if !record.is_empty())
     }
@@ -434,6 +481,37 @@ impl View {
             View::SessionOutputs { id, .. } => Some((Pane::Outputs, id)),
             _ => None,
         }
+    }
+
+    fn session_id(&self) -> Option<&str> {
+        match self {
+            View::Session { id, .. } => Some(id),
+            _ => self.session_pane().map(|(_, id)| id),
+        }
+    }
+
+    /// Opening a destination reuses its live pane, not a history entry.
+    /// Targets are navigation within it; searches and explorer/app routes
+    /// deliberately keep distinct queries, sections and records separate.
+    fn same_destination(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Session { id: a, .. }, Self::Session { id: b, .. })
+            | (Self::Docs { id: a, .. }, Self::Docs { id: b, .. })
+            | (Self::SessionOutputs { id: a, .. }, Self::SessionOutputs { id: b, .. }) => a == b,
+            (Self::Settings { .. }, Self::Settings { .. }) => true,
+            _ => self == other,
+        }
+    }
+
+    /// Only session companion panes retain explicit-copy behavior.
+    /// Sessions and all other destinations reveal their existing live pane.
+    fn single_copy(&self) -> bool {
+        self.session_pane().is_none()
+    }
+
+    /// Documents retain their reading target; normal session navigation is Latest.
+    fn navigates_existing(&self) -> bool {
+        !matches!(self, Self::Docs { target: None, .. })
     }
 }
 
@@ -466,8 +544,8 @@ pub struct Tile {
     /// when it opens and moved by dragging its bar.
     #[serde(default)]
     pub stack: Option<usize>,
-    /// Minimized: hidden (still loaded), keeping its column and its place
-    /// in it for when it comes back.
+    /// Minimized: hidden (keeping already-loaded state), keeping its column
+    /// and its place in it for when it comes back.
     #[serde(default)]
     pub minimized: bool,
 }
@@ -489,8 +567,8 @@ impl Tile {
 
     /// Shows its last pane, and makes it the active one.
     fn settle(&mut self) {
-        self.cursor = self.columns.len() - 1;
-        self.active = self.columns[self.cursor].key;
+        self.cursor = self.columns.len().saturating_sub(1);
+        self.active = self.columns.last().map_or(0, |c| c.key);
     }
 }
 
@@ -650,23 +728,6 @@ impl Layout {
         }
     }
 
-    /// Moves tile `key` one place earlier (`by` < 0) or later in reading
-    /// order among the tiles shown, trading places with that neighbour (its
-    /// column and its place in it); the focus stays on its tile.
-    fn step_tile(&mut self, key: u64, by: isize) {
-        let order: Vec<usize> = self.reading_order().into_iter().filter(|&i| !self.tiles[i].minimized).collect();
-        let Some(at) = order.iter().position(|&i| self.tiles[i].key == key) else { return };
-        let Some(&j) = at.checked_add_signed(by.signum()).and_then(|n| order.get(n)) else { return };
-        let (i, focused) = (order[at], self.tiles.get(self.focus).map(|t| t.key));
-        self.tiles.swap(i, j);
-        let stack = self.tiles[i].stack;
-        self.tiles[i].stack = self.tiles[j].stack;
-        self.tiles[j].stack = stack;
-        if let Some(f) = focused.and_then(|k| self.tiles.iter().position(|t| t.key == k)) {
-            self.focus = f;
-        }
-    }
-
     fn touch(&mut self, ti: usize) {
         let k = self.key();
         if let Some(t) = self.tiles.get_mut(ti) {
@@ -740,11 +801,101 @@ impl Layout {
         }
     }
 
+    /// Saved single-copy pages collapse to the focused copy, else the first.
+    /// Companion copies and history entries are retained, not mounted twice.
+    fn restore_single_copies(&mut self) {
+        let focused = self.tiles[self.focus].key;
+        let mut owners = Vec::<(View, (u64, u64))>::new();
+        let unique = View::single_copy;
+        for ti in [self.focus].into_iter().chain(0..self.tiles.len()) {
+            let t = &self.tiles[ti];
+            for c in t.columns.iter().filter(|c| ti == self.focus && c.key == t.active).chain(t.columns.iter()) {
+                if unique(&c.view) && !owners.iter().any(|(view, _)| view.same_destination(&c.view)) {
+                    owners.push((c.view.clone(), (t.key, c.key)));
+                }
+            }
+        }
+        let keep = |c: &Column, tile: u64, owners: &Vec<(View, (u64, u64))>| {
+            !unique(&c.view)
+                || owners.iter().find(|(view, _)| view.same_destination(&c.view)).is_none_or(|(_, owner)| *owner == (tile, c.key))
+        };
+        for t in &mut self.tiles {
+            let original = t.columns.clone();
+            let cursor = t.columns.get(t.cursor).map(|c| c.key);
+            t.columns.retain(|c| keep(c, t.key, &owners));
+            if t.columns.len() == original.len() {
+                continue;
+            }
+            if t.columns.is_empty() && (!t.back.is_empty() || !t.forward.is_empty()) {
+                // A duplicate-only tile still owns independent navigation.
+                // Walk to its nearest useful page rather than deleting that
+                // history or grafting it onto the surviving document tile.
+                let useful = |cs: &Vec<Column>| cs.iter().any(|c| keep(c, t.key, &owners));
+                let destination = t
+                    .back
+                    .iter()
+                    .rev()
+                    .position(useful)
+                    .map(|n| (true, n + 1))
+                    .or_else(|| t.forward.iter().rev().position(useful).map(|n| (false, n + 1)));
+                t.columns = original;
+                if let Some((back, steps)) = destination {
+                    for _ in 0..steps {
+                        let next = if back { t.back.pop() } else { t.forward.pop() }.unwrap();
+                        let now = std::mem::replace(&mut t.columns, next);
+                        if back { t.forward.push(now) } else { t.back.push(now) }
+                    }
+                    // A revived, previously history-only page now has a live
+                    // owner too: later revivals must not duplicate it.
+                    t.columns.retain(|c| {
+                        if unique(&c.view) && !owners.iter().any(|(view, _)| view.same_destination(&c.view)) {
+                            owners.push((c.view.clone(), (t.key, c.key)));
+                        }
+                        keep(c, t.key, &owners)
+                    });
+                } else {
+                    // All its history is already live elsewhere. Home can
+                    // carry that independent navigation only if it is free.
+                    // Otherwise retain a history-only tile, never a second
+                    // Sessions/Realms page or a discarded/merged history.
+                    t.forward.push(std::mem::take(&mut t.columns));
+                    let home = View::home();
+                    if !owners.iter().any(|(view, _)| view.same_destination(&home)) {
+                        self.next += 1;
+                        owners.push((home.clone(), (t.key, self.next)));
+                        t.columns.push(Column { key: self.next, view: home });
+                    }
+                }
+                t.settle();
+            } else if !t.columns.is_empty() {
+                t.cursor = t
+                    .columns
+                    .iter()
+                    .position(|c| Some(c.key) == cursor)
+                    .or_else(|| t.columns.iter().position(|c| c.key == t.active))
+                    .unwrap_or(0);
+                if !t.columns.iter().any(|c| c.key == t.active) {
+                    t.active = t.columns[t.cursor].key;
+                }
+            }
+        }
+        self.tiles.retain(|t| !t.columns.is_empty() || !t.back.is_empty() || !t.forward.is_empty());
+        self.focus = self.tiles.iter().position(|t| t.key == focused).unwrap_or(0);
+        self.place();
+        self.settle_focus();
+    }
+
     /// Closes tile `ti`; the focus stays where it was, or goes to the tile
     /// shown that was used last. The last tile closing leaves the home view.
     fn remove_tile(&mut self, ti: usize) {
         if self.tiles.len() == 1 {
-            *self = Layout::new(View::home());
+            // A replacement, not the old tile with new contents: keep keys
+            // monotonic so its ghost can exit while Home is already live.
+            let home = self.new_tile(View::home());
+            self.tiles = vec![home];
+            self.focus = 0;
+            self.full = false;
+            self.place();
             return;
         }
         let focused = self.tiles.get(self.focus).map(|t| t.key).filter(|_| self.focus != ti);
@@ -754,24 +905,127 @@ impl Layout {
         self.settle_focus();
     }
 
-    /// Where a session is open: (tile index, column index).
-    fn find_session(&self, id: &str) -> Option<(usize, usize)> {
-        self.tiles
-            .iter()
-            .enumerate()
-            .find_map(|(ti, t)| t.columns.iter().position(|c| matches!(&c.view, View::Session { id: x, .. } if x == id)).map(|ci| (ti, ci)))
+    /// The origin, then the focused tile, then other live panes. Opening
+    /// from an explicit copy never jumps to another live copy.
+    fn find_view(&self, origin: usize, view: &View) -> Option<(usize, usize)> {
+        [origin, self.focus].into_iter().chain(0..self.tiles.len()).find_map(|ti| {
+            let t = self.tiles.get(ti)?;
+            let ci = [t.cursor]
+                .into_iter()
+                .chain(0..t.columns.len())
+                .find(|&ci| t.columns.get(ci).is_some_and(|c| c.view.same_destination(view)))?;
+            Some((ti, ci))
+        })
     }
 
-    /// A Brief may already be beside Mail, not just first in its tile.
-    fn focus_brief(&mut self) -> bool {
-        let found =
-            self.tiles.iter().enumerate().find_map(|(ti, t)| t.columns.iter().position(|c| c.view == View::Brief).map(|ci| (ti, ci)));
-        let Some((ti, ci)) = found else { return false };
+    fn reuse(&mut self, origin: usize, view: &View) -> bool {
+        let Some((ti, ci)) = self.find_view(origin, view) else { return false };
         let t = &mut self.tiles[ti];
-        t.cursor = ci;
-        t.active = t.columns[ci].key;
-        self.show(ti);
+        if view.navigates_existing() && t.columns[ci].view != *view {
+            let mut columns = t.columns.clone();
+            columns[ci].view = view.clone();
+            t.go(columns);
+        }
+        let (tile, col) = (t.key, t.columns[ci].key);
+        self.reveal(tile, col);
         true
+    }
+
+    /// One open path for links, mentions, navigation and created documents.
+    /// Only session companions allow explicit copies. A new target
+    /// changes the reused pane's history; merely focusing it does not.
+    fn open(&mut self, from: Option<(u64, u64)>, view: View, how: How) {
+        if self.tiles.is_empty() {
+            self.open_tile(view);
+            return;
+        }
+        let origin = from.and_then(|(t, _)| self.tiles.iter().position(|x| x.key == t)).unwrap_or(self.focus);
+        if (how != How::NewTile || view.single_copy()) && self.reuse(origin, &view) {
+            return;
+        }
+        if how == How::Instead {
+            let key = self.key();
+            self.tiles[origin].go(vec![Column { key, view }]);
+            self.show(origin);
+            return;
+        }
+        if how != How::Beside {
+            self.open_tile(view);
+            return;
+        }
+        let key = self.key();
+        let t = &mut self.tiles[origin];
+        let next = match t.columns.first().cloned() {
+            Some(list) if from.is_some() || (!view.is_section() && list.view.is_section()) => vec![list, Column { key, view }],
+            _ => vec![Column { key, view }],
+        };
+        if t.columns.iter().map(|c| &c.view).ne(next.iter().map(|c| &c.view)) {
+            t.go(next);
+        }
+        t.settle();
+        self.show(origin);
+    }
+
+    fn step(&mut self, delta: isize) {
+        // A retained history entry must not silently recreate a single-copy
+        // copy. Reveal its live destination instead; the source's entire
+        // snapshot and both stacks remain available, including other panes.
+        let source = &self.tiles[self.focus];
+        let next = if delta < 0 { source.back.last() } else { source.forward.last() };
+        let existing = next.and_then(|cs| {
+            cs.iter().find_map(|c| {
+                if !c.view.single_copy() || source.columns.iter().any(|now| now.view.same_destination(&c.view)) {
+                    return None;
+                }
+                self.tiles
+                    .iter()
+                    .enumerate()
+                    .any(|(ti, t)| ti != self.focus && t.columns.iter().any(|now| now.view.same_destination(&c.view)))
+                    .then(|| c.view.clone())
+            })
+        });
+        if let Some(view) = existing {
+            self.reuse(self.focus, &view);
+            return;
+        }
+        let t = &mut self.tiles[self.focus];
+        let active = t.active;
+        let keys: Vec<_> = t.columns.iter().map(|c| c.key).collect();
+        if delta < 0 {
+            if let Some(prev) = t.back.pop() {
+                let now = std::mem::replace(&mut t.columns, prev);
+                t.forward.push(now);
+                t.settle();
+            }
+        } else if let Some(next) = t.forward.pop() {
+            let now = std::mem::replace(&mut t.columns, next);
+            t.back.push(now);
+            t.settle();
+        }
+        // Old snapshots can themselves contain two copies in one tile.
+        // Normalize only the newly current panes, never stored snapshots.
+        let mut pages = Vec::<View>::new();
+        t.columns.retain(|c| {
+            if !c.view.single_copy() {
+                return true;
+            }
+            if pages.iter().any(|view| view.same_destination(&c.view)) {
+                return false;
+            }
+            pages.push(c.view.clone());
+            true
+        });
+        if t.cursor >= t.columns.len() || !t.columns.iter().any(|c| c.key == t.active) {
+            t.settle();
+        }
+        // A target-only visit retains the pane keys. History must keep
+        // that pane active too, even when it is the left of two panes.
+        if t.columns.iter().map(|c| c.key).eq(keys)
+            && let Some(ci) = t.columns.iter().position(|c| c.key == active)
+        {
+            t.cursor = ci;
+            t.active = active;
+        }
     }
 
     /// Opens `view` in a new tile, after the others (left to right, then
@@ -795,7 +1049,13 @@ impl Layout {
     fn valid(&self) -> bool {
         !self.tiles.is_empty()
             && self.focus < self.tiles.len()
-            && self.tiles.iter().all(|t| !t.columns.is_empty() && t.columns.len() <= 2 && t.cursor < t.columns.len())
+            && self.tiles.iter().all(|t| {
+                if t.columns.is_empty() {
+                    t.cursor == 0 && t.active == 0 && (!t.back.is_empty() || !t.forward.is_empty())
+                } else {
+                    t.columns.len() <= 2 && t.cursor < t.columns.len()
+                }
+            })
     }
 
     /// Session ids shown now (in any tile's panes).
@@ -826,6 +1086,18 @@ impl Layout {
             .session_pane()
             .and_then(|(_, id)| t.columns.iter().find(|c| matches!(&c.view, View::Session { id: x, .. } if x == id)).map(|c| c.key));
         Some(session.unwrap_or(last.key))
+    }
+
+    /// The phone's ring belongs to the visible session or its companion's
+    /// session, not necessarily the column whose title/actions are shown.
+    fn phone_session_column(&self, tile: u64) -> Option<u64> {
+        let t = self.tile(tile)?;
+        let current = t.columns.get(t.cursor)?;
+        if matches!(current.view, View::Session { .. }) {
+            return Some(current.key);
+        }
+        let companion = current.view.session_pane().map(|(_, id)| id);
+        t.columns.iter().find(|c| matches!(&c.view, View::Session { id, .. } if companion.is_none_or(|owner| owner == id))).map(|c| c.key)
     }
 
     /// Where a session's pane is open, if it is: (tile key, pane key).
@@ -859,6 +1131,12 @@ impl Layout {
     fn open_after(&mut self, tile: u64, col: u64, view: View) {
         let Some(ti) = self.tiles.iter().position(|t| t.key == tile) else { return };
         let Some(me) = self.tiles[ti].columns.iter().find(|c| c.key == col).cloned() else { return };
+        // General detail links (Glance's worker, a started session, docs)
+        // obey the same destination policy. Session companions deliberately
+        // stay beside the selected transcript rather than stealing its list.
+        if view.session_pane().is_none() && self.reuse(ti, &view) {
+            return;
+        }
         let key = self.key();
         let t = &mut self.tiles[ti];
         let next = vec![me, Column { key, view }];
@@ -869,6 +1147,18 @@ impl Layout {
         self.focus = ti;
         self.touch(ti);
     }
+
+    /// In-place browsing (explorer links, search filters, Settings) cannot
+    /// replace a pane with a single-copy destination already live elsewhere.
+    fn replace(&mut self, tile: u64, col: u64, view: View) {
+        let Some(ti) = self.tiles.iter().position(|t| t.key == tile) else { return };
+        let Some(ci) = self.tiles[ti].columns.iter().position(|c| c.key == col) else { return };
+        if view.single_copy() && self.find_view(ti, &view).is_some_and(|owner| owner != (ti, ci)) && self.reuse(ti, &view) {
+            return;
+        }
+        // Editing this pane's own route retains its key and existing history.
+        self.tiles[ti].columns[ci].view = view;
+    }
 }
 
 /// How a link opens.
@@ -877,7 +1167,8 @@ pub enum How {
     /// In this tile: its right pane (from inside it), or in place of it
     /// (from the header's navigation).
     Beside,
-    /// In a new tile (⌘/Ctrl-click).
+    /// In a new tile (Mac ⌘-click, Ctrl-click elsewhere), unless a single-copy
+    /// destination is already open. Only session companion panes allow copies.
     NewTile,
     /// In a tile of its own: the one already showing it, or a new one (the
     /// Apps menu).
@@ -929,11 +1220,16 @@ const PINNED_KEY: &str = "c6.pinned";
 #[derive(Clone, Copy)]
 pub struct Workspace {
     pub layout: RwSignal<Layout>,
+    /// Explicit target visits, including a second click on the same target.
+    /// Transient: restoring a layout does not replay another pane's visit.
+    navigation: RwSignal<(u64, u64)>,
     /// A request to open, consumed by the active Brief. Never part of its view.
     pub brief_request: RwSignal<Option<i64>>,
     /// What each session pane offers its tile's bar (its actions, ⋯), by
     /// pane key, while it is shown.
     pub chrome: RwSignal<HashMap<u64, crate::session::SessionChrome>>,
+    /// View-owned phone actions, mounted in the single tile bar's popover.
+    view_actions: RwSignal<Vec<(u64, u64, ChildrenFn)>>,
     /// Sessions that finished or failed while not shown, newest first.
     pub attention: RwSignal<Vec<String>>,
     pub pinned: RwSignal<Vec<String>>,
@@ -952,7 +1248,205 @@ fn load<T: for<'de> Deserialize<'de>>(key: &str) -> Option<T> {
     serde_json::from_str(&storage_get(key)?).ok()
 }
 
+// Layout is committed by Leptos immediately. Only its picture catches up. Keep
+// this specific to workspace roots: no transcript observation or per-frame
+// layout reads, and never wait for an animation to mount/focus an input.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
+let workspaceMotion;
+const tileEaseMove = 'cubic-bezier(.3,0,0,1)';
+function tileMotionMode() {
+    const motion = window.c6Motion;
+    if (motion?.off() || document.documentElement.dataset.motion === 'off') return 'off';
+    return (motion ? motion.reduced() : matchMedia('(prefers-reduced-motion: reduce)').matches) ? 'reduced' : 'full';
+}
+function tileMotionNodes(root) {
+    const nodes = [];
+    for (const tile of root.children) {
+        if (!tile.hasAttribute('data-tile-motion')) continue;
+        nodes.push(tile);
+        // TileView's section ends with the pane host. Walk just these roots,
+        // not the potentially very large transcript/content trees inside them.
+        const host = tile.firstElementChild?.lastElementChild;
+        if (!host?.hasAttribute('data-pane-host')) continue;
+        for (const pane of host.children) if (pane.hasAttribute('data-pane-motion')) nodes.push(pane);
+    }
+    return nodes;
+}
+function tileMotionKey(el) {
+    return el.hasAttribute('data-tile-motion') ? 't' + el.dataset.tileMotion : 'p' + el.dataset.paneMotion;
+}
+function tileMotionCancel(state) {
+    if (state.frame) cancelAnimationFrame(state.frame);
+    state.frame = 0;
+    state.before = null;
+    for (const animation of state.animations.values()) animation.cancel();
+    state.animations.clear();
+}
+export function tileMotionStop() {
+    if (!workspaceMotion) return;
+    tileMotionCancel(workspaceMotion);
+    window.removeEventListener('c6-motion', workspaceMotion.preference);
+    workspaceMotion = undefined;
+}
+function tileMotionAnimate(state, el, frames, duration, easing, done = () => {}) {
+    if (!el.animate || !duration) { done(); return; }
+    const animation = el.animate(frames, { duration, easing });
+    state.animations.set(el, animation);
+    animation.onfinish = animation.oncancel = () => {
+        if (state.animations.get(el) === animation) state.animations.delete(el);
+        done();
+    };
+}
+function tileMotionReveal(state, tile, duration) {
+    const surface = tile.firstElementChild;
+    if (!surface) return;
+    // Fade an empty veil OFF the final, opaque surface, never fade the tile
+    // itself. Text reflows once at full size, with no outgoing text underneath.
+    // Prepending preserves the final pane-host child used by tileMotionNodes.
+    const veil = document.createElement('div');
+    veil.setAttribute('data-tile-reveal', '');
+    veil.setAttribute('aria-hidden', 'true');
+    Object.assign(veil.style, {
+        position: 'absolute', inset: '0', zIndex: '20', pointerEvents: 'none',
+        borderRadius: 'inherit', background: getComputedStyle(surface).backgroundColor,
+    });
+    surface.prepend(veil);
+    tileMotionAnimate(state, veil, [{ opacity: 1 }, { opacity: 0 }], duration, 'linear', () => veil.remove());
+}
+export function tileMotionPrepare() {
+    const root = document.querySelector('[data-workspace-motion]');
+    if (!root) return;
+    if (workspaceMotion?.root !== root) {
+        tileMotionStop();
+        const state = { root, before: null, frame: 0, animations: new Map() };
+        state.preference = () => { if (tileMotionMode() !== 'full') tileMotionCancel(state); };
+        window.addEventListener('c6-motion', state.preference);
+        workspaceMotion = state;
+    }
+    const state = workspaceMotion;
+    const mode = tileMotionMode();
+    if (mode === 'off') { tileMotionCancel(state); return; }
+    if (!state.before) {
+        // Read all displayed rects BEFORE cancelling interrupted animations.
+        // Batch reads, then writes; one first/last measurement per action.
+        state.before = new Map();
+        for (const el of tileMotionNodes(root)) {
+            const rect = el.getBoundingClientRect();
+            if (!rect.width || !rect.height) continue;
+            state.before.set(tileMotionKey(el), { el, rect });
+        }
+        for (const animation of state.animations.values()) animation.cancel();
+    }
+    // Removed/hidden roots disappear immediately. No cloned forms, text or
+    // translucent exit pictures can cover the new layout (or join radio groups).
+    if (state.frame) return;
+    state.frame = requestAnimationFrame(() => {
+        state.frame = 0;
+        const before = state.before;
+        state.before = null;
+        if (!root.isConnected || tileMotionMode() === 'off') return;
+        const reduced = tileMotionMode() === 'reduced';
+        const after = new Map();
+        for (const el of tileMotionNodes(root)) {
+            const rect = el.getBoundingClientRect();
+            if (rect.width && rect.height) after.set(tileMotionKey(el), { el, rect });
+        }
+        const reveals = new Set(), moves = [];
+        for (const [key, item] of after) {
+            const old = before.get(key);
+            const tile = item.el.closest('[data-tile-motion]');
+            const parentKey = tile !== item.el ? tileMotionKey(tile) : null;
+            if (!old) {
+                reveals.add(tile);
+                continue;
+            }
+            const a = item.rect, b = old.rect;
+            if (Math.abs(b.width - a.width) > .5 || Math.abs(b.height - a.height) > .5) {
+                reveals.add(tile);
+                continue;
+            }
+            let dx = b.left - a.left, dy = b.top - a.top;
+            // Same-size moves translate only. The tile already moves its pane;
+            // compensate that translation without ever scaling either root.
+            const bp = before.get(parentKey)?.rect, ap = after.get(parentKey)?.rect;
+            if (bp && ap) {
+                dx -= bp.left - ap.left;
+                dy -= bp.top - ap.top;
+            }
+            if (Math.abs(dx) < .5 && Math.abs(dy) < .5) continue;
+            if (reduced) reveals.add(tile);
+            else moves.push({ el: item.el, tile, dx, dy });
+        }
+        // Last reads are complete. Tile contents NEVER scale, including entry,
+        // restore and neighbours growing back. A reveal keeps the background
+        // opaque throughout; it cannot double-expose text from another tile.
+        for (const tile of reveals) tileMotionReveal(state, tile, reduced ? 80 : 100);
+        for (const { el, tile, dx, dy } of moves) if (!reveals.has(tile)) {
+            tileMotionAnimate(state, el, [
+                { transform: `translate(${dx}px,${dy}px)` }, { transform: 'none' },
+            ], 220, tileEaseMove);
+        }
+    });
+}
+"#)]
+extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = tileMotionPrepare)]
+    fn tile_motion_prepare(layout: &str);
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = tileMotionStop)]
+    fn tile_motion_stop();
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(PartialEq, Serialize)]
+struct MotionTile {
+    key: u64,
+    rect: [f64; 4],
+    desktop: bool,
+    phone: bool,
+    panes: Vec<(u64, bool)>,
+    even: bool,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn motion_layout(layout: &Layout) -> Vec<MotionTile> {
+    let rects = layout.rects();
+    layout
+        .tiles
+        .iter()
+        .enumerate()
+        .map(|(i, tile)| {
+            let rect = rects.get(&tile.key).copied().unwrap_or_default();
+            MotionTile {
+                key: tile.key,
+                rect: [rect.left, rect.top, rect.width, rect.height],
+                desktop: !tile.minimized && (!layout.full || layout.focus == i),
+                phone: !tile.minimized && layout.focus == i,
+                panes: tile.columns.iter().enumerate().map(|(i, col)| (col.key, tile.cursor == i)).collect(),
+                even: tile.columns.len() == 2 && layout.bar_column(tile.key) == Some(tile.columns[0].key),
+            }
+        })
+        .collect()
+}
+
 impl Workspace {
+    /// Capture before notifying reactive layout consumers. The rAF callback
+    /// reads their final geometry, without deferring layout, mounting or focus.
+    fn update_layout(&self, change: impl FnOnce(&mut Layout)) {
+        self.layout.update(|layout| {
+            #[cfg(target_arch = "wasm32")]
+            let before = motion_layout(layout);
+            change(layout);
+            #[cfg(target_arch = "wasm32")]
+            {
+                let after = motion_layout(layout);
+                if before != after {
+                    tile_motion_prepare(&serde_json::to_string(&after).unwrap_or_default());
+                }
+            }
+        });
+    }
+
     /// The saved workspace, with the page's URL opened in it.
     pub fn restore() -> Self {
         let here = View::from_location();
@@ -967,15 +1461,16 @@ impl Workspace {
         let layout = match load::<Layout>(LAYOUT_KEY).filter(Layout::valid) {
             None => Layout::new(here.clone()),
             Some(mut l) => {
-                l.place();
-                l.settle_focus();
+                l.restore_single_copies();
                 l
             }
         };
         let ws = Workspace {
             layout: RwSignal::new(layout),
+            navigation: RwSignal::new((0, 0)),
             brief_request: RwSignal::new(request),
             chrome: RwSignal::new(HashMap::new()),
+            view_actions: RwSignal::new(Vec::new()),
             attention: RwSignal::new(load(ATTENTION_KEY).unwrap_or_default()),
             pinned: RwSignal::new(load(PINNED_KEY).unwrap_or_default()),
             dragging: RwSignal::new(None),
@@ -1016,82 +1511,72 @@ impl Workspace {
     /// Opens `view` from pane `from` (tile key, pane key), or from outside
     /// the tiles (the header, a notification).
     ///
-    /// One rule: ⌘/Ctrl-click (`NewTile`) makes a new tile; anything else
+    /// One rule: ⌘/Ctrl-click (`NewTile`) requests a new tile; anything else
     /// stays in its tile. From a pane, it opens in the tile's right pane
     /// (beside a list, or in place of the item there). From outside, it
     /// replaces the focused tile (an item goes beside the list it shows).
-    /// A session already shown somewhere is shown where it is.
+    /// An already-open destination is focused in either pane, even with
+    /// `NewTile`; only session companion panes allow explicit copies.
     pub fn open(&self, from: Option<(u64, u64)>, view: View, how: How) {
-        self.layout.update(|l| {
-            if view == View::Brief && how != How::NewTile && l.focus_brief() {
-                return;
+        self.follow_session(from, &view);
+        let targeted = matches!(&view, View::Docs { target: Some(_), .. } | View::Session { target: Some(_), .. });
+        self.update_layout(|l| l.open(from, view, how));
+        self.visit_target(targeted);
+    }
+
+    fn follow_session(&self, from: Option<(u64, u64)>, view: &View) {
+        // A picker/title/mention opens the current end, even if this retained
+        // transcript was previously reading a search hit or scrolled upward.
+        // Run before changing the route so clearing a consumed target keeps
+        // the existing composer and stream, rather than remounting the pane.
+        if matches!(view, View::Session { target: None, .. }) {
+            let column = self.layout.with_untracked(|l| {
+                let origin = from.and_then(|(t, _)| l.tiles.iter().position(|x| x.key == t)).unwrap_or(l.focus);
+                l.find_view(origin, view).map(|(ti, ci)| l.tiles[ti].columns[ci].key)
+            });
+            if let Some(chrome) = column.and_then(|col| self.chrome.with_untracked(|cs| cs.get(&col).copied())) {
+                chrome.go_latest.run(());
             }
-            let origin = from.and_then(|(t, _)| l.tiles.iter().position(|x| x.key == t)).unwrap_or(l.focus);
-            if let View::Session { id, target } = &view
-                && let Some((ti, ci)) = l.find_session(id)
-            {
-                let t = &mut l.tiles[ti];
-                if target.is_some() {
-                    t.columns[ci].view = view.clone(); // go to the new place in it
-                }
-                t.cursor = ci;
-                t.active = t.columns[ci].key;
-                l.show(ti);
-                return;
-            }
-            if how == How::OwnTile
-                && let Some(ti) = l.tiles.iter().position(|t| t.columns[0].view == view)
-            {
-                l.tiles[ti].settle();
-                l.show(ti);
-                return;
-            }
-            if how == How::Instead {
-                let key = l.key();
-                l.tiles[origin].go(vec![Column { key, view }]);
-                l.focus = origin;
-                l.touch(origin);
-                return;
-            }
-            if how != How::Beside {
-                l.open_tile(view);
-                return;
-            }
-            let key = l.key();
-            let t = &mut l.tiles[origin];
-            let list = t.columns[0].clone();
-            let next = match from {
-                // Inside the tile: the item goes in the right pane.
-                Some(_) => vec![list, Column { key, view }],
-                // From outside: an item beside the list the tile shows, a
-                // section in place of the tile.
-                None if !view.is_section() && list.view.is_section() => vec![list, Column { key, view }],
-                None => vec![Column { key, view }],
-            };
-            if t.columns.iter().map(|c| &c.view).ne(next.iter().map(|c| &c.view)) {
-                t.go(next);
-            }
-            t.settle();
-            l.focus = origin;
-            l.touch(origin);
-        });
+        }
+    }
+
+    fn visit_target(&self, targeted: bool) {
+        if targeted && let Some(col) = self.layout.with_untracked(|l| l.tiles.get(l.focus).map(|t| t.active)) {
+            self.navigation.update(|(visit, pane)| {
+                *visit = visit.wrapping_add(1);
+                *pane = col;
+            });
+        }
+    }
+
+    /// Only this pane's visits notify it. Retain the last counter when a
+    /// different pane navigates, so its editor/scroll position stays put.
+    pub(crate) fn navigation_for(&self, col: u64) -> Memo<u64> {
+        let navigation = self.navigation;
+        Memo::new(move |last: Option<&u64>| {
+            let (visit, pane) = navigation.get();
+            if pane == col { visit } else { last.copied().unwrap_or_default() }
+        })
     }
 
     /// Opens `view` beside pane `col` of tile `tile`, keeping that pane (a
     /// session's Changes beside its transcript).
     pub fn open_after(&self, tile: u64, col: u64, view: View) {
-        self.layout.update(|l| l.open_after(tile, col, view));
+        self.follow_session(Some((tile, col)), &view);
+        let targeted = matches!(&view, View::Docs { target: Some(_), .. } | View::Session { target: Some(_), .. });
+        self.update_layout(|l| l.open_after(tile, col, view));
+        self.visit_target(targeted);
     }
 
     /// Brings a pane forward (its tile shown and focused; on a phone, the
     /// pane shown).
     pub fn reveal(&self, tile: u64, col: u64) {
-        self.layout.update(|l| l.reveal(tile, col));
+        self.update_layout(|l| l.reveal(tile, col));
     }
 
     /// Moves the item a tile shows (its right pane) into a tile of its own.
     pub fn detach(&self, tile: u64) {
-        self.layout.update(|l| {
+        self.update_layout(|l| {
             let Some(ti) = l.tiles.iter().position(|t| t.key == tile) else { return };
             if l.tiles[ti].columns.len() < 2 {
                 return;
@@ -1105,45 +1590,39 @@ impl Workspace {
 
     /// Back (`delta` < 0) or forward in the focused tile's history.
     pub fn step(&self, delta: isize) {
-        self.layout.update(|l| {
-            let t = &mut l.tiles[l.focus];
-            if delta < 0 {
-                if let Some(prev) = t.back.pop() {
-                    let now = std::mem::replace(&mut t.columns, prev);
-                    t.forward.push(now);
-                    t.settle();
-                }
-            } else if let Some(next) = t.forward.pop() {
-                let now = std::mem::replace(&mut t.columns, next);
-                t.back.push(now);
-                t.settle();
-            }
-        });
+        if !self
+            .layout
+            .with_untracked(|l| l.tiles.get(l.focus).is_some_and(|t| if delta < 0 { !t.back.is_empty() } else { !t.forward.is_empty() }))
+        {
+            return;
+        }
+        self.update_layout(|l| l.step(delta));
+        // A history collision can reveal an already-targeted document.
+        // Revisit that block even if its address did not change.
+        let targeted =
+            self.layout.with_untracked(|l| matches!(l.focused_view(), Some(View::Docs { target: Some(_), .. } | View::Session { .. })));
+        self.visit_target(targeted);
     }
 
     /// On a phone, from the item back to the list beside it.
     pub fn show_list(&self, tile: u64) {
-        self.layout.update(|l| {
+        self.update_layout(|l| {
             if let Some(t) = l.tile_mut(tile) {
                 t.cursor = 0;
-                t.active = t.columns[0].key;
+                t.active = t.columns.first().map_or(0, |c| c.key);
             }
         });
     }
 
     /// Changes what a column shows in place (e.g. a search's query).
     pub fn replace(&self, tile: u64, col: u64, view: View) {
-        self.layout.update(|l| {
-            if let Some(c) = l.tile_mut(tile).and_then(|t| t.columns.iter_mut().find(|c| c.key == col)) {
-                c.view = view;
-            }
-        });
+        self.update_layout(|l| l.replace(tile, col, view));
     }
 
     /// Closes a pane: the item (the list stays), or the list (the item
     /// takes the tile); a tile's last pane closes the tile.
     pub fn close_column(&self, tile: u64, col: u64) {
-        self.layout.update(|l| {
+        self.update_layout(|l| {
             let Some(ti) = l.tiles.iter().position(|t| t.key == tile) else { return };
             let t = &mut l.tiles[ti];
             let Some(i) = t.columns.iter().position(|c| c.key == col) else { return };
@@ -1158,7 +1637,7 @@ impl Workspace {
     }
 
     pub fn close_tile(&self, tile: u64) {
-        self.layout.update(|l| {
+        self.update_layout(|l| {
             let Some(ti) = l.tiles.iter().position(|t| t.key == tile) else { return };
             l.remove_tile(ti);
         });
@@ -1166,7 +1645,7 @@ impl Workspace {
 
     /// Minimizes a tile (not the last one shown).
     pub fn minimize(&self, tile: u64) {
-        self.layout.update(|l| {
+        self.update_layout(|l| {
             if let Some(ti) = l.tiles.iter().position(|t| t.key == tile) {
                 l.minimize(ti);
             }
@@ -1175,7 +1654,7 @@ impl Workspace {
 
     /// Brings a tile back, if minimized, and focuses it.
     pub fn show_tile(&self, tile: u64) {
-        self.layout.update(|l| {
+        self.update_layout(|l| {
             if let Some(ti) = l.tiles.iter().position(|t| t.key == tile) {
                 l.show(ti);
             }
@@ -1208,17 +1687,7 @@ impl Workspace {
 
     /// Moves a dragged tile to where it was dropped.
     pub fn move_tile(&self, key: u64, to: Drop) {
-        self.layout.update(|l| l.move_tile(key, to));
-    }
-
-    /// Moves a tile `by` places left (< 0) or right among the tiles shown,
-    /// in reading order (a phone's tab dropped).
-    pub fn step_tile(&self, key: u64, by: isize) {
-        let _ = self.layout.try_update(|l| {
-            for _ in 0..by.unsigned_abs() {
-                l.step_tile(key, by.signum());
-            }
-        });
+        self.update_layout(|l| l.move_tile(key, to));
     }
 
     pub fn new_tile(&self) {
@@ -1228,7 +1697,7 @@ impl Workspace {
     /// Focus mode on (for the tile `key`) or off: in it, the focused tile
     /// fills the workspace (and stays in it as the focus moves to another).
     pub fn set_full(&self, key: Option<u64>) {
-        self.layout.update(|l| {
+        self.update_layout(|l| {
             if let Some(i) = key.and_then(|k| l.tiles.iter().position(|t| t.key == k)) {
                 l.show(i);
             }
@@ -1245,7 +1714,7 @@ impl Workspace {
     pub fn focus_tile(&self, n: usize) {
         let Some(ti) = self.layout.with_untracked(|l| l.reading_order().get(n).copied()) else { return };
         if self.layout.with_untracked(|l| l.focus != ti || l.tiles[ti].minimized) {
-            self.layout.update(|l| l.show(ti));
+            self.update_layout(|l| l.show(ti));
         }
     }
 
@@ -1256,7 +1725,7 @@ impl Workspace {
         if let Some(i) = self.layout.with_untracked(|l| l.tiles.iter().position(|t| t.key == key))
             && self.layout.with_untracked(|l| l.focus != i)
         {
-            self.layout.update(|l| l.focus = i);
+            self.update_layout(|l| l.focus = i);
         }
     }
 
@@ -1265,13 +1734,13 @@ impl Workspace {
     fn grow(&self, key: u64) {
         let latest = self.layout.with_untracked(|l| l.tile(key).is_none_or(|t| t.used == l.next));
         if !latest && let Some(i) = self.layout.with_untracked(|l| l.tiles.iter().position(|t| t.key == key)) {
-            self.layout.update(|l| l.touch(i));
+            self.update_layout(|l| l.touch(i));
         }
     }
 
     pub fn set_active(&self, tile: u64, col: u64) {
         if self.layout.with_untracked(|l| l.tile(tile).is_some_and(|t| t.active != col)) {
-            self.layout.update(|l| {
+            self.update_layout(|l| {
                 if let Some(t) = l.tile_mut(tile) {
                     t.active = col;
                 }
@@ -1308,6 +1777,74 @@ impl Workspace {
     /// flag once they are.
     pub fn watch(&self, live: LiveFeed) {
         let ws = *self;
+        // Header resolution follows the same initial-load budget as panes.
+        // It still resolves omitted/archived rows after the focused paint.
+        let loading = TileLoading {
+            released: RwSignal::new(false),
+            drawn: RwSignal::new(HashSet::new()),
+            one_pane: RwSignal::new(crate::util::phone()),
+        };
+        provide_context(loading);
+        // Open views own their metadata, not their membership in a recent,
+        // non-archived list. This also covers restored layouts, direct links,
+        // minimized tiles and standalone session panes. Keep the last good
+        // row while resolving an omission; never close a view because of it.
+        let open = Memo::new(move |_| {
+            ws.layout.with(|l| {
+                l.tiles.iter().flat_map(|t| &t.columns).filter_map(|c| c.view.session_id().map(str::to_owned)).collect::<HashSet<_>>()
+            })
+        });
+        let fetching = StoredValue::new(HashSet::<String>::new());
+        let retry = RwSignal::new(0u64);
+        Effect::new(move || {
+            retry.track();
+            let ids = open.get();
+            let eligible = ws.layout.with(|l| initial_metadata_ids(l, loading.one_pane.get(), loading.released.get()));
+            let sessions = live.sessions.get();
+            let mut cached = live.resolved_sessions.get_untracked();
+            cached.retain(|id, _| ids.contains(id));
+            for s in sessions.iter().filter(|s| ids.contains(&s.id)) {
+                cached.insert(s.id.clone(), s.clone());
+            }
+            if live.resolved_sessions.with_untracked(|old| *old != cached) {
+                live.resolved_sessions.set(cached);
+            }
+            for id in ids.into_iter().filter(|id| eligible.contains(id) && !sessions.iter().any(|s| s.id == *id)) {
+                // A slow by-id request must get to finish even if newer
+                // live snapshots arrive; never pile up or starve requests.
+                if fetching.try_update_value(|pending| pending.insert(id.clone())) != Some(true) {
+                    continue;
+                }
+                // Capture the owned future while its arena handle is live.
+                // A completed cached value must not suppress a fresh check.
+                let pending = crate::resources::pending_session(&id).map(|data| std::future::IntoFuture::into_future(data.detail));
+                leptos::task::spawn_local(async move {
+                    let result = match pending {
+                        Some(pending) => pending.await,
+                        None => api::session(id.clone()).await,
+                    };
+                    let failed = result.is_err();
+                    fetching.try_update_value(|pending| pending.remove(&id));
+                    if let Ok(detail) = result
+                        && open.try_with_untracked(|ids| ids.contains(&id)) == Some(true)
+                        && live.sessions.try_with_untracked(|ss| !ss.iter().any(|s| s.id == id)) == Some(true)
+                    {
+                        live.remember_session(detail.session);
+                    } else if failed {
+                        // Live snapshots are change-driven. A transient
+                        // read failure must recover without another change.
+                        set_timeout(
+                            move || {
+                                if open.try_with_untracked(|ids| ids.contains(&id)) == Some(true) {
+                                    let _ = retry.try_update(|n| *n = n.wrapping_add(1));
+                                }
+                            },
+                            std::time::Duration::from_secs(2),
+                        );
+                    }
+                });
+            }
+        });
         let previous = StoredValue::new(HashMap::<String, SessionStatus>::new());
         Effect::new(move || {
             let sessions = live.sessions.get();
@@ -1468,6 +2005,8 @@ pub struct ColumnCtx {
     pub visible: Signal<bool>,
     /// The column keyboard shortcuts act on.
     pub active: Signal<bool>,
+    /// The height-aware phone layout: only the tile's single bar is used.
+    one_pane: RwSignal<bool>,
     /// Scroll position, kept while the column is folded away, and whether
     /// it was at the end (then it comes back at the end, however much was
     /// added meanwhile).
@@ -1494,10 +2033,10 @@ impl ColumnCtx {
 
     /// Whether its tile's bar speaks for it: it's the tile's last column,
     /// or one of its own panes is beside it (tracked: a column opened or
-    /// closed beside it changes it).
+    /// closed beside it changes it). Phones always use the single tile bar.
     pub fn in_bar(&self) -> bool {
         let (tile, col) = (self.tile, self.col);
-        self.ws.layout.with(|l| l.bar_column(tile) == Some(col))
+        self.one_pane.get() || self.ws.layout.with(|l| l.bar_column(tile) == Some(col))
     }
 }
 
@@ -1505,9 +2044,37 @@ pub fn use_column() -> Option<ColumnCtx> {
     use_context::<ColumnCtx>()
 }
 
+/// A view lends its actions to the phone bar without moving or serializing
+/// its content. The token keeps replacements from cleaning up a newer view.
+#[component]
+pub(crate) fn ViewActions(children: ChildrenFn) -> impl IntoView {
+    if let Some(col) = use_column() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let token = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let children: ChildrenFn = std::sync::Arc::new(move || {
+            // Render under the popover's disposable row owner, but retain
+            // the source column for navigation from the borrowed controls.
+            provide_context(col);
+            children()
+        });
+        col.ws.view_actions.update(|m| {
+            let entry = (col.col, token, children);
+            if let Some(old) = m.iter_mut().find(|(key, _, _)| *key == col.col) {
+                *old = entry;
+            } else {
+                m.push(entry);
+            }
+        });
+        on_cleanup(move || {
+            col.ws.view_actions.update(|m| m.retain(|(key, t, _)| *key != col.col || *t != token));
+        });
+    }
+}
+
 /// Opens a view: from inside a column, beside it (or with `own`, in a tile
 /// of its own); from elsewhere (the header's menus), in a tile of its own. ⌘/Ctrl-click opens
-/// a new tile; middle-click and "copy link" use the plain URL.
+/// a new tile for a destination not already open (only companions allow copies);
+/// middle-click and "copy link" use the plain URL.
 #[component]
 pub fn Go(
     to: View,
@@ -1611,8 +2178,10 @@ pub fn ScrollBox(
                 request_animation_frame(move || {
                     if let Some(el) = node.try_get_untracked().flatten() {
                         if follow.map_or(end, |f| f.try_get_untracked() == Some(true)) {
+                            stop_glide_to_end(&el);
                             el.set_scroll_top(el.scroll_height());
                         } else if top > 0 {
+                            stop_glide_to_end(&el);
                             el.set_scroll_top(top);
                         }
                     }
@@ -1625,32 +2194,72 @@ pub fn ScrollBox(
     let intent = StoredValue::new(None::<ScrollIntent>);
     let touch = StoredValue::new(None::<(i32, i32)>);
     if let Some(follow) = follow {
+        let pressed = StoredValue::new(false);
+        let pending = StoredValue::new(false);
+        let available = StoredValue::new(true);
         Effect::new(move || {
-            if follow.get() || intent.get_value() == Some(ScrollIntent::Toward) {
+            let following = follow.get();
+            if !following {
+                // A later false -> true must not revive an old press's work.
+                pending.set_value(false);
+                if let Some(el) = node.get_untracked() {
+                    stop_glide_to_end(&el);
+                }
+            }
+            if following || intent.get_value() == Some(ScrollIntent::Toward) {
                 // Opening / Latest explicitly follows; an anchor jump explicitly
                 // stops. Neither should inherit a pending user return to the end.
                 intent.set_value(None);
             }
         });
-        type ResizeWatch = (web_sys::ResizeObserver, wasm_bindgen::closure::Closure<dyn Fn(js_sys::Array)>);
-        let observer = StoredValue::new_local(None::<ResizeWatch>);
+        #[wasm_bindgen::prelude::wasm_bindgen]
+        extern "C" {
+            #[wasm_bindgen(js_name = c6FollowPress)]
+            fn watch_press(element: &web_sys::Element, change: &js_sys::Function) -> js_sys::Function;
+        }
+        type FollowWatch = (
+            web_sys::ResizeObserver,
+            wasm_bindgen::closure::Closure<dyn Fn(js_sys::Array)>,
+            js_sys::Function,
+            wasm_bindgen::closure::Closure<dyn Fn(bool, bool, bool)>,
+        );
+        let observer = StoredValue::new_local(None::<FollowWatch>);
+        let stop = move || {
+            pending.try_set_value(false);
+            pressed.try_set_value(false);
+            observer.try_update_value(|o| {
+                if let Some(watch) = o.take() {
+                    watch.0.disconnect();
+                    let _ = watch.2.call0(&wasm_bindgen::JsValue::NULL);
+                }
+            });
+        };
         Effect::new(move || {
             let Some(el) = node.get() else { return };
             // One at a time: a box drawn anew isn't watched twice.
-            observer.update_value(|o| {
-                if let Some((ro, _)) = o.take() {
-                    ro.disconnect();
-                }
-            });
-            let to_end = wasm_bindgen::closure::Closure::<dyn Fn(js_sys::Array)>::new(move |_: js_sys::Array| {
-                // A last resize may come after the box has gone.
+            stop();
+            let observed = el.clone();
+            let correct = move || {
+                // Before paint, including shrink/clamp: commit the real end
+                // and compensate its picture with a compositor translation.
+                // Press-held corrections are coalesced until after native click
+                // dispatch. Recheck permission here, not when they were queued.
+                // No scroll writes or measurements run during the animation.
                 if let Some(el) = node.try_get_untracked().flatten()
+                    && el.is_same_node(Some(&observed))
+                    && el.is_connected()
+                    && available.try_get_value() == Some(true)
                     && follow.try_get_untracked() == Some(true)
-                    && el.client_height() > 0
                 {
-                    glide_to_end(&el);
+                    if pressed.try_get_value() == Some(true) {
+                        pending.try_set_value(true);
+                    } else if el.client_height() > 0 {
+                        glide_to_end(&el);
+                    }
                 }
-            });
+            };
+            let resize = correct.clone();
+            let to_end = wasm_bindgen::closure::Closure::<dyn Fn(js_sys::Array)>::new(move |_: js_sys::Array| resize());
             if let Ok(obs) = web_sys::ResizeObserver::new(to_end.as_ref().unchecked_ref()) {
                 obs.observe(&el);
                 // The content: it grows as events arrive and render.
@@ -1660,16 +2269,32 @@ pub fn ScrollBox(
                         obs.observe(&child);
                     }
                 }
-                observer.set_value(Some((obs, to_end)));
+                // JS reports logical contact state, lifecycle availability,
+                // and whether this completion may flush deferred work.
+                let press = wasm_bindgen::closure::Closure::<dyn Fn(bool, bool, bool)>::new(move |held, ready, flush| {
+                    if pressed.try_update_value(|p| *p = held).is_none() {
+                        return;
+                    }
+                    let was_ready = available.try_update_value(|a| std::mem::replace(a, ready));
+                    if !ready {
+                        pending.try_set_value(false);
+                    } else if held {
+                        // Resume a paused glide even without another resize.
+                        pending.try_set_value(follow.try_get_untracked() == Some(true));
+                    } else {
+                        let queued = pending.try_update_value(std::mem::take) == Some(true);
+                        // Visible resume is a fresh request after discarding
+                        // hidden work; ordinary release consumes at most one bit.
+                        if was_ready == Some(false) || (flush && queued) {
+                            correct();
+                        }
+                    }
+                });
+                let dispose = watch_press(&el, press.as_ref().unchecked_ref());
+                observer.set_value(Some((obs, to_end, dispose, press)));
             }
         });
-        on_cleanup(move || {
-            observer.update_value(|o| {
-                if let Some((ro, _)) = o.take() {
-                    ro.disconnect();
-                }
-            });
-        });
+        on_cleanup(stop);
     }
     let yours = move |direction: ScrollIntent| {
         let (Some(f), Some(el)) = (follow, node.get_untracked()) else { return };
@@ -1767,19 +2392,34 @@ pub fn ScrollBox(
     }
 }
 
-/// Follows the end of a scroll box: a short glide down to what just arrived
-/// (rather than a jump for each line), straight there when it is more than
-/// a screen away (as when it opens) or motion is reduced.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = c6GlideToEnd)]
+    fn glide_to_end_js(el: &web_sys::Element);
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = c6StopGlide)]
+    fn stop_glide_to_end_js(el: &web_sys::Element);
+}
+
+/// Commits the end once and glides its inverse translation on the compositor.
+/// Growth and shrink add bounded 200ms corrections without restarting earlier
+/// motion. Pending corrections in one frame combine into one effect.
+/// Reduced/Off and jumps larger than a screen are immediate. User input
+/// cancels to the displayed reading position before native scrolling proceeds.
 pub fn glide_to_end(el: &web_sys::Element) {
-    let gap = el.scroll_height() - el.scroll_top() - el.client_height();
-    if gap <= 0 {
-        return;
-    }
-    let reduced = window().match_media("(prefers-reduced-motion: reduce)").ok().flatten().is_some_and(|m| m.matches());
-    let opts = web_sys::ScrollToOptions::new();
-    opts.set_top(el.scroll_height() as f64);
-    opts.set_behavior(if reduced || gap > el.client_height() { web_sys::ScrollBehavior::Instant } else { web_sys::ScrollBehavior::Smooth });
-    el.scroll_to_with_scroll_to_options(&opts);
+    #[cfg(target_arch = "wasm32")]
+    glide_to_end_js(el);
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = el;
+}
+
+/// Cancel a glide before a programmatic snap or anchor jump. Does not read
+/// geometry or move the box; the caller can set its intended position now.
+pub fn stop_glide_to_end(el: &web_sys::Element) {
+    #[cfg(target_arch = "wasm32")]
+    stop_glide_to_end_js(el);
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = el;
 }
 
 /// Whether a scrolling area is at its end (allowing a few pixels of rounding).
@@ -1825,8 +2465,32 @@ pub fn arrange(tiles: &[(usize, u64)]) -> Vec<Rect> {
 #[component]
 pub fn Tiles() -> impl IntoView {
     let ws = use_workspace();
+    let loading = expect_context::<TileLoading>();
+    let facets = crate::aspects::use_facets();
+    let resize = window_event_listener(leptos::ev::resize, move |_| {
+        loading.one_pane.set(crate::util::phone());
+    });
+    on_cleanup(move || resize.remove());
+    let drawn_focus = Memo::new(move |_| {
+        if loading.released.get() {
+            return None;
+        }
+        ws.layout.with(|l| loading.drawn.with(|drawn| focused_drawn(l, loading.one_pane.get(), drawn)))
+    });
+    Effect::new(move || {
+        let Some(cols) = drawn_focus.get() else { return };
+        // One frame lets the focused DOM and scroll restoration settle;
+        // the next yields a paint before other tiles start their requests.
+        request_animation_frame(move || {
+            request_animation_frame(move || {
+                if drawn_focus.try_get_untracked() == Some(Some(cols)) {
+                    loading.released.try_set(true);
+                }
+            });
+        });
+    });
     let keys = window_event_listener(leptos::ev::keydown, move |ev| {
-        if !(ev.meta_key() || ev.ctrl_key()) || ev.alt_key() {
+        if !crate::util::app_shortcut(&ev) {
             return;
         }
         match ev.key().as_str() {
@@ -1846,6 +2510,8 @@ pub fn Tiles() -> impl IntoView {
         }
     });
     on_cleanup(move || keys.remove());
+    #[cfg(target_arch = "wasm32")]
+    on_cleanup(tile_motion_stop);
     let keys = Memo::new(move |_| ws.layout.with(|l| l.tiles.iter().map(|t| t.key).collect::<Vec<_>>()));
     // In focus mode the focused tile takes the whole workspace (the others
     // keep their places, hidden).
@@ -1855,28 +2521,80 @@ pub fn Tiles() -> impl IntoView {
     // the screen.
     view! {
         <div class="flex min-h-0 min-w-0 flex-1 bg-zinc-100 dark:bg-black md:p-1">
-            <div class="relative flex min-h-0 min-w-0 flex-1">
+            <div data-workspace-motion class="relative flex min-h-0 min-w-0 flex-1">
                 <For each=move || keys.get() key=|k| *k let:key>
                     <TileView key rect=Signal::derive(move || rects.with(|r| r.get(&key).copied().unwrap_or_default())) />
                 </For>
+                <Show when=move || crate::aspects::tile_bars_shown(facets.tile_bars.get(), loading.one_pane.get())>
+                    <crate::aspects::TileMarks keys />
+                </Show>
             </div>
         </div>
     }
 }
 
-/// A session's own turn, as its tile's bar shows it: (its dot, its word).
-/// What runs in its background (subagents, side chats, tasks) doesn't
-/// count: the bar says that apart.
-fn status_dot(s: &Session) -> (&'static str, &'static str) {
-    if s.awaiting_approval {
-        return ("bg-amber-500", "needs you");
+/// Only initial loading is staged. Once mounted, a pane keeps its DOM,
+/// subscriptions, drafts and scroll state even while hidden.
+#[derive(Clone, Copy)]
+struct TileLoading {
+    released: RwSignal<bool>,
+    drawn: RwSignal<HashSet<u64>>,
+    one_pane: RwSignal<bool>,
+}
+
+fn initial_mount(mounted: bool, shown: bool, focused: bool, released: bool) -> bool {
+    mounted || (shown && (focused || released))
+}
+
+fn initial_metadata_ids(layout: &Layout, one_pane: bool, released: bool) -> HashSet<String> {
+    layout
+        .tiles
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| released || *i == layout.focus)
+        .flat_map(|(_, tile)| {
+            tile.columns
+                .iter()
+                .filter(move |col| released || layout.pane_shown(tile.key, col.key, one_pane))
+                .filter_map(|col| col.view.session_id().map(str::to_owned))
+        })
+        .collect()
+}
+
+fn focused_drawn(layout: &Layout, one_pane: bool, drawn: &HashSet<u64>) -> Option<Vec<u64>> {
+    let tile = layout.tiles.get(layout.focus)?;
+    // A history-only tile has no page to wait for. Its restored focus must
+    // still release the other tiles and their deferred session metadata.
+    if tile.columns.is_empty() {
+        return Some(Vec::new());
     }
-    match s.status {
-        SessionStatus::Running => ("animate-pulse bg-blue-500", "running"),
-        SessionStatus::Idle => ("bg-zinc-400 dark:bg-zinc-500", "idle"),
-        SessionStatus::Starting => ("bg-amber-400", "starting"),
-        SessionStatus::Failed => ("bg-red-500", "failed"),
-    }
+    let cols: Vec<_> = tile.columns.iter().filter(|c| layout.pane_shown(tile.key, c.key, one_pane)).map(|c| c.key).collect();
+    (!cols.is_empty() && cols.iter().all(|c| drawn.contains(c))).then_some(cols)
+}
+
+/// A session supplies readiness after its detail and initial log replay (or
+/// a disconnect notice), not its empty, still-loading shell.
+#[derive(Clone, Copy)]
+pub(crate) struct InitialDraw(pub RwSignal<bool>);
+
+#[component]
+fn InitialView(view: View, col: u64) -> impl IntoView {
+    let loading = expect_context::<TileLoading>();
+    let ready = RwSignal::new(!matches!(view, View::Session { .. }));
+    provide_context(InitialDraw(ready));
+    Effect::new(move || {
+        if ready.get() && !loading.released.get_untracked() {
+            loading.drawn.update(|drawn| {
+                drawn.insert(col);
+            });
+        }
+    });
+    on_cleanup(move || {
+        loading.drawn.try_update(|drawn| {
+            drawn.remove(&col);
+        });
+    });
+    render_view(view)
 }
 
 /// Where a popover opens: below the element clicked, kept on screen.
@@ -1899,7 +2617,7 @@ pub fn below_element(el: Option<&web_sys::Element>, width: f64) -> (f64, f64) {
 /// closes it, and so does Esc wherever focus is (focus going back to what
 /// opened it).
 #[component]
-pub fn Popover(at: RwSignal<Option<(f64, f64)>>, #[prop(into)] class: String, children: ChildrenFn) -> impl IntoView {
+pub fn Popover(at: RwSignal<Option<(f64, f64)>>, #[prop(into)] class: String, children: ChildrenFn) -> AnyView {
     let class = StoredValue::new(class);
     let children = StoredValue::new(children);
     let pop = StoredValue::new(crate::util::escapable(
@@ -1908,24 +2626,62 @@ pub fn Popover(at: RwSignal<Option<(f64, f64)>>, #[prop(into)] class: String, ch
             at.try_set(None);
         },
     ));
-    move || {
+    (move || {
         at.get().map(|(x, y)| {
             view! {
+                <leptos::portal::Portal>
                 <div class="fixed inset-0 z-40" on:click=move |ev| { ev.stop_propagation(); at.set(None) }></div>
                 <div data-pop=pop.get_value()
-                    class=format!("fixed z-50 max-h-[75vh] overflow-y-auto rounded-lg border border-zinc-200 bg-white p-2 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900 {}", class.get_value())
-                    style=format!("left:{x}px;top:{y}px")
+                    class=format!("c6-pop phone-popover fixed z-50 max-h-[75vh] overflow-y-auto rounded-lg border border-zinc-200 bg-white p-2 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900 {}", class.get_value())
+                    style=format!("left:{x}px;top:{y}px;--c6-pop-y:{y}px;transform-origin:top left")
                 >
                     {children.with_value(|c| c())}
                 </div>
+                </leptos::portal::Portal>
             }
         })
+    })
+    .into_any()
+}
+
+/// A composer menu opens upward within its tile and visible viewport. Its
+/// caller owns dismissal, so model, task and Send menus keep their semantics.
+#[component]
+pub(crate) fn ComposerPopover(
+    anchor: NodeRef<Div>,
+    pop: String,
+    #[prop(into)] class: String,
+    #[prop(optional)] menu: bool,
+    children: ChildrenFn,
+) -> impl IntoView {
+    #[wasm_bindgen::prelude::wasm_bindgen]
+    extern "C" {
+        #[wasm_bindgen(js_name = c6ComposerPopover)]
+        fn follow(element: &web_sys::Element, anchor: &web_sys::Element) -> js_sys::Function;
+    }
+    let node = NodeRef::<Div>::new();
+    Effect::new(move || {
+        if let (Some(node), Some(anchor)) = (node.get(), anchor.get()) {
+            let dispose = send_wrapper::SendWrapper::new(follow(&node, &anchor));
+            on_cleanup(move || {
+                let _ = dispose.call0(&wasm_bindgen::JsValue::NULL);
+            });
+        }
+    });
+    view! {
+        <leptos::portal::Portal>
+            <div node_ref=node data-pop=pop.clone() role=menu.then_some("menu") on:keydown=move |ev| { if menu { crate::util::menu_keys(ev); } }
+                class=format!("c6-pop fixed z-50 overflow-y-auto rounded-lg border border-zinc-200 bg-white text-zinc-700 shadow-xl dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 {class}")
+                style="visibility:hidden">{children()}</div>
+        </leptos::portal::Portal>
     }
 }
 
 #[component]
-fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
+fn TileView(key: u64, rect: Signal<Rect>) -> AnyView {
     let ws = use_workspace();
+    let phone = expect_context::<TileLoading>().one_pane;
+    let bar_colour = expect_context::<crate::settings::SessionBarDisplay>().colour;
     let live = api::live();
     let focused = Memo::new(move |_| ws.layout.with(|l| l.tiles.get(l.focus).map(|t| t.key) == Some(key)));
     // Focus mode: this tile alone, or hidden behind the one that is.
@@ -1934,47 +2690,93 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
     let minimized = Memo::new(move |_| ws.layout.with(|l| l.tile(key).is_some_and(|t| t.minimized)));
     let tile = Memo::new(move |_| ws.layout.with(|l| l.tile(key).cloned()));
     let cols = Memo::new(move |_| tile.get().map(|t| t.columns.iter().map(|c| c.key).collect::<Vec<_>>()).unwrap_or_default());
+    let current = Memo::new(move |_| tile.get().and_then(|t| t.columns.get(t.cursor).cloned()));
     // The tile's name: what it was opened on, and the item open in it.
     let title = Signal::derive(move || {
-        tile.get().map(|t| t.columns.iter().map(|c| c.view.label(&live)).collect::<Vec<_>>().join("  ›  ")).unwrap_or_default()
+        tile.get()
+            .map(|t| {
+                if phone.get() {
+                    return t.columns.get(t.cursor).map(|c| c.view.label(&live)).unwrap_or_else(|| "History".into());
+                }
+                if t.columns.is_empty() {
+                    "History".to_owned()
+                } else {
+                    t.columns.iter().map(|c| c.view.label(&live)).collect::<Vec<_>>().join("  ›  ")
+                }
+            })
+            .unwrap_or_default()
     });
     let can_back = move || tile.get().is_some_and(|t| !t.back.is_empty());
     let can_forward = move || tile.get().is_some_and(|t| !t.forward.is_empty());
     let two = move || tile.get().is_some_and(|t| t.columns.len() == 2);
+    let panes_at = RwSignal::new(None::<(f64, f64)>);
     // The session the tile shows on its own (beside a list, its pane pins it).
-    let pinnable = move || match tile.get().map(|t| t.columns) {
-        Some(c) if c.len() == 1 => match &c[0].view {
-            View::Session { id, .. } => Some(id.clone()),
-            _ => None,
-        },
-        _ => None,
+    let pinnable = move || {
+        if phone.get() {
+            current.get().and_then(|c| match c.view {
+                View::Session { id, .. } => Some(id),
+                _ => None,
+            })
+        } else {
+            match tile.get().map(|t| t.columns) {
+                Some(c) if c.len() == 1 => match &c[0].view {
+                    View::Session { id, .. } => Some(id.clone()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
     };
     // The session it shows (alone, as the item beside a list, or with one
     // of its panes beside it): its pane, and how it is now. The bar wears
     // its colour and says its state.
     let shown = Memo::new(move |_| {
         ws.layout.with(|l| {
-            let col = l.bar_column(key)?;
+            let col = if phone.get() {
+                // A companion still belongs to its session: keep the ring
+                // while the title and Actions speak for the shown pane.
+                l.phone_session_column(key)?
+            } else {
+                l.bar_column(key)?
+            };
             l.tile(key)?.columns.iter().find(|c| c.key == col).and_then(|c| match &c.view {
                 View::Session { id, .. } => Some((col, id.clone())),
                 _ => None,
             })
         })
     });
-    let session = Memo::new(move |_| shown.get().and_then(|(_, id)| live.sessions.with(|ss| ss.iter().find(|s| s.id == id).cloned())));
+    let session = Memo::new(move |_| shown.get().and_then(|(_, id)| live.session(&id)));
     let colour = Memo::new(move |_| session.get().map(|s| crate::marks::of(&s)));
     let palette_at = RwSignal::new(None::<(f64, f64)>);
     let menu_at = RwSignal::new(None::<(f64, f64)>);
+    // Navigation can dispose a borrowed action before its bubbling click
+    // reaches our wrapper. Close from the persistent bar owner as well.
+    Effect::new(move || {
+        if phone.get() {
+            current.track();
+            menu_at.set(None);
+            panes_at.set(None);
+        }
+    });
     let rename_at = RwSignal::new(None::<(f64, f64)>);
-    let renamable = move || session.get().is_some_and(|s| s.parent_id.is_none() && !s.observed);
+    let session_actions = move || !phone.get() || current.get().is_some_and(|c| matches!(c.view, View::Session { .. }));
+    let renamable = move || session_actions() && session.get().is_some_and(|s| s.parent_id.is_none() && !s.observed);
     let chrome = move || shown.get().and_then(|(col, _)| ws.chrome.with(|m| m.get(&col).copied()));
+    let menu_chrome = move || session_actions().then(chrome).flatten();
+    let view_actions = move || {
+        if !phone.get() {
+            return None;
+        }
+        let col = current.get()?.key;
+        ws.view_actions.with(|m| m.iter().find(|(key, _, _)| *key == col).map(|(_, token, actions)| (*token, actions.clone())))
+    };
     // The rename box opens under the name (from ⋯ as from a double-click).
     let title_el = NodeRef::<leptos::html::Span>::new();
     let rename_under_title = move || {
         let el: Option<web_sys::Element> = title_el.get_untracked().map(Into::into);
         rename_at.set(Some(below_element(el.as_ref(), 320.0)));
     };
-    let btn = crate::icons::BAR_BUTTON;
+    let btn = crate::session::SESSION_SLOT;
     // Another tile dragged over this one: where it would go, by where the
     // pointer is (the outer fifths make a new column beside this one's).
     // Include the padding between tiles: it belongs to this drop target too.
@@ -1999,8 +2801,9 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
     };
     view! {
         <div
+            data-tile-motion=key
             class=move || format!(
-                "min-h-0 min-w-0 flex-1 md:absolute md:left-(--l) md:top-(--t) md:h-(--h) md:w-(--w) md:p-1 md:transition-[left,top,width,height,opacity] md:duration-150 {} {}",
+                "min-h-0 min-w-0 flex-1 md:absolute md:left-(--l) md:top-(--t) md:h-(--h) md:w-(--w) md:p-1 {} {}",
                 if focused.get() && !minimized.get() { "flex" } else { "hidden" },
                 if minimized.get() || (full.get() && !focused.get()) { "md:hidden" } else { "md:flex" },
             )
@@ -2032,8 +2835,9 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
             }
         >
         <section
+            data-tile-surface=""
             class=move || format!(
-                "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-white dark:bg-zinc-950 md:rounded-lg md:border md:shadow-sm {}",
+                "@container/tile relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-white data-[aspect-dim=true]:opacity-30 dark:bg-zinc-950 md:rounded-lg md:border md:shadow-sm {}",
                 if focused.get() && many.get() { "md:border-blue-400 md:ring-1 md:ring-blue-400/40 dark:md:border-blue-500" } else { "md:border-zinc-200 dark:md:border-zinc-800" },
             )
             on:pointerdown=move |_| ws.focus_tile_key(key)
@@ -2047,9 +2851,10 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
             // and what you can do to the whole tile.
             // Dragged by its bar to another place or column. Always the
             // panel's own colours, so it reads whatever the mark; the mark
-            // is a stripe along its top. Taller on a touch screen, for its
-            // buttons' 40px.
-            <div class="@container relative flex h-9 shrink-0 cursor-grab items-center gap-0.5 pointer-coarse:h-11 pointer-coarse:gap-0 border-b border-zinc-200 bg-zinc-50 px-2 text-xs active:cursor-grabbing dark:border-zinc-800 dark:bg-zinc-900"
+            // is an optional stripe along its top. Mouse slots relax from
+            // 28 to 32 to 36px with tile width; below 30rem secondary
+            // controls move into ⋯, after optional marks yield below 40rem.
+            <div data-tile-bar=key class="relative flex h-11 shrink-0 cursor-grab items-center border-b border-zinc-200 bg-zinc-50 text-xs active:cursor-grabbing md:@container md:px-1 dark:border-zinc-800 dark:bg-zinc-900"
                 draggable=move || if many.get() { "true" } else { "false" }
                 title="Drag to move this tile: onto another tile's top or bottom half, or its left or right edge for a new column"
                 on:dragstart=move |ev: web_sys::DragEvent| {
@@ -2065,71 +2870,56 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                     ws.drop_at.set(None);
                 }
             >
-                {move || colour.get().map(|c| view! { <div class="pointer-events-none absolute inset-x-0 top-0 h-1" style=crate::marks::fill(&c)></div> })}
-                <button class=btn title="Back (⌘[)" aria-label="Back" prop:disabled=move || !can_back() on:click=move |_| { ws.focus_tile_key(key); ws.step(-1) }>{crate::icons::chevron_left()}</button>
-                <button class=btn title="Forward (⌘])" aria-label="Forward" prop:disabled=move || !can_forward() on:click=move |_| { ws.focus_tile_key(key); ws.step(1) }>{crate::icons::chevron_right()}</button>
-                {move || colour.get().map(|c| view! {
-                    <button class=format!("{btn} hover:[&>*]:scale-125") title="This session's mark: change it" aria-label="Its mark" on:click=move |ev| palette_at.set(Some(below(&ev, 380.0)))>
-                        <crate::marks::Glyph mark=Signal::stored(c) shape=crate::marks::Shape::Circle size=12 />
+                <span class="md:hidden"><crate::MobileMenu /></span>
+                <Show when=move || phone.get() && tile.get().is_some_and(|t| t.cursor > 0)>
+                    <button class=btn aria-label="Back to the previous pane" title=move || tile.get().and_then(|t| t.columns.first().map(|c| format!("Back to {}", c.view.label(&live))))
+                        on:click=move |_| ws.show_list(key)>{crate::icons::chevron_left()}</button>
+                </Show>
+                {move || colour.get().filter(|_| bar_colour.get() != c6_api::SessionBarColour::DotOnly).map(|c| view! { <div class="pointer-events-none absolute inset-x-0 top-0 hidden h-1 md:block" style=crate::marks::fill(&c)></div> })}
+                <Show when=move || colour.get().is_some()>
+                    <button class="hidden h-11 w-5 shrink-0 items-center justify-center md:flex" title="This session's mark: change it" aria-label="Its mark" on:click=move |ev| palette_at.set(Some(below(&ev, 380.0)))>
+                        <crate::marks::Glyph mark=Signal::derive(move || colour.get().unwrap_or_default()) shape=crate::marks::Shape::Circle size=10 />
                     </button>
-                })}
+                </Show>
                 // A session of your own is renamed by double-clicking its name
                 // (or from ⋯).
-                <span node_ref=title_el class="min-w-0 flex-1 truncate px-1 font-medium text-zinc-800 dark:text-zinc-100"
-                    title=move || if renamable() { format!("{} · Double-click to rename", title.get()) } else { title.get() }
-                    on:dblclick=move |ev| if renamable() { ev.stop_propagation(); rename_under_title() }>{title}</span>
-                {move || session.get().map(|s| {
-                    let (dot, label) = status_dot(&s);
-                    // A click goes to what waits on you, else what runs in
-                    // the background, else the glance. On a phone, the dot
-                    // alone (the word for screen readers).
-                    view! {
-                        <button class="flex h-7 shrink-0 items-center gap-1 rounded px-1 text-[11px] text-soft outline-none focus-visible:ring-2 focus-visible:ring-sky-500/60 pointer-coarse:h-10 pointer-coarse:min-w-10 pointer-coarse:justify-center pointer-fine:hover:bg-black/10 dark:pointer-fine:hover:bg-white/10"
-                            title=move || match chrome() {
-                                Some(c) => format!("{label} · {}", c.status_title()),
-                                None => label.to_owned(),
-                            }
-                            on:click=move |ev| if let Some(c) = chrome() { c.status_click(&ev) }>
-                            <span class=format!("size-1.5 rounded-full {dot}")></span>
-                            <span class="max-sm:sr-only">{label}</span>
-                        </button>
-                    }
-                })}
-                // What runs in it, its panes, then its actions.
-                {move || chrome().map(|c| view! {
-                    <crate::session::SessionControls chrome=c />
-                    <span class="mx-1 h-4 w-px shrink-0 bg-zinc-200 dark:bg-zinc-700"></span>
-                    <button class=btn title="Actions: rename, find, files, outputs, details, new like this, save as template, catch-up, fold finished turns, archive" aria-label="Actions"
-                        on:click=move |ev| menu_at.set(if menu_at.get_untracked().is_some() { None } else { Some(below(&ev, 240.0)) })>{crate::icons::ellipsis()}</button>
-                })}
-                {move || pinnable().map(|id| {
-                    let (a, b) = (StoredValue::new(id.clone()), id.clone());
-                    let on = move || ws.pinned.with(|p| p.contains(&a.get_value()));
-                    view! {
-                        <button class=btn title=move || if on() { "Unpin" } else { "Pin to the dock" } aria-label=move || if on() { "Unpin" } else { "Pin" }
-                            on:click=move |_| ws.toggle_pin(&b)>
-                            {move || crate::icons::star(on())}
-                        </button>
-                    }
-                })}
-                {move || two().then(|| view! {
-                    <button class=format!("{btn} hidden md:flex") title="Move the open item to a tile of its own (or ⌘-click a link)" aria-label="Into a tile of its own"
-                        on:click=move |_| ws.detach(key)>{crate::icons::square_arrow_out()}</button>
-                })}
-                {move || many.get().then(|| view! {
-                    <button class=format!("{btn} hidden md:flex") title="Minimize: hide this tile; bring it back from the sidebar (or ⌘ and its number)"
-                        aria-label="Minimize" on:click=move |ev| { ev.stop_propagation(); ws.minimize(key) }>
-                        {crate::icons::minus()}
+                <div class="flex min-w-0 flex-1 items-center overflow-hidden">
+                    <button class="flex h-11 min-w-0 flex-1 items-center text-left font-medium text-zinc-800 outline-none focus-visible:ring-2 focus-visible:ring-sky-500/60 md:hidden dark:text-zinc-100"
+                        aria-label="Switch panes" title=title disabled=move || !two()
+                        on:click=move |ev| panes_at.set(Some(below(&ev, 280.0)))>
+                        <span data-phone-title class="truncate">{title}</span>
+                        <Show when=two>{crate::icons::chevron_down()}</Show>
                     </button>
-                })}
-                <button class=format!("{btn} hidden md:flex") title=move || if full.get() { "Defocus: back to the tiles" } else { "Focus: this tile fills the screen" }
+                    <span node_ref=title_el class="hidden min-w-0 truncate font-medium text-zinc-800 @min-[14rem]/tile:px-1 md:block dark:text-zinc-100"
+                        title=move || if renamable() { format!("{} · Double-click to rename", title.get()) } else { title.get() }
+                        on:dblclick=move |ev| if renamable() { ev.stop_propagation(); rename_under_title() }>{title}</span>
+                    <span data-tile-aspects=key class="hidden shrink-0 items-center md:@min-[40rem]/tile:flex"></span>
+                </div>
+                // Chrome borrows its transcript's arena. A new registration
+                // needs fresh controls, not attribute rebuilds on the old one.
+                <For each=chrome key=|c| c.token let:c>
+                    <crate::session::SessionControls chrome=c />
+                </For>
+                <Show when=move || shown.get().is_some()>
+                    <button class=format!("{btn} hidden md:@min-[30rem]/tile:flex")
+                        disabled=move || pinnable().is_none()
+                        title=move || if pinnable().is_some_and(|id| ws.pinned.with(|p| p.contains(&id))) { "Unpin" } else { "Pin to the dock" }
+                        aria-label=move || if pinnable().is_some_and(|id| ws.pinned.with(|p| p.contains(&id))) { "Unpin" } else { "Pin" }
+                        on:click=move |_| if let Some(id) = pinnable() { ws.toggle_pin(&id) }>
+                        {move || crate::icons::star(pinnable().is_some_and(|id| ws.pinned.with(|p| p.contains(&id))))}
+                    </button>
+                </Show>
+                <button class=btn title="Actions: session actions, history and tile controls" aria-label="Actions"
+                    on:click=move |ev| menu_at.set(if menu_at.get_untracked().is_some() { None } else { Some(below(&ev, 240.0)) })>{crate::icons::ellipsis()}</button>
+                <button class=format!("{btn} hidden md:@min-[14rem]/tile:flex") title=move || if full.get() { "Defocus: back to the tiles" } else { "Focus: this tile fills the screen" }
                     aria-label=move || if full.get() { "Defocus" } else { "Focus" }
                     on:click=move |ev| { ev.stop_propagation(); ws.set_full(if full.get_untracked() { None } else { Some(key) }) }>
-                    // Corners pointing out (focus) or in (back to the tiles).
-                    {move || if full.get() { crate::icons::minimize().into_any() } else { crate::icons::maximize().into_any() }}
+                    {move || if full.get() { crate::icons::minimize() } else { crate::icons::maximize() }}
                 </button>
-                <button class=btn title="Close this tile" aria-label="Close this tile" on:click=move |_| ws.close_tile(key)>{crate::icons::x()}</button>
+                <button class=format!("{btn} hidden md:@min-[14rem]/tile:flex") title="Close this tile" aria-label="Close this tile" on:click=move |_| ws.close_tile(key)>{crate::icons::x()}</button>
+                <crate::activity::SessionsPicker />
             </div>
+            {move || shown.get().map(|(_, id)| view! { <crate::session::ArchivedSession id /> })}
             <Popover at=palette_at class="w-auto">
                 {move || shown.get().map(|(_, id)| view! { <crate::marks::SessionPalette session=id on_pick=move |()| palette_at.set(None) /> })}
             </Popover>
@@ -2141,11 +2931,54 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
                 })}
             </Popover>
             <Popover at=menu_at class="w-60">
-                {move || chrome().map(|c| view! {
+                <For each=menu_chrome key=|c| c.token let:c>
                     <crate::session::SessionMenu chrome=c on_rename=move |()| rename_under_title() on_done=move |()| menu_at.set(None) />
-                })}
+                </For>
+                <For each=view_actions key=|(token, _)| *token let:actions>
+                    <div on:click=move |_| menu_at.set(None)>{(actions.1)()}</div>
+                </For>
+                <div class="flex flex-col md:@min-[30rem]/tile:hidden">
+                    <Show when=move || session_actions() && shown.get().is_some()>
+                        <button class=crate::session::MENU_ITEM disabled=move || pinnable().is_none() on:click=move |_| { if let Some(id) = pinnable() { ws.toggle_pin(&id); } menu_at.set(None); }>
+                            {move || crate::icons::star(pinnable().is_some_and(|id| ws.pinned.with(|p| p.contains(&id))))}
+                            {move || if pinnable().is_some_and(|id| ws.pinned.with(|p| p.contains(&id))) { "Unpin" } else { "Pin" }}
+                        </button>
+                    </Show>
+                </div>
+                <button class=format!("{} hidden md:flex md:@min-[14rem]/tile:hidden", crate::session::MENU_ITEM) on:click=move |_| { ws.set_full(if full.get_untracked() { None } else { Some(key) }); menu_at.set(None); }>
+                    {move || if full.get() { crate::icons::minimize() } else { crate::icons::maximize() }}
+                    {move || if full.get() { "Defocus" } else { "Focus" }}
+                </button>
+                <Show when=move || phone.get() && two()>
+                    <button class=crate::session::MENU_ITEM on:click=move |_| { menu_at.set(None); if let Some(c) = current.get_untracked() { ws.close_column(key, c.key); } }>{crate::icons::x()}"Close this pane"</button>
+                </Show>
+                <button class=format!("{} md:@min-[14rem]/tile:hidden", crate::session::MENU_ITEM) on:click=move |_| { menu_at.set(None); ws.close_tile(key); }>{crate::icons::x()}"Close this tile"</button>
+                <div class="flex flex-col border-t border-zinc-200 pt-1 text-xs dark:border-zinc-700">
+                    <button class=crate::session::MENU_ITEM disabled=move || !can_back() on:click=move |_| { ws.step(-1); menu_at.set(None); }>{crate::icons::chevron_left()}"Back"</button>
+                    <button class=crate::session::MENU_ITEM disabled=move || !can_forward() on:click=move |_| { ws.step(1); menu_at.set(None); }>{crate::icons::chevron_right()}"Forward"</button>
+                    <Show when=two>
+                        <button class=crate::session::MENU_ITEM on:click=move |_| { ws.detach(key); menu_at.set(None); }>{crate::icons::square_arrow_out()}"Into its own tile"</button>
+                    </Show>
+                    <Show when=move || many.get()>
+                        <button class=crate::session::MENU_ITEM on:click=move |_| { ws.minimize(key); menu_at.set(None); }>{crate::icons::minus()}"Minimize"</button>
+                    </Show>
+                    <Show when=move || colour.get().is_some()>
+                        <button class=crate::session::MENU_ITEM on:click=move |ev| { palette_at.set(Some(below(&ev, 380.0))); menu_at.set(None); }>{crate::icons::circle()}"Session mark"</button>
+                    </Show>
+                </div>
             </Popover>
-            <div class="flex min-h-0 flex-1">
+            <Popover at=panes_at class="w-70">
+                <For each=move || tile.get().map(|t| t.columns).unwrap_or_default() key=|c| c.key let:column>
+                    <button class=crate::session::MENU_ITEM aria-current=move || current.get().filter(|c| c.key == column.key).map(|_| "page")
+                        on:click=move |_| { ws.reveal(key, column.key); panes_at.set(None); }>
+                        {move || column.view.label(&live)}
+                    </button>
+                </For>
+            </Popover>
+            <div data-pane-host class="flex min-h-0 flex-1">
+                <Show when=move || tile.get().is_some_and(|t| t.columns.is_empty())>
+                    <p class="m-auto max-w-sm px-4 py-6 text-sm text-muted">"This tile's pages are already open elsewhere. Back and Forward reveal them without making copies."</p>
+                </Show>
                 <For each=move || cols.get() key=|k| *k let:col>
                     <ColumnView tile=key col />
                 </For>
@@ -2153,11 +2986,255 @@ fn TileView(key: u64, rect: Signal<Rect>) -> impl IntoView {
         </section>
         </div>
     }
+    .into_any()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glide_frames_never_read_geometry_or_restart_native_smooth_scrolling() {
+        let motion = include_str!("../js/motion.js");
+        let glide = motion.split("window.c6GlideToEnd =").nth(1).expect("the shared bounded scroll helper");
+        let glide = glide.split("\n})();").next().unwrap();
+        for read in ["element.scrollTop", "element.scrollHeight", "element.clientHeight"] {
+            assert_eq!(glide.matches(read).count(), 1, "{read} is sampled once per invocation");
+        }
+        for work in ["requestAnimationFrame", "getBoundingClientRect", "getComputedStyle", "scale(", "scaleY("] {
+            assert!(!glide.contains(work), "the compositor glide needs no {work}");
+        }
+        assert!(glide.contains("content.animate(keyframes,"));
+        assert!(glide.contains("composite: 'replace'"), "additive effects did not advance in blocked Chromium films");
+        assert!(glide.contains("age: motion.age + elapsed"), "replacement must preserve each correction's clock");
+        assert!(glide.contains("const duration = 200;"));
+        assert!(!glide.contains("behavior: \"smooth\""));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_glide_never_invokes_a_browser_binding() {
+        // A null browser handle is safe here only because native SSR is a no-op.
+        let element = wasm_bindgen::JsValue::NULL.unchecked_into::<web_sys::Element>();
+        glide_to_end(&element);
+        stop_glide_to_end(&element);
+    }
+
+    #[test]
+    fn native_press_owns_resize_follow_independently_of_the_glide() {
+        let motion = include_str!("../js/motion.js");
+        let press = motion.split("window.c6FollowPress =").nth(1).unwrap().split("\n};").next().unwrap();
+        assert!(
+            press.contains("target?.closest(") && press.contains("element.contains(control)"),
+            "only transcript controls admit a new hold"
+        );
+        assert!(
+            press.contains("change(true, true, false)") && press.contains("c6StopGlide(element)"),
+            "press restores native anchoring before release"
+        );
+        assert!(press.contains("capture: true, passive: true"), "native activation and stopped child clicks remain intact");
+        assert!(press.contains("if (!pointers.size && !touches)"), "one finger cannot release another contact");
+        assert!(press.contains("clearTimer()") && press.contains("removeEventListener(type, listener, true)"));
+        for forbidden in ["preventDefault", "stopPropagation", "setPointerCapture", "requestAnimationFrame", "getBoundingClientRect"] {
+            assert!(!press.contains(forbidden), "press ownership must not use {forbidden}");
+        }
+        let source = include_str!("workspace.rs").split("#[cfg(test)]").next().unwrap();
+        let controller = source.split("pub fn ScrollBox(").nth(1).unwrap().split("let yours =").next().unwrap();
+        assert!(controller.contains("pending.set_value(false)"), "stopping follow invalidates deferred work");
+        assert!(controller.contains("pending.try_update_value(std::mem::take) == Some(true)"), "release consumes one correction");
+        assert!(controller.find("if pressed.try_get_value()").unwrap() < controller.find("else if el.client_height()").unwrap());
+        assert!(controller.contains("el.is_same_node(Some(&observed))") && controller.contains("el.is_connected()"));
+        assert!(controller.contains("available.try_get_value() == Some(true)"), "hidden/pagehide suspension also gates resize callbacks");
+    }
+
+    #[test]
+    fn motion_plan_tracks_geometry_and_panes_but_not_active_chrome() {
+        let mut layout = Layout::new(View::Sessions);
+        layout.open_tile(View::Workers);
+        let original = motion_layout(&layout);
+        let first = layout.tiles[0].key;
+        let col = layout.tiles[0].columns[0].key;
+        layout.tiles[0].active = 0;
+        layout.tiles[0].columns[0].view = View::Inbox;
+        assert!(original == motion_layout(&layout), "view/chrome updates do not measure or interrupt motion");
+        layout.open_after(first, col, View::Decisions); // a new destination, not the already-open Workers
+        assert!(original != motion_layout(&layout), "pane additions have their own FLIP boundary");
+        assert_eq!(motion_layout(&layout)[0].panes.len(), 2);
+        let split = motion_layout(&layout);
+        layout.tiles[0].cursor = 0;
+        assert!(split != motion_layout(&layout), "phone pane visibility changes animate too");
+    }
+
+    #[test]
+    fn motion_plan_matches_maximize_minimize_restore_and_phone_visibility() {
+        let mut layout = Layout::new(View::Sessions);
+        layout.open_tile(View::Workers);
+        let plan = motion_layout(&layout);
+        assert!(plan.iter().all(|t| t.desktop));
+        assert_eq!(plan.iter().filter(|t| t.phone).count(), 1);
+        assert!(plan[1].phone);
+        layout.full = true;
+        let plan = motion_layout(&layout);
+        assert!(!plan[0].desktop);
+        assert!(plan[1].desktop);
+        assert_eq!(plan[1].rect, [0.0, 0.0, 1.0, 1.0]);
+        layout.full = false;
+        layout.minimize(1);
+        let plan = motion_layout(&layout);
+        assert!(!plan[1].desktop && !plan[1].phone);
+        assert_eq!(plan[0].rect, [0.0, 0.0, 1.0, 1.0]);
+        layout.show(1);
+        assert!(motion_layout(&layout).iter().all(|t| t.desktop));
+    }
+
+    #[test]
+    fn closing_the_last_tile_gives_the_live_home_a_new_motion_identity() {
+        let mut layout = Layout::new(View::Sessions);
+        let (tile, pane) = (layout.tiles[0].key, layout.tiles[0].columns[0].key);
+        layout.full = true;
+        layout.remove_tile(0);
+        assert_ne!(layout.tiles[0].key, tile);
+        assert_ne!(layout.tiles[0].columns[0].key, pane);
+        assert_eq!(layout.tiles[0].columns[0].view, View::home());
+        assert_eq!(layout.tiles[0].stack, Some(0));
+        assert!(!layout.full);
+        assert!(layout.valid());
+    }
+
+    #[test]
+    fn initial_loading_prioritizes_focus_without_mounting_hidden_panes() {
+        for shown in [false, true] {
+            for focused in [false, true] {
+                for released in [false, true] {
+                    assert_eq!(initial_mount(false, shown, focused, released), shown && (focused || released));
+                    assert!(initial_mount(true, shown, focused, released), "hiding must never dispose a mounted pane");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn open_session_titles_status_and_marks_do_not_depend_on_the_live_list() {
+        Owner::new().with(|| {
+            let archived: Session = serde_json::from_value(serde_json::json!({
+                "id": "old", "worker_id": "00000000-0000-0000-0000-000000000001", "title": "Saved title",
+                "cwd": "", "connection_id": "c", "model": "m", "status": "idle", "archived": true,
+                "colour": "navy/dots", "error": null, "created_at": 0, "updated_at": 0, "last_seq": 0
+            }))
+            .unwrap();
+            let (sessions, set_sessions) = signal(Vec::new());
+            let live = LiveFeed {
+                workers: signal(Vec::new()).0,
+                sessions,
+                resolved_sessions: RwSignal::new(HashMap::from([("old".to_owned(), archived.clone())])),
+                connected: signal(true).0,
+                doc: signal(None).0,
+                marks: signal(Default::default()).0,
+                attention: signal(0).0,
+            };
+            assert_eq!(View::session("old").label(&live), "Saved title");
+            assert_eq!(View::SessionChanges { id: "old".into() }.label(&live), "Changes · Saved title");
+            assert!(live.sessions.get().is_empty(), "resolved rows never enter the rail");
+            let resolved = live.session("old").unwrap();
+            assert!(resolved.archived);
+            assert_eq!(resolved.status, SessionStatus::Idle);
+            assert_eq!(crate::marks::of(&resolved), "navy/dots");
+            let mut active = archived.clone();
+            active.archived = false;
+            active.title = "Restored title".into();
+            active.status = SessionStatus::Running;
+            set_sessions.set(vec![active.clone()]);
+            assert_eq!(live.session("old"), Some(active), "the fresh live row wins after unarchive");
+            assert_eq!(View::session("old").label(&live), "Restored title");
+            for view in [View::session("old"), View::SessionFiles { id: "old".into() }, View::SessionTerminal { id: "old".into() }] {
+                assert_eq!(view.session_id(), Some("old"));
+            }
+            assert_eq!(View::Sessions.session_id(), None);
+        });
+    }
+
+    #[test]
+    fn background_loading_waits_for_every_shown_focused_pane() {
+        let mut l = Layout::new(View::Sessions);
+        let tile = l.tiles[0].key;
+        let list = l.tiles[0].columns[0].key;
+        let session = l.key();
+        l.tiles[0].columns.push(Column { key: session, view: View::session("s1") });
+        l.tiles[0].settle();
+        let mut drawn = HashSet::from([list]);
+        assert_eq!(focused_drawn(&l, false, &drawn), None, "a list shell cannot release its loading session");
+        assert_eq!(focused_drawn(&l, true, &drawn), None, "the phone shows the session, not the list");
+        drawn.insert(session);
+        assert_eq!(focused_drawn(&l, false, &drawn), Some(vec![list, session]));
+        assert_eq!(focused_drawn(&l, true, &HashSet::from([session])), Some(vec![session]));
+        l.tiles[0].minimized = true;
+        assert_eq!(focused_drawn(&l, false, &drawn), None);
+        l.tiles[0].minimized = false;
+        assert!(l.pane_shown(tile, list, false));
+    }
+
+    #[test]
+    fn header_metadata_waits_with_hidden_panes_then_resolves_every_open_session() {
+        let mut l = Layout::new(View::session("first"));
+        l.open_tile(View::session("focus"));
+        let side = l.key();
+        l.tiles[1].columns.push(Column { key: side, view: View::session("side") });
+        l.tiles[1].settle();
+        l.open_tile(View::session("minimized"));
+        l.tiles[2].minimized = true;
+        l.focus = 1;
+        let ids = |ss: &[&str]| ss.iter().map(|s| s.to_string()).collect::<HashSet<_>>();
+        assert_eq!(initial_metadata_ids(&l, false, false), ids(&["focus", "side"]));
+        assert_eq!(initial_metadata_ids(&l, true, false), ids(&["side"]), "a hidden phone pane does not start a header read");
+        for phone in [false, true] {
+            assert_eq!(
+                initial_metadata_ids(&l, phone, true),
+                ids(&["first", "focus", "side", "minimized"]),
+                "after the focused paint, omitted/archived headers resolve even for minimized tiles"
+            );
+        }
+        l.focus = 0;
+        assert_eq!(initial_metadata_ids(&l, true, false), ids(&["first"]), "changing focus immediately changes eligibility");
+    }
+
+    #[test]
+    fn restored_history_only_focus_releases_initial_loading_without_a_drawn_pane() {
+        let mut l = Layout::new(View::Sessions);
+        l.open_tile(View::session("s"));
+        let mut shell = l.new_tile(View::session("s"));
+        shell.back.push(shell.columns.clone());
+        shell.columns.clear();
+        shell.settle();
+        l.tiles.push(shell);
+        l.focus = 2;
+        assert!(l.valid());
+        let mut restored: Layout = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
+        restored.restore_single_copies();
+        assert_eq!(restored.focus, 2);
+        for phone in [false, true] {
+            assert_eq!(focused_drawn(&restored, phone, &HashSet::new()), Some(Vec::new()));
+            assert!(initial_metadata_ids(&restored, phone, false).is_empty());
+            assert_eq!(initial_metadata_ids(&restored, phone, true), HashSet::from(["s".to_owned()]));
+        }
+        assert!(initial_mount(false, true, false, true), "the released barrier mounts other visible panes");
+    }
+
+    #[test]
+    fn changing_focus_or_closing_the_loading_tile_cannot_release_stale_readiness() {
+        let mut l = Layout::new(View::session("s1"));
+        let first = l.tiles[0].columns[0].key;
+        let second = l.new_tile(View::session("s2"));
+        let other = second.columns[0].key;
+        l.tiles.push(second);
+        let drawn = HashSet::from([first]);
+        assert_eq!(focused_drawn(&l, false, &drawn), Some(vec![first]));
+        l.focus = 1;
+        assert_eq!(focused_drawn(&l, false, &drawn), None, "focus must draw before the barrier opens");
+        assert_eq!(focused_drawn(&l, false, &HashSet::from([other])), Some(vec![other]));
+        l.tiles.remove(0);
+        l.focus = 0;
+        assert_eq!(focused_drawn(&l, false, &drawn), None, "a closed tile's replay is irrelevant");
+    }
 
     #[test]
     fn upward_input_stops_following_before_any_scroll_and_even_one_pixel_from_end() {
@@ -2228,29 +3305,6 @@ mod tests {
     }
 
     #[test]
-    fn tile_status_is_the_sessions_own_turn_not_what_runs_beside_it() {
-        let mut session: Session = serde_json::from_value(serde_json::json!({
-            "id": "main", "worker_id": "00000000-0000-0000-0000-000000000000",
-            "title": "Main", "cwd": "", "connection_id": "", "model": "",
-            "status": "idle", "created_at": 0, "updated_at": 0, "last_seq": 0,
-            "side_chats_running": 1
-        }))
-        .unwrap();
-        assert_eq!(status_dot(&session).1, "idle", "a side chat runs, not its turn");
-        session.subagents_running = 2;
-        session.tasks_running = 1;
-        assert_eq!(status_dot(&session).1, "idle", "subagents and tasks are its background");
-        session.status = SessionStatus::Running;
-        assert_eq!(status_dot(&session).1, "running");
-        session.status = SessionStatus::Idle;
-        session.awaiting_approval = true;
-        assert_eq!(status_dot(&session).1, "needs you");
-        session.awaiting_approval = false;
-        session.side_chats_running = 0;
-        assert_eq!(status_dot(&session).1, "idle");
-    }
-
-    #[test]
     fn brief_views_load_without_carrying_selection() {
         for json in [r#"{"view":"brief"}"#, r#"{"view":"brief","request":42}"#] {
             let view: View = serde_json::from_str(json).unwrap();
@@ -2262,12 +3316,11 @@ mod tests {
     #[test]
     fn opening_the_brief_reuses_its_mounted_column() {
         let mut layout = Layout::new(View::Mail);
-        assert!(!layout.focus_brief());
         let key = layout.key();
         layout.tiles[0].columns.push(Column { key, view: View::Brief });
         layout.open_tile(View::Calendar);
         for _ in 0..2 {
-            assert!(layout.focus_brief());
+            layout.open(None, View::Brief, How::OwnTile);
             assert_eq!(layout.tiles.len(), 2);
             assert_eq!(layout.focus, 0);
             assert_eq!(layout.tiles[0].cursor, 1);
@@ -2275,6 +3328,744 @@ mod tests {
             assert_eq!(layout.tiles[0].columns[1].key, key);
             assert_eq!(layout.tiles[0].columns[1].view, View::Brief);
         }
+    }
+
+    fn destinations() -> Vec<View> {
+        // Every view: exact repeats are single-copy, in either pane. The
+        // identities with navigation state are covered separately below.
+        [
+            r#"{"view":"sessions"}"#,
+            r#"{"view":"session","id":"s"}"#,
+            r#"{"view":"session_changes","id":"s"}"#,
+            r#"{"view":"session_terminal","id":"s"}"#,
+            r#"{"view":"session_files","id":"s"}"#,
+            r#"{"view":"session_outputs","id":"s"}"#,
+            r#"{"view":"search","q":"needle"}"#,
+            r#"{"view":"workers"}"#,
+            r#"{"view":"worker","id":"w"}"#,
+            r#"{"view":"settings"}"#,
+            r#"{"view":"inbox"}"#,
+            r#"{"view":"mission"}"#,
+            r#"{"view":"usage"}"#,
+            r#"{"view":"chats"}"#,
+            r#"{"view":"analytics"}"#,
+            r#"{"view":"activity"}"#,
+            r#"{"view":"memex"}"#,
+            r#"{"view":"mail"}"#,
+            r#"{"view":"chat"}"#,
+            r#"{"view":"conversation","target":"mail:m"}"#,
+            r#"{"view":"brief"}"#,
+            r#"{"view":"calendar"}"#,
+            r#"{"view":"contacts"}"#,
+            r#"{"view":"photos"}"#,
+            r#"{"view":"decisions"}"#,
+            r#"{"view":"work"}"#,
+            r#"{"view":"work","id":"w"}"#,
+            r#"{"view":"projects"}"#,
+            r#"{"view":"projects","id":"p"}"#,
+            r#"{"view":"docs"}"#,
+            r#"{"view":"docs","id":"d"}"#,
+            r#"{"view":"collections"}"#,
+            r#"{"view":"collections","name":"c"}"#,
+            r#"{"view":"realms"}"#,
+            r#"{"view":"explore","realm":"home","section":"docs"}"#,
+            r#"{"view":"app","name":"a"}"#,
+            r#"{"view":"app","name":"a","record":"r"}"#,
+        ]
+        .into_iter()
+        .map(|json| serde_json::from_str(json).unwrap())
+        .collect()
+    }
+
+    #[test]
+    fn opening_any_existing_destination_reveals_its_exact_pane_without_history_or_key_churn() {
+        for view in destinations() {
+            for pane in 0..2 {
+                for how in [How::Beside, How::OwnTile, How::Instead, How::NewTile] {
+                    if how == How::NewTile && !view.single_copy() {
+                        continue;
+                    }
+                    let mut l = Layout::new(view.clone());
+                    let extra = Column { key: l.key(), view: View::Worker { id: "different".into() } };
+                    l.tiles[0].columns.insert(1 - pane, extra);
+                    l.tiles[0].cursor = 1 - pane;
+                    let columns = l.tiles[0].columns.clone();
+                    let target_key = columns[pane].key;
+                    l.open_tile(View::Worker { id: "origin".into() });
+                    let from = Some((l.tiles[1].key, l.tiles[1].columns[0].key));
+                    l.tiles[0].minimized = true;
+                    l.full = true; // another tile is maximized
+                    let next = l.next;
+                    l.open(from, view.clone(), how);
+                    assert_eq!(l.tiles.len(), 2, "{view:?}, {how:?}");
+                    assert_eq!(l.next, next + 1, "only the MRU counter advances; no pane or tile keys allocated");
+                    assert_eq!(l.focus, 0);
+                    assert!(!l.tiles[0].minimized);
+                    assert_eq!(l.tiles[0].columns, columns);
+                    assert_eq!(l.tiles[0].cursor, pane);
+                    assert_eq!(l.tiles[0].active, target_key);
+                    assert!(l.pane_shown(l.tiles[0].key, target_key, true), "the target is shown even in focus/phone mode");
+                    assert!(l.tiles[0].back.is_empty());
+                    assert!(l.tiles[0].forward.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_new_tile_reuses_sessions_and_pages_but_keeps_companion_copies() {
+        for view in destinations() {
+            let mut l = Layout::new(view.clone());
+            l.place();
+            let original = l.tiles[0].clone();
+            l.open(Some((original.key, original.columns[0].key)), view.clone(), How::NewTile);
+            if view.single_copy() {
+                assert_eq!(l.tiles.len(), 1, "{view:?}");
+                assert_eq!(l.focus, 0);
+                assert_eq!(l.tiles[0].columns, original.columns);
+                assert_eq!(l.tiles[0].back, original.back);
+                assert_eq!(l.tiles[0].forward, original.forward);
+            } else {
+                assert_eq!(l.tiles.len(), 2, "{view:?}");
+                assert_eq!(l.focus, 1);
+                assert_eq!(l.tiles[0], original);
+                assert_ne!(l.tiles[0].columns[0].key, l.tiles[1].columns[0].key);
+            }
+            assert_eq!(l.focused_view(), Some(&view));
+        }
+    }
+
+    #[test]
+    fn restore_collapses_sessions_and_starters_but_keeps_companion_copies() {
+        for view in destinations() {
+            let mut l = Layout::new(view.clone());
+            l.open_tile(view.clone()); // Legacy saved duplicate, not a new open.
+            l.focus = 0;
+            let before = l.clone();
+            l.restore_single_copies();
+            if view.single_copy() {
+                assert_eq!(l.tiles, [before.tiles[0].clone()], "{view:?}");
+            } else {
+                assert_eq!(l, before, "{view:?}: deliberate copies survive restoration");
+            }
+        }
+    }
+
+    #[test]
+    fn starter_open_reveals_its_existing_tile_and_also_works_in_an_empty_workspace() {
+        for home in [View::Sessions, View::Realms] {
+            let mut l = Layout { tiles: Vec::new(), focus: 0, next: 1, full: false };
+            l.open(None, home.clone(), How::NewTile);
+            assert_eq!(l.tiles.len(), 1);
+            assert_eq!(l.focused_view(), Some(&home));
+            assert!(l.valid());
+            let original = l.tiles[0].clone();
+            l.open_tile(View::session("working"));
+            l.tiles[0].minimized = true;
+            l.full = true;
+            let next = l.next;
+            l.open(None, home.clone(), How::NewTile);
+            assert_eq!(l.tiles.len(), 2);
+            assert_eq!(l.focus, 0);
+            assert!(!l.tiles[0].minimized);
+            assert_eq!(l.tiles[0].columns, original.columns);
+            assert_eq!((&l.tiles[0].back, &l.tiles[0].forward), (&original.back, &original.forward));
+            assert_eq!(l.next, next + 1, "only the MRU counter advances; no tile or pane keys allocated");
+        }
+    }
+
+    #[test]
+    fn back_and_forward_reveal_every_live_single_copy_page_without_consuming_source_history() {
+        for view in destinations().into_iter().filter(View::single_copy) {
+            for delta in [-1, 1] {
+                let mut l = Layout::new(View::session("source"));
+                let snapshot = vec![Column { key: l.key(), view: View::session("companion") }, Column { key: l.key(), view: view.clone() }];
+                if delta < 0 {
+                    l.tiles[0].back.push(snapshot)
+                } else {
+                    l.tiles[0].forward.push(snapshot)
+                }
+                l.open_tile(view.clone());
+                l.tiles[1].minimized = true;
+                l.focus = 0;
+                l.full = true;
+                let source = l.tiles[0].clone();
+                l.step(delta);
+                assert_eq!(l.tiles[0], source, "{view:?}: mixed snapshot and both stacks survive");
+                assert_eq!(l.focus, 1);
+                assert!(!l.tiles[1].minimized);
+                assert_eq!(l.focused_view(), Some(&view));
+                assert_eq!(l.tiles.len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn history_snapshots_cannot_recreate_two_panes_of_a_single_copy_page() {
+        for view in destinations().into_iter().filter(View::single_copy) {
+            let mut l = Layout::new(View::session("source"));
+            let snapshot = vec![Column { key: l.key(), view: view.clone() }, Column { key: l.key(), view }];
+            l.tiles[0].back.push(snapshot.clone());
+            l.step(-1);
+            assert_eq!(l.tiles[0].columns, [snapshot[0].clone()]);
+            assert!(l.valid());
+        }
+    }
+
+    #[test]
+    fn in_place_routes_reveal_existing_sessions_and_pages_but_keep_companion_copy_behavior() {
+        for view in destinations() {
+            let mut l = Layout::new(View::session("source"));
+            l.place();
+            let source = l.tiles[0].clone();
+            l.open_tile(view.clone());
+            let target = l.tiles[1].columns.clone();
+            l.focus = 0;
+            l.tiles[1].minimized = true;
+            l.replace(source.key, source.columns[0].key, view.clone());
+            assert_eq!(l.tiles[1].columns, target);
+            if view.single_copy() {
+                assert_eq!(l.tiles[0], source, "{view:?}: in-place navigation leaves the source intact");
+                assert_eq!(l.focus, 1);
+                assert!(!l.tiles[1].minimized);
+            } else {
+                assert_eq!(l.tiles[0].columns[0].view, view, "companion selection still replaces in place");
+                assert_eq!(l.focus, 0);
+            }
+        }
+        let mut l = Layout::new(View::Settings { note: None, section: String::new() });
+        let source = l.tiles[0].clone();
+        let next = View::Settings { note: None, section: "appearance".into() };
+        l.replace(source.key, source.columns[0].key, next.clone());
+        assert_eq!(l.tiles[0].columns, [Column { key: source.columns[0].key, view: next }]);
+        assert_eq!(l.tiles[0].back, source.back);
+        assert_eq!(l.tiles[0].forward, source.forward);
+    }
+
+    #[test]
+    fn repeated_document_auto_opens_from_two_sessions_reuse_either_pane_and_keep_history() {
+        for pane in 0..2 {
+            let doc = View::from_path("/docs/shared#block.2");
+            let mut l = Layout::new(View::session("one"));
+            l.open_tile(View::session("two"));
+            let sessions = l.tiles.clone();
+            let from = sessions.iter().map(|t| (t.key, t.columns[0].key)).collect::<Vec<_>>();
+            l.open(Some(from[0]), View::from_path("/docs/shared#block.1"), How::OwnTile);
+            l.open(Some(from[0]), doc.clone(), How::OwnTile);
+            let extra = Column { key: l.key(), view: View::Inbox };
+            l.tiles[2].columns.insert(1 - pane, extra);
+            l.tiles[2].settle();
+            let target = l.tiles[2].clone();
+            for source in from.iter().cycle().take(6) {
+                l.tiles[2].minimized = true;
+                l.focus = 0;
+                l.full = true;
+                // SessionView uses an untargeted OwnTile open on creation;
+                // subsequent edits refresh only (covered by session tests).
+                l.open(Some(*source), View::from_path("/docs/shared"), How::OwnTile);
+                assert_eq!(l.tiles.len(), 3);
+                assert_eq!(l.focus, 2);
+                assert!(!l.tiles[2].minimized);
+                assert_eq!(l.tiles[2].columns, target.columns);
+                assert_eq!(l.tiles[2].active, target.columns[pane].key);
+                assert_eq!(l.tiles[2].back, target.back);
+                assert_eq!(l.tiles[2].forward, target.forward);
+                assert_eq!(&l.tiles[..2], sessions.as_slice(), "neither session is replaced");
+                assert_eq!(l.focused_view(), Some(&doc), "an edit must not reset the reading target");
+            }
+        }
+    }
+
+    #[test]
+    fn doc_targets_reuse_keys_and_record_back_forward_without_resetting_on_plain_links() {
+        let path = "/docs/d#block.2";
+        let targeted = View::from_path(path);
+        let plain = View::from_path(path.split(['?', '#']).next().unwrap());
+        let previous = View::from_path("/docs/d?block=block.1");
+        let mut l = Layout::new(View::Sessions);
+        let from = (l.tiles[0].key, l.tiles[0].columns[0].key);
+        l.open(Some(from), previous.clone(), How::Beside);
+        let columns = l.tiles[0].columns.clone();
+        let key = columns[1].key;
+        l.open_tile(View::Inbox);
+        let origin = l.tiles[1].clone();
+        l.open(None, targeted.clone(), How::OwnTile);
+        assert_eq!(l.tiles[0].columns[1].key, key);
+        assert_eq!(l.tiles[0].back.last(), Some(&columns));
+        assert_eq!(l.focused_view(), Some(&targeted));
+        assert_eq!(l.tiles[1], origin, "the source tile/history is untouched");
+        let history = l.tiles[0].back.clone();
+        for view in [targeted.clone(), plain.clone()] {
+            l.open(None, view, How::Beside);
+            assert_eq!(l.tiles[0].back, history);
+            assert_eq!(l.focused_view(), Some(&targeted));
+        }
+        l.step(-1);
+        assert_eq!(l.focused_view(), Some(&previous));
+        assert_eq!(l.tiles[0].columns[1].key, key);
+        let forward = l.tiles[0].forward.clone();
+        l.open(None, plain, How::OwnTile);
+        assert_eq!(l.tiles[0].forward, forward, "focus doesn't discard Forward");
+        l.step(1);
+        assert_eq!(l.focused_view(), Some(&targeted));
+        l.step(-1);
+        l.open(None, View::from_path(&format!("{}#different", path.split(['?', '#']).next().unwrap())), How::Beside);
+        assert!(l.tiles[0].forward.is_empty(), "a new target forks history");
+    }
+
+    #[test]
+    fn plain_session_navigation_clears_a_retained_historical_target() {
+        let targeted = View::from_path("/sessions/s?q=needle#e20");
+        let plain = View::session("s");
+        let mut l = Layout::new(targeted.clone());
+        let key = l.tiles[0].columns[0].key;
+        l.open(None, plain.clone(), How::OwnTile);
+        assert_eq!(l.focused_view(), Some(&plain));
+        assert_eq!(l.tiles[0].columns[0].key, key);
+        assert_eq!(l.tiles[0].back.last().unwrap()[0].view, targeted);
+        l.step(-1);
+        assert_eq!(l.focused_view(), Some(&targeted), "a deliberate historical visit still works");
+    }
+
+    #[test]
+    fn restored_companion_duplicates_are_not_collapsed_and_origin_or_focus_wins() {
+        let view = View::SessionChanges { id: "s".into() };
+        let mut saved = Layout::new(view.clone());
+        saved.open(None, view.clone(), How::NewTile);
+        saved.open(None, View::Inbox, How::NewTile);
+        let mut l: Layout = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        l.restore_single_copies();
+        assert_eq!(l, saved, "restoration keeps intentional and old duplicates");
+        let keys: Vec<_> = l.tiles.iter().map(|t| t.key).collect();
+        let from = (l.tiles[1].key, l.tiles[1].columns[0].key);
+        l.open(Some(from), view.clone(), How::Beside);
+        assert_eq!(l.focus, 1, "a link from a copy stays in that copy");
+        l.open(None, view.clone(), How::OwnTile);
+        assert_eq!(l.focus, 1, "external navigation prefers the focused copy");
+        l.focus = 2;
+        l.open(None, view, How::Beside);
+        assert_eq!(l.focus, 0, "otherwise the first live match wins deterministically");
+        assert_eq!(l.tiles.iter().map(|t| t.key).collect::<Vec<_>>(), keys);
+    }
+
+    #[test]
+    fn restore_collapses_sessions_starters_and_documents_to_focused_or_first_without_losing_other_panes() {
+        for (first, second) in [
+            (View::from_path("/docs/d#first"), View::from_path("/docs/d#second")),
+            (View::from_path("/sessions/keep#e1"), View::from_path("/sessions/keep#e2")),
+            (View::Sessions, View::Sessions),
+            (View::Realms, View::Realms),
+        ] {
+            for focus in 0..3 {
+                let mut saved = Layout::new(first.clone());
+                let inbox = Column { key: saved.key(), view: View::Inbox };
+                saved.tiles[0].columns.push(inbox.clone());
+                saved.tiles[0].settle();
+                saved.tiles[0].back.push(vec![Column { key: 100, view: View::Decisions }]);
+                saved.tiles[0].forward.push(vec![Column { key: 101, view: View::Workers }]);
+                // Legacy saved copies predate the single-copy open policy.
+                saved.open_tile(second.clone());
+                saved.open_tile(View::session("s"));
+                saved.focus = focus;
+                saved.full = true;
+                let winner = if focus == 1 { 1 } else { 0 };
+                let winner_column = saved.tiles[winner].columns[0].clone();
+                let focused = saved.tiles[focus].key;
+                let histories = (saved.tiles[0].back.clone(), saved.tiles[0].forward.clone());
+                let mut l: Layout = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+                l.restore_single_copies();
+                let copies: Vec<_> = l.tiles.iter().flat_map(|t| &t.columns).filter(|c| c.view.same_destination(&first)).collect();
+                assert_eq!(copies, [&winner_column]);
+                assert_eq!(l.tiles[l.focus].key, focused);
+                assert!(l.full);
+                let mixed = l.tile(saved.tiles[0].key).unwrap();
+                assert!(mixed.columns.contains(&inbox));
+                assert_eq!((&mixed.back, &mixed.forward), (&histories.0, &histories.1));
+                assert_eq!(mixed.active, inbox.key, "a surviving companion keeps focus");
+                assert!(l.valid());
+                let normalized = l.clone();
+                l.restore_single_copies();
+                assert_eq!(l, normalized, "normalization is idempotent");
+            }
+        }
+    }
+
+    #[test]
+    fn restore_prefers_active_copy_and_collapses_sessions_and_starter_lists() {
+        for (first, second) in [("/docs/d#first", "/docs/d#second"), ("/sessions/s#e1", "/sessions/s#e2")] {
+            for active in 0..2 {
+                let mut l = Layout::new(View::from_path(first));
+                let copy = Column { key: l.key(), view: View::from_path(second) };
+                l.tiles[0].columns.push(copy);
+                l.tiles[0].cursor = active;
+                l.tiles[0].active = l.tiles[0].columns[active].key;
+                let winner = l.tiles[0].columns[active].clone();
+                let index = View::from_path("/docs");
+                for v in [
+                    index.clone(),
+                    index,
+                    View::session("other"),
+                    View::session("other"),
+                    View::Sessions,
+                    View::Sessions,
+                    View::Realms,
+                    View::Realms,
+                ] {
+                    l.open_tile(v);
+                }
+                l.focus = 0;
+                let rest: Vec<_> = l.tiles[1..].iter().step_by(2).cloned().collect();
+                l.restore_single_copies();
+                assert_eq!(l.tiles[0].columns, [winner]);
+                assert_eq!(
+                    l.tiles[1..].iter().map(|t| &t.columns).collect::<Vec<_>>(),
+                    rest.iter().map(|t| &t.columns).collect::<Vec<_>>()
+                );
+                assert!(l.valid());
+            }
+        }
+    }
+
+    #[test]
+    fn restore_duplicate_only_tiles_traverses_history_without_discarding_either_stack() {
+        for back in [true, false] {
+            let mut l = Layout::new(View::from_path("/docs/d#keep"));
+            l.open_tile(View::from_path("/docs/d#lose"));
+            let original = l.tiles[1].columns.clone();
+            let skipped = vec![Column { key: l.key(), view: View::from_path("/docs/d#older") }];
+            let useful = vec![Column { key: l.key(), view: View::Inbox }];
+            let opposite = vec![Column { key: l.key(), view: View::Workers }];
+            if back {
+                l.tiles[1].back = vec![useful.clone(), skipped.clone()];
+            } else {
+                l.tiles[1].forward = vec![useful.clone(), skipped.clone()];
+            }
+            // The opposite direction also remains intact. Prefer Back when
+            // both have a useful page; test Forward with Back empty.
+            if back {
+                l.tiles[1].forward = vec![opposite.clone()];
+            }
+            l.focus = 0;
+            l.restore_single_copies();
+            assert_eq!(l.tiles[1].columns, useful);
+            let (visited, returned) = if back { (&l.tiles[1].back, &l.tiles[1].forward) } else { (&l.tiles[1].forward, &l.tiles[1].back) };
+            assert!(visited.is_empty());
+            let mut expected = if back { vec![opposite] } else { Vec::new() };
+            expected.extend([original, skipped]);
+            assert_eq!(*returned, expected);
+            assert!(l.valid());
+            l.focus = 1;
+            let before = l.tiles[1].clone();
+            l.step(if back { 1 } else { -1 });
+            assert_eq!(l.focus, 0, "revisiting the removed doc reveals its survivor");
+            assert_eq!(l.tiles[1], before, "no duplicate is recreated or history consumed");
+            assert_eq!(l.focused_view(), Some(&View::from_path("/docs/d#older")));
+        }
+    }
+
+    #[test]
+    fn restore_keeps_duplicate_only_navigation_as_home_instead_of_merging_or_deleting_it() {
+        let mut l = Layout::new(View::from_path("/docs/d#keep"));
+        l.open_tile(View::from_path("/docs/d#lose"));
+        let previous = vec![Column { key: l.key(), view: View::from_path("/docs/d#previous") }];
+        let future = vec![Column { key: l.key(), view: View::from_path("/docs/d#future") }];
+        l.tiles[1].back.push(previous.clone());
+        l.tiles[1].forward.push(future.clone());
+        let next = l.next;
+        let source = l.tiles[1].clone();
+        l.focus = 0;
+        l.restore_single_copies();
+        assert_eq!(l.tiles[1].columns[0].view, View::home());
+        assert_eq!(l.tiles[1].back, [previous]);
+        assert_eq!(l.tiles[1].forward, [future, source.columns]);
+        assert_eq!(l.tiles[1].columns[0].key, next + 1, "the Home shell allocates exactly one fresh pane key");
+        assert_eq!(l.next, next + 1);
+        let normalized = l.clone();
+        l.restore_single_copies();
+        assert_eq!(l, normalized);
+        l.focus = 1;
+        let source = l.tiles[1].clone();
+        l.step(-1);
+        assert_eq!(l.tiles[1], source);
+        assert_eq!(l.focused_view(), Some(&View::from_path("/docs/d#previous")));
+    }
+
+    #[test]
+    fn restore_retains_navigation_without_mounting_another_starter_when_home_is_already_open() {
+        let mut l = Layout::new(View::from_path("/sessions/s#keep"));
+        l.open_tile(View::Sessions);
+        l.open_tile(View::Realms);
+        l.open_tile(View::from_path("/sessions/s#lose"));
+        let previous = vec![Column { key: l.key(), view: View::from_path("/sessions/s#previous") }];
+        let future = vec![Column { key: l.key(), view: View::from_path("/sessions/s#future") }];
+        l.tiles[3].back.push(previous.clone());
+        l.tiles[3].forward.push(future.clone());
+        let loser = l.tiles[3].clone();
+        let next = l.next;
+        l.focus = 0;
+        l.restore_single_copies();
+        let shell = &l.tiles[3];
+        assert!(shell.columns.is_empty(), "retain only history, not another live session/starter");
+        assert_eq!((shell.cursor, shell.active), (0, 0));
+        assert_eq!(shell.back, [previous]);
+        assert_eq!(shell.forward, [future, loser.columns]);
+        assert_eq!(l.next, next, "a history-only tile needs no phantom pane");
+        assert!(l.valid());
+        let mut restored: Layout = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
+        restored.restore_single_copies();
+        assert_eq!(restored, l, "saved history-only tiles are valid and normalization is idempotent");
+        l.focus = 3;
+        let source = l.tiles[3].clone();
+        l.step(-1);
+        assert_eq!(l.tiles[3], source, "Back reveals the current owner without consuming source history");
+        assert_eq!(l.focused_view(), Some(&View::from_path("/sessions/s#previous")));
+        l.remove_tile(0);
+        l.focus = l.tiles.iter().position(|t| t.key == loser.key).unwrap();
+        l.step(-1);
+        assert_eq!(l.focused_view(), Some(&View::from_path("/sessions/s#previous")));
+        assert!(l.valid(), "a free historical destination can mount normally again");
+        l.step(1);
+        assert!(l.tiles[l.focus].columns.is_empty());
+        assert!(l.valid(), "returning to the history-only snapshot stays valid");
+        l.open(None, View::Inbox, How::Beside);
+        assert_eq!(l.focused_view(), Some(&View::Inbox));
+        assert!(l.valid(), "ordinary navigation can replace a history-only tile");
+    }
+
+    #[test]
+    fn restore_claims_the_first_home_fallback_before_retaining_later_history_shells() {
+        let mut l = Layout::new(View::session("s"));
+        for _ in 0..2 {
+            l.open_tile(View::session("s"));
+            let previous = vec![Column { key: l.key(), view: View::session("s") }];
+            l.tiles.last_mut().unwrap().back.push(previous);
+        }
+        l.focus = 0;
+        l.restore_single_copies();
+        assert_eq!(l.tiles[1].columns[0].view, View::home());
+        assert!(l.tiles[2].columns.is_empty());
+        assert_eq!(l.tiles.len(), 3, "both independent histories stay reachable");
+        assert!(l.valid());
+        let normalized = l.clone();
+        l.restore_single_copies();
+        assert_eq!(l, normalized);
+    }
+
+    #[test]
+    fn restore_reviving_history_claims_new_documents_before_retaining_another_copy() {
+        let mut l = Layout::new(View::from_path("/docs/d#keep"));
+        l.open_tile(View::from_path("/docs/d#lose"));
+        let first = Column { key: l.key(), view: View::from_path("/docs/x#first") };
+        let second = Column { key: l.key(), view: View::from_path("/docs/x#second") };
+        l.tiles[1].back.push(vec![first.clone(), second]);
+        l.focus = 0;
+        l.restore_single_copies();
+        assert_eq!(l.tiles[1].columns, [first]);
+        assert!(l.valid());
+        let normalized = l.clone();
+        l.restore_single_copies();
+        assert_eq!(l, normalized, "revived document copies must collapse in the first pass");
+    }
+
+    #[test]
+    fn history_reveals_live_documents_without_discarding_source_panes_or_history() {
+        for delta in [-1, 1] {
+            let mut l = Layout::new(View::session("source"));
+            let snapshot =
+                vec![Column { key: l.key(), view: View::Inbox }, Column { key: l.key(), view: View::from_path("/docs/d#target") }];
+            if delta < 0 {
+                l.tiles[0].back.push(snapshot);
+            } else {
+                l.tiles[0].forward.push(snapshot);
+            }
+            l.open_tile(View::from_path("/docs/d#reading"));
+            l.tiles[1].minimized = true;
+            l.focus = 0;
+            l.full = true;
+            let source = l.tiles[0].clone();
+            l.step(delta);
+            assert_eq!(l.tiles[0], source, "a mixed history snapshot stays intact and available");
+            assert_eq!(l.focus, 1);
+            assert!(!l.tiles[1].minimized);
+            assert_eq!(l.focused_view(), Some(&View::from_path("/docs/d#target")));
+            assert_eq!(l.tiles.len(), 2);
+        }
+    }
+
+    #[test]
+    fn history_only_copies_within_one_snapshot_do_not_become_two_live_panes() {
+        for (first, second) in [
+            (View::from_path("/docs/d#first"), View::from_path("/docs/d#second")),
+            (View::from_path("/sessions/s#first"), View::from_path("/sessions/s#second")),
+            (View::Sessions, View::Sessions),
+            (View::Realms, View::Realms),
+        ] {
+            let mut l = Layout::new(View::Inbox);
+            let snapshot = vec![Column { key: l.key(), view: first }, Column { key: l.key(), view: second }];
+            l.tiles[0].back.push(snapshot.clone());
+            let original = l.tiles[0].columns.clone();
+            l.step(-1);
+            assert_eq!(l.tiles[0].columns, [snapshot[0].clone()]);
+            assert_eq!(l.tiles[0].forward.as_slice(), std::slice::from_ref(&original));
+            assert!(l.valid());
+            l.step(1);
+            assert_eq!(l.tiles[0].columns, original);
+        }
+    }
+
+    #[test]
+    fn target_history_in_the_left_pane_keeps_that_pane_active() {
+        for path in ["/sessions/s#e1", "/docs/d#block.1"] {
+            let first = View::from_path(path);
+            let second = View::from_path(&format!("{}#next", path.split('#').next().unwrap()));
+            let mut l = Layout::new(first.clone());
+            let right = Column { key: l.key(), view: View::Inbox };
+            l.tiles[0].columns.push(right);
+            l.tiles[0].settle();
+            l.open(None, second.clone(), How::Beside);
+            assert_eq!(l.focused_view(), Some(&second));
+            l.step(-1);
+            assert_eq!(l.focused_view(), Some(&first));
+            assert_eq!(l.tiles[0].cursor, 0);
+            l.step(1);
+            assert_eq!(l.focused_view(), Some(&second));
+            assert_eq!(l.tiles[0].cursor, 0);
+        }
+    }
+
+    #[test]
+    fn history_only_matches_do_not_steal_a_live_pane_or_modify_old_history() {
+        let doc = View::Docs { id: "d".into(), target: None };
+        let mut l = Layout::new(doc.clone());
+        l.open(None, View::Inbox, How::Instead);
+        let history = l.tiles[0].back.clone();
+        l.open(None, doc.clone(), How::OwnTile);
+        assert_eq!(l.tiles.len(), 2);
+        assert_eq!(l.tiles[0].back, history);
+        assert_eq!(l.tiles[0].columns[0].view, View::Inbox);
+        assert_eq!(l.focused_view(), Some(&doc));
+    }
+
+    #[test]
+    fn selected_parent_opens_reuse_general_destinations_but_keep_new_session_companions_beside_the_parent() {
+        for view in [View::Worker { id: "worker".into() }, View::session("started"), View::Docs { id: "d".into(), target: None }] {
+            let mut l = Layout::new(View::Sessions);
+            let selected = Column { key: l.key(), view: View::session("parent") };
+            l.tiles[0].columns.push(selected.clone());
+            l.open_tile(view.clone());
+            let parent = l.tiles[0].key;
+            let before = l.tiles[0].clone();
+            l.tiles[1].minimized = true;
+            l.focus = 0;
+            l.open_after(parent, selected.key, view);
+            assert_eq!(l.tiles.len(), 2);
+            assert_eq!(l.focus, 1);
+            assert!(!l.tiles[1].minimized);
+            assert_eq!(l.tiles[0], before, "existing detail destination leaves its source intact");
+            l.open_after(parent, selected.key, View::SessionChanges { id: "parent".into() });
+            assert_eq!(l.tiles[0].columns[0], selected, "new companion keeps the selected transcript, not the list");
+            assert_eq!(l.tiles[0].columns[1].view, View::SessionChanges { id: "parent".into() });
+        }
+    }
+
+    #[test]
+    fn settings_sections_and_output_selection_navigate_one_destination_but_different_queries_and_objects_do_not() {
+        for (a, b) in [("/settings/appearance", "/settings/models"), ("/sessions/s/outputs?output=a", "/sessions/s/outputs?output=b")] {
+            let (a, b) = (View::from_path(a), View::from_path(b));
+            let mut l = Layout::new(a.clone());
+            let key = l.tiles[0].columns[0].key;
+            l.open(None, b.clone(), How::OwnTile);
+            assert_eq!(l.tiles.len(), 1);
+            assert_eq!(l.focused_view(), Some(&b));
+            assert_eq!(l.tiles[0].columns[0].key, key);
+            l.step(-1);
+            assert_eq!(l.focused_view(), Some(&a));
+        }
+        for (a, b) in [
+            ("/search?q=a", "/search?q=b"),
+            ("/search?q=a&kind=doc", "/search?q=a&kind=session"),
+            ("/docs/a", "/docs/b"),
+            ("/docs", "/docs/a"),
+            ("/work/a", "/work/b"),
+            ("/projects/a", "/projects/b"),
+            ("/collections/a", "/collections/b"),
+            ("/workers/a", "/workers/b"),
+            ("/sessions/a", "/sessions/b"),
+        ] {
+            let mut l = Layout::new(View::from_path(a));
+            l.open(None, View::from_path(b), How::OwnTile);
+            assert_eq!(l.tiles.len(), 2, "{a} and {b} are distinct destinations");
+        }
+    }
+
+    #[test]
+    fn new_destinations_keep_beside_instead_and_own_tile_history_rules() {
+        for how in [How::Beside, How::Instead, How::OwnTile, How::NewTile] {
+            let mut l = Layout::new(View::Sessions);
+            let original = l.tiles[0].columns.clone();
+            let from = (l.tiles[0].key, original[0].key);
+            let view = View::Docs { id: "new".into(), target: Some("b".into()) };
+            l.open(Some(from), view.clone(), how);
+            assert_eq!(l.focused_view(), Some(&view));
+            if matches!(how, How::OwnTile | How::NewTile) {
+                assert_eq!(l.tiles.len(), 2);
+                assert!(l.tiles[0].back.is_empty());
+            } else {
+                assert_eq!(l.tiles.len(), 1);
+                assert_eq!(l.tiles[0].columns.len(), if how == How::Beside { 2 } else { 1 });
+                assert_eq!(l.tiles[0].back, vec![original]);
+                l.step(-1);
+                assert_eq!(l.focused_view(), Some(&View::Sessions));
+                l.step(1);
+                assert_eq!(l.focused_view(), Some(&view));
+            }
+        }
+    }
+
+    #[test]
+    fn document_and_session_links_preserve_hashes_and_roundtrip_targets() {
+        for path in ["/docs/d#block.2", "/docs/d?block=block.2", "/docs/d?block=ignored#block.2"] {
+            let view = View::from_path(path);
+            assert_eq!(view, View::Docs { id: "d".into(), target: Some("block.2".into()) });
+            assert_eq!(view.path(), "/docs/d#block.2");
+        }
+        for path in ["/docs/d#block%20%C3%A9%2B", "/sessions/s?q=two+words&open=child%2Cnext#turn%2B4"] {
+            let view = View::from_path(path);
+            assert_eq!(View::from_path(&view.path()), view);
+        }
+        assert_eq!(View::from_path("/docs/d#block+2"), View::Docs { id: "d".into(), target: Some("block+2".into()) });
+        assert_eq!(
+            View::from_path("/sessions/s#turn-4"),
+            View::Session { id: "s".into(), target: Some(Target { anchor: Some("turn-4".into()), ..Default::default() }) }
+        );
+        assert_eq!(
+            View::from_path("/sessions/s?open=child"),
+            View::Session { id: "s".into(), target: Some(Target { open: vec!["child".into()], ..Default::default() }) }
+        );
+        assert_eq!(serde_json::from_str::<View>(r#"{"view":"docs","id":"old"}"#).unwrap(), View::Docs { id: "old".into(), target: None });
+    }
+
+    #[test]
+    fn mounted_content_keys_retain_documents_but_replace_targeted_sessions() {
+        let doc = View::from_path("/docs/d");
+        let doc_target = View::from_path("/docs/d#block.1");
+        assert_eq!(content_key(doc.clone(), 0), content_key(doc_target.clone(), 1), "a doc target must retain its editor owner");
+        assert_eq!(content_key(doc_target.clone(), 1), content_key(doc_target, 2), "revisiting a block must not remount DocPage");
+        assert_ne!(content_key(doc, 0), content_key(View::from_path("/docs/other"), 0));
+        let session = View::from_path("/sessions/s");
+        let target = View::from_path("/sessions/s?q=needle#e20");
+        assert_ne!(content_key(session.clone(), 0), content_key(target.clone(), 1), "a session target needs a fresh owner and DOM");
+        assert_ne!(
+            content_key(target.clone(), 1),
+            content_key(target.clone(), 2),
+            "a repeated target needs the same clean remount boundary"
+        );
+        assert_eq!(
+            content_key(target, 1),
+            content_key(session.clone(), 1),
+            "consuming a target at Latest must retain the composer and stream"
+        );
+        assert_eq!(content_key(session.clone(), 1), content_key(session, 1), "ordinary focus does not change its visit");
     }
 
     #[test]
@@ -2359,11 +4150,38 @@ mod tests {
         assert_eq!(l.tile(tile).unwrap().columns[0].key, key);
         assert_eq!(l.find_pane(Pane::Changes, "s1"), None);
         // Something else beside it (a doc): the bar speaks for that.
-        l.open_after(tile, key, View::Docs { id: "d1".into() });
+        l.open_after(tile, key, View::Docs { id: "d1".into(), target: None });
         assert_ne!(l.bar_column(tile), Some(key));
         // Another session's pane beside it is not its own.
         l.open_after(tile, key, View::SessionFiles { id: "s2".into() });
         assert_ne!(l.bar_column(tile), Some(key));
+    }
+
+    #[test]
+    fn phone_ring_follows_the_visible_session_and_stays_with_its_companions() {
+        let mut l = Layout::new(View::session("s1"));
+        let tile = l.tiles[0].key;
+        let session = l.tiles[0].columns[0].key;
+        assert_eq!(l.phone_session_column(tile), Some(session));
+        for view in [
+            View::Docs { id: "d1".into(), target: None },
+            View::SessionChanges { id: "s1".into() },
+            View::SessionTerminal { id: "s1".into() },
+        ] {
+            l.open_after(tile, session, view);
+            assert_eq!(l.tiles[0].cursor, 1);
+            assert_eq!(l.phone_session_column(tile), Some(session));
+            l.tiles[0].cursor = 0;
+            assert_eq!(l.phone_session_column(tile), Some(session));
+        }
+        l.open_after(tile, session, View::session("s2"));
+        assert_eq!(l.phone_session_column(tile), Some(l.tiles[0].columns[1].key), "two sessions use the visible one's ring");
+        l.open_after(tile, session, View::SessionChanges { id: "unrelated".into() });
+        assert_eq!(l.phone_session_column(tile), None, "do not lend a different session's ring to a companion");
+        for view in [View::Docs { id: "d1".into(), target: None }, View::Settings { note: None, section: String::new() }, View::Sessions] {
+            let l = Layout::new(view);
+            assert_eq!(l.phone_session_column(l.tiles[0].key), None);
+        }
     }
 
     fn r(left: f64, top: f64, width: f64, height: f64) -> Rect {
@@ -2485,28 +4303,6 @@ mod tests {
         assert_eq!(l.reading_order(), [1, 0, 2], "left column first, then top to bottom");
         l.minimize(0);
         assert_eq!(l.reading_order(), [1, 0, 2], "a minimized tile keeps its number");
-    }
-
-    #[test]
-    fn a_tile_steps_left_and_right_among_those_shown() {
-        let mut l = opened(5); // the fifth stacks under the first
-        let keys: Vec<u64> = l.tiles.iter().map(|t| t.key).collect();
-        let order = |l: &Layout| l.reading_order().into_iter().map(|i| l.tiles[i].key).collect::<Vec<_>>();
-        assert_eq!(order(&l), [keys[0], keys[4], keys[1], keys[2], keys[3]]);
-        l.focus = 2;
-        l.step_tile(keys[1], -1);
-        assert_eq!(order(&l), [keys[0], keys[1], keys[4], keys[2], keys[3]], "it trades places with the one before");
-        assert_eq!(l.tile(keys[1]).unwrap().stack, Some(0), "into that one's column");
-        assert_eq!(l.tile(keys[4]).unwrap().stack, Some(1));
-        assert_eq!(l.tiles[l.focus].key, keys[2], "the focus stays on its tile");
-        l.step_tile(keys[0], -1);
-        l.step_tile(keys[3], 1);
-        assert_eq!(order(&l), [keys[0], keys[1], keys[4], keys[2], keys[3]], "the ends stay");
-        // A minimized tile is stepped over.
-        let i = l.tiles.iter().position(|t| t.key == keys[4]).unwrap();
-        l.minimize(i);
-        l.step_tile(keys[2], -1);
-        assert_eq!(order(&l), [keys[0], keys[2], keys[4], keys[1], keys[3]]);
     }
 
     #[test]
@@ -2784,10 +4580,44 @@ struct Pos {
     even: bool,
 }
 
+/// The identity of a pane's mounted content, separate from its address.
+/// Documents observe targets in place; sessions consume targets at mount.
+/// Session visits remount; consuming a target at Latest does not change its key.
+/// A changed key must unmount its old owner/DOM, not rebuild against a
+/// disposed owner's reactive attribute state.
+fn content_key(mut view: View, visit: u64) -> (View, u64) {
+    match &mut view {
+        View::Docs { target, .. } => *target = None,
+        View::Session { target, .. } => {
+            *target = None;
+            return (view, visit);
+        }
+        _ => {}
+    }
+    (view, 0)
+}
+
 #[component]
 fn ColumnView(tile: u64, col: u64) -> impl IntoView {
     let ws = use_workspace();
     let live = api::live();
+    let loading = expect_context::<TileLoading>();
+    let mounted = Memo::new(move |was: Option<&bool>| {
+        initial_mount(
+            was.copied().unwrap_or(false),
+            ws.layout.with(|l| {
+                let one_pane = loading.one_pane.get();
+                let focused = l.tiles.get(l.focus).is_some_and(|t| t.key == tile);
+                // A companion's phone bar borrows its session's live ring
+                // and sheet. Mount that session after the visible content's
+                // first paint, without eagerly mounting other hidden panes.
+                let ring = one_pane && focused && loading.released.get() && l.phone_session_column(tile) == Some(col);
+                (l.pane_shown(tile, col, one_pane) || ring) && (!one_pane || focused)
+            }),
+            ws.layout.with(|l| l.tiles.get(l.focus).is_some_and(|t| t.key == tile)),
+            loading.released.get(),
+        )
+    });
     let pos = Memo::new(move |_| {
         ws.layout.with(|l| {
             let ti = l.tiles.iter().position(|t| t.key == tile)?;
@@ -2799,27 +4629,34 @@ fn ColumnView(tile: u64, col: u64) -> impl IntoView {
     });
     let view =
         Memo::new(move |_| ws.layout.with(|l| l.tile(tile).and_then(|t| t.columns.iter().find(|c| c.key == col)).map(|c| c.view.clone())));
+    // A block jump is not a new document. Keep DocPage (and unsaved block
+    // and comment drafts) mounted; it observes the target separately.
+    let navigation = ws.navigation_for(col);
+    let content = Memo::new(move |_| view.get().map(|v| (v, navigation.get())));
     let ctx = ColumnCtx {
         ws,
         tile,
         col,
         visible: Signal::derive(move || pos.get().is_some()),
         active: Signal::derive(move || pos.get().is_some_and(|p| p.active)),
+        one_pane: loading.one_pane,
         scroll: StoredValue::new((0, false)),
     };
     provide_context(ctx);
     let label = Signal::derive(move || view.get().map(|v| v.label(&live)).unwrap_or_default());
     view! {
-        // The list beside an item is narrower; a phone shows one pane.
+        // The list beside an item is narrower. A narrow tile reuses the
+        // phone's cursor/back navigation instead of squeezing two panes.
         <div
             id=ctx.root_id()
+            data-pane-motion=col
             class=move || match pos.get() {
                 Some(p) if p.len == 2 && p.index == 0 => format!(
-                    "min-w-0 flex-col border-r border-zinc-200 dark:border-zinc-800 md:flex md:shrink-0 {} {}",
-                    if p.even { "md:basis-1/2" } else { "md:basis-[40%]" },
+                    "min-w-0 flex-col border-r border-zinc-200 dark:border-zinc-800 md:@min-[40rem]/tile:flex md:@min-[40rem]/tile:grow-0 md:@min-[40rem]/tile:shrink-0 {} {}",
+                    if p.even { "md:@min-[40rem]/tile:basis-1/2" } else { "md:@min-[40rem]/tile:basis-[40%]" },
                     if p.cursor == 0 { "flex flex-1" } else { "hidden" },
                 ),
-                Some(p) => format!("min-w-0 flex-1 flex-col md:flex {}", if p.cursor == p.index { "flex" } else { "hidden" }),
+                Some(p) => format!("min-w-0 flex-1 flex-col md:@min-[40rem]/tile:flex {}", if p.cursor == p.index { "flex" } else { "hidden" }),
                 None => "hidden".to_owned(),
             }
             on:pointerdown=move |_| ws.set_active(tile, col)
@@ -2830,16 +4667,25 @@ fn ColumnView(tile: u64, col: u64) -> impl IntoView {
             <Show when=move || pos.get().is_some_and(|p| p.len == 2)>
                 <ColumnHeader label pos=Signal::derive(move || pos.get()) view=Signal::derive(move || view.get()) />
             </Show>
-            <div class="relative flex min-h-0 flex-1 flex-col">
-                {move || view.get().map(render_view)}
-            </div>
+            <Show when=move || mounted.get()>
+                <For each=move || content.get() key=|(view, visit)| content_key(view.clone(), *visit) let:content>
+                    // This existing wrapper shares the content's keyed mount
+                    // lifetime. A reactive attribute on the outer shell could
+                    // name the next view before it renders (or panics).
+                    {let kind = content.0.crash_kind(); view! {
+                        <div data-pane-kind=kind class="@container/view relative flex min-h-0 min-w-0 flex-1 flex-col">
+                            <InitialView view=content.0 col />
+                        </div>
+                    }}
+                </For>
+            </Show>
         </div>
     }
 }
 
-/// A pane's slim header, shown when its tile has two panes: its name, pin
-/// (sessions), and close (the tile's ✕ closes the tile). On a phone, the
-/// item's header goes back to the list beside it.
+/// A pane's desktop-only slim header, shown when its tile has two panes:
+/// its name, pin (sessions), and close (the tile's ✕ closes the tile).
+/// Narrow desktop uses Back here; phones use their single tile bar.
 #[component]
 fn ColumnHeader(label: Signal<String>, pos: Signal<Option<Pos>>, view: Signal<Option<View>>) -> impl IntoView {
     let ctx = use_column().expect("in a pane");
@@ -2852,12 +4698,12 @@ fn ColumnHeader(label: Signal<String>, pos: Signal<Option<Pos>>, view: Signal<Op
     // 24px round a 16px glyph (the bar is 28px), 40px on a touch screen.
     let btn = "flex size-6 shrink-0 items-center justify-center rounded text-muted outline-none focus-visible:ring-2 focus-visible:ring-sky-500/60 pointer-fine:hover:bg-zinc-200 pointer-fine:hover:text-zinc-900 pointer-coarse:size-10 dark:pointer-fine:hover:bg-zinc-800 dark:pointer-fine:hover:text-zinc-100";
     view! {
-        <div class=move || format!(
-            "flex h-7 shrink-0 items-center gap-1 border-b border-zinc-100 px-2 text-[11px] pointer-coarse:h-11 pointer-coarse:gap-0 dark:border-zinc-900 {}",
+        <div data-pane-bar class=move || format!(
+            "hidden h-7 shrink-0 items-center gap-1 border-b border-zinc-100 px-2 text-[11px] md:flex pointer-coarse:h-11 pointer-coarse:gap-0 dark:border-zinc-900 {}",
             if ctx.active.get() { "text-zinc-700 dark:text-zinc-300" } else { "text-muted" },
         )>
             <Show when=move || pos.get().is_some_and(|p| p.index == 1)>
-                <button class=format!("{btn} md:hidden") title="Back to the list" aria-label="Back to the list" on:click=move |_| ws.show_list(ctx.tile)>{crate::icons::chevron_left()}</button>
+                <button class=format!("{btn} md:@min-[40rem]/tile:hidden") title="Back to the list" aria-label="Back to the list" on:click=move |_| ws.show_list(ctx.tile)>{crate::icons::chevron_left()}</button>
             </Show>
             <span class="min-w-0 flex-1 truncate">{label}</span>
             {move || session().map(|id| view! {
@@ -2909,8 +4755,8 @@ fn render_view(view: View) -> AnyView {
                     View::Work { id } => view! { <crate::work::WorkItemPage id=id.clone() /> }.into_any(),
                     View::Projects { id } if id.is_empty() => view! { <crate::projects::ProjectsPage /> }.into_any(),
                     View::Projects { id } => view! { <crate::projects::ProjectPage id=id.clone() /> }.into_any(),
-                    View::Docs { id } if id.is_empty() => view! { <crate::docs::DocsPage /> }.into_any(),
-                    View::Docs { id } => view! { <crate::docs::DocPage id=id.clone() /> }.into_any(),
+                    View::Docs { id, .. } if id.is_empty() => view! { <crate::docs::DocsPage /> }.into_any(),
+                    View::Docs { id, .. } => view! { <crate::docs::DocPage id=id.clone() /> }.into_any(),
                     View::Collections { name } => view! { <crate::collections::CollectionsPage name=name.clone() /> }.into_any(),
                     View::App { name, record } => view! { <crate::views::ViewPage name=name.clone() record=record.clone() /> }.into_any(),
                     View::Realms => view! { <crate::explorer::RealmsMap /> }.into_any(),
@@ -2929,9 +4775,37 @@ fn render_view(view: View) -> AnyView {
 
 /// A path segment, percent-encoded.
 pub fn encode(s: &str) -> String {
-    js_sys::encode_uri_component(s).as_string().unwrap_or_default()
+    let mut out = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&b) {
+            out.push(char::from(b));
+        } else {
+            use std::fmt::Write;
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
 }
 
 fn decode(s: &str) -> String {
-    js_sys::decode_uri_component(&s.replace('+', " ")).ok().and_then(|v| v.as_string()).unwrap_or_else(|| s.to_owned())
+    decode_fragment(&s.replace('+', " "))
+}
+
+/// Fragments, unlike query parameters, preserve a literal plus sign.
+fn decode_fragment(s: &str) -> String {
+    let mut out = Vec::with_capacity(s.len());
+    let mut bytes = s.bytes();
+    while let Some(b) = bytes.next() {
+        if b == b'%' {
+            let Some((hi, lo)) =
+                bytes.next().and_then(|b| char::from(b).to_digit(16)).zip(bytes.next().and_then(|b| char::from(b).to_digit(16)))
+            else {
+                return s.to_owned();
+            };
+            out.push((hi * 16 + lo) as u8);
+        } else {
+            out.push(b);
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_owned())
 }

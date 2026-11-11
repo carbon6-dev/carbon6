@@ -21,11 +21,18 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::journal::StopUnconfirmed;
+
 /// Tool profile recorded for Claude Code sessions.
 pub const PROFILE: &str = "claude_code";
 
 /// What the log shows as a Claude Code session's system prompt.
 pub const SYSTEM_PROMPT: &str = "(Claude Code's own system prompt)";
+
+#[cfg(test)]
+pub(crate) fn replace_test_bin(bin: Option<PathBuf>) -> Option<PathBuf> {
+    std::mem::replace(&mut *tests::BIN.lock().unwrap(), bin)
+}
 
 /// The `claude` binary: `$C6_CLAUDE_BIN`, then `PATH`, then the usual
 /// install locations (services often run without the user's PATH).
@@ -68,6 +75,56 @@ pub struct ClaudeConversation {
     /// What a new conversation is told first, before the inputs: a side
     /// chat's branched-from context, or a handoff's transcript.
     pub preamble: Option<String>,
+}
+
+/// Tracking succeeded, but the old group has not confirmed whole-group
+/// absence. This is an ordinary retirement barrier, not a journal failure.
+#[derive(Debug)]
+pub(crate) struct ReplacementBlocked(Pid);
+
+impl std::fmt::Display for ReplacementBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Claude Code replacement is blocked until process group {} confirms absence", self.0)
+    }
+}
+
+impl std::error::Error for ReplacementBlocked {}
+
+/// Main-chain IDs, not API message IDs or the result event's UUID. A tool
+/// turn ends at its final assistant entry, not the tool-call entry.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct Boundary {
+    pub session_id: String,
+    pub input_uuids: Vec<String>,
+    pub cutoff_uuid: String,
+}
+
+/// Durable reset intent. Only an untouched intent can be abandoned safely.
+/// Old session files are never removed.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct Reset {
+    pub command_id: String,
+    pub to_seq: u64,
+    pub restore_files: bool,
+    pub session_id: String,
+    pub fresh: bool,
+    #[serde(default)]
+    pub withdrawn: Vec<String>,
+    /// Persisted before dispatch; cleared BEFORE stopping the old runtime.
+    /// Missing on older rows means potentially destructive, never untouched.
+    #[serde(default)]
+    pub untouched: bool,
+    /// Restore the last confirmed branch if preflight fails. Pending resets
+    /// never nest: only a confirmed mapping can become this snapshot.
+    #[serde(default)]
+    pub previous: Option<Box<(Reset, u64)>>,
+    /// A destructive failure waits for an explicit retry, not each new input.
+    #[serde(default)]
+    pub failure: String,
+    /// Explicit retry receipts authorizing this recovery. They must survive
+    /// a crash during initialization, and fail with it rather than retry again.
+    #[serde(default)]
+    pub retries: Vec<String>,
 }
 
 /// How long an idle process with no background tasks stays up, unless
@@ -261,6 +318,9 @@ pub(crate) struct Held {
     offset: Arc<std::sync::atomic::AtomicU64>,
     /// Stopped or closed on purpose: its folder goes with it.
     done: bool,
+    /// Explicit rewind cleanup must kill the group even if its future is
+    /// cancelled. Ordinary worker shutdown still leaves the keeper running.
+    stop_on_drop: bool,
 }
 
 /// What a held process records about itself.
@@ -397,13 +457,15 @@ pub(crate) struct Process {
     /// A line read while idle that begins a turn.
     pending: Option<Value>,
     /// Background-task notifications since the last turn ended.
-    notified: Vec<String>,
+    notified: Vec<(String, c6_proto::TaskNotice)>,
+    /// SDK task ids are not session ids. Keep their structured labels separately.
+    task_labels: HashMap<String, (String, String)>,
     /// Tasks Claude Code's subagents own: their ends are theirs to hear.
     subagent_tasks: HashSet<String>,
     /// Its own tasks that ended while no turn ran, as notices for the agent
     /// ([`Process::take_unwoken`]), and when to deliver them if Claude Code
     /// hasn't started a turn for them by itself.
-    unwoken: Vec<String>,
+    unwoken: Vec<(String, c6_proto::TaskNotice)>,
     wake_due: Option<tokio::time::Instant>,
     /// You stopped its last turn: until when a turn it starts by itself is
     /// taken as the stop's doing (`None` once one of its tasks ends on its
@@ -424,6 +486,7 @@ pub(crate) struct Process {
     /// `assistant` line's uuid, as in its transcript), and the tasks it
     /// reported ended during the running turn.
     last_uuid: Option<String>,
+    boundary: Boundary,
     turn_tasks: Vec<(String, String)>,
     /// Of the turn you stopped: its last message, when it ended, and the
     /// tasks it reported ended (to find, or else name, what it queued).
@@ -448,8 +511,17 @@ impl Drop for Process {
     fn drop(&mut self) {
         // A held one goes on without this worker; the next takes it up
         // (docs/restarts.md §3).
-        if self.held.as_ref().is_some_and(|h| !h.done) {
-            return;
+        if let Some(h) = &self.held
+            && !h.done
+        {
+            if !h.stop_on_drop {
+                return;
+            }
+            if let Some(pg) = self.pgid
+                && (keeper_holds_fifo(h.keeper, pg, &h.dir) || is_claude_for(pg.as_raw(), &self.launch.conversation))
+            {
+                let _ = killpg(pg, Signal::SIGKILL);
+            }
         }
         // Its background tasks are in its process group: none outlive it.
         if let (Some(Ok(None)), Some(pg)) = (self.child.as_mut().map(|c| c.try_wait()), self.pgid) {
@@ -492,15 +564,906 @@ pub async fn sweep_orphans(dir: &Path) {
     }
 }
 
-/// Process `pid` is a Claude Code CLI running `conversation` (not a
-/// process that has since been given the same id).
+/// The group leader is either the CLI or its keeper wrapper. Inspect argv,
+/// not a substring of the shell's command text: both must carry an actual
+/// conversation option. A reused PID is never signal authority.
 fn is_claude_for(pid: i32, conversation: &str) -> bool {
-    let Ok(out) = std::process::Command::new("ps").args(["-o", "args=", "-p", &pid.to_string()]).output() else { return false };
-    let line = String::from_utf8_lossy(&out.stdout);
-    out.status.success() && !conversation.is_empty() && line.contains("claude") && line.contains(conversation)
+    if pid <= 0 || nix::unistd::getpgid(Some(Pid::from_raw(pid))).ok() != Some(Pid::from_raw(pid)) {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(data) = std::fs::read(format!("/proc/{pid}/cmdline")) else { return false };
+        let Ok(args) = std::str::from_utf8(&data) else { return false };
+        claude_args_for(&args.split('\0').filter(|a| !a.is_empty()).collect::<Vec<_>>(), conversation)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use nix::libc;
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        let mut size = 0;
+        // Unlike ps's display string, KERN_PROCARGS2 preserves argument
+        // boundaries: the wrapper's shell program is one argument, and a
+        // program/path may itself contain spaces. Failure is not authority.
+        // SAFETY: mib and size are writable; a null output queries its size.
+        if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, std::ptr::null_mut(), &mut size, std::ptr::null_mut(), 0) } != 0
+            || size == 0
+            || size > 16 * 1024 * 1024
+        {
+            return false;
+        }
+        let mut data = vec![0u8; size];
+        // SAFETY: data has size writable bytes; sysctl reports bytes written.
+        if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, data.as_mut_ptr().cast(), &mut size, std::ptr::null_mut(), 0) } != 0
+            || size > data.len()
+        {
+            return false;
+        }
+        darwin_procargs(&data[..size]).is_some_and(|args| claude_args_for(&args, conversation))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let Ok(out) = std::process::Command::new("ps").args(["-ww", "-o", "args=", "-p", &pid.to_string()]).output() else { return false };
+        let line = String::from_utf8_lossy(&out.stdout);
+        out.status.success() && claude_args_for(&line.split_whitespace().collect::<Vec<_>>(), conversation)
+    }
+}
+
+/// Darwin returns argc, a NUL-terminated exec path, NUL padding, then argc
+/// NUL-terminated arguments. Do not read options from the environment after it.
+#[cfg(any(target_os = "macos", test))]
+fn darwin_procargs(data: &[u8]) -> Option<Vec<&str>> {
+    let argc = usize::try_from(i32::from_ne_bytes(data.get(..4)?.try_into().ok()?)).ok()?;
+    let mut rest = data.get(4..)?;
+    if argc == 0 || argc > rest.len() {
+        return None;
+    }
+    rest = rest.get(rest.iter().position(|b| *b == 0)? + 1..)?;
+    rest = rest.get(rest.iter().position(|b| *b != 0)?..)?;
+    let mut args = Vec::with_capacity(argc);
+    for _ in 0..argc {
+        let end = rest.iter().position(|b| *b == 0)?;
+        args.push(std::str::from_utf8(&rest[..end]).ok()?);
+        rest = &rest[end + 1..];
+    }
+    Some(args)
+}
+
+/// Signal-zero probe, with Darwin's zombie-only groups treated as stopped.
+/// EPERM alone is never absence: it can also mean inaccessible live members.
+/// This does not confer ownership or authorize any signal to a saved PGID.
+fn group_probe(pg: Pid) -> nix::Result<()> {
+    group_probe_with_detail(pg).0
+}
+
+/// Keep the disposition and diagnostics from the same observation together.
+/// In particular, an error reporter must not repeat a racy absence proof.
+fn group_probe_with_detail(pg: Pid) -> (nix::Result<()>, Option<String>) {
+    #[cfg(target_os = "macos")]
+    {
+        let observation = darwin_group_observation(pg);
+        (observation.result, observation.detail)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        (killpg(pg, None), None)
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DarwinGroupFailure {
+    Progress,
+    Refusal,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Debug)]
+struct DarwinGroupObservation {
+    result: nix::Result<()>,
+    detail: Option<String>,
+    failure: DarwinGroupFailure,
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_group_observation(pg: Pid) -> DarwinGroupObservation {
+    let result = killpg(pg, None);
+    darwin_group_observe(result, || {
+        if pg.as_raw() > 0 {
+            darwin_group_stopped_with_detail(pg.as_raw())
+        } else {
+            (false, DarwinGroupFailure::Refusal, vec![format!("nonpositive PGID {pg}; no absence proof attempted")])
+        }
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn darwin_group_observe(
+    result: nix::Result<()>,
+    proof: impl FnOnce() -> (bool, DarwinGroupFailure, Vec<String>),
+) -> DarwinGroupObservation {
+    let mut failure = DarwinGroupFailure::Refusal;
+    let (result, detail) = darwin_group_probe_with_detail(result, || {
+        let (stopped, observed_failure, observations) = proof();
+        failure = observed_failure;
+        (stopped, observations)
+    });
+    DarwinGroupObservation { result, detail, failure }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn darwin_group_probe(result: nix::Result<()>, stopped: impl FnOnce() -> bool) -> nix::Result<()> {
+    if result == Err(nix::errno::Errno::EPERM) && stopped() { Err(nix::errno::Errno::ESRCH) } else { result }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn darwin_group_probe_with_detail(
+    result: nix::Result<()>,
+    stopped: impl FnOnce() -> (bool, Vec<String>),
+) -> (nix::Result<()>, Option<String>) {
+    let raw = match result {
+        Ok(()) => "Darwin group signal-zero: Ok/live".to_owned(),
+        Err(error) => format!("Darwin group signal-zero: Err({error:?}) errno={}", error as i32),
+    };
+    let mut detail = Some(raw.clone());
+    let result = darwin_group_probe(result, || {
+        let (stopped, observations) = stopped();
+        let disposition = if stopped { "confirmed" } else { "refused" };
+        detail = Some(format!("{raw}; Darwin group absence proof {disposition}: {}", observations.join("; ")));
+        stopped
+    });
+    (result, detail)
+}
+
+// XNU's listpids allocates min(nprocs + 20, supplied slots) *before* taking
+// proc_list_lock. Supplying at most 20 slots guarantees that a short response
+// is complete even if the global process count grows before that lock. A full
+// buffer is ambiguous and must retain the barrier, even for all-zombie groups.
+#[cfg(any(target_os = "macos", test))]
+const DARWIN_GROUP_SLOTS: usize = 20;
+#[cfg(any(target_os = "macos", test))]
+const DARWIN_BSDINFO_SIZE: i32 = 136;
+// XNU bsd/sys/proc_info.h: PROC_FLAG_INEXIT. libc exports pbi_flags but
+// does not expose this constant (checked against the pinned libc 0.2.190).
+#[cfg(any(target_os = "macos", test))]
+const DARWIN_PROC_FLAG_INEXIT: u32 = 4;
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DarwinGroupMember {
+    pid: u32,
+    pgid: u32,
+    status: u32,
+    flags: u32,
+    start_sec: u64,
+    start_usec: u64,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug)]
+enum DarwinGroupSnapshot {
+    Complete(Vec<DarwinGroupMember>),
+    Reaped,
+    Refused,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn darwin_group_missing_member(returned: i32, error: i32) -> DarwinGroupSnapshot {
+    if returned == 0 && error == nix::errno::Errno::ESRCH as i32 { DarwinGroupSnapshot::Reaped } else { DarwinGroupSnapshot::Refused }
+}
+
+/// Progress is only permission for another observation, never absence proof.
+/// Complete snapshots contain only validated zombies or INEXIT members.
+#[cfg(any(target_os = "macos", test))]
+fn darwin_group_failure(snapshots: &[DarwinGroupSnapshot]) -> DarwinGroupFailure {
+    use DarwinGroupSnapshot::{Complete, Reaped};
+    match snapshots {
+        [Complete(members)]
+            if members.iter().any(|member| member.status != 5)
+                && members.iter().all(|member| member.status == 5 || darwin_member_exiting(member)) =>
+        {
+            DarwinGroupFailure::Progress
+        }
+        [Reaped] | [Complete(_), Reaped] => DarwinGroupFailure::Progress,
+        [Complete(first), Complete(second)] if second.len() < first.len() && second.iter().all(|member| first.contains(member)) => {
+            DarwinGroupFailure::Progress
+        }
+        _ => DarwinGroupFailure::Refusal,
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn darwin_group_pids(returned: i32, error: i32, buffer: &[i32]) -> Option<Vec<i32>> {
+    let bytes = usize::try_from(returned).ok()?;
+    let width = std::mem::size_of::<i32>();
+    // libproc maps syscall failures to zero, just like an empty successful
+    // response. Its caller must clear and capture errno around every call.
+    if error != 0 || buffer.len() != DARWIN_GROUP_SLOTS || bytes >= std::mem::size_of_val(buffer) || bytes % width != 0 {
+        return None;
+    }
+    let mut pids = buffer[..bytes / width].to_vec();
+    pids.sort_unstable();
+    if pids.iter().any(|pid| *pid <= 0) || pids.windows(2).any(|pair| pair[0] == pair[1]) {
+        return None;
+    }
+    Some(pids)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn darwin_zombie_member(returned: i32, pid: i32, pg: i32, member: DarwinGroupMember) -> Option<DarwinGroupMember> {
+    const SZOMB: u32 = 5;
+    (returned == DARWIN_BSDINFO_SIZE
+        && pid > 0
+        && pg > 0
+        && member.pid == pid as u32
+        && member.pgid == pg as u32
+        && member.status == SZOMB
+        && member.start_sec > 0
+        && member.start_usec < 1_000_000)
+        .then_some(member)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn darwin_member_exiting(member: &DarwinGroupMember) -> bool {
+    (1..5).contains(&member.status) && member.flags & DARWIN_PROC_FLAG_INEXIT != 0
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn darwin_observed_member(returned: i32, error: i32, pid: i32, pg: i32, member: DarwinGroupMember) -> Option<DarwinGroupMember> {
+    if error != 0 {
+        return None;
+    }
+    if member.status == 5 {
+        return darwin_zombie_member(returned, pid, pg, member);
+    }
+    (returned == DARWIN_BSDINFO_SIZE
+        && pid > 0
+        && pg > 0
+        && member.pid == pid as u32
+        && member.pgid == pg as u32
+        && member.start_sec > 0
+        && member.start_usec < 1_000_000
+        && darwin_member_exiting(&member))
+    .then_some(member)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn darwin_group_record_member(snapshot: &mut DarwinGroupSnapshot, returned: i32, error: i32, parsed: &Option<DarwinGroupMember>) {
+    if let Some(member) = parsed {
+        if let DarwinGroupSnapshot::Complete(members) = snapshot {
+            members.push(member.clone());
+        }
+    } else if matches!(snapshot, DarwinGroupSnapshot::Refused)
+        || matches!(darwin_group_missing_member(returned, error), DarwinGroupSnapshot::Refused)
+    {
+        *snapshot = DarwinGroupSnapshot::Refused;
+    } else {
+        *snapshot = DarwinGroupSnapshot::Reaped;
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn darwin_group_snapshots_stopped(
+    mut list: impl FnMut() -> Option<Vec<i32>>,
+    mut member: impl FnMut(i32) -> Option<DarwinGroupMember>,
+) -> bool {
+    let mut snapshot = || {
+        let pids = list()?;
+        let mut members = Vec::with_capacity(pids.len());
+        let mut complete = true;
+        // Do not let INEXIT or a reaped member hide another live member or
+        // hard error later in this complete PID list. Refusal dominates.
+        for pid in pids {
+            if let Some(observed) = member(pid) {
+                members.push(observed);
+            } else {
+                complete = false;
+            }
+        }
+        complete.then_some(members)
+    };
+    let Some(first) = snapshot() else { return false };
+    if first.iter().any(|member| member.status != 5) {
+        return false;
+    }
+    // A live member could fork after enumeration and then become a zombie.
+    // Repeat the complete enumeration and status/identity checks; a changed
+    // membership, PID reuse, lookup error, or live member keeps the barrier.
+    snapshot().is_some_and(|second| second.iter().all(|member| member.status == 5) && first == second)
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_group_stopped_with_detail(pg: i32) -> (bool, DarwinGroupFailure, Vec<String>) {
+    use nix::libc;
+    const PROC_PGRP_ONLY: u32 = 2;
+    const _: () = assert!(std::mem::size_of::<libc::proc_bsdinfo>() == DARWIN_BSDINFO_SIZE as usize);
+    const _: () = assert!(libc::SZOMB == 5);
+    let observations = std::cell::RefCell::new(Vec::new());
+    let snapshots = std::cell::RefCell::new(Vec::new());
+    let stopped = darwin_group_snapshots_stopped(
+        || {
+            let mut pids = [0i32; DARWIN_GROUP_SLOTS];
+            nix::errno::Errno::clear();
+            // SAFETY: pids is aligned writable storage of the supplied size.
+            let returned =
+                unsafe { libc::proc_listpids(PROC_PGRP_ONLY, pg as u32, pids.as_mut_ptr().cast(), std::mem::size_of_val(&pids) as i32) };
+            let error = nix::errno::Errno::last_raw();
+            let parsed = darwin_group_pids(returned, error, &pids);
+            let mut snapshots = snapshots.borrow_mut();
+            snapshots.push(if parsed.is_some() { DarwinGroupSnapshot::Complete(Vec::new()) } else { DarwinGroupSnapshot::Refused });
+            observations.borrow_mut().push(format!(
+                "snapshot {} list: pgid={pg} bytes={returned}/{} errno={error} ({}) raw_pids={pids:?} parsed={parsed:?}{}",
+                snapshots.len(),
+                std::mem::size_of_val(&pids),
+                nix::errno::Errno::from_raw(error),
+                if returned >= std::mem::size_of_val(&pids) as i32 { " saturated/truncation unknown" } else { "" }
+            ));
+            parsed
+        },
+        |pid| {
+            // SAFETY: proc_bsdinfo contains only integers and byte arrays.
+            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+            // Nonzero arg explicitly enables zombie lookup in PROC_PIDTBSDINFO.
+            nix::errno::Errno::clear();
+            // SAFETY: info has the exact ABI size asserted above and is writable.
+            let returned =
+                unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 1, std::ptr::from_mut(&mut info).cast(), DARWIN_BSDINFO_SIZE) };
+            let error = nix::errno::Errno::last_raw();
+            let raw = DarwinGroupMember {
+                pid: info.pbi_pid,
+                pgid: info.pbi_pgid,
+                status: info.pbi_status,
+                flags: info.pbi_flags,
+                start_sec: info.pbi_start_tvsec,
+                start_usec: info.pbi_start_tvusec,
+            };
+            let parsed = darwin_observed_member(returned, error, pid, pg, raw.clone());
+            let refusal = if error != 0 || returned != DARWIN_BSDINFO_SIZE {
+                "unreadable/incorrect BSD info size"
+            } else if raw.pid != pid as u32 || raw.pgid != pg as u32 {
+                "PID/PGID identity mismatch"
+            } else if raw.status != 5 && !darwin_member_exiting(&raw) {
+                "non-zombie/live status without valid INEXIT"
+            } else if raw.start_sec == 0 || raw.start_usec >= 1_000_000 {
+                "invalid start identity"
+            } else {
+                "none"
+            };
+            let mut snapshots = snapshots.borrow_mut();
+            observations.borrow_mut().push(format!(
+                "snapshot {} member: requested_pid={pid} expected_pgid={pg} bytes={returned}/{DARWIN_BSDINFO_SIZE} errno={error} ({}) raw={raw:?} flags={} accepted={} refusal={refusal}",
+                snapshots.len(),
+                nix::errno::Errno::from_raw(error),
+                raw.flags,
+                parsed.is_some()
+            ));
+            if let Some(snapshot) = snapshots.last_mut() {
+                darwin_group_record_member(snapshot, returned, error, &parsed);
+            }
+            parsed
+        },
+    );
+    let mut observations = observations.into_inner();
+    let snapshots = snapshots.into_inner();
+    let failure = darwin_group_failure(&snapshots);
+    if !stopped {
+        observations.push(match snapshots.as_slice() {
+            [DarwinGroupSnapshot::Refused, ..] => "first snapshot rejected: enumeration or member response above".into(),
+            [DarwinGroupSnapshot::Complete(_), DarwinGroupSnapshot::Refused] => {
+                "second snapshot rejected: enumeration or member response above".into()
+            }
+            [DarwinGroupSnapshot::Complete(first), DarwinGroupSnapshot::Complete(second)] => {
+                format!("snapshot identities/membership differ (possible reap or PID reuse): first={first:?} second={second:?}")
+            }
+            [DarwinGroupSnapshot::Complete(members)] => format!("complete group contains INEXIT members, never absence: {members:?}"),
+            [DarwinGroupSnapshot::Reaped] | [DarwinGroupSnapshot::Complete(_), DarwinGroupSnapshot::Reaped] => {
+                "listed member lookup returned zero bytes with ESRCH; no absence proof".into()
+            }
+            _ => "incomplete snapshot observations".into(),
+        });
+        observations.push(format!("classification={failure:?}; stopped=false"));
+    }
+    (stopped, failure, observations)
+}
+
+fn claude_args_for(args: &[&str], conversation: &str) -> bool {
+    let claude_program = |arg: &str| {
+        let path = Path::new(arg);
+        path.file_name().and_then(|s| s.to_str()).is_some_and(|s| s == "claude" || s.starts_with("claude-"))
+            || path.components().any(|c| matches!(c.as_os_str().to_str(), Some("claude" | "claude-code")))
+    };
+    let options =
+        match args {
+            [_, "-c", r#""$@"; echo $? > "$C6_HELD_CODE""#, "sh", program, options @ ..] if claude_program(program) => options,
+            [program, options @ ..] if claude_program(program) => options,
+            [interpreter, program, options @ ..]
+                if Path::new(interpreter).file_name().and_then(|s| s.to_str()).is_some_and(|s| {
+                    matches!(s, "sh" | "bash" | "node" | "nodejs" | "python" | "python3") || s.starts_with("python3.")
+                }) && claude_program(program) =>
+            {
+                options
+            }
+            _ => return false,
+        };
+    !conversation.is_empty() && options.windows(2).any(|a| matches!(a[0], "--resume" | "--session-id") && a[1] == conversation)
+}
+
+/// The keeper's open FIFO is stronger evidence than a saved PID: it still
+/// belongs to this exact runtime even after the CLI/group leader has exited.
+fn keeper_holds_fifo(keeper: Pid, pgid: Pid, dir: &Path) -> bool {
+    if keeper.as_raw() <= 0 || nix::unistd::getpgid(Some(keeper)).ok() != Some(pgid) {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let Ok(fifo) = std::fs::metadata(dir.join("in")) else { return false };
+        let Ok(open) = std::fs::metadata(format!("/proc/{}/fd/3", keeper.as_raw())) else { return false };
+        fifo.file_type().is_fifo() && (fifo.dev(), fifo.ino()) == (open.dev(), open.ino())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use nix::libc;
+        const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2; // <sys/proc_info.h>
+        // SAFETY: these repr(C) records contain only integers and arrays of
+        // integers, including libc's vnode_info_path; all-zero is valid.
+        let mut info: DarwinVnodeFdInfoWithPath = unsafe { std::mem::zeroed() };
+        // SAFETY: info is aligned, writable storage of precisely the size
+        // required by PROC_PIDFDVNODEPATHINFO. Never trust a short/error reply.
+        let returned = unsafe {
+            libc::proc_pidfdinfo(
+                keeper.as_raw(),
+                3,
+                PROC_PIDFDVNODEPATHINFO,
+                std::ptr::from_mut(&mut info).cast(),
+                std::mem::size_of::<DarwinVnodeFdInfoWithPath>() as libc::c_int,
+            )
+        };
+        let stat = &info.pvip.vip_vi.vi_stat;
+        // libc represents char[MAXPATHLEN] as [[c_char; 32]; 32]. Preserve
+        // raw pathname bytes rather than assuming UTF-8 or display escaping.
+        let path = info.pvip.vip_path.map(|row| row.map(|b| b as u8));
+        darwin_vnode_fifo(returned, stat.vst_dev, stat.vst_ino, stat.vst_mode, path.as_flattened(), &dir.join("in"))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = dir;
+        false
+    }
+}
+
+// libc exposes the function and inner vnode records, but not these two
+// enclosing records. Layout: Apple's <sys/proc_info.h> proc_fileinfo and
+// vnode_fdinfowithpath (also unchanged in Sonoma's xnu-10063.121.3).
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct DarwinProcFileInfo {
+    fi_openflags: u32,
+    fi_status: u32,
+    fi_offset: nix::libc::off_t,
+    fi_type: i32,
+    fi_guardflags: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct DarwinVnodeFdInfoWithPath {
+    pfi: DarwinProcFileInfo,
+    pvip: nix::libc::vnode_info_path,
+}
+
+#[cfg(any(target_os = "macos", test))]
+const DARWIN_VNODE_FDINFO_SIZE: usize = 1200;
+#[cfg(any(target_os = "macos", test))]
+const DARWIN_VNODE_PATH_SIZE: usize = 1024;
+
+#[cfg(target_os = "macos")]
+const _: () = {
+    assert!(std::mem::size_of::<DarwinProcFileInfo>() == 24);
+    assert!(std::mem::offset_of!(DarwinVnodeFdInfoWithPath, pvip) == 24);
+    assert!(std::mem::size_of::<DarwinVnodeFdInfoWithPath>() == DARWIN_VNODE_FDINFO_SIZE);
+    assert!(nix::libc::MAXPATHLEN as usize == DARWIN_VNODE_PATH_SIZE);
+};
+
+/// Decode the kernel's fixed-size C pathname without losing non-UTF-8 bytes.
+#[cfg(any(target_os = "macos", test))]
+fn darwin_vnode_path(path: &[u8]) -> Option<&Path> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    if path.len() != DARWIN_VNODE_PATH_SIZE {
+        return None;
+    }
+    let end = path.iter().position(|b| *b == 0)?;
+    let path = Path::new(OsStr::from_bytes(&path[..end]));
+    path.is_absolute().then_some(path)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn darwin_vnode_fifo(returned: i32, dev: u32, ino: u64, mode: u16, path: &[u8], fifo: &Path) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    if usize::try_from(returned).ok() != Some(DARWIN_VNODE_FDINFO_SIZE) {
+        return false;
+    }
+    let Ok(expected) = std::fs::metadata(fifo) else { return false };
+    // Device/inode/type are from the open descriptor's vnode, not a stat of
+    // its reported path. Darwin dev_t is 32-bit; compare its bits regardless
+    // of MetadataExt's widening of the signed st_dev to u64.
+    if !expected.file_type().is_fifo()
+        || dev != expected.dev() as u32
+        || ino != expected.ino()
+        || u64::from(mode) & u64::from(nix::libc::S_IFMT) != u64::from(nix::libc::S_IFIFO)
+    {
+        return false;
+    }
+    let Some(path) = darwin_vnode_path(path) else { return false };
+    let (Ok(open_path), Ok(expected_path)) = (std::fs::canonicalize(path), std::fs::canonicalize(fifo)) else { return false };
+    open_path == expected_path
+}
+
+fn held_group_owned(meta: &HeldMeta, dir: &Path) -> bool {
+    meta.conversation == meta.launch.conversation
+        && (is_claude_for(meta.pgid, &meta.conversation) || keeper_holds_fifo(Pid::from_raw(meta.keeper), Pid::from_raw(meta.pgid), dir))
+}
+
+/// SIGSTOP delivery is asynchronous. Observe the stopped state before the
+/// group's interrupt; Linux's distinct tracing-stop state is not sufficient.
+fn keeper_stopped(keeper: Pid) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string(format!("/proc/{}/status", keeper.as_raw())).is_ok_and(|status| {
+            status.lines().find_map(|line| line.strip_prefix("State:")).and_then(|state| state.split_whitespace().next()) == Some("T")
+        })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("/bin/ps")
+            .args(["-o", "stat=", "-p", &keeper.to_string()])
+            .output()
+            .is_ok_and(|out| out.status.success() && String::from_utf8_lossy(&out.stdout).trim().starts_with('T'))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = keeper;
+        false
+    }
+}
+
+async fn pin_held_keeper(keeper: Pid, pg: Pid, dir: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(keeper_holds_fifo(keeper, pg, dir), "Held Claude Code keeper ownership changed");
+    nix::sys::signal::kill(keeper, Signal::SIGSTOP)?;
+    for _ in 0..100 {
+        anyhow::ensure!(keeper_holds_fifo(keeper, pg, dir), "Held Claude Code keeper ownership changed");
+        if keeper_stopped(keeper) {
+            anyhow::ensure!(keeper_holds_fifo(keeper, pg, dir), "Held Claude Code keeper ownership changed");
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    anyhow::bail!("Held Claude Code keeper did not confirm that it stopped")
+}
+
+/// Retain an identified kernel group member across SIGINT grace. If the
+/// keeper has not opened its FIFO yet, wait before signaling anything. When
+/// only an identified leader remains, kill immediately rather than losing
+/// authority by first letting that leader exit during a grace period.
+async fn stop_held_group(pg: Pid, keeper: Pid, dir: &Path, conversation: &str) -> anyhow::Result<()> {
+    for _ in 0..100 {
+        if matches!(group_probe(pg), Err(nix::errno::Errno::ESRCH)) {
+            return Ok(());
+        }
+        if keeper_holds_fifo(keeper, pg, dir) {
+            if let Err(e) = pin_held_keeper(keeper, pg, dir).await {
+                if matches!(group_probe(pg), Err(nix::errno::Errno::ESRCH)) {
+                    return Ok(());
+                }
+                return Err(e);
+            }
+            let _ = killpg(pg, Signal::SIGINT);
+            for _ in 0..30 {
+                if nix::sys::signal::kill(pg, None).is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            if !keeper_holds_fifo(keeper, pg, dir) {
+                anyhow::ensure!(
+                    matches!(group_probe(pg), Err(nix::errno::Errno::ESRCH)),
+                    "Held Claude Code keeper disappeared during stop"
+                );
+                return Ok(());
+            }
+            let _ = killpg(pg, Signal::SIGKILL);
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    if is_claude_for(pg.as_raw(), conversation) {
+        let _ = killpg(pg, Signal::SIGKILL);
+        return Ok(());
+    }
+    anyhow::bail!("Cannot retain ownership of held Claude Code group {}; its cleanup record was kept", pg)
+}
+
+/// A persisted PGID may have been reused: never signal it here. Only absence
+/// proves that an old group's writers (including orphaned children) are gone.
+/// Live groups and permission errors keep the durable barrier. Linux zombies
+/// do too; Darwin zombie-only groups require the extra proof in group_probe.
+#[cfg(not(target_os = "macos"))]
+pub async fn confirm_stopped(journal: &crate::journal::Journal, session_id: &str, wait: Duration) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let mut pending = Vec::new();
+        for pgid in journal.claude_processes(session_id).await? {
+            let (result, detail) = group_probe_with_detail(Pid::from_raw(pgid));
+            match result {
+                Err(nix::errno::Errno::ESRCH) => journal.untrack_claude_process(session_id, pgid).await?,
+                Ok(()) => pending.push(pgid),
+                Err(error) => {
+                    let mut message = format!("Cannot confirm Claude Code process group {pgid} stopped");
+                    if let Some(detail) = detail {
+                        message.push_str(": ");
+                        message.push_str(&detail);
+                    }
+                    return Err(anyhow::Error::new(error).context(StopUnconfirmed(message)));
+                }
+            }
+        }
+        if pending.is_empty() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            StopUnconfirmed(format!("Claude Code process groups have not confirmed that they stopped: {pending:?}"))
+        );
+        tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + Duration::from_millis(25))).await;
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub async fn confirm_stopped(journal: &crate::journal::Journal, session_id: &str, wait: Duration) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let groups = journal.claude_processes(session_id).await?;
+        if groups.is_empty() {
+            return Ok(());
+        }
+        for pgid in groups {
+            darwin_confirm_group_stopped(pgid, deadline, || darwin_group_observation(Pid::from_raw(pgid))).await?;
+            journal.untrack_claude_process(session_id, pgid).await?;
+        }
+    }
+}
+
+/// Keep one supplied deadline across progress observations. In particular,
+/// ZERO still performs one probe, but neither sleeps nor grants a retry.
+#[cfg(any(target_os = "macos", test))]
+async fn darwin_confirm_group_stopped(
+    pgid: i32,
+    deadline: tokio::time::Instant,
+    mut probe: impl FnMut() -> DarwinGroupObservation,
+) -> anyhow::Result<()> {
+    loop {
+        let observation = probe();
+        if observation.result == Err(nix::errno::Errno::ESRCH) {
+            return Ok(());
+        }
+        if observation.result == Err(nix::errno::Errno::EPERM)
+            && observation.failure == DarwinGroupFailure::Progress
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + Duration::from_millis(25))).await;
+            if tokio::time::Instant::now() < deadline {
+                continue;
+            }
+        }
+        let mut message = format!("Cannot confirm Claude Code process group {pgid} stopped");
+        if let Some(detail) = observation.detail {
+            message.push_str(": ");
+            message.push_str(&detail);
+        }
+        return match observation.result {
+            Err(error) => Err(anyhow::Error::new(error).context(StopUnconfirmed(message))),
+            Ok(()) => Err(StopUnconfirmed(format!("{message}: signal-zero probe reports a live group")).into()),
+        };
+    }
+}
+
+/// Replacement gets only the remainder of kill's original absence phase.
+/// Early cleanup failure supplies no grace, but still requires a fresh proof.
+#[cfg(any(target_os = "macos", test))]
+async fn darwin_confirm_replacement_stopped(
+    pg: Pid,
+    deadline: Option<tokio::time::Instant>,
+    probe: impl FnMut() -> DarwinGroupObservation,
+) -> anyhow::Result<()> {
+    darwin_confirm_group_stopped(pg.as_raw(), deadline.unwrap_or_else(tokio::time::Instant::now), probe).await.map_err(|error| {
+        // The session's Error event uses ordinary Display, not {error:#}.
+        // Keep that display complete without losing either typed marker.
+        let message = format!("{}: {error:#}", ReplacementBlocked(pg));
+        error.context(ReplacementBlocked(pg)).context(message)
+    })
+}
+
+/// While an ordinary replacement waits, keep its turn future (and any
+/// already-open inputs) alive. Never signal/adopt here; only proven absence releases
+/// a tracked group. Database errors still abort the turn as journal failures.
+pub(crate) async fn wait_for_replacement(journal: &crate::journal::Journal, session_id: &str) -> anyhow::Result<()> {
+    loop {
+        let mut waiting = false;
+        for pg in journal.claude_processes(session_id).await? {
+            if matches!(group_probe(Pid::from_raw(pg)), Err(nix::errno::Errno::ESRCH)) {
+                journal.untrack_claude_process(session_id, pg).await?;
+            } else {
+                waiting = true;
+            }
+        }
+        if !waiting {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Serialize a resumed admission with durable Rewind publication. The caller
+/// carries this guard through its initial input writes, not the model reply.
+pub(crate) async fn replacement_admission<'a>(
+    journal: &'a crate::journal::Journal,
+    session_id: &str,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Option<tokio::sync::MutexGuard<'a, ()>>> {
+    let ownership = journal.claude_rewind_ownership.lock().await;
+    if cancel.is_cancelled() || matches!(journal.claude_rewind(session_id).await?, Some((_, 0))) {
+        return Ok(None);
+    }
+    Ok(Some(ownership))
+}
+
+/// A descendant's completed turn is not proof that its held CLI stopped.
+/// Inspect all runtimes owned by the session, not just its selected branch.
+/// Do not attach, signal, or remove records here: require proven group absence.
+/// Unreadable/unknown metadata fails closed, as it does for rewind cleanup.
+pub(crate) fn confirm_held_stopped(held: &Path, session: &str) -> anyhow::Result<()> {
+    let entries = match std::fs::read_dir(held) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries {
+        let dir = entry?.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let data = std::fs::read(dir.join("meta.json")).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                anyhow::Error::new(error).context(StopUnconfirmed("Held Claude Code session identity is unknown (missing metadata)".into()))
+            } else {
+                error.into()
+            }
+        })?;
+        let meta: HeldMeta = serde_json::from_slice(&data)?;
+        anyhow::ensure!(!meta.session.is_empty(), StopUnconfirmed("Held Claude Code session identity is unknown".into()));
+        if meta.session != session {
+            continue;
+        }
+        anyhow::ensure!(meta.pgid > 0, StopUnconfirmed("Held Claude Code process group is unknown".into()));
+        anyhow::ensure!(
+            group_probe(Pid::from_raw(meta.pgid)) == Err(nix::errno::Errno::ESRCH),
+            StopUnconfirmed(format!("Held Claude Code process group {} has not confirmed that it stopped", meta.pgid))
+        );
+    }
+    Ok(())
+}
+
+/// Recover ownership for cleanup, never for model input. Pending rewinds may
+/// name neither the old branch nor an interrupted reset's launch identity.
+/// Stop all of this session's held runtimes before the durable PGID barrier.
+/// A reused or unidentifiable group is left alone and keeps that barrier shut.
+pub async fn stop_held_for_rewind(held: &Path, session: &str, journal: &crate::journal::Journal) -> anyhow::Result<()> {
+    let entries = match std::fs::read_dir(held) {
+        Ok(entries) => Some(entries),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    let mut stopped = Vec::new();
+    for entry in entries.into_iter().flatten() {
+        let dir = entry?.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let meta: HeldMeta = serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?)?;
+        if meta.session != session {
+            continue;
+        }
+        anyhow::ensure!(meta.pgid > 0, "Held Claude Code process group is unknown");
+        journal.track_claude_process(session, meta.pgid).await?;
+        let pg = Pid::from_raw(meta.pgid);
+        match group_probe(pg) {
+            Err(nix::errno::Errno::ESRCH) => {}
+            Ok(()) => {
+                anyhow::ensure!(
+                    held_group_owned(&meta, &dir),
+                    "Cannot prove ownership of held Claude Code process group {}; stop confirmation is required",
+                    meta.pgid
+                );
+                stop_held_group(pg, Pid::from_raw(meta.keeper), &dir, &meta.conversation).await?;
+            }
+            Err(e) => anyhow::bail!("Cannot inspect held Claude Code process group {}: {e}", meta.pgid),
+        }
+        stopped.push((dir, meta.output_root));
+    }
+    confirm_stopped(journal, session, Duration::from_secs(3)).await?;
+    for (dir, output_root) in stopped {
+        let _ = std::fs::remove_dir_all(dir);
+        if let Some(root) = output_root {
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+    Ok(())
 }
 
 impl Process {
+    /// Persist before any input, including reuse after a turn and initialize
+    /// attempts that fail before a PID file or fork transcript is written.
+    async fn track(&self) -> anyhow::Result<()> {
+        if let Some(observer) = &self.mapper.observer {
+            let pgid = self.pgid.ok_or_else(|| anyhow::anyhow!("Claude Code process group is unknown"))?;
+            observer.journal.track_claude_process(&observer.session_id, pgid.as_raw()).await?;
+        }
+        Ok(())
+    }
+
+    pub fn needs_preamble(&self) -> bool {
+        !self.resumed && self.mapper.turn == 0
+    }
+
+    /// The SDK's no-model initialization handshake. In print mode Claude
+    /// loads/validates the requested resume before acknowledging initialize.
+    /// This also detects the hidden cutoff flag on versions that omit it from
+    /// --help: an unsupported flag exits instead of acknowledging the reset.
+    pub async fn ready(&mut self, session_id: &str) -> anyhow::Result<String> {
+        self.track().await?;
+        let source = self.launch.conversation.clone();
+        let mut confirmed_id = session_id.to_owned();
+        let request_id = uuid::Uuid::now_v7().to_string();
+        write_line(
+            &self.stdin,
+            &serde_json::json!({"type":"control_request", "request_id":request_id,
+            "request":{"subtype":"initialize"}}),
+        )
+        .await?;
+        let ready = async {
+            while let Some((end, v)) = self.lines.recv().await {
+                self.consumed(end, &v);
+                if v["type"] == "assistant" || v["type"] == "result" {
+                    anyhow::bail!("Claude Code started a turn before confirming its reset");
+                }
+                if let Some(id) = v["session_id"].as_str().filter(|id| !id.is_empty()) {
+                    anyhow::ensure!(
+                        uuid::Uuid::parse_str(id).is_ok() && (id == session_id || id != source),
+                        "Claude Code resumed an unexpected conversation"
+                    );
+                    confirmed_id = id.to_owned();
+                }
+                if v["type"] == "control_response" && v["response"]["request_id"] == request_id {
+                    anyhow::ensure!(
+                        v["response"]["subtype"] == "success",
+                        "Claude Code refused initialization: {}",
+                        v["response"]["error"]
+                    );
+                    return Ok(());
+                }
+            }
+            anyhow::bail!("Claude Code exited before confirming its reset")
+        };
+        // A product startup limit, generous enough for a cold CLI on a loaded
+        // worker. Failure never permits resuming the abandoned conversation.
+        tokio::time::timeout(Duration::from_secs(60), ready).await??;
+        self.launch.conversation = confirmed_id.clone();
+        self.launch.extra_args.clear();
+        self.mapper.scope = confirmed_id.clone();
+        Ok(confirmed_id)
+    }
+
     /// Starts `claude` for a conversation. `stdin` is the session's (see
     /// [`Stdin`]); `mcp` serves carbon6's tools to it for as long as it runs.
     #[allow(clippy::too_many_arguments)]
@@ -664,6 +1627,7 @@ impl Process {
             children: HashMap::new(),
             backgrounded: HashSet::new(),
             task_calls: HashMap::new(),
+            call_tasks: HashMap::new(),
             call_usage: HashMap::new(),
             per_call: false,
         };
@@ -681,6 +1645,7 @@ impl Process {
             unconfirmed: Default::default(),
             pending: None,
             notified: Vec::new(),
+            task_labels: HashMap::new(),
             subagent_tasks: HashSet::new(),
             unwoken: Vec::new(),
             wake_due: None,
@@ -690,6 +1655,7 @@ impl Process {
             cwd: cwd.to_owned(),
             transcripts: transcripts_root(),
             last_uuid: None,
+            boundary: Boundary::default(),
             turn_tasks: Vec::new(),
             stop_mark: None,
             idle_since: tokio::time::Instant::now(),
@@ -706,7 +1672,25 @@ impl Process {
         &self.launch
     }
 
-    /// Records its process group in `dir` while it runs.
+    pub fn is_held(&self) -> bool {
+        self.held.is_some()
+    }
+
+    /// Cleanup-only recording for a non-held initialization. Track the PGID
+    /// durably before any initialize input, and retain the original launch
+    /// conversation in the orphan record: ready may confirm a different fork
+    /// ID, but ownership checks must match the process's actual argv.
+    pub async fn record_in(&mut self, dir: &Path) -> anyhow::Result<()> {
+        anyhow::ensure!(self.held.is_none(), "Held Claude Code already has its own process record");
+        self.track().await?;
+        let pg = self.pgid.ok_or_else(|| anyhow::anyhow!("Claude Code process group is unknown"))?;
+        let path = dir.join(format!("{}.pid", self.launch.conversation));
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(&path, format!("{pg}\n{}\n", self.launch.conversation))?;
+        self.pidfile = Some(path);
+        Ok(())
+    }
+
     /// Starts `cmd` held in `dir`/<conversation> (see [`Held`]): through a
     /// shell that writes its exit code, its input the named pipe (which a
     /// keeper in its process group holds open), its output in files.
@@ -721,9 +1705,29 @@ impl Process {
         mcp: Option<&crate::mcp_bridge::Registration>,
         output_root: Option<&OutputRoot>,
     ) -> std::io::Result<(tokio::process::Child, Held, Option<Pid>)> {
+        // A finished leader/code file is not group absence. This also checks
+        // aliases whose authoritative stream ID differs from storage, and
+        // refuses corrupt/ambiguous records instead of overwriting them.
+        let record = Self::held_record(dir, &launch.conversation)?.map(|(path, _)| path);
         let dir = dir.join(&launch.conversation);
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir)?;
+        let mut prior = record.into_iter().collect::<Vec<_>>();
+        if dir.try_exists()? && !prior.contains(&dir) {
+            prior.push(dir.clone());
+        }
+        for path in prior {
+            let meta: HeldMeta = serde_json::from_slice(&std::fs::read(path.join("meta.json"))?).map_err(std::io::Error::other)?;
+            if meta.pgid <= 0 || !matches!(group_probe(Pid::from_raw(meta.pgid)), Err(nix::errno::Errno::ESRCH)) {
+                return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "Held Claude Code group has not confirmed absence"));
+            }
+            std::fs::remove_dir_all(&path)?;
+            if let Some(root) = meta.output_root {
+                let _ = std::fs::remove_dir_all(root);
+            }
+        }
+        std::fs::create_dir_all(dir.parent().expect("held runtime parent"))?;
+        // Reserve exclusively: another publisher after the absence check
+        // cannot have its record or FIFO silently replaced.
+        std::fs::create_dir(&dir)?;
         let fifo = dir.join("in");
         nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR).map_err(std::io::Error::from)?;
         // The worker's end reads too, so opening it never waits; with it
@@ -755,11 +1759,18 @@ impl Process {
         // Holds the pipe open while no worker does, so the process never
         // reads an end of its input by a restart; in its process group, so
         // stopping it stops the keeper too.
-        let keeper = {
-            use std::os::unix::process::CommandExt;
-            std::process::Command::new("/bin/sh")
+        let mut keeper = {
+            // Darwin delivers default-fatal SIGINT even to a stopped process.
+            // Ignore it in the keeper (and across exec) so its pinned FIFO
+            // remains authority throughout the CLI's grace period. SIGKILL
+            // still ends the keeper and the whole freshly verified group.
+            #[cfg(target_os = "macos")]
+            let program = r#"trap '' INT; exec 3<>"$0"; exec sleep 2147483647"#;
+            #[cfg(not(target_os = "macos"))]
+            let program = r#"exec 3<>"$0"; exec sleep 2147483647"#;
+            tokio::process::Command::new("/bin/sh")
                 .arg("-c")
-                .arg(r#"exec 3<>"$0"; exec sleep 2147483647"#)
+                .arg(program)
                 .arg(&fifo)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -767,7 +1778,13 @@ impl Process {
                 .process_group(pgid.map_or(0, |p| p.as_raw()))
                 .spawn()?
         };
-        let keeper = Pid::from_raw(keeper.id() as i32);
+        let keeper_pid = Pid::from_raw(keeper.id().expect("spawned keeper") as i32);
+        // Reap it while this worker lives, without owning its lifetime. A
+        // dropped wait on worker restart must not kill the detached keeper.
+        tokio::spawn(async move {
+            let _ = keeper.wait().await;
+        });
+        let keeper = keeper_pid;
         *stdin.try_lock().map_err(|_| std::io::Error::other("the session's Claude Code input is busy"))? =
             Some(ClaudeInput::Fifo(tokio::fs::File::from_std(writer)));
         let meta = HeldMeta {
@@ -781,15 +1798,33 @@ impl Process {
         };
         std::fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).unwrap_or_default())?;
         std::fs::write(dir.join("offset"), "0")?;
-        Ok((child, Held { dir, keeper, offset: Arc::new(std::sync::atomic::AtomicU64::new(0)), done: false }, pgid))
+        Ok((child, Held { dir, keeper, offset: Arc::new(std::sync::atomic::AtomicU64::new(0)), done: false, stop_on_drop: false }, pgid))
     }
 
-    /// Whether a previous worker left a held process for `conversation`,
-    /// and the bridge token it calls carbon6's tools with (to register it
-    /// again before [`Process::attach`]).
-    pub(crate) fn held_token(held: &Path, conversation: &str) -> Option<Option<String>> {
-        let meta: HeldMeta = serde_json::from_slice(&std::fs::read(held.join(conversation).join("meta.json")).ok()?).ok()?;
-        Some(meta.token)
+    /// The storage path stays fixed: the wrapper still writes its exit code
+    /// there. A streamed authoritative session ID may change, so resolve by
+    /// metadata, never by falling back to a different conversation's process.
+    pub(crate) fn held_record(held: &Path, conversation: &str) -> std::io::Result<Option<(PathBuf, Option<String>)>> {
+        let entries = match std::fs::read_dir(held) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let mut found = None;
+        for entry in entries {
+            let dir = entry?.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let meta: HeldMeta = serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?).map_err(std::io::Error::other)?;
+            if meta.conversation == conversation && meta.launch.conversation == conversation {
+                if found.is_some() {
+                    return Err(std::io::Error::other("Multiple held runtimes claim the same Claude Code conversation"));
+                }
+                found = Some((dir, meta.token));
+            }
+        }
+        Ok(found)
     }
 
     /// The sessions previous workers left held processes for.
@@ -806,7 +1841,7 @@ impl Process {
     /// conversation, where it had read up to (docs/restarts.md §3). None:
     /// there is none, or it has ended (its folder is cleared).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn attach(
+    pub(crate) async fn attach(
         held: &Path,
         conversation: &str,
         cwd: &Path,
@@ -815,15 +1850,51 @@ impl Process {
         mcp: Option<crate::mcp_bridge::Registration>,
         observer: Option<Arc<Observer>>,
     ) -> Option<Self> {
-        let dir = held.join(conversation);
+        let (dir, _) = Self::held_record(held, conversation).ok()??;
         let meta: HeldMeta = serde_json::from_slice(&std::fs::read(dir.join("meta.json")).ok()?).ok()?;
+        if meta.conversation != conversation || meta.launch.conversation != conversation {
+            return None;
+        }
         let launch = meta.launch.clone();
         let pg = Pid::from_raw(meta.pgid);
-        if meta.pgid <= 0 || dir.join("code").exists() || nix::sys::signal::kill(pg, None).is_err() {
-            let _ = nix::sys::signal::kill(Pid::from_raw(meta.keeper), Signal::SIGTERM);
+        if meta.pgid <= 0 {
+            return None;
+        }
+        if matches!(group_probe(pg), Err(nix::errno::Errno::ESRCH)) {
             let _ = std::fs::remove_dir_all(&dir);
             if let Some(r) = &meta.output_root {
                 let _ = std::fs::remove_dir_all(r);
+            }
+            return None;
+        }
+        // A replacement has retired this runtime, even if a live keeper can
+        // still prove ownership. Its journal PGID is cleanup-only until absence.
+        if dir.join("retiring").try_exists().ok()? {
+            return None;
+        }
+        if !held_group_owned(&meta, &dir) {
+            return None;
+        }
+        if dir.join("code").exists() {
+            // Finished while detached: close only a freshly identified group,
+            // never signal the persisted keeper PID blindly. Keep its record
+            // if any descendants still prevent absence confirmation.
+            let _ = killpg(pg, Signal::SIGKILL);
+            let absent = async {
+                loop {
+                    match group_probe(pg) {
+                        Err(nix::errno::Errno::ESRCH) => break,
+                        Ok(()) => tokio::time::sleep(Duration::from_millis(25)).await,
+                        Err(_) => return false,
+                    }
+                }
+                true
+            };
+            if matches!(tokio::time::timeout(Duration::from_secs(3), absent).await, Ok(true)) {
+                let _ = std::fs::remove_dir_all(&dir);
+                if let Some(r) = &meta.output_root {
+                    let _ = std::fs::remove_dir_all(r);
+                }
             }
             return None;
         }
@@ -845,6 +1916,7 @@ impl Process {
             children: HashMap::new(),
             backgrounded: HashSet::new(),
             task_calls: HashMap::new(),
+            call_tasks: HashMap::new(),
             call_usage: HashMap::new(),
             per_call: false,
         };
@@ -857,6 +1929,7 @@ impl Process {
                 keeper: Pid::from_raw(meta.keeper),
                 offset: Arc::new(std::sync::atomic::AtomicU64::new(offset)),
                 done: false,
+                stop_on_drop: false,
             }),
             stderr: None,
             pgid: Some(pg),
@@ -867,6 +1940,7 @@ impl Process {
             unconfirmed: Default::default(),
             pending: None,
             notified: Vec::new(),
+            task_labels: HashMap::new(),
             subagent_tasks: HashSet::new(),
             unwoken: Vec::new(),
             wake_due: None,
@@ -876,6 +1950,7 @@ impl Process {
             cwd: cwd.to_owned(),
             transcripts: transcripts_root(),
             last_uuid: None,
+            boundary: Boundary::default(),
             turn_tasks: Vec::new(),
             stop_mark: None,
             idle_since: tokio::time::Instant::now(),
@@ -891,7 +1966,32 @@ impl Process {
     /// A line was taken from a held process's output: a restarted worker
     /// reads on from after it (deltas as they stream aren't saved one by
     /// one: they're shown only while live).
-    fn consumed(&self, end: u64, v: &Value) {
+    fn consumed(&mut self, end: u64, v: &Value) {
+        if v["parent_tool_use_id"].is_null()
+            && let Some(id) = v["session_id"].as_str().filter(|id| !id.is_empty())
+        {
+            if let Some(h) = &self.held {
+                // Persist the identity before the offset: a crash may replay
+                // this line, but must never skip the only proof of its branch.
+                let update = || -> std::io::Result<()> {
+                    let path = h.dir.join("meta.json");
+                    let mut meta: HeldMeta = serde_json::from_slice(&std::fs::read(&path)?).map_err(std::io::Error::other)?;
+                    if meta.conversation != id || meta.launch.conversation != id {
+                        meta.conversation = id.into();
+                        meta.launch.conversation = id.into();
+                        let tmp = h.dir.join("meta.next");
+                        std::fs::write(&tmp, serde_json::to_vec(&meta).map_err(std::io::Error::other)?)?;
+                        std::fs::rename(tmp, path)?;
+                    }
+                    Ok(())
+                };
+                if let Err(e) = update() {
+                    warn!("persisting held Claude Code conversation identity: {e}");
+                    return;
+                }
+            }
+            self.launch.conversation = id.into();
+        }
         if let Some(h) = &self.held
             && end > 0
         {
@@ -932,11 +2032,15 @@ impl Process {
     /// It has ended (or is stopped on purpose): a held process's folder,
     /// keeper and guidance go with it.
     fn release_held(&mut self) {
+        if self.pgid.is_some_and(|pg| !matches!(group_probe(pg), Err(nix::errno::Errno::ESRCH))) {
+            // Leader exit is not group absence. Keep cleanup authority and
+            // its durable barrier until every descendant/keeper is gone.
+            return;
+        }
         if let Some(h) = &mut self.held
             && !h.done
         {
             h.done = true;
-            let _ = nix::sys::signal::kill(h.keeper, Signal::SIGTERM);
             let _ = std::fs::remove_dir_all(&h.dir);
             if let Some(r) = &self.mapper.output_root {
                 let _ = std::fs::remove_dir_all(r);
@@ -1010,7 +2114,7 @@ impl Process {
             // starts a turn for it; when it doesn't (seen with a long build),
             // the agent would wait for good, so the session tells it.
             if !v["task_id"].as_str().is_some_and(|t| self.subagent_tasks.contains(t)) {
-                self.unwoken.push(unwoken_notice(&v, status));
+                self.unwoken.push((unwoken_notice(&v, status), sdk_task_notice(&v, &self.task_labels)));
                 self.wake_due.get_or_insert_with(|| tokio::time::Instant::now() + WAKE_GRACE);
             }
         }
@@ -1024,10 +2128,11 @@ impl Process {
     }
 
     /// The notice for those tasks (`None`: nothing is waiting).
-    pub fn take_unwoken(&mut self) -> Option<String> {
+    pub fn take_unwoken(&mut self) -> Option<(String, c6_proto::TaskNotice)> {
         self.wake_due = None;
         let notices = std::mem::take(&mut self.unwoken);
-        (!notices.is_empty()).then(|| notices.join("\n"))
+        (!notices.is_empty())
+            .then(|| (notices.iter().map(|(text, _)| text.as_str()).collect::<Vec<_>>().join("\n"), combined_task_notice(&notices)))
     }
 
     /// Whether its last turn was one it started by itself right after your
@@ -1089,6 +2194,15 @@ impl Process {
     async fn side_line(&mut self, v: &Value, sink: &Arc<dyn EventSink>) -> anyhow::Result<()> {
         if v["type"] == "system"
             && v["subtype"] == "task_started"
+            && let Some(id) = v["task_id"].as_str()
+        {
+            self.task_labels.insert(
+                id.into(),
+                (v["description"].as_str().unwrap_or_default().into(), v["task_type"].as_str().unwrap_or_default().into()),
+            );
+        }
+        if v["type"] == "system"
+            && v["subtype"] == "task_started"
             && v["owned_by_subagent"].as_bool() == Some(true)
             && let Some(t) = v["task_id"].as_str()
         {
@@ -1099,7 +2213,7 @@ impl Process {
         }
         if v["type"] == "system" && v["subtype"] == "task_notification" && v["parent_tool_use_id"].is_null() {
             let summary = v["summary"].as_str().or(v["description"].as_str()).unwrap_or("A background task ended.");
-            self.notified.push(summary.to_owned());
+            self.notified.push((summary.to_owned(), sdk_task_notice(v, &self.task_labels)));
             let field = |k: &str| v[k].as_str().unwrap_or("").to_owned();
             self.turn_tasks.push((field("task_id"), field("status")));
         }
@@ -1121,8 +2235,8 @@ impl Process {
             "parent_tool_use_id": null,
             "message": {"role": "user", "content": user_content(&input, preamble)},
         });
-        // Your messages are a person's: Claude Code delivers one sent now
-        // into the running turn only then (not carbon6's notices).
+        // Only an explicitly authenticated browser message is a person's.
+        // API, internal and legacy inputs must not acquire human provenance.
         if is_yours(&input) {
             line["origin"] = serde_json::json!({"kind": "human"});
         }
@@ -1239,6 +2353,7 @@ impl Process {
     async fn confirm(&mut self, uuid: &str, started: &mut bool, sink: &Arc<dyn EventSink>) -> anyhow::Result<()> {
         let Some(i) = self.unconfirmed.iter().position(|w| w.uuid == uuid) else { return Ok(()) };
         let w = self.unconfirmed.remove(i).expect("found");
+        self.boundary.input_uuids.push(uuid.to_owned());
         if !w.recorded {
             sink.append(w.input.event()).await?;
         }
@@ -1261,9 +2376,10 @@ impl Process {
         } else if self.notified.is_empty() {
             vec!["A background task ended.".to_owned()]
         } else {
-            vec![self.notified.join("\n")]
+            vec![self.notified.iter().map(|(text, _)| text.as_str()).collect::<Vec<_>>().join("\n")]
         };
-        told(sink, texts).await?;
+        let task_notice = (!quiet && !self.notified.is_empty()).then(|| combined_task_notice(&self.notified));
+        told(sink, texts, task_notice).await?;
         sink.append(session_event::Kind::TurnStarted(TurnStarted { turn: self.mapper.turn, ..Default::default() })).await?;
         *started = true;
         Ok(())
@@ -1290,7 +2406,28 @@ impl Process {
         more: &tokio::sync::Notify,
         cancel: &CancellationToken,
     ) -> anyhow::Result<TurnEnd> {
+        self.turn_admitted(turn, inputs, opened, preamble, model, sink, feed, more, cancel, None).await
+    }
+
+    /// A resumed replacement holds Rewind publication out only until its
+    /// initial receipts and input writes finish. Ordinary turns need no guard.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn turn_admitted(
+        &mut self,
+        turn: u64,
+        inputs: Vec<PendingInput>,
+        opened: bool,
+        preamble: Option<&str>,
+        model: &str,
+        sink: &Arc<dyn EventSink>,
+        feed: &(dyn Fn() -> Joining + Send + Sync),
+        more: &tokio::sync::Notify,
+        cancel: &CancellationToken,
+        admission: Option<tokio::sync::MutexGuard<'_, ()>>,
+    ) -> anyhow::Result<TurnEnd> {
+        self.track().await?;
         self.mapper.turn = turn;
+        self.boundary = Boundary { session_id: self.launch.conversation.clone(), ..Default::default() };
         // This turn hears about whatever ended before it.
         self.unwoken.clear();
         self.wake_due = None;
@@ -1321,6 +2458,7 @@ impl Process {
         for (i, input) in inputs.into_iter().enumerate() {
             alive &= self.send(input, if i == 0 { preamble } else { None }, true).await.is_ok();
         }
+        drop(admission);
         // You had just stopped the agent: this turn stops as it begins. It
         // shows only if the model got to say something first.
         if quiet {
@@ -1382,6 +2520,21 @@ impl Process {
                 },
             };
             let main = v["parent_tool_use_id"].is_null();
+            if main {
+                if let Some(id) = v["session_id"].as_str().filter(|id| !id.is_empty()) {
+                    self.boundary.session_id = id.to_owned();
+                    self.launch.conversation = id.to_owned();
+                }
+                if v["type"] == "assistant" {
+                    // Never carry the preceding tool-call UUID forward if
+                    // this final entry lacks one: that requires fresh-history
+                    // fallback rather than an unsafe, incomplete cut.
+                    let blocks = v["message"]["content"].as_array();
+                    let final_reply =
+                        blocks.is_some_and(|bs| bs.iter().any(|b| b["type"] == "text") && !bs.iter().any(|b| b["type"] == "tool_use"));
+                    self.boundary.cutoff_uuid = if final_reply { v["uuid"].as_str().unwrap_or_default().to_owned() } else { String::new() };
+                }
+            }
             if main
                 && matches!(v["type"].as_str(), Some("user" | "assistant"))
                 && let Some(uuid) = v["uuid"].as_str()
@@ -1422,7 +2575,7 @@ impl Process {
                     self.unshown = quiet && !started;
                     if self.unshown {
                         let texts = self.queued_notices().await;
-                        told(sink, texts).await?;
+                        told(sink, texts, None).await?;
                         sink.append(session_event::Kind::Notice(c6_proto::Notice {
                             title: "Stopped before replying".into(),
                             message: "Right after you stopped the agent, Claude Code started a turn by itself for this notice; carbon6 stopped it before the agent replied. The agent reads it with your next message.".into(),
@@ -1440,7 +2593,14 @@ impl Process {
                         self.mapper.result.unwrap_or(TurnEndReason::Completed)
                     };
                     if !self.unshown {
-                        sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: reason as i32 })).await?;
+                        let seq = sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: reason as i32 })).await?;
+                        if let Some(obs) = &self.mapper.observer {
+                            // Seq, not the CLI/actor's turn counter: quiet turns
+                            // need not be shown, so counters can repeat after a
+                            // worker restart. A crash before this write leaves
+                            // no trusted cutoff and must use fresh history.
+                            obs.journal.record_claude_turn(&obs.session_id, seq, &self.boundary).await?;
+                        }
                     }
                     self.stop_mark = mark;
                     self.notified.clear();
@@ -1507,38 +2667,152 @@ impl Process {
 
     /// Closes it: no more input, then it exits by itself (or is killed).
     pub async fn close(mut self) {
-        *self.stdin.lock().await = None;
-        // A held one's input ends when its keeper lets go of the pipe too.
-        if let Some(h) = &self.held {
-            let _ = nix::sys::signal::kill(h.keeper, Signal::SIGTERM);
-        }
-        if tokio::time::timeout(CLOSE_GRACE, self.wait_exit()).await.is_err() {
+        if self.held.is_some() {
+            // Keep the FIFO writer until ownership-preserving cleanup: EOF
+            // could otherwise retire the only provably owned group leader.
             self.kill().await;
+            *self.stdin.lock().await = None;
+        } else {
+            *self.stdin.lock().await = None;
+            if tokio::time::timeout(CLOSE_GRACE, self.wait_exit()).await.is_err() {
+                self.kill().await;
+            }
         }
         self.release_held();
         let _ = self.mapper.close_children(TurnEndReason::Completed).await;
     }
 
+    /// Replacement may drain/send its inbox only after the old entire group
+    /// is absent. A failed stop retains held metadata and the durable PGID;
+    /// it is not permission to spawn another runtime over that authority.
+    pub async fn close_for_replacement(mut self) -> anyhow::Result<()> {
+        self.track().await?;
+        let pg = self.pgid.ok_or_else(|| anyhow::anyhow!("Claude Code process group is unknown"))?;
+        if !matches!(group_probe(pg), Err(nix::errno::Errno::ESRCH)) {
+            // turn() may already have released the held directory after
+            // observing absence. Only a still-present group needs retirement
+            // authority; a missing directory while live is still fatal.
+            if let Some(held) = &self.held {
+                std::fs::write(held.dir.join("retiring"), [])?;
+            }
+            if self.held.is_none() {
+                *self.stdin.lock().await = None;
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                self.kill().await;
+                let (result, detail) = group_probe_with_detail(pg);
+                if !matches!(result, Err(nix::errno::Errno::ESRCH)) {
+                    if let Some(detail) = detail {
+                        return Err(anyhow::Error::new(ReplacementBlocked(pg)).context(format!("{}: {detail}", ReplacementBlocked(pg))));
+                    }
+                    return Err(ReplacementBlocked(pg).into());
+                }
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let deadline = self.kill_with_deadline().await;
+                darwin_confirm_replacement_stopped(pg, deadline, || darwin_group_observation(pg)).await?;
+            }
+        }
+        *self.stdin.lock().await = None;
+        self.release_held();
+        let _ = self.mapper.close_children(TurnEndReason::Completed).await;
+        Ok(())
+    }
+
     /// Stops it and its background tasks now.
     pub async fn stop(mut self) {
-        *self.stdin.lock().await = None;
+        if self.held.is_none() {
+            *self.stdin.lock().await = None;
+        }
         self.kill().await;
+        *self.stdin.lock().await = None;
         if let Some(obs) = &self.mapper.observer {
             obs.tools.background.close_native(&self.mapper.scope, c6_tools::TaskState::Lost);
         }
         let _ = self.mapper.close_children(TurnEndReason::Interrupted).await;
     }
 
+    /// Rewind must not wait forever if signaling or child cleanup fails.
+    /// Its durable PGID survives timeout/Drop; confirm_stopped gates retries.
+    pub async fn stop_for_rewind(mut self) -> anyhow::Result<()> {
+        if let Some(h) = &mut self.held {
+            h.stop_on_drop = true;
+        }
+        tokio::time::timeout(Duration::from_secs(5), async move {
+            self.track().await?;
+            self.stop().await;
+            Ok(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Claude Code did not stop within the rewind cleanup limit"))?
+    }
+
+    #[cfg(not(target_os = "macos"))]
     async fn kill(&mut self) {
         if let Some(pg) = self.pgid {
-            // SIGINT lets Claude Code save its transcript; then make sure.
-            let _ = killpg(pg, Signal::SIGINT);
-            if tokio::time::timeout(Duration::from_secs(3), self.wait_exit()).await.is_err() {
+            if let Some(h) = &mut self.held {
+                h.stop_on_drop = true;
+                if let Err(e) = stop_held_group(pg, h.keeper, &h.dir, &self.launch.conversation).await {
+                    warn!("stopping held Claude Code: {e:#}");
+                    return;
+                }
+            } else {
+                // Non-held child ownership retains the existing stop path.
+                let _ = killpg(pg, Signal::SIGINT);
+                let _ = tokio::time::timeout(Duration::from_secs(3), self.wait_exit()).await;
                 let _ = killpg(pg, Signal::SIGKILL);
             }
         }
         let _ = tokio::time::timeout(Duration::from_secs(3), self.wait_exit()).await;
+        if let Some(pg) = self.pgid {
+            let absent = async {
+                while !matches!(group_probe(pg), Err(nix::errno::Errno::ESRCH)) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            };
+            let _ = tokio::time::timeout(Duration::from_secs(1), absent).await;
+        }
         self.release_held();
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn kill(&mut self) {
+        let _ = self.kill_with_deadline().await;
+    }
+
+    /// The deadline is timing information only, never ownership or absence.
+    #[cfg(target_os = "macos")]
+    async fn kill_with_deadline(&mut self) -> Option<tokio::time::Instant> {
+        if let Some(pg) = self.pgid {
+            if let Some(h) = &mut self.held {
+                h.stop_on_drop = true;
+                if let Err(e) = stop_held_group(pg, h.keeper, &h.dir, &self.launch.conversation).await {
+                    warn!("stopping held Claude Code: {e:#}");
+                    return None;
+                }
+            } else {
+                let _ = killpg(pg, Signal::SIGINT);
+                let _ = tokio::time::timeout(Duration::from_secs(3), self.wait_exit()).await;
+                let _ = killpg(pg, Signal::SIGKILL);
+            }
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(3), self.wait_exit()).await;
+        let deadline = if let Some(pg) = self.pgid {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            let absent = async {
+                while !matches!(group_probe(pg), Err(nix::errno::Errno::ESRCH)) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            };
+            let _ = tokio::time::timeout_at(deadline, absent).await;
+            Some(deadline)
+        } else {
+            None
+        };
+        self.release_held();
+        deadline
     }
 }
 
@@ -1546,7 +2820,7 @@ impl Process {
 /// expansion) with files inline, and images as image blocks.
 fn user_content(input: &PendingInput, preamble: Option<&str>) -> Value {
     let (images, files): (Vec<_>, Vec<_>) = input.attachments.iter().cloned().partition(|a| a.mime.starts_with("image/"));
-    let text = c6_agent::user_text(input.model_text(), &files);
+    let text = c6_agent::user_text(&input.attributed_text(), &files);
     let text = match preamble {
         Some(p) => format!("{p}\n\n{text}"),
         None => text,
@@ -1562,10 +2836,12 @@ fn user_content(input: &PendingInput, preamble: Option<&str>) -> Value {
     Value::Array(blocks)
 }
 
-/// The input is your message, not one of carbon6's notices (a background
-/// task's end, a subagent's report, another session's message).
+/// The input is explicitly human, not API automation or one of carbon6's
+/// notices. Missing provenance never implies a person.
 fn is_yours(input: &PendingInput) -> bool {
-    input.from_session_id.is_empty()
+    input.human_origin
+        && input.api_origin.is_none()
+        && input.from_session_id.is_empty()
         && input.delegated_by.is_empty()
         && !matches!(input.command.as_str(), "task-notification" | "session-message")
 }
@@ -1654,17 +2930,54 @@ fn is_task_notice(v: &Value) -> bool {
 }
 
 /// Logs what the agent was told, each as a task notification.
-async fn told(sink: &Arc<dyn EventSink>, texts: Vec<String>) -> anyhow::Result<()> {
+async fn told(sink: &Arc<dyn EventSink>, texts: Vec<String>, task_notice: Option<c6_proto::TaskNotice>) -> anyhow::Result<()> {
     for text in texts {
         let message = UserMessage {
             command_id: format!("task:{}", uuid::Uuid::now_v7()),
             text,
             command: "task-notification".into(),
+            task_notice: task_notice.clone(),
+            origin_recorded: true,
             ..Default::default()
         };
         sink.append(session_event::Kind::User(message)).await?;
     }
     Ok(())
+}
+
+/// Only SDK fields and task-start metadata are used, never notification prose.
+fn sdk_task_notice(v: &Value, labels: &HashMap<String, (String, String)>) -> c6_proto::TaskNotice {
+    let label = v["task_id"].as_str().and_then(|id| labels.get(id));
+    let title =
+        v["description"].as_str().filter(|s| !s.trim().is_empty()).or_else(|| label.map(|(title, _)| title.as_str())).unwrap_or_default();
+    let native_type =
+        v["task_type"].as_str().filter(|s| !s.is_empty()).or_else(|| label.map(|(_, kind)| kind.as_str())).unwrap_or_default();
+    let status = v["status"].as_str().unwrap_or_default();
+    let markdown = v["summary"].as_str().filter(|s| !s.trim().is_empty()).map(str::to_owned).unwrap_or_else(|| format!("Task {status}."));
+    c6_proto::TaskNotice {
+        kind: match native_type {
+            "local_bash" => "command",
+            "local_agent" => "subagent",
+            _ => "task",
+        }
+        .into(),
+        title: title.into(),
+        status: status.into(),
+        markdown,
+        ..Default::default()
+    }
+}
+
+fn combined_task_notice(notices: &[(String, c6_proto::TaskNotice)]) -> c6_proto::TaskNotice {
+    if notices.len() == 1 {
+        return notices[0].1.clone();
+    }
+    c6_proto::TaskNotice {
+        kind: "task".into(),
+        title: "Background tasks".into(),
+        markdown: notices.iter().map(|(_, n)| format!("{} · {}\n\n{}", n.title, n.status, n.markdown)).collect::<Vec<_>>().join("\n\n"),
+        ..Default::default()
+    }
 }
 
 /// Asks Claude Code to stop its turn (Esc). Its background agents stop with
@@ -1723,6 +3036,10 @@ struct Child {
     log: Arc<dyn EventSink>,
     depth: u32,
     open: bool,
+    /// Its original parent/spawn, retained so a later native task start
+    /// can link this same mirror without inventing another child.
+    parent_log: Arc<dyn EventSink>,
+    spawn: SubagentSpawned,
 }
 
 /// Maps stream-json lines to session events, for as long as its process
@@ -1754,6 +3071,9 @@ struct Mapper {
     /// The call that started each task, by the CLI's task id: a task the
     /// CLI moves to the background later says only its id.
     task_calls: HashMap<String, String>,
+    /// Exact native registry ID by originating tool call, not the SDK's
+    /// task ID. The task start may precede or follow its mirror's creation.
+    call_tasks: HashMap<String, String>,
     /// Each conversation's model call so far, by whose it is (`None`: the
     /// session's; else the call that started a subagent): its message id,
     /// model and usage. Claude Code sends a message per content block, each
@@ -1816,7 +3136,7 @@ impl Mapper {
     /// https://code.claude.com/docs/en/agent-sdk/typescript#sdktaskstartedmessage
     /// Process these before parent_tool_use_id routing: nested tasks belong
     /// in the common task registry too, even when their traffic is mirrored.
-    fn native_task(&self, v: &Value) -> bool {
+    fn native_task(&mut self, v: &Value) -> bool {
         if v["type"] != "system" {
             return false;
         }
@@ -1833,7 +3153,7 @@ impl Mapper {
             // does not promise a shell command for every kind of task. A
             // foreground one holds the turn until it ends or the CLI moves it.
             let foreground = v["is_backgrounded"].as_bool() == Some(false);
-            bg.start_native(
+            let id = bg.start_native(
                 &self.scope,
                 task_id,
                 run,
@@ -1841,6 +3161,9 @@ impl Mapper {
                 v["task_type"].as_str().unwrap_or(""),
                 foreground,
             );
+            if let Some(call) = v["tool_use_id"].as_str().filter(|c| !c.is_empty()) {
+                self.call_tasks.insert(call.to_owned(), id);
+            }
             return true;
         }
         // The CLI moved a foreground command or subagent to the background
@@ -1925,17 +3248,16 @@ impl Mapper {
         let id = uuid::Uuid::now_v7().to_string();
         let description = input["description"].as_str().unwrap_or("Subagent").to_owned();
         let agent = input["subagent_type"].as_str().filter(|a| *a != "general-purpose").unwrap_or_default().to_owned();
-        parent_log
-            .append(session_event::Kind::SubagentSpawned(SubagentSpawned {
-                call_id: call.to_owned(),
-                child_session_id: id.clone(),
-                agent: agent.clone(),
-                description: description.clone(),
-                background_task_id: String::new(),
-                model: None,
-                remote: None,
-            }))
-            .await?;
+        let spawn = SubagentSpawned {
+            call_id: call.to_owned(),
+            child_session_id: id.clone(),
+            agent: agent.clone(),
+            description: description.clone(),
+            background_task_id: self.call_tasks.get(call).cloned().unwrap_or_default(),
+            model: None,
+            remote: None,
+        };
+        parent_log.append(session_event::Kind::SubagentSpawned(spawn.clone())).await?;
         let started = SessionStarted {
             command_id: String::new(),
             title: if agent.is_empty() { description } else { format!("{description} ({agent})") },
@@ -1964,7 +3286,8 @@ impl Mapper {
         obs.journal.create_session(&id, &spec, &ev).await?;
         let log: Arc<dyn EventSink> = Arc::new(crate::session::Writer::new(id.clone(), obs.journal.clone(), obs.link.clone(), 2));
         log.append(session_event::Kind::TurnStarted(TurnStarted { turn: 1, ..Default::default() })).await?;
-        self.children.insert(call.to_owned(), Child { id: id.clone(), log: log.clone(), depth: parent_depth + 1, open: true });
+        self.children
+            .insert(call.to_owned(), Child { id: id.clone(), log: log.clone(), depth: parent_depth + 1, open: true, parent_log, spawn });
         Ok(Some((id, log)))
     }
 
@@ -2007,6 +3330,14 @@ impl Mapper {
                 if let Some(task) = v["task_id"].as_str() {
                     self.task_calls.insert(task.to_owned(), call.to_owned());
                 }
+                if let (Some(id), Some(child)) = (self.call_tasks.get(call), self.children.get_mut(call))
+                    && child.spawn.background_task_id != *id
+                {
+                    let mut spawn = child.spawn.clone();
+                    spawn.background_task_id = id.clone();
+                    child.parent_log.append(session_event::Kind::SubagentSpawned(spawn.clone())).await?;
+                    child.spawn = spawn;
+                }
                 return Ok(());
             }
             "task_notification" => v["status"].as_str(),
@@ -2037,8 +3368,7 @@ impl Mapper {
             "assistant" => {
                 self.note_usage(Some(call), &v["message"], sink).await?;
                 self.note_calls(&v["message"]["content"], Some(&id));
-                let blocks: Vec<ContentBlock> =
-                    v["message"]["content"].as_array().map(|a| a.iter().filter_map(assistant_block).collect()).unwrap_or_default();
+                let blocks = assistant_blocks(v);
                 if !blocks.is_empty() {
                     let stop_reason = v["message"]["stop_reason"].as_str().unwrap_or("").to_owned();
                     log.append(session_event::Kind::Assistant(AssistantMessage { turn: 1, blocks, stop_reason })).await?;
@@ -2056,8 +3386,13 @@ impl Mapper {
                     _ => String::new(),
                 };
                 if !text.trim().is_empty() {
-                    log.append(session_event::Kind::User(UserMessage { text, delegated_by: call.to_owned(), ..Default::default() }))
-                        .await?;
+                    log.append(session_event::Kind::User(UserMessage {
+                        text,
+                        delegated_by: call.to_owned(),
+                        origin_recorded: true,
+                        ..Default::default()
+                    }))
+                    .await?;
                 }
                 for b in content.as_array().into_iter().flatten().filter(|b| b["type"] == "tool_result") {
                     let r = tool_result(b);
@@ -2114,8 +3449,7 @@ impl Mapper {
             "assistant" => {
                 self.note_usage(None, &v["message"], sink).await?;
                 self.note_calls(&v["message"]["content"], None);
-                let blocks: Vec<ContentBlock> =
-                    v["message"]["content"].as_array().map(|a| a.iter().filter_map(assistant_block).collect()).unwrap_or_default();
+                let blocks = assistant_blocks(v);
                 if !blocks.is_empty() {
                     let stop_reason = v["message"]["stop_reason"].as_str().unwrap_or("").to_owned();
                     sink.append(session_event::Kind::Assistant(AssistantMessage { turn: self.turn, blocks, stop_reason })).await?;
@@ -2216,9 +3550,26 @@ fn tool_result(b: &Value) -> ToolResult {
     }
 }
 
-fn assistant_block(b: &Value) -> Option<ContentBlock> {
+/// Narration indexes name summarized updates encoded as thinking, not reasoning.
+/// Use original content positions before filtering empty or unsupported blocks.
+fn assistant_blocks(v: &Value) -> Vec<ContentBlock> {
+    v["message"]["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(i, b)| {
+            let narration =
+                v["narration_block_indexes"].as_array().is_some_and(|indexes| indexes.iter().any(|n| n.as_u64() == Some(i as u64)));
+            assistant_block(b, narration)
+        })
+        .collect()
+}
+
+fn assistant_block(b: &Value, narration: bool) -> Option<ContentBlock> {
     let block = match b["type"].as_str()? {
         "text" => content_block::Block::Text(b["text"].as_str()?.to_owned()),
+        "thinking" if narration => content_block::Block::Narration(b["thinking"].as_str().filter(|t| !t.is_empty())?.to_owned()),
         "thinking" => content_block::Block::Thinking(b["thinking"].as_str().filter(|t| !t.is_empty())?.to_owned()),
         "tool_use" => content_block::Block::ToolUse(ToolUse {
             id: b["id"].as_str()?.to_owned(),
@@ -2231,7 +3582,7 @@ fn assistant_block(b: &Value) -> Option<ContentBlock> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     /// The fake `claude` these tests use (not the process's environment,
     /// which tests running beside them read).
     pub(super) static BIN: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
@@ -2243,6 +3594,22 @@ mod tests {
     use c6_proto::SessionEvent;
 
     use super::*;
+
+    #[test]
+    fn sdk_notice_uses_structured_task_labels_not_summary_prose_or_ids() {
+        let labels = HashMap::from([("sdk-id".into(), ("Run checks".into(), "local_bash".into()))]);
+        let event = serde_json::json!({"task_id": "sdk-id", "status": "failed", "summary": "## Actual result\nOne failed."});
+        let notice = sdk_task_notice(&event, &labels);
+        assert_eq!((notice.kind.as_str(), notice.title.as_str(), notice.status.as_str()), ("command", "Run checks", "failed"));
+        assert!(notice.session_id.is_empty(), "a CLI task id is not a session id");
+        assert_eq!(notice.markdown, "## Actual result\nOne failed.");
+        let agent =
+            sdk_task_notice(&serde_json::json!({"task_type": "local_agent", "description": "Review", "status": "completed"}), &labels);
+        assert_eq!((agent.kind.as_str(), agent.title.as_str()), ("subagent", "Review"));
+        let unknown = sdk_task_notice(&serde_json::json!({"task_id": "raw-id", "summary": "Agent XYZ completed"}), &labels);
+        assert_eq!(unknown.kind, "task");
+        assert!(unknown.title.is_empty(), "do not parse prose or display the SDK id");
+    }
 
     #[derive(Default)]
     struct VecSink(Mutex<Vec<SessionEvent>>);
@@ -2256,6 +3623,156 @@ mod tests {
             Ok(v.len() as u64)
         }
         fn ephemeral(&self, _: ephemeral_event::Kind) {}
+    }
+
+    #[tokio::test]
+    async fn narration_and_text_survive_interleaved_tools_in_parent_and_child() {
+        for child in [false, true] {
+            let recorded = Arc::new(VecSink::default());
+            let sink: Arc<dyn EventSink> = if child { Arc::new(VecSink::default()) } else { recorded.clone() };
+            let mut mapper = Mapper {
+                turn: 436,
+                scope: "conversation".into(),
+                output_root: None,
+                saw_output: false,
+                result: None,
+                interrupted: false,
+                observer: None,
+                calls: HashMap::new(),
+                mcp_calls: HashSet::new(),
+                children: HashMap::new(),
+                backgrounded: HashSet::new(),
+                task_calls: HashMap::new(),
+                call_tasks: HashMap::new(),
+                call_usage: HashMap::new(),
+                per_call: false,
+            };
+            if child {
+                mapper.children.insert(
+                    "task".into(),
+                    Child {
+                        id: "child".into(),
+                        log: recorded.clone(),
+                        depth: 1,
+                        open: true,
+                        parent_log: recorded.clone(),
+                        spawn: SubagentSpawned::default(),
+                    },
+                );
+            }
+            // Recorded Claude Code 2.1.311 shape: narration indexes refer to
+            // the original content array, including empty/unsupported blocks.
+            let frames = [
+                serde_json::json!({"type": "assistant", "narration_block_indexes": [3], "message": {"content": [
+                    {"type": "thinking", "thinking": ""},
+                    {"type": "thinking", "thinking": "Private reasoning"},
+                    {"type": "future_block"},
+                    {"type": "thinking", "thinking": "The loop limit protects against cycles."},
+                    {"type": "text", "text": "Checking the setting now."},
+                    {"type": "tool_use", "id": "bash", "name": "Bash", "input": {"command": "true"}}
+                ], "stop_reason": "tool_use"}}),
+                serde_json::json!({"type": "user", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "bash", "content": "ok"}
+                ]}}),
+                serde_json::json!({"type": "assistant", "message": {"content": [
+                    {"type": "text", "text": "Cleanup is under way."}
+                ], "stop_reason": "end_turn"}}),
+            ];
+            for mut frame in frames {
+                if child {
+                    frame["parent_tool_use_id"] = "task".into();
+                }
+                mapper.handle(&frame, &sink).await.unwrap();
+            }
+            let events = recorded.0.lock().unwrap();
+            assert_eq!(events.len(), 3);
+            let blocks: Vec<_> = events
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    Some(session_event::Kind::Assistant(a)) => Some(&a.blocks),
+                    _ => None,
+                })
+                .flatten()
+                .map(|b| b.block.as_ref().unwrap())
+                .collect();
+            use content_block::Block;
+            assert!(
+                matches!(blocks.as_slice(), [Block::Thinking(t), Block::Narration(n), Block::Text(before), Block::ToolUse(_), Block::Text(after)]
+                if t == "Private reasoning" && n == "The loop limit protects against cycles."
+                    && before == "Checking the setting now." && after == "Cleanup is under way.")
+            );
+        }
+    }
+
+    #[test]
+    fn narration_metadata_is_optional_and_only_changes_indexed_thinking() {
+        for indexes in
+            [Value::Null, serde_json::json!([]), serde_json::json!([1]), serde_json::json!(["0", -1, 99]), serde_json::json!("invalid")]
+        {
+            let frame = serde_json::json!({"narration_block_indexes": indexes, "message": {"content": [
+                {"type": "thinking", "thinking": "Reasoning"}, {"type": "text", "text": "Reply"}
+            ]}});
+            let blocks = assistant_blocks(&frame);
+            assert!(matches!(&blocks[0].block, Some(content_block::Block::Thinking(t)) if t == "Reasoning"));
+            assert!(matches!(&blocks[1].block, Some(content_block::Block::Text(t)) if t == "Reply"));
+        }
+    }
+
+    #[test]
+    fn recorded_coordinator_summary_keeps_narration_provenance() {
+        // Relevant fields from the Coordinator's Claude Code 2.1.311 JSONL,
+        // lines 28939–28943, 2026-11-08. Opaque signatures, usage and tool
+        // inputs are omitted. The actual signatures classify the empty block
+        // as "thinking" and the 264-character summary as "narration".
+        // Local JSONL has no narration_block_indexes; the SDK adds them from
+        // those signatures. They index this frame, not apiBlockIndex or the
+        // non-empty blocks remaining after filtering.
+        let frames: Vec<Value> = serde_json::from_str(
+            r#"[
+                {"type":"assistant","thinkingDisplay":"updates","apiBlockIndex":0,"message":{
+                    "id":"msg_011Cgq1iDTmVz2S73WksHj73","content":[{"type":"thinking","thinking":""}]
+                }},
+                {"type":"assistant","thinkingDisplay":"updates","apiBlockIndex":1,"message":{
+                    "id":"msg_011Cgq1iDTmVz2S73WksHj73","content":[{"type":"thinking","thinking":"Carbon6 is capping how often helper notices can wake me while I'm idle, and I'm going to ask both helpers to report only on changes, not progress. Each update currently costs two wake-ups because the helpers send both a session message and an end-of-turn report.\n\n"}]
+                }},
+                {"type":"assistant","apiBlockIndex":2,"message":{
+                    "id":"msg_011Cgq1iDTmVz2S73WksHj73","content":[{"type":"tool_use","id":"toolu_01YaxdNrRaZikJDjiqutx9oA","name":"mcp__carbon6__SendMessage","input":{}}]
+                }},
+                {"type":"assistant","apiBlockIndex":3,"message":{
+                    "id":"msg_011Cgq1iDTmVz2S73WksHj73","content":[{"type":"tool_use","id":"toolu_01MhE8gNMSvYn8xtDpSpa6PD","name":"mcp__carbon6__SendMessage","input":{}}]
+                }}
+            ]"#,
+        )
+        .unwrap();
+        let summary = frames[1]["message"]["content"][0]["thinking"].as_str().unwrap();
+        assert_eq!(summary.len(), 264);
+
+        for batched in [false, true] {
+            for narration in [false, true] {
+                let mut frames = frames.clone();
+                if batched {
+                    let content: Vec<_> = frames.iter().flat_map(|f| f["message"]["content"].as_array().unwrap().clone()).collect();
+                    frames.truncate(1);
+                    frames[0]["message"]["content"] = content.into();
+                }
+                if narration {
+                    // SDK metadata reconstructed from the actual signature
+                    // classification, not copied from the local JSONL.
+                    let (frame, block) = if batched { (0, 1) } else { (1, 0) };
+                    frames[frame]["narration_block_indexes"] = serde_json::json!([block]);
+                }
+                let blocks: Vec<_> = frames.iter().flat_map(assistant_blocks).collect();
+                assert_eq!(blocks.len(), 3, "empty thinking is omitted, not the summary or either tool");
+                match &blocks[0].block {
+                    Some(content_block::Block::Narration(text)) if narration => assert_eq!(text, summary),
+                    Some(content_block::Block::Thinking(text)) if !narration => assert_eq!(text, summary),
+                    other => panic!("unexpected summary classification: {other:?}"),
+                }
+                for (block, id) in blocks[1..].iter().zip(["toolu_01YaxdNrRaZikJDjiqutx9oA", "toolu_01MhE8gNMSvYn8xtDpSpa6PD"]) {
+                    assert!(matches!(&block.block, Some(content_block::Block::ToolUse(tool)) if tool.id == id));
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -2286,6 +3803,7 @@ mod tests {
             children: HashMap::new(),
             backgrounded: HashSet::new(),
             task_calls: HashMap::new(),
+            call_tasks: HashMap::new(),
             call_usage: HashMap::new(),
             per_call: false,
         };
@@ -2392,6 +3910,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_agent_mirrors_link_exact_registry_ids_in_either_start_order() {
+        for (task_first, backgrounded) in [(true, true), (false, true), (true, false), (false, false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let tools = Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()));
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            tools.background.set_sink(Some(tx));
+            let observer = observer(dir.path(), tools.clone()).await;
+            let journal = observer.journal.clone();
+            let recorded = Arc::new(VecSink::default());
+            let sink: Arc<dyn EventSink> = recorded.clone();
+            let mut mapper = Mapper {
+                turn: 1,
+                scope: "cli-conversation".into(),
+                output_root: None,
+                saw_output: false,
+                result: None,
+                interrupted: false,
+                observer: Some(observer),
+                calls: HashMap::new(),
+                mcp_calls: HashSet::new(),
+                children: HashMap::new(),
+                backgrounded: HashSet::new(),
+                task_calls: HashMap::new(),
+                call_tasks: HashMap::new(),
+                call_usage: HashMap::new(),
+                per_call: false,
+            };
+            let call = serde_json::json!({"type":"assistant","message":{"content":[{
+                "type":"tool_use","id":"agent-call","name":"Agent",
+                "input":{"description":"Review session layout","subagent_type":"explorer","prompt":"Review it."}
+            }]}});
+            let start = serde_json::json!({
+                "type":"system","subtype":"task_started","task_id":"native-agent","run_id":"run-1",
+                "tool_use_id":"agent-call","description":"SDK task description","task_type":"local_agent",
+                "is_backgrounded":backgrounded
+            });
+            let traffic = serde_json::json!({"type":"assistant","parent_tool_use_id":"agent-call",
+                "message":{"content":[{"type":"text","text":"Checking the layout."}]}});
+            mapper.handle(&call, &sink).await.unwrap();
+            for frame in if task_first { [&start, &traffic] } else { [&traffic, &start] } {
+                mapper.handle(frame, &sink).await.unwrap();
+            }
+            let task = rx.try_recv().unwrap();
+            assert_eq!(task.native_type, "local_agent");
+            assert_eq!(task.foreground, !backgrounded, "linking does not promote foreground work to background work");
+            assert_eq!(task.id, "claude:[\"cli-conversation\",\"native-agent\",\"run\",\"run-1\"]");
+            let spawns = || {
+                recorded
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|e| match &e.kind {
+                        Some(session_event::Kind::SubagentSpawned(s)) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let linked = spawns();
+            assert_eq!(linked.len(), if task_first { 1 } else { 2 });
+            let last = linked.last().unwrap();
+            assert_eq!(
+                (last.call_id.as_str(), last.description.as_str(), last.agent.as_str()),
+                ("agent-call", "Review session layout", "explorer")
+            );
+            assert_eq!(last.background_task_id, task.id, "the exact registry ID, not the native task ID or an inferred name");
+            if !task_first {
+                assert!(linked[0].background_task_id.is_empty());
+                let mut original = linked[0].clone();
+                original.background_task_id = task.id.clone();
+                assert_eq!(original, *last, "the late link preserves the original child, call and metadata");
+            }
+            assert_eq!(mapper.children.len(), 1);
+            assert_eq!(mapper.children["agent-call"].id, last.child_session_id);
+            let (spec, child_events) = journal.load_session(&last.child_session_id).await.unwrap().unwrap();
+            assert!(spec.delegation.unwrap().observed, "the mirror stays read-only");
+            assert_eq!(child_events.iter().filter(|e| matches!(e.kind, Some(session_event::Kind::Started(_)))).count(), 1);
+            // A replayed start must not append another link or create a child.
+            mapper.handle(&start, &sink).await.unwrap();
+            assert_eq!(spawns(), linked);
+            if !backgrounded {
+                mapper
+                    .handle(
+                        &serde_json::json!({"type":"system","subtype":"task_updated",
+                    "task_id":"native-agent","run_id":"run-1","patch":{"is_backgrounded":true}}),
+                        &sink,
+                    )
+                    .await
+                    .unwrap();
+                let moved = rx.try_recv().unwrap();
+                assert_eq!(moved.id, task.id);
+                assert!(!moved.foreground, "only the native lifecycle moves the task into the background");
+                assert_eq!(spawns(), linked, "backgrounding keeps the existing mirror identity link");
+            }
+            assert_eq!(
+                tools.background.native_stop(&task.id).as_deref(),
+                Some("native-agent"),
+                "the underlying native task retains its real Stop target"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn bash_native_tasks_are_not_mirrored_as_subagents() {
         for (backgrounded, moved) in [(false, false), (false, true), (true, false)] {
             let dir = tempfile::tempdir().unwrap();
@@ -2422,6 +4043,7 @@ mod tests {
                 children: HashMap::new(),
                 backgrounded: HashSet::new(),
                 task_calls: HashMap::new(),
+                call_tasks: HashMap::new(),
                 call_usage: HashMap::new(),
                 per_call: false,
             };
@@ -2499,12 +4121,54 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"usage":{}}
         assert!(!tools.background.snapshot(&orphan.id).unwrap().running);
     }
 
+    /// Private fixture roots only. Held Drop intentionally survives worker
+    /// loss, so tests must separately kill freshly revalidated groups even
+    /// when an assertion unwinds before their async success-path cleanup.
+    pub(crate) struct HeldFixtureCleanup(pub PathBuf);
+
+    impl Drop for HeldFixtureCleanup {
+        fn drop(&mut self) {
+            let Ok(entries) = std::fs::read_dir(&self.0) else { return };
+            for entry in entries.flatten() {
+                let dir = entry.path();
+                let Some(meta) = std::fs::read(dir.join("meta.json")).ok().and_then(|data| serde_json::from_slice::<HeldMeta>(&data).ok())
+                else {
+                    continue;
+                };
+                if meta.pgid > 0 && held_group_owned(&meta, &dir) {
+                    let _ = killpg(Pid::from_raw(meta.pgid), Signal::SIGKILL);
+                }
+            }
+        }
+    }
+
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
-        std::fs::write(&path, body).unwrap();
+        // A concurrent fork can inherit even a CLOEXEC writer until exec,
+        // causing ETXTBSY after this thread closes it. Keep the writable fd
+        // out of the shared test process altogether; wait for its owner to
+        // exit before executing the fixture. No spawn retry is necessary.
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", r#"printf '%s' "$2" > "$1""#, "fixture-writer"])
+            .arg(&path)
+            .arg(body)
+            .status()
+            .unwrap();
+        assert!(status.success(), "fixture writer failed: {status}");
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    #[test]
+    fn fixture_program_publisher_preserves_literal_path_and_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = "#!/bin/sh\nprintf '%s' 'literal $variables `commands` and \"quotes\"'\n";
+        let bin = script(dir.path(), "fixture 'with $literal `characters`", body);
+        assert_eq!(std::fs::read_to_string(&bin).unwrap(), body);
+        let out = std::process::Command::new(&bin).output().unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"literal $variables `commands` and \"quotes\"");
     }
 
     async fn observer(dir: &Path, tools: Arc<c6_tools::SessionTools>) -> Arc<Observer> {
@@ -2524,7 +4188,172 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"usage":{}}
     }
 
     fn input(id: &str, text: &str) -> PendingInput {
-        PendingInput { command_id: id.into(), text: text.into(), ..Default::default() }
+        PendingInput { command_id: id.into(), text: text.into(), human_origin: true, ..Default::default() }
+    }
+
+    #[test]
+    fn only_explicit_human_inputs_are_yours() {
+        let human = input("human", "Continue.");
+        assert!(is_yours(&human));
+        assert!(!is_yours(&PendingInput { human_origin: false, ..human.clone() }));
+        // Even an inconsistent human flag cannot override server provenance.
+        assert!(!is_yours(&PendingInput {
+            api_origin: Some(c6_proto::ApiMessageOrigin { token_name: "build-bot".into() }),
+            ..human.clone()
+        }));
+        assert!(!is_yours(&PendingInput { from_session_id: "other".into(), ..human.clone() }));
+        assert!(!is_yours(&PendingInput { delegated_by: "call".into(), ..human.clone() }));
+        for command in ["task-notification", "session-message"] {
+            assert!(!is_yours(&PendingInput { command: command.into(), ..human.clone() }));
+        }
+    }
+
+    #[test]
+    fn input_content_labels_api_and_unknown_origins_without_changing_humans_or_sessions() {
+        let human = input("human", "Raw message");
+        assert_eq!(user_content(&human, None), "Raw message");
+        let unknown = PendingInput { human_origin: false, ..human.clone() };
+        assert_eq!(user_content(&unknown, None), "Message sent by an automation, not typed by the user:\nRaw message");
+        let api = PendingInput {
+            api_origin: Some(c6_proto::ApiMessageOrigin { token_name: "build\n\"bot\"".into() }),
+            prompt: "Expanded command".into(),
+            ..human.clone()
+        };
+        assert_eq!(
+            user_content(&api, Some("Preamble")),
+            "Preamble\n\nMessage sent via the API (token \"build\\n\\\"bot\\\"\"), not typed by the user:\nExpanded command"
+        );
+        assert!(api.attributed_text().starts_with("Message sent via the API"), "API overrides even an inconsistent human flag");
+        let unnamed = PendingInput { api_origin: Some(Default::default()), ..unknown.clone() };
+        assert_eq!(user_content(&unnamed, None), "Message sent via the API, not typed by the user:\nRaw message");
+        let session =
+            PendingInput { from_session_id: "other".into(), prompt: "<session-message>Existing wrapper</session-message>".into(), ..api };
+        assert_eq!(user_content(&session, None), "<session-message>Existing wrapper</session-message>");
+        for command in ["task-notification", "session-message"] {
+            assert_eq!(
+                user_content(&PendingInput { command: command.into(), ..unknown.clone() }, None),
+                "Message sent by an automation, not typed by the user:\nRaw message"
+            );
+        }
+    }
+
+    /// A dead leader is not proof that its group's writers stopped. The
+    /// durable barrier survives reopening the journal and never signals the
+    /// surviving member (both children are ours so the test can reap them).
+    #[tokio::test]
+    async fn pgid_barrier_survives_leader_loss_and_journal_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.db");
+        let journal = crate::journal::Journal::open(&path).await.unwrap();
+        let sid = "carbon6-owner";
+        let mut leader = tokio::process::Command::new("sleep").arg("300").process_group(0).kill_on_drop(true).spawn().unwrap();
+        let pgid = leader.id().unwrap() as i32;
+        let mut member = tokio::process::Command::new("sleep").arg("300").process_group(pgid).kill_on_drop(true).spawn().unwrap();
+        journal.track_claude_process(sid, pgid).await.unwrap();
+        journal.track_claude_process(sid, pgid).await.unwrap();
+        assert!(journal.claude_processes("not-the-owner").await.unwrap().is_empty());
+        leader.kill().await.unwrap();
+        assert!(confirm_stopped(&journal, sid, Duration::ZERO).await.is_err());
+        assert_eq!(journal.claude_processes(sid).await.unwrap(), [pgid]);
+        drop(journal);
+
+        let journal = crate::journal::Journal::open(&path).await.unwrap();
+        assert!(confirm_stopped(&journal, sid, Duration::from_millis(30)).await.is_err());
+        assert_eq!(journal.claude_processes(sid).await.unwrap(), [pgid]);
+        assert!(member.try_wait().unwrap().is_none(), "checking a persisted PGID must not signal it");
+        member.kill().await.unwrap();
+        confirm_stopped(&journal, sid, Duration::ZERO).await.unwrap();
+        assert!(journal.claude_processes(sid).await.unwrap().is_empty());
+    }
+
+    /// The fake itself checks SQLite when input arrives: a Rust assertion
+    /// after ready/turn would not prove the record preceded model input.
+    fn pgid_checking_claude(dir: &Path) -> PathBuf {
+        script(
+            dir,
+            "claude-pgid",
+            r#"#!/usr/bin/env python3
+import json, os, sqlite3, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    with sqlite3.connect('journal.db') as db:
+        assert db.execute('SELECT pgid FROM claude_processes WHERE session_id = ?', ('0199-main',)).fetchall() == [(os.getpgrp(),)]
+    with open('checked-inputs', 'a') as out:
+        out.write(request['type'] + '\n')
+    if request['type'] == 'control_request':
+        print(json.dumps({'type': 'control_response', 'response': {'subtype': 'error', 'request_id': request['request_id'], 'error': 'test initialization rejected'}}), flush=True)
+    else:
+        print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'usage': {}}), flush=True)
+"#,
+        )
+    }
+
+    #[tokio::test]
+    async fn nonheld_initialization_is_cleanup_recorded_before_handshake() {
+        if !c6_testkit::have("python3") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let bin = pgid_checking_claude(dir.path());
+        let observer = observer(dir.path(), Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()))).await;
+        let mut p = spawn(&bin, dir.path(), "launch-conversation", false, Some(observer.clone()));
+        let pgid = p.pgid.unwrap().as_raw();
+        let records = dir.path().join("claude");
+        p.record_in(&records).await.unwrap();
+        let path = records.join("launch-conversation.pid");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{pgid}\nlaunch-conversation\n"));
+        assert_eq!(observer.journal.claude_processes(&observer.session_id).await.unwrap(), [pgid]);
+        assert!(!dir.path().join("checked-inputs").exists(), "recording precedes initialize input");
+        assert!(!p.is_held(), "the cleanup record must not make initialization adoptable");
+        assert!(Process::held_record(&records.join("held"), "launch-conversation").unwrap().is_none());
+        assert!(p.ready(&uuid::Uuid::now_v7().to_string()).await.is_err());
+        p.stop_for_rewind().await.unwrap();
+        assert!(!path.exists());
+        assert_eq!(observer.journal.claude_processes(&observer.session_id).await.unwrap(), [pgid]);
+        confirm_stopped(&observer.journal, &observer.session_id, Duration::ZERO).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pgid_is_durable_before_rejected_initialization() {
+        if !c6_testkit::have("python3") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let bin = pgid_checking_claude(dir.path());
+        let observer = observer(dir.path(), Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()))).await;
+        let mut p = spawn(&bin, dir.path(), "cli-conversation-not-owner", false, Some(observer.clone()));
+        let pgid = p.pgid.unwrap().as_raw();
+        let error = p.ready(&uuid::Uuid::now_v7().to_string()).await.unwrap_err();
+        assert!(error.to_string().contains("test initialization rejected"), "{error:#}");
+        assert_eq!(std::fs::read_to_string(dir.path().join("checked-inputs")).unwrap(), "control_request\n");
+        assert_eq!(observer.journal.claude_processes(&observer.session_id).await.unwrap(), [pgid]);
+        assert!(observer.journal.claude_processes("cli-conversation-not-owner").await.unwrap().is_empty());
+        // Failed initialize attempts have no pidfile, but stopping/Drop must
+        // not retire their durable barrier without a separate absence check.
+        assert!(p.pidfile.is_none());
+        p.stop_for_rewind().await.unwrap();
+        assert_eq!(observer.journal.claude_processes(&observer.session_id).await.unwrap(), [pgid]);
+        confirm_stopped(&observer.journal, &observer.session_id, Duration::ZERO).await.unwrap();
+        assert!(observer.journal.claude_processes(&observer.session_id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pgid_is_durable_before_turn_input_and_process_reuse() {
+        if !c6_testkit::have("python3") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let bin = pgid_checking_claude(dir.path());
+        let observer = observer(dir.path(), Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()))).await;
+        let mut p = spawn(&bin, dir.path(), "cli-conversation-not-owner", false, Some(observer.clone()));
+        let sink: Arc<dyn EventSink> = Arc::new(VecSink::default());
+        for turn in 1..=2 {
+            let end = run(&mut p, turn, &[input(&format!("c{turn}"), "hi")], &sink).await;
+            assert_eq!(end.reason, Some(TurnEndReason::Completed));
+        }
+        assert_eq!(std::fs::read_to_string(dir.path().join("checked-inputs")).unwrap(), "user\nuser\n");
+        p.stop_for_rewind().await.unwrap();
+        confirm_stopped(&observer.journal, &observer.session_id, Duration::ZERO).await.unwrap();
     }
 
     /// A turn with nothing joining it.
@@ -2798,7 +4627,7 @@ EOF
 
     /// A stand-in `claude` whose turn runs a subagent (that runs its own).
     fn fake_claude_with_subagents(dir: &Path) -> PathBuf {
-        let script = r#"#!/bin/sh
+        let body = r#"#!/bin/sh
 read -r line
 cat <<'JSON'
 {"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_9","name":"Task","input":{"description":"look around","prompt":"List files.","subagent_type":"explorer"}}],"stop_reason":"tool_use"},"parent_tool_use_id":null}
@@ -2815,11 +4644,7 @@ cat <<'JSON'
 {"type":"result","subtype":"success","is_error":false,"result":"Done.","usage":{"input_tokens":5,"output_tokens":20},"modelUsage":{"claude-opus-5-5":{}}}
 JSON
 "#;
-        let path = dir.join("claude-sub");
-        std::fs::write(&path, script).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
+        script(dir, "claude-sub", body)
     }
 
     fn kind(e: &SessionEvent) -> &'static str {
@@ -3094,6 +4919,9 @@ done
         assert_eq!(events[5..].iter().map(kind).collect::<Vec<_>>(), ["user", "turn_started", "assistant", "usage", "turn_ended"]);
         let Some(session_event::Kind::User(u)) = &events[5].kind else { panic!() };
         assert_eq!((u.command.as_str(), u.text.as_str()), ("task-notification", "Build finished"));
+        let metadata = u.task_notice.as_ref().expect("live SDK notification metadata");
+        assert_eq!(metadata.markdown, "Build finished");
+        assert_eq!(metadata.status, "completed");
         p.close().await;
     }
 
@@ -3168,7 +4996,10 @@ done
         assert!(p.wake_due().is_none(), "nothing has ended yet");
         let began = idle_until_or_turn(&mut p, &sink, |p| p.wake_due().is_some()).await;
         assert!(!began, "this Claude Code starts no turn for it");
-        let notice = p.take_unwoken().expect("the build's end is waiting");
+        let (notice, task_notice) = p.take_unwoken().expect("the build's end is waiting");
+        assert_eq!(task_notice.status, "completed");
+        assert_eq!(task_notice.markdown, "Build finished");
+        assert!(task_notice.session_id.is_empty());
         assert!(
             notice.contains(r#"status="completed""#)
                 && notice.contains("Task: Build finished")
@@ -3182,6 +5013,7 @@ done
             command_id: "task:claude-wake:1".into(),
             text: notice,
             command: "task-notification".into(),
+            task_notice: Some(task_notice),
             ..Default::default()
         };
         assert_eq!(run(&mut p, 2, &[wake], &sink).await.reason, Some(TurnEndReason::Completed));
@@ -3553,24 +5385,1461 @@ done
     /// A held process has its folder while it runs, outlives the
     /// `Process` that started it when that is merely dropped (a worker
     /// going), is taken up again, and closing it ends it with its folder.
+    #[test]
+    fn held_wrapper_identity_requires_the_exact_program_and_conversation_option() {
+        let wrapper = ["/bin/sh", "-c", r#""$@"; echo $? > "$C6_HELD_CODE""#, "sh", "/tmp/claude-live", "--resume", "fork"];
+        assert!(claude_args_for(&wrapper, "fork"));
+        assert!(!claude_args_for(&wrapper, "for"));
+        assert!(claude_args_for(&["node", "/opt/claude-code/cli.js", "--session-id", "fork"], "fork"));
+        assert!(!claude_args_for(&["sleep", "/tmp/claude-notes", "--resume", "fork"], "fork"));
+        assert!(!claude_args_for(&["sh", "-c", "echo claude --resume fork"], "fork"));
+    }
+
+    #[test]
+    fn darwin_group_inexit_requires_exact_identity_and_never_proves_absence() {
+        use nix::errno::Errno;
+        let exiting = DarwinGroupMember { pid: 42, pgid: 41, status: 2, flags: DARWIN_PROC_FLAG_INEXIT, start_sec: 100, start_usec: 10 };
+        for status in 1..5 {
+            let member = DarwinGroupMember { status, ..exiting.clone() };
+            assert!(darwin_observed_member(136, 0, 42, 41, member.clone()).is_some());
+            assert!(darwin_zombie_member(136, 42, 41, member).is_none());
+        }
+        for bytes in [-1, 0, 135, 137] {
+            assert!(darwin_observed_member(bytes, 0, 42, 41, exiting.clone()).is_none());
+        }
+        for error in [Errno::ESRCH, Errno::EPERM, Errno::EACCES, Errno::EIO] {
+            assert!(darwin_observed_member(136, error as i32, 42, 41, exiting.clone()).is_none());
+        }
+        for invalid in [
+            DarwinGroupMember { flags: 0, ..exiting.clone() },
+            DarwinGroupMember { flags: 8, ..exiting.clone() },
+            DarwinGroupMember { pid: 43, ..exiting.clone() },
+            DarwinGroupMember { pgid: 43, ..exiting.clone() },
+            DarwinGroupMember { status: 0, ..exiting.clone() },
+            DarwinGroupMember { status: 6, ..exiting.clone() },
+            DarwinGroupMember { start_sec: 0, ..exiting.clone() },
+            DarwinGroupMember { start_usec: 1_000_000, ..exiting.clone() },
+        ] {
+            assert!(darwin_observed_member(136, 0, 42, 41, invalid).is_none());
+        }
+        let mut lookups = 0;
+        assert!(!darwin_group_snapshots_stopped(
+            || Some(vec![42]),
+            |_| {
+                lookups += 1;
+                Some(exiting.clone())
+            }
+        ));
+        assert_eq!(lookups, 1, "a complete INEXIT scan is progress, never even a candidate absence proof");
+        let zombie = DarwinGroupMember { status: 5, ..exiting };
+        assert!(darwin_observed_member(136, 0, 42, 41, zombie.clone()).is_some());
+        lookups = 0;
+        assert!(darwin_group_snapshots_stopped(
+            || Some(vec![42]),
+            |_| {
+                lookups += 1;
+                Some(zombie.clone())
+            }
+        ));
+        assert_eq!(lookups, 2, "INEXIT flags on SZOMB must not weaken the two-snapshot proof");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn darwin_group_inexit_scans_the_complete_group_before_bounded_reobservation() {
+        use nix::errno::Errno;
+        use std::cell::RefCell;
+        use std::collections::VecDeque;
+        type ListReply = (i32, i32, Vec<i32>);
+        type MemberReply = (i32, i32, i32, DarwinGroupMember);
+
+        fn observe(lists: Vec<ListReply>, members: Vec<MemberReply>, counts: &mut (usize, usize)) -> (DarwinGroupObservation, bool) {
+            let lists = RefCell::new(VecDeque::from(lists));
+            let members = RefCell::new(VecDeque::from(members));
+            let snapshots = RefCell::new(Vec::new());
+            let transcript = RefCell::new(Vec::new());
+            let mut stopped = false;
+            let observation = darwin_group_observe(Err(Errno::EPERM), || {
+                stopped = darwin_group_snapshots_stopped(
+                    || {
+                        counts.0 += 1;
+                        let (bytes, error, pids) = lists.borrow_mut().pop_front().expect("unexpected list probe");
+                        let mut buffer = [0; DARWIN_GROUP_SLOTS];
+                        buffer[..pids.len()].copy_from_slice(&pids);
+                        let parsed = darwin_group_pids(bytes, error, &buffer);
+                        snapshots.borrow_mut().push(if parsed.is_some() {
+                            DarwinGroupSnapshot::Complete(Vec::new())
+                        } else {
+                            DarwinGroupSnapshot::Refused
+                        });
+                        transcript.borrow_mut().push(format!("list bytes={bytes} errno={error} pids={pids:?}"));
+                        parsed
+                    },
+                    |pid| {
+                        counts.1 += 1;
+                        let (expected, bytes, error, raw) = members.borrow_mut().pop_front().expect("unexpected member probe");
+                        assert_eq!(pid, expected);
+                        let parsed = darwin_observed_member(bytes, error, pid, 41, raw.clone());
+                        transcript.borrow_mut().push(format!("pid={pid} bytes={bytes} errno={error} raw={raw:?}"));
+                        darwin_group_record_member(snapshots.borrow_mut().last_mut().unwrap(), bytes, error, &parsed);
+                        parsed
+                    },
+                );
+                let failure = darwin_group_failure(&snapshots.into_inner());
+                (stopped, failure, transcript.into_inner())
+            });
+            assert!(lists.borrow().is_empty());
+            assert!(members.borrow().is_empty(), "a complete enumeration must check every listed PID before progress");
+            (observation, stopped)
+        }
+
+        let exiting = DarwinGroupMember { pid: 42, pgid: 41, status: 2, flags: DARWIN_PROC_FLAG_INEXIT, start_sec: 100, start_usec: 10 };
+        let zombie = DarwinGroupMember { pid: 43, status: 5, ..exiting.clone() };
+        let live = DarwinGroupMember { pid: 43, flags: 0, ..exiting.clone() };
+        let reply = |member: DarwinGroupMember| (member.pid as i32, DARWIN_BSDINFO_SIZE, 0, member);
+        let full = |pids: Vec<i32>| ((pids.len() * 4) as i32, 0, pids);
+        struct Case {
+            name: &'static str,
+            lists: Vec<ListReply>,
+            members: Vec<MemberReply>,
+            progress: bool,
+            wait: Duration,
+            lookups: usize,
+        }
+        let budget = Duration::from_secs(3);
+        for case in [
+            Case {
+                name: "exiting",
+                lists: vec![full(vec![42])],
+                members: vec![reply(exiting.clone())],
+                progress: true,
+                wait: budget,
+                lookups: 1,
+            },
+            Case {
+                name: "exiting plus zombie",
+                lists: vec![full(vec![42, 43])],
+                members: vec![reply(exiting.clone()), reply(zombie.clone())],
+                progress: true,
+                wait: budget,
+                lookups: 2,
+            },
+            Case {
+                name: "hidden live",
+                lists: vec![full(vec![42, 43])],
+                members: vec![reply(exiting.clone()), reply(live.clone())],
+                progress: false,
+                wait: budget,
+                lookups: 2,
+            },
+            Case {
+                name: "live then exiting",
+                lists: vec![full(vec![42, 43])],
+                members: vec![
+                    reply(DarwinGroupMember { pid: 42, ..live.clone() }),
+                    reply(DarwinGroupMember { pid: 43, ..exiting.clone() }),
+                ],
+                progress: false,
+                wait: budget,
+                lookups: 2,
+            },
+            Case {
+                name: "hard error",
+                lists: vec![full(vec![42, 43])],
+                members: vec![reply(exiting.clone()), (43, 0, Errno::EIO as i32, zombie.clone())],
+                progress: false,
+                wait: budget,
+                lookups: 2,
+            },
+            Case {
+                name: "short response",
+                lists: vec![full(vec![42, 43])],
+                members: vec![reply(exiting.clone()), (43, 135, 0, zombie.clone())],
+                progress: false,
+                wait: budget,
+                lookups: 2,
+            },
+            Case {
+                name: "identity mismatch",
+                lists: vec![full(vec![42, 43])],
+                members: vec![reply(exiting.clone()), (43, 136, 0, DarwinGroupMember { pgid: 99, ..zombie.clone() })],
+                progress: false,
+                wait: budget,
+                lookups: 2,
+            },
+            Case {
+                name: "reaped cannot hide live",
+                lists: vec![full(vec![42, 43, 44])],
+                members: vec![
+                    reply(exiting.clone()),
+                    (43, 0, Errno::ESRCH as i32, zombie.clone()),
+                    (44, 136, 0, DarwinGroupMember { pid: 44, ..live.clone() }),
+                ],
+                progress: false,
+                wait: budget,
+                lookups: 3,
+            },
+            Case {
+                name: "live then reaped",
+                lists: vec![full(vec![42, 43])],
+                members: vec![reply(DarwinGroupMember { pid: 42, ..live.clone() }), (43, 0, Errno::ESRCH as i32, zombie.clone())],
+                progress: false,
+                wait: budget,
+                lookups: 2,
+            },
+            Case { name: "saturated", lists: vec![full((42..62).collect())], members: vec![], progress: false, wait: budget, lookups: 0 },
+            Case {
+                name: "zero deadline",
+                lists: vec![full(vec![42, 43])],
+                members: vec![reply(exiting.clone()), reply(zombie.clone())],
+                progress: true,
+                wait: Duration::ZERO,
+                lookups: 2,
+            },
+        ] {
+            let start = tokio::time::Instant::now();
+            let mut first = Some((case.lists, case.members));
+            let mut history = Vec::new();
+            let result = darwin_confirm_group_stopped(41, start + case.wait, || {
+                let mut counts = (0, 0);
+                let (observation, stopped) = if let Some((lists, members)) = first.take() {
+                    observe(lists, members, &mut counts)
+                } else {
+                    assert_eq!(history.len(), 1, "only one later complete proof is needed");
+                    // The next independent observation sees this former SRUN
+                    // member as SZOMB twice; never inject raw ESRCH success.
+                    let former_exiting = DarwinGroupMember { status: 5, ..exiting.clone() };
+                    observe(vec![full(vec![42]), full(vec![42])], vec![reply(former_exiting.clone()), reply(former_exiting)], &mut counts)
+                };
+                history.push((observation.result, observation.failure, stopped, counts));
+                observation
+            })
+            .await;
+            assert_eq!(history[0].0, Err(Errno::EPERM), "{}: exiting is never absent", case.name);
+            assert!(!history[0].2);
+            assert_eq!(history[0].1 == DarwinGroupFailure::Progress, case.progress, "{}", case.name);
+            assert_eq!(history[0].3, (1, case.lookups), "{}", case.name);
+            if case.progress && !case.wait.is_zero() {
+                result.unwrap();
+                assert_eq!(history.len(), 2);
+                assert_eq!(history[1].0, Err(Errno::ESRCH));
+                assert!(history[1].2);
+                assert_eq!(history[1].3, (2, 2));
+                assert_eq!(tokio::time::Instant::now() - start, Duration::from_millis(25));
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(history.len(), 1, "{}: must not retry", case.name);
+                assert_eq!(tokio::time::Instant::now(), start);
+                assert_eq!(error.downcast_ref::<Errno>(), Some(&Errno::EPERM));
+                assert!(error.to_string().contains("list bytes="));
+            }
+        }
+    }
+
+    #[test]
+    fn darwin_group_progress_requires_a_zero_byte_esrch_member_lookup() {
+        use nix::errno::Errno;
+        for returned in [-1, 0, 1, 135, 136, 137] {
+            for error in [0, Errno::ESRCH as i32, Errno::EPERM as i32, Errno::EACCES as i32, Errno::EIO as i32] {
+                let snapshot = darwin_group_missing_member(returned, error);
+                assert_eq!(matches!(snapshot, DarwinGroupSnapshot::Reaped), returned == 0 && error == Errno::ESRCH as i32);
+                let failure = darwin_group_failure(&[snapshot]);
+                assert_eq!(failure == DarwinGroupFailure::Progress, returned == 0 && error == Errno::ESRCH as i32);
+            }
+        }
+    }
+
+    #[test]
+    fn darwin_group_progress_requires_a_strict_subset_of_exact_zombie_identities() {
+        use DarwinGroupSnapshot::{Complete, Reaped, Refused};
+        let first = DarwinGroupMember { pid: 42, pgid: 41, status: 5, flags: 0, start_sec: 100, start_usec: 10 };
+        let second = DarwinGroupMember { pid: 43, ..first.clone() };
+        for snapshots in [
+            vec![Reaped],
+            vec![Complete(vec![first.clone()]), Reaped],
+            vec![Complete(vec![first.clone()]), Complete(vec![])],
+            vec![Complete(vec![first.clone(), second.clone()]), Complete(vec![second.clone()])],
+        ] {
+            assert_eq!(darwin_group_failure(&snapshots), DarwinGroupFailure::Progress, "{snapshots:?}");
+        }
+        for snapshots in [
+            vec![],
+            vec![Refused],
+            vec![Complete(vec![first.clone()]), Refused],
+            vec![Complete(vec![first.clone()])],
+            vec![Complete(vec![]), Complete(vec![first.clone()])],
+            vec![Complete(vec![first.clone()]), Complete(vec![first.clone()])],
+            vec![Complete(vec![first.clone()]), Complete(vec![second.clone()])],
+            vec![Complete(vec![first.clone()]), Complete(vec![first.clone(), second.clone()])],
+            vec![Complete(vec![first.clone(), second.clone()]), Complete(vec![DarwinGroupMember { start_sec: 101, ..first.clone() }])],
+            vec![Complete(vec![first.clone(), second.clone()]), Complete(vec![DarwinGroupMember { start_usec: 11, ..first.clone() }])],
+            vec![Complete(vec![first.clone(), second.clone()]), Complete(vec![DarwinGroupMember { pgid: 44, ..first.clone() }])],
+        ] {
+            assert_eq!(darwin_group_failure(&snapshots), DarwinGroupFailure::Refusal, "{snapshots:?}");
+        }
+    }
+
+    #[test]
+    fn darwin_group_progress_is_not_absence_and_comes_from_the_same_observation() {
+        use nix::errno::Errno;
+        let mut calls = 0;
+        let observed = darwin_group_observe(Err(Errno::EPERM), || {
+            calls += 1;
+            (false, DarwinGroupFailure::Progress, vec!["listed member reaped".into()])
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(observed.result, Err(Errno::EPERM));
+        assert_eq!(observed.failure, DarwinGroupFailure::Progress);
+        assert_eq!(
+            observed.detail.as_deref(),
+            Some("Darwin group signal-zero: Err(EPERM) errno=1; Darwin group absence proof refused: listed member reaped")
+        );
+        for result in [Ok(()), Err(Errno::ESRCH), Err(Errno::EACCES), Err(Errno::EIO)] {
+            let observed = darwin_group_observe(result, || panic!("non-EPERM must not collect another observation"));
+            assert_eq!(observed.result, result);
+            assert_eq!(observed.failure, DarwinGroupFailure::Refusal);
+            assert!(observed.detail.as_deref().unwrap().contains("Darwin group signal-zero:"));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn darwin_group_progress_transitions_need_a_later_complete_proof() {
+        use nix::errno::Errno;
+        use std::cell::RefCell;
+        use std::collections::VecDeque;
+
+        #[derive(Clone, Copy, Debug)]
+        enum Transition {
+            ListedThenReaped,
+            StrictSubset,
+            Empty,
+            Live,
+        }
+        // Requested PID, BSD bytes, errno, raw status. These are injected
+        // kernel replies, not preclassified progress/stopped observations.
+        type MemberReply = (i32, i32, i32, u32);
+        for transition in [Transition::ListedThenReaped, Transition::StrictSubset, Transition::Empty, Transition::Live] {
+            let start = tokio::time::Instant::now();
+            let mut history = Vec::new();
+            let result = darwin_confirm_group_stopped(41, start + Duration::from_secs(3), || {
+                let attempt = history.len() + 1;
+                let zombie = |pid| (pid, DARWIN_BSDINFO_SIZE, 0, 5);
+                let (lists, members): (Vec<Vec<i32>>, Vec<MemberReply>) = match (attempt, transition) {
+                    (1, Transition::ListedThenReaped) => (vec![vec![42]], vec![(42, 0, Errno::ESRCH as i32, 0)]),
+                    (1, Transition::StrictSubset) => (vec![vec![42, 43], vec![43]], vec![zombie(42), zombie(43), zombie(43)]),
+                    (1, Transition::Empty) => (vec![vec![42], vec![]], vec![zombie(42)]),
+                    (1, Transition::Live) => (vec![vec![42], vec![42]], vec![zombie(42), (42, DARWIN_BSDINFO_SIZE, 0, 2)]),
+                    (2, Transition::StrictSubset) => (vec![vec![43], vec![43]], vec![zombie(43), zombie(43)]),
+                    (2, Transition::ListedThenReaped | Transition::Empty) => (vec![vec![], vec![]], vec![]),
+                    _ => panic!("unexpected observation {attempt} for {transition:?}"),
+                };
+                let lists = RefCell::new(VecDeque::from(lists));
+                let members = RefCell::new(VecDeque::from(members));
+                let snapshots = RefCell::new(Vec::new());
+                let mut list_calls = 0;
+                let mut member_calls = 0;
+                let mut stopped = false;
+                let observed = darwin_group_observe(Err(Errno::EPERM), || {
+                    stopped = darwin_group_snapshots_stopped(
+                        || {
+                            list_calls += 1;
+                            let pids = lists.borrow_mut().pop_front().expect("unexpected enumeration");
+                            let mut buffer = [0; DARWIN_GROUP_SLOTS];
+                            buffer[..pids.len()].copy_from_slice(&pids);
+                            let parsed = darwin_group_pids((pids.len() * std::mem::size_of::<i32>()) as i32, 0, &buffer);
+                            snapshots.borrow_mut().push(if parsed.is_some() {
+                                DarwinGroupSnapshot::Complete(Vec::new())
+                            } else {
+                                DarwinGroupSnapshot::Refused
+                            });
+                            parsed
+                        },
+                        |pid| {
+                            member_calls += 1;
+                            let (expected_pid, bytes, error, status) = members.borrow_mut().pop_front().expect("unexpected member lookup");
+                            assert_eq!(pid, expected_pid);
+                            let raw = if bytes == DARWIN_BSDINFO_SIZE {
+                                DarwinGroupMember { pid: pid as u32, pgid: 41, status, flags: 0, start_sec: 100, start_usec: 10 }
+                            } else {
+                                DarwinGroupMember { pid: 0, pgid: 0, status: 0, flags: 0, start_sec: 0, start_usec: 0 }
+                            };
+                            let parsed = darwin_zombie_member(bytes, pid, 41, raw);
+                            let mut snapshots = snapshots.borrow_mut();
+                            let snapshot = snapshots.last_mut().expect("member lookup requires prior enumeration");
+                            darwin_group_record_member(snapshot, bytes, error, &parsed);
+                            parsed
+                        },
+                    );
+                    let snapshots = snapshots.into_inner();
+                    (stopped, darwin_group_failure(&snapshots), vec![format!("{transition:?} attempt {attempt}: {snapshots:?}")])
+                });
+                assert!(lists.borrow().is_empty(), "the proof must consume exactly the injected enumerations");
+                assert!(members.borrow().is_empty(), "the proof must consume exactly the injected member replies");
+                history.push((observed.result, observed.failure, stopped, list_calls, member_calls));
+                observed
+            })
+            .await;
+            let first = history[0];
+            assert_eq!(first.0, Err(Errno::EPERM), "the transition itself must never prove absence");
+            assert!(!first.2, "a partial/mismatched snapshot is never a complete proof");
+            if matches!(transition, Transition::Live) {
+                let error = result.unwrap_err();
+                assert_eq!(first.1, DarwinGroupFailure::Refusal);
+                assert_eq!((first.3, first.4), (2, 2));
+                assert_eq!(history.len(), 1, "a live second snapshot must not be retried");
+                assert_eq!(tokio::time::Instant::now(), start, "live refusal must not consume any wait budget");
+                assert_eq!(error.downcast_ref::<Errno>(), Some(&Errno::EPERM));
+                assert!(error.to_string().contains("Live attempt 1"));
+            } else {
+                result.unwrap();
+                assert_eq!(first.1, DarwinGroupFailure::Progress);
+                let expected_calls = match transition {
+                    Transition::ListedThenReaped => (1, 1),
+                    Transition::StrictSubset => (2, 3),
+                    Transition::Empty => (2, 1),
+                    Transition::Live => unreachable!(),
+                };
+                assert_eq!((first.3, first.4), expected_calls);
+                assert_eq!(history.len(), 2, "progress requires a later independent complete proof");
+                assert_eq!(tokio::time::Instant::now() - start, Duration::from_millis(25));
+                let last = history[1];
+                assert_eq!(last.0, Err(Errno::ESRCH), "only the later stable snapshots normalize initial EPERM");
+                assert!(last.2);
+                assert_eq!(last.3, 2, "the successful observation must enumerate both snapshots");
+                assert_eq!(last.4, if matches!(transition, Transition::StrictSubset) { 2 } else { 0 });
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn darwin_group_progress_zero_deadline_never_retries_or_sleeps() {
+        use nix::errno::Errno;
+        for (result, failure) in [
+            (Err(Errno::EPERM), DarwinGroupFailure::Progress),
+            (Err(Errno::EPERM), DarwinGroupFailure::Refusal),
+            (Err(Errno::EIO), DarwinGroupFailure::Progress),
+            (Ok(()), DarwinGroupFailure::Refusal),
+        ] {
+            let start = tokio::time::Instant::now();
+            let mut calls = 0;
+            let error = darwin_confirm_group_stopped(41, start, || {
+                calls += 1;
+                DarwinGroupObservation { result, detail: Some("last observation".into()), failure }
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(calls, 1);
+            assert_eq!(tokio::time::Instant::now(), start);
+            assert!(error.to_string().contains("last observation"));
+        }
+        let now = tokio::time::Instant::now();
+        let mut calls = 0;
+        darwin_confirm_group_stopped(41, now, || {
+            calls += 1;
+            DarwinGroupObservation { result: Err(Errno::ESRCH), detail: None, failure: DarwinGroupFailure::Refusal }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls, 1, "a complete absence proof still succeeds with ZERO budget");
+        assert_eq!(tokio::time::Instant::now(), now);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn darwin_group_progress_reobserves_until_stopped_or_immediate_refusal() {
+        use nix::errno::Errno;
+        for terminal in [Err(Errno::ESRCH), Ok(()), Err(Errno::EPERM), Err(Errno::EIO)] {
+            let start = tokio::time::Instant::now();
+            let mut calls = 0;
+            let result = darwin_confirm_group_stopped(41, start + Duration::from_secs(3), || {
+                calls += 1;
+                if calls == 1 {
+                    DarwinGroupObservation {
+                        result: Err(Errno::EPERM),
+                        detail: Some("progress".into()),
+                        failure: DarwinGroupFailure::Progress,
+                    }
+                } else {
+                    DarwinGroupObservation {
+                        result: terminal,
+                        detail: Some("terminal observation".into()),
+                        failure: DarwinGroupFailure::Refusal,
+                    }
+                }
+            })
+            .await;
+            assert_eq!(calls, 2);
+            assert_eq!(tokio::time::Instant::now() - start, Duration::from_millis(25));
+            assert_eq!(result.is_ok(), terminal == Err(Errno::ESRCH));
+            if let Err(error) = result {
+                assert!(error.to_string().contains("terminal observation"));
+                if let Err(errno) = terminal {
+                    assert_eq!(error.downcast_ref::<Errno>(), Some(&errno));
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn darwin_group_progress_deadline_keeps_last_diagnostics_without_extending_budget() {
+        use nix::errno::Errno;
+        let start = tokio::time::Instant::now();
+        let mut calls = 0;
+        let error = darwin_confirm_group_stopped(41, start + Duration::from_millis(60), || {
+            calls += 1;
+            DarwinGroupObservation {
+                result: Err(Errno::EPERM),
+                detail: Some(format!("full last observation {calls}")),
+                failure: DarwinGroupFailure::Progress,
+            }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls, 3, "observations at 0/25/50 ms only; no extra deadline probe");
+        assert_eq!(tokio::time::Instant::now() - start, Duration::from_millis(60));
+        assert!(error.to_string().contains("full last observation 3"));
+        assert_eq!(error.downcast_ref::<Errno>(), Some(&Errno::EPERM));
+        assert!(error.downcast_ref::<StopUnconfirmed>().is_some());
+    }
+
+    #[test]
+    fn darwin_group_probe_diagnostics_preserve_dispositions_without_reprobing() {
+        use nix::errno::Errno;
+        for result in [Ok(()), Err(Errno::EPERM), Err(Errno::ESRCH), Err(Errno::EACCES), Err(Errno::EINVAL), Err(Errno::EIO)] {
+            for stopped in [false, true] {
+                let mut calls = 0;
+                let (observed, detail) = darwin_group_probe_with_detail(result, || {
+                    calls += 1;
+                    (stopped, vec!["original observation".into()])
+                });
+                assert_eq!(observed, darwin_group_probe(result, || stopped));
+                assert_eq!(calls, usize::from(result == Err(Errno::EPERM)));
+                let detail = detail.expect("every raw disposition needs a same-observation transcript");
+                assert!(detail.contains("Darwin group signal-zero:"));
+                if result == Err(Errno::EPERM) {
+                    let disposition = if stopped { "confirmed" } else { "refused" };
+                    assert!(detail.contains(&format!("Darwin group absence proof {disposition}: original observation")));
+                } else {
+                    assert!(!detail.contains("absence proof"), "non-EPERM must not invoke the fallback");
+                    if let Err(error) = result {
+                        assert!(detail.contains(&format!("Err({error:?}) errno={}", error as i32)));
+                    } else {
+                        assert!(detail.contains("Ok/live"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn darwin_group_probe_diagnostics_retain_the_failed_second_snapshot() {
+        use nix::errno::Errno;
+        let mut lists = 0;
+        let mut lookups = 0;
+        let (result, detail) = darwin_group_probe_with_detail(Err(Errno::EPERM), || {
+            let observations = std::cell::RefCell::new(Vec::new());
+            let stopped = darwin_group_snapshots_stopped(
+                || {
+                    lists += 1;
+                    observations.borrow_mut().push(format!("list {lists}"));
+                    if lists == 1 { Some(vec![42]) } else { None }
+                },
+                |pid| {
+                    lookups += 1;
+                    observations.borrow_mut().push(format!("member {pid}"));
+                    Some(DarwinGroupMember { pid: pid as u32, pgid: 41, status: 5, flags: 0, start_sec: 100, start_usec: 10 })
+                },
+            );
+            (stopped, observations.into_inner())
+        });
+        assert_eq!(result, Err(Errno::EPERM));
+        assert_eq!(lists, 2, "reporting must not repeat enumeration");
+        assert_eq!(lookups, 1, "a failed second enumeration must not repeat member lookup");
+        assert_eq!(
+            detail.as_deref(),
+            Some("Darwin group signal-zero: Err(EPERM) errno=1; Darwin group absence proof refused: list 1; member 42; list 2")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn darwin_group_replacement_uses_only_the_remaining_kill_deadline() {
+        use nix::errno::Errno;
+        let start = tokio::time::Instant::now();
+        let deadline = start + Duration::from_secs(1);
+        tokio::time::advance(Duration::from_millis(940)).await;
+        let mut calls = 0;
+        let error = darwin_confirm_replacement_stopped(Pid::from_raw(41), Some(deadline), || {
+            calls += 1;
+            darwin_group_observe(Err(Errno::EPERM), || {
+                (false, DarwinGroupFailure::Progress, vec![format!("full last flags=4 observation {calls}")])
+            })
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls, 3, "only 940/965/990 ms, not a fresh one-second budget");
+        assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(1));
+        let event = format!("{error}; queued inputs remain pending");
+        assert!(event.contains("replacement is blocked"));
+        assert!(event.contains("full last flags=4 observation 3"));
+        assert!(event.contains("Err(EPERM) errno=1"));
+        assert!(error.downcast_ref::<ReplacementBlocked>().is_some());
+        assert!(error.downcast_ref::<StopUnconfirmed>().is_some());
+        assert_eq!(error.downcast_ref::<Errno>(), Some(&Errno::EPERM));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn darwin_group_replacement_without_remaining_grace_observes_once() {
+        use nix::errno::Errno;
+        for deadline in [None, Some(tokio::time::Instant::now())] {
+            let start = tokio::time::Instant::now();
+            let mut calls = 0;
+            let error = darwin_confirm_replacement_stopped(Pid::from_raw(41), deadline, || {
+                calls += 1;
+                darwin_group_observe(Err(Errno::EPERM), || (false, DarwinGroupFailure::Progress, vec!["no remaining grace".into()]))
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(calls, 1, "early ownership failure or expired phase must not gain grace");
+            assert_eq!(tokio::time::Instant::now(), start);
+            assert!(format!("{error}; queued inputs remain pending").contains("no remaining grace"));
+            assert!(error.downcast_ref::<ReplacementBlocked>().is_some());
+            assert_eq!(error.downcast_ref::<Errno>(), Some(&Errno::EPERM));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn darwin_group_replacement_live_and_hard_errors_keep_display_and_typed_refusals() {
+        use nix::errno::Errno;
+        for terminal in [Ok(()), Err(Errno::EIO), Err(Errno::EACCES), Err(Errno::EPERM)] {
+            let start = tokio::time::Instant::now();
+            let mut calls = 0;
+            let error = darwin_confirm_replacement_stopped(Pid::from_raw(41), Some(start + Duration::from_secs(1)), || {
+                calls += 1;
+                if calls == 1 {
+                    darwin_group_observe(Err(Errno::EPERM), || (false, DarwinGroupFailure::Progress, vec!["exiting flags=4".into()]))
+                } else {
+                    assert_eq!(calls, 2, "live and hard errors must refuse immediately");
+                    darwin_group_observe(terminal, || {
+                        assert_eq!(terminal, Err(Errno::EPERM), "other dispositions must not enumerate");
+                        (false, DarwinGroupFailure::Refusal, vec!["unflagged live member flags=0".into()])
+                    })
+                }
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(calls, 2);
+            assert_eq!(tokio::time::Instant::now() - start, Duration::from_millis(25));
+            let event = format!("{error}; queued inputs remain pending");
+            assert!(event.contains("Darwin group signal-zero:"));
+            assert!(error.downcast_ref::<ReplacementBlocked>().is_some());
+            assert!(error.downcast_ref::<StopUnconfirmed>().is_some());
+            if let Err(errno) = terminal {
+                assert!(event.contains(&format!("Err({errno:?}) errno={}", errno as i32)));
+                assert_eq!(error.downcast_ref::<Errno>(), Some(&errno));
+                if errno == Errno::EPERM {
+                    assert!(event.contains("unflagged live member flags=0"));
+                }
+            } else {
+                assert!(event.contains("Ok/live"));
+                assert!(error.downcast_ref::<Errno>().is_none());
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn darwin_group_replacement_always_requires_a_fresh_complete_proof() {
+        use nix::errno::Errno;
+        for grace in [None, Some(Duration::ZERO), Some(Duration::from_millis(60))] {
+            let start = tokio::time::Instant::now();
+            let deadline = grace.map(|duration| start + duration);
+            let mut calls = 0;
+            let mut enumerations = 0;
+            darwin_confirm_replacement_stopped(Pid::from_raw(41), deadline, || {
+                calls += 1;
+                if grace == Some(Duration::from_millis(60)) && calls == 1 {
+                    return darwin_group_observe(Err(Errno::EPERM), || {
+                        (false, DarwinGroupFailure::Progress, vec!["prior observation is not absence".into()])
+                    });
+                }
+                darwin_group_observe(Err(Errno::EPERM), || {
+                    let stopped = darwin_group_snapshots_stopped(
+                        || {
+                            enumerations += 1;
+                            Some(Vec::new())
+                        },
+                        |_| panic!("empty complete group has no member lookups"),
+                    );
+                    (stopped, DarwinGroupFailure::Refusal, vec!["fresh identical complete empty snapshots".into()])
+                })
+            })
+            .await
+            .unwrap();
+            let waits = usize::from(grace == Some(Duration::from_millis(60)));
+            assert_eq!(calls, 1 + waits);
+            assert_eq!(enumerations, 2, "no cached stopped result may authorize replacement");
+            assert_eq!(tokio::time::Instant::now() - start, Duration::from_millis(25 * waits as u64));
+        }
+    }
+
+    #[test]
+    fn darwin_group_probe_never_accepts_unproven_permission_errors() {
+        use nix::errno::Errno;
+        assert_eq!(darwin_group_probe(Err(Errno::EPERM), || false), Err(Errno::EPERM));
+        assert_eq!(darwin_group_probe(Err(Errno::EPERM), || true), Err(Errno::ESRCH));
+        for result in [Ok(()), Err(Errno::ESRCH), Err(Errno::EACCES), Err(Errno::EINVAL), Err(Errno::EIO)] {
+            assert_eq!(darwin_group_probe(result, || panic!("only EPERM may request enumeration")), result);
+        }
+    }
+
+    #[test]
+    fn darwin_group_enumeration_requires_a_complete_successful_pid_list() {
+        let mut buffer = [0; DARWIN_GROUP_SLOTS];
+        buffer[..3].copy_from_slice(&[43, 41, 42]);
+        assert_eq!(darwin_group_pids(12, 0, &buffer), Some(vec![41, 42, 43]));
+        assert_eq!(darwin_group_pids(0, 0, &buffer), Some(vec![]));
+        for returned in [-1, 1, 3, 13, 79, 80, 84] {
+            assert!(darwin_group_pids(returned, 0, &buffer).is_none(), "malformed or saturated response {returned}");
+        }
+        for error in [1, 3, 5, 12, 22] {
+            assert!(darwin_group_pids(0, error, &buffer).is_none(), "zero bytes with errno {error} is not absence");
+            assert!(darwin_group_pids(12, error, &buffer).is_none());
+        }
+        assert!(darwin_group_pids(0, 0, &buffer[..19]).is_none(), "the capacity proof depends on the exact supplied buffer");
+        for invalid in [[41, 0, 42], [41, -1, 42], [41, 42, 41]] {
+            buffer[..3].copy_from_slice(&invalid);
+            assert!(darwin_group_pids(12, 0, &buffer).is_none(), "invalid/duplicate PID {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn darwin_group_status_requires_an_exact_zombie_identity() {
+        let zombie = DarwinGroupMember { pid: 42, pgid: 41, status: 5, flags: 0, start_sec: 100, start_usec: 10 };
+        assert_eq!(darwin_zombie_member(136, 42, 41, zombie.clone()), Some(zombie.clone()));
+        for returned in [-1, 0, 135, 137] {
+            assert!(darwin_zombie_member(returned, 42, 41, zombie.clone()).is_none(), "BSD info size {returned}");
+        }
+        for status in [0, 1, 2, 3, 4, 6, u32::MAX] {
+            assert!(darwin_zombie_member(136, 42, 41, DarwinGroupMember { status, ..zombie.clone() }).is_none());
+        }
+        for member in [
+            DarwinGroupMember { pid: 43, ..zombie.clone() },
+            DarwinGroupMember { pgid: 43, ..zombie.clone() },
+            DarwinGroupMember { start_sec: 0, ..zombie.clone() },
+            DarwinGroupMember { start_usec: 1_000_000, ..zombie.clone() },
+        ] {
+            assert!(darwin_zombie_member(136, 42, 41, member).is_none());
+        }
+        assert!(darwin_zombie_member(136, -1, 41, zombie.clone()).is_none());
+        assert!(darwin_zombie_member(136, 42, -1, zombie).is_none());
+    }
+
+    #[test]
+    fn darwin_group_absence_requires_matching_complete_zombie_snapshots() {
+        let zombie = DarwinGroupMember { pid: 42, pgid: 41, status: 5, flags: 0, start_sec: 100, start_usec: 10 };
+        assert!(darwin_group_snapshots_stopped(|| Some(vec![]), |_| panic!("empty group has no member lookup")));
+        assert!(darwin_group_snapshots_stopped(|| Some(vec![42]), |_| Some(zombie.clone())));
+        assert!(!darwin_group_snapshots_stopped(|| None, |_| panic!("list errors cannot authorize member lookup")));
+        assert!(!darwin_group_snapshots_stopped(|| Some(vec![42]), |_| None), "member errors cannot mean dead");
+        for changed in [None, Some(vec![]), Some(vec![42, 43]), Some(vec![43])] {
+            let mut lists = [Some(vec![42]), changed].into_iter();
+            assert!(
+                !darwin_group_snapshots_stopped(
+                    || lists.next().unwrap(),
+                    |pid| Some(DarwinGroupMember { pid: pid as u32, ..zombie.clone() })
+                ),
+                "fork, exit, failed second list or changed membership cannot prove a stable zombie-only group"
+            );
+        }
+        for changed in [
+            None,
+            Some(DarwinGroupMember { start_sec: 101, ..zombie.clone() }),
+            Some(DarwinGroupMember { start_usec: 11, ..zombie.clone() }),
+        ] {
+            let mut members = [Some(zombie.clone()), changed].into_iter();
+            assert!(
+                !darwin_group_snapshots_stopped(|| Some(vec![42]), |_| members.next().unwrap()),
+                "PID reuse/lookup failure must fail closed"
+            );
+        }
+        let mut members = [Some(zombie.clone()), None].into_iter();
+        assert!(!darwin_group_snapshots_stopped(|| Some(vec![42, 43]), |_| members.next().unwrap()), "every enumerated member needs proof");
+    }
+
+    #[test]
+    fn darwin_process_identity_preserves_argument_boundaries_and_excludes_environment() {
+        let encode = |args: &[&str]| {
+            let mut data = (args.len() as i32).to_ne_bytes().to_vec();
+            data.extend_from_slice(b"/bin/sh\0\0\0");
+            for arg in args {
+                data.extend_from_slice(arg.as_bytes());
+                data.push(0);
+            }
+            data.extend_from_slice(b"--resume\0fork\0");
+            data
+        };
+        let wrapper = ["/bin/sh", "-c", r#""$@"; echo $? > "$C6_HELD_CODE""#, "sh", "/a path/claude-live", "--resume", "fork"];
+        let data = encode(&wrapper);
+        assert_eq!(darwin_procargs(&data).unwrap(), wrapper);
+        assert!(claude_args_for(&darwin_procargs(&data).unwrap(), "fork"));
+        let display = wrapper.join(" ");
+        assert!(!claude_args_for(&display.split_whitespace().collect::<Vec<_>>(), "fork"), "ps display is not argv");
+        assert!(!claude_args_for(&darwin_procargs(&encode(&["claude-live"])).unwrap(), "fork"), "environment is not argv");
+        let empty = encode(&["claude-live", "", "--session-id", "fork"]);
+        assert_eq!(darwin_procargs(&empty).unwrap(), ["claude-live", "", "--session-id", "fork"]);
+        for length in 0..data.len() - b"--resume\0fork\0".len() {
+            assert!(darwin_procargs(&data[..length]).is_none(), "truncated at {length}");
+        }
+        assert!(darwin_procargs(&0i32.to_ne_bytes()).is_none());
+        assert!(darwin_procargs(&(-1i32).to_ne_bytes()).is_none());
+    }
+
+    #[test]
+    fn darwin_fifo_identity_requires_open_vnode_device_inode_type_and_path() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{MetadataExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime with\na newline");
+        std::fs::create_dir(&runtime).unwrap();
+        let fifo = runtime.join("in");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR).unwrap();
+        let alias = dir.path().join("alias");
+        symlink(&runtime, &alias).unwrap();
+        let stat = std::fs::metadata(&fifo).unwrap();
+        let (dev, ino, mode) = (stat.dev() as u32, stat.ino(), stat.mode() as u16);
+        let size = DARWIN_VNODE_FDINFO_SIZE as i32;
+        let path = |name: &Path| {
+            let mut buffer = [0; DARWIN_VNODE_PATH_SIZE];
+            let bytes = name.as_os_str().as_bytes();
+            assert!(bytes.len() < buffer.len());
+            buffer[..bytes.len()].copy_from_slice(bytes);
+            buffer
+        };
+        let valid = path(&fifo);
+        assert!(darwin_vnode_fifo(size, dev, ino, mode, &valid, &fifo));
+        assert!(darwin_vnode_fifo(size, dev, ino, mode, &path(&alias.join("in")), &fifo), "canonical path accepts symlink aliases");
+        assert!(darwin_vnode_fifo(size, dev, ino, mode, &valid, &alias.join("in")), "the expected path may be an alias too");
+        assert!(darwin_vnode_fifo(size, dev, ino, mode & !0o777, &valid, &fifo), "FIFO type, not permissions, is authority");
+        assert!(
+            !darwin_vnode_fifo(size, dev.wrapping_add(1), ino, mode, &valid, &fifo),
+            "same inode/path on a different open-vnode device is not authority"
+        );
+        assert!(!darwin_vnode_fifo(size, dev, ino.wrapping_add(1), mode, &valid, &fifo));
+        assert!(!darwin_vnode_fifo(size, dev, ino, 0, &valid, &fifo), "open-vnode mode must prove FIFO type");
+        let other = runtime.join("other");
+        nix::unistd::mkfifo(&other, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR).unwrap();
+        assert!(!darwin_vnode_fifo(size, dev, ino, mode, &path(&other), &fifo), "matching vnode numbers still require the expected path");
+        assert!(!darwin_vnode_fifo(size, dev, ino, mode, &path(&runtime.join("missing")), &fifo));
+        for returned in [-1, 0, size - 1, size + 1] {
+            assert!(!darwin_vnode_fifo(returned, dev, ino, mode, &valid, &fifo), "malformed response size {returned}");
+        }
+        for malformed in [&valid[..valid.len() - 1], &[0; DARWIN_VNODE_PATH_SIZE], &[b'/'; DARWIN_VNODE_PATH_SIZE]] {
+            assert!(!darwin_vnode_fifo(size, dev, ino, mode, malformed, &fifo), "malformed kernel pathname");
+        }
+        std::fs::remove_file(&fifo).unwrap();
+        std::fs::write(&fifo, []).unwrap();
+        assert!(!darwin_vnode_fifo(size, dev, ino, mode, &valid, &fifo), "a replaced non-FIFO is not authority");
+    }
+
+    #[test]
+    fn darwin_vnode_path_preserves_bytes_and_rejects_malformed_paths() {
+        use std::os::unix::ffi::OsStrExt;
+        // No filesystem operation: non-UTF-8 path bytes can be checked even
+        // on a filesystem that refuses to create such filenames.
+        let raw = b"/runtime\xff/with\na newline/in";
+        let mut path = [0; DARWIN_VNODE_PATH_SIZE];
+        path[..raw.len()].copy_from_slice(raw);
+        assert_eq!(darwin_vnode_path(&path).unwrap().as_os_str().as_bytes(), raw);
+        assert!(darwin_vnode_path(&path[..path.len() - 1]).is_none());
+        assert!(darwin_vnode_path(&[0; DARWIN_VNODE_PATH_SIZE]).is_none());
+        assert!(darwin_vnode_path(&[b'/'; DARWIN_VNODE_PATH_SIZE]).is_none());
+        path[0] = b'r';
+        assert!(darwin_vnode_path(&path).is_none(), "kernel path must be absolute");
+    }
+
+    #[tokio::test]
+    async fn held_wrapper_process_identity_survives_spaces_in_the_program_path() {
+        let dir = tempfile::Builder::new().prefix("held runtime ").tempdir().unwrap();
+        let held = dir.path().join("held");
+        let _cleanup = HeldFixtureCleanup(held.clone());
+        let bin = live_claude(dir.path());
+        let p = Process::spawn_held(
+            &held,
+            "s",
+            &bin,
+            Launch { conversation: "fork".into(), ..Default::default() },
+            false,
+            dir.path(),
+            "opus",
+            Arc::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let pg = p.pgid.unwrap();
+        c6_testkit::eventually("the wrapper's exact argv to prove ownership", async || is_claude_for(pg.as_raw(), "fork").then_some(()))
+            .await;
+        assert!(!is_claude_for(pg.as_raw(), "for"));
+        p.close_for_replacement().await.unwrap();
+        assert_eq!(group_probe(pg), Err(nix::errno::Errno::ESRCH));
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn held_cleanup_confirms_keeper_stop_and_accepts_already_absent_group() {
+        if !c6_testkit::have("python3") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        let _cleanup = HeldFixtureCleanup(held.clone());
+        let bin = script(
+            dir.path(),
+            "claude-pin",
+            r#"#!/usr/bin/env python3
+import signal
+from pathlib import Path
+def interrupted(signum, frame):
+    keeper = Path('keeper-pid').read_text()
+    status = Path('/proc/' + keeper + '/status').read_text()
+    state = next(line.split()[1] for line in status.splitlines() if line.startswith('State:'))
+    Path('interrupted-state.tmp').write_text(state)
+    Path('interrupted-state.tmp').replace('interrupted-state')
+    raise SystemExit(0)
+signal.signal(signal.SIGINT, interrupted)
+Path('cli-ready').touch()
+while True:
+    signal.pause()
+"#,
+        );
+        let mut p = Process::spawn_held(
+            &held,
+            "s",
+            &bin,
+            Launch { conversation: "fork".into(), ..Default::default() },
+            false,
+            dir.path(),
+            "opus",
+            Arc::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let pg = p.pgid.unwrap();
+        let keeper = p.held.as_ref().unwrap().keeper;
+        let record = held.join("fork");
+        std::fs::write(dir.path().join("keeper-pid"), keeper.to_string()).unwrap();
+        c6_testkit::eventually("fixture CLI and FIFO keeper readiness", async || {
+            (dir.path().join("cli-ready").exists() && keeper_holds_fifo(keeper, pg, &record)).then_some(())
+        })
+        .await;
+        assert!(!keeper_stopped(keeper), "an open FIFO alone is not an observed stop");
+        pin_held_keeper(keeper, pg, &record).await.unwrap();
+        assert!(keeper_stopped(keeper) && keeper_holds_fifo(keeper, pg, &record));
+        // Freeze only the freshly verified fixture wrapper, not its group.
+        // Its CLI can handle SIGINT, but the wrapper cannot exit during the
+        // first poll of cleanup. Reuse the stopped-state reader for its PID.
+        assert!(is_claude_for(pg.as_raw(), "fork"));
+        nix::sys::signal::kill(pg, Signal::SIGSTOP).unwrap();
+        c6_testkit::eventually("the owned fixture wrapper to confirm its stop", async || {
+            (keeper_stopped(pg) && is_claude_for(pg.as_raw(), "fork")).then_some(())
+        })
+        .await;
+        let stop = stop_held_group(pg, keeper, &record, "fork");
+        tokio::pin!(stop);
+        // Keeper already stopped, wrapper confirmed alive and frozen: this
+        // single poll sends SIGINT and waits in grace. Do not poll cleanup
+        // again until fixture teardown proves whole-group absence.
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(stop.as_mut(), cx).is_pending(), "cleanup must wait while the owned wrapper is frozen");
+            std::task::Poll::Ready(())
+        })
+        .await;
+        c6_testkit::eventually("the CLI to observe the group interrupt", async || {
+            dir.path().join("interrupted-state").exists().then_some(())
+        })
+        .await;
+        assert_eq!(std::fs::read_to_string(dir.path().join("interrupted-state")).unwrap(), "T");
+        // Let the wrapper reap its CLI and reap the owned wrapper ourselves;
+        // only the fixture's stopped keeper remains to be killed and reaped.
+        assert!(keeper_stopped(pg) && is_claude_for(pg.as_raw(), "fork"));
+        nix::sys::signal::kill(pg, Signal::SIGCONT).unwrap();
+        c6_testkit::within("the fixture wrapper to exit after its CLI", p.child.as_mut().unwrap().wait()).await.unwrap();
+        assert!(keeper_stopped(keeper) && keeper_holds_fifo(keeper, pg, &record));
+        // Fresh FIFO proof, not saved IDs, authorizes this fixture-only kill.
+        killpg(pg, Signal::SIGKILL).unwrap();
+        c6_testkit::eventually("the fixture's entire group to be reaped", async || {
+            matches!(group_probe(pg), Err(nix::errno::Errno::ESRCH)).then_some(())
+        })
+        .await;
+        assert!(!keeper_holds_fifo(keeper, pg, &record));
+        stop.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn held_keeper_retains_fifo_ownership_through_group_interrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        let _cleanup = HeldFixtureCleanup(held.clone());
+        let bin = script(
+            dir.path(),
+            "claude-interrupt",
+            "#!/bin/sh\ntrap 'printf interrupted > interrupted; exit 0' INT\nprintf ready > ready\nwhile :; do read -r line || exit 0; done\n",
+        );
+        let mut p = Process::spawn_held(
+            &held,
+            "s",
+            &bin,
+            Launch { conversation: "fork".into(), ..Default::default() },
+            false,
+            dir.path(),
+            "opus",
+            Arc::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let pg = p.pgid.unwrap();
+        let keeper = p.held.as_ref().unwrap().keeper;
+        let record = held.join("fork");
+        c6_testkit::eventually("the CLI trap and FIFO keeper to be ready", async || {
+            (dir.path().join("ready").exists() && keeper_holds_fifo(keeper, pg, &record)).then_some(())
+        })
+        .await;
+        pin_held_keeper(keeper, pg, &record).await.unwrap();
+        killpg(pg, Signal::SIGINT).unwrap();
+        c6_testkit::eventually("the CLI to acknowledge the group interrupt", async || {
+            dir.path().join("interrupted").exists().then_some(())
+        })
+        .await;
+        c6_testkit::within("the interrupted CLI wrapper to exit", p.child.as_mut().unwrap().wait()).await.unwrap();
+        assert!(keeper_stopped(keeper), "the keeper must remain pinned after the group interrupt");
+        assert!(keeper_holds_fifo(keeper, pg, &record), "the pinned keeper must retain live FIFO authority after the leader exits");
+        p.close_for_replacement().await.unwrap();
+        assert_eq!(group_probe(pg), Err(nix::errno::Errno::ESRCH));
+    }
+
+    #[tokio::test]
+    async fn rewind_cleanup_stops_owned_descendants_after_the_wrapper_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        let _cleanup = HeldFixtureCleanup(held.clone());
+        let journal = crate::journal::Journal::open(&dir.path().join("journal.db")).await.unwrap();
+        let bin = live_claude(dir.path());
+        let mut old = Process::spawn_held(
+            &held,
+            "s",
+            &bin,
+            Launch { conversation: "old".into(), ..Default::default() },
+            false,
+            dir.path(),
+            "opus",
+            Arc::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let other = Process::spawn_held(
+            &held,
+            "other",
+            &bin,
+            Launch { conversation: "other".into(), ..Default::default() },
+            false,
+            dir.path(),
+            "opus",
+            Arc::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let pg = old.pgid.unwrap();
+        let keeper = old.held.as_ref().unwrap().keeper;
+        c6_testkit::eventually("fixture keeper owns its FIFO", async || keeper_holds_fifo(keeper, pg, &held.join("old")).then_some(()))
+            .await;
+        // Kill/reap only the wrapper created by this fixture, not its group.
+        let mut wrapper = old.child.take().unwrap();
+        wrapper.kill().await.unwrap();
+        drop(old);
+        assert!(killpg(pg, None).is_ok(), "the keeper/CLI still own the group");
+        stop_held_for_rewind(&held, "s", &journal).await.unwrap();
+        assert_eq!(group_probe(pg), Err(nix::errno::Errno::ESRCH));
+        assert!(!held.join("old").exists());
+        assert!(journal.claude_processes("s").await.unwrap().is_empty());
+        assert!(killpg(other.pgid.unwrap(), None).is_ok(), "another session is untouched");
+        other.close().await;
+    }
+
+    #[tokio::test]
+    async fn replacement_accepts_an_already_released_absent_held_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        let _cleanup = HeldFixtureCleanup(held.clone());
+        let bin = live_claude(dir.path());
+        let mut p = Process::spawn_held(
+            &held,
+            "s",
+            &bin,
+            Launch { conversation: "already-released".into(), ..Default::default() },
+            false,
+            dir.path(),
+            "opus",
+            Arc::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let pg = p.pgid.unwrap();
+        let keeper = p.held.as_ref().unwrap().keeper;
+        c6_testkit::eventually("keeper ownership before ordinary runtime cleanup", async || {
+            keeper_holds_fifo(keeper, pg, &held.join("already-released")).then_some(())
+        })
+        .await;
+        // Reproduce turn()'s post-release state without an artificial zombie:
+        // the entire group is absent and release_held removed its directory.
+        p.kill().await;
+        assert_eq!(group_probe(pg), Err(nix::errno::Errno::ESRCH));
+        assert!(p.held.as_ref().unwrap().done);
+        assert!(!held.join("already-released").exists());
+        p.close_for_replacement().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_retiring_held_record_is_cleanup_only_even_with_a_live_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        let _cleanup = HeldFixtureCleanup(held.clone());
+        let bin = live_claude(dir.path());
+        let p = Process::spawn_held(
+            &held,
+            "s",
+            &bin,
+            Launch { conversation: "retired".into(), ..Default::default() },
+            false,
+            dir.path(),
+            "opus",
+            Arc::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let pg = p.pgid.unwrap();
+        let keeper = p.held.as_ref().unwrap().keeper;
+        let record = held.join("retired");
+        c6_testkit::eventually("positive live keeper ownership before marking retirement", async || {
+            keeper_holds_fifo(keeper, pg, &record).then_some(())
+        })
+        .await;
+        drop(p);
+        assert!(!record.join("code").exists());
+        let meta: HeldMeta = serde_json::from_slice(&std::fs::read(record.join("meta.json")).unwrap()).unwrap();
+        assert!(held_group_owned(&meta, &record));
+        std::fs::write(record.join("retiring"), []).unwrap();
+        let adopted = Process::attach(&held, "retired", dir.path(), "opus", Arc::default(), None, None).await;
+        assert!(adopted.is_none(), "a valid live owner is still cleanup-only after replacement begins");
+        assert!(keeper_holds_fifo(keeper, pg, &record), "refusing adoption must not signal the keeper");
+        assert!(killpg(pg, None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn replacement_tracking_failure_remains_a_fatal_error_not_an_absence_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        let _cleanup = HeldFixtureCleanup(held.clone());
+        let obs = observer(dir.path(), Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()))).await;
+        let bin = live_claude(dir.path());
+        let p = Process::spawn_held(
+            &held,
+            &obs.session_id,
+            &bin,
+            Launch { conversation: "journal-failure".into(), ..Default::default() },
+            false,
+            dir.path(),
+            "opus",
+            Arc::default(),
+            None,
+            Some(obs.clone()),
+        )
+        .unwrap();
+        let pg = p.pgid.unwrap();
+        let record = held.join("journal-failure");
+        let metadata = std::fs::read(record.join("meta.json")).unwrap();
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", dir.path().join("journal.db").display())).await.unwrap();
+        sqlx::query("DROP TABLE claude_processes").execute(&pool).await.unwrap();
+        let error = p.close_for_replacement().await.unwrap_err();
+        assert!(format!("{error:#}").contains("claude_processes"));
+        assert!(!error.to_string().contains("replacement is blocked"), "database failure must not enter ordinary retirement waiting");
+        assert_eq!(std::fs::read(record.join("meta.json")).unwrap(), metadata);
+        assert!(!record.join("retiring").exists(), "durable tracking must precede retirement");
+        assert!(killpg(pg, None).is_ok(), "failed tracking must not signal the runtime");
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn replacement_admission_serializes_rewind_publication_through_initial_writes() {
+        for opened in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let obs = observer(dir.path(), Arc::new(c6_tools::SessionTools::new(dir.path().to_owned()))).await;
+            let reset = Reset {
+                command_id: "explicit-rewind".into(),
+                to_seq: 1,
+                restore_files: false,
+                session_id: "replacement".into(),
+                fresh: true,
+                withdrawn: Vec::new(),
+                untouched: false,
+                previous: None,
+                failure: String::new(),
+                retries: Vec::new(),
+            };
+            let cancel = CancellationToken::new();
+            // Force publication into the FIFO mutex queue before admission.
+            let blocker = obs.journal.claude_rewind_ownership.lock().await;
+            let mut publication = std::pin::pin!(obs.journal.prepare_claude_rewind(&obs.session_id, &reset));
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(publication.as_mut(), cx))).await.is_pending()
+            );
+            let mut admission = std::pin::pin!(replacement_admission(&obs.journal, &obs.session_id, &cancel));
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(admission.as_mut(), cx))).await.is_pending()
+            );
+            drop(blocker);
+            publication.await.unwrap();
+            assert!(admission.await.unwrap().is_none(), "published Rewind must suppress stale resumed admission");
+
+            // The reverse ordering must hold publication out through the
+            // initial input writes, then release it BEFORE any model reply.
+            let other = tempfile::tempdir().unwrap();
+            let obs = observer(other.path(), Arc::new(c6_tools::SessionTools::new(other.path().to_owned()))).await;
+            let bin =
+                script(other.path(), "claude-admission", "#!/bin/sh\nwhile read -r line; do printf '%s\\n' \"$line\" >> admitted; done\n");
+            // No observer on the process: track() and VecSink appends are
+            // immediately ready, so its first poll reaches the held stdin
+            // lock deterministically, for both opened receipt variants.
+            let mut p = spawn(&bin, other.path(), "old-branch", false, None);
+            let guard = replacement_admission(&obs.journal, &obs.session_id, &cancel).await.unwrap().unwrap();
+            let mut publication = std::pin::pin!(obs.journal.prepare_claude_rewind(&obs.session_id, &reset));
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(publication.as_mut(), cx))).await.is_pending()
+            );
+            assert!(obs.journal.claude_rewind(&obs.session_id).await.unwrap().is_none());
+            let recorded = Arc::new(VecSink::default());
+            let sink: Arc<dyn EventSink> = recorded.clone();
+            let original = input("original", "REPLACEMENT_ADMISSION");
+            if opened {
+                sink.append(original.event()).await.unwrap();
+                sink.append(session_event::Kind::TurnStarted(TurnStarted { turn: 7, ..Default::default() })).await.unwrap();
+            }
+            let more = tokio::sync::Notify::new();
+            let feed = || Joining::default();
+            let blocked_stdin = p.stdin.clone();
+            let write_blocker = blocked_stdin.lock().await;
+            let mut turn = Box::pin(p.turn_admitted(7, vec![original], opened, None, "opus", &sink, &feed, &more, &cancel, Some(guard)));
+            assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(turn.as_mut(), cx))).await.is_pending());
+            // Actively drive publication while the initial CLI write is
+            // fixture-blocked. Dropping admission before send() would let
+            // this finish, even though the CLI has received no input yet.
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), publication.as_mut()).await.is_err(),
+                "Rewind publication must remain blocked until the initial input write completes"
+            );
+            assert!(obs.journal.claude_rewind(&obs.session_id).await.unwrap().is_none());
+            assert!(!other.path().join("admitted").exists());
+            drop(write_blocker);
+            tokio::select! {
+                result = &mut turn => panic!("no model response was emitted: {result:?}"),
+                _ = c6_testkit::eventually("initial input admitted before releasing Rewind publication", async || {
+                    std::fs::read_to_string(other.path().join("admitted")).ok().filter(|text| text.contains("REPLACEMENT_ADMISSION"))
+                }) => {}
+            }
+            tokio::select! {
+                result = &mut turn => panic!("the turn must not wait for model output while holding admission: {result:?}"),
+                result = tokio::time::timeout(Duration::from_secs(3), publication) => {
+                    result.expect("Rewind publication must not wait for the model response").unwrap();
+                },
+            }
+            assert!(matches!(obs.journal.claude_rewind(&obs.session_id).await.unwrap(), Some((_, 0))));
+            let events = recorded.0.lock().unwrap().clone();
+            assert_eq!(events.iter().filter(|e| matches!(&e.kind, Some(session_event::Kind::User(_)))).count(), 1);
+            assert_eq!(events.iter().filter(|e| matches!(&e.kind, Some(session_event::Kind::TurnStarted(t)) if t.turn == 7)).count(), 1);
+            assert!(!events.iter().any(|e| matches!(&e.kind, Some(session_event::Kind::TurnEnded(_)))));
+            drop(turn);
+            p.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn held_replacement_requires_group_absence_and_preserves_live_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        let _cleanup = HeldFixtureCleanup(held.clone());
+        let bin = live_claude(dir.path());
+        let launch = || Launch { conversation: "fork".into(), ..Default::default() };
+        let p = Process::spawn_held(&held, "s", &bin, launch(), false, dir.path(), "opus", Arc::default(), None, None).unwrap();
+        let pg = p.pgid.unwrap();
+        let path = held.join("fork/meta.json");
+        let before = std::fs::read(&path).unwrap();
+        assert!(Process::spawn_held(&held, "s", &bin, launch(), true, dir.path(), "opus", Arc::default(), None, None).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before, "a live runtime's authority must not be overwritten");
+        assert!(killpg(pg, None).is_ok());
+        p.close_for_replacement().await.unwrap();
+        assert_eq!(group_probe(pg), Err(nix::errno::Errno::ESRCH));
+        let unknown = held.join("fork");
+        std::fs::create_dir(&unknown).unwrap();
+        assert!(Process::spawn_held(&held, "s", &bin, launch(), true, dir.path(), "opus", Arc::default(), None, None).is_err());
+        assert!(unknown.exists(), "an unconfirmed/corrupt record must not be discarded either");
+        std::fs::remove_dir(unknown).unwrap();
+        let replacement = Process::spawn_held(&held, "s", &bin, launch(), true, dir.path(), "opus", Arc::default(), None, None).unwrap();
+        replacement.close_for_replacement().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rewind_stop_without_a_ready_keeper_preserves_descendant_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        let _cleanup = HeldFixtureCleanup(held.clone());
+        let bin = live_claude(dir.path());
+        let p = Process::spawn_held(
+            &held,
+            "s",
+            &bin,
+            Launch { conversation: "fork".into(), ..Default::default() },
+            false,
+            dir.path(),
+            "opus",
+            Arc::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let pg = p.pgid.unwrap();
+        let keeper = p.held.as_ref().unwrap().keeper;
+        c6_testkit::eventually("owned fixture keeper readiness", async || keeper_holds_fifo(keeper, pg, &held.join("fork")).then_some(()))
+            .await;
+        let mut member = tokio::process::Command::new("sh")
+            .args(["-c", "trap '' INT; echo ready > member-ready; exec sleep 300"])
+            .current_dir(dir.path())
+            .process_group(pg.as_raw())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        c6_testkit::eventually("fixture descendant ignores SIGINT", async || dir.path().join("member-ready").exists().then_some(())).await;
+        // Only this fixture's verified keeper is stopped, never an arbitrary
+        // persisted PID. The live wrapper still proves group ownership.
+        nix::sys::signal::kill(keeper, Signal::SIGKILL).unwrap();
+        c6_testkit::eventually("fixture keeper to be reaped", async || nix::unistd::getpgid(Some(keeper)).is_err().then_some(())).await;
+        p.stop_for_rewind().await.unwrap();
+        if killpg(pg, None).is_ok() {
+            assert!(held.join("fork/meta.json").exists(), "live descendants/zombies retain cleanup metadata");
+        }
+        let status = c6_testkit::within("the SIGINT-ignoring fixture child to be killed", member.wait()).await.unwrap();
+        assert!(!status.success());
+        let journal = crate::journal::Journal::open(&dir.path().join("journal.db")).await.unwrap();
+        stop_held_for_rewind(&held, "s", &journal).await.unwrap();
+        assert_eq!(group_probe(pg), Err(nix::errno::Errno::ESRCH));
+    }
+
+    #[tokio::test]
+    async fn rewind_cleanup_does_not_signal_a_reused_held_process_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        let _cleanup = HeldFixtureCleanup(held.clone());
+        let journal = crate::journal::Journal::open(&dir.path().join("journal.db")).await.unwrap();
+        let bin = live_claude(dir.path());
+        let p = Process::spawn_held(
+            &held,
+            "s",
+            &bin,
+            Launch { conversation: "fork".into(), ..Default::default() },
+            false,
+            dir.path(),
+            "opus",
+            Arc::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let path = held.join("fork").join("meta.json");
+        let mut meta: HeldMeta = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        p.close().await;
+        let mut unrelated = tokio::process::Command::new("sleep").arg("300").process_group(0).kill_on_drop(true).spawn().unwrap();
+        let pg = unrelated.id().unwrap() as i32;
+        meta.pgid = pg;
+        meta.keeper = pg;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&meta).unwrap()).unwrap();
+        assert!(Process::attach(&held, "fork", dir.path(), "opus", Arc::default(), None, None).await.is_none());
+        assert!(stop_held_for_rewind(&held, "s", &journal).await.is_err());
+        assert!(unrelated.try_wait().unwrap().is_none(), "saved IDs are not signal authority");
+        assert!(path.exists());
+        assert_eq!(journal.claude_processes("s").await.unwrap(), vec![pg]);
+        // This child handle, unlike the forged metadata, is fixture ownership.
+        unrelated.kill().await.unwrap();
+        stop_held_for_rewind(&held, "s", &journal).await.unwrap();
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn rewind_transfers_only_unconfirmed_unrecorded_inputs_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = live_claude(dir.path());
+        let vec_sink = Arc::new(VecSink::default());
+        let sink: Arc<dyn EventSink> = vec_sink.clone();
+        let mut p = spawn(&bin, dir.path(), "before", false, None);
+        let confirmed = p.send(input("confirmed", "first"), None, false).await.unwrap();
+        p.send(input("waiting", "second"), None, false).await.unwrap();
+        p.send(input("recorded", "already in journal"), None, true).await.unwrap();
+        let mut started = false;
+        p.confirm(&confirmed, &mut started, &sink).await.unwrap();
+        p.confirm(&confirmed, &mut started, &sink).await.unwrap();
+        // Transfer before fallible shutdown, as reset_claude does.
+        let waiting = p.take_unsent();
+        assert_eq!(waiting.iter().map(|i| i.command_id.as_str()).collect::<Vec<_>>(), ["waiting"]);
+        assert!(p.take_unsent().is_empty());
+        p.stop_for_rewind().await.unwrap();
+        let mut replacement = spawn(&bin, dir.path(), "after", false, None);
+        assert_eq!(run(&mut replacement, 2, &waiting, &sink).await.reason, Some(TurnEndReason::Completed));
+        {
+            let events = vec_sink.0.lock().unwrap();
+            let users = events
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    Some(session_event::Kind::User(u)) => Some(u.command_id.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(users, ["confirmed", "waiting"]);
+        }
+        replacement.close().await;
+    }
+
     #[tokio::test]
     async fn a_held_process_outlives_its_worker_and_is_taken_up() {
         let dir = tempfile::tempdir().unwrap();
         let held = dir.path().join("held");
+        let _cleanup = HeldFixtureCleanup(held.clone());
         let bin = live_claude(dir.path());
         let launch = Launch { conversation: "conv-9".into(), ..Default::default() };
-        let p = Process::spawn_held(&held, "s-9", &bin, launch, false, dir.path(), "opus", Arc::default(), None, None).unwrap();
+        let mut p = Process::spawn_held(&held, "s-9", &bin, launch, false, dir.path(), "opus", Arc::default(), None, None).unwrap();
         let meta: Value = serde_json::from_slice(&std::fs::read(held.join("conv-9").join("meta.json")).unwrap()).unwrap();
         assert_eq!(meta["session"], "s-9");
         let pg = Pid::from_raw(meta["pgid"].as_i64().unwrap() as i32);
+        let keeper = p.held.as_ref().unwrap().keeper;
+        c6_testkit::eventually("the held fixture keeper to open its FIFO", async || {
+            keeper_holds_fifo(keeper, pg, &held.join("conv-9")).then_some(())
+        })
+        .await;
+        // The authoritative stream ID need not equal the launch/storage ID.
+        // Keep the wrapper's paths stable, but persist the identity before
+        // advancing its output offset so the next worker can find it.
+        p.consumed(42, &serde_json::json!({"type":"system", "session_id":"actual-9"}));
+        let (record, _) = Process::held_record(&held, "actual-9").unwrap().unwrap();
+        assert_eq!(record, held.join("conv-9"));
+        assert_eq!(std::fs::read_to_string(record.join("offset")).unwrap(), "42");
         drop(p);
         assert!(nix::sys::signal::kill(pg, None).is_ok(), "dropped, it goes on");
         assert_eq!(Process::held_sessions(&held), vec!["s-9".to_owned()]);
-        let p = Process::attach(&held, "conv-9", dir.path(), "opus", Arc::default(), None, None).expect("taken up");
+        let p = Process::attach(&held, "actual-9", dir.path(), "opus", Arc::default(), None, None).await.expect("taken up");
         p.close().await;
         c6_testkit::eventually("it ends", async || nix::sys::signal::kill(pg, None).is_err().then_some(())).await;
         assert!(!held.join("conv-9").exists(), "its folder goes with it");
-        assert!(Process::attach(&held, "conv-9", dir.path(), "opus", Arc::default(), None, None).is_none());
+        assert!(Process::attach(&held, "actual-9", dir.path(), "opus", Arc::default(), None, None).await.is_none());
     }
 
     /// What Claude Code says under a call of one of carbon6's MCP tools (its
@@ -3594,6 +6863,7 @@ done
             children: HashMap::new(),
             backgrounded: HashSet::new(),
             task_calls: HashMap::new(),
+            call_tasks: HashMap::new(),
             call_usage: HashMap::new(),
             per_call: false,
         };
@@ -3688,7 +6958,7 @@ done
 
     /// Runs a turn that waits on a foreground command; once it does, your
     /// message is sent with Send now.
-    async fn send_now_turn(p: &mut Process, first: &str, sink: &Arc<dyn EventSink>, vec_sink: &VecSink) -> TurnEnd {
+    async fn send_now_turn(p: &mut Process, first: &str, sink: &Arc<dyn EventSink>, vec_sink: &VecSink, next: PendingInput) -> TurnEnd {
         let queue = Mutex::new(Vec::new());
         let more = tokio::sync::Notify::new();
         let feed = || Joining { inputs: std::mem::take(&mut *queue.lock().unwrap()), now: Vec::new() };
@@ -3696,7 +6966,7 @@ done
         let turn = p.turn(1, vec![input("c1", first)], false, None, "opus", sink, &feed, &more, &cancel);
         let send = async {
             replied(vec_sink).await;
-            queue.lock().unwrap().push(PendingInput { send_now: true, ..input("c2", "PING now") });
+            queue.lock().unwrap().push(PendingInput { send_now: true, ..next });
             more.notify_one();
         };
         let (end, ()) = tokio::join!(turn, send);
@@ -3717,7 +6987,7 @@ done
         let vec_sink = Arc::new(VecSink::default());
         let sink: Arc<dyn EventSink> = vec_sink.clone();
         let mut p = spawn(&bin, dir.path(), "s", false, Some(observer(dir.path(), tools.clone()).await));
-        let end = send_now_turn(&mut p, "delivering", &sink, &vec_sink).await;
+        let end = send_now_turn(&mut p, "delivering", &sink, &vec_sink, input("c2", "PING now")).await;
         assert_eq!(end, TurnEnd { reason: Some(TurnEndReason::Completed), alive: true, no_conversation: false });
         assert_eq!(
             kinds(&vec_sink),
@@ -3743,6 +7013,44 @@ done
         p.close().await;
     }
 
+    #[tokio::test]
+    async fn automation_sent_mid_turn_never_acquires_human_origin() {
+        for api_origin in [Some(c6_proto::ApiMessageOrigin { token_name: "build-bot".into() }), Some(Default::default()), None] {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = send_now_claude(dir.path());
+            let vec_sink = Arc::new(VecSink::default());
+            let sink: Arc<dyn EventSink> = vec_sink.clone();
+            let mut p = spawn(&bin, dir.path(), "s", false, None);
+            let next = PendingInput { api_origin: api_origin.clone(), human_origin: false, ..input("c2", "PING now") };
+            let end = send_now_turn(&mut p, "delivering", &sink, &vec_sink, next).await;
+            assert_eq!(end.reason, Some(TurnEndReason::Completed));
+            let lines = read_lines(dir.path());
+            assert_eq!(lines[0]["origin"], serde_json::json!({"kind": "human"}));
+            assert!(lines[1].get("origin").is_none(), "automation must not be sent as a person: {:?}", lines[1]);
+            let text = lines[1]["message"]["content"].as_str().expect("labelled text");
+            let label = match &api_origin {
+                Some(origin) if !origin.token_name.is_empty() => "Message sent via the API (token \"build-bot\"), not typed by the user:",
+                Some(_) => "Message sent via the API, not typed by the user:",
+                None => "Message sent by an automation, not typed by the user:",
+            };
+            assert_eq!(text, format!("{label}\nPING now"));
+            assert_eq!(lines[2]["request"]["message_uuid"], lines[1]["uuid"], "Send now still targets the automation input");
+            let events = vec_sink.0.lock().unwrap().clone();
+            let message = events
+                .iter()
+                .find_map(|e| match &e.kind {
+                    Some(session_event::Kind::User(u)) if u.command_id == "c2" => Some(u),
+                    _ => None,
+                })
+                .expect("the delivered input is persisted");
+            assert_eq!(message.api_origin, api_origin);
+            assert!(!message.human_origin);
+            assert!(message.origin_recorded);
+            assert_eq!(message.text, "PING now", "the stored message is not rewritten with a model-only label");
+            p.close().await;
+        }
+    }
+
     /// "stopped": Claude Code stopped only the turn, which ends interrupted
     /// (not failed); the message starts the next turn.
     #[tokio::test]
@@ -3752,7 +7060,7 @@ done
         let vec_sink = Arc::new(VecSink::default());
         let sink: Arc<dyn EventSink> = vec_sink.clone();
         let mut p = spawn(&bin, dir.path(), "s", false, None);
-        let end = send_now_turn(&mut p, "stopped", &sink, &vec_sink).await;
+        let end = send_now_turn(&mut p, "stopped", &sink, &vec_sink, input("c2", "PING now")).await;
         assert_eq!(end, TurnEnd { reason: Some(TurnEndReason::Interrupted), alive: true, no_conversation: false });
         assert_eq!(kinds(&vec_sink), ["user", "turn_started", "assistant", "input_delivered", "usage", "turn_ended"], "not an error");
         // The next turn is the message's.
@@ -3774,7 +7082,7 @@ done
         let vec_sink = Arc::new(VecSink::default());
         let sink: Arc<dyn EventSink> = vec_sink.clone();
         let mut p = spawn(&bin, dir.path(), "s", false, None);
-        let end = send_now_turn(&mut p, "older", &sink, &vec_sink).await;
+        let end = send_now_turn(&mut p, "older", &sink, &vec_sink, input("c2", "PING now")).await;
         assert_eq!(end.reason, Some(TurnEndReason::Interrupted));
         let notices: Vec<c6_proto::Notice> = vec_sink
             .0
@@ -3818,6 +7126,38 @@ done
         p.close().await;
     }
 
+    #[tokio::test]
+    async fn initial_automation_inputs_keep_their_label_and_never_get_human_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = send_now_claude(dir.path());
+        let vec_sink = Arc::new(VecSink::default());
+        let sink: Arc<dyn EventSink> = vec_sink.clone();
+        let mut p = spawn(&bin, dir.path(), "s", false, None);
+        for (turn, api_origin, human_origin, label) in [
+            (
+                1,
+                Some(c6_proto::ApiMessageOrigin { token_name: "ops-controller".into() }),
+                false,
+                "Message sent via the API (token \"ops-controller\"), not typed by the user:",
+            ),
+            (2, Some(Default::default()), false, "Message sent via the API, not typed by the user:"),
+            (3, None, false, "Message sent by an automation, not typed by the user:"),
+            (
+                4,
+                Some(c6_proto::ApiMessageOrigin { token_name: "ops-controller".into() }),
+                true,
+                "Message sent via the API (token \"ops-controller\"), not typed by the user:",
+            ),
+        ] {
+            let next = PendingInput { api_origin, human_origin, ..input(&format!("c{turn}"), "quick: Continue.") };
+            assert_eq!(run(&mut p, turn, &[next], &sink).await.reason, Some(TurnEndReason::Completed));
+            let line = read_lines(dir.path()).pop().unwrap();
+            assert!(line.get("origin").is_none(), "automation must not acquire a human marker: {line}");
+            assert_eq!(line["message"]["content"], format!("{label}\nquick: Continue."));
+        }
+        p.close().await;
+    }
+
     /// A foreground subagent or command Claude Code moves to the background
     /// (`task_updated` with `is_backgrounded`) is a background task from
     /// then on: the subagent's call returning doesn't end it, its task does.
@@ -3844,6 +7184,7 @@ done
             children: HashMap::new(),
             backgrounded: HashSet::new(),
             task_calls: HashMap::new(),
+            call_tasks: HashMap::new(),
             call_usage: HashMap::new(),
             per_call: false,
         };

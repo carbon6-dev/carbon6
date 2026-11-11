@@ -343,8 +343,8 @@ pub(crate) fn Composer(place: Place, thread_ts: Option<String>) -> impl IntoView
                     }></textarea>
                 <div class="flex items-center gap-2 px-2 pb-1 text-[11px] text-muted">
                     {in_thread.then(|| view! {
-                        <label class="flex items-center gap-1">
-                            <input type="checkbox" prop:checked=move || broadcast.get() on:change=move |ev| broadcast.set(event_target_checked(&ev)) />
+                        <label class="flex min-h-8 items-center gap-1 pointer-coarse:min-h-11">
+                            <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || broadcast.get() on:change=move |ev| broadcast.set(event_target_checked(&ev)) />
                             {format!("Also send to {channel_name}")}
                         </label>
                     })}

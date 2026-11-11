@@ -50,6 +50,8 @@ Some sessions run for days. Learning from them (retrospectives), reviewing them,
 
 1. **Continuous retrospectives.**
    - Wakes on correction signals: you redirect, interrupt, rewind, deny an approval, or edit right after the agent. Also wakes on turn ends that had friction.
+   - Text is a human correction only when the event has explicit `human_origin`, no API origin, no sending session or delegation, and is not an agent notice or card-button answer. API-token input (direct or through the catalog), internal/agent input, and old/unknown events never become human corrections merely because they say “don't do that”. Digests label API input by its token display name and unknown input neutrally; older workers need no migration and never acquire an invented human sender.
+     The head sets that human bit for the browser page path (`X-C6-Realm`, or `c6_realm=`), requiring a verified cookie only when sign-in is on. With sign-in off, page input is still a human correction; unknown input is not, even though unknown provenance no longer prevents Edit/Rewind.
    - Proposes lessons while the session runs, each as a change to something carbon6 already uses: a memory note (scoped by label), a prompt line, a skill, a policy, a routing rule, a template default, or a task card for the repo.
    - A weekly roll-up over everything does three things: it finds repeats, checks whether applied lessons helped (did the signal recur?), and proposes pruning notes and rules that never fire.
 2. **Review as things progress.** Wakes when files change or a commit lands, and reviews only the new diff against the work's "done when" and the plan document. Findings go to the working agent as a note it sees at its next step. You get a mark only for serious ones.

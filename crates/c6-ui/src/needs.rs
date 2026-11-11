@@ -91,7 +91,7 @@ fn target(i: &AttentionItem) -> View {
                 .map(|call| crate::workspace::Target { anchor: Some(crate::session::waiting_card_id(s, call)), ..Default::default() }),
         },
         ("turn_ended" | "failed", Some(s), _) => View::session(s.clone()),
-        ("comment_answer", _, Some(d)) => View::Docs { id: d.clone() },
+        ("comment_answer", _, Some(d)) => View::Docs { id: d.clone(), target: None },
         ("brief", ..) => View::Brief,
         _ => View::Decisions,
     }
@@ -123,11 +123,11 @@ fn elsewhere_text(e: &AttentionElsewhere) -> String {
 }
 
 fn elsewhere_line(e: &AttentionElsewhere) -> impl IntoView {
-    view! { {elsewhere_text(e)}" "{crate::icons::arrow_right()} }
+    view! { {elsewhere_text(e)}" "{crate::icons::arrow_up_right()} }
 }
 
 #[component]
-pub fn NeedsYou() -> impl IntoView {
+pub fn NeedsYou(#[prop(optional)] labelled: bool, #[prop(optional)] touch: bool) -> impl IntoView {
     let live = api::live();
     let tick = RwSignal::new(0u32);
     let list = LocalResource::new(move || {
@@ -178,6 +178,14 @@ pub fn NeedsYou() -> impl IntoView {
         );
     });
     let open = RwSignal::new(false);
+    let panel = NodeRef::<leptos::html::Div>::new();
+    if touch {
+        // In the phone picker this dialog is portalled outside its parent's
+        // focus trap. Give the nested sheet its own modal focus boundary.
+        crate::util::modal(open, panel);
+    }
+    let present = crate::util::presence(move || open.get());
+    let anchor = RwSignal::new((0.0_f64, 8.0_f64));
     // Escape closes it, wherever focus is, and puts focus back on the pill.
     let pop = StoredValue::new(crate::util::escapable(
         move || open.get(),
@@ -218,9 +226,18 @@ pub fn NeedsYou() -> impl IntoView {
     };
     view! {
         <div class="relative shrink-0">
-            <button class="flex items-center rounded-md px-1 py-1 hover:bg-zinc-200/60 dark:hover:bg-zinc-800"
+            <button class=if touch { "flex min-h-11 min-w-11 items-center justify-center rounded-md px-1 py-1 hover:bg-zinc-200/60 dark:hover:bg-zinc-800" } else if labelled { "flex min-h-9 items-center gap-2 rounded-md px-1 py-1 hover:bg-zinc-200/60 dark:hover:bg-zinc-800" } else { "flex items-center rounded-md px-1 py-1 hover:bg-zinc-200/60 dark:hover:bg-zinc-800" }
                 aria-haspopup="dialog" aria-expanded=move || open.get().to_string() aria-label=title title=title data-pop=pop.get_value()
-                on:click=move |_| {
+                on:click=move |ev| {
+                    use wasm_bindgen::JsCast;
+                    if touch && let Some(el) = ev.current_target().and_then(|t| t.dyn_into::<web_sys::HtmlElement>().ok()) {
+                        let _ = el.focus();
+                    }
+                    if let Some(el) = ev.current_target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
+                        let rect = el.get_bounding_client_rect();
+                        let width = window().inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        anchor.set((rect.bottom() + 4.0, (width - rect.right()).max(8.0)));
+                    }
                     // Opened after a failed load, it tries again.
                     if !open.get_untracked() && failed.get_untracked().is_some() {
                         retry();
@@ -229,18 +246,20 @@ pub fn NeedsYou() -> impl IntoView {
                 }>
                 // A small bell, tight against its number.
                 <span class=pill_class>
-                    <svg viewBox="0 0 12 12" class="h-2.5 w-2.5 shrink-0" fill="currentColor" aria-hidden="true">
-                        <path d="M2 9h8l-1.4-2V5a2.6 2.6 0 0 0-5.2 0v2z" />
-                        <circle cx="6" cy="10.4" r="1.1" />
-                    </svg>
+                    {crate::icons::icon(crate::icons::Icon::Bell, crate::icons::Size::S14)}
                     {number}
                 </span>
+                {labelled.then_some("Needs you")}
             </button>
-            <Show when=move || open.get()>
+            <Show when=move || present.get()>
+                // Sheet motion creates a containing block while in flight.
+                // Keep nested bell sheets out of a moving Sessions/drawer.
+                <leptos::portal::Portal>
                 // A click outside closes it (on a phone the page dims).
-                <div class="fixed inset-0 z-40 bg-black/30 md:bg-transparent" on:click=move |_| open.set(false)></div>
-                <div role="dialog" aria-label="What needs you" data-pop=pop.get_value()
-                    class="fixed inset-x-0 bottom-0 z-50 flex max-h-[80dvh] flex-col rounded-t-xl border border-zinc-200 bg-white text-sm shadow-lg md:absolute md:inset-x-auto md:bottom-auto md:right-0 md:top-9 md:max-h-[70vh] md:w-[420px] md:rounded-lg dark:border-zinc-700 dark:bg-zinc-900">
+                <div class="c6-presence c6-scrim fixed inset-0 z-40 bg-black/30 md:bg-transparent" data-open=move || open.get().to_string() inert=move || !open.get() on:click=move |_| open.set(false)></div>
+                <div node_ref=panel tabindex=touch.then_some("-1") role="dialog" aria-label="What needs you" data-pop=pop.get_value() data-open=move || open.get().to_string() inert=move || !open.get()
+                    style=move || { let (top, right) = anchor.get(); format!("--needs-top:{top}px;--needs-right:{right}px") }
+                    class="c6-presence c6-sheet c6-pane phone-sheet fixed inset-x-0 bottom-0 z-50 flex max-h-[80dvh] flex-col rounded-t-xl border border-zinc-200 bg-white text-sm shadow-lg md:inset-x-auto md:bottom-auto md:right-(--needs-right) md:top-(--needs-top) md:max-h-[70vh] md:w-[420px] md:rounded-lg dark:border-zinc-700 dark:bg-zinc-900">
                     <div class="flex items-center gap-2 border-b border-zinc-200 px-3 py-2 dark:border-zinc-800">
                         <span class="flex-1 font-semibold">"Needs you"</span>
                         {move || (counts().1 > 0).then(|| view! {
@@ -309,6 +328,7 @@ pub fn NeedsYou() -> impl IntoView {
                         }}
                     </div>
                 </div>
+                </leptos::portal::Portal>
             </Show>
         </div>
     }
@@ -436,7 +456,10 @@ mod tests {
         assert_eq!(target(&AttentionItem { session_id: s.clone(), ..item("approval") }), View::session("s1"));
         assert_eq!(target(&AttentionItem { session_id: s.clone(), ..item("failed") }), View::session("s1"));
         assert_eq!(target(&AttentionItem { session_id: s, ..item("decision") }), View::Decisions);
-        assert_eq!(target(&AttentionItem { doc_id: Some("d1".into()), ..item("comment_answer") }), View::Docs { id: "d1".into() });
+        assert_eq!(
+            target(&AttentionItem { doc_id: Some("d1".into()), ..item("comment_answer") }),
+            View::Docs { id: "d1".into(), target: None }
+        );
         assert_eq!(target(&item("brief")), View::Brief);
         assert!(["turn_ended", "failed", "comment_answer", "brief"].into_iter().all(seen_by_opening));
         assert!(!["approval", "question", "decision"].into_iter().any(seen_by_opening));

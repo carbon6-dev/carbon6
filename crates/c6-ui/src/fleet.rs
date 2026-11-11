@@ -98,9 +98,9 @@ pub fn WorkerPage(id: String) -> impl IntoView {
     let worker = move || live.workers.with(|ws| ws.iter().find(|w| w.id.to_string() == id.get()).cloned());
     view! {
         <main class="mx-auto max-w-6xl space-y-4 px-4 py-6">
-            <div class="flex items-center gap-3">
+            <div class="flex flex-wrap items-center gap-3">
                 {move || view! { <crate::marks::MarkButton key=format!("worker:{}", id.get()) shape=crate::marks::Shape::Square size=14 /> }}
-                <h1 class="text-lg font-semibold">{move || worker().map(|w| w.name).unwrap_or_default()}</h1>
+                <h1 class="min-w-0 break-words text-lg font-semibold [overflow-wrap:anywhere]">{move || worker().map(|w| w.name).unwrap_or_default()}</h1>
                 {move || worker().map(|w| {
                     let online = w.status == WorkerStatus::Online;
                     view! { <span class=if online { "text-xs text-emerald-600" } else { "text-xs text-muted" }>{if online { "online" } else { "offline" }}</span> }
@@ -152,13 +152,15 @@ pub fn Fleet(workers: ReadSignal<Vec<Worker>>) -> impl IntoView {
 
     view! {
         <section class="space-y-4">
-            <div class="flex items-end justify-between gap-4">
+            <div class="flex flex-wrap items-end justify-between gap-4">
                 <div>
                     <h1 class="text-lg font-semibold">"Workers"</h1>
                     <p class="text-sm text-muted">{move || format!("{} online · {} enrolled", online(), active())}</p>
                 </div>
                 <AddWorker />
             </div>
+
+            <p class="text-sm text-muted">"Realms organise your work. They aren't a security boundary: sessions run as the worker's OS user and can reach each other's files on a shared worker. Limiting a worker to one realm doesn't prevent delegation to agents with wider access."</p>
 
             {move || error.get().map(|e| view! {
                 <div class="rounded-md border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200">{e}</div>
@@ -220,12 +222,10 @@ fn CodexLimitsSettings(workers: ReadSignal<Vec<Worker>>) -> impl IntoView {
                 view! {
                     <div class="space-y-1">
                     <div class="flex flex-wrap items-center gap-2">
-                    <label class="flex items-center gap-2">
-                        <input type="checkbox"
+                    <crate::components::Switch
                             disabled=move || pending.get() || !matches!(settings.get(), Some(Ok(_)))
-                            prop:checked=move || settings.get().and_then(Result::ok).is_some_and(|s| s.workers.contains(&checked_id))
-                            on:change=move |ev| {
-                                let enabled = event_target_checked(&ev);
+                            on=move || settings.get().and_then(Result::ok).is_some_and(|s| s.workers.contains(&checked_id))
+                            on_change=move |enabled| {
                                 let id = id.clone();
                                 pending.set(true);
                                 spawn_local(async move {
@@ -239,12 +239,10 @@ fn CodexLimitsSettings(workers: ReadSignal<Vec<Worker>>) -> impl IntoView {
                                     settings.refetch();
                                     pending.set(false);
                                 });
-                            } />
-                        {w.name}
-                    </label>
-                    <label class="flex items-center gap-2">
+                            } label=w.name />
+                    <label class="flex min-w-0 max-w-full flex-wrap items-center gap-2">
                         <span class="text-muted">"Codex command"</span>
-                        <input type="text" class="rounded border border-zinc-300 bg-transparent px-2 py-1 dark:border-zinc-700"
+                        <input type="text" class="min-w-0 max-w-full rounded border border-zinc-300 bg-transparent px-2 py-1 dark:border-zinc-700"
                             placeholder="auto-discover Codex"
                             title="Optional absolute executable path, without arguments or ~ expansion. Its folder is added to PATH for Codex only."
                             disabled=move || pending.get() || !matches!(settings.get(), Some(Ok(_)))
@@ -386,7 +384,8 @@ fn AddWorker() -> impl IntoView {
             "Add worker"
         </button>
         <Show when=move || open.get()>
-            <div class="fixed inset-0 z-10 flex items-center justify-center bg-black/40 px-4" on:click=close>
+            <leptos::portal::Portal>
+            <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4 text-sm text-zinc-900 dark:text-zinc-100" on:click=close>
                 <div
                     class="w-full max-w-xl space-y-4 rounded-lg bg-white p-5 shadow-xl dark:bg-zinc-900"
                     on:click=|ev| ev.stop_propagation()
@@ -425,6 +424,7 @@ fn AddWorker() -> impl IntoView {
                     }}
                 </div>
             </div>
+            </leptos::portal::Portal>
         </Show>
     }
 }

@@ -22,7 +22,6 @@ use c6_proto::{
     TurnEnded, TurnStarted, ephemeral_event, head_msg, session_command, session_event,
 };
 use c6_tools::{Concurrency, SessionTools, Tool, ToolCtx, ToolOutput};
-use prost::Message as _;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -41,14 +40,12 @@ const WAIT: Duration = Duration::from_secs(3600);
 /// lifetimes. Includes transport retries and ignores SSE keepalive bytes.
 const MODEL_LIMITS: c6_llm::limit::Limits = c6_llm::limit::Limits { total: Duration::from_secs(600), idle: Duration::from_secs(300) };
 
-/// Marks a request the head makes to itself (the assistant's calls): it is
-/// you, already signed in, limited to the realm the conversation works in
-/// (root, or none: every realm).
+/// Marks a request the head dispatches to itself. Catalog calls retain
+/// their authenticated caller; agent calls retain their approved authority
+/// and realm, without pretending the input was typed by a human.
 #[derive(Clone, Default)]
 pub struct InternalCall {
-    pub realm: Option<String>,
-    /// The console's assistant, acting in `realm` with your approval.
-    pub console: bool,
+    pub caller: crate::realms::Caller,
 }
 
 #[derive(Default)]
@@ -98,7 +95,7 @@ pub async fn start(st: Arc<HeadState>, router: axum::Router) -> anyhow::Result<(
                             break;
                         }
                         for row in rows {
-                            match SessionCommand::decode(row.data.as_slice()) {
+                            match c6_proto::decode_stored_command(&row.data) {
                                 Ok(cmd) => dispatch(&st, cmd),
                                 Err(e) => warn!("assistant: a bad command: {e}"),
                             }
@@ -240,7 +237,7 @@ enum Reply {
         cancelled: bool,
     },
     /// A subagent the conversation started (`c6_delegate`) ended its turn.
-    Delegation(c6_proto::DelegationEnded),
+    Delegation(Box<c6_proto::DelegationEnded>),
 }
 
 type Waiters = Arc<Mutex<HashMap<String, oneshot::Sender<Reply>>>>;
@@ -447,6 +444,8 @@ impl Actor {
                     text: input.text,
                     attachments: input.attachments,
                     prompt,
+                    api_origin: input.api_origin,
+                    human_origin: input.human_origin,
                     ..Default::default()
                 });
                 if running.is_none() {
@@ -479,13 +478,14 @@ impl Actor {
                 let waiter = self.env.waiters.lock().unwrap().remove(&d.call_id);
                 match waiter {
                     Some(w) => {
-                        let _ = w.send(Reply::Delegation(d));
+                        let _ = w.send(Reply::Delegation(Box::new(d)));
                     }
                     None if !d.call_id.is_empty() => {
                         self.inbox.lock().unwrap().push(PendingInput {
                             command_id: cmd.command_id,
                             text: report_text(&d),
                             command: "task-notification".into(),
+                            task_notice: d.task_notice.clone(),
                             ..Default::default()
                         });
                         if running.is_none() {
@@ -1381,7 +1381,10 @@ async fn policy_for(st: &HeadState, labels: &[String], input: &str) -> Option<ap
 /// Entries a list replacement would remove (by name or id).
 async fn removed_entries(st: &HeadState, op: &Op, args: &Value, realm: &str) -> anyhow::Result<Vec<String>> {
     let Some(get) = op.replaces.and_then(catalog::find) else { return Ok(Vec::new()) };
-    let current = execute(st, get, json!({}), "assistant", Some(realm)).await?;
+    // Only forward a query target when the replacement accepts one too.
+    // Body-only replacements (deck themes) keep their existing scope.
+    let target = if matches!(op.input, Input::BodyQuery(..)) { json!({"realm": args.get("realm")}) } else { json!({}) };
+    let current = execute(st, get, target, "assistant", Some(realm)).await?;
     let new = args["body"].as_array().cloned().unwrap_or_default();
     let key = |v: &Value| -> String {
         for k in ["name", "id", "path", "key"] {
@@ -1405,11 +1408,25 @@ pub async fn execute(st: &HeadState, op: &Op, args: Value, made_by: &str, realm:
 
 /// `execute`; `console`: as the console's assistant, in `realm` with your
 /// approval (what it writes is the console's).
-async fn execute_as(st: &HeadState, op: &Op, mut args: Value, made_by: &str, realm: Option<&str>, console: bool) -> anyhow::Result<Value> {
+async fn execute_as(st: &HeadState, op: &Op, args: Value, made_by: &str, realm: Option<&str>, console: bool) -> anyhow::Result<Value> {
+    let caller =
+        crate::realms::Caller { realm: realm.filter(|r| *r != crate::realms::ROOT).map(str::to_owned), console, ..Default::default() };
+    execute_for_caller(st, op, args, made_by, caller).await
+}
+
+/// Catalog calls retain the authenticated caller, including browser/API
+/// provenance. Agent calls above have authority, not a human input origin.
+pub async fn execute_for_caller(
+    st: &HeadState,
+    op: &Op,
+    mut args: Value,
+    made_by: &str,
+    caller: crate::realms::Caller,
+) -> anyhow::Result<Value> {
     if !args.is_object() {
         args = json!({});
     }
-    let realm = realm.filter(|r| *r != crate::realms::ROOT);
+    let realm = caller.realm.as_deref();
     match &op.via {
         // As you, on the realm's knowledge (home's, from root), as the API
         // calls it.
@@ -1427,44 +1444,41 @@ async fn execute_as(st: &HeadState, op: &Op, mut args: Value, made_by: &str, rea
                 uri = uri.replace(&format!("{{{p}}}"), &encode(&v));
             }
             let mut body = axum::body::Body::empty();
-            match op.input {
-                Input::Body(_) => {
-                    let b = args.get("body").cloned().unwrap_or(Value::Null);
-                    if !b.is_null() {
-                        body = axum::body::Body::from(serde_json::to_vec(&b)?);
-                    }
+            if let Input::Body(_) | Input::BodyQuery(_, _) = op.input {
+                let b = args.get("body").cloned().unwrap_or(Value::Null);
+                if !b.is_null() {
+                    body = axum::body::Body::from(serde_json::to_vec(&b)?);
                 }
-                Input::Query(_) => {
-                    let mut q = Vec::new();
-                    if let Some(o) = args.as_object() {
-                        for (k, v) in o {
-                            if params.contains(&k.as_str()) || v.is_null() {
-                                continue;
-                            }
-                            let s = match v {
-                                Value::String(s) => s.clone(),
-                                Value::Array(a) => a
-                                    .iter()
-                                    .map(|x| x.as_str().map(str::to_owned).unwrap_or_else(|| x.to_string()))
-                                    .collect::<Vec<_>>()
-                                    .join(","),
-                                other => other.to_string(),
-                            };
-                            q.push(format!("{}={}", encode(k), encode(&s)));
+            }
+            if let Input::Query(_) | Input::BodyQuery(_, _) = op.input {
+                let mut q = Vec::new();
+                if let Some(o) = args.as_object() {
+                    for (k, v) in o {
+                        if params.contains(&k.as_str()) || v.is_null() || (k == "body" && matches!(op.input, Input::BodyQuery(..))) {
+                            continue;
                         }
-                    }
-                    if !q.is_empty() {
-                        uri = format!("{uri}?{}", q.join("&"));
+                        let s = match v {
+                            Value::String(s) => s.clone(),
+                            Value::Array(a) => a
+                                .iter()
+                                .map(|x| x.as_str().map(str::to_owned).unwrap_or_else(|| x.to_string()))
+                                .collect::<Vec<_>>()
+                                .join(","),
+                            other => other.to_string(),
+                        };
+                        q.push(format!("{}={}", encode(k), encode(&s)));
                     }
                 }
-                _ => {}
+                if !q.is_empty() {
+                    uri = format!("{uri}?{}", q.join("&"));
+                }
             }
             let mut req = axum::http::Request::builder()
                 .method(*method)
                 .uri(&uri)
                 .header(axum::http::header::CONTENT_TYPE, "application/json")
                 .body(body)?;
-            req.extensions_mut().insert(InternalCall { realm: realm.map(str::to_owned), console });
+            req.extensions_mut().insert(InternalCall { caller });
             use tower::ServiceExt;
             let resp = router.oneshot(req).await?;
             let status = resp.status();
@@ -1632,8 +1646,9 @@ impl Tool for Delegate {
             description: format!(
                 "Starts a subagent on one of the user's machines and waits for its report: for what needs a machine (running commands, \
                  tests or builds, reading a repository in depth). It runs one of the templates the user lets agents start, which says \
-                 where (worker, folder) and on which model; you can't pick another place. prompt is all the subagent sees: make it \
-                 stand alone. Its report comes back as this call's result.\nTemplates:\n{list}"
+                 where (worker, folder) and on which model; you can't pick another place. Your conversation is not forwarded: \
+                 make prompt stand alone. The subagent also gets its session instructions and environment. Its report comes back \
+                 as this call's result.\nTemplates:\n{list}"
             ),
             parameters: json!({"type": "object", "properties": {
                 "template": {"type": "string", "description": "The template's name"},
@@ -1978,9 +1993,10 @@ give (an API key, a password), ask with a secret field.
 drafting, vision, transcription) in settings.memex, yourself in settings.assistant. A connection's available models: connections.models.
 - Be brief. After acting, say what you did and anything the user should do next (e.g. run a command on another machine).
 - You work in one realm: {{realm}}. In root you administer carbon6 (workers, connections, realms, grants, settings) and reach \
-every realm. In any other realm you see and change only that realm's sessions, collections, decisions, triggers, views, series and \
-knowledge, and administration is refused: for that, the user opens the assistant with \"All realms\". Never act in another realm; \
-when this realm needs another's data, suggest a grant.
+every realm. In any other realm your ordinary API operations address that realm's sessions, collections, decisions, triggers, \
+views, series and knowledge, and administration is refused: for that, the user opens the console's assistant. Never act in another \
+realm; when this realm needs another's data, suggest a grant. Realms organise; they don't isolate: shared-worker files and \
+delegation to agents with wider access are not contained by these API scopes.
 - You cannot run commands yourself. For work on a machine (running tests, builds, commands, reading a repository in depth), \
 use c6_delegate: it runs one of the templates the user lets agents start and waits for its report, which you then answer from. \
 With no template for the place, tell the user to add one (Settings → Templates, \"Agents may start it\"), or start a session on a \
@@ -2074,6 +2090,57 @@ mod mention_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message;
+
+    #[tokio::test]
+    async fn list_removal_preview_uses_the_replacement_realm() {
+        let data = tempfile::tempdir().unwrap();
+        let head = crate::start(crate::HeadConfig {
+            data_dir: data.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            auth: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let st = &head.state;
+        crate::realms::create(st, &api::RealmIn { id: "c6".into(), ..Default::default() }, "test").await.unwrap();
+        for list in ["templates", "policies"] {
+            let put = catalog::find(&format!("settings.{list}.put")).unwrap();
+            for realm in ["home", "root", "c6"] {
+                let entry =
+                    if list == "templates" { json!({"name": realm, "prompt": "test"}) } else { json!({"name": realm, "action": "ask"}) };
+                execute(st, put, json!({"realm": realm, "body": [entry]}), "test", None).await.unwrap();
+            }
+            // A root assistant's explicit target, rather than its default
+            // list, is what it warns about removing.
+            let args = json!({"realm": "c6", "body": []});
+            assert_eq!(removed_entries(st, put, &args, "root").await.unwrap(), ["c6"]);
+            execute(st, put, args, "test", None).await.unwrap();
+            assert!(removed_entries(st, put, &json!({"realm": "c6", "body": []}), "root").await.unwrap().is_empty());
+            let default = if list == "templates" { "home" } else { "root" };
+            assert_eq!(removed_entries(st, put, &json!({"body": []}), "root").await.unwrap(), [default]);
+            // Explicit query parameters cannot escape a realm-scoped
+            // internal caller, either reading or replacing the list.
+            let get = catalog::find(put.replaces.unwrap()).unwrap();
+            for op in [get, put] {
+                let error = execute(st, op, json!({"realm": "home", "body": []}), "test", Some("c6")).await.unwrap_err();
+                assert!(error.to_string().contains("limited to realm c6"), "{error}");
+            }
+        }
+        // The deck-theme catalog PUT is still body-only: unlike settings
+        // lists, an extraneous realm must not redirect just its preview.
+        for realm in ["home", "c6"] {
+            let mut theme = api::slides::default_themes().remove(0);
+            theme.name = format!("{realm}-only");
+            crate::decks::put(st, realm, &[theme], "test").await.unwrap();
+        }
+        let put = catalog::find("decks.themes.put").unwrap();
+        assert_eq!(removed_entries(st, put, &json!({"realm": "c6", "body": []}), "root").await.unwrap(), ["home-only"]);
+        head.shutdown().await.unwrap();
+    }
 
     /// What the assistant in root asks you for before it goes into a realm
     /// (docs/assistant.md §Realms) is these operations, each one that

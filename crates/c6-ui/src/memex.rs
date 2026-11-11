@@ -9,6 +9,7 @@ use serde_json::Value;
 use wasm_bindgen::prelude::*;
 
 use crate::api;
+use crate::icons::{Icon, Size, icon};
 use crate::models::ModelInput;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT, ago, now_ms};
 use crate::when::compact as when;
@@ -331,9 +332,9 @@ fn Hit(h: MemexHit, open: RwSignal<Option<String>>) -> impl IntoView {
                 <span class="text-xs text-muted">{when(h.created_at)}</span>
                 {h.matched.iter().map(|m| view! { <span class="text-[10px] uppercase tracking-wide text-muted">{m.clone()}</span> }).collect_view()}
                 <span class="flex-1"></span>
-                {session.map(|sid| view! { <Go to=View::session(sid) class="text-xs text-sky-700 hover:underline dark:text-sky-400">"open session "{crate::icons::arrow_up_right()}</Go> })}
-                {doc.map(|d| view! { <Go to=View::Docs { id: d } class="text-xs text-sky-700 hover:underline dark:text-sky-400">"open document "{crate::icons::arrow_up_right()}</Go> })}
-                {h.url.clone().map(|u| view! { <a href=crate::markdown::safe_href(&u) target="_blank" rel="noopener noreferrer" class="text-xs text-sky-700 hover:underline dark:text-sky-400">"page "{crate::icons::arrow_up_right()}</a> })}
+                {session.map(|sid| view! { <Go to=View::session(sid) class="text-xs text-sky-700 hover:underline dark:text-sky-400">"open session "{icon(Icon::ArrowUpRight, Size::S14)}</Go> })}
+                {doc.map(|d| view! { <Go to=View::Docs { id: d, target: None } class="text-xs text-sky-700 hover:underline dark:text-sky-400">"open document "{icon(Icon::ArrowUpRight, Size::S14)}</Go> })}
+                {h.url.clone().map(|u| view! { <a href=crate::markdown::safe_href(&u) target="_blank" rel="noopener noreferrer" class="text-xs text-sky-700 hover:underline dark:text-sky-400">"page "{icon(Icon::ExternalLink, Size::S14)}</a> })}
             </div>
             <p class="text-sm text-zinc-600 dark:text-zinc-400">{h.snippet.clone()}</p>
         </div>
@@ -394,7 +395,7 @@ fn item_view(it: Value, open: RwSignal<Option<String>>, error: RwSignal<Option<S
             <h2 class="font-medium">{s("title")}</h2>
             <span class="text-xs text-muted">{format!("{} · from {}", when(it["created_at"].as_i64().unwrap_or(0)), s("source"))}</span>
             <span class="flex-1"></span>
-            {has_original.then(|| view! { <a href=original.clone() target="_blank" rel="noopener" class="text-xs text-sky-700 hover:underline dark:text-sky-400">"Open original "{crate::icons::arrow_up_right()}</a> })}
+            {has_original.then(|| view! { <a href=original.clone() target="_blank" rel="noopener" class="text-xs text-sky-700 hover:underline dark:text-sky-400">"Open original "{icon(Icon::ExternalLink, Size::S14)}</a> })}
             <button class="text-xs text-red-600 hover:underline" on:click=remove>"Delete"</button>
         </div>
         <div class="flex flex-wrap gap-1">{chips(about, open)}</div>
@@ -487,8 +488,8 @@ type ModelTask = (&'static str, RwSignal<String>, RwSignal<String>, RwSignal<Str
 #[component]
 pub fn MemexSettings() -> impl IntoView {
     let status = LocalResource::new(api::memex_status);
-    let loaded = LocalResource::new(move || api::get_setting("memex"));
-    let connections = LocalResource::new(api::connections);
+    let loaded = crate::resources::setting("memex");
+    let connections = crate::resources::connections();
     let (conn, model, chars) = (RwSignal::new(String::new()), RwSignal::new(String::new()), RwSignal::new(String::new()));
     let (auto, approve) = (RwSignal::new(false), RwSignal::new(true));
     // Model tasks: (connection, model, effort) for understanding, drafting, vision,
@@ -583,12 +584,12 @@ pub fn MemexSettings() -> impl IntoView {
                     <span class="text-xs text-muted">"Embedding model"</span>
                     <ModelInput connection=conn value=model on_set=move |v| model.set(v) class=format!("{INPUT} py-1 text-xs") placeholder="e.g. nomic-embed-text, text-embedding-3-small" />
                 </label>
-                <label class="flex items-center gap-2 text-sm sm:col-span-3">
-                    <input type="checkbox" prop:checked=move || auto.get() on:change=move |ev| auto.set(event_target_checked(&ev)) />
+                <label class="flex min-h-8 items-center gap-2 text-sm pointer-coarse:min-h-11 sm:col-span-3">
+                    <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || auto.get() on:change=move |ev| auto.set(event_target_checked(&ev)) />
                     "Add people you correspond with (written to twice, heard from) to Google Contacts, in a carbon6 group"
                 </label>
-                <label class="flex items-center gap-2 text-sm sm:col-span-3">
-                    <input type="checkbox" prop:checked=move || approve.get() on:change=move |ev| approve.set(event_target_checked(&ev)) />
+                <label class="flex min-h-8 items-center gap-2 text-sm pointer-coarse:min-h-11 sm:col-span-3">
+                    <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || approve.get() on:change=move |ev| approve.set(event_target_checked(&ev)) />
                     "Agents' mail and calendar invitations wait for my approval"
                 </label>
                 {tasks.into_iter().map(|(k, c, m, e)| {

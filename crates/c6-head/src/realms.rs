@@ -1,7 +1,7 @@
-//! Realms (docs/os.md §3): every object belongs to exactly one. You, signed
-//! in (or with a root API token), reach every realm; an API token scoped to
-//! a realm reaches only that realm's data, and none of carbon6's
-//! administration. The head is where this is decided.
+//! Realms (docs/os.md §3) organise data and settings; they don't isolate
+//! agents. Signed-in users and root API tokens reach every realm. The head
+//! enforces realm-scoped API requests and refuses administrative operations
+//! to realm tokens. Those checks do not isolate worker files or delegation.
 
 use axum::http::{Method, StatusCode};
 use c6_api as api;
@@ -24,6 +24,9 @@ pub struct Caller {
     /// Your browser (a realm's page or the console), not a token: it may
     /// learn what waits in other realms (docs/realms-ux.md §6).
     pub browser: bool,
+    /// A verified browser sign-in, not just a page header with sign-in off.
+    /// Only authentication middleware sets this; agent calls never do.
+    pub authenticated_browser: bool,
     /// The console's assistant, acting in this realm with your approval
     /// (docs/assistant.md §Realms): what it writes is the console's.
     pub console: bool,
@@ -34,15 +37,21 @@ pub struct Caller {
 
 impl Caller {
     pub fn root() -> Self {
-        Self { realm: None, browser: false, console: false, api_token_name: None }
+        Self { realm: None, browser: false, authenticated_browser: false, console: false, api_token_name: None }
     }
 
     pub fn in_realm(realm: &str) -> Self {
-        Self { realm: Some(realm.to_owned()), browser: false, console: false, api_token_name: None }
+        Self { realm: Some(realm.to_owned()), browser: false, authenticated_browser: false, console: false, api_token_name: None }
     }
 
     pub fn api_origin(&self) -> Option<c6_proto::ApiMessageOrigin> {
         self.api_token_name.as_ref().map(|name| c6_proto::ApiMessageOrigin { token_name: name.clone() })
+    }
+
+    /// The page path represents the person when sign-in is off. With sign-in
+    /// on, it also needs a verified cookie. Tokens never become browser input.
+    pub fn human_origin(&self, auth_required: bool) -> bool {
+        self.browser && (!auth_required || self.authenticated_browser) && self.api_token_name.is_none()
     }
 
     /// Whose decisions and the like a caller lists: its realm's; the
@@ -107,7 +116,16 @@ pub async fn list(st: &HeadState, caller: &Caller) -> anyhow::Result<Vec<api::Re
 }
 
 pub async fn exists(st: &HeadState, realm: &str) -> anyhow::Result<bool> {
-    Ok(sqlx::query("SELECT 1 FROM realms WHERE id = ?").bind(realm).fetch_optional(&st.store.pool).await?.is_some())
+    let (generation, cached) = st.store.realm_cache.get(realm);
+    if cached == Some(true) {
+        return Ok(true);
+    }
+    let exists = sqlx::query("SELECT 1 FROM realms WHERE id = ?").bind(realm).fetch_optional(&st.store.pool).await?.is_some();
+    // Missing realms aren't cached: creating a realm is visible immediately.
+    if exists {
+        st.store.realm_cache.insert(generation, realm.to_owned(), true);
+    }
+    Ok(exists)
 }
 
 /// A realm sessions can run in: one that exists, and not root (root's
@@ -255,24 +273,44 @@ pub async fn delete(st: &HeadState, id: &str) -> anyhow::Result<()> {
     if !owned.is_empty() {
         return Err(bad_request(format!("realm {id} still owns {}", owned.join(", "))));
     }
-    let mut tx = st.store.pool.begin_with("BEGIN IMMEDIATE").await?;
-    sqlx::query("DELETE FROM records WHERE realm = ?").bind(id).execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM collections WHERE realm = ?").bind(id).execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM points WHERE realm = ?").bind(id).execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM series WHERE realm = ?").bind(id).execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM api_tokens WHERE realm = ?").bind(id).execute(&mut *tx).await?;
-    // Its grants end (their log stays).
-    sqlx::query("UPDATE grants SET state = 'revoked', revoked_at = ?1 WHERE (from_realm = ?2 OR to_realm = ?2) AND state IN ('active', 'requested')")
-        .bind(c6_core::now_ms())
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM realms WHERE id = ?").bind(id).execute(&mut *tx).await?;
-    tx.commit().await?;
-    // Its knowledge in the memex goes too (when the memex is next there).
-    crate::memex::enqueue(st, "memex.drop_realm", serde_json::json!({"realm": id})).await;
-    st.registry.bump();
-    Ok(())
+    delete_rows(st, id).await
+}
+
+/// Keep COMMIT and both invalidations together even if the requesting
+/// stream is cancelled while SQLite is finishing the transaction.
+async fn delete_rows(st: &HeadState, id: &str) -> anyhow::Result<()> {
+    let st = st.arc().ok_or_else(|| anyhow::anyhow!("the head stopped"))?;
+    let id = id.to_owned();
+    tokio::spawn(async move {
+        let store = &st.store;
+        let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query("DELETE FROM records WHERE realm = ?").bind(&id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM collections WHERE realm = ?").bind(&id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM points WHERE realm = ?").bind(&id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM series WHERE realm = ?").bind(&id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM api_tokens WHERE realm = ?").bind(&id).execute(&mut *tx).await?;
+        // Its grants end (their log stays).
+        sqlx::query("UPDATE grants SET state = 'revoked', revoked_at = ?1 WHERE (from_realm = ?2 OR to_realm = ?2) AND state IN ('active', 'requested')")
+            .bind(c6_core::now_ms())
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM realms WHERE id = ?").bind(&id).execute(&mut *tx).await?;
+        // Queue knowledge cleanup atomically: a cancelled request must not
+        // leave the deleted realm's knowledge behind when its id is reused.
+        sqlx::query("INSERT INTO memex_outbox (method, params, created_at) VALUES ('memex.drop_realm', ?, ?)")
+            .bind(serde_json::json!({"realm": id}).to_string())
+            .bind(c6_core::now_ms())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        store.auth_cache.invalidate();
+        store.realm_cache.invalidate();
+        st.memex_feed.wake();
+        st.registry.bump();
+        Ok::<_, anyhow::Error>(())
+    })
+    .await?
 }
 
 /// Sets which realms a worker or connection is available to (empty: all).
@@ -318,6 +356,100 @@ pub async fn of_session(st: &HeadState, session_id: &str) -> anyhow::Result<Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn brief_realm_cache_deletion_revokes_tokens_and_object_checks_stay_live() {
+        use futures::FutureExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let head = crate::start(crate::HeadConfig {
+            data_dir: dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let st = &head.state;
+        assert!(!exists(st, "lab").await.unwrap());
+        create(st, &api::RealmIn { id: "lab".into(), name: "Lab".into(), ..Default::default() }, "you").await.unwrap();
+        assert!(exists(st, "lab").await.unwrap(), "missing realms must not be negatively cached");
+        assert!(exists(st, "home").await.unwrap());
+
+        let root = st.store.create_api_token("root", None).await.unwrap().token.unwrap();
+        let scoped = st.store.create_api_token("lab", Some("lab")).await.unwrap().token.unwrap();
+        let url = format!("http://{}/api/v1/sessions", head.ui_addrs[0]);
+        for token in [&root, &scoped] {
+            assert_eq!(st.http.get(&url).bearer_auth(token).send().await.unwrap().status(), StatusCode::OK);
+        }
+        // Both cache key and returned value are realm-specific; no request
+        // can borrow a previous request's successful ownership decision.
+        sqlx::query(
+            "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, realm) \
+             VALUES ('owned', 'w', 'Owned', '', 'c', 'm', 'idle', 0, 0, 'lab')",
+        )
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+        let path = "/api/v1/sessions/owned";
+        assert!(admit(st, &Caller::in_realm("lab"), &Method::GET, path).await.is_ok());
+        assert_eq!(admit(st, &Caller::in_realm("home"), &Method::GET, path).await.unwrap_err().0, StatusCode::NOT_FOUND);
+        sqlx::query("UPDATE sessions SET realm = 'home' WHERE id = 'owned'").execute(&st.store.pool).await.unwrap();
+        assert_eq!(admit(st, &Caller::in_realm("lab"), &Method::GET, path).await.unwrap_err().0, StatusCode::NOT_FOUND);
+        assert!(admit(st, &Caller::in_realm("home"), &Method::GET, path).await.is_ok());
+
+        delete(st, "lab").await.unwrap();
+        assert!(!exists(st, "lab").await.unwrap(), "a warm realm entry cannot survive deletion");
+        assert!(exists(st, "home").await.unwrap());
+        assert_eq!(st.http.get(&url).bearer_auth(&scoped).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(st.http.get(&url).bearer_auth(&root).send().await.unwrap().status(), StatusCode::OK);
+        // Re-creating the same realm must not resurrect its revoked token.
+        create(st, &api::RealmIn { id: "lab".into(), name: "Lab again".into(), ..Default::default() }, "you").await.unwrap();
+        assert!(exists(st, "lab").await.unwrap());
+        assert_eq!(st.http.get(&url).bearer_auth(&scoped).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+        let mut connections = Vec::new();
+        for _ in 0..8 {
+            connections.push(st.store.pool.acquire().await.unwrap());
+        }
+        // Don't count async pool setup against the product's two-second TTL.
+        let generation = st.store.realm_cache.get("lab").0;
+        st.store.realm_cache.insert(generation, "lab".into(), true);
+        assert!(exists(st, "lab").now_or_never().expect("a warm realm check must not acquire a database connection").unwrap());
+        for connection in &mut connections {
+            let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous").fetch_one(&mut **connection).await.unwrap();
+            assert_eq!(synchronous, 2, "every head pool connection must retain synchronous=FULL");
+        }
+        drop(connections);
+
+        let recreated = st.store.create_api_token("recreated lab", Some("lab")).await.unwrap().token.unwrap();
+        assert_eq!(st.http.get(&url).bearer_auth(&recreated).send().await.unwrap().status(), StatusCode::OK);
+        // The sender may consume the outbox immediately. Audit the insert
+        // rather than racing its delivery when checking durable cleanup.
+        sqlx::query("CREATE TABLE cleanup_audit (params TEXT NOT NULL)").execute(&st.store.pool).await.unwrap();
+        sqlx::query("CREATE TRIGGER audit_cleanup AFTER INSERT ON memex_outbox WHEN new.method = 'memex.drop_realm' BEGIN INSERT INTO cleanup_audit VALUES (new.params); END")
+            .execute(&st.store.pool).await.unwrap();
+        let auth_generation = st.store.auth_cache.get("").0;
+        let realm_generation = st.store.realm_cache.get("").0;
+        let writer = st.store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        // Cancel the await after handing off the transaction. Its writer
+        // lock is gated so it cannot have committed before cancellation.
+        assert!(delete_rows(st, "lab").now_or_never().is_none());
+        writer.commit().await.unwrap();
+        c6_testkit::eventually("cancelled realm deletion invalidates realm and auth caches", async || {
+            (st.store.auth_cache.get("").0 != auth_generation && st.store.realm_cache.get("").0 != realm_generation).then_some(())
+        })
+        .await;
+        assert!(!exists(st, "lab").await.unwrap());
+        let cleanup: i64 = sqlx::query_scalar("SELECT count(*) FROM cleanup_audit WHERE json_extract(params, '$.realm') = 'lab'")
+            .fetch_one(&st.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(cleanup, 1, "cancelled deletion durably queues knowledge cleanup");
+        assert_eq!(st.http.get(&url).bearer_auth(&recreated).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        head.shutdown().await.unwrap();
+    }
 
     #[test]
     fn new_objects_go_in_the_callers_realm() {

@@ -80,6 +80,10 @@ message NoticeQueued {
   // When the hourly limit next permits this notice's automatic delivery
   // (Unix milliseconds); zero if it is not held by the limit.
   int64 deliver_at_ms = 9;
+  // Preview journals used 10 for bool quiet, then 5384d8e2 reused it for
+  // TaskNotice. Both encodings must remain unknown fields when replayed.
+  reserved 10;
+  TaskNotice task_notice = 11;
 }
 
 // The session's default for its subagents changed (you picked one in the
@@ -286,6 +290,16 @@ message SessionStarted {
   bool hosted_search_off = 19;
 }
 
+// Display metadata supplied by a task's producer, never parsed from its prose.
+// Missing metadata on older events retains the neutral notice presentation.
+message TaskNotice {
+  string kind = 1;
+  string title = 2;
+  string session_id = 3;
+  string status = 4;
+  string markdown = 5;
+}
+
 message UserMessage {
   string command_id = 1;
   string text = 2;
@@ -313,6 +327,23 @@ message UserMessage {
   uint32 hops = 11;
   // Present for HTTP API input; only the token's display name, never its secret.
   ApiMessageOrigin api_origin = 12;
+  // Known human input: set only by the head for the browser page path
+  // (with a verified cookie when sign-in is required).
+  // Absent/false in old records and internal input means unknown, not human.
+  bool human_origin = 13;
+  TaskNotice task_notice = 14;
+  // Distinguishes a newly recorded unknown/internal sender from a legacy
+  // journal entry with no provenance. The head also marks new old-worker events.
+  bool origin_recorded = 15;
+  // Stamped by the head from its durable input command, not inferred from
+  // session labels or message text. Historical events remain unchanged.
+  TaskCardOrigin task_card_origin = 16;
+}
+
+enum TaskCardOrigin {
+  TASK_CARD_ORIGIN_UNSPECIFIED = 0;
+  TASK_CARD_ORIGIN_START = 1;
+  TASK_CARD_ORIGIN_ANSWER = 2;
 }
 
 message ApiMessageOrigin {
@@ -351,6 +382,7 @@ message ContentBlock {
     string redacted_thinking = 5;       // Anthropic, opaque data
     Reasoning reasoning = 6;            // OpenAI Responses
     Opaque opaque = 7;                  // provider-run tools (web search …)
+    string narration = 9;              // server-summarized update, not reply text or private reasoning
   }
   // Display-only annotations on text (Responses url_citation, including
   // title, URL and character offsets). Absent in older events.
@@ -545,6 +577,7 @@ message DelegationEnded {
   // (older heads send plain text), and whether its report wakes the parent.
   repeated string said = 6;
   bool wake = 7;
+  TaskNotice task_notice = 8;
 }
 
 // Deliver the session's held notices now (docs/background.md §5): they
@@ -804,6 +837,15 @@ message UserInput {
   // @-mentions (chat threads, mail, events, projects, docs, work), read by
   // the head within the session's knowledge scope. The log shows `text`.
   string prompt = 16;
+  // Set only by the head for the browser page path (with a verified cookie
+  // when sign-in is required), retained in UserMessage.
+  // Old heads/workers omit it; unknown input must not be called human.
+  // Tag 16 was used for this bool only in deployed carbon6 fork builds;
+  // stored-command decoding upgrades those bytes before protobuf decoding.
+  bool human_origin = 18;
+  // Head-authored task-card provenance. The head restores this onto the
+  // event from its saved command even when an old worker ignores this field.
+  TaskCardOrigin task_card_origin = 17;
 }
 
 message Interrupt {

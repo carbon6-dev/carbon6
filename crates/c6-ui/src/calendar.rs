@@ -8,6 +8,7 @@ use leptos::task::spawn_local;
 use serde_json::json;
 
 use crate::api;
+use crate::icons::{Icon, Size, icon};
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT};
 
 pub(crate) const DAY: f64 = 86_400_000.0;
@@ -91,8 +92,8 @@ pub fn CalendarPage() -> impl IntoView {
         <main class="mx-auto max-w-6xl space-y-3 px-3 py-3">
             <div class="flex flex-wrap items-center gap-2">
                 <button class=BUTTON_QUIET on:click=move |_| anchor.set(midnight(js_sys::Date::now()))>"Today"</button>
-                <button class=BUTTON_QUIET on:click=move |_| step(-1.0)>"‹"</button>
-                <button class=BUTTON_QUIET on:click=move |_| step(1.0)>"›"</button>
+                <button class=BUTTON_QUIET title="Previous period" aria-label="Previous period" on:click=move |_| step(-1.0)>{icon(Icon::ChevronLeft, Size::S16)}</button>
+                <button class=BUTTON_QUIET title="Next period" aria-label="Next period" on:click=move |_| step(1.0)>{icon(Icon::ChevronRight, Size::S16)}</button>
                 <span class="font-medium">{move || {
                     let d = date_of(anchor.get());
                     String::from(d.to_locale_date_string("default", &js_sys::Object::from(js_sys::JSON::parse(r#"{"month":"long","year":"numeric"}"#).unwrap())))
@@ -108,14 +109,13 @@ pub fn CalendarPage() -> impl IntoView {
                     {cs.into_iter().map(|c| {
                         let (acc, id) = (c.account.clone(), c.id.clone());
                         view! {
-                            <label class="flex items-center gap-1">
-                                <input type="checkbox" prop:checked=c.selected on:change=move |ev| {
-                                    let (acc, id, on) = (acc.clone(), id.clone(), event_target_checked(&ev));
-                                    spawn_local(async move { let _ = api::rpc("memex.calendar.select", json!({"account": acc, "id": id, "on": on})).await; refresh.update(|n| *n += 1); });
-                                } />
+                            <div class="flex items-center gap-1">
                                 <span class="h-2 w-2 rounded-full" style=format!("background:{}", if c.color.is_empty() { "#888".to_owned() } else { c.color.clone() })></span>
-                                {c.summary.clone()}
-                            </label>
+                                <crate::components::Switch on=Signal::stored(c.selected) on_change=move |on| {
+                                    let (acc, id) = (acc.clone(), id.clone());
+                                    spawn_local(async move { let _ = api::rpc("memex.calendar.select", json!({"account": acc, "id": id, "on": on})).await; refresh.update(|n| *n += 1); });
+                                } label=c.summary.clone() />
+                            </div>
                         }
                     }).collect_view()}
                 </div>
@@ -135,7 +135,7 @@ pub fn CalendarPage() -> impl IntoView {
                             let e2 = e.clone();
                             let declined = e.my_status == "declined";
                             view! {
-                                <button class=format!("block w-full truncate rounded px-1 py-0.5 text-left text-xs hover:bg-sky-100 dark:hover:bg-sky-950 {}", if declined { "line-through text-muted" } else { "" })
+                                <button class=format!("block min-w-0 w-full truncate rounded px-1 py-0.5 text-left text-xs hover:bg-sky-100 dark:hover:bg-sky-950 {}", if declined { "line-through text-muted" } else { "" })
                                     on:click=move |_| open.set(Some(e2.clone()))>
                                     {(!e.all_day).then(|| view! { <span class="text-muted">{hm(e.start)}" "</span> })}
                                     {e.summary.clone()}
@@ -148,7 +148,7 @@ pub fn CalendarPage() -> impl IntoView {
                                     {days.into_iter().map(|d| {
                                         let today = d == midnight(js_sys::Date::now());
                                         view! {
-                                            <div class="min-h-20 bg-white p-1 dark:bg-zinc-950">
+                                            <div class="min-h-20 min-w-0 bg-white p-1 dark:bg-zinc-950">
                                                 <div class=if today { "font-semibold text-sky-600" } else { "text-muted" }>{date_of(d).get_date()}</div>
                                                 {on(d).into_iter().take(4).map(chip).collect_view()}
                                             </div>
@@ -170,9 +170,9 @@ pub fn CalendarPage() -> impl IntoView {
                                 </div>
                             }.into_any(),
                             _ => view! {
-                                <div class="grid gap-2 sm:grid-cols-7">
+                                <div class="grid min-w-0 grid-cols-1 gap-2 @min-[40rem]/view:grid-cols-7">
                                     {days.into_iter().map(|d| view! {
-                                        <div class="min-h-24 rounded-lg border border-zinc-200 p-1 dark:border-zinc-800">
+                                        <div class="min-h-24 min-w-0 rounded-lg border border-zinc-200 p-1 dark:border-zinc-800">
                                             <div class="mb-1 text-xs font-medium text-muted">{day_label(d)}</div>
                                             {on(d).into_iter().map(chip).collect_view()}
                                         </div>
@@ -224,7 +224,7 @@ fn Detail(e: CalendarEvent, open: RwSignal<Option<CalendarEvent>>, refresh: RwSi
     };
     let when = if e.all_day { "All day".to_owned() } else { format!("{} {}–{}", day_label(e.start as f64), hm(e.start), hm(e.end)) };
     view! {
-        <section class="space-y-2 rounded-lg border border-zinc-300 p-3 shadow-sm dark:border-zinc-700">
+        <section class="min-w-0 space-y-2 rounded-lg border border-zinc-300 p-3 shadow-sm [overflow-wrap:anywhere] dark:border-zinc-700">
             <div class="flex items-start gap-2">
                 <div class="min-w-0 flex-1">
                     <h2 class="font-semibold">{e.summary.clone()}</h2>
@@ -233,7 +233,7 @@ fn Detail(e: CalendarEvent, open: RwSignal<Option<CalendarEvent>>, refresh: RwSi
                 <button class=BUTTON_QUIET on:click=move |_| open.set(None)>"Close"</button>
             </div>
             {move || error.get().map(|x| view! { <ErrorBox message=x /> })}
-            {(!e.conference.is_empty()).then(|| view! { <a class="text-sm text-sky-700 hover:underline dark:text-sky-400" href=crate::markdown::safe_href(&e.conference) target="_blank" rel="noopener">"Join the call "{crate::icons::arrow_up_right()}</a> })}
+            {(!e.conference.is_empty()).then(|| view! { <a class="text-sm text-sky-700 hover:underline dark:text-sky-400" href=crate::markdown::safe_href(&e.conference) target="_blank" rel="noopener">"Join the call "{icon(Icon::ExternalLink, Size::S14)}</a> })}
             {(!e.description.is_empty()).then(|| view! { <pre class="max-h-48 overflow-auto whitespace-pre-wrap font-sans text-sm">{e.description.clone()}</pre> })}
             {(!e.attendees.is_empty()).then(|| view! {
                 <ul class="text-sm">
@@ -258,7 +258,7 @@ fn Detail(e: CalendarEvent, open: RwSignal<Option<CalendarEvent>>, refresh: RwSi
                     </select>
                 })}
                 <button class="text-xs text-red-600 hover:underline" on:click=delete>"Delete"</button>
-                {(!e.html_link.is_empty()).then(|| view! { <a class="text-xs text-sky-700 hover:underline dark:text-sky-400" href=crate::markdown::safe_href(&e.html_link) target="_blank" rel="noopener">"Open in Google "{crate::icons::arrow_up_right()}</a> })}
+                {(!e.html_link.is_empty()).then(|| view! { <a class="text-xs text-sky-700 hover:underline dark:text-sky-400" href=crate::markdown::safe_href(&e.html_link) target="_blank" rel="noopener">"Open in Google "{icon(Icon::ExternalLink, Size::S14)}</a> })}
             </div>
         </section>
     }
@@ -300,17 +300,17 @@ fn NewEvent(creating: RwSignal<bool>, refresh: RwSignal<u32>) -> impl IntoView {
     view! {
         <section class="space-y-2 rounded-lg border border-zinc-300 p-3 shadow-sm dark:border-zinc-700">
             {move || error.get().map(|x| view! { <ErrorBox message=x /> })}
-            <div class="grid gap-2 sm:grid-cols-2">
-                <input class=format!("{INPUT} py-1 text-sm sm:col-span-2") placeholder="Title" prop:value=move || title.get() on:input=move |ev| title.set(event_target_value(&ev)) />
-                <input class=format!("{INPUT} py-1 text-sm") type="datetime-local" prop:value=move || start.get() on:input=move |ev| start.set(event_target_value(&ev)) />
-                <input class=format!("{INPUT} py-1 text-sm") type="datetime-local" prop:value=move || end.get() on:input=move |ev| end.set(event_target_value(&ev)) />
+            <div class="grid gap-2 @sm/view:grid-cols-2">
+                <input class=format!("{INPUT} min-w-0 py-1 text-sm @sm/view:col-span-2") placeholder="Title" prop:value=move || title.get() on:input=move |ev| title.set(event_target_value(&ev)) />
+                <input class=format!("{INPUT} min-w-0 py-1 text-sm") type="datetime-local" prop:value=move || start.get() on:input=move |ev| start.set(event_target_value(&ev)) />
+                <input class=format!("{INPUT} min-w-0 py-1 text-sm") type="datetime-local" prop:value=move || end.get() on:input=move |ev| end.set(event_target_value(&ev)) />
                 <input class=format!("{INPUT} py-1 text-sm") placeholder="Where" prop:value=move || location.get() on:input=move |ev| location.set(event_target_value(&ev)) />
                 <input class=format!("{INPUT} py-1 text-sm") placeholder="Invite (addresses, comma-separated)" prop:value=move || attendees.get() on:input=move |ev| attendees.set(event_target_value(&ev)) />
                 <select class=format!("{INPUT} py-1 text-sm") prop:value=move || cal.get() on:change=move |ev| cal.set(event_target_value(&ev))>
                     <option value="">"Calendar…"</option>
                     {move || calendars.get().and_then(Result::ok).unwrap_or_default().into_iter().filter(|c| c.writable).map(|c| view! { <option value=format!("{}|{}", c.account, c.id)>{c.summary.clone()}</option> }).collect_view()}
                 </select>
-                <label class="flex items-center gap-2 text-sm"><input type="checkbox" prop:checked=move || all_day.get() on:change=move |ev| all_day.set(event_target_checked(&ev)) />"All day"</label>
+                <label class="flex min-h-8 items-center gap-2 text-sm pointer-coarse:min-h-11"><input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || all_day.get() on:change=move |ev| all_day.set(event_target_checked(&ev)) />"All day"</label>
             </div>
             <div class="flex justify-end gap-2">
                 <button class=BUTTON_QUIET on:click=move |_| creating.set(false)>"Cancel"</button>

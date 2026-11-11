@@ -30,7 +30,7 @@ use anyhow::Context;
 
 pub use conn::ConnState;
 pub use identity::Identity;
-pub use subagent::{digest_text, report_input, spawned_children, status_of};
+pub use subagent::{digest_text, report_input, spawned_children, status_of, task_report_notice};
 
 /// Idle, synced sessions stay in the journal this long.
 const JOURNAL_KEEP_MS: i64 = 7 * 24 * 3600 * 1000;
@@ -158,11 +158,19 @@ impl Worker {
 /// What a worker says it can do in its Hello: Claude Code, the head's kit
 /// jobs (a container runtime, `kits`, unless turned off), editing and
 /// cancelling queued inputs (`queue_ops`), Send now (`send_now`:
-/// `UserInput.send_now`, `Interrupt.send_now`), and its extension's.
+/// `UserInput.send_now`, `Interrupt.send_now`), enriched input prompts
+/// (`user_input_prompt_v1`: string tag 16, human provenance at 18), and its extension's.
+/// `claude_code_subagents_v1` means a Task on a Claude Code connection runs
+/// in Claude Code, not carbon6's ordinary loop; only offered with `claude`.
 pub(crate) fn capabilities(worker: &Worker, claude_code: bool, runtime: bool) -> Vec<String> {
     let mut c: Vec<String> = claude_code.then(|| "claude_code".to_owned()).into_iter().collect();
+    if claude_code {
+        c.push("claude_rewind".into());
+        c.push("claude_code_subagents_v1".into());
+    }
     c.push("queue_ops".into());
     c.push("send_now".into());
+    c.push("user_input_prompt_v1".into());
     if runtime && worker.runs_kit_jobs() {
         c.push("kits".into());
     }

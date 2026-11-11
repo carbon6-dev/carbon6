@@ -83,10 +83,7 @@ pub fn ActivityPage() -> impl IntoView {
                         }).collect_view()
                     }}
                     <span class="flex-1"></span>
-                    <label class="flex items-center gap-1 text-xs text-muted">
-                        <input type="checkbox" prop:checked=move || only_live.get() on:change=move |ev| only_live.set(event_target_checked(&ev)) />
-                        "Only in flight"
-                    </label>
+                    <crate::components::Switch on=move || only_live.get() on_change=move |v| only_live.set(v) label="Only in flight" />
                 </div>
                 <div class="divide-y divide-zinc-100 overflow-hidden rounded-lg border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
                     {move || calls.with(Vec::is_empty).then(|| view! {

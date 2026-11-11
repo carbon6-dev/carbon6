@@ -14,6 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
+use base64::Engine;
 use c6_api as api;
 use c6_api::watchers::{Finding, SessionWatch, Watcher, WatcherDef, preinstalled, severity_rank};
 use c6_core::now_ms;
@@ -21,6 +22,7 @@ use c6_llm::{Accumulator, Block, Message, ModelRequest, Role};
 use c6_proto::session_event::Kind;
 use c6_proto::{SessionEvent, SessionEventBatch, TurnEndReason, content_block};
 use futures::StreamExt;
+use prost::Message as _;
 use serde_json::{Value, json};
 use sqlx::Row;
 use tracing::{info, warn};
@@ -428,7 +430,9 @@ fn reasons(events: &[SessionEvent]) -> Vec<&'static str> {
             Some(Kind::User(u))
                 if u.from_session_id.is_empty()
                     && u.delegated_by.is_empty()
-                    && !matches!(u.command.as_str(), "task-notification" | "card-answer")
+                    && u.human_origin
+                    && u.api_origin.is_none()
+                    && !matches!(u.command.as_str(), "task-notification" | "stop-hook" | "card-answer")
                     && corrects(&u.text) =>
             {
                 add("correction")
@@ -463,6 +467,17 @@ fn reasons(events: &[SessionEvent]) -> Vec<&'static str> {
     out
 }
 
+/// Provenance, not the authority to send: old and internal input stays neutral.
+fn input_source(input: &c6_proto::UserMessage) -> String {
+    if let Some(origin) = &input.api_origin {
+        if origin.token_name.is_empty() { "API".into() } else { format!("API (token {:?})", origin.token_name) }
+    } else if input.human_origin {
+        "user".into()
+    } else {
+        "input of unknown origin".into()
+    }
+}
+
 /// The events since a watcher's position, as the model reads them.
 fn digest(events: &[SessionEvent]) -> String {
     let clip = |s: &str, n: usize| -> String {
@@ -478,12 +493,15 @@ fn digest(events: &[SessionEvent]) -> String {
             Some(Kind::User(u)) if u.command == "task-notification" => {
                 lines.push(format!("[{}] agent notice: {}", e.seq, clip(&u.text, 800)))
             }
-            Some(Kind::User(u)) => lines.push(format!("[{}] user: {}", e.seq, clip(&u.text, 800))),
+            Some(Kind::User(u)) => lines.push(format!("[{}] {}: {}", e.seq, input_source(u), clip(&u.text, 800))),
             Some(Kind::Assistant(a)) => {
                 for b in &a.blocks {
                     match &b.block {
                         Some(content_block::Block::Text(t)) if !t.trim().is_empty() => {
                             lines.push(format!("[{}] agent: {}", e.seq, clip(&api::citations::clean(t), 600)))
+                        }
+                        Some(content_block::Block::Narration(t)) if !t.trim().is_empty() => {
+                            lines.push(format!("[{}] agent (summarized update): {}", e.seq, clip(t, 600)))
                         }
                         Some(content_block::Block::ToolUse(t)) => {
                             lines.push(format!("[{}] agent calls {} {}", e.seq, t.name, clip(&t.input_json, 400)))
@@ -582,7 +600,7 @@ pub async fn session_ended(st: &HeadState, session_id: &str) {
 /// Asks for a wake of `watcher` on `key` (a session, or `*`): one at a
 /// time per watcher and key; what comes in while one runs is looked at
 /// after it.
-fn poke(st: &HeadState, watcher: &str, key: &str, forced: Vec<String>, message: Option<(String, String)>) {
+fn poke(st: &HeadState, watcher: &str, key: &str, forced: Vec<String>, message: Option<c6_proto::UserMessage>) {
     let Some(arc) = st.arc() else { return };
     let id = format!("{watcher}\u{1}{key}");
     {
@@ -590,8 +608,8 @@ fn poke(st: &HeadState, watcher: &str, key: &str, forced: Vec<String>, message: 
         if let Some(queued) = running.get_mut(&id) {
             queued.extend(forced);
             queued.push(String::new());
-            if let Some((cmd, text)) = message {
-                queued.push(format!("\u{2}{cmd}\u{3}{text}"));
+            if let Some(message) = message {
+                queued.push(format!("\u{2}{}", base64::engine::general_purpose::STANDARD.encode(message.encode_to_vec())));
             }
             return;
         }
@@ -611,10 +629,10 @@ fn poke(st: &HeadState, watcher: &str, key: &str, forced: Vec<String>, message: 
                 running.remove(&id);
                 break;
             }
-            message = queued
-                .iter()
-                .rev()
-                .find_map(|q| q.strip_prefix('\u{2}').and_then(|r| r.split_once('\u{3}')).map(|(c, t)| (c.to_owned(), t.to_owned())));
+            message = queued.iter().rev().find_map(|q| {
+                let data = base64::engine::general_purpose::STANDARD.decode(q.strip_prefix('\u{2}')?).ok()?;
+                c6_proto::UserMessage::decode(data.as_slice()).ok()
+            });
             forced = queued.into_iter().filter(|q| !q.is_empty() && !q.starts_with('\u{2}')).collect();
         }
         arc.watchers.busy.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -631,7 +649,7 @@ async fn skip(st: &HeadState, watcher: &str, key: &str) {
 
 /// One wake: read what's new; if it holds something this watcher wakes on
 /// (or it was asked to, or you wrote to it), one turn of its session.
-async fn wake(st: &HeadState, name: &str, key: &str, forced: &[String], message: Option<&(String, String)>) -> anyhow::Result<()> {
+async fn wake(st: &HeadState, name: &str, key: &str, forced: &[String], message: Option<&c6_proto::UserMessage>) -> anyhow::Result<()> {
     let Some(d) = def(st, name).await else { return Ok(()) };
     if !d.enabled && message.is_none() && forced.is_empty() {
         return Ok(());
@@ -707,7 +725,12 @@ async fn wake(st: &HeadState, name: &str, key: &str, forced: &[String], message:
     let s = state_for(st, &d, key, &realm, watched.as_ref()).await?;
     let mut diff = String::new();
     if let Some(w) = &watched {
-        let dig = digest(&events);
+        // Wake reasons and the cursor describe the raw audit stream. The
+        // new model context describes only the surviving conversation;
+        // even a rewind beyond this window can withdraw text inside it.
+        let from = position.max(w.last_seq - WINDOW).max(0) as u64;
+        let through = events.last().map_or(w.last_seq.max(0) as u64, |e| e.seq);
+        let dig = current_digest(st, &w.id, from, through).await?;
         input_shown = dig.clone();
         values.push(("digest", if dig.is_empty() { "(nothing new)".into() } else { dig }));
         values.push(("title", w.title.clone()));
@@ -738,8 +761,8 @@ async fn wake(st: &HeadState, name: &str, key: &str, forced: &[String], message:
     let agenda = crate::prompts::get(st, &d.agenda, &realm).await;
     let pairs: Vec<(&str, &str)> = values.iter().map(|(k, v)| (*k, v.as_str())).collect();
     let mut prompt = api::prompts::fill(&agenda, &pairs);
-    if let Some((_, text)) = message {
-        prompt.push_str(&format!("\n\nThe user wrote to you: {text}"));
+    if let Some(input) = message {
+        prompt.push_str(&format!("\n\nMessage from {}: {}", input_source(input), input.text));
     }
     prompt.push_str("\n\n");
     prompt.push_str(&crate::prompts::get(st, "watch.answer", &realm).await);
@@ -747,7 +770,7 @@ async fn wake(st: &HeadState, name: &str, key: &str, forced: &[String], message:
     // The turn, in its session.
     let turn = (s.turn + 1) as u64;
     let shown_input = match message {
-        Some((_, text)) => text.clone(),
+        Some(input) => input.text.clone(),
         None => {
             let mut t = format!("Woke on: {reason}");
             if !input_shown.is_empty() {
@@ -759,16 +782,8 @@ async fn wake(st: &HeadState, name: &str, key: &str, forced: &[String], message:
             t
         }
     };
-    let command_id = message.map(|(c, _)| c.clone()).unwrap_or_default();
-    append(
-        st,
-        &s.session_id,
-        vec![
-            Kind::TurnStarted(c6_proto::TurnStarted { turn, ..Default::default() }),
-            Kind::User(c6_proto::UserMessage { command_id, text: shown_input, ..Default::default() }),
-        ],
-    )
-    .await?;
+    let input = message.cloned().unwrap_or_else(|| c6_proto::UserMessage { text: shown_input, ..Default::default() });
+    append(st, &s.session_id, vec![Kind::TurnStarted(c6_proto::TurnStarted { turn, ..Default::default() }), Kind::User(input)]).await?;
     let (connection, model) = match model_for(st, &d, &realm, watched.as_ref()).await {
         Ok(m) => m,
         Err(e) => {
@@ -863,6 +878,12 @@ async fn wake(st: &HeadState, name: &str, key: &str, forced: &[String], message:
             .await?;
     }
     Ok(())
+}
+
+async fn current_digest(st: &HeadState, session_id: &str, after: u64, through: u64) -> anyhow::Result<String> {
+    let events = st.store.effective_events(session_id).await?;
+    let window: Vec<_> = events.into_iter().filter(|e| e.seq > after && e.seq <= through).take(WINDOW as usize).collect();
+    Ok(digest(&window))
 }
 
 fn clip_end(s: &str, n: usize) -> String {
@@ -1664,7 +1685,19 @@ pub fn command(st: &HeadState, cmd: c6_proto::SessionCommand) {
             .ok()
             .flatten();
         let Some((watcher, key)) = row else { return };
-        poke(&arc, &watcher, &key, Vec::new(), Some((cmd.command_id.clone(), input.text.clone())));
+        poke(
+            &arc,
+            &watcher,
+            &key,
+            Vec::new(),
+            Some(c6_proto::UserMessage {
+                command_id: cmd.command_id,
+                text: input.text,
+                api_origin: input.api_origin,
+                human_origin: input.human_origin,
+                ..Default::default()
+            }),
+        );
     });
 }
 
@@ -1810,6 +1843,26 @@ pub fn spawn(st: std::sync::Arc<HeadState>) {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn current_digest_projects_before_windowing_but_rewinds_still_wake() {
+        let (_dir, head, _mock, _id) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        let events = crate::store::tests::rewind_history();
+        crate::store::tests::insert_events(&st.store, "session", &events).await;
+        let text = current_digest(st, "session", 0, 19).await.unwrap();
+        assert!(text.contains("KEEP_ANSWER"), "{text}");
+        assert!(text.contains("KEEP_REPLACEMENT_ANSWER"), "{text}");
+        assert!(!text.contains("PRIVATE"), "{text}");
+        assert!(!text.contains("DROP"), "{text}");
+        // The rewind is outside this window, not outside its meaning.
+        assert!(current_digest(st, "session", 5, 11).await.unwrap().is_empty());
+        let raw = st.store.events_after("session", 0, i64::MAX).await.unwrap();
+        assert!(reasons(&raw).contains(&"correction"));
+        assert_eq!(raw.last().unwrap().seq, 19);
+        assert_eq!(raw, events);
+        head.shutdown().await.unwrap();
+    }
+
     fn result(output: &str, is_error: bool) -> SessionEvent {
         SessionEvent {
             seq: 1,
@@ -1888,6 +1941,7 @@ mod tests {
             kind: Some(Kind::User(c6_proto::UserMessage {
                 text: "Don't do that; the task card was declined".into(),
                 command: "task-notification".into(),
+                human_origin: true,
                 ..Default::default()
             })),
             ..Default::default()
@@ -1899,7 +1953,59 @@ mod tests {
         assert!(reasons(std::slice::from_ref(&consumed)).is_empty());
         assert_eq!(digest(std::slice::from_ref(&consumed)), "[3] user: Don't do that; the task card was declined\n");
         let Some(Kind::User(u)) = &mut consumed.kind else { unreachable!() };
+        u.command = "stop-hook".into();
+        assert!(reasons(std::slice::from_ref(&consumed)).is_empty());
+        let Some(Kind::User(u)) = &mut consumed.kind else { unreachable!() };
         u.command.clear();
         assert!(reasons(&[consumed]).contains(&"correction"));
+    }
+
+    #[test]
+    fn only_known_human_inputs_are_corrections() {
+        let mut input = c6_proto::UserMessage { text: "Don't do that".into(), ..Default::default() };
+        for (human_origin, token_name, correction, source) in [
+            (false, None, false, "input of unknown origin"), // Old events/workers and internal calls.
+            (true, None, true, "user"),
+            (false, Some("ops-controller"), false, "API (token \"ops-controller\")"),
+            (true, Some(""), false, "API"), // API always takes precedence.
+        ] {
+            input.human_origin = human_origin;
+            input.api_origin = token_name.map(|name| c6_proto::ApiMessageOrigin { token_name: name.into() });
+            let event = SessionEvent { seq: 1, kind: Some(Kind::User(input.clone())), ..Default::default() };
+            assert_eq!(reasons(std::slice::from_ref(&event)).contains(&"correction"), correction);
+            assert_eq!(digest(&[event]), format!("[1] {source}: Don't do that\n"));
+        }
+    }
+
+    #[test]
+    fn browser_corrections_follow_the_heads_signin_policy_not_body_or_token_claims() {
+        use crate::realms::Caller;
+        for auth_required in [false, true] {
+            for authenticated_browser in [false, true] {
+                for browser in [false, true] {
+                    for api_token_name in [None, Some("ops-controller".to_owned())] {
+                        let caller = Caller { browser, authenticated_browser, api_token_name, ..Caller::root() };
+                        let human = browser && (!auth_required || authenticated_browser) && caller.api_token_name.is_none();
+                        assert_eq!(caller.human_origin(auth_required), human);
+                        let input = c6_proto::UserMessage {
+                            text: "Don't do that".into(),
+                            human_origin: caller.human_origin(auth_required),
+                            api_origin: caller.api_origin(),
+                            origin_recorded: true,
+                            ..Default::default()
+                        };
+                        let event = SessionEvent { kind: Some(Kind::User(input.clone())), ..Default::default() };
+                        assert_eq!(reasons(&[event]).contains(&"correction"), human);
+                        for input in [
+                            c6_proto::UserMessage { from_session_id: "another-session".into(), ..input.clone() },
+                            c6_proto::UserMessage { delegated_by: "parent-call".into(), ..input.clone() },
+                        ] {
+                            let event = SessionEvent { kind: Some(Kind::User(input)), ..Default::default() };
+                            assert!(!reasons(&[event]).contains(&"correction"), "nonhuman provenance overrides the browser");
+                        }
+                    }
+                }
+            }
+        }
     }
 }

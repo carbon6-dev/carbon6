@@ -74,7 +74,7 @@ impl Tool for Bash {
             Err(e) => return e,
         };
         if input.run_in_background {
-            return match ctx.session.background.spawn(&input.command, &ctx.session.cwd(), input.notify) {
+            return match ctx.session.background.spawn(&input.command, &ctx.session.cwd(), input.notify, &ctx.cancel).await {
                 Ok(id) => ToolOutput::ok(if input.notify {
                     format!(
                         "Started in the background as {id}. You will be told when it finishes (with the end of its output); meanwhile, read its output with the output tool or stop it with the kill tool."

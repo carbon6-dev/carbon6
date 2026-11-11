@@ -1,20 +1,95 @@
 # A session's tile bar, panes and glance — Design
 
-Status: second step built (2026-11-02), for review live. The first step (2026-11-01: a second bar of tabs under the tile bar, a details drawer under it) was too busy and hard to read: its pills scrolled sideways on a phone, ⚙ and the ◆ pill said the same thing and grew with done, interrupted and failed counts, its task lists were long, and it had scrollbars. Decided with you after a design round (the options and mockups are in doc:01a19636-a09e-70ae-a84d-628864fe7dc7, "Reworking the session header and ⋯ popover"):
-- **one row** above the transcript, the tile bar; nothing else but the find bar when it's open;
-- **panes beside**, never in place of the transcript;
-- a read-only **glance** instead of the drawer.
+Status: phone revision and first desktop combined ring implemented (2026-11-06); S3 session sheet and merged background jobs implemented (2026-11-07); S12 fixed-place status row implements option A of doc:01a1b84e-0e64-735a-9e3d-259dae2e53da (2026-11-08). The **Revised direction** tab of doc:01a19e63-08ac-765f-8d88-21bb8c7a27ff and the settled session-sheet design doc:01a1b213-b669-724c-aa62-8e56284126f3 are the other design sources. Phones have one navigation bar, a fixed-height status slot above the composer, and no footer. Wide desktop tiles keep expanded metadata beside the transcript; narrower tiles prioritize quick access in the ring popover.
 
 ## 1. The tile bar
 
-Left to right: back and forward, the session's mark, its title (double-click to rename), its own turn's state as a dot and a word (idle, running, starting, failed, needs you; what runs in its background doesn't count), **◌ N** while any task or subagent of it runs, the icons, a divider, then **⋯**, ☆ pin, ⧉ detach, minimize, focus, ✕ (on a phone the state is its dot alone).
+Desktop, left to right: the session's identity dot, title (double-click to rename), optional aspect shapes, then **combined ring, Changes, Terminal, Pin, Actions, Focus, Close**. The identity dot is independent of agent state. Back/Forward, detach and minimize are in Actions, retaining their icons and keyboard shortcuts. Desktop dragging still reorders tiles. Tiles share the available workspace width without a minimum tile width or horizontal canvas scrolling; their contents must adapt to the tile rather than the window.
 
-- **The state** is a button: with something waiting on you (an approval, a question) it goes to its card in the transcript; else, while something runs in the background, it opens ◌ N's list; else the glance (nothing when the glance is a column). Its hover says which.
-- **◌ N** (a spinner and the count, blue) is the only count in the bar: nothing when nothing runs, no done or failed counts, no ⚙ or ◆. Its hover says "N running in the background:" and names each ("Subagent: …", "Task: …"), a line each; its accessible name says the same. A click lists them in a popover (a sheet from the bottom on a phone): the subagents and tasks running, then the last three of each that failed or were stopped, each with its state, name or command and how long it ran; a task has **Inspect** and, while it runs, **Stop**, and a subagent goes to its thread. **Show all** lists every one. The context ring, not ◌ N, opens the glance.
-- **Buttons:** every button in the bar, the session's strip and a pane's bar is a 16px Lucide icon (‹ › ⋯ ☆ ⧉ − focus ✕ too) in a 28px target (24px in a pane's 28px bar), 40px on a touch screen, where those bars grow to 44px. The session's icons are filled only while their pane is on screen (not when a phone has gone back to the transcript, or its tile is minimized: a click then brings it forward); hover shows only with a mouse, and focus only as a keyboard's ring. **Changes** (with how many files changed), **Terminal**, and the **context ring** (filling with the context used, amber from 80%, the figure in its title) while the glance isn't a column. Not over SSH: no Changes.
-- **⋯:** Rename… · Find in session (⌘F) · Files · Outputs · Session details… (usage, and what applies: labels, slash commands, agents, skills, hooks) · New like this… · Save as template… · the **Catch-up** and **Fold finished turns** switches (docs/catchup.md) · Archive.
-- With another view beside the session in its tile (a doc), the bar speaks for that view; the session's icons and ⋯ are in a slim strip at the top of the session. A pane of its own beside it leaves the bar the session's.
-- **Gone:** the second bar and its tabs, the drawer, ⚙, the ◆ pill, the aspect marks (and the dimming of other tiles when pointing at one).
+Fine-pointer desktop slots use the tile's own width: 36px at 40rem and above, 32px at 30–40rem, and compact 28px below 30rem. Phones and coarse pointers keep 44px targets. Below 30rem of tile width, Changes, Terminal and Pin move into Actions with the same icons. The combined ring, Actions, Focus (Maximize) and Close remain in the bar, leaving the title room to truncate even in a 240px tile. Focus is immediately left of Close, after Actions, at every width where they appear. Below 14rem Focus and Close also move into Actions, in that order, so even four columns at the smallest desktop breakpoint retain usable chrome. No action is removed.
+
+Optional aspect shapes sit immediately after the intrinsic-width title, left aligned with 8px gaps between marks and breathing room on both sides; spare space stays after the marks, not between them and the title. Long titles truncate to fit. The shapes yield first: below 40rem of tile content width they are hidden, before secondary controls collapse below 30rem. The title and core controls keep their room; the aspect preference and phone behaviour are unchanged.
+
+A desktop two-pane tile below 40rem shows one pane at a time, with
+**Back to the list** in the item's slim header. Phones instead put Back and
+the tappable pane title in their single bar (below), never a second header.
+Once mounted, both panes retain drafts and scroll while hidden. On a restored
+phone companion, the session mounts after the visible pane's initial paint
+to supply its live ring and sheet; unrelated hidden panes remain deferred.
+Wide desktop tiles show both panes beside each other and each view responds
+to its own pane's content container—not the window or whole tile's width.
+
+- **Combined ring:** a standalone 24px SVG with a neutral context-used arc inside a complete state rim: grey idle, blue working, amber waiting, red failed. Waiting is dashed and failure has a cross, so colour is not the only cue. A badge appears only for a positive count of distinct background jobs. Its accessible name and tooltip spell out state, context and jobs. The own main-agent state does not become working just because background work runs. Clicking opens the session overview, even with a glance column visible.
+- **Identity colour:** Settings → Appearance → **Session bar colour** uses the shared immediate-setting **Coloured stripe** switch: on (default) keeps the stripe; off is **Dot only**. The identity dot remains in either case. Saving disables the switch, and a failed save restores the previous choice and reports the error. This is independent of aspect marks.
+- **Optional aspects:** Settings → Appearance → **Session aspects → Show on tile bars**, using the shared Switch, is **off by default** so the default bar remains as in PR29. On desktop only, the chosen aspects appear after the title as shapes in their own colours/patterns, never named chips. They share the title's flexible room, not the ring or fixed control slots. Resting on a value for 400ms dims tiles without it; leaving cancels it, clicking opens its card (related sessions, destination and palette). The choice is `session_facets.tile_bars`, stored per realm alongside `shown`; missing fields from old saved settings/heads mean off, with no migration. One workspace-level gate unmounts the entire feature off/on phone: no per-tile mark signals, scans, listeners or timers when off. Enabling/disabling does not remount the bar's controls or the transcript.
+- **Buttons:** tile-bar and session-strip controls use 28px slots on fine-pointer desktops and 44px targets on phones or coarse pointers. Changes and Terminal are filled only while their pane is on screen. Over SSH, Changes remains available but disabled. Pane headers retain their existing sizing.
+- **Actions (⋯):** Rename… · Find in session (⌘F) · Files · Session details… (usage, and what applies: labels, slash commands, agents, skills, hooks) · New like this… · Save as template… · the **Catch-up** and **Fold finished turns** switches (docs/catchup.md) · Archive. Files is available here on phone and desktop, but omitted over SSH because the worker cannot browse that remote folder. There is no standalone Outputs entry; published outputs are conditional recent items in the glance/Details, with Show all.
+- **Desktop only:** with another view beside the session in its tile (a doc), the bar speaks for that view; the session's icons and ⋯ are in a slim strip at the top of the session. A pane of its own beside it leaves the bar the session's. Narrow desktop tiles retain the pane header and its Back navigation.
+- **Gone by default:** the second bar and its tabs, the drawer, ⚙, the ◆ pill, the aspect marks (and their hover dimming). Only aspect marks can be explicitly restored; phones remain unchanged.
+
+### Phone
+
+One 44px bar: **app menu, title, combined ring, Actions, Sessions picker**. There is no app header above it and no footer/bottom tabs. Phone and desktop use the same 24px `SessionRing`: neutral context usage inside, independent agent-state rim outside, and a positive-only running-background-count badge. Working uses the compositor-only 1.4s spin and 2.8s breathing arc; Waiting keeps its dashed rim and Failed its cross. Reduced and Off keep the same stationary full working rim as desktop. The ring stays inside its 44px touch target; the absolute badge takes no title or control space when its count appears or changes. Long titles truncate. It opens the session sheet: **Changes and Terminal only**, then **Running now**, **History**, and **Session details**. Files stays in Actions; outputs appear only inside Details when published. The sheet's two pane buttons are not repeated in the phone header or Actions. The independent status row above the composer remains the route for working, waiting and failure details, and spells out positive background work separately.
+
+- **Split tiles:** this is the only bar whether a session, document, Changes or Terminal is showing. There is no phone pane header, session strip or separate document toolbar. The title names the visible pane; tap it to switch between the retained panes, and use Back on the second pane to return to the first. A session anywhere in the tile keeps its ring and positive badge in the bar, including while reading its document. Actions belongs to the visible pane: session actions on the transcript, document controls (rename, comments, edit, export, history, archive and owning-session navigation) on a document, plus pane/tile controls. Pin/Unpin and Close this pane live in Actions rather than adding buttons to the bar. Standalone documents and app pages use the same bar without an unrelated session ring. Short landscape uses this phone policy too; desktop keeps its existing split-pane bars.
+
+- **App menu:** positive app-wide waiting count on the hamburger; realm selection (current row highlighted without a check), search, app navigation, Activity, notifications, connection and version. A disconnected indicator appears on the hamburger. Realm and Activity are no longer separate phone-header rows.
+- **Sessions:** one flat list of open sessions/pages, including hidden ones, with a current highlight and close controls; recently viewed, All sessions and New session or page follow it. Ask and the Needs you bell are in this sheet, centred on one header line with matching 20px visual pills inside 44px touch targets. The bell occupies the rows' close-control column; there is no header X. Tap outside, tap or swipe down on the handle, or press Escape to close. The handle is a native button named **Close Sessions**, including for screen readers. The old long-press/reorder footer is removed.
+- **Status:** immediately above the still-mounted composer, outside the transcript scroll area, a 44px slot is always reserved. The left shows **Working…** or stream status, the pulsing dot (retaining the phone's loader-circle), and live turn stats; it clears when idle. Existing **Waiting on you N** (triangle-alert) and **Last turn failed** (circle-x) notices remain available. Positive **1 background task / N background tasks** (clock) always sits on the right beside the chevron. This is one line, never stacked; stats ellipsize first, to the elapsed-time prefix on a narrow phone. Full stats are available from the opener's tooltip and accessible name. Background work is independent of main-agent work. The whole row is one native button with a name containing its current statuses and a visible inset keyboard-focus ring; there is no separate **Show** pill. It opens waiting cards, failure details and task/subagent controls. Quiet idle leaves the slot empty, with no false status or focusable opener. Updating the row never takes focus from the composer; live stats retain the opener. The details sheet's **Show** navigation and genuine approval/answer buttons remain separate actions. Phone and desktop background counts, including ring names and detail summaries, omit the redundant “running”. Linked child/task records count once; foreground native work and read-only mirrors do not inflate the count. Completed history and held notices remain in the session overview when idle. Desktop retains its existing transcript waiting affordances and icons.
+- Status changes consume no additional transcript height and never move the composer. Following stays bottom-anchored; reading older content stays put. The visual viewport bounds the app, sheets and dialogs with an overlay keyboard. Landscape uses this same layout when height is below 512px.
+- **Motion:** the fixed status slot neither rises nor yields height during state changes. ScrollBox remains the only transcript scroll controller. Session/status sheets and the glance retain their bodies through the exit and reverse if reopened; closed trees are inert immediately, and heavy bodies unmount after presence ends. Phone sheets use the shared 280ms spring enter/200ms exit and 30% scrim; desktop glance/panels use the shared 40px slide/fade (220ms enter/150ms exit). These effects never animate streaming text or delay input; the shared motion preference controls reduced/off behavior.
+- **App drawer:** on phones the ☰ drawer enters from and exits to the left, with the same sheet timings and uninterrupted reversal. Swipe left starting anywhere inside it, not at the Android Back edge: a clear horizontal drag follows the finger in Full, then closes at 35% of its width on release or springs back if released early/reversed. Vertical/diagonal starts keep native nested scrolling; taps, outside tap and Escape still work. It accepts input from its first frame. System follows the OS; Reduced fades without travel and Off is immediate, with the same swipe-to-close threshold in each setting. Its keyboard-aware height and 288px width (capped to the viewport) stay unchanged.
+- **Composer sizing:** working/suggestion changes refit only an empty draft's hint. A nonempty draft still resizes for text and width changes, but not for a status-only update: temporarily measuring it at `height:auto` can make WebKit clamp the transcript to a transient end without a net ResizeObserver size change. Text, resize and width notifications share one queued fit before paint, with no duplicate synchronous input fit. Avoiding repeated measurements preserves true end-following on small phones without moving or recreating the composer.
+- **Model chip:** on phones (including short landscape) its model, effort and subagent choices use the existing keyboard-aware bottom sheet; desktop keeps the anchored popover. Phone sheet controls stack at the normal sheet padding: the Model label sits directly above its full-width field and offered list, with no reserved connection column. Tap outside, tap or swipe the named close handle, or Escape to close; the model sheet has no redundant top X (other shared sheets retain theirs). The sheet retains its body through exit and can reverse without remounting. The model text field still accepts arbitrary ids and lists every offered model, not filtered suggestions; its list flows inside the sheet's scroll area so the keyboard cannot clip it. Selection still takes effect on the next send. New-session, side-chat and Ask forms keep their inline fields; their phone model lists flow in their existing scroll area too, rather than being clipped above or below it. The Sessions page retains its new-session form during subsequent model-list loading, so typing does not detach the focused input. Its Where and how sheet uses the shared keyboard inset and 80% visible-height cap. Desktop form dropdowns are unchanged. All use the existing per-connection model cache warmed by composer prefetch.
+
+## Transcript status and spacing
+
+On desktop, Working and the live turn's numbers use the reading column's
+existing bottom padding. A permanent flexible left block keeps background work
+at the right edge while working or idle, including with the wide overview open.
+Stats ellipsize before the nonwrapping task opener; full stats have a tooltip
+and a keyboard-focusable accessible label.
+These controls do not each add a transcript row or change the scroll range
+when they arrive. Empty log records (usage, turn start, a result already shown inside its
+tool card) keep their anchor ids but take no height or inter-message gap.
+The 16px separation between actual messages and the 28px action-control area
+remain intentional: Edit, Rewind and Ask are positioned in that area and do
+not add height on hover. There is no additional idle status spacer.
+Session-stream messages received before a presentation frame are applied in
+wire order in one reactive batch, including reply replacement, queue changes
+and turn completion. Disconnect flushes pending messages before replay begins;
+unmount cancels its pending frame. Hidden tabs flush immediately rather than
+buffering while animation frames are paused; failed frame registration also
+flushes without dropping messages.
+The newest 16 event elements use their real layout height immediately. Older
+off-screen rows retain `content-visibility: auto`. While following, a shared
+ResizeObserver remembers row heights as explicit intrinsic block sizes: the
+browser's `auto` cache can otherwise restore a width-old height when a row
+leaves the forced-visible tail after a tile resize. This avoids following a
+guessed 6rem tail row and then correcting both the transcript and its scrollbar
+again when its real height arrives. Removed rows are unobserved; stopping
+following disconnects the row observers.
+
+While following, ScrollBox's ResizeObserver commits the real end before paint
+and applies an inverse translation to the reading column. In Full, that
+translation glides away on the compositor in 200ms, without scaling text or
+writing scrollTop on every animation frame. New growth adds its own bounded
+correction without restarting earlier correction clocks; corrections still
+pending in one presentation frame combine. One native replace-transform effect
+presents their summed trajectory (2ms keyframes only when curves overlap).
+Native additive composition advertised acceleration in Chromium but did not
+advance the recorded text during a blocked main thread. Shrink uses the previous
+logical end, not the already-clamped scrollTop. The surrounding row clips the visual overflow,
+so translation cannot itself enlarge the scroll range. The glance is not
+translated. Reduced/Off, initial restoration and moves larger than a viewport
+are immediate. Native input cancels to the currently displayed reading
+position before wheel/touch/key/scrollbar scrolling proceeds. Native scroll
+anchoring is disabled while following so it cannot compensate the translated
+rows again when their effects finish; stopping restores the previous anchoring
+style for readers above the end. Reading above the end does not call the follow
+helper at all. The fixed app shell uses `overflow: clip`, not `hidden`: focusing
+the composer must not programmatically scroll the shell and move the entire
+transcript outside its own scroll box. Actual scroll boxes remain scrollable.
 
 ## Icons throughout the app
 
@@ -42,13 +117,60 @@ documents and terminal output remain content, including Slack's emoji picker
 and the terminal vendor's Unicode-width data. The native UI tests render
 representative session cards and scan app-owned Rust/HTML/JS to guard this rule.
 
+### Archived sessions stay readable
+
+An open session tile resolves its own metadata by id when the live session list
+omits it. Archiving never closes that tile, including from its own actions menu.
+Its real title, status and mark remain, with a visible **Archived** marker and a
+drawn **Unarchive** button in a slim archive header below the bar (or at the
+session's own strip when the bar represents another view). This leaves the
+existing bar's icons in place and keeps the title and archive action reachable
+on a narrow phone. Restored
+workspace layouts and direct session links behave the same way. Archived
+sessions still do not appear in the non-archived Sessions list or sidebar.
+
+The message box explains **“This session is archived. Unarchive it to send
+messages.”** and disables sending, preserving its draft text and attachments.
+Unarchive is explicit and does not itself send anything; then the draft can be
+sent normally. The head rejects new sends to an archived session with a clear
+archive/unarchive error, covering stale clients too. Previously those sends ran
+the agent while leaving it archived and hidden. Archiving is still not Stop:
+an already-running turn or already-queued message is not cancelled by this UI
+change.
+
+`Session.archived` is a boolean returned by the session API (default false when
+reading older responses). The existing by-id endpoint includes archived
+sessions; the live/list endpoints continue to omit them. No storage or database
+migration is needed.
+
 ## 2. Panes
 
-Changes, Terminal, Files and Outputs are views of their own (`/sessions/{id}/changes`, `/terminal`, `/files`, `/outputs`), each with its name and the session's title. Clicking an icon opens its pane, or closes it if open; ⌘/Ctrl-click opens it in a new tile. Opened beside the session, the session stays and a list beside it goes back in the tile's history; the two share the tile evenly.
+Changes, Terminal, Files and Outputs remain views of their own (`/sessions/{id}/changes`, `/terminal`, `/files`, `/outputs`), each with its name and the session's title. Changes and Terminal have the desktop bar controls and phone sheet buttons; there is no Files/Outputs button row in the overview. Files is reached from Actions everywhere (except over SSH), and outputs from Newest outputs and Show all. Desktop bar controls toggle their pane; the phone sheet's pane selection closes the sheet. ⌘/Ctrl-click on pane controls explicitly opens another tile. Opened beside the session, the session stays and a list beside it goes back in the tile's history; the two share the tile evenly.
 
-## 3. The glance
+An ordinary click always keeps the pane in its session's tile. Below 40rem
+of tile width, or on a phone, the retained single-pane navigation shows the
+chosen pane and Back returns to the transcript. Opening it again reveals
+the existing pane. Files from Actions and outputs from the glance/Details
+use that same retained-pane navigation. Only an explicit ⌘/Ctrl-click on
+controls supporting it separates a pane.
+This replaces the old 1100px automatic-new-tile fallback from `5a453ed0`,
+which predates both the phone-header revision and narrow-tile navigation.
 
-One line each, read-only: **Runs on** (worker, online dot, model and effort, runtime), **Worktree** (folder and the repository it's of) or **Folder**, **Branch**, **Changes** (files), **Work**, **Labels**, **Context** (meter, %, window, compacts at 85%); then **Newest outputs** (three); last, the **Timeline**: its turns by hour, newest first, the latest hour open, a line per turn (newest first) going to it in the transcript (docs/catchup.md §3). First of all, only while there is any, **Waiting on you**: each approval or question the session waits on ("approval: cargo publish", "question: which branch?"), going to its card in the transcript. Tasks and subagents aren't in the glance: ◌ N lists them, failures included, and so does the catch-up. A line acts where you would: Changes and the folder open their panes, Runs on the worker, Work and Labels their editors in a popover, Context its breakdown (Compact now) and usage, an output the Outputs pane on it.
+## 3. The glance and session sheet
+
+**Wide desktop:** expanded metadata stays at the top, before the single merged **Running now** list, History and Usage & configuration. There is no pane-button row repeating the desktop bar; the background-work opener stays at the right of the status row beside the list. **Narrow desktop:** the ring popover puts Running now first, then a compact Session details drill-in and History. **Phone:** the sheet starts with Changes and Terminal, then Running now, History and Session details. Quiet landing views retain History/Details and say **Nothing running now**, rather than showing ended jobs in the live list.
+
+**Metadata (`details.rs::Glance`):** **Runs on** (worker, online dot, model and effort, runtime), **Worktree** (folder and repository) or **Folder**, **Branch**, **Changes** (files), **Work**, **Labels**, **Watchers**, **Context** (meter, %, window, compacts at 85%). Hide empty Branch, Work, Labels and Watchers summaries; **Assign work** and **Edit labels** remain available. Populated labels wrap as readable name/value chips; their editor retains complete raw values. Unknown context says **Not measured yet**, never 0%. First, only while applicable, **Waiting on you** links approvals/questions to their existing cards. Changes and the folder open their panes (respecting SSH restrictions), Runs on opens the worker, Work and Labels their editors, and Context its breakdown and usage. The Timeline implementation/slot remains gated by `timeline::SHOWN = false`.
+
+**Published outputs:** only when any exist, **Newest outputs** shows up to three most recently published/republished outputs and **Show all**, even for one output. A recent item opens that output; Show all opens the existing full Outputs pane. With none, there is no heading, placeholder, count or Show all. Wide tiles show this inside expanded metadata; phone/narrow surfaces show it in Session details. Outputs are independent of whether background work is running.
+
+**One live job list:** task/child identities merge through producer-recorded `SubagentSpawned.background_task_id` links, not matching names. A continuation is another run of its child, with this run's elapsed time and the child's human title (original delegation description, then Background agent as fallbacks). Native agent mirrors join their underlying native task; standalone commands, servers and watchers remain separate jobs. Foreground-only work and the observed mirror itself do not add rows/counts. The heading, ring badge and list use the same distinct running identities. See docs/background.md §4 for producer links and historical limitations.
+
+**Inspect and actions:** a row title opens Inspect; its ⋯ opens a labelled action view with Inspect and **Stop this agent/command**, not permanent paired buttons on every row. Inspect retains the full name/state, elapsed, read-only output, Refresh, run outcomes/raw IDs, and Open thread when a linked child is known. Stop targets only that job; errors are shown and an ended job loses Stop. An observed mirror is read-only, but its real underlying native task can still be stopped. An offline worker's known state is labelled stale, and Stop is disabled rather than pretending success.
+
+**History:** the row reads **History**, or adds only positive latest-outcome counts such as **History · 2 failed · 1 interrupted**. Counts are distinct jobs, not task records or past attempts; resuming a job removes its earlier failure from the current problem count while retaining it in Inspect. History shows ended jobs newest first, with All / Failed / Interrupted filters. It initially renders 30 matching jobs; Show more adds 30 (client-side pagination over known history), rather than mounting all ended rows on landing.
+
+History, Session details and Inspect/actions replace the overview body; Back restores the prior view, scroll position and opener focus without moving the transcript. History retains its selected filter and loaded pages through Inspect/actions. Outputs Back restores Details only when its originating transcript is active, never over another focused tile. The phone sheet has no top X: outside tap, its named close handle, swipe/pull or Escape closes it, returning focus to the ring. Desktop popovers retain outside/Escape/ring dismissal; the wide overview stays beside the transcript. Existing status-row routes for approvals, questions and last-turn errors remain. S3 reuses existing panes, task/session/output APIs and event fields; it adds no API endpoints, protobuf fields or schema migrations.
 
 ## 4. Defaults
 
@@ -60,12 +182,12 @@ One line each, read-only: **Runs on** (worker, online dot, model and effort, run
 
   Unless it's off, a thin divider marks where the day changes ("Today", "Yesterday", "Monday, November 3") and pauses of 30 minutes or more ("2 h later"). Any entry without a time shows its full date and time when you point at it, in its top corner. Times are local clock times (`when::time`, `when::full`); nothing counts up in the transcript, so nothing redraws while you read. A tool call over a minute shows its duration as minutes and seconds ("4m 10s"). The choice is `TranscriptSettings.times` (`exchanges`, `all`, `off`), kept with Show thinking across realms and devices.
 - **Thinking preference storage and API:** one user per head, one preference across realms and devices, saved in the existing `settings` table as `transcript_display`; no migration. It is loaded when the app opens and updates all mounted transcripts when changed in Settings. Other open devices pick it up on reload; it is not a live cross-device broadcast. `GET /api/v1/settings/transcript` (`settings.transcript.get`) returns `{"show_thinking": false}` until saved; `PUT` on that path (`settings.transcript.put`) accepts the same object and returns 204. A missing field defaults to false. Available from either a realm or the console. This is display only: recorded events, streamed data, search indexing and model input are unchanged. The generated Settings API reference includes the request schema and default.
-- Icons: Lucide (ISC), inline, 16px; hit targets 28px with a mouse (24px in a pane's bar), 40px on a touch screen.
-- A pane opens beside the session when its tile is at least ~1100px wide, else in a tile of its own; on a phone beside (it fills the screen, ‹ goes back).
+- Icons: Lucide 1.66.0 (ISC and inherited Feather MIT), inline at 14/16/20px with an absolute 1.5px stroke; the bar's icons stay 16px. The shared phone/desktop combined ring is a 24px data visualization. Tile controls keep 44px phone/coarse targets and use the width-dependent mouse slots above. Settings and the ⋯ menu share `components::Switch`: label left, track at the row's end, 44px touch rows. Menu keyboard hints use `Kbd`.
+- A pane opens beside the session in the same tile at every width; below 40rem and on phones it fills the tile, with Back to the retained transcript. ⌘/Ctrl-click explicitly opens a separate tile.
 - The glance is a column 24px to the right of the transcript, 288px wide where it starts and growing with the room to 380px (`clamp(18rem, 100% − 59.5rem, 23.75rem)`), its values wrapping rather than cut short, which keeps its reading width (56rem); the two are centred together in the session's column, the glance stays in sight as the transcript scrolls, and the message box and the find bar line up with the transcript. That needs the session's column to be at least 1240px wide (896 + 24 + 288 and 16px either side); narrower, the glance is behind the context ring: a popover, a sheet from the bottom on a phone. ⌘I opens and closes it there; Esc closes it.
-- The bar's only count is *◌ N*; the state word is the session's own turn.
+- The shared phone/desktop ring's badge is positive background work only; its rim is the session's own state. The phone status row spells both out separately.
 - The branch has no "based on" yet.
-- **Transcript scrolling:** opening a session follows the latest reply; opening a search hit stays at its anchor. Any upward wheel/trackpad movement, vertical touch drag toward older content, or Up/Page Up/Home (Shift+Space too) immediately stops following, even a pixel from the bottom, and cancels a running glide. New text and resizes do not re-enable it. Scrolling down to the very bottom (less than 4px away), or clicking **↓ Latest**, resumes following. Folding and showing the tile preserves that choice and position. Touching without dragging and editing a text field do not stop following.
+- **Transcript scrolling:** opening a session follows the latest reply; opening a search hit stays at its anchor. Any upward wheel/trackpad movement, vertical touch drag toward older content, or Up/Page Up/Home (Shift+Space too) immediately stops following, even a pixel from the bottom, and cancels a running glide. New text and resizes do not re-enable it. Scrolling down to the very bottom (less than 4px away), or clicking **Latest** (with its trailing drawn down-arrow), resumes following. Folding and showing the tile preserves that choice and position. Touching without dragging and editing a text field do not stop following.
 
 ## 5. Not yet
 

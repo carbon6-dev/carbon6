@@ -4,15 +4,16 @@
 //! doesn't know carbon6's policies; the bridge applies them. A binary of its
 //! own: it sets C6_CLAUDE_BIN.
 
+#[path = "support/held_worker.rs"]
+mod held_worker;
+
 use std::path::Path;
 
 use c6_api::{Event, EventKind, SessionDetail, SessionStatus};
 use c6_head::HeadConfig;
 use c6_testkit::eventually;
-use c6_worker::{ConnState, Identity, Worker, conn, enroll};
+use c6_worker::enroll;
 use serde_json::{Value, json};
-use tokio::sync::watch;
-use tokio_util::sync::CancellationToken;
 
 /// A `claude` that calls ListSessions, then doc, over MCP (with curl),
 /// streaming each call first as Claude Code does, and records the answers.
@@ -67,11 +68,7 @@ async fn policies_hold_claude_codes_calls_of_carbon6s_tools() {
     let http = reqwest::Client::new();
     let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
     enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
-    let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
-    let (tx, mut rx) = watch::channel(ConnState::Connecting);
-    let stop = CancellationToken::new();
-    tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
-    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
+    let worker = held_worker::HeldWorker::start(state.path()).await;
     let cc: Value = http
         .post(format!("{api}/connections"))
         .json(&json!({"kind": "claude_code", "name": "cc", "base_url": ""}))
@@ -90,7 +87,7 @@ async fn policies_hold_claude_codes_calls_of_carbon6s_tools() {
 
     let s: Value = http
         .post(format!("{api}/sessions"))
-        .json(&json!({"worker_id": worker.identity.meta.worker_id.0, "cwd": project.path().display().to_string(),
+        .json(&json!({"worker_id": worker.id, "cwd": project.path().display().to_string(),
             "connection_id": cc["id"], "model": "opus", "prompt": "look around"}))
         .send()
         .await
@@ -130,6 +127,6 @@ async fn policies_hold_claude_codes_calls_of_carbon6s_tools() {
     assert_eq!(doc["result"]["isError"], true, "{doc}");
     let refusal = doc["result"]["content"][0]["text"].as_str().unwrap();
     assert!(refusal.contains("Denied by policy \"No documents here\"") && refusal.contains("not in this test"), "{refusal}");
-    stop.cancel();
+    worker.stop();
     head.shutdown().await.unwrap();
 }

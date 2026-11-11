@@ -89,6 +89,16 @@ pub struct TaskEvent {
 
 pub type TaskSink = tokio::sync::mpsc::UnboundedSender<TaskEvent>;
 
+/// Worker-local writer ownership, independent of asynchronous task notices.
+/// Reserve before creating a process; unknown ownership survives cancellation.
+#[async_trait]
+pub trait ShellOwner: Send + Sync {
+    async fn reserve(&self, task_id: &str) -> std::io::Result<String>;
+    async fn launched(&self, reservation: &str, local_pgid: Option<i32>) -> std::io::Result<()>;
+    /// Only a failed spawn, before any child exists, may abandon a reservation.
+    async fn not_launched(&self, reservation: &str) -> std::io::Result<()>;
+}
+
 /// Read-only inspection of a background task; matches the API DTO.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TaskSnapshot {
@@ -214,6 +224,8 @@ pub struct Background {
     native: Mutex<NativeTasks>,
     next: std::sync::atomic::AtomicU64,
     sink: Arc<Mutex<Option<TaskSink>>>,
+    shell_owner: Mutex<Option<Arc<dyn ShellOwner>>>,
+    shell_contexts: Mutex<Vec<CancellationToken>>,
     secrets: crate::Secrets,
     /// Commands run here, or on this SSH target.
     ssh: Option<Arc<crate::remote::SshHost>>,
@@ -370,6 +382,23 @@ impl Background {
     /// Where task starts and ends are reported.
     pub fn set_sink(&self, sink: Option<TaskSink>) {
         *self.sink.lock().unwrap() = sink;
+    }
+
+    pub fn set_shell_owner(&self, owner: Arc<dyn ShellOwner>) {
+        *self.shell_owner.lock().unwrap() = Some(owner);
+    }
+
+    /// Register before exposing a worker turn's tools, including MCP calls.
+    pub fn shell_context(&self, cancel: &CancellationToken) {
+        self.shell_contexts.lock().unwrap().push(cancel.clone());
+    }
+
+    /// Old ToolCtx tokens never reopen when the reset is confirmed. New
+    /// turns register new tokens; callbacks from an old actor stay canceled.
+    pub fn cancel_shell_contexts(&self) {
+        for cancel in self.shell_contexts.lock().unwrap().drain(..) {
+            cancel.cancel();
+        }
     }
 
     /// Makes new ids start after `bg{n}` (ids from before a restart stay
@@ -696,36 +725,45 @@ impl Background {
 
     /// Starts a shell command in the background; `notify`: tell the agent
     /// when it ends.
-    pub fn spawn(&self, command: &str, cwd: &std::path::Path, notify: bool) -> std::io::Result<String> {
+    pub async fn spawn(&self, command: &str, cwd: &std::path::Path, notify: bool, cancel: &CancellationToken) -> std::io::Result<String> {
+        if cancel.is_cancelled() {
+            return Err(std::io::Error::other("Shell launch canceled"));
+        }
         let held = self.held.lock().unwrap().clone();
         if let (Some(held), None) = (held, &self.ssh) {
-            return self.spawn_held(&held, command, cwd, notify);
+            return self.spawn_held(&held, command, cwd, notify, cancel).await;
         }
         let (stdout, stdout_writer) = std::io::pipe()?;
         let (stderr, stderr_writer) = std::io::pipe()?;
-        let (mut child, remote_pidfile) = match &self.ssh {
+        let id = self.new_id();
+        let owner = self.shell_owner.lock().unwrap().clone();
+        let reservation = match &owner {
+            Some(owner) => Some(owner.reserve(&id).await?),
+            None => None,
+        };
+        if cancel.is_cancelled() {
+            if let (Some(owner), Some(reservation)) = (&owner, &reservation) {
+                owner.not_launched(reservation).await?;
+            }
+            return Err(std::io::Error::other("Shell launch canceled"));
+        }
+        let spawned = match &self.ssh {
             // On the SSH target: the script records its process group so
             // stopping the task stops it there, not just the local ssh.
             Some(h) => {
                 let pidfile = crate::remote::SshHost::pidfile();
                 let script = crate::remote::SshHost::script(command, cwd, &self.secrets.env(), false, &pidfile);
-                let mut child = h
-                    .command(crate::remote::SshHost::script_runner())
+                h.command(crate::remote::SshHost::script_runner())
                     .stdin(Stdio::piped())
                     .stdout(Stdio::from(stdout_writer))
                     .stderr(Stdio::from(stderr_writer))
                     .process_group(0)
-                    .spawn()?;
-                let mut stdin = child.stdin.take().expect("piped");
-                tokio::spawn(async move {
-                    use tokio::io::AsyncWriteExt;
-                    let _ = stdin.write_all(script.as_bytes()).await;
-                });
-                (child, Some((h.clone(), pidfile)))
+                    .spawn()
+                    .map(|child| (child, Some((h.clone(), pidfile, script))))
             }
             None => {
                 let shell = if std::path::Path::new("/bin/bash").exists() { "/bin/bash" } else { "/bin/sh" };
-                let child = tokio::process::Command::new(shell)
+                tokio::process::Command::new(shell)
                     .arg("-c")
                     .arg(command)
                     .current_dir(cwd)
@@ -738,11 +776,32 @@ impl Background {
                     .stderr(Stdio::from(stderr_writer))
                     .process_group(0)
                     .kill_on_drop(true)
-                    .spawn()?;
-                (child, None)
+                    .spawn()
+                    .map(|child| (child, None))
             }
         };
-        let id = self.new_id();
+        let (mut child, remote_launch) = match spawned {
+            Ok(child) => child,
+            Err(error) => {
+                if let (Some(owner), Some(reservation)) = (&owner, &reservation) {
+                    owner.not_launched(reservation).await?;
+                }
+                return Err(error);
+            }
+        };
+        if let (Some(owner), Some(reservation)) = (&owner, &reservation) {
+            // An SSH proxy's local group is not the remote writer's identity.
+            let local_pgid = if remote_launch.is_none() { child.id().map(|id| id as i32) } else { None };
+            owner.launched(reservation, local_pgid).await?;
+        }
+        let remote_pidfile = remote_launch.map(|(host, pidfile, script)| {
+            let mut stdin = child.stdin.take().expect("piped");
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let _ = stdin.write_all(script.as_bytes()).await;
+            });
+            (host, pidfile)
+        });
         let mut proc = BackgroundProc::new(command, TaskKind::Shell, notify, child.id().map(|p| Pid::from_raw(p as i32)), None);
         proc.remote = remote_pidfile;
         let proc = Arc::new(proc);
@@ -784,14 +843,35 @@ impl Background {
     /// `spawn`, held: detached from the worker (its own process group, not
     /// killed when the worker goes), its output in files and its exit code
     /// written when it ends, so a restarted worker takes it up (`adopt`).
-    fn spawn_held(&self, held: &std::path::Path, command: &str, cwd: &std::path::Path, notify: bool) -> std::io::Result<String> {
+    async fn spawn_held(
+        &self,
+        held: &std::path::Path,
+        command: &str,
+        cwd: &std::path::Path,
+        notify: bool,
+        cancel: &CancellationToken,
+    ) -> std::io::Result<String> {
         let id = self.new_id();
         let dir = held.join(&id);
         std::fs::create_dir_all(&dir)?;
         let (out, err, code) = (dir.join("out"), dir.join("err"), dir.join("code"));
+        // Finish fallible file setup before reserving. After the reservation,
+        // only cancellation or a failed spawn may release writer ownership.
+        let (stdout, stderr) = (std::fs::File::create(&out)?, std::fs::File::create(&err)?);
         let shell = if std::path::Path::new("/bin/bash").exists() { "/bin/bash" } else { "/bin/sh" };
+        let owner = self.shell_owner.lock().unwrap().clone();
+        let reservation = match &owner {
+            Some(owner) => Some(owner.reserve(&id).await?),
+            None => None,
+        };
+        if cancel.is_cancelled() {
+            if let (Some(owner), Some(reservation)) = (&owner, &reservation) {
+                owner.not_launched(reservation).await?;
+            }
+            return Err(std::io::Error::other("Shell launch canceled"));
+        }
         // The command in its own shell; this one writes its exit code.
-        let mut child = tokio::process::Command::new("/bin/sh")
+        let spawned = tokio::process::Command::new("/bin/sh")
             .arg("-c")
             .arg(r#""$0" -c "$1"; echo $? > "$2""#)
             .arg(shell)
@@ -803,11 +883,26 @@ impl Background {
             .env("NO_COLOR", "1")
             .envs(self.secrets.env())
             .stdin(Stdio::null())
-            .stdout(Stdio::from(std::fs::File::create(&out)?))
-            .stderr(Stdio::from(std::fs::File::create(&err)?))
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
             .process_group(0)
-            .spawn()?;
+            .spawn();
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(error) => {
+                if let (Some(owner), Some(reservation)) = (&owner, &reservation) {
+                    owner.not_launched(reservation).await?;
+                }
+                return Err(error);
+            }
+        };
         let pgid = child.id().map(|p| Pid::from_raw(p as i32));
+        if let (Some(owner), Some(reservation)) = (&owner, &reservation) {
+            // This detached wrapper owns the writers' group, not a proxy.
+            // Keep its reservation even if registration fails or is dropped:
+            // a possibly live writer must remain a durable Rewind barrier.
+            owner.launched(reservation, pgid.map(|p| p.as_raw())).await?;
+        }
         let meta = HeldMeta { command: command.to_owned(), notify, pgid: pgid.map_or(0, |p| p.as_raw()) };
         std::fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).unwrap_or_default())?;
         let proc = Arc::new(BackgroundProc::new(command, TaskKind::Shell, notify, pgid, None));
@@ -1286,6 +1381,176 @@ mod tests {
         denied(&output);
     }
 
+    #[tokio::test]
+    async fn shell_writer_canceled_context_cannot_launch_after_reservation() {
+        canceled_context_cannot_launch_after_reservation(false).await;
+        canceled_context_cannot_launch_after_reservation(true).await;
+    }
+
+    async fn canceled_context_cannot_launch_after_reservation(held: bool) {
+        struct Gate {
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+            abandoned: std::sync::atomic::AtomicBool,
+        }
+        #[async_trait]
+        impl ShellOwner for Gate {
+            async fn reserve(&self, _: &str) -> std::io::Result<String> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok("reserved".into())
+            }
+            async fn launched(&self, _: &str, _: Option<i32>) -> std::io::Result<()> {
+                panic!("a canceled old callback must not launch")
+            }
+            async fn not_launched(&self, _: &str) -> std::io::Result<()> {
+                self.abandoned.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let gate = Arc::new(Gate { entered: Default::default(), release: Default::default(), abandoned: false.into() });
+        let bg = Arc::new(Background::default());
+        bg.set_shell_owner(gate.clone());
+        let dir = tempfile::tempdir().unwrap();
+        if held {
+            bg.set_held_dir(dir.path().join("held"));
+        }
+        let cancel = CancellationToken::new();
+        bg.shell_context(&cancel);
+        let (launch, cwd, token) = (bg.clone(), dir.path().to_owned(), cancel.clone());
+        let task = tokio::spawn(async move { launch.spawn("touch escaped", &cwd, false, &token).await });
+        c6_testkit::within("shell reservation to wait", gate.entered.notified()).await;
+        bg.cancel_shell_contexts();
+        gate.release.notify_one();
+        assert!(c6_testkit::within("old shell callback to refuse launch", task).await.unwrap().is_err());
+        assert!(gate.abandoned.load(Ordering::SeqCst));
+        assert!(!dir.path().join("escaped").exists());
+        assert!(bg.spawn("touch escaped", dir.path(), false, &cancel).await.is_err(), "old token stays canceled after admission reopens");
+    }
+
+    #[derive(Default)]
+    struct HeldOwner {
+        reserved: Mutex<Vec<String>>,
+        launched: Mutex<Vec<(String, Option<i32>)>>,
+        abandoned: Mutex<Vec<String>>,
+        cleanup: Mutex<Option<Pid>>,
+        fail_registration: bool,
+    }
+
+    impl Drop for HeldOwner {
+        fn drop(&mut self) {
+            // Installed inside launched(), before spawn can return or fail:
+            // even an early error/panic must not leave this test's writer.
+            if let Some(group) = self.cleanup.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
+                let _ = killpg(group, Signal::SIGKILL);
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ShellOwner for HeldOwner {
+        async fn reserve(&self, task_id: &str) -> std::io::Result<String> {
+            self.reserved.lock().unwrap().push(task_id.to_owned());
+            Ok(task_id.to_owned())
+        }
+
+        async fn launched(&self, reservation: &str, pgid: Option<i32>) -> std::io::Result<()> {
+            *self.cleanup.lock().unwrap() = pgid.filter(|pgid| *pgid > 0).map(Pid::from_raw);
+            self.launched.lock().unwrap().push((reservation.to_owned(), pgid));
+            if self.fail_registration {
+                return Err(std::io::Error::other("registration failed"));
+            }
+            Ok(())
+        }
+
+        async fn not_launched(&self, reservation: &str) -> std::io::Result<()> {
+            self.abandoned.lock().unwrap().push(reservation.to_owned());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn held_shell_writer_abandons_only_before_a_child_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let bg = Background::default();
+        bg.set_held_dir(dir.path().join("held"));
+        let owner = Arc::new(HeldOwner::default());
+        bg.set_shell_owner(owner.clone());
+        let cancel = CancellationToken::new();
+        assert!(bg.spawn("true", &dir.path().join("missing-cwd"), false, &cancel).await.is_err());
+        assert_eq!(*owner.reserved.lock().unwrap(), ["bg1"]);
+        assert_eq!(*owner.abandoned.lock().unwrap(), ["bg1"]);
+        assert!(owner.launched.lock().unwrap().is_empty());
+
+        let mut owner = HeldOwner::default();
+        owner.fail_registration = true;
+        let owner = Arc::new(owner);
+        bg.set_shell_owner(owner.clone());
+        // Even a command whose leader exits immediately has been launched:
+        // failure to persist its group must retain the unknown reservation.
+        let error = bg.spawn("true", dir.path(), false, &cancel).await.unwrap_err();
+        assert_eq!(error.to_string(), "registration failed");
+        assert_eq!(*owner.reserved.lock().unwrap(), ["bg2"]);
+        let launched = owner.launched.lock().unwrap();
+        assert_eq!(launched.len(), 1);
+        assert_eq!(launched[0].0, "bg2");
+        assert!(launched[0].1.is_some_and(|pgid| pgid > 0));
+        assert!(owner.abandoned.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn held_shell_registers_its_group_and_is_adopted_after_runtime_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        let owner = Arc::new(HeldOwner::default());
+        let runtime = || tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let first = runtime();
+        let id = first.block_on(async {
+            let bg = Background::default();
+            bg.set_held_dir(held.clone());
+            bg.set_shell_owner(owner.clone());
+            // Bound the gate too, in case a registration regression bypasses
+            // the test owner's cleanup callback entirely.
+            bg.spawn(
+                "printf before; n=0; while [ ! -e release ]; do n=$((n + 1)); [ \"$n\" -lt 1000 ] || exit 99; sleep 0.01; done; printf after; printf error >&2; exit 7",
+                dir.path(),
+                true,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+        });
+        let meta: HeldMeta = serde_json::from_slice(&std::fs::read(held.join(&id).join("meta.json")).unwrap()).unwrap();
+        assert!(meta.pgid > 0);
+        assert_eq!(owner.reserved.lock().unwrap().as_slice(), std::slice::from_ref(&id));
+        assert_eq!(*owner.launched.lock().unwrap(), [(id.clone(), Some(meta.pgid))]);
+        assert!(owner.abandoned.lock().unwrap().is_empty());
+        drop(first);
+        assert!(nix::sys::signal::kill(Pid::from_raw(meta.pgid), None).is_ok(), "runtime shutdown must not kill a held command");
+
+        let second = runtime();
+        second.block_on(async {
+            let bg = Background::default();
+            bg.set_held_dir(held.clone());
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            bg.set_sink(Some(tx));
+            assert!(bg.adopt(&id));
+            assert!(bg.snapshot(&id).unwrap().running);
+            std::fs::write(dir.path().join("release"), "").unwrap();
+            let done = next(&mut rx).await;
+            assert_eq!((done.id, done.state, done.exit_code, done.notify), (id.clone(), TaskState::Finished, Some(7), true));
+            // This command leaves no background children. Its completion is
+            // observed: disarm cleanup rather than signal an old group later.
+            owner.cleanup.lock().unwrap().take();
+            let snapshot = bg.snapshot(&id).unwrap();
+            assert_eq!(snapshot.stdout.text, "beforeafter");
+            assert_eq!(snapshot.stderr.text, "error");
+            assert!(!snapshot.running);
+            assert_eq!(*owner.reserved.lock().unwrap(), [id]);
+            assert_eq!(owner.launched.lock().unwrap().len(), 1, "adoption must not create a new ownership reservation");
+        });
+    }
+
     async fn next(rx: &mut tokio::sync::mpsc::UnboundedReceiver<TaskEvent>) -> TaskEvent {
         tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap()
     }
@@ -1303,7 +1568,9 @@ mod tests {
                 "if read -r line; then exit 99; fi; printf 'out private-value'; printf 'err private-value' >&2; exit 7",
                 dir.path(),
                 true,
+                &CancellationToken::new(),
             )
+            .await
             .unwrap();
         let started = next(&mut rx).await;
         assert_eq!(started.state, TaskState::Started);
@@ -1341,8 +1608,15 @@ mod tests {
         let bg = Background::with_secrets(Default::default(), Some(host));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         bg.set_sink(Some(tx));
-        let id =
-            bg.spawn("if read -r line; then echo unexpected-input; else echo closed; fi; echo remote-error >&2", dir.path(), true).unwrap();
+        let id = bg
+            .spawn(
+                "if read -r line; then echo unexpected-input; else echo closed; fi; echo remote-error >&2",
+                dir.path(),
+                true,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
         assert_eq!(next(&mut rx).await.state, TaskState::Started);
         assert_eq!(next(&mut rx).await.exit_code, Some(0));
         let snapshot = bg.snapshot(&id).unwrap();

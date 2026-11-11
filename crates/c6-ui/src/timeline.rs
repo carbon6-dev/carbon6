@@ -77,6 +77,14 @@ pub fn who(t: &TimelineTurn) -> String {
     match t.by.as_str() {
         "you" => format!("You: {}", t.words),
         "session" => format!("From {}", or(&t.from, "another session")),
+        "api" => {
+            if t.from.is_empty() {
+                "Sent via the API".to_owned()
+            } else {
+                format!("Sent via the API · token {}", t.from)
+            }
+        }
+        "automation" => "Sent by an automation".to_owned(),
         "task" => {
             if t.words.is_empty() {
                 "Task done".to_owned()
@@ -166,7 +174,7 @@ pub fn spans(evs: &[Event]) -> Vec<(Span, Range<usize>)> {
 /// after it, when it's open).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Piece {
-    Event(Event),
+    Event(Box<Event>),
     Turn(Span),
 }
 
@@ -194,7 +202,7 @@ pub fn fold(evs: &[Event], to_end: bool, open: impl Fn(&Span) -> Option<bool>) -
     let all = spans(evs);
     let last = all.len().checked_sub(1);
     for (i, (s, r)) in all.into_iter().enumerate() {
-        out.extend(evs[at..r.start].iter().cloned().map(Piece::Event));
+        out.extend(evs[at..r.start].iter().cloned().map(Box::new).map(Piece::Event));
         let latest = to_end && Some(i) == last;
         let shown = if s.end.is_none() || latest { None } else { open(&s) };
         let events = shown != Some(false);
@@ -202,11 +210,11 @@ pub fn fold(evs: &[Event], to_end: bool, open: impl Fn(&Span) -> Option<bool>) -
             out.push(Piece::Turn(s));
         }
         if events {
-            out.extend(evs[r.clone()].iter().cloned().map(Piece::Event));
+            out.extend(evs[r.clone()].iter().cloned().map(Box::new).map(Piece::Event));
         }
         at = r.end;
     }
-    out.extend(evs[at..].iter().cloned().map(Piece::Event));
+    out.extend(evs[at..].iter().cloned().map(Box::new).map(Piece::Event));
     out
 }
 
@@ -373,7 +381,7 @@ pub fn TurnRow(session: String, span: Span, timeline: Timeline) -> impl IntoView
         <div id=format!("{session}-t{start}") class="c6-fold">
             <button class=ROW aria-expanded=move || open().to_string() title=crate::when::full(span.at)
                 on:click=move |_| tl.toggle(start, end)>
-                <span class="w-3 shrink-0 text-xs text-muted">{move || if open() { crate::icons::chevron_down().into_any() } else { crate::icons::chevron_right().into_any() }}</span>
+                <span class="w-3 shrink-0 text-xs text-muted">{move || if open() { crate::icons::chevron_down() } else { crate::icons::chevron_right() }}</span>
                 <span class="min-w-0 flex-1">
                     <span class="block truncate font-medium">{by}</span>
                     {move || Some(said()).filter(|s| !s.is_empty()).map(|s| view! { <span class="block truncate text-xs text-soft">{s}</span> })}
@@ -486,7 +494,7 @@ pub fn Outline(timeline: Timeline, #[prop(into)] on_go: Callback<TimelineTurn>) 
                         <div>
                             <button class=format!("{LINE} font-medium") aria-expanded=move || is_open().to_string()
                                 on:click=move |_| open.update(|o| if !o.remove(&start) { o.insert(start); })>
-                                <span class="w-3 shrink-0 text-muted">{move || if is_open() { crate::icons::chevron_down().into_any() } else { crate::icons::chevron_right().into_any() }}</span>
+                                <span class="w-3 shrink-0 text-muted">{move || if is_open() { crate::icons::chevron_down() } else { crate::icons::chevron_right() }}</span>
                                 <span class="tabular-nums">{label}</span>
                                 {h.running.then(|| view! { <span class="size-1.5 shrink-0 self-center animate-pulse rounded-full bg-blue-500"></span> })}
                             </button>
@@ -575,6 +583,9 @@ mod tests {
         assert_eq!(who(&by("you", "", "fix the pager")), "You: fix the pager");
         assert_eq!(who(&by("session", "Release prep", "is it in?")), "From Release prep");
         assert_eq!(who(&by("session", "", "")), "From another session");
+        assert_eq!(who(&by("api", "c6-cli-zmbp", "Status")), "Sent via the API · token c6-cli-zmbp");
+        assert_eq!(who(&by("api", "", "Status")), "Sent via the API");
+        assert_eq!(who(&by("automation", "", "Status")), "Sent by an automation");
         assert_eq!(who(&by("task", "", "npm test")), "Task done: npm test");
         assert_eq!(who(&by("task", "", "")), "Task done");
         assert_eq!(who(&by("doc", "Q3 plan", "")), "Comments on Q3 plan");

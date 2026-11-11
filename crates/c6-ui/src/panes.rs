@@ -1,6 +1,6 @@
 //! A session's panes: its Changes, Terminal, Files and Outputs, each a view
-//! of its own beside the session (the transcript is never swapped out), or
-//! in a tile of its own when the tile has no room for both.
+//! of its own beside the session (the transcript is never swapped out).
+//! Narrow tiles retain both panes and show one at a time, with Back.
 
 use c6_api::{EventKind, SessionStatus};
 use leptos::prelude::*;
@@ -8,9 +8,6 @@ use leptos::prelude::*;
 use crate::api;
 use crate::util::ErrorBox;
 use crate::workspace::{ColumnCtx, How, ScrollBox, View, Workspace};
-
-/// How wide a tile must be for a pane beside the transcript.
-const BESIDE_MIN: i32 = 1100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pane {
@@ -40,12 +37,11 @@ impl Pane {
     }
 }
 
-/// Opens `view` from a session's column so the transcript stays in sight:
-/// beside it when its tile is wide enough for both (and on a phone, where
-/// it then fills the screen, ‹ going back), else in a tile of its own;
-/// `new_tile` (⌘/Ctrl-click): a new tile.
+/// Opens `view` beside its session in the same tile. Narrow tiles and phones
+/// use the workspace's retained single-pane navigation; only an explicit
+/// `new_tile` (⌘/Ctrl-click) makes a separate tile.
 pub fn open(col: ColumnCtx, view: View, new_tile: bool) {
-    if new_tile || !roomy(&col) {
+    if new_tile {
         col.open(view, How::NewTile);
     } else {
         col.ws.open_after(col.tile, col.col, view);
@@ -55,8 +51,18 @@ pub fn open(col: ColumnCtx, view: View, new_tile: bool) {
 /// Where a session's pane is, and whether it's on screen now (tracked: its
 /// button shows it pressed while it is).
 pub fn shown(ws: Workspace, pane: Pane, id: &str) -> Option<(u64, u64, bool)> {
-    let one_pane = crate::util::phone();
-    ws.layout.with(|l| l.find_pane(pane, id).map(|(t, c)| (t, c, l.pane_shown(t, c, one_pane))))
+    ws.layout.with(|l| {
+        l.find_pane(pane, id).map(|(t, c)| {
+            // The same 40rem boundary as ColumnView's /tile container query.
+            // A narrow desktop tile, like a phone, can have an open pane that
+            // Back has hidden: the next click must reveal it, not close it.
+            let narrow = document()
+                .get_element_by_id(&format!("col-{c}"))
+                .and_then(|el| el.closest("section").ok().flatten())
+                .is_some_and(|tile| tile.client_width() < 640);
+            (t, c, l.pane_shown(t, c, crate::util::phone() || narrow))
+        })
+    })
 }
 
 /// A session's pane: closed if it's on screen, brought forward if it's
@@ -92,15 +98,6 @@ pub fn show_output(col: ColumnCtx, id: &str, output: String) {
     }
 }
 
-/// Whether the column's tile has room for a pane beside the transcript.
-fn roomy(col: &ColumnCtx) -> bool {
-    crate::util::phone()
-        || document()
-            .get_element_by_id(&col.root_id())
-            .and_then(|el| el.closest("section").ok().flatten())
-            .is_some_and(|tile| tile.client_width() >= BESIDE_MIN)
-}
-
 /// A session's pane as a view: the session's Changes, Terminal or Files in
 /// the folder it works in (its worktree, if it has one), or its Outputs
 /// (`output`: the one shown; empty for the newest).
@@ -111,16 +108,14 @@ pub fn SessionPane(id: String, pane: Pane, #[prop(optional)] output: String) -> 
         let chosen = RwSignal::new(Some(output).filter(|o| !o.is_empty()));
         return view! {
             <ScrollBox>
-                <div class="px-4 py-3"><crate::outputs::Outputs session=id events=feed.events chosen /></div>
+                <div class="px-4 py-3"><crate::outputs::Outputs session=id events=feed.events synced=feed.synced chosen /></div>
             </ScrollBox>
         }
         .into_any();
     }
     let live = api::live();
-    let detail = LocalResource::new({
-        let id = id.clone();
-        move || api::session(id.clone())
-    });
+    let data = crate::resources::session(id.clone());
+    let detail = data.detail;
     // Where it works: its first event says. Asked again once it has started.
     let started = {
         let id = id.clone();
@@ -128,26 +123,48 @@ pub fn SessionPane(id: String, pane: Pane, #[prop(optional)] output: String) -> 
     };
     let first = LocalResource::new(move || {
         started.track();
-        api::session_events_before(id.clone(), 2, 1, None)
+        let (folder, id) = (data.folder.get(), id.clone());
+        async move {
+            if folder.is_none() {
+                let evs = api::session_events_before(id, 2, 1, None).await.ok()?;
+                evs.into_iter().find_map(|e| match e.kind {
+                    EventKind::Started { cwd, .. } => Some(cwd),
+                    _ => None,
+                })
+            } else {
+                folder
+            }
+        }
     });
+    Effect::new(move || {
+        if let Some(folder) = first.get().flatten()
+            && data.folder.get_untracked().as_ref() != Some(&folder)
+        {
+            data.folder.set(Some(folder));
+        }
+    });
+    let session = Signal::derive(move || detail.get().map(|r| r.map(|d| d.session)));
+    let folder = Signal::derive(move || data.folder.get().or_else(|| first.get().flatten()));
+    view! { <PaneContent pane session folder /> }.into_any()
+}
+
+/// Native pane views consume their parent's confirmed session and actual
+/// folder. They never fetch session metadata before asking the worker.
+#[component]
+fn PaneContent(pane: Pane, session: Signal<Option<Result<c6_api::Session, String>>>, folder: Signal<Option<String>>) -> impl IntoView {
     let note = |text: &'static str| view! { <p class="py-6 text-center text-sm text-muted">{text}</p> }.into_any();
     view! {
         <ScrollBox>
             <div class="px-4 py-3">
                 <Suspense fallback=|| ()>
                     {move || {
-                        let d = match detail.get()? {
-                            Ok(d) => d,
+                        let s = match session.get()? {
+                            Ok(s) => s,
                             Err(e) => return Some(view! { <ErrorBox message=e /> }.into_any()),
                         };
-                        let cwd = first.get()?.ok().and_then(|evs| {
-                            evs.into_iter().find_map(|e| match e.kind {
-                                EventKind::Started { cwd, .. } => Some(cwd),
-                                _ => None,
-                            })
-                        });
-                        let w = d.session.worker_id.to_string();
-                        let ssh = d.session.ssh;
+                        let cwd = folder.get();
+                        let w = s.worker_id.to_string();
+                        let ssh = s.ssh;
                         Some(match (pane, cwd) {
                             (_, None) => note("Available once the session has started."),
                             // The worker can't look at that machine's files.

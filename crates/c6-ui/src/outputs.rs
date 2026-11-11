@@ -4,6 +4,7 @@
 use c6_api::{Event, EventKind};
 use leptos::prelude::*;
 
+use crate::icons::{Icon, Size, icon};
 use crate::util::BUTTON_QUIET;
 
 #[derive(Clone, PartialEq)]
@@ -14,7 +15,7 @@ struct Version {
     size: u64,
 }
 
-/// Outputs by name, in the order first published; versions oldest first.
+/// Outputs by name, oldest latest-publication first; versions oldest first.
 fn outputs(events: &[Event]) -> Vec<(String, Vec<Version>)> {
     let mut out: Vec<(String, Vec<Version>)> = Vec::new();
     for e in events {
@@ -26,6 +27,7 @@ fn outputs(events: &[Event]) -> Vec<(String, Vec<Version>)> {
             }
         }
     }
+    out.sort_by_key(|(_, vs)| vs.last().map_or(0, |v| v.seq));
     out
 }
 
@@ -53,7 +55,7 @@ fn kind(name: &str, mime: &str) -> String {
 /// A session's Outputs pane. `chosen`: the output shown (by name; the
 /// newest when `None`), as its glance picked it.
 #[component]
-pub fn Outputs(session: String, events: RwSignal<Vec<Event>>, chosen: RwSignal<Option<String>>) -> impl IntoView {
+pub fn Outputs(session: String, events: RwSignal<Vec<Event>>, synced: RwSignal<bool>, chosen: RwSignal<Option<String>>) -> impl IntoView {
     let session = StoredValue::new(session);
     let list = Memo::new(move |_| events.with(|e| outputs(e)));
     // The chosen output (by name) and version (by seq); default the newest.
@@ -66,12 +68,17 @@ pub fn Outputs(session: String, events: RwSignal<Vec<Event>>, chosen: RwSignal<O
         Some((name, versions, v))
     });
     view! {
-        <div class="grid gap-4 py-2 md:grid-cols-[14rem_1fr]">
+        <div class="grid grid-cols-1 gap-4 py-2 @xl/view:grid-cols-[14rem_1fr]">
             <div class="space-y-1">
                 {move || {
                     let l = list.get();
                     if l.is_empty() {
-                        return view! { <p class="text-sm text-muted">"Nothing published yet. Deliverables the agent publishes (reports, decks, charts, documents) appear here."</p> }.into_any();
+                        let message = if synced.get() {
+                            "Nothing published yet. Deliverables the agent publishes (reports, decks, charts, documents) appear here."
+                        } else {
+                            "Loading published files…"
+                        };
+                        return view! { <p class="text-sm text-muted" role="status">{message}</p> }.into_any();
                     }
                     l.into_iter().rev().map(|(name, vs)| {
                         let latest = vs.last().cloned().expect("a version");
@@ -96,12 +103,12 @@ pub fn Outputs(session: String, events: RwSignal<Vec<Event>>, chosen: RwSignal<O
                         <div class="flex flex-wrap items-center gap-2">
                             <h3 class="min-w-0 flex-1 truncate font-medium">{v.title.clone()}<span class="ml-2 font-mono text-xs text-muted">{name.clone()}</span></h3>
                             {(n > 1).then(|| view! {
-                                <select class="rounded-md border border-zinc-300 bg-white px-1 py-0.5 text-xs dark:border-zinc-700 dark:bg-zinc-900"
+                                <select class="max-w-full rounded-md border border-zinc-300 bg-white px-1 py-0.5 text-xs dark:border-zinc-700 dark:bg-zinc-900"
                                     prop:value=v.seq.to_string() on:change=move |ev| version.set(event_target_value(&ev).parse().ok())>
-                                    {versions.iter().enumerate().rev().map(|(i, x)| view! { <option value=x.seq.to_string()>{format!("v{}{}", i + 1, if i + 1 == n { " (latest)" } else { "" })}</option> }).collect_view()}
+                                    {versions.iter().enumerate().rev().map(|(i, x)| view! { <option value=x.seq.to_string()>{format!("v{}{} — {}", i + 1, if i + 1 == n { " (latest)" } else { "" }, x.title)}</option> }).collect_view()}
                                 </select>
                             })}
-                            <a class=format!("{BUTTON_QUIET} text-xs") href=u.clone() target="_blank" rel="noopener">"Open "{crate::icons::arrow_up_right()}</a>
+                            <a class=format!("{BUTTON_QUIET} text-xs") href=u.clone() target="_blank" rel="noopener">"Open "{icon(Icon::ExternalLink, Size::S14)}</a>
                             <a class=format!("{BUTTON_QUIET} text-xs") href=format!("{u}?download=1")>"Download"</a>
                         </div>
                         <Preview url=u mime=v.mime.clone() />
@@ -138,8 +145,8 @@ pub fn Recent(events: RwSignal<Vec<Event>>, #[prop(into)] on_pick: Callback<Opti
                     </button>
                 }
             }).collect_view()}
-            {(n > 3).then(|| view! {
-                <button class="px-1.5 text-[11px] text-muted hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" on:click=move |_| on_pick.run(None)>{format!("All {n}")}</button>
+            {(n > 0).then(|| view! {
+                <button class="min-h-7 px-1.5 text-[11px] text-muted hover:text-zinc-900 hover:underline pointer-coarse:min-h-11 dark:hover:text-zinc-100" on:click=move |_| on_pick.run(None)>"Show all"</button>
             })}
         }
     }
@@ -186,7 +193,7 @@ pub fn published_line(session: &str, seq: u64, name: &str, title: &str, mime: &s
                 <span>"Published"</span>
                 <span class="font-medium text-zinc-700 dark:text-zinc-300">{title.to_owned()}</span>
                 <span class="font-mono">{format!("{name} · {}", size(size_bytes))}</span>
-                <a class="underline" href=u.clone() target="_blank" rel="noopener">"open"</a>
+                <a class="underline" href=u.clone() target="_blank" rel="noopener">"open "{icon(Icon::ExternalLink, Size::S14)}</a>
                 <span>"· see Outputs ("{crate::icons::ellipsis()}")"</span>
             </p>
             {image.then(|| view! {
@@ -197,4 +204,44 @@ pub fn published_line(session: &str, seq: u64, name: &str, title: &str, mime: &s
         </div>
     }
     .into_any()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn republished_files_sort_by_their_latest_publication_and_keep_old_titles() {
+        let publication = |seq, name: &str, title: &str| Event {
+            seq,
+            ts: 0,
+            kind: EventKind::Output { name: name.into(), title: title.into(), mime: "text/html".into(), size: 42 },
+        };
+        let grouped = outputs(&[
+            publication(2, "report.html", "Original report"),
+            publication(3, "other.html", "Other"),
+            publication(27, "report.html", "Latest report"),
+        ]);
+        assert_eq!(grouped.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["other.html", "report.html"]);
+        assert_eq!(
+            grouped[1].1.iter().map(|v| (v.seq, v.title.as_str())).collect::<Vec<_>>(),
+            [(2, "Original report"), (27, "Latest report")]
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn published_output_links_keep_the_external_arrow_and_existing_icons() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let html = published_line("s1", 1, "report.txt", "Report", "text/plain", 42).to_html();
+            let arrow = icon(Icon::ExternalLink, Size::S14).to_html();
+            let link = html.split("<a ").nth(1).unwrap().split("</a>").next().unwrap();
+            assert!(link.contains("target=\"_blank\""), "{html}");
+            assert!(link.contains(&arrow), "the link keeps its 14px external arrow: {html}");
+            assert!(html.contains(&crate::icons::package().to_html()), "keep the published icon: {html}");
+            assert!(html.contains(&crate::icons::ellipsis().to_html()), "keep the Outputs menu icon: {html}");
+            assert_eq!(html.matches("<svg").count(), 3, "{html}");
+        });
+    }
 }

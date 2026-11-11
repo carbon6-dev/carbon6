@@ -10,29 +10,43 @@ use crate::models::ModelInput;
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT};
 use crate::workspace::{How, View, use_workspace};
 
-/// The header button; ⌘J / Ctrl+J opens it too.
+/// One host, even with buttons in the desktop header and phone Sessions sheet.
+#[derive(Clone, Copy)]
+pub struct AskState(pub RwSignal<bool>);
+
 #[component]
-pub fn AskButton() -> impl IntoView {
-    let open = RwSignal::new(false);
+pub fn AskHost() -> impl IntoView {
+    let open = expect_context::<AskState>().0;
     let hotkey = window_event_listener(leptos::ev::keydown, move |ev| {
-        if ev.key().eq_ignore_ascii_case("j") && (ev.meta_key() || ev.ctrl_key()) {
+        if ev.key().eq_ignore_ascii_case("j") && crate::util::app_shortcut(&ev) {
             ev.prevent_default();
             open.set(true);
         }
     });
     on_cleanup(move || hotkey.remove());
     view! {
-        <button class="inline-flex items-center gap-1 rounded-md border border-zinc-300 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-200/60 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
-            title="Ask carbon6 to do or explain anything (⌘J)" on:click=move |_| open.set(true)>{crate::icons::sparkles()}" Ask"</button>
         <Show when=move || open.get()>
-            <AskBox on_close=Callback::new(move |()| open.set(false)) />
+            <leptos::portal::Portal><AskBox on_close=Callback::new(move |()| open.set(false)) /></leptos::portal::Portal>
         </Show>
+    }
+}
+
+/// The header or Sessions-sheet button; ⌘J / Ctrl+J opens the same dialog.
+#[component]
+pub fn AskButton(#[prop(optional)] touch: bool) -> impl IntoView {
+    let open = expect_context::<AskState>().0;
+    view! {
+        <button class=if touch { format!("{} min-h-11 min-w-11 px-1 text-xs text-zinc-700 dark:text-zinc-300", crate::components::BTN_QUIET) } else { "inline-flex items-center gap-1 rounded-md border border-zinc-300 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-200/60 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800".to_owned() }
+            title="Ask carbon6 to do or explain anything (⌘J)" on:click=move |_| open.set(true)>
+            <span class=if touch { "inline-flex h-5 items-center justify-center gap-1 rounded-full border border-zinc-300 px-1.5 dark:border-zinc-700" } else { "inline-flex items-center gap-1" }>{crate::icons::sparkles()}" Ask"</span>
+        </button>
     }
 }
 
 #[component]
 fn AskBox(on_close: Callback<()>) -> impl IntoView {
     let ws = use_workspace();
+    let pop = crate::util::escapable(|| true, move || on_close.run(()));
     let live = api::live();
     let text = crate::util::draft("ask");
     let error = RwSignal::new(None::<String>);
@@ -67,14 +81,14 @@ fn AskBox(on_close: Callback<()>) -> impl IntoView {
         });
     };
     view! {
-        <div class="fixed inset-0 z-40 flex items-start justify-center bg-black/40 px-4 pt-24" on:click=move |_| on_close.run(())>
-            <div class="w-full max-w-xl space-y-3 rounded-lg border border-zinc-200 bg-white p-4 shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
+        <div class="phone-dialog fixed inset-0 z-50 flex items-start justify-center bg-black/40 px-4 pt-24" on:click=move |_| on_close.run(())>
+            <div role="dialog" aria-modal="true" aria-label="Ask carbon6" data-pop=pop class="max-h-full w-full max-w-xl space-y-3 overflow-y-auto rounded-lg border border-zinc-200 bg-white p-4 shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
                 on:click=|ev| ev.stop_propagation()>
                 <div class="flex items-center gap-2">
                     <h2 class="font-medium">"Ask carbon6"</h2>
                     <span class="flex-1 text-xs text-muted">"anything you can do in the UI, or about your setup"</span>
                     <button class=format!("{BUTTON_QUIET} text-xs") title="Your Ask conversations: come back to one, or start one with a model of your choice"
-                        on:click=move |_| { on_close.run(()); ws.open(None, View::Chats, How::OwnTile); }>"Your conversations "{crate::icons::arrow_right()}</button>
+                        on:click=move |_| { on_close.run(()); ws.open(None, View::Chats, How::OwnTile); }>"Your conversations "{crate::icons::arrow_up_right()}</button>
                 </div>
                 <textarea node_ref=area class=format!("{INPUT} {} min-h-24", crate::util::GROWS)
                     placeholder="e.g. What can I do in carbon6? · Which models are set up for vision? · Create an enrollment token for a new worker"
@@ -97,8 +111,8 @@ fn AskBox(on_close: Callback<()>) -> impl IntoView {
 /// The assistant's model (Settings).
 #[component]
 pub fn AssistantSettings() -> impl IntoView {
-    let loaded = LocalResource::new(move || api::get_setting("assistant"));
-    let connections = LocalResource::new(api::connections);
+    let loaded = crate::resources::setting("assistant");
+    let connections = crate::resources::connections();
     let (conn, model) = (RwSignal::new(String::new()), RwSignal::new(String::new()));
     let note = RwSignal::new(None::<Result<String, String>>);
     Effect::new(move || {

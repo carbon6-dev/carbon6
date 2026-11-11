@@ -4,16 +4,16 @@ Status: being built (2026-10-16); §18 records what is built and where it differ
 
 ## 1. The problem
 
-Today an app *is* a realm (os.md §5): installing one creates a realm holding its code, its sessions and its data, and other realms reach in only through grants. A realm decides three things at once:
+Today an app *is* a realm (os.md §5): installing one creates a realm holding its code, its sessions and its data, and cross-realm API access uses grants. These API checks do not isolate agents or worker files (os.md §3.9). A realm decides three things at once:
 
-1. **Who can see data,** which is a question of trust: one business shouldn't see another's.
+1. **Which data its API requests address:** one business's lists and queries shouldn't mix in another's.
 2. **Who can change data,** which is a question of consistency: only the CRM knows what makes a relationship valid.
 3. **Where an app's code lives.**
 
 Tying the three together goes wrong for the apps we want:
 
 - **A service (decks).** A deck you make lands in the `decks` realm, out of your session list and away from your knowledge. Once made, it should be yours and need nothing more from decks.
-- **A processor (CRM).** It reads input (mail, business context), keeps working data of its own (summaries, scores), and publishes results (relationships) that add context to the input. As a realm it can only see its input through grants, and its results are hidden from the realm the input came from.
+- **A processor (CRM).** It reads input (mail, business context), keeps working data of its own (summaries, scores), and publishes results (relationships) that add context to the input. In a realm of its own, its ordinary API reads need grants for the input, and the source realm's ordinary API reads don't include its results.
 - **A mirror (Gmail).** It keeps a copy of data whose source of truth is elsewhere, and must be the only writer of that copy. Today it's built into the memex rather than written as an app (docs/knowledge.md §6).
 - **Many tenants.** Running unrelated businesses, you want a CRM for each, each fed from one business's data, with separate results. Today each is a realm wired up with its own grants.
 - **Silos.** Every app realm hides its data by default. But nobody knows in advance which app's data will be useful to which agent; that's the point of the knowledge graph.
@@ -22,7 +22,7 @@ And app realms can be edited in Settings, so a deployed app drifts from the vers
 
 ## 2. Principles
 
-- **Realms are trust domains, drawn by you.** Home, each business, anything that must stay apart. Installing an app never creates one.
+- **Realms organise; they don't isolate.** Home, each business, anything you want grouped separately. Installing an app never creates one. Realm-scoped APIs do not make a realm a security boundary around an agent.
 - **Reading is open within a realm.** Every agent in a realm can read every collection in it, and every piece of data describes itself well enough for an agent written by anyone to use it.
 - **Writing is owned.** Data belongs to whoever keeps its consistency: an app instance, or the realm itself. Only the owner changes it, directly or through the operations it publishes.
 - **The graph doesn't judge.** Links between things are claims, each with an owner; anyone may add their own, and readers decide whose to believe (9).
@@ -32,7 +32,7 @@ Unix works this way: `/etc/passwd` is readable by every program, and only `passw
 
 ## 3. Words
 
-- **Realm:** a trust domain (os.md §3), unchanged except that apps no longer get one each.
+- **Realm:** an organisational group with its own data, settings and API scopes (os.md §3), not a trust domain. Apps no longer get one each.
 - **Package:** immutable code: a manifest and its files, at a version (docs/packages.md).
 - **Instance:** a package version installed in a realm, with a name (the package's, by default), its own identity, its settings and the data it owns. One package can have many instances: `crm` in `biz-a` and `crm` in `biz-b`, or two in one realm with different names.
 - **Owner:** what may write a collection: an instance, or the realm (for collections you make by hand).
@@ -46,10 +46,10 @@ Unix works this way: `/etc/passwd` is readable by every program, and only `passw
 
 ## 4. Realms
 
-- **You create realms** for real boundaries. home is where you start; a realm per business is the multi-tenant case (11).
-- **Grants stay** the way data crosses realms (os.md §3.7): read, append, snapshot and call.
+- **You create realms** to organise work. home is where you start; a realm per business keeps its lists and settings together (11), not securely isolated.
+- **Grants stay** the explicit cross-realm API paths (os.md §3.7): read, append, snapshot and call. They do not govern worker files or delegated access.
 - **Policies and budgets** of a realm apply to everything in it, instances' sessions included. An instance can't override them.
-- **An untrusted package** is installed in a realm of its own, which you create for it, with only the grants you choose. No other mechanism is needed: a realm is the trust boundary, wherever the package is installed.
+- **An untrusted package** is not contained by putting it in a realm of its own, even on a worker limited to that realm. Commands run as the worker's OS user, and delegated work can borrow an agent's wider access. Realm membership and grants are not a sandbox; see os.md §3.9.
 
 ## 5. Instances
 
@@ -78,8 +78,8 @@ A package declares what it reads, and you approve it at install, the way Android
 ```
 
 - **Within its realm:** item kinds and things in the graph, and collections by name, or `<instance>.*` for everything an instance owns. Files on workers aren't covered: realms don't isolate them (os.md §3.9).
-- **Other realms:** only through grants, which the install asks for as today.
-- **What this limits** is what the *instance's* sessions can see. It never hides the instance's own data from anyone else in the realm: that stays open (2).
+- **Other realms through the API:** grants, which the install asks for as today.
+- **What this limits** is the *instance's* API reads, not its sessions' file access or delegated work. It never hides the instance's own data from anyone else in the realm: that stays open (2).
 
 ### 5.3 Sessions
 
@@ -88,7 +88,7 @@ An instance's sessions (from its templates, triggers and operations) run in its 
 - **Identity:** they act as the instance, `app:<instance>`, which is what history records (os.md §4.1) and what ownership checks (6).
 - **Labels:** `app:<instance>`, so they can be found and filtered. They show in the realm's lists.
 - **Configuration:** root's, then the realm's, then the instance's code. In its own sessions the instance's skills, agents and templates win over the realm's, because they are its logic. The realm's policies and budgets always apply.
-- **What it sees:** what 5.2 allows, plus everything it owns.
+- **What its API reads address:** what 5.2 allows, plus everything it owns. This is not a limit on OS or delegated access.
 
 ### 5.4 Settings
 
@@ -198,7 +198,7 @@ The graph is where data from every owner meets. It stores claims and doesn't dec
 - **You are an owner too.** A correction is a claim you make. Default policies rank you first (9.3), so you never edit an app's data; you outrank it.
 - **Identity is claims:** `same_as` and `not_same_as` between things, owned like any edge. Merging people stops being a judgment the store makes; whoever resolves identities writes claims, and readers choose whose to follow.
 - **A record's links** to things and items (os.md §4.1) are edges owned by the record's owner.
-- **Edges into another realm** exist only under a grant; a reader without one doesn't see them.
+- **Edges into another realm** are returned to realm-scoped API readers only under a grant; these checks don't cover direct file access.
 - **Removing an instance** retracts its claims, after offering an export. Each owner has a write quota, so a faulty app can't flood the graph.
 
 ### 9.3 Reader policies
@@ -241,7 +241,7 @@ A service makes something for whoever asked and keeps no hold on it.
 
 ## 11. Many tenants
 
-- **One instance per business realm.** `crm` in `biz-a` reads biz-a's mail and contacts and owns biz-a's relationships; `crm` in `biz-b` the same for biz-b. The realm boundary keeps them apart; neither instance is configured to be separate.
+- **One instance per business realm.** `crm` in `biz-a` reads biz-a's mail and contacts and owns biz-a's relationships; `crm` in `biz-b` the same for biz-b. Realm-scoped API queries keep their lists and data distinct; this does not isolate their agents or worker files.
 - **One package, one build.** Instances share their package version's code and kits; each has its own settings and data.
 - **Different versions:** each instance upgrades on its own, so one business can try a new version first.
 - **Across tenants on purpose:** an instance in one realm (a portfolio view in home, say) reads the businesses' published collections through grants you make.
@@ -286,14 +286,14 @@ A service makes something for whoever asked and keeps no hold on it.
 
 | Question | Decision | Why |
 |---|---|---|
-| What a realm is | A trust domain you draw; apps don't get one each | Trust boundaries are about people and businesses, not about which app made the data |
+| What a realm is | An organisational group you choose; apps don't get one each | Groups data and settings, with API scopes; not a security boundary |
 | Reading within a realm | Open to every agent, with data that describes itself | Nobody knows in advance which data will be useful to which agent; silos waste the knowledge graph |
 | Writing | Only the owner, directly or through its published operations; you can force, as a decision | Only the owner knows its invariants |
-| What an instance may read | Declared by the package, approved per instance at install | Limits what untrusted code sees without hiding anyone's data |
-| Untrusted packages | Install them in a realm of their own | The realm is already the trust boundary; no other mechanism needed |
+| What an instance may read | Declared by the package, approved per instance at install | Limits the instance's API reads without hiding anyone's data |
+| Untrusted packages | A realm of their own is not a sandbox | Shared-worker files and delegated access are not contained by realm membership |
 | Internal data | Readable, marked as internal and unstable | Open without inviting dependence on what may change |
 | Code | Immutable per version; settings, forks and upgrades are the only changes | A deployed app is exactly a version, so nothing drifts and nothing merges |
-| Many tenants | One instance per realm | The separation comes from the realm, not from configuring the app |
+| Many tenants | One instance per realm | Distinct lists and API scopes come from the realm, not from configuring the app; this is not tenant security isolation |
 | Service output | Handed off to the requester's realm, with provenance | It's the requester's work, and needs nothing more from the service |
 | Links and facts | Claims with owners; anyone adds their own, only the owner retracts | The graph stores and doesn't judge; each owner keeps its own consistency |
 | Which claims to believe | The reader's choice, with realm defaults per label, you first | Meaning is in the eye of the reader, but most readers want a sensible default |

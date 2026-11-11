@@ -60,3 +60,12 @@ opt-level = 1
 
 [profile.dev.package.tract-transformers]
 opt-level = 1
+
+# Trunk selects this only for the browser wasm. In particular, the head and
+# worker keep Cargo's normal release optimisation and unwinding behaviour.
+[profile.ui-release]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+opt-level = "z"

@@ -25,6 +25,38 @@ const LABEL: &str = "w-[4.5rem] shrink-0 text-[10px] font-medium uppercase track
 const HEADING: &str = "px-1.5 pt-2 text-[10px] font-medium uppercase tracking-wide text-muted";
 const MUTED: &str = "text-muted";
 
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+/// Copy the full identifier or a realm-qualified link, never the short label.
+#[component]
+pub fn CopySession(session: String, #[prop(optional)] link: bool, #[prop(optional)] inline: bool) -> impl IntoView {
+    let label = if link { "Copy session link" } else { "Copy session ID" };
+    let title = if inline { session.clone() } else { label.into() };
+    let text = if inline { short_id(&session) } else { label.into() };
+    let value =
+        if link { format!("{}{}", window().location().origin().unwrap_or_default(), View::session(session).href()) } else { session };
+    let value = StoredValue::new(value);
+    let status = RwSignal::new("");
+    view! {
+        <button class=if inline { "inline-flex items-center gap-2 rounded font-mono hover:underline" } else { crate::session::MENU_ITEM }
+            title=title aria-label=label on:click=move |_| {
+                spawn_local(async move {
+                    let result = wasm_bindgen_futures::JsFuture::from(window().navigator().clipboard().write_text(&value.get_value())).await;
+                    let _ = status.try_set(if result.is_ok() { "Copied" } else { "Couldn't copy" });
+                });
+            }>
+            {text}<span class="font-sans text-xs text-muted" role="status">{move || status.get()}</span>
+        </button>
+    }
+}
+
+#[component]
+fn SessionId(session: String) -> impl IntoView {
+    line("Session ID", view! { <CopySession session inline=true /> }, None)
+}
+
 /// The git state of a session's folder, (files changed, current branch):
 /// looked at when `at` (worker, folder) is known, and again after each
 /// turn. `None`: not a repository, or it couldn't be asked.
@@ -45,7 +77,7 @@ pub fn git_state(at: Memo<Option<(String, String)>>, events: RwSignal<Vec<Event>
 
 /// A line of the glance: a small label, what it says (wrapping rather than
 /// cut short), and what clicking it does.
-fn line(label: &'static str, body: impl IntoView + 'static, act: Option<Callback<web_sys::MouseEvent>>) -> AnyView {
+pub(crate) fn line(label: &'static str, body: impl IntoView + 'static, act: Option<Callback<web_sys::MouseEvent>>) -> AnyView {
     let label = view! { <span class=LABEL>{label}</span> };
     let body = view! { <span class="min-w-0 flex-1 [overflow-wrap:anywhere]">{body}</span> };
     match act {
@@ -98,7 +130,7 @@ pub fn Glance(chrome: SessionChrome, #[prop(optional, into)] on_done: Option<Cal
     };
 
     // Runs on: its worker (online or not), model and effort, runtime.
-    let connections = LocalResource::new(api::connections);
+    let connections = crate::resources::connections();
     let runtime = move || {
         let id = connection.get();
         let c = connections.get().and_then(Result::ok)?.into_iter().find(|c| c.id == id)?;
@@ -115,14 +147,19 @@ pub fn Glance(chrome: SessionChrome, #[prop(optional, into)] on_done: Option<Cal
         } else {
             let worker =
                 detail.get().and_then(Result::ok).map(|d| d.worker_name).unwrap_or_else(|| live.worker_name(&s.worker_id.to_string()));
-            let worker = match &s.ssh {
+            // Native title text stays plain; the visible label draws the relationship.
+            let worker_title = match &s.ssh {
                 Some(t) => format!("{worker} ⇄ {t}"),
-                None => worker,
+                None => worker.clone(),
             };
-            let title = format!("{worker}{} · {rest}", if online { "" } else { " (offline)" });
+            let title = format!("{worker_title}{} · {rest}", if online { "" } else { " (offline)" });
+            let worker = match &s.ssh {
+                Some(t) => crate::sessions::relationship_label(worker, t.clone()).into_any(),
+                None => worker.into_any(),
+            };
             view! {
                 <span class=format!("mr-1 inline-block size-1.5 rounded-full align-middle {}", if online { "bg-emerald-500" } else { "bg-zinc-400" })></span>
-                <span title=title>{format!("{worker} · {rest}")}</span>
+                <span title=title>{worker}" · "{rest}</span>
             }
             .into_any()
         };
@@ -174,32 +211,43 @@ pub fn Glance(chrome: SessionChrome, #[prop(optional, into)] on_done: Option<Cal
     let work_at = RwSignal::new(None::<(f64, f64)>);
     let serves = move || session.get().is_some_and(|s| s.parent_id.is_none() && !s.observed && s.instance.is_empty());
     let tag = Memo::new(move |_| session.get().and_then(|s| s.work).map(|w| w.id));
-    let item = LocalResource::new(move || {
+    let item = crate::resources::local(move || {
         tag.track();
         api::work_of(format!("session:{}", id.get_value()))
     });
     let work = move || {
-        serves().then(|| {
-            let body = move || match item.get().and_then(Result::ok).and_then(|w| w.into_iter().next()) {
-                Some(w) => view! {
-                    <span title=w.why.clone()>{crate::icons::diamond()}" "{w.fields.title}</span>
-                    <span class=MUTED>{format!(" · {}", c6_api::work::state_label(&w.state))}</span>
-                }
-                .into_any(),
-                None => view! { <span class=MUTED>"none"</span> }.into_any(),
-            };
-            line("Work", body, Some(Callback::new(move |ev: web_sys::MouseEvent| work_at.set(Some(below(&ev, 384.0))))))
-        })
+        if !serves() {
+            return None;
+        }
+        let w = item.get().and_then(Result::ok).and_then(|w| w.into_iter().next())?;
+        let body = view! {
+            <span title=w.why.clone()>{crate::icons::diamond()}" "{w.fields.title}</span>
+            <span class=MUTED>{format!(" · {}", c6_api::work::state_label(&w.state))}</span>
+        };
+        Some(line("Work", body, Some(Callback::new(move |ev: web_sys::MouseEvent| work_at.set(Some(below(&ev, 384.0)))))))
     };
 
     let labels_at = RwSignal::new(None::<(f64, f64)>);
     let labels = move || {
         let s = session.get()?;
         let all: Vec<String> = crate::labels::shown_auto(&s.auto_labels).into_iter().chain(s.labels).collect();
-        let body = if all.is_empty() {
-            view! { <span class=MUTED>"none"</span> }.into_any()
-        } else {
-            view! { <span class="font-mono text-[11px]" title=all.join(" ")>{all.join("  ")}</span> }.into_any()
+        if all.is_empty() {
+            return None;
+        }
+        // Only the summary is formatted; the editor keeps every raw label.
+        let body = view! {
+            <span class="inline-flex flex-wrap gap-1">
+                {all.into_iter().map(|label| {
+                    let (name, value) = label.split_once(':')
+                        .map(|(n, v)| (format!("{n}:"), v.to_owned()))
+                        .unwrap_or_else(|| (String::new(), label.clone()));
+                    view! {
+                        <span class="inline-flex max-w-full flex-wrap items-baseline gap-x-1 rounded bg-zinc-100 px-1.5 py-0.5 text-[11px] dark:bg-zinc-800" title=label>
+                            <span class="font-medium text-muted">{name}</span><span>{value}</span>
+                        </span>
+                    }
+                }).collect_view()}
+            </span>
         };
         Some(line("Labels", body, Some(Callback::new(move |ev: web_sys::MouseEvent| labels_at.set(Some(below(&ev, 384.0)))))))
     };
@@ -207,16 +255,12 @@ pub fn Glance(chrome: SessionChrome, #[prop(optional, into)] on_done: Option<Cal
     // Its watchers (docs/watchers.md §3): who follows it, each opening its
     // session, looked at again when the session's state changes.
     let moved = Signal::derive(move || session.get().map(|s| format!("{:?}", s.status)).unwrap_or_default());
-    let watchers = move || {
-        let _ = session.get()?;
-        Some(line("Watchers", view! { <crate::watchers::SessionWatchers session_id=id.get_value() moved /> }, None))
-    };
 
     let context_at = RwSignal::new(None::<(f64, f64)>);
     let context = move || {
         usage.with(|u| {
             let body = match u.context {
-                None => view! { <span class=MUTED>"known after the first model call"</span> }.into_any(),
+                None => view! { <span class=MUTED>"Not measured yet"</span> }.into_any(),
                 Some(used) => {
                     let pct = (used * 100).checked_div(u.context_window);
                     let full = pct.is_some_and(|p| p >= 80);
@@ -259,6 +303,7 @@ pub fn Glance(chrome: SessionChrome, #[prop(optional, into)] on_done: Option<Cal
 
     let published = Memo::new(move |_| events.with(|e| e.iter().any(|e| matches!(e.kind, EventKind::Output { .. }))));
     let show_output = move |name: Option<String>| {
+        chrome.remember_output_return();
         if let Some(c) = col {
             match name {
                 Some(n) => crate::panes::show_output(c, &id.get_value(), n),
@@ -271,13 +316,22 @@ pub fn Glance(chrome: SessionChrome, #[prop(optional, into)] on_done: Option<Cal
     view! {
         <div class="space-y-px">
             {waiting}
+            <SessionId session=id.get_value() />
             {runs_on}
             {place}
             {branch}
             {changes}
             {work}
             {labels}
-            {watchers}
+            <Show when=move || session.get().is_some()>
+                <div class="flex flex-wrap gap-x-3 px-1.5 py-1.5 text-[11px] text-muted">
+                    <Show when=serves>
+                        <button class="min-h-7 hover:underline pointer-coarse:min-h-11" on:click=move |ev| work_at.set(Some(below(&ev, 384.0)))>"Assign work"</button>
+                    </Show>
+                    <button class="min-h-7 hover:underline pointer-coarse:min-h-11" on:click=move |ev| labels_at.set(Some(below(&ev, 384.0)))>"Edit labels"</button>
+                </div>
+                <crate::watchers::SessionWatchers session_id=id.get_value() moved />
+            </Show>
             {context}
             <Show when=move || published.get()>
                 <div class=HEADING>"Newest outputs"</div>
@@ -335,7 +389,7 @@ pub fn Context(session: String, events: RwSignal<Vec<Event>>, usage: Memo<UsageS
         usage.with(|u| {
             let window = u.context_window;
             let Some(used) = u.context else {
-                return view! { <p class="py-1 text-xs text-muted">"Known after the first model call."</p> }.into_any();
+                return view! { <p class="py-1 text-xs text-muted">"Not measured yet"</p> }.into_any();
             };
             let system = (system_chars.get() / 4).min(used);
             let rest = used - system;
@@ -406,7 +460,8 @@ pub fn SessionDetails(session: String, usage: Memo<UsageStats>, #[prop(into)] on
         }
     });
     view! {
-        <div class="fixed inset-0 z-30 flex items-start justify-center overflow-y-auto bg-black/40 px-4 py-16" on:click=move |_| on_close.run(())
+        <leptos::portal::Portal>
+        <div class="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 px-4 py-16 text-sm text-zinc-900 dark:text-zinc-100" on:click=move |_| on_close.run(())
             on:keydown=move |ev| {
                 if ev.key() == "Escape" {
                     ev.stop_propagation();
@@ -419,19 +474,29 @@ pub fn SessionDetails(session: String, usage: Memo<UsageStats>, #[prop(into)] on
                     <h2 class="flex-1 font-medium">"Session details"</h2>
                     <button class=crate::icons::BAR_BUTTON title="Close (Esc)" aria-label="Close" on:click=move |_| on_close.run(())>{crate::icons::x()}</button>
                 </div>
+                <SessionId session=session.clone() />
                 <section class="space-y-1">
                     <h3 class="text-sm font-medium">"Usage"</h3>
                     <Usage usage />
                 </section>
-                <crate::labels::SessionConfig session />
+                <crate::labels::SessionConfig session=session.clone() />
             </div>
         </div>
+        </leptos::portal::Portal>
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_ids_show_eight_characters_without_changing_the_full_id() {
+        let id = "01a1b4ba-e2bb-7444-8962-fb70504fcd1d";
+        assert_eq!(short_id(id), "01a1b4ba");
+        assert_eq!(short_id("parent"), "parent");
+        assert_eq!(short_id(""), "");
+    }
 
     #[test]
     fn a_folder_is_shortened_to_its_last_two_parts() {

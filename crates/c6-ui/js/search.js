@@ -75,8 +75,14 @@
     reveal(root, id, termsJson) {
       const el = rootEl(root).querySelector("#" + CSS.escape(id));
       if (!el) return false;
-      for (let p = el; p; p = p.parentElement) if (p.tagName === "DETAILS") p.open = true;
-      el.querySelectorAll("details").forEach((d) => (d.open = true));
+      let opened = false;
+      const open = (d) => { if (!d.open) { d.open = true; opened = true; } };
+      for (let p = el; p; p = p.parentElement) if (p.tagName === "DETAILS") open(p);
+      el.querySelectorAll("details").forEach(open);
+      // The toggle mounts lazy tool/thinking bodies. Let it run before
+      // measuring/highlighting; the Rust reveal retry also handles nested
+      // blocks that only exist after their parent opens.
+      if (opened) return false;
       el.scrollIntoView({ block: "center" });
       el.classList.remove("c6-flash");
       void el.offsetWidth; // restart the animation

@@ -182,15 +182,7 @@ async fn session_queue_op(worker: &Arc<Worker>, p: &Value) -> anyhow::Result<Val
             let data = p["data"].as_str().filter(|d| !d.is_empty()).context("data required for an update")?;
             let data = b64.decode(data)?;
             let input: c6_proto::UserInput = c6_proto::UserInput::decode(&data[..])?;
-            Some(c6_agent::PendingInput {
-                command_id: command_id.clone(),
-                text: input.text,
-                attachments: input.attachments,
-                command: input.command,
-                wake: input.wake,
-                api_origin: input.api_origin,
-                ..Default::default()
-            })
+            Some(queued_input(command_id.clone(), input))
         }
         "cancel" => None,
         _ => bail!("op is update or cancel"),
@@ -208,6 +200,20 @@ async fn session_queue_op(worker: &Arc<Worker>, p: &Value) -> anyhow::Result<Val
                 Ok(json!({"state": "pending"}))
             }
         }
+    }
+}
+
+fn queued_input(command_id: String, input: c6_proto::UserInput) -> c6_agent::PendingInput {
+    c6_agent::PendingInput {
+        command_id,
+        text: input.text,
+        prompt: input.prompt,
+        attachments: input.attachments,
+        command: input.command,
+        wake: input.wake,
+        api_origin: input.api_origin,
+        human_origin: input.human_origin,
+        ..Default::default()
     }
 }
 
@@ -534,6 +540,31 @@ async fn git_log(dir: &Path) -> anyhow::Result<Value> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn queued_input_keeps_enriched_model_text_separate_from_original_text_and_human_origin() {
+        use prost::Message;
+
+        for prompt in ["", "original text plus scoped mention contents"] {
+            let input = c6_proto::UserInput {
+                text: "original [@Plan](c6:doc:d1)".into(),
+                prompt: prompt.into(),
+                human_origin: true,
+                wake: true,
+                attachments: vec![c6_proto::Attachment { name: "original.txt".into(), mime: "text/plain".into(), data: b"bytes".to_vec() }],
+                ..Default::default()
+            };
+            // The RPC uses the live schema, not the stored-command legacy decoder.
+            let decoded = c6_proto::UserInput::decode(input.encode_to_vec().as_slice()).unwrap();
+            let pending = queued_input("queued".into(), decoded);
+            assert_eq!(pending.command_id, "queued");
+            assert_eq!(pending.text, input.text);
+            assert_eq!(pending.prompt, prompt);
+            assert_eq!(pending.attachments, input.attachments);
+            assert!(pending.human_origin && pending.wake);
+            assert_eq!(pending.model_text(), if prompt.is_empty() { input.text.as_str() } else { prompt });
+        }
+    }
+
     async fn sh(dir: &Path, cmd: &str) {
         let ok = Command::new("sh").arg("-c").arg(cmd).current_dir(dir).status().await.unwrap().success();
         assert!(ok, "{cmd}");
@@ -553,10 +584,13 @@ mod tests {
         let identity = crate::Identity { meta, key_pem: String::new(), cert_pem: String::new(), ca_pem: String::new() };
         let worker = Worker::open(dir.path(), identity).await.unwrap();
         worker.overrides.lock().unwrap().kit_jobs = Some(true);
-        assert_eq!(crate::capabilities(&worker, false, true), vec!["queue_ops", "send_now", "kits"]);
-        assert_eq!(crate::capabilities(&worker, false, false), vec!["queue_ops", "send_now"]);
+        assert_eq!(crate::capabilities(&worker, false, true), vec!["queue_ops", "send_now", "user_input_prompt_v1", "kits"]);
+        assert_eq!(crate::capabilities(&worker, false, false), vec!["queue_ops", "send_now", "user_input_prompt_v1"]);
         worker.overrides.lock().unwrap().kit_jobs = Some(false);
-        assert_eq!(crate::capabilities(&worker, true, true), vec!["claude_code", "queue_ops", "send_now"]);
+        assert_eq!(
+            crate::capabilities(&worker, true, true),
+            vec!["claude_code", "claude_rewind", "claude_code_subagents_v1", "queue_ops", "send_now", "user_input_prompt_v1"]
+        );
         let e = handle(&worker, "kit.job", json!({"spec": {}, "command": []})).await.unwrap_err();
         assert!(e.to_string().contains("C6_KIT_JOBS=off"), "{e}");
     }

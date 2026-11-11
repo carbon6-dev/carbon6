@@ -111,7 +111,7 @@ pub fn LabelFilterBar() -> impl IntoView {
                 view! {
                     <span class="inline-flex items-center gap-1 rounded bg-sky-100 px-1.5 py-0.5 font-mono text-[11px] text-sky-800 dark:bg-sky-950 dark:text-sky-300">
                         {l}
-                        <button title="Remove this filter" on:click=move |_| filter.update(|f| f.retain(|x| *x != gone))>"×"</button>
+                        <button title="Remove this filter" aria-label="Remove this filter" on:click=move |_| filter.update(|f| f.retain(|x| *x != gone))>{crate::icons::icon(crate::icons::Icon::X, crate::icons::Size::S14)}</button>
                     </span>
                 }
             }).collect_view()}
@@ -158,7 +158,7 @@ pub fn LabelChip(
                 }
             }>{label}</button>
             {on_remove.map(|cb| view! {
-                <button class="opacity-60 hover:opacity-100" title="Remove this label" on:click=move |ev| { ev.stop_propagation(); cb.run(()); }>"×"</button>
+                <button class="opacity-60 hover:opacity-100" title="Remove this label" aria-label="Remove this label" on:click=move |ev| { ev.stop_propagation(); cb.run(()); }>{crate::icons::icon(crate::icons::Icon::X, crate::icons::Size::S14)}</button>
             })}
         </span>
     }
@@ -237,7 +237,7 @@ pub fn SessionLabels(session: String, labels: Vec<String>, auto_labels: Vec<Stri
                         on:blur=move |_| if draft.get_untracked().trim().is_empty() { adding.set(false) } else { add() } />
                 }.into_any()
             } else {
-                view! { <button class="rounded px-1 text-[11px] text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100" on:click=move |_| adding.set(true)>"+ label"</button> }.into_any()
+                view! { <button class="rounded px-1 text-[11px] text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100" on:click=move |_| adding.set(true)>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" label"</button> }.into_any()
             }}
             {move || error.get().map(|e| view! { <span class="text-xs text-red-600">{e}</span> })}
         </div>
@@ -276,7 +276,7 @@ fn ConfigLists(c: EffectiveConfig) -> impl IntoView {
                         let on = a.skipped.is_none();
                         view! {
                             <div class=format!("flex flex-wrap items-center gap-2 text-sm {}", if on { "" } else { "opacity-50" })>
-                                <span>{if on { crate::icons::check().into_any() } else { crate::icons::minus().into_any() }}</span>
+                                <span>{if on { crate::icons::check() } else { crate::icons::minus() }}</span>
                                 <span class="font-mono text-xs">{a.name}</span>
                                 {a.applies_to.into_iter().map(|l| view! { <LabelChip label=l auto=true /> }).collect_view()}
                                 {a.skipped.map(|s| view! { <span class="text-xs text-muted">{s}</span> })}

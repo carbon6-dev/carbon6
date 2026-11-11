@@ -6,11 +6,10 @@ use std::time::{Duration, Instant};
 
 use c6_core::{WorkerId, now_ms, protocol_compatible};
 use c6_proto::{
-    EnrollRequest, EnrollResponse, EventAck, HeadMsg, Hello, Pong, PtyFrame, SessionCommand, SessionCursor, Welcome, WorkerMsg,
+    EnrollRequest, EnrollResponse, EventAck, HeadMsg, Hello, Pong, PtyFrame, SessionCursor, Welcome, WorkerMsg,
     enrollment_server::Enrollment, head_msg, pty_frame, worker_hub_server::WorkerHub, worker_msg,
 };
 use futures::Stream;
-use prost::Message;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
@@ -163,7 +162,7 @@ impl WorkerHub for HubSvc {
                 st.memex_feed.wake();
             }
             info!(worker = %worker_id, name = %row.name, version = %hello.version, "worker attached");
-            let reason = serve_worker(&st, &guard, &mut inbound, &tx).await;
+            let reason = serve_worker(&st, &guard, &mut inbound, &tx, &hello.capabilities).await;
             st.store.touch_worker(worker_id, now_ms()).await.ok();
             info!(worker = %worker_id, %reason, "worker detached");
         });
@@ -177,6 +176,7 @@ async fn serve_worker(
     guard: &crate::registry::ConnGuard<'_>,
     inbound: &mut Streaming<WorkerMsg>,
     tx: &mpsc::Sender<Result<HeadMsg, Status>>,
+    capabilities: &[String],
 ) -> String {
     let worker_id = guard.worker_id;
     // Highest command seq sent on this connection; a new connection starts
@@ -192,7 +192,7 @@ async fn serve_worker(
             }
             _ = tokio::time::sleep_until(deadline.into()) => return "idle timeout".into(),
             _ = guard.deliver.notified() => {
-                match deliver_pending(st, worker_id, &mut delivered, tx).await {
+                match deliver_pending(st, worker_id, &mut delivered, tx, capabilities).await {
                     Ok(true) => continue,
                     Ok(false) => return "response stream closed".into(),
                     Err(e) => {
@@ -269,6 +269,7 @@ async fn deliver_pending(
     worker_id: WorkerId,
     delivered: &mut i64,
     tx: &mpsc::Sender<Result<HeadMsg, Status>>,
+    capabilities: &[String],
 ) -> anyhow::Result<bool> {
     loop {
         let rows = st.store.pending_commands(worker_id, *delivered).await?;
@@ -276,7 +277,36 @@ async fn deliver_pending(
             return Ok(true);
         }
         for row in rows {
-            let cmd = SessionCommand::decode(row.data.as_slice())?;
+            let mut cmd = c6_proto::decode_stored_command(&row.data)?;
+            // Use this stream's Hello, not a replacement in the registry.
+            let compatibility = match sessions::prepare_worker_subagents(capabilities, &mut cmd) {
+                Ok(()) if matches!(cmd.kind, Some(c6_proto::session_command::Kind::Input(_))) => {
+                    sessions::check_worker_subagent_input(st, capabilities, &cmd.session_id).await
+                }
+                result => result,
+            };
+            if let Err(error) = compatibility {
+                // A transient store failure or malformed saved spec is not
+                // a capability refusal: leave it pending for recovery.
+                if error.downcast_ref::<crate::UserError>().is_none() {
+                    return Err(error);
+                }
+                sessions::on_rejected(
+                    st,
+                    worker_id,
+                    c6_proto::CommandRejected { command_id: cmd.command_id, session_id: cmd.session_id, reason: error.to_string() },
+                )
+                .await?;
+                *delivered = row.seq;
+                // Rejecting Create also retires its queued inputs. Reload
+                // rather than sending those from this now-stale batch.
+                break;
+            }
+            if let Some(c6_proto::session_command::Kind::Input(input)) = &mut cmd.kind {
+                // Use this connection's Hello, not a replacement connection's
+                // capabilities while the previous delivery task is exiting.
+                sessions::prepare_worker_input(capabilities, input);
+            }
             if tx.send(Ok(head(head_msg::Msg::Command(cmd)))).await.is_err() {
                 return Ok(false);
             }
@@ -292,4 +322,257 @@ fn head(msg: head_msg::Msg) -> HeadMsg {
 fn internal(e: anyhow::Error) -> Status {
     warn!("internal error: {e:#}");
     Status::internal("internal error")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use c6_proto::{UserInput, session_command};
+    use prost::Message;
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct ForkInput {
+        #[prost(bool, tag = "16")]
+        human_origin: bool,
+    }
+
+    #[tokio::test]
+    async fn claude_code_subagent_choices_follow_the_receiving_hello_on_create_and_restore() {
+        let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        let choices = serde_json::json!([
+            {"id": "api", "name": "API", "kind": "openai_compat"},
+            {"id": "cc", "name": "Claude Code", "kind": "claude_code", "default_model": "opus"}
+        ])
+        .to_string();
+        for capable in [false, true] {
+            let worker = WorkerId::new();
+            let mut capabilities = vec!["claude_code".into()];
+            if capable {
+                capabilities.push("claude_code_subagents_v1".into());
+            }
+            let (tx, mut rx) = mpsc::channel(8);
+            // An unrelated/replacement capable worker is not evidence that
+            // the receiving connection implements Claude Code subagents.
+            let replacement = if capable { vec!["claude_code".into()] } else { vec!["claude_code_subagents_v1".into()] };
+            let guard = st.registry.attach(worker, now_ms(), tx.clone(), replacement, "worker");
+            let mut saved = Vec::new();
+            for restore in [false, true] {
+                let id = format!("choices-{capable}-{restore}");
+                let spec = c6_proto::CreateSession { subagent_connections_json: choices.clone(), ..Default::default() };
+                let kind = if restore {
+                    session_command::Kind::Restore(c6_proto::Restore { spec: Some(spec), ..Default::default() })
+                } else {
+                    session_command::Kind::Create(spec)
+                };
+                let data =
+                    c6_proto::SessionCommand { command_id: id.clone(), session_id: "session".into(), kind: Some(kind) }.encode_to_vec();
+                saved.push(data.clone());
+                st.store
+                    .enqueue_command(&crate::store::NewCommand { id: &id, session_id: "session", worker_id: worker, data, text: None })
+                    .await
+                    .unwrap();
+            }
+            let mut delivered = 0;
+            assert!(deliver_pending(st, worker, &mut delivered, &tx, &capabilities).await.unwrap());
+            for _ in 0..2 {
+                let message = rx.recv().await.unwrap().unwrap();
+                let Some(head_msg::Msg::Command(command)) = message.msg else { panic!("session command") };
+                let spec = match command.kind.unwrap() {
+                    session_command::Kind::Create(spec) => spec,
+                    session_command::Kind::Restore(restore) => restore.spec.unwrap(),
+                    _ => panic!("create or restore"),
+                };
+                let choices: Vec<c6_api::SubagentConnection> = serde_json::from_str(&spec.subagent_connections_json).unwrap();
+                assert_eq!(choices.iter().any(|c| c.kind == "claude_code"), capable);
+                assert!(choices.iter().any(|c| c.kind == "openai_compat"));
+            }
+            assert!(rx.try_recv().is_err());
+            let stored: Vec<_> = st.store.pending_commands(worker, 0).await.unwrap().into_iter().map(|c| c.data).collect();
+            assert_eq!(stored, saved, "wire filtering must leave the durable choices intact for a later worker");
+            drop(guard);
+        }
+        head.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_old_worker_never_receives_an_unsupported_saved_target_or_its_following_inputs() {
+        let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        let worker = WorkerId::new();
+        sqlx::query("UPDATE sessions SET worker_id = ?, connection_id = 'api', subagent_connection_id = 'cc', subagent_model = 'opus' WHERE id = 'session'")
+            .bind(worker.to_string())
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+        let target = c6_proto::ModelSpec {
+            connection_id: "cc".into(),
+            connection_kind: "claude_code".into(),
+            model: "opus".into(),
+            ..Default::default()
+        };
+        for (id, kind, text) in [
+            (
+                "restore",
+                session_command::Kind::Restore(c6_proto::Restore {
+                    spec: Some(c6_proto::CreateSession { subagent_target: Some(target.clone()), ..Default::default() }),
+                    ..Default::default()
+                }),
+                None,
+            ),
+            ("set", session_command::Kind::SetSubagentModel(c6_proto::SetSubagentModel { model: Some(target.clone()) }), None),
+            ("input", session_command::Kind::Input(UserInput { text: "continue".into(), ..Default::default() }), Some("continue")),
+        ] {
+            let data = c6_proto::SessionCommand { command_id: id.into(), session_id: "session".into(), kind: Some(kind) }.encode_to_vec();
+            st.store.enqueue_command(&crate::store::NewCommand { id, session_id: "session", worker_id: worker, data, text }).await.unwrap();
+        }
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut delivered = 0;
+        assert!(deliver_pending(st, worker, &mut delivered, &tx, &["claude_code".into()]).await.unwrap());
+        assert!(rx.try_recv().is_err(), "neither the target nor a later input may run in the wrong runtime");
+        let rejected: Vec<(String, String)> = sqlx::query_as("SELECT state, error FROM commands WHERE worker_id = ? ORDER BY seq")
+            .bind(worker.to_string())
+            .fetch_all(&st.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(rejected.len(), 3);
+        assert!(rejected.iter().all(|(state, error)| state == "rejected" && error.contains("claude_code_subagents_v1")));
+        let row = st.store.session("session").await.unwrap().unwrap();
+        assert_eq!((row.subagent_connection_id.as_str(), row.subagent_model.as_str()), ("cc", "opus"));
+
+        // Reconnecting an upgraded worker can use that unchanged target.
+        let command = c6_proto::SessionCommand {
+            command_id: "upgraded".into(),
+            session_id: "session".into(),
+            kind: Some(session_command::Kind::Create(c6_proto::CreateSession {
+                subagent_target: Some(target.clone()),
+                ..Default::default()
+            })),
+        };
+        st.store
+            .enqueue_command(&crate::store::NewCommand {
+                id: "upgraded",
+                session_id: "session",
+                worker_id: worker,
+                data: command.encode_to_vec(),
+                text: None,
+            })
+            .await
+            .unwrap();
+        assert!(deliver_pending(st, worker, &mut delivered, &tx, &["claude_code_subagents_v1".into()]).await.unwrap());
+        let Some(head_msg::Msg::Command(received)) = rx.recv().await.unwrap().unwrap().msg else { panic!("create") };
+        assert_eq!(received, command);
+
+        // Rejecting Create must also suppress inputs already fetched in
+        // that delivery batch, without overwriting its saved target.
+        let mut unsupported = command.clone();
+        unsupported.command_id = "unsupported-create".into();
+        let original = unsupported.encode_to_vec();
+        st.store
+            .enqueue_command(&crate::store::NewCommand {
+                id: "unsupported-create",
+                session_id: "session",
+                worker_id: worker,
+                data: original.clone(),
+                text: None,
+            })
+            .await
+            .unwrap();
+        let input = c6_proto::SessionCommand {
+            command_id: "after-create".into(),
+            session_id: "session".into(),
+            kind: Some(session_command::Kind::Input(UserInput { text: "do not run".into(), ..Default::default() })),
+        };
+        st.store
+            .enqueue_command(&crate::store::NewCommand {
+                id: "after-create",
+                session_id: "session",
+                worker_id: worker,
+                data: input.encode_to_vec(),
+                text: Some("do not run"),
+            })
+            .await
+            .unwrap();
+        assert!(deliver_pending(st, worker, &mut delivered, &tx, &["claude_code".into()]).await.unwrap());
+        assert!(rx.try_recv().is_err());
+        let row = st.store.session("session").await.unwrap().unwrap();
+        assert_eq!(row.status, "failed");
+        assert!(row.error.unwrap().contains("claude_code_subagents_v1"));
+        assert_eq!((row.subagent_connection_id.as_str(), row.subagent_model.as_str()), ("cc", "opus"));
+        let stored: Vec<u8> =
+            sqlx::query_scalar("SELECT data FROM commands WHERE id = 'unsupported-create'").fetch_one(&st.store.pool).await.unwrap();
+        assert_eq!(stored, original);
+        assert!(st.store.pending_commands(worker, delivered).await.unwrap().is_empty());
+        head.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stored_legacy_and_enriched_inputs_deliver_with_only_the_target_connections_prompt_capability() {
+        let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        for capable in [false, true] {
+            let worker = WorkerId::new();
+            let mut capabilities = vec!["queue_ops".into(), "send_now".into()];
+            if capable {
+                capabilities.push("user_input_prompt_v1".into());
+            }
+            for legacy in [true, false] {
+                let id = format!("{capable}-{legacy}");
+                let input = UserInput {
+                    text: "original [@Plan](c6:doc:d1)".into(),
+                    human_origin: true,
+                    prompt: if legacy { String::new() } else { "original text plus enriched document".into() },
+                    task_card_origin: c6_proto::TaskCardOrigin::Answer as i32,
+                    ..Default::default()
+                };
+                let data = if legacy {
+                    crate::store::tests::legacy_input_command(&id, "session", input)
+                } else {
+                    c6_proto::SessionCommand {
+                        command_id: id.clone(),
+                        session_id: "session".into(),
+                        kind: Some(session_command::Kind::Input(input)),
+                    }
+                    .encode_to_vec()
+                };
+                st.store
+                    .enqueue_command(&crate::store::NewCommand {
+                        id: &id,
+                        session_id: "session",
+                        worker_id: worker,
+                        data,
+                        text: Some("original"),
+                    })
+                    .await
+                    .unwrap();
+            }
+            let (tx, mut rx) = mpsc::channel(8);
+            // A replacing connection must not cause a prompt to be sent to
+            // the old connection whose own Hello did not advertise it.
+            let guard = st.registry.attach(worker, now_ms(), tx.clone(), vec!["user_input_prompt_v1".into()], "worker");
+            let mut delivered = 0;
+            assert!(deliver_pending(st, worker, &mut delivered, &tx, &capabilities).await.unwrap());
+            for legacy in [true, false] {
+                let message = rx.recv().await.unwrap().unwrap();
+                let Some(head_msg::Msg::Command(command)) = message.msg else { panic!("input command") };
+                assert_eq!(command.command_id, format!("{capable}-{legacy}"));
+                let Some(session_command::Kind::Input(input)) = command.kind else { panic!("input") };
+                assert_eq!(input.text, "original [@Plan](c6:doc:d1)");
+                assert!(input.human_origin);
+                assert_eq!(input.task_card_origin, c6_proto::TaskCardOrigin::Answer as i32);
+                assert_eq!(!input.prompt.is_empty(), capable && !legacy);
+                if !capable {
+                    ForkInput::decode(input.encode_to_vec().as_slice()).expect("old worker must not receive a string tag 16");
+                }
+                let stored = st.store.pending_input(&format!("{capable}-{legacy}")).await.unwrap().unwrap().2;
+                let Some(session_command::Kind::Input(saved)) = c6_proto::decode_stored_command(&stored).unwrap().kind else {
+                    panic!("saved input")
+                };
+                assert_eq!(!saved.prompt.is_empty(), !legacy, "wire downgrade must not erase saved enrichment");
+            }
+            assert!(rx.try_recv().is_err());
+            drop(guard);
+        }
+        head.shutdown().await.unwrap();
+    }
 }

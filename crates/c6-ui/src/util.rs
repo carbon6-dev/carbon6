@@ -6,6 +6,179 @@ use leptos::prelude::*;
 mod drafts;
 pub use drafts::attachments as draft_attachments;
 
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = c6Motion, js_name = reduced)]
+    pub fn reduced_motion() -> bool;
+    #[wasm_bindgen(js_namespace = c6Motion, js_name = off)]
+    fn motion_off() -> bool;
+    #[wasm_bindgen(js_name = c6FlipResize)]
+    fn watch_flip_resize(element: &web_sys::Element) -> js_sys::Function;
+    #[wasm_bindgen(js_name = c6FlipList)]
+    fn prepare_flip_list(element: &web_sys::Element, keys: &str);
+    #[wasm_bindgen(js_name = c6ToolReveal)]
+    fn tool_reveal(element: &web_sys::Element);
+}
+
+/// Retain an exiting body, not its interactivity. Callers set data-open and
+/// inert from the original state. Reopening cancels disposal, so CSS reverses
+/// from the displayed position instead of remounting or waiting on a timer.
+pub fn presence(open: impl Fn() -> bool + Send + Sync + 'static) -> Memo<bool> {
+    presence_signal(Signal::derive(open))
+}
+
+// Share the timer and effect machinery rather than specializing it for each caller.
+fn presence_signal(open: Signal<bool>) -> Memo<bool> {
+    let open = Memo::new(move |_| open.get());
+    let kept = RwSignal::new(false);
+    let timer = StoredValue::new(None::<TimeoutHandle>);
+    Effect::new(move || {
+        if let Some(timer) = timer.get_value() {
+            timer.clear();
+        }
+        if open.get() {
+            kept.set(true);
+        } else {
+            #[cfg(target_arch = "wasm32")]
+            let duration = if motion_off() {
+                0
+            } else if reduced_motion() {
+                80
+            } else {
+                300
+            };
+            #[cfg(not(target_arch = "wasm32"))]
+            let duration = 300;
+            timer.set_value(
+                set_timeout_with_handle(
+                    move || {
+                        kept.try_set(false);
+                    },
+                    std::time::Duration::from_millis(duration),
+                )
+                .ok(),
+            );
+        }
+    });
+    on_cleanup(move || {
+        if let Some(timer) = timer.get_value() {
+            timer.clear();
+        }
+    });
+    Memo::new(move |_| open.get() || kept.get())
+}
+
+/// A bounded card may opt into resize FLIP. Never attach this to streamed text
+/// or transcript rows: those must not measure or animate as tokens arrive.
+pub fn flip_resize(node: NodeRef<leptos::html::Div>) {
+    Effect::new(move || {
+        if let Some(el) = node.get() {
+            let dispose = send_wrapper::SendWrapper::new(watch_flip_resize(&el));
+            on_cleanup(move || {
+                let _ = dispose.call0(&wasm_bindgen::JsValue::NULL);
+            });
+        }
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn flip_list(node: NodeRef<leptos::html::Div>, next: &[String]) {
+    if let Some(el) = node.get_untracked() {
+        prepare_flip_list(&el, &serde_json::to_string(next).unwrap_or_default());
+    }
+}
+
+pub fn reveal_tool(ev: web_sys::Event) {
+    use wasm_bindgen::JsCast;
+    if let Some(el) = ev.current_target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
+        // Let the open signal mount its lazy body before measuring the reveal.
+        request_animation_frame(move || {
+            if el.is_connected() {
+                tool_reveal(&el);
+            }
+        });
+    }
+}
+
+/// A count's old and new values share a slot. The old one is decoration, not
+/// another announcement. Interruptions replace it, never queue more ticks.
+#[component]
+pub fn MotionCount(#[prop(into)] value: Signal<usize>) -> impl IntoView {
+    let old = RwSignal::new(None::<usize>);
+    #[cfg(target_arch = "wasm32")]
+    {
+        let current = RwSignal::new(value.get_untracked());
+        let timer = StoredValue::new(None::<TimeoutHandle>);
+        Effect::new(move || {
+            let next = value.get();
+            if next != current.get_untracked() {
+                old.set(Some(current.get_untracked()));
+                current.set(next);
+                if let Some(timer) = timer.get_value() {
+                    timer.clear();
+                }
+                timer.set_value(
+                    set_timeout_with_handle(
+                        move || {
+                            old.try_set(None);
+                        },
+                        std::time::Duration::from_millis(160),
+                    )
+                    .ok(),
+                );
+            }
+        });
+        on_cleanup(move || {
+            if let Some(timer) = timer.get_value() {
+                timer.clear();
+            }
+        });
+    }
+    view! {
+        <span class="c6-count">
+            {move || old.get().map(|n| view! { <span class="c6-count-out" aria-hidden="true">{n}</span> })}
+            <For each=move || vec![value.get()] key=|n| *n children=move |n| view! { <span class=move || if old.get().is_some() { "c6-count-in" } else { "" }>{n}</span> } />
+        </span>
+    }
+}
+
+/// Keep the app and its phone sheets in the *visible* viewport. Safari can
+/// overlay its keyboard without resizing 100dvh; Chromium may resize both.
+/// CSS applies these measurements only to phone layouts, not desktop tiles.
+pub fn watch_visible_viewport() {
+    use wasm_bindgen::{JsCast, closure::Closure};
+    let measure = || {
+        let w = window();
+        let height = w.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let (top, visible) = w.visual_viewport().map_or((0.0, height), |v| (v.offset_top(), v.height()));
+        if let Some(root) = document().document_element().and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok()) {
+            let style = root.style();
+            let _ = style.set_property("--c6-visible-top", &format!("{top}px"));
+            let _ = style.set_property("--c6-visible-height", &format!("{visible}px"));
+            let _ = style.set_property("--c6-keyboard-inset", &format!("{}px", (height - top - visible).max(0.0)));
+        }
+    };
+    measure();
+    let on = Closure::<dyn Fn()>::new(measure);
+    let callback = on.as_ref().unchecked_ref();
+    let _ = window().add_event_listener_with_callback("resize", callback);
+    let viewport = window().visual_viewport();
+    if let Some(v) = &viewport {
+        let _ = v.add_event_listener_with_callback("resize", callback);
+        let _ = v.add_event_listener_with_callback("scroll", callback);
+    }
+    let hooks = send_wrapper::SendWrapper::new((viewport, on));
+    on_cleanup(move || {
+        let (viewport, on) = &*hooks;
+        let callback = on.as_ref().unchecked_ref();
+        let _ = window().remove_event_listener_with_callback("resize", callback);
+        if let Some(v) = viewport {
+            let _ = v.remove_event_listener_with_callback("resize", callback);
+            let _ = v.remove_event_listener_with_callback("scroll", callback);
+        }
+    });
+}
+
 pub fn now_ms() -> i64 {
     js_sys::Date::now() as i64
 }
@@ -54,6 +227,9 @@ pub fn StatusPill(status: SessionStatus) -> impl IntoView {
 /// its placeholder) is sized to show all of it: measured as if typed, then
 /// emptied again. Without one, as `fit`.
 pub fn fit_hint(el: &web_sys::HtmlTextAreaElement, hint: Option<&str>) {
+    if content_sizing() {
+        return;
+    }
     if el.client_width() == 0 {
         return;
     }
@@ -70,6 +246,9 @@ pub fn fit_hint(el: &web_sys::HtmlTextAreaElement, hint: Option<&str>) {
 }
 
 pub fn fit(el: &web_sys::HtmlTextAreaElement) {
+    if content_sizing() && el.class_name().split_whitespace().any(|c| c == "grows") {
+        return;
+    }
     // Hidden tiles have no layout: scrollHeight would turn a restored draft
     // into a zero-height box. Leave even its existing inline style alone.
     if el.client_width() == 0 {
@@ -99,14 +278,35 @@ pub fn autosize(node: NodeRef<leptos::html::Textarea>, track: impl Fn() + 'stati
 /// Like `autosize`, preserving the placeholder's size on reveal and resize.
 pub fn autosize_hint(node: NodeRef<leptos::html::Textarea>, track: impl Fn() + 'static, hint: impl Fn() -> Option<String> + 'static) {
     use wasm_bindgen::JsCast;
-    let hint = StoredValue::new_local(hint);
-    let refit = move || {
-        request_animation_frame(move || {
-            if let Some(el) = node.try_get_untracked().flatten() {
-                let hint = hint.try_with_value(|h| untrack(h)).flatten();
-                fit_hint(&el, hint.as_deref());
+    if content_sizing() {
+        // Native sizing includes the placeholder and reacts to width/visibility
+        // changes without a measurement, observer, or per-keystroke frame.
+        Effect::new(move || {
+            if let Some(el) = node.get() {
+                let _ = el.set_attribute("data-c6-autosize", "");
             }
-        })
+        });
+        return;
+    }
+    let hint = StoredValue::new_local(hint);
+    let frame = StoredValue::new(None::<leptos::leptos_dom::helpers::AnimationFrameRequestHandle>);
+    let refit = move || {
+        // Text, resize and width notifications share one fit per frame.
+        // A duplicate height:auto can clamp a sibling transcript in WebKit
+        // without another net resize for its observer to notice.
+        let Some(None) = frame.try_get_value() else { return };
+        frame.set_value(
+            request_animation_frame_with_handle(move || {
+                if frame.try_update_value(|frame| *frame = None).is_none() {
+                    return;
+                }
+                if let Some(el) = node.try_get_untracked().flatten() {
+                    let hint = hint.try_with_value(|h| untrack(h)).flatten();
+                    fit_hint(&el, hint.as_deref());
+                }
+            })
+            .ok(),
+        );
     };
     Effect::new(move || {
         track();
@@ -116,6 +316,9 @@ pub fn autosize_hint(node: NodeRef<leptos::html::Textarea>, track: impl Fn() + '
     let resized = window_event_listener(leptos::ev::resize, move |_| refit());
     let visible = window_event_listener_untyped("visibilitychange", move |_| refit());
     on_cleanup(move || {
+        if let Some(f) = frame.try_update_value(Option::take).flatten() {
+            f.cancel();
+        }
         resized.remove();
         visible.remove();
     });
@@ -154,6 +357,10 @@ pub fn autosize_hint(node: NodeRef<leptos::html::Textarea>, track: impl Fn() + '
     });
 }
 
+fn content_sizing() -> bool {
+    web_sys::css::supports_with_value("field-sizing", "content").unwrap_or(false)
+}
+
 /// The class of a message box that grows with its text up to 40% of the
 /// window, then scrolls.
 pub const GROWS: &str = "grows max-h-[40dvh] resize-none overflow-y-auto";
@@ -168,6 +375,32 @@ pub fn touch_first() -> bool {
 /// needs 48rem of width and 32rem of height (`md` in the style).
 pub fn phone() -> bool {
     !window().match_media("(min-width: 48rem) and (min-height: 32rem)").ok().flatten().is_some_and(|m| m.matches())
+}
+
+fn mac_platform(platform: &str) -> bool {
+    platform.starts_with("Mac")
+}
+
+fn shortcut_modifiers(mac: bool, meta: bool, ctrl: bool, alt: bool, shift: bool) -> bool {
+    !alt && !shift && if mac { meta && !ctrl } else { ctrl && !meta }
+}
+
+/// Global app commands use this browser's command modifier, never terminal
+/// keystrokes. Check focus too: a window-dispatched event may have no element
+/// target, and a child may already have handled it before it bubbles here.
+pub fn app_shortcut(ev: &web_sys::KeyboardEvent) -> bool {
+    use wasm_bindgen::JsCast;
+
+    if ev.default_prevented() || ev.is_composing() {
+        return false;
+    }
+    let mac = mac_platform(&window().navigator().platform().unwrap_or_default());
+    if !shortcut_modifiers(mac, ev.meta_key(), ev.ctrl_key(), ev.alt_key(), ev.shift_key()) {
+        return false;
+    }
+    let in_terminal = |el: web_sys::Element| el.closest(".xterm").ok().flatten().is_some();
+    !ev.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()).is_some_and(in_terminal)
+        && !document().active_element().is_some_and(in_terminal)
 }
 
 /// The key that sends a message box: Enter (Shift+Enter for a new line);
@@ -196,25 +429,15 @@ pub fn storage_set(key: &str, value: &str) {
     storage_set_global(&placed_key(key), value);
 }
 
-pub fn storage_remove(key: &str) {
-    if let Ok(Some(s)) = window().local_storage() {
-        let _ = s.remove_item(&placed_key(key));
-    }
-}
-
 /// A message box's text, kept in this browser until it's sent
 /// (`c6.draft.<key>`): a panel that shows something else for a moment, or a
 /// popup closed by mistake, gives it back as it was.
 pub fn draft(key: &str) -> RwSignal<String> {
-    let key = format!("c6.draft.{key}");
-    let text = RwSignal::new(storage_get(&key).unwrap_or_default());
-    Effect::new(move || text.with(|t| if t.is_empty() { storage_remove(&key) } else { storage_set(&key, t) }));
-    text
+    drafts::text(key)
 }
 
 /// Drops a draft that was sent, from code that may outlive its box.
 pub fn forget_draft(key: &str) {
-    storage_remove(&format!("c6.draft.{key}"));
     drafts::forget(key);
 }
 
@@ -246,9 +469,8 @@ fn storage_remove_global(key: &str) {
     }
 }
 
-pub const INPUT: &str = "w-full rounded-md border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-700 dark:bg-zinc-900";
-pub const BUTTON: &str = "rounded-md bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300";
-pub const BUTTON_QUIET: &str = "rounded-md px-3 py-1.5 text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800";
+pub use crate::components::INPUT;
+pub use crate::components::{BTN_PRIMARY as BUTTON, BTN_QUIET as BUTTON_QUIET};
 
 /// A short notice at the bottom of the screen, with Undo for what can be
 /// undone (archiving), instead of asking first.
@@ -289,23 +511,51 @@ impl Notice {
 #[component]
 pub fn NoticeHost() -> impl IntoView {
     let notice = Notice::get();
-    move || {
-        notice.shown.get().map(|(_, text, undo)| {
-            view! {
-                <div class="notice-safe pointer-events-none fixed inset-x-0 bottom-0 z-50 flex justify-center px-4" role="status">
-                    <div class="pointer-events-auto flex min-h-11 items-center gap-1 rounded-full bg-zinc-900 pl-4 pr-1 text-sm text-white shadow-lg dark:bg-zinc-100 dark:text-zinc-900">
-                        <span class=if undo.is_some() { "" } else { "pr-3" }>{text}</span>
-                        {undo.map(|u| view! {
+    let last = RwSignal::new(None::<Shown>);
+    let previous = RwSignal::new(None::<String>);
+    let timer = StoredValue::new(None::<TimeoutHandle>);
+    Effect::new(move || {
+        if let Some(next) = notice.shown.get() {
+            previous.set(last.get_untracked().filter(|(n, ..)| *n != next.0).map(|(_, text, _)| text));
+            last.set(Some(next));
+            if let Some(timer) = timer.get_value() {
+                timer.clear();
+            }
+            timer.set_value(
+                set_timeout_with_handle(
+                    move || {
+                        previous.try_set(None);
+                    },
+                    std::time::Duration::from_millis(160),
+                )
+                .ok(),
+            );
+        }
+    });
+    on_cleanup(move || {
+        if let Some(timer) = timer.get_value() {
+            timer.clear();
+        }
+    });
+    view! {
+        <div class="c6-presence notice-safe pointer-events-none fixed inset-x-0 bottom-0 z-50 flex justify-center px-4"
+            data-open=move || notice.shown.with(Option::is_some).to_string() inert=move || notice.shown.with(Option::is_none)>
+            <div class="c6-rise pointer-events-auto flex min-h-11 items-center gap-1 rounded-full bg-zinc-900 pl-4 pr-1 text-sm text-white shadow-lg dark:bg-zinc-100 dark:text-zinc-900" role="status">
+                <span class="inline-grid">
+                    {move || previous.get().map(|text| view! { <span aria-hidden="true" class="c6-crossfade-out col-start-1 row-start-1">{text}</span> })}
+                    <For each=move || last.get().map(|s| vec![s]).unwrap_or_default() key=|(n, ..)| *n children=move |(_, text, undo)| view! {
+                        <span class=if undo.is_some() { "c6-crossfade col-start-1 row-start-1" } else { "c6-crossfade col-start-1 row-start-1 pr-3" }>{text}</span>
+                    } />
+                </span>
+                {move || last.get().and_then(|(_, _, undo)| undo).map(|u| view! {
                             " · "
                             <button class="min-h-11 rounded-full px-3 font-medium underline" on:click=move |_| {
                                 notice.shown.set(None);
                                 u.run(());
                             }>"Undo"</button>
-                        })}
-                    </div>
-                </div>
-            }
-        })
+                })}
+            </div>
+        </div>
     }
 }
 
@@ -318,8 +568,9 @@ type Hook = wasm_bindgen::closure::Closure<dyn FnMut(web_sys::Event)>;
 /// away.
 struct Up {
     id: u64,
-    owner: Option<Owner>,
+    owner: Option<leptos::reactive::owner::WeakOwner>,
     put_away: PutAway,
+    pinned: Option<RwSignal<bool>>,
 }
 
 thread_local! {
@@ -327,6 +578,12 @@ thread_local! {
     /// What pops up now, outermost first: one at a time, or one within
     /// another (a drop-down in a menu).
     static SHOWN: std::cell::RefCell<Vec<Up>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Passive previews may replace one another, but must not displace an
+/// explicitly opened panel (including one just exposed by a closing list).
+pub fn hover_allowed() -> bool {
+    SHOWN.with(|s| s.borrow().iter().all(|up| up.pinned.is_some_and(|p| p.try_get_untracked() == Some(false))))
 }
 
 /// Of what's up (outermost first) when another pops up: what stays (what
@@ -417,7 +674,7 @@ impl Drop for Dismiss {
 /// value returned: a press on its button is no press outside, so the button
 /// alone toggles it. `close` may run once its component is gone: `try_set`.
 pub fn dismissable(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static) -> String {
-    pop_up(shown, close, true)
+    pop_up(Box::new(shown), std::rc::Rc::new(close), true, None)
 }
 
 /// As `dismissable`, for what covers the page to catch a press outside it
@@ -425,10 +682,83 @@ pub fn dismissable(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone 
 /// wheels and focus left to what covers the page. What it shows carries
 /// `data-pop` (and its button, if one opens it, for focus to go back to).
 pub fn escapable(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static) -> String {
-    pop_up(shown, close, false)
+    pop_up(Box::new(shown), std::rc::Rc::new(close), false, None)
 }
 
-fn pop_up(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static, outside_closes: bool) -> String {
+/// An Escape-dismissed hover preview. Until explicitly pinned, another
+/// passive preview may replace it; a pinned preview blocks passive hover.
+pub fn previewable(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static, pinned: RwSignal<bool>) -> String {
+    pop_up(Box::new(shown), std::rc::Rc::new(close), false, Some(pinned))
+}
+
+/// A retained phone dialog: contain keyboard focus and make the background
+/// inert only while open. The dialog needs `tabindex="-1"`; Search is never
+/// automatically focused (which would summon the phone keyboard).
+pub fn modal(open: RwSignal<bool>, element: NodeRef<leptos::html::Div>) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        #[wasm_bindgen::prelude::wasm_bindgen]
+        extern "C" {
+            #[wasm_bindgen(js_name = c6Modal)]
+            fn modal(element: &web_sys::Element, close: &js_sys::Function) -> js_sys::Function;
+        }
+        Effect::new(move || {
+            if open.get()
+                && let Some(element) = element.get()
+            {
+                use wasm_bindgen::JsCast;
+                let close = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                    open.try_set(false);
+                });
+                let dispose = send_wrapper::SendWrapper::new(modal(&element, close.as_ref().unchecked_ref()));
+                let close = send_wrapper::SendWrapper::new(close);
+                on_cleanup(move || {
+                    let _ = dispose.call0(&wasm_bindgen::JsValue::NULL);
+                    drop(close);
+                });
+            }
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (open, element);
+}
+
+/// Both edge drawers share gesture arbitration and the motion preference.
+/// `data-drawer-side="right"` mirrors the app menu's outward close gesture.
+pub fn drawer_gesture(open: RwSignal<bool>, element: NodeRef<leptos::html::Div>, close: Callback<()>) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen::JsCast;
+        #[wasm_bindgen::prelude::wasm_bindgen]
+        extern "C" {
+            #[wasm_bindgen(js_name = c6DrawerSwipe)]
+            fn swipe(element: &web_sys::Element, close: &js_sys::Function) -> js_sys::Function;
+        }
+        Effect::new(move || {
+            if let Some(element) = element.get() {
+                let close = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                    if open.get_untracked() {
+                        close.run(());
+                    }
+                });
+                let dispose = send_wrapper::SendWrapper::new(swipe(&element, close.as_ref().unchecked_ref()));
+                let close = send_wrapper::SendWrapper::new(close);
+                on_cleanup(move || {
+                    let _ = dispose.call0(&wasm_bindgen::JsValue::NULL);
+                    drop(close);
+                });
+            }
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (open, element, close);
+}
+
+// Share the effect and DOM listener factories across caller closure types.
+// Rc preserves the callbacks' existing lifetime beyond an individual render;
+// an arena callback would instead depend on its reactive owner staying alive.
+#[inline(never)]
+fn pop_up(shown: Box<dyn Fn() -> bool>, close: std::rc::Rc<dyn Fn()>, outside_closes: bool, pinned: Option<RwSignal<bool>>) -> String {
     use wasm_bindgen::JsCast;
     let id = POPS.with(|n| {
         n.set(n.get() + 1);
@@ -437,7 +767,10 @@ fn pop_up(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static
     let key = format!("pop{id}");
     let mine = format!("[data-pop=\"{key}\"]");
     let marked = key.clone();
-    let owner = Owner::current();
+    // The dismiss effect and SHOWN registry outlive individual renders.
+    // A strong owner here creates a cycle that prevents pane cleanup,
+    // leaving its old transcript stream and draft listeners alive.
+    let owner = Owner::current().map(|o| o.downgrade());
     let hooks = StoredValue::new_local(None::<Dismiss>);
     Effect::new(move || {
         if !shown() {
@@ -453,10 +786,22 @@ fn pop_up(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static
             let mut s = s.borrow_mut();
             // Within it as components go, or on the page (a drop-down in a
             // panel the same component pops up).
-            let holds = |x: &Up| owner.as_ref().zip(x.owner.as_ref()).is_some_and(|(o, of)| within(o, of)) || inside(&marked, x.id);
+            let holds = |x: &Up| {
+                // Rail and list previews can share an ancestor owner, but
+                // are alternatives, not popups nested within one another.
+                if pinned.is_some() && x.pinned.is_some() {
+                    return false;
+                }
+                owner
+                    .as_ref()
+                    .and_then(|o| o.upgrade())
+                    .zip(x.owner.as_ref().and_then(|o| o.upgrade()))
+                    .is_some_and(|(o, of)| within(&o, &of))
+                    || inside(&marked, x.id)
+            };
             let (stay, gone) = opening(std::mem::take(&mut *s), holds);
             *s = stay;
-            s.push(Up { id, owner: owner.clone(), put_away: std::rc::Rc::new(close.clone()) });
+            s.push(Up { id, owner: owner.clone(), put_away: close.clone(), pinned });
             gone
         });
         for x in gone {
@@ -493,6 +838,9 @@ fn pop_up(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static
                 if !escape || !SHOWN.with(|s| innermost(&s.borrow().iter().map(|x| x.id).collect::<Vec<_>>(), id)) {
                     return;
                 }
+                // This key closed the innermost popup. Do not also deliver
+                // its default platform close request to a parent modal.
+                ev.prevent_default();
                 ev.stop_propagation();
                 close();
                 if let Some(el) = &opener {
@@ -502,8 +850,8 @@ fn pop_up(shown: impl Fn() -> bool + 'static, close: impl Fn() + Clone + 'static
         ));
         let opts = web_sys::AddEventListenerOptions::new();
         opts.set_capture(true);
-        opts.set_passive(true);
         for (kind, f) in &d.hooks {
+            opts.set_passive(*kind != "keydown");
             let _ = document().add_event_listener_with_callback_and_add_event_listener_options(kind, f.as_ref().unchecked_ref(), &opts);
         }
         hooks.set_value(Some(d));
@@ -531,6 +879,31 @@ pub fn details_pop(menu: NodeRef<leptos::html::Details>) -> (String, impl Fn(web
     (pop, toggled)
 }
 
+/// Menu keyboard navigation is live as soon as its buttons mount, independent
+/// of the visual enter. Escape/focus restoration belongs to dismissable.
+pub fn menu_keys(ev: web_sys::KeyboardEvent) {
+    use wasm_bindgen::JsCast;
+    if !matches!(ev.key().as_str(), "ArrowDown" | "ArrowUp" | "Home" | "End") {
+        return;
+    }
+    let Some(menu) = ev.current_target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) else { return };
+    let Ok(items) = menu.query_selector_all("[role=menuitem]:not(:disabled)") else { return };
+    let items = (0..items.length()).filter_map(|i| items.item(i)?.dyn_into::<web_sys::HtmlElement>().ok()).collect::<Vec<_>>();
+    if items.is_empty() {
+        return;
+    }
+    ev.prevent_default();
+    let current =
+        document().active_element().and_then(|active| items.iter().position(|el| el.unchecked_ref::<web_sys::Element>() == &active));
+    let next = match ev.key().as_str() {
+        "Home" => 0,
+        "End" => items.len() - 1,
+        "ArrowUp" => current.unwrap_or(0).checked_sub(1).unwrap_or(items.len() - 1),
+        _ => current.map_or(0, |i| (i + 1) % items.len()),
+    };
+    let _ = items[next].focus();
+}
+
 /// An ellipsis button and its menu. With `row`, it's a row's: on touch screens
 /// always there, elsewhere on hover or keyboard focus (style/input.css).
 /// The menu is fixed to the screen, so a scrolling list doesn't clip it,
@@ -538,12 +911,23 @@ pub fn details_pop(menu: NodeRef<leptos::html::Details>) -> (String, impl Fn(web
 #[component]
 pub fn Menu(items: Vec<(&'static str, Callback<()>)>, #[prop(optional)] row: bool, #[prop(optional, into)] label: String) -> impl IntoView {
     let open = RwSignal::new(None::<(f64, f64)>);
-    let pop = dismissable(
+    let menu = NodeRef::<leptos::html::Div>::new();
+    Effect::new(move || {
+        use wasm_bindgen::JsCast;
+        if open.get().is_some()
+            && let Some(menu) = menu.get()
+            && let Ok(Some(first)) = menu.query_selector("[role=menuitem]")
+            && let Ok(first) = first.dyn_into::<web_sys::HtmlElement>()
+        {
+            let _ = first.focus();
+        }
+    });
+    let pop = StoredValue::new(dismissable(
         move || open.get().is_some(),
         move || {
             open.try_set(None);
         },
-    );
+    ));
     let items = StoredValue::new(items);
     let trigger = if row {
         "row-action flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-muted hover:bg-zinc-200 dark:hover:bg-zinc-800"
@@ -553,7 +937,7 @@ pub fn Menu(items: Vec<(&'static str, Callback<()>)>, #[prop(optional)] row: boo
     let label = if label.is_empty() { "More".to_owned() } else { label };
     view! {
         <button class=trigger title=label.clone() aria-label=label aria-haspopup="menu" aria-expanded=move || open.get().is_some().to_string()
-            data-pop=pop.clone() on:click=move |ev| {
+            data-pop=pop.get_value() on:click=move |ev| {
                 ev.prevent_default();
                 ev.stop_propagation();
                 if open.get_untracked().is_some() {
@@ -568,7 +952,8 @@ pub fn Menu(items: Vec<(&'static str, Callback<()>)>, #[prop(optional)] row: boo
                 open.set(at.or(Some((0.0, 0.0))));
             }>{crate::icons::ellipsis()}</button>
         {move || open.get().map(|(top, right)| view! {
-            <div role="menu" data-pop=pop.clone() class="fixed z-50 min-w-40 rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900"
+            <leptos::portal::Portal>
+            <div node_ref=menu role="menu" data-pop=pop.get_value() on:keydown=menu_keys class="c6-pop fixed z-50 min-w-40 rounded-md border border-zinc-200 bg-white py-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900"
                 style=format!("top: {}px; right: {}px", top + 4.0, right.max(8.0))>
                 {items.get_value().into_iter().map(|(name, run)| view! {
                     <button role="menuitem" class="flex min-h-11 w-full items-center px-4 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
@@ -580,6 +965,7 @@ pub fn Menu(items: Vec<(&'static str, Callback<()>)>, #[prop(optional)] row: boo
                         }>{name}</button>
                 }).collect_view()}
             </div>
+            </leptos::portal::Portal>
         })}
     }
 }
@@ -589,7 +975,7 @@ pub fn Menu(items: Vec<(&'static str, Callback<()>)>, #[prop(optional)] row: boo
 pub fn OpenIn(link: c6_api::Link) -> impl IntoView {
     view! {
         <a class="inline-flex items-center rounded-md px-3 py-1.5 text-sm text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800"
-            href=link.url target="_blank" rel="noopener noreferrer">{format!("Open in {}", link.service)}" "{crate::icons::arrow_up_right()}</a>
+            href=link.url target="_blank" rel="noopener noreferrer">{format!("Open in {}", link.service)}" "{crate::icons::icon(crate::icons::Icon::ExternalLink, crate::icons::Size::S14)}</a>
     }
 }
 
@@ -681,6 +1067,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn app_shortcuts_use_the_browser_platform() {
+        for platform in ["MacIntel", "MacPPC", "Mac68K"] {
+            assert!(mac_platform(platform), "{platform}");
+        }
+        for platform in ["Win32", "Win64", "Linux x86_64", "Linux aarch64", "iPhone", "iPad", ""] {
+            assert!(!mac_platform(platform), "{platform}");
+        }
+    }
+
+    #[test]
+    fn app_shortcuts_require_only_the_platform_command_modifier() {
+        // Exhaust all modifier combinations on both platforms: neither, the
+        // other platform's modifier, both, Alt and Shift must not act.
+        for mac in [false, true] {
+            for bits in 0..16 {
+                let (meta, ctrl, alt, shift) = (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0);
+                assert_eq!(
+                    shortcut_modifiers(mac, meta, ctrl, alt, shift),
+                    bits == if mac { 1 } else { 2 },
+                    "mac={mac}, meta={meta}, ctrl={ctrl}, alt={alt}, shift={shift}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn attachment_drafts_use_the_text_drafts_place_and_key() {
         for key in ["new", "ask", "session-123"] {
             let key = format!("c6.draft.{key}");
@@ -702,6 +1114,19 @@ mod tests {
     }
 
     #[test]
+    fn passive_hover_cannot_displace_another_popup() {
+        assert!(hover_allowed());
+        let pinned = RwSignal::new(false);
+        SHOWN.with(|s| s.borrow_mut().push(Up { id: 1, owner: None, put_away: std::rc::Rc::new(|| {}), pinned: Some(pinned) }));
+        let _cleanup = Dismiss { id: 1, hooks: Vec::new() };
+        assert!(hover_allowed(), "moving between rail and list rows can replace a passive preview");
+        pinned.set(true);
+        assert!(!hover_allowed(), "an explicitly pinned preview blocks passive hover");
+        SHOWN.with(|s| s.borrow_mut()[0].pinned = None);
+        assert!(!hover_allowed(), "hover must not close an explicit panel");
+    }
+
+    #[test]
     fn escape_puts_away_the_innermost_only() {
         assert!(innermost(&[1, 2], 2));
         assert!(!innermost(&[1, 2], 1));
@@ -711,6 +1136,20 @@ mod tests {
     #[test]
     fn its_opener_carries_its_mark_or_is_its_summary() {
         assert_eq!(opener_selector("pop3"), ":is(button, summary, input, [role=button])[data-pop=\"pop3\"], [data-pop=\"pop3\"] > summary");
+    }
+
+    #[test]
+    fn popup_registry_does_not_keep_a_departed_component_alive() {
+        let owner = Owner::new();
+        let cleaned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        owner.with({
+            let cleaned = cleaned.clone();
+            move || on_cleanup(move || cleaned.store(true, std::sync::atomic::Ordering::SeqCst))
+        });
+        let shown = Up { id: 1, owner: Some(owner.downgrade()), put_away: std::rc::Rc::new(|| {}), pinned: None };
+        drop(owner);
+        assert!(cleaned.load(std::sync::atomic::Ordering::SeqCst), "popup bookkeeping must not block component cleanup");
+        assert!(shown.owner.unwrap().upgrade().is_none());
     }
 
     #[test]

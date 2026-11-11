@@ -404,8 +404,13 @@ pub(crate) async fn view(st: &HeadState, rows: Vec<Stored>) -> anyhow::Result<Ve
         for d in &r.fields.documents {
             let (title, kind, at) =
                 crate::docs::title_of(st, &r.realm, &d.doc).await.unwrap_or_else(|| ("(gone)".into(), String::new(), 0));
-            let answered = if kind.is_empty() { 0 } else { crate::docs::comments::answered(st, &r.realm, &d.doc).await as u32 };
-            docs.push(LiveDoc { doc: d.doc.clone(), role: d.role.clone(), title, kind, updated_at: at, answered });
+            let archived_at = crate::docs::archived_at(st, &r.realm, &d.doc).await;
+            let answered = if kind.is_empty() || archived_at.is_some() {
+                0
+            } else {
+                crate::docs::comments::answered(st, &r.realm, &d.doc).await as u32
+            };
+            docs.push(LiveDoc { doc: d.doc.clone(), role: d.role.clone(), title, kind, updated_at: at, archived_at, answered });
         }
         docs.sort_by_key(|d| d.role != "plan");
         let live_sessions = live_sessions(st, &r.realm, &r.fields.sessions).await;
@@ -770,10 +775,11 @@ fn doc_list(docs: &[LiveDoc]) -> String {
     docs.iter()
         .map(|d| {
             format!(
-                "- {} (doc:{}, {}{})",
+                "- {} (doc:{}, {}{}{})",
                 d.title,
                 d.doc,
                 if d.kind.is_empty() { "gone" } else { &d.kind },
+                if d.archived_at.is_some() { ", archived" } else { "" },
                 if d.role.is_empty() { String::new() } else { format!(", {}", d.role) }
             )
         })

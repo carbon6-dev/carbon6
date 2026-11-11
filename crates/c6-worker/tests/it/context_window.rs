@@ -177,12 +177,30 @@ async fn detected_ollama_window_is_recorded_and_triggers_compaction() {
         .json()
         .await
         .unwrap();
+    // Leave room for the summary in 16k regardless of optional tools on
+    // this machine (a browser's schema alone can fill that room).
+    let r = http
+        .put(format!("{api}/settings/routes"))
+        .json(&json!([{"name": "small window", "connection": c.id, "model": "qwen3.8:27b", "tools": ["read"]}]))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
     let (worker, stop) = worker(&head, state.path()).await;
-    let s: Session = http.post(format!("{api}/sessions")).json(&json!({
-        "worker_id": worker.identity.meta.worker_id.0, "cwd": project.path(), "connection_id": c.id, "model": "qwen3.8:27b", "prompt": "hi"
-    })).send().await.unwrap().json().await.unwrap();
+    let s: Session = http
+        .post(format!("{api}/sessions"))
+        .json(&json!({
+            "worker_id": worker.identity.meta.worker_id.0, "cwd": project.path(), "connection_id": c.id, "prompt": "hi"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let events = ended(&http, &api, &s.id, 1).await;
     assert!(events.iter().any(|e| matches!(e.kind, EventKind::Started { context_window: 16_384, .. })));
+    assert!(events.iter().any(|e| matches!(&e.kind, EventKind::Started { tools, .. } if tools == &["read"])));
     assert!(!events.iter().any(|e| matches!(e.kind, EventKind::Compaction { .. })));
     assert!(
         http.post(format!("{api}/sessions/{}/messages", s.id))

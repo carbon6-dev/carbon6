@@ -29,8 +29,11 @@ pub struct Job {
     pub args: serde_json::Map<String, Value>,
     /// Files written into the job's folder before the run.
     pub inputs: BTreeMap<String, Vec<u8>>,
-    /// Environment for this run only (access tokens, approved secrets).
+    /// Environment for this run only (access tokens, caller-supplied values).
     pub env: Vec<(String, String)>,
+    /// Approved realm secrets, resolved only after choosing the worker so
+    /// their `worker:` scopes can be checked before decryption or delivery.
+    pub secret_names: Vec<String>,
     /// The realm whose job it is: it runs only on a worker available to it.
     pub realm: String,
     /// The worker to run on (default: any that can).
@@ -119,17 +122,38 @@ pub async fn run(st: &HeadState, job: Job) -> anyhow::Result<Output> {
         let l = LOCAL.lock().unwrap();
         l.get(&format!("{kit}@{}", st.data_dir.display())).or_else(|| l.get(kit)).cloned()
     };
+    // Choose once: a secret is checked against the actual destination,
+    // never used to move the job to a different worker. Local runs have
+    // no worker identity and cannot receive worker-scoped secrets.
+    let worker = if local.is_none() { Some(worker_for(st, &job).await?) } else { None };
+    let worker_scope = match worker.filter(|_| !job.secret_names.is_empty()) {
+        Some(id) => st.store.worker(id).await?.map(|w| format!("worker:{}", w.name)),
+        None => None,
+    };
+    let mut env = Vec::new();
+    for name in &job.secret_names {
+        if let Some((blob, applies_to, _)) = st.store.secret(&job.realm, name).await? {
+            // The same worker-scope rule as sessions::secret_credential:
+            // any matching worker selector suffices; none means unscoped.
+            let worker_scopes: Vec<&String> = applies_to.iter().filter(|l| l.starts_with("worker:")).collect();
+            if !worker_scopes.is_empty() && !worker_scopes.iter().any(|l| Some(l.as_str()) == worker_scope.as_deref()) {
+                return Err(bad_request(format!("secret {name} is not for this worker")));
+            }
+            env.push((name.clone(), st.secrets.decrypt(&blob)?));
+        }
+    }
+    env.extend(job.env);
     if let Some(f) = local {
         let command = command(&job.spec, &job.tool, &job.args)?;
-        return f(LocalRun { tool: job.tool, command, inputs: job.inputs, env: job.env }).await;
+        return f(LocalRun { tool: job.tool, command, inputs: job.inputs, env }).await;
     }
-    let worker = worker_for(st, &job).await?;
+    let worker = worker.expect("a remote kit job has a selected worker");
     let cmd = command(&job.spec, &job.tool, &job.args)?;
     let b64 = base64::engine::general_purpose::STANDARD;
     let inputs: serde_json::Map<String, Value> = job.inputs.iter().map(|(k, v)| (k.clone(), json!(b64.encode(v)))).collect();
     let limit = Duration::from_secs(job.spec["permissions"]["timeout_s"].as_u64().unwrap_or(120)) + BUILD_ALLOWANCE;
     let mounts: Vec<Value> = job.mounts.iter().map(|(path, at)| json!({"path": path, "at": at})).collect();
-    let params = json!({"spec": job.spec, "command": cmd, "inputs": inputs, "env": job.env, "mounts": mounts});
+    let params = json!({"spec": job.spec, "command": cmd, "inputs": inputs, "env": env, "mounts": mounts});
     let v = st.registry.call(worker, "kit.job", params, limit).await.map_err(|e| anyhow::anyhow!("kit job: {e}"))?;
     let mut files = BTreeMap::new();
     for (k, data) in v["files"].as_object().into_iter().flatten() {
@@ -376,14 +400,11 @@ pub async fn for_instance(
         }
     };
     let spec = crate::packages::kit_spec_of(st, &kit_install).await?;
-    let mut env = Vec::new();
-    for s in spec["permissions"]["secrets"].as_array().into_iter().flatten().filter_map(Value::as_str) {
-        if let Some(v) = crate::secrets::value_in(st, realm, s).await? {
-            env.push((s.to_owned(), v));
-        }
-    }
-    env.extend(crate::providers::tokens_for(st, realm, instance).await?);
-    let out = run(st, Job { spec, tool: tool.to_owned(), args, inputs, env, realm: realm.to_owned(), ..Default::default() }).await?;
+    let secret_names =
+        spec["permissions"]["secrets"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
+    let env = crate::providers::tokens_for(st, realm, instance).await?;
+    let out = run(st, Job { spec, tool: tool.to_owned(), args, inputs, env, secret_names, realm: realm.to_owned(), ..Default::default() })
+        .await?;
     let mut result = json!({"exit": out.exit, "stdout": out.stdout, "stderr": out.stderr,
         "files": out.files.keys().cloned().collect::<Vec<_>>()});
     if let Some(batch) = out.files.get("ingest.json") {

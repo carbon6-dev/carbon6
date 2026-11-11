@@ -7,6 +7,7 @@ use leptos::task::spawn_local;
 
 use crate::api;
 use crate::icons;
+use crate::icons::{Icon, Size, icon};
 use crate::session::{ModelPicker, SEND, SEND_EMPTY, SEND_READY, SEND_SHAPE, send_icon};
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, GROWS, INPUT, StatusPill, ago, clock, escapable, storage_get, storage_set};
 use crate::workspace::{Go, How, Popover, View, below, use_column, use_workspace};
@@ -58,6 +59,13 @@ fn shows(s: &Session, show: &str) -> bool {
     }
 }
 
+/// Newest activity first, preserving input order when timestamps are equal.
+/// Keep one stable-sort specialization for the lists sharing this policy.
+#[inline(never)]
+pub(crate) fn sort_by_activity(list: &mut [Session]) {
+    list.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+}
+
 /// The sessions in the order `sort` says: for Recently viewed, those you
 /// viewed (`viewed`: id and when) newest first, then the rest by last
 /// activity.
@@ -71,7 +79,7 @@ fn sorted(mut list: Vec<Session>, sort: Sort, viewed: &[(String, i64)]) -> Vec<S
                 None => (true, Reverse(s.updated_at)),
             });
         }
-        Sort::Activity => list.sort_by_key(|s| Reverse(s.updated_at)),
+        Sort::Activity => sort_by_activity(&mut list),
         Sort::Title => list.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()).then(b.updated_at.cmp(&a.updated_at))),
     }
     list
@@ -115,7 +123,7 @@ fn home_form(path: &str) -> String {
     }
 }
 
-/// Where and how a new session runs, in one line: "on thalassa ·
+/// Native title text for where and how a new session runs: "on thalassa ·
 /// ~/projects/carbon6 · opus · high"; `short` (a phone's chip):
 /// "thalassa · carbon6 · opus".
 fn summary(worker: &str, ssh: Option<&str>, folder: &str, model: &str, effort: &str, short: bool) -> String {
@@ -131,6 +139,27 @@ fn summary(worker: &str, ssh: Option<&str>, folder: &str, model: &str, effort: &
     parts.extend([model, if short { "" } else { effort }].into_iter().filter(|x| !x.is_empty()).map(str::to_owned));
     let line = parts.join(" · ");
     if short { line } else { format!("on {line}") }
+}
+
+/// A visible relationship, without interpreting symbols inside either name.
+pub(crate) fn relationship_label(before: String, after: String) -> impl IntoView {
+    view! { {before}" "{icon(Icon::ArrowLeftRight, Size::S14)}" "{after} }
+}
+
+/// The visible counterpart of `summary`; native titles remain plain text.
+fn summary_label(worker: &str, ssh: Option<&str>, folder: &str, model: &str, effort: &str, short: bool) -> AnyView {
+    let Some(target) = ssh else { return summary(worker, None, folder, model, effort, short).into_any() };
+    let target = if folder.is_empty() {
+        target.to_owned()
+    } else if short {
+        format!("{target}:{}", last_part(folder))
+    } else {
+        format!("{target}:{folder}")
+    };
+    let before = if short { worker.to_owned() } else { format!("on {worker}") };
+    let rest = [model, if short { "" } else { effort }].into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" · ");
+    let rest = if rest.is_empty() { rest } else { format!(" · {rest}") };
+    view! { {relationship_label(before, target)}{rest} }.into_any()
 }
 
 /// The list's choices: Show (and its labels: the shared label filter), Sort
@@ -179,9 +208,12 @@ impl ListChoices {
 
 #[component]
 pub fn SessionsPage() -> impl IntoView {
+    let root = NodeRef::<leptos::html::Main>::new();
+    let hover = Hover::new();
+    let like_this = RwSignal::new(None);
     let live = api::live();
     let now = clock();
-    let connections = LocalResource::new(api::connections);
+    let connections = crate::resources::connections();
     let query = RwSignal::new(String::new());
     let choices = ListChoices {
         show: RwSignal::new(String::new()),
@@ -196,15 +228,15 @@ pub fn SessionsPage() -> impl IntoView {
     let search = move |ev: web_sys::Event| query.set(event_target_value(&ev));
 
     view! {
-        <main class="mx-auto max-w-6xl space-y-4 px-3 py-4 md:space-y-5 md:px-4 md:py-6">
-            <div class="hidden flex-wrap items-center gap-2 md:flex">
+        <main node_ref=root class="mx-auto max-w-6xl space-y-4 px-3 py-4 @min-[40rem]/view:space-y-5 @min-[40rem]/view:px-4 @min-[40rem]/view:py-6">
+            <div class="hidden flex-wrap items-center gap-2 @min-[40rem]/view:flex">
                 <h1 class="mr-2 text-lg font-semibold">"Sessions"</h1>
                 <input type="search" class=format!("{INPUT} {PLACEHOLDER} min-w-48 max-w-sm flex-1") placeholder="Search titles, labels, workers, folders"
                     prop:value=move || query.get() on:input=search />
                 <span class="flex-1"></span>
                 <ListMenus choices />
             </div>
-            <div class="flex items-center gap-2 md:hidden">
+            <div class="flex items-center gap-2 @min-[40rem]/view:hidden">
                 <label class="relative min-w-0 flex-1">
                     <span class="pointer-events-none absolute left-2.5 top-1/2 flex -translate-y-1/2 text-muted">{icons::search()}</span>
                     <input type="search" class=format!("{INPUT} {PLACEHOLDER} pl-8") placeholder="Search" aria-label="Search sessions"
@@ -218,7 +250,9 @@ pub fn SessionsPage() -> impl IntoView {
                     })}
                 </button>
             </div>
-            <Suspense fallback=|| ()>
+            // Later model-list loads must not detach the new-session form
+            // and interrupt an edit in its focused model input.
+            <Transition fallback=|| ()>
                 {move || connections.get().map(|r| match r {
                     Ok(conns) if conns.is_empty() => view! {
                         <div class="rounded-lg border border-dashed border-zinc-300 p-6 text-center text-sm text-soft dark:border-zinc-700">
@@ -228,7 +262,7 @@ pub fn SessionsPage() -> impl IntoView {
                     Ok(conns) => view! { <SessionForm connections=conns /> }.into_any(),
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
                 })}
-            </Suspense>
+            </Transition>
 
             <div class="divide-y divide-zinc-200 overflow-hidden rounded-lg border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
                 {move || {
@@ -257,13 +291,15 @@ pub fn SessionsPage() -> impl IntoView {
                         view! { <p class="px-4 py-8 text-center text-sm text-muted">{msg}</p> }.into_any()
                     } else {
                         let sessions = sorted(sessions, choices.sort.get(), &viewed);
-                        grouped(sessions, &choices.grouping.levels.get(), String::new(), folded, &|s| view! { <SessionRow s now /> }.into_any(), false)
+                        grouped(sessions, &choices.grouping.levels.get(), String::new(), folded, &|s| view! { <SessionRow s now hover /> }.into_any(), false)
                     }
                 }}
             </div>
         </main>
+        <SessionPreview hover like_this />
+        {move || like_this.get().map(|seed| view! { <NewSessionDialog seed on_close=move |()| like_this.set(None) /> })}
         <Show when=move || sheet.get()>
-            <Sheet open=sheet title="Filter, sort and group" reset=Callback::new(move |()| choices.reset())>
+            <Sheet root open=sheet title="Filter, sort and group" reset=Callback::new(move |()| choices.reset())>
                 <div class="space-y-5">
                     <section class="space-y-2"><ShowChips choices /></section>
                     <section class="space-y-2"><LabelChips choices /></section>
@@ -462,27 +498,35 @@ fn GroupChips(choices: ListChoices) -> impl IntoView {
     }
 }
 
-/// A phone's sheet from the bottom of the screen, over a dimmed page: a
-/// tap above it, Done or Esc closes it; `reset` puts Reset at its top
-/// right.
+/// A sheet from the owning tile's bottom, including in narrow desktop
+/// tiles; without a tile, fall back to the viewport. A tap above it, Done
+/// or Esc closes it; `reset` puts Reset at its top right.
 #[component]
 fn Sheet(
+    root: NodeRef<leptos::html::Main>,
     open: RwSignal<bool>,
     #[prop(into)] title: String,
     #[prop(optional)] reset: Option<Callback<()>>,
-    children: Children,
+    children: ChildrenFn,
 ) -> impl IntoView {
+    use wasm_bindgen::JsCast;
+    let mount = root.get_untracked().and_then(|root| root.closest("[data-tile-surface]").ok().flatten());
+    let position = if mount.is_some() { "absolute" } else { "fixed" };
+    // The phone shell already shrinks the tile above the keyboard.
+    let keyboard = if mount.is_some() { "" } else { "phone-sheet" };
+    let mount = mount.unwrap_or_else(|| document().body().expect("body").unchecked_into());
     let close = move || {
         open.try_set(false);
     };
     let pop = escapable(move || open.get(), close);
     let label = title.clone();
     view! {
-        <div class="fixed inset-0 z-40 bg-black/30" on:click=move |_| close()></div>
-        <div data-pop=pop role="dialog" aria-label=label
-            class="fixed inset-x-0 bottom-0 z-50 flex max-h-[85dvh] flex-col rounded-t-xl border-t border-zinc-200 bg-white text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900">
+        <leptos::portal::Portal mount=mount>
+        <div class=format!("c6-session-filter-scrim {position} inset-0 z-40 bg-black/30") on:click=move |_| close()></div>
+        <div data-pop=pop.clone() role="dialog" aria-label=label.clone()
+            class=format!("{keyboard} {position} inset-x-0 bottom-0 z-50 flex max-h-[85%] flex-col rounded-t-xl border-t border-zinc-200 bg-white text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900")>
             <div class="flex shrink-0 items-center gap-2 border-b border-zinc-200 py-1 pl-4 pr-2 dark:border-zinc-800">
-                <h2 class="flex-1 py-2 font-medium">{title}</h2>
+                <h2 class="flex-1 py-2 font-medium">{title.clone()}</h2>
                 {reset.map(|r| view! { <button class="rounded-md px-3 py-2 text-sky-700 dark:text-sky-400" on:click=move |_| r.run(())>"Reset"</button> })}
             </div>
             <div class="min-h-0 flex-1 overflow-y-auto px-4 py-4">{children()}</div>
@@ -490,6 +534,7 @@ fn Sheet(
                 <button class=format!("{BUTTON} w-full py-2") on:click=move |_| close()>"Done"</button>
             </div>
         </div>
+        </leptos::portal::Portal>
     }
 }
 
@@ -523,40 +568,6 @@ pub(crate) fn recent_state(s: &Session) -> (&'static str, &'static str) {
         ("bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300", "needs you")
     } else {
         crate::util::status_look(s.display_status())
-    }
-}
-
-/// A recently viewed session: its mark, title, state and when you viewed
-/// it. It opens in the focused tile (⌘/Ctrl-click: a new one), then
-/// `close` runs (the phone's sheet closes).
-#[component]
-pub(crate) fn RecentRow(s: Session, at: i64, now: RwSignal<i64>, #[prop(optional)] close: Option<Callback<()>>) -> impl IntoView {
-    let (ws, col) = (use_workspace(), use_column());
-    let to = View::session(s.id.clone());
-    let href = to.href();
-    let to = StoredValue::new(to);
-    let (pill, word) = recent_state(&s);
-    view! {
-        <a href=href class="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800" title="Open (⌘-click: new tile)"
-            on:click=move |ev: web_sys::MouseEvent| {
-                if ev.button() != 0 || ev.shift_key() || ev.alt_key() {
-                    return;
-                }
-                ev.prevent_default();
-                let how = How::from_mouse(&ev);
-                match col {
-                    Some(c) => c.open(to.get_value(), how),
-                    None => ws.open(None, to.get_value(), how),
-                }
-                if let Some(c) = close {
-                    c.run(());
-                }
-            }>
-            <span class="h-2.5 w-2.5 shrink-0 rounded-full" style=crate::marks::fill(&crate::marks::of(&s)) title="Its mark"></span>
-            <span class="min-w-0 flex-1 truncate">{s.title.clone()}</span>
-            <span class=format!("inline-flex shrink-0 items-center rounded-full px-2 py-0.5 text-xs font-medium {pill}")>{word}</span>
-            <span class="w-14 shrink-0 text-right text-xs text-muted">{move || ago(now.get() - at)}</span>
-        </a>
     }
 }
 
@@ -694,7 +705,7 @@ fn grouped(
             view! {
                 <div>
                     <button class=button on:click=toggle title=format!("{key}: {}", value.clone().unwrap_or_else(|| format!("no {key}")))>
-                        <span class="w-3 shrink-0 text-sm text-muted">{move || if is_folded.get() { crate::icons::chevron_right().into_any() } else { crate::icons::chevron_down().into_any() }}</span>
+                        <span class="w-3 shrink-0 text-sm text-muted">{move || if is_folded.get() { crate::icons::chevron_right() } else { crate::icons::chevron_down() }}</span>
                         {(!compact).then(|| view! { <span class="shrink-0 text-muted">{format!("{key}:")}</span> })}
                         <span class="min-w-0 truncate">{name}</span>
                         <span class="ml-auto shrink-0 tabular-nums">{count}</span>
@@ -747,21 +758,21 @@ pub fn GroupBar(grouping: Grouping) -> impl IntoView {
                 levels.iter().enumerate().map(|(i, k)| {
                     let (outer, gone) = (levels.clone(), levels.clone());
                     view! {
-                        {(i > 0).then(|| view! { <span class="text-muted">"›"</span> })}
+                        {(i > 0).then(|| view! { <span class="text-muted">{icon(Icon::ChevronRight, Size::S14)}</span> })}
                         <span class="inline-flex items-center gap-1 rounded bg-violet-100 px-1.5 py-0.5 font-mono text-[11px] text-violet-800 dark:bg-violet-950 dark:text-violet-300">
                             {(i > 0).then(|| view! {
-                                <button title="Group by this one level further out" on:click=move |_| {
+                                <button title="Group by this one level further out" aria-label="Group by this one level further out" on:click=move |_| {
                                     let mut l = outer.clone();
                                     l.swap(i - 1, i);
                                     save(l);
-                                }>"‹"</button>
+                                }>{icon(Icon::ChevronLeft, Size::S14)}</button>
                             })}
                             {k.clone()}
                             <button title="Stop grouping by this" on:click=move |_| {
                                 let mut l = gone.clone();
                                 l.remove(i);
                                 save(l);
-                            }>"×"</button>
+                            }>{crate::icons::icon(crate::icons::Icon::X, crate::icons::Size::S14)}</button>
                         </span>
                     }
                 }).collect_view()
@@ -788,30 +799,14 @@ pub fn GroupBar(grouping: Grouping) -> impl IntoView {
 }
 
 /// A session's menu in a list (its row, a card, the dock): archive it
-/// without opening it, with Undo rather than a question; and what the list
-/// adds (`dismiss`).
+/// without opening it (offering its docs if any, otherwise with Undo);
+/// and what the list adds (`dismiss`).
 #[component]
 pub(crate) fn SessionMenu(id: String, #[prop(optional)] dismiss: Option<Callback<()>>) -> impl IntoView {
-    let notice = crate::util::Notice::get();
+    let archiver = crate::session_archive::SessionArchive::get();
     let id = StoredValue::new(id);
     let archive = Callback::new(move |()| {
-        spawn_local(async move {
-            let sid = id.get_value();
-            match api::set_archived(sid.clone(), true).await {
-                Ok(()) => notice.show(
-                    "Archived",
-                    Some(Callback::new(move |()| {
-                        let sid = sid.clone();
-                        spawn_local(async move {
-                            if let Err(e) = api::set_archived(sid, false).await {
-                                notice.show(format!("Couldn't bring it back: {e}"), None);
-                            }
-                        });
-                    })),
-                ),
-                Err(e) => notice.show(format!("Couldn't archive it: {e}"), None),
-            }
-        });
+        archiver.start(id.get_value());
     });
     let mut items = Vec::new();
     if let Some(d) = dismiss {
@@ -833,26 +828,33 @@ fn state_colour(word: &str) -> &'static str {
 
 /// A row's line of where it runs: its worker, its folder's last part and
 /// its model.
-fn where_line(worker: &str, s: &Session) -> String {
+fn where_line(worker: &str, s: &Session) -> AnyView {
     let place = match (&s.ssh, s.cwd.is_empty()) {
-        (Some(t), true) => format!("⇄ {t}"),
-        (Some(t), false) => format!("⇄ {t}:{}", last_part(&s.cwd)),
-        (None, true) => "scratch folder".to_owned(),
-        (None, false) => last_part(&s.cwd),
+        (Some(t), empty) => {
+            let target = if empty { t.clone() } else { format!("{t}:{}", last_part(&s.cwd)) };
+            relationship_label(worker.to_owned(), target).into_any()
+        }
+        (None, empty) => {
+            let folder = if empty { "scratch folder".to_owned() } else { last_part(&s.cwd) };
+            [worker, folder.as_str()].into_iter().filter(|x| !x.is_empty()).collect::<Vec<_>>().join(" · ").into_any()
+        }
     };
-    [worker, place.as_str(), s.model.as_str()].into_iter().filter(|x| !x.is_empty()).collect::<Vec<_>>().join(" · ")
+    let model = if s.model.is_empty() { String::new() } else { format!(" · {}", s.model) };
+    view! { {place}{model} }.into_any()
 }
 
 /// A session in the list: its mark, title, state and when it was last
 /// active; under the title where it runs (all of it on hover) and, if you
 /// gave it any, its labels (with the aspects Settings → Appearance shows).
 #[component]
-fn SessionRow(s: Session, now: RwSignal<i64>) -> impl IntoView {
+fn SessionRow(s: Session, now: RwSignal<i64>, hover: Hover) -> impl IntoView {
+    let id = s.id.clone();
     let live = api::live();
     let worker = live.session_worker(&s);
     let updated = s.updated_at;
     let word = recent_state(&s).1;
     let mark = crate::marks::fill(&crate::marks::of(&s));
+    // Native hover text stays plain; `where_line` draws the visible relationship.
     let place = match (&s.ssh, s.cwd.is_empty()) {
         (Some(t), _) => format!("{worker} ⇄ {t}:{}", s.cwd),
         (None, true) => format!("{worker}: a scratch folder"),
@@ -864,8 +866,16 @@ fn SessionRow(s: Session, now: RwSignal<i64>) -> impl IntoView {
     let line = where_line(&worker, &s);
     let chips = s.clone();
     view! {
-        <div class="group flex items-center gap-1 pr-1 hover:bg-zinc-100 md:pr-2 dark:hover:bg-zinc-900">
-        <Go to=View::session(s.id.clone()) class="flex min-w-0 flex-1 items-center gap-3 py-2.5 pl-3 md:pl-4" title="Open beside this list (⌘-click: new tile)">
+        <div class="group flex items-center gap-1 pr-1 hover:bg-zinc-100 @min-[40rem]/view:pr-2 dark:hover:bg-zinc-900"
+            on:mouseenter=move |ev| {
+                use wasm_bindgen::JsCast;
+                if !window().match_media("(hover: hover)").ok().flatten().is_some_and(|m| m.matches()) { return; }
+                if let Some(el) = ev.current_target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
+                    hover.preview(id.clone(), &el);
+                }
+            }
+            on:mouseleave=move |_| hover.hide_soon()>
+        <Go to=View::session(s.id.clone()) class="flex min-w-0 flex-1 items-center gap-3 py-2.5 pl-3 @min-[40rem]/view:pl-4" title="Open beside this list (⌘/Ctrl-click: new tile if not already open)">
             <span class="mt-1.5 h-2.5 w-2.5 shrink-0 self-start rounded-full" style=mark title="Its mark"></span>
             <div class="min-w-0 flex-1">
                 <div class="truncate font-medium">{s.title.clone()}</div>
@@ -877,11 +887,12 @@ fn SessionRow(s: Session, now: RwSignal<i64>) -> impl IntoView {
                     </div>
                 })}
             </div>
-            <div class="flex shrink-0 flex-col items-end gap-0.5 text-xs md:flex-row md:items-center md:gap-0">
+            <div class="flex shrink-0 flex-col items-end gap-0.5 text-xs @min-[40rem]/view:flex-row @min-[40rem]/view:items-center @min-[40rem]/view:gap-0">
                 <span class=state_colour(word)>{word}</span>
-                <span class="text-muted md:w-20 md:text-right">{move || ago(now.get() - updated)}</span>
+                <span class="text-muted @min-[40rem]/view:w-20 @min-[40rem]/view:text-right">{move || ago(now.get() - updated)}</span>
             </div>
         </Go>
+        <PreviewButton id=s.id.clone() hover />
         <SessionMenu id=s.id.clone() />
         </div>
     }
@@ -890,7 +901,7 @@ fn SessionRow(s: Session, now: RwSignal<i64>) -> impl IntoView {
 /// The rail's sessions: every session (in this realm, with the label
 /// filter's labels), grouped as the sessions list is, one narrow row each.
 /// Hovering a row pops out its details, with its colour and "New like
-/// this"; clicking opens it (⌘-click: a new tile).
+/// this"; clicking reveals it, or opens it (⌘/Ctrl-click: a new tile if unopened).
 #[component]
 pub fn SessionsRail(open: RwSignal<bool>) -> impl IntoView {
     let live = api::live();
@@ -918,7 +929,7 @@ pub fn SessionsRail(open: RwSignal<bool>) -> impl IntoView {
     view! {
         <div class="flex items-center gap-1 pb-1 pl-1.5 pr-3 pt-2 text-[11px] font-semibold uppercase tracking-wide text-muted">
             <button class=crate::activity::FOLD title=move || if open.get() { "Fold" } else { "Unfold" } on:click=move |_| open.update(|o| *o = !*o)>
-                {move || if open.get() { crate::icons::chevron_down().into_any() } else { crate::icons::chevron_right().into_any() }}
+                {move || if open.get() { crate::icons::chevron_down() } else { crate::icons::chevron_right() }}
             </button>
             <span class="flex-1 pl-0.5">"Sessions"
                 {move || (!open.get()).then(|| view! { <span class="ml-1.5 rounded-full bg-zinc-200 px-1.5 font-normal tabular-nums dark:bg-zinc-800">{sessions.with(Vec::len)}</span> })}
@@ -951,9 +962,7 @@ pub fn SessionsRail(open: RwSignal<bool>) -> impl IntoView {
             }}
         </div>
         </Show>
-        {move || hover.shown.get().and_then(|(id, x, y)| live.sessions.with(|ss| ss.iter().find(|s| s.id == id).cloned()).map(|s| view! {
-            <RailCard s x y hover like_this />
-        }))}
+        <SessionPreview hover like_this />
         {move || like_this.get().map(|seed| view! { <NewSessionDialog seed on_close=move |()| like_this.set(None) /> })}
     }
 }
@@ -964,34 +973,49 @@ pub fn SessionsRail(open: RwSignal<bool>) -> impl IntoView {
 struct Hover {
     shown: RwSignal<Option<(String, f64, f64)>>,
     generation: StoredValue<u64>,
+    pinned: RwSignal<bool>,
 }
 
 impl Hover {
     fn new() -> Self {
-        Hover { shown: RwSignal::new(None), generation: StoredValue::new(0) }
+        Hover { shown: RwSignal::new(None), generation: StoredValue::new(0), pinned: RwSignal::new(false) }
+    }
+
+    fn preview(&self, id: String, row: &web_sys::Element) {
+        if crate::util::hover_allowed() {
+            self.show(id, row);
+        }
     }
 
     fn show(&self, id: String, row: &web_sys::Element) {
+        if self.pinned.get_untracked() {
+            return;
+        }
         self.keep();
         let r = row.get_bounding_client_rect();
         let vh = window().inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(800.0);
-        // Beside the rail, level with the row, kept on screen.
-        let y = r.top().min(vh - 340.0).max(8.0);
-        let rail = row.closest("aside").ok().flatten().map(|a| a.get_bounding_client_rect().right()).unwrap_or(r.right());
-        self.shown.set(Some((id, rail + 6.0, y)));
+        // Beside the rail, or below a list row/button. Clamping a card to
+        // the right edge of a wide list mustn't cover its own opener.
+        let (x, y) = match row.closest("aside").ok().flatten() {
+            Some(rail) => (rail.get_bounding_client_rect().right() + 6.0, r.top()),
+            None => (r.left(), r.bottom() + 6.0),
+        };
+        self.shown.set(Some((id, x, y.min(vh - 340.0).max(8.0))));
     }
 
     /// The pointer came back: don't hide.
     fn keep(&self) {
-        self.generation.update_value(|g| *g += 1);
+        self.generation.try_update_value(|g| *g += 1);
     }
 
     fn hide_soon(&self) {
-        self.generation.update_value(|g| *g += 1);
-        let (me, this) = (self.generation.get_value(), *self);
+        self.keep();
+        let Some(me) = self.generation.try_get_value() else { return };
+        let this = *self;
         set_timeout(
             move || {
-                if this.generation.try_get_value() == Some(me) {
+                let focused = document().active_element().is_some_and(|el| el.closest("[data-session-preview]").ok().flatten().is_some());
+                if this.generation.try_get_value() == Some(me) && this.pinned.try_get() == Some(false) && !focused {
                     this.shown.set(None);
                 }
             },
@@ -1001,9 +1025,44 @@ impl Hover {
 
     fn hide_now(&self) {
         self.keep();
-        if self.shown.with_untracked(Option::is_some) {
+        self.pinned.set(false);
+        if self.shown.try_with_untracked(Option::is_some) == Some(true) {
             self.shown.set(None);
         }
+    }
+}
+
+/// Touch and keyboard entry to the same card as the rail's hover.
+#[component]
+fn PreviewButton(id: String, hover: Hover) -> impl IntoView {
+    view! {
+        <button class=icons::BAR_BUTTON title="Session details" aria-label="Session details"
+            on:click=move |ev| {
+                use wasm_bindgen::JsCast;
+                hover.hide_now();
+                if let Some(el) = ev.current_target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
+                    hover.show(id.clone(), &el);
+                    hover.pinned.set(true);
+                }
+            }>{icons::info()}</button>
+    }
+}
+
+#[component]
+fn SessionPreview(hover: Hover, like_this: RwSignal<Option<SessionSeed>>) -> impl IntoView {
+    let live = api::live();
+    let pop = StoredValue::new(crate::util::previewable(move || hover.shown.with(Option::is_some), move || hover.hide_now(), hover.pinned));
+    // A heartbeat may change the row, not the identity of this preview.
+    // In particular it mustn't recreate its picker or discard focus.
+    let shown = move || {
+        hover.shown.get().filter(|(id, _, _)| live.sessions.with(|ss| ss.iter().any(|s| s.id == *id))).into_iter().collect::<Vec<_>>()
+    };
+    view! {
+        <For each=shown
+            key=|(id, _, _)| id.clone() children=move |(id, _, _)| {
+                let s = live.sessions.with_untracked(|ss| ss.iter().find(|s| s.id == id).cloned()).expect("previewed row");
+                view! { <RailCard s hover like_this pop=pop.get_value() /> }
+            } />
     }
 }
 
@@ -1029,19 +1088,23 @@ fn RailRow(s: Session, hover: Hover) -> impl IntoView {
     view! {
         <div
             on:mouseenter=move |ev| {
+                if !window().match_media("(hover: hover)").ok().flatten().is_some_and(|m| m.matches()) { return; }
                 if let Some(el) = ev.current_target().and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok()) {
-                    hover.show(id.clone(), &el);
+                    hover.preview(id.clone(), &el);
                 }
             }
             on:mouseleave=move |_| hover.hide_soon()
         >
-            <Go to=View::session(s.id.clone()) class="flex items-center gap-1.5 rounded px-1 py-0.5 text-[13px] hover:bg-zinc-200/60 dark:hover:bg-zinc-800/60">
+            <div class="flex items-center">
+            <Go to=View::session(s.id.clone()) class="flex min-w-0 flex-1 items-center gap-1.5 rounded px-1 py-0.5 text-[13px] hover:bg-zinc-200/60 dark:hover:bg-zinc-800/60">
                 <span class="h-2.5 w-1 shrink-0 rounded-sm" style=crate::marks::fill(&colour)></span>
                 <span class="min-w-0 flex-1 truncate">{s.title.clone()}</span>
                 <span class="flex shrink-0 items-center gap-0.5"><crate::aspects::AspectGlyphs s=glyphs /></span>
                 <span class=state></span>
                 {move || number.get().map(crate::activity::tile_badge)}
             </Go>
+            <PreviewButton id=s.id.clone() hover />
+            </div>
         </div>
     }
 }
@@ -1049,37 +1112,65 @@ fn RailRow(s: Session, hover: Hover) -> impl IntoView {
 /// A rail row's details: all of its title, its state, where it runs, its
 /// labels and colour, and what you can do with it.
 #[component]
-fn RailCard(s: Session, x: f64, y: f64, hover: Hover, like_this: RwSignal<Option<SessionSeed>>) -> impl IntoView {
+fn RailCard(s: Session, hover: Hover, like_this: RwSignal<Option<SessionSeed>>, pop: String) -> impl IntoView {
     let ws = use_workspace();
     let live = api::live();
     let now = clock();
     let worker = live.session_worker(&s);
-    let updated = s.updated_at;
-    let (open_id, tile_id) = (s.id.clone(), s.id.clone());
-    let seed = SessionSeed::from_session(&s);
-    let place = match (&s.ssh, s.cwd.is_empty()) {
-        (Some(t), _) => format!("⇄ {t}:{}", s.cwd),
-        (None, true) => "scratch workspace".to_owned(),
-        (None, false) => c6_api::labels::display_labels(&s.auto_labels)
+    let card = NodeRef::<leptos::html::Div>::new();
+    Effect::new(move || {
+        if !hover.pinned.get() || card.get().is_none() {
+            return;
+        }
+        request_animation_frame(move || {
+            use wasm_bindgen::JsCast;
+            if let Some(el) = card
+                .try_get_untracked()
+                .flatten()
+                .and_then(|el| el.query_selector("[aria-label=\"Change session mark\"]").ok().flatten())
+                .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok())
+            {
+                let _ = el.focus();
+            }
+        });
+    });
+    let id = StoredValue::new(s.id.clone());
+    let current = Memo::new({
+        let fallback = s.clone();
+        move |_| live.sessions.with(|ss| ss.iter().find(|s| s.id == id.get_value()).cloned()).unwrap_or_else(|| fallback.clone())
+    });
+    let place_session = s.clone();
+    let place = move || match (&place_session.ssh, place_session.cwd.is_empty()) {
+        (Some(t), _) => relationship_label(String::new(), format!("{t}:{}", place_session.cwd)).into_any(),
+        (None, true) => "scratch workspace".into_any(),
+        (None, false) => c6_api::labels::display_labels(&place_session.auto_labels)
             .iter()
             .find_map(|l| l.strip_prefix("folder:").map(str::to_owned))
-            .unwrap_or_else(|| s.cwd.clone()),
+            .unwrap_or_else(|| place_session.cwd.clone())
+            .into_any(),
     };
     let act = "rounded-md border border-zinc-200 px-2 py-1 text-xs hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800";
     view! {
-        <div class="fixed z-40 w-72 space-y-2 rounded-lg border border-zinc-200 bg-white p-3 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
-            style=format!("left:{x}px;top:{y}px")
+        <leptos::portal::Portal>
+        <div node_ref=card data-session-preview data-pop=pop.clone() class="fixed z-40 w-72 space-y-2 overflow-y-auto rounded-lg border border-zinc-200 bg-white p-3 text-sm shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
+            style=move || {
+                let (_, x, y) = hover.shown.get().unwrap_or_default();
+                format!("left:clamp(8px,{x}px,max(8px,calc(100vw - 18rem - 8px)));top:min({y}px,8px + max(0px,100dvh - 340px));max-width:calc(100vw - 16px);max-height:calc(100dvh - min({y}px,8px + max(0px,100dvh - 340px)) - 8px)")
+            }
             on:mouseenter=move |_| hover.keep()
+            on:focusin=move |_| hover.keep()
+            on:focusout=move |_| hover.hide_soon()
             on:mouseleave=move |_| hover.hide_soon()>
             <div class="flex items-start gap-2">
-                <div class="min-w-0 flex-1 break-words font-medium">{s.title.clone()}</div>
-                <StatusPill status=s.display_status() />
+                <div class="min-w-0 flex-1 break-words font-medium">{move || current.get().title}</div>
+                {move || view! { <StatusPill status=current.get().display_status() /> }}
+                <button class=icons::BAR_BUTTON title="Close session details" aria-label="Close session details" on:click=move |_| hover.hide_now()>{icons::x()}</button>
             </div>
             {s.awaiting_approval.then(|| view! { <p class="text-xs font-medium text-amber-600">"A tool call waits for your approval"</p> })}
             <div class="space-y-0.5 text-xs text-muted">
-                <div class="truncate"><span title=s.on_head.then_some(api::HEAD_TITLE)>{worker}</span> " · " {s.model.clone()}</div>
-                <div class="break-all font-mono">{place.clone()}</div>
-                <div>{move || format!("active {}", ago(now.get() - updated))}</div>
+                <div class="truncate"><span title=s.on_head.then_some(api::HEAD_TITLE)>{worker.clone()}</span> " · " {move || current.get().model}</div>
+                <div class="break-all font-mono">{place()}</div>
+                <div>{move || format!("active {}", ago(now.get() - current.get().updated_at))}</div>
             </div>
             {(!s.labels.is_empty() || !crate::labels::shown_auto(&s.auto_labels).is_empty()).then(|| view! {
                 <div class="flex flex-wrap gap-1">
@@ -1088,16 +1179,17 @@ fn RailCard(s: Session, x: f64, y: f64, hover: Hover, like_this: RwSignal<Option
                 </div>
             })}
             <crate::aspects::AspectChips s=s.clone() />
-            <crate::marks::SessionPalette session=s.id.clone() />
+            <crate::marks::SessionSwatch session=s.clone() />
             <div class="flex flex-wrap gap-1.5 pt-1">
-                <button class=act on:click=move |_| { hover.hide_now(); ws.open(None, View::session(open_id.clone()), How::Beside) }>"Open"</button>
-                <button class=act on:click=move |_| { hover.hide_now(); ws.open(None, View::session(tile_id.clone()), How::NewTile) }>"New tile"</button>
+                <button class=act on:click=move |_| { hover.hide_now(); ws.open(None, View::session(id.get_value()), How::Beside) }>"Open"</button>
+                <button class=act on:click=move |_| { hover.hide_now(); ws.open(None, View::session(id.get_value()), How::OwnTile) }>"New tile"</button>
                 {(!s.observed && s.instance.is_empty()).then(|| view! {
                     <button class=act title="Start a new, empty session with this one's worker, folder, model and labels (you can change them first)"
-                        on:click=move |_| { hover.hide_now(); like_this.set(Some(seed.clone())) }>"New like this"</button>
+                        on:click=move |_| { let seed = SessionSeed::from_session(&current.get_untracked()); hover.hide_now(); like_this.set(Some(seed)) }>"New like this"</button>
                 })}
             </div>
         </div>
+        </leptos::portal::Portal>
     }
 }
 
@@ -1142,7 +1234,7 @@ impl SessionSeed {
 /// you like and start it. The new session opens in a tile of its own.
 #[component]
 pub fn NewSessionDialog(seed: SessionSeed, #[prop(into)] on_close: Callback<()>) -> impl IntoView {
-    let connections = LocalResource::new(api::connections);
+    let connections = crate::resources::connections();
     let seed = StoredValue::new(seed);
     view! {
         // Over every tile, wherever it was opened from: inside a tile it
@@ -1195,10 +1287,11 @@ pub fn SaveTemplateDialog(seed: SessionSeed, #[prop(into)] on_close: Callback<()
     let agents = RwSignal::new(true);
     let worktree = RwSignal::new(seed.worktree);
     let status = RwSignal::new(None::<Result<String, String>>);
-    let place = match &seed.ssh {
-        Some(t) => format!("{worker} ⇄ {t}:{}", seed.cwd),
-        None if seed.cwd.is_empty() => format!("{worker}: a scratch folder"),
-        None => format!("{worker}:{}", seed.cwd),
+    let (place_worker, place_target, place_folder) = (worker.clone(), seed.ssh.clone(), seed.cwd.clone());
+    let place = move || match &place_target {
+        Some(t) => relationship_label(place_worker.clone(), format!("{t}:{place_folder}")).into_any(),
+        None if place_folder.is_empty() => format!("{place_worker}: a scratch folder").into_any(),
+        None => format!("{place_worker}:{place_folder}").into_any(),
     };
     let model = if seed.model.is_empty() { "by routing rules".to_owned() } else { seed.model.clone() };
     let seed = StoredValue::new(seed);
@@ -1269,12 +1362,12 @@ pub fn SaveTemplateDialog(seed: SessionSeed, #[prop(into)] on_close: Callback<()
                         <span class="text-xs text-muted">"Prompt (optional: standing instructions; a subagent's task fills {{input}}, or follows)"</span>
                         <textarea class=format!("{INPUT} min-h-20 font-mono text-xs") prop:value=move || prompt.get() on:input=move |ev| prompt.set(event_target_value(&ev))></textarea>
                     </label>
-                    <label class="flex items-start gap-2">
-                        <input type="checkbox" class="mt-1" prop:checked=move || agents.get() on:change=move |ev| agents.set(event_target_checked(&ev)) />
+                    <label class="flex min-h-8 items-start gap-2 pointer-coarse:min-h-11">
+                        <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || agents.get() on:change=move |ev| agents.set(event_target_checked(&ev)) />
                         <span>"Agents may start it"<span class="block text-xs text-muted">"Any session's agent can start it as a remote subagent, here, whatever worker it runs on"</span></span>
                     </label>
-                    <label class="flex items-start gap-2">
-                        <input type="checkbox" class="mt-1" prop:checked=move || worktree.get() on:change=move |ev| worktree.set(event_target_checked(&ev)) />
+                    <label class="flex min-h-8 items-start gap-2 pointer-coarse:min-h-11">
+                        <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || worktree.get() on:change=move |ev| worktree.set(event_target_checked(&ev)) />
                         <span>"New git worktree"<span class="block text-xs text-muted">"Each session works in a new worktree of the folder, on a new c6/… branch"</span></span>
                     </label>
                     <div class="flex items-center justify-end gap-3">
@@ -1310,7 +1403,7 @@ pub fn SessionDialog(
     #[prop(optional)]
     todo: Option<String>,
 ) -> impl IntoView {
-    let connections = LocalResource::new(api::connections);
+    let connections = crate::resources::connections();
     let first = StoredValue::new(first_message);
     let (seed, work, work_refs) = (StoredValue::new(seed), StoredValue::new(work), StoredValue::new(work_refs));
     let todo = StoredValue::new(todo.unwrap_or_default());
@@ -1731,7 +1824,7 @@ fn SessionForm(
                     if let Some(f) = on_session {
                         f.run(s.clone());
                     }
-                    let how = if on_cancel.is_some() { How::NewTile } else { How::Instead };
+                    let how = if on_cancel.is_some() { How::OwnTile } else { How::Instead };
                     match col {
                         Some(c) => c.open(View::session(s.id), how),
                         None => ws.open(None, View::session(s.id), how),
@@ -1804,7 +1897,10 @@ fn SessionForm(
         let folder = if on_ssh { remote_dir.get().trim().to_owned() } else { cwd.get() };
         let effort = if effort_supported() { effort.get() } else { String::new() };
         let target = if target.is_empty() { "an SSH host".to_owned() } else { target };
-        summary(&worker_label(), on_ssh.then_some(target.as_str()), &folder, &model_label(), &effort, short)
+        let worker = worker_label();
+        let model = model_label();
+        let target = on_ssh.then_some(target.as_str());
+        (summary(&worker, target, &folder, &model, &effort, short), summary_label(&worker, target, &folder, &model, &effort, short))
     };
     let template_label = |t: &c6_api::RealmTemplate| {
         if t.realm == "home" { t.template.name.clone() } else { format!("{} ({})", t.template.name, t.realm) }
@@ -1859,7 +1955,7 @@ fn SessionForm(
                                 {if image {
                                     view! { <img class="h-10 w-10 rounded object-cover" src=format!("data:{};base64,{}", a.mime, a.data) /> }.into_any()
                                 } else {
-                                    view! { <span class="px-1">{crate::icons::file()}</span> }.into_any()
+                                    view! { <span class="px-1">{crate::icons::icon(crate::icons::Icon::File, crate::icons::Size::S14)}</span> }.into_any()
                                 }}
                                 <span class="max-w-40 truncate">{a.name.clone()}</span>
                                 <button type="button" class="text-muted hover:text-zinc-900 dark:hover:text-zinc-100" title="Remove"
@@ -1891,14 +1987,12 @@ fn SessionForm(
                     if crate::util::sends(&ev) { ev.prevent_default(); submit(); }
                 }
             ></textarea>
-            <div class="flex min-w-0 items-center gap-1.5 px-2 pb-2">
+            <div class="flex min-w-0 flex-wrap items-center gap-1.5 px-2 pb-2">
                 {move || fixed().is_none().then(|| view! {
                     <button type="button" class="flex size-6.5 shrink-0 items-center justify-center rounded-md text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
                         title="Attach images or files (or paste / drop them)" aria-label="Attach images or files"
                         on:click=move |_| { if let Some(i) = picker.get_untracked() { i.click(); } }>
-                        <svg viewBox="0 0 16 16" class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
-                            <path d="M8 2.5v11M2.5 8h11" />
-                        </svg>
+                        {crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}
                     </button>
                 })}
                 <input node_ref=picker type="file" multiple class="hidden"
@@ -1914,26 +2008,29 @@ fn SessionForm(
                             on:click=move |_| pick_template(None)>{icons::x()}</button>
                     }.into_any(),
                     None => view! {
-                        <span class="hidden min-w-0 truncate text-xs text-muted md:inline" title=move || line(false)>{move || line(false)}</span>
+                        <span class="hidden min-w-0 truncate text-xs text-muted md:inline" title=move || line(false).0>{move || line(false).1}</span>
                     }.into_any(),
                 }}
                 // A phone's one chip, opening every field in a sheet.
                 <button data-pop=fields_pop.clone() aria-haspopup="dialog" aria-expanded=move || changing.get().to_string()
                     class="inline-flex h-8 min-w-0 items-center gap-1 rounded-md border border-zinc-200 px-2 text-xs text-soft md:hidden dark:border-zinc-700"
                     title="Where and how it runs" on:click=move |_| changing.update(|c| *c = !*c)>
-                    <span class="min-w-0 truncate">{move || template.with(|t| t.as_ref().map(template_label)).unwrap_or_else(|| line(true))}</span>
+                    <span class="min-w-0 truncate">{move || match template.with(|t| t.as_ref().map(template_label)) {
+                        Some(label) => label.into_any(),
+                        None => line(true).1,
+                    }}</span>
                     <span class="text-muted">{crate::icons::chevron_down()}</span>
                 </button>
-                <button type="button" role="switch" aria-checked=move || worktree.get().to_string()
+                <label
                     title="A new git worktree: a c6/… branch and a separate checkout for this session"
                     class=move || if remote.get() || template.with(Option::is_some) { "hidden".to_owned() } else {
-                        format!("inline-flex h-6 shrink-0 items-center gap-1 rounded-md border px-1.5 text-xs pointer-coarse:h-8 {}",
+                        format!("inline-flex min-h-8 shrink-0 cursor-pointer items-center gap-1 rounded-md border px-1.5 text-xs pointer-coarse:min-h-11 {}",
                             if worktree.get() { "border-sky-300 bg-sky-50 text-sky-800 dark:border-sky-800 dark:bg-sky-950 dark:text-sky-300" } else { "border-zinc-300 text-soft hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800" })
-                    }
-                    on:click=move |_| worktree.update(|w| *w = !*w)>
-                    {move || icons::check_box(worktree.get())}
+                    }>
+                    <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || worktree.get()
+                        on:change=move |ev| worktree.set(event_target_checked(&ev)) />
                     "Worktree"
-                </button>
+                </label>
                 <button data-pop=fields_pop.clone() aria-expanded=move || changing.get().to_string()
                     class=move || if template.with(Option::is_some) { "hidden".to_owned() } else { format!("{tool} hidden md:inline-flex") }
                     title="Change where and how it runs" on:click=move |_| changing.update(|c| *c = !*c)>
@@ -1997,14 +2094,14 @@ fn SessionForm(
             <div class:hidden=move || !changing.get()>
                 <div class="fixed inset-0 z-40 bg-black/30 md:hidden" on:click=move |_| changing.set(false)></div>
                 <div data-pop=fields_pop
-                    class="fixed inset-x-0 bottom-0 z-50 flex max-h-[85dvh] flex-col rounded-t-xl border-t border-zinc-200 bg-white text-sm shadow-xl md:static md:z-auto md:max-h-none md:rounded-t-none md:rounded-b-xl md:shadow-none dark:border-zinc-800 dark:bg-zinc-900">
+                    class="phone-sheet fixed inset-x-0 bottom-0 z-50 flex max-h-[85dvh] flex-col rounded-t-xl border-t border-zinc-200 bg-white text-sm shadow-xl md:static md:z-auto md:max-h-none md:rounded-t-none md:rounded-b-xl md:shadow-none dark:border-zinc-800 dark:bg-zinc-900">
                     <h2 class="shrink-0 border-b border-zinc-200 px-4 py-3 font-medium md:hidden dark:border-zinc-800">"New session: where and how it runs"</h2>
                     <div class="min-h-0 flex-1 space-y-3 overflow-y-auto px-4 py-4 md:overflow-visible md:px-3 md:py-3">
                         {move || template.with(Option::is_some).then(|| view! {
                             <p class="text-xs text-muted">"The template sets where and how its sessions run."</p>
                         })}
                         <div class="space-y-3" class:hidden=move || template.with(Option::is_some)>
-                            <div class="grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]">
+                            <div class="grid grid-cols-1 gap-3 @min-[40rem]/view:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]">
                                 <label class="block min-w-0 text-xs text-muted">
                                     "Worker"
                                     <select class=format!("mt-1 {INPUT}") on:change=move |ev| { chosen_by_hand.set(true); worker.set(event_target_value(&ev)) } prop:value=move || worker.get()>
@@ -2057,7 +2154,7 @@ fn SessionForm(
                                     <p class="mt-1">"The connection, model and effort come from the first rule in Settings → Model routing that matches this session's labels."</p>
                                 })}
                             </div>
-                            <div class="grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
+                            <div class="grid grid-cols-1 gap-3 @min-[40rem]/view:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
                                 <label class="block min-w-0 text-xs text-muted">
                                     "Labels"
                                     <input class=format!("mt-1 font-mono {INPUT} {PLACEHOLDER}") placeholder="optional, e.g. client:acme, spike"
@@ -2129,12 +2226,6 @@ fn SessionForm(
     }
 }
 
-/// Raw main-turn status for operational controls, not aggregated display status.
-/// From the session list feed.
-pub fn live_status(id: &str) -> Option<SessionStatus> {
-    api::live().sessions.with(|ss| ss.iter().find(|s| s.id == id).map(|s| s.status))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2183,6 +2274,25 @@ mod tests {
 
     fn ids(list: &[Session]) -> Vec<&str> {
         list.iter().map(|s| s.id.as_str()).collect()
+    }
+
+    #[test]
+    fn activity_sort_is_descending_and_keeps_equal_timestamps_in_input_order() {
+        let input = vec![
+            session("middle-z", "Zulu", 20),
+            session("latest-z", "Zulu", i64::MAX),
+            session("oldest-z", "Zulu", i64::MIN),
+            session("middle-a", "Alpha", 20),
+            session("latest-a", "Alpha", i64::MAX),
+            session("oldest-a", "Alpha", i64::MIN),
+            session("middle-m", "Middle", 20),
+        ];
+        let expected = ["latest-z", "latest-a", "middle-z", "middle-a", "middle-m", "oldest-z", "oldest-a"];
+        let mut list = input.clone();
+        sort_by_activity(&mut list);
+        assert_eq!(ids(&list), expected);
+        assert!(list.windows(2).all(|pair| pair[0].updated_at >= pair[1].updated_at));
+        assert_eq!(ids(&sorted(input, Sort::Activity, &[])), expected);
     }
 
     #[test]
@@ -2247,6 +2357,32 @@ mod tests {
         assert_eq!(home_form("/root"), "~");
         assert_eq!(home_form("/srv/app"), "/srv/app");
         assert_eq!(last_part("/srv/app/"), "app");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn visible_remote_labels_draw_the_relation_while_native_titles_stay_text() {
+        let arrow = icon(Icon::ArrowLeftRight, Size::S14).to_html();
+        for short in [true, false] {
+            let html = summary_label("worker", Some("admin@web1"), "/srv/app", "model", "high", short).to_html();
+            assert_eq!(html.matches("<svg").count(), 1, "keep the relationship icon: {html}");
+            assert!(html.contains(&arrow), "{html}");
+            assert!(!html.contains('⇄'), "the visible label is drawn: {html}");
+            assert!(html.find("worker").unwrap() < html.find("<svg").unwrap(), "{html}");
+            assert!(html.find("<svg").unwrap() < html.find("admin@web1").unwrap(), "{html}");
+            assert!(html.contains(if short { "admin@web1:app" } else { "admin@web1:/srv/app" }), "{html}");
+            assert!(summary("worker", Some("admin@web1"), "/srv/app", "model", "high", short).contains('⇄'));
+        }
+        let local = summary_label("worker", None, "/srv/app", "model", "high", false).to_html();
+        assert_eq!(local, summary("worker", None, "/srv/app", "model", "high", false));
+
+        let mut s = session("s1", "Remote session", 0);
+        s.ssh = Some("admin@web1".into());
+        s.cwd = "/srv/app".into();
+        let row = where_line("worker", &s).to_html();
+        assert!(row.contains(&arrow), "{row}");
+        assert!(row.contains("admin@web1:app"), "{row}");
+        assert!(!row.contains('⇄'), "{row}");
     }
 
     #[test]

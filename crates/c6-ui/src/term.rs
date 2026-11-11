@@ -8,18 +8,22 @@ use gloo_net::websocket::futures::WebSocket;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use serde_json::{Value, json};
+use std::{cell::RefCell, rc::Rc};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
 extern "C" {
     type TermHandle;
 
-    #[wasm_bindgen(js_namespace = c6Terminal, js_name = create)]
+    #[wasm_bindgen(catch, js_namespace = c6Terminal, js_name = load)]
+    async fn load_terminal() -> Result<JsValue, JsValue>;
+
+    #[wasm_bindgen(catch, js_namespace = c6Terminal, js_name = create)]
     fn create_terminal(
         el: &web_sys::HtmlElement,
         on_data: &Closure<dyn FnMut(String)>,
         on_resize: &Closure<dyn FnMut(u32, u32)>,
-    ) -> TermHandle;
+    ) -> Result<TermHandle, JsValue>;
 
     #[wasm_bindgen(method)]
     fn write(this: &TermHandle, data: &[u8]);
@@ -36,28 +40,60 @@ enum Out {
     Resize(u32, u32),
 }
 
+/// Dispose xterm/its observer before dropping callbacks it may still call.
+struct MountedTerminal {
+    term: Rc<TermHandle>,
+    _on_data: Closure<dyn FnMut(String)>,
+    _on_resize: Closure<dyn FnMut(u32, u32)>,
+}
+
+impl Drop for MountedTerminal {
+    fn drop(&mut self) {
+        self.term.dispose();
+    }
+}
+
 /// One live terminal. Reattaching shows the scrollback, so leaving the page
 /// and coming back loses nothing.
 #[component]
 pub fn TerminalView(worker_id: String, terminal_id: String) -> impl IntoView {
     let el = NodeRef::<leptos::html::Div>::new();
     let ws_path = format!("/api/v1/workers/{worker_id}/terminals/{terminal_id}/attach");
+    let loading = RwSignal::new(true);
+    let error = RwSignal::new(None::<String>);
 
     Effect::new(move || {
         let Some(div) = el.get() else { return };
-        let (out_tx, mut out_rx) = mpsc::unbounded::<Out>();
-        let data_tx = out_tx.clone();
-        let on_data = Closure::<dyn FnMut(String)>::new(move |s: String| {
-            let _ = data_tx.unbounded_send(Out::Bytes(s.into_bytes()));
-        });
-        let on_resize = Closure::<dyn FnMut(u32, u32)>::new(move |c, r| {
-            let _ = out_tx.unbounded_send(Out::Resize(c, r));
-        });
-        let term = std::rc::Rc::new(create_terminal(&div, &on_data, &on_resize));
+        let mounted = Rc::new(RefCell::new(None::<MountedTerminal>));
+        let for_cleanup = send_wrapper::SendWrapper::new(mounted.clone());
         let url = crate::api::ws_url(&ws_path);
 
-        let t = term.clone();
         let (fut, abort) = futures::future::abortable(async move {
+            // The shared JS promise continues if this view closes. This future
+            // does not: aborting prevents late DOM/PTY attachment and callbacks.
+            if let Err(e) = load_terminal().await {
+                loading.set(false);
+                error.set(Some(format!("Cannot load terminal: {e:?}. Close and reopen to retry.")));
+                return;
+            }
+            let (out_tx, mut out_rx) = mpsc::unbounded::<Out>();
+            let data_tx = out_tx.clone();
+            let on_data = Closure::<dyn FnMut(String)>::new(move |s: String| {
+                let _ = data_tx.unbounded_send(Out::Bytes(s.into_bytes()));
+            });
+            let on_resize = Closure::<dyn FnMut(u32, u32)>::new(move |c, r| {
+                let _ = out_tx.unbounded_send(Out::Resize(c, r));
+            });
+            let t = match create_terminal(&div, &on_data, &on_resize) {
+                Ok(term) => Rc::new(term),
+                Err(e) => {
+                    loading.set(false);
+                    error.set(Some(format!("Cannot open terminal: {e:?}. Close and reopen to retry.")));
+                    return;
+                }
+            };
+            *mounted.borrow_mut() = Some(MountedTerminal { term: t.clone(), _on_data: on_data, _on_resize: on_resize });
+            loading.set(false);
             let ws = match WebSocket::open(&url) {
                 Ok(ws) => ws,
                 Err(e) => return t.writeln(&format!("\r\n[cannot connect: {e}]")),
@@ -93,19 +129,22 @@ pub fn TerminalView(worker_id: String, terminal_id: String) -> impl IntoView {
             futures::pin_mut!(forward, receive);
             futures::future::select(forward, receive).await;
         });
+        on_cleanup(move || {
+            abort.abort();
+            for_cleanup.take().borrow_mut().take();
+        });
         spawn_local(async move {
             let _ = fut.await;
         });
-        let term_for_cleanup = send_wrapper::SendWrapper::new((term, on_data, on_resize));
-        on_cleanup(move || {
-            abort.abort();
-            let (term, on_data, on_resize) = term_for_cleanup.take();
-            term.dispose();
-            drop((on_data, on_resize));
-        });
     });
 
-    view! { <div node_ref=el class="h-[70vh] w-full overflow-hidden rounded-md border border-zinc-200 p-1 dark:border-zinc-800"></div> }
+    view! {
+        <div class="relative">
+            <Show when=move || loading.get()><p class="absolute left-3 top-3 text-sm text-muted">"Loading terminal…"</p></Show>
+            {move || error.get().map(|e| view! { <crate::util::ErrorBox message=e /> })}
+            <div node_ref=el class="h-[70vh] w-full overflow-hidden rounded-md border border-zinc-200 p-1 dark:border-zinc-800"></div>
+        </div>
+    }
 }
 
 /// A worker's terminals: open new ones, switch, close.
@@ -177,7 +216,7 @@ pub fn Terminals(
                             <button class="px-2 py-1 font-mono text-xs" title=t.cwd.clone() on:click=move |_| active.set(Some(id2.clone()))>
                                 {label}{t.exited.map(|c| format!(" (exited {c})"))}
                             </button>
-                            <button class="px-1.5 text-muted hover:text-red-600" title="Close" on:click={let id = t.id.clone(); move |_| close(id.clone())}>"×"</button>
+                            <button class="px-1.5 text-muted hover:text-red-600" title="Close" aria-label="Close terminal" on:click={let id = t.id.clone(); move |_| close(id.clone())}>{crate::icons::icon(crate::icons::Icon::X, crate::icons::Size::S14)}</button>
                         </span>
                     }
                 }).collect_view()}
@@ -185,13 +224,13 @@ pub fn Terminals(
                 <button class="flex size-6 items-center justify-center rounded-md text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100 pointer-coarse:size-9"
                     title="New terminal in the session's folder" aria-label="New terminal"
                     on:click=move |_| { cwd.set(home.get_value()); picking.set(false); open(); }>
-                    <svg viewBox="0 0 16 16" class="size-3.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
+                    {crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}
                 </button>
                 <button class="flex h-6 items-center rounded-md px-1 text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100 pointer-coarse:h-9"
-                    title="New terminal in another folder" aria-label="New terminal in another folder" on:click=move |_| picking.update(|p| *p = !*p)>"…"</button>
+                    title="New terminal in another folder" aria-label="New terminal in another folder" on:click=move |_| picking.update(|p| *p = !*p)>{crate::icons::icon(crate::icons::Icon::Ellipsis, crate::icons::Size::S14)}</button>
                 {move || picking.get().then(|| view! {
-                    <form class="flex items-center gap-1" on:submit=move |ev| { ev.prevent_default(); picking.set(false); open(); }>
-                        <input class=format!("{} w-64 font-mono text-xs", crate::util::INPUT) placeholder="folder (empty: home)" autofocus=true
+                    <form class="flex min-w-0 max-w-full items-center gap-1" on:submit=move |ev| { ev.prevent_default(); picking.set(false); open(); }>
+                        <input class=format!("{} min-w-0 w-64 font-mono text-xs", crate::util::INPUT) placeholder="folder (empty: home)" autofocus=true
                             prop:value=move || cwd.get() on:input=move |ev| cwd.set(event_target_value(&ev))
                             on:keydown=move |ev| if ev.key() == "Escape" { ev.stop_propagation(); picking.set(false) } />
                         <button type="submit" class=crate::util::BUTTON_QUIET>"Open"</button>

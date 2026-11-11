@@ -211,7 +211,10 @@ pub async fn handle(st: &HeadState, from: WorkerId, method: &str, mut params: Va
             // Anything you can do, by your rule for agents (docs/agent-actions.md).
             "op" => crate::agent_ops::for_session(st, &target, &params).await,
             // Documents (docs/docs.md §9).
-            "doc" => crate::docs::session::for_session(st, &target, &params).await,
+            "doc" => match params["action"].as_str().unwrap_or("") {
+                "archive" | "unarchive" | "archive_many" => crate::docs::archive::for_session(st, &target, &params).await,
+                _ => crate::docs::session::for_session(st, &target, &params).await,
+            },
             // The guard watcher judges a call a policy matched (docs/watchers.md §5.6).
             "guard" => {
                 let row = st.store.session(&target).await?.ok_or_else(|| bad_request("no such session"))?;

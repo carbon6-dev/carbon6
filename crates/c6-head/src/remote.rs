@@ -45,13 +45,13 @@ pub async fn for_session(st: &HeadState, parent: &SessionRow, what: &str, params
             }
             let req = api::SendMessage { text, ..Default::default() };
             let id = Uuid::now_v7().to_string();
-            // Running: the message joins its turn, whose report goes where
-            // it would. Idle: the call waits on the turn it starts.
+            // Every input owns a durable report obligation, including a
+            // steer. The running snapshot can already be stale, and the
+            // background task that owned the previous turn may have ended.
+            // A steer has no waiter: its report must arrive as a waking notice.
             let running = child.status == "running";
-            if !running {
-                st.store.add_remote_delegation(&id, &child.id, &parent.id, &call_id).await?;
-            }
-            if let Err(e) = crate::sessions::send_input_as(st, &child.id, &req, id.clone(), &call_id, None).await {
+            st.store.add_remote_delegation(&id, &child.id, &parent.id, if running { "" } else { &call_id }).await?;
+            if let Err(e) = crate::sessions::send_input_as(st, &child.id, &req, id.clone(), &call_id, None, false).await {
                 st.store.delegation_reported(&id).await?;
                 return Err(e);
             }
@@ -116,7 +116,95 @@ async fn digest(st: &HeadState, child_id: &str, status: &str) -> anyhow::Result<
 pub async fn turn_ended(st: &HeadState, session_id: &str, end_seq: u64, reason: i32) {
     if let Err(e) = relay(st, session_id, end_seq, reason).await {
         warn!(session = %session_id, "relaying a remote subagent's turn to its parent: {e:#}");
+        delivery_failed(st, session_id, &end_seq.to_string(), &e).await;
     }
+}
+
+async fn delivery_failed(st: &HeadState, session_id: &str, report: &str, error: &anyhow::Error) {
+    if let Some(child) = st.store.session(session_id).await.ok().flatten() {
+        let id = format!("subagent:delivery-failed:{session_id}:{report}");
+        let text = format!(
+            "Subagent report delivery failed: report from {session_id} to parent {} remains pending.",
+            child.parent_id.as_deref().unwrap_or("unknown")
+        );
+        let failure = async {
+            let data = SessionCommand {
+                command_id: id.clone(),
+                session_id: session_id.into(),
+                kind: Some(session_command::Kind::Input(c6_proto::UserInput { text: text.clone(), ..Default::default() })),
+            }
+            .encode_to_vec();
+            st.store
+                .subagent_report_failed(
+                    &NewCommand { id: &id, session_id, worker_id: child.worker_id.parse()?, data, text: Some(&text) },
+                    &format!("{error:#}"),
+                )
+                .await?;
+            crate::sessions::publish_queue(st, session_id).await;
+            anyhow::Ok(())
+        }
+        .await;
+        if let Err(error) = failure {
+            warn!(session = %session_id, "recording report delivery failure: {error:#}");
+        }
+    }
+    st.notifier.send(crate::notify::Note {
+        event: "failed",
+        title: "Subagent report delivery failed".into(),
+        message: format!(
+            "Report from subagent {session_id} could not reach its parent: {error:#}. Its delivery obligation is retained for retry."
+        ),
+        priority: "high",
+        session_id: Some(session_id.to_owned()),
+        ..Default::default()
+    });
+}
+
+async fn clear_delivery_failure(st: &HeadState, child: &str, report: &str) {
+    let id = format!("subagent:delivery-failed:{child}:{report}");
+    match sqlx::query("UPDATE commands SET state = 'done' WHERE id = ? AND state = 'rejected'").bind(id).execute(st.store.pool()).await {
+        Ok(done) if done.rows_affected() > 0 => crate::sessions::publish_queue(st, child).await,
+        Ok(_) => {}
+        Err(e) => warn!(session = %child, "clearing an earlier report delivery failure: {e:#}"),
+    }
+}
+
+/// Also used inside ingest's transaction: even an automatic turn with no
+/// parent call owns a report, durably, before the relay hook runs.
+pub(crate) fn turn_report_id(child: &str, seq: u64) -> String {
+    format!("subagent:turn:{child}:{seq}")
+}
+
+/// Ingest commits the child's events before running its hooks. If the
+/// head stopped between those operations, replay outstanding obligations
+/// from that durable log rather than waiting for another child turn.
+pub async fn recover(st: &HeadState) -> anyhow::Result<()> {
+    let children: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT child_id FROM remote_delegations WHERE state = 'waiting'").fetch_all(st.store.pool()).await?;
+    for child in children {
+        let pending = st.store.waiting_delegations(&child).await?;
+        let events = st.store.events_after(&child, 0, i64::MAX).await?;
+        let mut taken = false;
+        for event in events {
+            match event.kind {
+                Some(session_event::Kind::User(u)) if pending.iter().any(|(id, _)| id == &u.command_id) => taken = true,
+                Some(session_event::Kind::TurnEnded(t))
+                    if taken || pending.iter().any(|(id, _)| id == &turn_report_id(&child, event.seq)) =>
+                {
+                    turn_ended(st, &child, event.seq, t.reason).await;
+                    taken = false;
+                }
+                _ => {}
+            }
+        }
+        // Rejections are committed before their hook too.
+        let rejected_inputs: Vec<(String, String)> = sqlx::query_as("SELECT d.command_id, coalesce(c.error, 'input rejected') FROM remote_delegations d JOIN commands c ON c.id = d.command_id WHERE d.child_id = ? AND d.state = 'waiting' AND c.state = 'rejected'")
+            .bind(&child).fetch_all(st.store.pool()).await?;
+        for (id, error) in rejected_inputs {
+            rejected(st, &child, &id, &error).await;
+        }
+    }
+    Ok(())
 }
 
 async fn relay(st: &HeadState, child_id: &str, end_seq: u64, reason: i32) -> anyhow::Result<()> {
@@ -125,16 +213,18 @@ async fn relay(st: &HeadState, child_id: &str, end_seq: u64, reason: i32) -> any
     let events = st.store.since_last_turn(child_id, end_seq).await?;
     let mut taken = Vec::new();
     let mut said = Vec::new();
-    let mut yours = false;
+    let mut delegated = false;
+    let mut automatic = false;
     let mut wake = false;
     let mut report = String::new();
     for e in &events {
         match &e.kind {
             Some(session_event::Kind::User(u)) => {
                 taken.push(u.command_id.clone());
+                delegated |= !u.delegated_by.is_empty();
+                automatic |= u.command == "task-notification";
                 // Yours (not its parent's, nor its own tasks' notices).
                 if u.delegated_by.is_empty() && u.command != "task-notification" {
-                    yours = true;
                     wake |= u.wake;
                     said.push(c6_worker::report_input(
                         child_id,
@@ -143,6 +233,7 @@ async fn relay(st: &HeadState, child_id: &str, end_seq: u64, reason: i32) -> any
                         &u.from_session_id,
                         &u.from_title,
                         u.api_origin.as_ref(),
+                        u.human_origin,
                     ));
                 }
             }
@@ -162,9 +253,10 @@ async fn relay(st: &HeadState, child_id: &str, end_seq: u64, reason: i32) -> any
             _ => {}
         }
     }
+    taken.push(turn_report_id(child_id, end_seq));
     let settled: Vec<(String, String)> =
         st.store.waiting_delegations(child_id).await?.into_iter().filter(|(cmd, _)| taken.contains(cmd)).collect();
-    if settled.is_empty() && !yours {
+    if taken.len() == 1 && settled.is_empty() {
         return Ok(());
     }
     let reason = TurnEndReason::try_from(reason).unwrap_or(TurnEndReason::Unspecified);
@@ -181,15 +273,24 @@ async fn relay(st: &HeadState, child_id: &str, end_seq: u64, reason: i32) -> any
         digest: digest.clone(),
         said,
         wake,
+        task_notice: Some(c6_worker::task_report_notice(&child.title, child_id, reason, &report)),
     };
-    if settled.is_empty() {
-        send(st, &parent_id, ended("", said, wake)).await?;
+    let (steers, calls): (Vec<_>, Vec<_>) = settled.into_iter().partition(|(_, call)| call.is_empty());
+    let mut steers: Vec<String> = steers.into_iter().map(|(cmd, _)| cmd).collect();
+    if calls.is_empty() {
+        let id = format!("subagent:{child_id}:{end_seq}:notice");
+        let wake = wake || delegated || automatic || said.is_empty();
+        send(st, &parent_id, &id, &steers, ended("", said, wake)).await?;
     }
-    for (command_id, call_id) in settled {
-        if st.store.delegation_reported(&command_id).await? {
-            send(st, &parent_id, ended(&call_id, Vec::new(), false)).await?;
-        }
+    for (command_id, call_id) in calls {
+        let id = format!("subagent:{child_id}:{end_seq}:{call_id}");
+        // A turn's normal waiter also covers steers it took. Steers still
+        // queued for the next turn retain their own obligations.
+        let mut inputs = std::mem::take(&mut steers);
+        inputs.push(command_id);
+        send(st, &parent_id, &id, &inputs, ended(&call_id, Vec::new(), false)).await?;
     }
+    clear_delivery_failure(st, child_id, &end_seq.to_string()).await;
     Ok(())
 }
 
@@ -201,18 +302,21 @@ pub async fn rejected(st: &HeadState, session_id: &str, command_id: &str, why: &
         let Some(parent_id) = child.parent_id.clone().filter(|_| !child.remote_template.is_empty()) else { return Ok(()) };
         let failed = child.status == "failed";
         for (cmd, call_id) in st.store.waiting_delegations(session_id).await? {
-            if (failed || cmd == command_id) && st.store.delegation_reported(&cmd).await? {
+            if failed || cmd == command_id {
                 let digest = format!(
                     "<subagent id=\"{session_id}\" status=\"failed\" turns=\"0\" tool_calls=\"0\" elapsed=\"0s\">\nErrors: 1 (last: {why})\n</subagent>"
                 );
                 let ended = DelegationEnded {
+                    wake: call_id.is_empty(),
                     call_id,
                     child_session_id: session_id.to_owned(),
                     reason: TurnEndReason::Error as i32,
                     digest,
+                    task_notice: Some(c6_worker::task_report_notice(&child.title, session_id, TurnEndReason::Error, why)),
                     ..Default::default()
                 };
-                send(st, &parent_id, ended).await?;
+                let id = format!("subagent:rejected:{cmd}");
+                send(st, &parent_id, &id, &[cmd], ended).await?;
             }
         }
         Ok(())
@@ -220,21 +324,25 @@ pub async fn rejected(st: &HeadState, session_id: &str, command_id: &str, why: &
     .await;
     if let Err(e) = result {
         warn!(session = %session_id, "telling a remote subagent's parent of a rejected command: {e:#}");
+        delivery_failed(st, session_id, &format!("rejected:{command_id}"), &e).await;
+    } else {
+        clear_delivery_failure(st, session_id, &format!("rejected:{command_id}")).await;
     }
 }
 
 /// Queues `ended` for the parent: delivered when its worker is connected,
 /// and again until the parent's log says it got it.
-async fn send(st: &HeadState, parent_id: &str, ended: DelegationEnded) -> anyhow::Result<()> {
-    let Some(parent) = st.store.session(parent_id).await? else { return Ok(()) };
+async fn send(st: &HeadState, parent_id: &str, id: &str, inputs: &[String], ended: DelegationEnded) -> anyhow::Result<()> {
+    let parent = st.store.session(parent_id).await?.ok_or_else(|| anyhow::anyhow!("parent session {parent_id} is missing"))?;
     let worker_id: WorkerId = parent.worker_id.parse()?;
-    let id = Uuid::now_v7().to_string();
     let cmd = SessionCommand {
-        command_id: id.clone(),
+        command_id: id.to_owned(),
         session_id: parent_id.to_owned(),
         kind: Some(session_command::Kind::DelegationEnded(ended)),
     };
-    st.store.enqueue_command(&NewCommand { id: &id, session_id: parent_id, worker_id, data: cmd.encode_to_vec(), text: None }).await?;
+    st.store
+        .enqueue_subagent_report(&NewCommand { id, session_id: parent_id, worker_id, data: cmd.encode_to_vec(), text: None }, inputs)
+        .await?;
     st.registry.deliver(worker_id);
     Ok(())
 }

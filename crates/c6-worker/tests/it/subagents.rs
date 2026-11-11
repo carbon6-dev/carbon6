@@ -108,6 +108,69 @@ fn turn_end_after(events: &[Event], seq: u64) -> Option<TurnEndReason> {
     })
 }
 
+/// Normal subagent publications belong to the root sink, including the old
+/// events summarized for independently opened transcript and Outputs feeds.
+#[tokio::test]
+async fn normal_subagent_publication_replays_to_independent_root_subscribers() {
+    use futures::StreamExt;
+    let env = Env::new().await;
+    let state = tempfile::tempdir().unwrap();
+    env.enroll(state.path()).await;
+    let (worker, stop) = run_worker(state.path()).await;
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("report.html"), "<h1>Subagent report</h1>").unwrap();
+    env.mock.push(Reply::ToolCalls(vec![("task".into(), r#"{"description":"Report publisher","prompt":"Publish report.html."}"#.into())]));
+    env.mock.push(Reply::ToolCalls(vec![("publish_file".into(), r#"{"path":"report.html","title":"Subagent report"}"#.into())]));
+    env.mock.push(Reply::Text("Published the report.".into()));
+    env.mock.push(Reply::Text("The report is ready.".into()));
+    let root = env.create(&worker, project.path(), "Delegate the report publication").await;
+    let root_events = eventually("root turn and its subagent publication to finish", async || {
+        let events = env.events(&root).await;
+        (turn_end(&events).is_some() && events.iter().any(|e| matches!(e.kind, EventKind::Output { .. }))).then_some(events)
+    })
+    .await;
+    let child = root_events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::SubagentSpawned { child_session_id, .. } => Some(child_session_id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        !env.events(&child).await.iter().any(|e| matches!(e.kind, EventKind::Output { .. })),
+        "normal child publishes to root, not its own log"
+    );
+    let published = root_events.iter().find(|e| matches!(e.kind, EventKind::Output { .. })).unwrap().clone();
+    let first_end = root_events.last().unwrap().seq;
+    env.mock.push(Reply::Text("A later root turn.".into()));
+    env.http
+        .post(format!("{}/sessions/{root}/messages", env.api))
+        .json(&json!({"text":"Continue after the publication"}))
+        .send()
+        .await
+        .unwrap();
+    eventually("the later root turn to end", async || turn_end_after(&env.events(&root).await, first_end)).await;
+    let address = format!("ws://127.0.0.1:{}/api/v1/sessions/{root}/stream?after=0&tail=1", env.head.ui_addrs[0].port());
+    for _ in 0..2 {
+        let (mut socket, _) = tokio_tungstenite::connect_async(&address).await.unwrap();
+        let (mut from, mut seen) = (None, Vec::new());
+        loop {
+            let msg = c6_testkit::within("the root replay", socket.next()).await.unwrap().unwrap();
+            let tokio_tungstenite::tungstenite::Message::Text(text) = msg else { continue };
+            match serde_json::from_str::<c6_api::StreamMsg>(&text).unwrap() {
+                c6_api::StreamMsg::Window { from: first } => from = Some(first),
+                c6_api::StreamMsg::Event { event } => seen.push(event),
+                c6_api::StreamMsg::Synced => break,
+                _ => {}
+            }
+        }
+        assert!(from.unwrap() > published.seq, "publication precedes the tail window");
+        assert!(seen.contains(&published), "independent root subscribers receive the identical old Output event in their summaries");
+    }
+    stop.cancel();
+    env.head.shutdown().await.unwrap();
+}
+
 /// The parent's log names the child, the child's first message is the
 /// task (the subagent note goes to the model only), and stopping the parent
 /// stops the child, whose finished tool calls stay in its log.
@@ -229,8 +292,16 @@ async fn a_worker_restart_keeps_the_subagents_log() {
             let ev = env.events(sid).await;
             let closed = ev.iter().any(|e| matches!(e.kind, EventKind::TurnEnded { reason: TurnEndReason::WorkerRestarted, .. }));
             let idle = env.detail(sid).await?.session.status == SessionStatus::Idle;
-            let (_, journal) = second.journal.load_session(sid).await.ok()??;
-            (closed && idle && ev.len() == journal.len()).then_some(())
+            (closed && idle).then_some(())
+        })
+        .await;
+        // Receipts are deliberately hidden from the transcript API. Wait
+        // for replication, then compare the full durable logs, not a
+        // visible-event count taken before the receipt reached the head.
+        eventually("head and worker logs agree including report receipts", async || {
+            let (_, journal) = second.journal.load_session(sid).await.unwrap().unwrap();
+            let head = env.head.state.store.events_after(sid, 0, i64::MAX).await.unwrap();
+            (head == journal).then_some(())
         })
         .await;
     }
@@ -459,9 +530,20 @@ async fn message_to_a_subagent_reports_back(via_api: bool) {
     assert!(r.status().is_success(), "{}", r.status());
     eventually("subagent answered", async || (turn_end(&env.events(&child_id).await) == Some(TurnEndReason::Completed)).then_some(()))
         .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
     // The parent records the report for later (docs/background.md §5), but runs no turn.
-    let since: Vec<Event> = env.events(&id).await.into_iter().filter(|e| e.seq > parent_seq).collect();
+    // TurnEnded precedes the report hook: wait for the durable notice,
+    // not a pause that a loaded machine could outlast.
+    let since = eventually("the report to be queued in the parent", async || {
+        let since: Vec<Event> = env.events(&id).await.into_iter().filter(|e| e.seq > parent_seq).collect();
+        since
+            .iter()
+            .any(|e| {
+                matches!(&e.kind, EventKind::NoticeQueued { text, .. }
+            if text.contains("Half the haystack is searched."))
+            })
+            .then_some(since)
+    })
+    .await;
     assert!(!since.iter().any(|e| matches!(e.kind, EventKind::TurnStarted { .. })), "nothing ran in the parent: {since:?}");
 
     // Its next input brings the report.
@@ -481,6 +563,31 @@ async fn message_to_a_subagent_reports_back(via_api: bool) {
         format!("The user messaged subagent {child_id} directly:")
     };
     assert!(req.contains(&label.replace('"', "\\\"")), "{req}");
+    let producer_events = env.head.state.store.events_after(&id, parent_seq, i64::MAX).await.unwrap();
+    let report = producer_events
+        .iter()
+        .find_map(|e| match &e.kind {
+            Some(c6_proto::session_event::Kind::User(u)) if u.command == "task-notification" => Some(u),
+            _ => None,
+        })
+        .unwrap();
+    let metadata = report.task_notice.as_ref().expect("local child report metadata");
+    assert_eq!(
+        (metadata.kind.as_str(), metadata.title.as_str(), metadata.session_id.as_str(), metadata.status.as_str()),
+        ("subagent", "dig", child_id.as_str(), "completed")
+    );
+    assert_eq!(metadata.markdown, "Half the haystack is searched.");
+    assert!(report.text.contains(&label), "raw attribution is retained");
+    let logged = worker.journal.events_after(&child_id, 0, u32::MAX).await.unwrap();
+    let input = logged
+        .iter()
+        .find_map(|e| match &e.kind {
+            Some(c6_proto::session_event::Kind::User(u)) if u.text == "How far did you get?" => Some(u),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(input.human_origin, !via_api, "only the signed-in browser is human");
+    assert_eq!(input.api_origin.as_ref().map(|o| o.token_name.as_str()), via_api.then_some("ops-controller"));
 
     // With wake: the parent starts a turn by itself.
     env.mock.push(Reply::Text("All of it now.".into())); // the subagent

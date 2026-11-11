@@ -208,7 +208,7 @@ fn cell_view(v: Option<&Value>) -> leptos::prelude::AnyView {
         Some(id) if !id.is_empty() => {
             let title = format!("doc:{}", id.chars().take(8).collect::<String>());
             view! {
-                <crate::workspace::Go to=crate::workspace::View::Docs { id: id.to_owned() } class="text-sky-700 hover:underline dark:text-sky-400" stop=true>
+                <crate::workspace::Go to=crate::workspace::View::Docs { id: id.to_owned(), target: None } class="text-sky-700 hover:underline dark:text-sky-400" stop=true>
                     {crate::icons::file()}" "{title}
                 </crate::workspace::Go>
             }.into_any()
@@ -513,7 +513,7 @@ fn OperationForm(collection: Collection, op: c6_api::Operation, record: Option<R
                         </select>
                     }.into_any(),
                     Editor::Flag => view! {
-                        <div><input type="checkbox" prop:checked=move || v.get() == "true" on:change=move |ev| v.set(event_target_checked(&ev).to_string()) /></div>
+                        <div class="flex min-h-8 items-center pointer-coarse:min-h-11"><input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || v.get() == "true" on:change=move |ev| v.set(event_target_checked(&ev).to_string()) /></div>
                     }.into_any(),
                     Editor::Text { long: true } | Editor::Json => view! {
                         <textarea class=format!("{INPUT} h-20 font-mono text-xs") prop:value=move || v.get() on:input=move |ev| v.set(event_target_value(&ev))></textarea>
@@ -696,7 +696,7 @@ fn RecordForm(collection: Collection, record: Option<Record>, done: Callback<()>
                         </select>
                     }.into_any(),
                     Editor::Flag => view! {
-                        <div><input type="checkbox" prop:checked=move || v.get() == "true" on:change=move |ev| v.set(event_target_checked(&ev).to_string()) /></div>
+                        <div class="flex min-h-8 items-center pointer-coarse:min-h-11"><input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || v.get() == "true" on:change=move |ev| v.set(event_target_checked(&ev).to_string()) /></div>
                     }.into_any(),
                     Editor::Text { long: true } | Editor::Json => view! {
                         <textarea class=format!("{INPUT} h-20 font-mono text-xs") prop:value=move || v.get() on:input=move |ev| v.set(event_target_value(&ev))></textarea>

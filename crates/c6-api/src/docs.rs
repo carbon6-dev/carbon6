@@ -60,6 +60,9 @@ pub struct DocSummary {
     pub created_at: UnixMs,
     pub updated_by: String,
     pub updated_at: UnixMs,
+    /// Archived documents keep their links and history but must be unarchived to write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<UnixMs>,
     /// Blocks still to be written (pending), and who is writing them.
     #[serde(default)]
     pub pending: u32,
@@ -147,7 +150,7 @@ pub struct DocNew {
     pub tab: String,
 }
 
-/// `PATCH /api/v1/docs/{id}`: its title and labels.
+/// `PATCH /api/v1/docs/{id}`: its title, labels or archive state.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DocPatch {
@@ -155,6 +158,8 @@ pub struct DocPatch {
     pub title: Option<String>,
     #[serde(default)]
     pub labels: Option<Vec<String>>,
+    #[serde(default)]
+    pub archived: Option<bool>,
 }
 
 /// `POST /api/v1/docs/{id}/ops`: a batch, applied atomically or not at all.
@@ -381,6 +386,9 @@ pub struct DocRestore {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DocQuery {
+    /// Include archived documents (default: only active documents).
+    #[serde(default)]
+    pub archived: bool,
     /// The realm (default: yours, else home).
     #[serde(default)]
     pub realm: Option<String>,
@@ -692,4 +700,23 @@ pub struct CommentNew {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CommentEdit {
     pub text: String,
+}
+
+#[cfg(test)]
+mod archive_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn archive_fields_are_backwards_compatible_and_opt_in() {
+        assert!(!serde_json::from_value::<DocQuery>(json!({})).unwrap().archived);
+        assert!(serde_json::from_value::<DocQuery>(json!({"archived": true})).unwrap().archived);
+        assert_eq!(serde_json::from_value::<DocPatch>(json!({})).unwrap().archived, None);
+        assert_eq!(serde_json::from_value::<DocPatch>(json!({"archived": false})).unwrap().archived, Some(false));
+        let mut summary = serde_json::to_value(DocSummary::default()).unwrap();
+        assert!(summary.get("archived_at").is_none());
+        assert_eq!(serde_json::from_value::<DocSummary>(summary.clone()).unwrap().archived_at, None);
+        summary["archived_at"] = json!(42);
+        assert_eq!(serde_json::from_value::<DocSummary>(summary).unwrap().archived_at, Some(42));
+    }
 }

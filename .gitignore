@@ -3,6 +3,7 @@ crates/c6-ui/dist/
 .DS_Store
 dist/
 __pycache__/
+node_modules/
 
 # The test stand-in for claude logs its process ids here.
 crates/c6-worker/spawns.txt

@@ -11,7 +11,6 @@ use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router};
 use c6_api as api;
 use c6_core::{WorkerId, now_ms};
-use rust_embed::RustEmbed;
 
 use crate::HeadState;
 use crate::realms::Caller;
@@ -84,6 +83,8 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/settings/agents", get(get_agents).put(put_agents))
         .route("/api/v1/commands", get(list_commands))
         .route("/api/v1/sessions/{id}/messages", post(send_message).layer(axum::extract::DefaultBodyLimit::max(ATTACHED_BODY)))
+        .route("/api/v1/sessions/{id}/messages/{command_id}/draft", get(message_draft))
+        .route("/api/v1/sessions/{id}/messages/{command_id}/take-back", post(take_back_message))
         .route("/api/v1/sessions/{id}/seen", post(seen_session))
         .route("/api/v1/sessions/{id}/viewed", post(viewed_session))
         .route("/api/v1/sessions/recent", get(recent_sessions))
@@ -180,6 +181,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/settings/session_grouping", get(get_session_grouping).put(put_session_grouping))
         .route("/api/v1/settings/session_facets", get(get_session_facets).put(put_session_facets))
         .route("/api/v1/settings/transcript", get(get_transcript_settings).put(put_transcript_settings))
+        .route("/api/v1/settings/session_bar", get(get_session_bar_settings).put(put_session_bar_settings))
         .route("/api/v1/marks", get(get_marks).put(put_mark))
         .route("/api/v1/settings/own/{name}", get(get_own_setting).delete(drop_own_setting))
         .route("/api/v1/work", get(list_work).post(add_work))
@@ -290,12 +292,14 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/answers/{call_id}", post(answer_question))
         .merge(crate::auth::routes())
         .merge(crate::docs::http::routes())
+        .merge(crate::docs::archive::routes())
         .merge(crate::projects::routes())
         .merge(crate::quotas::routes())
         .merge(crate::decks::routes())
         .fallback(static_asset)
         .layer(axum::middleware::from_fn_with_state(state.clone(), settings_realm))
         .layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::require))
+        .layer(crate::assets::json_compression())
         .with_state(state)
 }
 
@@ -542,6 +546,7 @@ async fn create_connection(State(st): State<Arc<HeadState>>, Json(req): Json<api
         compact_at: None,
     };
     st.store.insert_connection(&row).await?;
+    st.models.clear();
     Ok(Json(connection_view(row)))
 }
 
@@ -581,6 +586,7 @@ async fn create_pool(st: &HeadState, req: &api::CreateConnection) -> anyhow::Res
         compact_at: None,
     };
     st.store.insert_connection(&row).await?;
+    st.models.clear();
     Ok(connection_view(row))
 }
 
@@ -627,6 +633,7 @@ async fn update_connection(
     };
     let row = crate::store::ConnectionRow { name, members, context_window, subagent_model, compact_at, ..c };
     st.store.update_connection(&row).await?;
+    st.models.clear();
     if let Some(link) = st.local_link.get() {
         link.forget_connection(&id);
     }
@@ -693,6 +700,7 @@ async fn finish_chatgpt(st: &HeadState, callback: &str) -> anyhow::Result<api::C
     }
     if let Some(id) = existing {
         st.store.set_connection_secret(&id, &secret).await?;
+        st.models.clear();
         let row = st.store.connection(&id).await?.ok_or_else(|| anyhow::anyhow!("the connection went away"))?;
         return Ok(connection_view(row));
     }
@@ -713,6 +721,7 @@ async fn finish_chatgpt(st: &HeadState, callback: &str) -> anyhow::Result<api::C
         compact_at: None,
     };
     st.store.insert_connection(&row).await?;
+    st.models.clear();
     Ok(connection_view(row))
 }
 
@@ -740,16 +749,9 @@ async fn chatgpt_callback(State(st): State<Arc<HeadState>>, uri: Uri) -> Respons
     }
 }
 
-/// Trunk's outputs: `name-<16 hex>.ext`, and the wasm, `name-<16 hex>_bg.wasm`.
 /// A body that may carry attachments: up to 20 MB of them (sessions.rs),
 /// as base64 (a third more) in JSON. The default 2 MB refused a screenshot.
 const ATTACHED_BODY: usize = 32 * 1024 * 1024;
-
-fn is_fingerprinted(path: &str) -> bool {
-    let stem = path.rsplit('/').next().unwrap_or(path).split('.').next().unwrap_or("");
-    let stem = stem.strip_suffix("_bg").unwrap_or(stem);
-    stem.rsplit_once('-').is_some_and(|(_, h)| h.len() == 16 && h.chars().all(|c| c.is_ascii_hexdigit()))
-}
 
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
@@ -759,6 +761,7 @@ async fn delete_connection(State(st): State<Arc<HeadState>>, Path(id): Path<Stri
     if !st.store.delete_connection(&id).await? {
         return Err(ApiErr(StatusCode::NOT_FOUND, "no such connection".into()));
     }
+    st.models.clear();
     if let Some(link) = st.local_link.get() {
         link.forget_connection(&id);
     }
@@ -767,16 +770,43 @@ async fn delete_connection(State(st): State<Arc<HeadState>>, Path(id): Path<Stri
 
 /// Lists models from the provider. The head calls the provider directly here;
 /// all model calls for sessions happen on workers.
-async fn connection_models(State(st): State<Arc<HeadState>>, Path(id): Path<String>) -> ApiResult<Json<Vec<String>>> {
+#[derive(Default, serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct ModelQuery {
+    /// Test the saved connection without reading or populating the cache.
+    #[serde(default)]
+    fresh: bool,
+}
+
+async fn connection_models(
+    State(st): State<Arc<HeadState>>,
+    Path(id): Path<String>,
+    Query(q): Query<ModelQuery>,
+) -> ApiResult<Json<Vec<String>>> {
+    let generation = st.models.generation();
     let c = st.store.connection(&id).await?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "no such connection".into()))?;
     if c.kind == crate::pools::KIND {
-        return Ok(Json(crate::pools::models(&st, &c).await?));
+        // The cheap union uses each member's cache. Caching it again
+        // would make a stale member list fresh for another ten minutes.
+        return Ok(Json(crate::pools::models(&st, &c, q.fresh).await?));
     }
-    connection_models_of(&st, &c).await.map(Json)
+    if q.fresh {
+        return list_connection_models(&st, &c).await.map(Json);
+    }
+    connection_models_of(&st, &c, generation).await.map(Json)
 }
 
 /// A (non-pool) connection's models, from its provider.
-pub(crate) async fn connection_models_of(st: &HeadState, c: &crate::store::ConnectionRow) -> ApiResult<Vec<String>> {
+pub(crate) async fn connection_models_of(st: &HeadState, c: &crate::store::ConnectionRow, generation: u64) -> ApiResult<Vec<String>> {
+    let cache = st.models.clone();
+    let st = st.arc().ok_or_else(|| anyhow::anyhow!("head has stopped"))?;
+    let c = c.clone();
+    cache
+        .get(c.id.clone(), generation, move || async move { list_connection_models(&st, &c).await })
+        .await
+        .map_err(|(status, message)| ApiErr(status, message))
+}
+
+pub(crate) async fn list_connection_models(st: &HeadState, c: &crate::store::ConnectionRow) -> ApiResult<Vec<String>> {
     let key = match c.kind.as_str() {
         "chatgpt" => crate::sessions::chatgpt_tokens(st, &c.id).await?.access_token,
         _ => c.api_key.as_deref().map(|k| st.secrets.decrypt(k)).transpose()?.unwrap_or_default(),
@@ -932,7 +962,7 @@ async fn create_session(
     if let Some(p) = crate::projects::with_context(&st, work.as_deref(), &prompt).await {
         req.prompt = Some(p);
     }
-    let s = crate::sessions::create(&st, req).await?;
+    let s = crate::sessions::create_from(&st, req, &caller).await?;
     // The work it belongs to (docs/work.md §4), and the to-do it's on.
     crate::work::on_new_session(&st, &s, work.as_deref(), &refs, &prompt, todo.as_deref()).await;
     // Its worktree may be its work's place (docs/dev-starts.md §4).
@@ -943,9 +973,10 @@ async fn create_session(
 async fn create_side_chat(
     State(st): State<Arc<HeadState>>,
     Path(id): Path<String>,
+    Extension(caller): Extension<Caller>,
     Json(req): Json<api::CreateSideChat>,
 ) -> ApiResult<Json<api::Session>> {
-    Ok(Json(crate::sessions::create_side_chat(&st, &id, req).await?))
+    Ok(Json(crate::sessions::create_side_chat_from(&st, &id, req, &caller).await?))
 }
 
 /// The web UI's CA, for devices to trust (public: it is a certificate).
@@ -1208,6 +1239,20 @@ async fn put_transcript_settings(State(st): State<Arc<HeadState>>, Json(settings
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Like transcript display, one preference for the head's user, not per realm.
+async fn get_session_bar_settings(State(st): State<Arc<HeadState>>) -> ApiResult<Json<api::SessionBarSettings>> {
+    let raw = st.store.setting("session_bar_display").await?;
+    Ok(Json(raw.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default()))
+}
+
+async fn put_session_bar_settings(
+    State(st): State<Arc<HeadState>>,
+    Json(settings): Json<api::SessionBarSettings>,
+) -> ApiResult<StatusCode> {
+    st.store.set_setting("session_bar_display", &serde_json::to_string(&settings).map_err(anyhow::Error::from)?).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 fn facets_key(caller: &Caller) -> String {
     match &caller.realm {
         Some(r) => format!("{SESSION_FACETS}:{r}"),
@@ -1234,7 +1279,7 @@ async fn put_session_facets(
     }
     // In the aspects' own order, each once.
     let shown = api::marks::ASPECTS.into_iter().filter(|a| f.shown.iter().any(|x| x == a)).map(str::to_owned).collect();
-    let value = serde_json::to_string(&api::marks::SessionFacets { shown }).map_err(anyhow::Error::from)?;
+    let value = serde_json::to_string(&api::marks::SessionFacets { shown, tile_bars: f.tile_bars }).map_err(anyhow::Error::from)?;
     st.store.set_setting(&facets_key(&caller), &value).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1285,9 +1330,52 @@ const MAX_TITLE: usize = 120;
 pub(crate) struct UpdateSession {
     title: Option<String>,
     archived: Option<bool>,
+    /// The user's explicit selection from archive-docs. Agents archive
+    /// documents separately, through their document permission gate.
+    #[serde(default)]
+    archive_docs: Vec<String>,
 }
 
-async fn update_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>, Json(req): Json<UpdateSession>) -> ApiResult<StatusCode> {
+async fn update_session(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateSession>,
+) -> ApiResult<StatusCode> {
+    let selected = if req.archive_docs.is_empty() {
+        Vec::new()
+    } else {
+        if crate::agent_ops::actor().is_some() {
+            return Err(crate::forbidden(
+                "archiving a session leaves its documents alone; use docs.archive_many to ask for a document cleanup",
+            )
+            .into());
+        }
+        if req.archived != Some(true) {
+            return Err(crate::bad_request("archive_docs is only a selection for archiving a session").into());
+        }
+        let session = st.store.session(&id).await?.ok_or_else(|| crate::not_found("no such session"))?;
+        if !caller.sees(&session.realm) {
+            return Err(crate::not_found("no such session").into());
+        }
+        let selected = crate::docs::archive::selection(&req.archive_docs)?;
+        let family = crate::docs::archive::family(&st, &id).await?;
+        let pool = crate::docs::pool(&st, &session.realm).await?;
+        // Validate every id before changing either the session or any doc.
+        // Soft-deleted/already archived docs may have changed since the
+        // dialog opened: archive_many skips those without widening it.
+        for doc in &selected {
+            let maker: Option<String> = sqlx::query_scalar("SELECT created_by FROM docs WHERE id = ?")
+                .bind(doc)
+                .fetch_optional(&pool)
+                .await
+                .map_err(anyhow::Error::from)?;
+            if !maker.is_some_and(|by| family.contains(&crate::agent_ops::made_by(&by))) {
+                return Err(crate::bad_request(format!("document {doc} wasn't made by this session or its subagents")).into());
+            }
+        }
+        selected
+    };
     let mut found = true;
     if let Some(t) = req.title.as_deref().map(str::trim) {
         if t.is_empty() {
@@ -1301,7 +1389,42 @@ async fn update_session(State(st): State<Arc<HeadState>>, Path(id): Path<String>
         crate::naming::forget(&st, &id).await?;
     }
     if let Some(a) = req.archived {
-        found &= st.store.set_archived(&id, a).await?;
+        let cleanup = if a && !selected.is_empty() {
+            let realm = crate::realms::of_session(&st, &id).await?.ok_or_else(|| crate::not_found("no such session"))?;
+            let result = crate::docs::archive::archive_many(&st, &realm, &selected, &crate::docs::by_of(&caller)).await?;
+            let failures: Vec<_> = result.skipped.iter().filter(|s| !matches!(s.reason.as_str(), "gone" | "already archived")).collect();
+            if !failures.is_empty() {
+                // Stale selections are harmless, but do not announce that
+                // cleanup succeeded when a document could not be changed.
+                // Earlier successes remain archived and are reported too.
+                return Err(ApiErr(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "Session kept open: some documents could not be archived. Archived ids: {}. Failures: {}",
+                        result.archived.join(", "),
+                        failures.iter().map(|s| format!("{}: {}", s.id, s.reason)).collect::<Vec<_>>().join("; ")
+                    ),
+                ));
+            }
+            Some(result)
+        } else {
+            None
+        };
+        let updated = st.store.set_archived(&id, a).await;
+        if let Some(cleanup) = cleanup {
+            let failure = match &updated {
+                Err(e) => Some(format!("{e:#}")),
+                Ok(false) => Some("no such session".into()),
+                Ok(true) => None,
+            };
+            if let Some(failure) = failure {
+                return Err(ApiErr(
+                    StatusCode::CONFLICT,
+                    format!("Session kept open: could not archive the session: {failure}. Archived ids: {}.", cleanup.archived.join(", ")),
+                ));
+            }
+        }
+        found &= updated?;
         if a && found {
             crate::starts::session_archived(&st, &id).await;
             crate::watchers::session_ended(&st, &id).await;
@@ -1846,7 +1969,16 @@ async fn send_message(
     // You answered: you'd seen how it stood (docs/work.md §3), not the
     // turn this starts.
     let at = now_ms();
-    let queued = crate::sessions::send_input_as(&st, &id, &req, uuid::Uuid::now_v7().to_string(), "", caller.api_origin()).await?;
+    let queued = crate::sessions::send_input_as(
+        &st,
+        &id,
+        &req,
+        uuid::Uuid::now_v7().to_string(),
+        "",
+        caller.api_origin(),
+        caller.human_origin(st.auth.required),
+    )
+    .await?;
     // The message is queued: failing to note this mustn't make the send
     // look failed (and get it sent twice).
     if let Err(e) = crate::work::seen_session(&st, &id, at).await {
@@ -3048,14 +3180,40 @@ async fn dismiss_rejected(State(st): State<Arc<HeadState>>, Path(id): Path<Strin
 
 async fn edit_queued(
     State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
     Path((id, command_id)): Path<(String, String)>,
     Json(req): Json<api::EditQueuedInput>,
 ) -> ApiResult<Json<api::QueuedInput>> {
-    Ok(Json(crate::sessions::edit_queued(&st, &id, &command_id, &req.text).await?))
+    Ok(Json(crate::sessions::edit_queued(&st, &id, &command_id, &req.text, &caller).await?))
 }
 
 async fn cancel_queued(State(st): State<Arc<HeadState>>, Path((id, command_id)): Path<(String, String)>) -> ApiResult<StatusCode> {
     crate::sessions::cancel_queued(&st, &id, &command_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Read-only draft uploads, including when delivery won the prefetch race.
+/// Session ownership is enforced by the same realm middleware as its events.
+async fn message_draft(
+    State(st): State<Arc<HeadState>>,
+    Path((id, command_id)): Path<(String, String)>,
+) -> ApiResult<Json<Vec<api::AttachmentUpload>>> {
+    use base64::Engine;
+
+    let files = st.store.message_attachments(&id, &command_id).await?.ok_or_else(|| crate::not_found("no such message"))?;
+    Ok(Json(
+        files
+            .into_iter()
+            // These are generated context, not uploads; sending again resolves
+            // them from the draft's mentions, just like editing the queue.
+            .filter(|a| !a.name.starts_with("@memex:"))
+            .map(|a| api::AttachmentUpload { name: a.name, mime: a.mime, data: base64::engine::general_purpose::STANDARD.encode(a.data) })
+            .collect(),
+    ))
+}
+
+async fn take_back_message(State(st): State<Arc<HeadState>>, Path((id, command_id)): Path<(String, String)>) -> ApiResult<StatusCode> {
+    crate::sessions::take_back_message(&st, &id, &command_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3325,29 +3483,11 @@ async fn terminal_socket(st: Arc<HeadState>, worker_id: WorkerId, tid: String, m
     }
 }
 
-#[derive(RustEmbed)]
-#[folder = "../c6-ui/dist"]
-#[allow_missing = true]
-struct UiAssets;
-
-async fn static_asset(uri: Uri) -> Response {
-    let path = uri.path().trim_start_matches('/');
-    if path.starts_with("api/") {
+async fn static_asset(uri: Uri, method: axum::http::Method, headers: HeaderMap) -> Response {
+    if uri.path().trim_start_matches('/').starts_with("api/") {
         return ApiErr(StatusCode::NOT_FOUND, "not found".into()).into_response();
     }
-    // SPA: unknown paths serve index.html and the client router takes over.
-    let (path, file) = match UiAssets::get(path).filter(|_| !path.is_empty()) {
-        Some(f) => (path, f),
-        None => match UiAssets::get("index.html") {
-            Some(f) => ("index.html", f),
-            None => return (StatusCode::NOT_FOUND, "web UI not built; run `make ui`").into_response(),
-        },
-    };
-    let mime = mime_guess::from_path(path).first_or_octet_stream();
-    // Trunk fingerprints its outputs (`name-<16 hex>.ext`); those never
-    // change. Everything else (index.html, vendored scripts) is revalidated.
-    let cache = if is_fingerprinted(path) { "public, max-age=31536000, immutable" } else { "no-cache" };
-    ([(header::CONTENT_TYPE, mime.as_ref().to_owned()), (header::CACHE_CONTROL, cache.to_owned())], file.data).into_response()
+    crate::assets::static_asset(uri, method, headers).await
 }
 
 // --- The assistant and the operation catalog ----------------------------------
@@ -3361,7 +3501,7 @@ async fn ask_assistant(
     if let Some(realm) = &caller.realm {
         req.realm = Some(realm.clone());
     }
-    Ok(Json(crate::sessions::create_assistant(&st, req).await?))
+    Ok(Json(crate::sessions::create_assistant_from(&st, req, &caller).await?))
 }
 
 /// Whether Ask can run on Claude Code on this machine (docs/ask.md §3).
@@ -4220,6 +4360,7 @@ async fn set_connection_realms(
     Json(r): Json<api::RealmsIn>,
 ) -> ApiResult<StatusCode> {
     crate::realms::set_availability(&st, "connections", &id, &r.realms).await?;
+    st.models.clear();
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -4298,12 +4439,16 @@ async fn get_openapi(State(st): State<Arc<HeadState>>) -> Json<serde_json::Value
 }
 
 /// Runs an operation (the CLI): destructive ones need `confirmed`.
-async fn call_catalog(State(st): State<Arc<HeadState>>, Json(c): Json<api::CatalogCall>) -> ApiResult<Json<serde_json::Value>> {
+async fn call_catalog(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Json(c): Json<api::CatalogCall>,
+) -> ApiResult<Json<serde_json::Value>> {
     let op = crate::catalog::find(&c.op).ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, format!("no operation {:?}", c.op)))?;
     if op.effect == crate::catalog::Effect::Destructive && !c.confirmed {
         return Err(ApiErr(StatusCode::CONFLICT, format!("{} is destructive ({}); confirm to run it", op.name, op.summary)));
     }
-    Ok(Json(crate::assistant::execute(&st, op, c.input, "you", None).await?))
+    Ok(Json(crate::assistant::execute_for_caller(&st, op, c.input, "you", caller).await?))
 }
 
 /// Your answers to the assistant's question (a form).
@@ -4532,7 +4677,15 @@ async fn answer_decision(
     Path(id): Path<i64>,
     Json(a): Json<api::DecisionAnswer>,
 ) -> ApiResult<Json<api::Decision>> {
-    let via = if caller.realm.is_some() { "an API token" } else { "carbon6" };
+    // Realm scope is not an auth origin: browsers can be in a realm,
+    // while root API tokens have no realm. Auth supplies names, not secrets.
+    let via = match caller.api_token_name.as_deref() {
+        Some(name) => {
+            let name = name.trim();
+            if !name.is_empty() && name.chars().count() <= 80 && !name.chars().any(char::is_control) { name } else { "an API token" }
+        }
+        None => "carbon6",
+    };
     Ok(Json(crate::decisions::answer(&st, id, &a, via).await?))
 }
 
@@ -4542,18 +4695,227 @@ async fn decision_session(State(st): State<Arc<HeadState>>, Path(id): Path<i64>)
 }
 
 #[cfg(test)]
-mod fingerprint_tests {
-    use super::is_fingerprinted;
+mod tests {
+    use super::*;
+    use serde_json::json;
 
-    #[test]
-    fn trunk_outputs_are_fingerprinted_and_the_rest_not() {
-        // The wasm too: without it, 15 MB went again on every page load.
-        assert!(is_fingerprinted("c6-ui-789d462898aabf89_bg.wasm"));
-        assert!(is_fingerprinted("c6-ui-1de8bb420f162f4a.js"));
-        assert!(is_fingerprinted("input-d3c90d3631cf98b5.css"));
-        assert!(!is_fingerprinted("index.html"));
-        assert!(!is_fingerprinted("vendor/xterm.js"));
-        assert!(!is_fingerprinted("js/terminal.js"));
-        assert!(!is_fingerprinted("c6-ui-notahexhashxxxxx_bg.wasm"));
+    #[tokio::test]
+    async fn message_draft_roundtrips_pending_and_durable_uploads_with_realm_scope() {
+        use base64::Engine;
+        use c6_proto::{Attachment, SessionCommand, SessionEvent, UserInput, UserMessage, session_command, session_event};
+        use prost::Message;
+
+        let dir = tempfile::tempdir().unwrap();
+        let head = crate::start(crate::HeadConfig {
+            data_dir: dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let st = &head.state;
+        crate::realms::create(st, &api::RealmIn { id: "lab".into(), name: "Lab".into(), ..Default::default() }, "you").await.unwrap();
+        let worker = WorkerId::new();
+        for (id, realm) in [("draft-home", "home"), ("draft-lab", "lab")] {
+            sqlx::query(
+                "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, realm) \
+                 VALUES (?, ?, 'Draft', '', 'c', 'm', 'idle', 0, 0, ?)",
+            )
+            .bind(id)
+            .bind(worker.to_string())
+            .bind(realm)
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+        }
+        let uploads = vec![
+            Attachment { name: "original image.png".into(), mime: "image/png".into(), data: vec![0, 255, 128, 1] },
+            Attachment { name: "notes ü.txt".into(), mime: "text/plain".into(), data: "original\ntext ü".as_bytes().to_vec() },
+        ];
+        let mut source = uploads.clone();
+        source.push(Attachment { name: "@memex:project:test".into(), mime: "text/markdown".into(), data: b"generated context".to_vec() });
+        for (id, files) in [("draft-input", source.clone()), ("empty-input", Vec::new())] {
+            st.store
+                .enqueue_command(&crate::store::NewCommand {
+                    id,
+                    session_id: "draft-lab",
+                    worker_id: worker,
+                    data: SessionCommand {
+                        command_id: id.into(),
+                        session_id: "draft-lab".into(),
+                        kind: Some(session_command::Kind::Input(UserInput {
+                            text: "draft".into(),
+                            attachments: files,
+                            ..Default::default()
+                        })),
+                    }
+                    .encode_to_vec(),
+                    text: Some("draft"),
+                })
+                .await
+                .unwrap();
+        }
+        let lab = st.store.create_api_token("lab", Some("lab")).await.unwrap().token.unwrap();
+        let home = st.store.create_api_token("home", Some("home")).await.unwrap().token.unwrap();
+        let root = st.store.create_api_token("root", None).await.unwrap().token.unwrap();
+        let url = format!("http://{}/api/v1/sessions", head.ui_addrs[0]);
+        let expected: Vec<_> = uploads
+            .iter()
+            .map(|a| json!({"name": a.name, "mime": a.mime, "data": base64::engine::general_purpose::STANDARD.encode(&a.data)}))
+            .collect();
+        let before = st.store.pending_input("draft-input").await.unwrap().unwrap();
+        // First pending, then taken: the same contract survives a late fetch.
+        for durable in [false, true] {
+            if durable {
+                let mut recorded = source.clone();
+                recorded.push(Attachment {
+                    name: "worker-mentioned.txt".into(),
+                    mime: "text/plain".into(),
+                    data: b"not an upload".to_vec(),
+                });
+                st.store
+                    .ingest(
+                        worker,
+                        "draft-lab",
+                        &[SessionEvent {
+                            seq: 1,
+                            ts_ms: now_ms(),
+                            kind: Some(session_event::Kind::User(UserMessage {
+                                command_id: "draft-input".into(),
+                                attachments: recorded,
+                                ..Default::default()
+                            })),
+                        }],
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(st.store.pending_input("draft-input").await.unwrap().is_none());
+            }
+            for token in [&lab, &root] {
+                let response = st.http.get(format!("{url}/draft-lab/messages/draft-input/draft")).bearer_auth(token).send().await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response.json::<serde_json::Value>().await.unwrap(), json!(expected));
+            }
+            for (token, session, command) in [
+                (&home, "draft-lab", "draft-input"),
+                (&lab, "draft-home", "draft-input"),
+                (&root, "draft-home", "draft-input"),
+                (&lab, "draft-lab", "missing"),
+                (&root, "missing", "draft-input"),
+            ] {
+                let response = st.http.get(format!("{url}/{session}/messages/{command}/draft")).bearer_auth(token).send().await.unwrap();
+                assert_eq!(response.status(), StatusCode::NOT_FOUND, "{session}/{command}");
+            }
+            let response = st.http.get(format!("{url}/draft-lab/messages/empty-input/draft")).bearer_auth(&lab).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.json::<serde_json::Value>().await.unwrap(), json!([]));
+        }
+        let stored: Vec<u8> =
+            sqlx::query_scalar("SELECT data FROM commands WHERE id = 'draft-input'").fetch_one(&st.store.pool).await.unwrap();
+        assert_eq!(stored, before.2, "reads preserve the original command and generated context");
+        // Old/imported events can have no retained source command at all.
+        st.store
+            .ingest(
+                worker,
+                "draft-lab",
+                &[SessionEvent {
+                    seq: 2,
+                    ts_ms: now_ms(),
+                    kind: Some(session_event::Kind::User(UserMessage {
+                        command_id: "source-less".into(),
+                        attachments: source,
+                        ..Default::default()
+                    })),
+                }],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let response = st.http.get(format!("{url}/draft-lab/messages/source-less/draft")).bearer_auth(&lab).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.json::<serde_json::Value>().await.unwrap(), json!(expected));
+        assert_eq!(st.store.events_after("draft-lab", 0, 10).await.unwrap().len(), 2, "draft reads never append or delete events");
+        head.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn decision_answer_attribution_uses_auth_origin_not_realm() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = crate::start(crate::HeadConfig {
+            data_dir: dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let st = &head.state;
+        crate::realms::create(st, &api::RealmIn { id: "lab".into(), name: "Lab".into(), ..Default::default() }, "you").await.unwrap();
+        let http = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+        let link = st.store.create_login_link().await.unwrap();
+        let login = http.post(format!("{url}/auth/link")).json(&json!({"token": link})).send().await.unwrap();
+        assert_eq!(login.status(), StatusCode::NO_CONTENT);
+        let cookie = login.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_owned();
+
+        // Exercise the real auth middleware and handler, then reload the
+        // decision: neither realm scope nor a token's secret is attribution.
+        for (place, realm) in [("admin", "root"), ("home", "home"), ("lab", "lab")] {
+            let decision = crate::decisions::open(st, &api::DecisionIn { title: "Browser answer".into(), ..Default::default() }, realm, "")
+                .await
+                .unwrap();
+            let response = http
+                .post(format!("{url}/decisions/{}/answer", decision.id))
+                .header("cookie", &cookie)
+                .header("x-c6-realm", place)
+                .json(&json!({"note": "Answered in the browser"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "browser in {place}");
+            let answered: api::Decision = response.json().await.unwrap();
+            assert_eq!(answered.answered_via, "carbon6", "browser in {place}");
+            assert_eq!(answered.state, "answered");
+            assert_eq!(crate::decisions::get(st, decision.id).await.unwrap().unwrap(), answered);
+        }
+
+        for (realm, name, expected) in [
+            (Some("lab"), "Lab automation", "Lab automation"),
+            (None, "Root automation", "Root automation"),
+            (Some("lab"), "  Trimmed name  ", "Trimmed name"),
+            (None, "", "an API token"),
+            (Some("lab"), "   ", "an API token"),
+            (None, "line\nbreak", "an API token"),
+            (Some("lab"), "control\u{7}name", "an API token"),
+            (None, &"x".repeat(81), "an API token"),
+        ] {
+            let token = st.store.create_api_token(name, realm).await.unwrap().token.unwrap();
+            let decision = crate::decisions::open(
+                st,
+                &api::DecisionIn { title: "Token answer".into(), ..Default::default() },
+                realm.unwrap_or("home"),
+                "",
+            )
+            .await
+            .unwrap();
+            let response = http
+                .post(format!("{url}/decisions/{}/answer", decision.id))
+                .bearer_auth(&token)
+                .json(&json!({"note": "Answered through the API"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "token in {realm:?}");
+            let answered: api::Decision = response.json().await.unwrap();
+            assert_eq!(answered.answered_via, expected, "token in {realm:?}");
+            assert!(!serde_json::to_string(&answered).unwrap().contains(&token), "never persist or return the token secret");
+            assert_eq!(answered.state, "answered");
+            assert_eq!(crate::decisions::get(st, decision.id).await.unwrap().unwrap(), answered);
+        }
+        head.shutdown().await.unwrap();
     }
 }

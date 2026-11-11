@@ -172,10 +172,17 @@ pub async fn list(st: &HeadState, realm: &str, doc: &str) -> anyhow::Result<Vec<
 /// The threads an agent answered and you haven't looked at yet, per
 /// document (for work and projects: needs you).
 pub async fn answered(st: &HeadState, realm: &str, doc: &str) -> usize {
-    match list(st, realm, doc).await {
-        Ok(t) => t.iter().filter(|t| t.needs_you).count(),
-        Err(_) => 0,
-    }
+    let Ok(pool) = super::pool(st, realm).await else { return 0 };
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM doc_threads t \
+         JOIN docs d ON d.id = t.doc_id AND d.deleted_at IS NULL AND d.archived_at IS NULL \
+         JOIN doc_comments c ON c.id = (SELECT id FROM doc_comments WHERE thread_id = t.id ORDER BY at DESC, id DESC LIMIT 1) \
+         WHERE t.doc_id = ? AND t.state = 'open' AND c.by LIKE 'session:%'",
+    )
+    .bind(doc)
+    .fetch_one(&pool)
+    .await
+    .unwrap_or(0) as usize
 }
 
 /// A thread an agent answered, waiting for your reply or for you to
@@ -201,7 +208,7 @@ pub async fn answered_in(st: &HeadState, realm: &str, limit: i64) -> anyhow::Res
     let pool = super::pool(st, realm).await?;
     let rows = sqlx::query(
         "SELECT t.id, t.doc_id, t.about, d.title, c.id AS comment, c.at FROM doc_threads t \
-         JOIN docs d ON d.id = t.doc_id AND d.deleted_at IS NULL \
+         JOIN docs d ON d.id = t.doc_id AND d.deleted_at IS NULL AND d.archived_at IS NULL \
          JOIN doc_comments c ON c.id = (SELECT id FROM doc_comments WHERE thread_id = t.id ORDER BY at DESC, id DESC LIMIT 1) \
          WHERE t.state = 'open' AND c.by LIKE 'session:%' ORDER BY c.at DESC LIMIT ?",
     )
@@ -223,6 +230,7 @@ pub async fn answered_in(st: &HeadState, realm: &str, limit: i64) -> anyhow::Res
 
 /// A new thread with its first comment; sent to an agent when asked.
 pub async fn create(st: &HeadState, realm: &str, doc: &str, n: &ThreadNew, by: &str) -> anyhow::Result<DocThread> {
+    let _guard = super::writable(st, realm, doc).await?;
     let text = check_text(&n.text)?;
     let pool = super::pool(st, realm).await?;
     let mut conn = pool.acquire().await?;
@@ -301,6 +309,7 @@ async fn one(st: &HeadState, realm: &str, doc: &str, thread: &str) -> anyhow::Re
 /// A reply; sent (again) to an agent when asked. A reply reopens a
 /// resolved thread.
 pub async fn reply(st: &HeadState, realm: &str, doc: &str, thread: &str, c: &CommentNew, by: &str) -> anyhow::Result<DocThread> {
+    let _guard = super::writable(st, realm, doc).await?;
     let text = check_text(&c.text)?;
     let pool = super::pool(st, realm).await?;
     thread_row(&pool, doc, thread).await?;
@@ -344,6 +353,7 @@ pub async fn edit(
     e: &CommentEdit,
     by: &str,
 ) -> anyhow::Result<DocThread> {
+    let _guard = super::writable(st, realm, doc).await?;
     let text = check_text(&e.text)?;
     changeable(st, realm, doc, thread, comment, by).await?;
     let pool = super::pool(st, realm).await?;
@@ -360,6 +370,7 @@ pub async fn edit(
 /// Your comment, gone while no agent has received it; with it the thread,
 /// if it was the only one.
 pub async fn delete(st: &HeadState, realm: &str, doc: &str, thread: &str, comment: &str, by: &str) -> anyhow::Result<()> {
+    let _guard = super::writable(st, realm, doc).await?;
     changeable(st, realm, doc, thread, comment, by).await?;
     let pool = super::pool(st, realm).await?;
     let mut tx = pool.begin().await?;
@@ -377,6 +388,7 @@ pub async fn delete(st: &HeadState, realm: &str, doc: &str, thread: &str, commen
 
 /// Resolves a thread. An agent resolves only threads it began.
 pub async fn resolve(st: &HeadState, realm: &str, doc: &str, thread: &str, by: &str) -> anyhow::Result<DocThread> {
+    let _guard = super::writable(st, realm, doc).await?;
     let pool = super::pool(st, realm).await?;
     let r = thread_row(&pool, doc, thread).await?;
     let made: String = r.get("created_by");
@@ -518,6 +530,7 @@ async fn send(st: &HeadState, realm: &str, doc: &str, thread: &str) -> anyhow::R
 /// one message, which answers each in its thread. `ids` empty: every open
 /// thread `by` began that hasn't been sent to an agent.
 pub async fn send_many(st: &HeadState, realm: &str, doc: &str, ids: &[String], by: &str) -> anyhow::Result<Vec<DocThread>> {
+    let _guard = super::writable(st, realm, doc).await?;
     let all = list(st, realm, doc).await?;
     let chosen: Vec<DocThread> =
         all.into_iter().filter(|t| t.state == "open").filter(|t| if ids.is_empty() { t.unsent } else { ids.contains(&t.id) }).collect();

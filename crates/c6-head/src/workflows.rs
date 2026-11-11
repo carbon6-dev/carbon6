@@ -277,7 +277,7 @@ async fn holds(st: &HeadState, run: &Run, c: &api::StepCondition) -> anyhow::Res
 /// The text of a session's last reply.
 async fn last_reply(st: &HeadState, session_id: &str) -> String {
     use c6_proto::content_block::Block;
-    let Ok(events) = st.store.events_after(session_id, 0, i64::MAX).await else { return String::new() };
+    let Ok(events) = st.store.effective_events(session_id).await else { return String::new() };
     events
         .iter()
         .rev()
@@ -558,6 +558,27 @@ pub async fn runs(st: &HeadState, workflow: Option<&str>, realm: Option<&str>, l
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn last_reply_ignores_withdrawn_answers_even_without_a_replacement() {
+        let (_dir, head, _mock, _id) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        let events = crate::store::tests::rewind_history();
+        crate::store::tests::insert_events(&st.store, "session", &events).await;
+        assert_eq!(last_reply(st, "session").await, "KEEP_REPLACEMENT_ANSWER");
+        crate::store::tests::insert_events(
+            &st.store,
+            "session",
+            &[c6_proto::SessionEvent {
+                seq: 20,
+                kind: Some(c6_proto::session_event::Kind::Rewound(c6_proto::Rewound { to_seq: 2, ..Default::default() })),
+                ..Default::default()
+            }],
+        )
+        .await;
+        assert!(last_reply(st, "session").await.is_empty());
+        head.shutdown().await.unwrap();
+    }
 
     #[test]
     fn rendering_and_results() {

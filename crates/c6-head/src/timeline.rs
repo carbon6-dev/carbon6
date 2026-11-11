@@ -47,7 +47,7 @@ pub(crate) struct Who {
 
 /// Who sent a message that starts a turn.
 pub(crate) fn who(kind: &EventKind) -> Option<Who> {
-    let EventKind::User { text, command, from_session_id, from_title, delegated_by, .. } = kind else { return None };
+    let EventKind::User { text, command, from_session_id, from_title, delegated_by, origin, .. } = kind else { return None };
     let words = |t: &str| clip(t.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or(""), 60);
     let (by, from, words) = if !from_session_id.is_empty() {
         ("session", from_title.clone(), words(text))
@@ -59,6 +59,13 @@ pub(crate) fn who(kind: &EventKind) -> Option<Who> {
         ("doc", doc, String::new())
     } else if !delegated_by.is_empty() {
         ("agent", String::new(), words(text))
+    } else if let Some(api::MessageOrigin::Api { token_name }) = origin.as_deref() {
+        ("api", token_name.clone(), words(text))
+    } else if matches!(
+        origin.as_deref(),
+        Some(api::MessageOrigin::Unknown | api::MessageOrigin::Session | api::MessageOrigin::TaskCard | api::MessageOrigin::TaskCardAnswer)
+    ) {
+        ("automation", String::new(), words(text))
     } else {
         ("you", String::new(), words(text))
     };
@@ -145,6 +152,15 @@ async fn turns(st: &HeadState, id: &str) -> anyhow::Result<Vec<TimelineTurn>> {
     while t.read < last {
         let page = st.store.events_after(id, t.read, 1000).await?;
         let Some(end) = page.last().map(|e| e.seq) else { break };
+        if page.iter().any(|e| matches!(e.kind, Some(c6_proto::session_event::Kind::Rewound(_)))) {
+            // A rewind invalidates already cached turns, not just this page.
+            t = Turns::default();
+            for e in st.store.effective_events(id).await?.iter().filter(|e| e.seq <= last).filter_map(crate::convert::event) {
+                t.feed(&e);
+            }
+            t.read = last;
+            break;
+        }
         for e in page.iter().filter_map(crate::convert::event) {
             t.feed(&e);
         }
@@ -212,12 +228,9 @@ async fn make_lines(st: &HeadState, row: &SessionRow, list: &mut [TimelineTurn])
     let mut parts = Vec::new();
     for &i in &missing {
         let t = &list[i];
-        let events = match st
-            .store
-            .events_after(&row.id, t.start_seq.saturating_sub(1), (t.end_seq + 1 - t.start_seq).min(TURN_EVENTS) as i64)
-            .await
-        {
-            Ok(evs) => evs.iter().filter_map(crate::convert::event).collect::<Vec<_>>(),
+        let last = t.end_seq.min(t.start_seq.saturating_add(TURN_EVENTS - 1));
+        let events = match crate::catchup::read(st, &row.id, t.start_seq.saturating_sub(1), last).await {
+            Ok(evs) => evs,
             Err(e) => {
                 warn!(session = %row.id, "reading a turn for its line: {e:#}");
                 return;
@@ -247,6 +260,8 @@ fn described(t: &TimelineTurn, events: &[Event]) -> String {
     let started = match t.by.as_str() {
         "you" => format!("the user: \"{}\"", t.words),
         "session" => format!("a message from the session \"{}\": \"{}\"", t.from, t.words),
+        "api" => format!("an API message (token {:?}): {:?}", t.from, t.words),
+        "automation" => format!("an automation message: {:?}", t.words),
         "task" => format!("a background task ended: {}", t.words),
         "doc" => format!("comments on the document \"{}\"", t.from),
         "agent" => format!("the agent that started it: \"{}\"", t.words),
@@ -305,7 +320,47 @@ pub(crate) fn parse_lines(text: &str) -> HashMap<u64, String> {
 mod tests {
     use super::*;
     use crate::catchup::tests::{card_answer, ev, from_session, notice, reply, result, user};
+
+    #[test]
+    fn automation_does_not_become_you_in_folded_turns_or_model_summaries() {
+        for (origin, by, from) in [
+            (api::MessageOrigin::Api { token_name: "c6-cli-zmbp".into() }, "api", "c6-cli-zmbp"),
+            (api::MessageOrigin::Unknown, "automation", ""),
+            (api::MessageOrigin::TaskCard, "automation", ""),
+            (api::MessageOrigin::TaskCardAnswer, "automation", ""),
+        ] {
+            let mut input = user("Status update");
+            let EventKind::User { origin: saved, .. } = &mut input else { panic!("user event") };
+            *saved = Some(Box::new(origin));
+            let sender = who(&input).unwrap();
+            assert_eq!((sender.by.as_str(), sender.from.as_str()), (by, from));
+            let described = described(&TimelineTurn { by: sender.by, from: sender.from, words: sender.words, ..Default::default() }, &[]);
+            assert!(!described.contains("the user"), "{described}");
+            assert!(described.contains("Status update"), "{described}");
+        }
+    }
     use serde_json::json;
+
+    #[tokio::test]
+    async fn timeline_discards_cached_withdrawn_turns_before_describing_them() {
+        let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
+        let events = crate::store::tests::rewind_history();
+        crate::store::tests::insert_events(&head.state.store, "session", &events[..11]).await;
+        let before = turns(&head.state, "session").await.unwrap();
+        assert_eq!(before.len(), 2);
+        assert!(before[1].words.contains("PRIVATE"));
+        crate::store::tests::insert_events(&head.state.store, "session", &events[11..]).await;
+        let after = turns(&head.state, "session").await.unwrap();
+        assert_eq!(after.iter().map(|t| t.turn).collect::<Vec<_>>(), [1, 3]);
+        for t in &after {
+            let effective = crate::catchup::read(&head.state, "session", t.start_seq - 1, t.end_seq).await.unwrap();
+            let text = described(t, &effective);
+            assert!(!text.contains("PRIVATE"), "{text}");
+            assert!(text.contains("KEEP"), "{text}");
+        }
+        assert_eq!(turns(&head.state, "session").await.unwrap(), after, "the rebuilt cache stays effective");
+        head.shutdown().await.unwrap();
+    }
 
     #[test]
     fn card_answers_start_and_attribute_turns_as_user_messages() {

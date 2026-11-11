@@ -12,7 +12,7 @@ use c6_proto::{ephemeral_event, session_event};
 pub use base_prompt::{BASE_PROMPT, base_prompt_for_tools};
 pub use history::{
     HANDOFF_BUDGET, compacted_context, context_tokens_from_events, effective_events, handoff_context, history_from_events, model_text,
-    portable_events, portable_messages, transcript_text, user_blocks, user_text,
+    portable_events, portable_messages, rewind_context, transcript_text, user_blocks, user_text,
 };
 pub use prompt::build_system_prompt;
 pub use turn::{
@@ -21,8 +21,8 @@ pub use turn::{
 };
 
 /// What a subagent is told (docs/os.md §4.6: an editable prompt).
-pub const SUBAGENT_NOTE: &str = "You are a subagent working for another agent, which cannot see this conversation. \
-Work autonomously. When you are done, reply with a concise but complete report of what you found or did; that report is all the other agent receives.";
+pub const SUBAGENT_NOTE: &str = "You are a subagent working for another agent, which does not receive this conversation automatically. \
+Work autonomously. When you are done, reply with a concise but complete report of what you found or did; your report is returned to the other agent.";
 
 /// What an agent is told after the digest of a subagent that did not
 /// finish (docs/subagents.md §10: an editable prompt).
@@ -51,8 +51,9 @@ then continue the task and finish with your report.";
 /// Introduces, in Task's description, the templates an agent may start as
 /// remote subagents (docs/remote-subagents.md §6: an editable prompt).
 pub const SUBAGENT_TEMPLATES: &str = "Templates (set template, and on when it lists several places): each starts the subagent as a \
-session of its own somewhere else, set up by the user: another worker, folder, repository or model, with its own tools. It cannot \
-see this conversation or your files; give it a complete prompt, and expect files it changes to stay where it runs.";
+session of its own in a place set up by the user: another worker, folder, repository or model, with its own tools. It does not \
+receive this conversation or copies of your files automatically; give it a complete prompt. File access depends on where it runs \
+and the tools and OS permissions available there; changes happen there. This is delegation, not isolation.";
 
 /// The result of a remote subagent's call after this worker restarted
 /// while the call waited (an editable prompt).
@@ -100,6 +101,11 @@ pub struct PendingInput {
     pub hops: u32,
     /// HTTP API origin, with only a token's display name (no secret).
     pub api_origin: Option<c6_proto::ApiMessageOrigin>,
+    /// Producer-supplied display metadata; the original text stays unchanged.
+    pub task_notice: Option<c6_proto::TaskNotice>,
+    /// Known human input from the head's authenticated browser route.
+    /// False for internal/legacy input, even when it has user authority.
+    pub human_origin: bool,
     /// Send now: a running turn gets it at once, not at its next step
     /// (docs/background.md §4). Not logged.
     pub send_now: bool,
@@ -121,12 +127,23 @@ impl PendingInput {
             from_title: self.from_title.clone(),
             hops: self.hops,
             api_origin: self.api_origin.clone(),
+            task_notice: self.task_notice.clone(),
+            human_origin: self.human_origin,
+            origin_recorded: true,
+            // The head restores task-card provenance from its durable command.
+            task_card_origin: 0,
         })
     }
 
     /// What the model gets: the text (or its expansion), then each attachment.
     pub fn blocks(&self) -> Vec<c6_llm::Block> {
-        history::user_blocks(self.model_text(), &self.attachments)
+        history::user_blocks(&self.attributed_text(), &self.attachments)
+    }
+
+    /// The model-facing text with server-derived attribution. Kept separate
+    /// from raw text and command expansions so hooks and logs retain them.
+    pub fn attributed_text(&self) -> std::borrow::Cow<'_, str> {
+        history::attributed_input_text(self.model_text(), &self.from_session_id, self.api_origin.as_ref(), self.human_origin)
     }
 
     pub fn model_text(&self) -> &str {

@@ -456,7 +456,7 @@ fn Fyi(t: Triage, b: Brief) -> impl IntoView {
             head=ViewFn::from({
                 let t = t.clone();
                 move || view! {
-                    <span class="shrink-0 text-xs" role="img" title=if t.kind == "mail" { "Mail" } else { "Chat" } aria-label=if t.kind == "mail" { "Mail" } else { "Chat" }>{if t.kind == "mail" { crate::icons::mail().into_any() } else { crate::icons::message().into_any() }}</span>
+                    <span class="shrink-0 text-xs" role="img" title=if t.kind == "mail" { "Mail" } else { "Chat" } aria-label=if t.kind == "mail" { "Mail" } else { "Chat" }>{if t.kind == "mail" { crate::icons::mail() } else { crate::icons::message() }}</span>
                     <span class="min-w-0 flex-1 truncate"><b class="font-medium">{t.sender_name.clone()}</b>" · "{t.title.clone()}</span>
                     <span class="hidden shrink-0 truncate text-xs text-muted sm:inline sm:max-w-[40%]">{t.reason.clone()}</span>
                 }.into_any()

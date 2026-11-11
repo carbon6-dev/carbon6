@@ -1,5 +1,6 @@
-//! Markdown rendering for model output. Raw HTML in the source is shown as
-//! text, never interpreted, and links and images only go to web, mail and
+//! Markdown rendering for model output. A small, balanced HTML allowlist is
+//! rebuilt without attributes; other raw HTML stays visible as text.
+//! Links and images only go to web, mail and
 //! same-site addresses (no `javascript:` or `data:` links). Links to
 //! carbon6's own things (sessions, documents, work, projects) show as
 //! mentions: the thing's mark and title on a tint of its colour.
@@ -117,11 +118,8 @@ pub fn render(src: &str, here: &Here) -> String {
 fn render_citations(src: &str, citations: &[c6_api::citations::UrlCitation], here: &Here) -> String {
     let src = c6_api::citations::markdown(src, citations);
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
-    // Raw HTML first, as text: the mentions are the only HTML let through.
-    let events = Parser::new_ext(&src, opts).map(|ev| match ev {
-        Event::Html(h) | Event::InlineHtml(h) => Event::Text(h),
-        other => other,
-    });
+    // Sanitize model HTML before adding our own trusted mentions/citations.
+    let events = allowed_html(Parser::new_ext(&src, opts)).into_iter();
     // String markup only: Leptos views cannot be rendered to strings in wasm.
     // Reference links we just generated get a small superscript, not raw HTML
     // from the model. All URLs still pass through the normal sanitizer.
@@ -181,6 +179,242 @@ fn render_citations(src: &str, citations: &[c6_api::citations::UrlCitation], her
     html_out
 }
 
+/// Raw tags begin as text. Only a complete, properly nested tree is promoted
+/// to rebuilt HTML, so streamed/unclosed input cannot leak into another cell,
+/// paragraph or view. No source bytes ever become an HTML event.
+fn allowed_html<'a>(events: impl Iterator<Item = Event<'a>>) -> Vec<Event<'a>> {
+    let mut events = events.peekable();
+    let mut out = Vec::new();
+    let mut stack: Vec<(&str, usize)> = Vec::new();
+    let mut pending = Vec::new();
+    let mut literal: Option<(&str, usize)> = None;
+    let mut depth = 0usize;
+    let mut phrasing = 0usize;
+    while let Some(ev) = events.next() {
+        match &ev {
+            Event::Start(Tag::Emphasis | Tag::Strong | Tag::Strikethrough | Tag::Link { .. } | Tag::Image { .. } | Tag::Heading { .. }) => {
+                phrasing += 1
+            }
+            Event::End(TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link | TagEnd::Image | TagEnd::Heading(_)) => {
+                phrasing -= 1
+            }
+            _ => {}
+        }
+        match ev {
+            Event::Start(_) => depth += 1,
+            Event::End(_) => {
+                if literal.is_some_and(|(_, at)| at >= depth) {
+                    literal = None;
+                }
+                if stack.last().is_some_and(|(_, at)| *at >= depth) {
+                    stack.clear();
+                    pending.clear();
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+        if let Event::Html(raw) | Event::InlineHtml(raw) = ev {
+            // Block HTML is emitted one line at a time, including tags and
+            // comments whose attributes/content span several lines.
+            let mut raw = raw.into_string();
+            while matches!(events.peek(), Some(Event::Html(_) | Event::InlineHtml(_))) {
+                if let Some(Event::Html(next) | Event::InlineHtml(next)) = events.next() {
+                    raw.push_str(&next);
+                }
+            }
+            let mut rest = raw.as_str();
+            while !rest.is_empty() {
+                // In raw text, '<', quotes and comments are body bytes. Find
+                // only its closing delimiter, independently of tag syntax.
+                if let Some((tag, _)) = literal {
+                    let end = rest.char_indices().find_map(|(i, c)| {
+                        if c != '<' {
+                            return None;
+                        }
+                        let after = rest[i..].strip_prefix("</")?;
+                        if !after.get(..tag.len())?.eq_ignore_ascii_case(tag) {
+                            return None;
+                        }
+                        let tail = &after[tag.len()..];
+                        let trimmed = tail.trim_start_matches([' ', '\t', '\n', '\r', '\u{c}']);
+                        trimmed.starts_with('>').then_some(i + 2 + tag.len() + tail.len() - trimmed.len() + 1)
+                    });
+                    let (text, tail) = rest.split_at(end.unwrap_or(rest.len()));
+                    out.push(Event::Text(text.to_owned().into()));
+                    rest = tail;
+                    if end.is_some() {
+                        literal = None;
+                    }
+                    continue;
+                }
+                // HTML blocks contain entire lines; inline events usually
+                // contain one tag. Keep comments opaque, including inner '<'.
+                let end = if let Some(comment) = rest.strip_prefix("<!--") {
+                    comment.find("-->").map_or(rest.len(), |i| i + 7)
+                } else if rest.starts_with('<') {
+                    let mut quote = None;
+                    rest.char_indices()
+                        .find_map(|(i, c)| match c {
+                            '\'' | '"' if quote == Some(c) => {
+                                quote = None;
+                                None
+                            }
+                            '\'' | '"' if quote.is_none() => {
+                                quote = Some(c);
+                                None
+                            }
+                            '>' if quote.is_none() => Some(i + 1),
+                            _ => None,
+                        })
+                        .unwrap_or(rest.len())
+                } else {
+                    rest.find('<').unwrap_or(rest.len())
+                };
+                let (text, tail) = rest.split_at(end);
+                rest = tail;
+                let index = out.len();
+                out.push(Event::Text(text.to_owned().into()));
+                // Rejected raw-text/RCDATA elements are source, not a place
+                // to interpret tag-looking strings in JS, CSS or text.
+                let name = html_name(text);
+                if let Some((name, false, tail)) = name
+                    && (tail.is_empty() || tail.starts_with(|c: char| c.is_ascii_whitespace()) || tail == "/")
+                    && let Some(tag) =
+                        ["script", "style", "iframe", "textarea", "title", "xmp", "noembed", "noframes", "noscript", "plaintext"]
+                            .into_iter()
+                            .find(|tag| name.eq_ignore_ascii_case(tag))
+                {
+                    literal = Some((tag, depth));
+                    stack.clear();
+                    pending.clear();
+                    continue;
+                }
+                if let Some((tag, close)) = html_tag(text) {
+                    let parent = stack.last().map(|(tag, _)| *tag);
+                    let list = |t| matches!(t, "ul" | "ol");
+                    let valid = if !close && matches!(tag, "ul" | "ol" | "li" | "p") && phrasing > 0 {
+                        false
+                    } else if close {
+                        stack.last() == Some(&(tag, depth))
+                    } else if tag == "li" {
+                        parent.is_some_and(list)
+                    } else if parent.is_some_and(list) {
+                        false
+                    } else if matches!(tag, "ul" | "ol" | "p") {
+                        parent.is_none() || parent == Some("li")
+                    } else {
+                        true
+                    };
+                    if valid && (close || stack.len() < 32) {
+                        pending.push((index, tag, close));
+                        if close {
+                            stack.pop();
+                        } else if tag != "br" {
+                            stack.push((tag, depth));
+                        }
+                        if stack.is_empty() {
+                            for (index, tag, close) in pending.drain(..) {
+                                out[index] = Event::InlineHtml(format!("<{}{tag}>", if close { "/" } else { "" }).into());
+                            }
+                        }
+                        continue;
+                    }
+                } else if !text.starts_with('<') && (text.trim().is_empty() || !matches!(stack.last(), Some(("ul" | "ol", _)))) {
+                    continue;
+                }
+                stack.clear();
+                pending.clear();
+            }
+        } else {
+            // Inline Markdown can live in an HTML wrapper, but raw lists may
+            // contain only list items, not bare Markdown text/containers.
+            if matches!(stack.last(), Some(("ul" | "ol", _))) && !matches!(&ev, Event::Text(t) if t.trim().is_empty()) {
+                stack.clear();
+                pending.clear();
+            }
+            out.push(ev);
+        }
+    }
+    // A list or p in an ordinary Markdown paragraph must not be nested in a
+    // generated <p> (the browser would implicitly close/reparent that wrapper).
+    let mut paragraph = None;
+    let mut block = false;
+    for i in 0..out.len() {
+        match &out[i] {
+            Event::Start(Tag::Paragraph) => {
+                paragraph = Some(i);
+                block = false;
+            }
+            Event::InlineHtml(h) if matches!(h.as_ref(), "<ul>" | "<ol>" | "<p>") => block = true,
+            Event::End(TagEnd::Paragraph) => {
+                if let Some(start) = paragraph.take().filter(|_| block) {
+                    out[start] = Event::InlineHtml("".into());
+                    out[i] = Event::InlineHtml("\n".into());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A deliberately strict tag grammar. Attribute syntax is checked, but no
+/// attributes (or entities, names, whitespace, casing) are copied to output.
+fn html_tag(text: &str) -> Option<(&'static str, bool)> {
+    let space = |c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{c}');
+    let (name, close, mut rest) = html_name(text)?;
+    let tag = ["br", "ul", "ol", "li", "b", "strong", "i", "em", "code", "sub", "sup", "p", "kbd"]
+        .into_iter()
+        .find(|tag| name.eq_ignore_ascii_case(tag))?;
+    if close {
+        return (tag != "br" && rest.trim_matches(space).is_empty()).then_some((tag, true));
+    }
+    loop {
+        let trimmed = rest.trim_start_matches(space);
+        if trimmed.is_empty() || (tag == "br" && trimmed == "/") {
+            return Some((tag, false));
+        }
+        if trimmed.len() == rest.len() {
+            return None;
+        }
+        rest = trimmed;
+        let name_end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '.'))).unwrap_or(rest.len());
+        if name_end == 0 || !rest.starts_with(|c: char| c.is_ascii_alphabetic() || matches!(c, '_' | ':')) {
+            return None;
+        }
+        rest = &rest[name_end..];
+        let value = rest.trim_start_matches(space);
+        if let Some(value) = value.strip_prefix('=') {
+            let value = value.trim_start_matches(space);
+            if value.starts_with(['\'', '"']) {
+                let quote = value.as_bytes()[0] as char;
+                let end = value[1..].find(quote)? + 1;
+                if value[1..end].contains('\0') {
+                    return None;
+                }
+                rest = &value[end + 1..];
+            } else {
+                let end = value.find(space).unwrap_or(value.len());
+                if end == 0 || value[..end].contains(['\'', '"', '=', '<', '>', '`', '\0']) {
+                    return None;
+                }
+                rest = &value[end..];
+            }
+        }
+    }
+}
+
+fn html_name(text: &str) -> Option<(&str, bool, &str)> {
+    let mut rest = text.strip_prefix('<')?.strip_suffix('>')?;
+    let close = rest.starts_with('/');
+    if close {
+        rest = &rest[1..];
+    }
+    let end = rest.find(|c: char| !c.is_ascii_alphabetic()).unwrap_or(rest.len());
+    Some((&rest[..end], close, &rest[end..]))
+}
+
 /// Links and images only to safe addresses.
 fn sanitize(ev: Event) -> Event {
     match ev {
@@ -202,7 +436,8 @@ fn sanitize(ev: Event) -> Event {
 pub fn thing_of(href: &str, here: &Here) -> Option<(Kind, String, String)> {
     let href = href.trim();
     if href.split_once(':').is_some_and(|(k, _)| Kind::parse(k).is_some()) {
-        return reference(href).map(|(kind, id)| (kind, id, String::new()));
+        let (reference_path, rest) = href.split_at(href.find(['?', '#']).unwrap_or(href.len()));
+        return reference(reference_path).map(|(kind, id)| (kind, id, rest.to_owned()));
     }
     let mut path = href;
     if !here.origin.is_empty()
@@ -348,6 +583,7 @@ fn safe_url(url: CowStr<'_>) -> CowStr<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::icons::{Icon, Size};
 
     const ID: &str = "01a18f50-9f48-7567-8070-43e1f17ba642";
 
@@ -410,6 +646,7 @@ mod tests {
     #[test]
     fn document_mentions_keep_a_drawn_file_before_the_given_label() {
         let html = render(&format!("[the plan](doc:{ID})"), &here(&nothing));
+        assert!(html.contains(&crate::icons::html::icon(Icon::FileText, Size::S14)), "{html}");
         assert!(html.find("<svg").expect("keep the document icon") < html.find("the plan").unwrap(), "{html}");
         assert!(!html.contains(">Doc "), "don't replace the icon with a word: {html}");
         crate::icons::tests::assert_no_icon_glyphs(&html);
@@ -449,6 +686,125 @@ mod tests {
         assert!(!out.contains("<script>"));
         assert!(out.contains("&lt;script&gt;"));
         assert!(out.contains("<strong>b</strong>"));
+    }
+
+    #[test]
+    fn allowed_html_is_rebuilt_without_attributes() {
+        for tag in ["b", "strong", "i", "em", "code", "sub", "sup", "kbd", "p"] {
+            let src = format!("<{tag} style='color:red' class=bad href=x src=x onclick=run() data-x=\"a>b<c\">text</{tag}>");
+            let out = to_html(&src);
+            assert!(out.contains(&format!("<{tag}>text</{tag}>")), "{src}: {out}");
+            assert!(!out.contains("bad") && !out.contains("run()") && !out.contains("style="), "{out}");
+        }
+        assert_eq!(to_html("first<BR class=x />second<br>third"), "<p>first<br>second<br>third</p>\n");
+        assert_eq!(to_html("<B title='x'>upper</B>"), "<p><b>upper</b></p>\n");
+        assert_eq!(to_html("before <b>**bold**</b> after"), "<p>before <b><strong>bold</strong></b> after</p>\n");
+    }
+
+    #[test]
+    fn html_lists_render_in_cells_paragraphs_and_blocks() {
+        let list = "<ul onclick><li>first<ol start=5><li><em>nested</em></li></ol></li><li>second<br>line</li></ul>";
+        let clean = "<ul><li>first<ol><li><em>nested</em></li></ol></li><li>second<br>line</li></ul>";
+        let table = to_html(&format!("| List | Next |\n| --- | --- |\n| {list} | safe |"));
+        assert!(table.contains(&format!("<td>{clean}</td><td>safe</td>")), "{table}");
+        assert_eq!(to_html(&format!("before {list} after")), format!("before {clean} after\n"));
+        assert_eq!(
+            to_html("<ul>\n<li>first</li>\n<li>second</li>\n</ul>\n\nafter"),
+            "<ul>\n<li>first</li>\n<li>second</li>\n</ul>\n<p>after</p>\n"
+        );
+        assert_eq!(to_html("<p>first<br>second</p>"), "<p>first<br>second</p>");
+        assert_eq!(to_html("<ul\n onclick=run()>\n<li>multiline</li>\n</ul>"), "<ul>\n<li>multiline</li>\n</ul>");
+    }
+
+    #[test]
+    fn unbalanced_or_badly_nested_html_stays_text_with_container_boundaries() {
+        for src in [
+            "<ul>",
+            "<ul><li>first</li>",
+            "<b>unclosed",
+            "<li>orphan</li>",
+            "<ul><b>bad</b></ul>",
+            "<ul><li>x</ul></li>",
+            "<b><i>x</b></i>",
+            "<p><ul><li>x</li></ul></p>",
+            "<ul>bare</ul>",
+            "<b/>x</b>",
+            "<b title='unfinished>x</b>",
+            "<b =x>x</b>",
+            "<b title=\"x\"id=y>x</b>",
+        ] {
+            let out = to_html(src);
+            assert!(!out.contains("<ul>") && !out.contains("<li>") && !out.contains("<b>") && !out.contains("<i>"), "{src}: {out}");
+            assert!(out.contains("&lt;"), "{src}: {out}");
+        }
+        let table = to_html("| A | B |\n|---|---|\n| <ul><li>open | </li></ul><b>safe</b> |\n\nafter");
+        assert!(table.contains("<td>&lt;ul&gt;&lt;li&gt;open</td><td>&lt;/li&gt;&lt;/ul&gt;<b>safe</b></td>"), "{table}");
+        assert!(table.ends_with("<p>after</p>\n"), "{table}");
+        let paragraphs = to_html("first <b>open\n\nsecond</b>");
+        assert_eq!(paragraphs, "<p>first &lt;b&gt;open</p>\n<p>second&lt;/b&gt;</p>\n");
+        let crossing = to_html("*inside <b>outside* tail</b>");
+        assert!(crossing.contains("<em>inside &lt;b&gt;outside</em> tail&lt;/b&gt;"), "{crossing}");
+        let deep = to_html(&format!("{}x{}", "<b>".repeat(33), "</b>".repeat(33)));
+        assert!(!deep.contains("<b>"), "depth is bounded: {deep}");
+        let deepest = format!("{}x{}", "<b>".repeat(32), "</b>".repeat(32));
+        assert_eq!(to_html(&deepest), format!("<p>{deepest}</p>\n"));
+        assert_eq!(to_html("<p><ul><li><b>x</b></li></ul></p>"), "&lt;p&gt;&lt;ul&gt;&lt;li&gt;<b>x</b>&lt;/li&gt;&lt;/ul&gt;&lt;/p&gt;");
+    }
+
+    #[test]
+    fn rejected_raw_text_bodies_and_multiline_comments_remain_literal() {
+        for tag in ["script", "style", "iframe", "textarea", "title", "xmp", "noembed", "noframes", "noscript", "plaintext"] {
+            for prefix in ["", "before "] {
+                let out = to_html(&format!("{prefix}<{tag}>\"<b>literal</b>\"</{tag}>"));
+                assert!(out.contains("&lt;b&gt;literal&lt;/b&gt;"), "{tag}: {out}");
+                assert!(!out.contains("<b>"), "{tag}: {out}");
+            }
+        }
+        let out = to_html("<scRipt>\nconst x = '<ul><li>literal</li></ul>';\n</scRipt>");
+        assert!(out.contains("&lt;ul&gt;&lt;li&gt;literal&lt;/li&gt;&lt;/ul&gt;"), "{out}");
+        assert!(!out.contains("<ul>"), "{out}");
+        assert_eq!(to_html("<!--\n<b>comment</b>\n-->"), "&lt;!--\n&lt;b&gt;comment&lt;/b&gt;\n--&gt;");
+        assert!(
+            to_html("before <script><b>literal</b></script><b>real</b>").contains("&lt;b&gt;literal&lt;/b&gt;&lt;/script&gt;<b>real</b>")
+        );
+        assert_eq!(to_html("<script>if (a < b) x();</script><b>real</b>"), "&lt;script&gt;if (a &lt; b) x();&lt;/script&gt;<b>real</b>");
+        assert_eq!(to_html("<style>/* a < b */</style><b>real</b>"), "&lt;style&gt;/* a &lt; b */&lt;/style&gt;<b>real</b>");
+        let table = to_html("| A | B |\n|---|---|\n| <script><b>literal</b> | <b>real</b> |");
+        assert!(table.contains("&lt;b&gt;literal&lt;/b&gt;</td><td><b>real</b>"), "{table}");
+    }
+
+    #[test]
+    fn unsafe_html_and_entity_tricks_are_visible_not_interpreted() {
+        for src in [
+            "<img src=x onerror=alert(1)>",
+            "<scRipt>alert(1)</scRipt>",
+            "<style>p{display:none}</style>",
+            "<iframe src=x></iframe>",
+            "<a href=\"javascript:alert(1)\">link</a>",
+            "<!-- <b>comment</b> -->",
+            "<svg onload=alert(1)></svg>",
+            "<u&#108;><li>x</li></ul>",
+            "<b\0>x</b>",
+            "<b\u{b}>x</b>",
+        ] {
+            let out = to_html(src);
+            assert!(out.contains("&lt;"), "{src}: {out}");
+            assert!(
+                !out.contains("<img")
+                    && !out.contains("<scRipt")
+                    && !out.contains("<style")
+                    && !out.contains("<iframe")
+                    && !out.contains("<a ")
+                    && !out.contains("<svg")
+                    && !out.contains("<b>")
+                    && !out.contains("<li>"),
+                "{src}: {out}"
+            );
+        }
+        assert_eq!(to_html("&lt;script&gt;alert(1)&lt;/script&gt;"), "<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>\n");
+        assert_eq!(to_html("&lt;b&gt;literal&lt;/b&gt;"), "<p>&lt;b&gt;literal&lt;/b&gt;</p>\n");
+        assert_eq!(to_html("`<b>code</b>`"), "<p><code>&lt;b&gt;code&lt;/b&gt;</code></p>\n");
+        assert!(to_html("```html\n<ul><li>code</li></ul>\n```").contains("&lt;ul&gt;&lt;li&gt;code&lt;/li&gt;&lt;/ul&gt;"));
     }
 
     #[test]
@@ -534,6 +890,17 @@ mod tests {
     fn a_session_link_keeps_its_place() {
         let out = render(&format!("[there](/r/home/sessions/{ID}?q=error#ev-12)"), &here(&nothing));
         assert_eq!(mentions(&out)[0].1, format!("/r/home/sessions/{ID}?q=error#ev-12"), "{out}");
+    }
+
+    #[test]
+    fn document_links_and_reference_mentions_keep_block_targets() {
+        for href in [format!("/docs/{ID}#block.2"), format!("doc:{ID}#block.2"), format!("doc:{ID}?block=block.2")] {
+            let out = render(&format!("[there]({href})"), &here(&nothing));
+            let found = mentions(&out);
+            let suffix = if href.contains('?') { "?block=block.2" } else { "#block.2" };
+            assert_eq!(found[0].1, format!("/r/home/docs/{ID}{suffix}"), "{out}");
+            assert_eq!(thing_of(&href, &here(&nothing)), Some((Kind::Doc, ID.into(), suffix.into())));
+        }
     }
 
     #[test]

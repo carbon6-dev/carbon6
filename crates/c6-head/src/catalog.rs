@@ -62,6 +62,8 @@ pub fn scope(name: &str) -> Option<Scope> {
         "sessions.locate",
         "settings.transcript.get",
         "settings.transcript.put",
+        "settings.session_bar.get",
+        "settings.session_bar.put",
     ];
     const SHARED: &[&str] =
         &["workers.list", "connections.list", "connections.models", "connections.quotas", "commands.list", "realms.list", "hosts.list"];
@@ -220,6 +222,8 @@ pub enum Input {
     Body(fn() -> Value),
     /// Query parameters, at the top level.
     Query(fn() -> Value),
+    /// A JSON body under `body`, plus query parameters at the top level.
+    BodyQuery(fn() -> Value, fn() -> Value),
     /// Memex parameters, at the top level (a hand-written schema).
     Params(&'static str),
     /// Memex parameters, at the top level (a type's schema).
@@ -305,9 +309,9 @@ macro_rules! op {
 macro_rules! list_setting {
     ($get:literal, $put:literal, $area:literal, $path:literal, $ty:ty, $what:literal) => {
         [
-            op!($get, $area, "GET" $path, Read, Input::None, $what),
-            op!($put, $area, "PUT" $path, Write, Input::Body(schema::<Vec<$ty>>),
-                "Replaces this whole list. Read it first and send every entry you want to keep.", replaces = $get),
+            op!($get, $area, "GET" $path, Read, Input::Query(schema::<api::InRealm>), $what),
+            op!($put, $area, "PUT" $path, Write, Input::BodyQuery(schema::<Vec<$ty>>, schema::<api::InRealm>),
+                "Replaces this whole list. Read it first in the same realm and send every entry you want to keep. Optional realm selects that realm's own list; omitted keeps the endpoint's default.", replaces = $get),
         ]
     };
 }
@@ -397,7 +401,7 @@ fn build() -> Vec<Op> {
         op!("connections.update", "connections", "PATCH" "/api/v1/connections/{id}", Write, Input::Body(schema::<api::UpdateConnection>), "Renames a connection, sets context_window (0 restores automatic), or sets a pool's members (all of them).", choices = &[("id", "connections.list")]),
         op!("connections.test", "connections", "POST" "/api/v1/connections/test", Read, Input::Body(schema::<TestConnection>), "Tests a connection (a saved one by id, or the details given) and lists its models."),
         op!("connections.delete", "connections", "DELETE" "/api/v1/connections/{id}", Destructive, Input::None, "Deletes a connection. Sessions using it can no longer call their model.", choices = &[("id", "connections.list")]),
-        op!("connections.models", "connections", "GET" "/api/v1/connections/{id}/models", Read, Input::None, "The models a connection offers.", choices = &[("id", "connections.list")]),
+        op!("connections.models", "connections", "GET" "/api/v1/connections/{id}/models", Read, Input::Query(schema::<crate::api::ModelQuery>), "The models a connection offers; fresh=true tests the provider without reading or populating the model-list cache.", choices = &[("id", "connections.list")]),
         op!("connections.chatgpt.start", "connections", "POST" "/api/v1/connections/chatgpt/start", Write, Input::Body(schema::<api::StartChatGptSignIn>), "Starts signing in with ChatGPT (a ChatGPT plan): returns the address for you to open; then connections.chatgpt.complete with where the browser ended up (unless it was this machine)."),
         op!("connections.chatgpt.complete", "connections", "POST" "/api/v1/connections/chatgpt/complete", Write, Input::Body(schema::<api::CompleteChatGptSignIn>), "Finishes signing in with ChatGPT with the address the browser ended on."),
 
@@ -410,6 +414,8 @@ fn build() -> Vec<Op> {
         op!("sessions.children", "sessions", "GET" "/api/v1/sessions/{id}/children", Read, Input::None, "A session's subagents and side chats (?tree=1: everything below it).", choices = &[("id", "sessions.list")]),
         op!("sessions.side_chat", "sessions", "POST" "/api/v1/sessions/{id}/side-chats", Write, Input::Body(schema::<api::CreateSideChat>), "Branches a side chat off a session at an event.", choices = &[("id", "sessions.list")]),
         op!("sessions.send", "sessions", "POST" "/api/v1/sessions/{id}/messages", Write, Input::Body(schema::<api::SendMessage>), "Sends a message to a session (it runs next), optionally switching its model.", choices = &[("id", "sessions.list")]),
+        op!("sessions.messages.draft", "sessions", "GET" "/api/v1/sessions/{id}/messages/{command_id}/draft", Read, Input::None, "Reads a message's draft attachments as an AttachmentUpload JSON array (name, MIME, base64 data), by input command id. Works for pending inputs and recorded User messages; generated @memex context is omitted. Does not withdraw, rewind or change anything. 404 if no such message.", choices = &[("id", "sessions.list")]),
+        op!("sessions.messages.take_back", "sessions", "POST" "/api/v1/sessions/{id}/messages/{command_id}/take-back", Destructive, Input::None, "Takes back only this message, identified by its input command id, only when its worker confirms cancellation before the agent takes it. Never rewinds, erases a transcript event or cancels later messages. 409 with The agent has this message once taken; offline or unsupported workers cannot confirm success.", choices = &[("id", "sessions.list")]),
         op!("sessions.seen", "sessions", "POST" "/api/v1/sessions/{id}/seen", Write, Input::None, "Records that the user has seen how a session stands: its last finished turn (or failure) no longer makes its work need them, until its next turn ends.", choices = &[("id", "sessions.list")]),
         op!("sessions.viewed", "sessions", "POST" "/api/v1/sessions/{id}/viewed", Write, Input::None, "Records that the user viewed a session: it goes first in its realm's recently viewed, shared by their devices (archived sessions, subagents and side chats aren't kept; a view within 30 seconds of the last isn't written).", choices = &[("id", "sessions.list")]),
         op!("sessions.recent", "sessions", "GET" "/api/v1/sessions/recent", Read, Input::Query(schema::<api::InRealm>), "The sessions the user viewed lately in the realm, newest first: each one's id and when (up to 20; archived ones left out)."),
@@ -442,10 +448,12 @@ fn build() -> Vec<Op> {
         op!("sessions.view.set", "sessions", "PUT" "/api/v1/sessions/{id}/view", Write, Input::Body(schema::<api::SessionViewSettings>), "Turns a session's catch-up card and its folded finished turns on or off, on every device.", choices = &[("id", "sessions.list")]),
         op!("sessions.grouping.get", "sessions", "GET" "/api/v1/settings/session_grouping", Read, Input::None, "How the session list is grouped: label keys, outermost first."),
         op!("sessions.grouping.put", "sessions", "PUT" "/api/v1/settings/session_grouping", Write, Input::Body(schema::<api::SessionGrouping>), "Sets how the session list is grouped: label keys such as repo, host or client, outermost first."),
-        op!("sessions.facets.get", "sessions", "GET" "/api/v1/settings/session_facets", Read, Input::None, "Which aspects of a session (worker, work, project, realm, repo, model) its header shows, each as a shape in its mark."),
-        op!("sessions.facets.put", "sessions", "PUT" "/api/v1/settings/session_facets", Write, Input::Body(schema::<api::marks::SessionFacets>), "Sets which aspects of a session its header shows: any of worker, work, project, realm, repo, model."),
+        op!("sessions.facets.get", "sessions", "GET" "/api/v1/settings/session_facets", Read, Input::None, "The realm's shown session aspects (worker, work, project, realm, repo, model) and tile_bars opt-in (false by default). Rows and dock show aspects; only opted-in desktop tile bars add marks and resting-hover dimming."),
+        op!("sessions.facets.put", "sessions", "PUT" "/api/v1/settings/session_facets", Write, Input::Body(schema::<api::marks::SessionFacets>), "Sets the realm's shown session aspects and tile_bars opt-in. tile_bars defaults to false; true adds desktop tile-bar shapes, resting-hover dimming and value cards. Phones are unchanged."),
         op!("settings.transcript.get", "settings", "GET" "/api/v1/settings/transcript", Read, Input::None, "The user's transcript display preference across realms and devices: show_thinking defaults to false (hidden); true shows thinking expanded. Display only, with no effect on stored events or model input."),
         op!("settings.transcript.put", "settings", "PUT" "/api/v1/settings/transcript", Write, Input::Body(schema::<api::TranscriptSettings>), "Saves the user's transcript display preference across realms and devices: show_thinking false hides thinking, true shows it expanded. Does not change stored events or model input."),
+        op!("settings.session_bar.get", "settings", "GET" "/api/v1/settings/session_bar", Read, Input::None, "The user's session bar colour preference across realms and devices: tinted by default, or dot_only for session identity colour on its dot alone. Aspect colours and hover/click behaviour are unchanged."),
+        op!("settings.session_bar.put", "settings", "PUT" "/api/v1/settings/session_bar", Write, Input::Body(schema::<api::SessionBarSettings>), "Saves session bar colour: tinted (default) or dot_only. Display only, across realms and devices; aspect colours and hover/click behaviour are unchanged."),
         op!("marks.list", "sessions", "GET" "/api/v1/marks", Read, Input::None, "The marks given to the values of sessions' aspects, by key (worker:<id>, work:<id>, project:<id>, realm:<id>, repo:<name>, model:<name>): a value without one wears a colour worked out from its name."),
         op!("marks.set", "sessions", "PUT" "/api/v1/marks", Write, Input::Body(schema::<api::marks::SetMark>), "Gives a worker, piece of work, project, realm, repo or model its mark (a colour, or <colour>/<pattern>: hstripes, vstripes, diagonal, dots), the same everywhere it shows; an empty mark takes it away."),
         op!("settings.own.get", "settings", "GET" "/api/v1/settings/own/{name}", Read, Input::None, "Whether this realm sets a setting itself (suggestions, web-search, assistant, subagent-limits) or follows root's."),
@@ -457,8 +465,8 @@ fn build() -> Vec<Op> {
         op!("commands.list", "settings", "GET" "/api/v1/commands", Read, Input::Query(schema::<ForSession>), "Slash commands available (for a session, by its labels)."),
 
         // Settings that shape sessions.
-        op!("settings.mcp_servers.get", "settings", "GET" "/api/v1/settings/mcp-servers", Read, Input::None, "MCP servers given to sessions (by label)."),
-        op!("settings.mcp_servers.put", "settings", "PUT" "/api/v1/settings/mcp-servers", Write, Input::Body(mcp_servers), "Replaces the MCP server list. Read it first and send every entry you want to keep.", replaces = "settings.mcp_servers.get"),
+        op!("settings.mcp_servers.get", "settings", "GET" "/api/v1/settings/mcp-servers", Read, Input::Query(schema::<api::InRealm>), "MCP servers given to sessions (by label)."),
+        op!("settings.mcp_servers.put", "settings", "PUT" "/api/v1/settings/mcp-servers", Write, Input::BodyQuery(mcp_servers, schema::<api::InRealm>), "Replaces the MCP server list. Read it first in the same realm and send every entry you want to keep. Optional realm selects that realm's own list; omitted keeps the endpoint's default.", replaces = "settings.mcp_servers.get"),
     ];
     v.extend(list_setting!("settings.skills.get", "settings.skills.put", "settings", "/api/v1/settings/skills", api::SkillDef, "Skills given to sessions (by label)."));
     v.extend(list_setting!("settings.commands.get", "settings.commands.put", "settings", "/api/v1/settings/commands", api::CommandDef, "Custom slash commands (by label)."));
@@ -601,7 +609,9 @@ fn build() -> Vec<Op> {
         op!("docs.get", "docs", "GET" "/api/v1/docs/{id}", Read, Input::Query(schema::<api::InRealm>), "A whole document: its tabs and every block (id, kind, Markdown, hash, who last wrote it).", choices = &[("id", "docs.list")]),
         op!("docs.read", "docs", "GET" "/api/v1/docs/{id}/read", Read, Input::Query(schema::<api::docs::DocRead>), "Reads part of a document: view=outline (ids, headings, first words, hashes), block or slide (id: its Markdown and hash), search (q), since (rev: what changed since that version), markdown (a tab or all), full; at= an older version.", choices = &[("id", "docs.list")]),
         op!("docs.edit", "docs", "POST" "/api/v1/docs/{id}/ops", Write, Input::Body(schema::<api::docs::DocBatch>), "Changes a document with a batch of operations, all or nothing: insert Markdown (before/after a block, at a section's or tab's end, into a slide's region), replace (a block's Markdown with ifRev and ifHash from a read; find/with words; a table cell; a slide's layout, notes, hidden), delete (guarded), move, table rows and columns, set (title, theme, tab title, tab order, a chip), add_tab, delete_tab. A guard that no longer holds refuses the batch: read again; their edit wins.", choices = &[("id", "docs.list")]),
-        op!("docs.rename", "docs", "PATCH" "/api/v1/docs/{id}", Write, Input::Body(schema::<api::docs::DocPatch>), "Renames a document or changes its labels.", choices = &[("id", "docs.list")]),
+        op!("docs.rename", "docs", "PATCH" "/api/v1/docs/{id}", Write, Input::Body(schema::<api::docs::DocPatch>), "Renames a document, changes its labels, or archives/unarchives it (archived: true/false). Agents ask once per other's document for archive state, including their work's or project's documents.", choices = &[("id", "docs.list")]),
+        op!("docs.archive_many", "docs", "POST" "/api/v1/docs/archive", Write, Input::Body(schema::<api::docs_archive::ArchiveDocsIn>), "Archives exactly the listed document ids, with an agent reason. For cleanup, use archive_many instead of one archive call per document. Own documents are free; a selection containing others asks once for this exact list, without granting future changes. Gone or already archived documents and per-document failures are skipped and reported."),
+        op!("sessions.archive_docs", "sessions", "GET" "/api/v1/sessions/{id}/archive-docs", Read, Input::None, "Live documents created by this session and its subagents, with safety reasons: open work or project references, outside writers and open comment threads. Empty reasons means safe to preselect.", choices = &[("id", "sessions.list")]),
         op!("docs.delete", "docs", "DELETE" "/api/v1/docs/{id}", Destructive, Input::Query(schema::<api::InRealm>), "Deletes a document.", choices = &[("id", "docs.list")]),
         op!("docs.history", "docs", "GET" "/api/v1/docs/{id}/history", Read, Input::Query(schema::<crate::docs::http::HistoryQuery>), "A document's versions, newest first: who made each (you, session:<id>), when, and the blocks it added, changed and removed.", choices = &[("id", "docs.list")]),
         op!("docs.restore", "docs", "POST" "/api/v1/docs/{id}/restore", Write, Input::Body(schema::<api::docs::DocRestore>), "Brings back an earlier version of a document, or one block or slide of it, as a new change.", choices = &[("id", "docs.list")]),
@@ -700,12 +710,12 @@ fn build() -> Vec<Op> {
         op!("records.history", "collections", "GET" "/api/v1/collections/{name}/records/{id}/history", Read, Input::None, "Every version of a record, with who changed it.", choices = &[("name", "collections.list")]),
         op!("settings.prompts.get", "settings", "GET" "/api/v1/settings/prompts", Read, Input::None, "The prompts carbon6 gives models (sessions, compaction, subagents, the assistant, action items, the memex), with their defaults and whether they were changed."),
         op!("settings.prompts.put", "settings", "PUT" "/api/v1/settings/prompts/{name}", Write, Input::Body(schema::<api::PromptIn>), "Changes one of carbon6's prompts (an empty body returns it to the default).", choices = &[("name", "settings.prompts.get")]),
-        op!("realms.create", "system", "POST" "/api/v1/realms", Write, Input::Body(schema::<api::RealmIn>), "Creates a realm: an isolated place for an app or a project, with its own sessions, collections, decisions, secrets and settings (it inherits root's)."),
+        op!("realms.create", "system", "POST" "/api/v1/realms", Write, Input::Body(schema::<api::RealmIn>), "Creates a realm to organise an app or a project, with its own sessions, collections, decisions, secrets and settings (it inherits root's). Realms aren't a security boundary: shared-worker files and delegation can reach beyond a realm."),
         op!("realms.update", "system", "PATCH" "/api/v1/realms/{id}", Write, Input::Body(schema::<api::RealmIn>), "Renames a realm, changes its description, or sets whether it reads commons (reads_commons).", choices = &[("id", "realms.list")]),
         op!("realms.delete", "system", "DELETE" "/api/v1/realms/{id}", Destructive, Input::None, "Deletes a realm that owns nothing yet.", choices = &[("id", "realms.list")]),
         op!("workers.labels", "fleet", "PUT" "/api/v1/workers/{id}/labels", Write, Input::Body(schema::<api::WorkerLabelsIn>), "Sets your labels for a worker, which a template's pool (pick one) picks by.", choices = &[("id", "workers.list")]),
         op!("sessions.start_plan", "sessions", "GET" "/api/v1/starts", Read, Input::Query(schema::<api::starts::StartQuery>), "What a new session for some work starts with: the template its work item or project starts with, the worker (back where the work's worktree is, else the least busy of the template's pool) and why, the folder, and how a new worktree is made (branch, base, fetch, tracking, setup)."),
-        op!("workers.realms", "fleet", "PUT" "/api/v1/workers/{id}/realms", Write, Input::Body(schema::<api::RealmsIn>), "Sets which realms a worker runs sessions for (empty: all; one: dedicated to it).", choices = &[("id", "workers.list")]),
+        op!("workers.realms", "fleet", "PUT" "/api/v1/workers/{id}/realms", Write, Input::Body(schema::<api::RealmsIn>), "Sets which realms may use a worker, including its file APIs and template targets (empty: every realm). This does not create a filesystem sandbox or contain all delegated access.", choices = &[("id", "workers.list")]),
         op!("connections.realms", "connections", "PUT" "/api/v1/connections/{id}/realms", Write, Input::Body(schema::<api::RealmsIn>), "Sets which realms' sessions may use a model connection (empty: all).", choices = &[("id", "connections.list")]),
         op!("views.list", "views", "GET" "/api/v1/views", Read, Input::Query(schema::<api::InRealm>), "The views a realm shows in its menu: root's and its own."),
         op!("views.act", "views", "POST" "/api/v1/views/{name}/act", Write, Input::Body(schema::<api::ViewAct>), "Runs a view's action on a record (sets its fields, and/or starts its template with the record as input, sessions labelled record:<id>), or, with item, on an item of a messages, calendar or gallery view (calls the owning app's operation, or starts the template).", choices = &[("name", "views.list")]),
@@ -956,22 +966,23 @@ pub fn input_schema(op: &Op) -> Value {
     }
     match op.input {
         Input::None => {}
-        Input::Body(f) => {
+        Input::Body(f) | Input::BodyQuery(f, _) => {
             props.insert("body".into(), f());
             required.push("body".into());
         }
-        Input::Query(f) => {
-            let s = f();
-            if let Some(p) = s["properties"].as_object() {
-                for (k, v) in p {
-                    props.insert(k.clone(), v.clone());
-                }
-            } else {
-                props.insert("query".into(), json!({"type": "object", "description": "query parameters"}));
-            }
-        }
+        Input::Query(_) => {}
         Input::Params(s) => return serde_json::from_str(s).unwrap_or_else(|_| any_object()),
         Input::Typed(f) => return f(),
+    }
+    if let Input::Query(f) | Input::BodyQuery(_, f) = op.input {
+        let s = f();
+        if let Some(p) = s["properties"].as_object() {
+            for (k, v) in p {
+                props.insert(k.clone(), v.clone());
+            }
+        } else {
+            props.insert("query".into(), json!({"type": "object", "description": "query parameters"}));
+        }
     }
     json!({"type": "object", "properties": props, "required": required})
 }
@@ -1214,6 +1225,11 @@ fn op_reference(op: &Op) -> String {
                 out.push('\n');
             }
             match input {
+                Input::BodyQuery(body, query) => {
+                    out.push_str(&format!("Query parameters (JSON Schema):\n{}\n", pretty(&query())));
+                    out.push_str(&format!("Body (JSON Schema):\n{}\n", pretty(&body())));
+                    Some("{…}".to_owned())
+                }
                 Input::Body(f) => {
                     out.push_str(&format!("Body (JSON Schema):\n{}\n", pretty(&f())));
                     Some("{…}".to_owned())
@@ -1342,18 +1358,16 @@ pub fn openapi(urls: &[String]) -> Value {
                 let mut entry = json!({
                     "operationId": op.name, "summary": op.summary, "tags": [op.area], "x-c6-effect": effect, "responses": responses,
                 });
-                match input {
-                    Input::Body(f) => entry["requestBody"] = json_body(hoist(f(), &mut defs)),
-                    Input::Query(f) => {
-                        let q = hoist(f(), &mut defs);
-                        let required: Vec<&str> = q["required"].as_array().into_iter().flatten().filter_map(|r| r.as_str()).collect();
-                        for (name, schema) in q["properties"].as_object().into_iter().flatten() {
-                            parameters.push(
-                                json!({"name": name, "in": "query", "required": required.contains(&name.as_str()), "schema": schema}),
-                            );
-                        }
+                if let Input::Body(f) | Input::BodyQuery(f, _) = input {
+                    entry["requestBody"] = json_body(hoist(f(), &mut defs));
+                }
+                if let Input::Query(f) | Input::BodyQuery(_, f) = input {
+                    let q = hoist(f(), &mut defs);
+                    let required: Vec<&str> = q["required"].as_array().into_iter().flatten().filter_map(|r| r.as_str()).collect();
+                    for (name, schema) in q["properties"].as_object().into_iter().flatten() {
+                        parameters
+                            .push(json!({"name": name, "in": "query", "required": required.contains(&name.as_str()), "schema": schema}));
                     }
-                    _ => {}
                 }
                 if !parameters.is_empty() {
                     entry["parameters"] = Value::Array(parameters);
@@ -1386,6 +1400,17 @@ pub fn openapi(urls: &[String]) -> Value {
 mod tests {
     use super::*;
 
+    #[test]
+    fn session_bar_preference_is_available_from_any_realm() {
+        for (method, name) in [("GET", "settings.session_bar.get"), ("PUT", "settings.session_bar.put")] {
+            assert_eq!(scope(name), Some(Scope::Device));
+            assert_eq!(route_scope(method, "/api/v1/settings/session_bar"), Scope::Device);
+        }
+        let put = ops().iter().find(|o| o.name == "settings.session_bar.put").unwrap();
+        let schema = input_schema(put);
+        assert_eq!(schema["properties"]["body"]["properties"]["colour"]["default"], "tinted");
+    }
+
     /// Every route is an operation or a known exception, and every
     /// operation is a route; every memex method the UI calls is an
     /// operation.
@@ -1399,6 +1424,7 @@ mod tests {
             include_str!("auth.rs"),
             include_str!("assistant.rs"),
             include_str!("docs/http.rs"),
+            include_str!("docs/archive.rs"),
             include_str!("projects.rs"),
             include_str!("decks.rs"),
             include_str!("quotas.rs"),
@@ -1461,6 +1487,35 @@ mod tests {
         assert!(d["operations"].as_array().unwrap().iter().any(|o| o["op"] == "settings.memex.get"), "{d}");
         let all = discover("", None);
         assert_eq!(all["areas"].as_array().unwrap().len(), AREAS.len());
+    }
+
+    #[test]
+    fn list_settings_expose_realm_and_body_separately() {
+        let doc = openapi(&[]);
+        for put in ops().iter().filter(|op| op.name.starts_with("settings.") && op.replaces.is_some()) {
+            let get = find(put.replaces.unwrap()).unwrap();
+            for op in [get, put] {
+                let input = input_schema(op);
+                assert!(input["properties"]["realm"].is_object(), "{}: {input}", op.name);
+                assert!(!input["required"].as_array().unwrap().contains(&json!("realm")), "{}", op.name);
+                let Via::Http { method, path } = op.via else { panic!("{} is not HTTP", op.name) };
+                let entry = &doc["paths"][path][method.to_lowercase()];
+                assert!(
+                    entry["parameters"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|p| p["name"] == "realm" && p["in"] == "query" && p["required"] == false)
+                );
+                let reference = reference("", op.name, &[]).unwrap();
+                assert!(reference.contains("Query parameters (JSON Schema)") && reference.contains("\"realm\""), "{reference}");
+                if op.replaces.is_some() {
+                    assert!(input["required"].as_array().unwrap().contains(&json!("body")));
+                    assert_eq!(entry["requestBody"]["content"]["application/json"]["schema"]["type"], "array");
+                    assert!(reference.contains("Body (JSON Schema)"), "{reference}");
+                }
+            }
+        }
     }
 
     #[test]

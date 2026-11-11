@@ -106,7 +106,13 @@ async fn agents_propose_tasks_you_start_with_one_click() {
     let done: Decision = serde_json::from_value(get(format!("decisions/{}", c.id)).await).unwrap();
     assert_eq!((done.state.as_str(), done.sessions.len()), ("answered", 1), "{done:?}");
     let task = done.sessions[0].clone();
-    ended(task.clone(), 1).await;
+    let task_events = ended(task.clone(), 1).await;
+    let first = task_events.iter().find(|e| matches!(e.kind, EventKind::User { .. })).unwrap();
+    assert!(
+        matches!(&first.kind, EventKind::User { origin, .. }
+        if matches!(origin.as_deref(), Some(c6_api::MessageOrigin::TaskCard))),
+        "{first:?}"
+    );
     ended(s1.id.clone(), 2).await;
     let detail = get(format!("sessions/{task}")).await;
     let s = &detail["session"];
@@ -347,7 +353,7 @@ impl Cards {
     }
 
     async fn recorded(&self, session: &str, text: &str) -> Event {
-        eventually("the card answer to show once as your message", async || {
+        let answer = eventually("the card answer to show once as a message", async || {
             let evs = self.events(session).await;
             let answers: Vec<_> = evs
                 .into_iter()
@@ -355,7 +361,13 @@ impl Cards {
                 .collect();
             (answers.len() == 1).then(|| answers[0].clone())
         })
-        .await
+        .await;
+        assert!(
+            matches!(&answer.kind, EventKind::User { origin, .. }
+            if matches!(origin.as_deref(), Some(c6_api::MessageOrigin::TaskCardAnswer))),
+            "{answer:?}"
+        );
+        answer
     }
 
     fn assert_agent_copy(&self, request: &Value, text: &str) {
@@ -465,8 +477,13 @@ async fn task_card_answers_start_idle_turns_and_withdraw_explains_them() {
         let command = Cards::input(&session.id, &shown);
         t.worker.sessions.handle(command.clone()).await.unwrap();
         let withdraw = |id| json!({"id": id, "why": "No longer needed"});
-        let error = c6_head::decisions::task_card(t.head(), &session.id, "task_withdraw", &withdraw(card.id)).await.unwrap_err();
-        assert_eq!(error.to_string(), format!("Task card #{} was already answered: {option}.", card.id));
+        let before = t.get(&format!("decisions/{}", card.id)).await;
+        for _ in 0..2 {
+            let result = c6_head::decisions::task_card(t.head(), &session.id, "task_withdraw", &withdraw(card.id)).await.unwrap();
+            assert_eq!(result["id"], card.id);
+            assert_eq!(result["message"], format!("task card #{} already closed: {option}, nothing to do", card.id));
+            assert_eq!(t.get(&format!("decisions/{}", card.id)).await, before, "withdrawing cannot change the answer");
+        }
         for (sid, id) in [(&other.id, card.id), (&session.id, i64::MAX)] {
             let error = c6_head::decisions::task_card(t.head(), sid, "task_withdraw", &withdraw(id)).await.unwrap_err();
             assert_eq!(error.to_string(), "no open task card of this session by that id");
@@ -515,6 +532,47 @@ async fn task_card_answers_start_idle_turns_and_withdraw_explains_them() {
     assert_eq!(t.get(&format!("decisions/{}", card.id)).await["state"], "open");
     assert_eq!(t.worker.journal.events_after(&session.id, 0, u32::MAX).await.unwrap(), before);
     c6_head::decisions::task_card(t.head(), &session.id, "task_withdraw", &json!({"id": card.id, "why": "No destination"})).await.unwrap();
+    t.close().await;
+}
+
+#[tokio::test]
+async fn doing_a_task_here_already_closes_its_card_and_withdraw_is_a_successful_noop() {
+    let t = Cards::new().await;
+    let session = t.start(false).await;
+    let card = t.propose(&session.id, "Clean up the retry module here").await;
+    let gate = t.mock.push_gated(Reply::ToolCalls(vec![(
+        "task_withdraw".into(),
+        json!({"id": card.id, "why": "The user asked for it here."}).to_string(),
+    )]));
+    t.mock.push(Reply::Text("Cleaned up the retry module.".into()));
+    // The redundant withdrawal happens only after the answer is recorded.
+    t.post(&format!("decisions/{}/answer", card.id), json!({"option": "Do it here"})).await;
+    gate.notify_one();
+    t.idle(&session.id, 2).await;
+
+    let events = t.events(&session.id).await;
+    assert!(
+        events.iter().any(|event| {
+            matches!(&event.kind, EventKind::User { text, .. }
+            if text.contains("Do the task you proposed here")
+                && text.contains("already closed")
+                && text.contains("nothing more is needed from you to close or withdraw it"))
+        }),
+        "the agent is explicitly told that the card needs no further action: {events:?}"
+    );
+    let results: Vec<_> = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::ToolResult { tool, output, is_error, .. } if tool == "task_withdraw" => Some((output.as_str(), *is_error)),
+            _ => None,
+        })
+        .collect();
+    let message = format!("task card #{} already closed: Do it here, nothing to do", card.id);
+    assert_eq!(results, [(message.as_str(), false)], "the tool reports a successful no-op, not a withdrawal or error");
+    let closed = t.get(&format!("decisions/{}", card.id)).await;
+    assert_eq!(closed["state"], "answered");
+    assert_eq!(closed["answer"]["option"], "Do it here");
+    assert!(closed["sessions"].as_array().unwrap().is_empty(), "no extra session is started");
     t.close().await;
 }
 
@@ -734,6 +792,39 @@ async fn old_workers_receive_task_card_answers_as_ordinary_inputs() {
     let pending = t.head().store.pending_commands(t.worker.identity.meta.worker_id, 0).await.unwrap();
     assert_eq!(pending.len(), 2, "neither answer is skipped without a capability");
     assert!(commands.iter().all(|id| pending.iter().any(|c| &c.id == id)));
+    // An old worker need not echo any provenance. The head restores it
+    // from the durable command before publishing and saving the event.
+    let seq = events.last().unwrap().seq + 1;
+    for (i, id) in commands.iter().enumerate() {
+        c6_head::sessions::ingest(
+            t.head(),
+            t.worker.identity.meta.worker_id,
+            c6_proto::SessionEventBatch {
+                session_id: session.id.clone(),
+                events: vec![c6_proto::SessionEvent {
+                    seq: seq + i as u64,
+                    ts_ms: c6_core::now_ms(),
+                    kind: Some(c6_proto::session_event::Kind::User(c6_proto::UserMessage {
+                        command_id: id.clone(),
+                        text: "Old worker's answer".into(),
+                        command: "card-answer".into(),
+                        ..Default::default()
+                    })),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let recorded = t.events(&session.id).await;
+    assert_eq!(
+        recorded
+            .iter()
+            .filter(|e| matches!(&e.kind, EventKind::User { origin, .. }
+        if matches!(origin.as_deref(), Some(c6_api::MessageOrigin::TaskCardAnswer))))
+            .count(),
+        2
+    );
     tx.send(c6_proto::WorkerMsg { msg: Some(c6_proto::worker_msg::Msg::Ping(c6_proto::Ping::default())) }).await.unwrap();
     let reply = c6_testkit::within("the old worker's pong", inbound.message()).await.unwrap().unwrap();
     assert!(matches!(reply.msg, Some(c6_proto::head_msg::Msg::Pong(_))), "{reply:?}");

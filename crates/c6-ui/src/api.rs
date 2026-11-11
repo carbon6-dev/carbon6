@@ -8,7 +8,7 @@ use c6_api::{
     StreamMsg, Worker,
 };
 use futures::StreamExt;
-use futures::future::{AbortHandle, abortable};
+use futures::future::{AbortHandle, LocalBoxFuture, abortable};
 use gloo_net::http::{RequestBuilder, Response};
 use gloo_net::websocket::Message;
 use gloo_net::websocket::futures::WebSocket;
@@ -22,6 +22,9 @@ use serde::de::DeserializeOwned;
 pub struct LiveFeed {
     pub workers: ReadSignal<Vec<Worker>>,
     pub sessions: ReadSignal<Vec<Session>>,
+    /// Metadata for open workspace sessions, including those absent from
+    /// the non-archived live list. Never added to that list or the rail.
+    pub(crate) resolved_sessions: RwSignal<std::collections::HashMap<String, Session>>,
     pub connected: ReadSignal<bool>,
     /// The latest change to a document (docs/docs.md §6).
     pub doc: ReadSignal<Option<c6_api::docs::DocChange>>,
@@ -29,6 +32,14 @@ pub struct LiveFeed {
     pub marks: ReadSignal<c6_api::marks::Marks>,
     /// Bumped when what needs you may have changed (read it again).
     pub attention: ReadSignal<u32>,
+}
+
+// Reconnection is an invalidation source for session resources. An ordinary
+// live frame must not look like another reconnect (same-value sets notify).
+fn connection_state(connected: ReadSignal<bool>, set_connected: WriteSignal<bool>, next: bool) {
+    if connected.get_untracked() != next {
+        set_connected.set(next);
+    }
 }
 
 impl LiveFeed {
@@ -48,7 +59,7 @@ impl LiveFeed {
                         let Message::Text(text) = msg else { continue };
                         match serde_json::from_str::<LiveEvent>(&text) {
                             Ok(ev) => {
-                                set_connected.set(true);
+                                connection_state(connected, set_connected, true);
                                 backoff = 500;
                                 match ev {
                                     LiveEvent::Workers { workers } => set_workers.set(workers),
@@ -67,12 +78,23 @@ impl LiveFeed {
                         }
                     }
                 }
-                set_connected.set(false);
+                connection_state(connected, set_connected, false);
                 gloo_timers::future::sleep(Duration::from_millis(backoff)).await;
                 backoff = (backoff * 2).min(10_000);
             }
         });
-        Self { workers, sessions, connected, doc, marks, attention }
+        Self { workers, sessions, resolved_sessions: RwSignal::new(Default::default()), connected, doc, marks, attention }
+    }
+
+    /// The live row wins when present; otherwise an open tile's by-id row.
+    pub fn session(&self, id: &str) -> Option<Session> {
+        self.sessions.with(|ss| ss.iter().find(|s| s.id == id).cloned()).or_else(|| self.resolved_sessions.with(|ss| ss.get(id).cloned()))
+    }
+
+    pub(crate) fn remember_session(&self, session: Session) {
+        let _ = self.resolved_sessions.try_update(|ss| {
+            ss.insert(session.id.clone(), session);
+        });
     }
 
     pub fn worker_name(&self, id: &str) -> String {
@@ -98,7 +120,13 @@ pub fn live() -> LiveFeed {
 /// Streams a session's events and live deltas, resuming from the last seen
 /// seq after reconnects. Returns a handle that stops it.
 /// `query`: where to (re)start, as the stream's query (`after=…`).
-pub fn stream_session(session_id: String, on_msg: impl Fn(StreamMsg) + 'static, query: impl Fn() -> String + 'static) -> AbortHandle {
+/// `on_disconnect`: the connection closed or failed to open; retry follows.
+pub fn stream_session(
+    session_id: String,
+    on_msg: impl Fn(StreamMsg) + 'static,
+    query: impl Fn() -> String + 'static,
+    on_disconnect: impl Fn() + 'static,
+) -> AbortHandle {
     let (fut, handle) = abortable(async move {
         let mut backoff = 500;
         loop {
@@ -116,6 +144,7 @@ pub fn stream_session(session_id: String, on_msg: impl Fn(StreamMsg) + 'static, 
                     }
                 }
             }
+            on_disconnect();
             gloo_timers::future::sleep(Duration::from_millis(backoff)).await;
             backoff = (backoff * 2).min(10_000);
         }
@@ -468,16 +497,28 @@ async fn check(resp: Result<Response, gloo_net::Error>) -> Result<Response, Stri
     Err(msg)
 }
 
-async fn json<T: DeserializeOwned>(req: Result<Response, gloo_net::Error>) -> Result<T, String> {
-    check(req).await?.json().await.map_err(|e| e.to_string())
+// Keep response decoding out of every endpoint/resource's poll state. The
+// body remains lazy and dropping the returned future still drops the decode.
+#[inline(never)]
+fn json<T: DeserializeOwned + 'static>(req: Result<Response, gloo_net::Error>) -> LocalBoxFuture<'static, Result<T, String>> {
+    Box::pin(async move { serde_json::from_str(&response_text(req).await?).map_err(|e| e.to_string()) })
 }
 
-async fn send_json<T: DeserializeOwned>(req: RequestBuilder, body: &impl Serialize) -> Result<T, String> {
+// HTTP checking and body-read polling do not depend on T. Keep them shared
+// rather than specializing their state and error paths for every JSON type.
+// This is gloo's Response::json sequence, with the same lazy read and errors.
+#[inline(never)]
+fn response_text(req: Result<Response, gloo_net::Error>) -> LocalBoxFuture<'static, Result<String, String>> {
+    Box::pin(async move { check(req).await?.text().await.map_err(|e| e.to_string()) })
+}
+
+async fn send_json<T: DeserializeOwned + 'static>(req: RequestBuilder, body: &impl Serialize) -> Result<T, String> {
     json(req.json(body).map_err(|e| e.to_string())?.send().await).await
 }
 
-async fn empty(req: Result<Response, gloo_net::Error>) -> Result<(), String> {
-    check(req).await.map(drop)
+#[inline(never)]
+fn empty(req: Result<Response, gloo_net::Error>) -> LocalBoxFuture<'static, Result<(), String>> {
+    Box::pin(async move { check(req).await.map(drop) })
 }
 
 pub async fn create_enrollment(name: Option<String>) -> Result<Enrollment, String> {
@@ -530,6 +571,12 @@ pub async fn delete_connection(id: String) -> Result<(), String> {
 
 pub async fn models(connection_id: String) -> Result<Vec<String>, String> {
     json(Request::get(&format!("/api/v1/connections/{connection_id}/models")).send().await).await
+}
+
+/// The saved connection's Test button must contact the provider even when
+/// a picker already has a successful list cached.
+pub async fn check_models(connection_id: String) -> Result<Vec<String>, String> {
+    json(Request::get(&format!("/api/v1/connections/{connection_id}/models?fresh=true")).send().await).await
 }
 
 pub async fn create_session(req: CreateSession) -> Result<Session, String> {
@@ -598,6 +645,35 @@ pub async fn send_queued_now(id: String, command_id: String) -> Result<(), Strin
     empty(Request::post(&format!("/api/v1/sessions/{id}/queue/{command_id}/now")).send().await).await
 }
 
+/// Original attachment bytes, recovered before withdrawing a waiting input.
+pub async fn message_draft(id: String, command_id: String) -> Result<Vec<c6_api::AttachmentUpload>, String> {
+    json(Request::get(&format!("/api/v1/sessions/{id}/messages/{}/draft", enc(&command_id))).send().await).await
+}
+
+/// Docs made by this session or its subagents, with reasons to keep each.
+pub use c6_api::docs_archive::ArchiveDocCandidate as SessionArchiveDoc;
+
+pub async fn session_archive_docs(id: String) -> Result<Vec<SessionArchiveDoc>, String> {
+    json(Request::get(&format!("/api/v1/sessions/{id}/archive-docs")).send().await).await
+}
+
+/// One request archives the session and exactly these docs; others stay as they are.
+pub async fn archive_with_docs(id: String, archive_docs: Vec<String>) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct Body {
+        archived: bool,
+        archive_docs: Vec<String>,
+    }
+    empty(
+        Request::patch(&format!("/api/v1/sessions/{id}"))
+            .json(&Body { archived: true, archive_docs })
+            .map_err(|e| e.to_string())?
+            .send()
+            .await,
+    )
+    .await
+}
+
 pub async fn archive(id: String) -> Result<(), String> {
     set_archived(id, true).await
 }
@@ -628,15 +704,23 @@ pub async fn dismiss_rejected(id: String) -> Result<(), String> {
     empty(Request::delete(&format!("/api/v1/sessions/{id}/queue/rejected")).send().await).await
 }
 
-/// Cancels a queued input before it is delivered.
-pub async fn cancel_queued_input(id: String, command_id: String) -> Result<(), String> {
-    empty(Request::delete(&format!("/api/v1/sessions/{id}/queue/{}", enc(&command_id))).send().await).await
-}
-
-/// Pulls a queued message and every message queued after it out of the
-/// queue (they are canceled), to be re-sent edited, reordered or dropped.
-pub async fn pull_queued(id: String, command_id: String) -> Result<Vec<QueuedInput>, String> {
-    json(Request::post(&format!("/api/v1/sessions/{id}/queue/{}/pull", enc(&command_id))).send().await).await
+/// Withdraw exactly one queued command after worker confirmation, never a tail
+/// or an already-taken transcript event.
+pub async fn take_back(id: String, command_id: String) -> Result<(), (String, bool)> {
+    let response = Request::post(&format!("/api/v1/sessions/{id}/messages/{}/take-back", enc(&command_id))).send().await;
+    // A lost response may hide a successful withdrawal. In that case keep
+    // the text in the box even if untouched: it may now be the only copy.
+    let response = response.map_err(|e| (e.to_string(), false))?;
+    if response.ok() {
+        return Ok(());
+    }
+    if response.status() == 401 {
+        signed_out().set(true);
+    }
+    match response.json::<c6_api::ApiError>().await {
+        Ok(error) => Err((error.error, true)),
+        Err(_) => Err((response.status_text(), false)),
+    }
 }
 
 // --- Worker files, git, terminals ---------------------------------------------
@@ -710,6 +794,14 @@ pub async fn transcript_settings() -> Result<c6_api::TranscriptSettings, String>
 
 pub async fn put_transcript_settings(settings: c6_api::TranscriptSettings) -> Result<(), String> {
     empty(Request::put("/api/v1/settings/transcript").json(&settings).map_err(|e| e.to_string())?.send().await).await
+}
+
+pub async fn session_bar_settings() -> Result<c6_api::SessionBarSettings, String> {
+    json(Request::get("/api/v1/settings/session_bar").send().await).await
+}
+
+pub async fn put_session_bar_settings(settings: c6_api::SessionBarSettings) -> Result<(), String> {
+    empty(Request::put("/api/v1/settings/session_bar").json(&settings).map_err(|e| e.to_string())?.send().await).await
 }
 
 /// A settings list's own entries in `realm` (the console, choosing which
@@ -1040,7 +1132,11 @@ pub async fn ask_claude() -> Result<c6_api::AskClaude, String> {
 
 /// What @ offers in an Ask conversation, or in session `session`'s message
 /// box, within its knowledge scope (docs/ask.md §4).
-pub async fn ask_mentionables(q: String, session: Option<String>) -> Result<Vec<c6_api::Mentionable>, String> {
+pub async fn ask_mentionables(
+    q: String,
+    session: Option<String>,
+    cancel: &web_sys::AbortSignal,
+) -> Result<Vec<c6_api::Mentionable>, String> {
     let realm = realm().get_untracked();
     json(
         Request::get(&format!(
@@ -1049,14 +1145,16 @@ pub async fn ask_mentionables(q: String, session: Option<String>) -> Result<Vec<
             js_sys::encode_uri_component(&realm),
             js_sys::encode_uri_component(session.as_deref().unwrap_or(""))
         ))
+        .abort_signal(Some(cancel))
         .send()
         .await,
     )
     .await
 }
 
-pub async fn memex_mentions(q: String) -> Result<Vec<c6_api::MemexThingRef>, String> {
-    json(Request::get(&format!("/api/v1/memex/mentions?q={}", js_sys::encode_uri_component(&q))).send().await).await
+pub async fn memex_mentions(q: String, cancel: &web_sys::AbortSignal) -> Result<Vec<c6_api::MemexThingRef>, String> {
+    json(Request::get(&format!("/api/v1/memex/mentions?q={}", js_sys::encode_uri_component(&q))).abort_signal(Some(cancel)).send().await)
+        .await
 }
 
 pub async fn memex_delete(id: String) -> Result<(), String> {
@@ -1196,9 +1294,15 @@ pub async fn rewind(id: String, to_seq: u64, restore_files: bool) -> Result<(), 
 }
 
 /// Files and folders under `root` matching `q`, best first: (path, is folder).
-pub async fn fs_find(worker: String, root: String, q: String) -> Result<Vec<(String, bool)>, String> {
-    let v: serde_json::Value =
-        json(Request::get(&format!("/api/v1/workers/{worker}/fs/find")).query([("root", root), ("q", q)]).send().await).await?;
+pub async fn fs_find(worker: String, root: String, q: String, cancel: &web_sys::AbortSignal) -> Result<Vec<(String, bool)>, String> {
+    let v: serde_json::Value = json(
+        Request::get(&format!("/api/v1/workers/{worker}/fs/find"))
+            .query([("root", root), ("q", q)])
+            .abort_signal(Some(cancel))
+            .send()
+            .await,
+    )
+    .await?;
     Ok(v["paths"]
         .as_array()
         .map(|a| a.iter().filter_map(|p| Some((p["path"].as_str()?.to_owned(), p["dir"].as_bool().unwrap_or(false)))).collect())
@@ -1628,6 +1732,9 @@ pub async fn work_todo_start(id: String, todo: String) -> Result<c6_api::work::T
 
 pub async fn docs_list(q: &c6_api::docs::DocQuery) -> Result<Vec<c6_api::docs::DocSummary>, String> {
     let mut params = Vec::new();
+    if q.archived {
+        params.push("archived=true".to_owned());
+    }
     for (k, v) in [("kind", &q.kind), ("q", &q.q), ("label", &q.label), ("by", &q.by)] {
         if let Some(v) = v {
             params.push(format!("{k}={}", enc(v)));
@@ -1857,4 +1964,38 @@ pub async fn doc_threads_send(id: String, threads: Vec<String>) -> Result<Vec<c6
 
 pub async fn doc_thread_resolve(id: String, thread: String) -> Result<c6_api::docs::DocThread, String> {
     json(Request::post(&format!("/api/v1/docs/{}/threads/{}/resolve", enc(&id), enc(&thread))).send().await).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_live_frames_do_not_invalidate_reconnect_subscribers() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let (connected, set_connected) = signal(false);
+            let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let fetched = {
+                let reads = reads.clone();
+                Memo::new(move |_| {
+                    connected.track();
+                    reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                })
+            };
+            assert_eq!(fetched.get_untracked(), 0);
+            connection_state(connected, set_connected, true);
+            assert_eq!(fetched.get_untracked(), 1, "the first connection reloads its resources");
+            for _ in 0..100 {
+                connection_state(connected, set_connected, true);
+                assert_eq!(fetched.get_untracked(), 1, "workers, sessions, marks and attention are not reconnects");
+            }
+            connection_state(connected, set_connected, false);
+            assert_eq!(fetched.get_untracked(), 2, "disconnection is still observable");
+            connection_state(connected, set_connected, false);
+            assert_eq!(fetched.get_untracked(), 2, "failed retries do not pretend the connection changed");
+            connection_state(connected, set_connected, true);
+            assert_eq!(fetched.get_untracked(), 3, "a real reconnect still reloads its resources");
+        });
+    }
 }

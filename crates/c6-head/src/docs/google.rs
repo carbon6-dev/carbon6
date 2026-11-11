@@ -118,6 +118,7 @@ const FIELDS: &str = "id,name,webViewLink,modifiedTime,trashed";
 
 /// Exports a document to Google: a new file, or its Google file updated.
 pub async fn export(st: &HeadState, realm: &str, id: &str, g: &GoogleExportIn, by: &str) -> anyhow::Result<GoogleFile> {
+    let _guard = super::writable(st, realm, id).await?;
     let doc = super::get(st, realm, id).await?;
     let accounts = accounts(st, realm).await?;
     let before = remembered(st, realm, id).await?;

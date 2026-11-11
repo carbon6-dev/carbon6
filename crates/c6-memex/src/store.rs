@@ -271,6 +271,8 @@ impl Store {
         let rows = sqlx::query(
             "SELECT p.id AS part_id, p.item_id AS item_id FROM parts_fts f JOIN parts p ON p.id = f.rowid JOIN items i ON i.id = p.item_id \
              WHERE parts_fts MATCH ?1 AND i.kind IN (SELECT value FROM json_each(?2)) \
+             AND NOT EXISTS (SELECT 1 FROM docs d WHERE i.source = 'docs' AND d.id = json_extract(i.meta, '$.doc') \
+                 AND (d.archived_at IS NOT NULL OR d.deleted_at IS NOT NULL)) \
              AND (?4 = 0 OR (SELECT COUNT(DISTINCT l.dst_thing) FROM links l WHERE l.src_item = i.id AND l.rel = 'about' \
                   AND l.dst_thing IN (SELECT value FROM json_each(?3))) = ?4) \
              ORDER BY bm25(parts_fts) LIMIT ?5",
@@ -291,6 +293,8 @@ impl Store {
         let rows = sqlx::query(
             "SELECT v.part_id AS part_id, p.item_id AS item_id, v.data AS data FROM vectors v JOIN parts p ON p.id = v.part_id \
              JOIN items i ON i.id = p.item_id WHERE v.space = ?1 AND i.kind IN (SELECT value FROM json_each(?2)) \
+             AND NOT EXISTS (SELECT 1 FROM docs d WHERE i.source = 'docs' AND d.id = json_extract(i.meta, '$.doc') \
+                 AND (d.archived_at IS NOT NULL OR d.deleted_at IS NOT NULL)) \
              AND (?4 = 0 OR (SELECT COUNT(DISTINCT l.dst_thing) FROM links l WHERE l.src_item = i.id AND l.rel = 'about' \
                   AND l.dst_thing IN (SELECT value FROM json_each(?3))) = ?4)",
         )
@@ -333,7 +337,17 @@ impl Store {
     pub async fn hits(&self, items: &[(String, f64, Option<i64>, Vec<String>)], query: &str) -> anyhow::Result<Vec<api::MemexHit>> {
         let mut out = Vec::new();
         for (id, score, part, matched) in items {
-            let Some(r) = sqlx::query("SELECT * FROM items WHERE id = ?").bind(id).fetch_optional(&self.pool).await? else { continue };
+            let Some(r) = sqlx::query(
+                "SELECT i.* FROM items i WHERE i.id = ? AND NOT EXISTS \
+                 (SELECT 1 FROM docs d WHERE i.source = 'docs' AND d.id = json_extract(i.meta, '$.doc') \
+                  AND (d.archived_at IS NOT NULL OR d.deleted_at IS NOT NULL))",
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            else {
+                continue;
+            };
             let text = match part {
                 Some(p) => self.part_text(*p).await?,
                 None => r.get("body"),
@@ -361,6 +375,8 @@ impl Store {
             Some(t) => {
                 sqlx::query(
                     "SELECT DISTINCT i.* FROM items i JOIN links l ON l.src_item = i.id WHERE l.dst_thing = ? \
+                     AND NOT EXISTS (SELECT 1 FROM docs d WHERE i.source = 'docs' AND d.id = json_extract(i.meta, '$.doc') \
+                         AND (d.archived_at IS NOT NULL OR d.deleted_at IS NOT NULL)) \
                      AND i.kind IN (SELECT value FROM json_each(?)) ORDER BY i.created_at DESC LIMIT ?",
                 )
                 .bind(t)
@@ -372,6 +388,8 @@ impl Store {
             None => {
                 sqlx::query(
                     "SELECT i.* FROM items i WHERE i.kind IN (SELECT value FROM json_each(?)) \
+                     AND NOT EXISTS (SELECT 1 FROM docs d WHERE i.source = 'docs' AND d.id = json_extract(i.meta, '$.doc') \
+                         AND (d.archived_at IS NOT NULL OR d.deleted_at IS NOT NULL)) \
                      AND NOT EXISTS (SELECT 1 FROM links l WHERE l.src_item = i.id AND l.rel = 'about') ORDER BY i.created_at DESC LIMIT ?",
                 )
                 .bind(serde_json::to_string(kinds)?)
@@ -903,6 +921,52 @@ fn from_blob(b: &[u8]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn archived_document_mirrors_are_hidden_even_before_outbox_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("memex.db")).await.unwrap();
+        sqlx::query(
+            "INSERT INTO docs (id, kind, title, rev, clock, created_by, created_at, updated_by, updated_at) \
+             VALUES ('document', 'doc', 'Archive test', 1, 0, 'you', 1, 'you', 1)",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let item = api::MemexItemIn {
+            kind: "doc".into(),
+            source: "docs".into(),
+            external_id: "document#tab".into(),
+            title: "Archive test".into(),
+            text: "searchable quasar".into(),
+            meta: serde_json::json!({"doc": "document"}),
+            ..Default::default()
+        };
+        let id = store.put(&item, "docs").await.unwrap();
+        let kinds = vec!["doc".to_owned()];
+        let found = store.keyword("quasar", &kinds, &[], 10).await.unwrap();
+        assert_eq!(found.len(), 1);
+        store.put_vector(found[0].part_id, "test", &[1.0]).await.unwrap();
+        let thing = store.ensure_thing("topic:test", "topic", "Test").await.unwrap();
+        assert_eq!(store.about(None, &kinds, 10).await.unwrap().len(), 1);
+        for archived in [Some(42_i64), None] {
+            sqlx::query("UPDATE docs SET archived_at = ? WHERE id = 'document'").bind(archived).execute(&store.pool).await.unwrap();
+            let expected = usize::from(archived.is_none());
+            assert_eq!(store.keyword("quasar", &kinds, &[], 10).await.unwrap().len(), expected);
+            assert_eq!(store.vectors("test", &kinds, &[]).await.unwrap().len(), expected);
+            assert_eq!(store.hits(&[(id.clone(), 1.0, Some(found[0].part_id), vec![])], "quasar").await.unwrap().len(), expected);
+            assert_eq!(store.about(None, &kinds, 10).await.unwrap().len(), expected);
+            // Historical knowledge links remain readable.
+            assert!(store.item(&id, &kinds).await.unwrap().is_some());
+            store.link(&id, "about", &thing, "observed", "docs", None).await.unwrap();
+            assert_eq!(store.about(Some(&thing), &kinds, 10).await.unwrap().len(), expected);
+            store.clear_links(&id, "docs").await.unwrap();
+        }
+        // A caller's unrelated uploaded document is not hidden by a matching meta key.
+        sqlx::query("UPDATE docs SET archived_at = 42 WHERE id = 'document'").execute(&store.pool).await.unwrap();
+        store.put(&api::MemexItemIn { source: "uploads".into(), ..item }, "you").await.unwrap();
+        assert_eq!(store.keyword("quasar", &kinds, &[], 10).await.unwrap().len(), 1);
+    }
 
     #[tokio::test]
     async fn failed_reads_get_two_more_tries_on_upgrade() {

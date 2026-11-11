@@ -40,7 +40,7 @@ fn open_work(p: &ProjectItem) -> usize {
 pub fn ProjectsLink(class: &'static str) -> impl IntoView {
     let tick = RwSignal::new(0u32);
     crate::decisions::reload_quietly(tick);
-    let list = LocalResource::new(move || {
+    let list = crate::resources::local(move || {
         tick.track();
         api::realm().track();
         api::projects_list(false)
@@ -49,7 +49,7 @@ pub fn ProjectsLink(class: &'static str) -> impl IntoView {
         <Go to=View::Projects { id: String::new() } class=class title="Long-running efforts made of work">
             "Projects"
             {move || list.get().and_then(Result::ok).map(|l| l.iter().filter(|p| matches!(p.state.as_str(), "needs_you" | "stalled")).count()).filter(|n| *n > 0).map(|n| view! {
-                <span class="ml-1 rounded-full bg-violet-600 px-1.5 text-[10px] font-semibold text-white">{n}</span>
+                <span data-header-count class="ml-1 rounded-full bg-violet-600 px-1.5 text-[10px] font-semibold text-white">{n}</span>
             })}
         </Go>
     }
@@ -61,12 +61,12 @@ pub fn ProjectsPage() -> impl IntoView {
     crate::decisions::reload_quietly(tick);
     let show_closed = RwSignal::new(false);
     // Steady: a reload that brings the same list back doesn't redraw it.
-    let list = crate::util::steady(LocalResource::new(move || {
+    let list = crate::util::steady(crate::resources::local(move || {
         tick.track();
         api::realm().track();
         api::projects_list(false)
     }));
-    let closed = crate::util::steady(LocalResource::new(move || {
+    let closed = crate::util::steady(crate::resources::local(move || {
         let on = show_closed.get();
         tick.track();
         async move { if on { api::projects_list(true).await } else { Ok(Vec::new()) } }
@@ -107,7 +107,7 @@ pub fn ProjectsPage() -> impl IntoView {
             </header>
             {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
             <div class="flex flex-wrap gap-2">
-                <button class=BUTTON on:click=move |_| adding.update(|a| *a = !*a)>"+ New project"</button>
+                <button class=BUTTON on:click=move |_| adding.update(|a| *a = !*a)>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" New project"</button>
             </div>
             {move || adding.get().then(|| view! {
                 <div class="space-y-2 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
@@ -138,7 +138,7 @@ pub fn ProjectsPage() -> impl IntoView {
                                     on:click=move |ev| open_project.with_value(|f| f(id.clone(), How::from_mouse(&ev)))>
                                     <div class="flex items-center gap-2">
                                         <crate::marks::ValueGlyph key=format!("project:{}", p.id) />
-                                        <span class="min-w-[6rem] flex-1 truncate font-medium">{p.fields.title.clone()}</span>
+                                        <span class="min-w-0 flex-1 truncate font-medium">{p.fields.title.clone()}</span>
                                         <StatePill state=p.state.clone() />
                                         <span class="shrink-0 text-xs text-muted">{since(p.fields.moved_at.max(p.updated_at))}</span>
                                     </div>
@@ -151,10 +151,7 @@ pub fn ProjectsPage() -> impl IntoView {
                 }.into_any(),
             }}
             <div class="pt-2">
-                <label class="flex items-center gap-1.5 text-sm text-muted">
-                    <input type="checkbox" prop:checked=move || show_closed.get() on:change=move |ev| show_closed.set(event_target_checked(&ev)) />
-                    "Show done and dropped projects"
-                </label>
+                <crate::components::Switch on=move || show_closed.get() on_change=move |v| show_closed.set(v) label="Show done and dropped projects" />
                 {move || show_closed.get().then(|| view! {
                     <div class="mt-2 space-y-1">
                         {move || closed.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|p| {
@@ -325,7 +322,7 @@ pub fn ProjectPage(id: String) -> impl IntoView {
                                 view! {
                                     <div class="flex items-start gap-2">
                                         <span class="mt-2"><crate::marks::MarkButton key=mark_key.clone() shape=crate::marks::Shape::Hexagon size=14 /></span>
-                                        <h1 class="min-w-0 flex-1 text-xl font-semibold">{t.clone()}</h1>
+                                        <h1 class="min-w-0 flex-1 text-xl font-semibold [overflow-wrap:anywhere]">{t.clone()}</h1>
                                         <button class=format!("{BUTTON_QUIET} text-xs") on:click=move |_| { title.set(t2.clone()); purpose.set(p2.clone()); editing.set(true); }>"Edit"</button>
                                     </div>
                                     <p class="whitespace-pre-wrap text-sm text-zinc-600 dark:text-zinc-400">{if pu.is_empty() { "Purpose: not said yet".to_owned() } else { pu.clone() }}</p>
@@ -370,7 +367,7 @@ pub fn ProjectPage(id: String) -> impl IntoView {
                                 <button class="text-xs text-muted hover:underline" title="Write it again now"
                                     on:click=move |_| spawn_local(async move {
                                         if let Err(e) = api::project_refresh(id.get_value()).await { error.set(Some(e)); }
-                                    })>{crate::icons::rotate()}</button>
+                                    })>{crate::icons::icon(crate::icons::Icon::RefreshCw, crate::icons::Size::S14)}</button>
                             </div>
                             <p class="whitespace-pre-wrap text-sm">{match &p.fields.note {
                                 Some(n) => n.text.clone(),
@@ -396,9 +393,9 @@ pub fn ProjectPage(id: String) -> impl IntoView {
                         {move || merging.get().then(|| {
                             let me = mine.clone();
                             view! {
-                                <div class="flex items-center gap-2 text-sm">
+                                <div class="flex flex-wrap items-center gap-2 text-sm">
                                     <span class="text-muted">"Merge into this:"</span>
-                                    <select class=format!("{INPUT} w-auto!") on:change=move |ev| {
+                                    <select class=format!("{INPUT} min-w-0 max-w-full w-auto!") on:change=move |ev| {
                                         let from = event_target_value(&ev);
                                         if from.is_empty() { return; }
                                         merging.set(false);
@@ -442,12 +439,12 @@ pub fn ProjectPage(id: String) -> impl IntoView {
                                     })
                                 }).collect_view().into_any()
                             }}
-                            <div class="flex items-center gap-2 pt-1 text-sm">
+                            <div class="flex min-w-0 flex-wrap items-center gap-2 pt-1 text-sm">
                                 {active.then(|| view! {
                                     <button class=format!("{BUTTON_QUIET} text-xs") title="A new work item in this project; its sessions start as the project says"
-                                        on:click=move |_| new_work.update(|n| *n = !*n)>"+ New work"</button>
+                                        on:click=move |_| new_work.update(|n| *n = !*n)>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" New work"</button>
                                 })}
-                                <AdoptPick placeholder="+ Bring in open work…" class=format!("{INPUT} w-auto! max-w-full")
+                                <AdoptPick placeholder="+ Bring in open work…" class=format!("{INPUT} min-w-0 w-auto! max-w-full")
                                     title="Open work: what's in no project first, then work in other projects (choosing it moves it here)"
                                     items=Signal::derive(move || {
                                         all_work.get().and_then(Result::ok).unwrap_or_default().into_iter()
@@ -551,12 +548,12 @@ fn QuickSessions(
         .collect_view();
     view! {
         <section class="space-y-1">
-            <div class="flex items-center gap-2">
-                <h2 class="flex-1 text-xs font-medium uppercase tracking-wide text-muted">{format!("Sessions ({n})")}</h2>
+            <div class="flex min-w-0 flex-wrap items-center gap-2">
+                <h2 class="min-w-0 flex-1 text-xs font-medium uppercase tracking-wide text-muted">{format!("Sessions ({n})")}</h2>
                 {active.then(|| view! {
                     <button class=format!("{BUTTON_QUIET} text-xs") title="A quick task in this project with no work item, such as drafting a doc"
-                        on:click=move |_| start.run(())>"+ Session"</button>
-                    <AdoptPick placeholder="Attach a session…" class="max-w-56 cursor-pointer rounded bg-transparent px-1 text-xs text-muted hover:bg-zinc-200/60 dark:hover:bg-zinc-800"
+                        on:click=move |_| start.run(())>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" Session"</button>
+                    <AdoptPick placeholder="Attach a session…" class="min-w-0 max-w-full cursor-pointer rounded bg-transparent px-1 text-xs text-muted hover:bg-zinc-200/60 @sm/view:max-w-56 dark:hover:bg-zinc-800"
                         title="A running session as a quick session here: free ones first, then ones serving work or in another project (choosing it moves it here)"
                         items=adoptable on_pick=adopt />
                 })}
@@ -638,7 +635,7 @@ fn PhaseStrip(p: ProjectItem, change: Callback<c6_api::projects::PhaseIn>) -> im
                 }).collect_view()}
                 <button class="rounded-md border border-dashed border-zinc-300 px-2 py-1 text-xs text-muted hover:bg-zinc-50 dark:border-zinc-700 dark:hover:bg-zinc-900"
                     title="Phases are optional: an ordered list, each with what done means" on:click=move |_| open_editor(None)>
-                    {if n == 0 { "+ Phases" } else { "+ Phase" }}
+                    {crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}{if n == 0 { " Phases" } else { " Phase" }}
                 </button>
             </div>
             {move || editing.get().map(|which| {
@@ -711,7 +708,7 @@ fn PhaseGroup(
             {real.then(|| view! { <span>{count}</span> })}
             <span class="flex-1"></span>
             {(active && real).then(|| view! {
-                <button class="hover:underline" on:click=move |_| adding.update(|a| *a = !*a)>"+ Work"</button>
+                <button class="hover:underline" on:click=move |_| adding.update(|a| *a = !*a)>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" Work"</button>
                 {(state != "done").then(|| view! {
                     <button class="hover:underline" title="A session that proposes this phase's work and updates the plan"
                         on:click=move |_| plan.run(c6_api::projects::ProjectPlanIn { phase: phase.get_value(), ..Default::default() })>"Plan it"</button>
@@ -795,7 +792,7 @@ fn Proposed(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> imp
                 let (a, b) = (x.id.clone(), x.id.clone());
                 view! {
                     <div class="flex flex-wrap items-center gap-2 text-sm">
-                        <span class="min-w-[10rem] flex-1">
+                        <span class="min-w-0 flex-1 basis-full break-words @sm/view:basis-0">
                             <span class="font-medium">{x.title.clone()}</span>
                             {(!x.done_when.is_empty()).then(|| view! { <span class="ml-2 text-xs text-muted">{format!("done when {}", x.done_when)}</span> })}
                             {phase_title(&x.phase).map(|t| view! { <span class="ml-2 text-xs text-violet-700 dark:text-violet-400">{t}</span> })}
@@ -821,18 +818,18 @@ fn WorkRow(
     let (moving, moving_project) = (w.id.clone(), project.clone());
     let current = w.phase.clone();
     view! {
-        <div class="flex items-center gap-2 rounded px-2 py-1 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900">
+        <div class="flex flex-wrap items-center gap-2 rounded px-2 py-1 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900">
             <span class=format!("shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium {}", state_class(if w.state == "needs_you" { "needs_you" } else if w.state == "moving" { "moving" } else { "" }))>
                 {c6_api::work::state_label(&w.state)}
             </span>
             <crate::marks::ValueGlyph key=format!("work:{}", w.id) />
-            <span class="min-w-[8rem] flex-1 truncate">
+            <span class="min-w-0 flex-1 truncate">
                 <Go to=View::Work { id: w.id.clone() } class="text-violet-700 hover:underline dark:text-violet-400" title=w.why.clone()>{w.title.clone()}</Go>
                 {(!w.why.is_empty()).then(|| view! { <span class="ml-2 text-xs text-muted">{w.why.clone()}</span> })}
             </span>
             <span class="shrink-0 text-xs text-muted">{(w.moved_at > 0).then(|| since(w.moved_at))}</span>
             {(!phases.is_empty()).then(|| view! {
-                <select class="shrink-0 rounded border-none bg-transparent text-xs text-muted" title="Its phase"
+                <select class="max-w-full rounded border-none bg-transparent text-xs text-muted" title="Its phase"
                     on:change=move |ev| {
                         let (p, w) = (moving_project.clone(), moving.clone());
                         let phase = event_target_value(&ev);
@@ -872,8 +869,8 @@ fn Documents(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> im
                     let did = d.summary.id.clone();
                     apply.run(api::project_doc(id.get_value(), did.clone(), String::new()).await);
                     match col {
-                        Some(c) => c.open(View::Docs { id: did }, How::Beside),
-                        None => ws.open(None, View::Docs { id: did }, How::Beside),
+                        Some(c) => c.open(View::Docs { id: did, target: None }, How::Beside),
+                        None => ws.open(None, View::Docs { id: did, target: None }, How::Beside),
                     }
                 }
                 Err(e) => apply.run(Err(e)),
@@ -896,13 +893,16 @@ fn Documents(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> im
                 let doc = d.doc.clone();
                 let doc2 = d.doc.clone();
                 let current = d.role.clone();
-                let mark = if d.kind == "deck" { crate::icons::chart().into_any() } else { crate::icons::file().into_any() };
+                let mark = if d.kind == "deck" { crate::icons::chart() } else { crate::icons::file() };
                 let title = d.title.clone();
                 view! {
                     <div class="flex items-center gap-2 rounded px-2 py-1 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900">
-                        <Go to=View::Docs { id: d.doc.clone() } class="min-w-0 flex-1 truncate text-sky-700 hover:underline dark:text-sky-400">
+                        <Go to=View::Docs { id: d.doc.clone(), target: None } class="min-w-0 flex-1 truncate text-sky-700 hover:underline dark:text-sky-400">
                             {mark}" "{title}
                         </Go>
+                        {d.archived_at.is_some().then(|| view! {
+                            <span class="shrink-0 rounded-full bg-zinc-100 px-2 py-0.5 text-xs text-muted dark:bg-zinc-800">"Archived"</span>
+                        })}
                         <span class="shrink-0 text-xs text-muted">{(d.updated_at > 0).then(|| since(d.updated_at))}</span>
                         <select class="shrink-0 cursor-pointer rounded bg-transparent px-1 text-xs text-muted hover:bg-zinc-200/60 dark:hover:bg-zinc-800"
                             title="Its role in the project" on:change=move |ev| set_role(doc.clone(), event_target_value(&ev))>
@@ -919,7 +919,7 @@ fn Documents(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> im
                 }
             }).collect_view()}
             <div class="flex flex-wrap items-center gap-2 pt-1 text-sm">
-                <select class=format!("{INPUT} w-auto! max-w-64") on:change=move |ev| {
+                <select class=format!("{INPUT} min-w-0 w-auto! max-w-full @sm/view:max-w-64") on:change=move |ev| {
                     let doc = event_target_value(&ev);
                     if doc.is_empty() { return; }
                     set_role(doc, role.get_untracked());
@@ -936,8 +936,8 @@ fn Documents(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> im
                     <option value="notes">"notes"</option>
                     <option value="review">"review"</option>
                 </select>
-                <button class=BUTTON_QUIET on:click=move |_| new_doc("doc")>"+ New doc"</button>
-                <button class=BUTTON_QUIET on:click=move |_| new_doc("deck")>"+ New deck"</button>
+                <button class=BUTTON_QUIET on:click=move |_| new_doc("doc")>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" New doc"</button>
+                <button class=BUTTON_QUIET on:click=move |_| new_doc("deck")>{crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}" New deck"</button>
             </div>
             <h2 class="pt-2 text-xs font-medium uppercase tracking-wide text-muted">"Links"</h2>
             {p.fields.links.iter().map(|l| {
@@ -949,7 +949,7 @@ fn Documents(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> im
                         {if href.is_empty() {
                             view! { <span class="min-w-0 flex-1 truncate">{text}</span> }.into_any()
                         } else {
-                            view! { <a href=href target="_blank" rel="noopener noreferrer" class="min-w-0 flex-1 truncate text-sky-700 hover:underline dark:text-sky-400">{crate::icons::arrow_up_right()}" "{text}</a> }.into_any()
+                            view! { <a href=href target="_blank" rel="noopener noreferrer" class="min-w-0 flex-1 truncate text-sky-700 hover:underline dark:text-sky-400">{text}" "{crate::icons::icon(crate::icons::Icon::ExternalLink, crate::icons::Size::S14)}</a> }.into_any()
                         }}
                         <button class="shrink-0 text-xs text-muted hover:text-red-600" title="Remove link" on:click=move |_| {
                             let d = ProjectDetach { link: Some(r.clone()), ..Default::default() };
@@ -958,10 +958,10 @@ fn Documents(p: ProjectItem, apply: Callback<Result<ProjectItem, String>>) -> im
                     </div>
                 }
             }).collect_view()}
-            <div class="flex gap-2">
+            <div class="flex flex-col gap-2 @sm/view:flex-row">
                 <input class=format!("{INPUT} min-w-0 flex-1") placeholder="A link: URL, record:<collection>:<id>, decision:<id>" prop:value=move || link.get()
                     on:input=move |ev| link.set(event_target_value(&ev)) on:keydown=move |ev| if ev.key() == "Enter" { add_link() } />
-                <input class=format!("{INPUT} w-40!") placeholder="Its name" prop:value=move || link_title.get()
+                <input class=format!("{INPUT} min-w-0 @sm/view:w-40!") placeholder="Its name" prop:value=move || link_title.get()
                     on:input=move |ev| link_title.set(event_target_value(&ev)) on:keydown=move |ev| if ev.key() == "Enter" { add_link() } />
                 <button class=BUTTON_QUIET on:click=move |_| add_link()>"Link"</button>
             </div>
@@ -977,9 +977,9 @@ pub fn StartWith(current: String, realm: String, none: &'static str, #[prop(into
     let realm = StoredValue::new(realm);
     let current = StoredValue::new(current);
     view! {
-        <label class="inline-flex items-center gap-1 text-xs text-muted" title="The template its work's sessions start with: worker, folder, worktree and branch, model">
+        <label class="inline-flex min-w-0 max-w-full flex-wrap items-center gap-1 text-xs text-muted" title="The template its work's sessions start with: worker, folder, worktree and branch, model">
             "Start with"
-            <select class=format!("{INPUT} w-auto! py-0.5 text-xs") data-start-with="" prop:value=move || current.get_value()
+            <select class=format!("{INPUT} min-w-0 max-w-full w-auto! py-0.5 text-xs") data-start-with="" prop:value=move || current.get_value()
                 on:change=move |ev| on_pick.run(event_target_value(&ev))>
                 <option value="">{none}</option>
                 {move || {

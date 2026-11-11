@@ -26,7 +26,7 @@ See [docs/requirements.md](docs/requirements.md) and [docs/architecture.md](docs
 - **Offline-tolerant.** Workers journal every event before sending it. Sessions keep running when the head is unreachable and sync back exactly when it returns. A worker that loses its journal has its sessions restored from the head.
 - **IDE-like access to workers:** browse files, review git changes, and open terminals in the browser.
 - **Observability:** the head exports OpenTelemetry GenAI traces over OTLP.
-- **An operating system for agents.** Realms isolate apps from each other, and apps are built from general primitives (collections, decisions, triggers, series, views) with configuration only, then installed as packages. See [docs/os.md](docs/os.md) and the examples in [examples/apps](examples/apps).
+- **An operating system for agents.** Realms organise your work; they don't isolate apps. Apps are built from general primitives (collections, decisions, triggers, series, views) with configuration only, then installed as packages. See [docs/os.md](docs/os.md) and the examples in [examples/apps](examples/apps).
 
 ## Status
 
@@ -39,6 +39,8 @@ carbon6 is version 0.1: a working system its author uses every day, not a finish
 ## Security
 
 carbon6 runs agents that execute shell commands as the worker's user, so the head is as sensitive as a shell on every worker.
+
+**Realms organise; they don't isolate.** Realm-scoped API tokens and tools have enforced scopes, but sessions run as the worker's OS user. Sessions on a shared worker can reach each other's files, including journals, transcripts, worktrees, credentials and config. A worker limited to one realm is not isolation either: an agent can delegate to another session or assistant with wider access. See [what realms provide and don't](docs/realms-ux.md#8-what-realms-provide-and-dont).
 
 - **The network:** by default the head binds only loopback, private (RFC 1918, IPv6 ULA) and tailnet addresses, and refuses public ones unless `allow_public_bind = true`. It answers only to its own names (against DNS rebinding) and refuses requests from other sites' pages.
 - **Sign-in** is on by default: passkeys, one-time login links made on the head, and API tokens. Outside a tailnet or `localhost`, turn on HTTPS (`ui_tls_head_ca = true`); the head warns at start when it serves plain HTTP on a LAN address.
@@ -82,7 +84,7 @@ make docker-token      # an enrollment token from that head
 
 **Website.** [carbon6.dev](https://carbon6.dev) is a static site generated with Leptos from `site/`, with the docs, this README's guide and the changelog rendered from the repository. `make site-serve` builds it and serves it locally; the Site workflow publishes it to GitHub Pages. See [docs/site.md](docs/site.md).
 
-**With a local toolchain.** You need Rust with the `wasm32-unknown-unknown` target, plus [Trunk](https://trunkrs.dev), which downloads Tailwind and wasm-bindgen on first use. The version is pinned in `rust-toolchain.toml`: with rustup, `cargo` and `make` in the repo install and use it on their own. protoc is vendored.
+**With a local toolchain.** You need Rust with the `wasm32-unknown-unknown` target, plus [Trunk](https://trunkrs.dev), which downloads Tailwind and wasm-bindgen on first use, and Brotli (`brew install brotli` or `apt-get install brotli`) for UI precompression. The version is pinned in `rust-toolchain.toml`: with rustup, `cargo` and `make` in the repo install and use it on their own. protoc is vendored.
 
 ```bash
 make build             # web UI, then release c6h and c6w into target/release
@@ -91,6 +93,34 @@ make check             # the code must be formatted (cargo fmt), and every targe
 ```
 
 `cargo build -p c6-head` also works before the web UI is built (UI requests then say to run `make ui`). Incremental head builds watch `crates/c6-ui/dist` when it exists, or its existing parent until it is created: an unchanged build is a no-op in either case, and building the UI later picks it up automatically.
+
+### UI components
+
+Chrome uses `crates/c6-ui/src/icons.rs`: `icon(Icon::Bell, Size::S16)`, with Lucide **1.66.0** paths vendored under their ISC/Feather MIT notices in `crates/c6-ui/LUCIDE-LICENSE`. Sizes are 14, 16 and 20px, all with an absolute 1.5px stroke. Existing helper names remain compatibility wrappers over the same data. For HTML strings use `icons::html::icon` (or the existing markup helpers), **never** a view's `.to_html()` in browser code. Keep every existing icon; user text, Slack emoji and terminal output are not chrome. In-app link arrows are `ArrowUpRight`, new-tab arrows `ExternalLink`, both 14px after the words.
+
+`components.rs` owns `Switch`, the native `CHECKBOX` class, `BTN_PRIMARY` / `BTN_SECONDARY` / `BTN_QUIET` / `BTN_DANGER` / `BTN_DANGER_SOLID`, `BTN_MD` / `BTN_SM`, `IconButton`, `Pill`, `Badge`, `Chip`, `SECTION_LABEL`, `INPUT`, `SELECT`, `Disclosure`, `EmptyState` and `Kbd`. `util::BUTTON` and `BUTTON_QUIET`, and `icons::BAR_BUTTON`, remain aliases. Primary stays neutral; sky stays for Send. Use a trailing **Switch** for an immediate setting/filter, a native **checkbox** for choices submitted with a form, multi-select or a to-do. Labels go left, tracks right; switch/menu rows are at least 44px on touch. Buttons are at least 40px on touch. Native title tooltips keep their text; menu key hints use `Kbd`.
+
+The hidden signed-in `/dev/components` page (also `/r/<realm>/dev/components`) is a small live specimen: inspect it in both themes and pointer modes. The first-stage migration provides the foundations, icons and switches; existing button-tier, pill/badge and overlay call-site migrations wait for visual review. See [docs/testing.md](docs/testing.md#icons-and-components-browser-check).
+
+The UI's release build uses the separate `ui-release` Cargo profile (size
+optimisation, fat LTO, one codegen unit and aborting panics), selected by Trunk's
+HTML entry point. Do not enable `--cfg erase_components` for this build: the
+locked renderer's erased-attribute rebuild clears and recreates attributes and
+SVG inner HTML on routine live updates, substantially increasing main-thread
+work. Keep the typed renderer even though its download is larger (see
+[the responsiveness investigation](docs/ui-responsiveness.md)). `make ui`, direct
+`trunk build --release`, Docker and package builds all use these settings; native
+`c6h`/`c6w` release optimisation, unwinding and build settings are unchanged. The
+browser panic hook still reports the panic to the head and shows its
+plain-JavaScript reload banner before wasm traps.
+
+After `make ui`, `make check` also checks the wasm size ratchet in
+`scripts/ui-size.sh`: both raw and Brotli bytes must stay within 3% of the last
+accepted production build. Lower its accepted byte counts when the UI shrinks;
+explain any increase in the commit message. The targets are at most 8 MB raw and
+2 MB Brotli (decimal bytes); the responsiveness fix explicitly exceeds those
+targets rather than trade input responsiveness for size. A checkout without
+built wasm skips this check; a built wasm without its Brotli sidecar fails it.
 
 ## Run
 
@@ -125,6 +155,7 @@ c6 login https://head.example:7700 --token c6_… --ca carbon6-ca.pem   # --ca o
 - **`c6 send <id> "…"`** continues a session (a unique id prefix is enough). Also: `c6 wait`, `c6 show` (Markdown), `c6 stop`, `c6 sessions`, `c6 search` and `c6 workers`.
 - **`c6 ops [words]`** finds operations, meaning everything you can do in carbon6 (with no words, it lists the areas; with an operation's name, it shows its input).
 - **`c6 op <name> key=value…`** runs one and prints the result as JSON, for example `c6 op workers.enrollments.create body='{"name":"build-1"}'` or `c6 op connections.models id=<id>`. Destructive operations ask first, or skip the question with `--yes`.
+  For list settings, select the realm explicitly on **both** reads and replacements: `c6 op settings.templates.get realm=c6`, then `c6 op settings.templates.put realm=c6 body=@templates.json` (likewise `settings.policies.get`/`put`). `realm` belongs beside `body`, not inside it; the file is the complete JSON array, including unrelated entries you want to keep. Omitting `realm` preserves each endpoint's default (templates: home; policies: root); a CLI launched from a realm's session does not infer that session's realm. Realm-scoped tokens cannot use the admin-only catalog-call endpoint or target another realm through the settings API.
 - **API tokens** reach the whole API except sign-in management, or only one realm's data if you limit them (`c6h api-token --realm home`, or the realm choice under Settings → Sign-in → API tokens). Revoke them in Settings. `C6_URL`, `C6_TOKEN` and `C6_CA` override the saved login.
 - **The API reference:**
   - `GET /api/v1/openapi.json` describes the whole API as OpenAPI 3.1, generated from the same catalog, for code generation.
@@ -404,9 +435,9 @@ The host inventory (**Settings → Hosts**) lists machines your workers reach ov
 - **Fleet runs:** a template's **Hosts by label** (`role:web, env:prod`, or `*`) starts one session per matching host, through that host's worker.
 - **Checks:** the **Workers** page lists hosts with their last check (reachable, latency and system, or why not) and a **Check** button. With a check interval, the head checks on its own and sends a `host` notification when a host stops answering or comes back.
 
-### Usage and budgets
+### Usage
 
-**Usage and budgets** (in the ☰ menu) shows tokens and cost for the sessions matching the label filter, over today or the last 7, 30 or 90 days: totals, a daily chart, and breakdowns by model, connection, label, and the most expensive sessions (subagents count toward the session that started them).
+**Usage** (in the ☰ menu, and the console's header) shows tokens and cost for the sessions matching the label filter, over today or the last 7, 30 or 90 days: totals, a daily chart, and breakdowns by model, connection, label, and the most expensive sessions (subagents count toward the session that started them).
 
 - **Prices** (**Settings → Prices**): USD per million tokens, per model id or prefix (`claude-sonnet-*`); cache reads and writes default to the input price. Models without a price count as $0, and Usage lists them.
 - **Budgets** (**Settings → Budgets**): a limit per day, week or month for sessions with given labels (`automation:`, `client:acme`, or everything).
@@ -539,9 +570,9 @@ Not every task belongs in a repository. Leave the folder empty when starting a s
 
 Keep API keys, tokens and passwords under **Settings → Secrets**. Each one is an environment variable (`$GITHUB_TOKEN`) for the agent's shell commands, background commands included, in the sessions it applies to (an "Applies to" label list, like other settings).
 
-- **The agent never sees a value.** The system prompt lists only names and descriptions, and a value that appears in command output is replaced by `[secret:NAME]` before the model or the UI sees it.
+- **Names in prompts, redacted output.** The system prompt lists only names and descriptions. Command output uses best-effort literal-value redaction (`[secret:NAME]`), not a guarantee that a value can never reach the model or UI. Redaction is not isolation from an agent that can use those credentials.
 - **Storage.** Values are encrypted on the head and can only be replaced, never read back.
-- **Delivery.** Workers fetch values when a turn starts, keep them in memory for a few minutes, and never write them to their journal. A secret scoped to a `worker:` label is only handed to that worker.
+- **Delivery.** Workers fetch values when a turn starts, keep them in memory for a few minutes, and never write them to their journal. Session credential requests enforce a secret's `worker:` labels; this is a delivery check, not a filesystem boundary.
 - **Per realm.** A secret belongs to a realm, and the same name can hold a different value in each (work's `GITHUB_TOKEN` and home's). A session gets its realm's, else root's: root's secrets are every realm's that has none of its own by that name. A realm's Settings → Secrets shows its own; the console's are root's.
 
 ### Background tasks
@@ -652,10 +683,11 @@ The UI is a workspace of **tiles**: framed cards, each with its own bar (‹ ›
 
   **Inbox** lists the same for triage; **Mission** shows them as live cards you can reply from.
 - **A session's glance:** a line each for where it runs (worker, model, runtime), its worktree or folder, branch and changes, its work and labels, and its context, then its newest outputs; first, while there is any, what waits on you (an approval or a question, going to its card). A line acts where you would: Changes and the folder open their panes, Work and Labels their editors, Context its breakdown (with **Compact now**) and usage. A wide session shows it as a column beside the transcript; otherwise the context ring (or ⌘I; Esc closes it) opens it, as a sheet from the bottom on a phone.
-- **Realms and the console:** each realm is its own app at `/r/<realm>/`: its sessions, inbox, decisions, analytics and its own settings, nothing of any other realm. The menu by the logo switches realm (⌘-click opens one in a new tab) and shows how many things wait on you in each. **Console** (`/admin/`) is carbon6's administration: realms, workers, connections, the defaults realms inherit, spending, sign-in and updates. The head enforces this, not the page. The app opens where you were last. Design: [docs/realms-ux.md](docs/realms-ux.md).
+- **Realms and the console:** each realm is its own app at `/r/<realm>/`: its sessions, inbox, decisions, analytics and its own settings, with realm-scoped API requests. This organises the UI; it does not isolate sessions or their files. The menu by the logo switches realm (⌘-click opens one in a new tab) and shows how many things wait on you in each. **Console** (`/admin/`) is carbon6's administration: realms, workers, connections, the defaults realms inherit, spending, sign-in and updates. The head enforces API scopes, not the page. The app opens where you were last. Design: [docs/realms-ux.md](docs/realms-ux.md).
 - **Light or dark:** Settings → Appearance: follow the system, or always light or dark (kept in each browser).
+- **Motion:** beside the theme, choose **System** (default, follows the device), **Full** (even if the device asks for reduced motion), **Reduced** (short fades, no travel or spinning/pulsing), or **Off** (no transitions or animations). Like the theme, this is kept in each browser, across realms. Menus and sheets work from their first frame; closing makes them inert immediately, and reopening during an exit reverses it. **Tile contents never scale.** Same-size tile moves translate only; maximize, restore, opening and neighbour resizing apply the final layout immediately, then reveal its full-size text through a brief 100ms fade (80ms Reduced) over an always-opaque background. Removed tiles disappear without cloned exit text; Off is instant. No tile animation changes layout frame by frame. New transcript entries and the following-end glide share a 200ms out curve; user scrolling interrupts at once, while long jumps and Reduced/Off snap. Streaming text never animates.
 - **Thinking:** Settings → Appearance → Session transcripts → **Show thinking**, off by default. Off hides reasoning entirely; on shows it expanded under **Thinking**, in sessions and inline threads on desktop and phone. Kept in carbon6 across realms and devices, without changing stored events or model input ([display preference and API](docs/session-header.md#4-defaults)).
-- **Phones:** one tile at a time with a switcher, **+** and **▸ N** at the bottom; the current tab's **×** closes its tile, and a long press lifts a tab: drag it and a line shows where it will land, or let go where it is for **Close** and **Minimize**. **▸ N** opens a sheet of every tile (to show or close each, the minimized too), the sessions you viewed lately that no tile holds, **All sessions** and **+ New tile**; Inbox is in ☰. One pane fills the screen (‹ in the item's header goes back to the list), and the nav is in ☰. A phone on its side keeps this layout: the desktop one needs 512px of height as well as width. On a touch screen Return is a new line in a message box; ⌘/Ctrl+Enter sends everywhere.
+- **Phones:** one 44px top bar, no footer. The app menu holds realm selection, navigation, search, Activity, notifications, connection and version; its positive count is app-wide waiting. **Sessions** opens a flat list of open sessions/pages (switch or close, hidden ones too), recently viewed, All sessions, New session or page, Ask and the Needs you bell. The plain context ring opens the session sheet with Changes, Terminal, Files, Outputs and the existing glance. A fixed 44px status slot above the message box keeps working and live turn stats on the left and positive background work on the right, on one line; idle leaves the left empty. The whole row opens its details without moving/remounting the message box; waiting and failure details remain available. A phone on its side keeps this layout: desktop needs 512px of height as well as width. On a touch screen Return is a new line in a message box; ⌘/Ctrl+Enter sends everywhere. See [session header](docs/session-header.md).
 - **The message box** grows with what you type, up to 40% of the window, then scrolls. An image pasted, dropped or attached opens full size when you click it, before you send. The session's model and its subagents' model are chips under the box, each opening its pickers; a change waiting for Send shows beside them.
 - **Tool calls** show their summary straight away and start collapsed (plans start open). Open one to watch its live output; live and final output, including images, share the same fixed-height scrolling area. Finishing a call doesn't open or close it. Calls that make a session or write a document reserve their link's space from the start, including on a phone.
 - **Recently viewed** heads the Sessions page: the last 8 sessions you looked at, newest first, with each one's state and when, the same on every device (the head keeps each realm's last 20: `POST /api/v1/sessions/{id}/viewed`, `GET /api/v1/sessions/recent`). Hidden while you search.

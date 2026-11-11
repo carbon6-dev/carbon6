@@ -10,6 +10,481 @@ use c6_testkit::eventually;
 use c6_testkit::{MockLlm, Reply};
 use serde_json::{Value, json};
 
+/// The public catalog must dispatch as the authenticated caller, not as
+/// an origin-less internal administrator. Exercise real auth and events.
+#[tokio::test]
+async fn catalog_forwards_authenticated_callers_and_input_origins() {
+    catalog_callers_and_input_origins(true).await;
+}
+
+#[tokio::test]
+async fn auth_off_browser_path_is_human_but_tokens_and_body_cannot_claim_it() {
+    catalog_callers_and_input_origins(false).await;
+}
+
+async fn catalog_callers_and_input_origins(auth: bool) {
+    use c6_proto::session_event::Kind;
+    use prost::Message as _;
+    let mock = MockLlm::start().await;
+    let model_input_text = |text: &str| {
+        mock.requests()
+            .iter()
+            .rev()
+            .find_map(|request| {
+                let messages = request["messages"].as_array()?;
+                let content = &messages.iter().rev().find(|m| m["role"] == "user")?["content"];
+                let content = content.as_str().map(str::to_owned).unwrap_or_else(|| {
+                    content.as_array().unwrap().iter().filter_map(|block| block["text"].as_str()).collect::<Vec<_>>().join("\n")
+                });
+                content.contains(text).then_some(content)
+            })
+            .expect("the model request for this input")
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let secret = head.state.store.create_api_token("ops-controller", None).await.unwrap().token.unwrap();
+    let http = reqwest::Client::builder()
+        .default_headers([(reqwest::header::AUTHORIZATION, format!("Bearer {secret}").parse().unwrap())].into_iter().collect())
+        .build()
+        .unwrap();
+    let input_event = async |id: &str, text: &str| {
+        eventually("the created conversation's turn to end", async || {
+            head.state
+                .store
+                .events_after(id, 0, i64::MAX)
+                .await
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e.kind, Some(Kind::TurnEnded(_))))
+                .then_some(())
+        })
+        .await;
+        let public: Vec<Value> =
+            http.get(format!("{api}/sessions/{id}/events?after=0")).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        public.into_iter().find(|e| e["type"] == "user" && e["text"] == text).expect("the initial public user event")
+    };
+    let r = http.post(format!("{api}/connections")).json(&json!({"name": "m", "base_url": mock.base_url()})).send().await.unwrap();
+    assert!(r.status().is_success());
+    let r =
+        http.put(format!("{api}/settings/assistant")).json(&json!({"model": {"connection": "m", "model": "mock-1"}})).send().await.unwrap();
+    assert!(r.status().is_success());
+    mock.push(Reply::Text("ready".into()));
+    let session: Session = http
+        .post(format!("{api}/assistant"))
+        .json(&json!({"prompt": "start", "human_origin": true, "origin": {"kind": "human"}}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let initial = input_event(&session.id, "start").await;
+    assert_eq!(initial["origin"], json!({"kind": "api", "token_name": "ops-controller"}));
+    assert!(model_input_text("start").contains("Message sent via the API (token \"ops-controller\"), not typed by the user:"));
+
+    let login = head.state.store.create_login_link().await.unwrap();
+    let signed_in = reqwest::Client::new().post(format!("{api}/auth/link")).json(&json!({"token": login})).send().await.unwrap();
+    let cookie = signed_in.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap();
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("x-c6-realm", "admin".parse().unwrap());
+    if auth {
+        headers.insert(reqwest::header::COOKIE, cookie.parse().unwrap());
+        let no_page = reqwest::Client::new()
+            .post(format!("{api}/sessions/{}/messages", session.id))
+            .header(reqwest::header::COOKIE, cookie)
+            .json(&json!({"text": "cookie without page context", "human_origin": true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(no_page.status(), reqwest::StatusCode::BAD_REQUEST, "a cookie alone is not the browser path");
+    }
+    let browser = reqwest::Client::builder().default_headers(headers).build().unwrap();
+    for (i, (catalog, human)) in [(false, false), (true, false), (false, true), (true, true)].into_iter().enumerate() {
+        let text = format!("Don't do that: input {i}");
+        mock.push(Reply::Text(format!("ack {i}")));
+        let client = if human { &browser } else { &http };
+        // Request-body provenance is never trusted, in either direction.
+        let body = json!({"text": text, "human_origin": !human, "api_origin": {"token_name": "forged"},
+            "origin_recorded": true, "origin": {"kind": "human"}});
+        let request = if catalog {
+            client.post(format!("{api}/catalog/call")).json(&json!({"op": "sessions.send", "input": {"id": session.id, "body": body}}))
+        } else {
+            client.post(format!("{api}/sessions/{}/messages", session.id)).json(&body)
+        };
+        // A valid token takes precedence even alongside a signed-in cookie.
+        let request = if human { request } else { request.header(reqwest::header::COOKIE, cookie) };
+        let r = request.header("x-c6-realm", "admin").send().await.unwrap();
+        assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+        let events = eventually("the sent input's turn to end", async || {
+            let events = head.state.store.events_after(&session.id, 0, i64::MAX).await.unwrap();
+            (events.iter().filter(|e| matches!(e.kind, Some(Kind::TurnEnded(_)))).count() == i + 2).then_some(events)
+        })
+        .await;
+        let input = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                Some(Kind::User(u)) if u.text == text => Some(u),
+                _ => None,
+            })
+            .expect("the input was recorded");
+        assert_eq!(input.human_origin, human, "catalog={catalog}, human={human}");
+        assert_eq!(input.api_origin.as_ref().map(|o| o.token_name.as_str()), (!human).then_some("ops-controller"));
+        assert!(input.origin_recorded);
+        let public: Vec<Value> = http
+            .get(format!("{api}/sessions/{}/events?after=0", session.id))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let public_input = public.iter().find(|e| e["type"] == "user" && e["text"] == text).expect("the public user event");
+        assert_eq!(
+            public_input["origin"],
+            if human { json!({"kind": "human"}) } else { json!({"kind": "api", "token_name": "ops-controller"}) },
+            "catalog={catalog}, human={human}"
+        );
+        let content = model_input_text(&text);
+        assert!(content.contains(&text), "{content}");
+        let label = "Message sent via the API (token \"ops-controller\"), not typed by the user:";
+        if human {
+            assert!(!content.contains("not typed by the user:"), "{content}");
+        } else {
+            assert!(content.contains(label), "{content}");
+        }
+        assert!(!format!("{events:?}").contains(&secret), "only the token name is retained");
+        assert!(!serde_json::to_string(&public).unwrap().contains(&secret));
+        assert!(!serde_json::to_string(&mock.requests()).unwrap().contains(&secret));
+    }
+
+    let unsigned = reqwest::Client::new();
+    for placed in [true, false] {
+        let text = if placed { "Don't do that: unsigned page input" } else { "Don't do that: unknown input" };
+        if !auth {
+            mock.push(Reply::Text("unsigned input acknowledged".into()));
+        }
+        let request = unsigned.post(format!("{api}/catalog/call")).json(&json!({"op": "sessions.send", "input": {"id": session.id,
+            "body": {"text": text, "human_origin": true, "origin": {"kind": "human"}}}}));
+        let r = if placed { request.header("x-c6-realm", "admin") } else { request }.send().await.unwrap();
+        if auth {
+            assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED);
+        } else {
+            assert!(r.status().is_success());
+            let events = eventually("the unsigned input's turn to end", async || {
+                let events = head.state.store.events_after(&session.id, 0, i64::MAX).await.unwrap();
+                (events.iter().filter(|e| matches!(e.kind, Some(Kind::TurnEnded(_)))).count() == if placed { 6 } else { 7 })
+                    .then_some(events)
+            })
+            .await;
+            let input = events
+                .iter()
+                .find_map(|e| match &e.kind {
+                    Some(Kind::User(u)) if u.text == text => Some(u),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(input.human_origin, placed, "only the auth-off page path is human, never a body assertion");
+            assert!(input.api_origin.is_none());
+            assert!(input.origin_recorded);
+            let public: Vec<Event> =
+                http.get(format!("{api}/sessions/{}/events?after=0", session.id)).send().await.unwrap().json().await.unwrap();
+            assert!(public.iter().any(|e| matches!(&e.kind, EventKind::User { text, origin, .. }
+            if text == &input.text && origin.as_deref() == Some(if placed { &c6_api::MessageOrigin::Human } else { &c6_api::MessageOrigin::Unknown }))));
+            let content = model_input_text(text);
+            assert_eq!(content.contains("Message sent by an automation, not typed by the user:"), !placed, "{content}");
+        }
+    }
+
+    // Acting with your authority is not proof that you typed the message.
+    mock.push(Reply::Text("agent input acknowledged".into()));
+    c6_head::assistant::execute(
+        &head.state,
+        c6_head::catalog::find("sessions.send").unwrap(),
+        json!({"id": session.id, "body": {"text": "Don't do that: agent input", "human_origin": true}}),
+        "agent",
+        None,
+    )
+    .await
+    .unwrap();
+    let events = eventually("the agent-authored input's turn to end", async || {
+        let events = head.state.store.events_after(&session.id, 0, i64::MAX).await.unwrap();
+        (events.iter().filter(|e| matches!(e.kind, Some(Kind::TurnEnded(_)))).count() == if auth { 6 } else { 8 }).then_some(events)
+    })
+    .await;
+    let input = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            Some(Kind::User(u)) if u.text == "Don't do that: agent input" => Some(u),
+            _ => None,
+        })
+        .unwrap();
+    assert!(!input.human_origin && input.api_origin.is_none());
+    assert!(input.origin_recorded);
+    let content = model_input_text("Don't do that: agent input");
+    assert!(content.contains("Message sent by an automation, not typed by the user:"), "{content}");
+
+    let scoped_secret = head.state.store.create_api_token("home-only", Some("home")).await.unwrap().token.unwrap();
+    let scoped = reqwest::Client::new()
+        .post(format!("{api}/catalog/call"))
+        .bearer_auth(&scoped_secret)
+        .json(&json!({"op": "sessions.send", "input": {"id": session.id, "body": {"text": "not admitted"}}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(scoped.status(), reqwest::StatusCode::FORBIDDEN, "realm tokens still cannot use the catalog");
+    let unconfirmed = http
+        .post(format!("{api}/catalog/call"))
+        .json(&json!({"op": "connections.delete", "input": {"id": "unused"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unconfirmed.status(), reqwest::StatusCode::CONFLICT);
+    let direct = http.get(format!("{api}/auth/tokens")).send().await.unwrap();
+    if auth {
+        assert_eq!(direct.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+    let forwarded = http
+        .post(format!("{api}/catalog/call"))
+        .json(&json!({"op": "auth.tokens.create", "input": {"body": {"name": "must-not-be-created"}}}))
+        .send()
+        .await
+        .unwrap();
+    assert!(!forwarded.status().is_success(), "the catalog cannot turn a token into browser sign-in");
+    let tokens: Value = browser.get(format!("{api}/auth/tokens")).send().await.unwrap().json().await.unwrap();
+    assert!(!tokens.to_string().contains("must-not-be-created"));
+
+    // Creation carries the same authenticated provenance as subsequent sends.
+    mock.push(Reply::Text("browser initial acknowledged".into()));
+    let browser_session: Session = browser
+        .post(format!("{api}/assistant"))
+        .json(&json!({"prompt": "browser initial prompt", "human_origin": false,
+            "api_origin": {"token_name": "forged"}, "origin": {"kind": "api", "token_name": "forged"}}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(input_event(&browser_session.id, "browser initial prompt").await["origin"], json!({"kind": "human"}));
+    assert!(!model_input_text("browser initial prompt").contains("not typed by the user:"));
+
+    // An offline worker is enough to inspect the durable first command from
+    // ordinary session creation; it must carry the authenticated fields too.
+    let worker_id = c6_core::WorkerId::new();
+    head.state
+        .store
+        .insert_worker(
+            &c6_head::store::NewWorker {
+                id: worker_id,
+                name: "origin-fixture",
+                hostname: "origin-fixture",
+                os: "linux",
+                arch: "x86_64",
+                version: "0",
+                cert_serial: "origin-fixture",
+            },
+            "",
+            c6_core::now_ms(),
+        )
+        .await
+        .unwrap();
+    head.state.store.set_worker_role(worker_id, "worker").await.unwrap();
+    for human in [false, true] {
+        let client = if human { &browser } else { &http };
+        let text = if human { "browser worker prompt" } else { "API worker prompt" };
+        let body = json!({"worker_id": worker_id.0, "cwd": "/srv/app", "connection_id": session.connection_id,
+            "model": "mock-1", "prompt": text, "work": "none", "human_origin": !human, "api_origin": {"token_name": "forged"}});
+        let request = if human {
+            client.post(format!("{api}/sessions")).json(&body)
+        } else {
+            client.post(format!("{api}/catalog/call")).json(&json!({"op": "sessions.create", "input": {"body": body}}))
+        };
+        let created: Session = request.send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        let commands = head.state.store.queued_inputs(&created.id).await.unwrap();
+        let command = commands.iter().find(|c| c.text.as_deref() == Some(text)).expect("the first worker input");
+        let command = c6_proto::SessionCommand::decode(command.data.as_slice()).unwrap();
+        let Some(c6_proto::session_command::Kind::Input(input)) = command.kind else { panic!("expected an input command") };
+        assert_eq!(input.human_origin, human);
+        assert_eq!(input.api_origin.as_ref().map(|o| o.token_name.as_str()), (!human).then_some("ops-controller"));
+    }
+
+    // A side chat's first question, including catalog dispatch, must not lose
+    // its caller's origin while branching from another conversation.
+    for human in [false, true] {
+        let client = if human { &browser } else { &http };
+        let text = if human { "browser side chat prompt" } else { "API side chat prompt" };
+        let body = json!({"anchor_seq": initial["seq"], "connection_id": session.connection_id,
+            "model": "mock-1", "prompt": text, "human_origin": !human, "api_origin": {"token_name": "forged"}});
+        mock.push(Reply::Text(format!("ack {text}")));
+        let request = if human {
+            client.post(format!("{api}/sessions/{}/side-chats", session.id)).json(&body)
+        } else {
+            client.post(format!("{api}/catalog/call")).json(&json!({"op": "sessions.side_chat", "input": {"id": session.id, "body": body}}))
+        };
+        let child: Session = request.send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        assert_eq!(
+            input_event(&child.id, text).await["origin"],
+            if human { json!({"kind": "human"}) } else { json!({"kind": "api", "token_name": "ops-controller"}) }
+        );
+        let content = model_input_text(text);
+        if human {
+            assert!(!content.contains("not typed by the user:"), "{content}");
+        } else {
+            assert!(content.contains("Message sent via the API (token \"ops-controller\"), not typed by the user:"), "{content}");
+        }
+    }
+    head.shutdown().await.unwrap();
+}
+
+/// An old worker's newly received message is unknown, while a saved journal
+/// entry remains legacy even when the worker replays it on reconnect.
+#[tokio::test]
+async fn head_records_old_worker_origins_without_rewriting_legacy_and_limits_rewind() {
+    use c6_proto::{ApiMessageOrigin, SessionEvent, SessionEventBatch, UserMessage, session_event::Kind};
+    let dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let worker_id = c6_core::WorkerId::new();
+    let row = c6_head::store::SessionRow {
+        id: "origin-fixture".into(),
+        worker_id: worker_id.to_string(),
+        title: "Origin fixture".into(),
+        cwd: String::new(),
+        connection_id: String::new(),
+        model: "unused".into(),
+        status: "idle".into(),
+        error: None,
+        effort: None,
+        parent_id: None,
+        parent_call_id: None,
+        fork_seq: None,
+        created_at: c6_core::now_ms(),
+        updated_at: c6_core::now_ms(),
+        last_seq: 0,
+        archived: 0,
+        labels: "[]".into(),
+        worker_name: "origin-fixture".into(),
+        repo: String::new(),
+        folder: String::new(),
+        home: String::new(),
+        ssh_target: String::new(),
+        awaiting: 0,
+        subagent_model: String::new(),
+        subagent_connection_id: String::new(),
+        subagent_effort: String::new(),
+        tools: "[]".into(),
+        realm: "admin".into(),
+        agent: String::new(),
+        end_reason: String::new(),
+        root_id: None,
+        observed: false,
+        instance: String::new(),
+        colour: String::new(),
+        remote_template: String::new(),
+    };
+    head.state.store.create_session(&row, &[], false).await.unwrap();
+    let messages = [
+        UserMessage { text: "saved legacy".into(), ..Default::default() },
+        UserMessage { text: "saved session".into(), from_session_id: "other".into(), ..Default::default() },
+        UserMessage { text: "saved delegation".into(), delegated_by: "parent-call".into(), ..Default::default() },
+        UserMessage { text: "new old-worker unknown".into(), ..Default::default() },
+        UserMessage { text: "known human".into(), human_origin: true, ..Default::default() },
+        UserMessage {
+            text: "known API".into(),
+            api_origin: Some(ApiMessageOrigin { token_name: "ops-controller".into() }),
+            ..Default::default()
+        },
+        UserMessage { text: "known session".into(), from_session_id: "other".into(), ..Default::default() },
+        UserMessage { text: "known delegation".into(), delegated_by: "parent-call".into(), ..Default::default() },
+        UserMessage { text: "recorded unknown".into(), origin_recorded: true, ..Default::default() },
+        UserMessage { text: "internal notice".into(), command: "task-notification".into(), ..Default::default() },
+        UserMessage { text: "internal hook".into(), command: "stop-hook".into(), ..Default::default() },
+    ];
+    let events: Vec<_> = messages
+        .iter()
+        .enumerate()
+        .map(|(i, message)| SessionEvent { seq: i as u64 + 1, ts_ms: c6_core::now_ms(), kind: Some(Kind::User(message.clone())) })
+        .collect();
+    // Bypass the receive path only to represent pre-upgrade durable records.
+    head.state.store.ingest(worker_id, &row.id, &events[..3]).await.unwrap().unwrap();
+    let mut live = head.state.hub.subscribe(&row.id);
+    assert_eq!(
+        c6_head::sessions::ingest(&head.state, worker_id, SessionEventBatch { session_id: row.id.clone(), events: events.clone() })
+            .await
+            .unwrap(),
+        Some(11)
+    );
+    let saved = head.state.store.events_after(&row.id, 0, i64::MAX).await.unwrap();
+    assert_eq!(&saved[..3], &events[..3], "replayed legacy events are not backfilled");
+    for (i, event) in saved.iter().enumerate().skip(3) {
+        let Some(Kind::User(input)) = &event.kind else { panic!("expected user event") };
+        let mut expected = messages[i].clone();
+        expected.origin_recorded = true;
+        assert_eq!(input, &expected, "authoritative fields survive ingestion");
+    }
+    let expected_origins = [
+        json!({"kind": "unknown"}),
+        json!({"kind": "human"}),
+        json!({"kind": "api", "token_name": "ops-controller"}),
+        json!({"kind": "session"}),
+        json!({"kind": "unknown"}),
+        json!({"kind": "unknown"}),
+        json!({"kind": "unknown"}),
+        json!({"kind": "unknown"}),
+    ];
+    for (i, origin) in expected_origins.iter().enumerate() {
+        let StreamMsg::Event { event } = live.try_recv().unwrap() else { panic!("expected a live event") };
+        assert_eq!(event.seq, i as u64 + 4);
+        assert_eq!(serde_json::to_value(event).unwrap()["origin"], *origin);
+    }
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    let public: Vec<Value> = http
+        .get(format!("{api}/sessions/{}/events?after=0", row.id))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(public[0].get("origin").is_none(), "old stored legacy input keeps its old presentation");
+    for (event, origin) in public[3..].iter().zip(expected_origins) {
+        assert_eq!(event["origin"], origin);
+    }
+    for seq in 1..=11 {
+        let response = http.post(format!("{api}/sessions/{}/rewind", row.id)).json(&json!({"to_seq": seq})).send().await.unwrap();
+        let expected = if matches!(seq, 1 | 4 | 5 | 9) { reqwest::StatusCode::ACCEPTED } else { reqwest::StatusCode::BAD_REQUEST };
+        assert_eq!(response.status(), expected, "rewind seq={seq}: {}", response.text().await.unwrap());
+    }
+    head.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn assistant_restart_closes_abandoned_turns_without_replaying_tools() {
     use c6_proto::{Approval, Question, SessionEvent, SessionEventBatch, ToolResult, TurnEndReason, TurnStarted, session_event::Kind};

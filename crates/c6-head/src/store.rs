@@ -10,6 +10,14 @@ use sqlx::{FromRow, Row};
 #[derive(Clone)]
 pub struct Store {
     pub(crate) pool: SqlitePool,
+    pub(crate) auth_cache: std::sync::Arc<crate::brief_cache::BriefCache<crate::auth::CachedAuth>>,
+    pub(crate) realm_cache: std::sync::Arc<crate::brief_cache::BriefCache<bool>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct InputOrigin {
+    pub human: bool,
+    pub task_card: i32,
 }
 
 #[derive(Clone, Debug, FromRow)]
@@ -315,7 +323,7 @@ impl Store {
         crate::prompts::seed(&pool).await?;
         crate::claims::seed(&pool).await?;
         crate::packages::fix_legacy(&pool).await?;
-        Ok((Self { pool }, report))
+        Ok((Self { pool, auth_cache: Default::default(), realm_cache: Default::default() }, report))
     }
 
     /// Earlier upgrades of this database, newest first.
@@ -635,6 +643,8 @@ pub struct CommandRow {
     pub error: Option<String>,
     /// The worker handed it to the agent, which reads it at its next step.
     pub with_agent: i64,
+    /// Session event highwater at enqueue; zero for pre-migration commands.
+    pub enqueued_after_seq: i64,
 }
 
 /// What an event batch changed.
@@ -741,8 +751,8 @@ impl Store {
             .await?)
     }
 
-    /// Records that the parent's call `call_id` waits on the turn that
-    /// takes input `command_id` of remote subagent `child_id`.
+    /// Records the report obligation for an input of a remote child.
+    /// `call_id` is empty for a steer without a waiting tool.
     pub async fn add_remote_delegation(&self, command_id: &str, child_id: &str, parent_id: &str, call_id: &str) -> anyhow::Result<()> {
         sqlx::query("INSERT OR REPLACE INTO remote_delegations (command_id, child_id, parent_id, call_id, state, created_at) VALUES (?, ?, ?, ?, 'waiting', ?)")
             .bind(command_id)
@@ -755,7 +765,7 @@ impl Store {
         Ok(())
     }
 
-    /// The calls still waiting on a remote subagent: (input command, call).
+    /// Pending report obligations: (input/turn id, call or empty for a notice).
     pub async fn waiting_delegations(&self, child_id: &str) -> anyhow::Result<Vec<(String, String)>> {
         Ok(sqlx::query_as(
             "SELECT command_id, call_id FROM remote_delegations WHERE child_id = ? AND state = 'waiting' ORDER BY created_at",
@@ -1163,19 +1173,23 @@ impl Store {
         use prost::Message;
 
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let mut row = sqlx::query("SELECT last_seq, status FROM sessions WHERE id = ? AND worker_id = ?")
+        let mut row = sqlx::query("SELECT last_seq, status, remote_template FROM sessions WHERE id = ? AND worker_id = ?")
             .bind(session_id)
             .bind(worker_id.to_string())
             .fetch_optional(&mut *tx)
             .await?;
         if row.is_none() && create_subagent_session(&mut tx, worker_id, session_id, events).await? {
-            row = sqlx::query("SELECT last_seq, status FROM sessions WHERE id = ?").bind(session_id).fetch_optional(&mut *tx).await?;
+            row = sqlx::query("SELECT last_seq, status, remote_template FROM sessions WHERE id = ?")
+                .bind(session_id)
+                .fetch_optional(&mut *tx)
+                .await?;
         }
         let Some(row) = row else {
             return Ok(None);
         };
         let mut last = row.get::<i64, _>("last_seq") as u64;
         let mut status: String = row.get("status");
+        let remote = !row.get::<String, _>("remote_template").is_empty();
         let mut stored = Vec::new();
         let mut done = Vec::new();
         let mut delivered: Vec<String> = Vec::new();
@@ -1250,6 +1264,17 @@ impl Store {
                 Some(Kind::SubagentReported(r)) => done.push(r.command_id.clone()),
                 Some(Kind::TurnStarted(_)) => status = "running".into(),
                 Some(Kind::TurnEnded(t)) => {
+                    // Commit the report obligation with the turn end, not
+                    // in its downstream hook. This includes turns resumed
+                    // by the child's own task notices, with no waiting call.
+                    if remote {
+                        sqlx::query("INSERT OR IGNORE INTO remote_delegations (command_id, child_id, parent_id, call_id, state, created_at) SELECT ?, id, parent_id, '', 'waiting', ? FROM sessions WHERE id = ? AND parent_id IS NOT NULL")
+                            .bind(crate::remote::turn_report_id(session_id, ev.seq))
+                            .bind(ev.ts_ms)
+                            .bind(session_id)
+                            .execute(&mut *tx)
+                            .await?;
+                    }
                     status = "idle".into();
                     let reason = match c6_proto::TurnEndReason::try_from(t.reason) {
                         Ok(c6_proto::TurnEndReason::Completed) => "completed",
@@ -1381,6 +1406,13 @@ impl Store {
         Ok(n.unwrap_or(0) as u64)
     }
 
+    /// The current conversation, not the append-only audit log. Apply
+    /// rewinds before callers take a prefix, window or digest: a marker
+    /// outside that window can withdraw events inside it.
+    pub async fn effective_events(&self, session_id: &str) -> anyhow::Result<Vec<c6_proto::SessionEvent>> {
+        Ok(c6_agent::effective_events(&self.events_after(session_id, 0, i64::MAX).await?))
+    }
+
     pub async fn events_after(&self, session_id: &str, after: u64, limit: i64) -> anyhow::Result<Vec<c6_proto::SessionEvent>> {
         use prost::Message;
         let rows = sqlx::query("SELECT data FROM events WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT ?")
@@ -1487,8 +1519,9 @@ pub struct NewCommand<'a> {
 /// it stays behind them), else pending.
 async fn insert_command(tx: &mut sqlx::SqliteConnection, c: &NewCommand<'_>, held: bool) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT INTO commands (id, session_id, worker_id, data, text, created_at, state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, \
-         CASE WHEN ?7 OR EXISTS (SELECT 1 FROM commands WHERE session_id = ?2 AND state = 'held') THEN 'held' ELSE 'pending' END)",
+        "INSERT INTO commands (id, session_id, worker_id, data, text, created_at, state, enqueued_after_seq) VALUES (?1, ?2, ?3, ?4, ?5, ?6, \
+         CASE WHEN ?7 OR EXISTS (SELECT 1 FROM commands WHERE session_id = ?2 AND state = 'held') THEN 'held' ELSE 'pending' END, \
+         COALESCE((SELECT last_seq FROM sessions WHERE id = ?2), 0))",
     )
     .bind(c.id)
     .bind(c.session_id)
@@ -1511,7 +1544,6 @@ impl Store {
         since: i64,
     ) -> anyhow::Result<std::collections::HashMap<String, std::collections::VecDeque<i64>>> {
         use c6_proto::{SessionCommand, session_command};
-        use prost::Message;
 
         let rows = sqlx::query(
             "SELECT c.created_at, c.data, previous.data AS previous_data FROM commands c \
@@ -1524,7 +1556,7 @@ impl Store {
         let mut sent: std::collections::HashMap<String, std::collections::VecDeque<i64>> = Default::default();
         for row in rows {
             let data: Vec<u8> = row.get("data");
-            let Ok(SessionCommand { kind: Some(session_command::Kind::Input(input)), .. }) = SessionCommand::decode(data.as_slice()) else {
+            let Ok(SessionCommand { kind: Some(session_command::Kind::Input(input)), .. }) = c6_proto::decode_stored_command(&data) else {
                 continue;
             };
             if input.from_session_id.is_empty() {
@@ -1535,7 +1567,7 @@ impl Store {
             let previous: Option<Vec<u8>> = row.get("previous_data");
             if previous
                 .as_deref()
-                .and_then(|data| SessionCommand::decode(data).ok())
+                .and_then(|data| c6_proto::decode_stored_command(data).ok())
                 .is_some_and(|c| matches!(c.kind, Some(session_command::Kind::Restore(_))))
             {
                 continue;
@@ -1548,6 +1580,37 @@ impl Store {
     pub async fn enqueue_command(&self, c: &NewCommand<'_>) -> anyhow::Result<()> {
         let mut conn = self.pool.acquire().await?;
         insert_command(&mut conn, c, false).await
+    }
+
+    /// Retiring delivery obligations and queuing their report are one
+    /// transaction. A stable report id makes replay safe even after ack.
+    pub async fn enqueue_subagent_report(&self, c: &NewCommand<'_>, inputs: &[String]) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM commands WHERE id = ?)").bind(c.id).fetch_one(&mut *tx).await?;
+        if !exists {
+            insert_command(&mut tx, c, false).await?;
+        }
+        for input in inputs {
+            sqlx::query("UPDATE remote_delegations SET state = 'reported' WHERE command_id = ? AND state = 'waiting'")
+                .bind(input)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// A durable, visible queue error, even when the report's parent has
+    /// disappeared. It is never sent to a model as if it were user input.
+    pub async fn subagent_report_failed(&self, c: &NewCommand<'_>, why: &str) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM commands WHERE id = ?)").bind(c.id).fetch_one(&mut *tx).await?;
+        if !exists {
+            insert_command(&mut tx, c, false).await?;
+        }
+        sqlx::query("UPDATE commands SET state = 'rejected', error = ? WHERE id = ?").bind(why).bind(c.id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Sessions whose commands are held.
@@ -1571,15 +1634,18 @@ impl Store {
                 Some((id, data)) if id == c.id => data,
                 _ => &c.data,
             };
-            sqlx::query("INSERT INTO commands (id, session_id, worker_id, data, text, created_at) VALUES (?, ?, ?, ?, ?, ?)")
-                .bind(&c.id)
-                .bind(&c.session_id)
-                .bind(&c.worker_id)
-                .bind(data)
-                .bind(&c.text)
-                .bind(c.created_at)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "INSERT INTO commands (id, session_id, worker_id, data, text, created_at, enqueued_after_seq) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&c.id)
+            .bind(&c.session_id)
+            .bind(&c.worker_id)
+            .bind(data)
+            .bind(&c.text)
+            .bind(c.created_at)
+            .bind(c.enqueued_after_seq)
+            .execute(&mut *tx)
+            .await?;
         }
         tx.commit().await?;
         Ok(held.len())
@@ -1650,7 +1716,7 @@ impl Store {
     pub async fn reject_command(&self, worker_id: WorkerId, id: &str, reason: &str) -> anyhow::Result<Option<String>> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let Some(row) =
-            sqlx::query("UPDATE commands SET state = 'rejected', error = ? WHERE id = ? AND worker_id = ? AND state = 'pending' RETURNING session_id, text")
+            sqlx::query("UPDATE commands SET state = 'rejected', error = ? WHERE id = ? AND worker_id = ? AND state = 'pending' RETURNING session_id, data")
                 .bind(reason)
                 .bind(id)
                 .bind(worker_id.to_string())
@@ -1660,7 +1726,18 @@ impl Store {
             return Ok(None);
         };
         let session_id: String = row.get("session_id");
-        if row.get::<Option<String>, _>("text").is_none() {
+        let kind = c6_proto::decode_stored_command(&row.get::<Vec<u8>, _>("data")).ok().and_then(|c| c.kind);
+        if let Some(c6_proto::session_command::Kind::DelegationEnded(d)) = kind {
+            // A rejected report is not a failed Create. Keep its parent
+            // usable and show the actual delivery failure in its queue.
+            sqlx::query("UPDATE commands SET text = ? WHERE id = ?")
+                .bind(format!("Subagent report delivery failed: report from {}. {reason}", d.child_session_id))
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        } else if matches!(kind, Some(c6_proto::session_command::Kind::Create(_))) {
+            // Rewind and other controls also have no text. Only a rejected
+            // Create means the session could not start.
             let now = c6_core::now_ms();
             sqlx::query("UPDATE sessions SET status = 'failed', error = ?, updated_at = ?, turn_ended_at = ? WHERE id = ?")
                 .bind(reason)
@@ -1680,6 +1757,39 @@ impl Store {
         Ok(Some(session_id))
     }
 
+    /// Head-authored input provenance survives delivery and a head restart,
+    /// including old commands that encoded human_origin at fork-only tag 16.
+    /// No text/label heuristics: pre-change commands have no such metadata.
+    pub(crate) async fn input_origins(
+        &self,
+        session_id: &str,
+        command_ids: &[&str],
+    ) -> anyhow::Result<std::collections::HashMap<String, InputOrigin>> {
+        use c6_proto::session_command;
+        let mut origins = std::collections::HashMap::new();
+        if command_ids.is_empty() {
+            return Ok(origins);
+        }
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new("SELECT id, data FROM commands WHERE session_id = ");
+        query.push_bind(session_id).push(" AND id IN (");
+        let mut ids = query.separated(", ");
+        for id in command_ids {
+            ids.push_bind(id);
+        }
+        query.push(")");
+        for (id, data) in query.build_query_as::<(String, Vec<u8>)>().fetch_all(&self.pool).await? {
+            let command = c6_proto::decode_stored_command(&data)?;
+            if command.session_id == session_id
+                && command.command_id == id
+                && let Some(session_command::Kind::Input(input)) = command.kind
+                && (input.human_origin || input.task_card_origin != 0)
+            {
+                origins.insert(id, InputOrigin { human: input.human_origin, task_card: input.task_card_origin });
+            }
+        }
+        Ok(origins)
+    }
+
     /// A pending input's text, creation time and encoded command.
     pub async fn pending_input(&self, command_id: &str) -> anyhow::Result<Option<(String, i64, Vec<u8>)>> {
         Ok(sqlx::query("SELECT text, created_at, data FROM commands WHERE id = ? AND state = 'pending'")
@@ -1687,6 +1797,61 @@ impl Store {
             .fetch_optional(&self.pool)
             .await?
             .map(|r| (r.get::<Option<String>, _>("text").unwrap_or_default(), r.get("created_at"), r.get::<Vec<u8>, _>("data"))))
+    }
+
+    /// Original uploads for a pending input, or its already-recorded User.
+    /// Prefer the source command: workers may add mentioned files to User.
+    /// The fallback streams only the command's enqueue floor through a captured
+    /// highwater (legacy/imported messages without a command start at zero).
+    /// Nothing is retired or changed, and no write transaction holds the scan.
+    pub(crate) async fn message_attachments(
+        &self,
+        session_id: &str,
+        command_id: &str,
+    ) -> anyhow::Result<Option<Vec<c6_proto::Attachment>>> {
+        use futures::TryStreamExt;
+        use prost::Message;
+
+        if command_id.is_empty() {
+            return Ok(None);
+        }
+        let mut conn = self.pool.acquire().await?;
+        let row = sqlx::query(
+            "SELECT s.last_seq, c.data, c.state, c.enqueued_after_seq FROM sessions s \
+             LEFT JOIN commands c ON c.session_id = s.id AND c.id = ? WHERE s.id = ?",
+        )
+        .bind(command_id)
+        .bind(session_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        let source = row.get::<Option<Vec<u8>>, _>("data").map(|data| c6_proto::decode_stored_command(&data)).transpose()?;
+        let uploads = source.and_then(|c| {
+            if c.session_id != session_id || c.command_id != command_id {
+                return None;
+            }
+            match c.kind {
+                Some(c6_proto::session_command::Kind::Input(input)) => Some(input.attachments),
+                _ => None,
+            }
+        });
+        if matches!(row.get::<Option<String>, _>("state").as_deref(), Some("pending" | "held")) && uploads.is_some() {
+            return Ok(uploads);
+        }
+        let mut rows = sqlx::query("SELECT data FROM events WHERE session_id = ? AND seq > ? AND seq <= ? ORDER BY seq")
+            .bind(session_id)
+            .bind(row.get::<Option<i64>, _>("enqueued_after_seq").unwrap_or(0))
+            .bind(row.get::<i64, _>("last_seq"))
+            .fetch(&mut *conn);
+        while let Some(row) = rows.try_next().await? {
+            let event = c6_proto::SessionEvent::decode(row.get::<Vec<u8>, _>("data").as_slice())?;
+            if let Some(c6_proto::session_event::Kind::User(user)) = event.kind
+                && user.command_id == command_id
+            {
+                return Ok(Some(uploads.unwrap_or(user.attachments)));
+            }
+        }
+        Ok(None)
     }
 
     /// Retires a rejected input and queues a restore followed by a copy of it.
@@ -1726,11 +1891,159 @@ impl Store {
         let r = sqlx::query("UPDATE commands SET state = 'done' WHERE id = ? AND state = 'pending'").bind(id).execute(&self.pool).await?;
         Ok(r.rows_affected() > 0)
     }
+
+    /// A durable UserMessage means the worker already owns this input,
+    /// regardless of stale pending metadata. Read the authoritative log,
+    /// not the asynchronously backfilled analytics index. A command that
+    /// disappeared or stopped being pending is also unavailable to take back.
+    pub(crate) async fn input_recorded(&self, session_id: &str, command_id: &str) -> anyhow::Result<bool> {
+        Ok(self.check_pending_input(session_id, command_id).await?.is_none())
+    }
+
+    /// Retires only this still-pending, unrecorded input after the worker
+    /// confirms inbox cancellation. Decode the bounded log outside the write
+    /// transaction; a cheap highwater recheck refuses concurrent log changes.
+    pub(crate) async fn take_back_pending_input(&self, session_id: &str, command_id: &str) -> anyhow::Result<bool> {
+        let Some(check) = self.check_pending_input(session_id, command_id).await? else { return Ok(false) };
+        self.retire_checked_input(session_id, command_id, check).await
+    }
+
+    async fn check_pending_input(&self, session_id: &str, command_id: &str) -> anyhow::Result<Option<InputCheck>> {
+        let mut conn = self.pool.acquire().await?;
+        let row = sqlx::query(
+            "SELECT c.enqueued_after_seq, s.last_seq FROM commands c JOIN sessions s ON s.id = c.session_id \
+             WHERE c.id = ? AND c.session_id = ? AND c.state = 'pending'",
+        )
+        .bind(command_id)
+        .bind(session_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        let check = InputCheck { after_seq: row.get("enqueued_after_seq"), through_seq: row.get("last_seq") };
+        if input_recorded_on(&mut conn, session_id, command_id, check).await? { Ok(None) } else { Ok(Some(check)) }
+    }
+
+    async fn retire_checked_input(&self, session_id: &str, command_id: &str, check: InputCheck) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let retired = sqlx::query(
+            "UPDATE commands SET state = 'done' WHERE id = ?1 AND session_id = ?2 AND state = 'pending' \
+             AND enqueued_after_seq = ?3 AND EXISTS (SELECT 1 FROM sessions WHERE id = ?2 AND last_seq = ?4)",
+        )
+        .bind(command_id)
+        .bind(session_id)
+        .bind(check.after_seq)
+        .bind(check.through_seq)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        tx.commit().await?;
+        Ok(retired)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InputCheck {
+    after_seq: i64,
+    through_seq: i64,
+}
+
+async fn input_recorded_on(
+    conn: &mut sqlx::SqliteConnection,
+    session_id: &str,
+    command_id: &str,
+    check: InputCheck,
+) -> anyhow::Result<bool> {
+    use futures::TryStreamExt;
+    use prost::Message;
+
+    let mut rows = sqlx::query("SELECT data FROM events WHERE session_id = ? AND seq > ? AND seq <= ? ORDER BY seq")
+        .bind(session_id)
+        .bind(check.after_seq)
+        .bind(check.through_seq)
+        .fetch(conn);
+    while let Some(row) = rows.try_next().await? {
+        let event = c6_proto::SessionEvent::decode(row.get::<Vec<u8>, _>("data").as_slice())?;
+        if matches!(event.kind, Some(c6_proto::session_event::Kind::User(u)) if u.command_id == command_id) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Actual fork wire bytes, not a new-schema input with a renamed field.
+    pub(crate) fn legacy_input_command(command_id: &str, session_id: &str, mut input: c6_proto::UserInput) -> Vec<u8> {
+        use prost::Message;
+
+        assert!(input.prompt.is_empty(), "the fork had no input prompt field");
+        let human = input.human_origin;
+        input.human_origin = false;
+        let mut payload = input.encode_to_vec();
+        if human {
+            payload.extend_from_slice(&[0x80, 0x01, 0x01]); // bool human_origin = 16
+        }
+        let mut data =
+            c6_proto::SessionCommand { command_id: command_id.into(), session_id: session_id.into(), kind: None }.encode_to_vec();
+        prost::encoding::bytes::encode(11, &payload, &mut data);
+        data
+    }
+
+    /// A full raw conversation with a withdrawn turn (including a summary),
+    /// a replacement, and a second rewind. Used by model-context readers.
+    pub(crate) fn rewind_history() -> Vec<c6_proto::SessionEvent> {
+        use c6_proto::{AssistantMessage, ContentBlock, SessionEvent, UserMessage, content_block, session_event::Kind};
+        let user = |text: &str| Kind::User(UserMessage { text: text.into(), ..Default::default() });
+        let answer = |turn, text: &str| {
+            Kind::Assistant(AssistantMessage {
+                turn,
+                blocks: vec![ContentBlock { block: Some(content_block::Block::Text(text.into())), ..Default::default() }],
+                ..Default::default()
+            })
+        };
+        [
+            Kind::Started(Default::default()),
+            user("KEEP original user question"),
+            Kind::TurnStarted(c6_proto::TurnStarted { turn: 1, ..Default::default() }),
+            answer(1, "KEEP_ANSWER"),
+            Kind::TurnEnded(c6_proto::TurnEnded { turn: 1, reason: c6_proto::TurnEndReason::Completed as i32 }),
+            user("DROP_PRIVATE withdrawn question"),
+            Kind::TurnStarted(c6_proto::TurnStarted { turn: 2, ..Default::default() }),
+            answer(2, "PRIVATE_WITHDRAWN_ANSWER"),
+            Kind::ToolResult(c6_proto::ToolResult { output: "PRIVATE_TOOL_RESULT".into(), ..Default::default() }),
+            Kind::Compaction(c6_proto::Compaction { summary: "PRIVATE_SUMMARY".into(), ..Default::default() }),
+            Kind::TurnEnded(c6_proto::TurnEnded { turn: 2, reason: c6_proto::TurnEndReason::Completed as i32 }),
+            Kind::Rewound(c6_proto::Rewound { to_seq: 6, ..Default::default() }),
+            user("KEEP replacement user question"),
+            Kind::TurnStarted(c6_proto::TurnStarted { turn: 3, ..Default::default() }),
+            answer(3, "KEEP_REPLACEMENT_ANSWER"),
+            Kind::TurnEnded(c6_proto::TurnEnded { turn: 3, reason: c6_proto::TurnEndReason::Completed as i32 }),
+            user("DROP_PRIVATE again"),
+            answer(4, "PRIVATE_WITHDRAWN_AGAIN"),
+            Kind::Rewound(c6_proto::Rewound { to_seq: 17, ..Default::default() }),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, kind)| SessionEvent { seq: i as u64 + 1, ts_ms: i as i64, kind: Some(kind) })
+        .collect()
+    }
+
+    pub(crate) async fn insert_events(store: &Store, id: &str, events: &[c6_proto::SessionEvent]) {
+        use prost::Message;
+        for e in events {
+            sqlx::query("INSERT INTO events (session_id, seq, ts, data) VALUES (?, ?, ?, ?)")
+                .bind(id)
+                .bind(e.seq as i64)
+                .bind(e.ts_ms)
+                .bind(e.encode_to_vec())
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        }
+    }
 
     fn session(id: &str, worker_id: WorkerId) -> SessionRow {
         SessionRow {
@@ -1774,6 +2087,463 @@ mod tests {
 
     fn command<'a>(id: &'a str, session_id: &'a str, worker_id: WorkerId, text: Option<&'a str>) -> NewCommand<'a> {
         NewCommand { id, session_id, worker_id, data: id.as_bytes().to_vec(), text }
+    }
+
+    fn input_event(seq: u64, command_id: &str) -> c6_proto::SessionEvent {
+        c6_proto::SessionEvent {
+            seq,
+            ts_ms: c6_core::now_ms(),
+            kind: Some(c6_proto::session_event::Kind::User(c6_proto::UserMessage {
+                command_id: command_id.into(),
+                text: "synthetic input".into(),
+                ..Default::default()
+            })),
+        }
+    }
+
+    #[tokio::test]
+    async fn task_card_provenance_is_durable_scoped_and_not_inferred_from_old_commands() {
+        use c6_proto::{SessionCommand, TaskCardOrigin, UserInput, session_command};
+        use prost::Message;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c6h.db");
+        let store = Store::open(&path).await.unwrap();
+        let worker = WorkerId::new();
+        store.create_session(&session("s", worker), &[], false).await.unwrap();
+        for (id, origin) in [("start", TaskCardOrigin::Start), ("answer", TaskCardOrigin::Answer), ("old", TaskCardOrigin::Unspecified)] {
+            let data = SessionCommand {
+                command_id: id.into(),
+                session_id: "s".into(),
+                kind: Some(session_command::Kind::Input(UserInput {
+                    text: "Start session: task card #1".into(),
+                    command: "card-answer".into(),
+                    task_card_origin: origin as i32,
+                    ..Default::default()
+                })),
+            }
+            .encode_to_vec();
+            store.enqueue_command(&NewCommand { id, session_id: "s", worker_id: worker, data, text: Some("card") }).await.unwrap();
+        }
+        for (id, legacy) in [("fork-human", true), ("current-human", false)] {
+            let input = UserInput { text: "the person's input".into(), human_origin: true, ..Default::default() };
+            let data = if legacy {
+                legacy_input_command(id, "s", input)
+            } else {
+                SessionCommand { command_id: id.into(), session_id: "s".into(), kind: Some(session_command::Kind::Input(input)) }
+                    .encode_to_vec()
+            };
+            store.enqueue_command(&NewCommand { id, session_id: "s", worker_id: worker, data, text: Some("person") }).await.unwrap();
+        }
+        // The table's scope alone cannot authorize a mismatched envelope.
+        let data = legacy_input_command("another-id", "another-session", UserInput { human_origin: true, ..Default::default() });
+        store
+            .enqueue_command(&NewCommand { id: "mismatch", session_id: "s", worker_id: worker, data, text: Some("not evidence") })
+            .await
+            .unwrap();
+        // Delivery retires the command, not its provenance.
+        sqlx::query("UPDATE commands SET state = 'done' WHERE session_id = 's'").execute(&store.pool).await.unwrap();
+        let legacy = input_event(1, "start");
+        store.ingest(worker, "s", std::slice::from_ref(&legacy)).await.unwrap().unwrap();
+        store.pool.close().await;
+        let store = Store::open(&path).await.unwrap();
+        let origins =
+            store.input_origins("s", &["start", "answer", "old", "fork-human", "current-human", "mismatch", "missing"]).await.unwrap();
+        assert_eq!(origins["start"], InputOrigin { human: false, task_card: TaskCardOrigin::Start as i32 });
+        assert_eq!(origins["answer"], InputOrigin { human: false, task_card: TaskCardOrigin::Answer as i32 });
+        assert_eq!(origins["fork-human"], InputOrigin { human: true, task_card: 0 });
+        assert_eq!(origins["current-human"], InputOrigin { human: true, task_card: 0 });
+        assert!(!origins.contains_key("old"), "text and command names cannot reclassify history");
+        assert!(!origins.contains_key("mismatch"));
+        assert!(!origins.contains_key("missing"));
+        assert!(store.input_origins("other", &["start", "fork-human"]).await.unwrap().is_empty());
+        assert!(store.input_origins("s", &[]).await.unwrap().is_empty());
+        // Even a replay stamped with new metadata cannot rewrite old history.
+        let mut replay = legacy.clone();
+        let Some(c6_proto::session_event::Kind::User(input)) = &mut replay.kind else { panic!("user event") };
+        input.task_card_origin = TaskCardOrigin::Start as i32;
+        input.human_origin = true;
+        assert!(store.ingest(worker, "s", &[replay]).await.unwrap().unwrap().events.is_empty());
+        assert_eq!(store.events_after("s", 0, 10).await.unwrap(), vec![legacy]);
+    }
+
+    #[tokio::test]
+    async fn fork_inputs_keep_attachments_queue_rejection_and_take_back_ownership() {
+        use c6_proto::{Attachment, UserInput};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("head.db")).await.unwrap();
+        let worker = WorkerId::new();
+        store.create_session(&session("s", worker), &[], false).await.unwrap();
+        let attachment = Attachment { name: "original.txt".into(), mime: "text/plain".into(), data: b"original bytes".to_vec() };
+        for id in ["take", "reject", "delivered"] {
+            let input =
+                UserInput { text: "original text".into(), human_origin: true, attachments: vec![attachment.clone()], ..Default::default() };
+            let data = legacy_input_command(id, "s", input);
+            store.enqueue_command(&NewCommand { id, session_id: "s", worker_id: worker, data, text: Some("original text") }).await.unwrap();
+        }
+        assert_eq!(store.queued_inputs("s").await.unwrap().len(), 3);
+        assert_eq!(store.message_attachments("s", "take").await.unwrap(), Some(vec![attachment.clone()]));
+        assert_eq!(store.message_attachments("other", "take").await.unwrap(), None);
+        assert!(store.take_back_pending_input("s", "take").await.unwrap());
+        assert_eq!(store.reject_command(worker, "reject", "worker is unavailable").await.unwrap(), Some("s".into()));
+        assert_ne!(store.session("s").await.unwrap().unwrap().status, "failed");
+        let rows = store.queued_inputs("s").await.unwrap();
+        assert_eq!(rows.iter().find(|r| r.id == "reject").unwrap().state, "rejected");
+        assert!(!rows.iter().any(|r| r.id == "take"));
+        // Recover the original upload from the saved done command, not extra
+        // files a worker may have attached when resolving its own mentions.
+        let event = input_event(1, "delivered");
+        store.ingest(worker, "s", &[event]).await.unwrap().unwrap();
+        assert_eq!(store.message_attachments("s", "delivered").await.unwrap(), Some(vec![attachment]));
+        assert!(!store.take_back_pending_input("s", "delivered").await.unwrap());
+        let origins = store.input_origins("s", &["take", "reject", "delivered"]).await.unwrap();
+        assert_eq!(origins.len(), 3);
+        assert!(origins.values().all(|origin| origin.human));
+    }
+
+    #[tokio::test]
+    async fn rejected_rewind_preserves_session_and_pending_inputs() {
+        use c6_proto::{Rewind, SessionCommand, UserInput, session_command};
+        use prost::Message;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("c6h.db")).await.unwrap();
+        let worker = WorkerId::new();
+        let mut s = session("a", worker);
+        s.status = "idle".into();
+        let input = |id: &'static str, text: &'static str| NewCommand {
+            id,
+            session_id: "a",
+            worker_id: worker,
+            data: SessionCommand {
+                command_id: id.into(),
+                session_id: "a".into(),
+                kind: Some(session_command::Kind::Input(UserInput { text: text.into(), ..Default::default() })),
+            }
+            .encode_to_vec(),
+            text: Some(text),
+        };
+        let rewind = NewCommand {
+            id: "rewind",
+            session_id: "a",
+            worker_id: worker,
+            data: SessionCommand {
+                command_id: "rewind".into(),
+                session_id: "a".into(),
+                kind: Some(session_command::Kind::Rewind(Rewind { to_seq: 3, restore_files: false })),
+            }
+            .encode_to_vec(),
+            text: None,
+        };
+        store.create_session(&s, &[input("before", "before rewind"), rewind, input("after", "after rewind")], false).await.unwrap();
+
+        assert_eq!(store.reject_command(worker, "rewind", "remote child has not stopped").await.unwrap().as_deref(), Some("a"));
+        let unchanged = store.session("a").await.unwrap().unwrap();
+        assert_eq!(unchanged.status, "idle");
+        assert!(unchanged.error.is_none(), "a rejected Rewind must not fail its session");
+        let rejected: (String, Option<String>) =
+            sqlx::query_as("SELECT state, error FROM commands WHERE id = 'rewind'").fetch_one(store.pool()).await.unwrap();
+        assert_eq!(rejected, ("rejected".into(), Some("remote child has not stopped".into())));
+        let pending = store.pending_commands(worker, 0).await.unwrap();
+        assert_eq!(pending.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["before", "after"]);
+        assert!(store.queued_inputs("a").await.unwrap().iter().all(|c| c.state == "pending" && c.error.is_none()));
+
+        store.enqueue_command(&input("later", "the session can continue")).await.unwrap();
+        assert!(store.reject_command(worker, "rewind", "redelivery").await.unwrap().is_none());
+        let pending = store.pending_commands(worker, 0).await.unwrap();
+        assert_eq!(pending.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["before", "after", "later"]);
+        assert_eq!(store.session("a").await.unwrap().unwrap().status, "idle");
+    }
+
+    #[tokio::test]
+    async fn rejected_command_only_fails_session_for_decoded_create() {
+        use c6_proto::{SessionCommand, session_command};
+        use prost::Message;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("c6h.db")).await.unwrap();
+        let worker = WorkerId::new();
+        for (id, kind, text, fails_session) in [
+            ("create", Some(session_command::Kind::Create(Default::default())), None, true),
+            ("create-with-text", Some(session_command::Kind::Create(Default::default())), Some("not a kind discriminator"), true),
+            ("control", Some(session_command::Kind::Rewind(Default::default())), None, false),
+            ("missing-kind", None, None, false),
+            ("malformed", None, None, false),
+        ] {
+            let data = if id == "malformed" {
+                vec![0xff]
+            } else {
+                SessionCommand { command_id: id.into(), session_id: id.into(), kind }.encode_to_vec()
+            };
+            let queued_id = format!("{id}-input");
+            store
+                .create_session(
+                    &session(id, worker),
+                    &[
+                        NewCommand { id, session_id: id, worker_id: worker, data, text },
+                        command(&queued_id, id, worker, Some("queued input")),
+                    ],
+                    false,
+                )
+                .await
+                .unwrap();
+            assert_eq!(store.reject_command(worker, id, "refused").await.unwrap().as_deref(), Some(id));
+            let s = store.session(id).await.unwrap().unwrap();
+            assert_eq!(s.status, if fails_session { "failed" } else { "starting" }, "{id}");
+            assert_eq!(s.error.as_deref(), fails_session.then_some("refused"), "{id}");
+            let queued = store.queued_inputs(id).await.unwrap();
+            let input = queued.iter().find(|c| c.id == queued_id).unwrap();
+            assert_eq!(input.state, if fails_session { "rejected" } else { "pending" }, "{id}");
+            assert_eq!(input.error.as_deref(), fails_session.then_some("session failed to start"), "{id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn message_attachments_bounds_durable_scan_by_enqueue_floor_and_highwater() {
+        use c6_proto::{Attachment, SessionCommand, UserInput, session_command};
+        use prost::Message;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("c6h.db")).await.unwrap();
+        let worker = WorkerId::new();
+        store.create_session(&session("s", worker), &[], false).await.unwrap();
+        store.ingest(worker, "s", &[input_event(1, "old")]).await.unwrap().unwrap();
+        let files = vec![Attachment { name: "upload.txt".into(), mime: "text/plain".into(), data: b"original".to_vec() }];
+        for id in ["taken", "unrecorded"] {
+            let mut cmd = command(id, "s", worker, Some("draft"));
+            cmd.data = SessionCommand {
+                command_id: id.into(),
+                session_id: "s".into(),
+                kind: Some(session_command::Kind::Input(UserInput { attachments: files.clone(), ..Default::default() })),
+            }
+            .encode_to_vec();
+            store.enqueue_command(&cmd).await.unwrap();
+        }
+        sqlx::query("UPDATE commands SET state = 'held' WHERE id = 'unrecorded'").execute(&store.pool).await.unwrap();
+        assert_eq!(
+            store.message_attachments("s", "unrecorded").await.unwrap(),
+            Some(files.clone()),
+            "held inputs also retain their uploads"
+        );
+        store.ingest(worker, "s", &[input_event(2, "taken")]).await.unwrap().unwrap();
+        sqlx::query("UPDATE commands SET state = 'done' WHERE id = 'unrecorded'").execute(&store.pool).await.unwrap();
+        // Neither the historical prefix nor rows beyond the durable highwater
+        // may be decoded, even when no matching User is found in the window.
+        sqlx::query("UPDATE events SET data = X'FF' WHERE session_id = 's' AND seq = 1").execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO events (session_id, seq, ts, data) VALUES ('s', 3, 0, X'FF')").execute(&store.pool).await.unwrap();
+        let got = store.message_attachments("s", "taken").await.unwrap().unwrap();
+        assert_eq!(got, files);
+        assert!(store.message_attachments("s", "unrecorded").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn take_back_bounds_a_100k_event_history_outside_the_retirement_transaction() {
+        use prost::Message;
+        use std::time::Instant;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("c6h.db")).await.unwrap();
+        let worker = WorkerId::new();
+        store.create_session(&session("s", worker), &[], false).await.unwrap();
+        let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        for start in (1..=100_000).step_by(500) {
+            let mut q = sqlx::QueryBuilder::new("INSERT INTO events (session_id, seq, ts, data) ");
+            q.push_values(start..start + 500, |mut row, seq| {
+                let event = input_event(seq, "history");
+                row.push_bind("s").push_bind(seq as i64).push_bind(event.ts_ms).push_bind(event.encode_to_vec());
+            });
+            q.build().execute(&mut *tx).await.unwrap();
+        }
+        sqlx::query("UPDATE sessions SET last_seq = 100000 WHERE id = 's'").execute(&mut *tx).await.unwrap();
+        tx.commit().await.unwrap();
+        store.enqueue_command(&command("target", "s", worker, Some("draft"))).await.unwrap();
+        // A held command keeps its original durable floor when handed over.
+        store.create_session(&session("held", worker), &[], false).await.unwrap();
+        store.ingest(worker, "held", &[input_event(1, "other")]).await.unwrap().unwrap();
+        {
+            let mut conn = store.pool.acquire().await.unwrap();
+            insert_command(&mut conn, &command("held-input", "held", worker, Some("held draft")), true).await.unwrap();
+        }
+        store.release_held("held", None).await.unwrap();
+        assert_eq!(store.queued_inputs("held").await.unwrap()[0].enqueued_after_seq, 1);
+
+        let tail: Vec<_> = (100_001..=100_032).map(|seq| input_event(seq, "other")).collect();
+        store.ingest(worker, "s", &tail).await.unwrap().unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM events WHERE session_id = 's'").fetch_one(&store.pool).await.unwrap();
+        assert_eq!(count, 100_032);
+        let mut scans = Vec::new();
+        let mut retirements = Vec::new();
+        for _ in 0..25 {
+            sqlx::query("UPDATE commands SET state = 'pending' WHERE id = 'target'").execute(&store.pool).await.unwrap();
+            let start = Instant::now();
+            let check = store.check_pending_input("s", "target").await.unwrap().unwrap();
+            scans.push(start.elapsed().as_micros());
+            assert_eq!((check.after_seq, check.through_seq), (100_000, 100_032));
+            let start = Instant::now();
+            assert!(store.retire_checked_input("s", "target", check).await.unwrap());
+            retirements.push(start.elapsed().as_micros());
+        }
+        scans.sort_unstable();
+        retirements.sort_unstable();
+        eprintln!(
+            "100k history / 32 scanned / 25 samples (microseconds): outside scan min/median/max={}/{}/{}; retirement BEGIN+UPDATE+COMMIT including pool acquire min/median/max={}/{}/{}",
+            scans[0], scans[12], scans[24], retirements[0], retirements[12], retirements[24],
+        );
+        // A corrupt historical prefix must not even be decoded for a new command.
+        sqlx::query("UPDATE events SET data = X'FF' WHERE session_id = 's' AND seq = 1").execute(&store.pool).await.unwrap();
+        sqlx::query("UPDATE commands SET state = 'pending' WHERE id = 'target'").execute(&store.pool).await.unwrap();
+        assert!(!store.input_recorded("s", "target").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn take_back_rechecks_log_highwater_pending_and_enqueue_floor_without_locked_decoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("c6h.db")).await.unwrap();
+        let worker = WorkerId::new();
+        store.create_session(&session("s", worker), &[], false).await.unwrap();
+        store.enqueue_command(&command("target", "s", worker, Some("draft"))).await.unwrap();
+        let check = store.check_pending_input("s", "target").await.unwrap().unwrap();
+        store.ingest(worker, "s", &[input_event(1, "other")]).await.unwrap().unwrap();
+        assert!(!store.retire_checked_input("s", "target", check).await.unwrap(), "even an unrelated log advance fails closed");
+        let check = store.check_pending_input("s", "target").await.unwrap().unwrap();
+        sqlx::query("UPDATE commands SET enqueued_after_seq = 1 WHERE id = 'target'").execute(&store.pool).await.unwrap();
+        assert!(!store.retire_checked_input("s", "target", check).await.unwrap(), "changed enqueue boundary fails closed");
+        let check = store.check_pending_input("s", "target").await.unwrap().unwrap();
+        assert!(store.cancel_pending_command("target").await.unwrap());
+        assert!(!store.retire_checked_input("s", "target", check).await.unwrap(), "another retirement wins");
+        sqlx::query("UPDATE commands SET state = 'pending', enqueued_after_seq = 0 WHERE id = 'target'")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let check = store.check_pending_input("s", "target").await.unwrap().unwrap();
+        assert_eq!(check.after_seq, 0, "legacy floor remains conservative");
+        store.ingest(worker, "s", &[input_event(2, "target")]).await.unwrap().unwrap();
+        sqlx::query("UPDATE commands SET state = 'pending' WHERE id = 'target'").execute(&store.pool).await.unwrap();
+        assert!(!store.retire_checked_input("s", "target", check).await.unwrap());
+        assert!(store.input_recorded("s", "target").await.unwrap(), "legacy scan sees durable ownership despite stale pending state");
+        assert!(!store.take_back_pending_input("s", "target").await.unwrap());
+        store.ingest(worker, "s", &[input_event(3, "legacy")]).await.unwrap().unwrap();
+        // A pre-migration command has no enqueue boundary: the schema's
+        // default must refuse a recorded input even below today's highwater.
+        sqlx::query(
+            "INSERT INTO commands (id, session_id, worker_id, data, text, created_at) VALUES ('legacy', 's', ?, X'', 'old draft', 0)",
+        )
+        .bind(worker.to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(store.queued_inputs("s").await.unwrap().iter().find(|c| c.id == "legacy").unwrap().enqueued_after_seq, 0);
+        assert!(store.input_recorded("s", "legacy").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_head_restart_recovers_a_steered_report_committed_before_its_hook() {
+        recover_report_after_ingest("", "steering-call", false).await;
+    }
+
+    #[tokio::test]
+    async fn a_head_restart_recovers_a_report_from_the_childs_own_task_notice() {
+        recover_report_after_ingest("task-notification", "", false).await;
+    }
+
+    #[tokio::test]
+    async fn a_missing_parent_leaves_a_visible_report_failure_and_pending_obligation() {
+        recover_report_after_ingest("", "steering-call", true).await;
+    }
+
+    async fn recover_report_after_ingest(command: &str, delegated_by: &str, missing_parent: bool) {
+        use c6_proto::{SessionEvent, TurnEndReason, content_block, session_command, session_event::Kind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = || crate::HeadConfig {
+            data_dir: dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            auth: false,
+            ..Default::default()
+        };
+        let head = crate::start(config()).await.unwrap();
+        let w = WorkerId::new();
+        if !missing_parent {
+            head.state.store.create_session(&session("parent", w), &[], false).await.unwrap();
+        }
+        let mut child = session("child", w);
+        child.parent_id = Some("parent".into());
+        child.parent_call_id = Some("original-call".into());
+        child.remote_template = "probe".into();
+        head.state.store.create_session(&child, &[], false).await.unwrap();
+        if !delegated_by.is_empty() {
+            head.state.store.add_remote_delegation("input", "child", "parent", "").await.unwrap();
+        }
+        let kinds = [
+            Kind::Started(Default::default()),
+            Kind::User(c6_proto::UserMessage {
+                command_id: "input".into(),
+                command: command.into(),
+                delegated_by: delegated_by.into(),
+                text: "finish the work".into(),
+                ..Default::default()
+            }),
+            Kind::TurnStarted(c6_proto::TurnStarted { turn: 1, ..Default::default() }),
+            Kind::Assistant(c6_proto::AssistantMessage {
+                blocks: vec![c6_proto::ContentBlock {
+                    block: Some(content_block::Block::Text("The recovered final report.".into())),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            Kind::TurnEnded(c6_proto::TurnEnded { turn: 1, reason: TurnEndReason::Completed as i32 }),
+        ];
+        let events: Vec<_> = kinds
+            .into_iter()
+            .enumerate()
+            .map(|(i, kind)| SessionEvent { seq: i as u64 + 1, ts_ms: c6_core::now_ms(), kind: Some(kind) })
+            .collect();
+        // Precisely the crash boundary: the events (and per-turn obligation)
+        // commit, but sessions::ingest's relay hook has not run.
+        head.state.store.ingest(w, "child", &events).await.unwrap().unwrap();
+        assert!(!head.state.store.waiting_delegations("child").await.unwrap().is_empty());
+        assert!(head.state.store.pending_commands(w, 0).await.unwrap().is_empty());
+        head.shutdown().await.unwrap();
+        let head = crate::start(config()).await.unwrap();
+        if missing_parent {
+            let failures = head.state.store.queued_inputs("child").await.unwrap();
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0].state, "rejected");
+            assert!(failures[0].text.as_ref().unwrap().contains("Subagent report delivery failed"));
+            assert!(!head.state.store.waiting_delegations("child").await.unwrap().is_empty());
+            head.state.store.create_session(&session("parent", w), &[], false).await.unwrap();
+            crate::remote::recover(&head.state).await.unwrap();
+            assert!(head.state.store.waiting_delegations("child").await.unwrap().is_empty());
+            assert!(head.state.store.queued_inputs("child").await.unwrap().is_empty(), "successful retry clears the failure");
+            assert_eq!(head.state.store.pending_commands(w, 0).await.unwrap().len(), 1);
+        } else {
+            let reports = head.state.store.pending_commands(w, 0).await.unwrap();
+            assert_eq!(reports.len(), 1);
+            let Some(session_command::Kind::DelegationEnded(ended)) = c6_proto::decode_stored_command(&reports[0].data).unwrap().kind
+            else {
+                panic!("a report")
+            };
+            assert_eq!(ended.child_session_id, "child");
+            assert_eq!(ended.report, "The recovered final report.");
+            assert!(ended.wake && ended.call_id.is_empty());
+            assert!(head.state.store.waiting_delegations("child").await.unwrap().is_empty());
+            crate::remote::recover(&head.state).await.unwrap();
+            assert_eq!(head.state.store.pending_commands(w, 0).await.unwrap().len(), 1, "recovery queues one report, not one per replay");
+            head.state.store.reject_command(w, &reports[0].id, "parent cannot accept the report").await.unwrap();
+            assert_ne!(
+                head.state.store.session("parent").await.unwrap().unwrap().status,
+                "failed",
+                "a rejected report is not a rejected Create"
+            );
+            let rejected = head.state.store.queued_inputs("parent").await.unwrap();
+            assert_eq!(rejected.len(), 1);
+            assert!(rejected[0].text.as_ref().unwrap().contains("Subagent report delivery failed"));
+            assert!(rejected[0].error.as_ref().unwrap().contains("parent cannot accept"));
+        }
+        head.shutdown().await.unwrap();
     }
 
     #[tokio::test]

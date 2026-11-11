@@ -128,17 +128,11 @@ pub async fn get(st: &HeadState, id: &str, q: &api::CatchupQuery, caller: &Calle
     Ok(Some(out))
 }
 
-/// The events after `after`, up to `last` (the newest [`MAX_EVENTS`] at most).
-async fn read(st: &HeadState, id: &str, after: u64, last: u64) -> anyhow::Result<Vec<Event>> {
-    let mut at = after.max(last.saturating_sub(MAX_EVENTS));
-    let mut out = Vec::new();
-    while at < last {
-        let page = st.store.events_after(id, at, 1000).await?;
-        let Some(end) = page.last() else { break };
-        at = end.seq;
-        out.extend(page.iter().filter_map(crate::convert::event));
-    }
-    Ok(out)
+/// The effective events after `after`, up to `last` (the newest
+/// [`MAX_EVENTS`] at most). Read rewind markers before slicing the window.
+pub(crate) async fn read(st: &HeadState, id: &str, after: u64, last: u64) -> anyhow::Result<Vec<Event>> {
+    let after = after.max(last.saturating_sub(MAX_EVENTS));
+    Ok(st.store.effective_events(id).await?.iter().filter(|e| e.seq > after && e.seq <= last).filter_map(crate::convert::event).collect())
 }
 
 /// A card is worth it for [`THRESHOLD`] steps or more, or anything
@@ -150,8 +144,9 @@ pub(crate) fn worth_a_card(steps: u64, waiting: usize) -> bool {
 /// Your own message to the session: not another session's, a task's, a
 /// document's comments or the agent's that started it.
 fn yours(kind: &EventKind) -> bool {
-    matches!(kind, EventKind::User { text, command, from_session_id, delegated_by, .. }
-        if from_session_id.is_empty() && delegated_by.is_empty() && !matches!(command.as_str(), "task-notification" | "stop-hook") && doc_comment(text).is_none())
+    matches!(kind, EventKind::User { text, command, from_session_id, delegated_by, origin, .. }
+        if from_session_id.is_empty() && delegated_by.is_empty() && !matches!(command.as_str(), "task-notification" | "stop-hook") && doc_comment(text).is_none()
+            && matches!(origin.as_deref(), None | Some(api::MessageOrigin::Human)))
 }
 
 /// Where a catch-up starts, and when: after `seen`, the last event before
@@ -506,6 +501,11 @@ pub(crate) fn condensed(events: &[Event]) -> String {
                     lines.push(format!("Comments on the document \"{doc}\": {}", clip(text, 300)));
                 } else if yours(&e.kind) {
                     lines.push(format!("User: {}", clip(text, 300)));
+                } else if matches!(&e.kind, EventKind::User { origin, .. }
+                    if matches!(origin.as_deref(), Some(api::MessageOrigin::Api { .. } | api::MessageOrigin::Unknown
+                        | api::MessageOrigin::TaskCard | api::MessageOrigin::TaskCardAnswer)))
+                {
+                    lines.push(format!("Automation message: {}", clip(text, 300)));
                 } else if command == "task-notification" {
                     lines.push(format!("(The agent was told: {})", clip(&task_words(text), 120)));
                 }
@@ -686,6 +686,23 @@ pub(crate) async fn ask(st: &HeadState, row: &SessionRow, label: &str, what: &st
 pub(crate) mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn catchup_summaries_apply_rewinds_before_windowing() {
+        let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
+        let events = crate::store::tests::rewind_history();
+        crate::store::tests::insert_events(&head.state.store, "session", &events).await;
+        // The rewind markers are outside this requested historical window.
+        // A raw slice would expose the withdrawn question and answer.
+        let withdrawn = read(&head.state, "session", 5, 11).await.unwrap();
+        assert!(withdrawn.is_empty(), "{withdrawn:?}");
+        let effective = read(&head.state, "session", 0, 19).await.unwrap();
+        let text = condensed(&effective);
+        assert!(text.contains("KEEP_ANSWER") && text.contains("KEEP_REPLACEMENT_ANSWER"), "{text}");
+        assert!(!text.contains("PRIVATE"), "{text}");
+        assert_eq!(effective.iter().map(|e| e.seq).collect::<Vec<_>>(), [1, 2, 3, 4, 5, 13, 14, 15, 16]);
+        head.shutdown().await.unwrap();
+    }
+
     #[test]
     fn catchup_previews_remove_citations_before_clipping() {
         assert_eq!(clip("Fact \u{e200}cite\u{e202}turn347046search1\u{e201}. More", 6), "Fact.…");
@@ -707,7 +724,26 @@ pub(crate) mod tests {
             wake: false,
             from_session_id: String::new(),
             from_title: String::new(),
+            task_notice: None,
+            origin: None,
         }
+    }
+
+    #[test]
+    fn automation_does_not_reset_the_last_human_message_boundary() {
+        for origin in [
+            api::MessageOrigin::Api { token_name: "c6-cli-zmbp".into() },
+            api::MessageOrigin::Unknown,
+            api::MessageOrigin::TaskCard,
+            api::MessageOrigin::TaskCardAnswer,
+        ] {
+            let mut input = user("Status update");
+            let EventKind::User { origin: saved, .. } = &mut input else { panic!("user event") };
+            *saved = Some(Box::new(origin));
+            assert!(!yours(&input));
+            assert_eq!(since(&[ev(10, 1000, input)], 9, 900), (9, 900));
+        }
+        assert!(yours(&user("Legacy input")), "legacy presentation is preserved");
     }
 
     pub(crate) fn from_session(title: &str, text: &str) -> EventKind {

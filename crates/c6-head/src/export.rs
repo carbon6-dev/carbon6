@@ -45,6 +45,12 @@ pub fn markdown(session: &SessionRow, events: &[SessionEvent]) -> String {
                         Some(content_block::Block::ToolUse(u)) => {
                             tools.insert(u.id.clone(), (u.name.clone(), u.input_json.clone()));
                         }
+                        Some(content_block::Block::Narration(t)) if !t.trim().is_empty() => {
+                            out.push_str(&format!(
+                                "\n> **Summarized update**\n>\n{}\n",
+                                t.lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n")
+                            ));
+                        }
                         _ => {}
                     }
                 }

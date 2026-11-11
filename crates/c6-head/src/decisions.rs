@@ -222,6 +222,12 @@ pub async fn open_count(st: &HeadState, caller: &Caller) -> anyhow::Result<i64> 
 pub async fn edit(st: &HeadState, id: i64, e: &api::DecisionEdit) -> anyhow::Result<api::Decision> {
     let mut d = get(st, id).await?.ok_or_else(|| not_found("no such decision"))?;
     if let Some(s) = &e.state {
+        if matches!(s.as_str(), "open" | "snoozed")
+            && d.context["op"] == "docs.archive_many"
+            && (d.state == "answered" || !d.context["archive_consumed"].is_null())
+        {
+            return Err(bad_request("a document cleanup approval is one-use and cannot be reopened; ask for a new exact selection"));
+        }
         if !matches!(s.as_str(), "open" | "snoozed" | "dismissed") {
             return Err(bad_request("a decision is opened, snoozed or dismissed here; answer it with …/answer"));
         }
@@ -260,6 +266,7 @@ pub async fn answer(st: &HeadState, id: i64, a: &api::DecisionAnswer, via: &str)
     // Destinations are chosen at answer time, including for older cards.
     // The work writer checks that the target is open and in this realm.
     let task_destination = d.kind == "task" && reference.starts_with("task:") && option.is_some_and(|o| o.starts_with(TASK_TO_WORK_PREFIX));
+    let task_new_work = d.kind == "task" && reference.starts_with("task:") && option == Some(TASK_TO_NEW_WORK);
     match option {
         Some(o) if !task_destination && !d.options.iter().any(|x| x.label == o) => {
             return Err(bad_request(format!("{o:?} is not one of its options")));
@@ -279,7 +286,7 @@ pub async fn answer(st: &HeadState, id: i64, a: &api::DecisionAnswer, via: &str)
             return Err(bad_request(format!("{}: {s:?} is not one of its choices", f.name)));
         }
     }
-    if a.values.keys().any(|k| !d.form.iter().any(|f| &f.name == k)) {
+    if a.values.keys().any(|k| !(task_new_work && k == "work_title") && !d.form.iter().any(|f| &f.name == k)) {
         return Err(bad_request("answer only the fields it asks for"));
     }
     let answer = json!({"option": option, "values": a.values});
@@ -376,7 +383,14 @@ async fn act(
             }
             Some(TASK_HERE) => do_task_here(st, d).await?,
             Some(o) if matches!(o, TASK_TO_WORK | TASK_TO_NEW_WORK) || o.starts_with(TASK_TO_WORK_PREFIX) => {
-                let id = crate::work::keep_todo(st, d, o == TASK_TO_WORK, o.strip_prefix(TASK_TO_WORK_PREFIX)).await?;
+                // The name is data, never part of an action identifier. Old
+                // clients/cards without a name still use the card's title.
+                let title = if o == TASK_TO_NEW_WORK {
+                    values.get("work_title").map(|v| v.as_str().ok_or_else(|| bad_request("work_title must be text"))).transpose()?
+                } else {
+                    None
+                };
+                let id = crate::work::keep_todo(st, d, o == TASK_TO_WORK, o.strip_prefix(TASK_TO_WORK_PREFIX), title).await?;
                 let work = crate::work::get(st, &id, &Caller::root()).await?;
                 task_answer_message(
                     st,
@@ -406,7 +420,17 @@ async fn act(
             if !note.trim().is_empty() {
                 text.push_str(&format!("\nNote: {}", note.trim()));
             }
-            crate::sessions::send_input(st, session, &api::SendMessage { text, ..Default::default() }).await?;
+            if let Err(e) = crate::sessions::send_input(st, session, &api::SendMessage { text, ..Default::default() }).await {
+                // The answer still belongs on the card if its agent has
+                // since been archived. All other delivery failures keep
+                // the decision open, as before.
+                if matches!(e.downcast_ref::<crate::UserError>(), Some(crate::UserError::BadRequest(m)) if m == crate::sessions::ARCHIVED_INPUT_MESSAGE)
+                {
+                    warn!(decision = d.id, %session, "telling the archived session: {e:#}");
+                } else {
+                    return Err(e);
+                }
+            }
         }
         _ => {}
     }
@@ -749,7 +773,7 @@ pub async fn task_card(st: &HeadState, session_id: &str, what: &str, params: &Va
         let d = get(st, id).await?.ok_or_else(|| not_found("no such task card"))?;
         if d.state == "answered" {
             let option = d.answer.as_ref().and_then(|a| a["option"].as_str()).unwrap_or("(no option)");
-            return Err(bad_request(format!("Task card #{id} was already answered: {option}.")));
+            return Ok(json!({"id": id, "message": format!("task card #{id} already closed: {option}, nothing to do")}));
         }
         if !matches!(d.state.as_str(), "open" | "snoozed") {
             return Err(bad_request(format!("Task card #{id} was already {}.", d.state)));
@@ -836,12 +860,13 @@ async fn task_answer_message(st: &HeadState, d: &api::Decision, text: String) {
 async fn do_task_here(st: &HeadState, d: &api::Decision) -> anyhow::Result<()> {
     let session = d.context["session"].as_str().ok_or_else(|| bad_request("the card names no session"))?;
     let text = format!(
-        "Do the task you proposed here, in this session (task card #{}: {}).\n\n{}",
+        "Do the task you proposed here, in this session (task card #{}: {}).\n\n\
+         This task card is already closed as Do it here; nothing more is needed from you to close or withdraw it.\n\n{}",
         d.id,
         d.title,
         d.context["prompt"].as_str().unwrap_or("").trim()
     );
-    crate::sessions::send_input(st, session, &api::SendMessage { text, ..Default::default() }).await?;
+    crate::sessions::task_card_input(st, session, text, "").await?;
     info!(decision = d.id, %session, "task card done in its session");
     Ok(())
 }
@@ -904,7 +929,7 @@ async fn start_task(st: &HeadState, d: &api::Decision) -> anyhow::Result<String>
             Err(e) => warn!(decision = d.id, "planning its start: {e:#}"),
         }
     }
-    let session = crate::sessions::create(st, req).await?;
+    let session = crate::sessions::create_from_task_card(st, req).await?;
     // It joins that work only when it starts as the work does.
     if !planned {
         work = None;
@@ -928,6 +953,105 @@ async fn start_task(st: &HeadState, d: &api::Decision) -> anyhow::Result<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn question_head() -> (tempfile::TempDir, crate::Head) {
+        let dir = tempfile::tempdir().unwrap();
+        let head = crate::start(crate::HeadConfig {
+            data_dir: dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            auth: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, realm) \
+             VALUES ('session', ?, 'Asking agent', '', 'c', 'm', 'idle', 0, 0, ?)",
+        )
+        .bind(c6_core::WorkerId::new().to_string())
+        .bind(crate::realms::HOME)
+        .execute(&head.state.store.pool)
+        .await
+        .unwrap();
+        (dir, head)
+    }
+
+    #[tokio::test]
+    async fn archived_question_answers_are_recorded_but_other_delivery_failures_stay_open() {
+        let (_dir, head) = question_head().await;
+        let st = &head.state;
+        let http = reqwest::Client::new();
+        let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+        let card = from_session(
+            st,
+            "session",
+            "decision",
+            &json!({"title": "Which region?", "options": [{"label": "Keep"}],
+                "form": [{"name": "region", "label": "Region", "required": true}]}),
+        )
+        .await
+        .unwrap();
+        let id = card["id"].as_i64().unwrap();
+        assert!(st.store.set_archived("session", true).await.unwrap());
+        let response = http
+            .post(format!("{api}/decisions/{id}/answer"))
+            .json(&json!({"option": "Keep", "values": {"region": "us-east"}, "note": "Leave staging here"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let answered: api::Decision = response.json().await.unwrap();
+        assert_eq!(answered.state, "answered");
+        assert_eq!(answered.answer, Some(json!({"option": "Keep", "values": {"region": "us-east"}})));
+        assert_eq!(answered.note, "Leave staging here");
+        assert_eq!(answered.answered_via, "carbon6");
+        assert!(answered.answered_at.is_some());
+        assert_eq!(get(st, id).await.unwrap().unwrap(), answered);
+        assert_eq!(st.store.session("session").await.unwrap().unwrap().archived, 1);
+        let commands: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM commands WHERE session_id = 'session'").fetch_one(&st.store.pool).await.unwrap();
+        assert_eq!(commands, 0, "recording an answer must not enqueue input or unarchive its session");
+
+        // A different bad request and a missing session must still fail,
+        // rather than turning all question-delivery errors into warnings.
+        st.store.set_archived("session", false).await.unwrap();
+        sqlx::query("UPDATE sessions SET observed = 1 WHERE id = 'session'").execute(&st.store.pool).await.unwrap();
+        for (session, status) in [("session", reqwest::StatusCode::BAD_REQUEST), ("missing", reqwest::StatusCode::NOT_FOUND)] {
+            let card = from_session(st, session, "decision", &json!({"title": format!("Question from {session}")})).await.unwrap();
+            let id = card["id"].as_i64().unwrap();
+            let response = http.post(format!("{api}/decisions/{id}/answer")).json(&json!({"note": "An answer"})).send().await.unwrap();
+            assert_eq!(response.status(), status);
+            let pending = get(st, id).await.unwrap().unwrap();
+            assert_eq!(pending.state, "open");
+            assert!(pending.answer.is_none() && pending.answered_at.is_none());
+        }
+        head.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_archived_task_refuses_do_it_here_but_can_still_be_put_away() {
+        let (_dir, head) = question_head().await;
+        let st = &head.state;
+        let card = task_card(st, "session", "task_propose", &json!({"title": "Clean up", "prompt": "Remove dead code"})).await.unwrap();
+        let id = card["id"].as_i64().unwrap();
+        st.store.set_archived("session", true).await.unwrap();
+        let http = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{}/api/v1/decisions/{id}/answer", head.ui_addrs[0].port());
+        let response = http.post(&url).json(&json!({"option": TASK_HERE})).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        let error: api::ApiError = response.json().await.unwrap();
+        assert_eq!(error.error, crate::sessions::ARCHIVED_INPUT_MESSAGE);
+        assert_eq!(get(st, id).await.unwrap().unwrap().state, "open");
+        let response = http.post(&url).json(&json!({"option": "Not now"})).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let answered: api::Decision = response.json().await.unwrap();
+        assert_eq!(answered.state, "answered");
+        assert_eq!(answered.answer.unwrap()["option"], "Not now");
+        assert!(st.store.queued_inputs("session").await.unwrap().is_empty());
+        head.shutdown().await.unwrap();
+    }
 
     #[test]
     fn a_card_drops_automatic_labels_its_agent_copied() {

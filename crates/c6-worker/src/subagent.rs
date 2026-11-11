@@ -478,11 +478,12 @@ impl Subagents for Runner {
         cancel: CancellationToken,
     ) -> Result<Option<String>, String> {
         let p = &self.parent;
-        let (child_id, remote) = self.resolve(to).await?;
-        if remote {
+        let spawn = self.resolve_spawn(to).await?;
+        let child_id = &spawn.child_session_id;
+        if spawn.remote.is_some() {
             // The head sends it; an idle subagent's turn reports to this call.
             let rx = p.manager.wait_remote(&p.session_id, call_id);
-            let params = serde_json::json!({"to": child_id, "message": message, "call_id": call_id});
+            let params = serde_json::json!({"to": child_id, "message": message, "call_id": call_id, "background": background});
             let sent = match self.head("session.subagent_message", params).await {
                 Ok(v) => v,
                 Err(e) => {
@@ -494,9 +495,15 @@ impl Subagents for Runner {
                 p.manager.take_remote_wait(&p.session_id, call_id);
                 return Ok(None);
             }
-            return self.wait_remote(&child_id, call_id, rx, cancel).await.map(Some);
+            // The head has accepted a new run, not a steer (or a refused
+            // input). Its RPC enqueues before replying, unlike local Delegate.
+            if let Err(e) = self.link_continuation(&spawn, call_id, background).await {
+                p.manager.take_remote_wait(&p.session_id, call_id);
+                return Err(e);
+            }
+            return self.wait_remote(child_id, call_id, rx, cancel).await.map(Some);
         }
-        let child = match p.manager.actor_for(&child_id).await {
+        let child = match p.manager.actor_for(child_id).await {
             Ok(Some(c)) => c,
             Ok(None) => return Err(format!("subagent {to} is no longer on this worker")),
             Err(e) => return Err(format!("subagent {to} could not be loaded: {e:#}")),
@@ -508,13 +515,17 @@ impl Subagents for Runner {
             ..Default::default()
         };
         // Running: the message joins its turn; the report comes as it would.
-        if p.manager.is_running(&child_id) && background.is_none() {
+        let running = p.manager.is_running(child_id);
+        if running && background.is_none() {
             child.send(crate::session::ActorMsg::Delegate(Box::new(input), None)).map_err(|_| format!("subagent {to} stopped"))?;
             return Ok(None);
         }
         let root = p.spec.delegation.as_ref().map_or(p.session_id.as_str(), |d| d.root_session_id.as_str()).to_owned();
         let _working = self.permit(&root)?;
-        self.delegate(&child_id, &child, input, cancel).await.map(Some)
+        if !running {
+            self.link_continuation(&spawn, call_id, background).await?;
+        }
+        self.delegate(child_id, &child, input, cancel).await.map(Some)
     }
 
     async fn peek(&self, to: &str) -> Result<String, String> {
@@ -554,6 +565,13 @@ impl Runner {
     /// session id or background task id (it must have been started here),
     /// and whether it is remote.
     async fn resolve(&self, to: &str) -> Result<(String, bool), String> {
+        let spawn = self.resolve_spawn(to).await?;
+        Ok((spawn.child_session_id, spawn.remote.is_some()))
+    }
+
+    /// Resolve only durable identities, retaining the original delegation's
+    /// metadata for a continuation (never the child's mutable title).
+    async fn resolve_spawn(&self, to: &str) -> Result<SubagentSpawned, String> {
         let p = &self.parent;
         let events = p.manager.journal().events_after(&p.session_id, 0, u32::MAX).await.map_err(|e| format!("{e:#}"))?;
         events
@@ -562,11 +580,22 @@ impl Runner {
                 Some(session_event::Kind::SubagentSpawned(sp))
                     if !to.is_empty() && (sp.child_session_id == to || sp.background_task_id == to) =>
                 {
-                    Some((sp.child_session_id.clone(), sp.remote.is_some()))
+                    Some(sp.clone())
                 }
                 _ => None,
             })
             .ok_or_else(|| format!("no subagent {to:?} was started in this session"))
+    }
+
+    /// A new background run of the same child has a new task/call identity.
+    /// Keep earlier links intact so either task id still resolves to it.
+    async fn link_continuation(&self, spawn: &SubagentSpawned, call_id: &str, background: Option<&str>) -> Result<(), String> {
+        let Some(background) = background else { return Ok(()) };
+        let mut link = spawn.clone();
+        link.call_id = call_id.to_owned();
+        link.background_task_id = background.to_owned();
+        self.parent.log.append(session_event::Kind::SubagentSpawned(link)).await.map_err(|e| format!("{e:#}"))?;
+        Ok(())
     }
 
     /// Asks the head about this session's remote subagents.
@@ -666,6 +695,20 @@ pub fn status_of(reason: TurnEndReason, report: &str) -> &'static str {
     }
 }
 
+/// Display a report without the model-facing attribution or digest wrappers.
+/// Callers use the child's title (or its delegation description), never its id.
+pub fn task_report_notice(title: &str, sid: &str, reason: TurnEndReason, report: &str) -> c6_proto::TaskNotice {
+    let status = status_of(reason, report);
+    let markdown = if reason == TurnEndReason::Completed && !report.trim().is_empty() {
+        report.to_owned()
+    } else if report.trim().is_empty() {
+        format!("Subagent {status}.")
+    } else {
+        format!("Subagent {status}.\n\n{report}")
+    };
+    c6_proto::TaskNotice { kind: "subagent".into(), title: title.into(), session_id: sid.into(), status: status.into(), markdown }
+}
+
 /// A subagent's depth in its tree: a local subagent's from its delegation,
 /// a remote one's from the head (a top-level session is 0).
 pub(crate) fn depth_of(spec: &CreateSession) -> u32 {
@@ -683,7 +726,8 @@ pub(crate) fn report_body(spec: &CreateSession, sid: &str, reason: TurnEndReason
 }
 
 /// Attribute an unasked input before its source is lost in `said` (also
-/// used by the head for remote subagents). A resume is not a user message.
+/// used by the head for remote subagents). A resume is not a user message;
+/// missing provenance (including older input) never implies a human.
 pub fn report_input(
     sid: &str,
     command: &str,
@@ -691,6 +735,7 @@ pub fn report_input(
     from_id: &str,
     from_title: &str,
     api_origin: Option<&c6_proto::ApiMessageOrigin>,
+    human_origin: bool,
 ) -> String {
     let sender = if from_title.is_empty() { from_id } else { from_title };
     if from_id == sid {
@@ -702,8 +747,10 @@ pub fn report_input(
         format!("Sent to subagent {sid} via the API{token}: \"{text}\"")
     } else if command == "resume" {
         format!("Subagent {sid} resumed: \"{text}\"")
-    } else {
+    } else if human_origin {
         format!("The user messaged subagent {sid} directly: \"{text}\"")
+    } else {
+        format!("Sent to subagent {sid}: \"{text}\"")
     }
 }
 
@@ -748,13 +795,15 @@ pub(crate) async fn digest(journal: &Journal, child_id: &str, status: &str, by: 
 
 /// The subagents a session's log says it started.
 pub fn spawned_children(events: &[c6_proto::SessionEvent]) -> Vec<String> {
-    events
-        .iter()
-        .filter_map(|e| match &e.kind {
-            Some(session_event::Kind::SubagentSpawned(sp)) => Some(sp.child_session_id.clone()),
-            _ => None,
-        })
-        .collect()
+    let mut children = Vec::new();
+    for e in events {
+        if let Some(session_event::Kind::SubagentSpawned(sp)) = &e.kind
+            && !children.contains(&sp.child_session_id)
+        {
+            children.push(sp.child_session_id.clone());
+        }
+    }
+    children
 }
 
 /// A subagent's digest from its log (`events`), with its own subagents'
@@ -806,7 +855,9 @@ pub fn digest_text(
                 }
             }
             Some(session_event::Kind::Error(err)) => errors.push(first_line(&err.message)),
-            Some(session_event::Kind::SubagentSpawned(sp)) => children.push((sp.child_session_id.clone(), sp.description.clone())),
+            Some(session_event::Kind::SubagentSpawned(sp)) if !children.iter().any(|(id, _)| id == &sp.child_session_id) => {
+                children.push((sp.child_session_id.clone(), sp.description.clone()));
+            }
             _ => {}
         }
     }
@@ -955,18 +1006,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn continuation_links_keep_one_child_in_the_tree_and_digest() {
+        let spawn = SubagentSpawned { child_session_id: "child".into(), description: "same name".into(), ..Default::default() };
+        let events: Vec<_> = [
+            spawn.clone(),
+            SubagentSpawned { call_id: "continue".into(), background_task_id: "bg2".into(), ..spawn.clone() },
+            SubagentSpawned { child_session_id: "sibling".into(), ..spawn },
+        ]
+        .into_iter()
+        .map(|sp| c6_proto::SessionEvent { kind: Some(session_event::Kind::SubagentSpawned(sp)), ..Default::default() })
+        .collect();
+        assert_eq!(spawned_children(&events), ["child", "sibling"]);
+        let digest = digest_text(&events, "parent", "interrupted", "", &Default::default());
+        assert_eq!(digest.matches("child \"same name\"").count(), 1, "{digest}");
+        assert_eq!(digest.matches("sibling \"same name\"").count(), 1, "{digest}");
+    }
+
+    #[test]
+    fn report_notice_uses_the_report_and_plain_outcome_not_the_model_digest() {
+        let report = "## Result\n\n**Passed.**\n";
+        let notice = task_report_notice("Review changes", "child", TurnEndReason::Completed, report);
+        assert_eq!(
+            (notice.kind.as_str(), notice.title.as_str(), notice.session_id.as_str(), notice.status.as_str()),
+            ("subagent", "Review changes", "child", "completed")
+        );
+        assert_eq!(notice.markdown, report, "successful Markdown stays verbatim");
+        let failed = task_report_notice("", "raw-id", TurnEndReason::Error, "Partial **findings**.");
+        assert!(failed.title.is_empty(), "the UI supplies subagent, not the raw id");
+        assert_eq!(failed.markdown, "Subagent failed.\n\nPartial **findings**.");
+        for (reason, status) in [
+            (TurnEndReason::Completed, "completed without a report"),
+            (TurnEndReason::WorkerRestarted, "lost"),
+            (TurnEndReason::Interrupted, "interrupted"),
+        ] {
+            let notice = task_report_notice("Review", "child", reason, "");
+            assert_eq!(notice.status, status);
+            assert_eq!(notice.markdown, format!("Subagent {status}."));
+        }
+    }
+
+    #[test]
     fn unasked_reports_name_the_input_source() {
-        let own = report_input("ops", "session-message", "Continue after restart.", "ops", "Deploy head", None);
+        let own = report_input("ops", "session-message", "Continue after restart.", "ops", "Deploy head", None, false);
         let text = unasked_report("ops", &[own], "Deployed.");
         assert!(text.starts_with("Subagent ops (Deploy head) resumed itself:"), "{text}");
         assert!(!text.contains("The user"));
-        let resume = unasked_report("ops", &[report_input("ops", "resume", "Continue.", "", "", None)], "Done.");
+        let resume = unasked_report("ops", &[report_input("ops", "resume", "Continue.", "", "", None, true)], "Done.");
         assert!(resume.starts_with("Subagent ops resumed:"), "{resume}");
         assert!(!resume.contains("The user"));
-        let other = report_input("ops", "session-message", "Deploy.", "coordinator", "Coordinator", None);
+        let other = report_input("ops", "session-message", "Deploy.", "coordinator", "Coordinator", None, false);
         assert!(other.starts_with("Session \"Coordinator\" (coordinator) messaged subagent ops:"));
-        let user = report_input("ops", "", "Status?", "", "", None);
+        let user = report_input("ops", "", "Status?", "", "", None, true);
         assert!(user.starts_with("The user messaged subagent ops directly:"));
+        for command in ["", "review", "task-notification"] {
+            let unknown = report_input("ops", command, "Status?", "", "", None, false);
+            assert_eq!(unknown, "Sent to subagent ops: \"Status?\"");
+        }
         assert!(!unasked_report("ops", &["an older worker's input".into()], "Done.").contains("The user"));
     }
 
@@ -974,14 +1069,35 @@ mod tests {
     fn api_inputs_name_only_the_token_display_name() {
         for command in ["", "resume"] {
             let origin = c6_proto::ApiMessageOrigin { token_name: "ops-controller".into() };
-            let text = report_input("ops", command, "Continue.", "", "", Some(&origin));
+            // API provenance wins even over an inconsistent human flag.
+            let text = report_input("ops", command, "Continue.", "", "", Some(&origin), true);
             assert_eq!(text, "Sent to subagent ops via the API (token \"ops-controller\"): \"Continue.\"");
-            let unnamed = report_input("ops", command, "Continue.", "", "", Some(&Default::default()));
+            let unnamed = report_input("ops", command, "Continue.", "", "", Some(&Default::default()), false);
             assert_eq!(unnamed, "Sent to subagent ops via the API: \"Continue.\"");
         }
         let origin = c6_proto::ApiMessageOrigin { token_name: "name\n\"quoted\"".into() };
-        let text = report_input("ops", "", "Continue.", "", "", Some(&origin));
+        let text = report_input("ops", "", "Continue.", "", "", Some(&origin), false);
         assert!(text.contains(r#"name\n\"quoted\""#), "{text}");
+    }
+
+    #[test]
+    fn older_wire_inputs_and_events_have_unknown_origin() {
+        use prost::Message;
+        // Only text, as an older head/worker encoded it: no origin field.
+        let input = c6_proto::UserInput::decode(&b"\x0a\x07Status?"[..]).unwrap();
+        let event = c6_proto::UserMessage::decode(&b"\x12\x07Status?"[..]).unwrap();
+        assert!(!input.human_origin && input.api_origin.is_none());
+        assert!(!event.human_origin && event.api_origin.is_none());
+        let report = report_input(
+            "ops",
+            &event.command,
+            &event.text,
+            &event.from_session_id,
+            &event.from_title,
+            event.api_origin.as_ref(),
+            event.human_origin,
+        );
+        assert_eq!(report, "Sent to subagent ops: \"Status?\"");
     }
 
     fn conn(id: &str, name: &str, kind: &str, default_model: &str) -> SubagentConnection {

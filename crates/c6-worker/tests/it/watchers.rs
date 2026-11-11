@@ -162,6 +162,46 @@ fn text_of(e: &Event) -> String {
 }
 
 #[tokio::test]
+async fn a_stuck_watchers_nudge_can_be_answered_in_the_running_turn() {
+    let env = Env::new().await;
+    env.set("stuck", |d| d.enabled = true).await;
+    let loop_call = Reply::ToolCalls(vec![("bash".into(), r#"{"command":"echo hi"}"#.into())]);
+    for _ in 0..3 {
+        env.mock.push_about_all(&[SESSION, "check the build"], loop_call.clone());
+    }
+    env.mock.push_about(
+        STUCK,
+        answer(json!([{"severity": "important", "kind": "note", "text": "It runs echo hi again and again.",
+                        "note": "You ran `echo hi` three times with the same result; try something else."}])),
+    );
+    // The watcher has its own matching step above. Hold the session's
+    // final reply so its turn cannot finish before the nudge arrives.
+    let finish = env.mock.push_gated(Reply::Text("Done checking.".into()));
+    env.mock.push_about_all(&[SESSION, "try something else"], Reply::Text("Understood: stopping the loop.".into()));
+    let s = env.start("check the build").await;
+    env.found("stuck", |f| f.done == "sent" && f.watched == s.id).await;
+    // Notices are recorded before the turn consumes them as User events.
+    // Wait for receipt and command acknowledgement before releasing it.
+    eventually("the nudge to reach the running turn", async || {
+        let detail: c6_api::SessionDetail = env.get(&format!("sessions/{}", s.id)).await;
+        let events = env.events(&s.id).await;
+        (detail.queued.is_empty()
+            && events.iter().any(|e| matches!(&e.kind, EventKind::NoticeQueued { text, .. } if text.contains("try something else"))))
+        .then_some(())
+    })
+    .await;
+    finish.notify_one();
+    let events = env.turns(&s.id, 1).await;
+    assert_eq!(events.iter().filter(|e| matches!(e.kind, EventKind::TurnEnded { .. })).count(), 1);
+    let nudge = events
+        .iter()
+        .position(|e| matches!(&e.kind, EventKind::User { text, from_title, .. } if text.contains("try something else") && from_title.contains("Stuck detection")))
+        .unwrap();
+    assert!(events[nudge + 1..].iter().any(|e| matches!(e.kind, EventKind::Assistant { .. })), "the agent answered the nudge");
+    env.stop.cancel();
+}
+
+#[tokio::test]
 async fn stuck_detection_nudges_a_looping_agent_and_answers_you() {
     let env = Env::new().await;
     env.set("stuck", |d| d.enabled = true).await;
@@ -170,13 +210,15 @@ async fn stuck_detection_nudges_a_looping_agent_and_answers_you() {
         env.mock.push_about_all(&[SESSION, "check the build"], loop_call.clone());
     }
     env.mock.push_about_all(&[SESSION, "check the build"], Reply::Text("Done checking.".into()));
-    env.mock.push_about(
-        STUCK,
-        answer(json!([{"severity": "important", "kind": "note", "text": "It runs echo hi again and again.",
-                        "note": "You ran `echo hi` three times with the same result; try something else."}])),
-    );
+    // The session's replies above match its prompt; this step is the
+    // watcher's. Hold its answer until the first turn is idle: a nudge
+    // received while running joins that turn rather than starting another.
+    let nudge = env.mock.push_gated(answer(json!([{"severity": "important", "kind": "note", "text": "It runs echo hi again and again.",
+                        "note": "You ran `echo hi` three times with the same result; try something else."}])));
     env.mock.push_about_all(&[SESSION, "try something else"], Reply::Text("Understood: stopping the loop.".into()));
     let s = env.start("check the build").await;
+    env.turns(&s.id, 1).await;
+    nudge.notify_one();
 
     // The nudge reaches the agent, as a message from the watcher.
     let sent = env.found("stuck", |f| f.done == "sent" && f.watched == s.id).await;
@@ -203,14 +245,37 @@ async fn stuck_detection_nudges_a_looping_agent_and_answers_you() {
     assert!(w.skipped >= 1, "the rest were skips");
     assert_eq!(env.mock.requests().iter().filter(|r| r["messages"].to_string().contains(STUCK)).count(), 1);
 
-    // You can write to it; its answer is a turn of its session.
+    // An API caller can write to it without becoming a human sender.
     env.mock.push_about_all(
         &[STUCK, "why did you nudge it"],
         Reply::Text(json!({"findings": [], "reply": "It repeated the same call three times."}).to_string()),
     );
-    env.send(M::POST, &format!("sessions/{wsid}/messages"), json!({"text": "why did you nudge it?"})).await;
+    let token = env.head.state.store.create_api_token("watcher-controller", None).await.unwrap().token.unwrap();
+    let r = env
+        .http
+        .post(format!("{}/catalog/call", env.api))
+        .bearer_auth(&token)
+        .json(&json!({"op": "sessions.send", "input": {"id": wsid, "body": {"text": "why did you nudge it?"}}}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
     let wev = env.turns(&wsid, 2).await;
     assert!(wev.iter().any(|e| text_of(e).contains("repeated the same call")), "its reply");
+    let events = env.head.state.store.events_after(&wsid, 0, i64::MAX).await.unwrap();
+    let input = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            Some(c6_proto::session_event::Kind::User(u)) if u.text == "why did you nudge it?" => Some(u),
+            _ => None,
+        })
+        .unwrap();
+    assert!(!input.human_origin);
+    assert_eq!(input.api_origin.as_ref().unwrap().token_name, "watcher-controller");
+    let asked = env.mock.requests().into_iter().find(|r| r["messages"].to_string().contains("why did you nudge it?")).unwrap();
+    let prompt = asked["messages"].to_string();
+    assert!(prompt.contains("watcher-controller") && !prompt.contains("The user wrote to you"), "{prompt}");
+    assert!(!prompt.contains(&token));
     env.stop.cancel();
 }
 
@@ -234,12 +299,19 @@ async fn a_correction_becomes_lessons_and_a_standard_that_review_checks() {
              "scope": "", "checkable": false, "audit": "Check every function that allocates accounts for its memory."}
         ])),
     );
-    env.send(
-        M::POST,
-        &format!("sessions/{}/messages", s.id),
-        json!({"text": "no, don't use npm here; make sure memory is accounted for in this function"}),
-    )
-    .await;
+    let login = env.head.state.store.create_login_link().await.unwrap();
+    let signed_in = env.http.post(format!("{}/auth/link", env.api)).json(&json!({"token": login})).send().await.unwrap();
+    let cookie = signed_in.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap();
+    let r = env
+        .http
+        .post(format!("{}/sessions/{}/messages", env.api, s.id))
+        .header(reqwest::header::COOKIE, cookie)
+        .header("x-c6-realm", "home")
+        .json(&json!({"text": "no, don't use npm here; make sure memory is accounted for in this function"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
 
     // Narrow: applied. Wider: asked. The directive: how far should it go?
     let applied = env.found("retro", |f| f.kind == "lesson" && f.done == "applied").await;

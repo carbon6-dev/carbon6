@@ -19,8 +19,8 @@ use uuid::Uuid;
 use crate::store::{NewCommand, SessionRow};
 use crate::{HeadState, bad_request, conflict, convert, not_found};
 
-/// The worker could not be reached (or did not answer): the request was
-/// fine and can be retried (the head answers 503).
+/// The worker could not confirm the request (unreachable, no answer, or
+/// unconfirmed ownership): it can be retried (the head answers 503).
 #[derive(Debug)]
 pub struct WorkerUnreachable(pub String);
 
@@ -87,6 +87,16 @@ pub async fn create(st: &HeadState, req: api::CreateSession) -> anyhow::Result<a
     create_as(st, req, "").await
 }
 
+/// Creates a session with server-authenticated provenance on its first input.
+pub async fn create_from(st: &HeadState, req: api::CreateSession, caller: &crate::realms::Caller) -> anyhow::Result<api::Session> {
+    create_linked_with_origin(st, req, "", None, caller.api_origin(), caller.human_origin(st.auth.required), false).await
+}
+
+/// Only a task-card start records this provenance on its initial command.
+pub async fn create_from_task_card(st: &HeadState, req: api::CreateSession) -> anyhow::Result<api::Session> {
+    create_linked_with_origin(st, req, "", None, None, false, true).await
+}
+
 /// A session acting as an app instance in its realm (docs/apps.md §5.3),
 /// or as the realm (`instance` empty). Only the head starts sessions as an
 /// instance: from its templates, triggers and operations.
@@ -109,6 +119,20 @@ pub struct Link {
 /// A session, linked to a parent's call when `link` is set: the parent's
 /// call waits on its first turn.
 pub async fn create_linked(st: &HeadState, req: api::CreateSession, instance: &str, link: Option<Link>) -> anyhow::Result<api::Session> {
+    create_linked_with_origin(st, req, instance, link, None, false, false).await
+}
+
+/// The HTTP caller's provenance for the initial prompt, never request-body
+/// fields. Internal callers keep using create_linked with unknown origin.
+async fn create_linked_with_origin(
+    st: &HeadState,
+    req: api::CreateSession,
+    instance: &str,
+    link: Option<Link>,
+    api_origin: Option<c6_proto::ApiMessageOrigin>,
+    human_origin: bool,
+    task_card: bool,
+) -> anyhow::Result<api::Session> {
     let worker_id = WorkerId(req.worker_id);
     let worker = st.store.worker(worker_id).await?.ok_or_else(|| bad_request("no such worker"))?;
     if worker.revoked_at.is_some() {
@@ -267,11 +291,33 @@ pub async fn create_linked(st: &HeadState, req: api::CreateSession, instance: &s
     if link.is_none() && named_by_first_line {
         crate::naming::expect(st, &row.id).await?;
     }
-    insert(st, row, spec, prompt.map(|p| (p, files)), input_id, Some(brief)).await
+    let first = prompt.map(|p| UserInput {
+        text: p.to_owned(),
+        attachments: files,
+        api_origin,
+        human_origin,
+        task_card_origin: if task_card { c6_proto::TaskCardOrigin::Start as i32 } else { 0 },
+        ..Default::default()
+    });
+    insert(st, row, spec, first, input_id, Some(brief)).await
 }
 
 /// A conversation with the assistant (it runs in the head).
 pub async fn create_assistant(st: &HeadState, req: api::AskAssistant) -> anyhow::Result<api::Session> {
+    create_assistant_with_origin(st, req, None, false).await
+}
+
+pub async fn create_assistant_from(st: &HeadState, req: api::AskAssistant, caller: &crate::realms::Caller) -> anyhow::Result<api::Session> {
+    create_assistant_with_origin(st, req, caller.api_origin(), caller.human_origin(st.auth.required)).await
+}
+
+/// As create_assistant, carrying only server-authenticated caller provenance.
+async fn create_assistant_with_origin(
+    st: &HeadState,
+    req: api::AskAssistant,
+    api_origin: Option<c6_proto::ApiMessageOrigin>,
+    human_origin: bool,
+) -> anyhow::Result<api::Session> {
     let prompt = req.prompt.trim();
     if prompt.is_empty() {
         return Err(bad_request("ask something"));
@@ -370,7 +416,8 @@ pub async fn create_assistant(st: &HeadState, req: api::AskAssistant) -> anyhow:
         ..Default::default()
     };
     crate::naming::expect(st, &row.id).await?;
-    let session = insert(st, row, spec, Some((prompt, Vec::new())), Uuid::now_v7().to_string(), None).await?;
+    let first = UserInput { text: prompt.to_owned(), api_origin, human_origin, ..Default::default() };
+    let session = insert(st, row, spec, Some(first), Uuid::now_v7().to_string(), None).await?;
     crate::assistant::started(&session.id);
     Ok(session)
 }
@@ -383,6 +430,26 @@ pub async fn route_for(st: &HeadState, connection: &str, model: &str, labels: &[
 
 /// A side chat on `parent_id`, branching after event `anchor_seq`.
 pub async fn create_side_chat(st: &HeadState, parent_id: &str, req: api::CreateSideChat) -> anyhow::Result<api::Session> {
+    create_side_chat_with_origin(st, parent_id, req, None, false).await
+}
+
+pub async fn create_side_chat_from(
+    st: &HeadState,
+    parent_id: &str,
+    req: api::CreateSideChat,
+    caller: &crate::realms::Caller,
+) -> anyhow::Result<api::Session> {
+    create_side_chat_with_origin(st, parent_id, req, caller.api_origin(), caller.human_origin(st.auth.required)).await
+}
+
+/// As create_side_chat, carrying only server-authenticated caller provenance.
+async fn create_side_chat_with_origin(
+    st: &HeadState,
+    parent_id: &str,
+    req: api::CreateSideChat,
+    api_origin: Option<c6_proto::ApiMessageOrigin>,
+    human_origin: bool,
+) -> anyhow::Result<api::Session> {
     let parent = st.store.session(parent_id).await?.ok_or_else(|| not_found("no such session"))?;
     if parent.status == "failed" {
         return Err(bad_request("the session failed to start"));
@@ -442,7 +509,8 @@ pub async fn create_side_chat(st: &HeadState, parent_id: &str, req: api::CreateS
     };
     let seed = fork_seed(st, &parent, req.anchor_seq).await?;
     let spec = session_spec(st, &row, false, seed).await?;
-    insert(st, row, spec, Some((prompt, Vec::new())), Uuid::now_v7().to_string(), None).await
+    let first = UserInput { text: prompt.to_owned(), api_origin, human_origin, ..Default::default() };
+    insert(st, row, spec, Some(first), Uuid::now_v7().to_string(), None).await
 }
 
 fn check_effort(effort: Option<String>) -> anyhow::Result<Option<String>> {
@@ -611,8 +679,16 @@ async fn fork_seed(st: &HeadState, session: &SessionRow, upto: u64) -> anyhow::R
         }
         _ => Vec::new(),
     };
+    seed.extend(fork_events(st.store.effective_events(&session.id).await?, upto));
+    Ok(seed)
+}
+
+/// Slice only after applying the parent's complete rewind history. A
+/// rewind after the anchor must not be lost along with its withdrawn steps.
+fn fork_events(events: Vec<SessionEvent>, upto: u64) -> Vec<SessionEvent> {
+    let mut seed = Vec::new();
     let mut calls = std::collections::HashSet::new();
-    for ev in st.store.events_after(&session.id, 0, i64::MAX).await? {
+    for ev in events {
         match &ev.kind {
             Some(session_event::Kind::Assistant(a)) if ev.seq <= upto => {
                 for b in &a.blocks {
@@ -627,7 +703,81 @@ async fn fork_seed(st: &HeadState, session: &SessionRow, upto: u64) -> anyhow::R
             _ => {}
         }
     }
-    Ok(seed)
+    seed
+}
+
+#[cfg(test)]
+mod effective_context_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn nested_fork_seeds_apply_each_complete_rewind_log_before_the_anchor() {
+        let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
+        let events = crate::store::tests::rewind_history();
+        crate::store::tests::insert_events(&head.state.store, "session", &events).await;
+        let parent = head.state.store.session("session").await.unwrap().unwrap();
+        // A historical anchor whose withdrawn turn preceded it: the
+        // later rewind must be applied before cutting the seed here.
+        let seed = fork_seed(&head.state, &parent, 15).await.unwrap();
+        let text = c6_agent::transcript_text(&seed);
+        assert!(text.contains("KEEP_ANSWER") && text.contains("KEEP_REPLACEMENT_ANSWER"), "{text}");
+        assert!(!text.contains("PRIVATE"), "{text}");
+
+        let mut side = parent.clone();
+        side.id = "side".into();
+        side.parent_id = Some(parent.id.clone());
+        side.fork_seq = Some(15);
+        head.state.store.create_session(&side, &[], false).await.unwrap();
+        let mut own = events.clone();
+        if let Some(session_event::Kind::User(u)) = &mut own[1].kind {
+            u.text = "KEEP_SIDE".into();
+        }
+        crate::store::tests::insert_events(&head.state.store, &side.id, &own).await;
+        let nested = fork_seed(&head.state, &side, 15).await.unwrap();
+        let text = c6_agent::transcript_text(&nested);
+        assert!(text.contains("KEEP_SIDE") && text.contains("KEEP original user question"), "{text}");
+        assert_eq!(text.matches("KEEP_REPLACEMENT_ANSWER").count(), 2, "overlapping seqs stay in their own segment: {text}");
+        assert!(!text.contains("PRIVATE"), "{text}");
+        // Direct model replay, Claude Code's seed text, and handoffs all
+        // consume the same filtered nested seed, without native state.
+        let messages = format!("{:?}", c6_agent::history_from_events(&nested));
+        let handoff = c6_agent::handoff_context(&nested, "carbon6", c6_agent::HANDOFF_BUDGET);
+        assert!(!messages.contains("PRIVATE") && !handoff.contains("PRIVATE"));
+        head.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn fork_seeds_still_answer_tool_calls_after_the_anchor() {
+        use c6_proto::{AssistantMessage, ContentBlock, ToolResult, ToolUse, content_block};
+        let event = |seq, kind| SessionEvent { seq, ts_ms: 0, kind: Some(kind) };
+        let events = vec![
+            event(1, session_event::Kind::Started(Default::default())),
+            event(
+                2,
+                session_event::Kind::Assistant(AssistantMessage {
+                    blocks: vec![ContentBlock {
+                        block: Some(content_block::Block::ToolUse(ToolUse {
+                            id: "kept".into(),
+                            name: "read".into(),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            ),
+            event(
+                3,
+                session_event::Kind::ToolResult(ToolResult { call_id: "kept".into(), output: "KEEP_RESULT".into(), ..Default::default() }),
+            ),
+            event(
+                4,
+                session_event::Kind::ToolResult(ToolResult { call_id: "other".into(), output: "NOT_IN_SEED".into(), ..Default::default() }),
+            ),
+        ];
+        let text = c6_agent::transcript_text(&fork_events(events, 2));
+        assert!(text.contains("KEEP_RESULT") && !text.contains("NOT_IN_SEED"), "{text}");
+    }
 }
 
 /// What a new session's memex brief is about.
@@ -644,7 +794,7 @@ async fn insert(
     st: &HeadState,
     row: SessionRow,
     spec: CreateSession,
-    first: Option<(&str, Vec<c6_proto::Attachment>)>,
+    first: Option<UserInput>,
     input_id: String,
     brief: Option<Brief>,
 ) -> anyhow::Result<api::Session> {
@@ -656,25 +806,15 @@ async fn insert(
     let create =
         SessionCommand { command_id: create_id.clone(), session_id: session_id.clone(), kind: Some(session_command::Kind::Create(spec)) };
     let mut commands = vec![NewCommand { id: &create_id, session_id: &session_id, worker_id, data: create.encode_to_vec(), text: None }];
-    let first_prompt = match &first {
-        Some((text, _)) => mentioned(st, &row, text).await,
-        None => String::new(),
-    };
-    if let Some((text, attachments)) = first {
+    let text = first.as_ref().map(|input| input.text.clone());
+    if let Some(mut input) = first {
+        input.prompt = mentioned(st, &row, &input.text).await;
         commands.push(NewCommand {
             id: &input_id,
             session_id: &session_id,
             worker_id,
-            data: input_command(
-                &input_id,
-                &session_id,
-                UserInput {
-                    prompt: first_prompt,
-                    ..with_command(st, &realm, labels.clone(), UserInput { text: text.to_owned(), attachments, ..Default::default() })
-                        .await?
-                },
-            ),
-            text: Some(text),
+            data: input_command(&input_id, &session_id, with_command(st, &realm, labels.clone(), input).await?),
+            text: text.as_deref(),
         });
     }
     let colour = st.store.create_session(&row, &commands, brief.is_some()).await?;
@@ -768,6 +908,65 @@ fn default_title(prompt: Option<&str>) -> String {
 fn input_command(command_id: &str, session_id: &str, input: UserInput) -> Vec<u8> {
     SessionCommand { command_id: command_id.to_owned(), session_id: session_id.to_owned(), kind: Some(session_command::Kind::Input(input)) }
         .encode_to_vec()
+}
+
+/// Only an explicitly upgraded worker can decode prompt at tag 16. Older
+/// fork workers used that tag for a bool; omit it entirely on their wire.
+/// Keep the enriched prompt in the saved command for later delivery/recovery.
+pub(crate) fn prepare_worker_input(capabilities: &[String], input: &mut UserInput) {
+    if !capabilities.iter().any(|c| c == "user_input_prompt_v1") {
+        input.prompt.clear();
+    }
+}
+
+const CLAUDE_CODE_SUBAGENTS: &str = "claude_code_subagents_v1";
+const CLAUDE_CODE_SUBAGENTS_UNAVAILABLE: &str = "Claude Code subagents need a connected worker advertising claude_code_subagents_v1: update this session's worker and install/sign in to Claude Code, or pick an API connection for subagents";
+
+fn claude_code_subagents(capabilities: &[String]) -> bool {
+    capabilities.iter().any(|c| c == CLAUDE_CODE_SUBAGENTS)
+}
+
+/// Prepare only the wire copy, against the receiving connection's Hello.
+/// An old worker would run a Claude Code target in the wrong runtime: refuse
+/// an explicit target, never erase it or silently inherit another model.
+pub(crate) fn prepare_worker_subagents(capabilities: &[String], command: &mut SessionCommand) -> anyhow::Result<()> {
+    let spec = match &mut command.kind {
+        Some(session_command::Kind::Create(spec)) => Some(spec),
+        Some(session_command::Kind::Restore(restore)) => restore.spec.as_mut(),
+        Some(session_command::Kind::SetSubagentModel(change)) => {
+            check_worker_subagent_target(capabilities, change.model.as_ref())?;
+            None
+        }
+        _ => None,
+    };
+    if let Some(spec) = spec {
+        check_worker_subagent_target(capabilities, spec.subagent_target.as_ref())?;
+        if !claude_code_subagents(capabilities) && !spec.subagent_connections_json.is_empty() {
+            let mut connections: Vec<api::SubagentConnection> = serde_json::from_str(&spec.subagent_connections_json)?;
+            connections.retain(|c| c.kind != "claude_code");
+            spec.subagent_connections_json = serde_json::to_string(&connections)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_worker_subagent_target(capabilities: &[String], target: Option<&ModelSpec>) -> anyhow::Result<()> {
+    if !claude_code_subagents(capabilities) && target.is_some_and(|t| t.connection_kind == "claude_code") {
+        return Err(bad_request(CLAUDE_CODE_SUBAGENTS_UNAVAILABLE));
+    }
+    Ok(())
+}
+
+/// A refused restore or model-setting command must not let a later input
+/// run with the worker's previous default. The durable target stays saved.
+pub(crate) async fn check_worker_subagent_input(st: &HeadState, capabilities: &[String], session_id: &str) -> anyhow::Result<()> {
+    if !claude_code_subagents(capabilities)
+        && let Some(row) = st.store.session(session_id).await?
+    {
+        let connections = st.store.connections().await?;
+        check_worker_subagent_target(capabilities, subagent_target(&row, &connections).as_ref())?;
+    }
+    Ok(())
 }
 
 const MAX_ATTACHMENT: usize = 10 * 1024 * 1024;
@@ -1012,8 +1211,12 @@ pub async fn effective_config(st: &HeadState, session_id: &str) -> anyhow::Resul
     })
 }
 
+/// Kept distinct so a non-blocking question can still be answered when
+/// only its delivery is refused because the asking session was archived.
+pub(crate) const ARCHIVED_INPUT_MESSAGE: &str = "this session is archived; unarchive it before sending a message";
+
 pub async fn send_input(st: &HeadState, session_id: &str, req: &api::SendMessage) -> anyhow::Result<api::QueuedInput> {
-    send_input_as(st, session_id, req, Uuid::now_v7().to_string(), "", None).await
+    send_input_as(st, session_id, req, Uuid::now_v7().to_string(), "", None, false).await
 }
 
 /// A button sends your message as typed, marked so Watchers do not mistake
@@ -1023,12 +1226,17 @@ pub async fn card_answer(st: &HeadState, session_id: &str, text: String) -> anyh
     if session.archived != 0 || session.status == "stopped" {
         return Err(bad_request("the proposing session is archived or stopped"));
     }
+    task_card_input(st, session_id, text, "card-answer").await
+}
+
+/// Includes "Do it here", whose task prompt keeps ordinary input rendering.
+pub async fn task_card_input(st: &HeadState, session_id: &str, text: String, command: &str) -> anyhow::Result<()> {
     send_input_with(
         st,
         session_id,
         &api::SendMessage { text, ..Default::default() },
         Uuid::now_v7().to_string(),
-        UserInput { command: "card-answer".into(), ..Default::default() },
+        UserInput { command: command.into(), task_card_origin: c6_proto::TaskCardOrigin::Answer as i32, ..Default::default() },
     )
     .await?;
     Ok(())
@@ -1043,8 +1251,16 @@ pub async fn send_input_as(
     id: String,
     delegated_by: &str,
     api_origin: Option<c6_proto::ApiMessageOrigin>,
+    human_origin: bool,
 ) -> anyhow::Result<api::QueuedInput> {
-    send_input_with(st, session_id, req, id, UserInput { delegated_by: delegated_by.to_owned(), api_origin, ..Default::default() }).await
+    send_input_with(
+        st,
+        session_id,
+        req,
+        id,
+        UserInput { delegated_by: delegated_by.to_owned(), api_origin, human_origin, ..Default::default() },
+    )
+    .await
 }
 
 /// What the model gets for `text` in `session`: the text with what it
@@ -1079,6 +1295,9 @@ async fn send_input_with(
         return Err(bad_request("message is empty"));
     }
     let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    if session.archived != 0 {
+        return Err(bad_request(ARCHIVED_INPUT_MESSAGE));
+    }
     if session.observed {
         return Err(bad_request("this is Claude Code's own subagent: it is shown here, and Claude Code runs it"));
     }
@@ -1148,7 +1367,7 @@ fn queue_gate(st: &HeadState, worker_id: WorkerId, worker_name: &str) -> anyhow:
 async fn pending_of(st: &HeadState, session_id: &str, command_id: &str) -> anyhow::Result<Option<(i64, c6_proto::UserInput)>> {
     Ok(match st.store.pending_input(command_id).await? {
         Some((_text, created_at, data)) => {
-            let Some(cmd) = SessionCommand::decode(data.as_slice()).ok() else {
+            let Some(cmd) = c6_proto::decode_stored_command(&data).ok() else {
                 return Ok(None);
             };
             if cmd.session_id != session_id {
@@ -1168,7 +1387,13 @@ async fn pending_of(st: &HeadState, session_id: &str, command_id: &str) -> anyho
 /// and memex attachments that go with it). 409 once it is in flight, 409
 /// when a connected worker cannot do it (an older one), 503 while the
 /// worker cannot be reached (the row stays as it is).
-pub async fn edit_queued(st: &HeadState, session_id: &str, command_id: &str, text: &str) -> anyhow::Result<api::QueuedInput> {
+pub async fn edit_queued(
+    st: &HeadState,
+    session_id: &str,
+    command_id: &str,
+    text: &str,
+    caller: &crate::realms::Caller,
+) -> anyhow::Result<api::QueuedInput> {
     let text = text.trim();
     if text.is_empty() {
         return Err(bad_request("message is empty"));
@@ -1188,21 +1413,28 @@ pub async fn edit_queued(st: &HeadState, session_id: &str, command_id: &str, tex
         // again below. A command was the old text's too.
         let mut input = input;
         input.text = text.to_owned();
+        // This caller wrote the replacement, not the original sender.
+        input.api_origin = caller.api_origin();
+        input.human_origin = caller.human_origin(st.auth.required);
+        input.task_card_origin = 0;
         input.attachments.retain(|a| !a.name.starts_with("@memex:"));
         input.command.clear();
         input.command_candidates_json.clear();
-        with_command(st, &session.realm, session.head_labels(), input).await?
-    };
-    let data = {
-        use base64::Engine;
-        base64::engine::general_purpose::STANDARD.encode(new_input.encode_to_vec())
+        let input = with_command(st, &session.realm, session.head_labels(), input).await?;
+        UserInput { prompt: mentioned(st, &session, text).await, ..input }
     };
     let call = st
         .registry
-        .call(
+        .call_with_params(
             worker_id,
             "session.queue_op",
-            serde_json::json!({ "session_id": session_id, "command_id": command_id, "op": "update", "data": data }),
+            |live| {
+                use base64::Engine;
+                let mut wire_input = new_input.clone();
+                prepare_worker_input(&live.capabilities, &mut wire_input);
+                let data = base64::engine::general_purpose::STANDARD.encode(wire_input.encode_to_vec());
+                serde_json::json!({ "session_id": session_id, "command_id": command_id, "op": "update", "data": data })
+            },
             std::time::Duration::from_secs(5),
         )
         .await;
@@ -1257,14 +1489,61 @@ pub async fn cancel_queued(st: &HeadState, session_id: &str, command_id: &str) -
         Err(e) => return Err(unreachable(e)),
     };
     match state.as_str() {
-        "cancelled" | "pending" => {}
-        "in_flight" | "delivered" => {
-            return Err(conflict("that message is on its way to the agent now; wait for its turn"));
+        "cancelled" => {}
+        "in_flight" | "delivered" | "pending" => {
+            return Err(conflict("The agent has this message"));
         }
         _ => return Err(anyhow::anyhow!("the worker answered {state:?}")),
     }
     if !st.store.cancel_pending_command(command_id).await? {
         return Err(conflict("that message is on its way to the agent now; wait for its turn"));
+    }
+    publish_queue(st, session_id).await;
+    Ok(())
+}
+
+/// Withdraws exactly one input command, never a queue tail or a rewind.
+/// An already recorded UserMessage is owned by the worker, even if the
+/// pending metadata is stale. Neither text nor a browser's queue snapshot
+/// is evidence of ownership. Only an inbox removal confirms cancellation:
+/// `pending` may still be in transit to
+/// the actor, and cannot promise that the agent will never receive it.
+pub async fn take_back_message(st: &HeadState, session_id: &str, command_id: &str) -> anyhow::Result<()> {
+    const TAKEN: &str = "The agent has this message";
+    let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    takes_input(&session)?;
+    if command_id.is_empty()
+        || pending_of(st, session_id, command_id).await?.is_none()
+        || st.store.input_recorded(session_id, command_id).await?
+    {
+        return Err(conflict(TAKEN));
+    }
+    let worker_id: WorkerId = session.worker_id.parse()?;
+    // The head's assistant has no queue_ops cancellation RPC. Unlike
+    // pulling its head-held queue, this needs confirmed inbox ownership.
+    if st.assistant.head_id() == Some(worker_id) {
+        return Err(conflict("this session's worker cannot confirm message withdrawal"));
+    }
+    queue_gate(st, worker_id, &session.worker_name)?;
+    let reply = st
+        .registry
+        .call(
+            worker_id,
+            "session.queue_op",
+            json!({ "session_id": session_id, "command_id": command_id, "op": "cancel" }),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .map_err(unreachable)?;
+    match reply["state"].as_str().unwrap_or_default() {
+        "cancelled" => {}
+        "in_flight" | "delivered" | "pending" => return Err(conflict(TAKEN)),
+        state => return Err(anyhow::anyhow!("the worker answered {state:?}")),
+    }
+    // Delivery/another operation may have changed the durable row while
+    // the RPC was in flight. Never claim success over that lost race.
+    if !st.store.take_back_pending_input(session_id, command_id).await? {
+        return Err(conflict(TAKEN));
     }
     publish_queue(st, session_id).await;
     Ok(())
@@ -1302,9 +1581,9 @@ pub async fn pull_queued(st: &HeadState, session_id: &str, command_id: &str) -> 
                 Err(e) => return Err(unreachable(e)),
             };
             match state.as_str() {
-                "cancelled" | "pending" => {}
-                "in_flight" | "delivered" => {
-                    return Err(conflict("that message is on its way to the agent now; wait for its turn"));
+                "cancelled" => {}
+                "in_flight" | "delivered" | "pending" => {
+                    return Err(conflict("The agent has this message"));
                 }
                 _ => return Err(anyhow::anyhow!("the worker answered {state:?}")),
             }
@@ -1577,11 +1856,23 @@ pub async fn resume(
 /// conversation.
 pub async fn rewind(st: &HeadState, session_id: &str, req: &api::RewindRequest) -> anyhow::Result<()> {
     let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    if st.store.connection(&session.connection_id).await?.is_some_and(|c| c.kind == "claude_code") {
+        let worker: WorkerId = session.worker_id.parse()?;
+        if !st.registry.get(worker).is_some_and(|w| w.capabilities.iter().any(|c| c == "claude_rewind")) {
+            return Err(bad_request("This worker cannot confirm a Claude Code memory rewind. Connect an updated worker before rewinding."));
+        }
+    }
     if session.parent_call_id.is_some() {
         return Err(bad_request("subagent sessions cannot be rewound"));
     }
     let target = st.store.events_after(session_id, req.to_seq.saturating_sub(1), 1).await?;
-    if !matches!(target.first().and_then(|e| e.kind.as_ref()), Some(session_event::Kind::User(_))) || target[0].seq != req.to_seq {
+    // Unknown provenance is not evidence against the person. Only positive
+    // nonhuman provenance (including agent notices) prevents rewind.
+    if !matches!(target.first().and_then(|e| e.kind.as_ref()), Some(session_event::Kind::User(u))
+        if u.api_origin.is_none() && u.from_session_id.is_empty() && u.delegated_by.is_empty()
+            && !matches!(u.command.as_str(), "task-notification" | "stop-hook"))
+        || target[0].seq != req.to_seq
+    {
         return Err(bad_request("can only rewind to before one of your messages"));
     }
     // A handoff to or from Claude Code cannot be taken back: the other
@@ -1838,8 +2129,8 @@ pub async fn check_routes(st: &HeadState, routes: &[api::Route]) -> anyhow::Resu
                 .iter()
                 .find(|c| c.id == want || c.name == want)
                 .ok_or_else(|| bad_request(format!("routing rule {:?}: no connection {want:?}", r.name)))?;
-            // A pool only for what runs in the head (the assistant,
-            // suggestions, catch-ups, timelines and names).
+            // A pool only for what runs in the head (the assistant and
+            // model-backed tasks, including work and projects).
             let head_side = r.applies_to.iter().any(|l| {
                 [
                     crate::assistant::LABEL,
@@ -1847,6 +2138,8 @@ pub async fn check_routes(st: &HeadState, routes: &[api::Route]) -> anyhow::Resu
                     crate::catchup::ROUTE_LABEL,
                     crate::timeline::ROUTE_LABEL,
                     crate::naming::ROUTE_LABEL,
+                    crate::work::ROUTE_LABEL,
+                    crate::projects::ROUTE_LABEL,
                 ]
                 .contains(&l.as_str())
             });
@@ -1854,7 +2147,8 @@ pub async fn check_routes(st: &HeadState, routes: &[api::Route]) -> anyhow::Resu
                 crate::pools::not_for_sessions(
                     c,
                     &format!(
-                        "routing rule {:?} (unless it applies to assistant, task:suggest, task:catchup, task:timeline or task:name)",
+                        "routing rule {:?} (unless it applies to assistant, task:suggest, task:catchup, task:timeline, task:name, \
+                         task:work or task:projects)",
                         r.name
                     ),
                 )?;
@@ -1990,7 +2284,32 @@ pub async fn publish_queue(st: &HeadState, session_id: &str) {
 }
 
 /// Stores a batch from a worker and returns the cumulative ack, if any.
-pub async fn ingest(st: &HeadState, worker_id: WorkerId, batch: SessionEventBatch) -> anyhow::Result<Option<u64>> {
+pub async fn ingest(st: &HeadState, worker_id: WorkerId, mut batch: SessionEventBatch) -> anyhow::Result<Option<u64>> {
+    // At most one lookup per batch, and none for batches without command input.
+    let command_ids: Vec<&str> = batch
+        .events
+        .iter()
+        .filter_map(|ev| match &ev.kind {
+            Some(session_event::Kind::User(u)) if !u.command_id.is_empty() => Some(u.command_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let origins = st.store.input_origins(&batch.session_id, &command_ids).await?;
+    // A new event from an older worker can lack provenance. Record that as
+    // unknown, not as legacy/human input. Only incoming events are marked:
+    // store.ingest ignores replayed sequences without rewriting saved history.
+    for ev in &mut batch.events {
+        if let Some(session_event::Kind::User(u)) = &mut ev.kind {
+            u.origin_recorded = true;
+            // Old workers can omit human provenance. Recover it from the
+            // saved command without erasing an explicitly attributed durable
+            // event (imports/recovery can have no command row). Task-card
+            // provenance remains exclusively head-authored.
+            let origin = origins.get(&u.command_id).copied().unwrap_or_default();
+            u.human_origin |= origin.human;
+            u.task_card_origin = origin.task_card;
+        }
+    }
     let Some(ing) = st.store.ingest(worker_id, &batch.session_id, &batch.events).await? else {
         debug!(session = %batch.session_id, worker = %worker_id, "events for unknown session ignored");
         return Ok(None);
@@ -2224,7 +2543,7 @@ async fn restore(st: &HeadState, worker_id: WorkerId, session_id: &str, command_
     }
     let Some((text, _created_at, data)) = st.store.pending_input(command_id).await? else { return Ok(false) };
     // The same input (model switch, attachments and all), under a new id.
-    let input = match SessionCommand::decode(data.as_slice()).ok().and_then(|c| c.kind) {
+    let input = match c6_proto::decode_stored_command(&data).ok().and_then(|c| c.kind) {
         Some(session_command::Kind::Input(i)) => i,
         _ => UserInput { text: text.clone(), ..Default::default() },
     };
@@ -2383,7 +2702,7 @@ async fn connections_used(st: &HeadState, root: &str) -> anyhow::Result<std::col
     .await?;
     for data in pending {
         if let Ok(SessionCommand { kind: Some(session_command::Kind::Input(UserInput { model: Some(m), .. })), .. }) =
-            SessionCommand::decode(data.as_slice())
+            c6_proto::decode_stored_command(&data)
         {
             used.insert(m.connection_id);
         }
@@ -2562,4 +2881,231 @@ async fn chatgpt_tokens_now(st: &HeadState, connection_id: &str, refused: bool) 
     let refreshed = st.oauth.refresh(&st.http, tokens).await?;
     st.store.set_connection_secret(connection_id, &st.secrets.encrypt(&serde_json::to_string(&refreshed)?)?).await?;
     Ok(refreshed)
+}
+
+#[cfg(test)]
+mod input_compatibility_tests {
+    use super::*;
+    use crate::store::tests::legacy_input_command;
+
+    // A real old fork input decoder: a string at 16 must fail, rather than
+    // merely being absent from a new-schema round trip's assertions.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct ForkInput {
+        #[prost(bool, tag = "16")]
+        human_origin: bool,
+    }
+
+    async fn assign_worker(st: &HeadState, worker: WorkerId) {
+        sqlx::query("UPDATE sessions SET worker_id = ? WHERE id = 'session'")
+            .bind(worker.to_string())
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn old_worker_events_recover_saved_origins_preserve_explicit_human_and_leave_history_unchanged() {
+        let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        let worker = WorkerId::new();
+        assign_worker(st, worker).await;
+        for (id, human, task) in [
+            ("historical", true, 0),
+            ("fork-human", true, 0),
+            ("current-human", true, 0),
+            ("automation", false, 0),
+            ("card", false, c6_proto::TaskCardOrigin::Start as i32),
+        ] {
+            let input = UserInput {
+                text: "identical prose is not provenance".into(),
+                human_origin: human,
+                task_card_origin: task,
+                ..Default::default()
+            };
+            let data = if id == "current-human" { input_command(id, "session", input) } else { legacy_input_command(id, "session", input) };
+            st.store
+                .enqueue_command(&NewCommand { id, session_id: "session", worker_id: worker, data, text: Some("input") })
+                .await
+                .unwrap();
+        }
+        let historical = SessionEvent {
+            seq: 1,
+            ts_ms: 1,
+            kind: Some(session_event::Kind::User(c6_proto::UserMessage { command_id: "historical".into(), ..Default::default() })),
+        };
+        st.store.ingest(worker, "session", std::slice::from_ref(&historical)).await.unwrap().unwrap();
+        sqlx::query("UPDATE commands SET state = 'done' WHERE session_id = 'session'").execute(&st.store.pool).await.unwrap();
+        let mut events = vec![historical.clone()];
+        for (i, id) in ["fork-human", "current-human", "automation", "card", "no-command", "worker-human"].into_iter().enumerate() {
+            events.push(SessionEvent {
+                seq: i as u64 + 2,
+                ts_ms: i as i64 + 2,
+                kind: Some(session_event::Kind::User(c6_proto::UserMessage {
+                    command_id: id.into(),
+                    text: "identical prose is not provenance".into(),
+                    command: if id == "automation" { "task-notification".into() } else { String::new() },
+                    // Omitted on old workers; explicit durable provenance
+                    // still survives when recovery has no saved command.
+                    human_origin: id == "worker-human",
+                    ..Default::default()
+                })),
+            });
+        }
+        let notice = SessionEvent {
+            seq: 8,
+            ts_ms: 8,
+            kind: Some(session_event::Kind::NoticeQueued(c6_proto::NoticeQueued {
+                command_id: "fork-human".into(),
+                text: "a system notice is not a user event".into(),
+                ..Default::default()
+            })),
+        };
+        events.push(notice.clone());
+        assert_eq!(ingest(st, worker, SessionEventBatch { session_id: "session".into(), events }).await.unwrap(), Some(8));
+        let stored = st.store.events_after("session", 0, 10).await.unwrap();
+        assert_eq!(stored[0], historical, "replayed history must remain legacy/neutral");
+        assert_eq!(stored[7], notice, "user command provenance must not be copied onto a notice");
+        assert!(matches!(convert::event(&stored[0]).unwrap().kind, api::EventKind::User { origin: None, .. }));
+        for (event, expected) in stored[1..7].iter().zip([
+            api::MessageOrigin::Human,
+            api::MessageOrigin::Human,
+            api::MessageOrigin::Unknown,
+            api::MessageOrigin::TaskCard,
+            api::MessageOrigin::Unknown,
+            api::MessageOrigin::Human,
+        ]) {
+            let api::EventKind::User { origin, .. } = convert::event(event).unwrap().kind else { panic!("user event") };
+            assert_eq!(origin.as_deref(), Some(&expected));
+        }
+        head.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_edits_gate_prompt_for_old_workers_and_recompute_mentions_without_changing_display_text() {
+        use base64::Engine;
+
+        let (_dir, head, _mock, work) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        let attachment = c6_proto::Attachment { name: "original.txt".into(), mime: "text/plain".into(), data: b"original".to_vec() };
+        for capable in [false, true] {
+            let worker = WorkerId::new();
+            assign_worker(st, worker).await;
+            let id = if capable { "new-worker" } else { "old-worker" };
+            let input =
+                UserInput { text: "old text".into(), human_origin: true, attachments: vec![attachment.clone()], ..Default::default() };
+            let data = legacy_input_command(id, "session", input);
+            st.store
+                .enqueue_command(&NewCommand { id, session_id: "session", worker_id: worker, data, text: Some("old text") })
+                .await
+                .unwrap();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let mut capabilities = vec!["queue_ops".into(), "send_now".into()];
+            if capable {
+                capabilities.push("user_input_prompt_v1".into());
+            }
+            let guard = st.registry.attach(worker, now_ms(), tx, capabilities, "worker");
+            for (has_mention, text) in [(true, format!("Read [@Pager](c6:work:{work})")), (false, "No reference any more".into())] {
+                let caller = crate::realms::Caller { browser: true, ..Default::default() };
+                let reply = async {
+                    let message = rx.recv().await.unwrap().unwrap();
+                    let Some(c6_proto::head_msg::Msg::RpcRequest(request)) = message.msg else { panic!("queue RPC") };
+                    let args: Value = serde_json::from_slice(&request.params_json).unwrap();
+                    assert_eq!(request.method, "session.queue_op");
+                    assert_eq!(args["command_id"], id);
+                    let bytes = base64::engine::general_purpose::STANDARD.decode(args["data"].as_str().unwrap()).unwrap();
+                    let input = UserInput::decode(bytes.as_slice()).unwrap();
+                    assert_eq!(input.text, text);
+                    assert_eq!(input.attachments, vec![attachment.clone()]);
+                    assert!(input.human_origin);
+                    if capable && has_mention {
+                        assert!(input.prompt.contains("Fix the pager"), "{}", input.prompt);
+                    } else {
+                        assert!(input.prompt.is_empty());
+                        ForkInput::decode(bytes.as_slice()).expect("old fork wire decoder must accept an omitted tag 16");
+                    }
+                    guard.rpc_response(c6_proto::RpcResponse {
+                        id: request.id,
+                        result_json: br#"{"state":"updated"}"#.to_vec(),
+                        error: String::new(),
+                    });
+                };
+                let (result, ()) = c6_testkit::within("the queued edit and its worker RPC", async {
+                    tokio::join!(edit_queued(st, "session", id, &text, &caller), reply)
+                })
+                .await;
+                let row = result.unwrap();
+                assert_eq!(row.text, format!("{text} [original.txt]"));
+                let (_, saved) = pending_of(st, "session", id).await.unwrap().unwrap();
+                assert_eq!(saved.text, text);
+                assert_eq!(saved.attachments, vec![attachment.clone()]);
+                assert!(saved.human_origin);
+                assert_eq!(saved.task_card_origin, 0);
+                assert_eq!(!saved.prompt.is_empty(), has_mention, "stored enrichment is independent of worker support");
+            }
+            drop(guard);
+        }
+        head.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fork_input_take_back_and_rejected_session_restore_preserve_original_uploads_model_and_origin() {
+        let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        let worker = WorkerId::new();
+        assign_worker(st, worker).await;
+        let input = UserInput {
+            text: "original [@link](c6:work:kept)".into(),
+            human_origin: true,
+            model: Some(ModelSpec { connection_id: "api".into(), model: "m".into(), ..Default::default() }),
+            attachments: vec![c6_proto::Attachment { name: "original.txt".into(), mime: "text/plain".into(), data: b"upload".to_vec() }],
+            ..Default::default()
+        };
+        st.store
+            .ingest(worker, "session", &[SessionEvent { seq: 1, ts_ms: 1, kind: Some(session_event::Kind::Started(Default::default())) }])
+            .await
+            .unwrap()
+            .unwrap();
+        for id in ["take", "recover"] {
+            let data = legacy_input_command(id, "session", input.clone());
+            st.store
+                .enqueue_command(&NewCommand { id, session_id: "session", worker_id: worker, data, text: Some(&input.text) })
+                .await
+                .unwrap();
+        }
+        assert_eq!(pending_of(st, "session", "take").await.unwrap().unwrap().1, input);
+        assert_eq!(st.store.message_attachments("session", "take").await.unwrap(), Some(input.attachments.clone()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let guard = st.registry.attach(worker, now_ms(), tx, vec!["queue_ops".into()], "worker");
+        let reply = async {
+            let message = rx.recv().await.unwrap().unwrap();
+            let Some(c6_proto::head_msg::Msg::RpcRequest(request)) = message.msg else { panic!("queue RPC") };
+            let args: Value = serde_json::from_slice(&request.params_json).unwrap();
+            assert_eq!(args["command_id"], "take");
+            assert_eq!(args["op"], "cancel");
+            guard.rpc_response(c6_proto::RpcResponse {
+                id: request.id,
+                result_json: br#"{"state":"cancelled"}"#.to_vec(),
+                error: String::new(),
+            });
+        };
+        let (result, ()) = c6_testkit::within("confirmed take-back and its worker RPC", async {
+            tokio::join!(take_back_message(st, "session", "take"), reply)
+        })
+        .await;
+        result.unwrap();
+        assert!(pending_of(st, "session", "take").await.unwrap().is_none());
+        assert!(pending_of(st, "session", "recover").await.unwrap().is_some(), "taking back one input cannot pull its tail");
+        // This is the path used when the worker rejects an unknown session.
+        assert!(restore(st, worker, "session", "recover").await.unwrap());
+        let pending = st.store.pending_commands(worker, 0).await.unwrap();
+        assert_eq!(pending.len(), 2);
+        assert!(matches!(c6_proto::decode_stored_command(&pending[0].data).unwrap().kind, Some(session_command::Kind::Restore(_))));
+        let Some(session_command::Kind::Input(restored)) = c6_proto::decode_stored_command(&pending[1].data).unwrap().kind else {
+            panic!("restored input")
+        };
+        assert_eq!(restored, input, "recovery must not fall back to a text-only input");
+        drop(guard);
+        head.shutdown().await.unwrap();
+    }
 }

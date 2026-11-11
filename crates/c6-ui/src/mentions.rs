@@ -8,6 +8,7 @@ use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
 use crate::api;
+use crate::icons::{Icon, Size, icon};
 use crate::markdown::{Kind, Known};
 use crate::util::{ago, now_ms, status_look};
 use crate::workspace::{ColumnCtx, How, View, Workspace, use_column, use_workspace};
@@ -52,20 +53,18 @@ fn in_app(href: &str) -> Option<View> {
     let origin = window().location().origin().unwrap_or_default();
     let here = crate::markdown::Here { origin: origin.clone(), realm: crate::place::realm(), base: crate::place::base(), known: &nothing };
     if let Some((kind, id, rest)) = crate::markdown::thing_of(href, &here) {
-        let query = rest.split('#').next().unwrap_or_default();
-        return Some(View::from_path(&format!("{}{query}", kind.path(&id))));
+        return Some(View::from_path(&format!("{}{rest}", kind.path(&id))));
     }
     let path = href.strip_prefix(origin.as_str()).filter(|_| !origin.is_empty()).unwrap_or(href);
     if !path.starts_with('/') || path.starts_with("//") {
         return None;
     }
     let path = crate::place::strip(path);
-    let path = path.split('#').next().unwrap_or_default();
     // Another place's (a realm's, the console's) loads that place.
     if path.starts_with("/r/") || path.starts_with(&format!("/{}", crate::place::CONSOLE)) {
         return None;
     }
-    let to = View::from_path(path);
+    let to = View::from_path(&path);
     (to != View::home() || path == "/").then_some(to)
 }
 
@@ -360,7 +359,7 @@ fn SessionPeek(id: String) -> impl IntoView {
             .into_any()
         }
         None => view! {
-            {title_row(None, crate::icons::circle().into_any(), short.clone(), None)}
+            {title_row(None, icon(Icon::CircleDashed, Size::S16), short.clone(), None)}
             <div class="text-xs text-muted">"Not among this realm's sessions"</div>
         }
         .into_any(),
@@ -386,21 +385,25 @@ fn by_whom(by: &str) -> String {
 #[component]
 fn DocPeek(id: String) -> impl IntoView {
     let title = crate::docs::title_of(&id).unwrap_or_else(|| Kind::Doc.short(&id));
+    let changed = api::live().doc;
     let doc = {
         let id = id.clone();
-        LocalResource::new(move || api::doc_get(id.clone()))
+        LocalResource::new(move || {
+            changed.track();
+            api::doc_get(id.clone())
+        })
     };
     move || {
-        let (title, line) = match doc.get() {
-            None => (title.clone(), "…".to_owned()),
+        let (title, line, archived) = match doc.get() {
+            None => (title.clone(), "…".to_owned(), false),
             Some(Ok(d)) => {
                 let s = d.summary;
-                (s.title, format!("changed {} by {}", ago(now_ms() - s.updated_at), by_whom(&s.updated_by)))
+                (s.title, format!("changed {} by {}", ago(now_ms() - s.updated_at), by_whom(&s.updated_by)), s.archived_at.is_some())
             }
-            Some(Err(e)) => (title.clone(), e),
+            Some(Err(e)) => (title.clone(), e, false),
         };
         view! {
-            {title_row(None, crate::icons::file().into_any(), title, None)}
+            {title_row(None, icon(Icon::FileText, Size::S16), title, archived.then(|| ("Archived".to_owned(), STATE_QUIET)))}
             <div class="truncate text-xs text-muted">{line}</div>
         }
     }
@@ -412,14 +415,19 @@ fn ItemPeek(kind: Kind, id: String) -> impl IntoView {
     let reference = format!("{}:{id}", kind.name());
     let title = known(kind, &id).title.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| kind.short(&id));
     let mark = live_mark_of(&reference);
+    let changed = api::live().doc;
     let now = {
         let reference = reference.clone();
-        LocalResource::new(move || api::doc_refs(vec![reference.clone()]))
+        LocalResource::new(move || {
+            changed.track();
+            api::doc_refs(vec![reference.clone()])
+        })
     };
     move || {
         let l = now.get().and_then(Result::ok).and_then(|v| v.into_iter().next());
         let (title, state, at) = match l {
             Some(l) if l.state == "gone" => (title.clone(), Some(("gone".to_owned(), STATE_QUIET)), 0),
+            Some(l) if l.state == "archived" => (l.title, Some(("Archived".to_owned(), STATE_QUIET)), l.at),
             Some(l) => (l.title, Some((l.state.replace('_', " "), state_look(&l.state))), l.at),
             None => (title.clone(), None, 0),
         };

@@ -3,6 +3,7 @@
 
 pub mod citations;
 pub mod docs;
+pub mod docs_archive;
 pub mod labels;
 pub mod marks;
 pub mod projects;
@@ -43,6 +44,26 @@ pub enum TranscriptTimes {
     All,
     /// None (on hover only).
     Off,
+}
+
+/// Session identity colour in tile bars; aspect marks keep their colours.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SessionBarColour {
+    #[default]
+    Tinted,
+    DotOnly,
+}
+
+/// Display only, for this head's user across realms and devices.
+/// `GET/PUT /api/v1/settings/session_bar`; does not change marks or interactions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SessionBarSettings {
+    /// Preserve the current coloured stripe unless the user opts into dot-only colour.
+    #[serde(default)]
+    pub colour: SessionBarColour,
 }
 
 /// Non-destructive inspection of a background shell command, subagent or observed Claude Code task.
@@ -379,6 +400,9 @@ pub struct Session {
     pub connection_id: String,
     pub model: String,
     pub status: SessionStatus,
+    /// Archived sessions remain readable by id; unarchive before sending.
+    #[serde(default)]
+    pub archived: bool,
     pub error: Option<String>,
     pub effort: Option<String>,
     /// Subagent sessions: the parent session and the Task call that ran it.
@@ -484,6 +508,30 @@ mod session_tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn session_bar_settings_default_and_wire_round_trip() {
+        let default = SessionBarSettings::default();
+        assert_eq!(default.colour, SessionBarColour::Tinted);
+        assert_eq!(serde_json::from_value::<SessionBarSettings>(json!({})).unwrap(), default);
+        for (colour, wire) in [(SessionBarColour::Tinted, "tinted"), (SessionBarColour::DotOnly, "dot_only")] {
+            let settings = SessionBarSettings { colour };
+            let value = serde_json::to_value(settings).unwrap();
+            assert_eq!(value, json!({"colour": wire}));
+            assert_eq!(serde_json::from_value::<SessionBarSettings>(value).unwrap(), settings);
+        }
+        for invalid in [json!({"colour": "none"}), json!({"colour": true}), json!({"colour": null})] {
+            assert!(serde_json::from_value::<SessionBarSettings>(invalid).is_err());
+        }
+    }
+
+    #[cfg(feature = "schema")]
+    #[test]
+    fn session_bar_settings_schema_keeps_tinted_default() {
+        let schema = serde_json::to_value(schemars::schema_for!(SessionBarSettings)).unwrap();
+        assert_eq!(schema["properties"]["colour"]["default"], "tinted");
+        assert_eq!(schema["$defs"]["SessionBarColour"]["enum"], json!(["tinted", "dot_only"]));
+    }
+
     fn session() -> Session {
         // Older servers did not send activity counts or the other optional
         // fields. Keep that wire format readable.
@@ -508,6 +556,17 @@ mod session_tests {
         s.subagents_running = 2;
         let wire = serde_json::to_value(&s).unwrap();
         assert_eq!(wire["side_chats_running"], 3);
+        assert_eq!(serde_json::from_value::<Session>(wire).unwrap(), s);
+    }
+
+    #[test]
+    fn session_archived_wire_defaults_and_round_trip() {
+        let mut s = session();
+        assert!(!s.archived, "older servers omit archived");
+        assert_eq!(serde_json::to_value(&s).unwrap()["archived"], false);
+        s.archived = true;
+        let wire = serde_json::to_value(&s).unwrap();
+        assert_eq!(wire["archived"], true);
         assert_eq!(serde_json::from_value::<Session>(wire).unwrap(), s);
     }
 
@@ -2095,6 +2154,9 @@ pub struct AttachmentInfo {
 }
 
 /// An image or file sent with a message.
+/// Also returned as a JSON array by
+/// `GET /api/v1/sessions/{id}/messages/{command_id}/draft` (read-only;
+/// pending or recorded User message; generated `@memex:` context omitted).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AttachmentUpload {
@@ -2176,6 +2238,62 @@ impl Handoff {
     }
 }
 
+/// Readable background-notice metadata, separate from the exact text the agent
+/// received. Absent in old journals and from workers that do not provide it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(default)]
+pub struct TaskNotice {
+    pub kind: String,
+    pub title: String,
+    pub session_id: String,
+    pub status: String,
+    pub markdown: String,
+}
+
+/// Server-recorded message provenance. Only a token's display name is exposed;
+/// absence on a historical event is legacy presentation, not proof of a human.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MessageOrigin {
+    Human,
+    Api {
+        token_name: String,
+    },
+    Session,
+    /// Initial prompt of a newly started task-card session.
+    TaskCard,
+    /// A task-card button's message to its proposing session.
+    TaskCardAnswer,
+    Unknown,
+}
+
+#[cfg(test)]
+mod message_origin_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn task_card_origins_are_additive_and_do_not_reclassify_old_answers() {
+        for (origin, name) in [(MessageOrigin::TaskCard, "task_card"), (MessageOrigin::TaskCardAnswer, "task_card_answer")] {
+            let value = json!({"kind": name});
+            assert_eq!(serde_json::to_value(&origin).unwrap(), value);
+            assert_eq!(serde_json::from_value::<MessageOrigin>(value).unwrap(), origin);
+        }
+        for origin in [None, Some(json!({"kind": "unknown"}))] {
+            let mut value = json!({"type": "user", "command_id": "old", "command": "card-answer", "text": "Not now: task card #1"});
+            if let Some(origin) = origin {
+                value["origin"] = origin;
+            }
+            let event: EventKind = serde_json::from_value(value.clone()).unwrap();
+            let EventKind::User { origin, .. } = &event else { panic!("user event") };
+            assert!(matches!(origin.as_deref(), None | Some(MessageOrigin::Unknown)));
+            assert_eq!(serde_json::to_value(event).unwrap().get("origin"), value.get("origin"));
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -2225,6 +2343,14 @@ pub enum EventKind {
         from_session_id: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         from_title: String,
+        /// Structured description of a background notice; raw agent-facing
+        /// text remains in `text`. Older events need no backfill.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_notice: Option<Box<TaskNotice>>,
+        /// Determined by the server, never by a send request's body. Missing on
+        /// legacy events; newly received unprovenanced input is `unknown`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<Box<MessageOrigin>>,
     },
     TurnStarted {
         turn: u64,
@@ -2461,6 +2587,10 @@ pub enum ContentBlock {
         citations: Vec<citations::UrlCitation>,
     },
     Thinking {
+        text: String,
+    },
+    /// A visible server-summarized update, distinct from a reply or reasoning.
+    Narration {
         text: String,
     },
     ToolUse {
@@ -3571,7 +3701,8 @@ pub struct Policy {
     /// Bash or Edit, work with every model); empty: every tool.
     #[serde(default)]
     pub tools: String,
-    /// A regular expression over the call's input (as JSON); empty: any.
+    /// A regular expression over the call's input, as JSON and each string in
+    /// it as plain text; empty: any.
     #[serde(default)]
     pub pattern: String,
     /// "ask" (wait for your approval) or "deny".
@@ -5177,11 +5308,12 @@ pub struct TimelineTurn {
     pub steps: u64,
     /// Who started it: `you`, `session` (another session's message),
     /// `task` (a background task or subagent ended), `doc` (comments on a
-    /// document), `agent` (the agent that started this subagent), or empty
+    /// document), `agent` (the agent that started this subagent), `api`,
+    /// `automation` (unknown/internal origin), or empty
     /// (nothing said).
     #[serde(default)]
     pub by: String,
-    /// The session's or document's title, for `session` and `doc`.
+    /// The session's/document's title, or the API token's display name.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub from: String,
     /// The first words of the message that started it.

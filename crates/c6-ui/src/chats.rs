@@ -19,7 +19,7 @@ fn conversations(all: &[Session], realm: &str) -> Vec<Session> {
         .filter(|s| realm.is_empty() || s.realm == realm)
         .cloned()
         .collect();
-    list.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+    crate::sessions::sort_by_activity(&mut list);
     list
 }
 
@@ -63,7 +63,7 @@ pub fn ChatsPage() -> impl IntoView {
         <main class="mx-auto max-w-3xl space-y-4 px-4 py-5" data-hold-reloads="">
             <header class="flex flex-wrap items-baseline gap-x-3 gap-y-1">
                 <h1 class="text-xl font-semibold">"Ask"</h1>
-                <span class="text-sm text-zinc-500">"Ask anything, or about your setup: no worker or folder needed. ⌘J asks from any page."</span>
+                <span class="text-sm text-zinc-500 dark:text-zinc-400">"Ask anything, or about your setup: no worker or folder needed. ⌘J asks from any page."</span>
             </header>
             <NewChat
                 like=Signal::derive(move || list.with(|l| l.first().map(|s| (s.connection_id.clone(), s.model.clone()))))
@@ -71,7 +71,7 @@ pub fn ChatsPage() -> impl IntoView {
             {move || {
                 let l = list.get();
                 if l.is_empty() {
-                    view! { <p class="text-sm text-zinc-500">"No conversations yet."</p> }.into_any()
+                    view! { <p class="text-sm text-zinc-500 dark:text-zinc-400">"No conversations yet."</p> }.into_any()
                 } else {
                     view! {
                         <div class="space-y-1">
@@ -139,19 +139,17 @@ fn ChatRow(s: Session, open: Callback<(String, How)>) -> impl IntoView {
                     view! {
                         <div class="flex items-center gap-2">
                             {running.then(|| view! { <span class="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-blue-500" title="running"></span> })}
-                            <button class="min-w-0 flex-1 truncate text-left font-medium hover:underline" title="Open beside (⌘-click: new tile)"
+                            <button class="min-w-0 flex-1 truncate text-left font-medium hover:underline" title="Open beside (⌘/Ctrl-click: new tile if not already open)"
                                 on:click=move |ev| open.run((id.get_value(), How::from_mouse(&ev)))>{t.clone()}</button>
-                            <span class="shrink-0 text-xs text-zinc-500">{crate::when::ago(now_ms() - s.updated_at)}</span>
+                            <span class="shrink-0 text-xs text-zinc-500 dark:text-zinc-400">{crate::when::ago(now_ms() - s.updated_at)}</span>
                         </div>
                     }.into_any()
                 }
             }}
-            <div class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-zinc-500">
+            <div class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-zinc-500 dark:text-zinc-400">
                 <span class="font-mono">{s.model.clone()}</span>
-                <label class="flex items-center gap-1" title="Let this conversation read your mail, chat and calendar">
-                    <input type="checkbox" prop:checked=personal on:change=move |ev| toggle(event_target_checked(&ev)) />
-                    "mail, chat, calendar"
-                </label>
+                <crate::components::Switch on=Signal::stored(personal) on_change=move |v| toggle(v)
+                    label="mail, chat, calendar" title="Let this conversation read your mail, chat and calendar" />
                 <span class="flex-1"></span>
                 <button class=BUTTON_QUIET on:click={ let t = s.title.clone(); move |_| renaming.set(Some(t.clone())) }>"Rename"</button>
                 <button class=BUTTON_QUIET on:click=archive>"Archive"</button>
@@ -213,13 +211,13 @@ fn NewChat(like: Signal<Option<(String, String)>>, on_started: Callback<Session>
                 prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev))
                 on:keydown=move |ev| if crate::util::sends(&ev) { ev.prevent_default(); send(); }></textarea>
             <div class="flex flex-wrap items-center gap-2 text-xs">
-                <span class="text-zinc-500">"Model"</span>
+                <span class="text-zinc-500 dark:text-zinc-400">"Model"</span>
                 <crate::session::ModelPicker connection model effort claude_off=claude_off />
 
             </div>
             <div class="flex flex-wrap items-center gap-3">
-                <label class="flex items-center gap-1 text-xs text-zinc-600 dark:text-zinc-400" title="Off: it can't read your mail, chat or calendar. You can still @-mention one item in a message.">
-                    <input type="checkbox" prop:checked=move || personal.get() on:change=move |ev| personal.set(event_target_checked(&ev)) />
+                <label class="flex min-h-8 items-center gap-1 text-xs text-zinc-600 pointer-coarse:min-h-11 dark:text-zinc-400" title="Off: this switch does not add mail, chat or calendar to this conversation's knowledge scope. You can still @-mention one item in a message.">
+                    <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || personal.get() on:change=move |ev| personal.set(event_target_checked(&ev)) />
                     "Include my mail, chat and calendar"
                 </label>
                 <span class="flex-1"></span>

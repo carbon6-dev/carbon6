@@ -1,5 +1,5 @@
 //! Pools (docs/pools.md): connections made of other connections, for what
-//! runs in the head (the memex, the assistant, suggestions). Which member
+//! runs in the head (the memex, the assistant and model-backed tasks). Which member
 //! takes a call is `c6_llm::pool`'s; the head keeps one pool per pool
 //! connection, with its members as configured, and gives them credentials.
 //! Sessions don't use pools: their workers dial their connection
@@ -166,7 +166,7 @@ pub async fn check_members(st: &HeadState, pool_id: &str, members: &[api::PoolMe
 pub fn not_for_sessions(c: &ConnectionRow, what: &str) -> anyhow::Result<()> {
     if c.kind == KIND {
         return Err(bad_request(format!(
-            "{what}: {} is a pool, which only what runs in the head uses (the memex, the assistant, suggestions); sessions dial their \
+            "{what}: {} is a pool for head-side model calls (the memex, the assistant, suggestions, work and projects); sessions dial their \
              connection from their worker, so choose one of its members",
             c.name
         )));
@@ -175,11 +175,17 @@ pub fn not_for_sessions(c: &ConnectionRow, what: &str) -> anyhow::Result<()> {
 }
 
 /// The models a pool offers: each member's, together.
-pub async fn models(st: &HeadState, c: &ConnectionRow) -> anyhow::Result<Vec<String>> {
+pub async fn models(st: &HeadState, c: &ConnectionRow, fresh: bool) -> anyhow::Result<Vec<String>> {
     let mut all = Vec::new();
     for m in members(c) {
+        let generation = st.models.generation();
         let Some(mc) = st.store.connection(&m.connection_id).await? else { continue };
-        match crate::api::connection_models_of(st, &mc).await {
+        let listed = if fresh {
+            crate::api::list_connection_models(st, &mc).await
+        } else {
+            crate::api::connection_models_of(st, &mc, generation).await
+        };
+        match listed {
             Ok(models) => all.extend(models),
             Err(e) => warn!(pool = %c.name, member = %mc.name, "a pool member's models: {}", e.1),
         }

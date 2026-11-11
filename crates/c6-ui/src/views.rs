@@ -429,7 +429,7 @@ fn FeedView(view: ViewDef) -> impl IntoView {
                         .filter(|s| realm.is_empty() || s.realm == realm)
                         .filter(|s| labels.iter().all(|l| s.labels.contains(l) || s.auto_labels.contains(l)))
                         .collect();
-                    ss.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+                    crate::sessions::sort_by_activity(&mut ss);
                     ss.into_iter().take(50).map(|s| {
                         let status = s.display_status();
                         view! {

@@ -1,4 +1,4 @@
-//! Usage and budgets: tokens and cost by day, model, connection, label and
+//! Usage: tokens and cost by day, model, connection, label and
 //! session, for the label filter's sessions; where each budget stands.
 
 use c6_api::{BudgetStatus, UsageReport, UsageRow};
@@ -75,7 +75,7 @@ pub fn UsagePage() -> impl IntoView {
 /// used and when it starts afresh.
 #[component]
 fn PlanLimits() -> impl IntoView {
-    let connections = LocalResource::new(api::connections);
+    let connections = crate::resources::connections();
     move || {
         let quotas = crate::quota::all();
         let has_unmatched = quotas.iter().any(|q| q.connection_id.starts_with("codex-cli:"));
