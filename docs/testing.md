@@ -1819,7 +1819,44 @@ or failed earlier, including the original keeper-stop/ownership error. The
 `darwin_group_replacement_preserves_early_cleanup_failure_without_grace` test
 checks that an early failure grants no waiting budget and still needs a fresh
 absence proof. A raw Ok/live error alone cannot distinguish the two paths.
-No production budget, ownership check, signal or Linux cleanup behavior changes.
+The replacement absence budget, ownership checks and Linux cleanup behavior
+remain unchanged.
+
+### Darwin keeper stop confirmation
+
+Before interrupting a held group, macOS observes the keeper's state directly with
+`PROC_PIDTBSDINFO`, not a fork/exec of `/bin/ps` for every poll. An exact-sized,
+zero-errno response must identify the expected PID and process group, have a
+valid start time and a live, non-exiting state. Capture that start identity
+before SIGSTOP and require it to remain unchanged. Only `pbi_status == SSTOP`
+confirms the stop; a successful SIGSTOP syscall alone does not. The actual FIFO
+vnode authority is checked before every state observation and again after a
+stopped observation. BSD state is never a substitute for FIFO ownership.
+
+Keeper readiness, stop confirmation and SIGINT grace share **one absolute
+three-second deadline**, anchored at entry to the held-group stop. This spends
+the existing three-second interrupt-grace allowance, rather than adding time to
+it. Readiness still uses a one-second wait/fallback interval and retains the
+separately identified-leader fallback. For example, confirmation at 1.5 seconds leaves only
+1.5 seconds of SIGINT grace; it does not start another three seconds. Child
+waiting, group-absence confirmation and the outer five-second Rewind cleanup
+limit are unchanged. Linux retains its existing `/proc` reader and polling loops.
+
+A missing, malformed, changed or late confirmation fails closed before group
+SIGINT. It cannot fall through to a speculative group kill. As before, a fresh
+whole-group absence proof can resolve a failed pin; otherwise held records and
+the durable PGID remain. Consuming `Process` cleanup may subsequently make a
+freshly ownership-authorized SIGKILL attempt in Drop, but Drop does not prove
+absence. Metadata-only Rewind cleanup has no such Process fallback, so this is
+a production stop/replacement issue, not just fixture teardown.
+
+Keeper-confirmation errors retain the **observation count and last raw state or
+query error** in ordinary displayed errors, including PID, PGID, state, flags and
+start time (plus response size/errno on invalid replies). Successful confirmation
+records its count/state at debug level. The `darwin_keeper_tests` module drives
+the actual Darwin orchestration with paused time: slow/readiness-delayed STOP,
+the shared deadline, no premature SIGINT, unconfirmed/invalid/changed state,
+FIFO authority loss, cancellation, fresh absence and leader-only fallback.
 
 ## Production image-preview browser regression
 

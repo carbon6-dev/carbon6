@@ -1107,6 +1107,7 @@ fn held_group_owned(meta: &HeldMeta, dir: &Path) -> bool {
 
 /// SIGSTOP delivery is asynchronous. Observe the stopped state before the
 /// group's interrupt; Linux's distinct tracing-stop state is not sufficient.
+#[cfg(any(not(target_os = "macos"), test))]
 fn keeper_stopped(keeper: Pid) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -1116,10 +1117,7 @@ fn keeper_stopped(keeper: Pid) -> bool {
     }
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("/bin/ps")
-            .args(["-o", "stat=", "-p", &keeper.to_string()])
-            .output()
-            .is_ok_and(|out| out.status.success() && String::from_utf8_lossy(&out.stdout).trim().starts_with('T'))
+        nix::unistd::getpgid(Some(keeper)).is_ok_and(|pg| darwin_keeper_state(keeper, pg).is_ok_and(|member| member.status == 4))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -1128,6 +1126,7 @@ fn keeper_stopped(keeper: Pid) -> bool {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 async fn pin_held_keeper(keeper: Pid, pg: Pid, dir: &Path) -> anyhow::Result<()> {
     anyhow::ensure!(keeper_holds_fifo(keeper, pg, dir), "Held Claude Code keeper ownership changed");
     nix::sys::signal::kill(keeper, Signal::SIGSTOP)?;
@@ -1142,10 +1141,202 @@ async fn pin_held_keeper(keeper: Pid, pg: Pid, dir: &Path) -> anyhow::Result<()>
     anyhow::bail!("Held Claude Code keeper did not confirm that it stopped")
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn darwin_keeper_member(returned: i32, error: i32, pid: i32, pg: i32, member: DarwinGroupMember) -> anyhow::Result<DarwinGroupMember> {
+    anyhow::ensure!(
+        returned == DARWIN_BSDINFO_SIZE
+            && error == 0
+            && pid > 0
+            && pg > 0
+            && member.pid == pid as u32
+            && member.pgid == pg as u32
+            && member.start_sec > 0
+            && member.start_usec < 1_000_000
+            && (1..=4).contains(&member.status)
+            && member.flags & DARWIN_PROC_FLAG_INEXIT == 0,
+        "Unproven keeper state: pid={pid} pgid={pg} bytes={returned}/{DARWIN_BSDINFO_SIZE} errno={error} raw={member:?}"
+    );
+    Ok(member)
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_keeper_state(keeper: Pid, pg: Pid) -> anyhow::Result<DarwinGroupMember> {
+    use nix::libc;
+    const _: () = assert!(std::mem::size_of::<libc::proc_bsdinfo>() == DARWIN_BSDINFO_SIZE as usize);
+    const _: () = assert!(libc::SSTOP == 4);
+    // SAFETY: proc_bsdinfo contains only integers and byte arrays.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    nix::errno::Errno::clear();
+    // SAFETY: info is aligned writable storage of exactly the required size.
+    // Ordinary live lookup only: a zombie is never a pinnable keeper.
+    let returned = unsafe {
+        libc::proc_pidinfo(keeper.as_raw(), libc::PROC_PIDTBSDINFO, 0, std::ptr::from_mut(&mut info).cast(), DARWIN_BSDINFO_SIZE)
+    };
+    let error = nix::errno::Errno::last_raw();
+    darwin_keeper_member(
+        returned,
+        error,
+        keeper.as_raw(),
+        pg.as_raw(),
+        DarwinGroupMember {
+            pid: info.pbi_pid,
+            pgid: info.pbi_pgid,
+            status: info.pbi_status,
+            flags: info.pbi_flags,
+            start_sec: info.pbi_start_tvsec,
+            start_usec: info.pbi_start_tvusec,
+        },
+    )
+}
+
+/// The stopped-state proof never replaces FIFO authority. Capture start
+/// identity before SIGSTOP and reject a changed/exiting/unreadable member.
+/// Pinning spends the caller's existing grace, not a fresh retry allowance.
+#[cfg(any(target_os = "macos", test))]
+async fn darwin_pin_keeper_until(
+    deadline: tokio::time::Instant,
+    mut owned: impl FnMut() -> bool,
+    mut state: impl FnMut() -> anyhow::Result<DarwinGroupMember>,
+    stop: impl FnOnce() -> nix::Result<()>,
+) -> anyhow::Result<()> {
+    let mut observations = 0;
+    let mut last = "no state observation".to_owned();
+    let result = async {
+        let mut observe = || {
+            observations += 1;
+            let result = state();
+            last = match &result {
+                Ok(member) => format!("{member:?}"),
+                Err(error) => format!("{error:#}"),
+            };
+            result
+        };
+        anyhow::ensure!(owned(), "Held Claude Code keeper ownership changed");
+        let identity = observe()?;
+        anyhow::ensure!(owned(), "Held Claude Code keeper ownership changed");
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "Held Claude Code keeper stop deadline elapsed before SIGSTOP");
+        stop()?;
+        loop {
+            anyhow::ensure!(owned(), "Held Claude Code keeper ownership changed");
+            let member = observe()?;
+            anyhow::ensure!(
+                (member.pid, member.pgid, member.start_sec, member.start_usec)
+                    == (identity.pid, identity.pgid, identity.start_sec, identity.start_usec),
+                "Held Claude Code keeper process identity changed"
+            );
+            if member.status == 4 && tokio::time::Instant::now() <= deadline {
+                anyhow::ensure!(owned(), "Held Claude Code keeper ownership changed");
+                anyhow::ensure!(
+                    tokio::time::Instant::now() <= deadline,
+                    "Held Claude Code keeper stop proof exceeded the held stop deadline"
+                );
+                return Ok(());
+            }
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "Held Claude Code keeper did not confirm that it stopped by the held stop deadline"
+            );
+            tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + Duration::from_millis(10))).await;
+        }
+    }
+    .await;
+    result.map_err(|error: anyhow::Error| {
+        let message = format!("Held Claude Code keeper stop confirmation: observations={observations}; last={last}: {error:#}");
+        error.context(message)
+    })?;
+    tracing::debug!(observations, last, "Held Claude Code keeper stop confirmed");
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", test))]
+async fn pin_held_keeper(keeper: Pid, pg: Pid, dir: &Path) -> anyhow::Result<()> {
+    darwin_pin_keeper_until(
+        tokio::time::Instant::now() + Duration::from_secs(3),
+        || keeper_holds_fifo(keeper, pg, dir),
+        || darwin_keeper_state(keeper, pg),
+        || nix::sys::signal::kill(keeper, Signal::SIGSTOP),
+    )
+    .await
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DarwinHeldSignal {
+    StopKeeper,
+    InterruptGroup,
+    KillGroup,
+}
+
+/// Readiness, stop confirmation and SIGINT grace share the old three-second
+/// interrupt allowance. Slow confirmation leaves less grace, never more time.
+#[cfg(any(target_os = "macos", test))]
+async fn darwin_stop_held_group(
+    mut absent: impl FnMut() -> bool,
+    mut owned: impl FnMut() -> bool,
+    state: impl FnMut() -> anyhow::Result<DarwinGroupMember>,
+    mut signal: impl FnMut(DarwinHeldSignal) -> nix::Result<()>,
+    mut leader_alive: impl FnMut() -> bool,
+    mut leader_owned: impl FnMut() -> bool,
+) -> anyhow::Result<()> {
+    let start = tokio::time::Instant::now();
+    let deadline = start + Duration::from_secs(3);
+    let readiness = start + Duration::from_secs(1);
+    loop {
+        if absent() {
+            return Ok(());
+        }
+        if owned() {
+            if let Err(error) = darwin_pin_keeper_until(deadline, &mut owned, state, || signal(DarwinHeldSignal::StopKeeper)).await {
+                if absent() {
+                    return Ok(());
+                }
+                return Err(error);
+            }
+            let _ = signal(DarwinHeldSignal::InterruptGroup);
+            while tokio::time::Instant::now() < deadline && leader_alive() {
+                tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + Duration::from_millis(100))).await;
+            }
+            if !owned() {
+                anyhow::ensure!(absent(), "Held Claude Code keeper disappeared during stop");
+                return Ok(());
+            }
+            let _ = signal(DarwinHeldSignal::KillGroup);
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= readiness {
+            break;
+        }
+        tokio::time::sleep_until(readiness.min(tokio::time::Instant::now() + Duration::from_millis(10))).await;
+    }
+    if leader_owned() {
+        let _ = signal(DarwinHeldSignal::KillGroup);
+        return Ok(());
+    }
+    anyhow::bail!("Cannot retain ownership of held Claude Code group; its cleanup record was kept")
+}
+
+#[cfg(target_os = "macos")]
+async fn stop_held_group(pg: Pid, keeper: Pid, dir: &Path, conversation: &str) -> anyhow::Result<()> {
+    darwin_stop_held_group(
+        || matches!(group_probe(pg), Err(nix::errno::Errno::ESRCH)),
+        || keeper_holds_fifo(keeper, pg, dir),
+        || darwin_keeper_state(keeper, pg),
+        |signal| match signal {
+            DarwinHeldSignal::StopKeeper => nix::sys::signal::kill(keeper, Signal::SIGSTOP),
+            DarwinHeldSignal::InterruptGroup => killpg(pg, Signal::SIGINT),
+            DarwinHeldSignal::KillGroup => killpg(pg, Signal::SIGKILL),
+        },
+        || nix::sys::signal::kill(pg, None).is_ok(),
+        || is_claude_for(pg.as_raw(), conversation),
+    )
+    .await
+}
+
 /// Retain an identified kernel group member across SIGINT grace. If the
 /// keeper has not opened its FIFO yet, wait before signaling anything. When
 /// only an identified leader remains, kill immediately rather than losing
 /// authority by first letting that leader exit during a grace period.
+#[cfg(not(target_os = "macos"))]
 async fn stop_held_group(pg: Pid, keeper: Pid, dir: &Path, conversation: &str) -> anyhow::Result<()> {
     for _ in 0..100 {
         if matches!(group_probe(pg), Err(nix::errno::Errno::ESRCH)) {
@@ -5967,6 +6158,261 @@ done
             detail.as_deref(),
             Some("Darwin group signal-zero: Err(EPERM) errno=1; Darwin group absence proof refused: list 1; member 42; list 2")
         );
+    }
+
+    mod darwin_keeper_tests {
+        use super::*;
+        use std::cell::{Cell, RefCell};
+
+        fn member(status: u32) -> DarwinGroupMember {
+            DarwinGroupMember { pid: 42, pgid: 41, status, flags: 0, start_sec: 100, start_usec: 10 }
+        }
+
+        fn observed(status: u32) -> anyhow::Result<DarwinGroupMember> {
+            darwin_keeper_member(DARWIN_BSDINFO_SIZE, 0, 42, 41, member(status))
+        }
+
+        #[test]
+        fn state_requires_a_complete_live_nonexiting_kernel_identity() {
+            for status in 0..=7 {
+                assert_eq!(observed(status).is_ok(), (1..=4).contains(&status));
+            }
+            for returned in [-1, 0, 1, DARWIN_BSDINFO_SIZE - 1, DARWIN_BSDINFO_SIZE + 1] {
+                assert!(darwin_keeper_member(returned, 0, 42, 41, member(4)).is_err());
+            }
+            for error in [nix::errno::Errno::EPERM, nix::errno::Errno::ESRCH, nix::errno::Errno::EIO] {
+                let message = darwin_keeper_member(DARWIN_BSDINFO_SIZE, error as i32, 42, 41, member(4)).unwrap_err().to_string();
+                assert!(message.contains(&format!("errno={}", error as i32)));
+                assert!(message.contains("status: 4"));
+            }
+            for invalid in [
+                DarwinGroupMember { pid: 43, ..member(4) },
+                DarwinGroupMember { pgid: 43, ..member(4) },
+                DarwinGroupMember { start_sec: 0, ..member(4) },
+                DarwinGroupMember { start_usec: 1_000_000, ..member(4) },
+                DarwinGroupMember { flags: DARWIN_PROC_FLAG_INEXIT, ..member(4) },
+            ] {
+                assert!(darwin_keeper_member(DARWIN_BSDINFO_SIZE, 0, 42, 41, invalid).is_err());
+            }
+            for (pid, pg) in [(0, 41), (42, 0), (-1, 41), (42, -1)] {
+                assert!(darwin_keeper_member(DARWIN_BSDINFO_SIZE, 0, pid, pg, member(4)).is_err());
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn slow_confirmation_and_readiness_spend_only_the_existing_interrupt_grace() {
+            for (ready_ms, stopped_ms) in [(0, 1500), (800, 2000), (0, 3000)] {
+                let start = tokio::time::Instant::now();
+                let elapsed = || (tokio::time::Instant::now() - start).as_millis();
+                let signals = RefCell::new(Vec::new());
+                darwin_stop_held_group(
+                    || false,
+                    || elapsed() >= ready_ms,
+                    || observed(if elapsed() >= stopped_ms { 4 } else { 2 }),
+                    |signal| {
+                        signals.borrow_mut().push((signal, elapsed()));
+                        Ok(())
+                    },
+                    || true,
+                    || panic!("an owned keeper must not fall back to the leader"),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    signals.into_inner(),
+                    vec![
+                        (DarwinHeldSignal::StopKeeper, ready_ms),
+                        (DarwinHeldSignal::InterruptGroup, stopped_ms),
+                        (DarwinHeldSignal::KillGroup, 3000),
+                    ],
+                    "no SIGINT before confirmed STOP and no new grace after slow confirmation"
+                );
+                assert_eq!(elapsed(), 3000);
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn missing_confirmation_reports_count_and_last_state_without_group_signals() {
+            let start = tokio::time::Instant::now();
+            let signals = RefCell::new(Vec::new());
+            let error = darwin_stop_held_group(
+                || false,
+                || true,
+                || observed(2),
+                |signal| {
+                    signals.borrow_mut().push(signal);
+                    Ok(())
+                },
+                || panic!("unconfirmed STOP must not enter interrupt grace"),
+                || panic!("failed pinning must not fall back to a leader kill"),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(3));
+            assert_eq!(signals.into_inner(), vec![DarwinHeldSignal::StopKeeper]);
+            let error = darwin_confirm_replacement_stopped(Pid::from_raw(41), Err(error), || {
+                darwin_group_observe(Ok(()), || panic!("raw live must not enumerate"))
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(3), "replacement must not add cleanup grace");
+            assert!(error.downcast_ref::<ReplacementBlocked>().is_some());
+            assert!(error.downcast_ref::<StopUnconfirmed>().is_some());
+            let transcript = error.to_string();
+            assert!(transcript.contains("observations=302"), "{transcript}");
+            assert!(transcript.contains("status: 2"), "{transcript}");
+            assert!(transcript.contains("held cleanup failed before the absence phase"), "{transcript}");
+            assert!(transcript.contains("did not confirm that it stopped by the held stop deadline"), "{transcript}");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn malformed_or_changed_keeper_state_refuses_before_interrupt() {
+            for changed_identity in [false, true] {
+                let start = tokio::time::Instant::now();
+                let observations = Cell::new(0);
+                let signals = RefCell::new(Vec::new());
+                let error = darwin_stop_held_group(
+                    || false,
+                    || true,
+                    || {
+                        observations.set(observations.get() + 1);
+                        if observations.get() == 1 {
+                            return observed(2);
+                        }
+                        if changed_identity {
+                            Ok(DarwinGroupMember { start_sec: 101, ..member(4) })
+                        } else {
+                            darwin_keeper_member(DARWIN_BSDINFO_SIZE - 1, 0, 42, 41, member(4))
+                        }
+                    },
+                    |signal| {
+                        signals.borrow_mut().push(signal);
+                        Ok(())
+                    },
+                    || panic!("invalid state must not enter interrupt grace"),
+                    || panic!("invalid state must not fall back to a leader kill"),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(tokio::time::Instant::now(), start);
+                assert_eq!(signals.into_inner(), vec![DarwinHeldSignal::StopKeeper]);
+                let transcript = error.to_string();
+                assert!(transcript.contains("observations=2"));
+                assert!(transcript.contains(if changed_identity { "process identity changed" } else { "bytes=135/136" }));
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn every_observation_and_group_kill_require_fresh_fifo_authority() {
+            for loss in 0..4 {
+                let checks = Cell::new(0);
+                let stopped = Cell::new(false);
+                let proof = Cell::new(false);
+                let interrupted = Cell::new(false);
+                let signals = RefCell::new(Vec::new());
+                darwin_stop_held_group(
+                    || false,
+                    || {
+                        checks.set(checks.get() + 1);
+                        !(match loss {
+                            0 => checks.get() > 1,  // Readiness succeeded, but pre-STOP authority is gone.
+                            1 => stopped.get(),     // Gone before the first post-STOP observation.
+                            2 => proof.get(),       // Gone after SSTOP, before accepting its proof.
+                            3 => interrupted.get(), // Gone during grace, before group SIGKILL.
+                            _ => unreachable!(),
+                        })
+                    },
+                    || {
+                        proof.set(stopped.get());
+                        observed(if stopped.get() { 4 } else { 2 })
+                    },
+                    |signal| {
+                        signals.borrow_mut().push(signal);
+                        stopped.set(signal == DarwinHeldSignal::StopKeeper || stopped.get());
+                        interrupted.set(signal == DarwinHeldSignal::InterruptGroup || interrupted.get());
+                        Ok(())
+                    },
+                    || false,
+                    || panic!("ownership loss during pin/grace must not fall back"),
+                )
+                .await
+                .unwrap_err();
+                let signals = signals.into_inner();
+                assert!(!signals.contains(&DarwinHeldSignal::KillGroup));
+                assert_eq!(signals.contains(&DarwinHeldSignal::InterruptGroup), loss == 3);
+                assert_eq!(signals.contains(&DarwinHeldSignal::StopKeeper), loss != 0);
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn fresh_absence_alone_can_resolve_a_failed_pin() {
+            let stopped = Cell::new(false);
+            let signals = RefCell::new(Vec::new());
+            darwin_stop_held_group(
+                || stopped.get(),
+                || true,
+                || if stopped.get() { observed(5) } else { observed(2) },
+                |signal| {
+                    signals.borrow_mut().push(signal);
+                    stopped.set(true);
+                    Ok(())
+                },
+                || panic!("absent group needs no grace"),
+                || panic!("absent group needs no leader fallback"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(signals.into_inner(), vec![DarwinHeldSignal::StopKeeper]);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn expired_deadline_and_cancellation_never_send_group_signals() {
+            let start = tokio::time::Instant::now();
+            let error = darwin_pin_keeper_until(start, || true, || observed(2), || panic!("no SIGSTOP after deadline")).await.unwrap_err();
+            assert!(error.to_string().contains("elapsed before SIGSTOP"));
+            assert!(error.to_string().contains("observations=1"));
+            assert_eq!(tokio::time::Instant::now(), start);
+
+            let signals = RefCell::new(Vec::new());
+            let mut stop = Box::pin(darwin_stop_held_group(
+                || false,
+                || true,
+                || observed(2),
+                |signal| {
+                    signals.borrow_mut().push(signal);
+                    Ok(())
+                },
+                || true,
+                || false,
+            ));
+            assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(stop.as_mut(), cx))).await.is_pending());
+            drop(stop);
+            assert_eq!(signals.into_inner(), vec![DarwinHeldSignal::StopKeeper]);
+            assert_eq!(tokio::time::Instant::now(), start);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn missing_fifo_uses_only_the_existing_identified_leader_fallback() {
+            for identified in [false, true] {
+                let start = tokio::time::Instant::now();
+                let signals = RefCell::new(Vec::new());
+                let result = darwin_stop_held_group(
+                    || false,
+                    || false,
+                    || panic!("no keeper state without FIFO authority"),
+                    |signal| {
+                        signals.borrow_mut().push(signal);
+                        Ok(())
+                    },
+                    || panic!("no SIGINT grace for leader-only cleanup"),
+                    || identified,
+                )
+                .await;
+                assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(1));
+                assert_eq!(result.is_ok(), identified);
+                assert_eq!(signals.into_inner(), if identified { vec![DarwinHeldSignal::KillGroup] } else { vec![] });
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
