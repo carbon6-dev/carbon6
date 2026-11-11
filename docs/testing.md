@@ -163,6 +163,13 @@ atomically confirm every receipt before pre-existing Inbox inputs, and remain
 durable through a crash and subsequent failed recovery.
 Worker unit regressions also check held native wake withdrawal and recursive
 child/background quiescence.
+On macOS, held-runtime ownership reads exact argument boundaries from
+`KERN_PROCARGS2`, not the flattened `ps` display. The portable
+`darwin_process_identity_` parser regression excludes environment strings and
+truncated records; `held_wrapper_process_identity_survives_spaces_in_the_program_path`
+also exercises the live wrapper and requires the whole process group to vanish.
+These tests must also run on macOS: Linux parser coverage cannot qualify the
+Darwin syscall or process-group behavior.
 The `shell_writer_` worker regressions hold a shell's Started event outside the
 actor, refuse rewind before interruption, reopen the journal with empty tools,
 and verify that neither restore nor a Rewound receipt can bypass the live writer.

@@ -577,12 +577,56 @@ fn is_claude_for(pid: i32, conversation: &str) -> bool {
         let Ok(args) = std::str::from_utf8(&data) else { return false };
         claude_args_for(&args.split('\0').filter(|a| !a.is_empty()).collect::<Vec<_>>(), conversation)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        use nix::libc;
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        let mut size = 0;
+        // Unlike ps's display string, KERN_PROCARGS2 preserves argument
+        // boundaries: the wrapper's shell program is one argument, and a
+        // program/path may itself contain spaces. Failure is not authority.
+        // SAFETY: mib and size are writable; a null output queries its size.
+        if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, std::ptr::null_mut(), &mut size, std::ptr::null_mut(), 0) } != 0
+            || size == 0
+            || size > 16 * 1024 * 1024
+        {
+            return false;
+        }
+        let mut data = vec![0u8; size];
+        // SAFETY: data has size writable bytes; sysctl reports bytes written.
+        if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, data.as_mut_ptr().cast(), &mut size, std::ptr::null_mut(), 0) } != 0
+            || size > data.len()
+        {
+            return false;
+        }
+        darwin_procargs(&data[..size]).is_some_and(|args| claude_args_for(&args, conversation))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let Ok(out) = std::process::Command::new("ps").args(["-ww", "-o", "args=", "-p", &pid.to_string()]).output() else { return false };
         let line = String::from_utf8_lossy(&out.stdout);
         out.status.success() && claude_args_for(&line.split_whitespace().collect::<Vec<_>>(), conversation)
     }
+}
+
+/// Darwin returns argc, a NUL-terminated exec path, NUL padding, then argc
+/// NUL-terminated arguments. Do not read options from the environment after it.
+#[cfg(any(target_os = "macos", test))]
+fn darwin_procargs(data: &[u8]) -> Option<Vec<&str>> {
+    let argc = usize::try_from(i32::from_ne_bytes(data.get(..4)?.try_into().ok()?)).ok()?;
+    let mut rest = data.get(4..)?;
+    if argc == 0 || argc > rest.len() {
+        return None;
+    }
+    rest = rest.get(rest.iter().position(|b| *b == 0)? + 1..)?;
+    rest = rest.get(rest.iter().position(|b| *b != 0)?..)?;
+    let mut args = Vec::with_capacity(argc);
+    for _ in 0..argc {
+        let end = rest.iter().position(|b| *b == 0)?;
+        args.push(std::str::from_utf8(&rest[..end]).ok()?);
+        rest = &rest[end + 1..];
+    }
+    Some(args)
 }
 
 fn claude_args_for(args: &[&str], conversation: &str) -> bool {
@@ -4791,6 +4835,61 @@ done
         assert!(claude_args_for(&["node", "/opt/claude-code/cli.js", "--session-id", "fork"], "fork"));
         assert!(!claude_args_for(&["sleep", "/tmp/claude-notes", "--resume", "fork"], "fork"));
         assert!(!claude_args_for(&["sh", "-c", "echo claude --resume fork"], "fork"));
+    }
+
+    #[test]
+    fn darwin_process_identity_preserves_argument_boundaries_and_excludes_environment() {
+        let encode = |args: &[&str]| {
+            let mut data = (args.len() as i32).to_ne_bytes().to_vec();
+            data.extend_from_slice(b"/bin/sh\0\0\0");
+            for arg in args {
+                data.extend_from_slice(arg.as_bytes());
+                data.push(0);
+            }
+            data.extend_from_slice(b"--resume\0fork\0");
+            data
+        };
+        let wrapper = ["/bin/sh", "-c", r#""$@"; echo $? > "$C6_HELD_CODE""#, "sh", "/a path/claude-live", "--resume", "fork"];
+        let data = encode(&wrapper);
+        assert_eq!(darwin_procargs(&data).unwrap(), wrapper);
+        assert!(claude_args_for(&darwin_procargs(&data).unwrap(), "fork"));
+        let display = wrapper.join(" ");
+        assert!(!claude_args_for(&display.split_whitespace().collect::<Vec<_>>(), "fork"), "ps display is not argv");
+        assert!(!claude_args_for(&darwin_procargs(&encode(&["claude-live"])).unwrap(), "fork"), "environment is not argv");
+        let empty = encode(&["claude-live", "", "--session-id", "fork"]);
+        assert_eq!(darwin_procargs(&empty).unwrap(), ["claude-live", "", "--session-id", "fork"]);
+        for length in 0..data.len() - b"--resume\0fork\0".len() {
+            assert!(darwin_procargs(&data[..length]).is_none(), "truncated at {length}");
+        }
+        assert!(darwin_procargs(&0i32.to_ne_bytes()).is_none());
+        assert!(darwin_procargs(&(-1i32).to_ne_bytes()).is_none());
+    }
+
+    #[tokio::test]
+    async fn held_wrapper_process_identity_survives_spaces_in_the_program_path() {
+        let dir = tempfile::Builder::new().prefix("held runtime ").tempdir().unwrap();
+        let held = dir.path().join("held");
+        let _cleanup = HeldFixtureCleanup(held.clone());
+        let bin = live_claude(dir.path());
+        let p = Process::spawn_held(
+            &held,
+            "s",
+            &bin,
+            Launch { conversation: "fork".into(), ..Default::default() },
+            false,
+            dir.path(),
+            "opus",
+            Arc::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let pg = p.pgid.unwrap();
+        c6_testkit::eventually("the wrapper's exact argv to prove ownership", async || is_claude_for(pg.as_raw(), "fork").then_some(()))
+            .await;
+        assert!(!is_claude_for(pg.as_raw(), "for"));
+        p.close_for_replacement().await.unwrap();
+        assert_eq!(killpg(pg, None), Err(nix::errno::Errno::ESRCH));
     }
 
     #[tokio::test]
