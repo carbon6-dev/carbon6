@@ -162,6 +162,46 @@ fn text_of(e: &Event) -> String {
 }
 
 #[tokio::test]
+async fn a_stuck_watchers_nudge_can_be_answered_in_the_running_turn() {
+    let env = Env::new().await;
+    env.set("stuck", |d| d.enabled = true).await;
+    let loop_call = Reply::ToolCalls(vec![("bash".into(), r#"{"command":"echo hi"}"#.into())]);
+    for _ in 0..3 {
+        env.mock.push_about_all(&[SESSION, "check the build"], loop_call.clone());
+    }
+    env.mock.push_about(
+        STUCK,
+        answer(json!([{"severity": "important", "kind": "note", "text": "It runs echo hi again and again.",
+                        "note": "You ran `echo hi` three times with the same result; try something else."}])),
+    );
+    // The watcher has its own matching step above. Hold the session's
+    // final reply so its turn cannot finish before the nudge arrives.
+    let finish = env.mock.push_gated(Reply::Text("Done checking.".into()));
+    env.mock.push_about_all(&[SESSION, "try something else"], Reply::Text("Understood: stopping the loop.".into()));
+    let s = env.start("check the build").await;
+    env.found("stuck", |f| f.done == "sent" && f.watched == s.id).await;
+    // Notices are recorded before the turn consumes them as User events.
+    // Wait for receipt and command acknowledgement before releasing it.
+    eventually("the nudge to reach the running turn", async || {
+        let detail: c6_api::SessionDetail = env.get(&format!("sessions/{}", s.id)).await;
+        let events = env.events(&s.id).await;
+        (detail.queued.is_empty()
+            && events.iter().any(|e| matches!(&e.kind, EventKind::NoticeQueued { text, .. } if text.contains("try something else"))))
+        .then_some(())
+    })
+    .await;
+    finish.notify_one();
+    let events = env.turns(&s.id, 1).await;
+    assert_eq!(events.iter().filter(|e| matches!(e.kind, EventKind::TurnEnded { .. })).count(), 1);
+    let nudge = events
+        .iter()
+        .position(|e| matches!(&e.kind, EventKind::User { text, from_title, .. } if text.contains("try something else") && from_title.contains("Stuck detection")))
+        .unwrap();
+    assert!(events[nudge + 1..].iter().any(|e| matches!(e.kind, EventKind::Assistant { .. })), "the agent answered the nudge");
+    env.stop.cancel();
+}
+
+#[tokio::test]
 async fn stuck_detection_nudges_a_looping_agent_and_answers_you() {
     let env = Env::new().await;
     env.set("stuck", |d| d.enabled = true).await;
@@ -170,13 +210,15 @@ async fn stuck_detection_nudges_a_looping_agent_and_answers_you() {
         env.mock.push_about_all(&[SESSION, "check the build"], loop_call.clone());
     }
     env.mock.push_about_all(&[SESSION, "check the build"], Reply::Text("Done checking.".into()));
-    env.mock.push_about(
-        STUCK,
-        answer(json!([{"severity": "important", "kind": "note", "text": "It runs echo hi again and again.",
-                        "note": "You ran `echo hi` three times with the same result; try something else."}])),
-    );
+    // The session's replies above match its prompt; this step is the
+    // watcher's. Hold its answer until the first turn is idle: a nudge
+    // received while running joins that turn rather than starting another.
+    let nudge = env.mock.push_gated(answer(json!([{"severity": "important", "kind": "note", "text": "It runs echo hi again and again.",
+                        "note": "You ran `echo hi` three times with the same result; try something else."}])));
     env.mock.push_about_all(&[SESSION, "try something else"], Reply::Text("Understood: stopping the loop.".into()));
     let s = env.start("check the build").await;
+    env.turns(&s.id, 1).await;
+    nudge.notify_one();
 
     // The nudge reaches the agent, as a message from the watcher.
     let sent = env.found("stuck", |f| f.done == "sent" && f.watched == s.id).await;
