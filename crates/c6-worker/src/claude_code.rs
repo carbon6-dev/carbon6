@@ -579,27 +579,10 @@ fn is_claude_for(pid: i32, conversation: &str) -> bool {
     }
     #[cfg(target_os = "macos")]
     {
-        use nix::libc;
-        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
-        let mut size = 0;
-        // Unlike ps's display string, KERN_PROCARGS2 preserves argument
-        // boundaries: the wrapper's shell program is one argument, and a
-        // program/path may itself contain spaces. Failure is not authority.
-        // SAFETY: mib and size are writable; a null output queries its size.
-        if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, std::ptr::null_mut(), &mut size, std::ptr::null_mut(), 0) } != 0
-            || size == 0
-            || size > 16 * 1024 * 1024
-        {
-            return false;
-        }
-        let mut data = vec![0u8; size];
-        // SAFETY: data has size writable bytes; sysctl reports bytes written.
-        if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, data.as_mut_ptr().cast(), &mut size, std::ptr::null_mut(), 0) } != 0
-            || size > data.len()
-        {
-            return false;
-        }
-        darwin_procargs(&data[..size]).is_some_and(|args| claude_args_for(&args, conversation))
+        darwin_process_args(pid)
+            .ok()
+            .and_then(|data| darwin_procargs(&data).map(|args| claude_args_for(&args, conversation)))
+            .unwrap_or(false)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -607,6 +590,27 @@ fn is_claude_for(pid: i32, conversation: &str) -> bool {
         let line = String::from_utf8_lossy(&out.stdout);
         out.status.success() && claude_args_for(&line.split_whitespace().collect::<Vec<_>>(), conversation)
     }
+}
+
+/// Preserve argument boundaries rather than inspecting ps's display string.
+#[cfg(target_os = "macos")]
+fn darwin_process_args(pid: i32) -> anyhow::Result<Vec<u8>> {
+    use nix::libc;
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut size = 0;
+    // SAFETY: mib and size are writable; a null output queries its size.
+    if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, std::ptr::null_mut(), &mut size, std::ptr::null_mut(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    anyhow::ensure!(size > 0 && size <= 16 * 1024 * 1024, "Invalid Darwin process argument size: {size}");
+    let mut data = vec![0u8; size];
+    // SAFETY: data has size writable bytes; sysctl reports bytes written.
+    if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, data.as_mut_ptr().cast(), &mut size, std::ptr::null_mut(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    anyhow::ensure!(size <= data.len(), "Oversized Darwin process argument reply: {size}");
+    data.truncate(size);
+    Ok(data)
 }
 
 /// Darwin returns argc, a NUL-terminated exec path, NUL padding, then argc
@@ -1141,6 +1145,57 @@ async fn pin_held_keeper(keeper: Pid, pg: Pid, dir: &Path) -> anyhow::Result<()>
     anyhow::bail!("Held Claude Code keeper did not confirm that it stopped")
 }
 
+// Only builtins follow FIFO readiness: no exec can replace the stopped task.
+// read parks on its private stdin, NOT the CLI FIFO on fd 3. The keeper's own
+// stdout retains the other end, so worker exit cannot cause EOF.
+#[cfg(any(target_os = "macos", test))]
+const DARWIN_HELD_KEEPER_PROGRAM: &str = r#"trap '' INT; exec 3<>"$0"; IFS= read -r line"#;
+
+#[cfg(any(target_os = "macos", test))]
+fn darwin_keeper_command(fifo: &Path) -> std::io::Result<tokio::process::Command> {
+    let (reader, writer) = std::io::pipe()?;
+    let mut command = tokio::process::Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg(DARWIN_HELD_KEEPER_PROGRAM)
+        .arg(fifo)
+        .stdin(Stdio::from(reader))
+        .stdout(Stdio::from(writer))
+        .stderr(Stdio::null());
+    Ok(command)
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DarwinKeeperPhase {
+    Builtin,
+    LegacySleep,
+    Pending(String),
+}
+
+/// This is readiness, never signal authority. Old worker records have no
+/// version marker: wait for their final sleep image/argv, not the shell that
+/// still has an exec to perform. New keepers have no exec after opening fd 3.
+#[cfg(any(target_os = "macos", test))]
+fn darwin_keeper_phase(args: &[&str], image: &Path, fifo: &Path) -> DarwinKeeperPhase {
+    if matches!(image.to_str(), Some("/bin/sh" | "/bin/bash"))
+        && matches!(args, ["/bin/sh" | "sh", "-c", program, input] if *program == DARWIN_HELD_KEEPER_PROGRAM && Some(*input) == fifo.to_str())
+    {
+        DarwinKeeperPhase::Builtin
+    } else if image == Path::new("/bin/sleep") && matches!(args, ["sleep" | "/bin/sleep", "2147483647"]) {
+        DarwinKeeperPhase::LegacySleep
+    } else {
+        DarwinKeeperPhase::Pending(format!("Keeper final image/arguments are not confirmed: image={image:?}"))
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug)]
+struct DarwinKeeperObservation {
+    member: DarwinGroupMember,
+    phase: DarwinKeeperPhase,
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn darwin_keeper_member(returned: i32, error: i32, pid: i32, pg: i32, member: DarwinGroupMember) -> anyhow::Result<DarwinGroupMember> {
     anyhow::ensure!(
@@ -1189,6 +1244,31 @@ fn darwin_keeper_state(keeper: Pid, pg: Pid) -> anyhow::Result<DarwinGroupMember
     )
 }
 
+#[cfg(target_os = "macos")]
+fn darwin_keeper_observation(keeper: Pid, pg: Pid, dir: &Path) -> anyhow::Result<DarwinKeeperObservation> {
+    use nix::libc;
+    let member = darwin_keeper_state(keeper, pg)?;
+    let phase = (|| -> anyhow::Result<DarwinKeeperPhase> {
+        let data = darwin_process_args(keeper.as_raw())?;
+        let args = darwin_procargs(&data).ok_or_else(|| anyhow::anyhow!("Invalid keeper argument reply"))?;
+        let mut image = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        nix::errno::Errno::clear();
+        // SAFETY: image is writable storage of the SDK's maximum path size.
+        let returned = unsafe { libc::proc_pidpath(keeper.as_raw(), image.as_mut_ptr().cast(), image.len() as u32) };
+        let error = nix::errno::Errno::last_raw();
+        let end = usize::try_from(returned).unwrap_or(0);
+        anyhow::ensure!(
+            end > 0 && end < image.len() && error == 0 && image[end] == 0,
+            "Unproven keeper image: bytes={returned} errno={error}"
+        );
+        use std::os::unix::ffi::OsStrExt;
+        let image = Path::new(std::ffi::OsStr::from_bytes(&image[..end]));
+        Ok(darwin_keeper_phase(&args, image, &dir.join("in")))
+    })()
+    .unwrap_or_else(|error| DarwinKeeperPhase::Pending(format!("{error:#}")));
+    Ok(DarwinKeeperObservation { member, phase })
+}
+
 /// The stopped-state proof never replaces FIFO authority. Capture start
 /// identity before SIGSTOP and reject a changed/exiting/unreadable member.
 /// Pinning spends the caller's existing grace, not a fresh retry allowance.
@@ -1196,7 +1276,7 @@ fn darwin_keeper_state(keeper: Pid, pg: Pid) -> anyhow::Result<DarwinGroupMember
 async fn darwin_pin_keeper_until(
     deadline: tokio::time::Instant,
     mut owned: impl FnMut() -> bool,
-    mut state: impl FnMut() -> anyhow::Result<DarwinGroupMember>,
+    mut state: impl FnMut() -> anyhow::Result<DarwinKeeperObservation>,
     stop: impl FnOnce() -> nix::Result<()>,
 ) -> anyhow::Result<()> {
     let mut observations = 0;
@@ -1212,25 +1292,46 @@ async fn darwin_pin_keeper_until(
             result
         };
         anyhow::ensure!(owned(), "Held Claude Code keeper ownership changed");
-        let identity = observe()?;
+        let mut observation = observe()?;
+        let identity = (observation.member.pid, observation.member.pgid, observation.member.start_sec, observation.member.start_usec);
+        while matches!(observation.phase, DarwinKeeperPhase::Pending(_)) {
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "Held Claude Code keeper final image was not confirmed before the held stop deadline"
+            );
+            tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + Duration::from_millis(10))).await;
+            anyhow::ensure!(owned(), "Held Claude Code keeper ownership changed");
+            observation = observe()?;
+            let member = &observation.member;
+            anyhow::ensure!(
+                (member.pid, member.pgid, member.start_sec, member.start_usec) == identity,
+                "Held Claude Code keeper process identity changed before SIGSTOP"
+            );
+        }
+        let phase = observation.phase;
         anyhow::ensure!(owned(), "Held Claude Code keeper ownership changed");
         anyhow::ensure!(tokio::time::Instant::now() < deadline, "Held Claude Code keeper stop deadline elapsed before SIGSTOP");
         stop()?;
+        let mut first_stopped = None;
         loop {
             anyhow::ensure!(owned(), "Held Claude Code keeper ownership changed");
-            let member = observe()?;
+            let observation = observe()?;
+            let member = observation.member;
             anyhow::ensure!(
-                (member.pid, member.pgid, member.start_sec, member.start_usec)
-                    == (identity.pid, identity.pgid, identity.start_sec, identity.start_usec),
+                (member.pid, member.pgid, member.start_sec, member.start_usec) == identity,
                 "Held Claude Code keeper process identity changed"
             );
-            if member.status == 4 && tokio::time::Instant::now() <= deadline {
+            anyhow::ensure!(observation.phase == phase, "Held Claude Code keeper final image changed after SIGSTOP");
+            if member.status == 4 {
                 anyhow::ensure!(owned(), "Held Claude Code keeper ownership changed");
-                anyhow::ensure!(
-                    tokio::time::Instant::now() <= deadline,
-                    "Held Claude Code keeper stop proof exceeded the held stop deadline"
-                );
-                return Ok(());
+                let now = tokio::time::Instant::now();
+                anyhow::ensure!(now <= deadline, "Held Claude Code keeper stop proof exceeded the held stop deadline");
+                if first_stopped.is_some_and(|first| now.duration_since(first) >= Duration::from_millis(10)) {
+                    return Ok(());
+                }
+                first_stopped.get_or_insert(now);
+            } else {
+                anyhow::ensure!(first_stopped.is_none(), "Held Claude Code keeper stopped state regressed before confirmation");
             }
             anyhow::ensure!(
                 tokio::time::Instant::now() < deadline,
@@ -1253,7 +1354,7 @@ async fn pin_held_keeper(keeper: Pid, pg: Pid, dir: &Path) -> anyhow::Result<()>
     darwin_pin_keeper_until(
         tokio::time::Instant::now() + Duration::from_secs(3),
         || keeper_holds_fifo(keeper, pg, dir),
-        || darwin_keeper_state(keeper, pg),
+        || darwin_keeper_observation(keeper, pg, dir),
         || nix::sys::signal::kill(keeper, Signal::SIGSTOP),
     )
     .await
@@ -1273,7 +1374,7 @@ enum DarwinHeldSignal {
 async fn darwin_stop_held_group(
     mut absent: impl FnMut() -> bool,
     mut owned: impl FnMut() -> bool,
-    state: impl FnMut() -> anyhow::Result<DarwinGroupMember>,
+    state: impl FnMut() -> anyhow::Result<DarwinKeeperObservation>,
     mut signal: impl FnMut(DarwinHeldSignal) -> nix::Result<()>,
     mut leader_alive: impl FnMut() -> bool,
     mut leader_owned: impl FnMut() -> bool,
@@ -1320,7 +1421,7 @@ async fn stop_held_group(pg: Pid, keeper: Pid, dir: &Path, conversation: &str) -
     darwin_stop_held_group(
         || matches!(group_probe(pg), Err(nix::errno::Errno::ESRCH)),
         || keeper_holds_fifo(keeper, pg, dir),
-        || darwin_keeper_state(keeper, pg),
+        || darwin_keeper_observation(keeper, pg, dir),
         |signal| match signal {
             DarwinHeldSignal::StopKeeper => nix::sys::signal::kill(keeper, Signal::SIGSTOP),
             DarwinHeldSignal::InterruptGroup => killpg(pg, Signal::SIGINT),
@@ -1964,19 +2065,17 @@ impl Process {
             .stdout(Stdio::from(std::fs::File::create(dir.join("out"))?))
             .stderr(Stdio::from(std::fs::File::create(dir.join("err"))?))
             .process_group(0);
+        // Allocate the parking pipe before starting the CLI: allocation
+        // failure must not strand an already-started wrapper.
+        #[cfg(target_os = "macos")]
+        let mut keeper_command = darwin_keeper_command(&fifo)?;
         let child = wrapped.spawn()?;
         let pgid = child.id().map(|id| Pid::from_raw(id as i32));
         // Holds the pipe open while no worker does, so the process never
         // reads an end of its input by a restart; in its process group, so
         // stopping it stops the keeper too.
+        #[cfg(not(target_os = "macos"))]
         let mut keeper = {
-            // Darwin delivers default-fatal SIGINT even to a stopped process.
-            // Ignore it in the keeper (and across exec) so its pinned FIFO
-            // remains authority throughout the CLI's grace period. SIGKILL
-            // still ends the keeper and the whole freshly verified group.
-            #[cfg(target_os = "macos")]
-            let program = r#"trap '' INT; exec 3<>"$0"; exec sleep 2147483647"#;
-            #[cfg(not(target_os = "macos"))]
             let program = r#"exec 3<>"$0"; exec sleep 2147483647"#;
             tokio::process::Command::new("/bin/sh")
                 .arg("-c")
@@ -1987,6 +2086,14 @@ impl Process {
                 .stderr(Stdio::null())
                 .process_group(pgid.map_or(0, |p| p.as_raw()))
                 .spawn()?
+        };
+        #[cfg(target_os = "macos")]
+        let mut keeper = {
+            let keeper = keeper_command.process_group(pgid.map_or(0, |p| p.as_raw())).spawn()?;
+            // Do not retain parent pipe ends: the keeper alone owns its
+            // lifetime, including across worker exit/adoption.
+            drop(keeper_command);
+            keeper
         };
         let keeper_pid = Pid::from_raw(keeper.id().expect("spawned keeper") as i32);
         // Reap it while this worker lives, without owning its lifetime. A
@@ -6168,8 +6275,263 @@ done
             DarwinGroupMember { pid: 42, pgid: 41, status, flags: 0, start_sec: 100, start_usec: 10 }
         }
 
-        fn observed(status: u32) -> anyhow::Result<DarwinGroupMember> {
-            darwin_keeper_member(DARWIN_BSDINFO_SIZE, 0, 42, 41, member(status))
+        fn observed(status: u32) -> anyhow::Result<DarwinKeeperObservation> {
+            Ok(DarwinKeeperObservation {
+                member: darwin_keeper_member(DARWIN_BSDINFO_SIZE, 0, 42, 41, member(status))?,
+                phase: DarwinKeeperPhase::Builtin,
+            })
+        }
+
+        #[test]
+        fn final_phase_requires_exact_builtin_or_legacy_sleep_image_and_arguments() {
+            let fifo = Path::new("/private/held path/in");
+            let builtin = ["/bin/sh", "-c", DARWIN_HELD_KEEPER_PROGRAM, fifo.to_str().unwrap()];
+            for image in ["/bin/sh", "/bin/bash"] {
+                assert_eq!(darwin_keeper_phase(&builtin, Path::new(image), fifo), DarwinKeeperPhase::Builtin);
+            }
+            for args in [["sleep", "2147483647"], ["/bin/sleep", "2147483647"]] {
+                assert_eq!(darwin_keeper_phase(&args, Path::new("/bin/sleep"), fifo), DarwinKeeperPhase::LegacySleep);
+            }
+            for (args, image) in [
+                (builtin.as_slice(), "/bin/sleep"),
+                (["/bin/sh", "-c", DARWIN_HELD_KEEPER_PROGRAM, "/other/in"].as_slice(), "/bin/bash"),
+                (["/bin/sh", "-c", r#"trap '' INT; exec 3<>"$0"; exec sleep 2147483647"#, fifo.to_str().unwrap()].as_slice(), "/bin/bash"),
+                (["sleep", "2147483647"].as_slice(), "/bin/bash"),
+                (["sleep", "2147483647"].as_slice(), "/other/sleep"),
+                (["sleep", "2147483647", "extra"].as_slice(), "/bin/sleep"),
+                (["sleep", "300"].as_slice(), "/bin/sleep"),
+                ([].as_slice(), "/bin/sleep"),
+            ] {
+                assert!(matches!(darwin_keeper_phase(args, Path::new(image), fifo), DarwinKeeperPhase::Pending(_)), "{args:?} {image}");
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn legacy_exec_must_publish_its_final_image_before_the_only_stop() {
+            let start = tokio::time::Instant::now();
+            let elapsed = || (tokio::time::Instant::now() - start).as_millis();
+            let stopped = Cell::new(false);
+            let signals = RefCell::new(Vec::new());
+            darwin_stop_held_group(
+                || false,
+                || true,
+                || {
+                    Ok(DarwinKeeperObservation {
+                        member: member(if stopped.get() { 4 } else { 2 }),
+                        phase: if elapsed() < 1500 {
+                            DarwinKeeperPhase::Pending("legacy exec is still replacing the shell".into())
+                        } else {
+                            DarwinKeeperPhase::LegacySleep
+                        },
+                    })
+                },
+                |signal| {
+                    signals.borrow_mut().push((signal, elapsed()));
+                    if signal == DarwinHeldSignal::StopKeeper {
+                        stopped.set(true);
+                    }
+                    Ok(())
+                },
+                || true,
+                || panic!("an owned pending keeper must never use the leader fallback"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                signals.into_inner(),
+                vec![(DarwinHeldSignal::StopKeeper, 1500), (DarwinHeldSignal::InterruptGroup, 1510), (DarwinHeldSignal::KillGroup, 3000),]
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn unproven_final_image_never_signals_or_uses_the_leader_fallback() {
+            let start = tokio::time::Instant::now();
+            let error = darwin_stop_held_group(
+                || false,
+                || true,
+                || {
+                    Ok(DarwinKeeperObservation {
+                        member: member(2),
+                        phase: DarwinKeeperPhase::Pending("unreadable or mixed image/arguments".into()),
+                    })
+                },
+                |_| panic!("no signal before final-image readiness"),
+                || panic!("no interrupt grace before final-image readiness"),
+                || panic!("pending image is not lost FIFO authority"),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(3));
+            let transcript = error.to_string();
+            assert!(transcript.contains("observations=301"), "{transcript}");
+            assert!(transcript.contains("unreadable or mixed image/arguments"), "{transcript}");
+            assert!(transcript.contains("final image was not confirmed"), "{transcript}");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_transient_stop_or_changed_final_phase_never_authorizes_interrupt() {
+            for changed_image in [false, true] {
+                let observations = Cell::new(0);
+                let signals = RefCell::new(Vec::new());
+                let start = tokio::time::Instant::now();
+                let error = darwin_stop_held_group(
+                    || false,
+                    || true,
+                    || {
+                        observations.set(observations.get() + 1);
+                        Ok(DarwinKeeperObservation {
+                            member: member(if observations.get() == 3 && !changed_image { 2 } else { 4 }),
+                            phase: if observations.get() == 3 && changed_image {
+                                DarwinKeeperPhase::LegacySleep
+                            } else {
+                                DarwinKeeperPhase::Builtin
+                            },
+                        })
+                    },
+                    |signal| {
+                        signals.borrow_mut().push(signal);
+                        Ok(())
+                    },
+                    || panic!("transient proof must not enter interrupt grace"),
+                    || panic!("no fallback after a failed pin"),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(signals.into_inner(), vec![DarwinHeldSignal::StopKeeper]);
+                assert_eq!(tokio::time::Instant::now() - start, Duration::from_millis(10));
+                assert!(error.to_string().contains(if changed_image { "final image changed" } else { "stopped state regressed" }));
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_truncated_deadline_cannot_turn_one_stop_sample_into_two() {
+            let start = tokio::time::Instant::now();
+            let stops = Cell::new(0);
+            let error = darwin_pin_keeper_until(
+                start + Duration::from_millis(5),
+                || true,
+                || observed(4),
+                || {
+                    stops.set(stops.get() + 1);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(stops.get(), 1);
+            assert_eq!(tokio::time::Instant::now() - start, Duration::from_millis(5));
+            assert!(error.to_string().contains("did not confirm that it stopped by the held stop deadline"));
+        }
+
+        #[tokio::test]
+        async fn builtin_keeper_holds_its_private_pipe_without_consuming_fifo_and_dies_on_kill() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            for group in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let fifo = dir.path().join("in");
+                nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR).unwrap();
+                let mut command = darwin_keeper_command(&fifo).unwrap();
+                command.process_group(0).kill_on_drop(true);
+                let mut child = command.spawn().unwrap();
+                drop(command); // No parent-owned pipe end or child stdin writer.
+                assert!(child.stdin.is_none() && child.stdout.is_none());
+                let pid = Pid::from_raw(child.id().unwrap() as i32);
+                c6_testkit::eventually("the builtin keeper's own FIFO readiness", async || {
+                    keeper_holds_fifo(pid, pid, dir.path()).then_some(())
+                })
+                .await;
+                let mut input = tokio::fs::OpenOptions::new().read(true).write(true).open(&fifo).await.unwrap();
+                input.write_all(b"not keeper input\n").await.unwrap();
+                let mut bytes = [0u8; 17];
+                c6_testkit::within("the CLI FIFO bytes to remain unread by the keeper", input.read_exact(&mut bytes)).await.unwrap();
+                assert_eq!(&bytes, b"not keeper input\n");
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(30), child.wait()).await.is_err(),
+                    "dropping every parent pipe end and polling wait must not cause keeper EOF"
+                );
+                nix::sys::signal::kill(pid, Signal::SIGSTOP).unwrap();
+                c6_testkit::eventually("the builtin keeper's stop", async || keeper_stopped(pid).then_some(())).await;
+                killpg(pid, Signal::SIGINT).unwrap();
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(30), child.wait()).await.is_err(),
+                    "the self-held pipe and ignored INT must survive waiting/cancellation"
+                );
+                assert!(keeper_stopped(pid) && keeper_holds_fifo(pid, pid, dir.path()));
+                if group {
+                    killpg(pid, Signal::SIGKILL).unwrap();
+                } else {
+                    nix::sys::signal::kill(pid, Signal::SIGKILL).unwrap();
+                }
+                c6_testkit::within("the builtin keeper to reap after SIGKILL", child.wait()).await.unwrap();
+                c6_testkit::eventually("the builtin keeper's whole isolated group to disappear", async || {
+                    (group_probe(pid) == Err(nix::errno::Errno::ESRCH)).then_some(())
+                })
+                .await;
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        #[tokio::test]
+        async fn legacy_exec_sleep_records_survive_adoption_and_metadata_only_rewind_cleanup() {
+            for rewind in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let held = dir.path().join("held");
+                let _cleanup = HeldFixtureCleanup(held.clone());
+                let bin = live_claude(dir.path());
+                let mut p = Process::spawn_held(
+                    &held,
+                    "s",
+                    &bin,
+                    Launch { conversation: "legacy".into(), ..Default::default() },
+                    false,
+                    dir.path(),
+                    "opus",
+                    Arc::default(),
+                    None,
+                    None,
+                )
+                .unwrap();
+                let pg = p.pgid.unwrap();
+                let record = held.join("legacy");
+                let original = p.held.as_ref().unwrap().keeper;
+                c6_testkit::eventually("the owned builtin keeper before legacy fixture handover", async || {
+                    keeper_holds_fifo(original, pg, &record).then_some(())
+                })
+                .await;
+                let mut legacy = tokio::process::Command::new("/bin/sh")
+                    .arg("-c")
+                    .arg(r#"trap '' INT; exec 3<>"$0"; exec sleep 2147483647"#)
+                    .arg(record.join("in"))
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .process_group(pg.as_raw())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .unwrap();
+                let keeper = Pid::from_raw(legacy.id().unwrap() as i32);
+                c6_testkit::eventually("the legacy keeper's FIFO authority", async || keeper_holds_fifo(keeper, pg, &record).then_some(()))
+                    .await;
+                assert!(keeper_holds_fifo(original, pg, &record));
+                nix::sys::signal::kill(original, Signal::SIGKILL).unwrap();
+                p.held.as_mut().unwrap().keeper = keeper;
+                let path = record.join("meta.json");
+                let mut meta: HeldMeta = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                meta.keeper = keeper.as_raw();
+                std::fs::write(&path, serde_json::to_vec(&meta).unwrap()).unwrap();
+                drop(p); // Existing metadata, no new protocol/version field.
+                if rewind {
+                    let journal = crate::journal::Journal::open(&dir.path().join("journal.db")).await.unwrap();
+                    stop_held_for_rewind(&held, "s", &journal).await.unwrap();
+                    assert!(journal.claude_processes("s").await.unwrap().is_empty());
+                } else {
+                    let adopted = Process::attach(&held, "legacy", dir.path(), "opus", Arc::default(), None, None).await.unwrap();
+                    adopted.close_for_replacement().await.unwrap();
+                }
+                c6_testkit::within("the old-format keeper to reap after upgraded cleanup", legacy.wait()).await.unwrap();
+                assert_eq!(group_probe(pg), Err(nix::errno::Errno::ESRCH));
+                assert!(!record.exists());
+            }
         }
 
         #[test]
@@ -6201,7 +6563,7 @@ done
 
         #[tokio::test(start_paused = true)]
         async fn slow_confirmation_and_readiness_spend_only_the_existing_interrupt_grace() {
-            for (ready_ms, stopped_ms) in [(0, 1500), (800, 2000), (0, 3000)] {
+            for (ready_ms, stopped_ms) in [(0, 1500), (800, 2000), (0, 2990)] {
                 let start = tokio::time::Instant::now();
                 let elapsed = || (tokio::time::Instant::now() - start).as_millis();
                 let signals = RefCell::new(Vec::new());
@@ -6222,7 +6584,7 @@ done
                     signals.into_inner(),
                     vec![
                         (DarwinHeldSignal::StopKeeper, ready_ms),
-                        (DarwinHeldSignal::InterruptGroup, stopped_ms),
+                        (DarwinHeldSignal::InterruptGroup, stopped_ms + 10),
                         (DarwinHeldSignal::KillGroup, 3000),
                     ],
                     "no SIGINT before confirmed STOP and no new grace after slow confirmation"
@@ -6280,9 +6642,13 @@ done
                             return observed(2);
                         }
                         if changed_identity {
-                            Ok(DarwinGroupMember { start_sec: 101, ..member(4) })
+                            Ok(DarwinKeeperObservation {
+                                member: DarwinGroupMember { start_sec: 101, ..member(4) },
+                                phase: DarwinKeeperPhase::Builtin,
+                            })
                         } else {
                             darwin_keeper_member(DARWIN_BSDINFO_SIZE - 1, 0, 42, 41, member(4))
+                                .map(|member| DarwinKeeperObservation { member, phase: DarwinKeeperPhase::Builtin })
                         }
                     },
                     |signal| {
@@ -6304,7 +6670,7 @@ done
 
         #[tokio::test(start_paused = true)]
         async fn every_observation_and_group_kill_require_fresh_fifo_authority() {
-            for loss in 0..4 {
+            for loss in 0..5 {
                 let checks = Cell::new(0);
                 let stopped = Cell::new(false);
                 let proof = Cell::new(false);
@@ -6319,6 +6685,7 @@ done
                             1 => stopped.get(),     // Gone before the first post-STOP observation.
                             2 => proof.get(),       // Gone after SSTOP, before accepting its proof.
                             3 => interrupted.get(), // Gone during grace, before group SIGKILL.
+                            4 => checks.get() >= 7, // Gone after the second SSTOP, before accepting proof.
                             _ => unreachable!(),
                         })
                     },
@@ -6373,22 +6740,24 @@ done
             assert!(error.to_string().contains("observations=1"));
             assert_eq!(tokio::time::Instant::now(), start);
 
-            let signals = RefCell::new(Vec::new());
-            let mut stop = Box::pin(darwin_stop_held_group(
-                || false,
-                || true,
-                || observed(2),
-                |signal| {
-                    signals.borrow_mut().push(signal);
-                    Ok(())
-                },
-                || true,
-                || false,
-            ));
-            assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(stop.as_mut(), cx))).await.is_pending());
-            drop(stop);
-            assert_eq!(signals.into_inner(), vec![DarwinHeldSignal::StopKeeper]);
-            assert_eq!(tokio::time::Instant::now(), start);
+            for status in [2, 4] {
+                let signals = RefCell::new(Vec::new());
+                let mut stop = Box::pin(darwin_stop_held_group(
+                    || false,
+                    || true,
+                    || observed(status),
+                    |signal| {
+                        signals.borrow_mut().push(signal);
+                        Ok(())
+                    },
+                    || true,
+                    || false,
+                ));
+                assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(stop.as_mut(), cx))).await.is_pending());
+                drop(stop);
+                assert_eq!(signals.into_inner(), vec![DarwinHeldSignal::StopKeeper]);
+                assert_eq!(tokio::time::Instant::now(), start);
+            }
         }
 
         #[tokio::test(start_paused = true)]

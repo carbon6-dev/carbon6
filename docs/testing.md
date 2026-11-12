@@ -1828,10 +1828,33 @@ Before interrupting a held group, macOS observes the keeper's state directly wit
 `PROC_PIDTBSDINFO`, not a fork/exec of `/bin/ps` for every poll. An exact-sized,
 zero-errno response must identify the expected PID and process group, have a
 valid start time and a live, non-exiting state. Capture that start identity
-before SIGSTOP and require it to remain unchanged. Only `pbi_status == SSTOP`
-confirms the stop; a successful SIGSTOP syscall alone does not. The actual FIFO
-vnode authority is checked before every state observation and again after a
-stopped observation. BSD state is never a substitute for FIFO ownership.
+before SIGSTOP and require it to remain unchanged. Confirmation requires two
+`pbi_status == SSTOP` observations at least 10 ms apart, both within the original
+deadline and with the same eligible final-image phase. A successful SIGSTOP
+syscall or a single transient SSTOP is not enough. The actual FIFO vnode
+authority is checked before every observation and again after each stopped
+observation. BSD state is never a substitute for FIFO ownership.
+
+Darwin exec can replace the proc/task after a successful STOP without changing
+the PID or start timestamp. New macOS keepers therefore do **not** exec sleep
+after opening the authoritative FIFO. Their final system-shell image uses only
+builtins: ignore INT, open FD 3, then read from a private anonymous pipe on
+stdin. The same keeper holds that pipe's writer on stdout, so no parent handle
+or worker lifetime keeps it alive. No bytes are written to the private pipe,
+and it never reads the CLI FIFO. The pipe is allocated before starting the CLI,
+parent ends are dropped after spawning the keeper, and SIGKILL closes both child
+ends without another process or filesystem artifact.
+
+Existing records from the INT-ignoring exec-sleep launcher remain supported
+without a metadata change. Before sending STOP, read exact argument boundaries
+and `proc_pidpath`: accept either the exact new builtin script/FIFO in the system
+shell or the known final `/bin/sleep` image with its exact duration argument.
+The legacy shell, mixed transition samples and unreadable/unknown arguments or
+image remain pending within the same budget. Pending image is **not** absent
+FIFO ownership and must not enter the leader-only fallback. Path/argv checks
+are readiness, not ownership; no thread-WAITING or zero-running heuristic is
+used. After STOP, unreadable/changed phase, identity loss or an observed SSTOP
+regression refuses cleanup rather than re-signaling or accepting weaker proof.
 
 Keeper readiness, stop confirmation and SIGINT grace share **one absolute
 three-second deadline**, anchored at entry to the held-group stop. This spends
@@ -1853,10 +1876,15 @@ a production stop/replacement issue, not just fixture teardown.
 Keeper-confirmation errors retain the **observation count and last raw state or
 query error** in ordinary displayed errors, including PID, PGID, state, flags and
 start time (plus response size/errno on invalid replies). Successful confirmation
-records its count/state at debug level. The `darwin_keeper_tests` module drives
+records its count/state at debug level. Final-image phase/reason is included in
+each observation. The `darwin_keeper_tests` module drives
 the actual Darwin orchestration with paused time: slow/readiness-delayed STOP,
 the shared deadline, no premature SIGINT, unconfirmed/invalid/changed state,
-FIFO authority loss, cancellation, fresh absence and leader-only fallback.
+pending legacy exec, transient SSTOP, truncated two-sample deadlines, FIFO
+authority loss, cancellation, fresh absence and leader-only fallback. Real-child
+tests exercise the builtin's self-held pipe, FIFO non-consumption, ignored group
+INT and individual/group SIGKILL reaping. Native tests also exercise adoption
+and metadata-only Rewind cleanup of the old exec-sleep record format.
 
 ## Production image-preview browser regression
 
