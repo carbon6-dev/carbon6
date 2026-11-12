@@ -1,6 +1,6 @@
 # Starting several tasks together — Design
 
-Status: proposed (2026-11-12), not built. Open questions in §7.
+Status: decided (2026-11-12), not built. Decisions in §7.
 
 ## 1. The problem
 
@@ -25,9 +25,9 @@ Where the link shows:
 |---|---|---|
 | A session's panel | **Suggested tasks** | 2+ open cards |
 | Decisions | **Suggested tasks** (all sessions) | 2+ open cards |
-| A work item | **To do** | 2+ open to-dos |
+| A work item | **To do** | 2+ open to-dos and task cards together |
 
-To batch cards from different sessions into one piece of work, save them for later (to that work), then start them together from its To do list. That path already exists, so it needs nothing new.
+**Cards and to-dos together.** A work item's picker lists its open to-dos and, below them, the open task cards raised by the sessions it holds. Each card is marked "task card". Starting a batch that includes cards first saves each picked card as a to-do on this work (as Save for later does, answering the card) and then starts them all as to-dos (§3). So every task in the batch is tracked and ticked off the same way. Cards from sessions outside this work still get there by Save elsewhere….
 
 ## 3. What starting together does
 
@@ -43,7 +43,7 @@ To batch cards from different sessions into one piece of work, save them for lat
 
 **Cards → Do them here.** One message to the proposing session, with all their prompts. Each card is answered "Do it here".
 
-**To-dos → Start N in one session.** As ▶ Start does today, the new-session form opens, joining the work, filled in as for a single to-do. Its first message comes from the editable prompt `work.todos`: the to-dos with their prompts, what the work is and where it stands, and how to tick off each one (`todo_done` per to-do, with its own evidence). The new session becomes each to-do's `session`. Ticking stays per to-do, so an item it doesn't finish stays open.
+**To-dos (with any cards) → Start N in one session.** As ▶ Start does today, the new-session form opens, joining the work, filled in as for a single to-do. Its first message comes from the editable prompt `work.todos`: the to-dos with their prompts, what the work is and where it stands, and how to tick off each one (`todo_done` per to-do, with its own evidence). The new session becomes each to-do's `session`. Ticking stays per to-do, so an item it doesn't finish stays open.
 
 ## 4. Rules that keep it simple
 
@@ -55,7 +55,7 @@ To batch cards from different sessions into one piece of work, save them for lat
 
 - Selection mode or checkboxes on the cards themselves.
 - Batches the agent proposes (`task_propose` stays one task). A session that proposes related cards puts them side by side, where Start together finds them.
-- Batch Save for later or Not now: those stay per card.
+- Batch Save for later or Not now: those stay per card (except that a card picked on a work item is saved there as part of its start, §2).
 - Batching across workers or repos; starting each in its own session from the picker (that's the existing Start).
 
 ## 6. Steps
@@ -63,6 +63,7 @@ To batch cards from different sessions into one piece of work, save them for lat
 1. **Head:**
    - `POST /api/v1/decisions/task-batch {ids, how: "start" | "here"}`, which checks the cards are open, share a place and number 2–10, then starts or delivers and answers each card;
    - `GET /api/v1/work/{id}/todos/start?todos=a,b,c`, giving the batch's first message and the session to start from;
+   - `GET /api/v1/work/{id}/cards`, the open task cards of the work's sessions, and `POST /api/v1/work/{id}/todos/from-cards {ids}`, which saves them as this work's to-dos (answering each) and returns their to-do ids; the form's start then names those with the others;
    - the catalog ops for both, so the assistant and API have them.
 2. **Prompts:** `session.task_batch` and `work.todos`, editable.
 3. **UI:** one `StartTogether` picker component, used by the session panel's and Decisions' Suggested tasks and by the work item's To do.
@@ -71,10 +72,13 @@ To batch cards from different sessions into one piece of work, save them for lat
    - cards in different folders aren't offered together;
    - a failed start answers no card;
    - a batched to-do start marks each to-do's session, and ticking one leaves the others open;
-   - Do them here sends one message.
+   - Do them here sends one message;
+   - a work item's picker lists the open cards of its sessions; a batch with one card and two to-dos saves the card as a to-do (answered once), starts one session for all three, and ticking each works as for any to-do;
+   - cancelling the form after picking cards leaves them saved as to-dos, not lost and not re-raised.
 
-## 7. Open questions
+## 7. Decisions (2026-11-12)
 
-1. **Cards start at once, to-dos open the form,** as their single starts do today. Keep that difference, or have both open the form, so you can edit the combined message before it goes?
-2. **Default order:** the order shown (oldest first). Or let the agent pick the order, since it's told to do them in a sensible sequence?
-3. **One commit per task:** in the default prompt, or left to the repo's own conventions?
+1. **Cards and to-dos batch together** on a work item (§2). That picker includes the open cards of the work's sessions.
+2. **Cards start at once, to-dos open the form,** as their single starts do. A batch with any to-do (including a work item's batch with cards) opens the form, where the combined message can be edited.
+3. **Order:** as shown in the picker, to-dos first, then cards. The agent may say why it would change the order, but follows it.
+4. **Commits:** the default prompt asks for one commit per task where the repo uses commits. It's an editable prompt, so a repo's own conventions can override it.
