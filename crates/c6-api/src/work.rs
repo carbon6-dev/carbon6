@@ -95,6 +95,113 @@ pub struct Todo {
     pub done_by: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub evidence: String,
+    /// What prompted it, in a session's transcript (docs/capture.md §5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote: Option<Quote>,
+}
+
+/// A piece of a session's transcript: the entry (`seq`) and the words
+/// chosen in it (docs/capture.md §5).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Quote {
+    pub session: String,
+    pub seq: u64,
+    #[serde(default)]
+    pub text: String,
+}
+
+/// A thought about a session to send it later: a follow-up in its Up next
+/// (docs/capture.md §4).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Followup {
+    pub id: String,
+    pub session: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote: Option<Quote>,
+    pub at: UnixMs,
+}
+
+/// `POST /api/v1/sessions/{id}/followups` (and `PATCH …/{followup}`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct FollowupNew {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote: Option<Quote>,
+}
+
+/// `POST /api/v1/sessions/{id}/followups/send`: these, as one message
+/// (all of them when empty); `POST …/followups/{followup}/todo` moves one
+/// to the session's work.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct FollowupSend {
+    #[serde(default)]
+    pub ids: Vec<String>,
+}
+
+/// `POST /api/v1/sessions/{id}/todos`: a to-do on the session's work (new
+/// work named after it if it has none), from its message box or
+/// transcript (docs/capture.md §3).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SessionTodo {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote: Option<Quote>,
+}
+
+/// What `POST /api/v1/sessions/{id}/todos` did: the work it went to.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SessionTodoAdded {
+    pub work: String,
+    pub title: String,
+}
+
+/// `POST /api/v1/decisions/task-batch`: start task cards together
+/// (docs/batch-starts.md §3), `how` "start" (one new session) or "here"
+/// (the session that proposed them).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TaskBatch {
+    pub ids: Vec<i64>,
+    pub how: String,
+}
+
+/// What a task batch did: the new session, for "start".
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TaskBatchStarted {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+}
+
+/// `POST /api/v1/work/{id}/todos/from-cards`: open task cards of the
+/// work's sessions kept as its to-dos, for a batch (docs/batch-starts.md §2).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct FromCards {
+    pub ids: Vec<i64>,
+}
+
+/// The to-dos those cards became, in order.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct FromCardsKept {
+    pub todos: Vec<String>,
+}
+
+/// `GET /api/v1/work/{id}/todos/start?todos=a,b,c`: several to-dos'
+/// session, started together.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TodosStartQuery {
+    /// The to-dos' ids, comma-separated, in order.
+    pub todos: String,
 }
 
 /// `POST /api/v1/work/{id}/todos`.
@@ -105,6 +212,9 @@ pub struct TodoNew {
     /// What a session started on it is told, if more than the text.
     #[serde(default)]
     pub prompt: String,
+    /// What prompted it, in a session's transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote: Option<Quote>,
 }
 
 /// `PATCH /api/v1/work/{id}/todos/{todo}`: what changes.

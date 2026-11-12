@@ -1,6 +1,6 @@
 # Capturing thoughts while a session runs — Design
 
-Status: proposed (2026-11-12), not built. Open questions in §8.
+Status: built (2026-11-12). Decisions in §8, as built in §9.
 
 ## 1. The problem
 
@@ -83,8 +83,24 @@ Without a selection, each entry's existing ⋯ menu offers the same three for th
    - archiving with unsent follow-ups moves them to the work;
    - a quoted to-do's link opens the session at that entry.
 
-## 8. Open questions
+## 8. Decisions (2026-11-12)
 
-1. **Command names:** `/todo` and `/next`? Or `/later` for follow-ups?
-2. **Unsent follow-ups on archive** become to-dos (my recommendation), or are they dropped?
-3. **Up next and notifications:** should a "finished" notification mention unsent follow-ups ("2 follow-ups waiting")?
+1. **Commands:** `/todo` and `/next`.
+2. **Archiving:** unsent follow-ups become to-dos on the session's work.
+3. **Notifications:** a "finished" notification says how many follow-ups are waiting.
+
+## 9. As built (2026-11-12)
+
+- **Head:**
+  - Follow-ups are a table (`0065_followups.sql`) with `crate::followups`, served at `/api/v1/sessions/{id}/followups[/send|/{f}|/{f}/todo]` (ops `sessions.followups.*`).
+  - `POST /api/v1/sessions/{id}/todos` (`work::session_todo`, op `sessions.todos.add`) adds to the session's work. If it has none, it makes new work named after the session, holding it.
+  - `Todo.quote` and `Followup.quote` are `{session, seq, text}`, the text kept to 1,000 characters.
+  - `api::Session.followups` counts what's waiting for the session list.
+  - A to-do's quote goes into the first message of a session started on it.
+- **UI:**
+  - `/todo` and `/next` are composer commands (in the slash menu, run by the UI unless a custom command takes the name). Each confirms on the status line under the box.
+  - `capture::UpNext` sits above the message box.
+  - `capture::SelectionCapture` is the popover for a selection within one entry. `capture::EntryCapture` adds Quote, To-do… and Ask next… to the phone's Message actions.
+  - `capture::QuoteLine` shows a quote on a work item's to-dos and in Up next. It opens the session at the entry (`Target.at`, now also in the URL as `&at=`).
+- **Different from §5:** a sent follow-up carries its quote as a Markdown quote (`> …`) above your words. It has no `c6:session:<id>@<seq>` link, because your messages show as plain text and the agent already has the transcript. The link back stays on the follow-up and the to-do.
+- **Tests:** `batch_capture::notes_while_it_works_and_to_dos_with_cards_start_together` (the head) and `capture::tests::a_quote_links_to_its_entry` (the UI).

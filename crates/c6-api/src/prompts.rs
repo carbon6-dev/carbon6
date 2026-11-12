@@ -257,6 +257,21 @@ pub const WORK_TODO: &str = "{{todo}}\n\n---\nThis is one step of a piece of wor
 {{done_when}}).\nWhere the work stands:\n{{note}}\n\nWhen this step is done, tick it off with the work tool (action todo_done, id \
 {{id}}, with the evidence in one line).";
 
+/// The first message of a session started on several of a work's to-dos
+/// together (docs/batch-starts.md §3). `{{todos}}` (each: its id, then
+/// what it asks), `{{title}}`, `{{done_when}}`, `{{note}}`.
+pub const WORK_TODOS: &str = "Do these steps of a piece of work I mean to finish, in this order, in this one session:\n\n{{todos}}\n\n---\n\
+The work: {{title}} (done when: {{done_when}}).\nWhere it stands:\n{{note}}\n\nKeep each step a separate commit where the repo uses \
+commits. As each step is done, tick it off with the work tool (action todo_done, its id, with the evidence in one line). If you would \
+change the order, say why, but follow it. At the end, report each step in one line: done, or not and why.";
+
+/// The first message of a session started on several task cards
+/// together (docs/batch-starts.md §3). `{{tasks}}` (each: its card's
+/// number and title, then its prompt).
+pub const TASK_BATCH: &str = "Do these tasks, in this order, in this one session:\n\n{{tasks}}\n\n---\nKeep each task a separate \
+commit where the repo uses commits. If you would change the order, say why, but follow it. At the end, report each task in one line: \
+done, or not and why.";
+
 /// Pieces of work in what's open (the one-time offer, docs/work.md §9).
 /// `{{things}}` (open sessions and requests, one per line with a ref).
 pub const WORK_PROPOSE: &str = "The user has many things open at once and is losing track of them. Group what is open below into the \

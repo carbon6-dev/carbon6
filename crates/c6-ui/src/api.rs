@@ -1712,7 +1712,7 @@ pub async fn work_pickup(id: String) -> Result<String, String> {
 }
 
 pub async fn work_todo_add(id: String, text: String) -> Result<WorkItem, String> {
-    send_json(Request::post(&format!("/api/v1/work/{id}/todos")), &c6_api::work::TodoNew { text, prompt: String::new() }).await
+    send_json(Request::post(&format!("/api/v1/work/{id}/todos")), &c6_api::work::TodoNew { text, ..Default::default() }).await
 }
 
 pub async fn work_todo_patch(id: String, todo: String, p: c6_api::work::TodoPatch) -> Result<WorkItem, String> {
@@ -1726,6 +1726,66 @@ pub async fn work_todo_remove(id: String, todo: String) -> Result<WorkItem, Stri
 /// A session's first message for a to-do, and the session to start from.
 pub async fn work_todo_start(id: String, todo: String) -> Result<c6_api::work::TodoStart, String> {
     json(Request::get(&format!("/api/v1/work/{id}/todos/{todo}/start")).send().await).await
+}
+
+/// The first message of one session for several to-dos, and where it
+/// starts from (docs/batch-starts.md).
+pub async fn work_todos_start(id: String, todos: Vec<String>) -> Result<c6_api::work::TodoStart, String> {
+    json(Request::get(&format!("/api/v1/work/{id}/todos/start")).query([("todos", todos.join(","))]).send().await).await
+}
+
+/// The open task cards of a work's sessions.
+pub async fn work_cards(id: String) -> Result<Vec<c6_api::Decision>, String> {
+    json(Request::get(&format!("/api/v1/work/{id}/cards")).send().await).await
+}
+
+/// Keeps task cards as a work's to-dos; their ids, in order.
+pub async fn work_todos_from_cards(id: String, ids: Vec<i64>) -> Result<Vec<String>, String> {
+    let kept: c6_api::work::FromCardsKept =
+        send_json(Request::post(&format!("/api/v1/work/{id}/todos/from-cards")), &c6_api::work::FromCards { ids }).await?;
+    Ok(kept.todos)
+}
+
+/// Starts task cards together: `how` "start" or "here".
+pub async fn task_batch(ids: Vec<i64>, how: &str) -> Result<Option<String>, String> {
+    let r: c6_api::work::TaskBatchStarted =
+        send_json(Request::post("/api/v1/decisions/task-batch"), &c6_api::work::TaskBatch { ids, how: how.to_owned() }).await?;
+    Ok(r.session)
+}
+
+// --- Capture (docs/capture.md) ------------------------------------------------
+
+/// A to-do on a session's work; the work it went to.
+pub async fn session_todo(id: String, text: String, quote: Option<c6_api::work::Quote>) -> Result<c6_api::work::SessionTodoAdded, String> {
+    send_json(Request::post(&format!("/api/v1/sessions/{id}/todos")), &c6_api::work::SessionTodo { text, quote }).await
+}
+
+pub async fn followups(id: String) -> Result<Vec<c6_api::work::Followup>, String> {
+    json(Request::get(&format!("/api/v1/sessions/{id}/followups")).send().await).await
+}
+
+pub async fn followup_add(id: String, text: String, quote: Option<c6_api::work::Quote>) -> Result<c6_api::work::Followup, String> {
+    send_json(Request::post(&format!("/api/v1/sessions/{id}/followups")), &c6_api::work::FollowupNew { text, quote }).await
+}
+
+pub async fn followup_edit(id: String, followup: String, text: String) -> Result<c6_api::work::Followup, String> {
+    send_json(Request::patch(&format!("/api/v1/sessions/{id}/followups/{followup}")), &c6_api::work::FollowupNew { text, quote: None })
+        .await
+}
+
+pub async fn followup_remove(id: String, followup: String) -> Result<(), String> {
+    empty(Request::delete(&format!("/api/v1/sessions/{id}/followups/{followup}")).send().await).await
+}
+
+/// Sends follow-ups (all, when `ids` is empty) as one message.
+pub async fn followups_send(id: String, ids: Vec<String>) -> Result<(), String> {
+    let _: serde_json::Value =
+        send_json(Request::post(&format!("/api/v1/sessions/{id}/followups/send")), &c6_api::work::FollowupSend { ids }).await?;
+    Ok(())
+}
+
+pub async fn followup_to_todo(id: String, followup: String) -> Result<c6_api::work::SessionTodoAdded, String> {
+    json(Request::post(&format!("/api/v1/sessions/{id}/followups/{followup}/todo")).send().await).await
 }
 
 // --- Documents (docs/docs.md) ------------------------------------------------

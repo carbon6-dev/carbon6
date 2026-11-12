@@ -2595,6 +2595,23 @@ fn Transcript(
             actions_open.try_set(false);
         },
     ));
+    // Words you pick in the transcript, quoted into your message
+    // (docs/capture.md §5).
+    let quote_in = Callback::new(move |q: String| {
+        if let Some(d) = feed.composer.get_untracked() {
+            let quoted = q.lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n");
+            d.text.update(|t| {
+                if !t.is_empty() && !t.ends_with("\n\n") {
+                    t.push_str(if t.ends_with('\n') { "\n" } else { "\n\n" });
+                }
+                t.push_str(&quoted);
+                t.push_str("\n\n");
+            });
+            if let Some(a) = d.area.get_untracked() {
+                let _ = a.focus();
+            }
+        }
+    });
     let actions_context = Memo::new(move |_| {
         events.with(|evs| {
             evs.iter()
@@ -2969,6 +2986,7 @@ fn Transcript(
                 })}
             </div>
             {move || (!running.get()).then(|| view! { <div class="c6-transcript-notices hidden md:block"><WaitingNotices events now session_id=id.get_value() /></div> })}
+            <crate::capture::SelectionCapture session=id.get_value() on_quote=quote_in />
             <Show when=move || actions_present.get()>
                 <leptos::portal::Portal>
                     <BottomSheet open=actions_open label="Message actions" panel=actions_panel pop=actions_pop.get_value() class="phone-message-actions" instant=true>
@@ -2982,6 +3000,9 @@ fn Transcript(
                                 actions_open.set(false);
                                 asking.set(message_actions.get_untracked());
                             }>{crate::icons::corner_down_right()}"Ask in a side chat"</button>
+                        <crate::capture::EntryCapture session=id.get_value() seq=Signal::derive(move || message_actions.get())
+                            text=Signal::derive(move || actions_context.get().1) on_quote=quote_in
+                            done=Callback::new(move |()| actions_open.set(false)) />
                         {move || actions_can_rewind.get().then(|| view! {
                             <div class="mt-2 border-t border-zinc-200 pt-2 dark:border-zinc-700">
                                 <button type="button" class="flex min-h-12 w-full items-center gap-3 rounded-md px-3 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
@@ -6200,6 +6221,38 @@ fn Composer(
         let custom = |n: &str| {
             commands.get_untracked().and_then(|l| l.into_iter().find(|c| c.name == n).map(|c| c.source == "custom")).unwrap_or(false)
         };
+        // Thoughts you note while it works (docs/capture.md §3): never sent.
+        let capture = ["todo", "next"].into_iter().find_map(|name| {
+            let rest = t.trim().strip_prefix('/')?.strip_prefix(name)?;
+            (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| (name, rest.trim().to_owned()))
+        });
+        if let Some((name, what)) = capture.filter(|(name, _)| !custom(name)) {
+            if what.is_empty() {
+                error.set(Some(format!("Write what to note after /{name}.")));
+                return;
+            }
+            let session = id.get_value();
+            spawn_local(async move {
+                let done = if name == "todo" {
+                    api::session_todo(session, what, None).await.map(|w| format!("To-do added to “{}”.", w.title))
+                } else {
+                    api::followup_add(session, what, None).await.map(|_| {
+                        crate::capture::noted();
+                        "Held in Up next, to send when it's done.".to_owned()
+                    })
+                };
+                match done {
+                    Ok(note) => {
+                        text.set(String::new());
+                        command.set(None);
+                        error.set(None);
+                        draft_note.set(Some(note));
+                    }
+                    Err(e) => error.set(Some(e)),
+                }
+            });
+            return;
+        }
         match t.trim() {
             "/export" if !custom("export") => {
                 text.set(String::new());
@@ -6227,6 +6280,7 @@ fn Composer(
                         work,
                         work_refs: Vec::new(),
                         todo: None,
+                        todos: Vec::new(),
                         labels: d.session.labels,
                         worker_id: d.session.worker_id,
                         cwd: d.session.cwd,
@@ -6370,6 +6424,8 @@ fn Composer(
             // In line with the transcript, the glance's room beside it.
             <div class=if inline { "" } else { READING_ROW }>
             <div class=if inline { "space-y-2" } else { "w-full min-w-0 max-w-4xl space-y-2 px-2 py-1.5 sm:px-3 sm:py-2" }>
+                // What you noted to send once it's done (docs/capture.md §4).
+                {(!inline).then(|| view! { <crate::capture::UpNext session=id.get_value() running=running /> })}
                 {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
                 <Show when=move || archived.get()>
                     <p class="text-xs text-muted" role="status">"This session is archived. Unarchive it to send messages."</p>

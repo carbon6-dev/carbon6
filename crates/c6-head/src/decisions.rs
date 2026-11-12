@@ -845,6 +845,126 @@ pub async fn task_card(st: &HeadState, session_id: &str, what: &str, params: &Va
     Ok(json!({"id": decision.id, "count": decision.count}))
 }
 
+/// How many task cards or to-dos start together at most
+/// (docs/batch-starts.md §4).
+pub const MAX_BATCH: usize = 10;
+
+/// Open task cards `ids`, checked to be startable together: 2 to
+/// [`MAX_BATCH`], each visible to `caller`, all in the same place (realm,
+/// worker, folder, SSH target).
+async fn batch_cards(st: &HeadState, ids: &[i64], caller: &Caller) -> anyhow::Result<Vec<api::Decision>> {
+    let mut seen = std::collections::HashSet::new();
+    if ids.len() < 2 || ids.len() > MAX_BATCH || !ids.iter().all(|i| seen.insert(*i)) {
+        return Err(bad_request(format!("choose 2 to {MAX_BATCH} different task cards")));
+    }
+    let mut cards = Vec::new();
+    for &id in ids {
+        let d = get(st, id).await?.filter(|d| caller.sees(&d.realm)).ok_or_else(|| not_found(format!("no task card #{id}")))?;
+        let reference: String = sqlx::query_scalar("SELECT ref FROM decisions WHERE id = ?").bind(id).fetch_one(&st.store.pool).await?;
+        if d.kind != "task" || !reference.starts_with("task:") {
+            return Err(bad_request(format!("#{id} is not a task card")));
+        }
+        if !matches!(d.state.as_str(), "open" | "snoozed") {
+            return Err(bad_request(format!("task card #{id} is already {}", d.state)));
+        }
+        cards.push(d);
+    }
+    let place = |d: &api::Decision| {
+        let c = &d.context;
+        (
+            d.realm.clone(),
+            c["worker"].as_str().unwrap_or("").to_owned(),
+            c["cwd"].as_str().unwrap_or("").to_owned(),
+            c["ssh"].as_str().unwrap_or("").to_owned(),
+        )
+    };
+    if cards.iter().any(|d| place(d) != place(&cards[0])) {
+        return Err(bad_request("these task cards would run in different places: start together only those in the same folder"));
+    }
+    Ok(cards)
+}
+
+/// Starts several task cards together (docs/batch-starts.md §3): `how`
+/// "start" in one new session (by `session.task_batch`), or "here" in the
+/// session that proposed them all. Each card is answered once, and each
+/// proposing session hears once about its cards. Nothing is answered if
+/// the start fails. Returns the new session's id, for "start".
+pub async fn task_batch(st: &HeadState, ids: &[i64], how: &str, caller: &Caller, via: &str) -> anyhow::Result<Option<String>> {
+    let cards = batch_cards(st, ids, caller).await?;
+    let list = |d: &api::Decision| format!("#{} {:?}", d.id, d.title);
+    let proposers: Vec<String> = {
+        let mut v: Vec<String> = Vec::new();
+        for d in &cards {
+            let s = d.context["session"].as_str().unwrap_or("").to_owned();
+            if !s.is_empty() && !v.contains(&s) {
+                v.push(s);
+            }
+        }
+        v
+    };
+    match how {
+        "start" => {
+            let tasks = cards
+                .iter()
+                .enumerate()
+                .map(|(i, d)| {
+                    format!("{}. {} (task card #{})\n{}", i + 1, d.title, d.id, d.context["prompt"].as_str().unwrap_or("").trim())
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let template = crate::prompts::get(st, "session.task_batch", &cards[0].realm).await;
+            let prompt = api::prompts::fill(&template, &[("tasks", &tasks)]);
+            let title = format!("{} + {} more", cards[0].title, cards.len() - 1);
+            let worktree = cards.iter().any(|d| d.context["worktree"].as_bool().unwrap_or(false));
+            let session = start_task_with(st, &cards[0], &prompt, &title, &proposers, worktree).await?;
+            let answer = json!({"option": TASK_START, "values": {}});
+            for d in &cards {
+                if d.id != cards[0].id {
+                    let mut sessions = d.sessions.clone();
+                    sessions.push(session.clone());
+                    sqlx::query("UPDATE decisions SET sessions = ? WHERE id = ?")
+                        .bind(serde_json::to_string(&sessions)?)
+                        .bind(d.id)
+                        .execute(&st.store.pool)
+                        .await?;
+                }
+                record(st, d.id, "answered", &answer, "", via).await?;
+            }
+            for p in &proposers {
+                let mine: Vec<String> = cards.iter().filter(|d| d.context["session"].as_str() == Some(p)).map(list).collect();
+                let text = format!("Start session: task cards {} (together). session:{session}", mine.join(", "));
+                if let Err(e) = crate::sessions::card_answer(st, p, text).await {
+                    warn!(%p, "telling the session about its task cards: {e:#}");
+                }
+            }
+            info!(cards = ?ids, %session, "task cards started together");
+            Ok(Some(session))
+        }
+        "here" => {
+            let [session] = proposers.as_slice() else {
+                return Err(bad_request("Do them here needs task cards all from one session"));
+            };
+            let tasks = cards
+                .iter()
+                .map(|d| format!("Task card #{}: {}\n{}", d.id, d.title, d.context["prompt"].as_str().unwrap_or("").trim()))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let text = format!(
+                "Do these tasks you proposed here, in this session, in this order ({}).\n\n\
+                 These task cards are already closed as Do it here; nothing more is needed from you to close or withdraw them.\n\n{tasks}",
+                cards.iter().map(list).collect::<Vec<_>>().join(", ")
+            );
+            crate::sessions::task_card_input(st, session, text, "").await?;
+            let answer = json!({"option": TASK_HERE, "values": {}});
+            for d in &cards {
+                record(st, d.id, "answered", &answer, "", via).await?;
+            }
+            Ok(None)
+        }
+        other => Err(bad_request(format!("{other:?}: start or here"))),
+    }
+}
+
 /// The button sends your answer as a message; a closed proposer cannot
 /// prevent the card's action from succeeding.
 async fn task_answer_message(st: &HeadState, d: &api::Decision, text: String) {
@@ -887,6 +1007,21 @@ fn card_labels(labels: &Value) -> Vec<String> {
 
 async fn start_task(st: &HeadState, d: &api::Decision) -> anyhow::Result<String> {
     let c = &d.context;
+    let prompt = c["prompt"].as_str().unwrap_or("").to_owned();
+    start_task_with(st, d, &prompt, &d.title, &[], c["worktree"].as_bool().unwrap_or(false)).await
+}
+
+/// Starts a session where card `d`'s session worked, on `prompt`, titled
+/// `title`, labelled also `from` each of `also` (other proposing sessions).
+async fn start_task_with(
+    st: &HeadState,
+    d: &api::Decision,
+    prompt: &str,
+    title: &str,
+    also: &[String],
+    worktree: bool,
+) -> anyhow::Result<String> {
+    let c = &d.context;
     let s = |k: &str| c[k].as_str().unwrap_or("").to_owned();
     let workers = st.store.workers().await?;
     let online = |w: &&crate::store::WorkerRow| {
@@ -900,18 +1035,24 @@ async fn start_task(st: &HeadState, d: &api::Decision) -> anyhow::Result<String>
         .ok_or_else(|| bad_request("no worker is online to start it"))?;
     let mut labels = card_labels(&c["labels"]);
     labels.extend(["task-card".to_owned(), format!("from:{}", s("session"))]);
+    for other in also {
+        let l = format!("from:{other}");
+        if !labels.contains(&l) {
+            labels.push(l);
+        }
+    }
     let mut req: api::CreateSession = serde_json::from_value(json!({
         "worker_id": worker.id, "cwd": s("cwd"), "connection_id": "", "model": "", "realm": d.realm,
         "ssh": if s("ssh").is_empty() { Value::Null } else { json!(s("ssh")) },
-        "worktree": c["worktree"].as_bool().unwrap_or(false),
-        "prompt": s("prompt"), "title": d.title, "labels": labels,
+        "worktree": worktree,
+        "prompt": prompt, "title": title, "labels": labels,
     }))?;
     // A card raised in some work's session starts as that work does: back
     // in its worktree, or with its template (docs/dev-starts.md §4).
     let mut work = crate::work::holding(st, &format!("session:{}", s("session"))).await?.into_iter().next();
     let mut planned = false;
     if let Some(w) = &work {
-        let q = api::starts::StartQuery { work: w.clone(), text: d.title.clone(), ..Default::default() };
+        let q = api::starts::StartQuery { work: w.clone(), text: title.to_owned(), ..Default::default() };
         match crate::starts::plan(st, &Caller::root(), &q).await {
             Ok(p) if (p.reuse || !p.template.is_empty()) && !p.offline && p.worker_id.is_some() => {
                 req.worker_id = p.worker_id.unwrap_or(req.worker_id);
@@ -935,7 +1076,7 @@ async fn start_task(st: &HeadState, d: &api::Decision) -> anyhow::Result<String>
         work = None;
     }
     if let Some(w) = &work {
-        crate::work::on_new_session(st, &session, Some(w), &[], &s("prompt"), None).await;
+        crate::work::on_new_session(st, &session, Some(w), &[], prompt, &[]).await;
         crate::starts::record_place(st, &session.id).await;
     }
     let mut sessions = d.sessions.clone();

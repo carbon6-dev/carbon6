@@ -1,6 +1,6 @@
 # Starting several tasks together — Design
 
-Status: decided (2026-11-12), not built. Decisions in §7.
+Status: built (2026-11-12). Decisions in §7, as built in §8.
 
 ## 1. The problem
 
@@ -82,3 +82,18 @@ Where the link shows:
 2. **Cards start at once, to-dos open the form,** as their single starts do. A batch with any to-do (including a work item's batch with cards) opens the form, where the combined message can be edited.
 3. **Order:** as shown in the picker, to-dos first, then cards. The agent may say why it would change the order, but follows it.
 4. **Commits:** the default prompt asks for one commit per task where the repo uses commits. It's an editable prompt, so a repo's own conventions can override it.
+
+## 8. As built (2026-11-12)
+
+- **Head:**
+  - `decisions::task_batch` (`POST /api/v1/decisions/task-batch`, op `decisions.task_batch`) checks 2–10 open cards in one place.
+    - **start:** one session through `start_task_with` (titled "‹first› + N more", labelled `from:` each proposing session, with a worktree if any card asks for one). Its first message is from `session.task_batch`.
+    - **here:** one message to the proposing session.
+    - Each card is answered once. Each proposing session gets one "Start session: task cards #…, … (together). session:<id>" message.
+  - `work::cards` (`GET /api/v1/work/{id}/cards`) lists the open cards of the work's sessions and their trees.
+  - `work::from_cards` (`POST …/todos/from-cards`) answers each card "Add to work:<id>" and returns its to-do.
+  - `work::todos_start` (`GET …/todos/start?todos=`) fills `work.todos`.
+  - `CreateSession.todos` (with `todo`) links each to-do to the new session, which is titled "‹first› + N more".
+- **UI:** `capture::CardsTogether` sits in every Suggested tasks group header (the session panel and Decisions share it). `capture::WorkTogether` sits in the work item's To do header. The new-session form takes several to-dos, comma-separated in its `todo`.
+- **Different from §4:** the work item's picker doesn't check places. Everything in it becomes this work's to-dos, and the new-session form chooses where the session runs, as for one to-do.
+- **Tests:** `batch_capture::task_cards_start_together_in_one_session_or_here` and `batch_capture::notes_while_it_works_and_to_dos_with_cards_start_together`.

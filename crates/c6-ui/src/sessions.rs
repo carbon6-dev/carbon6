@@ -889,6 +889,12 @@ fn SessionRow(s: Session, now: RwSignal<i64>, hover: Hover) -> impl IntoView {
             </div>
             <div class="flex shrink-0 flex-col items-end gap-0.5 text-xs @min-[40rem]/view:flex-row @min-[40rem]/view:items-center @min-[40rem]/view:gap-0">
                 <span class=state_colour(word)>{word}</span>
+                // What you noted to send it (docs/capture.md §4).
+                {(s.followups > 0).then(|| view! {
+                    <span class="text-amber-700 dark:text-amber-400 @min-[40rem]/view:ml-3" title="Follow-ups of yours waiting to be sent (Up next)">
+                        {format!("{} up next", s.followups)}
+                    </span>
+                })}
                 <span class="text-muted @min-[40rem]/view:w-20 @min-[40rem]/view:text-right">{move || ago(now.get() - updated)}</span>
             </div>
         </Go>
@@ -1399,7 +1405,8 @@ pub fn SessionDialog(
     #[prop(optional)]
     work: Option<String>,
     #[prop(optional)] work_refs: Vec<WorkRef>,
-    /// The to-do of `work` it does.
+    /// The to-do of `work` it does (several, comma-separated, when started
+    /// together: docs/batch-starts.md).
     #[prop(optional)]
     todo: Option<String>,
 ) -> impl IntoView {
@@ -1470,7 +1477,8 @@ fn SessionForm(
     /// What it was started from, attached to its work with it.
     #[prop(optional)]
     work_refs: Vec<WorkRef>,
-    /// The to-do of `work` it does (empty: none).
+    /// The to-do of `work` it does (empty: none; several, comma-separated,
+    /// when started together).
     #[prop(optional, into)]
     todo: String,
 ) -> impl IntoView {
@@ -1575,7 +1583,7 @@ fn SessionForm(
         }
         let q = c6_api::starts::StartQuery {
             work: w,
-            todo: todo.get_value(),
+            todo: todo.get_value().split(',').next().unwrap_or_default().to_owned(),
             worker: other,
             text: prompt.get_untracked(),
             ..Default::default()
@@ -1785,7 +1793,13 @@ fn SessionForm(
             work: Some(work_pick.get_untracked()).map(|w| if w.is_empty() { "guess".to_owned() } else { w }),
             work_refs: work_refs.get_value(),
             // Its to-do, while it still joins that work.
-            todo: Some(todo.get_value()).filter(|t| !t.is_empty() && work_pick.get_untracked() == todo_work.get_value()),
+            todo: Some(todo.get_value())
+                .filter(|t| !t.is_empty() && work_pick.get_untracked() == todo_work.get_value())
+                .and_then(|t| t.split(',').next().map(str::to_owned)),
+            todos: Some(todo.get_value())
+                .filter(|t| !t.is_empty() && work_pick.get_untracked() == todo_work.get_value())
+                .map(|t| t.split(',').skip(1).map(str::to_owned).collect())
+                .unwrap_or_default(),
         };
         if on_ssh {
             // Recent targets of this worker, newest first.

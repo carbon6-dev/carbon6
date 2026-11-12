@@ -147,7 +147,17 @@ fn Cards(list: LocalResource<Result<Vec<Decision>, String>>, refresh: Callback<(
                             let g = group.0.clone();
                             let n = move || groups.with(|gs| gs.iter().find(|(x, _)| *x == g).map_or(0, |(_, ds)| ds.len()));
                             let name = group.0.clone();
-                            view! { <h2 class="text-xs font-medium uppercase tracking-wide text-muted">{move || format!("{name} ({})", n())}</h2> }
+                            // Task cards can start several together (docs/batch-starts.md).
+                            let g2 = group.0.clone();
+                            let tasks = Signal::derive(move || {
+                                groups.with(|gs| gs.iter().find(|(x, _)| *x == g2).map(|(_, ds)| ds.iter().filter(|d| d.kind == "task").cloned().collect()).unwrap_or_default())
+                            });
+                            view! {
+                                <div class="flex items-baseline gap-3">
+                                    <h2 class="text-xs font-medium uppercase tracking-wide text-muted">{move || format!("{name} ({})", n())}</h2>
+                                    <crate::capture::CardsTogether cards=tasks refresh />
+                                </div>
+                            }
                         })}
                         {
                             let g = group.0.clone();

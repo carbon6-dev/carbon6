@@ -281,6 +281,7 @@ pub fn session(r: &SessionRow, head: Option<WorkerId>) -> api::Session {
         subagent_connection_id: r.subagent_connection_id.clone(),
         subagent_model: r.subagent_model.clone(),
         subagent_effort: r.subagent_effort.clone(),
+        followups: 0,
     }
 }
 

@@ -2449,6 +2449,12 @@ async fn notify_events(st: &HeadState, session_id: &str, events: &[SessionEvent]
                         if reply.trim().chars().count() > 500 {
                             message.push('…');
                         }
+                        // What you meant to ask it once done (docs/capture.md §4).
+                        match crate::followups::list(st, session_id).await.map(|f| f.len()).unwrap_or(0) {
+                            0 => {}
+                            1 => message.push_str("\n\n1 follow-up of yours is waiting to be sent."),
+                            n => message.push_str(&format!("\n\n{n} follow-ups of yours are waiting to be sent.")),
+                        }
                         crate::notify::Note { event: "finished", title: title("Done"), message, ..base.clone() }
                     }
                     _ => continue,

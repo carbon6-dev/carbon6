@@ -95,6 +95,9 @@ const NEVER: &[&str] = &[
     "workflows.steps.decide",
     "decisions.answer",
     "decisions.session",
+    // Starting task cards together, or keeping them as to-dos: answers too.
+    "decisions.task_batch",
+    "work.todos.from_cards",
     // Your attention: what you've seen.
     "sessions.seen",
     "sessions.viewed",

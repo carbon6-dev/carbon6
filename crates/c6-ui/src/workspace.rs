@@ -234,6 +234,9 @@ impl View {
                 if !t.open.is_empty() {
                     p.push_str(&format!("&open={}", enc(&t.open.join(","))));
                 }
+                if let Some(at) = t.at {
+                    p.push_str(&format!("&at={at}"));
+                }
                 if let Some(a) = &t.anchor {
                     p.push_str(&format!("#{}", enc(a)));
                 }
@@ -302,7 +305,7 @@ impl View {
             .ok()
             .map(|p| {
                 let mut m = HashMap::new();
-                for key in ["q", "kind", "worker", "open", "output", "block", "signed_in", "signed_in_with_link"] {
+                for key in ["q", "kind", "worker", "open", "output", "block", "at", "signed_in", "signed_in_with_link"] {
                     if let Some(v) = p.get(key) {
                         m.insert(key.to_owned(), v);
                     }
@@ -330,15 +333,18 @@ impl View {
         let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
         match parts.as_slice() {
             ["sessions", id] => {
-                let target = (query.contains_key("q") || query.contains_key("open") || !hash.is_empty()).then(|| Target {
-                    q: get("q"),
-                    anchor: Some(hash).filter(|h| !h.is_empty()),
-                    open: query
-                        .get("open")
-                        .map(|o| o.split(',').filter(|s| !s.is_empty()).map(str::to_owned).collect())
-                        .unwrap_or_default(),
-                    at: None,
-                });
+                let target =
+                    (query.contains_key("q") || query.contains_key("open") || query.contains_key("at") || !hash.is_empty()).then(|| {
+                        Target {
+                            q: get("q"),
+                            anchor: Some(hash).filter(|h| !h.is_empty()),
+                            open: query
+                                .get("open")
+                                .map(|o| o.split(',').filter(|s| !s.is_empty()).map(str::to_owned).collect())
+                                .unwrap_or_default(),
+                            at: query.get("at").and_then(|a| a.parse().ok()),
+                        }
+                    });
                 View::Session { id: (*id).to_owned(), target }
             }
             ["sessions", id, "changes"] => View::SessionChanges { id: (*id).to_owned() },

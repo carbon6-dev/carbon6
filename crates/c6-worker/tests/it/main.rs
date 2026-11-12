@@ -15,6 +15,7 @@ mod attention;
 mod automations;
 mod background;
 mod backups;
+mod batch_capture;
 mod cards;
 mod catchup;
 mod chaos;

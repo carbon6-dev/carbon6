@@ -10,6 +10,7 @@ mod auth;
 mod backups;
 mod brief;
 mod calendar;
+mod capture;
 mod catchup;
 mod chat;
 mod chats;

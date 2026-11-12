@@ -487,6 +487,9 @@ pub struct Session {
     pub subagent_model: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub subagent_effort: String,
+    /// Your follow-ups for it not sent yet (docs/capture.md §4).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub followups: u32,
 }
 
 impl Session {
@@ -1932,6 +1935,9 @@ pub struct CreateSession {
     /// The to-do of `work` (an item's id) it was started on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub todo: Option<String>,
+    /// Or several of its to-dos, started together (docs/batch-starts.md).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub todos: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -4331,12 +4337,14 @@ pub struct ApprovalDecision {
 /// The commands built into carbon6: (name, description, argument hint).
 /// `compact`, `init` and `review` run on the worker; `clear` and `export`
 /// in the UI.
-pub const BUILTIN_COMMANDS: [(&str, &str, &str); 5] = [
+pub const BUILTIN_COMMANDS: [(&str, &str, &str); 7] = [
     ("compact", "Summarize the conversation so far to free context", "[what to focus on]"),
     ("init", "Write an AGENTS.md describing this codebase", ""),
     ("review", "Review the changes (uncommitted, or a branch or PR)", "[what to review]"),
     ("clear", "Start a fresh session in the same folder, with the same model", ""),
     ("export", "Download this conversation as Markdown", ""),
+    ("todo", "Note a to-do on this session's work, for later (the agent doesn't see it)", "<what to do>"),
+    ("next", "Hold a follow-up to send once it's done (Up next; the agent doesn't see it yet)", "<what to ask or tell it>"),
 ];
 
 /// A command as the composer lists it (`GET /api/v1/commands`).

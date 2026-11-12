@@ -96,6 +96,11 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/outputs/{seq}", get(output))
         .route("/api/v1/sessions/{id}/labels", put(set_session_labels))
         .route("/api/v1/sessions/{id}/colour", put(set_session_colour))
+        .route("/api/v1/sessions/{id}/todos", post(add_session_todo))
+        .route("/api/v1/sessions/{id}/followups", get(list_followups).post(add_followup))
+        .route("/api/v1/sessions/{id}/followups/send", post(send_followups))
+        .route("/api/v1/sessions/{id}/followups/{followup}", axum::routing::patch(edit_followup).delete(remove_followup))
+        .route("/api/v1/sessions/{id}/followups/{followup}/todo", post(followup_to_todo))
         .route("/api/v1/sessions/{id}/subagent-model", put(set_subagent_model))
         .route("/api/v1/sessions/{id}/tasks/{task}", get(task_snapshot))
         .route("/api/v1/sessions/{id}/tasks/{task}/stop", post(stop_task))
@@ -197,9 +202,13 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/work/{id}/todos", post(add_work_todo))
         .route("/api/v1/work/{id}/todos/{todo}", axum::routing::patch(edit_work_todo).delete(remove_work_todo))
         .route("/api/v1/work/{id}/todos/{todo}/start", get(start_work_todo))
+        .route("/api/v1/work/{id}/todos/start", get(start_work_todos))
+        .route("/api/v1/work/{id}/todos/from-cards", post(work_todos_from_cards))
+        .route("/api/v1/work/{id}/cards", get(work_cards))
         .route("/api/v1/settings/work", get(get_work_settings).put(put_work_settings))
         .route("/api/v1/decisions", get(list_decisions).post(add_decision))
         .route("/api/v1/decisions/count", get(count_decisions))
+        .route("/api/v1/decisions/task-batch", post(task_batch))
         .route("/api/v1/decisions/{id}", get(get_decision).patch(edit_decision))
         .route("/api/v1/decisions/{id}/answer", post(answer_decision))
         .route("/api/v1/decisions/{id}/session", post(decision_session))
@@ -875,6 +884,7 @@ const EVENT_PAGE: i64 = 1000;
 pub async fn sessions_snapshot(st: &HeadState, caller: &Caller) -> anyhow::Result<Vec<api::Session>> {
     let working = st.store.session_activity(caller.realm.as_deref()).await?;
     let work = crate::work::session_tags(st, caller.realm.as_deref()).await?;
+    let followups = crate::followups::counts(st).await?;
     Ok(st
         .store
         .sessions(caller.realm.as_deref(), SESSION_LIST_LIMIT)
@@ -885,7 +895,11 @@ pub async fn sessions_snapshot(st: &HeadState, caller: &Caller) -> anyhow::Resul
         .map(|r| {
             // Subagents and side chats serve their tree's work.
             let tag = work.get(&r.id).or_else(|| r.root_id.as_ref().and_then(|root| work.get(root)));
-            api::Session { work: tag.cloned(), ..crate::convert::session_with_activity(r, working.get(&r.id), st.assistant.head_id()) }
+            api::Session {
+                work: tag.cloned(),
+                followups: followups.get(&r.id).copied().unwrap_or(0),
+                ..crate::convert::session_with_activity(r, working.get(&r.id), st.assistant.head_id())
+            }
         })
         .collect())
 }
@@ -951,12 +965,19 @@ async fn create_session(
 ) -> ApiResult<Json<api::Session>> {
     req.realm = Some(caller.realm_for_new(req.realm.as_deref())?);
     let (work, refs, prompt) = (req.work.take(), std::mem::take(&mut req.work_refs), req.prompt.clone().unwrap_or_default());
-    let todo = req.todo.take();
-    // Started on a to-do: named after it, unless you named it.
-    if let (Some(w), Some(t)) = (work.as_deref(), todo.as_deref())
+    let mut todos = std::mem::take(&mut req.todos);
+    if let Some(t) = req.todo.take() {
+        todos.insert(0, t);
+    }
+    // Started on to-dos: named after the first (and how many more), unless
+    // you named it.
+    if let (Some(w), Some(t)) = (work.as_deref(), todos.first())
         && req.title.as_deref().is_none_or(|t| t.trim().is_empty())
     {
-        req.title = crate::work::todo_text(&st, w, t).await;
+        req.title = crate::work::todo_text(&st, w, t).await.map(|first| match todos.len() {
+            1 => first,
+            n => format!("{first} + {} more", n - 1),
+        });
     }
     // In a project: the project's context follows the first message.
     if let Some(p) = crate::projects::with_context(&st, work.as_deref(), &prompt).await {
@@ -964,7 +985,7 @@ async fn create_session(
     }
     let s = crate::sessions::create_from(&st, req, &caller).await?;
     // The work it belongs to (docs/work.md §4), and the to-do it's on.
-    crate::work::on_new_session(&st, &s, work.as_deref(), &refs, &prompt, todo.as_deref()).await;
+    crate::work::on_new_session(&st, &s, work.as_deref(), &refs, &prompt, &todos).await;
     // Its worktree may be its work's place (docs/dev-starts.md §4).
     crate::starts::record_place(&st, &s.id).await;
     Ok(Json(s))
@@ -1426,6 +1447,7 @@ async fn update_session(
         }
         found &= updated?;
         if a && found {
+            crate::followups::on_archived(&st, &id).await;
             crate::starts::session_archived(&st, &id).await;
             crate::watchers::session_ended(&st, &id).await;
         }
@@ -4606,6 +4628,120 @@ async fn start_work_todo(
     Path((id, todo)): Path<(String, String)>,
 ) -> ApiResult<Json<api::work::TodoStart>> {
     Ok(Json(crate::work::todo_start(&st, &id, &todo, &caller).await?))
+}
+
+async fn start_work_todos(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Query(q): Query<api::work::TodosStartQuery>,
+) -> ApiResult<Json<api::work::TodoStart>> {
+    let todos: Vec<String> = q.todos.split(',').map(str::trim).filter(|t| !t.is_empty()).map(str::to_owned).collect();
+    Ok(Json(crate::work::todos_start(&st, &id, &todos, &caller).await?))
+}
+
+async fn work_cards(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<api::Decision>>> {
+    Ok(Json(crate::work::cards(&st, &id, &caller).await?))
+}
+
+async fn work_todos_from_cards(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(req): Json<api::work::FromCards>,
+) -> ApiResult<Json<api::work::FromCardsKept>> {
+    Ok(Json(api::work::FromCardsKept { todos: crate::work::from_cards(&st, &id, &req.ids, &caller).await? }))
+}
+
+/// A session the caller may see (its realm's), or not found.
+async fn visible_session(st: &HeadState, caller: &Caller, id: &str) -> ApiResult<crate::store::SessionRow> {
+    match st.store.session(id).await? {
+        Some(s) if caller.sees(&s.realm) => Ok(s),
+        _ => Err(ApiErr(StatusCode::NOT_FOUND, "no such session".into())),
+    }
+}
+
+async fn add_session_todo(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(req): Json<api::work::SessionTodo>,
+) -> ApiResult<Json<api::work::SessionTodoAdded>> {
+    visible_session(&st, &caller, &id).await?;
+    let (work, title) = crate::work::session_todo(&st, &id, &req.text, "", req.quote.as_ref(), &crate::agent_ops::by("you")).await?;
+    Ok(Json(api::work::SessionTodoAdded { work, title }))
+}
+
+async fn list_followups(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<api::work::Followup>>> {
+    visible_session(&st, &caller, &id).await?;
+    Ok(Json(crate::followups::list(&st, &id).await?))
+}
+
+async fn add_followup(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(req): Json<api::work::FollowupNew>,
+) -> ApiResult<Json<api::work::Followup>> {
+    visible_session(&st, &caller, &id).await?;
+    Ok(Json(crate::followups::add(&st, &id, &req).await?))
+}
+
+async fn edit_followup(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path((id, followup)): Path<(String, String)>,
+    Json(req): Json<api::work::FollowupNew>,
+) -> ApiResult<Json<api::work::Followup>> {
+    visible_session(&st, &caller, &id).await?;
+    Ok(Json(crate::followups::edit(&st, &id, &followup, &req.text).await?))
+}
+
+async fn remove_followup(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path((id, followup)): Path<(String, String)>,
+) -> ApiResult<StatusCode> {
+    visible_session(&st, &caller, &id).await?;
+    crate::followups::remove(&st, &id, &followup).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn send_followups(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(req): Json<api::work::FollowupSend>,
+) -> ApiResult<Json<api::QueuedInput>> {
+    visible_session(&st, &caller, &id).await?;
+    Ok(Json(crate::followups::send(&st, &id, &req.ids).await?))
+}
+
+async fn followup_to_todo(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path((id, followup)): Path<(String, String)>,
+) -> ApiResult<Json<api::work::SessionTodoAdded>> {
+    visible_session(&st, &caller, &id).await?;
+    let (work, title) = crate::followups::to_todo(&st, &id, &followup).await?;
+    Ok(Json(api::work::SessionTodoAdded { work, title }))
+}
+
+async fn task_batch(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Json(req): Json<api::work::TaskBatch>,
+) -> ApiResult<Json<api::work::TaskBatchStarted>> {
+    let session = crate::decisions::task_batch(&st, &req.ids, &req.how, &caller, "carbon6").await?;
+    Ok(Json(api::work::TaskBatchStarted { session }))
 }
 
 async fn propose_work(

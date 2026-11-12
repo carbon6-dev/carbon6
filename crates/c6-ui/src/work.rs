@@ -635,6 +635,25 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
             }
         });
     };
+    // Several to-dos in one session (docs/batch-starts.md): the form, for
+    // all of them.
+    let start_todos = Callback::new(move |todos: Vec<String>| {
+        spawn_local(async move {
+            match api::work_todos_start(id.get_value(), todos.clone()).await {
+                Ok(s) => {
+                    let mut seed = None;
+                    if let Some(sid) = s.seed {
+                        seed = live.sessions.with_untracked(|ss| ss.iter().find(|x| x.id == sid).cloned());
+                        if seed.is_none() {
+                            seed = api::session(sid).await.ok().map(|d| d.session);
+                        }
+                    }
+                    pickup.set(Some((s.text, seed, Some(todos.join(",")))));
+                }
+                Err(e) => error.set(Some(e)),
+            }
+        });
+    });
     let add_todo = move || {
         let text = new_todo.get_untracked().trim().to_owned();
         if text.is_empty() {
@@ -814,7 +833,13 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
                             }}
                         </section>
                         <section class="space-y-1">
-                            <h2 class="text-xs font-medium uppercase tracking-wide text-muted">"To do"</h2>
+                            <div class="flex items-baseline gap-3">
+                                <h2 class="text-xs font-medium uppercase tracking-wide text-muted">"To do"</h2>
+                                {open.then(|| {
+                                    let todos = w.fields.todos.clone();
+                                    view! { <crate::capture::WorkTogether work=id.get_value() todos=Signal::derive(move || todos.clone()) start=start_todos /> }
+                                })}
+                            </div>
                             {w.fields.todos.iter().map(|t| {
                                 let done = t.done_at.is_some();
                                 let (tid, tid2, tid3) = (t.id.clone(), t.id.clone(), t.id.clone());
@@ -830,7 +855,10 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
                                                 let p = c6_api::work::TodoPatch { done: Some(!done), ..Default::default() };
                                                 spawn_local(async move { apply(api::work_todo_patch(id.get_value(), todo, p).await) });
                                             } />
-                                        <span class=if done { "min-w-0 flex-1 truncate text-muted line-through" } else { "min-w-0 flex-1 truncate" } title=what>{t.text.clone()}</span>
+                                        <span class="min-w-0 flex-1">
+                                            <span class=if done { "block truncate text-muted line-through" } else { "block truncate" } title=what>{t.text.clone()}</span>
+                                            {t.quote.clone().map(|q| view! { <crate::capture::QuoteLine quote=q /> })}
+                                        </span>
                                         {t.from.starts_with("decision:").then(|| view! { <span class="shrink-0 text-[11px] text-muted" title="An agent proposed it as a task card">"task card"</span> })}
                                         {t.by.strip_prefix("session:").filter(|_| !t.from.starts_with("decision:")).map(|s| view! {
                                             <Go to=View::session(s.to_owned()) class="shrink-0 text-[11px] text-muted hover:underline" title="An agent added it; this opens its session">"by an agent"</Go>
@@ -897,7 +925,8 @@ pub fn WorkItemPage(id: String) -> impl IntoView {
                 }
             }}
             {move || pickup.get().map(|(first, seed, todo)| {
-                let (title, note) = match todo {
+                let (title, note) = match todo.as_deref() {
+                    Some(t) if t.contains(',') => ("Start these to-dos in one session", "It joins this work, and each to-do links to it. The agent ticks each off as it's done; any it doesn't finish stay open."),
                     Some(_) => ("Start this to-do in a new session", "It joins this work, and the to-do links to it. Tick the to-do off when it's done, or the agent will."),
                     None => ("Pick this work up in a new session", "Starts where it stood: the note and what belongs to it. It joins this work."),
                 };

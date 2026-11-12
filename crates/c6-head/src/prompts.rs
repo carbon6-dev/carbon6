@@ -186,6 +186,16 @@ pub const DEFAULTS: &[Prompt] = &[
         default: text::WORK_TODO,
     },
     Prompt {
+        name: "work.todos",
+        description: "The first message of a session started on several of a piece of work's to-dos together (docs/batch-starts.md; you can change it before starting). Placeholders: {{todos}}, {{title}}, {{done_when}}, {{note}}.",
+        default: text::WORK_TODOS,
+    },
+    Prompt {
+        name: "session.task_batch",
+        description: "The first message of a session started on several task cards together (docs/batch-starts.md). Placeholder: {{tasks}}.",
+        default: text::TASK_BATCH,
+    },
+    Prompt {
         name: "work.propose",
         description: "How what's open is grouped into pieces of work, once, for you to accept or skip (docs/work.md §9). Placeholder: {{things}}.",
         default: text::WORK_PROPOSE,

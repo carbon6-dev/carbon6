@@ -329,6 +329,7 @@ async fn start(
             work: None,
             work_refs: Vec::new(),
             todo: None,
+            todos: Vec::new(),
         };
         match crate::sessions::create_as(st, req, &acting).await {
             Ok(s) => sessions.push(s),
@@ -448,6 +449,7 @@ pub async fn start_subagent(
         work: None,
         work_refs: Vec::new(),
         todo: None,
+        todos: Vec::new(),
     };
     let link = crate::sessions::Link {
         parent_id: parent.id.clone(),

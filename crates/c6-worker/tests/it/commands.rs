@@ -64,7 +64,7 @@ async fn slash_commands_compact_and_export() {
     // The composer's list: built-ins and the enabled custom ones.
     let list: serde_json::Value = http.get(format!("{api}/commands")).send().await.unwrap().json().await.unwrap();
     let names: Vec<&str> = list.as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["clear", "compact", "export", "greet", "init", "review"]);
+    assert_eq!(names, ["clear", "compact", "export", "greet", "init", "next", "review", "todo"]);
     assert_eq!(list[3]["argument_hint"], "<name>");
 
     let citation = "\u{e200}cite\u{e202}turn601432view0\u{e202}turn601432view1\u{e201}";
