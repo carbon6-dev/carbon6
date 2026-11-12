@@ -10,7 +10,11 @@
 //! focused in either pane, even on ⌘/Ctrl-click. Only explicit session
 //! companion panes allow live copies; a session itself is single-copy.
 //! Each tile keeps its own
-//! back and forward history (⌘[ and ⌘]).
+//! back and forward history (⌘[ and ⌘]). The browser's Back goes back in
+//! the focused tile (on a phone, from an item to its list first), then to
+//! the tile you were in before, and leaves carbon6 only when there is
+//! nothing to go back to
+//! ([`browser_back`]).
 //!
 //! On a phone one tile and one pane show at a time, with a single bar for
 //! navigation, the shown pane's actions and the Sessions picker.
@@ -1242,6 +1246,10 @@ pub struct Workspace {
     pub looked: StoredValue<crate::catchup::Looked>,
     /// Counts the views the head has taken (recently viewed loads again).
     pub viewed: RwSignal<u32>,
+    /// The tiles focused before this one, the latest last (for the
+    /// browser's Back), and whether a Back is returning to one now.
+    trail: StoredValue<Vec<u64>>,
+    returning: StoredValue<bool>,
 }
 
 fn load<T: for<'de> Deserialize<'de>>(key: &str) -> Option<T> {
@@ -1478,6 +1486,8 @@ impl Workspace {
             viewed: RwSignal::new(0),
             catchups: RwSignal::new(HashMap::new()),
             looked: StoredValue::new(crate::catchup::Looked::restore()),
+            trail: StoredValue::new(Vec::new()),
+            returning: StoredValue::new(false),
         };
         // A link or redirect to a particular view opens it (the home page
         // just restores the workspace).
@@ -1491,7 +1501,28 @@ impl Workspace {
             let l = ws.layout.get();
             storage_set(LAYOUT_KEY, &serde_json::to_string(&l).unwrap_or_default());
             if let Some(v) = l.focused_view() {
-                let _ = window().history().and_then(|h| h.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&v.href())));
+                show_address(&v.href());
+            }
+        });
+        // Where focus was, for the browser's Back (not across reloads).
+        let focused = StoredValue::new(None::<u64>);
+        Effect::new(move || {
+            let key = ws.layout.with(|l| l.tiles.get(l.focus).map(|t| t.key));
+            let before = focused.get_value();
+            if before == key {
+                return;
+            }
+            focused.set_value(key);
+            if ws.returning.get_value() {
+                ws.returning.set_value(false);
+            } else if let Some(before) = before {
+                ws.trail.update_value(|t| {
+                    t.retain(|k| *k != before);
+                    t.push(before);
+                    if t.len() > HISTORY {
+                        t.remove(0);
+                    }
+                });
             }
         });
         Effect::new(move || storage_set(ATTENTION_KEY, &serde_json::to_string(&ws.attention.get()).unwrap_or_default()));
@@ -1588,12 +1619,36 @@ impl Workspace {
         });
     }
 
+    /// Whether the focused tile has history to go back (`delta` < 0) or
+    /// forward in.
+    pub fn can_step(&self, delta: isize) -> bool {
+        self.layout
+            .with_untracked(|l| l.tiles.get(l.focus).is_some_and(|t| if delta < 0 { !t.back.is_empty() } else { !t.forward.is_empty() }))
+    }
+
+    /// Focuses the tile focused before this one that is still open, for
+    /// the browser's Back. False: there is none.
+    fn back_to_earlier_tile(&self) -> bool {
+        let current = self.layout.with_untracked(|l| l.tiles.get(l.focus).map(|t| t.key));
+        loop {
+            let mut earlier = None;
+            self.trail.update_value(|t| earlier = t.pop());
+            let Some(key) = earlier else { return false };
+            if Some(key) == current {
+                continue;
+            }
+            let Some(i) = self.layout.with_untracked(|l| l.tiles.iter().position(|t| t.key == key && !t.columns.is_empty())) else {
+                continue;
+            };
+            self.returning.set_value(true);
+            self.update_layout(|l| l.show(i));
+            return true;
+        }
+    }
+
     /// Back (`delta` < 0) or forward in the focused tile's history.
     pub fn step(&self, delta: isize) {
-        if !self
-            .layout
-            .with_untracked(|l| l.tiles.get(l.focus).is_some_and(|t| if delta < 0 { !t.back.is_empty() } else { !t.forward.is_empty() }))
-        {
+        if !self.can_step(delta) {
             return;
         }
         self.update_layout(|l| l.step(delta));
@@ -2461,6 +2516,66 @@ pub fn arrange(tiles: &[(usize, u64)]) -> Vec<Rect> {
     out
 }
 
+/// The browser history entries carbon6 keeps: its page, and a guard
+/// behind it that the browser's Back lands on.
+const PAGE_ENTRY: &str = "c6-page";
+const BACK_ENTRY: &str = "c6-back";
+
+/// Shows `href` in the address bar, keeping the entry's marker.
+fn show_address(href: &str) {
+    if let Ok(h) = window().history() {
+        let _ = h.replace_state_with_url(&h.state().unwrap_or(wasm_bindgen::JsValue::NULL), "", Some(href));
+    }
+}
+
+/// The browser's Back goes back where you are: on a phone from an item to
+/// its list, else back in the focused tile's history (as its ← does), else
+/// to the tile you were in before (one a header link opened has no history
+/// of its own). With nowhere to go back to, it leaves carbon6 as before.
+///
+/// The page keeps a guard entry behind its own. Back lands on the guard;
+/// carbon6 steps back, then returns to its page, so the next Back lands on
+/// the guard again. The tiles keep their own forward history (the tile's
+/// →, ⌘]); the browser's Forward is not used.
+fn browser_back(ws: Workspace, one_pane: RwSignal<bool>) -> WindowListenerHandle {
+    if let Ok(h) = window().history() {
+        // A reload keeps both entries.
+        if h.state().ok().and_then(|s| s.as_string()).as_deref() != Some(PAGE_ENTRY) {
+            let href = window().location().href().unwrap_or_default();
+            let _ = h.replace_state_with_url(&BACK_ENTRY.into(), "", Some(&href));
+            let _ = h.push_state_with_url(&PAGE_ENTRY.into(), "", Some(&href));
+        }
+    }
+    window_event_listener(leptos::ev::popstate, move |ev| {
+        let Ok(h) = window().history() else { return };
+        match ev.state().as_string().as_deref() {
+            Some(BACK_ENTRY) => {
+                let list = one_pane
+                    .get_untracked()
+                    .then(|| ws.layout.with_untracked(|l| l.tiles.get(l.focus).filter(|t| t.cursor > 0).map(|t| t.key)))
+                    .flatten();
+                if let Some(tile) = list {
+                    ws.show_list(tile);
+                } else if ws.can_step(-1) {
+                    ws.step(-1);
+                } else if !ws.back_to_earlier_tile() {
+                    // Nothing to go back to here: leave, as the page did.
+                    let _ = h.back();
+                    return;
+                }
+                let _ = h.forward();
+            }
+            // Back on carbon6's page: it shows where the workspace is now.
+            Some(PAGE_ENTRY) => {
+                if let Some(href) = ws.layout.with_untracked(|l| l.focused_view().map(View::href)) {
+                    show_address(&href);
+                }
+            }
+            _ => {}
+        }
+    })
+}
+
 /// The tiles. Keyboard: ⌘1–9 focus a tile, ⌘[ / ⌘] go back and forward in it.
 #[component]
 pub fn Tiles() -> impl IntoView {
@@ -2489,6 +2604,8 @@ pub fn Tiles() -> impl IntoView {
             });
         });
     });
+    let back = browser_back(ws, loading.one_pane);
+    on_cleanup(move || back.remove());
     let keys = window_event_listener(leptos::ev::keydown, move |ev| {
         if !crate::util::app_shortcut(&ev) {
             return;
