@@ -222,6 +222,16 @@ impl Drop for ReplacementZombie {
     }
 }
 
+/// Waits until the session's actor holds the input in its inbox. Until
+/// then a cancel finds it still on its way from the head and is refused
+/// (409), which under load is a matter of timing, not of what is tested.
+async fn in_inbox(worker: &WorkerProcess, id: &str, command_id: &str) {
+    eventually("the input to reach the session's inbox, where a cancel finds it", async || {
+        worker.sessions.inbox_holds(id, command_id).then_some(())
+    })
+    .await;
+}
+
 #[cfg(target_os = "linux")]
 async fn replacement_paused(api: &Api, worker: &WorkerProcess, id: &str) {
     eventually("replacement refusal to pause or expose a prematurely exited producer actor", async || {
@@ -648,6 +658,7 @@ async fn claude_rewind_resets_native_history_before_acknowledging_and_fails_clos
             api.detail(&id).await.queued.into_iter().find(|q| q.text == "CANCEL_BEFORE_REPLACEMENT_DRAIN")
         })
         .await;
+        in_inbox(&worker, &id, &canceled.command_id).await;
         api.cancel(&id, &canceled.command_id).await;
         api.barrier(&id).await;
         assert!(worker.sessions.active().iter().any(|s| s == &id));
@@ -747,6 +758,7 @@ async fn claude_rewind_resets_native_history_before_acknowledging_and_fails_clos
     #[cfg(target_os = "linux")]
     {
         replacement_paused(&api, &worker, &missing_id).await;
+        in_inbox(&worker, &missing_id, &canceled.command_id).await;
         api.cancel(&missing_id, &canceled.command_id).await;
         api.barrier(&missing_id).await;
         assert!(worker.sessions.active().iter().any(|s| s == &missing_id));
@@ -1550,6 +1562,7 @@ async fn claude_rewind_resets_native_history_before_acknowledging_and_fails_clos
 
         // Cancel the middle input, not a suffix. A stale InputDelivered
         // marker must not make the recovered inbox answer permanent 409.
+        in_inbox(&worker, &held_id, &delivered[1].command_id).await;
         api.cancel(&held_id, &delivered[1].command_id).await;
         eventually("cancellation to remove only the selected recovered input", async || {
             let detail = api.detail(&held_id).await;

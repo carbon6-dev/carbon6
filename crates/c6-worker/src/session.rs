@@ -325,6 +325,17 @@ impl SessionManager {
         serde_json::to_value(snapshot).ok()
     }
 
+    /// Whether a session's live actor holds this input in its inbox, not
+    /// yet taken: what a cancel needs. Until then a cancel finds it on its
+    /// way from the head (`pending`), and tests wait on this, not on time.
+    pub fn inbox_holds(&self, session_id: &str, command_id: &str) -> bool {
+        let actors = self.actors.lock().unwrap();
+        actors
+            .get(session_id)
+            .filter(|a| !a.tx.is_closed())
+            .is_some_and(|a| a.inbox.lock().unwrap().queue.iter().any(|(i, _)| i.command_id == command_id))
+    }
+
     /// Session ids with a live actor.
     pub fn active(&self) -> Vec<String> {
         self.actors.lock().unwrap().iter().filter(|(_, a)| !a.tx.is_closed()).map(|(id, _)| id.clone()).collect()
@@ -6511,7 +6522,10 @@ for line in sys.stdin:
         (spec, started, bin)
     }
 
-    fn leave_rewind_held(manager: &SessionManager, spec: &CreateSession, bin: &Path, cwd: &Path, conversation: &str) {
+    /// Leaves a held runtime behind, as a worker that went away would, once
+    /// it can be proven ours (a worker waits for `ready` before anything
+    /// could stop it; under load a stop right after the spawn could not).
+    async fn leave_rewind_held(manager: &SessionManager, spec: &CreateSession, bin: &Path, cwd: &Path, conversation: &str) {
         let launch = crate::claude_code::Launch {
             conversation: conversation.into(),
             settings: Some(claude_code_settings(spec, None)),
@@ -6534,6 +6548,11 @@ for line in sys.stdin:
             )
             .unwrap(),
         );
+        let held = manager.claude_dir().join("held");
+        c6_testkit::eventually("the held runtime's CLI or keeper in its final image", async || {
+            crate::claude_code::held_record_owned(&held, conversation).then_some(())
+        })
+        .await;
     }
 
     fn held_trace(dir: &Path) -> Vec<serde_json::Value> {
@@ -6561,7 +6580,7 @@ for line in sys.stdin:
                 ev(4, session_event::Kind::Rewound(Rewound { command_id: "completed".into(), to_seq: 3, ..Default::default() })),
             ];
             manager.journal.import("s", &spec, &events).await.unwrap();
-            leave_rewind_held(&manager, &spec, &bin, dir.path(), "s");
+            leave_rewind_held(&manager, &spec, &bin, dir.path(), "s").await;
             c6_testkit::eventually("the unselected held fixture to start", async || {
                 held_trace(dir.path()).iter().any(|v| v["kind"] == "spawn").then_some(())
             })
@@ -6669,8 +6688,8 @@ for line in sys.stdin:
             .append("s", &ev(6, session_event::Kind::Rewound(Rewound { command_id: "confirmed".into(), to_seq: 3, ..Default::default() })))
             .await
             .unwrap();
-        leave_rewind_held(&manager, &spec, &bin, dir.path(), "s");
-        leave_rewind_held(&manager, &spec, &bin, dir.path(), &fork);
+        leave_rewind_held(&manager, &spec, &bin, dir.path(), "s").await;
+        leave_rewind_held(&manager, &spec, &bin, dir.path(), &fork).await;
         let publishing = manager.claude_dir().join("held/another-session-publishing");
         std::fs::create_dir(&publishing).unwrap();
         let reopened = Arc::new(Journal::open(&dir.path().join("journal.db")).await.unwrap());
@@ -6756,8 +6775,8 @@ for line in sys.stdin:
             ..Default::default()
         };
         manager.journal.prepare_claude_rewind("s", &reset).await.unwrap();
-        leave_rewind_held(&manager, &spec, &bin, dir.path(), "s");
-        leave_rewind_held(&manager, &spec, &bin, dir.path(), "reset-attempt");
+        leave_rewind_held(&manager, &spec, &bin, dir.path(), "s").await;
+        leave_rewind_held(&manager, &spec, &bin, dir.path(), "reset-attempt").await;
         let reopened = Arc::new(Journal::open(&dir.path().join("journal.db")).await.unwrap());
         let manager = SessionManager::new(reopened, Arc::default(), dir.path().join("worktrees"));
         manager.recover().await.unwrap();
@@ -7325,7 +7344,7 @@ for line in sys.stdin:
             user(4, "target"),
         ];
         manager.journal.import("root", &spec, &events).await.unwrap();
-        leave_rewind_held(&manager, &child_spec, &bin, work.path(), "unselected-child-fork");
+        leave_rewind_held(&manager, &child_spec, &bin, work.path(), "unselected-child-fork").await;
         let (record, _) =
             crate::claude_code::Process::held_record(&manager.claude_dir().join("held"), "unselected-child-fork").unwrap().unwrap();
         let metadata = std::fs::read(record.join("meta.json")).unwrap();
@@ -7740,7 +7759,7 @@ for line in sys.stdin:
         // conversation. Looking up only that conversation would miss it.
         let conversation = journal_claude_conversation(&manager.journal, "s", &spec, &grandchild).await.unwrap();
         assert_eq!(conversation.id, "s");
-        leave_rewind_held(&manager, &spec, &bin, dir.path(), "unselected-child-fork");
+        leave_rewind_held(&manager, &spec, &bin, dir.path(), "unselected-child-fork").await;
         assert!(manager.journal.claude_processes("s").await.unwrap().is_empty(), "no actor/observer owns this held runtime");
         let (record, _) =
             crate::claude_code::Process::held_record(&manager.claude_dir().join("held"), "unselected-child-fork").unwrap().unwrap();

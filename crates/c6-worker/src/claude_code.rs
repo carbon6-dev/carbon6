@@ -1104,6 +1104,20 @@ fn darwin_vnode_fifo(returned: i32, dev: u32, ino: u64, mode: u16, path: &[u8], 
     open_path == expected_path
 }
 
+/// For tests: whether a held runtime is settled, as a worker's `ready`
+/// would see it: its keeper holds the input FIFO (its final image, which a
+/// stop's proof of ownership relies on) and the group is provably ours.
+/// Right after `spawn_held` neither may hold yet, and a stop then fails
+/// closed: a test waits for this before stopping it.
+#[cfg(test)]
+pub(crate) fn held_record_owned(held: &Path, conversation: &str) -> bool {
+    let Ok(Some((dir, _))) = Process::held_record(held, conversation) else { return false };
+    std::fs::read(dir.join("meta.json"))
+        .ok()
+        .and_then(|data| serde_json::from_slice::<HeldMeta>(&data).ok())
+        .is_some_and(|meta| keeper_holds_fifo(Pid::from_raw(meta.keeper), Pid::from_raw(meta.pgid), &dir) && held_group_owned(&meta, &dir))
+}
+
 fn held_group_owned(meta: &HeldMeta, dir: &Path) -> bool {
     meta.conversation == meta.launch.conversation
         && (is_claude_for(meta.pgid, &meta.conversation) || keeper_holds_fifo(Pid::from_raw(meta.keeper), Pid::from_raw(meta.pgid), dir))
