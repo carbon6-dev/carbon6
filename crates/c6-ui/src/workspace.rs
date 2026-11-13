@@ -2959,6 +2959,8 @@ fn TileView(key: u64, rect: Signal<Rect>) -> AnyView {
         >
         <section
             data-tile-surface=""
+            // Focus mode: what it shows may use the width (focus-mode: variant).
+            data-focus-mode=move || (full.get() && focused.get()).then_some("")
             class=move || format!(
                 "@container/tile relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-white data-[aspect-dim=true]:opacity-30 dark:bg-zinc-950 md:rounded-lg md:border md:shadow-sm {}",
                 if focused.get() && many.get() { "md:border-blue-400 md:ring-1 md:ring-blue-400/40 dark:md:border-blue-500" } else { "md:border-zinc-200 dark:md:border-zinc-800" },

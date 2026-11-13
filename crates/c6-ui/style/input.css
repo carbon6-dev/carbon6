@@ -156,6 +156,10 @@
 @custom-variant lg (@media (width >= 64rem) and (height >= 32rem));
 @custom-variant xl (@media (width >= 80rem) and (height >= 32rem));
 
+/* Inside the tile in focus mode (data-focus-mode on its surface): reading
+   columns take more of the width it has. */
+@custom-variant focus-mode (&:where([data-focus-mode] *));
+
 /* Mouse targets relax as the tile (not the window) gains room. These only
    feed the fine-pointer utility: phone/coarse targets remain 44px. The Changes
    count can grow beyond the same minimum without squeezing its icon. */

@@ -1339,7 +1339,8 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
 
 /// The transcript's reading column (and what lines up with it: the message
 /// box, the find bar): at most 56rem, centred.
-const READING: &str = "w-full min-w-0 max-w-4xl";
+/// Wider in focus mode, where the tile has the screen.
+const READING: &str = "w-full min-w-0 max-w-4xl focus-mode:max-w-7xl";
 /// A row centring the reading column and, when the glance is beside it,
 /// the gap and the glance (or the room they take), as one group.
 const READING_ROW: &str = "flex justify-center gap-6";
@@ -6423,7 +6424,7 @@ fn Composer(
         >
             // In line with the transcript, the glance's room beside it.
             <div class=if inline { "" } else { READING_ROW }>
-            <div class=if inline { "space-y-2" } else { "w-full min-w-0 max-w-4xl space-y-2 px-2 py-1.5 sm:px-3 sm:py-2" }>
+            <div class=if inline { "space-y-2" } else { "w-full min-w-0 max-w-4xl space-y-2 px-2 py-1.5 focus-mode:max-w-7xl sm:px-3 sm:py-2" }>
                 // What you noted to send once it's done (docs/capture.md §4).
                 {(!inline).then(|| view! { <crate::capture::UpNext session=id.get_value() running=running /> })}
                 {move || error.get().map(|e| view! { <ErrorBox message=e /> })}

@@ -1835,7 +1835,7 @@ pub fn DocPage(id: String) -> impl IntoView {
     let bar = move || {
         view! {
             <div data-doc-header="" class="sticky top-0 z-20 hidden border-b border-zinc-200 bg-white md:block dark:border-zinc-800 dark:bg-zinc-950">
-                <div class="relative mx-auto flex max-w-3xl flex-wrap items-center gap-1 px-4 py-1">
+                <div class="relative mx-auto flex max-w-3xl flex-wrap items-center gap-1 px-4 py-1 focus-mode:max-w-5xl">
                     <span class="shrink-0 text-muted" title=move || summary.with(|s| s.kind.clone())>{move || summary.with(|s| kind_mark(&s.kind))}</span>
                     <div data-doc-heading="" class="flex min-w-0 flex-1 basis-40 items-center gap-1">
                     {move || owner.get().map(|id| view! { <FromSession id /> })}
@@ -2009,7 +2009,7 @@ pub fn DocPage(id: String) -> impl IntoView {
             <div class="grid">
                 <div class="min-w-0 [grid-area:1/1]">
                     {move || (state.get() == 2).then(bar)}
-                    <main data-doc-reading="" class="mx-auto max-w-3xl space-y-4 px-4 pb-8 pt-3">
+                    <main data-doc-reading="" class="mx-auto max-w-3xl space-y-4 px-4 pb-8 pt-3 focus-mode:max-w-5xl">
                         {move || error.get().map(|e| view! {
                             <div class="flex items-start gap-2">
                                 <div class="flex-1"><ErrorBox message=e /></div>
