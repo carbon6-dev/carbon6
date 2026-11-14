@@ -1753,6 +1753,23 @@ pub async fn task_batch(ids: Vec<i64>, how: &str) -> Result<Option<String>, Stri
     Ok(r.session)
 }
 
+// --- Goals (docs/goals.md) ------------------------------------------------------
+
+pub async fn goal_set(id: String, text: String) -> Result<c6_api::SessionGoal, String> {
+    send_json(Request::put(&format!("/api/v1/sessions/{id}/goal")), &c6_api::GoalSet { text, ..Default::default() }).await
+}
+
+/// Pauses, resumes ("active") or stops a session's goal.
+pub async fn goal_state(id: String, state: &str) -> Result<(), String> {
+    let _: c6_api::SessionGoal =
+        send_json(Request::patch(&format!("/api/v1/sessions/{id}/goal")), &c6_api::GoalPatch { state: state.to_owned() }).await?;
+    Ok(())
+}
+
+pub async fn goal_clear(id: String) -> Result<(), String> {
+    empty(Request::delete(&format!("/api/v1/sessions/{id}/goal")).send().await).await
+}
+
 // --- Capture (docs/capture.md) ------------------------------------------------
 
 /// A to-do on a session's work; the work it went to.

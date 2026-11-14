@@ -2337,6 +2337,7 @@ pub async fn ingest(st: &HeadState, worker_id: WorkerId, mut batch: SessionEvent
     crate::watchers::on_events(st, &batch.session_id, &ing.events).await;
     crate::memex::on_events(st, &batch.session_id, &ing.events).await;
     crate::decisions::on_events(st, &batch.session_id, &ing.events).await;
+    crate::goals::on_events(st, &batch.session_id, &ing.events).await;
     crate::naming::on_events(st, &batch.session_id, &ing.events).await;
     crate::starts::on_events(st, &batch.session_id, &ing.events).await;
     // How a run's session went: its first turn's end.

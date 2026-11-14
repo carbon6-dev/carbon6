@@ -479,7 +479,7 @@ fn input_source(input: &c6_proto::UserMessage) -> String {
 }
 
 /// The events since a watcher's position, as the model reads them.
-fn digest(events: &[SessionEvent]) -> String {
+pub(crate) fn digest(events: &[SessionEvent]) -> String {
     let clip = |s: &str, n: usize| -> String {
         let s = s.trim();
         if s.chars().count() > n { format!("{}…", s.chars().take(n).collect::<String>()) } else { s.to_owned() }
@@ -1633,9 +1633,23 @@ async fn ask(
     model: &str,
     prompt: String,
 ) -> anyhow::Result<(Value, c6_llm::Usage)> {
+    ask_json(st, realm, &format!("watcher {watcher}"), watcher, connection, model, prompt).await
+}
+
+/// One model call answered in JSON, shown on Activity as `what` (about
+/// `about`): a watcher's wake, a goal's check.
+pub(crate) async fn ask_json(
+    st: &HeadState,
+    realm: &str,
+    what: &str,
+    about: &str,
+    connection: &str,
+    model: &str,
+    prompt: String,
+) -> anyhow::Result<(Value, c6_llm::Usage)> {
     let origin = c6_llm::activity::Origin {
-        what: format!("watcher {watcher}"),
-        about: watcher.to_owned(),
+        what: what.to_owned(),
+        about: about.to_owned(),
         connection: connection.to_owned(),
         realm: realm.to_owned(),
         via: String::new(),

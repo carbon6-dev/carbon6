@@ -7,8 +7,11 @@ cd "$(dirname "$0")/.."
 # Retain typed views: erase_components made ordinary live snapshots clear and
 # rebuild attributes/SVG innerHTML. Accept the measured runtime/size tradeoff;
 # the 8 MB / 2 MB targets below remain goals, not a reason to regress input.
-accepted_raw=10412407
-accepted_br=2589638
+# 2026-11-14: raised for the UI that landed since (126 UI commits: batch
+# starts, capture and Up next, session goals, browser Back, transcript times
+# and more), measured from the Linux release build.
+accepted_raw=10852038
+accepted_br=2708080
 dist=${UI_DIST:-crates/c6-ui/dist}
 shopt -s nullglob
 wasm=("$dist"/*_bg.wasm)

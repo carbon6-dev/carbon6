@@ -97,6 +97,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/sessions/{id}/labels", put(set_session_labels))
         .route("/api/v1/sessions/{id}/colour", put(set_session_colour))
         .route("/api/v1/sessions/{id}/todos", post(add_session_todo))
+        .route("/api/v1/sessions/{id}/goal", get(get_goal).put(set_goal).patch(patch_goal).delete(clear_goal))
         .route("/api/v1/sessions/{id}/followups", get(list_followups).post(add_followup))
         .route("/api/v1/sessions/{id}/followups/send", post(send_followups))
         .route("/api/v1/sessions/{id}/followups/{followup}", axum::routing::patch(edit_followup).delete(remove_followup))
@@ -885,6 +886,7 @@ pub async fn sessions_snapshot(st: &HeadState, caller: &Caller) -> anyhow::Resul
     let working = st.store.session_activity(caller.realm.as_deref()).await?;
     let work = crate::work::session_tags(st, caller.realm.as_deref()).await?;
     let followups = crate::followups::counts(st).await?;
+    let goals = crate::goals::all(st).await?;
     Ok(st
         .store
         .sessions(caller.realm.as_deref(), SESSION_LIST_LIMIT)
@@ -898,6 +900,7 @@ pub async fn sessions_snapshot(st: &HeadState, caller: &Caller) -> anyhow::Resul
             api::Session {
                 work: tag.cloned(),
                 followups: followups.get(&r.id).copied().unwrap_or(0),
+                goal: goals.get(&r.id).cloned(),
                 ..crate::convert::session_with_activity(r, working.get(&r.id), st.assistant.head_id())
             }
         })
@@ -4674,6 +4677,45 @@ async fn add_session_todo(
     visible_session(&st, &caller, &id).await?;
     let (work, title) = crate::work::session_todo(&st, &id, &req.text, "", req.quote.as_ref(), &crate::agent_ops::by("you")).await?;
     Ok(Json(api::work::SessionTodoAdded { work, title }))
+}
+
+async fn get_goal(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Option<api::SessionGoal>>> {
+    visible_session(&st, &caller, &id).await?;
+    Ok(Json(crate::goals::get(&st, &id).await?))
+}
+
+async fn set_goal(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(req): Json<api::GoalSet>,
+) -> ApiResult<Json<api::SessionGoal>> {
+    visible_session(&st, &caller, &id).await?;
+    Ok(Json(crate::goals::set(&st, &id, &req).await?))
+}
+
+async fn patch_goal(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(req): Json<api::GoalPatch>,
+) -> ApiResult<Json<api::SessionGoal>> {
+    visible_session(&st, &caller, &id).await?;
+    Ok(Json(crate::goals::patch(&st, &id, &req).await?))
+}
+
+async fn clear_goal(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    visible_session(&st, &caller, &id).await?;
+    crate::goals::clear(&st, &id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list_followups(

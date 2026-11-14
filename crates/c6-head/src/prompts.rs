@@ -196,6 +196,21 @@ pub const DEFAULTS: &[Prompt] = &[
         default: text::TASK_BATCH,
     },
     Prompt {
+        name: "session.goal_start",
+        description: "The first message toward a goal set on an idle session (docs/goals.md). Placeholder: {{goal}}.",
+        default: text::GOAL_START,
+    },
+    Prompt {
+        name: "session.goal_check",
+        description: "After each turn toward a goal: reached, needs you, or keep going (docs/goals.md). Placeholders: {{goal}}, {{turn}}, {{previous}}.",
+        default: text::GOAL_CHECK,
+    },
+    Prompt {
+        name: "session.goal_continue",
+        description: "The message that keeps a session going toward its goal (docs/goals.md). Placeholders: {{goal}}, {{left}}, {{turn}}, {{max}}.",
+        default: text::GOAL_CONTINUE,
+    },
+    Prompt {
         name: "work.propose",
         description: "How what's open is grouped into pieces of work, once, for you to accept or skip (docs/work.md §9). Placeholder: {{things}}.",
         default: text::WORK_PROPOSE,

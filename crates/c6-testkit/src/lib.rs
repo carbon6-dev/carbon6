@@ -140,6 +140,13 @@ impl MockLlm {
         gate
     }
 
+    /// `push_gated` for the first request whose messages contain `about`.
+    pub fn push_gated_about(&self, about: &str, reply: Reply) -> Arc<Notify> {
+        let gate = Arc::new(Notify::new());
+        self.inner.script.lock().unwrap().push_back(Step { reply, gate: Some(gate.clone()), about: vec![about.to_owned()] });
+        gate
+    }
+
     pub fn requests(&self) -> Vec<Value> {
         self.inner.requests.lock().unwrap().clone()
     }

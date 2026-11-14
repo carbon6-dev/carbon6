@@ -31,6 +31,7 @@ mod examples;
 mod explorer;
 mod extract;
 mod fixtures;
+mod goals;
 mod grants;
 mod hooks;
 mod ide;

@@ -25,6 +25,7 @@ mod docs;
 mod explorer;
 mod files;
 mod fleet;
+mod goal;
 mod icons;
 mod itemviews;
 mod labels;

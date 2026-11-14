@@ -490,6 +490,52 @@ pub struct Session {
     /// Your follow-ups for it not sent yet (docs/capture.md §4).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub followups: u32,
+    /// The goal it works toward (docs/goals.md).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<SessionGoal>,
+}
+
+/// A session's goal (docs/goals.md): after each turn a check decides
+/// whether it is reached, needs you, or the session keeps going.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SessionGoal {
+    /// What done looks like.
+    pub text: String,
+    /// active, paused, achieved, needs_you or stopped.
+    pub state: String,
+    /// Turns it has started toward the goal, and the most it may.
+    pub turns: u32,
+    pub max_turns: u32,
+    /// When it stops trying (`max_hours` after it was set).
+    pub deadline: UnixMs,
+    /// The last check's reason, and what it said is left.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub why: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub left: String,
+    pub created_at: UnixMs,
+    pub updated_at: UnixMs,
+}
+
+/// `PUT /api/v1/sessions/{id}/goal`: sets (or replaces) its goal.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct GoalSet {
+    pub text: String,
+    /// Default 20.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u32>,
+    /// Default 8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_hours: Option<u32>,
+}
+
+/// `PATCH /api/v1/sessions/{id}/goal`: pause, resume (active) or stop it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct GoalPatch {
+    pub state: String,
 }
 
 impl Session {
@@ -3792,7 +3838,7 @@ pub struct Channel {
 }
 
 /// Events a channel can carry: (name, description).
-pub const NOTIFY_EVENTS: [(&str, &str); 13] = [
+pub const NOTIFY_EVENTS: [(&str, &str); 14] = [
     ("approval", "a tool call waits for your approval (with Allow / Deny links)"),
     ("decision", "something needs your decision (with a link to answer, when it has options)"),
     ("failed", "a turn ended with an error"),
@@ -3806,11 +3852,12 @@ pub const NOTIFY_EVENTS: [(&str, &str); 13] = [
     ("work", "work you left open went quiet, or has needed you for a while"),
     ("quota", "a plan's usage limit (Claude Code, ChatGPT) passed 80% or 95%, or ran out"),
     ("backup", "backups fell behind, or a test restore failed"),
+    ("goal", "a session's goal was reached, needs you, or stopped (docs/goals.md)"),
 ];
 
 /// The events a channel without a list carries.
-pub const DEFAULT_NOTIFY_EVENTS: [&str; 11] =
-    ["approval", "decision", "failed", "notice", "automation", "trigger", "budget", "host", "work", "quota", "backup"];
+pub const DEFAULT_NOTIFY_EVENTS: [&str; 12] =
+    ["approval", "decision", "failed", "notice", "automation", "trigger", "budget", "host", "work", "quota", "backup", "goal"];
 
 /// A machine reached over SSH through a worker (`/api/v1/settings/hosts`).
 /// Sessions on it get its labels; templates can target hosts by label.
@@ -4337,7 +4384,7 @@ pub struct ApprovalDecision {
 /// The commands built into carbon6: (name, description, argument hint).
 /// `compact`, `init` and `review` run on the worker; `clear` and `export`
 /// in the UI.
-pub const BUILTIN_COMMANDS: [(&str, &str, &str); 7] = [
+pub const BUILTIN_COMMANDS: [(&str, &str, &str); 8] = [
     ("compact", "Summarize the conversation so far to free context", "[what to focus on]"),
     ("init", "Write an AGENTS.md describing this codebase", ""),
     ("review", "Review the changes (uncommitted, or a branch or PR)", "[what to review]"),
@@ -4345,6 +4392,11 @@ pub const BUILTIN_COMMANDS: [(&str, &str, &str); 7] = [
     ("export", "Download this conversation as Markdown", ""),
     ("todo", "Note a to-do on this session's work, for later (the agent doesn't see it)", "<what to do>"),
     ("next", "Hold a follow-up to send once it's done (Up next; the agent doesn't see it yet)", "<what to ask or tell it>"),
+    (
+        "goal",
+        "Set what done looks like: it keeps going until that's reached, it needs you, or it runs out of turns",
+        "<what done looks like>",
+    ),
 ];
 
 /// A command as the composer lists it (`GET /api/v1/commands`).

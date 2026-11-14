@@ -11,19 +11,21 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-struct Env {
-    mock: MockLlm,
-    api: String,
-    http: reqwest::Client,
-    conn: String,
-    wid: uuid::Uuid,
+/// A head, a worker attached to it and a mock model connection (also for
+/// goals.rs).
+pub(crate) struct Env {
+    pub(crate) mock: MockLlm,
+    pub(crate) api: String,
+    pub(crate) http: reqwest::Client,
+    pub(crate) conn: String,
+    pub(crate) wid: uuid::Uuid,
     _head: c6_head::Head,
     _dirs: Vec<tempfile::TempDir>,
-    stop: CancellationToken,
+    pub(crate) stop: CancellationToken,
 }
 
 impl Env {
-    async fn new() -> Self {
+    pub(crate) async fn new() -> Self {
         let mock = MockLlm::start().await;
         let (head_dir, state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let head = c6_head::start(HeadConfig {
@@ -57,12 +59,12 @@ impl Env {
         Env { mock, api, http, conn: conn.id, wid: worker.identity.meta.worker_id.0, _head: head, _dirs: vec![head_dir, state], stop }
     }
 
-    async fn get(&self, path: &str) -> Value {
+    pub(crate) async fn get(&self, path: &str) -> Value {
         self.http.get(format!("{}/{path}", self.api)).send().await.unwrap().json().await.unwrap()
     }
 
     /// POSTs, failing the test on an error status.
-    async fn post(&self, path: &str, body: Value) -> Value {
+    pub(crate) async fn post(&self, path: &str, body: Value) -> Value {
         let r = self.http.post(format!("{}/{path}", self.api)).json(&body).send().await.unwrap();
         let status = r.status();
         let text = r.text().await.unwrap();
@@ -71,13 +73,13 @@ impl Env {
     }
 
     /// POSTs what should be refused: its error.
-    async fn refused(&self, path: &str, body: Value) -> String {
+    pub(crate) async fn refused(&self, path: &str, body: Value) -> String {
         let r = self.http.post(format!("{}/{path}", self.api)).json(&body).send().await.unwrap();
         assert!(r.status().is_client_error(), "POST {path} should be refused: {}", r.status());
         r.text().await.unwrap()
     }
 
-    async fn start(&self, cwd: &std::path::Path, prompt: &str) -> Session {
+    pub(crate) async fn start(&self, cwd: &std::path::Path, prompt: &str) -> Session {
         serde_json::from_value(
             self.post("sessions", json!({"worker_id": self.wid, "cwd": cwd, "connection_id": self.conn, "model": "m", "prompt": prompt}))
                 .await,
@@ -85,13 +87,13 @@ impl Env {
         .unwrap()
     }
 
-    async fn events(&self, id: &str) -> Vec<Event> {
+    pub(crate) async fn events(&self, id: &str) -> Vec<Event> {
         serde_json::from_value(self.get(&format!("sessions/{id}/events")).await).unwrap()
     }
 
     /// Its events once `turns` turns have ended and it is idle with
     /// nothing queued.
-    async fn ended(&self, id: &str, turns: usize) -> Vec<Event> {
+    pub(crate) async fn ended(&self, id: &str, turns: usize) -> Vec<Event> {
         eventually("the turns to end", async || {
             let ev = self.events(id).await;
             let detail = self.get(&format!("sessions/{id}")).await;
@@ -103,12 +105,12 @@ impl Env {
         .await
     }
 
-    async fn decision(&self, id: i64) -> Decision {
+    pub(crate) async fn decision(&self, id: i64) -> Decision {
         serde_json::from_value(self.get(&format!("decisions/{id}")).await).unwrap()
     }
 }
 
-fn user_texts(events: &[Event]) -> Vec<String> {
+pub(crate) fn user_texts(events: &[Event]) -> Vec<String> {
     events
         .iter()
         .filter_map(|e| match &e.kind {

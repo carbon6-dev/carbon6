@@ -28,6 +28,7 @@ pub mod extract;
 pub mod fabric;
 pub mod files;
 pub mod followups;
+pub mod goals;
 pub mod google;
 pub mod grants;
 pub mod guard;

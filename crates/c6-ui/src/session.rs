@@ -6222,6 +6222,31 @@ fn Composer(
         let custom = |n: &str| {
             commands.get_untracked().and_then(|l| l.into_iter().find(|c| c.name == n).map(|c| c.source == "custom")).unwrap_or(false)
         };
+        // A goal it keeps going toward (docs/goals.md).
+        let goal =
+            t.trim().strip_prefix("/goal").filter(|r| r.is_empty() || r.starts_with(char::is_whitespace)).map(|r| r.trim().to_owned());
+        if let Some(what) = goal.filter(|_| !custom("goal")) {
+            if what.is_empty() {
+                error.set(Some("Write what done looks like after /goal.".into()));
+                return;
+            }
+            let session = id.get_value();
+            spawn_local(async move {
+                match api::goal_set(session, what).await {
+                    Ok(g) => {
+                        text.set(String::new());
+                        command.set(None);
+                        error.set(None);
+                        draft_note.set(Some(format!(
+                            "Goal set: it keeps going until it's reached, needs you, or uses its {} turns.",
+                            g.max_turns
+                        )));
+                    }
+                    Err(e) => error.set(Some(e)),
+                }
+            });
+            return;
+        }
         // Thoughts you note while it works (docs/capture.md §3): never sent.
         let capture = ["todo", "next"].into_iter().find_map(|name| {
             let rest = t.trim().strip_prefix('/')?.strip_prefix(name)?;
@@ -6425,7 +6450,9 @@ fn Composer(
             // In line with the transcript, the glance's room beside it.
             <div class=if inline { "" } else { READING_ROW }>
             <div class=if inline { "space-y-2" } else { "w-full min-w-0 max-w-4xl space-y-2 px-2 py-1.5 focus-mode:max-w-7xl sm:px-3 sm:py-2" }>
-                // What you noted to send once it's done (docs/capture.md §4).
+                // The goal it works toward (docs/goals.md), and what you noted
+                // to send once it's done (docs/capture.md §4).
+                {(!inline).then(|| view! { <crate::goal::GoalStrip session=id.get_value() /> })}
                 {(!inline).then(|| view! { <crate::capture::UpNext session=id.get_value() running=running /> })}
                 {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
                 <Show when=move || archived.get()>
