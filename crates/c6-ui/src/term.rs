@@ -33,7 +33,112 @@ extern "C" {
 
     #[wasm_bindgen(method)]
     fn dispose(this: &TermHandle);
+
+    #[wasm_bindgen(method)]
+    fn focus(this: &TermHandle);
+
+    #[wasm_bindgen(method, js_name = appCursor)]
+    fn app_cursor(this: &TermHandle) -> bool;
 }
+
+/// Modifiers the touch key row holds for the next key (a phone's keyboard
+/// has neither).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Mods {
+    ctrl: bool,
+    alt: bool,
+}
+
+/// What typing `text` sends with `mods` held: Ctrl turns a letter (or one of
+/// @[\]^_ and space) into its control character, Alt puts Esc before it.
+fn with_mods(text: &str, mods: Mods) -> String {
+    if !mods.ctrl && !mods.alt {
+        return text.to_owned();
+    }
+    let mut chars = text.chars();
+    let (Some(c), None) = (chars.next(), chars.next()) else { return text.to_owned() };
+    let mut out = String::new();
+    if mods.alt {
+        out.push('\x1b');
+    }
+    match c {
+        _ if mods.ctrl && c.is_ascii_alphabetic() => out.push(((c.to_ascii_uppercase() as u8) & 0x1f) as char),
+        '@' | ' ' | '2' if mods.ctrl => out.push('\0'),
+        '[' | '\\' | ']' | '^' | '_' if mods.ctrl => out.push(((c as u8) & 0x1f) as char),
+        '?' if mods.ctrl => out.push('\x7f'),
+        _ => out.push(c),
+    }
+    out
+}
+
+/// A key of the touch row.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Key {
+    Esc,
+    Tab,
+    Up,
+    Down,
+    Right,
+    Left,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Text(&'static str),
+}
+
+/// What a key of the row sends: arrows in the cursor mode the program asked
+/// for, and with Ctrl or Alt as xterm encodes them (`ESC [1;5A`).
+fn key_bytes(key: Key, mods: Mods, app_cursor: bool) -> String {
+    let modifier = 1 + if mods.alt { 2 } else { 0 } + if mods.ctrl { 4 } else { 0 };
+    let cursor = |c: char| {
+        if modifier > 1 {
+            format!("\x1b[1;{modifier}{c}")
+        } else if app_cursor {
+            format!("\x1bO{c}")
+        } else {
+            format!("\x1b[{c}")
+        }
+    };
+    let tilde = |n: u8| if modifier > 1 { format!("\x1b[{n};{modifier}~") } else { format!("\x1b[{n}~") };
+    match key {
+        Key::Esc => "\x1b".into(),
+        Key::Tab if mods.alt => "\x1b\t".into(),
+        Key::Tab => "\t".into(),
+        Key::Up => cursor('A'),
+        Key::Down => cursor('B'),
+        Key::Right => cursor('C'),
+        Key::Left => cursor('D'),
+        Key::Home => cursor('H'),
+        Key::End => cursor('F'),
+        Key::PageUp => tilde(5),
+        Key::PageDown => tilde(6),
+        Key::Text(t) => with_mods(t, mods),
+    }
+}
+
+/// The touch key row's keys, in order: a label (or, for arrows, an icon
+/// with the label as its name).
+const KEYS: [(&str, Option<crate::icons::Icon>, Key); 15] = {
+    use crate::icons::Icon;
+    [
+        ("Esc", None, Key::Esc),
+        ("Tab", None, Key::Tab),
+        ("Left", Some(Icon::ArrowLeft), Key::Left),
+        ("Up", Some(Icon::ArrowUp), Key::Up),
+        ("Down", Some(Icon::ArrowDown), Key::Down),
+        ("Right", Some(Icon::ArrowRight), Key::Right),
+        ("|", None, Key::Text("|")),
+        ("~", None, Key::Text("~")),
+        ("/", None, Key::Text("/")),
+        ("-", None, Key::Text("-")),
+        ("Home", None, Key::Home),
+        ("End", None, Key::End),
+        ("PgUp", None, Key::PageUp),
+        ("PgDn", None, Key::PageDown),
+        ("^C", None, Key::Text("\x03")),
+    ]
+};
 
 enum Out {
     Bytes(Vec<u8>),
@@ -61,6 +166,11 @@ pub fn TerminalView(worker_id: String, terminal_id: String) -> impl IntoView {
     let ws_path = format!("/api/v1/workers/{worker_id}/terminals/{terminal_id}/attach");
     let loading = RwSignal::new(true);
     let error = RwSignal::new(None::<String>);
+    // The touch key row (a phone's keyboard has no Ctrl, Esc or arrows):
+    // the held modifiers, and where its keys go.
+    let mods = RwSignal::new(Mods::default());
+    let input = StoredValue::new(None::<mpsc::UnboundedSender<Out>>);
+    let handle = StoredValue::new_local(None::<Rc<TermHandle>>);
 
     Effect::new(move || {
         let Some(div) = el.get() else { return };
@@ -78,7 +188,14 @@ pub fn TerminalView(worker_id: String, terminal_id: String) -> impl IntoView {
             }
             let (out_tx, mut out_rx) = mpsc::unbounded::<Out>();
             let data_tx = out_tx.clone();
+            input.set_value(Some(data_tx.clone()));
             let on_data = Closure::<dyn FnMut(String)>::new(move |s: String| {
+                // A held Ctrl or Alt applies to the next key typed, once.
+                let held = mods.get_untracked();
+                let s = with_mods(&s, held);
+                if held != Mods::default() {
+                    mods.set(Mods::default());
+                }
                 let _ = data_tx.unbounded_send(Out::Bytes(s.into_bytes()));
             });
             let on_resize = Closure::<dyn FnMut(u32, u32)>::new(move |c, r| {
@@ -93,6 +210,7 @@ pub fn TerminalView(worker_id: String, terminal_id: String) -> impl IntoView {
                 }
             };
             *mounted.borrow_mut() = Some(MountedTerminal { term: t.clone(), _on_data: on_data, _on_resize: on_resize });
+            handle.set_value(Some(t.clone()));
             loading.set(false);
             let ws = match WebSocket::open(&url) {
                 Ok(ws) => ws,
@@ -130,6 +248,8 @@ pub fn TerminalView(worker_id: String, terminal_id: String) -> impl IntoView {
             futures::future::select(forward, receive).await;
         });
         on_cleanup(move || {
+            input.set_value(None);
+            handle.set_value(None);
             abort.abort();
             for_cleanup.take().borrow_mut().take();
         });
@@ -143,7 +263,88 @@ pub fn TerminalView(worker_id: String, terminal_id: String) -> impl IntoView {
             <Show when=move || loading.get()><p class="absolute left-3 top-3 text-sm text-muted">"Loading terminal…"</p></Show>
             {move || error.get().map(|e| view! { <crate::util::ErrorBox message=e /> })}
             <div node_ref=el class="h-[70vh] w-full overflow-hidden rounded-md border border-zinc-200 p-1 dark:border-zinc-800"></div>
+            {crate::util::touch_first().then(|| view! { <KeyRow mods input handle /> })}
         </div>
+    }
+}
+
+/// Keys a phone's keyboard lacks, under the terminal: Esc, Tab, Ctrl and
+/// Alt (held for the next key; tap again to let go), arrows, Home, End, page
+/// keys and awkward symbols. Pressing one never takes the focus (and the
+/// keyboard) from the terminal.
+#[component]
+fn KeyRow(
+    mods: RwSignal<Mods>,
+    input: StoredValue<Option<mpsc::UnboundedSender<Out>>>,
+    handle: StoredValue<Option<Rc<TermHandle>>, LocalStorage>,
+) -> impl IntoView {
+    let press = move |key: Key| {
+        let app = handle.with_value(|h| h.as_ref().is_some_and(|t| t.app_cursor()));
+        let bytes = key_bytes(key, mods.get_untracked(), app);
+        mods.set(Mods::default());
+        input.with_value(|tx| {
+            if let Some(tx) = tx {
+                let _ = tx.unbounded_send(Out::Bytes(bytes.into_bytes()));
+            }
+        });
+        handle.with_value(|h| {
+            if let Some(t) = h {
+                t.focus();
+            }
+        });
+    };
+    const KEY: &str = "min-h-11 min-w-11 shrink-0 rounded-md border border-zinc-200 bg-white px-2 font-mono text-sm active:bg-zinc-200 dark:border-zinc-700 dark:bg-zinc-900 dark:active:bg-zinc-700";
+    let held = |on: bool| if on { "border-sky-500 bg-sky-100 text-sky-900 dark:bg-sky-900 dark:text-sky-100" } else { "" };
+    let keep = |ev: web_sys::PointerEvent| ev.prevent_default();
+    view! {
+        <div class="mt-1 flex gap-1 overflow-x-auto pb-1" data-term-keys="" role="toolbar" aria-label="Terminal keys">
+            <button type="button" class=move || format!("{KEY} {}", held(mods.get().ctrl)) aria-pressed=move || mods.get().ctrl.to_string()
+                on:pointerdown=keep on:click=move |_| mods.update(|m| m.ctrl = !m.ctrl)>"Ctrl"</button>
+            <button type="button" class=move || format!("{KEY} {}", held(mods.get().alt)) aria-pressed=move || mods.get().alt.to_string()
+                on:pointerdown=keep on:click=move |_| mods.update(|m| m.alt = !m.alt)>"Alt"</button>
+            {KEYS.iter().map(|&(label, icon, key)| view! {
+                <button type="button" class=format!("{KEY} inline-flex items-center justify-center") aria-label=label title=label
+                    on:pointerdown=keep on:click=move |_| press(key)>
+                    {match icon {
+                        Some(i) => crate::icons::icon(i, crate::icons::Size::S16),
+                        None => view! { {label} }.into_any(),
+                    }}
+                </button>
+            }).collect_view()}
+        </div>
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+
+    #[test]
+    fn ctrl_and_alt_change_the_next_key() {
+        let ctrl = Mods { ctrl: true, alt: false };
+        let alt = Mods { ctrl: false, alt: true };
+        assert_eq!(with_mods("c", ctrl), "\x03");
+        assert_eq!(with_mods("D", ctrl), "\x04");
+        assert_eq!(with_mods("[", ctrl), "\x1b");
+        assert_eq!(with_mods(" ", ctrl), "\0");
+        assert_eq!(with_mods("b", alt), "\x1bb");
+        assert_eq!(with_mods("x", Mods { ctrl: true, alt: true }), "\x1b\x18");
+        assert_eq!(with_mods("ab", ctrl), "ab", "pasted text is left alone");
+        assert_eq!(with_mods("c", Mods::default()), "c");
+    }
+
+    #[test]
+    fn keys_send_what_a_terminal_expects() {
+        let none = Mods::default();
+        assert_eq!(key_bytes(Key::Up, none, false), "\x1b[A");
+        assert_eq!(key_bytes(Key::Up, none, true), "\x1bOA", "application cursor mode (vim, less)");
+        assert_eq!(key_bytes(Key::Left, Mods { ctrl: true, alt: false }, false), "\x1b[1;5D");
+        assert_eq!(key_bytes(Key::Right, Mods { ctrl: false, alt: true }, true), "\x1b[1;3C");
+        assert_eq!(key_bytes(Key::PageUp, none, false), "\x1b[5~");
+        assert_eq!(key_bytes(Key::Esc, none, false), "\x1b");
+        assert_eq!(key_bytes(Key::Tab, none, false), "\t");
+        assert_eq!(key_bytes(Key::Text("|"), none, false), "|");
+        assert_eq!(key_bytes(Key::Text("c"), Mods { ctrl: true, alt: false }, false), "\x03");
     }
 }
 

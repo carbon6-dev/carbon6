@@ -66,6 +66,10 @@ window.c6Terminal = (() => {
           // and xterm parses asynchronously: copy it.
           write: (bytes) => term.write(bytes.slice()),
           writeln: (s) => term.writeln(s),
+          // For the touch key row: back to the terminal (and its keyboard),
+          // and whether arrows are in application mode (vim, less).
+          focus: () => term.focus(),
+          appCursor: () => !!term.modes?.applicationCursorKeysMode,
           dispose: () => { ro.disconnect(); term.dispose(); },
         };
       } catch (error) {
