@@ -138,9 +138,49 @@ def stub_old_tool_output(prefix, keep, min_chars, keep_first=0):
     return out, stubbed
 
 
+def is_instruction(line):
+    """A message to the agent (its task, or a later one), not a tool result."""
+    if line.get("type") != "user" or line.get("isMeta"):
+        return False
+    c = (line.get("message") or {}).get("content")
+    if isinstance(c, str):
+        return bool(c.strip())
+    return isinstance(c, list) and any(b.get("type") == "text" for b in c) and not any(b.get("type") == "tool_result" for b in c)
+
+
+def stub_old_keep_turn_starts(prefix, keep, min_chars, keep_first=5):
+    """stub-old-tool-output, keeping the first `keep_first` outputs after
+    every message to the agent: what it read to learn each instruction
+    (an instruction handed over mid-run points at files too)."""
+    kept = set()
+    count = None
+    for i, line in enumerate(prefix):
+        if is_instruction(line):
+            count = 0
+        for j, b in enumerate(blocks(line)):
+            if b.get("type") == "tool_result" and count is not None and count < keep_first:
+                kept.add((i, j))
+                count += 1
+    names = tool_names(prefix)
+    results = [(i, j) for i, line in enumerate(prefix) for j, b in enumerate(blocks(line)) if b.get("type") == "tool_result"]
+    old = [r for r in results[: max(0, len(results) - keep)] if r not in kept]
+    out = [json.loads(json.dumps(line)) for line in prefix]
+    stubbed = 0
+    for i, j in old:
+        b = out[i]["message"]["content"][j]
+        if len(result_text(b)) < min_chars:
+            continue
+        b["content"] = STUB.format(what=names.get(b.get("tool_use_id"), "a tool call"))
+        if "toolUseResult" in out[i]:
+            out[i]["toolUseResult"] = b["content"]
+        stubbed += 1
+    return out, stubbed
+
+
 POLICIES = {
     "stub-old-tool-output": stub_old_tool_output,
     "stub-old-keep-start": lambda prefix, keep, min_chars: stub_old_tool_output(prefix, keep, min_chars, keep_first=5),
+    "stub-old-keep-turn-starts": stub_old_keep_turn_starts,
 }
 
 
@@ -233,7 +273,7 @@ def judge(task, recent, original, other, model):
         "Replayed from the same point, it chose the OTHER step. Decide whether OTHER is as good a step toward the task: "
         "the same step, an equivalent one (e.g. reading the same thing another way), or a reasonable alternative. "
         "It is worse if it repeats finished work, loses track of the task, or re-does something the log shows was done.\n\n"
-        f"Task (start of its instructions):\n{task[:1500]}\n\nThe last steps before this point:\n{recent}\n\n"
+        f"Its instructions:\n{task[:2600]}\n\nThe last steps before this point:\n{recent}\n\n"
         f"ORIGINAL next step:\n{show(original)}\n\nOTHER next step:\n{show(other)}\n\n"
         'Answer with JSON only: {"verdict": "same" | "equivalent" | "worse", "why": one line}.'
     )
@@ -260,7 +300,7 @@ def judge_pair(task, recent, reference, other, model):
         "An agent is doing a coding task. From the same point in its log, two runs chose these next steps. "
         "Which is the better step toward the task? Equal if they are the same step, equivalent ones, or both reasonable. "
         "A step is worse if it repeats finished work, loses track of the task, or re-reads what the log shows it already has.\n\n"
-        f"Task (start of its instructions):\n{task[:1500]}\n\nThe last steps before this point:\n{recent}\n\n"
+        f"Its instructions:\n{task[:2600]}\n\nThe last steps before this point:\n{recent}\n\n"
         f"STEP 1:\n{show(one)}\n\nSTEP 2:\n{show(two)}\n\n"
         'Answer with JSON only: {"better": "1" | "2" | "equal", "why": one line}.'
     )
@@ -303,6 +343,21 @@ def after_compaction(prefix):
     return prefix[last:]
 
 
+def instructions_of(prefix):
+    """The task as the judge should know it at a point: the first message to
+    the agent and, if one came later, the latest."""
+    texts = []
+    for line in prefix:
+        if is_instruction(line):
+            c = line["message"]["content"]
+            texts.append(c if isinstance(c, str) else "".join(b.get("text", "") for b in c if b.get("type") == "text"))
+    if not texts:
+        return ""
+    if len(texts) == 1:
+        return texts[0][:1500]
+    return f"{texts[0][:1000]}\n\n[Later, the latest instruction it was given:]\n{texts[-1][:1500]}"
+
+
 def task_of(lines):
     for line in lines:
         if line.get("type") == "user":
@@ -310,6 +365,11 @@ def task_of(lines):
             if isinstance(c, str):
                 return c
     return ""
+
+
+def prior_arms(prior, prefix, a):
+    """The earlier run's policy arms at this point, with the history each sent."""
+    return [(name, POLICIES[name](prefix, a.keep, a.min_chars)[0]) for name in POLICIES if prior.get(name)]
 
 
 def main():
@@ -329,6 +389,7 @@ def main():
     ap.add_argument("--timeout", type=int, default=900)
     ap.add_argument("--out", default="replay-results.jsonl")
     ap.add_argument("--dry-run", action="store_true", help="choose points and apply the policy; call no model")
+    ap.add_argument("--reuse-baselines", help="an earlier --out: its baseline steps for the same points are used, not replayed again")
     a = ap.parse_args()
 
     lines = load(a.transcript)
@@ -340,6 +401,12 @@ def main():
     chosen = points(lines, a.points, a.min_context)
     print(f"{len(lines)} lines; model {model}; {len(chosen)} points with context >= {a.min_context}", file=sys.stderr)
     work = tempfile.mkdtemp(prefix="c6-replay-")
+    earlier = {}
+    if a.reuse_baselines:
+        for l in open(a.reuse_baselines):
+            r = json.loads(l)
+            if r.get("baseline"):
+                earlier[(os.path.basename(r["transcript"]), r["line"])] = r
     policies = a.policy or ["stub-old-tool-output"]
     with open(a.out, "a") as out:
         for n, (i, original, ctx) in enumerate(chosen, 1):
@@ -351,13 +418,34 @@ def main():
                 shrunk, stubbed = POLICIES[name](prefix, a.keep, a.min_chars)
                 row[f"{name}_stubbed"], row[f"{name}_est_tokens"] = stubbed, est(shrunk)
                 arms.append((name, shrunk))
+            prior = earlier.get((os.path.basename(a.transcript), i))
+            if prior and not a.dry_run:
+                row["baseline"], row["baseline_usage"] = prior["baseline"], prior.get("baseline_usage", {})
+                row["baseline_reused"] = True
+                arms = [x for x in arms if x[0] != "baseline"]
             if not a.dry_run:
+                replayed = {}
                 for arm, p in arms:
-                    sid = fork(p, project_dir)
-                    try:
-                        action, usage = replay(sid, cwd, model, effort, work, a.timeout)
-                    finally:
-                        drop_fork(project_dir, sid)
+                    digest = json.dumps(p, sort_keys=True)
+                    if prior and prior.get(arm):
+                        # The same policy's step from the earlier run: judged again, not replayed.
+                        action, usage = prior[arm], prior.get(f"{arm}_usage", {})
+                        row[f"{arm}_reused"] = True
+                    elif digest in replayed:
+                        # Another arm sent exactly this history: the same step.
+                        action, usage = replayed[digest]
+                        row[f"{arm}_reused"] = True
+                    elif prior and any(prior.get(x) and json.dumps(q, sort_keys=True) == digest for x, q in prior_arms(prior, prefix, a)):
+                        x = next(x for x, q in prior_arms(prior, prefix, a) if prior.get(x) and json.dumps(q, sort_keys=True) == digest)
+                        action, usage = prior[x], prior.get(f"{x}_usage", {})
+                        row[f"{arm}_reused"] = x
+                    else:
+                        sid = fork(p, project_dir)
+                        try:
+                            action, usage = replay(sid, cwd, model, effort, work, a.timeout)
+                        finally:
+                            drop_fork(project_dir, sid)
+                    replayed[digest] = (action, usage)
                     row[arm] = action
                     row[f"{arm}_usage"] = usage
                     # Against the logged step; or, for a policy, against the
@@ -366,13 +454,13 @@ def main():
                         reference = row["baseline"]
                         row[f"{arm}_same"] = same(action, reference)
                         row[f"{arm}_judge"] = {"verdict": "same", "why": "identical call"} if row[f"{arm}_same"] else judge_pair(
-                            task, recent_steps(prefix), reference, action, a.judge_model)
+                            instructions_of(prefix), recent_steps(prefix), reference, action, a.judge_model)
                         continue
                     row[f"{arm}_same"] = same(action, original)
                     if a.judge_against == "baseline":
                         continue
                     row[f"{arm}_judge"] = {"verdict": "same", "why": "identical call"} if row[f"{arm}_same"] else judge(
-                        task, recent_steps(prefix), original, action, a.judge_model)
+                        instructions_of(prefix), recent_steps(prefix), original, action, a.judge_model)
             out.write(json.dumps(row) + "\n")
             out.flush()
             v = lambda arm: row.get(f"{arm}_judge", {}).get("verdict", "-")  # noqa: E731

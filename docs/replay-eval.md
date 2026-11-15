@@ -68,3 +68,21 @@ It runs where the transcript is, a worker, with the `claude` that wrote it:
 - **Six of the ten "worse" points** are the agent re-reading instruction files it was handed mid-run (`FIX_PROMPT.md`, `red1-*.md`, `WAVE2_PROMPT.md`). They came after the first five outputs, so they were stubbed. Keeping the first few outputs after every new message, not only at the start, should cover them.
 - **By area:** planner 0/6 worse, KQL 4/6.
 - **The judge** sees only the task's opening instructions, so it can't tell when a later instruction made a read relevant.
+
+## Third run (2026-11-15): keeping the start of every instruction
+
+**What was run:**
+- **New policy:** `stub-old-keep-turn-starts`, which keeps the first five outputs after every message to the agent (its task and any instruction handed over later), not only at the very start.
+- **Same 30 points** as the second run.
+- **Judging:** both policies against the stored baselines, with a judge that now also sees the latest instruction before each point.
+- **Replays:** `stub-old-keep-start` was re-judged on its earlier steps. `stub-old-keep-turn-starts` was replayed only where its history differed (20 points).
+
+| | Better | Equivalent | Worse | Re-read an instruction file | Context vs baseline (estimate) |
+|---|---|---|---|---|---|
+| `stub-old-keep-start` | 16 | 3 | 11 | 7 | −40% |
+| `stub-old-keep-turn-starts` | 17 | 4 | 9 | 0 (baseline: 0) | −37% |
+
+**What it shows:**
+- **The one concrete failure is gone:** the new policy never went back to re-read an instruction file, against 7 times for `stub-old-keep-start`.
+- **The judge is noisy:** re-judging the same `stub-old-keep-start` steps moved them from 11/9/10 to 16/3/11. Read the verdict columns as "no sign of a loss", not as a measured gain.
+- **The estimates undercount the saving:** they count characters from the last compaction. The measured saving for `stub-old-keep-start` in the second run was 56%.
