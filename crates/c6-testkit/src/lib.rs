@@ -81,6 +81,9 @@ struct Inner {
     requests: Mutex<Vec<Value>>,
     /// Each request as it was answered, one line: for a test's failure.
     log: Mutex<Vec<String>>,
+    /// Report the request's own size as its prompt tokens (`real_usage`),
+    /// not a fixed 100.
+    real_usage: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone)]
@@ -109,6 +112,13 @@ impl MockLlm {
     /// refused.
     pub fn stop(&self) {
         self.server.abort();
+    }
+
+    /// From now on, report each request's prompt tokens from its size (about
+    /// 3.5 characters a token), as a provider would: for tests of what
+    /// happens as a conversation grows (trimming, compaction).
+    pub fn real_usage(&self) {
+        self.inner.real_usage.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn base_url(&self) -> String {
@@ -193,6 +203,7 @@ async fn embeddings(Json(body): Json<Value>) -> Json<Value> {
 
 async fn completions(State(inner): State<Arc<Inner>>, Json(body): Json<Value>) -> Response {
     let messages = body["messages"].to_string();
+    let size = (body.to_string().chars().count() as u64 * 2).div_ceil(7);
     let asked: String = {
         let last = body["messages"].as_array().and_then(|m| m.last()).map(|m| m["content"].to_string()).unwrap_or_default();
         format!("{} {}", body["model"].as_str().unwrap_or("?"), last.chars().take(160).collect::<String>())
@@ -247,8 +258,9 @@ async fn completions(State(inner): State<Arc<Inner>>, Json(body): Json<Value>) -
             v
         }
     };
-    let usage =
-        json!({"choices": [], "usage": {"prompt_tokens": 100, "completion_tokens": 10, "prompt_tokens_details": {"cached_tokens": 80}}});
+    let prompt = if inner.real_usage.load(std::sync::atomic::Ordering::SeqCst) { size } else { 100 };
+    let usage = json!({"choices": [], "usage": {"prompt_tokens": prompt, "completion_tokens": 10,
+                       "prompt_tokens_details": {"cached_tokens": prompt * 4 / 5}}});
     let gate = step.gate;
     let stream = async_stream(chunks, usage, gate);
     Response::builder().header("content-type", "text/event-stream").body(Body::from_stream(stream)).unwrap()

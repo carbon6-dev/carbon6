@@ -74,11 +74,18 @@ pub struct CompactPrompts {
     pub why_asked: String,
     /// What the summary must hold.
     pub instructions: String,
+    /// What a trimmed tool output says instead (`{{call}}`).
+    pub trimmed: String,
 }
 
 impl Default for CompactPrompts {
     fn default() -> Self {
-        Self { why_full: COMPACT_WHY.into(), why_asked: COMPACT_WHY_ASKED.into(), instructions: COMPACT_PROMPT.into() }
+        Self {
+            why_full: COMPACT_WHY.into(),
+            why_asked: COMPACT_WHY_ASKED.into(),
+            instructions: COMPACT_PROMPT.into(),
+            trimmed: crate::history::TRIMMED_OUTPUT.into(),
+        }
     }
 }
 
@@ -97,6 +104,10 @@ pub struct TurnConfig {
     /// Percent of the window at which to compact; 0: [`compact_share`]'s
     /// default for the window.
     pub compact_at: u32,
+    /// Tokens above which old tool output is trimmed from the conversation
+    /// before a request (`history::trim_old_tool_output`); 0: never. Below
+    /// the compaction threshold, so trimming comes first.
+    pub trim_at: u64,
 }
 
 /// Mutable conversation state carried across turns.
@@ -305,8 +316,22 @@ impl Turn<'_> {
             if self.cancel.is_cancelled() {
                 return Ok(TurnEndReason::Interrupted);
             }
-            let estimate = self.estimate_request(&conv.history, &self.specs);
-            let next = next_tokens(conv.context_tokens, estimate, reported);
+            let mut estimate = self.estimate_request(&conv.history, &self.specs);
+            let mut next = next_tokens(conv.context_tokens, estimate, reported);
+            // Old tool output goes before the context nears full: only when
+            // it saves at least a fifth, so the cached prefix changes rarely.
+            if self.cfg.trim_at > 0 && next > self.cfg.trim_at {
+                let mut trimmed = conv.history.clone();
+                if crate::history::trim_old_tool_output(&mut trimmed, &self.cfg.compact.trimmed) > 0 {
+                    let after = self.estimate_request(&trimmed, &self.specs);
+                    if after * 5 <= estimate * 4 {
+                        conv.history = trimmed;
+                        reported = None;
+                        estimate = after;
+                        next = next_tokens(conv.context_tokens, estimate, reported);
+                    }
+                }
+            }
             if self.cfg.context_window > 0
                 && next as f64 > self.cfg.context_window as f64 * compact_share(self.cfg.context_window, self.cfg.compact_at)
                 && compacted_estimate != Some(estimate)

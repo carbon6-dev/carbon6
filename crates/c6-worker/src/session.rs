@@ -3800,6 +3800,7 @@ impl Actor {
             web_search: hosted_web_search(provider, &self.started),
             compact: compact_prompts(&self.spec),
             compact_at: model.compact_at_percent,
+            trim_at: trim_at(&self.spec, info.context_window),
         };
         let mut conv = self.conv.take().expect("no turn is running");
         let sub = crate::subagent::Parent {
@@ -3864,10 +3865,13 @@ impl Actor {
         let (mut claude, claude_stdin, claude_dir) = (self.claude.take(), self.claude_stdin.clone(), self.manager.claude_dir());
         // Claude Code's calls of carbon6's tools are held to the session's policies.
         let policies = self.policies.clone();
+        let trim_spec = self.spec.clone();
         let task = tokio::spawn(async move {
             let sink: Arc<dyn EventSink> = writer.clone();
             if !claude_code {
                 cfg.context_window = link.context_window(&on_behalf_of, &model).await;
+                // As the window the connection says, not the model's default.
+                cfg.trim_at = trim_at(&trim_spec, cfg.context_window);
             }
             // Secrets for this turn's commands (values only in memory).
             if !secret_names.is_empty() {
@@ -5106,8 +5110,20 @@ pub(crate) fn compact_prompts(spec: &CreateSession) -> c6_agent::CompactPrompts 
         why_full: spec_prompt(spec, "session.compact.full", c6_agent::COMPACT_WHY),
         why_asked: spec_prompt(spec, "session.compact.asked", c6_agent::COMPACT_WHY_ASKED),
         instructions: spec_prompt(spec, "session.compact", c6_agent::COMPACT_PROMPT),
+        trimmed: spec_prompt(spec, "session.trimmed_output", c6_agent::TRIMMED_OUTPUT),
     }
 }
+
+/// Where a subagent's old tool output starts to be trimmed: 200k tokens,
+/// or half a smaller window (docs/replay-eval.md). Not your own sessions.
+fn trim_at(spec: &CreateSession, window: u64) -> u64 {
+    if spec.delegation.is_none() || window == 0 {
+        return 0;
+    }
+    SUBAGENT_TRIM_AT.min(window / 2)
+}
+
+const SUBAGENT_TRIM_AT: u64 = 200_000;
 
 #[cfg(test)]
 mod route_tool_tests {

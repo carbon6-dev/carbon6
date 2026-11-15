@@ -525,6 +525,7 @@ impl Actor {
             web_search: false,
             compact: self.compact.clone(),
             compact_at: self.model.compact_at_percent,
+            trim_at: 0,
         };
         let mut conv = self.conv.take().unwrap_or(Conversation { history: Vec::new(), context_tokens: 0 });
         let (st, sink, inbox, env, c, connection_id) =

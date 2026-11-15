@@ -340,6 +340,15 @@ The head sends each session the connections its realm may use (`CreateSession.su
 
 Until 2026-11-09 Claude Code was left out. A Claude Code session's agent then named the API connection for its subagents to run at all, which billed every one per call instead of on the Claude Code plan. Claude Code sessions are now told their subagents run on Claude Code unless the user asks for another model (`CLAUDE_CODE_NOTE`).
 
+### Long subagents shed old tool output
+
+In carbon6's own loop, a subagent whose request would read more than 200k tokens (or half its model's window, if that is smaller) has its old tool output trimmed first (`history::trim_old_tool_output`, `TurnConfig.trim_at`).
+- **What stays:** the latest 8 outputs, the first 5 after every message to the agent (what it read to learn each instruction), and outputs under 400 characters.
+- **What goes:** each other output becomes the editable prompt `session.trimmed_output` ("[Earlier output of ‹call› removed to save context. Run the tool again if you need it.]").
+- **Cache-friendly:** a trim happens only when it saves at least a fifth, and trimmed outputs stay trimmed, so the cached prefix changes about as often as with compaction, which still comes after if needed.
+- **Evidence:** in step replays of 30 points from long Falcon subagents, this policy read 52% less context with no loss beyond the judge's own noise (docs/replay-eval.md).
+- **Scope:** your own sessions aren't trimmed. Neither are Claude Code sessions: Claude Code keeps its context itself.
+
 ### Tools and prompt
 
 Where the subagent's model takes the parent's tool profile, it shares the parent's tools as before. Otherwise (a GPT subagent under a Claude parent, or any subagent of a Claude Code session) it gets tools of its own in its model's profile, with the inherited routing rule's tool list, then the same filters: the named agent's tools, the depth limit, no task cards. Its system prompt is the parent's with the skills index renamed for the profile, shown only if the skill loader is present. Under Claude Code, whose prompt is its own, it gets the prompt a carbon6 session would have. `SessionStarted.tool_profile`, `tools` and `context_window` are the subagent's own, so a reload rebuilds the same set.

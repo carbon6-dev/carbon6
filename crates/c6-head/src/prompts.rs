@@ -71,6 +71,11 @@ pub const DEFAULTS: &[Prompt] = &[
         default: c6_agent::COMPACT_PROMPT,
     },
     Prompt {
+        name: "session.trimmed_output",
+        description: "What an old tool output says instead, once a long subagent's conversation is trimmed (docs/replay-eval.md). Placeholder: {{call}} (the tool and its main argument).",
+        default: c6_agent::TRIMMED_OUTPUT,
+    },
+    Prompt {
         name: "session.compact.full",
         description: "Why the conversation is compacted, when the context window is nearly full.",
         default: c6_agent::COMPACT_WHY,
@@ -464,6 +469,7 @@ pub async fn compact(st: &HeadState, realm: &str) -> c6_agent::CompactPrompts {
         why_full: s("session.compact.full", c6_agent::COMPACT_WHY),
         why_asked: s("session.compact.asked", c6_agent::COMPACT_WHY_ASKED),
         instructions: s("session.compact", c6_agent::COMPACT_PROMPT),
+        trimmed: s("session.trimmed_output", c6_agent::TRIMMED_OUTPUT),
     }
 }
 

@@ -74,6 +74,7 @@ mod suggestions;
 mod take_back;
 mod task_cards;
 mod triggers;
+mod trim;
 mod updates;
 mod upgrade_backups;
 mod usage;

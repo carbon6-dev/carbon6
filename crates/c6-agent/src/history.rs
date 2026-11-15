@@ -854,3 +854,134 @@ mod tests {
         assert!(handoff_context(&[], "Claude Code", 100).contains("(nothing yet)"));
     }
 }
+
+/// How old tool output is trimmed from a long conversation (docs/replay-eval.md):
+/// the latest outputs, and the first after every message to the agent, stay.
+pub const TRIM_KEEP_LATEST: usize = 8;
+pub const TRIM_KEEP_AFTER_INSTRUCTION: usize = 5;
+/// Shorter outputs stay: a stub would save little.
+pub const TRIM_MIN_CHARS: usize = 400;
+
+/// What a trimmed tool output says instead (the editable prompt
+/// `session.trimmed_output`): `{{call}}` is the tool and its main argument.
+pub const TRIMMED_OUTPUT: &str = "[Earlier output of {{call}} removed to save context. Run the tool again if you need it.]";
+
+/// Replaces old tool outputs with `stub` (naming each call), keeping the
+/// latest [`TRIM_KEEP_LATEST`], the first [`TRIM_KEEP_AFTER_INSTRUCTION`]
+/// after every message to the agent (what it read to learn each
+/// instruction), and short ones. Tool calls and the agent's words stay.
+/// Trimmed outputs stay trimmed, so a conversation's prefix changes only
+/// when it is trimmed again. Returns how many outputs it trimmed.
+pub fn trim_old_tool_output(history: &mut [Message], stub: &str) -> usize {
+    let mut calls = std::collections::HashMap::new();
+    for m in history.iter() {
+        for b in &m.blocks {
+            if let Block::ToolUse { id, name, input_json } = b {
+                let v: serde_json::Value = serde_json::from_str(input_json).unwrap_or_default();
+                let arg = ["file_path", "path", "pattern", "command", "cmd", "query", "url"]
+                    .iter()
+                    .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
+                    .unwrap_or("");
+                let arg: String = arg.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(80).collect();
+                calls.insert(id.clone(), if arg.is_empty() { name.clone() } else { format!("{name} {arg}") });
+            }
+        }
+    }
+    // Every tool result, in order, and whether it opens an instruction's
+    // first outputs.
+    let mut results = Vec::new();
+    let mut since_instruction = None::<usize>;
+    for (i, m) in history.iter().enumerate() {
+        if m.role != Role::User {
+            continue;
+        }
+        for (j, b) in m.blocks.iter().enumerate() {
+            match b {
+                Block::ToolResult { .. } => {
+                    let kept = since_instruction.is_some_and(|n| n < TRIM_KEEP_AFTER_INSTRUCTION);
+                    if let Some(n) = since_instruction.as_mut() {
+                        *n += 1;
+                    }
+                    results.push((i, j, kept));
+                }
+                Block::Text(t) if !t.starts_with(TOOL_IMAGE) => since_instruction = Some(0),
+                _ => {}
+            }
+        }
+    }
+    let old = results.len().saturating_sub(TRIM_KEEP_LATEST);
+    let mut trimmed = 0;
+    for &(i, j, kept) in &results[..old] {
+        if kept {
+            continue;
+        }
+        if let Block::ToolResult { id, content, .. } = &mut history[i].blocks[j] {
+            if content.chars().count() < TRIM_MIN_CHARS || content.starts_with(TRIMMED_MARK) {
+                continue;
+            }
+            let call = calls.get(id).cloned().unwrap_or_else(|| "a tool call".into());
+            *content = format!("{TRIMMED_MARK}{}", stub.replace("{{call}}", &call));
+            trimmed += 1;
+        }
+    }
+    trimmed
+}
+
+/// Marks a trimmed output, so it is never trimmed (or counted) again.
+const TRIMMED_MARK: &str = "\u{2060}";
+
+#[cfg(test)]
+mod trim_tests {
+    use super::*;
+
+    fn call(id: &str, path: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            blocks: vec![Block::ToolUse { id: id.into(), name: "Read".into(), input_json: format!(r#"{{"file_path":"{path}"}}"#) }],
+        }
+    }
+
+    fn result(id: &str) -> Block {
+        Block::ToolResult { id: id.into(), content: "x".repeat(1000), is_error: false }
+    }
+
+    fn content(m: &[Message], id: &str) -> String {
+        m.iter()
+            .flat_map(|m| &m.blocks)
+            .find_map(|b| match b {
+                Block::ToolResult { id: i, content, .. } if i == id => Some(content.clone()),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    /// Old outputs go, but not the latest, the first after each
+    /// instruction, or short ones; trimming again changes nothing.
+    #[test]
+    fn old_tool_output_is_trimmed_keeping_what_teaches_the_task() {
+        let mut h = vec![Message::user_text(String::from("Do the task in TASK.md"))];
+        for n in 0..30 {
+            let id = format!("t{n}");
+            h.push(call(&id, &format!("/src/f{n}.rs")));
+            if n == 20 {
+                // An instruction handed over mid-run, with the result.
+                h.push(Message { role: Role::User, blocks: vec![result(&id), Block::Text("Now read FIX.md and fix it".into())] });
+            } else {
+                h.push(Message { role: Role::User, blocks: vec![result(&id)] });
+            }
+        }
+        h.push(call("short", "/a"));
+        let n = trim_old_tool_output(&mut h, TRIMMED_OUTPUT);
+        for kept in ["t0", "t4", "t21", "t25", "t22", "t29"] {
+            assert_eq!(content(&h, kept).len(), 1000, "{kept} stays");
+        }
+        for gone in ["t5", "t10", "t20"] {
+            let c = content(&h, gone);
+            assert!(c.contains("Earlier output of Read /src/f"), "{gone}: {c}");
+        }
+        // t0..t4 (the task's first), t21..t25 (the later instruction's first)
+        // and t22..t29 (the latest) stay: t5..t20 go.
+        assert_eq!(n, 16);
+        assert_eq!(trim_old_tool_output(&mut h, TRIMMED_OUTPUT), 0, "trimmed outputs stay as they are");
+    }
+}

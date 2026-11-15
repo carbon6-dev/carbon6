@@ -41,6 +41,7 @@ fn cfg() -> TurnConfig {
         web_search: false,
         compact: Default::default(),
         compact_at: 0,
+        trim_at: 0,
     }
 }
 
