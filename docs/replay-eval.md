@@ -82,7 +82,10 @@ It runs where the transcript is, a worker, with the `claude` that wrote it:
 | `stub-old-keep-start` | 16 | 3 | 11 | 7 | −40% |
 | `stub-old-keep-turn-starts` | 17 | 4 | 9 | 0 (baseline: 0) | −37% |
 
+Both rows were judged in this run, by the same judge, against the same baselines: compare them only with each other, not with the second run.
+
 **What it shows:**
-- **The one concrete failure is gone:** the new policy never went back to re-read an instruction file, against 7 times for `stub-old-keep-start`.
-- **The judge is noisy:** re-judging the same `stub-old-keep-start` steps moved them from 11/9/10 to 16/3/11. Read the verdict columns as "no sign of a loss", not as a measured gain.
+- **The one concrete failure is gone:** the new policy never went back to re-read an instruction file, against 7 times for `stub-old-keep-start`. This is a count of the steps themselves, not a judge's verdict.
+- **The verdicts aren't evidence either way:** with identical steps, `stub-old-keep-start` went from 11 better / 9 equivalent / 10 worse under the second run's judge to 16/3/11 under this one. The run had no noise control (baseline against baseline, or the same pairs judged twice), so the verdict columns can't show a gain or a loss.
 - **The estimates undercount the saving:** they count characters from the last compaction. The measured saving for `stub-old-keep-start` in the second run was 56%.
+- **Next measurement:** add a noise control (each point's baseline replayed twice and judged against itself, and every pair judged twice) before reading the verdicts.
