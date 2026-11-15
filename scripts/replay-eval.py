@@ -165,7 +165,7 @@ def drop_fork(project_dir, sid):
             p.unlink()
 
 
-def replay(sid, cwd, model, work, timeout):
+def replay(sid, cwd, model, effort, work, timeout):
     """Resumes a fork until Claude picks its next action; the hook blocks
     and records the tool call, then the process is stopped. Returns the
     action (tool call, or text if it chose none) and the call's usage."""
@@ -178,7 +178,7 @@ def replay(sid, cwd, model, work, timeout):
         }
     }
     cmd = [
-        "claude", "-p", CONTINUE, "--resume", sid, "--model", model,
+        "claude", "-p", CONTINUE, "--resume", sid, "--model", model, *(["--effort", effort] if effort else []),
         "--output-format", "stream-json", "--verbose",
         "--settings", json.dumps(settings), "--setting-sources", "", "--strict-mcp-config",
     ]
@@ -248,6 +248,42 @@ def judge(task, recent, original, other, model):
         return {"verdict": "unknown", "why": out[:200]}
 
 
+def judge_pair(task, recent, reference, other, model):
+    """Pairwise: which of two next steps from the same point is better, shown
+    in random order. Returns the verdict for `other` against `reference`:
+    same, equivalent, better or worse."""
+    import random
+
+    first_is_ref = random.random() < 0.5
+    one, two = (reference, other) if first_is_ref else (other, reference)
+    prompt = (
+        "An agent is doing a coding task. From the same point in its log, two runs chose these next steps. "
+        "Which is the better step toward the task? Equal if they are the same step, equivalent ones, or both reasonable. "
+        "A step is worse if it repeats finished work, loses track of the task, or re-reads what the log shows it already has.\n\n"
+        f"Task (start of its instructions):\n{task[:1500]}\n\nThe last steps before this point:\n{recent}\n\n"
+        f"STEP 1:\n{show(one)}\n\nSTEP 2:\n{show(two)}\n\n"
+        'Answer with JSON only: {"better": "1" | "2" | "equal", "why": one line}.'
+    )
+    out = subprocess.run(
+        ["claude", "-p", prompt, "--model", model, "--tools", "", "--setting-sources", "", "--strict-mcp-config"],
+        capture_output=True, text=True, timeout=600, cwd=tempfile.gettempdir(),
+    ).stdout
+    m = re.search(r"\{.*\}", out, re.S)
+    try:
+        v = json.loads(m.group(0)) if m else {}
+    except ValueError:
+        v = {}
+    b = str(v.get("better", "")).strip()
+    if b == "equal":
+        verdict = "equivalent"
+    elif b in ("1", "2"):
+        other_won = (b == "2") == first_is_ref
+        verdict = "better" if other_won else "worse"
+    else:
+        verdict = "unknown"
+    return {"verdict": verdict, "why": v.get("why", out[:200])}
+
+
 def recent_steps(prefix, n=6):
     out = []
     for line in prefix[-40:]:
@@ -286,6 +322,9 @@ def main():
     ap.add_argument("--min-chars", type=int, default=400, help="shorter tool outputs are kept")
     ap.add_argument("--model", help="default: the session's own")
     ap.add_argument("--judge-model", default="sonnet")
+    ap.add_argument("--effort", help="default: the session's own (as logged)")
+    ap.add_argument("--judge-against", choices=["original", "baseline"], default="original",
+                    help="compare each policy's step with the logged one, or with the baseline's from the same point")
     ap.add_argument("--cwd", help="default: the session's own folder")
     ap.add_argument("--timeout", type=int, default=900)
     ap.add_argument("--out", default="replay-results.jsonl")
@@ -296,6 +335,7 @@ def main():
     project_dir = Path(a.transcript).parent
     model = a.model or next((l["message"].get("model") for l in lines if l.get("type") == "assistant"), "opus")
     cwd = a.cwd or next((l["cwd"] for l in lines if l.get("cwd")), os.getcwd())
+    effort = a.effort or next((l.get("effort") for l in lines if l.get("type") == "assistant" and l.get("effort")), None)
     task = task_of(lines)
     chosen = points(lines, a.points, a.min_context)
     print(f"{len(lines)} lines; model {model}; {len(chosen)} points with context >= {a.min_context}", file=sys.stderr)
@@ -315,12 +355,22 @@ def main():
                 for arm, p in arms:
                     sid = fork(p, project_dir)
                     try:
-                        action, usage = replay(sid, cwd, model, work, a.timeout)
+                        action, usage = replay(sid, cwd, model, effort, work, a.timeout)
                     finally:
                         drop_fork(project_dir, sid)
                     row[arm] = action
                     row[f"{arm}_usage"] = usage
+                    # Against the logged step; or, for a policy, against the
+                    # baseline's from the same point (its drift cancels out).
+                    if a.judge_against == "baseline" and arm != "baseline":
+                        reference = row["baseline"]
+                        row[f"{arm}_same"] = same(action, reference)
+                        row[f"{arm}_judge"] = {"verdict": "same", "why": "identical call"} if row[f"{arm}_same"] else judge_pair(
+                            task, recent_steps(prefix), reference, action, a.judge_model)
+                        continue
                     row[f"{arm}_same"] = same(action, original)
+                    if a.judge_against == "baseline":
+                        continue
                     row[f"{arm}_judge"] = {"verdict": "same", "why": "identical call"} if row[f"{arm}_same"] else judge(
                         task, recent_steps(prefix), original, action, a.judge_model)
             out.write(json.dumps(row) + "\n")

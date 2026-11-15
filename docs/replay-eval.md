@@ -47,3 +47,24 @@ It runs where the transcript is, a worker, with the `claude` that wrote it:
 - **Keeping the first five outputs** stayed within the baseline's noise while reading 57% less.
 
 **Next:** about 30 points, judging each policy against the baseline from the same point rather than against the logged step, and passing the logged effort.
+
+## Second run (2026-11-15): 30 points, judged against the baseline
+
+**What was run:**
+- **Points:** 30, six each from five Falcon backlog subagents (SQL, execution, OS, planner, KQL), with logged contexts of 200–950k tokens.
+- **Arms:** baseline and `stub-old-keep-start`.
+- **Effort:** as logged (medium).
+- **Judge:** `--judge-against baseline`, pairwise and in random order.
+
+| | Count |
+|---|---|
+| Policy judged better than the baseline | 11 |
+| Equivalent | 9 |
+| Worse | 10 |
+| Context read: baseline vs policy | 14.3M vs 6.4M (−56%) |
+
+**What it shows:**
+- **No measurable loss in step quality** at less than half the context.
+- **Six of the ten "worse" points** are the agent re-reading instruction files it was handed mid-run (`FIX_PROMPT.md`, `red1-*.md`, `WAVE2_PROMPT.md`). They came after the first five outputs, so they were stubbed. Keeping the first few outputs after every new message, not only at the start, should cover them.
+- **By area:** planner 0/6 worse, KQL 4/6.
+- **The judge** sees only the task's opening instructions, so it can't tell when a later instruction made a read relevant.
