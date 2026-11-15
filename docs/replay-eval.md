@@ -89,3 +89,25 @@ Both rows were judged in this run, by the same judge, against the same baselines
 - **The verdicts aren't evidence either way:** with identical steps, `stub-old-keep-start` went from 11 better / 9 equivalent / 10 worse under the second run's judge to 16/3/11 under this one. The run had no noise control (baseline against baseline, or the same pairs judged twice), so the verdict columns can't show a gain or a loss.
 - **The estimates undercount the saving:** they count characters from the last compaction. The measured saving for `stub-old-keep-start` in the second run was 56%.
 - **Next measurement:** add a noise control (each point's baseline replayed twice and judged against itself, and every pair judged twice) before reading the verdicts.
+
+## Fourth run (2026-11-15): with a noise control
+
+**What was run:**
+- **Same 30 points.**
+- **Noise floor:** each point's unchanged history replayed a second time (`--noise-control`, arm `baseline-again`) and judged against the stored baseline, exactly as the policy is.
+- **Policy:** the `stub-old-keep-turn-starts` steps from the third run.
+- **Judging:** every pair judged twice (`--judge-twice`).
+
+| | Better (1st / 2nd judging) | Equivalent | Worse | Judge agreed with itself |
+|---|---|---|---|---|
+| `baseline-again` (noise floor) | 13 / 13 | 6 / 7 | 11 / 10 | 21 / 30 |
+| `stub-old-keep-turn-starts` | 19 / 15 | 4 / 4 | 7 / 10 (1 unclear) | 25 / 30 |
+
+- **Context read:** 14.3M for the unchanged history, 6.9M for the policy (−52%, measured).
+- **Point by point:** each pairing scored +1 for better, −1 for worse, averaged over both judgings. The policy scored above the noise floor at 12 points, below at 6, and level at 12 (mean +0.2). That isn't significant at 30 points.
+- **Re-reads of an instruction file:** 0 in all three arms.
+
+**What it shows:**
+- **The noise is large.** The same history replayed and judged against itself comes out "worse" a third of the time, and the judge disagrees with itself on 30% of pairs.
+- **No detectable loss:** against that floor, keeping the first outputs after every instruction halves the context with no detectable cost to the next step.
+- **This is still a one-step measure.** It doesn't show how whole runs end.

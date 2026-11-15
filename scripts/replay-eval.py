@@ -389,6 +389,9 @@ def main():
     ap.add_argument("--timeout", type=int, default=900)
     ap.add_argument("--out", default="replay-results.jsonl")
     ap.add_argument("--dry-run", action="store_true", help="choose points and apply the policy; call no model")
+    ap.add_argument("--noise-control", action="store_true",
+                    help="also replay the unchanged history again (arm baseline-again) and judge it like a policy: the noise floor")
+    ap.add_argument("--judge-twice", action="store_true", help="judge every pair a second time (the judge's own consistency)")
     ap.add_argument("--reuse-baselines", help="an earlier --out: its baseline steps for the same points are used, not replayed again")
     a = ap.parse_args()
 
@@ -414,6 +417,8 @@ def main():
             est = lambda p: sum(len(json.dumps(b)) for l in after_compaction(p) for b in blocks(l)) // 4  # noqa: E731
             row = {"transcript": a.transcript, "line": i, "logged_context": ctx, "original": original, "est_tokens_baseline": est(prefix)}
             arms = [("baseline", prefix)]
+            if a.noise_control:
+                arms.append(("baseline-again", prefix))
             for name in policies:
                 shrunk, stubbed = POLICIES[name](prefix, a.keep, a.min_chars)
                 row[f"{name}_stubbed"], row[f"{name}_est_tokens"] = stubbed, est(shrunk)
@@ -427,7 +432,14 @@ def main():
                 replayed = {}
                 for arm, p in arms:
                     digest = json.dumps(p, sort_keys=True)
-                    if prior and prior.get(arm):
+                    if arm == "baseline-again":
+                        # Always a fresh replay of the unchanged history.
+                        sid = fork(p, project_dir)
+                        try:
+                            action, usage = replay(sid, cwd, model, effort, work, a.timeout)
+                        finally:
+                            drop_fork(project_dir, sid)
+                    elif prior and prior.get(arm):
                         # The same policy's step from the earlier run: judged again, not replayed.
                         action, usage = prior[arm], prior.get(f"{arm}_usage", {})
                         row[f"{arm}_reused"] = True
@@ -445,7 +457,8 @@ def main():
                             action, usage = replay(sid, cwd, model, effort, work, a.timeout)
                         finally:
                             drop_fork(project_dir, sid)
-                    replayed[digest] = (action, usage)
+                    if arm != "baseline-again":
+                        replayed[digest] = (action, usage)
                     row[arm] = action
                     row[f"{arm}_usage"] = usage
                     # Against the logged step; or, for a policy, against the
@@ -453,8 +466,13 @@ def main():
                     if a.judge_against == "baseline" and arm != "baseline":
                         reference = row["baseline"]
                         row[f"{arm}_same"] = same(action, reference)
-                        row[f"{arm}_judge"] = {"verdict": "same", "why": "identical call"} if row[f"{arm}_same"] else judge_pair(
-                            instructions_of(prefix), recent_steps(prefix), reference, action, a.judge_model)
+                        verdicts = []
+                        for _ in range(2 if a.judge_twice else 1):
+                            verdicts.append({"verdict": "same", "why": "identical call"} if row[f"{arm}_same"] else judge_pair(
+                                instructions_of(prefix), recent_steps(prefix), reference, action, a.judge_model))
+                        row[f"{arm}_judge"] = verdicts[0]
+                        if len(verdicts) > 1:
+                            row[f"{arm}_judge2"] = verdicts[1]
                         continue
                     row[f"{arm}_same"] = same(action, original)
                     if a.judge_against == "baseline":
