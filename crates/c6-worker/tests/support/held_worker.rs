@@ -52,6 +52,18 @@ impl HeldWorker {
         self.finish().expect("fixture worker must stop and leave no held process groups");
     }
 
+    #[allow(dead_code)] // Only restart fixtures need to retain their held processes.
+    pub async fn restart(mut self) -> Self {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        let thread = self.thread.take().expect("fixture worker thread");
+        within("the old fixture worker runtime to stop", tokio::task::spawn_blocking(move || thread.join().unwrap())).await.unwrap();
+        let next = Self::start(self.state.as_ref().expect("fixture state")).await;
+        self.state.take();
+        next
+    }
+
     fn finish(&mut self) -> anyhow::Result<()> {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());

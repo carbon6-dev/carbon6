@@ -283,7 +283,7 @@ pub type Stdin = Arc<tokio::sync::Mutex<Option<ClaudeInput>>>;
 /// reads (docs/restarts.md §3).
 pub enum ClaudeInput {
     Pipe(tokio::process::ChildStdin),
-    Fifo(tokio::fs::File),
+    Fifo(tokio::net::unix::pipe::Sender),
 }
 
 impl tokio::io::AsyncWrite for ClaudeInput {
@@ -336,9 +336,25 @@ struct HeldMeta {
     launch: Launch,
 }
 
+/// Observes leader exit without taking reaping away from `Process::wait_exit`.
+/// Signal zero alone cannot distinguish our exited, unreaped child from a live
+/// wrapper. A detached wrapper is no longer our child; ESRCH then proves exit.
+/// This is not group absence or authority to signal any remaining descendants.
+fn held_leader_exited(pid: Pid) -> bool {
+    use nix::libc;
+    // SAFETY: waitid initializes this valid siginfo buffer, WNOHANG never blocks,
+    // and WNOWAIT leaves the exit status for the owning tokio Child to reap.
+    let exited = unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        libc::waitid(libc::P_PID, pid.as_raw() as libc::id_t, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) == 0
+            && info.si_pid() == pid.as_raw()
+    };
+    exited || matches!(nix::sys::signal::kill(pid, None), Err(nix::errno::Errno::ESRCH))
+}
+
 /// Follows a held process's output file from `offset`: each JSON line, with
-/// where it ends; closed once its exit code is written and all is read.
-fn follow_held(dir: PathBuf, offset: u64) -> tokio::sync::mpsc::UnboundedReceiver<(u64, Value)> {
+/// where it ends; closed once its wrapper exits and all final output is read.
+fn follow_held(dir: PathBuf, offset: u64, pid: Pid) -> tokio::sync::mpsc::UnboundedReceiver<(u64, Value)> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -348,10 +364,14 @@ fn follow_held(dir: PathBuf, offset: u64) -> tokio::sync::mpsc::UnboundedReceive
         }
         let (mut pos, mut partial, mut buf) = (offset, Vec::<u8>::new(), vec![0u8; 64 * 1024]);
         let code = dir.join("code");
-        // Its exit code is written after its last output: one more read
-        // once it is there, then nothing more comes.
+        // The normal wrapper writes its code after the last output. A signal
+        // can bypass that write, so also observe its actual exit (including an
+        // unreaped zombie). Read once more after either proof to drain output.
         let mut last = false;
         loop {
+            if tx.is_closed() {
+                return;
+            }
             match f.read(&mut buf).await {
                 Ok(n) if n > 0 => {
                     partial.extend_from_slice(&buf[..n]);
@@ -373,7 +393,7 @@ fn follow_held(dir: PathBuf, offset: u64) -> tokio::sync::mpsc::UnboundedReceive
                     }
                 }
                 Ok(_) if last => return,
-                Ok(_) if code.exists() => last = true,
+                Ok(_) if code.exists() || held_leader_exited(pid) => last = true,
                 Ok(_) => tokio::time::sleep(Duration::from_millis(25)).await,
                 Err(_) => return,
             }
@@ -1904,7 +1924,7 @@ impl Process {
                 if let Some(root) = output_root.take() {
                     std::mem::forget(root);
                 }
-                let lines = follow_held(held.dir.clone(), 0);
+                let lines = follow_held(held.dir.clone(), 0, pgid.expect("spawned held wrapper"));
                 (Some(child), lines, None, pgid, Some(held))
             }
             None => {
@@ -2064,6 +2084,7 @@ impl Process {
         // The worker's end reads too, so opening it never waits; with it
         // open, opening the process's end doesn't either.
         let writer = std::fs::OpenOptions::new().read(true).write(true).open(&fifo)?;
+        let writer = tokio::net::unix::pipe::Sender::from_file(writer)?;
         let reader = std::fs::OpenOptions::new().read(true).open(&fifo)?;
         let std_cmd = cmd.as_std();
         let program = std_cmd.get_program().to_owned();
@@ -2122,8 +2143,7 @@ impl Process {
             let _ = keeper.wait().await;
         });
         let keeper = keeper_pid;
-        *stdin.try_lock().map_err(|_| std::io::Error::other("the session's Claude Code input is busy"))? =
-            Some(ClaudeInput::Fifo(tokio::fs::File::from_std(writer)));
+        *stdin.try_lock().map_err(|_| std::io::Error::other("the session's Claude Code input is busy"))? = Some(ClaudeInput::Fifo(writer));
         let meta = HeldMeta {
             session: session.to_owned(),
             conversation: launch.conversation.clone(),
@@ -2212,10 +2232,11 @@ impl Process {
         if !held_group_owned(&meta, &dir) {
             return None;
         }
-        if dir.join("code").exists() {
-            // Finished while detached: close only a freshly identified group,
-            // never signal the persisted keeper PID blindly. Keep its record
-            // if any descendants still prevent absence confirmation.
+        if dir.join("code").exists() || held_leader_exited(pg) {
+            // Finished or its wrapper died without writing code: close only a
+            // freshly identified group, never signal the persisted keeper PID
+            // blindly. Leader death is not group absence; keep its record if
+            // any descendants still prevent absence confirmation.
             let _ = killpg(pg, Signal::SIGKILL);
             let absent = async {
                 loop {
@@ -2236,9 +2257,9 @@ impl Process {
             return None;
         }
         let writer = std::fs::OpenOptions::new().read(true).write(true).open(dir.join("in")).ok()?;
-        *stdin.try_lock().ok()? = Some(ClaudeInput::Fifo(tokio::fs::File::from_std(writer)));
+        *stdin.try_lock().ok()? = Some(ClaudeInput::Fifo(tokio::net::unix::pipe::Sender::from_file(writer).ok()?));
         let offset = std::fs::read_to_string(dir.join("offset")).ok().and_then(|o| o.trim().parse::<u64>().ok()).unwrap_or(0);
-        let lines = follow_held(dir.clone(), offset);
+        let lines = follow_held(dir.clone(), offset, pg);
         info!(conversation = %launch.conversation, offset, "took up a Claude Code process the previous worker held");
         let mapper = Mapper {
             turn: 0,
@@ -2341,10 +2362,18 @@ impl Process {
     }
 
     /// Waits for it to end: as this worker's child, or, held by a previous
-    /// worker, until its exit code is written or its process group is gone.
+    /// worker, until its exit code is written or its wrapper is gone.
     async fn wait_exit(&mut self) -> String {
         if let Some(c) = self.child.as_mut() {
-            return c.wait().await.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string());
+            let status = c.wait().await.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string());
+            // Reap the wrapper first, but report the CLI's recorded status:
+            // the wrapper's final `echo` normally exits successfully itself.
+            if let Some(h) = &self.held
+                && let Ok(code) = std::fs::read_to_string(h.dir.join("code"))
+            {
+                return format!("exit status: {}", code.trim());
+            }
+            return status;
         }
         let Some(h) = &self.held else { return String::new() };
         let code = h.dir.join("code");
@@ -2352,7 +2381,7 @@ impl Process {
             if let Ok(c) = std::fs::read_to_string(&code) {
                 return format!("exit status: {}", c.trim());
             }
-            if self.pgid.is_none_or(|g| nix::sys::signal::kill(g, None).is_err()) {
+            if self.pgid.is_none_or(held_leader_exited) {
                 return "gone".into();
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2586,7 +2615,13 @@ impl Process {
 
     /// Writes an input; its uuid. The first input of a new conversation
     /// gets `preamble` in front.
-    async fn send(&mut self, input: PendingInput, preamble: Option<&str>, recorded: bool) -> std::io::Result<String> {
+    async fn send_in_turn(
+        &mut self,
+        input: PendingInput,
+        preamble: Option<&str>,
+        recorded: bool,
+        cancel: &CancellationToken,
+    ) -> std::io::Result<String> {
         let uuid = uuid::Uuid::now_v7().to_string();
         let mut line = serde_json::json!({
             "type": "user",
@@ -2600,9 +2635,51 @@ impl Process {
         if is_yours(&input) {
             line["origin"] = serde_json::json!({"kind": "human"});
         }
+        // Track ownership before selecting cancellation: a joining input has
+        // left the inbox and must remain available to take_unsent on failure.
         self.unconfirmed.push_back(Written { uuid: uuid.clone(), input, recorded });
-        write_line(&self.stdin, &line).await?;
+        self.write_in_turn(&line, cancel).await?;
         Ok(uuid)
+    }
+
+    /// A full FIFO must not hide Stop or a dead wrapper. Dropping a blocking
+    /// file write cannot cancel its syscall; held inputs use a nonblocking pipe.
+    /// A cancelled partial JSON line retires this runtime, never the next input.
+    async fn write_in_turn(&mut self, line: &Value, cancel: &CancellationToken) -> std::io::Result<()> {
+        let held = self.held.as_ref().zip(self.pgid).map(|(h, pid)| (h.dir.join("code"), pid));
+        let exited = async {
+            let Some((code, pid)) = held else { return std::future::pending().await };
+            loop {
+                if code.exists() || held_leader_exited(pid) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        };
+        let interrupted = tokio::select! {
+            result = write_line(&self.stdin, line) => return result,
+            _ = cancel.cancelled() => true,
+            _ = exited => false,
+        };
+        self.mapper.interrupted |= interrupted;
+        // The line may have been partly written. Stop all readers before
+        // another turn can reuse this transport, preserving normal ownership.
+        self.kill().await;
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+
+    /// Stop's control message gets the same grace as its response. A full
+    /// pipe must not prevent the caller from reaching forced cleanup.
+    async fn interrupt_in_turn(&mut self) -> std::io::Result<()> {
+        let request = interrupt_request();
+        let cancel = CancellationToken::new();
+        match tokio::time::timeout(INTERRUPT_GRACE, self.write_in_turn(&request, &cancel)).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.kill().await;
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
     }
 
     /// Asks it to deliver a message written already (`uuid`) now, rather than
@@ -2611,7 +2688,7 @@ impl Process {
     /// into the turn, or stops only the turn and starts the next with it;
     /// either way its background agents run on, which a plain interrupt
     /// would stop (docs/background.md §1).
-    async fn deliver_now(&mut self, uuid: &str) -> std::io::Result<()> {
+    async fn deliver_now(&mut self, uuid: &str, cancel: &CancellationToken) -> std::io::Result<()> {
         let request_id = uuid::Uuid::now_v7().to_string();
         let request = serde_json::json!({
             "type": "control_request",
@@ -2619,7 +2696,7 @@ impl Process {
             "request": {"subtype": "interrupt", "send_now": true, "message_uuid": uuid},
         });
         self.send_now = Some(SendNow { request_id, turn: self.mapper.turn });
-        write_line(&self.stdin, &request).await
+        self.write_in_turn(&request, cancel).await
     }
 
     /// Its answer to a control request; only a Send now's matters. `running`:
@@ -2807,16 +2884,17 @@ impl Process {
         let mut alive = true;
         if !model.is_empty() && model != "default" && model != self.model {
             let request = serde_json::json!({"subtype": "set_model", "model": model});
-            alive &= write_line(
-                &self.stdin,
-                &serde_json::json!({"type": "control_request", "request_id": uuid::Uuid::now_v7().to_string(), "request": request}),
-            )
-            .await
-            .is_ok();
+            alive &= self
+                .write_in_turn(
+                    &serde_json::json!({"type": "control_request", "request_id": uuid::Uuid::now_v7().to_string(), "request": request}),
+                    cancel,
+                )
+                .await
+                .is_ok();
             self.model = model.to_owned();
         }
         for (i, input) in inputs.into_iter().enumerate() {
-            alive &= self.send(input, if i == 0 { preamble } else { None }, true).await.is_ok();
+            alive &= self.send_in_turn(input, if i == 0 { preamble } else { None }, true, cancel).await.is_ok();
         }
         drop(admission);
         // You had just stopped the agent: this turn stops as it begins. It
@@ -2824,7 +2902,7 @@ impl Process {
         if quiet {
             info!(session = %self.launch.conversation, "Claude Code started a turn by itself right after you stopped one: stopping it too");
             self.mapper.interrupted = true;
-            alive &= write_line(&self.stdin, &interrupt_request()).await.is_ok();
+            alive &= self.interrupt_in_turn().await.is_ok();
         }
         let mut interrupted_at: Option<tokio::time::Instant> = None;
         while alive {
@@ -2834,7 +2912,7 @@ impl Process {
                     _ = cancel.cancelled(), if interrupted_at.is_none() => {
                         self.mapper.interrupted = true;
                         interrupted_at = Some(tokio::time::Instant::now());
-                        alive = write_line(&self.stdin, &interrupt_request()).await.is_ok();
+                        alive = self.interrupt_in_turn().await.is_ok();
                         continue;
                     }
                     _ = tokio::time::sleep_until(interrupted_at.map_or_else(tokio::time::Instant::now, |t| t + INTERRUPT_GRACE)), if interrupted_at.is_some() => {
@@ -2849,7 +2927,7 @@ impl Process {
                         let Joining { inputs, now } = feed();
                         for input in inputs {
                             let (command_id, send_now) = (input.command_id.clone(), input.send_now);
-                            let sent = self.send(input, None, false).await;
+                            let sent = self.send_in_turn(input, None, false, cancel).await;
                             alive &= sent.is_ok();
                             // It is with the agent now: it reads it at its next step.
                             if sent.is_ok() && !command_id.is_empty() {
@@ -2859,12 +2937,12 @@ impl Process {
                             if let Ok(uuid) = &sent
                                 && send_now
                             {
-                                alive &= self.deliver_now(uuid).await.is_ok();
+                                alive &= self.deliver_now(uuid, cancel).await.is_ok();
                             }
                         }
                         for command_id in now {
                             match self.unconfirmed.iter().find(|w| w.input.command_id == command_id).map(|w| w.uuid.clone()) {
-                                Some(uuid) => alive &= self.deliver_now(&uuid).await.is_ok(),
+                                Some(uuid) => alive &= self.deliver_now(&uuid, cancel).await.is_ok(),
                                 None => info!(session = %self.launch.conversation, command = %command_id, "Send now: the agent has taken that message already"),
                             }
                         }
@@ -7737,9 +7815,10 @@ while True:
         let vec_sink = Arc::new(VecSink::default());
         let sink: Arc<dyn EventSink> = vec_sink.clone();
         let mut p = spawn(&bin, dir.path(), "before", false, None);
-        let confirmed = p.send(input("confirmed", "first"), None, false).await.unwrap();
-        p.send(input("waiting", "second"), None, false).await.unwrap();
-        p.send(input("recorded", "already in journal"), None, true).await.unwrap();
+        let cancel = CancellationToken::new();
+        let confirmed = p.send_in_turn(input("confirmed", "first"), None, false, &cancel).await.unwrap();
+        p.send_in_turn(input("waiting", "second"), None, false, &cancel).await.unwrap();
+        p.send_in_turn(input("recorded", "already in journal"), None, true, &cancel).await.unwrap();
         let mut started = false;
         p.confirm(&confirmed, &mut started, &sink).await.unwrap();
         p.confirm(&confirmed, &mut started, &sink).await.unwrap();
@@ -7762,6 +7841,53 @@ while True:
             assert_eq!(users, ["confirmed", "waiting"]);
         }
         replacement.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_dead_held_wrapper_without_code_is_cleaned_not_readopted() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        let _cleanup = HeldFixtureCleanup(held.clone());
+        let bin = live_claude(dir.path());
+        let mut p = Process::spawn_held(
+            &held,
+            "s",
+            &bin,
+            Launch { conversation: "dead-wrapper".into(), ..Default::default() },
+            false,
+            dir.path(),
+            "opus",
+            Arc::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let pg = p.pgid.unwrap();
+        let keeper = p.held.as_ref().unwrap().keeper;
+        let record = held.join("dead-wrapper");
+        c6_testkit::eventually("the held keeper to prove ownership before wrapper death", async || {
+            keeper_holds_fifo(keeper, pg, &record).then_some(())
+        })
+        .await;
+        // Kill only the wrapper, bypassing its final exit-code write. Reap it
+        // exactly as the actor's idle exited() path does, leaving the keeper.
+        nix::sys::signal::kill(pg, Signal::SIGKILL).unwrap();
+        c6_testkit::within("the dead held wrapper to be reaped", p.wait_exit()).await;
+        assert!(held_leader_exited(pg));
+        assert!(!record.join("code").exists());
+        assert!(keeper_holds_fifo(keeper, pg, &record), "leader death must not mean group absence");
+        drop(p);
+
+        let adopted = Process::attach(&held, "dead-wrapper", dir.path(), "opus", Arc::default(), None, None).await;
+        assert!(adopted.is_none(), "a dead wrapper must be cleanup-only, not repeatedly re-adopted by its idle actor");
+        c6_testkit::eventually("the freshly owned dead runtime's whole group to disappear", async || {
+            matches!(group_probe(pg), Err(nix::errno::Errno::ESRCH)).then_some(())
+        })
+        .await;
+        // If group absence arrived just after attach's bounded cleanup phase,
+        // a later lookup may remove its retained record, but must never adopt.
+        assert!(Process::attach(&held, "dead-wrapper", dir.path(), "opus", Arc::default(), None, None).await.is_none());
+        assert!(!record.exists(), "confirmed group absence releases the held metadata");
     }
 
     #[tokio::test]

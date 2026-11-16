@@ -65,6 +65,7 @@ Not goals:
 ### Lifecycle
 
 - **Start.** A Claude Code session's actor starts its process with the first input that needs it. It passes `--input-format stream-json --replay-user-messages`, plus today's flags (`--resume` or `--session-id`, model, effort, settings and `--mcp-config`). A new conversation's preamble goes in front of its first message, as now.
+- **Transport and exit.** In-turn held FIFO writes stay cancellable under backpressure, including an initial report delivered between turns. Stop retires a runtime with a partially written input; the next turn never appends to that partial JSON line. The output follower observes wrapper exit even without a `code` file, drains final output and reaps its child. A running turn that loses its process ends with an error instead of holding the update drain indefinitely (docs/restarts.md).
 - **Keep it up** while any of these holds:
   - a turn is running;
   - a native background task is running (`Background::list`, kind `claude_code`);
