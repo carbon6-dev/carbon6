@@ -103,7 +103,12 @@ pub async fn memex_call(st: &HeadState, method: &str, params: Value) -> anyhow::
 /// memex scopes allow, or for an app's session what its install approved
 /// (docs/apps.md §5.2).
 pub async fn session_scope(st: &HeadState, session: &crate::store::SessionRow) -> anyhow::Result<Vec<String>> {
-    if let Some(i) = crate::instances::of_session(&st.store.pool, &session.id).await? {
+    // The first prompt is resolved before its session is inserted. Its row
+    // already names the app: a database lookup by session id would miss it
+    // and give that first input the realm's broader knowledge scope.
+    if !session.instance.is_empty()
+        && let Some(i) = crate::instances::get(&st.store.pool, &session.realm, &session.instance).await?
+    {
         return Ok(crate::instances::approved_reads(&st.store.pool, i.id).await?.items.kinds);
     }
     Ok(crate::memex::scope_for(st, &session.realm, &session.all_labels()).await)

@@ -1132,12 +1132,14 @@ pub async fn ask_claude() -> Result<c6_api::AskClaude, String> {
 
 /// What @ offers in an Ask conversation, or in session `session`'s message
 /// box, within its knowledge scope (docs/ask.md §4).
+/// Before creation, a form supplies its destination realm instead.
 pub async fn ask_mentionables(
     q: String,
     session: Option<String>,
+    realm: Option<String>,
     cancel: &web_sys::AbortSignal,
 ) -> Result<Vec<c6_api::Mentionable>, String> {
-    let realm = realm().get_untracked();
+    let realm = realm.unwrap_or_else(|| self::realm().get_untracked());
     json(
         Request::get(&format!(
             "/api/v1/assistant/mentionables?q={}&realm={}&session={}",

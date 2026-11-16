@@ -15,6 +15,7 @@ mod catchup;
 mod chat;
 mod chats;
 mod collections;
+mod completion;
 mod components;
 mod compose;
 mod contacts;

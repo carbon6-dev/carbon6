@@ -2912,6 +2912,117 @@ mod input_compatibility_tests {
     }
 
     #[tokio::test]
+    async fn first_prompt_and_sent_messages_resolve_memex_and_links_with_the_same_scope() {
+        let (_dir, head, _mock, work) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        let worker = WorkerId::new();
+        st.store
+            .insert_worker(
+                &crate::store::NewWorker {
+                    id: worker,
+                    name: "mentions",
+                    hostname: "localhost",
+                    os: "test",
+                    arch: "test",
+                    version: "test",
+                    cert_serial: "mentions",
+                },
+                "unused",
+                now_ms(),
+            )
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        for (kind, text) in [("note", "ALLOWED_NOTE_CONTEXT"), ("document", "DOCUMENT_CONTEXT")] {
+            let item = api::MemexItemIn {
+                kind: kind.into(),
+                source: "test".into(),
+                external_id: kind.into(),
+                title: kind.into(),
+                text: text.into(),
+                ..Default::default()
+            };
+            let result = crate::memex::call(st, "memex.ingest", json!(item)).await.unwrap();
+            ids.push(result["id"].as_str().unwrap().to_owned());
+        }
+        let package = crate::packages::add(
+            st,
+            json!({
+                "package": "mention-scope", "version": "1.0.0", "description": "Mention scope fixture",
+                "settings": {"type": "object", "properties": {}},
+            }),
+            Default::default(),
+            "local",
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO installs (package, version, digest, realm, name, state, approved, created_at, updated_at) \
+             VALUES ('mention-scope', '1.0.0', ?, ?, 'mention-scope', 'installed', ?, 0, 0)",
+        )
+        .bind(&package.digest)
+        .bind(crate::realms::HOME)
+        .bind(json!({"reads": {"items": {"kinds": ["note"]}}}).to_string())
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+        let text = format!("Read @memex:{} [@note](c6:item:{}) [@document](c6:item:{}) [@work](c6:work:{work})", ids[0], ids[0], ids[1]);
+        let upload = api::AttachmentUpload { name: "original.txt".into(), mime: "text/plain".into(), data: "b3JpZ2luYWw=".into() };
+        for app in [false, true] {
+            let req = serde_json::from_value(json!({
+                "worker_id": worker.0, "cwd": "", "connection_id": "api", "model": "m",
+                "title": "Mention parity", "prompt": text, "attachments": [upload],
+            }))
+            .unwrap();
+            let session = if app { create_as(st, req, "mention-scope").await } else { create(st, req).await }.unwrap();
+            // Creation holds both commands until its background brief is saved.
+            // Observe that handover boundary before inspecting either input.
+            let commands = c6_testkit::eventually("the create and its first input handed over", async || {
+                let commands: Vec<_> =
+                    st.store.pending_commands(worker, 0).await.ok()?.into_iter().filter(|c| c.session_id == session.id).collect();
+                (commands.len() == 2).then_some(commands)
+            })
+            .await;
+            let first = commands
+                .into_iter()
+                .find_map(|c| match c6_proto::decode_stored_command(&c.data).unwrap().kind {
+                    Some(session_command::Kind::Input(input)) => Some(input),
+                    _ => None,
+                })
+                .unwrap();
+            let sent = send_input(
+                st,
+                &session.id,
+                &api::SendMessage { text: text.clone(), attachments: vec![upload.clone()], ..Default::default() },
+            )
+            .await
+            .unwrap();
+            let (_, later) = pending_of(st, &session.id, &sent.command_id).await.unwrap().unwrap();
+            assert_eq!(first.text, text);
+            assert_eq!(later.text, text);
+            assert_eq!(first.attachments, later.attachments);
+            assert_eq!(first.attachments.len(), 2, "original upload plus generated memex card");
+            assert_eq!(first.attachments[0].data, b"original");
+            assert_eq!(first.attachments[1].name, format!("@memex:{}", ids[0]));
+            assert!(String::from_utf8_lossy(&first.attachments[1].data).contains("ALLOWED_NOTE_CONTEXT"));
+            assert!(first.prompt.contains("ALLOWED_NOTE_CONTEXT"), "{}", first.prompt);
+            assert!(first.prompt.contains("Fix the pager"), "{}", first.prompt);
+            assert!(later.prompt.contains("Fix the pager"), "{}", later.prompt);
+            // Work's summary includes a clock-dependent age; compare the
+            // knowledge blocks, not two snapshots of that live summary.
+            let knowledge = |prompt: &str| prompt.split("\n\n<mentioned ref=\"work:").next().unwrap().to_owned();
+            assert_eq!(
+                knowledge(&first.prompt),
+                knowledge(&later.prompt),
+                "first and later inputs must use the same knowledge scope (app={app})"
+            );
+            assert_eq!(first.prompt.contains("DOCUMENT_CONTEXT"), !app, "{}", first.prompt);
+            assert_eq!(first.prompt.contains("could not read it"), app, "{}", first.prompt);
+        }
+        head.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn old_worker_events_recover_saved_origins_preserve_explicit_human_and_leave_history_unchanged() {
         let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
         let st = &head.state;

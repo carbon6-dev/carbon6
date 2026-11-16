@@ -1861,6 +1861,36 @@ fn SessionForm(
         });
     };
     let prompt_box = NodeRef::<leptos::html::Textarea>::new();
+    let completion = crate::completion::use_completion(
+        prompt,
+        prompt_box,
+        Signal::derive(move || {
+            // Templates choose their own context; fs_find cannot address SSH.
+            let (worker, folder) = (worker.get(), cwd.get());
+            (template.with(Option::is_none) && !remote.get() && !worker.is_empty() && !folder.is_empty()).then_some((worker, folder))
+        }),
+        None,
+        None,
+        Some(Signal::derive(move || {
+            template.with(|t| t.as_ref().map(|t| t.realm.clone())).unwrap_or_else(|| {
+                if seeded {
+                    let realm = seed_realm.get_value();
+                    if realm.is_empty() { "home".into() } else { realm }
+                } else {
+                    api::realm().get()
+                }
+            })
+        })),
+    );
+    Effect::new(move || {
+        if prompt.with(String::is_empty) {
+            completion.mention.set(None);
+        }
+    });
+    Effect::new(move || {
+        template.track();
+        completion.mention.set(None);
+    });
     // It grows with the text (a template's prompt, shown, too).
     crate::util::autosize(prompt_box, move || {
         prompt.track();
@@ -1996,11 +2026,17 @@ fn SessionForm(
                 }
                 prop:value=move || fixed().unwrap_or_else(|| prompt.get())
                 prop:disabled=move || fixed().is_some()
-                on:input=move |ev| prompt.set(event_target_value(&ev))
+                data-pop=completion.pop.get_value()
+                on:input=move |ev| { prompt.set(event_target_value(&ev)); completion.update.run(()); }
+                on:click=move |_| completion.update.run(())
+                on:keyup=move |ev| if matches!(ev.key().as_str(), "ArrowLeft" | "ArrowRight" | "Home" | "End") { completion.update.run(()); }
                 on:keydown=move |ev| {
+                    if ev.is_composing() { return; }
+                    if completion.keydown(&ev, || {}) { return; }
                     if crate::util::sends(&ev) { ev.prevent_default(); submit(); }
                 }
             ></textarea>
+            <crate::completion::CompletionList completion=completion below=true />
             <div class="flex min-w-0 flex-wrap items-center gap-1.5 px-2 pb-2">
                 {move || fixed().is_none().then(|| view! {
                     <button type="button" class="flex size-6.5 shrink-0 items-center justify-center rounded-md text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
