@@ -372,12 +372,36 @@ def prior_arms(prior, prefix, a):
     return [(name, POLICIES[name](prefix, a.keep, a.min_chars)[0]) for name in POLICIES if prior.get(name)]
 
 
+def compact_fork(sid, cwd, model, effort, timeout):
+    """Claude Code's own compaction of a fork (`/compact`), in place: the
+    fork's transcript then ends with its compact boundary and summary.
+    Returns the compaction call's usage, if it reported one."""
+    cmd = ["claude", "-p", "/compact", "--resume", sid, "--model", model, *(["--effort", effort] if effort else []),
+           "--output-format", "stream-json", "--verbose", "--setting-sources", "", "--strict-mcp-config"]
+    out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout).stdout
+    usage = {}
+    for raw in out.splitlines():
+        try:
+            ev = json.loads(raw)
+        except ValueError:
+            continue
+        if ev.get("type") == "result":
+            usage = ev.get("usage") or {}
+    return usage
+
+
+# Arms that are not a transform of the history but something Claude Code
+# does to a fork before the replay.
+FORK_ARMS = {"claude-compact"}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--transcript", required=True)
     ap.add_argument("--points", type=int, default=10)
     ap.add_argument("--min-context", type=int, default=200_000, help="only points whose next call read this many tokens")
-    ap.add_argument("--policy", action="append", choices=sorted(POLICIES), help="one or more (default: stub-old-tool-output)")
+    ap.add_argument("--policy", action="append", choices=sorted(POLICIES) + sorted(FORK_ARMS),
+                    help="one or more (default: stub-old-tool-output); claude-compact: Claude Code's own /compact of the history")
     ap.add_argument("--keep", type=int, default=8, help="tool outputs kept in full (the latest)")
     ap.add_argument("--min-chars", type=int, default=400, help="shorter tool outputs are kept")
     ap.add_argument("--model", help="default: the session's own")
@@ -420,6 +444,9 @@ def main():
             if a.noise_control:
                 arms.append(("baseline-again", prefix))
             for name in policies:
+                if name in FORK_ARMS:
+                    arms.append((name, prefix))
+                    continue
                 shrunk, stubbed = POLICIES[name](prefix, a.keep, a.min_chars)
                 row[f"{name}_stubbed"], row[f"{name}_est_tokens"] = stubbed, est(shrunk)
                 arms.append((name, shrunk))
@@ -432,10 +459,22 @@ def main():
                 replayed = {}
                 for arm, p in arms:
                     digest = json.dumps(p, sort_keys=True)
-                    if arm == "baseline-again":
-                        # Always a fresh replay of the unchanged history.
+                    if arm == "baseline-again" and prior and prior.get(arm):
+                        # The earlier run's second replay: judged again.
+                        action, usage = prior[arm], prior.get(f"{arm}_usage", {})
+                        row[f"{arm}_reused"] = True
+                    elif arm == "baseline-again":
+                        # A fresh replay of the unchanged history.
                         sid = fork(p, project_dir)
                         try:
+                            action, usage = replay(sid, cwd, model, effort, work, a.timeout)
+                        finally:
+                            drop_fork(project_dir, sid)
+                    elif arm in FORK_ARMS and not (prior and prior.get(arm)):
+                        # Compacted by Claude Code itself, then replayed.
+                        sid = fork(p, project_dir)
+                        try:
+                            row[f"{arm}_compact_usage"] = compact_fork(sid, cwd, model, effort, a.timeout)
                             action, usage = replay(sid, cwd, model, effort, work, a.timeout)
                         finally:
                             drop_fork(project_dir, sid)

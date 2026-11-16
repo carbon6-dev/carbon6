@@ -111,3 +111,21 @@ Both rows were judged in this run, by the same judge, against the same baselines
 - **The noise is large.** The same history replayed and judged against itself comes out "worse" a third of the time, and the judge disagrees with itself on 30% of pairs.
 - **No detectable loss:** against that floor, keeping the first outputs after every instruction halves the context with no detectable cost to the next step.
 - **This is still a one-step measure.** It doesn't show how whole runs end.
+
+## Fifth run (2026-11-16): Claude Code's own compaction
+
+**What was run:**
+- **New arm:** `claude-compact`. At each point the fork is compacted by Claude Code itself (`claude -p /compact --resume`), then replayed.
+- **Same 30 points.**
+- **Judging:** the earlier `baseline-again` and `stub-old-keep-turn-starts` steps were judged again alongside it, by the same judge, each pair twice.
+
+| | Better (1st / 2nd) | Worse | Score vs the noise floor | Context read |
+|---|---|---|---|---|
+| `baseline-again` (noise floor) | 10 / 13 | 14 / 15 | — | 14.6M |
+| `stub-old-keep-turn-starts` | 18 / 16 | 9 / 10 | +0.35 (higher at 14 points, lower at 4) | 7.0M |
+| `claude-compact` | 9 / 5 | 19 / 24 | −0.38 (higher at 5 points, lower at 14) | 0.8M |
+
+**What it shows:**
+- **Compaction loses the thread:** after `/compact` the agent re-reads code it had read, drifts, or loses its place.
+- **Part of it is the judge:** some "worse" verdicts penalise a dropped `cd` into the worktree, which the process already runs in. Without those, compaction is still worse more often than better.
+- **So `--autocompact` early for Claude Code subagents is not a free saving:** it costs the work. Trimming old tool output keeps it.
