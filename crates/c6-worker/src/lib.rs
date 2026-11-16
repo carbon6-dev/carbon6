@@ -58,6 +58,8 @@ pub struct Overrides {
     pub update_exe: Option<PathBuf>,
     pub update_keys: Option<Vec<String>>,
     pub update_as_version: Option<String>,
+    /// Update drain clock (debug builds only); other worker clocks are real.
+    pub update_now_ms: Option<i64>,
     /// Runs the head's kit jobs (instead of `C6_KIT_JOBS`).
     pub kit_jobs: Option<bool>,
     /// Codex plan-limit polling: test binary and timing, never global env.

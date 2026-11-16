@@ -5631,6 +5631,12 @@ pub struct MachineUpdate {
     pub method: String,
     pub detail: String,
     pub updated_at: UnixMs,
+    /// First wait for quiet, preserved when a newer build supersedes it.
+    #[serde(default)]
+    pub waiting_since: Option<UnixMs>,
+    /// When this waiting machine updates even if work has not ended.
+    #[serde(default)]
+    pub deadline_ms: Option<UnixMs>,
 }
 
 /// `/api/v1/system/updates`.

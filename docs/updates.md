@@ -115,6 +115,7 @@ The worker checks the manifest's signature again itself, so a compromised head c
      - At the deadline it updates anyway. The interrupted turns are marked interrupted and resume after the restart, like after a crash.
      - It keeps taking turns while it waits. A worker that's never idle updates at the deadline.
      - It reports `waiting` with the number of busy sessions.
+     - The wait belongs to the machine, not the version: a newer edge build inherits the original wait start and deadline. A successful update resets them. The head persists the deadline, and the worker also refuses to extend a pending deadline when its target changes (including after **Update now**). Settings → Updates shows the elapsed wait, what holds it, and how long remains before it updates anyway.
    - Then it downloads, verifies and installs, reports `restarting`, and exits with 75. Its `pending.json` is in its state folder.
    - The new version, once attached, reports `done` (or `rolled_back`, from the old version after a rollback).
    - If a worker isn't back within 10 minutes, it's marked failed. A failed worker doesn't hold up the others; Update now tries it again. Workers that are offline update when they next connect.

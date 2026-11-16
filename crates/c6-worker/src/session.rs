@@ -3475,13 +3475,13 @@ impl Actor {
             fork.conversation = cutoff.session_id;
             // The cutoff is inclusive. Choose a fresh fork ID, then adopt the
             // session_id from stream-json on every subsequent turn.
-            fork.extra_args = vec![
+            fork.extra_args.extend([
                 "--resume-session-at".into(),
                 cutoff.cutoff_uuid,
                 "--fork-session".into(),
                 "--session-id".into(),
                 reset.session_id.clone(),
-            ];
+            ]);
             attempts.push((fork, true));
         }
         attempts.push((launch, false));

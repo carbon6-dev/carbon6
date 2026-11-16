@@ -354,6 +354,130 @@ async fn a_worker_follows_the_edge_when_it_moves_on() {
     head.shutdown().await.unwrap();
 }
 
+/// A never-ending turn cannot reset a machine's drain clock with each edge
+/// build. The head has already updated; publish two worker targets in order.
+#[tokio::test]
+async fn superseding_edge_builds_share_the_first_drain_deadline() {
+    let doc = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+    let key = Ed25519KeyPair::from_pkcs8(doc.as_ref()).unwrap();
+    let public = hex::encode(key.public_key().as_ref());
+    let (first, second) = ("9.9.8+git20261116120000.aaaaaaa", "9.9.8+git20261116130000.bbbbbbb");
+    let files: Files = Arc::default();
+    let (source, _) = github(files.clone(), "unused").await;
+    let head_dir = tempfile::tempdir().unwrap();
+    let head = c6_head::start(HeadConfig {
+        data_dir: head_dir.path().to_owned(),
+        bind: vec!["127.0.0.1".parse().unwrap()],
+        ui_port: 0,
+        worker_port: 0,
+        auth: false,
+        update_as_version: Some(V.into()),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+    let http = reqwest::Client::new();
+    c6_head::updates::set_settings(&head.state, &c6_api::UpdateSettings { drain_hours: 1, ..Default::default() }).await.unwrap();
+    let (state, bin) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let exe = bin.path().join("c6w");
+    std::fs::write(&exe, "old c6w").unwrap();
+    let e = c6_head::api::new_enrollment(&head.state, Some("laptop")).await.unwrap();
+    enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
+    let worker = Worker::open(state.path(), Identity::load(state.path()).unwrap()).await.unwrap();
+    *worker.overrides.lock().unwrap() = c6_worker::Overrides {
+        update_exe: Some(exe.clone()),
+        update_keys: Some(vec![public]),
+        update_as_version: Some("9.9.7".into()),
+        ..Default::default()
+    };
+    let (tx, mut rx) = watch::channel(ConnState::Connecting);
+    let stop = CancellationToken::new();
+    tokio::spawn(conn::run(worker.clone(), tx, stop.clone()));
+    c6_testkit::within("worker attached", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
+    let wid = worker.identity.meta.worker_id.0.to_string();
+    let mock = c6_testkit::MockLlm::start().await;
+    let _gate = mock.push_gated(Reply::Text("Still working.".into()));
+    let connection: Value = http
+        .post(format!("{api}/connections"))
+        .json(&json!({"name":"m", "base_url":mock.base_url()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: Value = http
+        .post(format!("{api}/sessions"))
+        .json(&json!({
+            "worker_id":wid, "cwd":"", "connection_id":connection["id"], "model":"m", "prompt":"Never finish", "title":"Scout"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sid = session["id"].as_str().unwrap();
+    eventually("a turn that never ends", async || {
+        worker.sessions.holding().iter().any(|(s, what)| s == sid && what == "a turn").then_some(())
+    })
+    .await;
+    let publish = async |v: &str| {
+        let body = tgz(&[("c6w", &format!("c6w {v}"))]);
+        let sum = c6_core::update::checksum(&body);
+        let names = [
+            format!("c6w-{v}-darwin-arm64.tar.gz"),
+            format!("c6w-{v}-darwin-x86_64.tar.gz"),
+            format!("carbon6-{v}-linux-amd64.tar.gz"),
+            format!("carbon6-{v}-linux-arm64.tar.gz"),
+        ];
+        let assets: serde_json::Map<String, Value> = names.iter().map(|n| (n.clone(), json!(sum))).collect();
+        for name in names {
+            files.lock().unwrap().insert(format!("v{v}/{name}"), body.clone());
+        }
+        let raw = serde_json::to_string(&json!({"version":v, "assets":assets})).unwrap();
+        // Already verified/applied on this newer head, as after its restart.
+        sqlx::query("INSERT INTO updates (version, manifest, signature, base_url, found_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
+            .bind(v)
+            .bind(&raw)
+            .bind(hex::encode(key.sign(raw.as_bytes()).as_ref()))
+            .bind(format!("{source}/releases/download/v{v}/"))
+            .bind(c6_core::now_ms())
+            .bind(c6_core::now_ms())
+            .execute(head.state.store.pool())
+            .await
+            .unwrap();
+        c6_head::updates::apply(&head.state, v).await.unwrap();
+    };
+    let waiting = async |v: &str| {
+        eventually("worker waiting on the published build", async || {
+            let updates = c6_head::updates::status(&head.state).await.ok()?;
+            updates.machines.into_iter().find(|m| m.machine == wid && m.version == v && m.state == "waiting" && m.detail.contains("a turn"))
+        })
+        .await
+    };
+    publish(first).await;
+    let one = waiting(first).await;
+    let since = one.waiting_since.unwrap();
+    let deadline = one.deadline_ms.unwrap();
+    assert_eq!(deadline - since, 3600 * 1000);
+    worker.overrides.lock().unwrap().update_now_ms = Some(since + 30 * 60 * 1000);
+    publish(second).await;
+    let two = waiting(second).await;
+    assert_eq!(two.waiting_since, Some(since));
+    assert_eq!(two.deadline_ms, Some(deadline));
+    assert!(two.detail.contains("Scout"));
+    assert!(!worker.update.restart_requested());
+    // Advance exactly to the FIRST build's deadline, not the second's.
+    worker.overrides.lock().unwrap().update_now_ms = Some(deadline);
+    c6_testkit::within("restart at the original deadline despite the live turn", stop.cancelled()).await;
+    assert!(worker.update.restart_requested());
+    assert!(worker.sessions.holding().iter().any(|(s, what)| s == sid && what == "a turn"));
+    assert_eq!(std::fs::read_to_string(exe).unwrap(), format!("c6w {second}"));
+    head.shutdown().await.unwrap();
+}
+
 /// An update waits for background work a restart would cut short, not only
 /// for turns, and says what it waits on; a server started not to be waited
 /// for doesn't hold it; Update now restarts it anyway (docs/restarts.md §2).

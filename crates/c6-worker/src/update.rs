@@ -139,13 +139,19 @@ pub async fn apply(worker: &Arc<Worker>, p: &Value) -> anyhow::Result<Value> {
     if !up::newer(&m.version, &version(worker)) {
         anyhow::bail!("this worker runs {} already", version(worker));
     }
-    let t = Target { m, raw, sig, base: s("base_url"), deadline: p["deadline_ms"].as_i64().unwrap_or(0) };
+    // Older callers may omit the deadline. Even a turn whose end cannot
+    // be confirmed must not hold an update forever.
+    let deadline = p["deadline_ms"].as_i64().filter(|d| *d > 0).unwrap_or_else(|| now_ms() + 24 * 3600 * 1000);
+    let mut t = Target { m, raw, sig, base: s("base_url"), deadline };
     {
         let mut slot = worker.update.target.lock().unwrap();
         match slot.as_ref() {
             Some(o) if !up::newer(&t.m.version, &o.m.version) => return Ok(json!({"already": true})),
             // Under way: it takes this one instead.
-            Some(_) => {
+            Some(o) => {
+                // Waiting is per machine, not per edge build. Also preserve
+                // Update now if another release arrives before the next poll.
+                t.deadline = t.deadline.min(o.deadline);
                 *slot = Some(t);
                 return Ok(json!({"started": true}));
             }
@@ -172,6 +178,15 @@ pub async fn apply(worker: &Arc<Worker>, p: &Value) -> anyhow::Result<Value> {
 
 fn current(w: &Worker) -> Option<Target> {
     w.update.target.lock().unwrap().clone()
+}
+
+fn drain_now(w: &Worker) -> i64 {
+    if cfg!(debug_assertions)
+        && let Some(now) = w.overrides.lock().unwrap().update_now_ms
+    {
+        return now;
+    }
+    now_ms()
 }
 
 /// Tells the head how the update goes (`update.status`).
@@ -213,7 +228,7 @@ async fn run(w: &Arc<Worker>) -> anyhow::Result<()> {
     let t = loop {
         let t = current(w).ok_or_else(|| anyhow::anyhow!("no release to update to"))?;
         let holding = w.sessions.holding();
-        if holding.is_empty() || (t.deadline > 0 && now_ms() >= t.deadline) {
+        if holding.is_empty() || drain_now(w) >= t.deadline {
             break t;
         }
         if (t.m.version.as_str(), &holding) != (said.0.as_str(), &said.1) {

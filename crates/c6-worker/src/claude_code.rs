@@ -493,6 +493,8 @@ pub(crate) struct Process {
     stop_mark: Option<StopMark>,
     /// When its last turn ended, it last wrote between turns, or it started.
     idle_since: tokio::time::Instant,
+    /// An idle state closed the last turn before its optional result.
+    ended_on_idle: bool,
     /// A Send now it hasn't answered yet.
     send_now: Option<SendNow>,
     /// It answered a Send now without saying how it took it (an older
@@ -1890,6 +1892,9 @@ impl Process {
         // no tasks, or when the worker is gone: then nobody reads it, so it
         // should not go on (docs/background.md §4).
         cmd.env("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", "5000");
+        // Explicit turn-over edges, including autonomous notification turns.
+        // Older CLIs ignore this and still end turns with result.
+        cmd.env("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS", "1");
         let mut output_root = output_root;
         let (child, lines, stderr, pgid, held) = match held_in {
             Some((dir, session)) => {
@@ -1984,6 +1989,7 @@ impl Process {
             turn_tasks: Vec::new(),
             stop_mark: None,
             idle_since: tokio::time::Instant::now(),
+            ended_on_idle: false,
             send_now: None,
             old_send_now: false,
             checked_init: false,
@@ -2285,6 +2291,7 @@ impl Process {
             turn_tasks: Vec::new(),
             stop_mark: None,
             idle_since: tokio::time::Instant::now(),
+            ended_on_idle: false,
             send_now: None,
             old_send_now: false,
             checked_init: false,
@@ -2414,6 +2421,11 @@ impl Process {
     /// input written during the last turn): it is kept for that turn, and
     /// this returns true.
     pub async fn idle_line(&mut self, v: Value, sink: &Arc<dyn EventSink>) -> anyhow::Result<bool> {
+        // A result can trail the authoritative idle edge. It belongs to the
+        // turn already closed, not a new notification-only turn.
+        if self.trailing_result(&v) {
+            return Ok(false);
+        }
         // A long task can end after the last turn's idle deadline. Once
         // its update clears tasks_running(), give Claude Code a fresh idle
         // interval to reply, rather than closing stdin on the next actor
@@ -2509,12 +2521,29 @@ impl Process {
         vec![note]
     }
 
+    fn trailing_result(&mut self, v: &Value) -> bool {
+        if !self.ended_on_idle || !v["parent_tool_use_id"].is_null() {
+            return false;
+        }
+        if v["type"] == "result" {
+            self.ended_on_idle = false;
+            return true;
+        }
+        // A new input may already be written while the previous result is
+        // queued in stdout. Only new activity in the ordered CLI stream,
+        // not writing that input, proves a result belongs to the next turn.
+        if self.begins_turn(v) {
+            self.ended_on_idle = false;
+        }
+        false
+    }
+
     fn begins_turn(&self, v: &Value) -> bool {
         if !v["parent_tool_use_id"].is_null() {
             return false;
         }
         match v["type"].as_str().unwrap_or("") {
-            "system" => v["subtype"] == "init",
+            "system" => v["subtype"] == "init" || (v["subtype"] == "session_state_changed" && v["state"] == "running"),
             "user" if v["isReplay"].as_bool() == Some(true) => self.unconfirmed.iter().any(|w| v["uuid"].as_str() == Some(w.uuid.as_str())),
             "assistant" | "stream_event" | "result" | "user" => true,
             _ => false,
@@ -2850,6 +2879,9 @@ impl Process {
                     },
                 },
             };
+            if self.trailing_result(&v) {
+                continue;
+            }
             let main = v["parent_tool_use_id"].is_null();
             if main {
                 if let Some(id) = v["session_id"].as_str().filter(|id| !id.is_empty()) {
@@ -2880,7 +2912,11 @@ impl Process {
                 }
                 "system" if v["subtype"] == "init" => self.check_init(&v, sink).await?,
                 "control_response" => self.control_response(&v, true, sink).await?,
-                "result" if main => {
+                "result" | "system"
+                    if main
+                        && (v["type"] == "result"
+                            || (v["subtype"] == "session_state_changed" && v["state"] == "idle" && !self.tasks_running())) =>
+                {
                     // A Send now not answered yet whose turn ends stopped: the
                     // turn was stopped for it, not failed.
                     if self.send_now.as_ref().is_some_and(|s| s.turn == turn) && v["subtype"] == "error_during_execution" {
@@ -2917,6 +2953,11 @@ impl Process {
                     } else {
                         self.woke(&mut started, quiet, sink).await?;
                         self.mapper.handle(&v, sink).await?;
+                        // Unlike status:null (compaction finished), the SDK's
+                        // session_state_changed idle edge means the result was
+                        // flushed and the background-agent loop has exited.
+                        // Some notification-only turns have no result at all.
+                        self.mapper.result.get_or_insert(TurnEndReason::Completed);
                     }
                     let reason = if self.mapper.interrupted {
                         TurnEndReason::Interrupted
@@ -2934,6 +2975,7 @@ impl Process {
                         }
                     }
                     self.stop_mark = mark;
+                    self.ended_on_idle = v["type"] != "result";
                     self.notified.clear();
                     self.idle_since = tokio::time::Instant::now();
                     return Ok(TurnEnd { reason: Some(reason), alive: true, no_conversation: false });

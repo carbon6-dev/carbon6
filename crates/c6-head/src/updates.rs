@@ -370,18 +370,38 @@ async fn set_state(st: &HeadState, version: &str, state: &str, detail: &str) -> 
 
 async fn machine(st: &HeadState, machine: &str, version: &str, state: &str, method: &str, detail: &str) -> anyhow::Result<()> {
     let now = now_ms();
+    // Carry the start of a pending drain across superseding edge builds.
+    // A successful update is the newest row in state done, so the next
+    // wait starts afresh; historical waiting rows do not revive its clock.
+    let previous = sqlx::query(
+        "SELECT state, started_at, deadline_ms FROM update_machines WHERE machine = ? ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+    )
+    .bind(machine)
+    .fetch_optional(&st.store.pool)
+    .await?;
+    let pending = previous.as_ref().filter(|r| state == "waiting" && r.get::<String, _>("state") != "done");
+    let started = pending.map(|r| r.get::<i64, _>("started_at")).unwrap_or(now);
+    let deadline = if state == "waiting" {
+        Some(match pending.and_then(|r| r.get::<Option<i64>, _>("deadline_ms")) {
+            Some(d) => d,
+            None => started + settings(st).await?.drain_hours as i64 * 3600 * 1000,
+        })
+    } else {
+        None
+    };
     sqlx::query(
-        "INSERT INTO update_machines (machine, version, state, method, detail, started_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) \
+        "INSERT INTO update_machines (machine, version, state, method, detail, started_at, updated_at, deadline_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT (machine, version) DO UPDATE SET state = excluded.state, method = CASE WHEN excluded.method = '' THEN method ELSE excluded.method END, \
-         detail = excluded.detail, updated_at = excluded.updated_at",
+         detail = excluded.detail, updated_at = excluded.updated_at, deadline_ms = COALESCE(update_machines.deadline_ms, excluded.deadline_ms)",
     )
     .bind(machine)
     .bind(version)
     .bind(state)
     .bind(method)
     .bind(detail)
+    .bind(started)
     .bind(now)
-    .bind(now)
+    .bind(deadline)
     .execute(&st.store.pool)
     .await?;
     st.registry.bump();
@@ -658,12 +678,17 @@ async fn workers(st: &HeadState, rel: &Rel) -> anyhow::Result<()> {
             continue;
         }
         machine(st, &w.id, v, "waiting", "", "").await?;
+        let deadline: i64 = sqlx::query_scalar("SELECT deadline_ms FROM update_machines WHERE machine = ? AND version = ?")
+            .bind(&w.id)
+            .bind(v)
+            .fetch_one(&st.store.pool)
+            .await?;
         let params = json!({
             "version": v,
             "manifest": rel.raw,
             "signature": hex::encode(&rel.sig),
             "base_url": rel.base,
-            "deadline_ms": now + s.drain_hours as i64 * 3600 * 1000,
+            "deadline_ms": deadline,
         });
         if let Err(e) = st.registry.call(id, "update.apply", params, Duration::from_secs(30)).await {
             machine(st, &w.id, v, "failed", "", &e).await?;
@@ -709,11 +734,17 @@ pub async fn now(st: &HeadState, machine: &str) -> anyhow::Result<()> {
     let id: c6_core::WorkerId = machine.parse().map_err(|_| bad_request(format!("no machine {machine:?}")))?;
     anyhow::ensure!(st.registry.get(id).is_some(), "that worker isn't connected");
     st.registry.call(id, "update.now", json!({}), Duration::from_secs(30)).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    sqlx::query("UPDATE update_machines SET deadline_ms = ? WHERE machine = ? AND state = 'waiting'")
+        .bind(now_ms())
+        .bind(machine)
+        .execute(&st.store.pool)
+        .await?;
     Ok(())
 }
 
 /// Settings → System → Updates.
 pub async fn status(st: &HeadState) -> anyhow::Result<api::Updates> {
+    let settings = settings(st).await?;
     let rows = sqlx::query("SELECT * FROM updates ORDER BY found_at DESC LIMIT 20").fetch_all(&st.store.pool).await?;
     let mut releases: Vec<api::Release> = rows
         .iter()
@@ -733,7 +764,7 @@ pub async fn status(st: &HeadState) -> anyhow::Result<api::Updates> {
     releases.sort_by(|a, b| if up::newer(&a.version, &b.version) { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater });
     releases.truncate(6);
     let latest = |machine: String| async move {
-        sqlx::query("SELECT * FROM update_machines WHERE machine = ? ORDER BY updated_at DESC LIMIT 1")
+        sqlx::query("SELECT * FROM update_machines WHERE machine = ? ORDER BY updated_at DESC, rowid DESC LIMIT 1")
             .bind(machine)
             .fetch_optional(&st.store.pool)
             .await
@@ -747,6 +778,11 @@ pub async fn status(st: &HeadState) -> anyhow::Result<api::Updates> {
         method: r.as_ref().map(|r| r.get("method")).unwrap_or_default(),
         detail: r.as_ref().map(|r| r.get("detail")).unwrap_or_default(),
         updated_at: r.as_ref().map(|r| r.get("updated_at")).unwrap_or_default(),
+        waiting_since: r.as_ref().filter(|r| r.get::<String, _>("state") == "waiting").map(|r| r.get("started_at")),
+        deadline_ms: r.as_ref().filter(|r| r.get::<String, _>("state") == "waiting").map(|r| {
+            r.get::<Option<i64>, _>("deadline_ms")
+                .unwrap_or_else(|| r.get::<i64, _>("started_at") + settings.drain_hours as i64 * 3600 * 1000)
+        }),
     };
     let mut machines = vec![as_api("head".into(), "head".into(), ver(st).to_owned(), latest("head".into()).await?)];
     let (_, method) = st.updates.exe_method();
@@ -760,7 +796,7 @@ pub async fn status(st: &HeadState) -> anyhow::Result<api::Updates> {
     let checked = st.updates.checked_at.load(Ordering::SeqCst);
     Ok(api::Updates {
         version: ver(st).to_owned(),
-        settings: settings(st).await?,
+        settings,
         releases,
         machines,
         checked_at: (checked > 0).then_some(checked),
@@ -771,6 +807,95 @@ pub async fn status(st: &HeadState) -> anyhow::Result<api::Updates> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn drain_migration_recovers_superseded_waits_but_not_successful_ones() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0047_updates.sql")).execute(&pool).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO update_machines (machine, version, state, started_at, updated_at) VALUES
+            ('pending', '1', 'waiting', 10, 20), ('pending', '2', 'waiting', 30, 40),
+            ('reset', '1', 'waiting', 10, 20), ('reset', '2', 'done', 30, 40),
+            ('reset', '3', 'waiting', 50, 60), ('reset', '4', 'waiting', 70, 80),
+            ('reset', '5', 'failed', 90, 100)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0067_update_drain_deadline.sql")).execute(&pool).await.unwrap();
+        let start = async |machine: &str, version: &str| -> i64 {
+            sqlx::query_scalar("SELECT started_at FROM update_machines WHERE machine = ? AND version = ?")
+                .bind(machine)
+                .bind(version)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+        assert_eq!(start("pending", "2").await, 10);
+        assert_eq!(start("reset", "4").await, 50);
+        assert_eq!(start("reset", "5").await, 50);
+        assert_eq!(start("reset", "1").await, 10);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_machine_carries_its_wait_until_an_update_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = crate::start(crate::HeadConfig {
+            data_dir: dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            auth: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let st = &head.state;
+        machine(st, "worker", "1", "waiting", "tarball", "a turn").await.unwrap();
+        sqlx::query("UPDATE update_machines SET started_at = 100, deadline_ms = 200 WHERE machine = 'worker'")
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+        machine(st, "worker", "2", "waiting", "", "a turn").await.unwrap();
+        let row = sqlx::query("SELECT started_at, deadline_ms FROM update_machines WHERE machine = 'worker' AND version = '2'")
+            .fetch_one(&st.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<i64, _>("started_at"), 100);
+        assert_eq!(row.get::<i64, _>("deadline_ms"), 200);
+        machine(st, "worker", "2", "done", "", "").await.unwrap();
+        machine(st, "worker", "3", "waiting", "", "a turn").await.unwrap();
+        let row = sqlx::query("SELECT started_at, deadline_ms FROM update_machines WHERE machine = 'worker' AND version = '3'")
+            .fetch_one(&st.store.pool)
+            .await
+            .unwrap();
+        assert!(row.get::<i64, _>("started_at") > 100);
+        assert!(row.get::<i64, _>("deadline_ms") > 200);
+        // Upgrade from an old head: a waiting row has no persisted deadline.
+        sqlx::query("UPDATE update_machines SET started_at = 300, deadline_ms = NULL WHERE machine = 'worker' AND version = '3'")
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+        machine(st, "worker", "4", "waiting", "", "a turn").await.unwrap();
+        let row = sqlx::query("SELECT started_at, deadline_ms FROM update_machines WHERE machine = 'worker' AND version = '4'")
+            .fetch_one(&st.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<i64, _>("started_at"), 300);
+        assert_eq!(row.get::<i64, _>("deadline_ms"), 300 + 24 * 3600 * 1000);
+        // A failed install is not a successful update and must not buy a
+        // new drain period when the next build is offered.
+        machine(st, "worker", "4", "failed", "", "download failed").await.unwrap();
+        machine(st, "worker", "5", "waiting", "", "a turn").await.unwrap();
+        let row = sqlx::query("SELECT started_at, deadline_ms FROM update_machines WHERE machine = 'worker' AND version = '5'")
+            .fetch_one(&st.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<i64, _>("started_at"), 300);
+        assert_eq!(row.get::<i64, _>("deadline_ms"), 300 + 24 * 3600 * 1000);
+        head.shutdown().await.unwrap();
+    }
 
     #[test]
     fn windows() {

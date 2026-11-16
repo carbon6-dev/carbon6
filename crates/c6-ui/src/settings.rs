@@ -1773,7 +1773,20 @@ fn UpdatesSetting() -> impl IntoView {
                                     <td class="font-mono text-xs">{m.running.clone()}</td>
                                     <td class="text-xs text-muted">{if m.method.is_empty() { "—".to_owned() } else { m.method.clone() }}</td>
                                     <td class="text-xs">{if m.state.is_empty() { String::new() } else { format!("{} {}", m.version, m.state.replace('_', " ")) }}
-                                        {(!m.detail.is_empty()).then(|| view! { <span class="ml-1 text-muted">{format!("({})", m.detail)}</span> })}
+                                        {(!m.detail.is_empty() || m.waiting_since.is_some()).then(|| {
+                                            let now = crate::util::now_ms();
+                                            let duration = |ms| crate::util::ago(ms).trim_end_matches(" ago").to_owned();
+                                            let detail = match (m.waiting_since, m.deadline_ms) {
+                                                (Some(since), Some(deadline)) => {
+                                                    let on = m.detail.strip_prefix("waiting ").unwrap_or(&m.detail);
+                                                    let end = if deadline <= now { "updates anyway now".to_owned() }
+                                                        else { format!("updates anyway in {}", duration(deadline - now)) };
+                                                    format!("waiting {} {on} · {end}", duration(now - since))
+                                                }
+                                                _ => m.detail.clone(),
+                                            };
+                                            view! { <span class="ml-1 text-muted">{format!("({detail})")}</span> }
+                                        })}
                                         {(m.state == "waiting" && m.machine != "head").then(|| {
                                             let id = m.machine.clone();
                                             view! {
