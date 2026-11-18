@@ -1434,6 +1434,11 @@ async fn darwin_stop_held_group(
                 tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + Duration::from_millis(100))).await;
             }
             if !owned() {
+                // Another authorized cleaner may have killed the keeper while
+                // we interrupted the CLI. Lost authority permits no further
+                // signals: spend only this stop's remaining budget observing
+                // absence, including Darwin's transient teardown refusals.
+                wait_group_absence_until(deadline, || if absent() { Err(nix::errno::Errno::ESRCH) } else { Ok(()) }).await;
                 anyhow::ensure!(absent(), "Held Claude Code keeper disappeared during stop");
                 return Ok(());
             }
@@ -1598,9 +1603,7 @@ async fn darwin_confirm_group_stopped(
 
 /// Bounded best-effort cleanup, not an absence guarantee. A live group may
 /// outlast this phase; replacement must still obtain its own fresh proof.
-#[cfg(any(target_os = "macos", test))]
-async fn darwin_wait_group_absence(mut probe: impl FnMut() -> nix::Result<()>) -> tokio::time::Instant {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+async fn wait_group_absence_until(deadline: tokio::time::Instant, mut probe: impl FnMut() -> nix::Result<()>) -> tokio::time::Instant {
     let absent = async {
         while !matches!(probe(), Err(nix::errno::Errno::ESRCH)) {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2238,17 +2241,11 @@ impl Process {
             // blindly. Leader death is not group absence; keep its record if
             // any descendants still prevent absence confirmation.
             let _ = killpg(pg, Signal::SIGKILL);
-            let absent = async {
-                loop {
-                    match group_probe(pg) {
-                        Err(nix::errno::Errno::ESRCH) => break,
-                        Ok(()) => tokio::time::sleep(Duration::from_millis(25)).await,
-                        Err(_) => return false,
-                    }
-                }
-                true
-            };
-            if matches!(tokio::time::timeout(Duration::from_secs(3), absent).await, Ok(true)) {
+            // Darwin can report EPERM while killed members are still exiting
+            // and cannot yet supply a stable zombie-only absence proof. Use
+            // the bounded cleanup wait, not the first refusal as its result.
+            wait_group_absence_until(tokio::time::Instant::now() + Duration::from_secs(3), || group_probe(pg)).await;
+            if matches!(group_probe(pg), Err(nix::errno::Errno::ESRCH)) {
                 let _ = std::fs::remove_dir_all(&dir);
                 if let Some(r) = &meta.output_root {
                     let _ = std::fs::remove_dir_all(r);
@@ -3072,15 +3069,24 @@ impl Process {
         // The process is gone (or going): it ended without a result.
         let interrupted = self.mapper.interrupted;
         self.mapper.close_children(if interrupted { TurnEndReason::Interrupted } else { TurnEndReason::Error }).await?;
-        *self.stdin.lock().await = None;
-        let status = match tokio::time::timeout(CLOSE_GRACE, self.wait_exit()).await {
-            Ok(s) => s,
+        if self.held.is_none() {
+            *self.stdin.lock().await = None;
+        }
+        let (status, killed) = match tokio::time::timeout(CLOSE_GRACE, self.wait_exit()).await {
+            Ok(s) => (s, false),
             Err(_) => {
                 self.kill().await;
-                "killed".into()
+                ("killed".into(), true)
             }
         };
         let stderr = self.stderr_text().await;
+        if self.held.is_some() && !killed {
+            // Wrapper exit is not keeper/descendant exit. Retire this runtime
+            // while its FIFO and ownership remain ours, before returning it
+            // to the actor's restart-adoption path as an apparently lost one.
+            self.kill().await;
+        }
+        *self.stdin.lock().await = None;
         self.release_held();
         if let Some(obs) = &self.mapper.observer {
             // Only an upstream notification can say how a task ended.
@@ -3110,6 +3116,12 @@ impl Process {
         }
         let status = self.wait_exit().await;
         let stderr = self.stderr_text().await;
+        if self.held.is_some() {
+            // Keep the FIFO through ownership-preserving cleanup, including a
+            // keeper that has not finished opening it yet. Reaping the wrapper
+            // alone must not send normal idle death through unsafe adoption.
+            self.kill().await;
+        }
         self.release_held();
         warn!(session = %self.launch.conversation, %status, stderr = %stderr.trim().lines().last().unwrap_or(""), "Claude Code exited between turns");
         *self.stdin.lock().await = None;
@@ -3252,7 +3264,11 @@ impl Process {
             }
         }
         let _ = tokio::time::timeout(Duration::from_secs(3), self.wait_exit()).await;
-        let deadline = if let Some(pg) = self.pgid { Some(darwin_wait_group_absence(|| group_probe(pg)).await) } else { None };
+        let deadline = if let Some(pg) = self.pgid {
+            Some(wait_group_absence_until(tokio::time::Instant::now() + Duration::from_secs(1), || group_probe(pg)).await)
+        } else {
+            None
+        };
         self.release_held();
         Ok(deadline)
     }
@@ -6846,6 +6862,36 @@ done
         }
 
         #[tokio::test(start_paused = true)]
+        async fn concurrent_cleanup_waits_for_absence_without_signaling_a_lost_keeper() {
+            for disappears in [true, false] {
+                let start = tokio::time::Instant::now();
+                let interrupted = Cell::new(false);
+                let signals = RefCell::new(Vec::new());
+                let result = darwin_stop_held_group(
+                    || disappears && tokio::time::Instant::now() >= start + Duration::from_millis(50),
+                    || !interrupted.get(),
+                    || observed(4),
+                    |signal| {
+                        signals.borrow_mut().push(signal);
+                        interrupted.set(signal == DarwinHeldSignal::InterruptGroup);
+                        Ok(())
+                    },
+                    || false,
+                    || panic!("lost keeper authority must not fall back to a group signal"),
+                )
+                .await;
+                assert_eq!(result.is_ok(), disappears, "another cleaner's exit still requires confirmed absence: {result:?}");
+                assert_eq!(signals.into_inner(), vec![DarwinHeldSignal::StopKeeper, DarwinHeldSignal::InterruptGroup]);
+                if disappears {
+                    assert!(tokio::time::Instant::now() >= start + Duration::from_millis(50));
+                    assert!(tokio::time::Instant::now() < start + Duration::from_secs(3));
+                } else {
+                    assert_eq!(tokio::time::Instant::now(), start + Duration::from_secs(3), "no fresh stop budget");
+                }
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
         async fn fresh_absence_alone_can_resolve_a_failed_pin() {
             let stopped = Cell::new(false);
             let signals = RefCell::new(Vec::new());
@@ -6919,6 +6965,27 @@ done
     }
 
     #[tokio::test(start_paused = true)]
+    async fn held_cleanup_waits_through_teardown_errors_but_never_infers_absence() {
+        use nix::errno::Errno;
+        let start = tokio::time::Instant::now();
+        let mut probes = [Ok(()), Err(Errno::EPERM), Err(Errno::ESRCH)].into_iter();
+        let deadline = wait_group_absence_until(start + Duration::from_secs(3), || probes.next().expect("stop at confirmed absence")).await;
+        assert!(probes.next().is_none());
+        assert!(tokio::time::Instant::now() > start, "a transient EPERM must not end cleanup immediately");
+        assert!(tokio::time::Instant::now() < deadline);
+
+        // Neither a live group nor a persistent error grants absence when the
+        // bounded wait expires. Callers still require a fresh ESRCH proof.
+        for result in [Ok(()), Err(Errno::EPERM), Err(Errno::EACCES)] {
+            let start = tokio::time::Instant::now();
+            let deadline = wait_group_absence_until(start + Duration::from_secs(3), || result).await;
+            assert_eq!(deadline, start + Duration::from_secs(3));
+            assert_eq!(tokio::time::Instant::now(), deadline);
+            assert_ne!(result, Err(Errno::ESRCH));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn darwin_group_live_after_kill_budget_blocks_until_fresh_absence() {
         use nix::errno::Errno;
         let start = tokio::time::Instant::now();
@@ -6927,7 +6994,7 @@ done
         // the actual bounded kill phase with virtual time so this does not
         // depend on making a CI process slow enough to outlive SIGKILL.
         let probe = || if tokio::time::Instant::now() < live_until { Ok(()) } else { Err(Errno::ESRCH) };
-        let deadline = darwin_wait_group_absence(probe).await;
+        let deadline = wait_group_absence_until(start + Duration::from_secs(1), probe).await;
         assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(1));
         assert_eq!(deadline, tokio::time::Instant::now());
         let mut observations = 0;
@@ -7844,6 +7911,127 @@ while True:
     }
 
     #[tokio::test]
+    async fn held_missing_conversation_is_detected_before_exit_cleanup_removes_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        let _cleanup = HeldFixtureCleanup(held.clone());
+        let bin = script(dir.path(), "claude", "#!/bin/sh\nread -r line\nprintf 'No conversation found\\n' >&2\nexit 1\n");
+        let mut p = Process::spawn_held(
+            &held,
+            "s",
+            &bin,
+            Launch { conversation: "missing".into(), ..Default::default() },
+            true,
+            dir.path(),
+            "opus",
+            Arc::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let sink: Arc<dyn EventSink> = Arc::new(VecSink::default());
+        let end = run(&mut p, 2, &[input("retry", "continue")], &sink).await;
+        assert_eq!(end, TurnEnd { reason: None, alive: false, no_conversation: true });
+    }
+
+    #[tokio::test]
+    async fn idle_wrapper_exit_waits_for_a_gated_keeper_before_releasing_held_state() {
+        use tokio::io::AsyncWriteExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        let _cleanup = HeldFixtureCleanup(held.clone());
+        let bin = live_claude(dir.path());
+        let mut p = Process::spawn_held(
+            &held,
+            "s",
+            &bin,
+            Launch { conversation: "gated-idle-exit".into(), ..Default::default() },
+            false,
+            dir.path(),
+            "opus",
+            Arc::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let pg = p.pgid.unwrap();
+        let record = held.join("gated-idle-exit");
+        let original = p.held.as_ref().unwrap().keeper;
+        c6_testkit::eventually("the original keeper before fixture handover", async || {
+            keeper_holds_fifo(original, pg, &record).then_some(())
+        })
+        .await;
+
+        // Substitute a real group member parked before opening fd 3. Once
+        // released it execs the exact production keeper before opening the
+        // FIFO, so no later exec can race stopped-state confirmation.
+        let mut keeper = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(r#"printf 'ready\n'; IFS= read -r gate || exit 1; exec /bin/sh -c "$1" "$0""#)
+            .arg(record.join("in"))
+            .arg(DARWIN_HELD_KEEPER_PROGRAM)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(pg.as_raw())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let keeper_pid = Pid::from_raw(keeper.id().unwrap() as i32);
+        let mut gate = keeper.stdin.take().unwrap();
+        let mut ready = BufReader::new(keeper.stdout.take().unwrap()).lines();
+        assert_eq!(
+            c6_testkit::within("the substitute keeper at its readiness gate", ready.next_line()).await.unwrap().as_deref(),
+            Some("ready")
+        );
+        nix::sys::signal::kill(original, Signal::SIGKILL).unwrap();
+        c6_testkit::eventually("the original fixture keeper to be reaped", async || {
+            nix::unistd::getpgid(Some(original)).is_err().then_some(())
+        })
+        .await;
+        p.held.as_mut().unwrap().keeper = keeper_pid;
+        let meta_path = record.join("meta.json");
+        let mut meta: HeldMeta = serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+        meta.keeper = keeper_pid.as_raw();
+        std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+
+        // Only the wrapper dies: its keeper is alive but cannot yet prove
+        // ownership. Exit cleanup must handle this startup window too.
+        nix::sys::signal::kill(pg, Signal::SIGKILL).unwrap();
+        c6_testkit::within("the idle wrapper to be reaped", p.wait_exit()).await;
+        assert!(held_leader_exited(pg));
+        assert!(!record.join("code").exists());
+        assert!(killpg(pg, None).is_ok());
+        assert!(!keeper_holds_fifo(keeper_pid, pg, &record));
+        assert!(!held_group_owned(&meta, &record));
+
+        let mut exited = Box::pin(p.exited());
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(exited.as_mut(), cx))).await.is_pending(),
+            "idle exit must wait for keeper readiness instead of returning an unowned held record to adoption"
+        );
+        assert!(meta_path.exists(), "cleanup authority survives while keeper readiness is gated");
+        gate.write_all(b"go\n").await.unwrap();
+        // Production reaps its keeper concurrently too; on Linux its zombie
+        // remains a group member until this child handle is waited.
+        let (unsent, reaped) = tokio::join!(
+            c6_testkit::within("idle exit to retire the newly ready keeper", exited),
+            c6_testkit::within("the substitute keeper to be reaped", keeper.wait()),
+        );
+        assert!(unsent.is_empty());
+        reaped.unwrap();
+        c6_testkit::eventually("the exited runtime's whole group to disappear", async || {
+            matches!(group_probe(pg), Err(nix::errno::Errno::ESRCH)).then_some(())
+        })
+        .await;
+        // Cleanup is bounded and may retain authority after an inspection
+        // refusal. Recovery must release it once absence is freshly proven.
+        assert!(Process::attach(&held, "gated-idle-exit", dir.path(), "opus", Arc::default(), None, None).await.is_none());
+        assert!(!record.exists(), "idle exit releases metadata only after whole-group absence");
+    }
+
+    #[tokio::test]
     async fn a_dead_held_wrapper_without_code_is_cleaned_not_readopted() {
         let dir = tempfile::tempdir().unwrap();
         let held = dir.path().join("held");
@@ -7870,7 +8058,7 @@ while True:
         })
         .await;
         // Kill only the wrapper, bypassing its final exit-code write. Reap it
-        // exactly as the actor's idle exited() path does, leaving the keeper.
+        // as a previous worker could have done, leaving its keeper to attach.
         nix::sys::signal::kill(pg, Signal::SIGKILL).unwrap();
         c6_testkit::within("the dead held wrapper to be reaped", p.wait_exit()).await;
         assert!(held_leader_exited(pg));

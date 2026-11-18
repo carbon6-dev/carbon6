@@ -1886,6 +1886,20 @@ tests exercise the builtin's self-held pipe, FIFO non-consumption, ignored group
 INT and individual/group SIGKILL reaping. Native tests also exercise adoption
 and metadata-only Rewind cleanup of the old exec-sleep record format.
 
+Held-wrapper exit coverage also gates a real replacement keeper before its
+FIFO opens. The idle `exited()` future must wait for readiness, then retire the
+owned group before releasing its metadata; reaping the wrapper alone is not
+cleanup completion. `claude_code_held_exit` waits for the old whole group and
+record to disappear before asserting that idle death added no Error or phantom
+turn, then sends another input and checks exactly-once completion. The no-Error
+assertion covers the completed cleanup, not just wrapper reaping. Paused-time
+coverage drives the shared absence waiter through live, EPERM and confirmed
+absence observations, and checks that persistent failures exhaust the original
+budget without granting absence. Concurrent cleanup coverage withdraws keeper
+authority after interrupt: no further signal is allowed, and only fresh absence
+within the original stop deadline can resolve it. All gates and completion
+barriers are conditions, not scheduling delays.
+
 ## Production image-preview browser regression
 
 `crates/c6-ui/tests/image-preview.cjs` runs the actual production WASM, not

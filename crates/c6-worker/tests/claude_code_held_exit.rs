@@ -42,6 +42,7 @@ while read -r line; do
   case "$line" in *IDLE*) printf '%s\n' '{"type":"result","subtype":"success","usage":{}}';; esac
   read -r gate < gate
   printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Final output before exit."}],"stop_reason":"end_turn"},"parent_tool_use_id":null}'
+  printf '%s\n' 'Held CLI stderr detail.' >&2
   exit 17
 done
 "#).unwrap();
@@ -138,13 +139,31 @@ done
                 matches!(kill(pid, None), Err(nix::errno::Errno::ESRCH)).then_some(())
             })
             .await;
-            // Reaping is the completion barrier for the actor's idle exited()
-            // path, not a pause hoping that no phantom event will appear.
+            // Reaping only ends wait_exit(), not the actor's cleanup/adoption
+            // work. Wait for the whole runtime's cleanup before inspecting
+            // the journal, including any ownership error that work appended.
+            eventually("the idle runtime's whole group and held record to be released", async || {
+                (matches!(killpg(pid, None), Err(nix::errno::Errno::ESRCH)) && !dir.join("meta.json").exists()).then_some(())
+            })
+            .await;
             let ev = events().await;
             assert_eq!(ev.iter().filter(|e| matches!(e.kind, EventKind::TurnStarted { .. })).count(), 1);
             assert_eq!(ev.iter().filter(|e| matches!(e.kind, EventKind::TurnEnded { .. })).count(), 1);
             assert!(!ev.iter().any(|e| matches!(e.kind, EventKind::Error { .. })), "idle death must not invent a failed turn: {ev:?}");
             assert!(!dir.join("code").exists(), "idle SIGTERM must also bypass the code file");
+            let response = http.post(format!("{api}/sessions/{id}/messages")).json(&json!({"text":"IDLE again"})).send().await.unwrap();
+            assert!(response.status().is_success(), "{}", response.status());
+            let ev = eventually("a new input to complete after idle runtime cleanup", async || {
+                let ev = events().await;
+                (ev.iter().any(|e| matches!(e.kind, EventKind::TurnEnded { turn: 2, reason: TurnEndReason::Completed }))
+                    && worker.sessions.holding().iter().all(|(s, what)| s != id || what != "a turn"))
+                .then_some(ev)
+            })
+            .await;
+            assert_eq!(ev.iter().filter(|e| matches!(e.kind, EventKind::User { .. })).count(), 2);
+            assert_eq!(ev.iter().filter(|e| matches!(e.kind, EventKind::TurnStarted { .. })).count(), 2);
+            assert_eq!(ev.iter().filter(|e| matches!(e.kind, EventKind::TurnEnded { .. })).count(), 2);
+            assert!(!ev.iter().any(|e| matches!(e.kind, EventKind::Error { .. })), "idle recovery must not invent a failed turn: {ev:?}");
             continue;
         }
         let ev = eventually("held exit visibly fails the running turn", async || {
@@ -157,8 +176,8 @@ done
         if !wrapper_signal {
             assert!(ev.iter().any(|e| matches!(&e.kind, EventKind::Assistant { blocks, .. } if format!("{blocks:?}").contains("Final output before exit."))), "drain final output before reporting exit");
             assert!(
-                ev.iter().any(|e| matches!(&e.kind, EventKind::Error { message } if message.contains("17"))),
-                "retain the actual exit status"
+                ev.iter().any(|e| matches!(&e.kind, EventKind::Error { message } if message.contains("17") && message.contains("Held CLI stderr detail."))),
+                "retain the actual exit status and stderr detail"
             );
         }
         eventually("the wrapper is reaped, not left a zombie", async || {
