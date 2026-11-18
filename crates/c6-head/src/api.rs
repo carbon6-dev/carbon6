@@ -213,6 +213,8 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/decisions/{id}", get(get_decision).patch(edit_decision))
         .route("/api/v1/decisions/{id}/answer", post(answer_decision))
         .route("/api/v1/decisions/{id}/session", post(decision_session))
+        .route("/api/v1/decisions/{id}/discussion", get(decision_discussion).post(discuss_decision))
+        .route("/api/v1/decisions/{id}/discussion/session", post(decision_discussion_session))
         .route("/api/v1/attention", get(get_attention))
         .route("/api/v1/attention/seen", post(attention_seen))
         .route("/api/v1/assistant", post(ask_assistant))
@@ -4872,10 +4874,79 @@ async fn decision_session(State(st): State<Arc<HeadState>>, Path(id): Path<i64>)
     Ok(Json(crate::decisions::start_session(&st, id).await?))
 }
 
+// Like the card's get/answer routes, these are checked for exact decision
+// realm ownership by realms::admit in the authentication middleware.
+async fn decision_discussion(State(st): State<Arc<HeadState>>, Path(id): Path<i64>) -> ApiResult<Json<api::DecisionDiscussion>> {
+    Ok(Json(crate::card_chat::get(&st, id).await?))
+}
+
+async fn discuss_decision(
+    State(st): State<Arc<HeadState>>,
+    Path(id): Path<i64>,
+    Json(req): Json<api::DecisionDiscuss>,
+) -> ApiResult<Json<api::DecisionDiscussion>> {
+    Ok(Json(crate::card_chat::discuss(&st, id, &req).await?))
+}
+
+async fn decision_discussion_session(
+    State(st): State<Arc<HeadState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<i64>,
+    Json(req): Json<api::DecisionDiscuss>,
+) -> ApiResult<Json<api::Session>> {
+    Ok(Json(crate::card_chat::ask_session(&st, id, req, &caller).await?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn card_discussion_routes_require_the_cards_exact_realm() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = crate::start(crate::HeadConfig {
+            data_dir: dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let st = &head.state;
+        crate::realms::create(st, &api::RealmIn { id: "lab".into(), name: "Lab".into(), ..Default::default() }, "you").await.unwrap();
+        let decision =
+            crate::decisions::open(st, &api::DecisionIn { title: "Home card".into(), ..Default::default() }, "home", "").await.unwrap();
+        let token = st.store.create_api_token("lab", Some("lab")).await.unwrap().token.unwrap();
+        let http = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
+        let link = st.store.create_login_link().await.unwrap();
+        let login = http.post(format!("{url}/auth/link")).json(&json!({"token": link})).send().await.unwrap();
+        assert_eq!(login.status(), StatusCode::NO_CONTENT);
+        let cookie = login.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_owned();
+
+        for (method, suffix) in [
+            (axum::http::Method::GET, "discussion"),
+            (axum::http::Method::POST, "discussion"),
+            (axum::http::Method::POST, "discussion/session"),
+        ] {
+            let path = format!("/api/v1/decisions/{}/{suffix}", decision.id);
+            assert!(crate::realms::admit(st, &Caller::in_realm("home"), &method, &path).await.is_ok());
+            assert!(crate::realms::admit(st, &Caller::root(), &method, &path).await.is_ok());
+            for browser in [false, true] {
+                // Neither a browser's cross-realm overview nor an explicit
+                // realm query grants access to the card's private thread.
+                let request = http.request(method.clone(), format!("{url}/decisions/{}/{suffix}?realm=home", decision.id));
+                let request =
+                    if browser { request.header("cookie", &cookie).header("x-c6-realm", "lab") } else { request.bearer_auth(&token) };
+                let response = request.json(&json!({"text": "Revise this card"})).send().await.unwrap();
+                assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {suffix}, browser={browser}");
+            }
+        }
+        assert_eq!(crate::decisions::get(st, decision.id).await.unwrap().unwrap(), decision);
+        head.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn message_draft_roundtrips_pending_and_durable_uploads_with_realm_scope() {

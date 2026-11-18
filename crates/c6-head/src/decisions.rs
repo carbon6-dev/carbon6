@@ -220,6 +220,7 @@ pub async fn open_count(st: &HeadState, caller: &Caller) -> anyhow::Result<i64> 
 
 /// Snoozes, dismisses or reopens a decision (answering is `answer`).
 pub async fn edit(st: &HeadState, id: i64, e: &api::DecisionEdit) -> anyhow::Result<api::Decision> {
+    let _guard = crate::card_chat::lock(st, id).await;
     let mut d = get(st, id).await?.ok_or_else(|| not_found("no such decision"))?;
     if let Some(s) = &e.state {
         if matches!(s.as_str(), "open" | "snoozed")
@@ -257,6 +258,7 @@ pub async fn edit(st: &HeadState, id: i64, e: &api::DecisionEdit) -> anyhow::Res
 
 /// Answers a decision: records it, then answers what waits on it.
 pub async fn answer(st: &HeadState, id: i64, a: &api::DecisionAnswer, via: &str) -> anyhow::Result<api::Decision> {
+    let _guard = crate::card_chat::lock(st, id).await;
     let d = get(st, id).await?.ok_or_else(|| not_found("no such decision"))?;
     if !matches!(d.state.as_str(), "open" | "snoozed") {
         return Err(bad_request(format!("decision {id} is already {}", d.state)));
@@ -890,6 +892,18 @@ async fn batch_cards(st: &HeadState, ids: &[i64], caller: &Caller) -> anyhow::Re
 /// proposing session hears once about its cards. Nothing is answered if
 /// the start fails. Returns the new session's id, for "start".
 pub async fn task_batch(st: &HeadState, ids: &[i64], how: &str, caller: &Caller, via: &str) -> anyhow::Result<Option<String>> {
+    if ids.len() < 2 || ids.len() > MAX_BATCH {
+        return Err(bad_request(format!("choose 2 to {MAX_BATCH} different task cards")));
+    }
+    // A stable order avoids deadlocks between overlapping batches; dedup
+    // before locking, leaving batch_cards to reject repeated selections.
+    let mut lock_ids = ids.to_vec();
+    lock_ids.sort_unstable();
+    lock_ids.dedup();
+    let mut _guards = Vec::with_capacity(lock_ids.len());
+    for id in lock_ids {
+        _guards.push(crate::card_chat::lock(st, id).await);
+    }
     let cards = batch_cards(st, ids, caller).await?;
     let list = |d: &api::Decision| format!("#{} {:?}", d.id, d.title);
     let proposers: Vec<String> = {

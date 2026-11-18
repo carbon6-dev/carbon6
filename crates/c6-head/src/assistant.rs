@@ -1091,7 +1091,9 @@ fn reach(op: &str) -> Option<Reach> {
         "templates.run" => Template,
         "apps.operations.call" => PathRealm,
         "triggers.update" | "triggers.run" => Object { table: "triggers", collection: "", noun: "trigger" },
-        "decisions.answer" | "decisions.session" => Object { table: "decisions", collection: "", noun: "decision" },
+        "decisions.answer" | "decisions.session" | "decisions.discuss" | "decisions.discussion_session" => {
+            Object { table: "decisions", collection: "", noun: "decision" }
+        }
         "memories.update" => record(crate::lists::MEMORY, "memory note"),
         "work.edit" | "work.attach" | "work.todos.add" | "work.todos.edit" => record(crate::work::WORK, "work item"),
         "projects.edit" | "projects.work" | "projects.links" | "projects.phases" => record(crate::projects::PROJECTS, "project"),
@@ -2160,6 +2162,8 @@ mod tests {
             "decisions.add",
             "decisions.answer",
             "decisions.session",
+            "decisions.discuss",
+            "decisions.discussion_session",
             "memories.create",
             "memories.update",
             "work.add",

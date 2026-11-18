@@ -1647,14 +1647,6 @@ pub(crate) async fn ask_json(
     model: &str,
     prompt: String,
 ) -> anyhow::Result<(Value, c6_llm::Usage)> {
-    let origin = c6_llm::activity::Origin {
-        what: what.to_owned(),
-        about: about.to_owned(),
-        connection: connection.to_owned(),
-        realm: realm.to_owned(),
-        via: String::new(),
-    };
-    let client = crate::pools::client(st, connection, realm, origin).await?;
     let req = ModelRequest {
         model: model.to_owned(),
         system: String::new(),
@@ -1667,16 +1659,37 @@ pub(crate) async fn ask_json(
         web_search: false,
         json: true,
     };
-    let mut stream = client.stream(&req).await?;
+    let (msg, usage) = ask_message(st, realm, what, about, connection, &req).await?;
+    let text: String = msg.blocks.iter().filter_map(|b| if let Block::Text(t) = b { Some(t.as_str()) } else { None }).collect();
+    let v = json_of(&text).ok_or_else(|| anyhow::anyhow!("{model} gave no JSON: {}", text.chars().take(200).collect::<String>()))?;
+    Ok((v, usage))
+}
+
+/// One bounded head model call, shared by JSON checks and card tool turns.
+pub(crate) async fn ask_message(
+    st: &HeadState,
+    realm: &str,
+    what: &str,
+    about: &str,
+    connection: &str,
+    req: &ModelRequest,
+) -> anyhow::Result<(Message, c6_llm::Usage)> {
+    let origin = c6_llm::activity::Origin {
+        what: what.to_owned(),
+        about: about.to_owned(),
+        connection: connection.to_owned(),
+        realm: realm.to_owned(),
+        via: String::new(),
+    };
+    let client = crate::pools::client(st, connection, realm, origin).await?;
+    let mut stream = client.stream(req).await?;
     let mut acc = Accumulator::default();
     while let Some(ev) = stream.next().await {
         acc.push(&ev?);
     }
     let usage = acc.usage;
     let msg = acc.finish(true);
-    let text: String = msg.blocks.iter().filter_map(|b| if let Block::Text(t) = b { Some(t.as_str()) } else { None }).collect();
-    let v = json_of(&text).ok_or_else(|| anyhow::anyhow!("{model} gave no JSON: {}", text.chars().take(200).collect::<String>()))?;
-    Ok((v, usage))
+    Ok((msg, usage))
 }
 
 fn json_of(text: &str) -> Option<Value> {

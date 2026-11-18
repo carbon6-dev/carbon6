@@ -206,6 +206,11 @@ pub const DEFAULTS: &[Prompt] = &[
         default: text::GOAL_START,
     },
     Prompt {
+        name: "decision.discuss",
+        description: "The head-run discussion inside a decision card: explanations and revisions, never settlement (docs/card-chat.md).",
+        default: text::DECISION_DISCUSS,
+    },
+    Prompt {
         name: "session.goal_check",
         description: "After each turn toward a goal: reached, needs you, or keep going (docs/goals.md). Placeholders: {{goal}}, {{turn}}, {{previous}}.",
         default: text::GOAL_CHECK,

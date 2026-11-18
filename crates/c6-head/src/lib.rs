@@ -11,6 +11,7 @@ pub mod attention;
 pub mod auth;
 pub mod backups;
 mod brief_cache;
+pub mod card_chat;
 pub mod catalog;
 pub mod catchup;
 pub mod claims;
@@ -207,6 +208,8 @@ pub struct HeadState {
     pub backups: backups::Engine,
     /// Watchers' wakes under way, and which sessions are theirs.
     pub(crate) watchers: watchers::Runtime,
+    /// Per-card action/revision guards; discussion model calls stay unlocked.
+    pub(crate) card_chat: card_chat::Runtime,
     /// HeadConfig's `watchers`: the shipped ones start as they ship.
     pub(crate) watchers_as_shipped: bool,
     /// The config file it was started from (for backups).
@@ -344,6 +347,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         catchup: Default::default(),
         backups: Default::default(),
         watchers: Default::default(),
+        card_chat: Default::default(),
         watchers_as_shipped: cfg.watchers.unwrap_or(false),
         config_file: cfg.config_file.clone(),
         me: Default::default(),

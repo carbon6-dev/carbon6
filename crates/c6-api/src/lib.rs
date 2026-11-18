@@ -2789,6 +2789,38 @@ pub struct Decision {
     pub updated_at: UnixMs,
 }
 
+/// A card's private, head-run discussion (not a session).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct DecisionDiscussion {
+    pub messages: Vec<DecisionDiscussionMessage>,
+    pub revisions: Vec<DecisionRevision>,
+    pub closed: bool,
+    pub can_ask_session: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct DecisionDiscussionMessage {
+    pub role: String,
+    pub text: String,
+    pub created_at: UnixMs,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct DecisionRevision {
+    pub before: serde_json::Value,
+    pub after: serde_json::Value,
+    pub created_at: UnixMs,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct DecisionDiscuss {
+    pub text: String,
+}
+
 /// One answer a decision offers.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

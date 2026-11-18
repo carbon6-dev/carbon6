@@ -656,6 +656,9 @@ fn build() -> Vec<Op> {
         op!("decisions.answer", "decisions", "POST" "/api/v1/decisions/{id}/answer", Write, Input::Body(schema::<api::DecisionAnswer>), "Answers a decision (an option, the form's fields, a note); what waits on it gets the answer.", choices = &[("id", "decisions.list")]),
         op!("decisions.edit", "decisions", "PATCH" "/api/v1/decisions/{id}", Write, Input::Body(schema::<api::DecisionEdit>), "Snoozes, dismisses or reopens a decision.", choices = &[("id", "decisions.list")]),
         op!("decisions.session", "decisions", "POST" "/api/v1/decisions/{id}/session", Write, Input::None, "Starts a session that helps the user settle a decision, with its context.", choices = &[("id", "decisions.list")]),
+        op!("decisions.discussion", "decisions", "GET" "/api/v1/decisions/{id}/discussion", Read, Input::None, "A card's discussion and revision history. Reading it does not start a model turn.", choices = &[("id", "decisions.list")]),
+        op!("decisions.discuss", "decisions", "POST" "/api/v1/decisions/{id}/discussion", Write, Input::Body(schema::<api::DecisionDiscuss>), "Discusses a card and may revise its wording or task proposal; never answers the decision or starts its work.", choices = &[("id", "decisions.list")]),
+        op!("decisions.discussion_session", "decisions", "POST" "/api/v1/decisions/{id}/discussion/session", Write, Input::Body(schema::<api::DecisionDiscuss>), "Asks the session that raised the card in a side chat, with the card's context.", choices = &[("id", "decisions.list")]),
         op!("attention.list", "decisions", "GET" "/api/v1/attention", Read, Input::None, "What needs the user in this realm: waiting (open decisions, among them tool calls to approve and agents' questions; not task cards), worth a look (sessions whose turn ended or failed since the user saw them, agents' answers to the user's comments, people waiting on the user in the Brief), and for other realms only how many wait there."),
         op!("attention.seen", "decisions", "POST" "/api/v1/attention/seen", Write, Input::Body(schema::<api::AttentionSeen>), "Marks worth-a-look items seen, by key (none: all of them): a session's ended turn or failure stops being worth a look until its next. Waiting items leave only when answered, snoozed or dismissed; a comment answer when its thread is replied to or resolved; the Brief's row when its people are answered there."),
 
@@ -1414,6 +1417,19 @@ pub fn openapi(urls: &[String]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn card_discussion_effects_and_scopes() {
+        for (name, effect) in
+            [("decisions.discussion", Effect::Read), ("decisions.discuss", Effect::Write), ("decisions.discussion_session", Effect::Write)]
+        {
+            let op = find(name).unwrap();
+            assert_eq!(op.effect, effect, "{name}");
+            assert_eq!(scope(name), Some(Scope::Realm), "{name}");
+            let Via::Http { method, path } = op.via else { panic!("{name} must be an HTTP operation") };
+            assert_eq!(route_scope(method, &path.replace("{id}", "42")), Scope::Realm, "{name}");
+        }
+    }
 
     #[test]
     fn session_bar_preference_is_available_from_any_realm() {

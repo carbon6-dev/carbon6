@@ -16,6 +16,7 @@ mod automations;
 mod background;
 mod backups;
 mod batch_capture;
+mod card_chat;
 mod cards;
 mod catchup;
 mod chaos;

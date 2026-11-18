@@ -1566,6 +1566,18 @@ pub async fn decision_session(id: i64) -> Result<c6_api::Session, String> {
     send_json(Request::post(&format!("/api/v1/decisions/{id}/session")), &serde_json::json!({})).await
 }
 
+pub async fn decision_discussion(id: i64) -> Result<c6_api::DecisionDiscussion, String> {
+    json(Request::get(&format!("/api/v1/decisions/{id}/discussion")).send().await).await
+}
+
+pub async fn discuss_decision(id: i64, text: String) -> Result<c6_api::DecisionDiscussion, String> {
+    send_json(Request::post(&format!("/api/v1/decisions/{id}/discussion")), &c6_api::DecisionDiscuss { text }).await
+}
+
+pub async fn decision_discussion_session(id: i64, text: String) -> Result<c6_api::Session, String> {
+    send_json(Request::post(&format!("/api/v1/decisions/{id}/discussion/session")), &c6_api::DecisionDiscuss { text }).await
+}
+
 // --- Collections (docs/os.md §4.1) ---------------------------------------------
 
 pub async fn collections() -> Result<Vec<c6_api::Collection>, String> {

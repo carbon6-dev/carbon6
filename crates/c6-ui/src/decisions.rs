@@ -110,6 +110,12 @@ fn later(due: StoredValue<bool>, tick: RwSignal<u32>) {
 #[component]
 fn Cards(list: LocalResource<Result<Vec<Decision>, String>>, refresh: Callback<()>, #[prop(optional)] in_session: bool) -> impl IntoView {
     let shown = RwSignal::new(None::<Result<Vec<Decision>, String>>);
+    // A revision changes the card's version and rebuilds it. Keep its thread
+    // expanded while the fresh card and durable history load.
+    let discussions = RwSignal::new(std::collections::BTreeSet::<i64>::new());
+    // A failed turn can still revise the card. Its error must survive the
+    // version-keyed remount when we fetch that latest proposal.
+    let discussion_errors = RwSignal::new(std::collections::BTreeMap::<i64, String>::new());
     Effect::new(move || {
         if let Some(r) = list.get() {
             shown.set(Some(r));
@@ -164,7 +170,7 @@ fn Cards(list: LocalResource<Result<Vec<Decision>, String>>, refresh: Callback<(
                             view! {
                                 <For each=move || groups.with(|gs| gs.iter().find(|(x, _)| *x == g).map(|(_, ds)| ds.clone()).unwrap_or_default())
                                     key=|d| (d.id, d.updated_at) let:d>
-                                    <DecisionCard d refresh in_session />
+                                    <DecisionCard d refresh in_session discussions discussion_errors />
                                 </For>
                             }
                         }
@@ -262,11 +268,25 @@ pub(crate) fn card_id(id: i64) -> String {
 }
 
 #[component]
-fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session: bool) -> impl IntoView {
+fn DecisionCard(
+    d: Decision,
+    refresh: Callback<()>,
+    discussions: RwSignal<std::collections::BTreeSet<i64>>,
+    discussion_errors: RwSignal<std::collections::BTreeMap<i64, String>>,
+    #[prop(optional)] in_session: bool,
+) -> impl IntoView {
     let ws = use_workspace();
     let col = use_column();
     let task = d.kind == "task";
     let id = d.id;
+    let expanded = Signal::derive(move || discussions.with(|ids| ids.contains(&id)));
+    let toggle = Callback::new(move |()| {
+        discussions.update(|ids| {
+            if !ids.remove(&id) {
+                ids.insert(id);
+            }
+        })
+    });
     let note = RwSignal::new(String::new());
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
@@ -396,7 +416,7 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
                 let session_title = Signal::derive(move || proposing.get().map(|s| s.title).filter(|t| !t.is_empty())
                     .or_else(|| task_session.get_value()).unwrap_or_else(|| "the proposing session".into()));
                 let work_title = Signal::derive(move || proposing.get().and_then(|s| s.work).map(|w| w.title));
-                view! { <TaskActions busy session_title work_title card_title=d.title.clone() realm=d.realm.clone()
+                view! { <TaskActions busy session_title work_title card_title=d.title.clone() realm=d.realm.clone() discussion=(id, expanded, toggle)
                     answer=Callback::new(move |(o, title)| submit(Some(o), title)) /> }.into_any()
             } else { view! {
                 {values.get_value().into_iter().map(|(f, v)| {
@@ -429,10 +449,296 @@ fn DecisionCard(d: Decision, refresh: Callback<()>, #[prop(optional)] in_session
                         <button class=BUTTON_QUIET on:click=move |_| set(json!({"state": "snoozed", "snooze_until": now_ms() + 86_400_000}))>"Tomorrow"</button>
                         <button class=format!("{BUTTON_QUIET} text-muted") on:click=move |_| set(json!({"state": "dismissed"}))>"Dismiss"</button>
                     })}
+                    {discussion_toggle(id, expanded, toggle)}
                 </div>
             }.into_any() })}
             {(!open && d.state == "dismissed").then(|| view! { <button class=BUTTON_QUIET on:click=move |_| set(json!({"state": "open"}))>"Reopen"</button> })}
+            {(!open).then(|| discussion_toggle(id, expanded, toggle))}
+            <CardDiscussion id open busy refresh expanded errors=discussion_errors />
         </section>
+    }
+}
+
+/// Shared by every kind of card, including closed cards. The history is loaded
+/// even when collapsed so a revision remains visible without opening the thread.
+#[component]
+fn CardDiscussion(
+    id: i64,
+    open: bool,
+    busy: RwSignal<bool>,
+    refresh: Callback<()>,
+    expanded: Signal<bool>,
+    errors: RwSignal<std::collections::BTreeMap<i64, String>>,
+) -> impl IntoView {
+    let ws = use_workspace();
+    let col = use_column();
+    let thread = LocalResource::new(move || api::decision_discussion(id));
+    let shown = RwSignal::new(None::<c6_api::DecisionDiscussion>);
+    let error = Signal::derive(move || errors.with(|errors| errors.get(&id).cloned()));
+    let text = RwSignal::new(String::new());
+    Effect::new(move || {
+        if let Some(Ok(d)) = thread.get() {
+            shown.set(Some(d));
+        }
+    });
+    let closed = Signal::derive(move || !open || shown.with(|d| d.as_ref().is_none_or(|d| d.closed)));
+    let ask_session = Signal::derive(move || shown.with(|d| d.as_ref().is_some_and(|d| d.can_ask_session)));
+    let send = Callback::new(move |side_chat: bool| {
+        if busy.get_untracked() || closed.get_untracked() || text.with_untracked(|s| s.trim().is_empty()) {
+            return;
+        }
+        let message = text.get_untracked();
+        errors.update(|errors| {
+            errors.remove(&id);
+        });
+        busy.set(true);
+        spawn_local(async move {
+            if side_chat {
+                match api::decision_discussion_session(id, message).await {
+                    Ok(s) => {
+                        let view = View::session(s.id);
+                        match col {
+                            Some(c) => ws.open_after(c.tile, c.col, view),
+                            None => ws.open(None, view, How::Beside),
+                        }
+                        text.set(String::new());
+                    }
+                    Err(e) => errors.update(|errors| {
+                        errors.insert(id, e);
+                    }),
+                }
+            } else {
+                match api::discuss_decision(id, message).await {
+                    Ok(d) => {
+                        shown.set(Some(d));
+                        text.set(String::new());
+                        // Revisions change the proposal, never its answer.
+                        refresh.run(());
+                    }
+                    Err(e) => discussion_failed(id, e, errors, Callback::new(move |()| thread.refetch()), refresh),
+                }
+            }
+            busy.set(false);
+        });
+    });
+    view! {
+        <div class="space-y-2">
+            {move || shown.get().filter(|d| !d.revisions.is_empty()).map(|d| discussion_revisions(d.revisions, now_ms()))}
+            <Show when=move || expanded.get()>
+                <div id=format!("decision-discussion-{id}") class="space-y-3 border-t border-zinc-200 pt-3 dark:border-zinc-800" aria-label="Card discussion">
+                    <p class="text-xs text-muted">"Discuss the proposal or revise it. Only the answer buttons settle this card."</p>
+                    <Suspense fallback=|| view! { <p class="text-xs text-muted">"Loading discussion…"</p> }>
+                        {move || thread.get().and_then(Result::err).map(|e| view! { <ErrorBox message=e />
+                            <button class=BUTTON_QUIET on:click=move |_| thread.refetch()>"Retry"</button> })}
+                    </Suspense>
+                    <div on:click=crate::mentions::link_clicks()>
+                        {move || shown.get().map(|d| discussion_messages(d.messages, now_ms()))}
+                    </div>
+                    {move || error.get().map(|e| view! { <ErrorBox message=e /> })}
+                    <Show when=move || shown.with(|d| d.is_some())>
+                        {discussion_composer(closed, busy, text, ask_session, send)}
+                    </Show>
+                </div>
+            </Show>
+        </div>
+    }
+}
+
+/// A revision or user message may have committed before the model failed.
+/// Reload both durable history and the current proposal without losing why
+/// the turn failed when the card's new version replaces its old component.
+fn discussion_failed(
+    id: i64,
+    error: String,
+    errors: RwSignal<std::collections::BTreeMap<i64, String>>,
+    refetch: Callback<()>,
+    refresh: Callback<()>,
+) {
+    errors.update(|errors| {
+        errors.insert(id, error);
+    });
+    refetch.run(());
+    refresh.run(());
+}
+
+fn discussion_toggle(id: i64, expanded: Signal<bool>, toggle: Callback<()>) -> impl IntoView {
+    view! {
+        <button class=format!("{BUTTON_QUIET} text-muted pointer-coarse:min-h-11") aria-controls=format!("decision-discussion-{id}")
+            aria-expanded=move || expanded.get().to_string() on:click=move |_| toggle.run(())>"Discuss"</button>
+    }
+}
+
+fn discussion_messages(messages: Vec<c6_api::DecisionDiscussionMessage>, now: i64) -> impl IntoView {
+    view! {
+        <div class="max-h-80 space-y-3 overflow-y-auto" role="log" aria-label="Discussion messages">
+            {messages.into_iter().map(|m| view! {
+                <div class="space-y-1">
+                    <p class="text-xs text-muted">{if m.role == "user" { "You" } else { "Assistant" }}" · "{ago(now - m.created_at)}</p>
+                    <div class="md text-sm" inner_html=crate::markdown::to_html(&m.text)></div>
+                </div>
+            }).collect_view()}
+        </div>
+    }
+}
+
+struct RevisionField {
+    label: &'static str,
+    before: String,
+    after: String,
+    long: bool,
+}
+
+fn revision_fields(before: &serde_json::Value, after: &serde_json::Value) -> Vec<RevisionField> {
+    let text = |value: Option<&serde_json::Value>| match value {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => s.clone(),
+        Some(serde_json::Value::Bool(b)) => if *b { "Yes" } else { "No" }.into(),
+        Some(serde_json::Value::Array(a)) if !a.is_empty() => a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "),
+        _ => "None".into(),
+    };
+    [
+        ("Title", "/title", false),
+        ("Why", "/document", true),
+        ("What the new session is told", "/context/prompt", true),
+        ("Labels", "/context/labels", false),
+        ("Worktree", "/context/worktree", false),
+        // Ordinary decisions may revise explanatory context, never action data.
+        ("Context", "/context/discussion", true),
+    ]
+    .into_iter()
+    .filter_map(|(label, path, long)| {
+        let (old, new) = (before.pointer(path), after.pointer(path));
+        (old != new).then(|| RevisionField { label, before: text(old), after: text(new), long })
+    })
+    .collect()
+}
+
+#[derive(Debug, PartialEq)]
+enum WordChange<'a> {
+    Same(&'a str),
+    Removed(&'a str),
+    Added(&'a str),
+}
+
+/// Bound the quadratic LCS table before allocating it. Long text keeps a
+/// plain before/after comparison instead of blocking the browser.
+fn word_diff<'a>(before: &'a str, after: &'a str) -> Option<Vec<WordChange<'a>>> {
+    if [before, after].iter().any(|s| s.chars().take(4001).count() > 4000) {
+        return None;
+    }
+    let (a, b): (Vec<_>, Vec<_>) = (before.split_whitespace().collect(), after.split_whitespace().collect());
+    // Indentation and line breaks can be meaningful task instructions. A
+    // word-only comparison must not make such a revision look unchanged.
+    if a == b && before != after {
+        return None;
+    }
+    let cols = b.len() + 1;
+    let mut lcs = vec![0_u16; (a.len() + 1) * cols];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            lcs[i * cols + j] =
+                if a[i] == b[j] { lcs[(i + 1) * cols + j + 1] + 1 } else { lcs[(i + 1) * cols + j].max(lcs[i * cols + j + 1]) };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    let mut changes = Vec::new();
+    while i < a.len() || j < b.len() {
+        if i < a.len() && j < b.len() && a[i] == b[j] {
+            changes.push(WordChange::Same(a[i]));
+            i += 1;
+            j += 1;
+        } else if i < a.len() && (j == b.len() || lcs[(i + 1) * cols + j] >= lcs[i * cols + j + 1]) {
+            changes.push(WordChange::Removed(a[i]));
+            i += 1;
+        } else {
+            changes.push(WordChange::Added(b[j]));
+            j += 1;
+        }
+    }
+    Some(changes)
+}
+
+const REVISION_REMOVED: &str = "text-red-700/75 dark:text-red-300/75";
+const REVISION_ADDED: &str = "rounded bg-emerald-50 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-200";
+
+fn revision_comparison(field: RevisionField) -> impl IntoView {
+    let comparison = if !field.long {
+        view! {
+            <p class="leading-relaxed"><del class="text-muted">{field.before}</del>" → "<span>{field.after}</span></p>
+        }
+        .into_any()
+    } else if let Some(words) = word_diff(&field.before, &field.after) {
+        // Own the words before constructing the retained view. Text nodes,
+        // not inner_html: model-supplied markup must remain escaped.
+        let words = words
+            .into_iter()
+            .enumerate()
+            .map(|(i, change)| {
+                let word = match change {
+                    WordChange::Same(s) => view! { <span>{s.to_owned()}</span> }.into_any(),
+                    WordChange::Removed(s) => view! { <del class=REVISION_REMOVED>{s.to_owned()}</del> }.into_any(),
+                    WordChange::Added(s) => view! { <ins class=format!("{REVISION_ADDED} no-underline")>{s.to_owned()}</ins> }.into_any(),
+                };
+                view! { {if i == 0 { "" } else { " " }}{word} }
+            })
+            .collect_view();
+        view! { <p class="leading-relaxed">{words}</p> }.into_any()
+    } else {
+        view! {
+            <div class="max-h-48 space-y-2 overflow-auto" role="region" aria-label="Long text comparison" tabindex="0">
+                <p class=format!("whitespace-pre-wrap {REVISION_REMOVED}")><span class="font-medium">"Before: "</span>{field.before}</p>
+                <p class=format!("whitespace-pre-wrap {REVISION_ADDED}")><span class="font-medium">"After: "</span>{field.after}</p>
+            </div>
+        }
+        .into_any()
+    };
+    view! { <div class="space-y-1"><p class="font-medium">{field.label}</p>{comparison}</div> }
+}
+
+fn discussion_revisions(mut revisions: Vec<c6_api::DecisionRevision>, now: i64) -> impl IntoView {
+    revisions.reverse();
+    revisions.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+    view! {
+        <details class="text-xs">
+            <summary class="cursor-pointer text-muted">"revised in discussion"</summary>
+            <ol class="mt-2 space-y-2" aria-label="Card revision history">
+                {revisions.into_iter().enumerate().map(|(i, r)| view! {
+                    <li>
+                        <details open=i == 0 class="rounded border border-zinc-200 p-2 dark:border-zinc-800">
+                            <summary class="cursor-pointer text-muted">{ago(now - r.created_at)}</summary>
+                            <div class="mt-2 space-y-3">
+                                {revision_fields(&r.before, &r.after).into_iter().map(revision_comparison).collect_view()}
+                            </div>
+                        </details>
+                    </li>
+                }).collect_view()}
+            </ol>
+        </details>
+    }
+}
+
+fn discussion_composer(
+    closed: Signal<bool>,
+    busy: RwSignal<bool>,
+    text: RwSignal<String>,
+    ask_session: Signal<bool>,
+    send: Callback<bool>,
+) -> impl IntoView {
+    view! {
+        <Show when=move || !closed.get() fallback=|| view! { <p class="text-xs text-muted">"This discussion is read-only."</p> }>
+            <form class="space-y-2" on:submit=move |ev| { ev.prevent_default(); send.run(false); }>
+                <textarea class=format!("{INPUT} h-20 text-sm") aria-label="Message about this card" placeholder="Ask about the proposal or suggest a change…"
+                    disabled=move || busy.get() prop:value=move || text.get() on:input=move |ev| text.set(event_target_value(&ev))></textarea>
+                <div class="flex flex-wrap items-center gap-2">
+                    <button type="submit" class=BUTTON disabled=move || busy.get() || text.with(|s| s.trim().is_empty())>
+                        {move || if busy.get() { "Working…" } else { "Send to discussion" }}
+                    </button>
+                    <Show when=move || ask_session.get()>
+                        <button type="button" class=BUTTON_QUIET disabled=move || busy.get() || text.with(|s| s.trim().is_empty())
+                            title="Open a side chat that re-reads the source session's full context, with this message" on:click=move |_| send.run(true)>"Ask the session that raised it"</button>
+                    </Show>
+                </div>
+            </form>
+        </Show>
     }
 }
 
@@ -534,6 +840,7 @@ fn TaskActions(
     card_title: String,
     realm: String,
     answer: Callback<(String, Option<String>)>,
+    discussion: (i64, Signal<bool>, Callback<()>),
 ) -> impl IntoView {
     let chooser = RwSignal::new(false);
     let realm = StoredValue::new(realm);
@@ -546,7 +853,7 @@ fn TaskActions(
         }
     });
     view! {
-        {task_actions(busy, session_title, work_title, Callback::new(move |o| answer.run((o, None))), chooser, trigger)}
+        {task_actions(busy, session_title, work_title, Callback::new(move |o| answer.run((o, None))), chooser, trigger, Some(discussion))}
         <Show when=move || chooser.get()>
             <TaskWorkChooser busy realm=realm.get_value() card_title=card_title.get_value() answer=Callback::new(move |option| {
                 close.run(());
@@ -563,6 +870,7 @@ fn task_actions(
     answer: Callback<String>,
     chooser: RwSignal<bool>,
     trigger: NodeRef<leptos::html::Button>,
+    discussion: Option<(i64, Signal<bool>, Callback<()>)>,
 ) -> impl IntoView {
     let act = move |action: TaskAction| answer.run(action.option().into());
     let save_title = move || {
@@ -586,6 +894,7 @@ fn task_actions(
             <button node_ref=trigger class="rounded-md px-1 py-1.5 text-xs text-muted hover:underline disabled:opacity-50 pointer-coarse:min-h-11"
                 disabled=move || busy.get() aria-haspopup="dialog" aria-expanded=move || chooser.get().to_string()
                 on:click=move |_| chooser.set(true)>"Save elsewhere…"</button>
+            {discussion.map(|(id, expanded, toggle)| discussion_toggle(id, expanded, toggle))}
         </div>
     }
 }
@@ -789,6 +1098,233 @@ mod tests {
     use super::*;
 
     #[test]
+    fn failed_discussion_refetches_history_and_card_without_losing_its_error() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let errors = RwSignal::new(std::collections::BTreeMap::from([(7, "Another card's error".to_owned())]));
+            let fetched = RwSignal::new(Vec::<&str>::new());
+            discussion_failed(
+                42,
+                "Model failed after revising the card".into(),
+                errors,
+                Callback::new(move |()| fetched.update(|calls| calls.push("history"))),
+                Callback::new(move |()| {
+                    assert_eq!(
+                        errors.with_untracked(|errors| errors.get(&42).cloned()).as_deref(),
+                        Some("Model failed after revising the card")
+                    );
+                    fetched.update(|calls| calls.push("card"));
+                }),
+            );
+            assert_eq!(fetched.get_untracked(), ["history", "card"]);
+            // A replacement card reads the same parent-owned state.
+            let replacement_error = Signal::derive(move || errors.with(|errors| errors.get(&42).cloned()));
+            assert_eq!(replacement_error.get_untracked().as_deref(), Some("Model failed after revising the card"));
+            assert_eq!(errors.with_untracked(|errors| errors.get(&7).cloned()).as_deref(), Some("Another card's error"));
+        });
+    }
+
+    #[test]
+    fn discussion_control_is_quiet_and_exposes_its_inline_thread() {
+        for expanded in [false, true] {
+            let owner = Owner::new();
+            let html = owner.with(|| discussion_toggle(42, Signal::stored(expanded), Callback::new(|()| ())).to_html());
+            assert!(html.contains(">Discuss</button>"));
+            assert!(html.contains("text-muted"));
+            assert!(html.contains("pointer-coarse:min-h-11"));
+            assert!(html.contains("aria-controls=\"decision-discussion-42\""));
+            assert!(html.contains(&format!("aria-expanded=\"{expanded}\"")));
+        }
+    }
+
+    #[test]
+    fn word_diff_handles_replacements_insertions_deletions_and_repeated_words() {
+        use WordChange::{Added, Removed, Same};
+        assert_eq!(word_diff("keep old shim", "keep public shim"), Some(vec![Same("keep"), Removed("old"), Added("public"), Same("shim")]));
+        assert_eq!(word_diff("", "new words"), Some(vec![Added("new"), Added("words")]));
+        assert_eq!(word_diff("old words", ""), Some(vec![Removed("old"), Removed("words")]));
+        assert_eq!(word_diff("", ""), Some(vec![]));
+        assert_eq!(word_diff("a b a", "a a"), Some(vec![Same("a"), Removed("b"), Same("a")]));
+        assert_eq!(word_diff("garder café", "garder thé"), Some(vec![Same("garder"), Removed("café"), Added("thé")]));
+        assert_eq!(word_diff("same words", "same words"), Some(vec![Same("same"), Same("words")]));
+    }
+
+    #[test]
+    fn word_diff_bounds_lcs_work_by_characters_in_either_input() {
+        let limit = "é".repeat(4000);
+        assert!(word_diff(&limit, "short").is_some());
+        let long = format!("{limit}é");
+        assert_eq!(word_diff(&long, "short"), None);
+        assert_eq!(word_diff("short", &long), None);
+        let owner = Owner::new();
+        let html = owner.with(|| {
+            revision_comparison(RevisionField { label: "Why", before: long.clone(), after: "short".into(), long: true }).to_html()
+        });
+        assert!(html.contains("Before: ") && html.contains("After: "));
+        assert!(html.contains("Long text comparison") && html.contains("tabindex=\"0\""));
+        assert!(!html.contains("<del") && !html.contains("<ins"));
+    }
+
+    #[test]
+    fn whitespace_only_revisions_keep_the_original_formatting_visible() {
+        let before = "Run:\n    first\n    second";
+        let after = "Run: first second";
+        assert_eq!(word_diff(before, after), None);
+        let fields = revision_fields(&json!({"context":{"prompt":before}}), &json!({"context":{"prompt":after}}));
+        assert_eq!(fields.len(), 1);
+        let owner = Owner::new();
+        let html = owner.with(|| revision_comparison(fields.into_iter().next().unwrap()).to_html());
+        assert!(html.contains(before) && html.contains(after));
+        assert_eq!(html.matches("whitespace-pre-wrap").count(), 2);
+    }
+
+    #[test]
+    fn revision_fields_select_only_changed_editable_fields_with_plain_labels() {
+        let before = json!({"title":"Old", "document":"Why", "context":{"prompt":"Prompt", "labels":["cleanup"], "worktree":false, "session":"one"}});
+        let mut after = before.clone();
+        assert!(revision_fields(&before, &after).is_empty());
+        after["context"]["session"] = json!("two");
+        assert!(revision_fields(&before, &after).is_empty(), "unchanged wording must not repeat action data");
+        after["title"] = json!("New");
+        after["document"] = json!("New why");
+        after["context"]["prompt"] = json!("New prompt");
+        after["context"]["labels"] = json!(["compatibility", "retry"]);
+        after["context"]["worktree"] = json!(true);
+        let fields = revision_fields(&before, &after);
+        assert_eq!(
+            fields.iter().map(|f| f.label).collect::<Vec<_>>(),
+            ["Title", "Why", "What the new session is told", "Labels", "Worktree"]
+        );
+        assert_eq!(fields.iter().map(|f| f.long).collect::<Vec<_>>(), [false, true, true, false, false]);
+        assert_eq!((&fields[3].before[..], &fields[3].after[..]), ("cleanup", "compatibility, retry"));
+        assert_eq!((&fields[4].before[..], &fields[4].after[..]), ("No", "Yes"));
+        let ordinary = revision_fields(&json!({}), &json!({"context":{"discussion":"Explanation"}}));
+        assert_eq!(ordinary.len(), 1);
+        assert_eq!((ordinary[0].label, ordinary[0].before.as_str(), ordinary[0].after.as_str()), ("Context", "None", "Explanation"));
+    }
+
+    #[test]
+    fn discussion_revision_history_is_readable_escaped_and_newest_first() {
+        let owner = Owner::new();
+        let html = owner.with(|| {
+            discussion_revisions(
+                vec![
+                    c6_api::DecisionRevision {
+                        before: json!({"title": "Old <title>", "context": {"prompt": "Original task"}}),
+                        after: json!({"title": "New title", "context": {"prompt": "Revised task"}}),
+                        created_at: 1,
+                    },
+                    c6_api::DecisionRevision {
+                        before: json!({"title": "New title", "document":"Keep old <script>shim</script>"}),
+                        after: json!({"title": "Latest title", "document":"Keep public shim"}),
+                        created_at: 2000,
+                    },
+                ],
+                3000,
+            )
+            .to_html()
+        });
+        assert!(html.contains("revised in discussion"));
+        assert!(html.contains("Card revision history"));
+        assert!(html.contains(">Title</p>") && html.contains(">Why</p>"));
+        assert!(html.contains("What the new session is told"));
+        assert!(html.contains("Old &lt;title&gt;"));
+        assert!(html.contains("&lt;script&gt;shim&lt;/script&gt;"));
+        assert!(!html.contains("<script>") && !html.contains("<pre"));
+        assert!(html.contains("<del") && html.contains("<ins") && html.contains(" → "));
+        assert!(html.contains(REVISION_REMOVED) && html.contains(REVISION_ADDED));
+        assert!(html.find("Latest title").unwrap() < html.find("Old &lt;title&gt;").unwrap());
+        let details: Vec<_> = html.split("<details").skip(1).map(|s| s.split('>').next().unwrap()).collect();
+        assert_eq!(details.len(), 3);
+        assert!(!details[0].contains("open"), "the marker starts collapsed");
+        assert!(details[1].contains("open"), "the latest revision starts expanded within the marker");
+        assert!(!details[2].contains("open"), "older revisions start collapsed");
+    }
+
+    #[test]
+    fn discussion_history_keeps_both_speakers_and_renders_safe_markdown() {
+        let owner = Owner::new();
+        let html = owner.with(|| {
+            discussion_messages(
+                vec![
+                    c6_api::DecisionDiscussionMessage { role: "user".into(), text: "Why **this task**?".into(), created_at: 1 },
+                    c6_api::DecisionDiscussionMessage {
+                        role: "assistant".into(),
+                        text: "Because `<script>` is only text.".into(),
+                        created_at: 2,
+                    },
+                ],
+                1000,
+            )
+            .to_html()
+        });
+        assert!(html.contains("Discussion messages"));
+        assert!(html.contains("You"));
+        assert!(html.contains("Assistant"));
+        assert!(html.contains("<strong>this task</strong>"));
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(!html.contains("<script>"));
+    }
+
+    #[test]
+    fn task_card_discuss_sits_with_the_existing_answer_buttons() {
+        let owner = Owner::new();
+        let html = owner.with(|| {
+            untrack(|| {
+                task_actions(
+                    RwSignal::new(false),
+                    Signal::stored("Proposer".into()),
+                    Signal::stored(None),
+                    Callback::new(|_| ()),
+                    RwSignal::new(false),
+                    NodeRef::new(),
+                    Some((42, Signal::stored(false), Callback::new(|()| ()))),
+                )
+                .to_html()
+            })
+        });
+        for label in ["Start session", "Do it here", "Save for later", "Not now", "Save elsewhere…", "Discuss"] {
+            assert!(html.contains(label), "missing {label}: {html}");
+        }
+        assert_eq!(html.matches(">Discuss</button>").count(), 1);
+        assert!(!html.contains("<form"), "discussion must not turn a task card into an answer form");
+    }
+
+    #[test]
+    fn discussion_composer_respects_closure_session_availability_and_pending_turns() {
+        let html = |closed, busy, ask_session, text: &str| {
+            let owner = Owner::new();
+            owner.with(|| {
+                untrack(|| {
+                    discussion_composer(
+                        Signal::stored(closed),
+                        RwSignal::new(busy),
+                        RwSignal::new(text.to_owned()),
+                        Signal::stored(ask_session),
+                        Callback::new(|_| ()),
+                    )
+                    .to_html()
+                })
+            })
+        };
+        let closed = html(true, false, true, "A question");
+        assert!(closed.contains("read-only"));
+        assert!(!closed.contains("textarea"));
+        assert!(!closed.contains("Ask the session"));
+        let open = html(false, false, true, "A question");
+        assert!(open.contains("Send to discussion"));
+        assert!(open.contains("Ask the session that raised it"));
+        assert!(open.contains("re-reads the source session"));
+        assert!(open.contains("full context"));
+        assert!(!open.contains(" disabled"));
+        assert!(!html(false, false, false, "A question").contains("Ask the session"));
+        let pending = html(false, true, true, "A question");
+        assert!(pending.contains("Working…"));
+        assert_eq!(pending.matches(" disabled").count(), 3);
+        assert_eq!(html(false, false, true, "  ").matches(" disabled").count(), 2);
+    }
+
+    #[test]
     fn cleanup_approval_keeps_the_exact_linked_selection_scrollable_and_explains_its_limits() {
         let owner = Owner::new();
         let html = owner.with(|| {
@@ -910,7 +1446,7 @@ mod tests {
                 let busy = RwSignal::new(busy);
                 let session_title = Signal::stored("The proposing session".to_owned());
                 let work_title = Signal::stored(work.map(str::to_owned));
-                task_actions(busy, session_title, work_title, Callback::new(|_| ()), RwSignal::new(false), NodeRef::new()).to_html()
+                task_actions(busy, session_title, work_title, Callback::new(|_| ()), RwSignal::new(false), NodeRef::new(), None).to_html()
             })
         })
     }

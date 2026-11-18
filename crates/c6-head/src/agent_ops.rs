@@ -95,6 +95,10 @@ const NEVER: &[&str] = &[
     "workflows.steps.decide",
     "decisions.answer",
     "decisions.session",
+    // Card discussions are the user's conversation: they may revise a
+    // proposal or ask its source session, not an arbitrary agent write tool.
+    "decisions.discuss",
+    "decisions.discussion_session",
     // Starting task cards together, or keeping them as to-dos: answers too.
     "decisions.task_batch",
     "work.todos.from_cards",
@@ -1045,6 +1049,9 @@ mod tests {
         assert_eq!(c("work.todos.remove"), Class::Delete);
         assert_eq!(c("work.list"), Class::Read);
         assert_eq!(c("decisions.answer"), Class::Never);
+        assert_eq!(c("decisions.discussion"), Class::Read);
+        assert_eq!(c("decisions.discuss"), Class::Never);
+        assert_eq!(c("decisions.discussion_session"), Class::Never);
         assert_eq!(c("connections.create"), Class::Never);
         assert_eq!(c("auth.tokens.list"), Class::Never);
         assert_eq!(c("realms.create"), Class::Never);
