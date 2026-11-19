@@ -66,6 +66,18 @@ pub const RESUME_AFTER_RESTART: &str = "carbon6's worker restarted while you wer
 was cut short where the conversation above ends. A command or subagent that was still running then was stopped; its result says \
 so. Carry on with the task from there, running again whatever you still need.";
 
+/// Editable recovery prompts: keep the cause distinct from the task's outcome.
+pub const RESUME_AFTER_FAILURE: &str = "Your session stopped after a journal write failed; the worker did not restart. Your turn \
+was cut short where the conversation above ends. Check what was saved and what is still running, then continue from there.";
+pub const TASK_LOST_AFTER_RESTART: &str = "The worker restarted before this task's outcome could be recorded.";
+pub const TASK_LOST_AFTER_FAILURE: &str = "The subagent's session stopped after a journal write failed; the worker did not restart.";
+pub const TASK_LOST_UNKNOWN: &str =
+    "This task was no longer being tracked when the session reloaded, before its outcome could be recorded.";
+pub const TASK_LOST_WITH_CLI: &str = "The Claude Code process stopped before this task's outcome could be recorded. Files it changed \
+stay as they are; check them before deciding whether to run the task again.";
+pub const SUBAGENT_REMOTE_REATTACH_AFTER_RELOAD: &str = "This session reloaded while it waited. The subagent runs elsewhere and keeps \
+working: its report will arrive as a notice when it finishes.";
+
 /// Where a session's events go. Durable appends are journaled before they
 /// return; ephemeral events are best-effort live updates.
 #[async_trait]

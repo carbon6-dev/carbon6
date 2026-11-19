@@ -66,6 +66,8 @@ carbon6's own loop (every connection except Claude Code) keeps each turn's steps
 - **carbon6's subagents** resume the same way from their own journals, and report to their parent as before.
 - **Remote subagents** run on another worker. Their reports reach the parent through the head, which already delivers notices durably.
 
+The worker journal uses one pooled SQLite connection in WAL mode with `synchronous=FULL`. Local reads and writes queue for that connection (60-second acquisition timeout); write transactions begin with `BEGIN IMMEDIATE`, and SQLite has a 30-second busy timeout for an external writer. In a local 382 MB synthetic journal with 65,223 events, event inserts used the composite primary key and session updates used the session ID index. Across 200 warm insert/update/commit cycles, median latency was 0.11 ms and p95 was 0.20 ms. A separate warm replay of a 378 MB single-session fixture fetched and decoded in about 1.15 seconds. These are local measurements, not production guarantees: a large replay occupies the same connection while it fetches rows.
+
 ## 5. Across connection types
 
 | Connection | Layer 1 | Carried across a restart |
@@ -114,6 +116,7 @@ Each step is tested with a worker that really restarts mid-work (the chaos tests
      - systemd stops only `c6w` now (`KillMode=process` in `c6w@.service` and the user unit). launchd stops the worker's process group, which held processes have left.
      - `c6w` exits for an update only after shutting down its async runtime. That ends its sessions' foreground commands (a dropped call kills its whole process group, `KillGroup`) and Claude Code processes it doesn't hold, and leaves held ones running.
 3. **Layer 3: turns that were cut short go on.**
+   - A failed worker-journal write does not require a worker restart or a new notice. The session supervisor stops and joins the old turn before rebuilding its conversation and sequence cursor from the durable log, closes an open turn with `error`, and resumes through the editable `session.resume_after_failure` prompt. The same mailbox, inbox and background-tool sinks stay alive; pending durable notices are reconstructed without duplicating inputs already taken. Recovery retries with bounded backoff if the journal remains unavailable. A live child is not declared lost merely because its parent's turn failed. A held Claude Code reader may have advanced past the output whose write failed: recovery retires that CLI with ownership and process-group checks, rather than adopting an offset that could skip the reply, then explicitly continues on a replacement CLI. Failure to prove cleanup keeps input blocked.
    - At start-up the worker still closes a turn that a restart cut short (`worker restarted`). It then wakes the session with a notice, so the agent carries on from its log.
      - The notice is the editable prompt `session.resume_after_restart`.
      - The agent also sees "Tool call did not complete (interrupted)" for any call that was running.

@@ -7,12 +7,13 @@
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use c6_proto::{CreateSession, SessionEvent, session_event};
 use prost::Message;
-use sqlx::Row;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous};
+use sqlx::{Row, Sqlite, Transaction};
 use tokio::sync::Notify;
 
 /// A known live writer or missing stop/identity confirmation, not a storage
@@ -223,7 +224,7 @@ impl Journal {
 
     pub async fn prepare_claude_rewind(&self, session_id: &str, reset: &crate::claude_code::Reset) -> anyhow::Result<()> {
         let _ownership = self.claude_rewind_ownership.lock().await;
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.begin_write().await?;
         let mut reset = reset.clone();
         // An actor can be initializing while the manager admits an explicit
         // retry. Its older snapshot must not erase that durable authorization.
@@ -255,7 +256,7 @@ impl Journal {
     /// must reread its mapping and prepare a new intent instead.
     pub async fn authorize_claude_rewind_retry(&self, session_id: &str, original: &str, retry: &str) -> anyhow::Result<bool> {
         let _ownership = self.claude_rewind_ownership.lock().await;
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.begin_write().await?;
         // Dispatch's receipt check can race a failure committing on the
         // actor. Never resurrect an authorization already consumed by it.
         if let Some(rejection) = sqlx::query_scalar::<_, Option<String>>("SELECT rejection FROM applied_commands WHERE command_id = ?")
@@ -296,7 +297,7 @@ impl Journal {
         event: &SessionEvent,
         retries: &[String],
     ) -> anyhow::Result<(bool, Vec<String>)> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.begin_write().await?;
         let row = sqlx::query("SELECT data FROM claude_rewinds WHERE session_id = ? AND command_id = ? AND applied_seq = 0")
             .bind(session_id)
             .bind(command_id)
@@ -370,7 +371,7 @@ impl Journal {
     /// Returns the number of consecutive events appended under the writer lock.
     pub async fn append_rewind(&self, session_id: &str, event: &SessionEvent) -> anyhow::Result<u64> {
         let Some(session_event::Kind::Rewound(rewound)) = &event.kind else { anyhow::bail!("Expected a rewind confirmation") };
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.begin_write().await?;
         let data =
             sqlx::query_scalar::<_, String>("SELECT data FROM claude_rewinds WHERE session_id = ? AND command_id = ? AND applied_seq = 0")
                 .bind(session_id)
@@ -422,12 +423,27 @@ impl Journal {
             .filename(path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
+            // An external connection can still hold the writer lock. This
+            // wait applies to both transactions and standalone writes.
+            .busy_timeout(Duration::from_secs(30))
             // FULL: an event must survive power loss once appended.
             .synchronous(SqliteSynchronous::Full);
-        let pool =
-            SqlitePoolOptions::new().max_connections(4).connect_with(opts).await.with_context(|| format!("opening {}", path.display()))?;
+        // SQLite has only one writer. Queue local operations in the pool
+        // rather than racing for the WAL write lock on separate connections.
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(60))
+            .connect_with(opts)
+            .await
+            .with_context(|| format!("opening {}", path.display()))?;
         sqlx::migrate!("./migrations").run(&pool).await.context("journal migrations")?;
         Ok(Self { pool, claude_rewind_ownership: tokio::sync::Mutex::new(()), appended: Notify::new() })
+    }
+
+    async fn begin_write(&self) -> sqlx::Result<Transaction<'_, Sqlite>> {
+        // Wait for the writer lock before any reads; a deferred read
+        // snapshot can fail to upgrade without honoring the busy timeout.
+        self.pool.begin_with("BEGIN IMMEDIATE").await
     }
 
     pub async fn is_applied(&self, command_id: &str) -> anyhow::Result<bool> {
@@ -454,7 +470,7 @@ impl Journal {
 
     /// Records a new session with its first event (`SessionStarted`, seq 1).
     pub async fn create_session(&self, session_id: &str, spec: &CreateSession, started: &SessionEvent) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let now = c6_core::now_ms();
         sqlx::query("INSERT INTO sessions (id, spec, created_at, last_activity) VALUES (?, ?, ?, ?)")
             .bind(session_id)
@@ -472,7 +488,7 @@ impl Journal {
     /// Appends an event. The caller (the session's single writer) assigns
     /// consecutive seqs.
     pub async fn append(&self, session_id: &str, event: &SessionEvent) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await.with_context(|| format!("starting append of seq {} to {session_id}", event.seq))?;
         append_in(&mut tx, session_id, event).await?;
         tx.commit().await?;
         self.appended.notify_one();
@@ -523,7 +539,7 @@ impl Journal {
     /// Imports a session from the head's log (see `Restore`). Everything is
     /// already acknowledged.
     pub async fn import(&self, session_id: &str, spec: &CreateSession, events: &[SessionEvent]) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         // Leftovers of a session whose row was lost (rows written by an
         // earlier build that trimmed live sessions) would collide.
         sqlx::query("DELETE FROM events WHERE session_id = ?").bind(session_id).execute(&mut *tx).await?;
@@ -558,7 +574,7 @@ impl Journal {
             if keep.contains(&id) {
                 continue;
             }
-            let mut tx = self.pool.begin().await?;
+            let mut tx = self.begin_write().await?;
             sqlx::query("DELETE FROM events WHERE session_id = ?").bind(&id).execute(&mut *tx).await?;
             sqlx::query("DELETE FROM applied_commands WHERE session_id = ?").bind(&id).execute(&mut *tx).await?;
             sqlx::query("DELETE FROM sessions WHERE id = ?").bind(&id).execute(&mut *tx).await?;
@@ -572,7 +588,7 @@ impl Journal {
     /// earlier build could trim a live session). Without this, the head's
     /// redelivered input would be taken as already applied.
     pub async fn drop_orphans(&self) -> anyhow::Result<u64> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let events =
             sqlx::query("DELETE FROM events WHERE session_id NOT IN (SELECT id FROM sessions)").execute(&mut *tx).await?.rows_affected();
         sqlx::query("DELETE FROM applied_commands WHERE session_id NOT IN (SELECT id FROM sessions)").execute(&mut *tx).await?;

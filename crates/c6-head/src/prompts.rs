@@ -61,9 +61,39 @@ pub const DEFAULTS: &[Prompt] = &[
         default: c6_agent::RESUME_AFTER_RESTART,
     },
     Prompt {
+        name: "session.resume_after_failure",
+        description: "What the agent is told when continuing a turn after its session's journal write failed, without a worker restart.",
+        default: c6_agent::RESUME_AFTER_FAILURE,
+    },
+    Prompt {
+        name: "session.task_lost_after_restart",
+        description: "Why a command or subagent's outcome was not recorded after an actual worker restart.",
+        default: c6_agent::TASK_LOST_AFTER_RESTART,
+    },
+    Prompt {
+        name: "session.task_lost_after_failure",
+        description: "Why a local subagent's turn failed when its journal write failed, without a worker restart.",
+        default: c6_agent::TASK_LOST_AFTER_FAILURE,
+    },
+    Prompt {
+        name: "session.task_lost_unknown",
+        description: "What the agent is told when a task is no longer tracked on session reload and the reason is unknown.",
+        default: c6_agent::TASK_LOST_UNKNOWN,
+    },
+    Prompt {
+        name: "session.task_lost_with_cli",
+        description: "What the agent is told when a Claude Code task lost its CLI process without a known worker restart.",
+        default: c6_agent::TASK_LOST_WITH_CLI,
+    },
+    Prompt {
         name: "session.subagent_remote_reattach",
         description: "The result of a remote subagent's call when the parent's worker restarted while it waited.",
         default: c6_agent::SUBAGENT_REMOTE_REATTACH,
+    },
+    Prompt {
+        name: "session.subagent_remote_reattach_after_reload",
+        description: "What the agent is told about a remote subagent that keeps running when the parent reloads without a known worker restart.",
+        default: c6_agent::SUBAGENT_REMOTE_REATTACH_AFTER_RELOAD,
     },
     Prompt {
         name: "session.compact",
@@ -441,6 +471,8 @@ pub async fn for_worker(st: &HeadState, realm: &str) -> String {
         .filter(|(k, _)| {
             k.starts_with("session.subagent")
                 || k.starts_with("session.compact")
+                || k.starts_with("session.task_lost_")
+                || k.starts_with("session.resume_after_")
                 || k == "session.task_cards"
                 || k == "session.claude_code"
                 || k == "session.carbon6"

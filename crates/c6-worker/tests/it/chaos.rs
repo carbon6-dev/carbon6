@@ -102,6 +102,232 @@ impl Env {
     }
 }
 
+/// A durability failure is local to an actor, not a worker restart. Neither
+/// resuming the open turn nor delivering inputs already queued needs a poke.
+#[tokio::test]
+async fn journal_failure_resumes_without_an_external_poke() {
+    let env = Env::new().await;
+    let prompt = "EDITED-RECOVERY: continue the turn after its failed journal write.";
+    assert!(
+        env.http
+            .put(format!("{}/settings/prompts/session.resume_after_failure", env.api))
+            .json(&json!({"body": prompt}))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    let state = tempfile::tempdir().unwrap();
+    env.enroll(state.path()).await;
+    let (worker, stop) = run_worker(state.path()).await;
+    let project = tempfile::tempdir().unwrap();
+    let gate = env.mock.push_gated(Reply::Text("reject-this-journal-event".into()));
+    env.mock.push(Reply::Text("Recovered the interrupted work.".into()));
+    let id = env.create(&worker, project.path(), "finish the work").await;
+    eventually("the first request to reach the model", async || (!env.mock.requests().is_empty()).then_some(())).await;
+    let db = sqlx::SqlitePool::connect(&format!("sqlite:{}", state.path().join("journal.db").display())).await.unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_turn_write BEFORE INSERT ON events \
+         WHEN instr(NEW.data, CAST('reject-this-journal-event' AS BLOB)) > 0 \
+         BEGIN SELECT RAISE(FAIL, 'injected journal write failure'); END",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    gate.notify_one();
+    eventually("the failed turn to resume without a message or notice", async || {
+        env.events(&id).await.iter().any(|e| matches!(&e.kind, EventKind::Assistant { blocks, .. } if format!("{blocks:?}").contains("Recovered the interrupted work"))).then_some(())
+    }).await;
+    let events = env.events(&id).await;
+    assert!(events.iter().any(|e| matches!(&e.kind, EventKind::TurnEnded { reason, .. } if *reason == TurnEndReason::Error)));
+    assert_eq!(env.mock.requests().len(), 2);
+    assert!(env.mock.requests()[1]["messages"].to_string().contains(prompt));
+    stop.cancel();
+    db.close().await;
+}
+
+#[tokio::test]
+async fn journal_failure_preserves_inputs_waiting_for_the_next_boundary() {
+    let env = Env::new().await;
+    let state = tempfile::tempdir().unwrap();
+    env.enroll(state.path()).await;
+    let (worker, stop) = run_worker(state.path()).await;
+    let project = tempfile::tempdir().unwrap();
+    let gate = env.mock.push_gated(Reply::Text("reject-this-journal-event".into()));
+    env.mock.push(Reply::Text("Saw the queued input after recovery.".into()));
+    let id = env.create(&worker, project.path(), "finish the work").await;
+    eventually("the first model request", async || (!env.mock.requests().is_empty()).then_some(())).await;
+    // Go directly to the worker: the head cannot rescue this by redelivery.
+    worker
+        .sessions
+        .handle(c6_proto::SessionCommand {
+            session_id: id.clone(),
+            command_id: "queued-before-failure".into(),
+            kind: Some(c6_proto::session_command::Kind::Input(c6_proto::UserInput {
+                text: "Do not drop this queued input".into(),
+                ..Default::default()
+            })),
+        })
+        .await
+        .unwrap();
+    eventually("input waiting in the worker inbox", async || worker.sessions.inbox_holds(&id, "queued-before-failure").then_some(())).await;
+    let db = sqlx::SqlitePool::connect(&format!("sqlite:{}", state.path().join("journal.db").display())).await.unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_turn_write BEFORE INSERT ON events \
+         WHEN instr(NEW.data, CAST('reject-this-journal-event' AS BLOB)) > 0 \
+         BEGIN SELECT RAISE(FAIL, 'injected journal write failure'); END",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    gate.notify_one();
+    eventually("the queued input to be taken after the failed actor recovers", async || {
+        env.events(&id)
+            .await
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::User { command_id, .. } if command_id == "queued-before-failure"))
+            .then_some(())
+    })
+    .await;
+    let events = env.events(&id).await;
+    assert_eq!(
+        events.iter().filter(|e| matches!(&e.kind, EventKind::User { command_id, .. } if command_id == "queued-before-failure")).count(),
+        1
+    );
+    stop.cancel();
+    db.close().await;
+}
+
+#[tokio::test]
+async fn journal_failure_keeps_a_notice_whose_queue_marker_could_not_be_written() {
+    let env = Env::new().await;
+    let state = tempfile::tempdir().unwrap();
+    env.enroll(state.path()).await;
+    let (worker, stop) = run_worker(state.path()).await;
+    let project = tempfile::tempdir().unwrap();
+    let gate = env.mock.push_gated(Reply::Text("The old request was canceled.".into()));
+    env.mock.push(Reply::Text("Recovered with the notice.".into()));
+    let id = env.create(&worker, project.path(), "finish the work").await;
+    eventually("the first model request", async || (!env.mock.requests().is_empty()).then_some(())).await;
+    let db = sqlx::SqlitePool::connect(&format!("sqlite:{}", state.path().join("journal.db").display())).await.unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_notice_write BEFORE INSERT ON events \
+         WHEN instr(NEW.data, CAST('notice-with-no-marker' AS BLOB)) > 0 \
+         BEGIN SELECT RAISE(FAIL, 'injected notice queue failure'); END",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    worker
+        .sessions
+        .handle(c6_proto::SessionCommand {
+            session_id: id.clone(),
+            command_id: "notice-with-no-marker".into(),
+            kind: Some(c6_proto::session_command::Kind::Input(c6_proto::UserInput {
+                text: "This notice must survive its failed queue write".into(),
+                from_session_id: "sender".into(),
+                ..Default::default()
+            })),
+        })
+        .await
+        .unwrap();
+    eventually("the failed actor to stop its old turn", async || (worker.sessions.running() == 0).then_some(())).await;
+    sqlx::query("DROP TRIGGER fail_notice_write").execute(&db).await.unwrap();
+    gate.notify_one();
+    eventually("the retained notice to be taken without head redelivery", async || {
+        env.events(&id)
+            .await
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::User { command_id, .. } if command_id == "notice-with-no-marker"))
+            .then_some(())
+    })
+    .await;
+    let events = env.events(&id).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(&e.kind, EventKind::NoticeQueued { command_id, .. } if command_id == "notice-with-no-marker"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events.iter().filter(|e| matches!(&e.kind, EventKind::User { command_id, .. } if command_id == "notice-with-no-marker")).count(),
+        1
+    );
+    stop.cancel();
+    db.close().await;
+}
+
+#[tokio::test]
+async fn journal_failure_keeps_a_background_completion_before_its_first_event() {
+    let env = Env::new().await;
+    let state = tempfile::tempdir().unwrap();
+    env.enroll(state.path()).await;
+    let (worker, stop) = run_worker(state.path()).await;
+    let project = tempfile::tempdir().unwrap();
+    let fifo = project.path().join("finish");
+    assert!(tokio::process::Command::new("mkfifo").arg(&fifo).status().await.unwrap().success());
+    env.mock.push(Reply::ToolCalls(vec![(
+        "bash".into(),
+        json!({
+            "command": "read line < finish; printf '%s\\n' \"$line\"", "run_in_background": true
+        })
+        .to_string(),
+    )]));
+    let gate = env.mock.push_gated(Reply::Text("The old request was canceled.".into()));
+    env.mock.push(Reply::Text("Saw the completed background command.".into()));
+    let id = env.create(&worker, project.path(), "start the background command").await;
+    eventually("the background start and the gated second request", async || {
+        (env.mock.requests().len() == 2
+            && env.events(&id).await.iter().any(|e| matches!(&e.kind, EventKind::BackgroundTask { state, .. } if state == "started")))
+        .then_some(())
+    })
+    .await;
+    let db = sqlx::SqlitePool::connect(&format!("sqlite:{}", state.path().join("journal.db").display())).await.unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_completion BEFORE INSERT ON events \
+         WHEN instr(NEW.data, CAST('finished' AS BLOB)) > 0 \
+         BEGIN SELECT RAISE(FAIL, 'injected background completion failure'); END",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    let mut release = tokio::process::Command::new("sh")
+        .args(["-c", "printf 'completion output\\n' > \"$1\"", "release-gate"])
+        .arg(fifo)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    assert!(c6_testkit::within("the background command to read its gate", release.wait()).await.unwrap().success());
+    eventually("recovery to close the turn after its completion callback failed", async || {
+        env.events(&id)
+            .await
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::TurnEnded { reason, .. } if *reason == TurnEndReason::Error))
+            .then_some(())
+    })
+    .await;
+    sqlx::query("DROP TRIGGER fail_completion").execute(&db).await.unwrap();
+    gate.notify_one();
+    eventually("the completion notice to be taken without callback redelivery", async || {
+        env.events(&id)
+            .await
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::User { command_id, .. } if command_id == "task:bg1:finished"))
+            .then_some(())
+    })
+    .await;
+    let events = env.events(&id).await;
+    assert_eq!(events.iter().filter(|e| matches!(&e.kind, EventKind::BackgroundTask { state, .. } if state == "finished")).count(), 1);
+    assert_eq!(
+        events.iter().filter(|e| matches!(&e.kind, EventKind::User { command_id, .. } if command_id == "task:bg1:finished")).count(),
+        1
+    );
+    stop.cancel();
+    db.close().await;
+}
+
 #[tokio::test]
 async fn head_restarts_during_a_long_turn() {
     let mut env = Env::new().await;

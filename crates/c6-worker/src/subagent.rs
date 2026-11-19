@@ -677,7 +677,7 @@ impl Runner {
                 let status = status_of(o.reason, &o.report);
                 // Stopped from elsewhere than this call: by you.
                 let by = if o.reason == TurnEndReason::Interrupted && !stopped_here { "user" } else { "" };
-                Err(partial(&p.spec, &digest(journal, child_id, status, by).await))
+                Err(o.with_failure_cause(&p.spec, partial(&p.spec, &digest(journal, child_id, status, by).await)))
             }
             Err(_) => Err(partial(&p.spec, &digest(journal, child_id, "failed", "").await)),
         }
@@ -775,7 +775,11 @@ pub(crate) fn partial(spec: &CreateSession, digest: &str) -> String {
 /// report: how far it got, the files it changed (by its own calls, so other
 /// agents' edits do not show), its errors and its own subagents.
 pub(crate) async fn digest(journal: &Journal, child_id: &str, status: &str, by: &str) -> String {
-    let events = journal.events_after(child_id, 0, u32::MAX).await.unwrap_or_default();
+    let mut events = journal.events_after(child_id, 0, u32::MAX).await.unwrap_or_default();
+    // The local outcome renders this cause through an editable prompt, not
+    // by repeating the user-facing diagnostic in the digest.
+    events
+        .retain(|e| !matches!(&e.kind, Some(session_event::Kind::Error(err)) if err.message == crate::session::JOURNAL_FAILURE_DIAGNOSTIC));
     let mut states = std::collections::HashMap::new();
     for id in spawned_children(&events) {
         let ev = journal.events_after(&id, 0, u32::MAX).await.unwrap_or_default();

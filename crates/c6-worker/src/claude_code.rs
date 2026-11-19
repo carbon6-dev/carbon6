@@ -1709,6 +1709,18 @@ pub(crate) fn confirm_held_stopped(held: &Path, session: &str) -> anyhow::Result
 /// Stop all of this session's held runtimes before the durable PGID barrier.
 /// A reused or unidentifiable group is left alone and keeps that barrier shut.
 pub async fn stop_held_for_rewind(held: &Path, session: &str, journal: &crate::journal::Journal) -> anyhow::Result<()> {
+    stop_session_held(held, session, journal, false).await
+}
+
+/// A held CLI can be idle even though the worker never recorded its reply.
+/// A raw line can also have partially committed to multiple session logs,
+/// so rewinding its output cursor is not safe. Retire the runtime instead;
+/// the supervisor can then send a new, explicit continuation.
+pub(crate) async fn retire_after_journal_failure(held: &Path, session: &str, journal: &crate::journal::Journal) -> anyhow::Result<()> {
+    stop_session_held(held, session, journal, true).await
+}
+
+async fn stop_session_held(held: &Path, session: &str, journal: &crate::journal::Journal, retire: bool) -> anyhow::Result<()> {
     let entries = match std::fs::read_dir(held) {
         Ok(entries) => Some(entries),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -1726,6 +1738,11 @@ pub async fn stop_held_for_rewind(held: &Path, session: &str, journal: &crate::j
         }
         anyhow::ensure!(meta.pgid > 0, "Held Claude Code process group is unknown");
         journal.track_claude_process(session, meta.pgid).await?;
+        if retire {
+            // If stopping fails, the held runtime is cleanup-only, even
+            // when its keeper still proves ownership on a later attempt.
+            std::fs::write(dir.join("retiring"), [])?;
+        }
         let pg = Pid::from_raw(meta.pgid);
         match group_probe(pg) {
             Err(nix::errno::Errno::ESRCH) => {}
