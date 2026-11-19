@@ -24,6 +24,8 @@ mod deck;
 mod details;
 mod docs;
 mod explorer;
+mod file_formats;
+mod file_viewers;
 mod files;
 mod fleet;
 mod goal;
@@ -64,6 +66,7 @@ mod util;
 mod views;
 mod watchers;
 mod when;
+mod word_diff;
 mod work;
 mod workspace;
 
@@ -95,6 +98,8 @@ fn main() {
     }));
     // Each page is one realm's app or the console (docs/realms-ux.md).
     if place::resolve() {
+        #[cfg(target_arch = "wasm32")]
+        file_viewers::init();
         leptos::mount::mount_to_body(App);
     }
 }

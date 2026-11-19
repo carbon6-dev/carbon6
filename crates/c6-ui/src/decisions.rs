@@ -12,6 +12,7 @@ use serde_json::json;
 use crate::api;
 use crate::icons::{Icon, Size, icon};
 use crate::util::{BUTTON, BUTTON_QUIET, ErrorBox, INPUT, ago, now_ms};
+use crate::word_diff::{WordChange, word_diff};
 use crate::workspace::{Go, How, View, use_column, use_workspace};
 
 /// The header link, with how many are open.
@@ -610,51 +611,6 @@ fn revision_fields(before: &serde_json::Value, after: &serde_json::Value) -> Vec
         (old != new).then(|| RevisionField { label, before: text(old), after: text(new), long })
     })
     .collect()
-}
-
-#[derive(Debug, PartialEq)]
-enum WordChange<'a> {
-    Same(&'a str),
-    Removed(&'a str),
-    Added(&'a str),
-}
-
-/// Bound the quadratic LCS table before allocating it. Long text keeps a
-/// plain before/after comparison instead of blocking the browser.
-fn word_diff<'a>(before: &'a str, after: &'a str) -> Option<Vec<WordChange<'a>>> {
-    if [before, after].iter().any(|s| s.chars().take(4001).count() > 4000) {
-        return None;
-    }
-    let (a, b): (Vec<_>, Vec<_>) = (before.split_whitespace().collect(), after.split_whitespace().collect());
-    // Indentation and line breaks can be meaningful task instructions. A
-    // word-only comparison must not make such a revision look unchanged.
-    if a == b && before != after {
-        return None;
-    }
-    let cols = b.len() + 1;
-    let mut lcs = vec![0_u16; (a.len() + 1) * cols];
-    for i in (0..a.len()).rev() {
-        for j in (0..b.len()).rev() {
-            lcs[i * cols + j] =
-                if a[i] == b[j] { lcs[(i + 1) * cols + j + 1] + 1 } else { lcs[(i + 1) * cols + j].max(lcs[i * cols + j + 1]) };
-        }
-    }
-    let (mut i, mut j) = (0, 0);
-    let mut changes = Vec::new();
-    while i < a.len() || j < b.len() {
-        if i < a.len() && j < b.len() && a[i] == b[j] {
-            changes.push(WordChange::Same(a[i]));
-            i += 1;
-            j += 1;
-        } else if i < a.len() && (j == b.len() || lcs[(i + 1) * cols + j] >= lcs[i * cols + j + 1]) {
-            changes.push(WordChange::Removed(a[i]));
-            i += 1;
-        } else {
-            changes.push(WordChange::Added(b[j]));
-            j += 1;
-        }
-    }
-    Some(changes)
 }
 
 const REVISION_REMOVED: &str = "text-red-700/75 dark:text-red-300/75";

@@ -123,20 +123,7 @@ pub fn render(src: &str, here: &Here) -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Paths {
     pub session: String,
-}
-
-/// The optional source location stays outside the link; it isn't a filename.
-fn path_part(token: &str) -> (&str, &str) {
-    let mut end = token.len();
-    for _ in 0..2 {
-        if let Some((path, line)) = token[..end].rsplit_once(':')
-            && !line.is_empty()
-            && line.bytes().all(|b| b.is_ascii_digit())
-        {
-            end = path.len();
-        }
-    }
-    (&token[..end], &token[end..])
+    pub worker: String,
 }
 
 fn worker_path(path: &str) -> Option<&str> {
@@ -164,12 +151,18 @@ fn worker_path(path: &str) -> Option<&str> {
 }
 
 fn path_link(path: &str, paths: &Paths, here: &Here, code: bool) -> Option<String> {
-    let resolved = worker_path(path)?;
-    let href =
-        format!("{}/sessions/{}/files?path={}", here.base, crate::workspace::encode(&paths.session), crate::workspace::encode(resolved));
+    let (file, line, _) = crate::file_viewers::location(path);
+    let resolved = worker_path(file)?;
+    let href = format!("{}/sessions/{}/files?path={}", here.base, crate::workspace::encode(&paths.session), crate::workspace::encode(path));
+    let url = crate::api::fs_download_url(&paths.worker, resolved);
     let label = esc(path);
     let label = if code { format!("<code>{label}</code>") } else { label };
-    Some(format!("<a href=\"{}\" class=\"c6-file-link\">{label}</a>", esc(&href)))
+    Some(format!(
+        "<a href=\"{}\" class=\"c6-file-link\" data-fv-path=\"{}\" data-fv-line=\"{line}\" data-fv-url=\"{}\">{label}</a>",
+        esc(&href),
+        esc(resolved),
+        esc(&url)
+    ))
 }
 
 fn bare_paths(text: &str, paths: &Paths, here: &Here) -> Vec<Event<'static>> {
@@ -193,11 +186,10 @@ fn bare_paths(text: &str, paths: &Paths, here: &Here) -> Vec<Event<'static>> {
         }
         let end = text[start..].find(boundary).map_or(text.len(), |n| start + n);
         let token = text[start..end].trim_end_matches(['.', ',', ';', ':', '!', '?']);
-        let (path, _) = path_part(token);
-        if let Some(link) = path_link(path, paths, here, false) {
+        if let Some(link) = path_link(token, paths, here, false) {
             out.push(Event::Text(text[from..start].to_owned().into()));
             out.push(Event::InlineHtml(link.into()));
-            from = start + path.len();
+            from = start + token.len();
         }
     }
     out.push(Event::Text(text[from..].to_owned().into()));
@@ -214,7 +206,7 @@ fn render_paths(src: &str, citations: &[c6_api::citations::UrlCitation], here: &
     // Sanitize model HTML before adding our own trusted mentions/citations.
     // The parser can split plain text at brackets. Keep whole bare URLs
     // together so path detection can distinguish their suffixes from paths.
-    let events = allowed_html(pulldown_cmark::TextMergeStream::new(Parser::new_ext(&src, opts))).into_iter();
+    let events = viewer_fences(allowed_html(pulldown_cmark::TextMergeStream::new(Parser::new_ext(&src, opts)))).into_iter();
     // String markup only: Leptos views cannot be rendered to strings in wasm.
     // Reference links we just generated get a small superscript, not raw HTML
     // from the model. All URLs still pass through the normal sanitizer.
@@ -269,12 +261,8 @@ fn render_paths(src: &str, citations: &[c6_api::citations::UrlCitation], here: &
                     out.push(Event::InlineHtml(CowStr::from(mention(kind, &id, "", None, here))));
                     continue;
                 }
-                let (path, suffix) = path_part(c);
-                if let Some(link) = paths.and_then(|paths| path_link(path, paths, here, true)) {
+                if let Some(link) = paths.and_then(|paths| path_link(c, paths, here, true)) {
                     out.push(Event::InlineHtml(link.into()));
-                    if !suffix.is_empty() {
-                        out.push(Event::Code(suffix.to_owned().into()));
-                    }
                     continue;
                 }
             }
@@ -285,6 +273,34 @@ fn render_paths(src: &str, citations: &[c6_api::citations::UrlCitation], here: &
     let mut html_out = String::new();
     html::push_html(&mut html_out, out.into_iter());
     html_out
+}
+
+fn viewer_fences(events: Vec<Event<'_>>) -> Vec<Event<'_>> {
+    let mut out = Vec::new();
+    let mut events = events.into_iter();
+    while let Some(event) = events.next() {
+        if let Event::Start(Tag::CodeBlock(ref kind)) = event {
+            let language = match kind {
+                pulldown_cmark::CodeBlockKind::Fenced(s) => s.split_whitespace().next().unwrap_or("text"),
+                _ => "text",
+            }
+            .to_owned();
+            let mut text = String::new();
+            for event in events.by_ref() {
+                match event {
+                    Event::End(TagEnd::CodeBlock) => break,
+                    Event::Text(t) | Event::Code(t) => text.push_str(&t),
+                    _ => {}
+                }
+            }
+            let language = if language == "json" && text.lines().count() <= 30 { "json-code" } else { &language };
+            let html = crate::file_viewers::fence(&text, language);
+            out.push(Event::Html(html.into()));
+        } else {
+            out.push(event);
+        }
+    }
+    out
 }
 
 /// Raw tags begin as text. Only a complete, properly nested tree is promoted
@@ -701,7 +717,7 @@ mod tests {
 
     #[test]
     fn worker_paths_link_only_in_session_prose_and_inline_code() {
-        let paths = Paths { session: "s".into() };
+        let paths = Paths { session: "s".into(), worker: "w".into() };
         let render = |src: &str| render_paths(src, &[], &here(&nothing), Some(&paths));
         for path in ["/tmp/report.docx", "~/Drive/report.docx", "src/main.rs", "./folder", "/tmp/folder/", "/tmp/日本語.txt"] {
             for src in [path.to_owned(), format!("`{path}`"), format!("See ({path}).")] {
@@ -712,11 +728,16 @@ mod tests {
         let html = render("`/tmp/a b&c.docx` and src/main.rs:42");
         assert!(html.contains("%2Ftmp%2Fa%20b%26c.docx"), "{html}");
         assert!(html.contains("path=src%2Fmain.rs"), "{html}");
-        assert!(html.contains("</a>:42"), "{html}");
+        assert!(html.contains("src%2Fmain.rs%3A42") && html.contains("data-fv-line=\"42\""), "{html}");
         let html = render("https://[::1]/report.txt and /tmp/report.txt");
         assert_eq!(html.matches("/sessions/s/files?path=").count(), 1, "{html}");
         assert!(html.contains("path=%2Ftmp%2Freport.txt"), "{html}");
         for src in [
+            "10:30",
+            "10:30:45",
+            "127.0.0.1:8080/path.rs:42",
+            "[2001:db8::1]:443/path.rs:42",
+            "http://localhost:8080/src/main.rs:42",
             "https://example.org/a.txt",
             "https://[::1]/report.txt",
             "See (https://[::1]/report.txt).",
@@ -746,6 +767,11 @@ mod tests {
         }
         assert!(!render_paths("/tmp/file.txt", &[], &here(&nothing), None).contains("/files?path="));
         assert!(!render("`/tmp/<script>.txt`").contains("<script>"));
+        for src in ["src/main.rs:42", "`src/main.rs:42:7`", "/tmp/a.rs:1:2"] {
+            let html = render(src);
+            assert!(html.contains("data-fv-line=\""), "{html}");
+            assert!(html.contains("%3A"), "{html}");
+        }
     }
 
     #[test]

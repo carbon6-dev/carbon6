@@ -549,3 +549,44 @@ html.dark {
   transition: none !important;
   scroll-behavior: auto !important;
 }
+
+/* File and fence renderers share structure in full and compact surfaces. */
+.fv, .fv-host, .fv-collapsed { min-width: 0; max-width: 100%; }
+.fv { margin-block: .5rem; border: 1px solid var(--color-zinc-200); border-radius: .5rem; padding: .5rem; font-size: .8rem; overflow: hidden; }
+.dark .fv { border-color: var(--color-zinc-700); }
+.fv [hidden] { display: none !important; }
+.fv button, .fv-controls a, .fv input { min-height: 44px; padding: .4rem .65rem; border: 1px solid var(--color-zinc-300); border-radius: .3rem; font: inherit; background: transparent; }
+.dark .fv button, .dark .fv input, .dark .fv-controls a { border-color: var(--color-zinc-700); }
+.fv button:hover { background: #8882; }
+.fv-controls { display: flex; flex-wrap: wrap; align-items: center; gap: .35rem; margin-block: .35rem; }
+.fv-code { overflow: auto; max-height: 70vh; font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.65; tab-size: 4; }
+.fv-line { display: flex; min-width: max-content; }
+.fv-line-number { position: sticky; left: 0; flex: none; min-width: 4.5ch; padding-right: 1ch; text-align: right; color: var(--color-zinc-500); background: var(--color-zinc-50); user-select: none; }
+.dark .fv-line-number { background: var(--color-zinc-950); }
+.fv-line code { display: block; white-space: pre; background: transparent !important; padding: 0 !important; }
+.fv-selected { background: #eab30830; border-inline-start: 3px solid #ca8a04; }
+.fv-table-scroll { overflow: auto; max-height: 65vh; }
+.fv table { border-collapse: collapse; white-space: nowrap; width: 100%; }
+.fv td, .fv th { padding: .3rem .6rem; border: 1px solid #8884; text-align: left; }
+.fv th { position: sticky; top: 0; background: var(--color-zinc-100); z-index: 1; }
+.dark .fv th { background: var(--color-zinc-900); }
+.fv-tree { overflow: auto; max-height: 65vh; overflow-wrap: anywhere; }
+.fv-tree details { margin-left: .75rem; }
+.fv-tree summary { cursor: pointer; min-height: 44px; }
+.fv-tree .fv-node { margin-left: 1.5rem; }
+.fv-tree button { font-size: .7rem; margin: .15rem; }
+.fv-image { overflow: auto; max-height: 70vh; touch-action: pan-x pan-y; }
+.fv-image img { display: block; max-width: 100%; max-height: 65vh; object-fit: contain; margin: auto; }
+.fv[data-mode="inline"] .fv-image img { max-height: 180px; }
+.fv-pdf iframe { width: 100%; height: 70vh; border: 0; }
+.fv-markdown-card pre { white-space: pre-wrap; max-height: 10rem; overflow: hidden; }
+.fv .md { overflow: auto; max-height: 70vh; }
+.fv-collapsed > summary { cursor: pointer; min-height: 44px; padding: .5rem; }
+.hljs-keyword, .hljs-selector-tag, .hljs-literal { color: #9d174d; }
+.hljs-string, .hljs-attr { color: #166534; }
+.hljs-number, .hljs-built_in, .hljs-type { color: #1d4ed8; }
+.hljs-comment, .hljs-quote { color: #71717a; }
+.dark .hljs-keyword, .dark .hljs-selector-tag, .dark .hljs-literal { color: #f9a8d4; }
+.dark .hljs-string, .dark .hljs-attr { color: #86efac; }
+.dark .hljs-number, .dark .hljs-built_in, .dark .hljs-type { color: #93c5fd; }
+.dark .hljs-comment, .dark .hljs-quote { color: #a1a1aa; }

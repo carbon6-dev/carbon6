@@ -2427,8 +2427,9 @@ fn Transcript(
     let id = StoredValue::new(session.id.clone());
     let paths = {
         let session_id = session.id.clone();
+        let worker = session.worker_id.to_string();
         let allowed = session.ssh.is_none() && !session.on_head;
-        Memo::new(move |_| allowed.then(|| markdown::Paths { session: session_id.clone() }))
+        Memo::new(move |_| allowed.then(|| markdown::Paths { session: session_id.clone(), worker: worker.clone() }))
     };
     // Find asking for an event before the window: load back to it.
     let reach = use_context::<Reach>();

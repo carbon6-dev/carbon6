@@ -11,7 +11,9 @@ turning ordinary slash-separated words into links, relative paths must start
 with `./` or `../`, or have a filename extension and a directory component.
 URLs, existing Markdown links and fenced/indented code blocks are not changed.
 Put paths containing spaces in backticks. A trailing `:line` or `:line:column`
-remains visible but opens the file, without jumping to that line.
+opens at a highlighted line; hovering or focusing the link previews nearby
+source. File mentions can also show compact read-only previews (see
+`docs/file-viewers.md`).
 
 A directory opens the file browser. Text opens the existing source/Markdown
 viewer; binary formats such as `.docx` offer Download. Missing files show an

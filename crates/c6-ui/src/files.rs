@@ -84,6 +84,8 @@ pub fn FileBrowser(worker_id: String, #[prop(optional)] root: Option<String>) ->
 /// Resolve a file or directory on the session's worker before showing it.
 #[component]
 pub fn LinkedFileBrowser(worker_id: String, path: String) -> impl IntoView {
+    let (resolved, line, _) = crate::file_viewers::location(&path);
+    let path = resolved.to_owned();
     let wid = StoredValue::new(worker_id);
     let target = crate::resources::local(move || {
         let (worker, path) = (wid.get_value(), path.clone());
@@ -94,7 +96,10 @@ pub fn LinkedFileBrowser(worker_id: String, path: String) -> impl IntoView {
     view! {
         <Suspense fallback=|| view! { <p class="text-sm text-muted">"Loading…"</p> }>
             {move || target.get().map(|result| match result {
-                Ok(initial) => browser(wid.get_value(), String::new(), Some(initial)).into_any(),
+                Ok(mut initial) => {
+                    if let FileTarget::File(ref mut file) = initial { file["viewer_line"] = line.into(); }
+                    browser(wid.get_value(), String::new(), Some(initial)).into_any()
+                },
                 Err(e) => view! { <ErrorBox message=e /> }.into_any(),
             })}
         </Suspense>
@@ -208,34 +213,21 @@ fn FileViewer(worker_id: String, path: String, #[prop(optional_no_strip)] initia
         }
     });
     let download = api::fs_download_url(&worker_id, &path);
-    let is_md = path.ends_with(".md") || path.ends_with(".markdown");
-    let rendered = RwSignal::new(is_md);
     view! {
         <div class="space-y-2">
             <div class="flex items-center gap-2">
                 <span class="min-w-0 flex-1 truncate font-mono text-xs text-muted">{path.clone()}</span>
                 <a class="rounded-md border border-zinc-300 px-2 py-0.5 text-xs hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
                     href=download download="">"Download"</a>
-                {is_md.then(|| view! {
-                    <button class="rounded px-2 py-0.5 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800" on:click=move |_| rendered.update(|r| *r = !*r)>
-                        {move || if rendered.get() { "Source" } else { "Rendered" }}
-                    </button>
-                })}
             </div>
             <Suspense fallback=|| view! { <p class="text-sm text-muted">"Loading…"</p> }>
                 {move || file.get().map(|r| match r {
                     Err(e) => view! { <ErrorBox message=e /> }.into_any(),
-                    Ok(f) if f["binary"] == true => view! { <p class="text-sm text-muted">{format!("Binary file ({} bytes)", f["size"])}</p> }.into_any(),
                     Ok(f) => {
-                        let text = f["content"].as_str().unwrap_or("").to_owned();
-                        let truncated = f["truncated"] == true;
+                        let line = f["viewer_line"].as_u64().unwrap_or(0) as usize;
                         view! {
-                            {truncated.then(|| view! { <p class="text-xs text-amber-600">"Showing the first 2 MB."</p> })}
-                            {move || if rendered.get() {
-                                view! { <div class="md max-h-[70vh] overflow-auto rounded-md border border-zinc-200 p-4 dark:border-zinc-800" on:click=crate::mentions::link_clicks() inner_html=crate::markdown::to_html(&text)></div> }.into_any()
-                            } else {
-                                view! { <CodeView text=text.clone() /> }.into_any()
-                            }}
+                            <p class="text-xs text-muted">{format!("{} bytes", f["size"])}</p>
+                            <crate::file_viewers::FileContent path=path.clone() url=api::fs_download_url(&worker_id, &path) line mime=if f["binary"] == true { "".into() } else { "text/plain".into() } />
                         }.into_any()
                     }
                 })}

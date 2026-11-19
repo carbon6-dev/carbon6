@@ -3472,14 +3472,40 @@ async fn fs_download(State(st): State<Arc<HeadState>>, Path(id): Path<String>, Q
     let name = std::path::Path::new(&q.path).file_name().and_then(|name| name.to_str()).unwrap_or("download");
     Ok((
         [
-            (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
+            (header::CONTENT_TYPE, download_mime(name).to_owned()),
             (header::CONTENT_DISPOSITION, download_disposition(name)),
             (header::CACHE_CONTROL, "private, no-store".to_owned()),
             (header::HeaderName::from_static("x-content-type-options"), "nosniff".to_owned()),
+            (header::CONTENT_SECURITY_POLICY, "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data: blob:".to_owned()),
         ],
         bytes,
     )
         .into_response())
+}
+
+// The decoded path is a filesystem path, not a URL. Only allow known MIME
+// types by filename extension; source code gets no executable MIME type.
+fn download_mime(name: &str) -> &'static str {
+    let extension = std::path::Path::new(name).extension().and_then(|ext| ext.to_str()).unwrap_or_default();
+    match extension.to_ascii_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "csv" => "text/csv",
+        "tsv" => "text/tab-separated-values",
+        "json" => "application/json",
+        "md" | "markdown" => "text/markdown",
+        "txt" | "text" | "log" | "jsonl" | "ndjson" | "diff" | "patch" | "mmd" | "mermaid" | "rs" | "go" | "py" | "rb" | "php" | "js"
+        | "mjs" | "cjs" | "jsx" | "ts" | "tsx" | "css" | "scss" | "xml" | "yaml" | "yml" | "toml" | "ini" | "sh" | "bash" | "zsh"
+        | "fish" | "ps1" | "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "cs" | "java" | "kt" | "kts" | "swift" | "sql" | "lua" | "zig" => {
+            "text/plain"
+        }
+        _ => "application/octet-stream",
+    }
 }
 
 fn download_disposition(name: &str) -> String {
@@ -5019,6 +5045,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn download_mime_only_uses_allowlisted_filename_extensions() {
+        for (name, mime) in [
+            ("image.PNG", "image/png"),
+            ("image.jpg", "image/jpeg"),
+            ("image.JPEG", "image/jpeg"),
+            ("image.gif", "image/gif"),
+            ("image.WebP", "image/webp"),
+            ("image.avif", "image/avif"),
+            ("image.svg", "image/svg+xml"),
+            ("report.PDF", "application/pdf"),
+            ("table.csv", "text/csv"),
+            ("table.tsv", "text/tab-separated-values"),
+            ("data.json", "application/json"),
+            ("README.md", "text/markdown"),
+            ("README.Markdown", "text/markdown"),
+            ("notes.txt", "text/plain"),
+            ("main.RS", "text/plain"),
+            ("script.js", "text/plain"),
+            ("page.HTML", "application/octet-stream"),
+            ("image.png.htm", "application/octet-stream"),
+            ("page.xhtml", "application/octet-stream"),
+            ("blob.bin", "application/octet-stream"),
+            ("no_extension", "application/octet-stream"),
+            (".png", "application/octet-stream"),
+            ("image.png?fake=query", "application/octet-stream"),
+        ] {
+            assert_eq!(download_mime(name), mime, "{name}");
+        }
+    }
+
     #[tokio::test]
     async fn worker_fs_download_serves_binary_to_a_browser_in_the_workers_realm() {
         let dir = tempfile::tempdir().unwrap();
@@ -5052,41 +5109,58 @@ mod tests {
         let cookie = login.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap();
         let download = format!("{url}/workers/{worker}/fs/download");
         let file = "~/report # ü\".bin";
-        let get = |realm| http.get(&download).query(&[("path", file), ("c6_realm", realm)]);
+        let get = |path, realm| http.get(&download).query(&[("path", path), ("c6_realm", realm)]);
 
-        assert_eq!(get("home").send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
-        let denied = get("lab").header("cookie", cookie).send().await.unwrap();
+        assert_eq!(get(file, "home").send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        let denied = get(file, "lab").header("cookie", cookie).send().await.unwrap();
         assert_eq!(denied.status(), StatusCode::NOT_FOUND);
         assert_eq!(denied.json::<serde_json::Value>().await.unwrap()["error"], "no such worker");
         let token = st.store.create_api_token("lab", Some("lab")).await.unwrap().token.unwrap();
-        assert_eq!(get("home").bearer_auth(token).send().await.unwrap().status(), StatusCode::NOT_FOUND);
+        assert_eq!(get(file, "home").bearer_auth(token).send().await.unwrap().status(), StatusCode::NOT_FOUND);
         assert!(requests.try_recv().is_err(), "denied requests must not reach the worker");
 
         let bytes = [0, 255, 128, 1];
-        let reply = async {
-            use c6_proto::head_msg::Msg;
-            let request = tokio::time::timeout(Duration::from_secs(5), requests.recv()).await.unwrap().unwrap().unwrap();
-            let Some(Msg::RpcRequest(request)) = request.msg else { panic!("expected a worker RPC") };
-            assert_eq!(request.method, "fs.read_file");
-            let params: serde_json::Value = serde_json::from_slice(&request.params_json).unwrap();
-            assert_eq!(params["path"], file);
-            use base64::Engine;
-            conn.rpc_response(c6_proto::RpcResponse {
-                id: request.id,
-                result_json: serde_json::to_vec(&json!({"data": base64::engine::general_purpose::STANDARD.encode(bytes)})).unwrap(),
-                error: String::new(),
-            });
-        };
-        let (response, ()) = tokio::join!(get("home").header("cookie", cookie).send(), reply);
-        let response = response.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()["content-type"], "application/octet-stream");
-        assert_eq!(response.headers()["cache-control"], "private, no-store");
-        assert!(response.headers()["content-disposition"].to_str().unwrap().contains("filename*=UTF-8''report%20%23%20%C3%BC%22.bin"));
-        assert_eq!(response.bytes().await.unwrap().as_ref(), bytes);
+        for (path, mime) in [
+            (file, "application/octet-stream"),
+            ("~/image.PNG", "image/png"),
+            ("~/report.pdf", "application/pdf"),
+            ("~/image.svg", "image/svg+xml"),
+            ("~/page.html", "application/octet-stream"),
+        ] {
+            let reply = async {
+                use c6_proto::head_msg::Msg;
+                let request = tokio::time::timeout(Duration::from_secs(5), requests.recv()).await.unwrap().unwrap().unwrap();
+                let Some(Msg::RpcRequest(request)) = request.msg else { panic!("expected a worker RPC") };
+                assert_eq!(request.method, "fs.read_file");
+                let params: serde_json::Value = serde_json::from_slice(&request.params_json).unwrap();
+                assert_eq!(params["path"], path);
+                use base64::Engine;
+                conn.rpc_response(c6_proto::RpcResponse {
+                    id: request.id,
+                    result_json: serde_json::to_vec(&json!({"data": base64::engine::general_purpose::STANDARD.encode(bytes)})).unwrap(),
+                    error: String::new(),
+                });
+            };
+            let (response, ()) = tokio::join!(get(path, "home").header("cookie", cookie).send(), reply);
+            let response = response.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(response.headers()["content-type"], mime, "{path}");
+            assert_eq!(response.headers()["cache-control"], "private, no-store");
+            assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+            assert_eq!(
+                response.headers()["content-security-policy"],
+                "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data: blob:"
+            );
+            let disposition = response.headers()["content-disposition"].to_str().unwrap();
+            assert!(disposition.starts_with("attachment;"));
+            if path == file {
+                assert!(disposition.contains("filename*=UTF-8''report%20%23%20%C3%BC%22.bin"));
+            }
+            assert_eq!(response.bytes().await.unwrap().as_ref(), bytes);
+        }
 
         drop(conn);
-        assert_eq!(get("home").header("cookie", cookie).send().await.unwrap().status(), StatusCode::CONFLICT);
+        assert_eq!(get(file, "home").header("cookie", cookie).send().await.unwrap().status(), StatusCode::CONFLICT);
         head.shutdown().await.unwrap();
     }
 
