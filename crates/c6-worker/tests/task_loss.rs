@@ -141,6 +141,127 @@ async fn replayed_child_failure_uses_the_editable_journal_failure_cause() {
     assert!(!notice.contains("worker restarted"), "{notice}");
 }
 
+const REUSED_CALL_CHILD: &str = "child-a";
+const REUSED_CALL_REPORT_ID: &str = "subagent:local:child-a:6";
+
+async fn reused_call_fixture() -> (tempfile::TempDir, Arc<Journal>, SessionManager) {
+    use c6_proto::{AssistantMessage, ContentBlock, SubagentSpawned, ToolResult, ToolUse, content_block::Block};
+    use session_event::Kind;
+
+    const CALL: &str = "call_0_task";
+    const REPORT_A: &str = "Checked the first tree.";
+
+    let (dir, journal, manager) = fixture("").await;
+    let mut seq = 1;
+    for (turn, child, report) in [(1, REUSED_CALL_CHILD, REPORT_A), (2, "child-b", "Checked the second tree.")] {
+        for kind in [
+            Kind::User(UserMessage { text: format!("Run check {turn}"), command_id: format!("check-{turn}"), ..Default::default() }),
+            Kind::TurnStarted(TurnStarted { turn, ..Default::default() }),
+            Kind::Assistant(AssistantMessage {
+                turn,
+                blocks: vec![ContentBlock {
+                    block: Some(Block::ToolUse(ToolUse {
+                        id: CALL.into(),
+                        name: "Task".into(),
+                        input_json: r#"{"description":"Check the tree","prompt":"Check the tree"}"#.into(),
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            Kind::SubagentSpawned(SubagentSpawned { call_id: CALL.into(), child_session_id: child.into(), ..Default::default() }),
+            Kind::ToolResult(ToolResult {
+                call_id: CALL.into(),
+                tool: "Task".into(),
+                output: format!("{report}\n\n[subagent session {child}]"),
+                ..Default::default()
+            }),
+            Kind::TurnEnded(TurnEnded { turn, reason: TurnEndReason::Completed as i32 }),
+        ] {
+            seq += 1;
+            journal.append(SID, &SessionEvent { seq, kind: Some(kind), ..Default::default() }).await.unwrap();
+        }
+    }
+
+    let spec = CreateSession {
+        delegation: Some(Delegation { parent_session_id: SID.into(), root_session_id: SID.into(), ..Default::default() }),
+        ..Default::default()
+    };
+    // The parent recorded the inline result, but the worker stopped before A
+    // recorded its local receipt. B's later result must not hide A's receipt.
+    let events = [
+        Kind::Started(SessionStarted { cwd: dir.path().display().to_string(), ..Default::default() }),
+        Kind::SubagentReported(SubagentReported {
+            command_id: format!("subagent:local:{REUSED_CALL_CHILD}:tracking"),
+            child_session_id: REUSED_CALL_CHILD.into(),
+            status: "tracking".into(),
+            ..Default::default()
+        }),
+        Kind::User(UserMessage {
+            text: "Check the tree".into(),
+            delegated_by: CALL.into(),
+            command_id: "run-child-a".into(),
+            ..Default::default()
+        }),
+        Kind::TurnStarted(TurnStarted { turn: 1, ..Default::default() }),
+        Kind::Assistant(AssistantMessage {
+            turn: 1,
+            blocks: vec![ContentBlock { block: Some(Block::Text(REPORT_A.into())), ..Default::default() }],
+            ..Default::default()
+        }),
+        Kind::TurnEnded(TurnEnded { turn: 1, reason: TurnEndReason::Completed as i32 }),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, kind)| SessionEvent { seq: i as u64 + 1, kind: Some(kind), ..Default::default() })
+    .collect::<Vec<_>>();
+    journal.import(REUSED_CALL_CHILD, &spec, &events).await.unwrap();
+    (dir, journal, manager)
+}
+
+#[tokio::test]
+async fn startup_does_not_reload_a_reported_child_when_the_parent_reuses_its_call_id() {
+    let (_dir, _journal, manager) = reused_call_fixture().await;
+    manager.recover().await.unwrap();
+    let active = manager.active();
+    assert!(
+        !active.iter().any(|id| id == REUSED_CALL_CHILD),
+        "startup reloaded {REUSED_CALL_CHILD} even though the parent durably recorded its inline result: {active:?}"
+    );
+}
+
+#[tokio::test]
+async fn reloading_a_reported_child_does_not_queue_a_duplicate_notice_after_call_id_reuse() {
+    use session_event::Kind;
+
+    let (_dir, journal, manager) = reused_call_fixture().await;
+    // Independently load the child, without starting another turn. Startup
+    // recovery should skip it, but an explicit command can still load it.
+    manager
+        .handle(SessionCommand {
+            session_id: REUSED_CALL_CHILD.into(),
+            command_id: "load-child-a".into(),
+            kind: Some(session_command::Kind::SetSubagentModel(c6_proto::SetSubagentModel::default())),
+        })
+        .await
+        .unwrap();
+
+    // The receipt is causal: either the child recognizes the old inline
+    // result or the parent records/acknowledges its fallback notice first.
+    eventually("the child to durably settle its report", async || {
+        journal.events_after(REUSED_CALL_CHILD, 0, u32::MAX).await.unwrap().into_iter().find_map(|event| match event.kind {
+            Some(Kind::SubagentReported(r)) if r.command_id == REUSED_CALL_REPORT_ID && r.status == "completed" => Some(()),
+            _ => None,
+        })
+    })
+    .await;
+    let duplicate = journal.events_after(SID, 0, u32::MAX).await.unwrap().into_iter().find_map(|event| match event.kind {
+        Some(Kind::NoticeQueued(n)) if n.command_id == REUSED_CALL_REPORT_ID => Some(n),
+        _ => None,
+    });
+    assert!(duplicate.is_none(), "parent already recorded the inline result but got a duplicate notice: {duplicate:?}");
+}
+
 struct MockHead(String);
 
 #[async_trait::async_trait]

@@ -3,18 +3,18 @@
 //! may put a subagent on another connection and model than its parent's;
 //! carbon6 runs it in its own loop either way.
 
+use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
-use c6_api::{Event, EventKind, Session, TurnEndReason};
+use c6_api::{Event, EventKind, QueuedInput, Session, TurnEndReason};
 use c6_head::HeadConfig;
 use c6_testkit::eventually;
 use c6_testkit::{MockLlm, Reply};
 use c6_worker::{ConnState, Worker, conn, enroll};
 use serde_json::{Value, json};
-use tokio::sync::watch;
-use tokio_util::sync::CancellationToken;
+use tokio::sync::{oneshot, watch};
+use tokio_util::sync::{CancellationToken, DropGuard};
 
 struct Env {
     head: c6_head::Head,
@@ -92,13 +92,54 @@ impl Env {
         self.http.get(format!("{}/sessions/{id}/children", self.api)).send().await.unwrap().json().await.unwrap()
     }
 
+    async fn turn_child(&self, id: &str, events: &[Event]) -> Session {
+        let child_id = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::SubagentSpawned { child_session_id, .. } => Some(child_session_id),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no child in the turn\n{}", self.trace(events)));
+        // Child and parent journals upload independently. The parent's turn
+        // ending does not acknowledge publication of the child's row.
+        eventually("the linked child to be published", async || self.children(id).await.into_iter().find(|child| &child.id == child_id))
+            .await
+    }
+
     async fn set_subagent_model(&self, id: &str, body: Value) -> reqwest::Response {
         self.http.put(format!("{}/sessions/{id}/subagent-model", self.api)).json(&body).send().await.unwrap()
     }
 
-    async fn say(&self, id: &str, text: &str) {
+    async fn say(&self, id: &str, text: &str) -> String {
         let r = self.http.post(format!("{}/sessions/{id}/messages", self.api)).json(&json!({"text": text})).send().await.unwrap();
         assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+        r.json::<QueuedInput>().await.unwrap().command_id
+    }
+
+    fn trace(&self, events: &[Event]) -> String {
+        format!("parent events: {events:#?}\nmain mock:\n{}\nother mock:\n{}", self.main.log(), self.other.log())
+    }
+
+    /// Wait for the turn started by this input, not the next end in the log.
+    async fn input_turn(&self, id: &str, command_id: &str) -> Vec<Event> {
+        let last = RefCell::new(Vec::new());
+        c6_testkit::eventually_or(
+            &format!("the turn for input {command_id} to end"),
+            async || {
+                *last.borrow_mut() = self.events(id).await;
+                let ev = last.borrow();
+                let user = ev.iter().position(|e| matches!(&e.kind, EventKind::User { command_id: c, .. } if c == command_id))?;
+                let start =
+                    (user + 1..ev.len()).find(|&i| matches!(ev[i].kind, EventKind::TurnStarted { .. } | EventKind::TurnEnded { .. }))?;
+                let EventKind::TurnStarted { turn, .. } = ev[start].kind else {
+                    panic!("input {command_id} joined an earlier turn\n{}", self.trace(&ev));
+                };
+                let end = (start + 1..ev.len()).find(|&i| matches!(ev[i].kind, EventKind::TurnEnded { turn: t, .. } if t == turn))?;
+                Some(ev[start..=end].to_vec())
+            },
+            || self.trace(&last.borrow()),
+        )
+        .await
     }
 
     /// The session's events once its turns have ended `turns` times.
@@ -119,6 +160,43 @@ async fn run_worker(state: &Path) -> (Arc<Worker>, CancellationToken) {
     tokio::spawn(conn::run(w.clone(), tx, stop.clone()));
     c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
     (w, stop)
+}
+
+/// Stop the worker's runtime as well as its connection: session actors keep
+/// journal handles even after `conn::run` returns.
+struct RestartableWorker {
+    worker: Arc<Worker>,
+    stop: DropGuard,
+    runtime: tokio::task::JoinHandle<()>,
+}
+
+impl RestartableWorker {
+    async fn start(state: &Path) -> Self {
+        let state = state.to_owned();
+        let (tx, mut rx) = watch::channel(ConnState::Connecting);
+        let (ready, worker) = oneshot::channel();
+        let stop = CancellationToken::new();
+        let guard = stop.clone().drop_guard();
+        let runtime = tokio::task::spawn_blocking(move || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async move {
+                let identity = c6_worker::Identity::load(&state).unwrap();
+                let worker = Worker::open(&state, identity).await.unwrap();
+                ready.send(worker.clone()).ok().expect("test waiting for worker");
+                conn::run(worker, tx, stop).await.unwrap();
+            });
+        });
+        let worker = c6_testkit::within("the worker to open", worker).await.unwrap();
+        c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
+        Self { worker, stop: guard, runtime }
+    }
+
+    async fn stop(self, env: &Env) {
+        let id = self.worker.identity.meta.worker_id;
+        drop(self.stop);
+        c6_testkit::within("the worker runtime to exit", self.runtime).await.unwrap();
+        drop(self.worker);
+        eventually("the head to unregister the worker", async || env.head.state.registry.get(id).is_none().then_some(())).await;
+    }
 }
 
 fn tool_names(req: &Value) -> Vec<String> {
@@ -226,11 +304,11 @@ async fn the_session_default_for_subagents_can_be_changed() {
     let env = Env::new().await;
     let state = tempfile::tempdir().unwrap();
     env.enroll(state.path()).await;
-    let (worker, stop) = run_worker(state.path()).await;
+    let worker = RestartableWorker::start(state.path()).await;
     let project = tempfile::tempdir().unwrap();
 
-    env.main.push(Reply::Text("ready".into()));
-    let id = env.create(&worker, project.path(), "hello").await;
+    env.main.push_about("hello", Reply::Text("ready".into()));
+    let id = env.create(&worker.worker, project.path(), "hello").await;
     env.after_turns(&id, 1).await;
 
     // Refused: a connection that is not there, a bad effort.
@@ -251,39 +329,72 @@ async fn the_session_default_for_subagents_can_be_changed() {
     })
     .await;
 
-    env.main.push(Reply::ToolCalls(vec![("task".into(), r#"{"description":"a","prompt":"A."}"#.into())]));
-    env.other.push(Reply::Text("from small".into()));
-    env.main.push(Reply::Text("ok".into()));
-    env.say(&id, "delegate").await;
-    env.after_turns(&id, 2).await;
+    env.main
+        .push_about("route phase a", Reply::ToolCalls(vec![("task".into(), r#"{"description":"a","prompt":"child prompt a"}"#.into())]));
+    env.other.push_about("child prompt a", Reply::Text("from small".into()));
+    env.main.push_about("from small", Reply::Text("ok".into()));
+    let a = env.say(&id, "route phase a").await;
+    let a_turn = env.input_turn(&id, &a).await;
     assert_eq!(env.other.requests().last().unwrap()["model"], "small");
-    let child = env.children(&id).await.remove(0);
+    let child = env.turn_child(&id, &a_turn).await;
     assert_eq!((child.connection_id.as_str(), child.effort.as_deref()), (env.other_id.as_str(), Some("low")));
 
     // After a restart the actor reloads it from the log.
-    stop.cancel();
-    drop(worker);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let (_worker, stop) = run_worker(state.path()).await;
-    env.main.push(Reply::ToolCalls(vec![("task".into(), r#"{"description":"b","prompt":"B."}"#.into())]));
-    env.other.push(Reply::Text("still small".into()));
-    env.main.push(Reply::Text("ok".into()));
-    env.say(&id, "again").await;
-    env.after_turns(&id, 3).await;
-    assert_eq!(env.other.requests().len(), 2, "on the other connection again");
+    worker.stop(&env).await;
+    let worker = RestartableWorker::start(state.path()).await;
+    env.main
+        .push_about("route phase b", Reply::ToolCalls(vec![("task".into(), r#"{"description":"b","prompt":"child prompt b"}"#.into())]));
+    env.other.push_about("child prompt b", Reply::Text("still small".into()));
+    env.main.push_about("still small", Reply::Text("ok".into()));
+    let b = env.say(&id, "route phase b").await;
+    let b_turn = env.input_turn(&id, &b).await;
+    assert_eq!(task_results(&b_turn).last().and_then(|result| result.0.lines().next()), Some("still small"), "{}", env.trace(&b_turn));
+    assert_eq!(env.other.requests().len(), 2, "on the other connection again\n{}", env.trace(&b_turn));
+    assert_eq!(env.other.requests().last().unwrap()["model"], "small");
+    let child = env.turn_child(&id, &b_turn).await;
+    assert_eq!(
+        (child.connection_id.as_str(), child.model.as_str(), child.effort.as_deref()),
+        (env.other_id.as_str(), "small", Some("low"))
+    );
 
-    // Cleared: the session's own.
+    // Clearing while the parent already has a model request in flight takes
+    // effect on the next task, even in the already-running turn.
+    let gate = env.main.push_gated_about(
+        "route phase c",
+        Reply::ToolCalls(vec![("task".into(), r#"{"description":"c","prompt":"child prompt c"}"#.into())]),
+    );
+    env.main.push_about("child prompt c", Reply::Text("from m".into()));
+    env.main.push_about("from m", Reply::Text("ok".into()));
+    let c = env.say(&id, "route phase c").await;
+    c6_testkit::eventually_or(
+        "the parent to request C's gated tool call",
+        async || env.main.requests().iter().any(|r| r["messages"].to_string().contains("route phase c")).then_some(()),
+        || env.trace(&[]),
+    )
+    .await;
+    let before_clear = b_turn.last().unwrap().seq;
     assert!(env.set_subagent_model(&id, json!({"model": ""})).await.status().is_success());
     assert!(env.session(&id).await.subagent_model.is_empty());
-    env.main.push(Reply::ToolCalls(vec![("task".into(), r#"{"description":"c","prompt":"C."}"#.into())]));
-    env.main.push(Reply::Text("from m".into()));
-    env.main.push(Reply::Text("ok".into()));
-    env.say(&id, "once more").await;
-    let ev = env.after_turns(&id, 4).await;
-    assert_eq!(task_results(&ev).last().unwrap().0.lines().next(), Some("from m"));
+    c6_testkit::eventually_or(
+        "the worker to record the cleared default",
+        async || {
+            env.events(&id)
+                .await
+                .iter()
+                .any(|e| e.seq > before_clear && matches!(&e.kind, EventKind::SubagentModelSet { model, .. } if model.is_empty()))
+                .then_some(())
+        },
+        || env.trace(&[]),
+    )
+    .await;
+    gate.notify_one();
+    let ev = env.input_turn(&id, &c).await;
+    assert_eq!(task_results(&ev).last().and_then(|result| result.0.lines().next()), Some("from m"), "{}", env.trace(&ev));
     assert_eq!(env.other.requests().len(), 2);
     assert_eq!(turn_end(&ev), Some(TurnEndReason::Completed));
-    stop.cancel();
+    let child = env.turn_child(&id, &ev).await;
+    assert_eq!((child.connection_id.as_str(), child.model.as_str(), child.effort.as_deref()), (env.main_id.as_str(), "m", None));
+    worker.stop(&env).await;
 }
 
 /// A routing rule names the subagents' connection, model and effort; a

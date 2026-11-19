@@ -1942,41 +1942,105 @@ fn pending_local_reports<'a>(sid: &str, events: &'a [SessionEvent]) -> Vec<(Stri
 /// report. A placeholder saying the child is still running/lost does not
 /// acknowledge a later completed report.
 fn report_recorded(events: &[SessionEvent], call: &str, child: &str, status: &str) -> bool {
-    if call.is_empty() {
+    if call.is_empty() || child.is_empty() {
         return false;
     }
-    // Some providers (and the scripted model) reuse ids across turns.
-    // A previous invocation's result must not acknowledge the latest one.
-    let start = events
-        .iter()
-        .rposition(|e| match &e.kind {
-            Some(session_event::Kind::Assistant(a)) => a.blocks.iter().any(|b| {
-                matches!(&b.block,
-            Some(c6_proto::content_block::Block::ToolUse(u)) if u.id == call)
-            }),
-            _ => false,
-        })
-        .unwrap_or(0);
-    let Some(result) = events[start..].iter().rev().find_map(|e| match &e.kind {
-        Some(session_event::Kind::ToolResult(r)) if r.call_id == call => Some(r),
+    if events.iter().any(|e| matches!(&e.kind, Some(session_event::Kind::Rewound(_)))) {
+        // Project the remaining branch without cloning messages or tool output.
+        let mut kept: Vec<&SessionEvent> = Vec::with_capacity(events.len());
+        let mut segment = 0;
+        for event in events {
+            match &event.kind {
+                Some(session_event::Kind::Started(_)) => {
+                    segment = kept.len();
+                    kept.push(event);
+                }
+                Some(session_event::Kind::Rewound(r)) => {
+                    kept.truncate(segment + kept[segment..].partition_point(|e| e.seq < r.to_seq));
+                }
+                _ => kept.push(event),
+            }
+        }
+        return report_recorded_in(kept.iter().copied(), call, child, status);
+    }
+    report_recorded_in(events.iter(), call, child, status)
+}
+
+fn call_invocation<'a>(kind: Option<&'a session_event::Kind>, call: &str) -> Option<&'a str> {
+    let Some(session_event::Kind::Assistant(a)) = kind else { return None };
+    a.blocks.iter().find_map(|b| match &b.block {
+        Some(c6_proto::content_block::Block::ToolUse(u)) if u.id == call => Some(u.name.as_str()),
         _ => None,
-    }) else {
-        return false;
+    })
+}
+
+fn report_recorded_in<'a>(
+    events: impl DoubleEndedIterator<Item = &'a SessionEvent> + Clone,
+    call: &str,
+    child: &str,
+    status: &str,
+) -> bool {
+    let matches_result = |result: Option<&c6_proto::ToolResult>, link: Option<&c6_proto::SubagentSpawned>| {
+        let Some(result) = result else { return false };
+        if result.output.starts_with("Started the subagent in the background as ")
+            || result.output.starts_with("Continuing the subagent in the background as ")
+        {
+            let Some(task) = result.output.split(" as ").nth(1).and_then(|s| s.split('.').next()) else {
+                return false;
+            };
+            if link.is_some_and(|s| !s.background_task_id.is_empty() && s.background_task_id != task) {
+                return false;
+            }
+            let prefix = format!("task:{task}:");
+            // Completion can arrive after another invocation of this call ID.
+            return events.clone().any(|e| {
+                matches!(&e.kind, Some(session_event::Kind::NoticeQueued(n)) if n.command_id.starts_with(&prefix)
+                    && (status == "lost" || !n.command_id.ends_with(":lost")))
+            });
+        }
+        result.output.contains(&format!("[subagent session {child}]"))
+            || result.output.contains(&format!("<subagent id=\"{child}\" status=\"{status}\""))
     };
-    if result.output.starts_with("Started the subagent in the background as ")
-        || result.output.starts_with("Continuing the subagent in the background as ")
-    {
-        let Some(task) = result.output.split(" as ").nth(1).and_then(|s| s.split('.').next()) else {
-            return false;
-        };
-        return events.iter().any(|e| {
-            matches!(&e.kind,
-            Some(session_event::Kind::NoticeQueued(n)) if n.command_id.starts_with(&format!("task:{task}:"))
-                && (status == "lost" || !n.command_id.ends_with(":lost")))
-        });
+
+    // Some providers (and the scripted model) reuse ids across turns.
+    // Only an explicit link identifies an older invocation. A newer
+    // unlinked send_message may have continued this very child: don't let
+    // the earlier linked result acknowledge that newer call.
+    let (mut latest, mut has_link, mut link, mut result) = (true, false, None, None);
+    for event in events.clone().rev().map(Some).chain(std::iter::once(None)) {
+        let kind = event.and_then(|e| e.kind.as_ref());
+        match kind {
+            Some(session_event::Kind::ToolResult(r)) if r.call_id == call && result.is_none() => result = Some(r),
+            Some(session_event::Kind::SubagentSpawned(s)) if s.call_id == call && !s.child_session_id.is_empty() => {
+                has_link = true;
+                if s.child_session_id == child && link.is_none() {
+                    link = Some(s);
+                }
+            }
+            _ => {
+                let invocation = call_invocation(kind, call);
+                if event.is_some() && invocation.is_none() {
+                    continue;
+                }
+                if link.is_some() {
+                    return matches_result(result, link);
+                }
+                if !has_link {
+                    if latest && matches_result(result, None) {
+                        return true;
+                    }
+                    // A Task always starts a new child, even if its link has
+                    // not been recorded yet. An unlinked continuation might
+                    // instead be the very report we're trying to settle.
+                    if !matches!(invocation, Some("task" | "Task")) {
+                        return false;
+                    }
+                }
+                (latest, has_link, link, result) = (false, false, None, None);
+            }
+        }
     }
-    result.output.contains(&format!("[subagent session {child}]"))
-        || (result.output.contains(&format!("<subagent id=\"{child}\" status=\"{status}\"")))
+    false
 }
 
 /// The original call may record its result while the fallback is in flight.
@@ -1988,6 +2052,19 @@ pub(crate) struct InlineChildReport {
 }
 
 impl InlineChildReport {
+    fn check_after(calls: &[String], events: &[SessionEvent], cursor: u64) -> u64 {
+        events
+            .iter()
+            .find(|e| {
+                calls.iter().any(|call| {
+                    call_invocation(e.kind.as_ref(), call).is_some()
+                        || matches!(&e.kind, Some(session_event::Kind::SubagentSpawned(s)) if s.call_id == *call)
+                        || matches!(&e.kind, Some(session_event::Kind::ToolResult(r)) if r.call_id == *call)
+                })
+            })
+            .map_or(cursor, |e| e.seq.saturating_sub(1))
+    }
+
     fn recorded(&self, events: &[SessionEvent]) -> bool {
         self.calls.iter().any(|call| report_recorded(events, call, &self.child, self.status))
     }
@@ -2051,7 +2128,19 @@ impl LocalReportParent {
                         });
                         !a.blocks.is_empty()
                     }
-                    Some(session_event::Kind::SubagentSpawned(s)) => s.child_session_id == child && self.calls.contains(&s.call_id),
+                    Some(session_event::Kind::SubagentSpawned(s)) if self.calls.contains(&s.call_id) => {
+                        *s = c6_proto::SubagentSpawned {
+                            call_id: std::mem::take(&mut s.call_id),
+                            child_session_id: std::mem::take(&mut s.child_session_id),
+                            background_task_id: std::mem::take(&mut s.background_task_id),
+                            ..Default::default()
+                        };
+                        true
+                    }
+                    Some(session_event::Kind::Rewound(r)) => {
+                        self.events.truncate(self.events.partition_point(|e| e.seq < r.to_seq));
+                        true
+                    }
                     Some(session_event::Kind::ToolResult(r)) => self.calls.contains(&r.call_id),
                     Some(session_event::Kind::NoticeQueued(n))
                         if n.command_id.starts_with(&notices) || n.command_id.starts_with("task:") =>
@@ -3362,24 +3451,7 @@ impl Actor {
             let outcome = last_turn_outcome(&events[..=end]);
             let status = crate::subagent::status_of(outcome.reason, &outcome.report);
             let calls: Vec<_> = inputs.iter().filter(|u| !u.delegated_by.is_empty()).map(|u| u.delegated_by.clone()).collect();
-            let after = calls
-                .iter()
-                .filter_map(|call| {
-                    parent
-                        .iter()
-                        .rev()
-                        .find(|event| match &event.kind {
-                            Some(session_event::Kind::Assistant(a)) => a
-                                .blocks
-                                .iter()
-                                .any(|b| matches!(&b.block, Some(c6_proto::content_block::Block::ToolUse(u)) if &u.id == call)),
-                            Some(session_event::Kind::ToolResult(r)) => &r.call_id == call,
-                            _ => false,
-                        })
-                        .map(|event| event.seq.saturating_sub(1))
-                })
-                .min()
-                .unwrap_or(self.local_report_parent.after);
+            let after = InlineChildReport::check_after(&calls, parent, self.local_report_parent.after);
             let inline = InlineChildReport { child: sid.clone(), status, calls, after };
             // Sending, rather than testing is_closed, decides ownership. A
             // waiter can disappear between those operations.
@@ -6397,6 +6469,87 @@ mod notice_tests {
             session_event::Kind::NoticeQueued(c6_proto::NoticeQueued { command_id: "task:bg2:finished".into(), ..Default::default() }),
         ));
         assert!(report_recorded(&events, "call", "child", "completed"));
+    }
+
+    #[test]
+    fn linked_receipts_survive_call_id_reuse_without_acknowledging_new_calls() {
+        let invoke = |seq, name: &str| {
+            ev(
+                seq,
+                seq as i64,
+                session_event::Kind::Assistant(c6_proto::AssistantMessage {
+                    blocks: vec![c6_proto::ContentBlock {
+                        block: Some(c6_proto::content_block::Block::ToolUse(c6_proto::ToolUse {
+                            id: "call".into(),
+                            name: name.into(),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            )
+        };
+        let spawn = |seq, child: &str, task: &str| {
+            ev(
+                seq,
+                seq as i64,
+                session_event::Kind::SubagentSpawned(c6_proto::SubagentSpawned {
+                    call_id: "call".into(),
+                    child_session_id: child.into(),
+                    background_task_id: task.into(),
+                    ..Default::default()
+                }),
+            )
+        };
+        let result = |seq, output: &str| {
+            ev(
+                seq,
+                seq as i64,
+                session_event::Kind::ToolResult(c6_proto::ToolResult {
+                    call_id: "call".into(),
+                    output: output.into(),
+                    ..Default::default()
+                }),
+            )
+        };
+        let recorded = |events: &[SessionEvent], child| report_recorded(events, "call", child, "completed");
+        let mut events = vec![invoke(1, "task"), spawn(2, "a", ""), result(3, "A done\n[subagent session a]"), invoke(4, "Task")];
+        assert!(recorded(&events, "a"), "the next Task need not have linked yet");
+        events.push(spawn(5, "b", ""));
+        assert!(!recorded(&events, "b"));
+        events.push(result(6, "B done\n[subagent session b]"));
+        assert!(recorded(&events, "a") && recorded(&events, "b"));
+        assert_eq!(InlineChildReport::check_after(&["call".into()], &events, 6), 0);
+
+        events.push(invoke(7, "send_message"));
+        assert!(!recorded(&events, "a"), "an unlinked continuation could be a new run of A");
+        events.push(result(8, "A continuation done\n[subagent session a]"));
+        assert!(recorded(&events, "a"));
+        events.push(ev(9, 9, session_event::Kind::Rewound(Rewound { to_seq: 4, ..Default::default() })));
+        assert!(recorded(&events, "a") && !recorded(&events, "b"));
+        events.push(ev(10, 10, session_event::Kind::Rewound(Rewound { to_seq: 1, ..Default::default() })));
+        assert!(!recorded(&events, "a"));
+
+        let mut events = vec![
+            invoke(1, "task"),
+            spawn(2, "a", "bg1"),
+            result(3, "Started the subagent in the background as bg1."),
+            invoke(4, "task"),
+            spawn(5, "b", "bg2"),
+            result(6, "Started the subagent in the background as bg2."),
+        ];
+        let notice = |seq, command_id: &str| {
+            ev(
+                seq,
+                seq as i64,
+                session_event::Kind::NoticeQueued(c6_proto::NoticeQueued { command_id: command_id.into(), ..Default::default() }),
+            )
+        };
+        events.extend([notice(7, "task:bg2:finished"), notice(8, "task:bg1:lost")]);
+        assert!(!recorded(&events, "a") && recorded(&events, "b"));
+        events.push(notice(9, "task:bg1:finished"));
+        assert!(recorded(&events, "a"));
     }
 
     #[test]
