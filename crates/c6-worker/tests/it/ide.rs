@@ -50,6 +50,29 @@ fn sh(dir: &Path, cmd: &str) {
 }
 
 #[tokio::test]
+async fn worker_fs_download_reads_the_whole_binary_file_or_rejects_it() {
+    let s = setup().await;
+    let wid = s.worker.identity.meta.worker_id;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("worker # bytes.bin");
+    let contents = [0, 0xff, 0x80, b'a'].repeat(600_000);
+    std::fs::write(&path, &contents).unwrap();
+    let url = format!("{}/workers/{wid}/fs/download", s.api);
+    let download = |path: &Path| s.http.get(&url).query(&[("path", path.to_str().unwrap())]).send();
+    let response = download(&path).await.unwrap().error_for_status().unwrap();
+    assert!(response.bytes().await.unwrap().as_ref() == contents, "the download must not be lossy or truncated");
+
+    std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(40 * 1024 * 1024 + 1).unwrap();
+    let too_large = download(&path).await.unwrap();
+    assert_eq!(too_large.status(), 400);
+    assert!(too_large.text().await.unwrap().contains("40 MiB"));
+    assert_eq!(download(dir.path()).await.unwrap().status(), 400);
+    assert_eq!(download(&dir.path().join("missing")).await.unwrap().status(), 400);
+    s.stop.cancel();
+    s.head.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn files_git_and_terminal() {
     let s = setup().await;
     let wid = s.worker.identity.meta.worker_id;

@@ -928,6 +928,7 @@ pub const NOT_OPERATIONS: &[(&str, &str, &str, Scope)] = &[
     ("GET", "/api/v1/docs/{id}/files/{blob}", "a document's picture or file (an image or file embed names it)", Scope::Realm),
     ("GET", "/api/v1/head/fs/list", "the head's own files, for the UI's file picker only", Scope::Admin),
     ("GET", "/api/v1/head/fs/read", "the head's own files, for the UI's file picker only", Scope::Admin),
+    ("GET", "/api/v1/workers/{id}/fs/download", "a worker file download", Scope::Realm),
     ("GET", "/api/v1/automations", "the old name of /api/v1/triggers", Scope::Realm),
     ("POST", "/api/v1/automations", "the old name of /api/v1/triggers", Scope::Realm),
     ("PATCH", "/api/v1/automations/{id}", "the old name of /api/v1/triggers", Scope::Realm),

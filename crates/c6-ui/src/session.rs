@@ -2425,6 +2425,11 @@ fn Transcript(
 ) -> impl IntoView {
     let Feed { events, usage, spawns, streaming, queued, secrets, from, to, .. } = feed;
     let id = StoredValue::new(session.id.clone());
+    let paths = {
+        let session_id = session.id.clone();
+        let allowed = session.ssh.is_none() && !session.on_head;
+        Memo::new(move |_| allowed.then(|| markdown::Paths { session: session_id.clone() }))
+    };
     // Find asking for an event before the window: load back to it.
     let reach = use_context::<Reach>();
     if let Some(Reach(reach)) = reach {
@@ -2817,7 +2822,7 @@ fn Transcript(
                                             </div>
                                         }.into_any()
                                     }
-                                    None => (!(side && matches!(e.kind, EventKind::Started { .. }))).then(|| render_event(&id.get_value(), &e, results, decided, streaming, usage)).into_any(),
+                                    None => (!(side && matches!(e.kind, EventKind::Started { .. }))).then(|| render_event(&id.get_value(), &e, results, decided, streaming, usage, paths)).into_any(),
                                 }}
                                 {move || if captioned() {
                                     view! {
@@ -2936,7 +2941,7 @@ fn Transcript(
             {move || (has_thinking.get() || has_text.get()).then(|| view! {
                 <div class="space-y-2">
                     {move || has_thinking.get().then(|| view! { <Thinking text=stream_thinking show=show_thinking /> })}
-                    {move || has_text.get().then(|| view! { <div class="md" on:click=crate::mentions::link_clicks() inner_html=move || markdown::to_html(&stream_text.get())></div> })}
+                    {move || has_text.get().then(|| view! { <div class="md" on:click=crate::mentions::link_clicks() inner_html=move || markdown::session_html(&stream_text.get(), &[], paths.get().as_ref())></div> })}
                 </div>
             })}
             // Waiting input follows everything above, including the live reply,
@@ -4701,6 +4706,7 @@ fn render_event(
     decided: Memo<std::collections::HashSet<String>>,
     streaming: RwSignal<Streaming>,
     usage: Memo<UsageStats>,
+    paths: Memo<Option<markdown::Paths>>,
 ) -> AnyView {
     match &e.kind {
         EventKind::Started { system_prompt, tools, .. } => view! {
@@ -4773,7 +4779,7 @@ fn render_event(
                         ContentBlock::ServerTool { label } => view! {
                             <p class="flex items-center gap-2 text-xs text-muted"><span>{crate::icons::search()}</span><span class="font-mono">{label.clone()}</span></p>
                         }.into_any(),
-                        ContentBlock::Text { text, citations } => view! { <div class="md" on:click=crate::mentions::link_clicks() inner_html=markdown::with_citations(text, citations)></div> }.into_any(),
+                        ContentBlock::Text { text, citations } => view! { <div class="md" on:click=crate::mentions::link_clicks() inner_html=markdown::session_html(text, citations, paths.get_untracked().as_ref())></div> }.into_any(),
                         ContentBlock::Thinking { text } => view! { <Thinking text=text.clone() show=crate::settings::show_thinking() /> }.into_any(),
                         ContentBlock::Narration { text } => view! { <SummarizedUpdate text=text.clone() /> }.into_any(),
                         ContentBlock::ToolUse { id, name, input_json } => {

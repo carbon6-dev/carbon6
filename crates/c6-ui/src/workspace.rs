@@ -59,9 +59,11 @@ pub enum View {
     SessionTerminal {
         id: String,
     },
-    /// A session's folder.
+    /// A session's folder, or a particular file or directory on its worker.
     SessionFiles {
         id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        path: String,
     },
     /// What a session published; `output`: the one shown (empty: the newest).
     SessionOutputs {
@@ -244,7 +246,8 @@ impl View {
             }
             View::SessionChanges { id } => format!("/sessions/{id}/changes"),
             View::SessionTerminal { id } => format!("/sessions/{id}/terminal"),
-            View::SessionFiles { id } => format!("/sessions/{id}/files"),
+            View::SessionFiles { id, path } if path.is_empty() => format!("/sessions/{id}/files"),
+            View::SessionFiles { id, path } => format!("/sessions/{id}/files?path={}", enc(path)),
             View::SessionOutputs { id, output } if output.is_empty() => format!("/sessions/{id}/outputs"),
             View::SessionOutputs { id, output } => format!("/sessions/{id}/outputs?output={}", enc(output)),
             View::Search { q, kind, worker } => {
@@ -305,7 +308,7 @@ impl View {
             .ok()
             .map(|p| {
                 let mut m = HashMap::new();
-                for key in ["q", "kind", "worker", "open", "output", "block", "at", "signed_in", "signed_in_with_link"] {
+                for key in ["q", "kind", "worker", "open", "output", "path", "block", "at", "signed_in", "signed_in_with_link"] {
                     if let Some(v) = p.get(key) {
                         m.insert(key.to_owned(), v);
                     }
@@ -349,7 +352,7 @@ impl View {
             }
             ["sessions", id, "changes"] => View::SessionChanges { id: (*id).to_owned() },
             ["sessions", id, "terminal"] => View::SessionTerminal { id: (*id).to_owned() },
-            ["sessions", id, "files"] => View::SessionFiles { id: (*id).to_owned() },
+            ["sessions", id, "files"] => View::SessionFiles { id: (*id).to_owned(), path: get("path") },
             ["sessions", id, "outputs"] => View::SessionOutputs { id: (*id).to_owned(), output: get("output") },
             ["search"] => View::Search { q: get("q"), kind: get("kind"), worker: get("worker") },
             ["workers"] => View::Workers,
@@ -420,7 +423,10 @@ impl View {
             View::Sessions => "Sessions".into(),
             View::Session { id, .. } => live.session(id).map(|s| s.title).unwrap_or_else(|| "Session".into()),
             // Its name, and the session's.
-            View::SessionChanges { id } | View::SessionTerminal { id } | View::SessionFiles { id } | View::SessionOutputs { id, .. } => {
+            View::SessionChanges { id }
+            | View::SessionTerminal { id }
+            | View::SessionFiles { id, .. }
+            | View::SessionOutputs { id, .. } => {
                 let name = self.session_pane().map_or("", |(p, _)| p.name());
                 match live.session(id).map(|s| s.title) {
                     Some(t) => format!("{name} · {t}"),
@@ -487,7 +493,7 @@ impl View {
         match self {
             View::SessionChanges { id } => Some((Pane::Changes, id)),
             View::SessionTerminal { id } => Some((Pane::Terminal, id)),
-            View::SessionFiles { id } => Some((Pane::Files, id)),
+            View::SessionFiles { id, .. } => Some((Pane::Files, id)),
             View::SessionOutputs { id, .. } => Some((Pane::Outputs, id)),
             _ => None,
         }
@@ -507,6 +513,7 @@ impl View {
         match (self, other) {
             (Self::Session { id: a, .. }, Self::Session { id: b, .. })
             | (Self::Docs { id: a, .. }, Self::Docs { id: b, .. })
+            | (Self::SessionFiles { id: a, .. }, Self::SessionFiles { id: b, .. })
             | (Self::SessionOutputs { id: a, .. }, Self::SessionOutputs { id: b, .. }) => a == b,
             (Self::Settings { .. }, Self::Settings { .. }) => true,
             _ => self == other,
@@ -961,6 +968,16 @@ impl Layout {
         }
         if how != How::Beside {
             self.open_tile(view);
+            return;
+        }
+        // Keep the originating transcript, even if it is the right pane
+        // and the file belongs to a nested session rendered inside it.
+        if let Some((tile, col)) = from
+            && let View::SessionFiles { path, .. } = &view
+            && !path.is_empty()
+            && self.tiles[origin].columns.iter().any(|c| c.key == col && matches!(&c.view, View::Session { .. }))
+        {
+            self.open_after(tile, col, view);
             return;
         }
         let key = self.key();
@@ -3271,7 +3288,7 @@ mod tests {
             set_sessions.set(vec![active.clone()]);
             assert_eq!(live.session("old"), Some(active), "the fresh live row wins after unarchive");
             assert_eq!(View::session("old").label(&live), "Restored title");
-            for view in [View::session("old"), View::SessionFiles { id: "old".into() }, View::SessionTerminal { id: "old".into() }] {
+            for view in [View::session("old"), crate::panes::Pane::Files.view("old".into()), View::SessionTerminal { id: "old".into() }] {
                 assert_eq!(view.session_id(), Some("old"));
             }
             assert_eq!(View::Sessions.session_id(), None);
@@ -4194,12 +4211,70 @@ mod tests {
     }
 
     #[test]
+    fn session_file_target_round_trips_as_a_query_value() {
+        let href = "/sessions/s1/files?path=~%2Fnotes%20%2B%20%23%26%3F%3D%2F%E6%97%A5%2520.md";
+        let view = View::SessionFiles { id: "s1".into(), path: "~/notes + #&?=/日%20.md".into() };
+        assert_eq!(View::from_path(href), view);
+        assert_eq!(view.path(), href);
+        assert_eq!(view.session_pane(), Some((crate::panes::Pane::Files, "s1")));
+        let saved: View = serde_json::from_str(&serde_json::to_string(&view).unwrap()).unwrap();
+        assert_eq!(saved, view);
+
+        let plain = View::from_path("/sessions/s1/files");
+        let legacy: View = serde_json::from_str(r#"{"view":"session_files","id":"s1"}"#).unwrap();
+        assert_eq!(plain, legacy);
+        assert_eq!(View::from_path("/sessions/s1/files?path="), plain);
+        assert_ne!(content_key(view, 0), content_key(plain, 0));
+    }
+
+    #[test]
+    fn a_file_link_from_the_right_column_keeps_its_transcript() {
+        let session = View::session("s");
+        // A nested child transcript uses the parent's column but its own URL.
+        for id in ["s", "child"] {
+            let file = View::from_path(&format!("/sessions/{id}/files?path=src%2Fmain.rs"));
+            let mut layout = Layout::new(View::Sessions);
+            let (tile, list) = (layout.tiles[0].key, layout.tiles[0].columns[0].key);
+            layout.open_after(tile, list, session.clone());
+            let transcript = layout.tiles[0].columns[1].key;
+
+            layout.open(Some((tile, transcript)), file.clone(), How::Beside);
+            let t = &layout.tiles[0];
+            assert_eq!(t.columns[0].key, transcript, "preserve the source column for {id}");
+            assert_eq!(t.columns[0].view, session);
+            assert_eq!(t.columns[1].view, file);
+            assert_eq!(layout.focused_view(), Some(&file));
+            assert_eq!(t.back.last().unwrap()[0].view, View::Sessions);
+
+            layout.open(Some((tile, transcript)), file.clone(), How::NewTile);
+            assert_eq!(layout.tiles.len(), 2);
+            assert_eq!(layout.tiles[0].columns[0].key, transcript);
+            assert_eq!(layout.focused_view(), Some(&file));
+        }
+    }
+
+    #[test]
+    fn a_new_file_target_reuses_the_open_files_pane_and_keeps_its_history() {
+        let first = View::from_path("/sessions/s/files?path=%2Ffirst");
+        let second = View::from_path("/sessions/s/files?path=%2Fsecond");
+        let mut layout = Layout::new(View::session("s"));
+        let (tile, transcript) = (layout.tiles[0].key, layout.tiles[0].columns[0].key);
+        layout.open_after(tile, transcript, first.clone());
+        let files = layout.tiles[0].columns[1].key;
+        layout.open(Some((tile, transcript)), second.clone(), How::Beside);
+        assert_eq!(layout.tiles[0].columns[1].key, files);
+        assert_eq!(layout.focused_view(), Some(&second));
+        layout.step(-1);
+        assert_eq!(layout.focused_view(), Some(&first));
+    }
+
+    #[test]
     fn a_sessions_panes_have_their_own_addresses() {
         use crate::panes::Pane;
         for (view, path, pane) in [
             (View::SessionChanges { id: "s1".into() }, "/sessions/s1/changes", Pane::Changes),
             (View::SessionTerminal { id: "s1".into() }, "/sessions/s1/terminal", Pane::Terminal),
-            (View::SessionFiles { id: "s1".into() }, "/sessions/s1/files", Pane::Files),
+            (Pane::Files.view("s1".into()), "/sessions/s1/files", Pane::Files),
             (View::SessionOutputs { id: "s1".into(), output: String::new() }, "/sessions/s1/outputs", Pane::Outputs),
         ] {
             assert_eq!(view.path(), path);
@@ -4278,7 +4353,7 @@ mod tests {
         l.open_after(tile, key, View::Docs { id: "d1".into(), target: None });
         assert_ne!(l.bar_column(tile), Some(key));
         // Another session's pane beside it is not its own.
-        l.open_after(tile, key, View::SessionFiles { id: "s2".into() });
+        l.open_after(tile, key, crate::panes::Pane::Files.view("s2".into()));
         assert_ne!(l.bar_column(tile), Some(key));
     }
 
@@ -4850,7 +4925,7 @@ fn render_view(view: View) -> AnyView {
         View::SessionOutputs { id, output } => view! { <crate::panes::SessionPane id pane=crate::panes::Pane::Outputs output /> }.into_any(),
         View::SessionChanges { id } => view! { <crate::panes::SessionPane id pane=crate::panes::Pane::Changes /> }.into_any(),
         View::SessionTerminal { id } => view! { <crate::panes::SessionPane id pane=crate::panes::Pane::Terminal /> }.into_any(),
-        View::SessionFiles { id } => view! { <crate::panes::SessionPane id pane=crate::panes::Pane::Files /> }.into_any(),
+        View::SessionFiles { id, path } => view! { <crate::panes::SessionPane id pane=crate::panes::Pane::Files path /> }.into_any(),
         other => view! {
             <ScrollBox>
                 {match other {

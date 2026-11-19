@@ -31,7 +31,7 @@ impl Pane {
         match self {
             Pane::Changes => View::SessionChanges { id },
             Pane::Terminal => View::SessionTerminal { id },
-            Pane::Files => View::SessionFiles { id },
+            Pane::Files => View::SessionFiles { id, path: String::new() },
             Pane::Outputs => View::SessionOutputs { id, output: String::new() },
         }
     }
@@ -100,9 +100,9 @@ pub fn show_output(col: ColumnCtx, id: &str, output: String) {
 
 /// A session's pane as a view: the session's Changes, Terminal or Files in
 /// the folder it works in (its worktree, if it has one), or its Outputs
-/// (`output`: the one shown; empty for the newest).
+/// (`output`: the one shown; empty for the newest). Files can deep-link to `path`.
 #[component]
-pub fn SessionPane(id: String, pane: Pane, #[prop(optional)] output: String) -> impl IntoView {
+pub fn SessionPane(id: String, pane: Pane, #[prop(optional)] output: String, #[prop(optional)] path: String) -> impl IntoView {
     if pane == Pane::Outputs {
         let feed = crate::session::Feed::open(id.clone(), crate::session::Window::Tail);
         let chosen = RwSignal::new(Some(output).filter(|o| !o.is_empty()));
@@ -145,30 +145,67 @@ pub fn SessionPane(id: String, pane: Pane, #[prop(optional)] output: String) -> 
     });
     let session = Signal::derive(move || detail.get().map(|r| r.map(|d| d.session)));
     let folder = Signal::derive(move || data.folder.get().or_else(|| first.get().flatten()));
-    view! { <PaneContent pane session folder /> }.into_any()
+    view! { <PaneContent pane session folder path /> }.into_any()
+}
+
+fn rooted_worker_path(path: &str) -> bool {
+    path.starts_with('/') || path == "~" || path.starts_with("~/")
+}
+
+/// Keep worker path semantics (including `..` through a symlink). Only the
+/// Started event's folder can supply the base for a relative link.
+fn linked_worker_path(path: &str, folder: impl FnOnce() -> Option<String>) -> Option<String> {
+    if rooted_worker_path(path) {
+        return Some(path.to_owned());
+    }
+    let mut cwd = folder().filter(|cwd| rooted_worker_path(cwd))?;
+    if !cwd.ends_with('/') {
+        cwd.push('/');
+    }
+    cwd.push_str(path);
+    Some(cwd)
 }
 
 /// Native pane views consume their parent's confirmed session and actual
 /// folder. They never fetch session metadata before asking the worker.
 #[component]
-fn PaneContent(pane: Pane, session: Signal<Option<Result<c6_api::Session, String>>>, folder: Signal<Option<String>>) -> impl IntoView {
+fn PaneContent(
+    pane: Pane,
+    session: Signal<Option<Result<c6_api::Session, String>>>,
+    folder: Signal<Option<String>>,
+    path: String,
+) -> impl IntoView {
     let note = |text: &'static str| view! { <p class="py-6 text-center text-sm text-muted">{text}</p> }.into_any();
+    let linked = pane == Pane::Files && !path.is_empty();
     view! {
         <ScrollBox>
             <div class="px-4 py-3">
-                <Suspense fallback=|| ()>
+                <Suspense fallback=move || linked.then(|| note("Loading…"))>
                     {move || {
                         let s = match session.get()? {
                             Ok(s) => s,
                             Err(e) => return Some(view! { <ErrorBox message=e /> }.into_any()),
                         };
-                        let cwd = folder.get();
                         let w = s.worker_id.to_string();
                         let ssh = s.ssh;
-                        Some(match (pane, cwd) {
+                        if pane == Pane::Files {
+                            if ssh.is_some() {
+                                return Some(note("Not for a session working over SSH."));
+                            }
+                            if s.on_head {
+                                return Some(note("This session does not run on a worker."));
+                            }
+                            if linked {
+                                let Some(path) = linked_worker_path(&path, || folder.get()) else {
+                                    return Some(note("The session’s working directory is not available."));
+                                };
+                                return Some(view! { <crate::files::LinkedFileBrowser worker_id=w path /> }.into_any());
+                            }
+                        }
+                        Some(match (pane, folder.get()) {
                             (_, None) => note("Available once the session has started."),
                             // The worker can't look at that machine's files.
-                            (Pane::Changes | Pane::Files, Some(_)) if ssh.is_some() => note("Not for a session working over SSH."),
+                            (Pane::Changes, Some(_)) if ssh.is_some() => note("Not for a session working over SSH."),
                             (Pane::Changes, Some(c)) => view! { <crate::files::Changes worker_id=w path=c /> }.into_any(),
                             (Pane::Files, Some(c)) => view! { <crate::files::FileBrowser worker_id=w root=c /> }.into_any(),
                             (_, Some(c)) => view! { <crate::term::Terminals worker_id=w default_cwd=c ssh /> }.into_any(),
@@ -179,4 +216,25 @@ fn PaneContent(pane: Pane, session: Signal<Option<Result<c6_api::Session, String
         </ScrollBox>
     }
     .into_any()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::linked_worker_path;
+
+    #[test]
+    fn relative_links_use_the_actual_worktree_or_wait_for_it() {
+        let worktree = || Some("/workspace/actual-worktree/".into());
+        assert_eq!(linked_worker_path("src/main.rs", worktree).as_deref(), Some("/workspace/actual-worktree/src/main.rs"));
+        assert_eq!(linked_worker_path("./link/../dir", worktree).as_deref(), Some("/workspace/actual-worktree/./link/../dir"));
+        assert_eq!(linked_worker_path("src/main.rs", || None), None);
+        assert_eq!(linked_worker_path("src/main.rs", || Some("not/rooted".into())), None);
+    }
+
+    #[test]
+    fn rooted_links_do_not_need_the_session_folder() {
+        for path in ["/var/log/c6.log", "~/notes.md", "~"] {
+            assert_eq!(linked_worker_path(path, || panic!("unexpected folder lookup")).as_deref(), Some(path));
+        }
+    }
 }

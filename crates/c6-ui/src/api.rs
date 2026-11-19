@@ -747,6 +747,10 @@ pub async fn fs_read(worker: String, path: String) -> Result<serde_json::Value, 
     json(Request::get(&format!("/api/v1/workers/{worker}/fs/read?path={}", enc(&path))).send().await).await
 }
 
+pub fn fs_download_url(worker: &str, path: &str) -> String {
+    url(&format!("/api/v1/workers/{worker}/fs/download?path={}", enc(path)))
+}
+
 pub async fn git_status(worker: String, path: String) -> Result<serde_json::Value, String> {
     json(Request::get(&format!("/api/v1/workers/{worker}/git/status?path={}", enc(&path))).send().await).await
 }

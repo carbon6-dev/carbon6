@@ -345,15 +345,24 @@ struct ReadParams {
 }
 
 async fn fs_read(p: ReadParams) -> anyhow::Result<Value> {
+    use tokio::io::AsyncReadExt;
+
     let path = crate::expand_home(&p.path);
     let meta = tokio::fs::metadata(&path).await.with_context(|| format!("{} not found", path.display()))?;
     if meta.is_dir() {
         bail!("{} is a directory", path.display());
     }
-    use tokio::io::AsyncReadExt;
-    let mut f = tokio::fs::File::open(&path).await?;
+    anyhow::ensure!(meta.is_file(), "{} is not a regular file", path.display());
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.read(true);
+    // Don't block opening a FIFO if the path changed since the metadata check.
+    #[cfg(unix)]
+    opts.custom_flags(nix::libc::O_NONBLOCK);
+    let file = opts.open(&path).await?;
+    let meta = file.metadata().await?;
+    anyhow::ensure!(meta.is_file(), "{} is not a regular file", path.display());
     let mut buf = Vec::with_capacity(meta.len().min(MAX_READ) as usize);
-    (&mut f).take(MAX_READ).read_to_end(&mut buf).await?;
+    file.take(MAX_READ).read_to_end(&mut buf).await?;
     let binary = buf[..buf.len().min(8192)].contains(&0);
     let content = if binary { Value::Null } else { Value::String(String::from_utf8_lossy(&buf).into_owned()) };
     Ok(
@@ -361,16 +370,31 @@ async fn fs_read(p: ReadParams) -> anyhow::Result<Value> {
     )
 }
 
-/// A file whole (base64), up to `max` bytes (a watched folder's document).
+/// A file whole (base64), up to `max` bytes (e.g. a download or watched document).
 async fn fs_read_file(p: &Value) -> anyhow::Result<Value> {
     use base64::Engine;
+    use tokio::io::AsyncReadExt;
+
     let path = crate::expand_home(p["path"].as_str().unwrap_or_default());
     let max = p["max"].as_u64().unwrap_or(MAX_READ).min(MAX_FILE);
     let meta = tokio::fs::metadata(&path).await.with_context(|| format!("{} not found", path.display()))?;
-    if meta.is_dir() || meta.len() > max {
-        bail!("{} is a folder, or larger than {} MB", path.display(), max >> 20);
+    anyhow::ensure!(meta.is_file(), "{} is not a regular file", path.display());
+    let too_large = || format!("{} is larger than {} MiB", path.display(), max >> 20);
+    anyhow::ensure!(meta.len() <= max, "{}", too_large());
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.read(true);
+    // Don't block opening a FIFO if the path changed since the metadata check.
+    #[cfg(unix)]
+    opts.custom_flags(nix::libc::O_NONBLOCK);
+    let file = opts.open(&path).await?;
+    anyhow::ensure!(file.metadata().await?.is_file(), "{} is not a regular file", path.display());
+    let mut bytes = Vec::new();
+    // Metadata alone isn't a bound: the file could grow while we read it.
+    file.take(max + 1).read_to_end(&mut bytes).await?;
+    if bytes.len() as u64 > max {
+        bail!("{}", too_large());
     }
-    Ok(json!({"data": base64::engine::general_purpose::STANDARD.encode(tokio::fs::read(&path).await?)}))
+    Ok(json!({"data": base64::engine::general_purpose::STANDARD.encode(bytes)}))
 }
 
 /// Every file under a folder (hidden ones left out): its full path, size
@@ -675,6 +699,38 @@ mod find_tests {
         assert_eq!(&paths[..2], ["src/main.rs", "docs/maintenance.md"]);
         assert!(fuzzy_score("srmn", "src/main.rs").is_some(), "characters in order");
         assert!(fuzzy_score("zz", "src/main.rs").is_none());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod read_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn preview_reads_source_and_rejects_fifo_without_waiting_for_a_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("test.rs");
+        let text = "fn main() {}\n";
+        std::fs::write(&source, text).unwrap();
+        let fifo = dir.path().join("pipe");
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let result = runtime.block_on(async {
+            let preview = fs_read(ReadParams { path: source.display().to_string() }).await.unwrap();
+            assert_eq!(
+                preview,
+                json!({"path": source.display().to_string(), "size": text.len(), "truncated": false, "binary": false, "content": text})
+            );
+            tokio::time::timeout(Duration::from_secs(2), fs_read(ReadParams { path: fifo.display().to_string() })).await
+        });
+        if result.is_err() {
+            // A regression can leave a blocking open in flight even after the timeout.
+            runtime.shutdown_background();
+        }
+        let error = result.expect("a preview must not wait for a FIFO writer").unwrap_err();
+        assert!(error.to_string().contains("not a regular file"), "{error:#}");
     }
 }
 

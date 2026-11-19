@@ -163,6 +163,7 @@ pub fn router(state: Arc<HeadState>) -> Router {
         .route("/api/v1/head/fs/read", get(head_fs_read))
         .route("/api/v1/workers/{id}/fs/list", get(fs_list))
         .route("/api/v1/workers/{id}/fs/read", get(fs_read))
+        .route("/api/v1/workers/{id}/fs/download", get(fs_download))
         .route("/api/v1/workers/{id}/fs/find", get(fs_find))
         .route("/api/v1/workers/{id}/fs/mkdir", post(fs_mkdir))
         .route("/api/v1/workers/{id}/git/status", get(git_status))
@@ -3414,6 +3415,53 @@ async fn fs_read(State(st): State<Arc<HeadState>>, Path(id): Path<String>, Query
     worker_call(&st, &id, "fs.read", params_json(q)).await
 }
 
+#[derive(serde::Deserialize)]
+struct FsDownloadQuery {
+    path: String,
+}
+
+async fn fs_download(State(st): State<Arc<HeadState>>, Path(id): Path<String>, Query(q): Query<FsDownloadQuery>) -> ApiResult<Response> {
+    use base64::Engine;
+
+    // The worker's existing whole-file RPC carries base64 inside a 64 MiB
+    // message. Keep a fixed cap (independent of the caller), not a partial file.
+    const MAX_DOWNLOAD: usize = 40 * 1024 * 1024;
+    let Json(result) = worker_call(&st, &id, "fs.read_file", serde_json::json!({"path": q.path, "max": MAX_DOWNLOAD})).await?;
+    let invalid = || ApiErr(StatusCode::BAD_GATEWAY, "invalid file response from worker".into());
+    let encoded = result["data"].as_str().filter(|data| data.len() <= MAX_DOWNLOAD.div_ceil(3) * 4).ok_or_else(invalid)?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).map_err(|_| invalid())?;
+    if bytes.len() > MAX_DOWNLOAD {
+        return Err(invalid());
+    }
+    let name = std::path::Path::new(&q.path).file_name().and_then(|name| name.to_str()).unwrap_or("download");
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
+            (header::CONTENT_DISPOSITION, download_disposition(name)),
+            (header::CACHE_CONTROL, "private, no-store".to_owned()),
+            (header::HeaderName::from_static("x-content-type-options"), "nosniff".to_owned()),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+fn download_disposition(name: &str) -> String {
+    use std::fmt::Write;
+
+    let name: String = name.chars().map(|c| if c.is_control() || c == '\\' { '_' } else { c }).collect();
+    let fallback: String = name.chars().map(|c| if !c.is_ascii() || matches!(c, '"' | '%') { '_' } else { c }).collect();
+    let mut disposition = format!("attachment; filename=\"{fallback}\"; filename*=UTF-8''");
+    for b in name.bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+            disposition.push(char::from(b));
+        } else {
+            let _ = write!(disposition, "%{b:02X}");
+        }
+    }
+    disposition
+}
+
 async fn fs_mkdir(
     State(st): State<Arc<HeadState>>,
     Path(id): Path<String>,
@@ -4901,6 +4949,77 @@ async fn decision_discussion_session(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn worker_fs_download_serves_binary_to_a_browser_in_the_workers_realm() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = crate::start(crate::HeadConfig {
+            data_dir: dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: 0,
+            worker_port: 0,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let st = &head.state;
+        crate::realms::create(st, &api::RealmIn { id: "lab".into(), name: "Lab".into(), ..Default::default() }, "you").await.unwrap();
+        let worker = WorkerId::new();
+        sqlx::query(
+            "INSERT INTO workers (id, name, hostname, os, arch, version, cert_serial, enrolled_at, realms) \
+             VALUES (?, 'Download', 'test', '', '', '', 'test', 0, '[\"home\"]')",
+        )
+        .bind(worker.to_string())
+        .execute(&st.store.pool)
+        .await
+        .unwrap();
+        let (tx, mut requests) = tokio::sync::mpsc::channel(1);
+        let conn = st.registry.attach(worker, now_ms(), tx, vec![], "worker");
+        let http = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
+        let url = format!("http://{}/api/v1", head.ui_addrs[0]);
+        let link = st.store.create_login_link().await.unwrap();
+        let login = http.post(format!("{url}/auth/link")).json(&json!({"token": link})).send().await.unwrap();
+        assert_eq!(login.status(), StatusCode::NO_CONTENT);
+        let cookie = login.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap();
+        let download = format!("{url}/workers/{worker}/fs/download");
+        let file = "~/report # ü\".bin";
+        let get = |realm| http.get(&download).query(&[("path", file), ("c6_realm", realm)]);
+
+        assert_eq!(get("home").send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        let denied = get("lab").header("cookie", cookie).send().await.unwrap();
+        assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+        assert_eq!(denied.json::<serde_json::Value>().await.unwrap()["error"], "no such worker");
+        let token = st.store.create_api_token("lab", Some("lab")).await.unwrap().token.unwrap();
+        assert_eq!(get("home").bearer_auth(token).send().await.unwrap().status(), StatusCode::NOT_FOUND);
+        assert!(requests.try_recv().is_err(), "denied requests must not reach the worker");
+
+        let bytes = [0, 255, 128, 1];
+        let reply = async {
+            use c6_proto::head_msg::Msg;
+            let request = tokio::time::timeout(Duration::from_secs(5), requests.recv()).await.unwrap().unwrap().unwrap();
+            let Some(Msg::RpcRequest(request)) = request.msg else { panic!("expected a worker RPC") };
+            assert_eq!(request.method, "fs.read_file");
+            let params: serde_json::Value = serde_json::from_slice(&request.params_json).unwrap();
+            assert_eq!(params["path"], file);
+            use base64::Engine;
+            conn.rpc_response(c6_proto::RpcResponse {
+                id: request.id,
+                result_json: serde_json::to_vec(&json!({"data": base64::engine::general_purpose::STANDARD.encode(bytes)})).unwrap(),
+                error: String::new(),
+            });
+        };
+        let (response, ()) = tokio::join!(get("home").header("cookie", cookie).send(), reply);
+        let response = response.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "application/octet-stream");
+        assert_eq!(response.headers()["cache-control"], "private, no-store");
+        assert!(response.headers()["content-disposition"].to_str().unwrap().contains("filename*=UTF-8''report%20%23%20%C3%BC%22.bin"));
+        assert_eq!(response.bytes().await.unwrap().as_ref(), bytes);
+
+        drop(conn);
+        assert_eq!(get("home").header("cookie", cookie).send().await.unwrap().status(), StatusCode::CONFLICT);
+        head.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn card_discussion_routes_require_the_cards_exact_realm() {

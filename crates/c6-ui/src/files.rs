@@ -1,5 +1,9 @@
 //! Remote file browsing and git changes on a worker.
 
+use std::cell::Cell;
+use std::future::Future;
+use std::sync::Arc;
+
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use serde_json::Value;
@@ -7,15 +11,121 @@ use serde_json::Value;
 use crate::api;
 use crate::util::{ErrorBox, INPUT, ago, now_ms};
 
+#[derive(Clone, Debug, PartialEq)]
+enum FileTarget {
+    Directory(Value),
+    File(Value),
+}
+
+async fn resolve_target<L, R>(path: &str, list: impl FnOnce() -> L, read: impl FnOnce() -> R) -> Result<FileTarget, String>
+where
+    L: Future<Output = Result<Value, String>>,
+    R: Future<Output = Result<Value, String>>,
+{
+    match list().await {
+        Ok(listing) => Ok(FileTarget::Directory(listing)),
+        Err(list_error) => match read().await {
+            Ok(file) => Ok(FileTarget::File(file)),
+            Err(read_error) => {
+                let error = if read_error.ends_with(" is a directory") { list_error } else { read_error };
+                Err(format!("Could not open {path}: {error}"))
+            }
+        },
+    }
+}
+
+fn parent_path(path: &str) -> &str {
+    match path.rsplit_once('/') {
+        Some(("", _)) => "/",
+        Some((parent, _)) => parent,
+        None => ".",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::executor::block_on;
+    use std::future::ready;
+
+    #[test]
+    fn file_target_prefers_a_directory_listing() {
+        let listing = serde_json::json!({"path": "/home/worker/project", "entries": []});
+        let result =
+            block_on(resolve_target("~/project", || ready(Ok(listing.clone())), || -> std::future::Ready<_> { panic!("unexpected read") }));
+        assert_eq!(result, Ok(FileTarget::Directory(listing)));
+    }
+
+    #[test]
+    fn file_target_falls_back_to_a_file_and_uses_the_worker_path() {
+        let file = serde_json::json!({"path": "/home/worker/paper.pdf", "size": 10, "binary": true});
+        let result = block_on(resolve_target("~/paper.pdf", || ready(Err("cannot list".into())), || ready(Ok(file.clone()))));
+        assert_eq!(result, Ok(FileTarget::File(file)));
+        assert_eq!(parent_path("/home/worker/paper.pdf"), "/home/worker");
+        assert_eq!(parent_path("/file.md"), "/");
+    }
+
+    #[test]
+    fn missing_file_target_names_the_path_and_failure() {
+        let path = "~/missing";
+        let err = || ready(Err("/home/worker/missing not found".into()));
+        let message = block_on(resolve_target(path, err, err)).unwrap_err();
+        assert!(message.contains(path));
+        assert!(message.contains("not found"));
+    }
+}
+
 /// Directory listing plus file viewer, starting at `root`.
 #[component]
 pub fn FileBrowser(worker_id: String, #[prop(optional)] root: Option<String>) -> impl IntoView {
+    browser(worker_id, root.unwrap_or_default(), None)
+}
+
+/// Resolve a file or directory on the session's worker before showing it.
+#[component]
+pub fn LinkedFileBrowser(worker_id: String, path: String) -> impl IntoView {
     let wid = StoredValue::new(worker_id);
-    let dir = RwSignal::new(root.unwrap_or_default());
+    let target = crate::resources::local(move || {
+        let (worker, path) = (wid.get_value(), path.clone());
+        async move {
+            resolve_target(&path, || api::fs_list(worker.clone(), path.clone(), false), || api::fs_read(worker.clone(), path.clone())).await
+        }
+    });
+    view! {
+        <Suspense fallback=|| view! { <p class="text-sm text-muted">"Loading…"</p> }>
+            {move || target.get().map(|result| match result {
+                Ok(initial) => browser(wid.get_value(), String::new(), Some(initial)).into_any(),
+                Err(e) => view! { <ErrorBox message=e /> }.into_any(),
+            })}
+        </Suspense>
+    }
+}
+
+fn browser(worker_id: String, root: String, initial: Option<FileTarget>) -> impl IntoView {
+    let (root, initial_list, initial_file) = match initial {
+        Some(FileTarget::Directory(listing)) => (listing["path"].as_str().unwrap_or_default().to_owned(), Some(listing), None),
+        Some(FileTarget::File(file)) => {
+            let path = file["path"].as_str().unwrap_or_default().to_owned();
+            (parent_path(&path).to_owned(), None, Some((path, Some(Arc::new(file)))))
+        }
+        None => (root, None, None),
+    };
+    let wid = StoredValue::new(worker_id);
+    let path_input = RwSignal::new(root.clone());
+    let dir = RwSignal::new(root);
     let hidden = RwSignal::new(false);
-    let open_file = RwSignal::new(None::<String>);
-    let listing = LocalResource::new(move || api::fs_list(wid.get_value(), dir.get(), hidden.get()));
-    let path_input = RwSignal::new(String::new());
+    let open_file = RwSignal::new(initial_file);
+    let initial_list = Cell::new(initial_list);
+    let listing = crate::resources::local(move || {
+        let (dir, hidden) = (dir.get(), hidden.get());
+        let initial = initial_list.take();
+        async move {
+            match initial {
+                Some(l) => Ok(l),
+                None => api::fs_list(wid.get_value(), dir, hidden).await,
+            }
+        }
+    });
     Effect::new(move || {
         if let Some(Ok(l)) = listing.get()
             && let Some(p) = l["path"].as_str()
@@ -56,9 +166,9 @@ pub fn FileBrowser(worker_id: String, #[prop(optional)] root: Option<String>) ->
                                             let full2 = full.clone();
                                             let mtime = e["mtime"].as_i64();
                                             view! {
-                                                <li class=move || if open_file.get().as_deref() == Some(full2.as_str()) { "bg-zinc-200 dark:bg-zinc-800" } else { "" }>
+                                                <li class=move || if open_file.with(|f| f.as_ref().is_some_and(|(p, _)| p == &full2)) { "bg-zinc-200 dark:bg-zinc-800" } else { "" }>
                                                     <button class="flex w-full items-center gap-2 px-2 py-1 text-left hover:bg-zinc-100 dark:hover:bg-zinc-900"
-                                                        on:click=move |_| if is_dir { dir.set(full.clone()) } else { open_file.set(Some(full.clone())) }>
+                                                        on:click=move |_| if is_dir { dir.set(full.clone()) } else { open_file.set(Some((full.clone(), None))) }>
                                                         <span class="w-4 text-muted">{if is_dir { crate::icons::chevron_right() } else { ().into_any() }}</span>
                                                         <span class=if is_dir { "min-w-0 flex-1 truncate font-medium" } else { "min-w-0 flex-1 truncate" }>{name}</span>
                                                         <span class="shrink-0 text-[11px] text-muted">{mtime.map(|t| ago(now - t)).unwrap_or_default()}</span>
@@ -75,7 +185,7 @@ pub fn FileBrowser(worker_id: String, #[prop(optional)] root: Option<String>) ->
             </div>
             <div class="min-w-0">
                 {move || match open_file.get() {
-                    Some(p) => view! { <FileViewer worker_id=wid.get_value() path=p /> }.into_any(),
+                    Some((p, initial)) => view! { <FileViewer worker_id=wid.get_value() path=p initial=initial /> }.into_any(),
                     None => view! { <p class="py-10 text-center text-sm text-muted">"Select a file to view it."</p> }.into_any(),
                 }}
             </div>
@@ -84,17 +194,28 @@ pub fn FileBrowser(worker_id: String, #[prop(optional)] root: Option<String>) ->
 }
 
 #[component]
-fn FileViewer(worker_id: String, path: String) -> impl IntoView {
+fn FileViewer(worker_id: String, path: String, #[prop(optional_no_strip)] initial: Option<Arc<Value>>) -> impl IntoView {
     let file = crate::resources::local({
         let (w, p) = (worker_id.clone(), path.clone());
-        move || api::fs_read(w.clone(), p.clone())
+        move || {
+            let (w, p, initial) = (w.clone(), p.clone(), initial.clone());
+            async move {
+                match initial {
+                    Some(f) => Ok(f),
+                    None => api::fs_read(w, p).await.map(Arc::new),
+                }
+            }
+        }
     });
+    let download = api::fs_download_url(&worker_id, &path);
     let is_md = path.ends_with(".md") || path.ends_with(".markdown");
     let rendered = RwSignal::new(is_md);
     view! {
         <div class="space-y-2">
             <div class="flex items-center gap-2">
                 <span class="min-w-0 flex-1 truncate font-mono text-xs text-muted">{path.clone()}</span>
+                <a class="rounded-md border border-zinc-300 px-2 py-0.5 text-xs hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
+                    href=download download="">"Download"</a>
                 {is_md.then(|| view! {
                     <button class="rounded px-2 py-0.5 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800" on:click=move |_| rendered.update(|r| *r = !*r)>
                         {move || if rendered.get() { "Source" } else { "Rendered" }}

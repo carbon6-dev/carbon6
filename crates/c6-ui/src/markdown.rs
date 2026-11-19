@@ -99,13 +99,18 @@ pub fn text_with_mentions(src: &str) -> String {
 }
 
 pub fn with_citations(src: &str, citations: &[c6_api::citations::UrlCitation]) -> String {
+    session_html(src, citations, None)
+}
+
+/// Only transcripts supply worker paths; other Markdown surfaces stay unchanged.
+pub fn session_html(src: &str, citations: &[c6_api::citations::UrlCitation], paths: Option<&Paths>) -> String {
     // Titles and marks as the message renders, untracked: a message isn't
     // drawn again for every change to a session (its hover card shows
     // those). Outside the app (no live feed) nothing is known.
     let live = leptos::prelude::use_context::<crate::api::LiveFeed>();
     let origin = live.and_then(|_| leptos::prelude::window().location().origin().ok()).unwrap_or_default();
     let here = Here { origin, realm: crate::place::realm(), base: crate::place::base(), known: &crate::mentions::known };
-    if citations.is_empty() { render(src, &here) } else { render_citations(src, citations, &here) }
+    if paths.is_none() && citations.is_empty() { render(src, &here) } else { render_paths(src, citations, &here, paths) }
 }
 
 /// Markdown as HTML, with its links to carbon6 things (`session:<id>`,
@@ -115,11 +120,101 @@ pub fn render(src: &str, here: &Here) -> String {
     render_citations(src, &[], here)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Paths {
+    pub session: String,
+}
+
+/// The optional source location stays outside the link; it isn't a filename.
+fn path_part(token: &str) -> (&str, &str) {
+    let mut end = token.len();
+    for _ in 0..2 {
+        if let Some((path, line)) = token[..end].rsplit_once(':')
+            && !line.is_empty()
+            && line.bytes().all(|b| b.is_ascii_digit())
+        {
+            end = path.len();
+        }
+    }
+    (&token[..end], &token[end..])
+}
+
+fn worker_path(path: &str) -> Option<&str> {
+    let trimmed = path.trim_end_matches('/');
+    let (first, name) = (trimmed.split('/').next()?, trimmed.rsplit('/').next()?);
+    if !trimmed.contains('/')
+        || path.starts_with("//")
+        || name.is_empty()
+        || matches!(name, "." | "..")
+        || path.contains([':', '\\', '<', '>', '\n', '\r', '\t'])
+    {
+        return None;
+    }
+    if path.starts_with('/') || path.starts_with("~/") {
+        return Some(path);
+    }
+    // A dotted first component is more likely a hostname than a folder.
+    let explicit = path.starts_with("./") || path.starts_with("../");
+    let extension =
+        name.rsplit_once('.').is_some_and(|(stem, ext)| !stem.is_empty() && !ext.is_empty() && ext.chars().all(|c| c.is_alphanumeric()));
+    if !explicit && (first.contains(['.', '@']) || first.chars().any(char::is_whitespace) || !extension) {
+        return None;
+    }
+    Some(path)
+}
+
+fn path_link(path: &str, paths: &Paths, here: &Here, code: bool) -> Option<String> {
+    let resolved = worker_path(path)?;
+    let href =
+        format!("{}/sessions/{}/files?path={}", here.base, crate::workspace::encode(&paths.session), crate::workspace::encode(resolved));
+    let label = esc(path);
+    let label = if code { format!("<code>{label}</code>") } else { label };
+    Some(format!("<a href=\"{}\" class=\"c6-file-link\">{label}</a>", esc(&href)))
+}
+
+fn bare_paths(text: &str, paths: &Paths, here: &Here) -> Vec<Event<'static>> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    let mut run_end = 0;
+    let mut url = false;
+    let boundary = |c: char| c.is_whitespace() || "()[]\"'".contains(c);
+    for (start, _) in
+        text.char_indices().filter(|(i, c)| !boundary(*c) && (*i == 0 || text[..*i].chars().next_back().is_some_and(boundary)))
+    {
+        // Scan each whitespace-delimited run once. Brackets/parentheses
+        // inside a bare URL (such as IPv6) don't begin a worker path.
+        if start >= run_end {
+            run_end = text[start..].find(char::is_whitespace).map_or(text.len(), |n| start + n);
+            let run = &text[start..run_end];
+            url = run.contains("://") || run.starts_with("//");
+        }
+        if url {
+            continue;
+        }
+        let end = text[start..].find(boundary).map_or(text.len(), |n| start + n);
+        let token = text[start..end].trim_end_matches(['.', ',', ';', ':', '!', '?']);
+        let (path, _) = path_part(token);
+        if let Some(link) = path_link(path, paths, here, false) {
+            out.push(Event::Text(text[from..start].to_owned().into()));
+            out.push(Event::InlineHtml(link.into()));
+            from = start + path.len();
+        }
+    }
+    out.push(Event::Text(text[from..].to_owned().into()));
+    out
+}
+
 fn render_citations(src: &str, citations: &[c6_api::citations::UrlCitation], here: &Here) -> String {
+    render_paths(src, citations, here, None)
+}
+
+fn render_paths(src: &str, citations: &[c6_api::citations::UrlCitation], here: &Here, paths: Option<&Paths>) -> String {
     let src = c6_api::citations::markdown(src, citations);
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     // Sanitize model HTML before adding our own trusted mentions/citations.
-    let events = allowed_html(Parser::new_ext(&src, opts)).into_iter();
+    // The parser can split plain text at brackets. Keep whole bare URLs
+    // together so path detection can distinguish their suffixes from paths.
+    let events = allowed_html(pulldown_cmark::TextMergeStream::new(Parser::new_ext(&src, opts))).into_iter();
     // String markup only: Leptos views cannot be rendered to strings in wasm.
     // Reference links we just generated get a small superscript, not raw HTML
     // from the model. All URLs still pass through the normal sanitizer.
@@ -159,14 +254,27 @@ fn render_citations(src: &str, citations: &[c6_api::citations::UrlCitation], her
             }
             Event::Start(Tag::Link { .. } | Tag::CodeBlock(_) | Tag::Image { .. }) => plain += 1,
             Event::End(TagEnd::Link | TagEnd::CodeBlock | TagEnd::Image) => plain -= 1,
-            Event::Text(t) if plain == 0 && Kind::ALL.iter().any(|k| t.contains(&format!("{}:", k.name()))) => {
-                out.extend(bare_mentions(t, here));
+            Event::Text(t) if plain == 0 && (paths.is_some() || Kind::ALL.iter().any(|k| t.contains(&format!("{}:", k.name())))) => {
+                for ev in bare_mentions(t, here) {
+                    match (ev, paths) {
+                        (Event::Text(t), Some(paths)) => out.extend(bare_paths(&t, paths, here)),
+                        (ev, _) => out.push(ev),
+                    }
+                }
                 continue;
             }
             // A reference alone in backticks, as models write them.
             Event::Code(c) if plain == 0 => {
                 if let Some((kind, id)) = bare_ref(c).filter(|(k, id)| c.len() == k.name().len() + 1 + id.len()) {
                     out.push(Event::InlineHtml(CowStr::from(mention(kind, &id, "", None, here))));
+                    continue;
+                }
+                let (path, suffix) = path_part(c);
+                if let Some(link) = paths.and_then(|paths| path_link(path, paths, here, true)) {
+                    out.push(Event::InlineHtml(link.into()));
+                    if !suffix.is_empty() {
+                        out.push(Event::Code(suffix.to_owned().into()));
+                    }
                     continue;
                 }
             }
@@ -589,6 +697,55 @@ mod tests {
 
     fn nothing(_: Kind, _: &str) -> Known {
         Known::default()
+    }
+
+    #[test]
+    fn worker_paths_link_only_in_session_prose_and_inline_code() {
+        let paths = Paths { session: "s".into() };
+        let render = |src: &str| render_paths(src, &[], &here(&nothing), Some(&paths));
+        for path in ["/tmp/report.docx", "~/Drive/report.docx", "src/main.rs", "./folder", "/tmp/folder/", "/tmp/日本語.txt"] {
+            for src in [path.to_owned(), format!("`{path}`"), format!("See ({path}).")] {
+                let html = render(&src);
+                assert!(html.contains("/sessions/s/files?path="), "{src}: {html}");
+            }
+        }
+        let html = render("`/tmp/a b&c.docx` and src/main.rs:42");
+        assert!(html.contains("%2Ftmp%2Fa%20b%26c.docx"), "{html}");
+        assert!(html.contains("path=src%2Fmain.rs"), "{html}");
+        assert!(html.contains("</a>:42"), "{html}");
+        let html = render("https://[::1]/report.txt and /tmp/report.txt");
+        assert_eq!(html.matches("/sessions/s/files?path=").count(), 1, "{html}");
+        assert!(html.contains("path=%2Ftmp%2Freport.txt"), "{html}");
+        for src in [
+            "https://example.org/a.txt",
+            "https://[::1]/report.txt",
+            "See (https://[::1]/report.txt).",
+            "//[::1]/report.txt",
+            "https://example.org/a(b)/report.txt",
+            "example.org/a.txt",
+            "//example.org/a.txt",
+            "`//example.org/a.txt`",
+            "a/b",
+            "and/or",
+            "2026/11/19",
+            "1/2",
+            "text/plain",
+            "`cat /tmp/file.txt`",
+            "`https://example.org/a.txt`",
+            "</tmp/file.txt>",
+            "[label](/tmp/file.txt)",
+            "```sh\n/tmp/file.txt\n```",
+            "    /tmp/file.txt",
+            "/",
+            "~/",
+            "foo/bar",
+            "../",
+        ] {
+            let html = render(src);
+            assert!(!html.contains("/sessions/s/files?path="), "{src}: {html}");
+        }
+        assert!(!render_paths("/tmp/file.txt", &[], &here(&nothing), None).contains("/files?path="));
+        assert!(!render("`/tmp/<script>.txt`").contains("<script>"));
     }
 
     #[test]

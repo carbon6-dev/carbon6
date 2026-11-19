@@ -24,7 +24,7 @@ See [docs/requirements.md](docs/requirements.md) and [docs/architecture.md](docs
 - **Model failures don't stop a turn.** A response that breaks off, or a provider that errors or is overloaded, is tried again up to 6 times, waiting 2s, 4s, … up to a minute. The session shows why it's waiting. A token the provider refuses (an expired ChatGPT sign-in) is renewed through the head, and the call goes again. Only a request the provider rejects outright stops the turn.
 - **Tool sets per model family:** Claude Code-style for Claude, Codex-style for GPT, and a generic set otherwise. Tools include read, write, edit, `apply_patch`, bash (with background jobs), grep, glob, `web_fetch`, the provider's own web search, plans, subagents, MCP servers and skills.
 - **Offline-tolerant.** Workers journal every event before sending it. Sessions keep running when the head is unreachable and sync back exactly when it returns. A worker that loses its journal has its sessions restored from the head.
-- **IDE-like access to workers:** browse files, review git changes, and open terminals in the browser.
+- **IDE-like access to workers:** browse files, review git changes, and open terminals in the browser. [Paths in agent replies](docs/file-links.md) open that session's worker files, with downloads for binary formats.
 - **Observability:** the head exports OpenTelemetry GenAI traces over OTLP.
 - **An operating system for agents.** Realms organise your work; they don't isolate apps. Apps are built from general primitives (collections, decisions, triggers, series, views) with configuration only, then installed as packages. See [docs/os.md](docs/os.md) and the examples in [examples/apps](examples/apps).
 
