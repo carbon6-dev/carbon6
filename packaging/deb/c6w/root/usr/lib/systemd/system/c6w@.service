@@ -16,6 +16,13 @@ Environment=NO_COLOR=1
 # Only c6w is stopped here: background commands it holds outlive a restart
 # (an update), and the next c6w takes them up (docs/restarts.md §3).
 KillMode=process
+# An OOM-killed workload shouldn't stop the worker or other sessions.
+# Children inherit the adjustment; c6w resets workloads to zero before exec.
+# Held work leaves the process group, not this cgroup: keep KillMode=process.
+# No default MemoryHigh: reclaim would throttle the daemon and all sessions;
+# operators can budget their host with a percentage in a drop-in (docs/restarts.md).
+OOMPolicy=continue
+OOMScoreAdjust=-500
 TimeoutStopSec=30
 Restart=on-failure
 RestartSec=5

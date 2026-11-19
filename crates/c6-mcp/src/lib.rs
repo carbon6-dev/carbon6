@@ -156,7 +156,7 @@ async fn connect_one(s: &ServerConfig, cwd: &std::path::Path) -> anyhow::Result<
             if command.trim().is_empty() {
                 bail!("empty command");
             }
-            let mut cmd = tokio::process::Command::new(command);
+            let mut cmd = c6_tools::process::session_command(command);
             cmd.args(args).envs(env).current_dir(cwd);
             let transport = TokioChildProcess::new(cmd).with_context(|| format!("starting {command}"))?;
             Ok(().serve(transport).await.context("MCP handshake")?)

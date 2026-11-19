@@ -96,6 +96,10 @@ impl Terminals {
         cmd.cwd(&cwd);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
+        // portable-pty owns pre_exec. Keep its PTY setup, env and cwd,
+        // resetting the score in a shell that execs the original argv.
+        #[cfg(target_os = "linux")]
+        cmd.get_argv_mut().splice(..0, ["/bin/sh", "-c", c6_tools::process::SESSION_EXEC, "c6-terminal"].map(Into::into));
         let mut child = pair.slave.spawn_command(cmd).context("starting shell")?;
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader()?;

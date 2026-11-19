@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, anyhow, bail};
+use c6_tools::process::session_command;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::process::Command;
 
 use crate::Worker;
 
@@ -417,7 +417,7 @@ fn hostname() -> String {
 }
 
 async fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let out = Command::new("git")
+    let out = session_command("git")
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -438,7 +438,7 @@ async fn in_repo(dir: &Path) -> anyhow::Result<bool> {
     if !tokio::fs::metadata(dir).await.map(|m| m.is_dir()).unwrap_or(false) {
         bail!("{} is not a directory", dir.display());
     }
-    let out = Command::new("git")
+    let out = session_command("git")
         .arg("-C")
         .arg(dir)
         .args(["rev-parse", "--is-inside-work-tree"])
@@ -505,7 +505,7 @@ async fn git_diff(dir: &Path, file: Option<&str>) -> anyhow::Result<Value> {
     }
     for path in git(dir, &untracked_args).await?.lines().take(200) {
         let out =
-            Command::new("git").arg("-C").arg(dir).args(["diff", "--no-color", "--no-index", "--", "/dev/null", path]).output().await?;
+            session_command("git").arg("-C").arg(dir).args(["diff", "--no-color", "--no-index", "--", "/dev/null", path]).output().await?;
         diff.push_str(&String::from_utf8_lossy(&out.stdout));
         if diff.len() > MAX_DIFF {
             break;
@@ -566,7 +566,7 @@ mod tests {
     }
 
     async fn sh(dir: &Path, cmd: &str) {
-        let ok = Command::new("sh").arg("-c").arg(cmd).current_dir(dir).status().await.unwrap().success();
+        let ok = session_command("sh").arg("-c").arg(cmd).current_dir(dir).status().await.unwrap().success();
         assert!(ok, "{cmd}");
     }
 

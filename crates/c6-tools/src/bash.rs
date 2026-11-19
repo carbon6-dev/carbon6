@@ -105,7 +105,7 @@ async fn run(ctx: &ToolCtx, command: &str, timeout: Duration) -> std::io::Result
 
     // One pipe for both streams keeps stdout and stderr interleaved in order.
     let (reader, writer) = std::io::pipe()?;
-    let mut child = tokio::process::Command::new(shell)
+    let mut child = crate::process::session_command(shell)
         .arg("-c")
         .arg(&script)
         .current_dir(&cwd)

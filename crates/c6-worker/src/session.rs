@@ -132,7 +132,7 @@ struct Place {
 /// host/owner/name; empty outside a repository or without a remote.
 pub(crate) async fn repo_slug(cwd: &Path) -> String {
     let git = |args: &'static [&'static str]| {
-        let mut c = tokio::process::Command::new("git");
+        let mut c = c6_tools::process::session_command("git");
         c.arg("-C").arg(cwd).args(args).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null());
         c
     };
@@ -144,7 +144,7 @@ pub(crate) async fn repo_slug(cwd: &Path) -> String {
                 if first.is_empty() {
                     return String::new();
                 }
-                match tokio::process::Command::new("git").arg("-C").arg(cwd).args(["remote", "get-url", &first]).output().await {
+                match c6_tools::process::session_command("git").arg("-C").arg(cwd).args(["remote", "get-url", &first]).output().await {
                     Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_owned(),
                     _ => return String::new(),
                 }

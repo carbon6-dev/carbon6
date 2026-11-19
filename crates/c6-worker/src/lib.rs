@@ -2,6 +2,7 @@
 //! runs agent sessions on this machine.
 
 pub mod checkpoint;
+mod checkpoint_process;
 pub mod claude_code;
 pub mod codex_limits;
 pub mod commands;
@@ -98,6 +99,9 @@ impl Worker {
         let lock = std::fs::File::create(&lock_path).with_context(|| format!("creating {}", lock_path.display()))?;
         if lock.try_lock().is_err() {
             anyhow::bail!("another c6w is already running with state directory {}", state_dir.display());
+        }
+        if let Err(error) = checkpoint::Checkpoints::recover(state_dir).await {
+            tracing::warn!(%error, "could not finish checkpoint startup recovery");
         }
         let journal = Arc::new(journal::Journal::open(&state_dir.join("journal.db")).await?);
         // What its kit runs make on the container runtime carries its id.

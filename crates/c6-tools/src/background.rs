@@ -763,7 +763,7 @@ impl Background {
             }
             None => {
                 let shell = if std::path::Path::new("/bin/bash").exists() { "/bin/bash" } else { "/bin/sh" };
-                tokio::process::Command::new(shell)
+                crate::process::session_command(shell)
                     .arg("-c")
                     .arg(command)
                     .current_dir(cwd)
@@ -871,7 +871,7 @@ impl Background {
             return Err(std::io::Error::other("Shell launch canceled"));
         }
         // The command in its own shell; this one writes its exit code.
-        let spawned = tokio::process::Command::new("/bin/sh")
+        let spawned = crate::process::session_command("/bin/sh")
             .arg("-c")
             .arg(r#""$0" -c "$1"; echo $? > "$2""#)
             .arg(shell)

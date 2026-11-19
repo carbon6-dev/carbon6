@@ -1884,7 +1884,7 @@ impl Process {
                 None
             }
         };
-        let mut cmd = tokio::process::Command::new(bin);
+        let mut cmd = c6_tools::process::session_command(bin);
         if let Some(root) = &output_root {
             cmd.env("CLAUDE_CODE_TMPDIR", &root.0);
         }
@@ -2111,7 +2111,7 @@ impl Process {
         let args: Vec<std::ffi::OsString> = std_cmd.get_args().map(|a| a.to_owned()).collect();
         let envs: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> =
             std_cmd.get_envs().map(|(k, v)| (k.to_owned(), v.map(|v| v.to_owned()))).collect();
-        let mut wrapped = tokio::process::Command::new("/bin/sh");
+        let mut wrapped = c6_tools::process::session_command("/bin/sh");
         wrapped.arg("-c").arg(r#""$@"; echo $? > "$C6_HELD_CODE""#).arg("sh").arg(&program).args(&args);
         for (k, v) in envs {
             match v {
@@ -2138,7 +2138,7 @@ impl Process {
         #[cfg(not(target_os = "macos"))]
         let mut keeper = {
             let program = r#"exec 3<>"$0"; exec sleep 2147483647"#;
-            tokio::process::Command::new("/bin/sh")
+            c6_tools::process::session_command("/bin/sh")
                 .arg("-c")
                 .arg(program)
                 .arg(&fifo)

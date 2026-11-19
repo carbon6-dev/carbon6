@@ -46,11 +46,35 @@ run 'systemctl enable --now c6w@alice'
 until_ok 'journalctl -u c6w@alice | grep -q "attached to head"' "c6w@alice did not attach to the head"
 run 'systemctl is-active c6w@alice && ps -o user=,args= -C c6w'
 
+step "Worker OOM policy"
+run 'test "$(systemctl show -P OOMPolicy c6w@alice)" = continue &&
+    pid=$(systemctl show -P MainPID c6w@alice) &&
+    test "$(cat "/proc/$pid/oom_score_adj")" = -500 &&
+    cg=$(systemctl show -P ControlGroup c6w@alice) &&
+    test -n "$cg" &&
+    group="/sys/fs/cgroup$cg/memory.oom.group" &&
+    { test ! -e "$group" || test "$(cat "$group")" = 0; }' || fail "system worker unit did not apply its OOM policy"
+
 step "CLI"
 api_token=$(run 'sudo -u c6h c6h --config /etc/c6h/c6h.toml api-token smoke-test')
 run "sudo -iu alice c6 login http://127.0.0.1:7700 --token $api_token"
 until_ok 'sudo -iu alice c6 workers | grep -qE "online +alice"' "c6 workers does not list alice online"
 run 'sudo -iu alice c6 workers'
+
+step "Worker terminal does not inherit the daemon's OOM protection"
+worker_id=$(run 'sudo -iu alice c6 workers' | awk '$2 == "online" && $3 == "alice" {print $1}')
+# Record from an actual worker-spawned PTY without needing a WebSocket client.
+# The TTY guard keeps ordinary login shells (including c6w's) unaffected.
+run 'sudo -u alice tee /home/alice/.bash_profile >/dev/null <<"PROFILE"
+if [ -t 0 ]; then
+    cat /proc/self/oom_score_adj > "$HOME/.c6-terminal-oom-score"
+    exit
+fi
+PROFILE'
+run "curl -fsS -H 'Authorization: Bearer $api_token' -H 'Content-Type: application/json' \
+    -d '{\"cwd\":\"/home/alice\"}' 'http://127.0.0.1:7700/api/v1/workers/$worker_id/terminals'" >/dev/null || fail "could not open worker terminal"
+until_ok 'test "$(cat /home/alice/.c6-terminal-oom-score)" = 0' "worker terminal did not start with oom_score_adj=0"
+run 'rm -f /home/alice/.bash_profile /home/alice/.c6-terminal-oom-score'
 
 step "Clean stop (SIGTERM) and restart"
 run 'systemctl restart c6h c6w@alice'

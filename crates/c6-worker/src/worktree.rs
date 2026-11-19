@@ -30,7 +30,8 @@ pub struct Made {
 
 /// git in `dir`: its stdout, or its stderr as the error.
 async fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = tokio::process::Command::new("git").arg("-C").arg(dir).args(args).output().await.map_err(|e| format!("running git: {e}"))?;
+    let out =
+        c6_tools::process::session_command("git").arg("-C").arg(dir).args(args).output().await.map_err(|e| format!("running git: {e}"))?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
     } else {
@@ -92,7 +93,7 @@ pub async fn create(worktrees: &Path, session_id: &str, cwd: &Path, spec: &Workt
 pub async fn setup(made: &Made, commands: &[String]) -> Result<String, String> {
     let mut log = String::new();
     for line in commands.iter().map(|c| c.trim()).filter(|c| !c.is_empty()) {
-        let run = tokio::process::Command::new("sh")
+        let run = c6_tools::process::session_command("sh")
             .arg("-c")
             .arg(line)
             .current_dir(&made.top)

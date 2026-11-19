@@ -52,7 +52,7 @@ fn search_path() -> std::ffi::OsString {
 
 /// A command of the runtime, finding its helpers wherever they are.
 pub fn runtime_command(rt: &str) -> Command {
-    let mut c = Command::new(rt);
+    let mut c = crate::process::session_command(rt);
     c.env("PATH", search_path());
     c
 }

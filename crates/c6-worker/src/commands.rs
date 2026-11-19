@@ -150,7 +150,7 @@ async fn shell(cmd: &str, cwd: &Path, ssh: Option<&c6_tools::remote::SshHost>) -
             Err(e) => format!("(`{cmd}` could not run: {e})"),
         };
     }
-    let run = tokio::process::Command::new("sh").arg("-c").arg(cmd).current_dir(cwd).kill_on_drop(true).output();
+    let run = c6_tools::process::session_command("sh").arg("-c").arg(cmd).current_dir(cwd).kill_on_drop(true).output();
     let text = match tokio::time::timeout(SHELL_TIMEOUT, run).await {
         Err(_) => format!("(`{cmd}` timed out)"),
         Ok(Err(e)) => format!("(`{cmd}` could not run: {e})"),

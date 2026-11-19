@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 fn shell_command(shell: Option<&OsStr>) -> tokio::process::Command {
     let shell = shell.filter(|s| !s.is_empty());
-    let mut command = tokio::process::Command::new(shell.unwrap_or(OsStr::new("/bin/sh")));
+    let mut command = c6_tools::process::session_command(shell.unwrap_or(OsStr::new("/bin/sh")));
     command.args([if shell.is_some() { "-lic" } else { "-lc" }, "command -v codex"]);
     command
 }

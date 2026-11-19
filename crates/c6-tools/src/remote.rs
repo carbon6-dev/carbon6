@@ -79,7 +79,7 @@ impl SshHost {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&self.control_dir, std::fs::Permissions::from_mode(0o700));
         }
-        let mut c = tokio::process::Command::new(&self.program);
+        let mut c = crate::process::session_command(&self.program);
         c.args(["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=30", "-o", "ControlMaster=auto"])
             .arg("-o")
             .arg(format!("ControlPath={}/%C", self.control_dir.display()))

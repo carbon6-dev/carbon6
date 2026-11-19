@@ -212,7 +212,7 @@ impl c6_llm::ModelClient for ClaudeOnce {
         use tokio::io::AsyncWriteExt;
         let dir = std::env::temp_dir().join(format!("c6-claude-once-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).map_err(|e| LlmError::Config(format!("making a folder for Claude Code: {e}")))?;
-        let mut cmd = tokio::process::Command::new(&self.bin);
+        let mut cmd = c6_tools::process::session_command(&self.bin);
         cmd.args(["-p", "--output-format", "json"]).args(LOCKED_DOWN);
         if !req.model.trim().is_empty() {
             cmd.args(["--model", req.model.trim()]);

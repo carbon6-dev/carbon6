@@ -203,7 +203,7 @@ impl HookRunner {
 
     /// (exit code, stdout, stderr); no code on timeout or failure to start.
     async fn exec(&self, c: &Command, input: &str) -> (Option<i32>, String, String) {
-        let child = tokio::process::Command::new("sh")
+        let child = c6_tools::process::session_command("sh")
             .arg("-c")
             .arg(&c.command)
             .current_dir(&self.cwd)

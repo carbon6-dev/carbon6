@@ -17,6 +17,7 @@ mod names;
 pub mod notify;
 mod patch;
 mod plan;
+pub mod process;
 pub mod profiles;
 pub mod publish;
 pub mod records;

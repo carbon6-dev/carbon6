@@ -135,7 +135,7 @@ impl Browser {
         // What it says on the way (why it didn't start, if it doesn't).
         let log_path = profile.join("c6-browser.log");
         let log = std::fs::File::create(&log_path).map_err(|e| format!("creating {}: {e}", log_path.display()))?;
-        let mut child = tokio::process::Command::new(chrome)
+        let mut child = crate::process::session_command(chrome)
             .args([
                 "--headless=new",
                 "--remote-debugging-port=0",

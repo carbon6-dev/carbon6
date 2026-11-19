@@ -267,7 +267,7 @@ pub fn spawn(worker: Arc<Worker>, stop: CancellationToken) {
 }
 
 fn command(binary: &Path) -> anyhow::Result<tokio::process::Command> {
-    let mut command = tokio::process::Command::new(binary);
+    let mut command = c6_tools::process::session_command(binary);
     if binary.is_absolute()
         && let Some(folder) = binary.parent()
     {
