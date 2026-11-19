@@ -6,9 +6,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use c6_proto::{
-    CommandRejected, HeadMsg, Hello, Ping, RpcResponse, SessionCursor, SessionEventBatch, WorkerMsg, head_msg,
+    CommandRejected, HeadMsg, Hello, Ping, RpcResponse, SessionCursor, SessionEvent, SessionEventBatch, WorkerMsg, head_msg,
     worker_hub_client::WorkerHubClient, worker_msg,
 };
+use prost::Message;
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -28,6 +29,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const STABLE_AFTER: Duration = Duration::from_secs(60);
 /// Events per upload message.
 const UPLOAD_BATCH: u32 = 256;
+/// Encoded bytes per upload message, including the `WorkerMsg` envelope.
+const UPLOAD_BYTES: usize = 32 * 1024 * 1024;
 /// Largest message either way (a `Restore` carries a whole session log).
 pub(crate) const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 
@@ -298,8 +301,8 @@ async fn upload(journal: Arc<Journal>, tx: mpsc::Sender<WorkerMsg>, stop: Cancel
                     continue;
                 }
             };
-            let last = events.last().map(|e| e.seq).unwrap_or(from);
-            let batch = SessionEventBatch { session_id: c.session_id.clone(), events };
+            let batch = upload_batch(c.session_id.clone(), events, UPLOAD_BYTES);
+            let last = batch.events.last().map(|e| e.seq).unwrap_or(from);
             tokio::select! {
                 _ = stop.cancelled() => return,
                 r = tx.send(WorkerMsg { msg: Some(worker_msg::Msg::Events(batch)) }) => if r.is_err() { return },
@@ -314,6 +317,25 @@ async fn upload(journal: Arc<Journal>, tx: mpsc::Sender<WorkerMsg>, stop: Cancel
             }
         }
     }
+}
+
+fn upload_batch(session_id: String, mut events: Vec<SessionEvent>, max_bytes: usize) -> SessionEventBatch {
+    use prost::encoding::{encoded_len_varint, key_len, message};
+
+    let mut batch = SessionEventBatch { session_id, events: Vec::new() };
+    let mut batch_len = batch.encoded_len();
+    let fitting = events
+        .iter()
+        .take_while(|event| {
+            batch_len += message::encoded_len(2, *event); // SessionEventBatch.events
+            let envelope_len = key_len(3) + encoded_len_varint(batch_len as u64); // WorkerMsg.events
+            batch_len + envelope_len <= max_bytes
+        })
+        .count();
+    // Always attempt the first event, even if it alone exceeds the batch target.
+    events.truncate(fitting.max(1));
+    batch.events = events;
+    batch
 }
 
 struct ClearChannel(Arc<Worker>);
@@ -337,4 +359,36 @@ fn classify(s: tonic::Status) -> Ended {
 
 fn jitter(d: Duration) -> Duration {
     d.mul_f64(rand::random_range(0.5..1.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn journal_upload_batch_counts_envelope_and_keeps_a_contiguous_prefix() {
+        let session_id = "session".to_owned();
+        let events: Vec<_> = (1..=3)
+            .map(|seq| SessionEvent {
+                seq,
+                kind: Some(c6_proto::session_event::Kind::User(c6_proto::UserMessage {
+                    attachments: vec![c6_proto::Attachment { data: vec![0; 128], ..Default::default() }],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })
+            .collect();
+        let wire_len = |batch| WorkerMsg { msg: Some(worker_msg::Msg::Events(batch)) }.encoded_len();
+        let two_events = wire_len(SessionEventBatch { session_id: session_id.clone(), events: events[..2].to_vec() });
+
+        let batch = upload_batch(session_id.clone(), events.clone(), two_events);
+        assert_eq!(batch.events, events[..2]);
+        assert_eq!(wire_len(batch), two_events);
+        let batch = upload_batch(session_id.clone(), events.clone(), two_events - 1);
+        assert_eq!(batch.events, events[..1]);
+        assert!(wire_len(batch) < two_events);
+        let first = events[..1].to_vec();
+        let batch = upload_batch(session_id, events, 1);
+        assert_eq!(batch.events, first, "a single event still goes out above the batch target");
+    }
 }

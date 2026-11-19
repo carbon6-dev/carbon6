@@ -2049,20 +2049,56 @@ async fn attachment(State(st): State<Arc<HeadState>>, Path((id, seq, index)): Pa
         _ => None,
     };
     let Some(a) = a else { return Err(ApiErr(StatusCode::NOT_FOUND, "no such attachment".into())) };
-    // Text is served as plain text, never as something a browser would run;
-    // an image opened on its own (an SVG can hold script) gets an origin of
-    // its own.
-    let mime = if a.mime.starts_with("image/") { a.mime } else { "text/plain; charset=utf-8".into() };
-    Ok((
+    Ok(attachment_response(a))
+}
+
+fn attachment_response(a: c6_proto::Attachment) -> Response {
+    let declared = a.mime.parse::<mime_guess::Mime>().ok().zip(header::HeaderValue::from_str(&a.mime).ok());
+    let (mime, kind) = match declared {
+        Some((parsed, value)) => {
+            let kind = match parsed.essence_str() {
+                "image/png" | "image/jpeg" | "image/gif" | "image/webp" => "inline",
+                _ => "attachment",
+            };
+            (value, kind)
+        }
+        None => (header::HeaderValue::from_static("application/octet-stream"), "attachment"),
+    };
+    (
         [
             (header::CONTENT_TYPE, mime),
-            (header::CACHE_CONTROL, "private, max-age=31536000, immutable".into()),
-            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".into()),
-            (header::CONTENT_SECURITY_POLICY, "sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'".into()),
+            (header::CONTENT_DISPOSITION, attachment_disposition(kind, &a.name)),
+            (header::CACHE_CONTROL, header::HeaderValue::from_static("private, max-age=31536000, immutable")),
+            (header::X_CONTENT_TYPE_OPTIONS, header::HeaderValue::from_static("nosniff")),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                header::HeaderValue::from_static("sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'"),
+            ),
         ],
         a.data,
     )
-        .into_response())
+        .into_response()
+}
+
+fn attachment_disposition(kind: &str, name: &str) -> header::HeaderValue {
+    use std::fmt::Write;
+
+    // A download name is a basename on both Unix and Windows. Keep a safe
+    // ASCII fallback and send the actual Unicode name using filename*.
+    let name = name.rsplit(['/', '\\']).next().unwrap_or_default();
+    let name = if matches!(name.trim(), "" | "." | "..") { "attachment" } else { name };
+    let name: String = name.chars().map(|c| if c.is_control() { '_' } else { c }).collect();
+    let ascii: String =
+        name.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.') { c } else { '_' }).collect();
+    let mut disposition = format!("{kind}; filename=\"{ascii}\"; filename*=UTF-8''");
+    for byte in name.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
+            disposition.push(char::from(byte));
+        } else {
+            write!(disposition, "%{byte:02X}").expect("writing to String cannot fail");
+        }
+    }
+    header::HeaderValue::from_str(&disposition).expect("disposition values are safe ASCII")
 }
 
 async fn set_session_labels(
@@ -4950,6 +4986,39 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn attachment_download_headers_are_safe_and_only_raster_images_inline() {
+        for (mime, expected_mime, inline) in [
+            ("image/png", "image/png", true),
+            ("Image/JPEG", "Image/JPEG", true),
+            ("image/gif", "image/gif", true),
+            ("image/webp", "image/webp", true),
+            ("image/svg+xml", "image/svg+xml", false),
+            ("text/html; charset=UTF-8", "text/html; charset=UTF-8", false),
+            ("application/pdf", "application/pdf", false),
+            ("", "application/octet-stream", false),
+            ("invalid-type", "application/octet-stream", false),
+            ("image/png\r\nx-injected: yes", "application/octet-stream", false),
+        ] {
+            let response = attachment_response(c6_proto::Attachment {
+                name: "../folder\\Résumé \"100%\"\r\n.txt".into(),
+                mime: mime.into(),
+                data: vec![0, 128, 255],
+            });
+            let headers = response.headers();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(headers[header::CONTENT_TYPE], expected_mime);
+            assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+            assert!(headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap().starts_with("sandbox;"));
+            assert!(!headers.contains_key("x-injected"));
+            let kind = if inline { "inline" } else { "attachment" };
+            assert_eq!(
+                headers[header::CONTENT_DISPOSITION],
+                format!("{kind}; filename=\"R_sum_ _100____.txt\"; filename*=UTF-8''R%C3%A9sum%C3%A9%20%22100%25%22__.txt")
+            );
+        }
+    }
+
     #[tokio::test]
     async fn worker_fs_download_serves_binary_to_a_browser_in_the_workers_realm() {
         let dir = tempfile::tempdir().unwrap();
@@ -5101,6 +5170,7 @@ mod tests {
         let uploads = vec![
             Attachment { name: "original image.png".into(), mime: "image/png".into(), data: vec![0, 255, 128, 1] },
             Attachment { name: "notes ü.txt".into(), mime: "text/plain".into(), data: "original\ntext ü".as_bytes().to_vec() },
+            Attachment { name: "Résumé.pdf".into(), mime: "application/pdf".into(), data: b"%PDF-1.7\n\xff".to_vec() },
         ];
         let mut source = uploads.clone();
         source.push(Attachment { name: "@memex:project:test".into(), mime: "text/markdown".into(), data: b"generated context".to_vec() });
@@ -5205,6 +5275,14 @@ mod tests {
         let response = st.http.get(format!("{url}/draft-lab/messages/source-less/draft")).bearer_auth(&lab).send().await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.json::<serde_json::Value>().await.unwrap(), json!(expected));
+        let pdf = st.http.get(format!("{url}/draft-lab/attachments/2/2")).bearer_auth(&lab).send().await.unwrap();
+        assert_eq!(pdf.status(), StatusCode::OK);
+        assert_eq!(pdf.headers()[header::CONTENT_TYPE], "application/pdf");
+        assert_eq!(
+            pdf.headers()[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"R_sum_.pdf\"; filename*=UTF-8''R%C3%A9sum%C3%A9.pdf"
+        );
+        assert_eq!(pdf.bytes().await.unwrap().as_ref(), uploads[2].data.as_slice());
         assert_eq!(st.store.events_after("draft-lab", 0, 10).await.unwrap().len(), 2, "draft reads never append or delete events");
         head.shutdown().await.unwrap();
     }

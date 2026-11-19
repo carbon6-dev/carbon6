@@ -11,8 +11,8 @@ window.c6Files = {
   has(ev) {
     return this.list(ev).length > 0;
   },
-  // An image too big for models (Anthropic's take 5 MB at most), such as a
-  // whole-screen capture, scaled down until it fits: as PNG, else JPEG.
+  // Keep the existing inline-image behavior: Anthropic accepts at most 5 MB
+  // per image. Other file types always retain their original bytes.
   async shrink(f) {
     const LIMIT = 4.5 * 1024 * 1024;
     if (f.size <= LIMIT || !/^image\/(png|jpeg|webp)$/.test(f.type)) return f;
@@ -40,16 +40,18 @@ window.c6Files = {
   },
   // Resolves to a JSON array of {name, mime, data (base64)}.
   async read(ev) {
+    // Snapshot the files before awaiting: paste and drop data are only
+    // accessible while their event is being dispatched.
+    const files = this.list(ev);
+    if (ev.target && ev.target.files) ev.target.value = "";
     const out = [];
-    for (const raw of this.list(ev)) {
+    for (const raw of files) {
       const f = await this.shrink(raw);
       const buf = new Uint8Array(await f.arrayBuffer());
       let s = "";
       for (let i = 0; i < buf.length; i += 0x8000) s += String.fromCharCode(...buf.subarray(i, i + 0x8000));
-      const name = f.name && f.name !== "image.png" ? f.name : `pasted-${Date.now()}.${(f.type.split("/")[1] || "png")}`;
-      out.push({ name, mime: f.type || "text/plain", data: btoa(s) });
+      out.push({ name: f.name, mime: f.type || "application/octet-stream", data: btoa(s) });
     }
-    if (ev.target && ev.target.files) ev.target.value = "";
     return JSON.stringify(out);
   },
 };

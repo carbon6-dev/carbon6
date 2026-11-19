@@ -187,7 +187,20 @@ async fn session_queue_op(worker: &Arc<Worker>, p: &Value) -> anyhow::Result<Val
         "cancel" => None,
         _ => bail!("op is update or cancel"),
     };
-    match worker.sessions.queue_op(&session_id, &command_id, input) {
+    let result = match input {
+        Some(mut input) => {
+            commit_queue_edit(
+                async {
+                    worker.sessions.prepare_attachments(&session_id, &mut input).await?;
+                    Ok(input)
+                },
+                |input| worker.sessions.queue_op(&session_id, &command_id, Some(input)),
+            )
+            .await?
+        }
+        None => worker.sessions.queue_op(&session_id, &command_id, None),
+    };
+    match result {
         crate::session::QueueOp::Updated => Ok(json!({"state": "updated"})),
         crate::session::QueueOp::Cancelled => Ok(json!({"state": "cancelled"})),
         crate::session::QueueOp::Absent => {
@@ -201,6 +214,19 @@ async fn session_queue_op(worker: &Arc<Worker>, p: &Value) -> anyhow::Result<Val
             }
         }
     }
+}
+
+async fn commit_queue_edit<T>(
+    prepare: impl std::future::Future<Output = anyhow::Result<c6_agent::PendingInput>>,
+    commit: impl FnOnce(c6_agent::PendingInput) -> T,
+) -> anyhow::Result<T> {
+    // The head waits five seconds. Cancelling slow preparation must not apply
+    // an edit after the caller has been told it failed. Only immutable staged
+    // files may outlive cancellation; the inbox commit never does.
+    let input = tokio::time::timeout(std::time::Duration::from_secs(2), prepare)
+        .await
+        .context("attachment preparation took too long; queued input was not changed")??;
+    Ok(commit(input))
 }
 
 fn queued_input(command_id: String, input: c6_proto::UserInput) -> c6_agent::PendingInput {
@@ -685,6 +711,29 @@ mod tests {
         assert!(!r.to_string().is_empty());
         let r = session_queue_op(&worker, &json!({"session_id": "s1", "command_id": "c1", "op": "nonsense"})).await.unwrap_err();
         assert!(r.to_string().contains("update or cancel"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queue_edit_deadline_never_commits_a_late_preparation() {
+        let original = c6_agent::PendingInput { text: "original".into(), ..Default::default() };
+        let replacement = c6_agent::PendingInput { text: "edited".into(), ..Default::default() };
+        let mut queued = original.clone();
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let error = commit_queue_edit(
+            async {
+                wait.await.unwrap();
+                Ok(replacement.clone())
+            },
+            |input| queued = input,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("queued input was not changed"));
+        assert!(release.send(()).is_err(), "timed-out preparation must be dropped");
+        assert_eq!(queued, original);
+
+        commit_queue_edit(async { Ok(replacement.clone()) }, |input| queued = input).await.unwrap();
+        assert_eq!(queued, replacement);
     }
 }
 

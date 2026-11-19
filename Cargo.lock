@@ -876,8 +876,10 @@ dependencies = [
  "futures",
  "gethostname",
  "hex",
+ "html5ever",
  "ignore",
  "image",
+ "lopdf",
  "nix 0.31.3",
  "opentelemetry-proto",
  "pem",
@@ -904,6 +906,8 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "xml5ever",
+ "zip",
 ]
 
 [[package]]

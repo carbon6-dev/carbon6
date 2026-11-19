@@ -201,7 +201,8 @@ impl Turn<'_> {
     }
 
     /// Estimate unreported requests and growth since the last report at 3.5
-    /// characters per token, with a fixed allowance per image instead of bytes.
+    /// characters per token, with fixed allowances for media instead of
+    /// counting serialized bytes (which do not reflect model context usage).
     fn estimate_request(&self, history: &[Message], specs: &[ToolSpec]) -> u64 {
         let mut chars = self.cfg.system_prompt.chars().count() as u64;
         chars += serde_json::to_string(specs).unwrap_or_default().chars().count() as u64;
@@ -210,6 +211,7 @@ impl Turn<'_> {
             for block in &message.blocks {
                 chars += match block {
                     Block::Image { .. } => 3_584,
+                    Block::Document { .. } => 14_336,
                     _ => serde_json::to_string(block).unwrap_or_default().chars().count() as u64,
                 };
             }

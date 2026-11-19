@@ -4,7 +4,7 @@ Architecture: @ARCH@
 Maintainer: @MAINTAINER@
 Installed-Size: @SIZE@
 Depends: @SHLIBS@, ca-certificates, git
-Recommends: openssh-client, procps, python3
+Recommends: openssh-client, procps, python3, poppler-utils, unrtf
 Section: net
 Priority: optional
 Homepage: https://github.com/carbon6-dev/carbon6

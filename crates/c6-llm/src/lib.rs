@@ -76,6 +76,12 @@ pub enum Block {
         content: String,
         is_error: bool,
     },
+    /// An original user attachment for providers that can consume it natively.
+    Document {
+        media_type: String,
+        filename: String,
+        data: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -234,10 +240,63 @@ pub enum Provider {
     Anthropic,
 }
 
-/// An image as a `data:` URL (OpenAI's APIs take images this way).
+/// An image or document as a `data:` URL for OpenAI's APIs.
 pub(crate) fn data_url(media_type: &str, data: &[u8]) -> String {
     use base64::Engine;
     format!("data:{media_type};base64,{}", base64::engine::general_purpose::STANDARD.encode(data))
+}
+
+/// Sniff a PDF header even if the upload's name and declared MIME are generic.
+pub fn has_pdf_header(data: &[u8]) -> bool {
+    data[..data.len().min(1024)].windows(5).any(|w| w == b"%PDF-")
+}
+
+/// A cheap conservative PDF preflight, not a PDF parser. Require a header,
+/// EOF and an in-bounds cross-reference target; do not send encrypted PDFs.
+pub fn is_native_pdf(data: &[u8]) -> bool {
+    let Some(body) = data.trim_ascii_end().strip_suffix(b"%%EOF") else { return false };
+    if !has_pdf_header(body) || pdf_has_name(body, b"Encrypt") {
+        return false;
+    }
+    let tail = &body[body.len().saturating_sub(1024)..];
+    let Some(start) = tail.windows(b"startxref".len()).rposition(|w| w == b"startxref") else { return false };
+    let Some(offset) = std::str::from_utf8(tail[start + b"startxref".len()..].trim_ascii()).ok().and_then(|s| s.parse::<usize>().ok())
+    else {
+        return false;
+    };
+    let Some(xref) = body.get(offset..body.len() - tail.len() + start) else { return false };
+    if let Some(table) = xref.strip_prefix(b"xref") {
+        return table.first().is_some_and(u8::is_ascii_whitespace) && table.windows(7).any(|w| w == b"trailer");
+    }
+    // PDF 1.5+ may use an indirect cross-reference stream instead of a table.
+    let mut tokens = xref.split(|b| b.is_ascii_whitespace()).filter(|t| !t.is_empty());
+    let is_number = |token: &[u8]| token.iter().all(u8::is_ascii_digit);
+    tokens.next().is_some_and(is_number)
+        && tokens.next().is_some_and(is_number)
+        && tokens.next() == Some(b"obj")
+        && pdf_has_name(&xref[..xref.len().min(1024)], b"XRef")
+}
+
+fn pdf_has_name(data: &[u8], name: &[u8]) -> bool {
+    let delimiter = |b: u8| b.is_ascii_whitespace() || b == 0 || b"()<>[]{}/%".contains(&b);
+    data.split(|b| *b == b'/').skip(1).any(|mut entry| {
+        for expected in name {
+            let Some((&b, rest)) = entry.split_first() else { return false };
+            if b == b'#' {
+                let Some(pair) = rest.get(..2) else { return false };
+                let digit = |b: u8| (b as char).to_digit(16);
+                if digit(pair[0]).zip(digit(pair[1])).map(|(hi, lo)| hi * 16 + lo) != Some(u32::from(*expected)) {
+                    return false;
+                }
+                entry = &rest[2..];
+            } else if b == *expected {
+                entry = rest;
+            } else {
+                return false;
+            }
+        }
+        entry.first().is_none_or(|b| delimiter(*b))
+    })
 }
 
 /// Whether a connection passes the reasoning effort on to the model. Every
@@ -299,6 +358,55 @@ pub fn install_crypto_provider() {
 
 #[cfg(test)]
 mod tests {
+    use super::Block;
+
+    pub(super) fn sample_pdf() -> Vec<u8> {
+        use std::fmt::Write;
+        let mut pdf = String::from("%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for (id, body) in [
+            (1, "<</Type /Catalog /Pages 2 0 R>>"),
+            (2, "<</Type /Pages /Kids [3 0 R] /Count 1>>"),
+            (3, "<</Type /Page /Parent 2 0 R /MediaBox [0 0 100 100]>>"),
+        ] {
+            offsets.push(pdf.len());
+            writeln!(pdf, "{id} 0 obj\n{body}\nendobj").unwrap();
+        }
+        let startxref = pdf.len();
+        pdf.push_str("xref\n0 4\n0000000000 65535 f \n");
+        for offset in offsets {
+            writeln!(pdf, "{offset:010} 00000 n ").unwrap();
+        }
+        writeln!(pdf, "trailer\n<</Root 1 0 R /Size 4>>\nstartxref\n{startxref}\n%%EOF").unwrap();
+        pdf.into_bytes()
+    }
+
+    #[test]
+    fn pdf_preflight_rejects_bad_offsets_truncation_and_encryption() {
+        let pdf = String::from_utf8(sample_pdf()).unwrap();
+        assert!(super::is_native_pdf(pdf.as_bytes()));
+        assert!(!super::is_native_pdf(b"%PDF-1.5\nstartxref\n9\n%%EOF"));
+        assert!(!super::is_native_pdf(pdf.trim_end_matches("%%EOF\n").as_bytes()));
+        for name in ["/Encrypt", "/Encr#79pt"] {
+            let encrypted = pdf.replace("/Size 4", &format!("/Size 4 {name} 5 0 R"));
+            assert!(!super::is_native_pdf(encrypted.as_bytes()));
+        }
+        let mut stream = b"%PDF-1.5\n".to_vec();
+        stream.extend_from_slice(b"1 0 obj\n<</Type/XRef /Root 2 0 R>>\nstream\nx\nendstream\nendobj\nstartxref\n9\n%%EOF\n");
+        assert!(super::is_native_pdf(&stream));
+    }
+
+    #[test]
+    fn document_blocks_round_trip_without_changing_existing_block_encoding() {
+        let pdf = Block::Document { media_type: "application/pdf".into(), filename: "report.pdf".into(), data: vec![1, 2, 3] };
+        let raw = serde_json::to_string(&pdf).unwrap();
+        assert_eq!(serde_json::from_str::<Block>(&raw).unwrap(), pdf);
+        let old = r#"{"Image":{"media_type":"image/png","data":[1,2,3]}}"#;
+        let image = Block::Image { media_type: "image/png".into(), data: vec![1, 2, 3] };
+        assert_eq!(serde_json::from_str::<Block>(old).unwrap(), image);
+        assert_eq!(serde_json::to_string(&image).unwrap(), old);
+    }
+
     #[test]
     fn effort_support() {
         for kind in ["openai_compat", "openai", "chatgpt", "anthropic", "claude_code"] {

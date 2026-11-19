@@ -3291,7 +3291,11 @@ impl Process {
 /// An input as Claude Code's user message content: its text (or
 /// expansion) with files inline, and images as image blocks.
 fn user_content(input: &PendingInput, preamble: Option<&str>) -> Value {
-    let (images, files): (Vec<_>, Vec<_>) = input.attachments.iter().cloned().partition(|a| a.mime.starts_with("image/"));
+    let image_type = |mime: &str| {
+        let essence = mime.split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
+        matches!(essence.as_str(), "image/png" | "image/jpeg" | "image/gif" | "image/webp").then_some(essence)
+    };
+    let (images, files): (Vec<_>, Vec<_>) = input.attachments.iter().cloned().partition(|a| image_type(&a.mime).is_some());
     let text = c6_agent::user_text(&input.attributed_text(), &files);
     let text = match preamble {
         Some(p) => format!("{p}\n\n{text}"),
@@ -3303,7 +3307,7 @@ fn user_content(input: &PendingInput, preamble: Option<&str>) -> Value {
     use base64::Engine;
     let mut blocks = vec![serde_json::json!({"type": "text", "text": text})];
     blocks.extend(images.iter().map(|a| {
-        serde_json::json!({"type": "image", "source": {"type": "base64", "media_type": a.mime, "data": base64::engine::general_purpose::STANDARD.encode(&a.data)}})
+        serde_json::json!({"type": "image", "source": {"type": "base64", "media_type": image_type(&a.mime), "data": base64::engine::general_purpose::STANDARD.encode(&a.data)}})
     }));
     Value::Array(blocks)
 }
@@ -4678,6 +4682,23 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"usage":{}}
         for command in ["task-notification", "session-message"] {
             assert!(!is_yours(&PendingInput { command: command.into(), ..human.clone() }));
         }
+    }
+
+    #[test]
+    fn only_supported_raster_attachments_are_sent_as_images() {
+        let mut input = input("files", "Read the attachments.");
+        input.attachments = vec![
+            c6_proto::Attachment { name: "photo.png".into(), mime: "Image/PNG; charset=binary".into(), data: vec![1, 2, 3] },
+            c6_proto::Attachment { name: "photo.heic".into(), mime: "image/heic".into(), data: vec![0xff, 0] },
+            c6_proto::Attachment { name: "report.pdf".into(), mime: "application/pdf".into(), data: b"%PDF-1.7".to_vec() },
+        ];
+        let blocks = user_content(&input, None);
+        let blocks = blocks.as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+        let text = blocks[0]["text"].as_str().unwrap();
+        assert!(text.contains("photo.heic") && text.contains("report.pdf"));
+        assert!(!text.contains('\u{fffd}'));
     }
 
     #[test]

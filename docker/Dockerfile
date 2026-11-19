@@ -43,7 +43,7 @@ FROM scratch AS artifacts
 COPY --from=build /out/ /
 
 FROM toolchain AS test
-RUN apt-get update && apt-get install -y --no-install-recommends python3 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends python3 poppler-utils unrtf && rm -rf /var/lib/apt/lists/*
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
@@ -66,7 +66,7 @@ EXPOSE 7700 7701
 ENTRYPOINT ["c6h", "--config", "/etc/c6h/c6h.toml"]
 
 FROM debian:bookworm-slim AS c6w
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git bash procps python3 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git bash procps python3 poppler-utils unrtf && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/c6w /usr/local/bin/c6w
 VOLUME /state
 ENTRYPOINT ["c6w", "--state-dir", "/state"]

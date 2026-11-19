@@ -2213,7 +2213,7 @@ pub struct AttachmentInfo {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AttachmentUpload {
     pub name: String,
-    /// image/png, image/jpeg, image/gif, image/webp, or a text type.
+    /// The file's declared media type. Any media type is accepted and stored as given.
     pub mime: String,
     /// Base64.
     pub data: String,

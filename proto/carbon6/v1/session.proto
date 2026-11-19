@@ -338,6 +338,9 @@ message UserMessage {
   // Stamped by the head from its durable input command, not inferred from
   // session labels or message text. Historical events remain unchanged.
   TaskCardOrigin task_card_origin = 16;
+  // Worker-generated attachment notes occupy this many trailing entries.
+  // Never accepted from UserInput or inferred from user-controlled file data.
+  uint32 generated_attachment_count = 17;
 }
 
 enum TaskCardOrigin {
@@ -354,8 +357,8 @@ message ApiMessageOrigin {
 message Attachment {
   // File name or, for @mentions, the path as written.
   string name = 1;
-  // MIME type: image/* is shown to the model as an image; anything else is
-  // UTF-8 text included in the message.
+  // Original declared MIME type. Supported rasters and PDFs may be sent
+  // natively; other files use extracted text or worker-local file metadata.
   string mime = 2;
   bytes data = 3;
 }

@@ -462,6 +462,14 @@ impl SessionManager {
         self.state_dir.join("claude")
     }
 
+    /// Queue edits bypass the actor's normal input expansion path. Prepare
+    /// their files before acquiring the inbox lock; immutable filenames keep
+    /// an edit racing delivery from changing a file already given to the agent.
+    pub(crate) async fn prepare_attachments(&self, session_id: &str, input: &mut PendingInput) -> anyhow::Result<()> {
+        let remote = self.actors.lock().unwrap().get(session_id).is_some_and(|h| h.tools.ssh().is_some());
+        crate::attachments::prepare(&self.state_dir, session_id, input, remote).await
+    }
+
     /// Only for a completed public rewind whose selected branch has no held
     /// record. Unselected runtimes may be stopped, never adopted. Publication
     /// of a new untouched intent must not race this destructive cleanup.
@@ -932,12 +940,13 @@ impl SessionManager {
         &self,
         session_id: &str,
         command_id: &str,
-        spec: CreateSession,
+        mut spec: CreateSession,
         place: Place,
         labels: Vec<String>,
         system_prompt: String,
     ) -> Result<(), String> {
         let Place { cwd, local, home, repo, worktree_branch, repo_root, ssh_target, system, setup_log } = place;
+        crate::attachments::restore(&self.state_dir, session_id, &mut spec.seed, !ssh_target.is_empty()).await;
         let model = spec.model.clone().unwrap_or_default();
         let mut setup_errors = Vec::new();
         let mut session_tools = Vec::new();
@@ -1183,6 +1192,8 @@ impl SessionManager {
         let turns = events.iter().filter(|e| matches!(e.kind, Some(session_event::Kind::TurnStarted(_)))).count() as u64;
         let mut spec = spec;
         let local_child = spec.delegation.is_some();
+        crate::attachments::restore(&self.state_dir, session_id, &mut spec.seed, !started.ssh_target.is_empty()).await;
+        crate::attachments::restore(&self.state_dir, session_id, &mut events, !started.ssh_target.is_empty()).await;
         let conv = conversation_from_log(&mut spec, &events);
         let handle = self.spawn(session_id, spec, started, conv, next_seq, turns, None).await?;
         let tx = handle.tx.clone();
@@ -2909,6 +2920,14 @@ impl Actor {
                         // @paths name files here, not on an SSH target.
                         if ssh.is_none() {
                             crate::mentions::resolve(cwd, &mut input);
+                        }
+                        if let Err(e) = crate::attachments::prepare(
+                            &self.manager.state_dir,
+                            &self.writer.session_id,
+                            &mut input,
+                            ssh.is_some(),
+                        ).await {
+                            warn!(session = %self.writer.session_id, "preparing message attachments: {e:#}");
                         }
                         if let Some(h) = self.hooks.as_ref().filter(|_| self.started.tool_profile != crate::claude_code::PROFILE) {
                             let v = h.run("UserPromptSubmit", None, serde_json::json!({"prompt": input.model_text()})).await;

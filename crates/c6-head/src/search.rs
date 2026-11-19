@@ -17,7 +17,7 @@ use crate::bad_request;
 use crate::store::Store;
 
 /// Bump when what gets indexed changes; the head then re-indexes.
-const VERSION: &str = "1";
+const VERSION: &str = "2";
 const VERSION_KEY: &str = "search.version";
 /// Text indexed per entry. Tool output is most of the text in a session.
 const MAX_TEXT: usize = 32 * 1024;
@@ -31,10 +31,26 @@ fn entries(ev: &SessionEvent) -> Vec<(u32, &'static str, String)> {
     let mut out = Vec::new();
     match &ev.kind {
         Some(Kind::User(u)) => {
-            // Text attachments (pasted logs, mentioned files) are searchable too.
+            // Put names before contents so a large excerpt does not hide
+            // the names of other attachments within the entry's size cap.
             let mut text = u.text.clone();
-            for a in u.attachments.iter().filter(|a| !a.mime.starts_with("image/")) {
-                text.push_str(&format!("\n\n{}\n{}", a.name, String::from_utf8_lossy(&a.data)));
+            for a in &u.attachments {
+                if text.len() >= MAX_TEXT {
+                    break;
+                }
+                text.push_str("\n\n");
+                let end = a.name.floor_char_boundary(MAX_TEXT.saturating_sub(text.len()));
+                text.extend(a.name[..end].chars().map(|c| if c.is_control() { ' ' } else { c }));
+            }
+            for a in &u.attachments {
+                if text.len() >= MAX_TEXT {
+                    break;
+                }
+                if let Some(body) = readable_attachment(a) {
+                    text.push_str("\n\n");
+                    let end = body.floor_char_boundary(MAX_TEXT.saturating_sub(text.len()));
+                    text.push_str(&body[..end]);
+                }
             }
             // Another session's agent wrote it, not you.
             out.push((0, if u.from_session_id.is_empty() { "user" } else { "session_message" }, text))
@@ -63,6 +79,38 @@ fn entries(ev: &SessionEvent) -> Vec<(u32, &'static str, String)> {
         truncate(t, MAX_TEXT);
     }
     out
+}
+
+/// Follow the agent's text fallback: no raster images, raw documents, invalid
+/// UTF-8 or binary controls. Worker-extracted text is a separate attachment.
+fn readable_attachment(a: &c6_proto::Attachment) -> Option<&str> {
+    let mime = a.mime.split(';').next().unwrap_or_default().trim();
+    if [
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
+        "application/pdf",
+        "text/html",
+        "application/xhtml+xml",
+        "application/rtf",
+        "text/rtf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.oasis.opendocument.text",
+    ]
+    .iter()
+    .any(|t| mime.eq_ignore_ascii_case(t))
+        || a.name.rsplit_once('.').is_some_and(|(_, ext)| {
+            ["pdf", "docx", "pptx", "xlsx", "odt", "html", "htm", "xhtml", "rtf"].iter().any(|t| ext.eq_ignore_ascii_case(t))
+        })
+        || a.data[..a.data.len().min(1024)].windows(5).any(|w| w == b"%PDF-")
+    {
+        return None;
+    }
+    let text = std::str::from_utf8(&a.data).ok()?;
+    (!text.chars().any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t' | '\x0c'))).then_some(text)
 }
 
 /// A tool call as text: its name and the string values of its arguments
@@ -557,6 +605,43 @@ mod tests {
         };
         assert_eq!(entries(&input), [(0, "user", text.into())]);
         assert_eq!(crate::convert::event(&input).unwrap().seq, 17, "search points to the user message");
+    }
+
+    #[test]
+    fn attachment_search_indexes_names_and_readable_text_but_not_raw_binary() {
+        let files: &[(&str, &str, &[u8])] = &[
+            ("source.rs", "text/x-rust", b"inline code\r\n\tmore code"),
+            ("report.pdf (extracted text)", "text/plain", "Extracted résumé\x0cpage two".as_bytes()),
+            ("typed-document", "Application/PDF; charset=UTF-8", b"declared PDF raw data"),
+            ("report.PDF", "application/octet-stream", b"named PDF raw data"),
+            ("no-extension", "application/octet-stream", b"%PDF-1.7\nheader PDF raw data"),
+            ("artifact.bin", "application/octet-stream", b"non-UTF8 raw data\xff"),
+            ("controls.bin", "text/plain", b"control raw data\x00"),
+            ("photo.png", "IMAGE/PNG", b"mislabeled image data"),
+            ("page.html", "text/html", b"<script>HTML raw data</script>"),
+            ("letter.rtf", "application/octet-stream", b"{\\rtf1 RTF raw data}"),
+        ];
+        let ev = SessionEvent {
+            kind: Some(session_event::Kind::User(c6_proto::UserMessage {
+                text: "Please review".into(),
+                attachments: files
+                    .iter()
+                    .map(|&(name, mime, data)| c6_proto::Attachment { name: name.into(), mime: mime.into(), data: data.to_vec() })
+                    .collect(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let entries = entries(&ev);
+        assert_eq!(entries.len(), 1);
+        let indexed = &entries[0].2;
+        for (name, _, _) in files {
+            assert!(indexed.contains(name), "attachment name missing: {name}");
+        }
+        for text in ["Please review", "inline code", "more code", "Extracted résumé", "page two"] {
+            assert!(indexed.contains(text), "readable text missing: {text}");
+        }
+        assert!(!indexed.contains("raw data") && !indexed.contains("mislabeled image data"), "indexed raw attachment bytes: {indexed}");
     }
 
     #[test]

@@ -11,8 +11,9 @@ use c6_proto::{ephemeral_event, session_event};
 
 pub use base_prompt::{BASE_PROMPT, base_prompt_for_tools};
 pub use history::{
-    HANDOFF_BUDGET, TRIMMED_OUTPUT, compacted_context, context_tokens_from_events, effective_events, handoff_context, history_from_events,
-    model_text, portable_events, portable_messages, rewind_context, transcript_text, user_blocks, user_text,
+    HANDOFF_BUDGET, NATIVE_PDF_REJECTED_NOTE, TRIMMED_OUTPUT, compacted_context, context_tokens_from_events, effective_events,
+    handoff_context, history_from_events, model_text, portable_events, portable_messages, rewind_context, transcript_text, user_blocks,
+    user_text,
 };
 pub use prompt::build_system_prompt;
 pub use turn::{
@@ -106,6 +107,8 @@ pub struct PendingInput {
     pub text: String,
     /// Images and files sent with it, and files it mentions (@path).
     pub attachments: Vec<c6_proto::Attachment>,
+    /// Number of worker-generated notes appended to `attachments`.
+    pub generated_attachment_count: u32,
     /// The slash command it invoked, if any.
     pub command: String,
     /// A custom command's template (from the head), to expand; not logged.
@@ -142,6 +145,7 @@ impl PendingInput {
             command_id: self.command_id.clone(),
             text: self.text.clone(),
             attachments: self.attachments.clone(),
+            generated_attachment_count: self.generated_attachment_count,
             command: self.command.clone(),
             prompt: self.prompt.clone(),
             blocked: self.blocked.clone(),
@@ -161,7 +165,7 @@ impl PendingInput {
 
     /// What the model gets: the text (or its expansion), then each attachment.
     pub fn blocks(&self) -> Vec<c6_llm::Block> {
-        history::user_blocks(&self.attributed_text(), &self.attachments)
+        history::user_blocks_with_generated_attachments(&self.attributed_text(), &self.attachments, self.generated_attachment_count)
     }
 
     /// The model-facing text with server-derived attribution. Kept separate

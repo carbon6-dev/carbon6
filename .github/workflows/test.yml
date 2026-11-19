@@ -26,6 +26,9 @@ jobs:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/rust
       - uses: Swatinem/rust-cache@v2
+      - name: Document text converters
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y poppler-utils unrtf
       # Lints don't depend on the OS: once, on Linux.
       - name: The code is formatted (cargo fmt), every target passes clippy without warnings (and the web UI for wasm), and the tests' lint
         if: runner.os == 'Linux'
@@ -51,6 +54,8 @@ jobs:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/rust
       - uses: Swatinem/rust-cache@v2
+      - name: Document text converters
+        run: sudo apt-get update && sudo apt-get install -y poppler-utils unrtf
       - name: A git identity, for tests that commit
         run: git config --global user.email test@c6 && git config --global user.name test
       # cargo test here: nextest's process per test, on top of a busy loop

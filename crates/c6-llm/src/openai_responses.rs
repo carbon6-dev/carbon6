@@ -70,7 +70,7 @@ pub struct OpenAiResponses {
     headers: HashMap<String, String>,
     /// ChatGPT-plan tokens: the backend ignores sampling and output caps.
     plan: bool,
-    /// api.openai.com (not a compatible server): built-in tools are available.
+    /// api.openai.com: built-in tools and native files are available.
     official: bool,
     /// Attempts at each request (`http::post_json`).
     attempts: u32,
@@ -111,7 +111,7 @@ impl OpenAiResponses {
         let mut body = json!({
             "model": req.model,
             "instructions": req.system,
-            "input": input_items(&req.messages),
+            "input": input_items(&req.messages, self.official && !self.plan),
             "stream": true,
             "store": false,
             "include": ["reasoning.encrypted_content"],
@@ -143,12 +143,12 @@ impl OpenAiResponses {
     }
 }
 
-fn input_items(msgs: &[crate::Message]) -> Vec<Value> {
+fn input_items(msgs: &[crate::Message], native_files: bool) -> Vec<Value> {
     let mut items = Vec::new();
     for m in msgs {
         match m.role {
             Role::User => {
-                // Text and images go together in one message.
+                // Text, images and files go together in one message.
                 let mut parts: Vec<Value> = Vec::new();
                 let flush = |parts: &mut Vec<Value>, items: &mut Vec<Value>| {
                     if !parts.is_empty() {
@@ -166,6 +166,18 @@ fn input_items(msgs: &[crate::Message]) -> Vec<Value> {
                         }
                         Block::Image { media_type, data } => {
                             parts.push(json!({"type": "input_image", "image_url": crate::data_url(media_type, data)}))
+                        }
+                        Block::Document { media_type, filename, data }
+                            if native_files && media_type == "application/pdf" && crate::is_native_pdf(data) =>
+                        {
+                            let filename = if filename.rsplit_once('.').is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("pdf")) {
+                                std::borrow::Cow::Borrowed(filename.as_str())
+                            } else {
+                                // Magic-sniffed PDFs may have no PDF extension.
+                                // Keep the original name in history, not on this wire part.
+                                std::borrow::Cow::Owned(format!("{filename}.pdf"))
+                            };
+                            parts.push(json!({"type": "input_file", "filename": filename, "file_data": crate::data_url(media_type, data)}))
                         }
                         _ => {}
                     }
@@ -210,7 +222,15 @@ impl ModelClient for OpenAiResponses {
     async fn stream(&self, req: &ModelRequest) -> Result<EventStream, LlmError> {
         let body = self.request_body(req);
         let headers = self.request_headers(req);
-        let resp = http::post_json(&self.http, &format!("{}/responses", self.base_url), &headers, &body, self.attempts).await?;
+        let resp = http::post_with_document_fallback(
+            &self.http,
+            &format!("{}/responses", self.base_url),
+            &headers,
+            body,
+            self.attempts,
+            ("input", "input_file"),
+        )
+        .await?;
         if self.plan {
             match parse_chatgpt_limits(resp.headers()) {
                 Some(limits) => {
@@ -442,6 +462,46 @@ mod tests {
     use crate::{Accumulator, Message, ToolSpec};
 
     #[test]
+    fn official_responses_serializes_user_pdf_as_input_file() {
+        use base64::Engine;
+        let data = crate::tests::sample_pdf();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+        let req = ModelRequest {
+            model: "gpt-5.5".into(),
+            system: String::new(),
+            messages: vec![Message {
+                role: Role::User,
+                blocks: vec![
+                    Block::Text("Extracted report".into()),
+                    Block::Document { media_type: "application/pdf".into(), filename: "report.bin".into(), data },
+                    Block::Document { media_type: "application/octet-stream".into(), filename: "data.bin".into(), data: vec![0, 1] },
+                    Block::Document { media_type: "application/pdf".into(), filename: "bad.pdf".into(), data: b"%PDF-1.7".to_vec() },
+                ],
+            }],
+            tools: vec![],
+            max_output_tokens: None,
+            cache_key: None,
+            effort: None,
+            web_search: false,
+            json: false,
+        };
+        let api = OpenAiResponses::new("https://api.openai.com/v1", "tok", HashMap::new(), false).unwrap();
+        assert_eq!(
+            api.request_body(&req)["input"][0]["content"],
+            json!([
+                {"type": "input_text", "text": "Extracted report"},
+                {"type": "input_file", "filename": "report.bin.pdf", "file_data": format!("data:application/pdf;base64,{encoded}")},
+            ]),
+        );
+        for (url, plan) in
+            [("https://chatgpt.com/backend-api/codex", true), ("https://proxy.example/v1", false), ("https://api.openai.com/v1", true)]
+        {
+            let client = OpenAiResponses::new(url, "tok", HashMap::new(), plan).unwrap();
+            assert_eq!(client.request_body(&req)["input"][0]["content"], json!([{"type": "input_text", "text": "Extracted report"}]));
+        }
+    }
+
+    #[test]
     fn streamed_citations_survive_finished_items_without_changing_model_replay() {
         let text = "A fact. \u{e200}cite\u{e202}turn347046search1\u{e201}";
         let annotation = json!({"type": "url_citation", "url": "https://source.test/fact", "title": "The source", "start_index": 8, "end_index": text.chars().count()});
@@ -462,7 +522,10 @@ mod tests {
         let [Block::AnnotatedText { text: kept, annotations_json }] = message.blocks.as_slice() else { panic!("missing annotations") };
         assert_eq!(kept, text);
         assert_eq!(serde_json::from_str::<Value>(annotations_json).unwrap(), json!([annotation]));
-        assert_eq!(input_items(&[message]), input_items(&[Message { role: Role::Assistant, blocks: vec![Block::Text(text.into())] }]));
+        assert_eq!(
+            input_items(&[message], true),
+            input_items(&[Message { role: Role::Assistant, blocks: vec![Block::Text(text.into())] }], true)
+        );
     }
 
     #[test]
@@ -503,7 +566,7 @@ mod tests {
                 label: "web_search: q".into(),
             }],
         }];
-        let items = input_items(&msgs);
+        let items = input_items(&msgs, true);
         assert_eq!(
             items,
             [json!({"type": "web_search_call", "id": "ws_1", "status": "completed", "action": {"type": "search", "query": "q"}})]

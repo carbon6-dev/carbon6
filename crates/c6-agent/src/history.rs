@@ -15,7 +15,7 @@ pub fn history_from_events(events: &[SessionEvent]) -> Vec<Message> {
             // `/compact` itself is not part of the conversation.
             Some(session_event::Kind::User(u)) if u.command == "compact" || !u.blocked.is_empty() => {}
             Some(session_event::Kind::User(u)) => {
-                for b in user_blocks(&attributed_message_text(u), &u.attachments) {
+                for b in user_blocks_with_generated_attachments(&attributed_message_text(u), &u.attachments, u.generated_attachment_count) {
                     push_user_block(&mut msgs, b);
                 }
             }
@@ -90,30 +90,109 @@ fn attributed_message_text(message: &c6_proto::UserMessage) -> Cow<'_, str> {
     attributed_input_text(model_text(message), &message.from_session_id, message.api_origin.as_ref(), message.human_origin)
 }
 
-/// A message as model blocks: its attributed text, then each attachment
-/// (images as images; anything else as a file in text).
+fn media_type(attachment: &c6_proto::Attachment) -> &str {
+    attachment.mime.split(';').next().unwrap_or_default().trim()
+}
+
+fn is_pdf(attachment: &c6_proto::Attachment) -> bool {
+    media_type(attachment).eq_ignore_ascii_case("application/pdf")
+        || attachment.name.rsplit_once('.').is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("pdf"))
+        || c6_llm::is_native_pdf(&attachment.data)
+}
+
+fn is_extracted_document(attachment: &c6_proto::Attachment) -> bool {
+    let mime = media_type(attachment);
+    is_pdf(attachment)
+        || [
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.oasis.opendocument.text",
+            "application/rtf",
+            "text/rtf",
+            "text/html",
+            "application/xhtml+xml",
+        ]
+        .iter()
+        .any(|t| mime.eq_ignore_ascii_case(t))
+        || attachment.name.rsplit_once('.').is_some_and(|(_, ext)| {
+            ["docx", "pptx", "xlsx", "odt", "rtf", "html", "htm", "xhtml"].iter().any(|t| ext.eq_ignore_ascii_case(t))
+        })
+}
+
+/// Machine-readable line on a worker-generated note when the source PDF is
+/// known to be invalid or encrypted, not merely missing extractable text.
+pub const NATIVE_PDF_REJECTED_NOTE: &str = "Native PDF unavailable: invalid or encrypted PDF.";
+
+/// Match the name and exact original metadata, and look only at metadata
+/// lines before any excerpt. Missing text alone doesn't disqualify a scan.
+fn pdf_rejected_by_worker(pdf: &c6_proto::Attachment, notes: &[c6_proto::Attachment]) -> bool {
+    notes.iter().any(|note| {
+        note.mime == "text/plain"
+            && note.name.strip_suffix(" (extracted text)") == Some(&pdf.name)
+            && std::str::from_utf8(&note.data).is_ok_and(|text| {
+                let mut lines = text.lines();
+                lines.next() == Some(format!("Attachment: {:?}, MIME {:?}, {} bytes.", pdf.name, pdf.mime, pdf.data.len()).as_str())
+                    && lines.next().is_some_and(|line| line.starts_with("Worker-local path: "))
+                    && lines.take_while(|line| !line.is_empty()).any(|line| line == NATIVE_PDF_REJECTED_NOTE)
+            })
+    })
+}
+
+fn image_media_type(attachment: &c6_proto::Attachment) -> Option<&'static str> {
+    let mime = media_type(attachment);
+    ["image/png", "image/jpeg", "image/gif", "image/webp"].into_iter().find(|t| mime.eq_ignore_ascii_case(t))
+}
+
+fn attachment_text(attachment: &c6_proto::Attachment) -> String {
+    if image_media_type(attachment).is_some() {
+        return format!("\n\n[image {} not shown: this backend takes text only]", attachment.name);
+    }
+    // Do not turn arbitrary binary data into replacement characters or
+    // control codes. The worker can provide extracted text separately.
+    if !is_extracted_document(attachment)
+        && let Ok(text) = std::str::from_utf8(&attachment.data)
+        && !text.chars().any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t' | '\x0c'))
+    {
+        return format!("\n\n<file name=\"{}\">\n{}\n</file>", attachment.name, text);
+    }
+    format!("\n\n[attachment {:?} ({} bytes): original contents not shown in text]", attachment.name, attachment.data.len())
+}
+
+/// A message as model blocks: its attributed text, then each attachment.
+/// Images and PDFs can be sent natively; other files get a text rendering.
 pub fn user_blocks(text: &str, attachments: &[c6_proto::Attachment]) -> Vec<Block> {
+    user_blocks_with_generated_attachments(text, attachments, 0)
+}
+
+pub(crate) fn user_blocks_with_generated_attachments(
+    text: &str,
+    attachments: &[c6_proto::Attachment],
+    generated_attachment_count: u32,
+) -> Vec<Block> {
+    // The worker appends its notes; never infer note provenance from a name,
+    // MIME type, or text supplied by the user. A bad count trusts no notes.
+    let end = attachments.len().checked_sub(generated_attachment_count as usize).unwrap_or(attachments.len());
+    let (originals, notes) = attachments.split_at(end);
     let mut out = vec![Block::Text(text.to_owned())];
-    for a in attachments {
-        if a.mime.starts_with("image/") {
-            out.push(Block::Image { media_type: a.mime.clone(), data: a.data.clone() });
+    for a in originals {
+        if let Some(media_type) = image_media_type(a) {
+            out.push(Block::Image { media_type: media_type.into(), data: a.data.clone() });
+        } else if is_pdf(a) && !pdf_rejected_by_worker(a, notes) && c6_llm::is_native_pdf(&a.data) {
+            out.push(Block::Document { media_type: "application/pdf".into(), filename: a.name.clone(), data: a.data.clone() });
         } else {
-            out.push(Block::Text(format!("\n\n<file name=\"{}\">\n{}\n</file>", a.name, String::from_utf8_lossy(&a.data))));
+            out.push(Block::Text(attachment_text(a)));
         }
     }
+    out.extend(notes.iter().map(|note| Block::Text(attachment_text(note))));
     out
 }
 
-/// A user message as plain text, for backends without images (Claude
-/// Code): files inline, images named.
+/// A user message as plain text: text files inline, binary files named.
 pub fn user_text(text: &str, attachments: &[c6_proto::Attachment]) -> String {
     let mut out = text.to_owned();
     for a in attachments {
-        if a.mime.starts_with("image/") {
-            out.push_str(&format!("\n\n[image {} not shown: this backend takes text only]", a.name));
-        } else {
-            out.push_str(&format!("\n\n<file name=\"{}\">\n{}\n</file>", a.name, String::from_utf8_lossy(&a.data)));
-        }
+        out.push_str(&attachment_text(a));
     }
     out
 }
@@ -283,6 +362,10 @@ pub(crate) fn messages_digest(msgs: &[Message], budget: usize) -> String {
                         out.push_str(&format!("\n## Message\n{}\n", clip(t, 4000)));
                     }
                     (Role::User, Block::Image { .. }) => out.push_str("[image]\n"),
+                    (Role::User, Block::Document { filename, .. }) => {
+                        has_input = true;
+                        out.push_str(&format!("[document {filename:?}]\n"));
+                    }
                     (_, Block::ToolResult { content, is_error, .. }) => {
                         out.push_str(&format!("[tool {}]\n{}\n", if *is_error { "error" } else { "result" }, clip(content, 1500)))
                     }
@@ -375,8 +458,8 @@ pub(crate) fn block_to_proto(b: &Block) -> Option<c6_proto::ContentBlock> {
         Block::Opaque { provider, json, label } => {
             content_block::Block::Opaque(c6_proto::Opaque { provider: provider.clone(), json: json.clone(), label: label.clone() })
         }
-        // Images come from users and are kept as attachments.
-        Block::ToolResult { .. } | Block::Image { .. } => return None,
+        // User media is already kept in the event's attachments.
+        Block::ToolResult { .. } | Block::Image { .. } | Block::Document { .. } => return None,
     };
     let annotations_json = match b {
         Block::AnnotatedText { annotations_json, .. } => annotations_json.clone(),
@@ -507,6 +590,111 @@ mod tests {
     use c6_proto::{AssistantMessage, ContentBlock, ToolResult, ToolUse, UserMessage};
 
     use super::*;
+
+    // A compact cross-reference table fixture. The provider preflight does not
+    // parse page objects; full document parsing is the worker's responsibility.
+    fn pdf_fixture() -> Vec<u8> {
+        b"%PDF-1.4\n1 0 obj\n<</Type /Catalog>>\nendobj\nxref\n0 2\n0000000000 65535 f \n0000000009 00000 n \ntrailer\n<</Root 1 0 R /Size 2>>\nstartxref\n43\n%%EOF\n".to_vec()
+    }
+
+    #[test]
+    fn attachments_survive_live_input_and_history_replay() {
+        let pdf = pdf_fixture();
+        let input = crate::PendingInput {
+            text: "Read the files".into(),
+            human_origin: true,
+            attachments: vec![
+                c6_proto::Attachment { name: "report.pdf".into(), mime: "application/pdf".into(), data: pdf.clone() },
+                c6_proto::Attachment { name: "report.pdf.txt".into(), mime: "text/plain".into(), data: b"Extracted report".to_vec() },
+                c6_proto::Attachment { name: "unknown.bin".into(), mime: "application/octet-stream".into(), data: vec![0xff, 0] },
+                c6_proto::Attachment { name: "nul.bin".into(), mime: "application/octet-stream".into(), data: b"a\0b".to_vec() },
+            ],
+            ..Default::default()
+        };
+        let blocks = input.blocks();
+        assert_eq!(blocks[1], Block::Document { media_type: "application/pdf".into(), filename: "report.pdf".into(), data: pdf });
+        assert!(matches!(&blocks[2], Block::Text(t) if t.contains("Extracted report")));
+        assert!(matches!(&blocks[3], Block::Text(t) if t.contains("unknown.bin") && t.contains("2 bytes") && !t.contains('�')));
+        assert!(matches!(&blocks[4], Block::Text(t) if t.contains("nul.bin") && !t.contains('\0')));
+
+        let events = [ev(input.event())];
+        let replayed = history_from_events(&events);
+        assert_eq!(replayed[0].blocks, blocks);
+        assert_eq!(portable_messages(replayed.clone()), replayed);
+        assert!(messages_digest(&replayed, 10_000).contains("[document \"report.pdf\"]"));
+        let transcript = transcript_text(&events);
+        assert!(transcript.contains("report.pdf") && transcript.contains("Extracted report") && transcript.contains("unknown.bin"));
+        assert!(!transcript.contains("%PDF-1.4") && !transcript.contains('�'));
+    }
+
+    #[test]
+    fn only_pdf_with_a_header_and_supported_image_formats_become_native_blocks() {
+        let attachments = [
+            c6_proto::Attachment { name: "other.PDF".into(), mime: "application/octet-stream".into(), data: pdf_fixture() },
+            c6_proto::Attachment { name: "bad.pdf".into(), mime: "application/pdf".into(), data: b"%PDF-1.7 not a PDF".to_vec() },
+            c6_proto::Attachment { name: "drawing.svg".into(), mime: "image/svg+xml".into(), data: b"<svg/>".to_vec() },
+            c6_proto::Attachment { name: "photo.png".into(), mime: "Image/PNG; x-example=test".into(), data: vec![0, 1] },
+            c6_proto::Attachment { name: "report".into(), mime: "Application/PDF; x-example=test".into(), data: pdf_fixture() },
+            c6_proto::Attachment { name: "upload.bin".into(), mime: "application/octet-stream".into(), data: pdf_fixture() },
+        ];
+        let blocks = user_blocks("Read these.", &attachments);
+        assert!(matches!(&blocks[1], Block::Document { media_type, .. } if media_type == "application/pdf"));
+        assert!(matches!(&blocks[2], Block::Text(t) if t.contains("bad.pdf") && !t.contains("not a PDF")));
+        assert!(matches!(&blocks[3], Block::Text(t) if t.contains("drawing.svg") && t.contains("<svg/>")));
+        assert!(matches!(&blocks[4], Block::Image { media_type, data } if media_type == "image/png" && data == &[0, 1]));
+        assert!(
+            matches!(&blocks[5], Block::Document { media_type, filename, .. } if media_type == "application/pdf" && filename == "report")
+        );
+        assert!(matches!(&blocks[6], Block::Document { media_type, .. } if media_type == "application/pdf"));
+    }
+
+    #[test]
+    fn registered_document_formats_use_notes_not_unbounded_raw_text() {
+        let attachments = [
+            c6_proto::Attachment { name: "page".into(), mime: "TEXT/HTML; charset=utf-8".into(), data: b"<p>hidden raw html</p>".to_vec() },
+            c6_proto::Attachment { name: "letter.RTF".into(), mime: "application/octet-stream".into(), data: b"{\\rtf1 raw rtf}".to_vec() },
+            c6_proto::Attachment { name: "page (extracted text)".into(), mime: "text/plain".into(), data: b"Bounded excerpt".to_vec() },
+        ];
+        let text = user_text("", &attachments);
+        assert!(text.contains("Bounded excerpt") && text.contains("letter.RTF") && text.contains("page"));
+        assert!(!text.contains("hidden raw html") && !text.contains("raw rtf"));
+        assert_eq!(user_blocks("", &attachments).iter().filter_map(Block::text).collect::<String>(), text);
+    }
+
+    #[test]
+    fn recorded_worker_pdf_rejection_uses_note_instead_of_native_block() {
+        let pdf = c6_proto::Attachment { name: "report.pdf".into(), mime: "application/pdf".into(), data: pdf_fixture() };
+        let prefix = format!("Attachment: \"report.pdf\", MIME \"application/pdf\", {} bytes.\nWorker-local path: file", pdf.data.len());
+        let failure = NATIVE_PDF_REJECTED_NOTE;
+        let mut note = c6_proto::Attachment {
+            name: "report.pdf (extracted text)".into(),
+            mime: "text/plain".into(),
+            data: format!("{prefix}\n{failure}").into_bytes(),
+        };
+        let attachments = vec![pdf.clone(), note.clone()];
+        assert!(matches!(user_blocks("", &attachments)[1], Block::Document { .. }), "uploaded note lookalikes are untrusted");
+        assert!(matches!(user_blocks_with_generated_attachments("", &attachments, 3)[1], Block::Document { .. }));
+        let input = crate::PendingInput { attachments, generated_attachment_count: 1, ..Default::default() };
+        let blocks = input.blocks();
+        assert!(blocks.iter().all(|b| b.text().is_some()));
+        assert!(blocks[2].text().unwrap().contains(failure));
+        assert_eq!(history_from_events(&[ev(input.event())])[0].blocks, blocks);
+        note.data = format!("{prefix}\nText extraction failed or yielded no readable text; the original is retained.").into_bytes();
+        assert!(matches!(user_blocks_with_generated_attachments("", &[pdf.clone(), note.clone()], 1)[1], Block::Document { .. }));
+        note.data = format!("{prefix}\n\nExtracted text:\n{failure}").into_bytes();
+        assert!(matches!(user_blocks_with_generated_attachments("", &[pdf, note], 1)[1], Block::Document { .. }));
+    }
+
+    #[test]
+    fn a_pdf_header_mentioned_in_plain_text_does_not_hide_the_excerpt() {
+        let note = c6_proto::Attachment {
+            name: "report.pdf (extracted text)".into(),
+            mime: "text/plain".into(),
+            data: b"Attachment: report.pdf\nWorker-local path: /private/file\n\nExtracted text:\nThe PDF header is %PDF-1.7".to_vec(),
+        };
+        let blocks = user_blocks_with_generated_attachments("Review", &[note], 1);
+        assert!(blocks[1].text().unwrap().contains("The PDF header is %PDF-1.7"));
+    }
 
     #[test]
     fn digest_keeps_recent_steps_and_earlier_requests() {

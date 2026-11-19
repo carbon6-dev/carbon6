@@ -1,6 +1,7 @@
 //! The carbon6 worker (`c6w`): a headless daemon that attaches to the head and
 //! runs agent sessions on this machine.
 
+mod attachments;
 pub mod checkpoint;
 mod checkpoint_process;
 pub mod claude_code;
@@ -118,6 +119,9 @@ impl Worker {
         let trimmed = journal.trim(c6_core::now_ms() - JOURNAL_KEEP_MS, &sessions.active()).await?;
         if trimmed > 0 {
             tracing::info!(trimmed, "trimmed idle sessions from the journal");
+        }
+        if let Err(error) = attachments::prune(state_dir, &journal).await {
+            tracing::warn!(?error, "could not clean up evicted sessions' attachments");
         }
         Ok(Arc::new(Self {
             identity,

@@ -1,5 +1,67 @@
 # Conversations: people, attachments, and sessions from any reply box — Design
 
+## Session file uploads
+
+Session reply boxes and the new-session form accept any file, preserving its
+name, declared MIME type and original bytes. The limits remain 10 MiB per file
+and 20 MiB per message (32 MiB HTTP JSON bodies and 64 MiB head–worker messages
+leave room for encoding). Messages accept up to 64 files, with names up to
+1024 bytes and declared MIME types up to 256 bytes, bounding metadata and
+derived notes as well as the original bytes. Pick, paste and drop use the same path. Raster images
+(PNG, JPEG, GIF and WebP) retain inline previews; other formats have download
+chips showing their name, MIME type and byte size. Existing inline-image
+resizing is retained for large raster images to fit model image-input limits;
+documents and other files are never resized or re-encoded.
+
+On a worker, non-inline files are stored outside the repository in the private
+`<state>/attachments/<session>/` directory. Filenames include the input ID, an
+index, a content digest and a sanitized original name. A text attachment names
+the original, its type and size, and its absolute worker-local path. This works
+for Claude Code's Read tool and carbon6's file tools without copying documents
+into the user's repository. SSH sessions receive the same extracted context,
+but the note explicitly says the original path is on the worker, not accessible
+on the remote SSH host; there is no implicit remote upload.
+
+PDFs additionally become native Anthropic `document` blocks and official OpenAI
+Responses `input_file` blocks. Chat Completions/openai_compat, custom Responses
+endpoints and the ChatGPT subscription backend receive extracted text instead.
+Claude Code receives the text and path,
+with supported images still sent as image blocks. Native PDF providers receive
+the extracted text too, so changing providers can replay the same conversation.
+Structurally invalid or encrypted PDFs are not sent natively. If the provider
+rejects a native document or reports HTTP 413, carbon6 retries once without
+native documents, retaining the text and paths.
+
+Best-effort extraction runs on the worker before queuing the input. PDF uses
+an isolated converter: built-in PDFKit on macOS, or `pdftotext` from
+`poppler-utils` on Linux. Linux conversion has an address-space ceiling;
+macOS conversion is killed if its monitored resident memory exceeds the budget.
+Both have a deadline and bounded output; PDF parsing never runs in the worker
+process. DOCX, PPTX, XLSX and ODT read bounded body XML from their ZIP containers;
+HTML uses the streaming `html5ever` tokenizer, without building or recursively
+walking a DOM. These Rust libraries were already in the workspace lockfile. The
+knowledge extract kit cannot be invoked directly here: it requires a head-owned
+kit specification, approval and a container runtime. Using the small parser
+dependencies and isolated platform converters avoids pulling the extract kit's image and machine-learning stack
+into every session or requiring Docker just to attach a document. RTF uses
+macOS `textutil`, or `unrtf` on other systems when installed. No OCR or embedded
+object execution is performed. Extracted context is capped at 64 KiB per file
+(at most 64 PDF pages), with a truncation note. A five-second message-wide
+extraction deadline and two concurrent parsing slots bound how long input waits;
+a timed-out blocking Office/HTML parser keeps its slot until it finishes.
+Queue edits have a shorter deadline so a failed edit cannot apply later; they
+return an error without changing the queued input if preparation takes too long.
+On ordinary sends, extraction or storage failure never rejects
+the input: a note reports it, and the original bytes remain in the event log.
+
+The worker removes attachment directories whose sessions have been evicted by
+its normal startup journal trim. Restoring a session recreates local files from
+the original logged bytes and refreshes the paths before rebuilding model
+history. Saved excerpts are retained even if a converter is no longer available.
+Generated notes have worker-stamped provenance, not a user-spoofable filename
+convention. Ending a turn or archiving a conversation does not remove files still
+needed by that session.
+
 Status: built 2026-10-28 (§5 is what was built, step by step).
 
 Mail, Chat and the Brief show conversations. Three things a real client (and a good assistant) gives you that they don't yet:

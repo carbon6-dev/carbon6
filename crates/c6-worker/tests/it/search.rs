@@ -144,11 +144,15 @@ async fn search_finds_events_and_survives_reindex() {
 
     // A format change re-indexes on start, without duplicates.
     stop.cancel();
+    let version = head.state.store.setting("search.version").await.unwrap().expect("search version before restart");
+    assert_ne!(version, "0");
     head.state.store.set_setting("search.version", "0").await.unwrap();
     head.shutdown().await.unwrap();
     let head = crate::restart_head(cfg(head_dir.path(), ports.0, ports.1)).await;
-    eventually("re-index", async || (head.state.store.setting("search.version").await.unwrap().as_deref() == Some("1")).then_some(()))
-        .await;
+    eventually("re-index", async || {
+        (head.state.store.setting("search.version").await.unwrap().as_deref() == Some(version.as_str())).then_some(())
+    })
+    .await;
     let r = search(&http, &api, &[("q", "quokka")]).await;
     assert_eq!(r["results"][0]["total_hits"], 1, "{r}");
     head.shutdown().await.unwrap();

@@ -972,13 +972,21 @@ pub(crate) async fn check_worker_subagent_input(st: &HeadState, capabilities: &[
 const MAX_ATTACHMENT: usize = 10 * 1024 * 1024;
 const MAX_ATTACHMENTS: usize = 20 * 1024 * 1024;
 
-/// Uploaded attachments, checked: images of the kinds models take, or
-/// UTF-8 text, within size limits.
+/// Decode uploaded bytes within size limits without changing their metadata.
 fn attachments(uploads: &[api::AttachmentUpload]) -> anyhow::Result<Vec<c6_proto::Attachment>> {
     use base64::Engine;
+    // Bound per-file metadata and the derived worker notes as well as bytes.
+    // Otherwise many empty files can expand a small upload into an event too
+    // large to sync over the head–worker channel.
+    if uploads.len() > 64 {
+        return Err(bad_request("at most 64 attachments per message"));
+    }
     let mut out = Vec::new();
     let mut total = 0;
     for u in uploads {
+        if u.name.len() > 1024 || u.mime.len() > 256 {
+            return Err(bad_request("attachment names must be at most 1024 bytes and MIME types at most 256 bytes"));
+        }
         let data = base64::engine::general_purpose::STANDARD
             .decode(u.data.trim())
             .map_err(|_| bad_request(format!("{}: not valid base64", u.name)))?;
@@ -986,15 +994,10 @@ fn attachments(uploads: &[api::AttachmentUpload]) -> anyhow::Result<Vec<c6_proto
             return Err(bad_request(format!("{} is larger than 10 MB", u.name)));
         }
         total += data.len();
-        let mime = u.mime.to_ascii_lowercase();
-        let image = matches!(mime.as_str(), "image/png" | "image/jpeg" | "image/gif" | "image/webp");
-        if !image && (mime.starts_with("image/") || std::str::from_utf8(&data).is_err()) {
-            return Err(bad_request(format!("{}: only PNG, JPEG, GIF and WebP images, or text files, can be attached", u.name)));
+        if total > MAX_ATTACHMENTS {
+            return Err(bad_request("attachments total more than 20 MB"));
         }
-        out.push(c6_proto::Attachment { name: u.name.clone(), mime: if image { mime } else { "text/plain".into() }, data });
-    }
-    if total > MAX_ATTACHMENTS {
-        return Err(bad_request("attachments total more than 20 MB"));
+        out.push(c6_proto::Attachment { name: u.name.clone(), mime: u.mime.clone(), data });
     }
     Ok(out)
 }
@@ -2895,6 +2898,50 @@ mod input_compatibility_tests {
     use super::*;
     use crate::store::tests::legacy_input_command;
 
+    fn upload(name: &str, mime: &str, bytes: &[u8]) -> api::AttachmentUpload {
+        use base64::Engine;
+        api::AttachmentUpload { name: name.into(), mime: mime.into(), data: base64::engine::general_purpose::STANDARD.encode(bytes) }
+    }
+
+    #[test]
+    fn uploaded_attachments_preserve_name_mime_and_bytes() {
+        for (name, mime, bytes) in [
+            ("Résumé.pdf", "application/pdf", b"%PDF-1.7\n\xff".as_slice()),
+            ("report.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", b"PK\x03\x04\x00\xff"),
+            ("frames.heic", "image/heic", b"\x00\xff"),
+            ("source.rs", "Text/X-Rust; charset=UTF-8", b"fn main() {}"),
+            ("unknown", "application/octet-stream", b"\xff\x00"),
+            ("no-declared-type", "", b"\x00\xff"),
+        ] {
+            let files = attachments(&[upload(name, mime, bytes)]).unwrap();
+            assert_eq!(files, vec![c6_proto::Attachment { name: name.into(), mime: mime.into(), data: bytes.to_vec() }]);
+        }
+    }
+
+    #[test]
+    fn uploaded_attachments_bound_count_and_metadata() {
+        let empty = upload("empty.bin", "application/octet-stream", b"");
+        assert_eq!(attachments(&vec![empty.clone(); 64]).unwrap().len(), 64);
+        assert!(attachments(&vec![empty; 65]).unwrap_err().to_string().contains("64 attachments"));
+        assert!(attachments(&[upload(&"n".repeat(1025), "text/plain", b"")]).is_err());
+        assert!(attachments(&[upload("name", &"m".repeat(257), b"")]).is_err());
+        assert!(attachments(&[upload(&"n".repeat(1024), &"m".repeat(256), b"")]).is_ok());
+    }
+
+    #[test]
+    fn uploaded_attachments_require_base64_and_enforce_decoded_byte_limits() {
+        let malformed = api::AttachmentUpload { name: "malformed.bin".into(), mime: "application/octet-stream".into(), data: "%%%".into() };
+        assert!(attachments(&[malformed]).unwrap_err().to_string().contains("not valid base64"));
+
+        let bytes = vec![0xff; MAX_ATTACHMENT + 1];
+        let exact = upload("exact.bin", "application/octet-stream", &bytes[..MAX_ATTACHMENT]);
+        assert_eq!(attachments(&[exact.clone(), exact.clone()]).unwrap().iter().map(|a| a.data.len()).sum::<usize>(), MAX_ATTACHMENTS);
+        let one_byte = upload("one.bin", "application/octet-stream", &bytes[..1]);
+        assert!(attachments(&[exact.clone(), exact, one_byte]).unwrap_err().to_string().contains("attachments total more than 20 MB"));
+        let oversize = upload("big.bin", "application/octet-stream", &bytes);
+        assert!(attachments(&[oversize]).unwrap_err().to_string().contains("big.bin is larger than 10 MB"));
+    }
+
     // A real old fork input decoder: a string at 16 must fail, rather than
     // merely being absent from a new-schema round trip's assertions.
     #[derive(Clone, PartialEq, prost::Message)]
@@ -2967,7 +3014,7 @@ mod input_compatibility_tests {
         .await
         .unwrap();
         let text = format!("Read @memex:{} [@note](c6:item:{}) [@document](c6:item:{}) [@work](c6:work:{work})", ids[0], ids[0], ids[1]);
-        let upload = api::AttachmentUpload { name: "original.txt".into(), mime: "text/plain".into(), data: "b3JpZ2luYWw=".into() };
+        let upload = upload("Résumé.pdf", "application/pdf", b"%PDF-1.7\n\xff");
         for app in [false, true] {
             let req = serde_json::from_value(json!({
                 "worker_id": worker.0, "cwd": "", "connection_id": "api", "model": "m",
@@ -3002,7 +3049,9 @@ mod input_compatibility_tests {
             assert_eq!(later.text, text);
             assert_eq!(first.attachments, later.attachments);
             assert_eq!(first.attachments.len(), 2, "original upload plus generated memex card");
-            assert_eq!(first.attachments[0].data, b"original");
+            assert_eq!(first.attachments[0].name, "Résumé.pdf");
+            assert_eq!(first.attachments[0].mime, "application/pdf");
+            assert_eq!(first.attachments[0].data, b"%PDF-1.7\n\xff");
             assert_eq!(first.attachments[1].name, format!("@memex:{}", ids[0]));
             assert!(String::from_utf8_lossy(&first.attachments[1].data).contains("ALLOWED_NOTE_CONTEXT"));
             assert!(first.prompt.contains("ALLOWED_NOTE_CONTEXT"), "{}", first.prompt);

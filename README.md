@@ -610,7 +610,7 @@ Hover one of your messages: **↶ Rewind** takes the conversation back to before
 
 ### Attachments and @-mentions
 
-Paste, drop or pick (📎) images and text files into the message box; they go with the message (images as images, for models that see them; text files inline). Type `@` to mention a file or folder in the session's folder: a fuzzy finder completes the path, and the worker attaches the file (or a folder's listing) when the message arrives, so the model has it without a tool call. Files over 256 KB are mentioned but not inlined. Limits: 10 MB per upload, 20 MB per message. The Claude Code backend gets text only.
+Paste, drop or pick (📎) files of any type in the message box or when starting a session. Documents keep their filename, media type and original bytes; large inline images are still resized for model limits. The worker stores non-inline files outside your repository and tells the agent their paths, with best-effort extracted text for PDF, Office, HTML and RTF documents. Anthropic and the official OpenAI Responses API also receive PDFs natively; other backends use the text and path. See [session file uploads](docs/conversations.md#session-file-uploads) for extraction limits and SSH behavior. Type `@` to mention a file or folder in the session's folder: a fuzzy finder completes the path, and the worker attaches the file (or a folder's listing) when the message arrives, so the model has it without a tool call. Files over 256 KB are mentioned but not inlined. Upload limits: 10 MiB per file, 20 MiB per message.
 
 **Drafts survive a reload**, including attachments in session and Ask reply boxes
 and the ordinary new-session form. Text stays in this browser's localStorage;

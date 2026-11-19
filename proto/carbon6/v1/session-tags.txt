@@ -363,3 +363,5 @@ carbon6.v1.UserMessage 16 TaskCardOrigin task_card_origin
 # The guard permits only this exact history with canonical human18 registered.
 carbon6.v1.UserInput 16 string prompt
 carbon6.v1.UserInput 18 bool human_origin
+# Only the worker stamps provenance for appended attachment notes.
+carbon6.v1.UserMessage 17 uint32 generated_attachment_count

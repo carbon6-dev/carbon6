@@ -500,6 +500,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn chat_completions_uses_extracted_text_without_native_document() {
+        let c = OpenAiChat::new("http://localhost:1/v1", "", HashMap::new()).unwrap();
+        let mut req = json_request("none");
+        req.messages[0].blocks = vec![
+            Block::Document { media_type: "application/pdf".into(), filename: "report.pdf".into(), data: b"%PDF".to_vec() },
+            Block::Text("Extracted report".into()),
+        ];
+        assert_eq!(c.request_body(&req)["messages"][1], json!({"role": "user", "content": "Extracted report"}));
+    }
+
     #[tokio::test]
     async fn length_finish_reason_is_normalized() {
         use c6_testkit::{MockLlm, Reply, within};

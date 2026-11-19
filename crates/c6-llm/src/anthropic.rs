@@ -111,6 +111,13 @@ fn messages(msgs: &[crate::Message]) -> Vec<Value> {
                         let data = base64::engine::general_purpose::STANDARD.encode(data);
                         Some(json!({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}}))
                     }
+                    Block::Document { media_type, filename, data }
+                        if m.role == Role::User && media_type == "application/pdf" && crate::is_native_pdf(data) =>
+                    {
+                        use base64::Engine;
+                        let data = base64::engine::general_purpose::STANDARD.encode(data);
+                        Some(json!({"type": "document", "title": filename, "source": {"type": "base64", "media_type": media_type, "data": data}}))
+                    }
                     Block::SignedThinking { text, signature } if m.role == Role::Assistant => {
                         Some(json!({"type": "thinking", "thinking": text, "signature": signature}))
                     }
@@ -143,7 +150,15 @@ fn messages(msgs: &[crate::Message]) -> Vec<Value> {
 impl ModelClient for Anthropic {
     async fn stream(&self, req: &ModelRequest) -> Result<EventStream, LlmError> {
         let body = self.request_body(req);
-        let resp = http::post_json(&self.http, &format!("{}/v1/messages", self.base_url), &self.headers, &body, self.attempts).await?;
+        let resp = http::post_with_document_fallback(
+            &self.http,
+            &format!("{}/v1/messages", self.base_url),
+            &self.headers,
+            body,
+            self.attempts,
+            ("messages", "document"),
+        )
+        .await?;
         let state = State::new(resp.bytes_stream().boxed());
         Ok(futures::stream::unfold(state, |mut st| async move {
             loop {
@@ -401,6 +416,27 @@ fn opaque_label(b: &Value) -> String {
 mod tests {
     use super::*;
     use crate::{Accumulator, Message, ToolSpec};
+
+    #[test]
+    fn serializes_user_pdf_as_base64_document() {
+        use base64::Engine;
+        let data = crate::tests::sample_pdf();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+        let pdf = Block::Document { media_type: "application/pdf".into(), filename: "report.pdf".into(), data };
+        let unsupported = Block::Document { media_type: "application/octet-stream".into(), filename: "data.bin".into(), data: vec![0, 1] };
+        let invalid = Block::Document { media_type: "application/pdf".into(), filename: "bad.pdf".into(), data: b"%PDF-1.7".to_vec() };
+        let messages = messages(&[
+            Message { role: Role::User, blocks: vec![Block::Text("Read this.".into()), pdf.clone(), unsupported, invalid] },
+            Message { role: Role::Assistant, blocks: vec![pdf] },
+        ]);
+        assert_eq!(
+            messages,
+            vec![json!({"role": "user", "content": [
+                {"type": "text", "text": "Read this."},
+                {"type": "document", "title": "report.pdf", "source": {"type": "base64", "media_type": "application/pdf", "data": encoded}},
+            ]})],
+        );
+    }
 
     fn run(events: &[&str]) -> Vec<Result<ModelEvent, String>> {
         let mut st = State::new(futures::stream::empty().boxed());

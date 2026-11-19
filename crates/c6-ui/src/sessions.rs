@@ -1993,11 +1993,11 @@ fn SessionForm(
             {move || (!attachments.with(Vec::is_empty)).then(|| view! {
                 <div class="flex flex-wrap gap-2 px-2 pt-2">
                     {attachments.get().into_iter().enumerate().map(|(i, a)| {
-                        let image = a.mime.starts_with("image/");
+                        let preview_mime = crate::session::attachment_preview_mime(&a.mime);
                         view! {
                             <div class="flex items-center gap-1.5 rounded-md border border-zinc-200 bg-white p-1 pr-2 text-xs dark:border-zinc-700 dark:bg-zinc-900">
-                                {if image {
-                                    view! { <img class="h-10 w-10 rounded object-cover" src=format!("data:{};base64,{}", a.mime, a.data) /> }.into_any()
+                                {if let Some(mime) = preview_mime {
+                                    view! { <img class="h-10 w-10 rounded object-cover" src=format!("data:{mime};base64,{}", a.data) /> }.into_any()
                                 } else {
                                     view! { <span class="px-1">{crate::icons::icon(crate::icons::Icon::File, crate::icons::Size::S14)}</span> }.into_any()
                                 }}

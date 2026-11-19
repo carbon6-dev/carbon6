@@ -4267,8 +4267,11 @@ pub(crate) fn tokens(n: u64) -> String {
 /// The files a paste, drop or picker brought (`ev`), added to `attachments`
 /// within the head's limits; else why not, in `error`.
 pub(crate) fn add_attachments(ev: web_sys::Event, attachments: RwSignal<Vec<c6_api::AttachmentUpload>>, error: RwSignal<Option<String>>) {
+    // Read starts synchronously to capture clipboard/drag data before the
+    // browser closes access to the event's file list.
+    let reading = js_read_files(&ev);
     spawn_local(async move {
-        match js_read_files(&ev).await.ok().and_then(|v| v.as_string()) {
+        match wasm_bindgen_futures::JsFuture::from(reading).await.ok().and_then(|v| v.as_string()) {
             Some(json) => match serde_json::from_str::<Vec<c6_api::AttachmentUpload>>(&json) {
                 Ok(files) => match too_large(&attachments.get_untracked(), &files) {
                     Some(e) => error.set(Some(e)),
@@ -4281,16 +4284,27 @@ pub(crate) fn add_attachments(ev: web_sys::Event, attachments: RwSignal<Vec<c6_a
     });
 }
 
+fn attachment_size(a: &c6_api::AttachmentUpload) -> usize {
+    let data = a.data.trim();
+    (data.len() / 4 * 3).saturating_sub(data.len() - data.trim_end_matches('=').len())
+}
+
+/// Only the raster formats supported by the inline transcript preview.
+/// Other images can still be picked, sent and opened as files.
+pub(crate) fn attachment_preview_mime(mime: &str) -> Option<&'static str> {
+    let essence = mime.split(';').next().unwrap_or_default().trim();
+    ["image/png", "image/jpeg", "image/gif", "image/webp"].into_iter().find(|m| m.eq_ignore_ascii_case(essence))
+}
+
 /// Why `adding` can't join the attachments already `held`, if it can't: the
 /// head takes 10 MB a file and 20 MB a message (c6-head sessions.rs).
 pub(crate) fn too_large(held: &[c6_api::AttachmentUpload], adding: &[c6_api::AttachmentUpload]) -> Option<String> {
     const MB: usize = 1024 * 1024;
-    let size = |a: &c6_api::AttachmentUpload| a.data.trim().len() / 4 * 3;
     let mb = |n: usize| format!("{:.1} MB", n as f64 / MB as f64);
-    if let Some(a) = adding.iter().find(|a| size(a) > 10 * MB) {
-        return Some(format!("{} is too large to attach ({}; the limit is 10 MB a file)", a.name, mb(size(a))));
+    if let Some(a) = adding.iter().find(|a| attachment_size(a) > 10 * MB) {
+        return Some(format!("{} is too large to attach ({}; the limit is 10 MB a file)", a.name, mb(attachment_size(a))));
     }
-    let total: usize = held.iter().chain(adding).map(size).sum();
+    let total: usize = held.iter().chain(adding).map(attachment_size).sum();
     (total > 20 * MB).then(|| format!("Too much to send in one message ({}; the limit is 20 MB in all)", mb(total)))
 }
 
@@ -4469,10 +4483,10 @@ pub(crate) fn FullImage(
 /// An image sent in the transcript: a click shows it full size, and ⌘-,
 /// Ctrl-, Shift- or middle-click opens it in a new tab as a link would.
 #[component]
-fn TranscriptImage(src: String, name: String) -> impl IntoView {
+fn TranscriptImage(src: String, name: String, info: String) -> impl IntoView {
     let open = RwSignal::new(false);
     let (full, title) = (src.clone(), name.clone());
-    let (href, hover) = (src.clone(), name.clone());
+    let (href, hover) = (src.clone(), format!("{name} · {info}"));
     view! {
         <a href=href target="_blank" title=hover
             on:click=move |ev: web_sys::MouseEvent| {
@@ -4486,7 +4500,7 @@ fn TranscriptImage(src: String, name: String) -> impl IntoView {
         {move || open.get().then(|| {
             let href = full.clone();
             view! {
-                <FullImage src=full.clone() name=title.clone() close=move |_| open.set(false)>
+                <FullImage src=full.clone() name=title.clone() info=info.clone() close=move |_| open.set(false)>
                     <a class=FULL_BUTTON href=href.clone() target="_blank" on:click=move |_| open.set(false)>"Open in new tab"</a>
                 </FullImage>
             }
@@ -4495,11 +4509,16 @@ fn TranscriptImage(src: String, name: String) -> impl IntoView {
 }
 
 /// A file sent in the transcript (pictures use `TranscriptImage`).
-fn transcript_file(src: String, name: String, size: u64) -> AnyView {
+fn transcript_file(src: String, name: String, info: String) -> AnyView {
+    let hover = format!("{name} · {info}");
     view! {
-        <a href=src target="_blank" title=format!("{size} bytes")
-            class="flex items-center gap-1 rounded-md border border-zinc-300 bg-white px-2 py-1 font-mono text-xs text-zinc-600 hover:text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100">
-            {icon(Icon::File, Size::S14)}{name}
+        <a href=src target="_blank" title=hover
+            class="flex min-w-0 items-center gap-1.5 rounded-md border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-600 hover:text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100">
+            <span class="shrink-0">{icon(Icon::File, Size::S14)}</span>
+            <span class="min-w-0">
+                <span class="block truncate font-mono">{name}</span>
+                <span class="block truncate text-muted">{info}</span>
+            </span>
         </a>
     }.into_any()
 }
@@ -4623,10 +4642,12 @@ fn user_attachments(session: &str, seq: u64, attachments: &[c6_api::AttachmentIn
         .enumerate()
         .map(|(i, a)| {
             let url = crate::api::url(&format!("/api/v1/sessions/{session}/attachments/{seq}/{i}"));
-            if a.mime.starts_with("image/") {
-                view! { <TranscriptImage src=url name=a.name.clone() /> }.into_any()
+            let mime = if a.mime.is_empty() { "application/octet-stream" } else { &a.mime };
+            let info = format!("{mime} · {} bytes", a.size);
+            if attachment_preview_mime(mime).is_some() {
+                view! { <TranscriptImage src=url name=a.name.clone() info=info /> }.into_any()
             } else {
-                transcript_file(url, a.name.clone(), a.size)
+                transcript_file(url, a.name.clone(), info)
             }
         })
         .collect_view()
@@ -5822,8 +5843,8 @@ extern "C" {
     #[wasm_bindgen(js_namespace = c6Files, js_name = has)]
     pub(crate) fn js_has_files(ev: &web_sys::Event) -> bool;
 
-    #[wasm_bindgen(catch, js_namespace = c6Files, js_name = read)]
-    pub(crate) async fn js_read_files(ev: &web_sys::Event) -> Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>;
+    #[wasm_bindgen(js_namespace = c6Files, js_name = read)]
+    fn js_read_files(ev: &web_sys::Event) -> js_sys::Promise;
 }
 
 /// Starts a browser download of `url`.
@@ -6000,20 +6021,7 @@ fn Composer(
     );
     let (mention, command, suggest_pop) = (completion.mention, completion.command, completion.pop);
     let update_mention = move || completion.update.run(());
-    let add_files = move |ev: web_sys::Event| {
-        spawn_local(async move {
-            match js_read_files(&ev).await.ok().and_then(|v| v.as_string()) {
-                Some(json) => match serde_json::from_str::<Vec<c6_api::AttachmentUpload>>(&json) {
-                    Ok(files) => match too_large(&attachments.get_untracked(), &files) {
-                        Some(e) => error.set(Some(e)),
-                        None => attachments.update(|a| a.extend(files)),
-                    },
-                    Err(e) => error.set(Some(e.to_string())),
-                },
-                None => error.set(Some("could not read the file".into())),
-            }
-        });
-    };
+    let add_files = move |ev: web_sys::Event| add_attachments(ev, attachments, error);
     let (col, ws) = (crate::workspace::use_column(), crate::workspace::use_workspace());
     // `now`: Send now (the agent gets it at once, not at its next step).
     let send_with = move |now: bool| {
@@ -6275,13 +6283,13 @@ fn Composer(
                 {move || (!attachments.with(Vec::is_empty)).then(|| view! {
                     <div class="flex flex-wrap gap-2 px-2 pt-2">
                         {attachments.get().into_iter().enumerate().map(|(i, a)| {
-                            let image = a.mime.starts_with("image/");
+                            let preview_mime = attachment_preview_mime(&a.mime);
                             view! {
                                 <div class="group relative flex items-center gap-1.5 rounded-md border border-zinc-200 bg-white p-1 pr-2 text-xs dark:border-zinc-700 dark:bg-zinc-900">
-                                    {if image {
+                                    {if let Some(mime) = preview_mime {
                                         view! {
                                             <button class="shrink-0 rounded focus-visible:ring-2 focus-visible:ring-blue-500" title="See it full size" on:click=move |_| preview.set(Some(i))>
-                                                <img class="h-10 w-10 rounded object-cover" src=format!("data:{};base64,{}", a.mime, a.data) />
+                                                <img class="h-10 w-10 rounded object-cover" src=format!("data:{mime};base64,{}", a.data) />
                                             </button>
                                         }.into_any()
                                     } else {
@@ -6295,15 +6303,16 @@ fn Composer(
                     </div>
                 })}
                 // An image waiting to go, full size: Esc or a click outside closes it.
-                {move || preview.get().and_then(|i| attachments.with(|v| v.get(i).cloned()).map(|a| (i, a))).map(|(i, a)| {
-                    let size = a.data.len() * 3 / 4;
+                {move || preview.get().and_then(|i| attachments.with(|v| v.get(i).cloned()).map(|a| (i, a))).and_then(|(i, a)| {
+                    let mime = attachment_preview_mime(&a.mime)?;
+                    let size = attachment_size(&a);
                     let size = if size >= 1 << 20 { format!("{:.1} MB", size as f64 / (1 << 20) as f64) } else { format!("{} KB", size.div_ceil(1024)) };
-                    view! {
-                        <FullImage src=format!("data:{};base64,{}", a.mime, a.data) name=a.name.clone() info=size close=move |_| preview.set(None)>
+                    Some(view! {
+                        <FullImage src=format!("data:{mime};base64,{}", a.data) name=a.name.clone() info=size close=move |_| preview.set(None)>
                             <button class=FULL_BUTTON
                                 on:click=move |_| { attachments.update(|v| { if i < v.len() { v.remove(i); } }); preview.set(None) }>"Remove"</button>
                         </FullImage>
-                    }
+                    })
                 })}
                     <crate::completion::CompletionList completion=completion />
                     // The suggestion is the empty box's text, in italics, with a
@@ -7823,7 +7832,7 @@ mod tests {
                 notice_line("Build finished", "", "normal").to_html(),
                 memory_line("remember", "n1", "", "Use this branch").to_html(),
                 memory_line("forget", "n1", "", "").to_html(),
-                transcript_file("/notes.txt".into(), "notes.txt".into(), 42).to_html(),
+                transcript_file("/notes.txt".into(), "notes.txt".into(), "text/plain · 42 bytes".into()).to_html(),
                 crate::outputs::published_line("s1", 1, "report.txt", "Report", "text/plain", 42).to_html(),
                 view! { <ApprovalCard session="s1".into() call_id="a1".into() tool="bash".into() input="echo ready".into() policy="ask".into() message="Review".into() open=Signal::derive(|| true) /> }.to_html(),
                 view! { <QuestionCard session="s1".into() call_id="q1".into() title="Which branch?".into() fields=Vec::new() open=Signal::derive(|| true) /> }.to_html(),
@@ -8038,6 +8047,22 @@ mod tests {
         assert_eq!(too_large(&[], &[file("small.png", 3)]), None);
         assert!(too_large(&[], &[file("big.png", 11)]).is_some_and(|e| e.contains("big.png") && e.contains("10 MB a file")));
         assert!(too_large(&[file("a.png", 9), file("b.png", 9)], &[file("c.png", 9)]).is_some_and(|e| e.contains("20 MB in all")));
+        let mut exact = file("exact.bin", 10);
+        exact.mime = "application/octet-stream".into();
+        exact.data.push_str("AA=="); // 10 MiB is one byte over a multiple of three.
+        assert_eq!(too_large(&[exact.clone()], &[exact]), None);
+    }
+
+    #[test]
+    fn arbitrary_files_show_their_name_media_type_and_size_in_the_transcript() {
+        for (name, mime) in [("Résumé.pdf", "application/pdf"), ("diagram.svg", "image/svg+xml"), ("camera.heic", "image/heic")] {
+            let html =
+                user_attachments("session", 42, &[c6_api::AttachmentInfo { name: name.into(), mime: mime.into(), size: 1234 }]).to_html();
+            for expected in ["/attachments/42/0", name, mime, "1234 bytes"] {
+                assert!(html.contains(expected), "missing {expected}: {html}");
+            }
+            assert!(!html.contains("<img"), "unsupported preview should use a file chip: {html}");
+        }
     }
 
     /// A notice is waiting until a turn takes it.
