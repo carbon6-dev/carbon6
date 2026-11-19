@@ -36,6 +36,10 @@
     if (source) {
       const src = next.querySelector(":scope > .fv-source-view"), rendered = next.querySelector(":scope > .fv-rendered");
       if (src && rendered) { src.hidden = false; rendered.hidden = true; }
+      next.querySelectorAll('[data-fv-action="source"]').forEach(button => {
+        if (button.closest(".fv") !== next) return;
+        button.setAttribute("aria-pressed", String(button.dataset.fvView !== "pretty"));
+      });
     }
     if (split) {
       next.querySelectorAll(".fv-diff-unified").forEach(el => { el.hidden = true; });
@@ -55,8 +59,18 @@
     if (!root) return;
     if (target.hasAttribute("data-fv-copy") || target.hasAttribute("data-fv-copy-json")) {
       ev.preventDefault(); ev.stopPropagation();
-      try { await navigator.clipboard.writeText(target.hasAttribute("data-fv-copy-json") ? JSON.parse(target.dataset.fvCopyJson) : target.dataset.fvCopy); target.textContent = "Copied"; }
-      catch (_) { target.textContent = "Copy unavailable"; }
+      let message;
+      try {
+        await navigator.clipboard.writeText(target.hasAttribute("data-fv-copy-json") ? JSON.parse(target.dataset.fvCopyJson) : target.dataset.fvCopy);
+        message = "Copied"; target.dataset.copied = "true";
+      } catch (_) { message = "Copy unavailable"; }
+      target.title = message;
+      let status = root.querySelector(".fv-copy-status");
+      if (!status) {
+        status = document.createElement("span"); status.className = "fv-copy-status";
+        status.setAttribute("role", "status"); root.append(status);
+      }
+      status.textContent = message;
       return;
     }
     if (target.hasAttribute("data-fv-sort")) {

@@ -16,7 +16,7 @@ fn limit(input: &Input, compact: usize) -> usize {
 }
 
 fn more(out: &mut String, label: &str) {
-    let _ = write!(out, "<button type=\"button\" data-fv-action=\"more\">{label}</button>");
+    let _ = write!(out, "<button type=\"button\" class=\"fv-more\" data-fv-action=\"more\">{label}</button>");
 }
 
 pub(crate) fn diff(input: &Input) -> String {

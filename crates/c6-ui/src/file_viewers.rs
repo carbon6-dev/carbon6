@@ -6,6 +6,8 @@ use leptos::prelude::*;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::icons::{Icon, Size, icon_html};
+
 pub(crate) fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
 }
@@ -137,7 +139,8 @@ pub(crate) fn json_lines(text: &str) -> impl Iterator<Item = (usize, Result<Valu
 }
 
 fn button(action: &str, label: &str) -> String {
-    format!("<button type=\"button\" data-fv-action=\"{action}\">{label}</button>")
+    let class = if action == "more" { "fv-more" } else { "fv-control" };
+    format!("<button type=\"button\" class=\"{class}\" data-fv-action=\"{action}\">{label}</button>")
 }
 
 fn code(text: &str, language: &str, line: usize, limit: usize) -> String {
@@ -203,7 +206,7 @@ fn table(input: &Input, delimiter: char) -> String {
         10_000
     };
     let mut out = format!(
-        "<label>Filter <input data-fv-filter type=\"search\" value=\"{}\"></label><p>{} rows</p><div class=\"fv-table-scroll\" tabindex=\"0\"><table><thead><tr>",
+        "<div class=\"fv-table-tools\"><label>Filter <input data-fv-filter type=\"search\" value=\"{}\"></label><span class=\"fv-row-count\">{} rows</span></div><div class=\"fv-table-scroll\" tabindex=\"0\"><table><thead><tr>",
         esc(&input.filter),
         body.len()
     );
@@ -240,14 +243,20 @@ fn tree(value: &Value, path: &str, label: &str, budget: &mut usize, depth: usize
     }
     *budget -= 1;
     let copy = format!(
-        "<button type=\"button\" data-fv-copy-json=\"{}\" title=\"Copy JSON Pointer\">Copy path</button>",
-        esc(&serde_json::to_string(path).unwrap_or_default())
+        "<button type=\"button\" class=\"fv-copy-icon {}\" data-fv-copy-json=\"{}\" aria-label=\"Copy JSON Pointer for {}\" title=\"Copy JSON Pointer\">{}</button>",
+        crate::components::BAR_BUTTON,
+        esc(&serde_json::to_string(path).unwrap_or_default()),
+        esc(&clipped(label)),
+        icon_html(Icon::Copy, Size::S14)
     );
     let label = esc(&clipped(label));
     match value {
         Value::Object(map) => {
-            let mut out =
-                format!("<details{}><summary>{label} {{ {} keys }} {copy}</summary>", if depth == 0 { " open" } else { "" }, map.len());
+            let mut out = format!(
+                "<details{}><summary class=\"fv-json-row\"><span>{label} <span class=\"fv-json-count\">{{ {} keys }}</span></span>{copy}</summary>",
+                if depth == 0 { " open" } else { "" },
+                map.len()
+            );
             for (key, val) in map.iter().take(*budget) {
                 out.push_str(&tree(val, &pointer(path, key), key, budget, depth + 1));
             }
@@ -255,28 +264,33 @@ fn tree(value: &Value, path: &str, label: &str, budget: &mut usize, depth: usize
             out
         }
         Value::Array(array) => {
-            let mut out =
-                format!("<details{}><summary>{label} [ {} items ] {copy}</summary>", if depth == 0 { " open" } else { "" }, array.len());
+            let mut out = format!(
+                "<details{}><summary class=\"fv-json-row\"><span>{label} <span class=\"fv-json-count\">[ {} items ]</span></span>{copy}</summary>",
+                if depth == 0 { " open" } else { "" },
+                array.len()
+            );
             for (i, val) in array.iter().enumerate().take(*budget) {
                 out.push_str(&tree(val, &pointer(path, &i.to_string()), &i.to_string(), budget, depth + 1));
             }
             out.push_str("</details>");
             out
         }
-        _ => format!("<div class=\"fv-node\">{label}: <code>{}</code> {copy}</div>", esc(&clipped(&value.to_string()))),
+        _ => format!(
+            "<div class=\"fv-node fv-json-row\"><span>{label}: <code>{}</code></span>{copy}</div>",
+            esc(&clipped(&value.to_string()))
+        ),
     }
 }
 
 fn json(input: &Input, lines: bool) -> String {
     let limit = if input.limit > 0 { input.limit } else { 1000 };
     let mut budget = limit;
-    let mut out = button("source", "Pretty / Raw");
-    out.push_str("<div class=\"fv-rendered fv-tree\">");
+    let mut out = String::from("<div class=\"fv-rendered fv-tree\">");
     if lines {
         let records = json_lines(&input.text).take(limit.saturating_add(1)).collect::<Vec<_>>();
         for (i, value) in records.iter().take(limit) {
             let body = match value {
-                Ok(v) => tree(v, "", "$", &mut budget, 0),
+                Ok(v) => tree(v, "", "root", &mut budget, 0),
                 Err(e) => format!("<p role=\"alert\">{}</p>", esc(e)),
             };
             let _ = write!(out, "<details><summary>Line {i}</summary>{body}</details>");
@@ -286,7 +300,7 @@ fn json(input: &Input, lines: bool) -> String {
         }
     } else {
         match serde_json::from_str::<Value>(&input.text) {
-            Ok(v) => out.push_str(&tree(&v, "", "$", &mut budget, 0)),
+            Ok(v) => out.push_str(&tree(&v, "", "root", &mut budget, 0)),
             Err(e) => {
                 let _ = write!(out, "<p role=\"alert\">{}</p>", esc(&e.to_string()));
             }
@@ -380,15 +394,39 @@ pub(crate) fn render(input: &Input) -> String {
         Renderer::Mermaid => crate::file_viewers_extra::mermaid(input),
         _ => format!("<p>{} · {}</p>", esc(name), esc(if input.mime.is_empty() { "File" } else { &input.mime })),
     };
+    let toolbar = if matches!(kind, Renderer::Json | Renderer::JsonLines) {
+        "<div class=\"fv-json-toolbar\"><div class=\"fv-segmented\" role=\"group\" aria-label=\"JSON view\"><button type=\"button\" class=\"fv-segment\" data-fv-action=\"source\" data-fv-view=\"pretty\" aria-pressed=\"true\">Pretty</button><button type=\"button\" class=\"fv-segment\" data-fv-action=\"source\" data-fv-view=\"raw\" aria-pressed=\"false\">Raw</button></div></div>"
+    } else {
+        ""
+    };
     let kind = format!("{kind:?}").to_lowercase();
     let cap_note = if input.text.len() > 2 * 1024 * 1024 {
         "<p class=\"fv-cap-note\">Source preview capped at 2 MiB; Download has the complete file.</p>"
     } else {
         ""
     };
-    let open = if input.url.is_empty() { String::new() } else { format!("<a href=\"{}\" download>Download</a>", esc(&input.url)) };
+    let open = if input.url.is_empty() {
+        String::new()
+    } else {
+        format!("<a class=\"fv-download\" href=\"{}\" download>Download</a>", esc(&input.url))
+    };
+    let copy = if input.path.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<button type=\"button\" class=\"fv-copy-icon {}\" data-fv-copy=\"{}\" aria-label=\"Copy path\" title=\"Copy path\">{}</button>",
+            crate::components::BAR_BUTTON,
+            esc(&input.path),
+            icon_html(Icon::Copy, Size::S14)
+        )
+    };
+    let header = if toolbar.is_empty() && open.is_empty() && copy.is_empty() {
+        String::new()
+    } else {
+        format!("<div class=\"fv-header\">{toolbar}<div class=\"fv-actions\">{open}{copy}</div></div>")
+    };
     format!(
-        "<section class=\"fv\" data-kind=\"{kind}\" data-path=\"{}\" data-url=\"{}\" data-mode=\"{}\" data-language=\"{}\" data-mime=\"{}\" data-line=\"{}\" data-source-truncated=\"{}\"><pre class=\"fv-source\" hidden>{}</pre>{cap_note}{body}<div class=\"fv-controls\">{open}{}</div></section>",
+        "<section class=\"fv pointer-coarse:[&_button]:min-h-11 pointer-coarse:[&_button]:min-w-11 pointer-coarse:[&_a]:min-h-11 pointer-coarse:[&_a]:min-w-11 pointer-coarse:[&_input]:min-h-11 pointer-coarse:[&_summary]:min-h-11\" data-kind=\"{kind}\" data-path=\"{}\" data-url=\"{}\" data-mode=\"{}\" data-language=\"{}\" data-mime=\"{}\" data-line=\"{}\" data-source-truncated=\"{}\"><pre class=\"fv-source\" hidden>{}</pre>{header}{cap_note}{body}</section>",
         esc(&input.path),
         esc(&input.url),
         esc(&input.mode),
@@ -396,12 +434,7 @@ pub(crate) fn render(input: &Input) -> String {
         esc(&input.mime),
         input.line,
         input.text.len() > 2 * 1024 * 1024,
-        esc(prefix(&input.text, 2 * 1024 * 1024)),
-        if input.path.is_empty() {
-            String::new()
-        } else {
-            format!("<button type=\"button\" data-fv-copy=\"{}\">Copy path</button>", esc(&input.path))
-        }
+        esc(prefix(&input.text, 2 * 1024 * 1024))
     )
 }
 
@@ -437,7 +470,7 @@ pub(crate) fn fence(text: &str, language: &str) -> String {
     let language = if language.is_empty() { "text" } else { language };
     let html = render(&Input { text: text.into(), language: language.into(), mode: "inline".into(), ..Default::default() });
     if language == "json" && text.lines().count() > 30 {
-        format!("<details class=\"fv-collapsed\"><summary>JSON · Expand</summary>{html}</details>")
+        format!("<details class=\"fv-collapsed pointer-coarse:[&>summary]:min-h-11\"><summary>JSON · Expand</summary>{html}</details>")
     } else {
         html
     }
@@ -543,6 +576,26 @@ mod tests {
     }
 
     #[test]
+    fn json_rows_and_inline_actions_use_quiet_accessible_controls() {
+        let html = render(&Input {
+            path: "data.json".into(),
+            url: "/download".into(),
+            text: "{\"a\":1}".into(),
+            mode: "inline".into(),
+            ..Default::default()
+        });
+        assert!(html.contains("<summary class=\"fv-json-row\"><span>root "));
+        assert!(!html.contains("$ {"));
+        assert!(html.contains("aria-label=\"Copy JSON Pointer for a\""));
+        assert!(!html.contains(">Copy path</button>"));
+        assert!(html.contains("class=\"fv-segmented\" role=\"group\" aria-label=\"JSON view\""));
+        assert!(html.contains("data-fv-view=\"pretty\" aria-pressed=\"true\""));
+        assert!(html.contains("data-fv-view=\"raw\" aria-pressed=\"false\""));
+        assert!(html.find("class=\"fv-actions\"").unwrap() < html.find("class=\"fv-rendered fv-tree\"").unwrap());
+        assert!(html.contains("pointer-coarse:[&_button]:min-h-11"));
+    }
+
+    #[test]
     fn distant_source_locations_render_a_window_not_the_entire_prefix() {
         let text = "line\n".repeat(100_000);
         let html = code(&text, "rust", 90_000, 2000);
@@ -584,7 +637,9 @@ mod tests {
             ..Default::default()
         });
         assert!(html.contains("<img alt="));
-        assert!(!html.contains("<svg"));
+        assert_eq!(html.matches("<svg ").count(), 1, "only the trusted Copy icon enters markup");
+        assert!(!html.contains("<svg onload="));
+        assert!(html.contains("&lt;svg onload="));
         assert!(!html.contains("<script"));
         assert!(!without_images("<p>Hi<img src=\"https://x\" /></p>").contains("<img"));
     }

@@ -193,8 +193,10 @@
     if (!source || !rendered) return;
     source.hidden = !show;
     rendered.hidden = show;
-    const button = own(root, '[data-fv-action="source"]');
-    if (button) button.setAttribute("aria-pressed", String(show));
+    for (const button of root.querySelectorAll('[data-fv-action="source"]')) {
+      if (button.closest(".fv") !== root) continue;
+      button.setAttribute("aria-pressed", String(button.dataset.fvView === "pretty" ? !show : show));
+    }
     if (show) centerLine(root);
   }
 
@@ -804,7 +806,7 @@
     const root = button?.closest(".fv");
     if (!root) return;
     const action = button.dataset.fvAction;
-    if (action === "source") sourceView(root, !!own(root, ".fv-source-view")?.hidden);
+    if (action === "source") sourceView(root, button.dataset.fvView ? button.dataset.fvView === "raw" : !!own(root, ".fv-source-view")?.hidden);
     else if (["zoom-in", "zoom-out", "fit"].includes(action)) states.get(root)?.zoom?.(action);
     else if (action === "expand") {
       const details = own(root, "details:not([open])");
