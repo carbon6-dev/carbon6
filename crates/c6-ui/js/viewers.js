@@ -7,6 +7,7 @@
   const images = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", avif: "image/avif", svg: "image/svg+xml" };
   const ext = path => path.split(".").pop().toLowerCase();
   const media = path => ext(path) === "pdf" ? "application/pdf" : Object.hasOwn(images, ext(path)) ? images[ext(path)] : "";
+  const mediaType = (path, mime) => media(path) || ([...Object.values(images), "application/pdf"].includes(mime) ? mime : "");
   const candidates = ".fv, pre > code[class*='language-'], .c6-file-link[data-fv-path][data-fv-url]";
   const states = new WeakMap();
   const own = (root, sel) => Array.from(root.querySelectorAll(sel)).find(el => el.closest(".fv") === root);
@@ -19,6 +20,10 @@
       document.querySelectorAll(".c6-file-link[data-fv-path][data-fv-url]").forEach(scanNode);
     },
     render(input) { return renderer ? renderer(JSON.stringify(input)) : ""; },
+    async text(url, owner) {
+      if (owner && !owner.isConnected) throw new DOMException("Viewer disconnected", "AbortError");
+      return asText(await read(url, limit, owner && stateFor(owner).abort.signal));
+    },
   };
 
   function downloadURL(value) {
@@ -31,9 +36,49 @@
     return url;
   }
 
+  const waitingReads = new Set();
+  let activeReads = 0;
+
+  function releaseReadSlot() {
+    activeReads--;
+    waitingReads.values().next().value?.();
+  }
+
+  function acquireReadSlot(signal) {
+    return new Promise((resolve, reject) => {
+      signal?.throwIfAborted();
+      const abort = () => { waitingReads.delete(start); reject(signal.reason); };
+      const start = () => {
+        waitingReads.delete(start);
+        signal?.removeEventListener("abort", abort);
+        activeReads++;
+        resolve(releaseReadSlot);
+      };
+      if (activeReads < 2) start();
+      else {
+        waitingReads.add(start);
+        signal?.addEventListener("abort", abort, { once: true });
+      }
+    });
+  }
+
   async function read(url, max, signal) {
-    const response = await fetch(downloadURL(url), { signal, redirect: "error", credentials: "same-origin" });
-    if (!response.ok) throw new Error(`Download unavailable (${response.status})`);
+    const target = downloadURL(url);
+    const release = await acquireReadSlot(signal);
+    try {
+      signal?.throwIfAborted();
+      return await readBytes(target, max, signal);
+    } finally {
+      release();
+    }
+  }
+
+  async function readBytes(url, max, signal) {
+    const response = await fetch(url, { signal, redirect: "error", credentials: "same-origin" });
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw new Error(`Download unavailable (${response.status})`);
+    }
     if (Number(response.headers.get("Content-Length")) > max) {
       await response.body?.cancel();
       throw new Error(`File exceeds ${max / 1024 / 1024} MiB`);
@@ -325,15 +370,125 @@
     return task;
   }
 
+  let pdfEngine;
+  function pdfLibrary() {
+    if (!pdfEngine) pdfEngine = import(new URL("pdf-6.5.438.min.mjs", assets).href).then(engine => {
+      engine.GlobalWorkerOptions.workerSrc = new URL("pdf.worker-6.5.438.min.mjs", assets).href;
+      return engine;
+    });
+    return pdfEngine;
+  }
+
+  async function renderPDF(root, state, target, parts) {
+    const status = document.createElement("p");
+    status.className = "fv-pdf-status";
+    status.setAttribute("role", "status");
+    status.textContent = "Loading PDF preview…";
+    target.append(status);
+    const active = () => root.isConnected && !state.abort.signal.aborted;
+    let engine;
+    try { engine = await pdfLibrary(); }
+    catch (_) { if (active()) status.textContent = "PDF preview engine unavailable. Open PDF to view the file."; return; }
+    if (!active()) return;
+    const data = new Uint8Array(parts.reduce((bytes, part) => bytes + part.byteLength, 0));
+    let offset = 0;
+    for (const part of parts) { data.set(part, offset); offset += part.byteLength; }
+    const loading = engine.getDocument({
+      data, isEvalSupported: false, disableAutoFetch: true, disableRange: true, disableStream: true,
+      useWorkerFetch: false, useWasm: false, disableFontFace: true, useSystemFonts: true,
+      maxImageSize: 8e6, canvasMaxAreaInBytes: 32e6, disableWorkerRendering: true, enableXfa: false,
+    });
+    let inFlight;
+    const canvases = new Set();
+    state.cleanup.push(() => {
+      inFlight?.cancel();
+      void loading.destroy().catch(() => {}); // also destroys the document, if already loaded
+      for (const canvas of canvases) canvas.width = canvas.height = 0;
+    });
+    let passwordProtected = false;
+    loading.onPassword = () => {
+      passwordProtected = true;
+      void loading.destroy().catch(() => {});
+    };
+    let pdf;
+    try { pdf = await loading.promise; }
+    catch (e) {
+      if (active()) status.textContent = passwordProtected ? "This PDF requires a password. Open PDF to unlock it." :
+        `PDF preview unavailable: ${e.message || "Cannot open document"}`;
+      return;
+    }
+    if (!active()) return;
+    const pages = document.createElement("div");
+    pages.className = "fv-pdf-pages";
+    const more = document.createElement("button");
+    more.type = "button";
+    more.className = "fv-pdf-more";
+    more.textContent = "Load more pages";
+    target.append(pages, more);
+    const documentLimit = 18e6;
+    const pageLimit = 2e6;
+    let pixels = 0, next = 1, busy = false, capped = false, warning = "";
+    async function batch() {
+      if (busy || !active()) return;
+      busy = true;
+      more.disabled = true;
+      more.hidden = next + 4 >= pdf.numPages;
+      const end = Math.min(next + 4, pdf.numPages, 60);
+      for (; next <= end && active(); next++) {
+        let page, canvas;
+        try {
+          page = await pdf.getPage(next);
+          if (!active()) break;
+          const size = page.getViewport({ scale: 1 });
+          if (!Number.isFinite(size.width) || !Number.isFinite(size.height) || size.width <= 0 || size.height <= 0) {
+            throw new Error("Invalid page size");
+          }
+          const scale = Math.min(2, 1200 / size.width, 4096 / size.height, Math.sqrt(pageLimit / size.width / size.height));
+          const viewport = page.getViewport({ scale });
+          const width = Math.max(1, Math.floor(viewport.width));
+          const height = Math.max(1, Math.floor(viewport.height));
+          if (width * height > pageLimit || pixels + width * height > documentLimit) { capped = true; break; }
+          canvas = document.createElement("canvas");
+          canvas.width = width;
+          canvas.height = height;
+          canvas.setAttribute("role", "img");
+          canvas.setAttribute("aria-label", `PDF page ${next} of ${pdf.numPages}`);
+          canvas.style.cssText = "display:block;max-width:100%;height:auto;margin:0.5rem auto;background:white";
+          canvases.add(canvas);
+          inFlight = page.render({ canvas, viewport, annotationMode: engine.AnnotationMode.DISABLE });
+          await inFlight.promise;
+          if (!active()) break;
+          pages.append(canvas);
+          pixels += width * height;
+        } catch (e) {
+          if (!active()) break;
+          if (canvas) { canvases.delete(canvas); canvas.width = canvas.height = 0; }
+          warning = `Page ${next} could not be rendered: ${e.message || "Unknown error"}`;
+          break;
+        } finally {
+          inFlight = undefined;
+          page?.cleanup();
+        }
+      }
+      if (!active()) return;
+      capped ||= next > 60 && next <= pdf.numPages;
+      status.textContent = `${pdf.numPages} ${pdf.numPages === 1 ? "page" : "pages"}` +
+        (warning ? ` · ${warning}` : capped ? ` · Preview limit reached after ${next - 1} pages. Open PDF to see the rest.` : "");
+      more.hidden = capped || !!warning || next > pdf.numPages;
+      more.disabled = false;
+      busy = false;
+    }
+    more.addEventListener("click", () => { void batch(); }, { signal: state.abort.signal });
+    await batch();
+  }
+
   async function loadMedia(root, state) {
     const img = own(root, ".fv-image img, img.fv-image") || (root.dataset.kind === "image" ? own(root, "img") : null);
     const pdf = own(root, ".fv-pdf");
     if (!img && !pdf) return;
     if (img) setupImage(root, state, img);
-    const display = blob => {
+    const display = (blob, parts) => {
       if (img) { img.src = blob; return; }
-      const frame = pdf.querySelector("iframe");
-      if (frame) frame.src = blob;
       const open = document.createElement("a");
       open.textContent = "Open PDF";
       open.href = blob;
@@ -341,6 +496,7 @@
       open.rel = "noopener noreferrer";
       pdf.prepend(open);
       state.cleanup.push(() => open.remove());
+      if (root.dataset.mode === "full" && parts) return renderPDF(root, state, pdf, parts);
     };
     const url = root.dataset.url || root.dataset.fvUrl;
     // Inline cards already have a bridge-owned binary URL; do not fetch twice.
@@ -348,11 +504,11 @@
       if (trustedBlob(root, url)) display(url);
       return;
     }
-    const type = media(root.dataset.path || "");
+    const type = mediaType(root.dataset.path || "", root.dataset.mime);
     if (!url || !type || (root.dataset.kind === "image") !== type.startsWith("image/")) return;
     const parts = await read(url, limit, state.abort.signal);
     if (!root.isConnected || state.abort.signal.aborted) return;
-    display(blobURL(state, type === "image/svg+xml" ? [safeSVG(asText(parts))] : parts, type));
+    return display(blobURL(state, type === "image/svg+xml" ? [safeSVG(asText(parts))] : parts, type), parts);
   }
 
   function setupImage(root, state, img) {
@@ -611,7 +767,7 @@
         if (!state.context) { state.context = true; setupContext(el, state, line); }
         return;
       }
-      if (!media(path) && !["md", "markdown", "csv", "tsv"].includes(ext(path))) return;
+      if (!media(path) && !["md", "markdown", "csv", "tsv", "json", "jsonl", "ndjson", "diff", "patch", "log", "mmd", "mermaid"].includes(ext(path))) return;
     } else if (el.matches("code")) {
       if (el.closest(".fv-code") || !language(el)) return;
     } else if (!["image", "pdf", "mermaid"].includes(el.dataset.kind) && !el.querySelector(".fv-code code")) return;

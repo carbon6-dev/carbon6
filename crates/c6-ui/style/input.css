@@ -590,3 +590,21 @@ html.dark {
 .dark .hljs-string, .dark .hljs-attr { color: #86efac; }
 .dark .hljs-number, .dark .hljs-built_in, .dark .hljs-type { color: #93c5fd; }
 .dark .hljs-comment, .dark .hljs-quote { color: #a1a1aa; }
+.fv-diff-file > summary { cursor: pointer; min-height: 44px; overflow-wrap: anywhere; }
+.fv-diff-added { background: #16a34a18; }
+.fv-diff-removed { background: #dc262618; }
+.fv-diff-added mark { background: #16a34a38; color: inherit; }
+.fv-diff-removed mark { background: #dc262638; color: inherit; }
+.fv-diff-line { display: flex; min-width: max-content; white-space: pre; }
+.fv-diff-number { display: inline-block; width: 4.5ch; color: var(--color-zinc-500); text-align: right; padding-right: .5ch; }
+.fv-diff-marker { display: inline-block; width: 2ch; }
+.fv-diff-hunk { color: #0284c7; background: #0284c710; white-space: pre; }
+.fv-diff-pair { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); min-width: 650px; }
+.fv-diff-old, .fv-diff-new { white-space: pre; overflow-x: auto; }
+.fv-diff-new { border-left: 1px solid #8884; }
+.fv-log-error { background: #dc262620; border-inline-start: 3px solid #dc2626; }
+.fv-log-warning { background: #eab30818; border-inline-start: 3px solid #ca8a04; }
+.fv-mermaid { overflow: auto; max-height: 70vh; }
+.fv-mermaid img { display: block; max-width: 100%; margin: auto; }
+.fv-js-error { color: #dc2626; overflow-wrap: anywhere; }
+.fv-source-view { overflow: auto; max-height: 70vh; }

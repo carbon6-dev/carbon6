@@ -26,6 +26,7 @@ mod docs;
 mod explorer;
 mod file_formats;
 mod file_viewers;
+mod file_viewers_extra;
 mod files;
 mod fleet;
 mod goal;

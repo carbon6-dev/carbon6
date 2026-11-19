@@ -25,7 +25,12 @@ where
     match list().await {
         Ok(listing) => Ok(FileTarget::Directory(listing)),
         Err(list_error) => match read().await {
-            Ok(file) => Ok(FileTarget::File(file)),
+            Ok(mut file) => {
+                if let Some(meta) = file.as_object_mut() {
+                    meta.remove("content");
+                }
+                Ok(FileTarget::File(file))
+            }
             Err(read_error) => {
                 let error = if read_error.ends_with(" is a directory") { list_error } else { read_error };
                 Err(format!("Could not open {path}: {error}"))
@@ -207,7 +212,12 @@ fn FileViewer(worker_id: String, path: String, #[prop(optional_no_strip)] initia
             async move {
                 match initial {
                     Some(f) => Ok(f),
-                    None => api::fs_read(w, p).await.map(Arc::new),
+                    None => api::fs_read(w, p).await.map(|mut file| {
+                        if let Some(meta) = file.as_object_mut() {
+                            meta.remove("content");
+                        }
+                        Arc::new(file)
+                    }),
                 }
             }
         }
@@ -233,20 +243,6 @@ fn FileViewer(worker_id: String, path: String, #[prop(optional_no_strip)] initia
                 })}
             </Suspense>
         </div>
-    }
-}
-
-/// Text with line numbers.
-#[component]
-fn CodeView(text: String) -> impl IntoView {
-    let lines: Vec<String> = text.lines().map(str::to_owned).collect();
-    let width = lines.len().to_string().len();
-    view! {
-        <pre class="max-h-[70vh] overflow-auto rounded-md border border-zinc-200 bg-white p-2 font-mono text-xs leading-5 dark:border-zinc-800 dark:bg-zinc-950">
-            {lines.into_iter().enumerate().map(|(i, l)| view! {
-                <div class="flex"><span class="mr-3 select-none text-right text-muted" style=format!("min-width:{width}ch")>{i + 1}</span><span class="whitespace-pre">{l}</span></div>
-            }).collect_view()}
-        </pre>
     }
 }
 

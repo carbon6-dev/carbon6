@@ -19,9 +19,12 @@ existing filesystem access, not browser-local files.
 * Images (PNG, JPEG, GIF, WebP, AVIF, SVG) fit the pane, show natural size and
   support zoom and pan. Inline mentions show clickable thumbnails. SVG bytes
   are only image resources, never inserted into the document as markup.
-* PDFs use a sandboxed native PDF iframe backed by downloaded bytes, with an
-  Open/Download fallback for browsers without an embedded viewer. Inline is a
-  filename/Open card; page count is omitted unless available without parsing.
+* PDFs were first tested in a sandboxed native iframe backed by downloaded
+  bytes. Chrome blocks that embed even when `pdfViewerEnabled` is true, so full
+  mode instead lazy-loads self-hosted PDF.js and paints bounded pages to canvas.
+  It never enables PDF scripting, annotation or link layers, or document URLs.
+  Open/Download remains available; inline is a filename/Open card (no engine
+  download merely to count its pages).
 * CSV/TSV are parsed in Rust, including quoted fields and embedded newlines.
   Tables have a sticky header, sorting, filtering and horizontal scrolling.
   Full mode initially shows 10,000 rows and Load more; compact mode shows 20.
@@ -51,17 +54,37 @@ attachment filename and nosniff. Its Content-Type is an allowlisted image/PDF
 or text type; HTML and unknown formats remain octet-stream. A restrictive CSP
 on byte responses prevents active content/network access if opened directly.
 The viewer fetches bounded bytes for complete text rather than silently using
-the fs/read preview's 2 MiB truncation. Blob URLs have explicit allowlisted MIME
+the fs/read preview's 2 MiB truncation. The bridge runs up to two downloads at
+a time per page; queued work for disconnected viewers is dropped. This does not
+change the backend's 40 MiB cap per download. Blob URLs have explicit allowlisted MIME
 types and are revoked when their owner disappears. No content scripts run;
 source HTML is escaped; Mermaid and SVG never enter innerHTML. Markdown file
 images must not initiate network requests. Links remain user-initiated.
 
 Views cap rendered rows/lines/nodes, then expose Load more within the byte cap.
+There are also hard display limits (2 MiB of source/table text, 256 table
+columns, 100,000 displayed cells, 8 KiB per displayed line/value and 64 JSON
+levels). A display-cap notice points to the complete Download; large text is
+streamed with a 40 MiB ceiling, not buffered before checking its size.
 No library is fetched from a CDN at runtime. JS vendors are version-pinned,
 licensed, served from the same origin and loaded only by their renderer.
 `scripts/ui-size.sh` measures wasm and its Brotli sibling, not lazy JS; report
 both wasm size and separately shipped vendor assets so lazy loading is not a
 hidden base-bundle increase.
+
+The shipped lazy vendors are highlight.js 11.12.0 (common grammars, BSD-3-Clause,
+129,254 bytes) and Mermaid 11.17.2 (MIT, 3,572,661 bytes). Their licenses live
+beside the pinned builds in `crates/c6-ui/vendor`. The small bridge loads at
+startup; the vendor code is fetched only for visible highlighted code/diagrams.
+Mermaid also runs in an opaque script-only iframe with a deny-network CSP;
+its SVG passes an element/attribute/resource allowlist before becoming an image.
+The 2 MiB inline byte cap is separate from the full viewer's 40 MiB cap; an
+oversized preview keeps its Open/Download link rather than truncating silently.
+PDF.js 6.5.438 is also lazy (Apache-2.0; 474,284-byte module and
+1,271,915-byte worker). It initially paints five pages, then loads five more
+per click, with hard limits of 2 million pixels per page, 18 million pixels per
+preview and 60 pages. Canvas only: annotations, XFA, scripting, eval, document
+URLs, external font/CMap fetches and worker network fetches are disabled.
 
 All controls are keyboard accessible and touch sized. At 390px, tables/source
 scroll inside their pane rather than widening the page. Colour tokens support

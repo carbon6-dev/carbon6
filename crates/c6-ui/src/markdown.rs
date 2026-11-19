@@ -154,7 +154,11 @@ fn path_link(path: &str, paths: &Paths, here: &Here, code: bool) -> Option<Strin
     let (file, line, _) = crate::file_viewers::location(path);
     let resolved = worker_path(file)?;
     let href = format!("{}/sessions/{}/files?path={}", here.base, crate::workspace::encode(&paths.session), crate::workspace::encode(path));
-    let url = crate::api::fs_download_url(&paths.worker, resolved);
+    let mut url =
+        format!("/api/v1/workers/{}/fs/download?path={}", crate::workspace::encode(&paths.worker), crate::workspace::encode(resolved));
+    if let Some(realm) = &here.realm {
+        url.push_str(&format!("&c6_realm={}", crate::workspace::encode(realm)));
+    }
     let label = esc(path);
     let label = if code { format!("<code>{label}</code>") } else { label };
     Some(format!(
@@ -201,6 +205,12 @@ fn render_citations(src: &str, citations: &[c6_api::citations::UrlCitation], her
 }
 
 fn render_paths(src: &str, citations: &[c6_api::citations::UrlCitation], here: &Here, paths: Option<&Paths>) -> String {
+    if citations.is_empty()
+        && (src.starts_with("diff --git ") || src.starts_with("--- "))
+        && crate::file_formats::parse_unified_diff(src).is_some()
+    {
+        return crate::file_viewers::fence(src, "diff");
+    }
     let src = c6_api::citations::markdown(src, citations);
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     // Sanitize model HTML before adding our own trusted mentions/citations.

@@ -10,5 +10,5 @@ if ! command -v brotli >/dev/null 2>&1; then
 fi
 # Keep originals for clients without Brotli support. Rebuild sidecars even if
 # they already exist: a watch rebuild or a size check must not keep stale bytes.
-find "$dist" -type f \( -name '*.wasm' -o -name '*.js' -o -name '*.css' -o -name '*.html' \) \
+find "$dist" -type f \( -name '*.wasm' -o -name '*.js' -o -name '*.mjs' -o -name '*.css' -o -name '*.html' \) \
     -exec sh -ec 'for file do brotli --quality=11 --force --no-copy-stat --output="$file.br" "$file"; done' sh {} +
