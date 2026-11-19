@@ -1,16 +1,22 @@
-//! This binary owns C6_CLAUDE_BIN. A held CLI reaches idle after its reply
-//! fails to journal; recovery must not adopt that idle process and stall.
+//! This binary owns C6_CLAUDE_BIN. Recovery must retire a held CLI after a
+//! journal failure, but distinguish a turn already sent from an unsent turn.
 
 use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
 use c6_api::{EventKind, TurnEndReason};
+use c6_proto::{ModelSpec, SessionCommand, UserInput, session_command, session_event};
 use c6_testkit::eventually;
 use c6_worker::{ConnState, Identity, Worker, conn, enroll};
 use serde_json::{Value, json};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-struct StopFakeCli(std::path::PathBuf);
+const WARMUP: &str = "Hold this warmup turn at the reply gate.";
+const ORIGINAL: &str = "Keep this exact request after the TurnStarted failure.";
+const SECOND: &str = "Keep this second request in the same original batch.";
+
+struct StopFakeCli(PathBuf);
 
 impl Drop for StopFakeCli {
     fn drop(&mut self) {
@@ -25,27 +31,81 @@ impl Drop for StopFakeCli {
     }
 }
 
+fn shell_path(path: &Path) -> String {
+    format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"))
+}
+
+fn cli_inputs(path: &Path) -> Vec<Value> {
+    std::fs::read_to_string(path).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect()
+}
+
+async fn send_once(worker: &Worker, sid: &str, command_id: &str, text: &str, model: Option<ModelSpec>) {
+    worker
+        .sessions
+        .handle(SessionCommand {
+            session_id: sid.into(),
+            command_id: command_id.into(),
+            kind: Some(session_command::Kind::Input(UserInput { text: text.into(), human_origin: true, model, ..Default::default() })),
+        })
+        .await
+        .unwrap();
+}
+
+fn completed(event: &c6_proto::SessionEvent) -> bool {
+    matches!(&event.kind, Some(session_event::Kind::TurnEnded(end)) if end.reason == c6_proto::TurnEndReason::Completed as i32)
+}
+
+async fn release_reply(gate: &Path) {
+    let mut release = tokio::process::Command::new("sh")
+        .args(["-c", "printf 'reply\\n' > \"$1\"", "release-gate"])
+        .arg(gate)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    assert!(c6_testkit::within("the fake CLI to read its reply gate", release.wait()).await.unwrap().success());
+}
+
 #[tokio::test]
-async fn a_held_cli_with_a_failed_append_is_retired_and_resumed_without_input() {
+async fn journal_recovery_retires_a_held_cli_and_distinguishes_sent_and_unsent_turns() {
     let temp = tempfile::tempdir().unwrap();
     let gate = temp.path().join("reply");
     assert!(tokio::process::Command::new("mkfifo").arg(&gate).status().await.unwrap().success());
     let starts = temp.path().join("starts");
+    let stdin = temp.path().join("stdin.jsonl");
+    let batch_model = temp.path().join("batch-model");
     let cli = temp.path().join("claude");
     std::fs::write(
         &cli,
         format!(
             r#"#!/bin/sh
 [ "$1" = --version ] && exit 0
+model=default
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --model ]; then shift; model="$1"; fi
+  shift
+done
 first=0
-[ -f '{starts}' ] || first=1
-echo start >> '{starts}'
+[ -f {starts} ] || first=1
+echo start >> {starts}
 while read -r line; do
-  case "$line" in *'"control_request"'*) continue;; esac
+  case "$line" in
+    *'"control_request"'*)
+      case "$line" in
+        *'"subtype":"set_model"'*) model=$(printf '%s' "$line" | sed -n 's/.*"model":"\([^"]*\)".*/\1/p') ;;
+      esac
+      continue ;;
+  esac
+  printf '%s\n' "$line" >> {stdin}
   uuid=$(printf '%s' "$line" | sed -n 's/.*"uuid":"\([^"]*\)".*/\1/p')
   printf '{{"type":"user","isReplay":true,"uuid":"%s","message":{{"role":"user","content":"echo"}}}}\n' "$uuid"
+  case "$line" in
+    *'{WARMUP}'*) read -r ignored < {gate} ;;
+    *'{ORIGINAL}'*)
+      printf '%s\n' "$model" > {batch_model}
+      continue ;; # The next input completes this two-input turn.
+  esac
   if [ "$first" = 1 ]; then
-    read -r ignored < '{gate}'
+    read -r ignored < {gate}
     printf '%s\n' '{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"native-call","name":"Task","input":{{"description":"Native child","prompt":"Look around"}}}}],"stop_reason":"tool_use"}}}}'
     printf '%s\n' '{{"type":"assistant","parent_tool_use_id":"native-call","message":{{"content":[{{"type":"text","text":"Native child was still running"}}],"stop_reason":""}}}}'
     text='fail-this-held-journal-append'
@@ -56,8 +116,10 @@ while read -r line; do
   printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"usage":{{"input_tokens":1,"output_tokens":1}}}}'
 done
 "#,
-            starts = starts.display(),
-            gate = gate.display(),
+            starts = shell_path(&starts),
+            stdin = shell_path(&stdin),
+            batch_model = shell_path(&batch_model),
+            gate = shell_path(&gate),
         ),
     )
     .unwrap();
@@ -125,13 +187,7 @@ done
             .then_some(())
     })
     .await;
-    let mut release = tokio::process::Command::new("sh")
-        .args(["-c", "printf 'reply\\n' > \"$1\"", "release-gate"])
-        .arg(gate)
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    assert!(c6_testkit::within("the fake CLI to read its reply gate", release.wait()).await.unwrap().success());
+    release_reply(&gate).await;
     let events = eventually("explicit recovery without another message", async || {
         let events: Vec<c6_api::Event> = http.get(format!("{api}/sessions/{sid}/events")).send().await.unwrap().json().await.unwrap();
         events.iter().any(|e| matches!(&e.kind, EventKind::Assistant { blocks, .. } if format!("{blocks:?}").contains("Reply from explicit recovery"))).then_some(events)
@@ -144,7 +200,7 @@ done
             .count(),
         1
     );
-    assert_eq!(std::fs::read_to_string(starts).unwrap().lines().count(), 2);
+    assert_eq!(std::fs::read_to_string(&starts).unwrap().lines().count(), 2);
     let child = events
         .iter()
         .find_map(|e| match &e.kind {
@@ -160,6 +216,135 @@ done
         .then_some(())
     })
     .await;
+    let recovery_end = eventually("the replacement's successful turn to commit", async || {
+        worker.journal.events_after(sid, 0, u32::MAX).await.unwrap().into_iter().rev().find(completed).map(|event| event.seq)
+    })
+    .await;
+    let (held_record, held_pgid) = std::fs::read_dir(&held)
+        .unwrap()
+        .find_map(|entry| {
+            let record = entry.unwrap().path().join("meta.json");
+            let meta: Value = serde_json::from_slice(&std::fs::read(&record).ok()?).ok()?;
+            (meta["session"] == sid).then(|| (record, meta["pgid"].as_i64().unwrap()))
+        })
+        .expect("the replacement has a held record");
+    // Hold that replacement in a warmup turn. The first queued input changes
+    // the model without changing the CLI launch settings, so neither input can
+    // join the warmup; both must be drained in order into the following turn.
+    let post_send_inputs = cli_inputs(&stdin);
+    send_once(&worker, sid, "warmup-for-ordered-batch", WARMUP, None).await;
+    eventually("the warmup TurnStarted to commit", async || {
+        worker
+            .journal
+            .events_after(sid, recovery_end, u32::MAX)
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event.kind, Some(session_event::Kind::TurnStarted(_))))
+            .then_some(())
+    })
+    .await;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TRIGGER fail_turn_start BEFORE UPDATE OF open_turn ON sessions
+         WHEN NEW.id = '{}' AND NEW.open_turn IS NOT NULL
+         BEGIN SELECT RAISE(ABORT, 'injected TurnStarted failure'); END",
+        sid.replace('\'', "''")
+    )))
+    .execute(&db)
+    .await
+    .unwrap();
+    let first_id = "input-that-never-reached-stdin";
+    let second_id = "second-input-that-never-reached-stdin";
+    let batch_user = |event: &c6_proto::SessionEvent| match &event.kind {
+        Some(session_event::Kind::User(user)) if [first_id, second_id].contains(&user.command_id.as_str()) => Some(user.clone()),
+        _ => None,
+    };
+    let (spec, _) = worker.journal.load_session(sid).await.unwrap().unwrap();
+    let mut model = spec.model.unwrap();
+    assert_ne!(model.model, "sonnet");
+    model.model = "sonnet".into();
+    // Deliver once at the worker command boundary. The head has no queued
+    // command that could redeliver this input and mask a broken local retry.
+    send_once(&worker, sid, first_id, ORIGINAL, Some(model)).await;
+    send_once(&worker, sid, second_id, SECOND, None).await;
+    eventually("both inputs to queue behind the model switch", async || {
+        (worker.sessions.inbox_holds(sid, first_id) && worker.sessions.inbox_holds(sid, second_id)).then_some(())
+    })
+    .await;
+    release_reply(&gate).await;
+    let last_end = eventually("the warmup turn to commit", async || {
+        worker.journal.events_after(sid, recovery_end, u32::MAX).await.unwrap().into_iter().find(completed).map(|event| event.seq)
+    })
+    .await;
+    eventually("the faulted held CLI to retire", async || {
+        // Recovery can publish another record at this same path while the
+        // trigger is still installed. Wait for the original owner to go away.
+        match std::fs::read(&held_record) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(()),
+            Ok(bytes) => {
+                let meta = serde_json::from_slice::<Value>(&bytes).ok()?;
+                (meta["pgid"].as_i64()? != held_pgid).then_some(())
+            }
+            Err(e) => panic!("reading the held record: {e}"),
+        }
+    })
+    .await;
+    let pending = worker.journal.events_after(sid, last_end, u32::MAX).await.unwrap();
+    assert!(!pending.iter().any(|event| matches!(event.kind, Some(session_event::Kind::TurnStarted(_)))));
+    let before = cli_inputs(&stdin);
+    assert_eq!(&before[..post_send_inputs.len()], post_send_inputs.as_slice());
+    assert!(
+        matches!(&before[post_send_inputs.len()..], [line] if line["message"]["content"].as_str() == Some(WARMUP)),
+        "the retired CLI only got the warmup on stdin"
+    );
+    let receipts_before_retry = pending.iter().filter_map(&batch_user).count();
+    sqlx::query("DROP TRIGGER fail_turn_start").execute(&db).await.unwrap();
+
+    let replay_end = eventually("the replayed turn to complete without a new command", async || {
+        worker.journal.events_after(sid, last_end, u32::MAX).await.unwrap().into_iter().find(completed).map(|event| event.seq)
+    })
+    .await;
+    let inputs = cli_inputs(&stdin);
+    let replacement_inputs: Vec<_> = inputs[before.len()..].iter().map(|line| line["message"]["content"].as_str().unwrap()).collect();
+    assert!(
+        matches!(replacement_inputs.as_slice(), [first, second] if first.ends_with(ORIGINAL) && *second == SECOND),
+        "replacement stdin must contain the original inputs in order exactly once, not a generic continuation; got {replacement_inputs:?} \
+         ({receipts_before_retry} original User receipts committed before retry)"
+    );
+    assert_eq!(receipts_before_retry, 0, "a failed turn boundary must roll back the entire unsent batch's receipts");
+    assert_eq!(std::fs::read_to_string(&batch_model).unwrap().trim(), "sonnet", "retry must keep the requested model");
+
+    // Only after proving autonomous recovery, use a later turn to check that
+    // neither the journal nor the CLI receives another copy of the input.
+    let later = "This is the next independent request.";
+    let later_id = "input-after-recovery";
+    send_once(&worker, sid, later_id, later, None).await;
+    let recovered = eventually("the independent turn to complete", async || {
+        let events = worker.journal.events_after(sid, last_end, u32::MAX).await.unwrap();
+        events
+            .iter()
+            .skip_while(|event| !matches!(&event.kind, Some(session_event::Kind::User(user)) if user.command_id == later_id))
+            .any(|event| event.seq > replay_end && completed(event))
+            .then_some(events)
+    })
+    .await;
+    assert_eq!(
+        recovered.iter().filter_map(batch_user).map(|user| (user.command_id, user.text)).collect::<Vec<_>>(),
+        [(first_id.into(), ORIGINAL.into()), (second_id.into(), SECOND.into())],
+        "one journal User receipt per input in the original batch, in order"
+    );
+    assert!(
+        !recovered.iter().any(
+            |event| matches!(&event.kind, Some(session_event::Kind::User(user)) if user.command_id.starts_with("resume-after-failure-"))
+        ),
+        "an unsent turn needs replay, not a generic continuation"
+    );
+    let inputs = cli_inputs(&stdin);
+    let new_inputs: Vec<_> = inputs[before.len()..].iter().map(|line| line["message"]["content"].as_str().unwrap()).collect();
+    assert!(
+        matches!(new_inputs.as_slice(), [first, second, third] if first.ends_with(ORIGINAL) && *second == SECOND && *third == later),
+        "{new_inputs:?}"
+    );
     stop.cancel();
     head.shutdown().await.unwrap();
 }

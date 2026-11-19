@@ -2889,10 +2889,7 @@ impl Process {
         self.turn_tasks.clear();
         let mut started = opened;
         if !inputs.is_empty() && !opened {
-            for input in &inputs {
-                sink.append(input.event()).await?;
-            }
-            sink.append(session_event::Kind::TurnStarted(TurnStarted { turn, ..Default::default() })).await?;
+            sink.start_turn(turn, &inputs).await?;
             started = true;
         }
         let mut alive = true;

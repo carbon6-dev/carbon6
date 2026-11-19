@@ -84,6 +84,18 @@ working: its report will arrive as a notice when it finishes.";
 pub trait EventSink: Send + Sync {
     /// Appends a durable event and returns its seq.
     async fn append(&self, kind: session_event::Kind) -> anyhow::Result<u64>;
+
+    /// Records initial input receipts and their turn boundary before delivery.
+    /// The default is sequential; the worker overrides it with one journal
+    /// transaction so a failed boundary leaves the entire unsent batch queued.
+    async fn start_turn(&self, turn: u64, inputs: &[PendingInput]) -> anyhow::Result<()> {
+        for input in inputs {
+            self.append(input.event()).await?;
+        }
+        self.append(session_event::Kind::TurnStarted(c6_proto::TurnStarted { turn, ..Default::default() })).await?;
+        Ok(())
+    }
+
     fn ephemeral(&self, kind: ephemeral_event::Kind);
 }
 

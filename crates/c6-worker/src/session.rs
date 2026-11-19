@@ -2299,6 +2299,15 @@ impl EventSink for TurnSink {
         Ok(seq)
     }
 
+    async fn start_turn(&self, turn: u64, inputs: &[PendingInput]) -> anyhow::Result<()> {
+        self.writer.start_turn(turn, inputs).await?;
+        let mut inbox = self.inbox.lock().unwrap();
+        for input in inputs {
+            inbox.recorded(&input.command_id);
+        }
+        Ok(())
+    }
+
     fn ephemeral(&self, kind: ephemeral_event::Kind) {
         self.writer.ephemeral(kind);
     }
@@ -4600,10 +4609,7 @@ async fn claude_turn(
     let more = inbox.lock().unwrap().more.clone();
     let feed = || inbox.lock().unwrap().joining();
     let failed = async |message: String| -> anyhow::Result<Option<Process>> {
-        for input in &inputs {
-            sink.append(input.event()).await?;
-        }
-        sink.append(session_event::Kind::TurnStarted(TurnStarted { turn, ..Default::default() })).await?;
+        sink.start_turn(turn, &inputs).await?;
         sink.append(session_event::Kind::Error(ErrorEvent { message })).await?;
         sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: TurnEndReason::Error as i32 })).await?;
         Ok(None)
@@ -5394,6 +5400,23 @@ impl EventSink for Writer {
         *next += count;
         self.logged.store(*next, std::sync::atomic::Ordering::SeqCst);
         Ok(ev.seq)
+    }
+
+    async fn start_turn(&self, turn: u64, inputs: &[PendingInput]) -> anyhow::Result<()> {
+        let mut next = self.next_seq.lock().await;
+        self.link.flush_ephemeral();
+        let kinds = inputs
+            .iter()
+            .map(PendingInput::event)
+            .chain(std::iter::once(session_event::Kind::TurnStarted(TurnStarted { turn, ..Default::default() })));
+        let events: Vec<_> = kinds
+            .enumerate()
+            .map(|(offset, kind)| SessionEvent { seq: *next + offset as u64, ts_ms: c6_core::now_ms(), kind: Some(kind) })
+            .collect();
+        self.journal.append_turn(&self.session_id, &events).await?;
+        *next += events.len() as u64;
+        self.logged.store(*next, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 
     fn ephemeral(&self, mut kind: ephemeral_event::Kind) {
@@ -8661,8 +8684,74 @@ for line in sys.stdin:
 #[cfg(test)]
 mod writer_tests {
     use c6_proto::{AssistantMessage, TextDelta, WorkerMsg, worker_msg};
+    use sqlx::Connection;
 
     use super::*;
+
+    #[tokio::test]
+    async fn initial_turn_failure_keeps_the_whole_unsent_batch() {
+        for fail_boundary in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("journal.db");
+            let journal = Arc::new(Journal::open(&path).await.unwrap());
+            let started =
+                SessionEvent { seq: 1, kind: Some(session_event::Kind::Started(SessionStarted::default())), ..Default::default() };
+            journal.create_session("s", &CreateSession::default(), &started).await.unwrap();
+            let writer = Arc::new(Writer::new("s".into(), journal.clone(), Arc::new(HeadLink::default()), 2));
+            let inputs: Vec<_> = ["first", "second"]
+                .into_iter()
+                .map(|id| PendingInput { command_id: id.into(), text: id.into(), ..Default::default() })
+                .collect();
+            let inbox = Arc::new(Mutex::new(Inbox::default()));
+            for input in &inputs {
+                inbox.lock().unwrap().push(input.clone(), None);
+            }
+            assert_eq!(inbox.lock().unwrap().drain(), inputs);
+            let sink = TurnSink { writer: writer.clone(), inbox: inbox.clone() };
+            let opts = sqlx::sqlite::SqliteConnectOptions::new().filename(&path);
+            let mut fault = sqlx::SqliteConnection::connect_with(&opts).await.unwrap();
+            let trigger = if fail_boundary {
+                "CREATE TRIGGER admission_fault BEFORE UPDATE OF open_turn ON sessions
+                 WHEN NEW.id = 's' AND NEW.open_turn IS NOT NULL
+                 BEGIN SELECT RAISE(ABORT, 'test TurnStarted failure'); END"
+            } else {
+                "CREATE TRIGGER admission_fault BEFORE INSERT ON applied_commands
+                 WHEN NEW.command_id = 'second'
+                 BEGIN SELECT RAISE(ABORT, 'test second User failure'); END"
+            };
+            sqlx::query(trigger).execute(&mut fault).await.unwrap();
+
+            assert!(sink.start_turn(1, &inputs).await.is_err());
+            assert_eq!(journal.events_after("s", 0, u32::MAX).await.unwrap(), [started]);
+            assert!(journal.open_turns().await.unwrap().is_empty());
+            for input in &inputs {
+                assert!(!journal.is_applied(&input.command_id).await.unwrap());
+            }
+            assert_eq!(*writer.next_seq.lock().await, 2);
+            assert_eq!(writer.logged.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert_eq!(inbox.lock().unwrap().in_flight.iter().cloned().collect::<Vec<_>>(), inputs);
+
+            sqlx::query("DROP TRIGGER admission_fault").execute(&mut fault).await.unwrap();
+            {
+                let mut inbox = inbox.lock().unwrap();
+                inbox.recover(&HashSet::new(), &HashSet::new(), false);
+                assert_eq!(inbox.drain(), inputs, "retry the complete batch in its original order");
+            }
+            sink.start_turn(1, &inputs).await.unwrap();
+            let events = journal.events_after("s", 1, u32::MAX).await.unwrap();
+            assert_eq!(events.iter().map(|event| event.seq).collect::<Vec<_>>(), [2, 3, 4]);
+            assert_eq!(
+                events.iter().map(|event| event.kind.clone().unwrap()).collect::<Vec<_>>(),
+                [inputs[0].event(), inputs[1].event(), session_event::Kind::TurnStarted(TurnStarted { turn: 1, ..Default::default() }),]
+            );
+            for input in &inputs {
+                assert!(journal.is_applied(&input.command_id).await.unwrap());
+            }
+            assert_eq!(*writer.next_seq.lock().await, 5);
+            assert_eq!(writer.logged.load(std::sync::atomic::Ordering::SeqCst), 5);
+            assert!(inbox.lock().unwrap().in_flight.is_empty());
+        }
+    }
 
     /// Streamed text says where the log was: a viewer that catches up gets
     /// the reply from the log before the text it streamed, and drops that

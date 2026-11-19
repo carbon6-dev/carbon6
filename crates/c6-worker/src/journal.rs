@@ -495,6 +495,24 @@ impl Journal {
         Ok(())
     }
 
+    /// Admit initial Claude inputs and their turn together, before any stdin
+    /// writes. A failed boundary must not leave receipts for unsent inputs.
+    pub(crate) async fn append_turn(&self, session_id: &str, events: &[SessionEvent]) -> anyhow::Result<()> {
+        let (started, inputs) = events.split_last().context("missing turn boundary")?;
+        anyhow::ensure!(
+            matches!(started.kind, Some(session_event::Kind::TurnStarted(_)))
+                && inputs.iter().all(|event| matches!(event.kind, Some(session_event::Kind::User(_)))),
+            "expected initial User events followed by TurnStarted"
+        );
+        let mut tx = self.begin_write().await.with_context(|| format!("starting turn append to {session_id}"))?;
+        for event in events {
+            append_in(&mut tx, session_id, event).await?;
+        }
+        tx.commit().await?;
+        self.appended.notify_one();
+        Ok(())
+    }
+
     pub async fn load_session(&self, session_id: &str) -> anyhow::Result<Option<(CreateSession, Vec<SessionEvent>)>> {
         let Some(row) = sqlx::query("SELECT spec FROM sessions WHERE id = ?").bind(session_id).fetch_optional(&self.pool).await? else {
             return Ok(None);
