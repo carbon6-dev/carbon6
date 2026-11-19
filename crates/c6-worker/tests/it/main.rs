@@ -103,18 +103,28 @@ pub async fn open_worker(state: &std::path::Path) -> std::sync::Arc<c6_worker::W
     }
 }
 
-/// Starts a head again on the ports it had (its workers know them): ports
-/// from `c6_testkit::port()`, which no other test is given. Binding is
-/// still retried while the old listener lets go.
-pub async fn restart_head(cfg: c6_head::HeadConfig) -> c6_head::Head {
-    let deadline = tokio::time::Instant::now() + c6_testkit::wait::deadline();
-    loop {
-        match c6_head::start(cfg.clone()).await {
-            Ok(h) => return h,
-            Err(e) if format!("{e:#}").contains("binding") && tokio::time::Instant::now() < deadline => {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await
-            }
-            Err(e) => panic!("starting the head again: {e:#}"),
+/// Keeps both loopback sockets bound across head generations, so worker
+/// enrollment and UI URLs survive without rebinding either port.
+struct HeadListeners {
+    ui: std::net::TcpListener,
+    worker: std::net::TcpListener,
+}
+
+impl HeadListeners {
+    fn new() -> Self {
+        fn bind() -> std::net::TcpListener {
+            let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            listener
         }
+        Self { ui: bind(), worker: bind() }
+    }
+
+    async fn start(&self, cfg: c6_head::HeadConfig) -> c6_head::Head {
+        use tokio::net::TcpListener;
+
+        let ui = TcpListener::from_std(self.ui.try_clone().unwrap()).unwrap();
+        let worker = TcpListener::from_std(self.worker.try_clone().unwrap()).unwrap();
+        c6_head::start_with_listeners(cfg, vec![ui], vec![worker]).await.unwrap_or_else(|e| panic!("starting the head: {e:#}"))
     }
 }

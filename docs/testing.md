@@ -1,5 +1,28 @@
 # Tests that fail only when something is wrong
 
+## Restarted heads release their listening sockets
+
+Same-address worker integration tests keep their bound sockets in
+`HeadListeners` for the entire test, handing nonblocking copies to each head
+through `start_with_listeners`. They never drop and rebind a port number, so
+neither another test nor a descriptor inherited by a concurrent fork can
+block the next generation. `Head::shutdown()` joins the old server tasks
+before the next head starts. During the outage a new TCP handshake may queue
+in the retained listener, but no head is accepting or serving it. There are
+no bind retries or timing sleeps.
+
+On Linux, closing a listener is not enough when another test forks while it
+is open. `CLOEXEC` closes the child's copy only at exec; until then, that copy
+can keep the old socket listening. Both head listeners and the test port
+probe explicitly shut down the shared kernel socket before closing it.
+Caller-owned listeners are close-only: shutting down a copy would also
+invalidate the fixture's original. Darwin does not support listener shutdown,
+so retaining fixture sockets also avoids its fork/exec window without retries.
+`shutdown_releases_ports_with_duplicated_listeners` retains duplicate UI and
+worker descriptors across shutdown and requires an immediate restart while
+they remain open. `port_probe_releases_an_inherited_socket` covers the same
+race before a server's first bind. Neither regression retries or sleeps.
+
 ## Background work and typing benchmark (S15)
 
 `crates/c6-ui/tests/background-work.cjs` serves production WASM on a private

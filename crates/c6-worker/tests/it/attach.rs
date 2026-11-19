@@ -8,12 +8,12 @@ use c6_worker::{ConnState, Identity, Worker, conn, enroll};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-fn head_config(data_dir: &Path, worker_port: u16) -> HeadConfig {
+fn head_config(data_dir: &Path) -> HeadConfig {
     HeadConfig {
         data_dir: data_dir.to_owned(),
         bind: vec!["127.0.0.1".parse().unwrap()],
         ui_port: 0,
-        worker_port,
+        worker_port: 0,
         auth: false,
         ..Default::default()
     }
@@ -34,8 +34,8 @@ async fn enroll_attach_restart_revoke() {
     let head_dir = tempfile::tempdir().unwrap();
     let worker_dir = tempfile::tempdir().unwrap();
 
-    let head = c6_head::start(head_config(head_dir.path(), 0)).await.unwrap();
-    let worker_port = head.worker_addrs[0].port();
+    let listeners = crate::HeadListeners::new();
+    let head = listeners.start(head_config(head_dir.path())).await;
 
     // Enroll with a one-time token.
     let enrollment = c6_head::api::new_enrollment(&head.state, Some("testbox")).await.unwrap();
@@ -60,7 +60,7 @@ async fn enroll_attach_restart_revoke() {
     // Head restarts on the same port; the worker comes back by itself.
     head.shutdown().await.unwrap();
     wait_for(&mut state_rx, |s| matches!(s, ConnState::Disconnected { .. })).await;
-    let head = c6_head::start(head_config(head_dir.path(), worker_port)).await.unwrap();
+    let head = listeners.start(head_config(head_dir.path())).await;
     wait_for(&mut state_rx, |s| matches!(s, ConnState::Attached { .. })).await;
     assert_eq!(status(&head, id).await, WorkerStatus::Online);
 
@@ -77,7 +77,7 @@ async fn enroll_attach_restart_revoke() {
 #[tokio::test]
 async fn wrong_ca_fingerprint_is_rejected() {
     let head_dir = tempfile::tempdir().unwrap();
-    let head = c6_head::start(head_config(head_dir.path(), 0)).await.unwrap();
+    let head = c6_head::start(head_config(head_dir.path())).await.unwrap();
     let enrollment = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
 
     let mut token = c6_core::enrollment::EnrollmentToken::decode(&enrollment.token).unwrap();

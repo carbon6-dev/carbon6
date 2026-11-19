@@ -88,13 +88,29 @@ pub fn port() -> u16 {
             continue; // another test process has it
         }
         // Something outside the tests may hold it: take the next.
-        if std::net::TcpListener::bind(("127.0.0.1", p)).is_err() {
+        let Ok(probe) = std::net::TcpListener::bind(("127.0.0.1", p)) else {
             continue;
-        }
+        };
+        release_port_probe(probe);
         HELD.lock().unwrap().push(file);
         return p;
     }
     panic!("no free test port in {FIRST}..{}", FIRST + COUNT);
+}
+
+fn release_port_probe(probe: std::net::TcpListener) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+
+        // A concurrent fork can retain the socket until exec despite CLOEXEC.
+        // Stop the shared listener so even the first server bind cannot race
+        // that inherited descriptor. Darwin does not support this operation.
+        // SAFETY: the probe owns this live socket throughout the call.
+        let result = unsafe { libc::shutdown(probe.as_raw_fd(), libc::SHUT_RDWR) };
+        assert_eq!(result, 0, "shutting down a test port probe: {}", std::io::Error::last_os_error());
+    }
+    drop(probe);
 }
 
 /// Whether `tool` (a program on PATH) is here: see [`need`].
@@ -118,6 +134,17 @@ pub fn need(what: &str, present: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn port_probe_releases_an_inherited_socket() {
+        let probe = std::net::TcpListener::bind(("127.0.0.1", super::port())).unwrap();
+        let addr = probe.local_addr().unwrap();
+        let inherited = probe.try_clone().unwrap();
+        super::release_port_probe(probe);
+        let next = std::net::TcpListener::bind(addr).expect("the probe must release the port even before a concurrent child execs");
+        drop((next, inherited));
+    }
+
     #[test]
     fn ports_are_never_handed_out_twice() {
         let a: std::collections::HashSet<u16> = (0..50).map(|_| super::port()).collect();

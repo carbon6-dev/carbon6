@@ -659,6 +659,7 @@ dependencies = [
  "hyper-util",
  "if-addrs",
  "lettre",
+ "libc",
  "mime_guess",
  "opentelemetry-proto",
  "pem",

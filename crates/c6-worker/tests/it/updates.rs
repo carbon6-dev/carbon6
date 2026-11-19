@@ -93,11 +93,11 @@ async fn the_head_then_its_workers_update_to_a_signed_release() {
     std::fs::write(&c6w, "old c6w").unwrap();
 
     let (head_dir, state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let cfg = |runs: &str, (ui_port, worker_port): (u16, u16)| HeadConfig {
+    let cfg = |runs: &str| HeadConfig {
         data_dir: head_dir.path().to_owned(),
         bind: vec!["127.0.0.1".parse().unwrap()],
-        ui_port,
-        worker_port,
+        ui_port: 0,
+        worker_port: 0,
         auth: false,
         update_source: source.clone(),
         update_keys: vec![public.clone()],
@@ -105,10 +105,9 @@ async fn the_head_then_its_workers_update_to_a_signed_release() {
         update_as_version: Some(runs.to_owned()),
         ..Default::default()
     };
-    // Ports it gets back when it restarts (its worker knows them).
-    let mut head = c6_head::start(cfg("9.9.8", (c6_testkit::port(), c6_testkit::port()))).await.unwrap();
-    let ports = (head.ui_addrs[0].port(), head.worker_addrs[0].port());
-    let api = format!("http://127.0.0.1:{}/api/v1", ports.0);
+    let listeners = crate::HeadListeners::new();
+    let mut head = listeners.start(cfg("9.9.8")).await;
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
     let http = reqwest::Client::new();
     let get = async |path: &str| -> Value { http.get(format!("{api}/{path}")).send().await.unwrap().json().await.unwrap() };
     let post = async |path: &str, body: Value| -> Value {
@@ -150,7 +149,7 @@ async fn the_head_then_its_workers_update_to_a_signed_release() {
     drop(head);
 
     // The new version starts: done; then the worker updates.
-    let head = crate::restart_head(cfg(V, ports)).await;
+    let head = listeners.start(cfg(V)).await;
     let s = get("system/updates").await;
     assert_eq!(s["machines"][0]["state"], "done", "{s}");
     run.await.unwrap().unwrap();

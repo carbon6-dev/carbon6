@@ -12,12 +12,12 @@ use serde_json::json;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-fn head_config(data_dir: &Path, worker_port: u16, ui_port: u16) -> HeadConfig {
+fn head_config(data_dir: &Path) -> HeadConfig {
     HeadConfig {
         data_dir: data_dir.to_owned(),
         bind: vec!["127.0.0.1".parse().unwrap()],
-        ui_port,
-        worker_port,
+        ui_port: 0,
+        worker_port: 0,
         auth: false,
         ..Default::default()
     }
@@ -32,8 +32,9 @@ async fn task_runs_and_survives_head_outage() {
     let project = tempfile::tempdir().unwrap();
     std::fs::write(project.path().join("AGENTS.md"), "Always be brief.").unwrap();
 
-    let head = c6_head::start(head_config(head_dir.path(), 0, 0)).await.unwrap();
-    let (worker_port, ui_port) = (head.worker_addrs[0].port(), head.ui_addrs[0].port());
+    let listeners = crate::HeadListeners::new();
+    let head = listeners.start(head_config(head_dir.path())).await;
+    let ui_port = head.ui_addrs[0].port();
     let api = format!("http://127.0.0.1:{ui_port}/api/v1");
     let http = reqwest::Client::new();
 
@@ -122,7 +123,7 @@ async fn task_runs_and_survives_head_outage() {
     let (_, journal) = worker.journal.load_session(&session.id).await.unwrap().unwrap();
 
     // The head comes back on the same ports and catches up.
-    let head = c6_head::start(head_config(head_dir.path(), worker_port, ui_port)).await.unwrap();
+    let head = listeners.start(head_config(head_dir.path())).await;
     let last = journal.last().unwrap().seq;
     eventually("head to catch up", async || {
         detail(session.id.clone()).await.filter(|d| d.session.last_seq == last && d.session.status == SessionStatus::Idle)
@@ -184,7 +185,7 @@ async fn bad_cwd_fails_the_session() {
     let mock = MockLlm::start().await;
     let head_dir = tempfile::tempdir().unwrap();
     let worker_dir = tempfile::tempdir().unwrap();
-    let head = c6_head::start(head_config(head_dir.path(), 0, 0)).await.unwrap();
+    let head = c6_head::start(head_config(head_dir.path())).await.unwrap();
     let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
     let http = reqwest::Client::new();
 

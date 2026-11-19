@@ -39,6 +39,7 @@ pub mod imports;
 pub mod instances;
 pub mod kitjobs;
 pub mod knowledge;
+mod listener;
 pub mod lists;
 pub mod marks;
 pub mod memex;
@@ -92,7 +93,6 @@ use anyhow::Context;
 use c6_proto::{enrollment_server::EnrollmentServer, worker_hub_server::WorkerHubServer};
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
-use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Certificate, Server, ServerTlsConfig};
 use tracing::info;
@@ -269,16 +269,49 @@ impl Head {
 }
 
 /// Binds all listeners, prepares state and starts serving.
-pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
+pub async fn start(cfg: HeadConfig) -> anyhow::Result<Head> {
+    start_impl(cfg, None).await
+}
+
+/// Serves on copies of caller-owned listening sockets. The caller controls
+/// their lifetime: shutdown closes these copies without shutting down the
+/// shared sockets, which can be handed to a later head generation. Their
+/// actual addresses replace the configured bind addresses and ports, and
+/// remain subject to `allow_public_bind`.
+pub async fn start_with_listeners(mut cfg: HeadConfig, ui: Vec<TcpListener>, worker: Vec<TcpListener>) -> anyhow::Result<Head> {
+    anyhow::ensure!(!ui.is_empty() && !worker.is_empty(), "both UI and worker listeners are required");
+    cfg.bind = ui.iter().chain(&worker).map(|l| l.local_addr().map(|a| a.ip())).collect::<Result<_, _>>()?;
+    cfg.ui_port = ui[0].local_addr()?.port();
+    cfg.worker_port = worker[0].local_addr()?.port();
+    start_impl(cfg, Some((ui, worker))).await
+}
+
+async fn start_impl(mut cfg: HeadConfig, listeners: Option<(Vec<TcpListener>, Vec<TcpListener>)>) -> anyhow::Result<Head> {
     cfg.extra_names.extend(config::tailnet_names().await);
     let ips = cfg.bind_ips()?;
     let public_ui = cfg.public_ui()?;
     c6_core::create_private_dir(&cfg.data_dir).with_context(|| format!("creating {}", cfg.data_dir.display()))?;
 
-    let ui_listeners = bind_all(&ips, cfg.ui_port).await.context("binding UI port")?;
-    let worker_listeners = bind_all(&ips, cfg.worker_port).await.context("binding worker port")?;
-    let ui_addrs: Vec<_> = ui_listeners.iter().map(|l| l.local_addr()).collect::<Result<_, _>>()?;
-    let worker_addrs: Vec<_> = worker_listeners.iter().map(|l| l.local_addr()).collect::<Result<_, _>>()?;
+    let (ui_listeners, worker_listeners) = match listeners {
+        Some((ui, worker)) => {
+            (ui.into_iter().map(listener::Listener::shared).collect(), worker.into_iter().map(listener::Listener::shared).collect())
+        }
+        None => (
+            bind_all(&ips, cfg.ui_port).await.context("binding UI port")?,
+            bind_all(&ips, cfg.worker_port).await.context("binding worker port")?,
+        ),
+    };
+    start_bound(cfg, public_ui, ui_listeners, worker_listeners).await
+}
+
+async fn start_bound(
+    cfg: HeadConfig,
+    public_ui: Option<config::PublicUi>,
+    ui_listeners: Vec<listener::Listener>,
+    worker_listeners: Vec<listener::Listener>,
+) -> anyhow::Result<Head> {
+    let ui_addrs: Vec<_> = ui_listeners.iter().map(|l| l.get().local_addr()).collect::<Result<_, _>>()?;
+    let worker_addrs: Vec<_> = worker_listeners.iter().map(|l| l.get().local_addr()).collect::<Result<_, _>>()?;
 
     // A wildcard bind (0.0.0.0) is reached at the interface addresses: those
     // go into the certificate, the advertised URL and the Host allowlist.
@@ -433,7 +466,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
         // Enrollment runs before the worker has a certificate; Attach checks
         // for one itself.
         .client_auth_optional(true);
-    let incoming = futures::stream::select_all(worker_listeners.into_iter().map(TcpListenerStream::new));
+    let incoming = futures::stream::select_all(worker_listeners);
     let grpc = Server::builder()
         .tls_config(tls)?
         .http2_keepalive_interval(Some(Duration::from_secs(20)))
@@ -462,7 +495,7 @@ pub async fn start(mut cfg: HeadConfig) -> anyhow::Result<Head> {
             None => None,
         };
         let public = public_ui.as_ref().map(|p| p.url.clone());
-        tasks.spawn(async move { tls::serve(listener, app, tls, public, token).await.context("UI port") });
+        tasks.spawn(async move { tls::serve_listener(listener, app, tls, public, token).await.context("UI port") });
     }
     let port = ui_addrs[0].port();
     let ui_urls = match (&public_ui, &ui_tls) {
@@ -588,11 +621,11 @@ pub async fn offline_enrollment(mut cfg: HeadConfig, name: Option<&str>) -> anyh
     create_enrollment(&store, pki.ca_sha256(), &worker_url, name).await
 }
 
-async fn bind_all(ips: &[IpAddr], port: u16) -> anyhow::Result<Vec<TcpListener>> {
+async fn bind_all(ips: &[IpAddr], port: u16) -> anyhow::Result<Vec<listener::Listener>> {
     let mut out = Vec::new();
     for ip in ips {
         let addr = SocketAddr::new(*ip, port);
-        out.push(TcpListener::bind(addr).await.with_context(|| format!("binding {addr}"))?);
+        out.push(listener::Listener::new(TcpListener::bind(addr).await.with_context(|| format!("binding {addr}"))?));
     }
     Ok(out)
 }
@@ -605,4 +638,83 @@ pub(crate) fn util_clip(s: &str, n: usize) -> String {
     let mut out: String = s.chars().take(n.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(target_os = "linux")]
+    use std::os::fd::AsFd;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn shutdown_releases_ports_with_duplicated_listeners() {
+        let dir = tempfile::tempdir().unwrap();
+        let bind = vec!["127.0.0.1".parse().unwrap()];
+        let ui = bind_all(&bind, c6_testkit::port()).await.unwrap();
+        let worker = bind_all(&bind, c6_testkit::port()).await.unwrap();
+        // Model a forked child retaining the descriptors until it execs.
+        let ui_dup = std::net::TcpListener::from(ui[0].get().as_fd().try_clone_to_owned().unwrap());
+        let worker_dup = std::net::TcpListener::from(worker[0].get().as_fd().try_clone_to_owned().unwrap());
+        let cfg = HeadConfig {
+            data_dir: dir.path().to_owned(),
+            bind,
+            ui_port: ui[0].get().local_addr().unwrap().port(),
+            worker_port: worker[0].get().local_addr().unwrap().port(),
+            auth: false,
+            ..Default::default()
+        };
+        let head = start_bound(cfg.clone(), cfg.public_ui().unwrap(), ui, worker).await.unwrap();
+        head.shutdown().await.unwrap();
+
+        let restarted = start(cfg).await.unwrap();
+        drop((ui_dup, worker_dup));
+        restarted.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn caller_owned_listeners_serve_each_head_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let ui = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let worker = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        ui.set_nonblocking(true).unwrap();
+        worker.set_nonblocking(true).unwrap();
+        let cfg = HeadConfig {
+            data_dir: dir.path().to_owned(),
+            bind: vec!["127.0.0.1".parse().unwrap()],
+            ui_port: ui.local_addr().unwrap().port(),
+            worker_port: worker.local_addr().unwrap().port(),
+            auth: false,
+            ..Default::default()
+        };
+
+        for _ in 0..2 {
+            let head = start_with_listeners(
+                cfg.clone(),
+                vec![TcpListener::from_std(ui.try_clone().unwrap()).unwrap()],
+                vec![TcpListener::from_std(worker.try_clone().unwrap()).unwrap()],
+            )
+            .await
+            .unwrap();
+            let response = reqwest::get(format!("http://{}/api/v1/auth/status", head.ui_addrs[0])).await.unwrap();
+            assert!(response.status().is_success());
+            let enrollment = api::new_enrollment(&head.state, None).await.unwrap();
+            c6_worker::enroll::enroll(&enrollment.token).await.unwrap();
+            head.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_owned_listeners_obey_the_private_bind_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeadConfig { data_dir: dir.path().to_owned(), bind: vec!["127.0.0.1".parse().unwrap()], ..Default::default() };
+        let result = start_with_listeners(
+            cfg,
+            vec![TcpListener::bind(("0.0.0.0", 0)).await.unwrap()],
+            vec![TcpListener::bind(("127.0.0.1", 0)).await.unwrap()],
+        )
+        .await;
+        let Err(error) = result else { panic!("caller-owned sockets must not bypass the private bind policy") };
+        assert!(error.to_string().contains("refusing to bind non-private address"), "{error:#}");
+    }
 }

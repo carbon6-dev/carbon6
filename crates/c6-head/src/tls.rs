@@ -193,7 +193,17 @@ pub async fn serve(
     public: Option<String>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
-    let port = listener.local_addr()?.port();
+    serve_listener(crate::listener::Listener::new(listener), app, tls, public, shutdown).await
+}
+
+pub(crate) async fn serve_listener(
+    listener: crate::listener::Listener,
+    app: Router,
+    tls: Option<(TlsAcceptor, String)>,
+    public: Option<String>,
+    shutdown: CancellationToken,
+) -> anyhow::Result<()> {
+    let port = listener.get().local_addr()?.port();
     let secure_app = app.clone().layer(axum::Extension(crate::auth::Tls));
     let plain_app = match &tls {
         Some((_, name)) => {
@@ -206,7 +216,7 @@ pub async fn serve(
     loop {
         let (stream, _) = tokio::select! {
             _ = shutdown.cancelled() => return Ok(()),
-            r = listener.accept() => match r {
+            r = listener.get().accept() => match r {
                 Ok(c) => c,
                 Err(e) => { warn!("accepting a UI connection: {e}"); continue; }
             },

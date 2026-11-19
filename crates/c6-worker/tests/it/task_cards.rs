@@ -227,6 +227,7 @@ async fn agents_propose_tasks_you_start_with_one_click() {
 
 struct Cards {
     head: Option<c6_head::Head>,
+    listeners: crate::HeadListeners,
     config: HeadConfig,
     _head_dir: tempfile::TempDir,
     state: tempfile::TempDir,
@@ -246,18 +247,20 @@ impl Cards {
         let config = HeadConfig {
             data_dir: head_dir.path().to_owned(),
             bind: vec!["127.0.0.1".parse().unwrap()],
-            ui_port: c6_testkit::port(),
-            worker_port: c6_testkit::port(),
+            ui_port: 0,
+            worker_port: 0,
             auth: false,
             ..Default::default()
         };
-        let head = c6_head::start(config.clone()).await.unwrap();
+        let listeners = crate::HeadListeners::new();
+        let head = listeners.start(config.clone()).await;
         let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
         let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
         enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
         let worker = crate::open_worker(state.path()).await;
         let mut this = Self {
             head: Some(head),
+            listeners,
             config,
             _head_dir: head_dir,
             state,
@@ -626,7 +629,7 @@ async fn a_queued_task_card_answer_survives_restarts_and_deduplicates_after_relo
     assert_eq!(detail["queued"].as_array().unwrap().len(), 1, "ordinary queued delivery: {detail}");
     assert_eq!(detail["queued"][0]["text"], offline_text);
     t.head.take().unwrap().shutdown().await.unwrap();
-    t.head = Some(c6_head::start(t.config.clone()).await.unwrap());
+    t.head = Some(t.listeners.start(t.config.clone()).await);
     // In-process shutdown leaves existing HTTP keep-alive tasks alive;
     // a real process restart closes those sockets.
     t.http = reqwest::Client::new();

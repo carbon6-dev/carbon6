@@ -10,12 +10,12 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-fn cfg(dir: &std::path::Path, ui: u16, worker: u16) -> HeadConfig {
+fn cfg(dir: &std::path::Path) -> HeadConfig {
     HeadConfig {
         data_dir: dir.to_owned(),
         bind: vec!["127.0.0.1".parse().unwrap()],
-        ui_port: ui,
-        worker_port: worker,
+        ui_port: 0,
+        worker_port: 0,
         auth: false,
         ..Default::default()
     }
@@ -31,10 +31,9 @@ async fn search_finds_events_and_survives_reindex() {
     let head_dir = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
-    // Ports it gets back when it restarts (its worker knows them).
-    let head = c6_head::start(cfg(head_dir.path(), c6_testkit::port(), c6_testkit::port())).await.unwrap();
-    let ports = (head.ui_addrs[0].port(), head.worker_addrs[0].port());
-    let api = format!("http://127.0.0.1:{}/api/v1", ports.0);
+    let listeners = crate::HeadListeners::new();
+    let head = listeners.start(cfg(head_dir.path())).await;
+    let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
     let http = reqwest::Client::new();
     let e = c6_head::api::new_enrollment(&head.state, None).await.unwrap();
     enroll::enroll(&e.token).await.unwrap().save(state.path()).unwrap();
@@ -148,7 +147,7 @@ async fn search_finds_events_and_survives_reindex() {
     assert_ne!(version, "0");
     head.state.store.set_setting("search.version", "0").await.unwrap();
     head.shutdown().await.unwrap();
-    let head = crate::restart_head(cfg(head_dir.path(), ports.0, ports.1)).await;
+    let head = listeners.start(cfg(head_dir.path())).await;
     eventually("re-index", async || {
         (head.state.store.setting("search.version").await.unwrap().as_deref() == Some(version.as_str())).then_some(())
     })

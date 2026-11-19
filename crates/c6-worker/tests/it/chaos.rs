@@ -14,12 +14,12 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-fn cfg(dir: &Path, ui: u16, worker: u16) -> HeadConfig {
+fn cfg(dir: &Path) -> HeadConfig {
     HeadConfig {
         data_dir: dir.to_owned(),
         bind: vec!["127.0.0.1".parse().unwrap()],
-        ui_port: ui,
-        worker_port: worker,
+        ui_port: 0,
+        worker_port: 0,
         auth: false,
         ..Default::default()
     }
@@ -36,9 +36,9 @@ async fn run_worker(state: &Path) -> (Arc<Worker>, CancellationToken) {
 
 struct Env {
     head: Option<c6_head::Head>,
+    listeners: crate::HeadListeners,
     head_dir: tempfile::TempDir,
     api: String,
-    ports: (u16, u16),
     http: reqwest::Client,
     mock: MockLlm,
     conn_id: String,
@@ -47,10 +47,9 @@ struct Env {
 impl Env {
     async fn new() -> Self {
         let head_dir = tempfile::tempdir().unwrap();
-        // Ports it gets back when it restarts (its worker knows them).
-        let head = c6_head::start(cfg(head_dir.path(), c6_testkit::port(), c6_testkit::port())).await.unwrap();
-        let ports = (head.ui_addrs[0].port(), head.worker_addrs[0].port());
-        let api = format!("http://127.0.0.1:{}/api/v1", ports.0);
+        let listeners = crate::HeadListeners::new();
+        let head = listeners.start(cfg(head_dir.path())).await;
+        let api = format!("http://127.0.0.1:{}/api/v1", head.ui_addrs[0].port());
         let http = reqwest::Client::new();
         let mock = MockLlm::start().await;
         let conn: Value = http
@@ -62,7 +61,7 @@ impl Env {
             .json()
             .await
             .unwrap();
-        Self { head: Some(head), head_dir, api, ports, http, mock, conn_id: conn["id"].as_str().unwrap().to_owned() }
+        Self { head: Some(head), listeners, head_dir, api, http, mock, conn_id: conn["id"].as_str().unwrap().to_owned() }
     }
 
     async fn enroll(&self, state: &Path) {
@@ -375,7 +374,7 @@ async fn head_restarts_during_a_long_turn() {
         .await;
         assert!(!result.is_error, "{result:?}");
         assert_eq!(result.output, format!("step-{step}\n"));
-        env.head = Some(crate::restart_head(cfg(env.head_dir.path(), env.ports.0, env.ports.1)).await);
+        env.head = Some(env.listeners.start(cfg(env.head_dir.path())).await);
         eventually("the worker to reattach", async || {
             (env.head.as_ref().unwrap().state.registry.get(worker.identity.meta.worker_id).is_some() && worker.link.is_connected())
                 .then_some(())
