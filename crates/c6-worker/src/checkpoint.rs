@@ -54,7 +54,7 @@ impl Checkpoints {
                                 Ok(true) => {}
                                 Err(error) => {
                                     if !noted_uncertainty {
-                                        tracing::warn!(repo = %self.git_dir.display(), %error, "waiting for uncertain checkpoint Git ownership");
+                                        tracing::warn!(repo = %self.git_dir.display(), error = %format_args!("{error:#}"), "waiting for uncertain checkpoint Git ownership");
                                         noted_uncertainty = true;
                                     }
                                 }
@@ -89,7 +89,7 @@ impl Checkpoints {
             match lock.try_lock() {
                 Ok(()) => {
                     if let Err(error) = Self::remove_stale_index_lock(&git_dir).await {
-                        tracing::warn!(repo = %git_dir.display(), %error, "could not recover checkpoint index lock");
+                        tracing::warn!(repo = %git_dir.display(), error = %format_args!("{error:#}"), "could not recover checkpoint index lock");
                     }
                 }
                 Err(TryLockError::WouldBlock) => {}
@@ -230,6 +230,7 @@ impl Checkpoints {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkpoint_process::{OwnershipUncertain, conclusive};
 
     #[tokio::test]
     async fn startup_recovers_stale_index_locks() {
@@ -329,14 +330,14 @@ mod tests {
         Checkpoints::recover(state.path()).await.unwrap();
         let lock = Checkpoints::open_lock(&cp.git_dir).unwrap();
         c6_testkit::eventually("legacy repo's sidecar is not inherited by an unrelated fork", async || lock.try_lock().ok()).await;
-        let recovered = Checkpoints::remove_stale_index_lock(&cp.git_dir).await.unwrap();
+        let recovered = conclusive(async || Checkpoints::remove_stale_index_lock(&cp.git_dir).await).await.unwrap();
         let retained = std::fs::read_to_string(cp.git_dir.join("index.lock"));
         drop(child.stdin.take());
         assert!(c6_testkit::within("legacy git exits after stdin EOF", child.wait()).await.unwrap().success());
         assert!(!recovered, "must not recover over a live legacy git");
         assert_eq!(retained.unwrap(), "live legacy index");
         drop(lock);
-        cp.snapshot().await.unwrap();
+        conclusive(async || cp.snapshot().await).await.unwrap();
         assert!(!cp.git_dir.join("index.lock").exists());
     }
 
@@ -355,9 +356,24 @@ mod tests {
             cp.git_dir.join("index.lock").display(),
             cp.git_dir.join("index.lock").display()
         );
-        let error = cp.git(&["-c", &alias, "fail"], &lock).await.unwrap_err();
+        let attempts = work.path().join("attempts");
+        let error = conclusive(async || {
+            std::fs::write(&attempts, "")?;
+            let error = cp.git(&["-c", &alias, "fail"], &lock).await.unwrap_err();
+            if error.is::<OwnershipUncertain>() {
+                // This invocation must fail closed: only its initial Git
+                // command ran, and the scanner must have left the lock intact.
+                assert_eq!(std::fs::read_to_string(&attempts)?, "x");
+                assert!(cp.git_dir.join("index.lock").exists());
+                Err(error)
+            } else {
+                Ok(error)
+            }
+        })
+        .await
+        .unwrap();
         assert!(error.to_string().contains("File exists"));
-        assert_eq!(std::fs::read_to_string(work.path().join("attempts")).unwrap(), "xx");
+        assert_eq!(std::fs::read_to_string(attempts).unwrap(), "xx");
         assert!(cp.git_dir.join("index.lock").exists(), "a second failure must not remove another lock or retry again");
     }
 
@@ -391,7 +407,7 @@ mod tests {
         // A killed git add leaves this file behind. No git process owns it.
         std::fs::write(cp.git_dir.join("index.lock"), "interrupted index").unwrap();
         std::fs::write(work.path().join("file"), "after").unwrap();
-        let commit = cp.snapshot().await.expect("a stale index.lock must be recovered");
+        let commit = conclusive(async || cp.snapshot().await).await.expect("a stale index.lock must be recovered");
         assert!(!cp.git_dir.join("index.lock").exists());
         std::fs::write(work.path().join("file"), "later").unwrap();
         cp.restore(&commit).await.unwrap();

@@ -12,6 +12,34 @@ pub(crate) async fn running(git_dir: &Path) -> anyhow::Result<bool> {
     tokio::task::spawn_blocking(move || scan(&git_dir)).await?
 }
 
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+pub(crate) struct OwnershipUncertain;
+
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+impl std::fmt::Display for OwnershipUncertain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("uncertain checkpoint Git ownership")
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn conclusive<T>(mut probe: impl AsyncFnMut() -> anyhow::Result<T>) -> anyhow::Result<T> {
+    let last = std::cell::RefCell::new(String::new());
+    c6_testkit::eventually_or(
+        "a conclusive checkpoint ownership observation",
+        async || match probe().await {
+            Err(error) if error.is::<OwnershipUncertain>() => {
+                *last.borrow_mut() = format!("{error:#}");
+                None
+            }
+            result => Some(result),
+        },
+        || last.borrow().clone(),
+    )
+    .await
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod unix {
     use std::ffi::OsStr;
@@ -24,6 +52,8 @@ mod unix {
     use anyhow::Context;
     use nix::libc;
 
+    use super::OwnershipUncertain;
+
     pub(super) fn scan(git_dir: &Path) -> anyhow::Result<bool> {
         let target = fs::metadata(git_dir).with_context(|| format!("identifying checkpoint repo {}", git_dir.display()))?;
         let worker = std::env::current_exe()?;
@@ -31,15 +61,14 @@ mod unix {
         let uid = unsafe { libc::geteuid() };
         let mut uncertain = None;
         for process in processes(uid)? {
-            let Process { pid, name } = process;
+            let pid = process.pid;
             // Read argv even for unrecognized executable names (e.g. a Git
             // launcher). Only fail on unreadable argv for plausible owners.
             let candidate = match command_line(pid) {
                 Ok(Some(path)) => path,
                 Ok(None) => continue,
                 Err(err) => {
-                    let name = Path::new(&name).file_name().unwrap_or_default();
-                    if plausible_owner(name, worker.file_name()) && still_live(pid) {
+                    if possibly_owns_without_argv(&process, worker.file_name()) {
                         uncertain = Some(err.context(format!("reading checkpoint Git argv for PID {pid}")));
                     }
                     continue;
@@ -57,12 +86,13 @@ mod unix {
                 Err(_) => {}
             }
         }
-        uncertain.map_or(Ok(false), Err)
+        uncertain.map_or(Ok(false), |error| Err(error.context(OwnershipUncertain)))
     }
 
     fn plausible_owner(name: &OsStr, worker: Option<&OsStr>) -> bool {
         let name = name.as_bytes();
         name == b"git"
+            || name.starts_with(b"git-")
             || name == b"c6w"
             || worker.is_some_and(|worker| {
                 let worker = worker.as_bytes();
@@ -72,6 +102,7 @@ mod unix {
 
     struct Process {
         pid: i32,
+        #[cfg(target_os = "macos")]
         name: std::ffi::OsString,
     }
 
@@ -108,8 +139,7 @@ mod unix {
             let euid = status_field(&status, b"Uid:")
                 .and_then(|uids| std::str::from_utf8(uids).ok()?.split_ascii_whitespace().nth(1)?.parse::<u32>().ok());
             if euid == Some(uid) && !dead(&status) {
-                let name = status_field(&status, b"Name:").unwrap_or_default();
-                found.push(Process { pid, name: OsStr::from_bytes(name).to_owned() });
+                found.push(Process { pid });
             }
         }
         Ok(found)
@@ -135,17 +165,78 @@ mod unix {
 
     #[cfg(target_os = "linux")]
     fn stat_dead(stat: &[u8]) -> bool {
+        stat_identity(stat).is_some_and(|(_, state, flags)| matches!(state, b"Z" | b"X" | b"x") || flags & PF_EXITING != 0)
+    }
+
+    // Linux can clear cmdline before the task reaches zombie state. A
+    // running-state task with PF_EXITING set cannot return to Git code.
+    #[cfg(target_os = "linux")]
+    const PF_EXITING: u32 = 0x4;
+
+    #[cfg(target_os = "linux")]
+    fn stat_identity(stat: &[u8]) -> Option<(&[u8], &[u8], u32)> {
         // comm (field 2) may itself contain whitespace and parentheses.
-        let Some(end) = stat.windows(2).rposition(|pair| pair == b") ") else { return false };
+        let start = stat.iter().position(|&b| b == b'(')?;
+        let end = stat.windows(2).rposition(|pair| pair == b") ")?;
+        let comm = stat.get(start + 1..end)?;
         let mut fields = stat[end + 2..].split(u8::is_ascii_whitespace).filter(|field| !field.is_empty());
-        if matches!(fields.next(), Some(b"Z" | b"X" | b"x")) {
+        let state = fields.next()?;
+        // Flags are field 9 (index 6 after comm, five more after state).
+        let flags = std::str::from_utf8(fields.nth(5)?).ok()?.parse().ok()?;
+        Some((comm, state, flags))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn possibly_owns_without_argv(process: &Process, worker: Option<&OsStr>) -> bool {
+        let pid = process.pid;
+        let stat = match fs::read(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat,
+            Err(error) => return !gone(&error),
+        };
+        // A missing exe link alone does not prove exit; the task may have
+        // disappeared between these reads, so recheck liveness if uncertain.
+        linux_argv_uncertain(&stat, worker, || fs::read_link(format!("/proc/{pid}/exe")).ok()) && still_live(pid)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_argv_uncertain(stat: &[u8], worker: Option<&OsStr>, exe: impl FnOnce() -> Option<PathBuf>) -> bool {
+        let Some((comm, state, flags)) = stat_identity(stat) else { return true };
+        const PF_KTHREAD: u32 = 0x0020_0000;
+        if matches!(state, b"Z" | b"X" | b"x") || flags & (PF_EXITING | PF_KTHREAD) != 0 {
+            return false;
+        }
+        // An exec can publish a new executable and clear the cmdline before
+        // updating comm. Only skip when both fresh observations exclude a
+        // worker and Git. In particular, a Git script can have an interpreter
+        // as its executable, and a fork still in the worker can exec Git.
+        if comm.is_empty() || plausible_owner(OsStr::from_bytes(comm), worker) {
             return true;
         }
-        // Linux can clear cmdline before the task reaches zombie state. A
-        // running-state task with PF_EXITING set cannot return to Git code.
-        // Flags are field 9 (index 6 after comm, five more after state).
-        const PF_EXITING: u32 = 0x4;
-        fields.nth(5).and_then(|flags| std::str::from_utf8(flags).ok()?.parse::<u32>().ok()).is_some_and(|flags| flags & PF_EXITING != 0)
+        let exe = exe();
+        exe.as_deref().and_then(Path::file_name).is_none_or(|name| {
+            let name = name.as_bytes();
+            plausible_owner(OsStr::from_bytes(name.strip_suffix(b" (deleted)").unwrap_or(name)), worker)
+        })
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    #[test]
+    fn unreadable_argv_requires_fresh_evidence_to_exclude_an_owner() {
+        let worker = Some(OsStr::new("c6_worker-0123456789"));
+        let check = |stat: &[u8], path: &str| linux_argv_uncertain(stat, worker, || Some(path.into()));
+        let unrelated = b"42 (true) R 1 2 3 0 -1 4194368 10\n";
+        assert!(!check(unrelated, "/usr/bin/true"));
+        assert!(check(unrelated, "/usr/bin/git (deleted)"));
+        assert!(check(unrelated, "/usr/bin/git-checkout"));
+        assert!(check(unrelated, "/path/c6_worker-0123456789"));
+        assert!(linux_argv_uncertain(unrelated, worker, || None));
+        let pre_exec = b"42 (c6_worker-01234) R 1 2 3 0 -1 4194368 10\n";
+        assert!(check(pre_exec, "/path/c6_worker-0123456789"));
+        assert!(check(pre_exec, "/usr/bin/git"));
+        assert!(check(pre_exec, "/usr/bin/true"));
+        assert!(check(b"42 (git) R 1 2 3 0 -1 0 10\n", "/bin/sh"));
+        assert!(!linux_argv_uncertain(b"42 (git) R 1 2 3 0 -1 4 10\n", worker, || None));
+        assert!(!linux_argv_uncertain(b"42 (kworker) I 1 2 3 0 -1 2097152 10\n", worker, || None));
     }
 
     #[cfg(all(test, target_os = "linux"))]
@@ -208,6 +299,12 @@ mod unix {
             return info.pbi_status != libc::SZOMB;
         }
         !gone(&io::Error::last_os_error())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn possibly_owns_without_argv(process: &Process, worker: Option<&OsStr>) -> bool {
+        let name = Path::new(&process.name).file_name().unwrap_or_default();
+        plausible_owner(name, worker) && still_live(process.pid)
     }
 
     #[cfg(target_os = "macos")]
@@ -286,7 +383,7 @@ mod tests {
         let link = work.join("alias repo.git");
         symlink(&repo, &link)?;
         for alias in [&link as &Path, Path::new("alias repo.git")] {
-            let mut git = Command::new("git")
+            let mut git = tokio::process::Command::new("git")
                 .arg("--git-dir")
                 .arg(alias)
                 .arg("--work-tree")
@@ -294,17 +391,76 @@ mod tests {
                 .args(["hash-object", "--stdin"])
                 .current_dir(work)
                 .stdin(Stdio::piped())
+                .kill_on_drop(true)
                 .spawn()?;
             // Leave stdin open so the real Git child cannot finish. Always
             // reap it before asserting, including when detection fails.
-            let actual = running(&repo).await;
-            let unrelated = running(&other).await;
-            let _ = git.kill();
-            git.wait()?;
+            let actual = conclusive(async || running(&repo).await).await;
+            let unrelated = conclusive(async || running(&other).await).await;
+            let _ = git.start_kill();
+            git.wait().await?;
             assert!(actual?, "missed live Git for {alias:?}");
             assert!(!unrelated?, "matched another repo's Git");
-            assert!(!running(&repo).await?, "matched the reaped Git process");
+            assert!(!conclusive(async || running(&repo).await).await?, "matched the reaped Git process");
         }
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn observes_checkpoint_ownership_during_unrelated_exec_and_reap_churn() -> anyhow::Result<()> {
+        if !c6_testkit::have("git") {
+            return Ok(());
+        }
+        let repo = tempfile::tempdir()?;
+        let other = tempfile::tempdir()?;
+        assert!(Command::new("git").arg("--git-dir").arg(repo.path()).args(["init", "--quiet"]).status()?.success());
+        let mut git = tokio::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(repo.path())
+            .arg("--work-tree")
+            .arg(repo.path())
+            .args(["hash-object", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()?;
+
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (stop, keep_going) = std::sync::mpsc::channel::<()>();
+        let churn = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            use std::os::unix::process::CommandExt;
+            let mut cmd = Command::new("/bin/sh");
+            cmd.args(["-c", ":"]);
+            // SAFETY: A no-op callback forces the fork/exec path without
+            // doing anything unsafe in the forked child.
+            unsafe { cmd.pre_exec(|| Ok(())) };
+            let mut started = Some(started);
+            while let Err(std::sync::mpsc::TryRecvError::Empty) = keep_going.try_recv() {
+                if !cmd.status()?.success() {
+                    return Err(std::io::Error::other("churn child failed"));
+                }
+                if let Some(started) = started.take() {
+                    let _ = started.send(());
+                }
+            }
+            Ok(())
+        });
+        ready.await?;
+
+        let observations = async {
+            for _ in 0..32 {
+                assert!(conclusive(async || running(repo.path()).await).await?, "missed live checkpoint Git amid churn");
+                assert!(!conclusive(async || running(other.path()).await).await?, "matched an unrelated repo amid churn");
+            }
+            git.start_kill()?;
+            git.wait().await?;
+            assert!(!conclusive(async || running(repo.path()).await).await?, "matched a reaped Git amid churn");
+            anyhow::Ok(())
+        }
+        .await;
+        drop(stop);
+        churn.await??;
+        observations
     }
 }
