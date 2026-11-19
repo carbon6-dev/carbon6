@@ -2,14 +2,14 @@
 //! child, the child runs as its own actor, and an interrupt or a worker
 //! restart leaves what it did in its log.
 
+use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use c6_api::{Event, EventKind, Session, SessionDetail, SessionStatus, TurnEndReason};
 use c6_head::HeadConfig;
-use c6_testkit::eventually;
-use c6_testkit::{MockLlm, Reply};
+use c6_testkit::{MockLlm, Reply, eventually, eventually_or};
 use c6_worker::{ConnState, Worker, conn, enroll};
 use serde_json::{Value, json};
 use tokio::sync::watch;
@@ -264,25 +264,70 @@ async fn a_worker_restart_keeps_the_subagents_log() {
     let env = Env::new().await;
     let state = tempfile::tempdir().unwrap();
     env.enroll(state.path()).await;
-    let (first, stop_first) = run_worker(state.path()).await;
+    let first = crate::open_worker(state.path()).await;
+    let worker_id = first.identity.meta.worker_id;
+    let (tx, mut rx) = watch::channel(ConnState::Connecting);
+    let stop_first = CancellationToken::new();
+    let first_conn = tokio::spawn(conn::run(first.clone(), tx, stop_first.clone()));
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
     let project = tempfile::tempdir().unwrap();
 
     env.mock.push(Reply::ToolCalls(vec![("task".into(), r#"{"description":"dig","prompt":"Dig."}"#.into())]));
     env.mock.push(Reply::ToolCalls(vec![("bash".into(), r#"{"command":"echo partial"}"#.into())]));
     let _gate = env.mock.push_gated(Reply::Text("never finishes".into()));
     let id = env.create(&first, project.path(), "go").await;
-    let child_id = eventually("subagent working", async || {
-        let c = env.children(&id).await.into_iter().next()?;
-        let ev = env.events(&c.id).await;
-        ev.iter().any(|e| matches!(&e.kind, EventKind::ToolResult { output, .. } if output.contains("partial"))).then_some(c.id)
-    })
-    .await;
+    let last_poll = RefCell::default();
+    let diagnostics = || {
+        let last_poll = last_poll.borrow();
+        let (parent, child): &(_, Option<(String, SessionStatus, Vec<Event>)>) = &last_poll;
+        let child = child.as_ref().map_or_else(
+            || "no child visible to the head".to_owned(),
+            |(id, status, events)| format!("child {id} ({status:?}) transcript: {events:#?}"),
+        );
+        format!("parent {id} transcript: {parent:#?}\n{child}\nmock model exchanges:\n{}", env.mock.log())
+    };
+    let child_id = eventually_or(
+        "subagent working before the worker restart",
+        async || {
+            let (parent, children) = tokio::join!(env.events(&id), env.children(&id));
+            let child = if let Some(c) = children.into_iter().next() {
+                let events = env.events(&c.id).await;
+                Some((c.id, c.status, events))
+            } else {
+                None
+            };
+            *last_poll.borrow_mut() = (parent, child);
+            let last_poll = last_poll.borrow();
+            let (parent, child) = &*last_poll;
+            if turn_end(parent) == Some(TurnEndReason::Error) {
+                return Some(Err("parent turn ended in error"));
+            }
+            let (child_id, _, events) = child.as_ref()?;
+            if turn_end(events) == Some(TurnEndReason::Error) {
+                return Some(Err("child turn ended in error"));
+            }
+            events.iter().find_map(|e| match &e.kind {
+                EventKind::ToolResult { tool, output, is_error, .. } if tool == "bash" => {
+                    Some(if !is_error && output.contains("partial") {
+                        Ok(child_id.clone())
+                    } else {
+                        Err("child bash did not return the expected partial output")
+                    })
+                }
+                _ => None,
+            })
+        },
+        &diagnostics,
+    )
+    .await
+    .unwrap_or_else(|why| panic!("before the worker restart: {why}\n{}", diagnostics()));
 
     // The parent goes on after the restart (docs/restarts.md §4): its reply.
     env.mock.push(Reply::Text("Carried on.".into()));
     stop_first.cancel();
+    c6_testkit::within("the worker connection to stop", first_conn).await.unwrap().unwrap();
+    eventually("the head to see the worker offline", async || env.head.state.registry.get(worker_id).is_none().then_some(())).await;
     drop(first);
-    tokio::time::sleep(Duration::from_millis(200)).await;
     let (second, stop_second) = run_worker(state.path()).await;
     // Both turns are closed as cut short, and the head has each log as the
     // worker does (the parent then goes on by itself, docs/restarts.md §4,
@@ -363,31 +408,43 @@ async fn a_lost_background_subagent_is_reported_with_its_work() {
     let env = Env::new().await;
     let state = tempfile::tempdir().unwrap();
     env.enroll(state.path()).await;
-    let (first, stop_first) = run_worker(state.path()).await;
+    let first = crate::open_worker(state.path()).await;
+    let worker_id = first.identity.meta.worker_id;
+    let (tx, mut rx) = watch::channel(ConnState::Connecting);
+    let stop_first = CancellationToken::new();
+    let first_conn = tokio::spawn(conn::run(first.clone(), tx, stop_first.clone()));
+    c6_testkit::within("the worker to attach", rx.wait_for(|s| matches!(s, ConnState::Attached { .. }))).await.unwrap();
     let project = tempfile::tempdir().unwrap();
 
-    // The parent sleeps after starting it, so the subagent asks the model
-    // first.
-    env.mock.push(Reply::ToolCalls(vec![
-        ("task".into(), r#"{"description":"dig","prompt":"Dig.","run_in_background":true}"#.into()),
-        ("bash".into(), r#"{"command":"sleep 1"}"#.into()),
-    ]));
-    env.mock.push(Reply::ToolCalls(vec![("bash".into(), r#"{"command":"echo partial"}"#.into())])); // the subagent
-    let _gate = env.mock.push_gated(Reply::Text("never finishes".into()));
-    env.mock.push(Reply::Text("Started it.".into())); // the parent, while the subagent works
+    env.mock.push(Reply::ToolCalls(vec![("task".into(), r#"{"description":"dig","prompt":"Dig.","run_in_background":true}"#.into())]));
+    // The parent and child can ask in either order. Route their continuations
+    // by tool result, and match the child's expanded prompt, not the task arguments.
+    env.mock.push_about(r#""tool_call_id":"call_0_task""#, Reply::Text("Started it.".into()));
+    let _gate = env.mock.push_gated_about(r#""tool_call_id":"call_0_bash""#, Reply::Text("never finishes".into()));
+    env.mock.push_about(r#"Dig.\n\n---\n"#, Reply::ToolCalls(vec![("bash".into(), r#"{"command":"echo partial"}"#.into())]));
     let id = env.create(&first, project.path(), "go").await;
-    let child_id = eventually("subagent working", async || {
-        let c = env.children(&id).await.into_iter().next()?;
-        let ev = env.events(&c.id).await;
-        ev.iter().any(|e| matches!(&e.kind, EventKind::ToolResult { output, .. } if output.contains("partial"))).then_some(c.id)
-    })
+    let child_id = eventually_or(
+        "subagent working",
+        async || {
+            let c = env.children(&id).await.into_iter().next()?;
+            let ev = env.events(&c.id).await;
+            ev.iter().any(|e| matches!(&e.kind, EventKind::ToolResult { output, .. } if output.contains("partial"))).then_some(c.id)
+        },
+        || env.mock.log(),
+    )
     .await;
-    eventually("the parent is idle", async || env.detail(&id).await.filter(|d| d.session.status == SessionStatus::Idle)).await;
+    eventually_or(
+        "the parent is idle",
+        async || env.detail(&id).await.filter(|d| d.session.status == SessionStatus::Idle),
+        || env.mock.log(),
+    )
+    .await;
 
     stop_first.cancel();
+    c6_testkit::within("the worker connection to stop", first_conn).await.unwrap().unwrap();
+    eventually("the head to see the worker offline", async || env.head.state.registry.get(worker_id).is_none().then_some(())).await;
     drop(first);
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    env.mock.push(Reply::Text("I will continue it.".into())); // the parent, told
+    env.mock.push_about(&format!(r#"<subagent id=\"{child_id}\" status=\"lost\""#), Reply::Text("I will continue it.".into()));
     let (_second, stop_second) = run_worker(state.path()).await;
     let notice = eventually("the parent is told", async || {
         env.events(&id).await.into_iter().find_map(|e| match e.kind {

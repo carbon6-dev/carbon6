@@ -1985,69 +1985,103 @@ fn call_invocation<'a>(kind: Option<&'a session_event::Kind>, call: &str) -> Opt
     })
 }
 
+fn background_report_task(output: &str) -> Option<&str> {
+    let task = if let Some(rest) = output.strip_prefix("Started the subagent in the background as ") {
+        rest.strip_suffix(". Its report will arrive as a notice when it finishes; continue with other work meanwhile.")?
+    } else {
+        output
+            .strip_prefix("Continuing the subagent in the background as ")?
+            .strip_suffix(". Its report will arrive as a notice when it finishes.")?
+    };
+    let number = task.strip_prefix("bg")?;
+    (!number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())).then_some(task)
+}
+
 fn report_recorded_in<'a>(
     events: impl DoubleEndedIterator<Item = &'a SessionEvent> + Clone,
     call: &str,
     child: &str,
     status: &str,
 ) -> bool {
-    let matches_result = |result: Option<&c6_proto::ToolResult>, link: Option<&c6_proto::SubagentSpawned>| {
-        let Some(result) = result else { return false };
-        if result.output.starts_with("Started the subagent in the background as ")
-            || result.output.starts_with("Continuing the subagent in the background as ")
-        {
-            let Some(task) = result.output.split(" as ").nth(1).and_then(|s| s.split('.').next()) else {
-                return false;
-            };
-            if link.is_some_and(|s| !s.background_task_id.is_empty() && s.background_task_id != task) {
-                return false;
-            }
-            let prefix = format!("task:{task}:");
-            // Completion can arrive after another invocation of this call ID.
-            return events.clone().any(|e| {
-                matches!(&e.kind, Some(session_event::Kind::NoticeQueued(n)) if n.command_id.starts_with(&prefix)
-                    && (status == "lost" || !n.command_id.ends_with(":lost")))
-            });
-        }
-        result.output.contains(&format!("[subagent session {child}]"))
-            || result.output.contains(&format!("<subagent id=\"{child}\" status=\"{status}\""))
-    };
-
     // Some providers (and the scripted model) reuse ids across turns.
     // Only an explicit link identifies an older invocation. A newer
     // unlinked send_message may have continued this very child: don't let
     // the earlier linked result acknowledge that newer call.
-    let (mut latest, mut has_link, mut link, mut result) = (true, false, None, None);
+    let (mut latest, mut has_link, mut linked_here, mut result) = (true, false, false, None);
     for event in events.clone().rev().map(Some).chain(std::iter::once(None)) {
         let kind = event.and_then(|e| e.kind.as_ref());
         match kind {
             Some(session_event::Kind::ToolResult(r)) if r.call_id == call && result.is_none() => result = Some(r),
-            Some(session_event::Kind::SubagentSpawned(s)) if s.call_id == call && !s.child_session_id.is_empty() => {
+            Some(session_event::Kind::SubagentSpawned(s))
+                if s.call_id == call && !s.child_session_id.is_empty() && s.background_task_id.is_empty() =>
+            {
                 has_link = true;
-                if s.child_session_id == child && link.is_none() {
-                    link = Some(s);
-                }
+                linked_here |= s.child_session_id == child;
             }
             _ => {
                 let invocation = call_invocation(kind, call);
                 if event.is_some() && invocation.is_none() {
                     continue;
                 }
-                if link.is_some() {
-                    return matches_result(result, link);
+                let output = result.map(|r| r.output.as_str());
+                // The report body can quote another footer or even a
+                // background placeholder. Only its generated last line counts.
+                let footer = output.and_then(|text| {
+                    text.lines().next_back()?.strip_prefix("[subagent session ")?.strip_suffix(']').filter(|id| !id.is_empty())
+                });
+                if let Some(task) = output.filter(|_| footer.is_none()).and_then(background_report_task) {
+                    // Background links are appended by a spawned future;
+                    // their position does not identify an invocation. Join
+                    // the exact task in the placeholder to its durable owner.
+                    let mut owners = events.clone().filter_map(|e| match &e.kind {
+                        Some(session_event::Kind::SubagentSpawned(s)) if s.call_id == call && s.background_task_id == task => {
+                            Some(s.child_session_id.as_str())
+                        }
+                        _ => None,
+                    });
+                    let owner = owners.next();
+                    if owner.is_none() && matches!(invocation, Some("task" | "Task")) {
+                        // A new Task cannot be a continuation of the child
+                        // we're already tracking, even before its link lands.
+                        (latest, has_link, linked_here, result) = (false, false, false, None);
+                        continue;
+                    }
+                    let Some(owner) = owner.filter(|id| !id.is_empty() && owners.all(|other| other == *id)) else {
+                        return false;
+                    };
+                    if owner == child {
+                        let prefix = format!("task:{task}:");
+                        return events.clone().any(|e| {
+                            matches!(&e.kind, Some(session_event::Kind::NoticeQueued(n)) if n.command_id.starts_with(&prefix)
+                                && (status == "lost" || !n.command_id.ends_with(":lost")))
+                        });
+                    }
+                    (latest, has_link, linked_here, result) = (false, false, false, None);
+                    continue;
+                }
+                let matches_result = if let Some(footer) = footer {
+                    footer == child
+                } else {
+                    output.is_some_and(|text| text.contains(&format!("<subagent id=\"{child}\" status=\"{status}\"")))
+                };
+                if linked_here {
+                    return matches_result;
                 }
                 if !has_link {
-                    if latest && matches_result(result, None) {
+                    if latest && matches_result {
                         return true;
                     }
                     // A Task always starts a new child, even if its link has
-                    // not been recorded yet. An unlinked continuation might
-                    // instead be the very report we're trying to settle.
-                    if !matches!(invocation, Some("task" | "Task")) {
+                    // not been recorded yet. An unlinked continuation is
+                    // ambiguous unless a successful send identifies a sibling.
+                    let sibling = matches!(invocation, Some("send_message" | "SendMessage"))
+                        && result.is_some_and(|r| !r.is_error)
+                        && footer.is_some_and(|id| id != child);
+                    if !matches!(invocation, Some("task" | "Task")) && !sibling {
                         return false;
                     }
                 }
-                (latest, has_link, link, result) = (false, false, None, None);
+                (latest, has_link, linked_here, result) = (false, false, false, None);
             }
         }
     }
@@ -6481,13 +6515,27 @@ mod notice_tests {
             session_event::Kind::NoticeQueued(c6_proto::NoticeQueued { command_id: "task:bg2:lost".into(), ..Default::default() }),
         ));
         assert!(!report_recorded(&events, "call", "child", "completed"));
-        assert!(report_recorded(&events, "call", "child", "lost"));
+        assert!(!report_recorded(&events, "call", "child", "lost"), "a notice without an owner is not a receipt");
         events.push(ev(
             3,
             3,
+            session_event::Kind::SubagentSpawned(c6_proto::SubagentSpawned {
+                call_id: "call".into(),
+                child_session_id: "child".into(),
+                background_task_id: "bg2".into(),
+                ..Default::default()
+            }),
+        ));
+        assert!(!report_recorded(&events, "call", "child", "completed"));
+        assert!(report_recorded(&events, "call", "child", "lost"));
+        events.push(ev(
+            4,
+            4,
             session_event::Kind::NoticeQueued(c6_proto::NoticeQueued { command_id: "task:bg2:finished".into(), ..Default::default() }),
         ));
         assert!(report_recorded(&events, "call", "child", "completed"));
+        events[0] = result("Continuing the subagent in the background as bg2. This is prose, not a placeholder.");
+        assert!(!report_recorded(&events, "call", "child", "completed"));
     }
 
     #[test]
@@ -6550,13 +6598,18 @@ mod notice_tests {
         events.push(ev(10, 10, session_event::Kind::Rewound(Rewound { to_seq: 1, ..Default::default() })));
         assert!(!recorded(&events, "a"));
 
+        let started = |task: &str| {
+            format!(
+                "Started the subagent in the background as {task}. Its report will arrive as a notice when it finishes; continue with other work meanwhile."
+            )
+        };
         let mut events = vec![
             invoke(1, "task"),
             spawn(2, "a", "bg1"),
-            result(3, "Started the subagent in the background as bg1."),
+            result(3, &started("bg1")),
             invoke(4, "task"),
             spawn(5, "b", "bg2"),
-            result(6, "Started the subagent in the background as bg2."),
+            result(6, &started("bg2")),
         ];
         let notice = |seq, command_id: &str| {
             ev(
@@ -6569,6 +6622,38 @@ mod notice_tests {
         assert!(!recorded(&events, "a") && recorded(&events, "b"));
         events.push(notice(9, "task:bg1:finished"));
         assert!(recorded(&events, "a"));
+        events.extend([invoke(10, "task"), result(11, &started("bg3"))]);
+        assert!(recorded(&events, "a") && recorded(&events, "b"), "the next Task's missing link cannot hide either receipt");
+
+        // B's background future can link after a foreground continuation
+        // of A has started. The delayed link does not belong to A's call.
+        let placeholder = "Continuing the subagent in the background as bg2. Its report will arrive as a notice when it finishes.";
+        let mut delayed = vec![invoke(1, "send_message"), result(2, placeholder), spawn(4, "b", "bg2"), notice(5, "task:bg2:finished")];
+        assert!(!recorded(&delayed, "a") && recorded(&delayed, "b"));
+        delayed.insert(2, invoke(3, "send_message"));
+        assert!(!recorded(&delayed, "a"), "B's late link and notice cannot settle A's unresolved call");
+        delayed.push(result(6, &format!("{placeholder}\n\n[subagent session a]")));
+        assert!(recorded(&delayed, "a"), "a real report can begin with the exact placeholder text");
+        assert!(recorded(&delayed, "b"), "the older placeholder finds its link across invocation boundaries");
+
+        let quoted = [invoke(1, "send_message"), result(2, "An earlier result said:\n[subagent session a]\n\n[subagent session b]")];
+        assert!(!recorded(&quoted, "a") && recorded(&quoted, "b"));
+
+        let mut footer_reuse = vec![
+            invoke(1, "task"),
+            spawn(2, "a", ""),
+            result(3, "A done\n[subagent session a]"),
+            invoke(4, "send_message"),
+            result(5, "Looks like B\n[subagent session b]"),
+        ];
+        assert!(recorded(&footer_reuse, "a"), "a successful send to B does not hide A's receipt");
+        if let Some(session_event::Kind::ToolResult(r)) = &mut footer_reuse[4].kind {
+            r.is_error = true;
+        }
+        assert!(!recorded(&footer_reuse, "a"), "an error cannot use its output footer to identify a sibling");
+        footer_reuse[3] = invoke(4, "bash");
+        footer_reuse[4] = result(5, "Looks like B\n[subagent session b]");
+        assert!(!recorded(&footer_reuse, "a"), "an unrelated tool cannot use its output footer to identify a sibling");
     }
 
     #[test]
