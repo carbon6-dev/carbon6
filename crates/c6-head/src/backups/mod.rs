@@ -225,8 +225,8 @@ pub struct Engine {
     /// The head's backup key, once read.
     key: tokio::sync::Mutex<Option<HeadKey>>,
     /// Reading the logs, one pass at a time, with each database's own
-    /// connections (one holds the write lock while its log is read; the
-    /// other checkpoints).
+    /// connections (a writer briefly aligns the snapshot, a reader pins
+    /// it, and a third connection checkpoints).
     capture: tokio::sync::Mutex<BTreeMap<String, capture::Conns>>,
     /// Databases whose checkpoints wait for a base copy, and how many copies.
     paused: std::sync::Mutex<BTreeMap<String, u32>>,

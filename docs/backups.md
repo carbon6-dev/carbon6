@@ -71,7 +71,14 @@ Every step is tested against a folder destination and a stand-in S3 on loopback,
 Built 2026-11-04 on branch `backups`, one commit per step (§8). The code is in `crates/c6-head/src/backups/` (`mod.rs` settings, passes and status; `crypt.rs`; `dest.rs`; `wal.rs`; `capture.rs`; `gens.rs`; `restore.rs`), `crates/c6-core/src/wal.rs`, `crates/c6-ui/src/backups.rs`, and `c6h restore`.
 
 - **The head always checkpoints its databases itself,** backups on or not. Every connection to a database in the head's folder (`c6_core::wal::manual_under`, set when `c6h.db` opens) has `wal_autocheckpoint = 0`, `journal_size_limit` 64 MB, and SQLite's checkpoint on close turned off (`SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`, through `libsqlite3-sys`). The log therefore keeps every change, across restarts too, until the head has read it. `c6h` subcommands (upgrade, login link…) open their databases the same way, so nothing they write is missed either.
-- **A pass, per database, every interval:** on its own connection, `BEGIN IMMEDIATE` (no one else can write), read the frames committed since the last pass, write them as a segment into the local spool (`<data>/backup-state/spool/`, plaintext like the databases beside it), `PRAGMA wal_checkpoint(PASSIVE)` on a second connection, `ROLLBACK`. The lock is held for milliseconds. Nothing waits on a destination.
+- **A pass, per database, every interval:** briefly take `BEGIN IMMEDIATE`
+  to align a read snapshot with the committed WAL end reported by
+  `wal_checkpoint(NOOP)`. Release the writer before reading or syncing WAL
+  frames to the local spool (`<data>/backup-state/spool/`, plaintext like the
+  databases beside it). Keep the read snapshot pinned through
+  `wal_checkpoint(PASSIVE)` on another connection, so newer writes can commit
+  but their frames cannot be checkpointed before the next capture. Nothing
+  waits on a destination.
 - **Changed from §3: the checkpoint doesn't wait for destinations.** Segments wait in the spool instead, and each destination's sender drains it at its own pace. The limit is on the spool: a destination with more than `spool_limit_mb` unsent falls back to a new base copy and stops holding the spool. The WAL therefore never grows because a destination is down.
 - **Changed from §3: generations are per destination,** so one slow destination never makes the others take base copies.
 - **The line of changes** breaks (an epoch, after which earlier base copies take no more segments) when:
@@ -107,5 +114,7 @@ Built 2026-11-04 on branch `backups`, one commit per step (§8). The code is in 
 - **Settings → Backups** (a console page) covers the key (made there, the private key shown once), destinations, limits, status per destination and per base copy, the restore key for tests, and Send now, New base copies now and Test restore now. Its operations are `system.backups.*`, which are administration, so agents don't get them.
 - **Cost while quiet,** measured in the tests:
   - Passes with nothing changed sent no objects and no bytes.
-  - Each pass, per database, takes the write lock for a moment, reads the log's header, and runs a checkpoint only if the log has frames.
+  - Each pass briefly takes the write lock to pin a snapshot and sample the
+    committed WAL end. It skips the checkpoint when all frames are already
+    backfilled.
   - The blob scan reads only blob folders whose time changed since the destination last had all of theirs.

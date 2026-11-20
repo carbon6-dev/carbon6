@@ -345,6 +345,51 @@ pub async fn for_session(st: &HeadState, realm: &str, session_id: &str, what: &s
     }
 }
 
+const PRUNE_BATCH: i64 = 256;
+
+async fn prune_batch(pool: &sqlx::SqlitePool, realm: &str, name: &str, now: i64) -> anyhow::Result<u64> {
+    // The realm/series/time index bounds both the lookup and the delete.
+    // Read the current retention in this same statement: a setting changed
+    // since the sweep listed this series must not cause data to be dropped.
+    Ok(sqlx::query(
+        "DELETE FROM points WHERE rowid IN (\
+         SELECT rowid FROM points WHERE realm = ?1 AND series = ?2 AND ts < (\
+         SELECT ?3 - retention_days * 86400000 FROM series WHERE realm = ?1 AND name = ?2 AND retention_days > 0\
+         ) ORDER BY ts, rowid LIMIT ?4)",
+    )
+    .bind(realm)
+    .bind(name)
+    .bind(now)
+    .bind(PRUNE_BATCH)
+    .execute(pool)
+    .await?
+    .rows_affected())
+}
+
+async fn prune(st: &HeadState) -> anyhow::Result<()> {
+    let now = now_ms();
+    let pool = &st.store.pool;
+    let retained: Vec<(String, String)> = sqlx::query_as("SELECT realm, name FROM series WHERE retention_days > 0").fetch_all(pool).await?;
+    for (realm, name) in retained {
+        while !st.shutdown.is_cancelled() {
+            let deleted = prune_batch(pool, &realm, &name, now).await?;
+            if deleted > 0 {
+                tokio::select! {
+                    _ = st.shutdown.cancelled() => return Ok(()),
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
+            }
+            if deleted < PRUNE_BATCH as u64 {
+                break;
+            }
+        }
+        if st.shutdown.is_cancelled() {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// Every minute: thresholds (including "stopped arriving"), and points
 /// past their series' retention.
 pub fn spawn_sweeper(st: Arc<HeadState>) {
@@ -357,18 +402,53 @@ pub fn spawn_sweeper(st: Arc<HeadState>) {
             }
             crate::triggers::watch_series(&st, None, None).await;
             ticks += 1;
-            if ticks % 60 == 1 {
-                let r = sqlx::query(
-                    "DELETE FROM points WHERE rowid IN (SELECT p.rowid FROM points p JOIN series s ON s.realm = p.realm AND s.name = p.series \
-                     WHERE s.retention_days > 0 AND p.ts < ? - s.retention_days * 86400000)",
-                )
-                .bind(now_ms())
-                .execute(&st.store.pool)
-                .await;
-                if let Err(e) = r {
-                    warn!("dropping old points: {e:#}");
-                }
+            if ticks % 60 == 1
+                && let Err(e) = prune(&st).await
+            {
+                warn!("dropping old points: {e:#}");
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn retention_prunes_one_indexed_page_and_rechecks_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(&dir.path().join("test.db")).await.unwrap();
+        let pool = &store.pool;
+        sqlx::query("INSERT INTO series (realm, name, retention_days, created_by, created_at) VALUES ('home', 'test', 1, 'test', 0)")
+            .execute(pool)
+            .await
+            .unwrap();
+        let now = 2 * 86_400_000;
+        // Many equal timestamps at the expired boundary, plus one at the
+        // exact retained boundary and one outside the target series.
+        sqlx::query(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < ?1) \
+             INSERT INTO points (realm, series, ts, value) SELECT 'home', 'test', ?2, 1 FROM n",
+        )
+        .bind(PRUNE_BATCH + 2)
+        .bind(now - 86_400_001)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO points (realm, series, ts, value) VALUES ('home', 'test', ?, 1), ('home', 'other', 0, 1)")
+            .bind(now - 86_400_000)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        assert_eq!(prune_batch(pool, "home", "test", now).await.unwrap(), PRUNE_BATCH as u64);
+        sqlx::query("UPDATE series SET retention_days = 0 WHERE realm = 'home' AND name = 'test'").execute(pool).await.unwrap();
+        assert_eq!(prune_batch(pool, "home", "test", now).await.unwrap(), 0);
+        sqlx::query("UPDATE series SET retention_days = 1 WHERE realm = 'home' AND name = 'test'").execute(pool).await.unwrap();
+        assert_eq!(prune_batch(pool, "home", "test", now).await.unwrap(), 2);
+        assert_eq!(prune_batch(pool, "home", "test", now).await.unwrap(), 0);
+        let left: Vec<(String, i64)> = sqlx::query_as("SELECT series, ts FROM points ORDER BY series").fetch_all(pool).await.unwrap();
+        assert_eq!(left, vec![("other".into(), 0), ("test".into(), now - 86_400_000)]);
+    }
 }

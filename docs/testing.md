@@ -1,5 +1,23 @@
 # Tests that fail only when something is wrong
 
+## Head indexing and SQLite contention
+
+Search backfill tests use a committed-chunk boundary, not elapsed time, to
+pause a version rebuild while foreground event ingest and a settings write
+complete. They reopen the database mid-session, verify that committed event
+ranges and finished sessions keep their FTS rowids, and require exactly one
+search entry per event after live ingest. Legacy-row purge tests cover stale
+entries and SQLite reusing a deleted rowid during the purge.
+
+The hub regression injects one genuine SQLite BUSY error from a zero-timeout
+connection blocked by an explicitly held WAL writer. On the same gRPC stream
+it requires a pong before writer release, ordered acknowledgements afterward,
+and one live publication per durable event. Auth tests hold the same writer
+gate to check that failed activity bookkeeping neither signs out a verified
+cookie nor widens a scoped token's authority. Usage/activity cursor rollback,
+bounded retention, and backup snapshot-pin tests cover the other maintenance
+writers. None uses a scheduling sleep to establish contention.
+
 ## Restarted heads release their listening sockets
 
 Same-address worker integration tests keep their bound sockets in

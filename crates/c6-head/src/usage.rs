@@ -19,7 +19,6 @@ pub const PRICES: &str = "prices";
 pub const BUDGETS: &str = "budgets";
 /// Budgets already used up: name → period key, so each tells you once.
 const BUDGET_STATE: &str = "budget_state";
-const BACKFILLED: &str = "usage_backfilled";
 
 /// Records a model call (while its event is stored).
 pub async fn record(tx: &mut sqlx::SqliteConnection, session_id: &str, seq: u64, ts: i64, u: &c6_proto::Usage) -> anyhow::Result<()> {
@@ -44,43 +43,153 @@ pub async fn record(tx: &mut sqlx::SqliteConnection, session_id: &str, seq: u64,
 
 /// Fills the table from events stored before it existed (once).
 pub fn spawn_backfill(st: std::sync::Arc<HeadState>) {
+    spawn_event_backfill(st, EventBackfill::Usage);
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum EventBackfill {
+    Usage,
+    Activity,
+}
+
+impl EventBackfill {
+    fn keys(self) -> (&'static str, &'static str) {
+        // Older heads treat any value in the original marker as finished.
+        match self {
+            Self::Usage => ("usage_backfilled", "usage_backfill_cursor"),
+            Self::Activity => ("activity_backfilled", "activity_backfill_cursor"),
+        }
+    }
+
+    async fn state<'e, E: sqlx::Executor<'e, Database = sqlx::Sqlite>>(self, db: E) -> anyhow::Result<(bool, Option<String>)> {
+        let (done, cursor) = self.keys();
+        Ok(sqlx::query_as("SELECT EXISTS(SELECT 1 FROM settings WHERE key = ?), (SELECT value FROM settings WHERE key = ?)")
+            .bind(done)
+            .bind(cursor)
+            .fetch_one(db)
+            .await?)
+    }
+}
+
+pub(crate) fn spawn_event_backfill(st: std::sync::Arc<HeadState>, job: EventBackfill) {
     tokio::spawn(async move {
-        if let Err(e) = backfill(&st).await {
-            warn!("filling usage from earlier events: {e:#}");
+        match backfill_events(&st.store.pool, &st.shutdown, job).await {
+            Ok(events) if events > 0 => info!(?job, events, "filled index from earlier events"),
+            Ok(_) => {}
+            Err(e) => warn!(?job, "filling index from earlier events: {e:#}"),
         }
     });
 }
 
-async fn backfill(st: &HeadState) -> anyhow::Result<()> {
-    if st.store.setting(BACKFILLED).await?.is_some() {
-        return Ok(());
+const EVENT_BACKFILL_BATCH: i64 = 128;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BackfillCursor {
+    after: (String, i64),
+    through: (String, i64),
+}
+
+async fn backfill_events(
+    pool: &sqlx::SqlitePool,
+    shutdown: &tokio_util::sync::CancellationToken,
+    job: EventBackfill,
+) -> anyhow::Result<usize> {
+    let mut events = 0;
+    while !shutdown.is_cancelled() {
+        let Some(n) = backfill_batch(pool, job).await? else { break };
+        events += n;
+        // Leave a gap for foreground writers rather than immediately
+        // trying to acquire another writer after COMMIT. Stop between
+        // pages rather than interrupting a page's transaction.
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+        }
     }
-    let (mut after_session, mut after_seq, mut n) = (String::new(), 0i64, 0u64);
-    loop {
-        let rows = sqlx::query(
-            "SELECT session_id, seq, ts, data FROM events WHERE (session_id, seq) > (?, ?) ORDER BY session_id, seq LIMIT 2000",
-        )
-        .bind(&after_session)
-        .bind(after_seq)
-        .fetch_all(&st.store.pool)
-        .await?;
-        let Some(last) = rows.last() else { break };
-        (after_session, after_seq) = (last.get("session_id"), last.get("seq"));
-        let mut tx = st.store.pool.begin_with("BEGIN IMMEDIATE").await?;
-        for r in &rows {
-            let ev = c6_proto::SessionEvent::decode(r.get::<Vec<u8>, _>("data").as_slice())?;
-            if let Some(c6_proto::session_event::Kind::Usage(u)) = &ev.kind {
-                record(&mut tx, &r.get::<String, _>("session_id"), ev.seq, r.get("ts"), u).await?;
-                n += 1;
+    Ok(events)
+}
+
+/// None means finished; Some(0) means another backfill won this page.
+async fn backfill_batch(pool: &sqlx::SqlitePool, job: EventBackfill) -> anyhow::Result<Option<usize>> {
+    let (done, saved) = job.state(pool).await?;
+    if done {
+        return Ok(None);
+    }
+    let cursor: Option<BackfillCursor> = saved.as_deref().map(serde_json::from_str).transpose()?;
+    // Capture the end once and persist it with the first page. New events
+    // are indexed at ingest, even if their key falls before our cursor.
+    let through = match &cursor {
+        Some(cursor) => Some(cursor.through.clone()),
+        None => {
+            sqlx::query_as("SELECT session_id, seq FROM events ORDER BY session_id DESC, seq DESC LIMIT 1").fetch_optional(pool).await?
+        }
+    };
+    let mut events = Vec::new();
+    let mut next = None;
+    if let Some((end_session, end_seq)) = through {
+        let query = if let Some(cursor) = cursor {
+            sqlx::query(
+                "SELECT session_id, seq, ts, data FROM events WHERE (session_id, seq) <= (?, ?) AND (session_id, seq) > (?, ?) \
+                 ORDER BY session_id, seq LIMIT ?",
+            )
+            .bind(&end_session)
+            .bind(end_seq)
+            .bind(cursor.after.0)
+            .bind(cursor.after.1)
+        } else {
+            sqlx::query("SELECT session_id, seq, ts, data FROM events WHERE (session_id, seq) <= (?, ?) ORDER BY session_id, seq LIMIT ?")
+                .bind(&end_session)
+                .bind(end_seq)
+        };
+        // No reader transaction is held while decoding, and no SQLite
+        // writer has been acquired. The source log is append-only.
+        let mut after = None;
+        for r in query.bind(EVENT_BACKFILL_BATCH).fetch_all(pool).await? {
+            let session: String = r.get("session_id");
+            let seq: i64 = r.get("seq");
+            let ev = c6_proto::SessionEvent::decode(r.get::<Vec<u8>, _>("data").as_slice())
+                .map_err(|e| anyhow::anyhow!("decoding event {session}:{seq}: {e}"))?;
+            after = Some((session.clone(), seq));
+            events.push((session, r.get::<i64, _>("ts"), ev));
+        }
+        if let Some(after) = after {
+            next = Some(serde_json::to_string(&BackfillCursor { after, through: (end_session, end_seq) })?);
+        }
+    }
+
+    let (done_key, cursor_key) = job.keys();
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    // Another backfill may have committed while we read and decoded.
+    // Recheck under the write lock so progress can never move backwards.
+    let (done, current) = job.state(&mut *tx).await?;
+    if done || current != saved {
+        tx.rollback().await?;
+        return Ok(if done { None } else { Some(0) });
+    }
+    if let Some(next) = next {
+        for (session, ts, ev) in &events {
+            match job {
+                EventBackfill::Usage => {
+                    if let Some(c6_proto::session_event::Kind::Usage(u)) = &ev.kind {
+                        record(&mut tx, session, ev.seq, *ts, u).await?;
+                    }
+                }
+                EventBackfill::Activity => crate::analytics::mark(&mut tx, session, ev).await?,
             }
         }
+        sqlx::query("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+            .bind(cursor_key)
+            .bind(next)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
+        Ok(Some(events.len()))
+    } else {
+        sqlx::query("INSERT INTO settings (key, value) VALUES (?, '1')").bind(done_key).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM settings WHERE key = ?").bind(cursor_key).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(None)
     }
-    st.store.set_setting(BACKFILLED, "1").await?;
-    if n > 0 {
-        info!(calls = n, "usage filled from earlier events");
-    }
-    Ok(())
 }
 
 pub async fn prices(st: &HeadState) -> anyhow::Result<Vec<api::Price>> {
@@ -534,6 +643,111 @@ pub async fn report(st: &HeadState, days: u32, filter: &[String], realm: Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::Store;
+
+    fn usage_event(seq: i64) -> c6_proto::SessionEvent {
+        c6_proto::SessionEvent {
+            seq: seq as u64,
+            ts_ms: seq,
+            kind: Some(c6_proto::session_event::Kind::Usage(c6_proto::Usage {
+                model: "model".into(),
+                input_tokens: 5,
+                ..Default::default()
+            })),
+        }
+    }
+
+    async fn backfill_session(store: &Store, worker: c6_core::WorkerId, id: &str, historical: i64) {
+        sqlx::query(
+            "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at, last_seq) \
+             VALUES (?, ?, '', '', 'c', 'session-model', 'idle', 0, 0, ?)",
+        )
+        .bind(id)
+        .bind(worker.to_string())
+        .bind(historical)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let mut tx = store.pool.begin().await.unwrap();
+        for seq in 1..=historical {
+            sqlx::query("INSERT INTO events (session_id, seq, ts, data) VALUES (?, ?, ?, ?)")
+                .bind(id)
+                .bind(seq)
+                .bind(seq)
+                .bind(usage_event(seq).encode_to_vec())
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+    }
+
+    async fn derived_counts(store: &Store) -> (i64, i64) {
+        sqlx::query_as("SELECT (SELECT COUNT(*) FROM usage), (SELECT COUNT(*) FROM activity)").fetch_one(&store.pool).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn event_backfills_resume_bounded_pages_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("head.db");
+        let store = Store::open(&path).await.unwrap();
+        let worker = c6_core::WorkerId::new();
+        let cap = EVENT_BACKFILL_BATCH;
+        backfill_session(&store, worker, "history", cap + 2).await;
+        backfill_session(&store, worker, "earlier", 0).await;
+        let jobs = [EventBackfill::Usage, EventBackfill::Activity];
+        for job in jobs {
+            assert_eq!(backfill_batch(&store.pool, job).await.unwrap(), Some(cap as usize));
+            let (done, saved) = job.state(&store.pool).await.unwrap();
+            assert!(!done);
+            let cursor: BackfillCursor = serde_json::from_str(&saved.unwrap()).unwrap();
+            assert_eq!(cursor.after, ("history".to_owned(), cap));
+            assert_eq!(cursor.through, ("history".to_owned(), cap + 2));
+        }
+        assert_eq!(derived_counts(&store).await, (cap, cap));
+
+        // Actual foreground ingest both before the cursor and beyond the
+        // captured end. Neither write should need a historical replay.
+        assert!(store.ingest(worker, "earlier", &[usage_event(1)]).await.unwrap().is_some());
+        assert!(store.ingest(worker, "history", &[usage_event(cap + 3)]).await.unwrap().is_some());
+        assert_eq!(derived_counts(&store).await, (cap + 2, cap + 2));
+
+        store.pool.close().await;
+        drop(store);
+        let store = Store::open(&path).await.unwrap();
+        for job in jobs {
+            assert_eq!(backfill_batch(&store.pool, job).await.unwrap(), Some(2));
+            assert_eq!(backfill_batch(&store.pool, job).await.unwrap(), None);
+            assert_eq!(job.state(&store.pool).await.unwrap(), (true, None));
+        }
+        assert_eq!(derived_counts(&store).await, (cap + 4, cap + 4));
+    }
+
+    #[tokio::test]
+    async fn event_backfill_rejects_partial_page_and_honors_legacy_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("head.db")).await.unwrap();
+        let job = EventBackfill::Usage;
+        backfill_session(&store, c6_core::WorkerId::new(), "history", 2).await;
+        sqlx::query(
+            "CREATE TRIGGER fail_cursor BEFORE INSERT ON settings WHEN NEW.key = 'usage_backfill_cursor' \
+             BEGIN SELECT RAISE(ABORT, 'cursor failure'); END",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let e = backfill_batch(&store.pool, job).await.unwrap_err();
+        assert!(e.to_string().contains("cursor failure"));
+        assert_eq!(job.state(&store.pool).await.unwrap(), (false, None));
+        assert_eq!(derived_counts(&store).await, (0, 0));
+        sqlx::query("DROP TRIGGER fail_cursor").execute(&store.pool).await.unwrap();
+
+        store.set_setting(EventBackfill::Activity.keys().0, "1").await.unwrap();
+        assert_eq!(backfill_batch(&store.pool, EventBackfill::Activity).await.unwrap(), None);
+        assert_eq!(backfill_batch(&store.pool, job).await.unwrap(), Some(2));
+        assert_eq!(backfill_batch(&store.pool, job).await.unwrap(), None);
+        assert_eq!(derived_counts(&store).await, (2, 0));
+    }
 
     #[test]
     fn prices_and_periods() {

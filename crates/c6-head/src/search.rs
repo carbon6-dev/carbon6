@@ -4,7 +4,7 @@
 //! the same transaction that stores the event, so the index never drifts
 //! from the log. The index is derived data: when `search.version` differs
 //! from [`VERSION`] (first start, or a format change), a background task
-//! rebuilds it session by session.
+//! rebuilds it in bounded, resumable batches.
 
 use std::collections::HashMap;
 
@@ -145,7 +145,7 @@ fn truncate(s: &mut String, max: usize) {
 /// Indexes `ev` (called in the transaction that stores it).
 pub(crate) async fn index_event(conn: &mut SqliteConnection, session_id: &str, ev: &SessionEvent) -> anyhow::Result<()> {
     for (part, kind, text) in entries(ev) {
-        sqlx::query("INSERT INTO search (text, session_id, seq, part, kind) VALUES (?, ?, ?, ?, ?)")
+        let result = sqlx::query("INSERT INTO search (text, session_id, seq, part, kind) VALUES (?, ?, ?, ?, ?)")
             .bind(text)
             .bind(session_id)
             .bind(ev.seq as i64)
@@ -153,34 +153,186 @@ pub(crate) async fn index_event(conn: &mut SqliteConnection, session_id: &str, e
             .bind(kind)
             .execute(&mut *conn)
             .await?;
+        sqlx::query("INSERT INTO search_entries (rowid, session_id, seq) VALUES (?, ?, ?)")
+            .bind(result.last_insert_rowid())
+            .bind(session_id)
+            .bind(ev.seq as i64)
+            .execute(&mut *conn)
+            .await?;
     }
     Ok(())
 }
 
-/// Rebuilds the index if it is missing or from another version. Each
-/// session is re-indexed in one transaction (delete, then insert all), so
-/// events ingested meanwhile are neither lost nor doubled.
+const BACKFILL_BATCH: i64 = 200;
+
+/// Clears only the old generation's rowids, then replaces bounded event
+/// ranges atomically with their cursor. Live ingest uses the same rowid
+/// bookkeeping, so replacing a range never duplicates or loses its events.
+/// Every commit returns its connection before yielding to foreground writes.
 pub async fn backfill(store: &Store) -> anyhow::Result<()> {
+    backfill_between_chunks(store, |_| std::future::ready(())).await
+}
+
+// The boundary callback also lets tests stop at a committed cursor, rather
+// than racing a timer against the background task on a shared machine.
+async fn backfill_between_chunks<F, Fut>(store: &Store, mut between: F) -> anyhow::Result<()>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     if store.setting(VERSION_KEY).await?.as_deref() == Some(VERSION) {
         return Ok(());
     }
     let started = std::time::Instant::now();
-    let ids: Vec<String> = sqlx::query("SELECT id FROM sessions").fetch_all(&store.pool).await?.iter().map(|r| r.get("id")).collect();
-    let mut events = 0usize;
-    for id in &ids {
+    let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
+    sqlx::query("INSERT OR IGNORE INTO search_rebuild (version, old_rowid) VALUES (?, COALESCE((SELECT rowid FROM search ORDER BY rowid DESC LIMIT 1), 0))")
+        .bind(VERSION)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    let mut purged = 0usize;
+    let mut logged = std::time::Instant::now();
+    loop {
         let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query("DELETE FROM search WHERE session_id = ?").bind(id).execute(&mut *tx).await?;
-        let rows = sqlx::query("SELECT data FROM events WHERE session_id = ? ORDER BY seq").bind(id).fetch_all(&mut *tx).await?;
-        for r in &rows {
-            let ev = SessionEvent::decode(r.get::<Vec<u8>, _>("data").as_slice())?;
-            index_event(&mut tx, id, &ev).await?;
+        let (cutoff, cursor, cleared): (i64, i64, bool) =
+            sqlx::query_as("SELECT old_rowid, cursor, cleared FROM search_rebuild WHERE version = ?")
+                .bind(VERSION)
+                .fetch_one(&mut *tx)
+                .await?;
+        if cleared {
+            tx.commit().await?;
+            break;
         }
-        events += rows.len();
+        // Delete by rowid: filtering on FTS's unindexed session_id would
+        // scan hundreds of thousands of rows while holding the write lock.
+        let rows: Vec<i64> = sqlx::query_scalar("SELECT rowid FROM search WHERE rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?")
+            .bind(cursor)
+            .bind(cutoff)
+            .bind(BACKFILL_BATCH)
+            .fetch_all(&mut *tx)
+            .await?;
+        for rowid in &rows {
+            sqlx::query("DELETE FROM search WHERE rowid = ?").bind(rowid).execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM search_entries WHERE rowid = ?").bind(rowid).execute(&mut *tx).await?;
+        }
+        sqlx::query("UPDATE search_rebuild SET cursor = ?, cleared = ? WHERE version = ?")
+            .bind(rows.last().copied().unwrap_or(cursor))
+            .bind(rows.len() < BACKFILL_BATCH as usize)
+            .bind(VERSION)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
+        purged += rows.len();
+        if logged.elapsed().as_secs() >= 5 {
+            let rate = purged as f64 / started.elapsed().as_secs_f64();
+            tracing::info!(
+                sessions = 0,
+                events = purged,
+                rows_per_second = rate,
+                eta_seconds = (cutoff - rows.last().copied().unwrap_or(cursor)).max(0) as f64 / rate.max(1.0),
+                "search index clearing old generation"
+            );
+            logged = std::time::Instant::now();
+        }
+        tokio::task::yield_now().await;
+        between(0).await;
+    }
+    let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM sessions ORDER BY id").fetch_all(&store.pool).await?;
+    let mut events = 0usize;
+    let mut logged = std::time::Instant::now();
+    for (sessions, id) in ids.iter().enumerate() {
+        while let Some(n) = backfill_chunk(store, id).await? {
+            events += n;
+            if logged.elapsed().as_secs() >= 5 {
+                let rate = events as f64 / started.elapsed().as_secs_f64();
+                let remaining: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM events e LEFT JOIN search_backfill b ON b.version = ? AND b.session_id = e.session_id \
+                     WHERE e.seq > COALESCE(b.seq, 0) AND COALESCE(b.done, 0) = 0 \
+                     AND (b.session_id IS NULL OR e.seq <= b.through)",
+                )
+                .bind(VERSION)
+                .fetch_one(&store.pool)
+                .await?;
+                tracing::info!(
+                    sessions,
+                    total_sessions = ids.len(),
+                    events,
+                    events_per_second = rate,
+                    eta_seconds = remaining as f64 / rate.max(1.0),
+                    "search index rebuilding"
+                );
+                logged = std::time::Instant::now();
+            }
+            tokio::task::yield_now().await;
+            between(events).await;
+        }
     }
     store.set_setting(VERSION_KEY, VERSION).await?;
     tracing::info!(sessions = ids.len(), events, elapsed = ?started.elapsed(), "search index built");
     Ok(())
+}
+
+/// `None` means this session was already complete (including before restart).
+async fn backfill_chunk(store: &Store, id: &str) -> anyhow::Result<Option<usize>> {
+    let mut tx = store.pool.begin_with("BEGIN IMMEDIATE").await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO search_backfill (version, session_id, through) \
+                 VALUES (?, ?, COALESCE((SELECT seq FROM events WHERE session_id = ? ORDER BY seq DESC LIMIT 1), 0))",
+    )
+    .bind(VERSION)
+    .bind(id)
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    let (seq, through, done): (i64, i64, bool) =
+        sqlx::query_as("SELECT seq, through, done FROM search_backfill WHERE version = ? AND session_id = ?")
+            .bind(VERSION)
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if done {
+        tx.commit().await?;
+        return Ok(None);
+    }
+    let rows = sqlx::query("SELECT seq, data FROM events WHERE session_id = ? AND seq > ? AND seq <= ? ORDER BY seq LIMIT ?")
+        .bind(id)
+        .bind(seq)
+        .bind(through)
+        .bind(BACKFILL_BATCH)
+        .fetch_all(&mut *tx)
+        .await?;
+    let end = rows.last().map_or(seq, |r| r.get::<i64, _>("seq"));
+    sqlx::query("DELETE FROM search WHERE rowid IN (SELECT rowid FROM search_entries WHERE session_id = ? AND seq > ? AND seq <= ?)")
+        .bind(id)
+        .bind(seq)
+        .bind(end)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM search_entries WHERE session_id = ? AND seq > ? AND seq <= ?")
+        .bind(id)
+        .bind(seq)
+        .bind(end)
+        .execute(&mut *tx)
+        .await?;
+    for row in &rows {
+        match SessionEvent::decode(row.get::<Vec<u8>, _>("data").as_slice()) {
+            Ok(ev) => index_event(&mut tx, id, &ev).await?,
+            Err(error) => {
+                // One damaged log record must not leave every subsequent
+                // session unsearchable after clearing an old generation.
+                tracing::warn!(session = id, seq = row.get::<i64, _>("seq"), %error, "cannot index damaged event");
+            }
+        }
+    }
+    sqlx::query("UPDATE search_backfill SET seq = ?, done = ? WHERE version = ? AND session_id = ?")
+        .bind(end)
+        .bind(rows.len() < BACKFILL_BATCH as usize)
+        .bind(VERSION)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Some(rows.len()))
 }
 
 /// The user's query as an FTS5 expression: whitespace-separated terms and
@@ -514,6 +666,206 @@ pub async fn search(store: &Store, req: &api::SearchQuery, head: Option<c6_core:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn backfill_chunks_resume_and_replace_live_events_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c6h.db");
+        let store = Store::open(&path).await.unwrap();
+        let worker = c6_core::WorkerId::new();
+        sqlx::query(
+            "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at) \
+             VALUES ('large', ?, 'Large', '', 'c', 'm', 'idle', 0, 0)",
+        )
+        .bind(worker.to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let event = |seq| SessionEvent {
+            seq,
+            kind: Some(session_event::Kind::User(c6_proto::UserMessage { text: format!("needle {seq}"), ..Default::default() })),
+            ..Default::default()
+        };
+        let input: Vec<_> = (1..=1200).map(event).collect();
+        store.ingest(worker, "large", &input).await.unwrap().unwrap();
+        // Simulate the completed purge phase of a version bump. Ingested
+        // rows are already present: range replacement must not double them.
+        sqlx::query("INSERT INTO search_rebuild (version, old_rowid, cleared) VALUES (?, 0, 1)")
+            .bind(VERSION)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(backfill_chunk(&store, "large").await.unwrap(), Some(200));
+        let cursor: i64 =
+            sqlx::query_scalar("SELECT seq FROM search_backfill WHERE session_id = 'large'").fetch_one(&store.pool).await.unwrap();
+        assert_eq!(cursor, 200, "one transaction must not rebuild a whole large session");
+        let first_rowid: i64 = sqlx::query_scalar("SELECT rowid FROM search_entries WHERE session_id = 'large' AND seq = 1")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        // Foreground ingest and an API settings write between chunks. The
+        // transaction has returned its pooled connection and writer lock.
+        store.ingest(worker, "large", &[event(1201)]).await.unwrap().unwrap();
+        store.set_setting("backfill-test", "foreground write").await.unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at) \
+             VALUES ('finished', ?, 'Finished', '', 'c', 'm', 'idle', 0, 0)",
+        )
+        .bind(worker.to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        store.ingest(worker, "finished", &[event(1)]).await.unwrap().unwrap();
+        assert_eq!(backfill_chunk(&store, "finished").await.unwrap(), Some(1));
+        let finished_rowid: i64 =
+            sqlx::query_scalar("SELECT rowid FROM search_entries WHERE session_id = 'finished'").fetch_one(&store.pool).await.unwrap();
+        store.pool.close().await;
+        let store = Store::open(&path).await.unwrap();
+        backfill(&store).await.unwrap();
+        let finished_after: i64 =
+            sqlx::query_scalar("SELECT rowid FROM search_entries WHERE session_id = 'finished'").fetch_one(&store.pool).await.unwrap();
+        assert_eq!(finished_after, finished_rowid, "restart must skip completed sessions");
+        let after: i64 = sqlx::query_scalar("SELECT rowid FROM search_entries WHERE session_id = 'large' AND seq = 1")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(after, first_rowid, "restart must not redo a committed range");
+        let (rows, distinct): (i64, i64) =
+            sqlx::query_as("SELECT COUNT(*), COUNT(DISTINCT seq) FROM search WHERE session_id = 'large' AND search MATCH 'needle'")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!((rows, distinct), (1201, 1201));
+        let high_water: (i64, i64) =
+            sqlx::query_as("SELECT seq, through FROM search_backfill WHERE session_id = 'large'").fetch_one(&store.pool).await.unwrap();
+        assert_eq!(high_water, (1200, 1200), "live ingest must not extend the historical rebuild");
+        assert_eq!(backfill_chunk(&store, "large").await.unwrap(), None, "finished sessions are durable too");
+        assert_eq!(store.setting(VERSION_KEY).await.unwrap().as_deref(), Some(VERSION));
+    }
+
+    #[tokio::test]
+    async fn version_bump_clears_legacy_rows_including_entries_that_no_longer_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("c6h.db")).await.unwrap();
+        // Old indexes have no search_entries bookkeeping. Include exactly
+        // one full batch to exercise the empty final purge transaction.
+        for seq in 1..=BACKFILL_BATCH {
+            sqlx::query("INSERT INTO search (text, session_id, seq, part, kind) VALUES ('obsolete', 'deleted', ?, 0, 'user')")
+                .bind(seq)
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        }
+        store.set_setting(VERSION_KEY, "old").await.unwrap();
+        backfill(&store).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM search").fetch_one(&store.pool).await.unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(store.setting(VERSION_KEY).await.unwrap().as_deref(), Some(VERSION));
+    }
+
+    #[tokio::test]
+    async fn background_backfill_releases_writer_for_ingest_and_api_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("c6h.db")).await.unwrap();
+        let worker = c6_core::WorkerId::new();
+        sqlx::query(
+            "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at) \
+             VALUES ('large', ?, 'Large', '', 'c', 'm', 'idle', 0, 0)",
+        )
+        .bind(worker.to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let event = |seq| SessionEvent {
+            seq,
+            kind: Some(session_event::Kind::User(c6_proto::UserMessage { text: format!("needle {seq}"), ..Default::default() })),
+            ..Default::default()
+        };
+        let input: Vec<_> = (1..=1200).map(event).collect();
+        store.ingest(worker, "large", &input).await.unwrap().unwrap();
+        sqlx::query("INSERT INTO events (session_id, seq, ts, data) VALUES ('damaged', 1, 0, X'FF')").execute(&store.pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at) \
+             VALUES ('damaged', ?, 'Damaged', '', 'c', 'm', 'idle', 0, 0)",
+        )
+        .bind(worker.to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        store.set_setting(VERSION_KEY, "old").await.unwrap();
+        let (paused_tx, paused_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let background_store = store.clone();
+        let task = tokio::spawn(async move {
+            let mut gate = Some((paused_tx, resume_rx));
+            backfill_between_chunks(&background_store, move |events| {
+                let gate = if events > 1 { gate.take() } else { None };
+                async move {
+                    if let Some((paused, resume)) = gate {
+                        paused.send(()).unwrap();
+                        resume.await.unwrap();
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        });
+        c6_testkit::within("backfill's first committed event chunk", paused_rx).await.unwrap();
+        // A separate foreground writer proves no pooled connection or
+        // transaction survives the boundary. No timeout measures throughput.
+        c6_testkit::within("ingest during backfill", store.ingest(worker, "large", &[event(1201)])).await.unwrap().unwrap();
+        c6_testkit::within("API settings write during backfill", store.set_setting("backfill-test", "write")).await.unwrap();
+        resume_tx.send(()).unwrap();
+        c6_testkit::within("background index completion", task).await.unwrap();
+        let (rows, distinct): (i64, i64) =
+            sqlx::query_as("SELECT COUNT(*), COUNT(DISTINCT seq) FROM search WHERE session_id = 'large' AND search MATCH 'needle'")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!((rows, distinct), (1201, 1201));
+    }
+
+    #[tokio::test]
+    async fn purge_does_not_revisit_live_rows_when_sqlite_reuses_a_rowid() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("c6h.db")).await.unwrap();
+        let worker = c6_core::WorkerId::new();
+        sqlx::query(
+            "INSERT INTO sessions (id, worker_id, title, cwd, connection_id, model, status, created_at, updated_at) \
+             VALUES ('live', ?, 'Live', '', 'c', 'm', 'idle', 0, 0)",
+        )
+        .bind(worker.to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        for seq in 1..=BACKFILL_BATCH {
+            sqlx::query("INSERT INTO search (text, session_id, seq, part, kind) VALUES ('obsolete', 'deleted', ?, 0, 'user')")
+                .bind(seq)
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        }
+        let mut live = Some(SessionEvent {
+            seq: 1,
+            kind: Some(session_event::Kind::User(c6_proto::UserMessage { text: "needle".into(), ..Default::default() })),
+            ..Default::default()
+        });
+        backfill_between_chunks(&store, |_| {
+            let live = live.take();
+            let store = &store;
+            async move {
+                if let Some(ev) = live {
+                    // All 200 old rows have just been removed. SQLite may
+                    // reuse rowid 1; the durable purge cursor must skip it.
+                    store.ingest(worker, "live", &[ev]).await.unwrap().unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let rows: Vec<(String, i64)> = sqlx::query_as("SELECT session_id, seq FROM search").fetch_all(&store.pool).await.unwrap();
+        assert_eq!(rows, [("live".into(), 1)]);
+    }
 
     #[tokio::test]
     async fn continuation_spawn_links_keep_the_original_child_insertion_point() {

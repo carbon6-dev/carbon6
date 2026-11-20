@@ -87,6 +87,9 @@ pub async fn run(worker: Arc<Worker>, state: watch::Sender<ConnState>, shutdown:
         state.send_replace(ConnState::Connecting);
         let started = Instant::now();
         let ended = attach_once(&worker, &state, &shutdown).await;
+        if !matches!(&ended, Ended::Retry(_)) {
+            worker.link.stop_credentials();
+        }
         worker.link.disconnected();
         let err = match ended {
             Ended::Shutdown => return Ok(()),

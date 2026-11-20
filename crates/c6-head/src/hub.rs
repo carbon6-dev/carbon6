@@ -12,6 +12,7 @@ use c6_proto::{
 use futures::Stream;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{info, warn};
 
@@ -22,7 +23,39 @@ use crate::{HeadState, sessions};
 /// every 10s.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const OUTBOUND_CAPACITY: usize = 1024;
+// Event batches can be large. Bound the amount buffered ahead of the ordered
+// persistence task; saturation backpressures the gRPC reader.
+const WORK_CAPACITY: usize = 4;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub(crate) fn sqlite_busy(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<sqlx::Error>().is_some_and(|e| {
+        // Extended result codes such as SQLITE_BUSY_SNAPSHOT have the same
+        // low byte. Do not retry SQLITE_LOCKED or other database failures.
+        e.as_database_error().and_then(|e| e.code()).and_then(|code| code.parse::<u32>().ok()).is_some_and(|code| code & 0xff == 5)
+    })
+}
+
+/// Only use on reads, single statements, or atomic transactions whose error
+/// is returned before any other effects. Never time out a running attempt:
+/// dropping its future does not necessarily stop a SQLx SQLite worker.
+pub(crate) async fn retry_sqlite_busy<T, F>(mut run: impl FnMut() -> F) -> anyhow::Result<T>
+where
+    F: Future<Output = anyhow::Result<T>> + Send,
+{
+    let start = Instant::now();
+    for delay_ms in [25, 75] {
+        match run().await {
+            // SQLite already has a busy handler. Don't stack another full
+            // busy timeout after a statement waited on persistent contention.
+            Err(e) if sqlite_busy(&e) && start.elapsed() < Duration::from_secs(1) => {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            result => return result,
+        }
+    }
+    run().await
+}
 
 pub struct EnrollmentSvc(pub Arc<HeadState>);
 
@@ -102,7 +135,10 @@ impl WorkerHub for HubSvc {
             .first()
             .and_then(|c| crate::pki::worker_identity(c))
             .ok_or_else(|| Status::unauthenticated("certificate has no worker identity"))?;
-        let row = st.store.worker(worker_id).await.map_err(internal)?.ok_or_else(|| Status::permission_denied("unknown worker"))?;
+        let row = retry_sqlite_busy(|| st.store.worker(worker_id))
+            .await
+            .map_err(attach_error)?
+            .ok_or_else(|| Status::permission_denied("unknown worker"))?;
         if row.revoked_at.is_some() || !crate::pki::same_serial(&row.cert_serial, &serial) {
             return Err(Status::permission_denied("worker revoked"));
         }
@@ -126,7 +162,7 @@ impl WorkerHub for HubSvc {
         // worker cannot later claim to be the memex, or the reverse.
         let says = if hello.capabilities.iter().any(|c| c == "memex") { "memex" } else { "worker" };
         let role = if row.role.is_empty() {
-            st.store.set_worker_role(worker_id, says).await.map_err(internal)?;
+            retry_sqlite_busy(|| st.store.set_worker_role(worker_id, says)).await.map_err(attach_error)?;
             says.to_owned()
         } else if row.role != says {
             return Err(Status::failed_precondition(format!(
@@ -142,10 +178,10 @@ impl WorkerHub for HubSvc {
                 "the memex is part of the head now: stop c6m (the head moves its data in when it upgrades)",
             ));
         }
-        st.store.worker_attached(worker_id, hostname, os, arch, version, now_ms()).await.map_err(internal)?;
+        retry_sqlite_busy(|| st.store.worker_attached(worker_id, hostname, os, arch, version, now_ms())).await.map_err(attach_error)?;
 
         let session_ids: Vec<String> = hello.sessions.iter().map(|c| c.session_id.clone()).collect();
-        let acks = st.store.session_positions(worker_id, &session_ids).await.map_err(internal)?;
+        let acks = retry_sqlite_busy(|| st.store.session_positions(worker_id, &session_ids)).await.map_err(attach_error)?;
         let (tx, rx) = mpsc::channel(OUTBOUND_CAPACITY);
         let welcome = Welcome {
             protocol_version: c6_core::PROTOCOL_VERSION,
@@ -179,28 +215,21 @@ async fn serve_worker(
     capabilities: &[String],
 ) -> String {
     let worker_id = guard.worker_id;
-    // Highest command seq sent on this connection; a new connection starts
-    // over, and the worker ignores commands it already applied.
-    let mut delivered: i64 = 0;
-    guard.deliver.notify_one();
+    let (work, pending) = mpsc::channel(WORK_CAPACITY);
+    let stop = guard.cancel.child_token();
+    let _stop = stop.clone().drop_guard();
+    let mut lane =
+        tokio::spawn(ordered_work(st.clone(), worker_id, tx.clone(), capabilities.to_vec(), guard.deliver.clone(), stop, pending));
     let mut deadline = Instant::now() + IDLE_TIMEOUT;
     loop {
         let msg = tokio::select! {
             _ = guard.cancel.cancelled() => {
-                tx.send(Err(Status::aborted("connection replaced or revoked"))).await.ok();
+                let _ = tx.try_send(Err(Status::aborted("connection replaced or revoked")));
                 return "cancelled".into();
             }
             _ = tokio::time::sleep_until(deadline.into()) => return "idle timeout".into(),
-            _ = guard.deliver.notified() => {
-                match deliver_pending(st, worker_id, &mut delivered, tx, capabilities).await {
-                    Ok(true) => continue,
-                    Ok(false) => return "response stream closed".into(),
-                    Err(e) => {
-                        warn!(worker = %worker_id, "delivering commands: {e:#}");
-                        continue;
-                    }
-                }
-            }
+            _ = tx.closed() => return "response stream closed".into(),
+            r = &mut lane => return ordered_work_ended(tx, r),
             r = inbound.message() => r,
         };
         deadline = Instant::now() + IDLE_TIMEOUT;
@@ -218,23 +247,6 @@ async fn serve_worker(
                 let _ = tx.try_send(Ok(head(head_msg::Msg::Pong(Pong { nonce: p.nonce }))));
             }
             worker_msg::Msg::Hello(_) => warn!(worker = %worker_id, "duplicate Hello ignored"),
-            worker_msg::Msg::Events(batch) => {
-                let session_id = batch.session_id.clone();
-                match sessions::ingest(st, worker_id, batch).await {
-                    // Acks are cumulative, so a dropped one is covered by the next.
-                    Ok(Some(seq)) => {
-                        let _ = tx.try_send(Ok(head(head_msg::Msg::Ack(EventAck { session_id, seq }))));
-                    }
-                    Ok(None) => {}
-                    Err(e) => warn!(worker = %worker_id, session = %session_id, "storing events: {e:#}"),
-                }
-            }
-            worker_msg::Msg::Ephemeral(ev) => sessions::on_ephemeral(st, worker_id, ev).await,
-            worker_msg::Msg::Rejected(r) => {
-                if let Err(e) = sessions::on_rejected(st, worker_id, r).await {
-                    warn!(worker = %worker_id, "recording rejection: {e:#}");
-                }
-            }
             worker_msg::Msg::RpcResponse(resp) => guard.rpc_response(resp),
             worker_msg::Msg::HeadCall(call) => {
                 // Off the read loop: a relayed call waits on another node.
@@ -252,14 +264,153 @@ async fn serve_worker(
                     st.registry.reply(worker_id, reply).await;
                 });
             }
-            worker_msg::Msg::CredentialRequest(req) => {
-                let grant = sessions::credential(st, worker_id, req).await;
-                if tx.send(Ok(head(head_msg::Msg::Credential(grant)))).await.is_err() {
-                    return "response stream closed".into();
+            m => {
+                // Keep messages which may depend on earlier durable events in
+                // order, without holding up pongs while the lane has room.
+                tokio::select! {
+                    _ = guard.cancel.cancelled() => {
+                        let _ = tx.try_send(Err(Status::aborted("connection replaced or revoked")));
+                        return "cancelled".into();
+                    }
+                    _ = tx.closed() => return "response stream closed".into(),
+                    r = &mut lane => return ordered_work_ended(tx, r),
+                    result = work.send(m) => if result.is_err() {
+                        return ordered_work_ended(tx, lane.await);
+                    },
                 }
             }
         }
     }
+}
+
+fn ordered_work_ended(tx: &mpsc::Sender<Result<HeadMsg, Status>>, result: Result<Result<(), Status>, tokio::task::JoinError>) -> String {
+    let err = match result {
+        Ok(Ok(())) => return "ordered worker task closed".into(),
+        Ok(Err(err)) => err,
+        Err(err) => {
+            warn!("ordered worker task: {err:#}");
+            Status::internal("ordered worker task failed")
+        }
+    };
+    let reason = err.message().to_owned();
+    let _ = tx.try_send(Err(err));
+    reason
+}
+
+async fn ordered_work(
+    st: Arc<HeadState>,
+    worker_id: WorkerId,
+    tx: mpsc::Sender<Result<HeadMsg, Status>>,
+    capabilities: Vec<String>,
+    deliver: Arc<tokio::sync::Notify>,
+    stop: CancellationToken,
+    mut pending: mpsc::Receiver<worker_msg::Msg>,
+) -> Result<(), Status> {
+    // Highest command seq sent on this connection; a new connection starts
+    // over, and the worker ignores commands it already applied.
+    let mut delivered = 0;
+    deliver.notify_one();
+    let mut redeliver_at = None;
+    loop {
+        // Do not cancel an in-flight mutation on disconnect: it may already
+        // have committed and still need to publish its post-commit effects.
+        if stop.is_cancelled() {
+            return Ok(());
+        }
+        let redeliver = async {
+            match redeliver_at {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+        let msg = tokio::select! {
+            _ = stop.cancelled() => return Ok(()),
+            _ = tx.closed() => return Ok(()),
+            _ = redeliver => None,
+            _ = deliver.notified() => None,
+            msg = pending.recv() => match msg {
+                Some(msg) => Some(msg),
+                None => return Ok(()),
+            },
+        };
+        if stop.is_cancelled() {
+            return Ok(());
+        }
+        match msg {
+            None => {
+                redeliver_at = None;
+                match deliver_pending(&st, worker_id, &mut delivered, &tx, &capabilities).await {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(()),
+                    Err(e) => {
+                        warn!(worker = %worker_id, "delivering commands: {e:#}");
+                        if e.is::<CommandDeliveryBusy>() {
+                            // A failed read leaves the cursor on the last
+                            // completed command. No new notification is needed.
+                            redeliver_at = Some(tokio::time::Instant::now() + Duration::from_millis(250));
+                        }
+                    }
+                }
+            }
+            Some(worker_msg::Msg::Events(batch)) => {
+                let session_id = batch.session_id.clone();
+                // `ingest` propagates errors only before the durable commit;
+                // publication, notifications, and triggers run only afterward.
+                match retry_sqlite_busy(|| ingest_batch(&st, worker_id, &batch)).await {
+                    Ok(Some(seq)) => {
+                        let _ = tx.try_send(Ok(head(head_msg::Msg::Ack(EventAck { session_id, seq }))));
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(worker = %worker_id, session = %session_id, "storing events: {e:#}");
+                        // The worker sends each batch once per connection. If
+                        // we can't persist it here, continuing would leave a
+                        // gap that blocks even otherwise healthy later batches.
+                        return Err(if sqlite_busy(&e) {
+                            Status::unavailable("head database busy; reconnect to resume event upload")
+                        } else {
+                            Status::internal("could not store events; reconnect to resume event upload")
+                        });
+                    }
+                }
+            }
+            Some(worker_msg::Msg::Ephemeral(ev)) => sessions::on_ephemeral(&st, worker_id, ev).await,
+            Some(worker_msg::Msg::Rejected(r)) => {
+                // Rejection can enqueue a Restore and fire triggers. Do not
+                // replay the handler, which is not one atomic operation.
+                if let Err(e) = sessions::on_rejected(&st, worker_id, r).await {
+                    warn!(worker = %worker_id, "recording rejection: {e:#}");
+                }
+            }
+            Some(worker_msg::Msg::CredentialRequest(req)) => {
+                let grant = sessions::credential(&st, worker_id, req).await;
+                if tx.send(Ok(head(head_msg::Msg::Credential(grant)))).await.is_err() {
+                    return Ok(());
+                }
+            }
+            Some(_) => unreachable!("control messages are handled by the stream reader"),
+        }
+    }
+}
+
+async fn ingest_batch(st: &HeadState, worker_id: WorkerId, batch: &c6_proto::SessionEventBatch) -> anyhow::Result<Option<u64>> {
+    #[cfg(test)]
+    if let Some(error) = INGEST_FAILURES.lock().unwrap().remove(&worker_id) {
+        return Err(error.into());
+    }
+    sessions::ingest(st, worker_id, batch.clone()).await
+}
+
+#[cfg(test)]
+static INGEST_FAILURES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<WorkerId, sqlx::Error>>> =
+    std::sync::LazyLock::new(Default::default);
+
+#[derive(Debug, thiserror::Error)]
+#[error("reading pending commands: {0}")]
+struct CommandDeliveryBusy(#[source] anyhow::Error);
+
+fn command_read_error(e: anyhow::Error) -> anyhow::Error {
+    if sqlite_busy(&e) { CommandDeliveryBusy(e).into() } else { e }
 }
 
 /// Sends pending commands newer than `delivered`, in order. Ok(false) if the
@@ -272,7 +423,7 @@ async fn deliver_pending(
     capabilities: &[String],
 ) -> anyhow::Result<bool> {
     loop {
-        let rows = st.store.pending_commands(worker_id, *delivered).await?;
+        let rows = st.store.pending_commands(worker_id, *delivered).await.map_err(command_read_error)?;
         if rows.is_empty() {
             return Ok(true);
         }
@@ -281,7 +432,7 @@ async fn deliver_pending(
             // Use this stream's Hello, not a replacement in the registry.
             let compatibility = match sessions::prepare_worker_subagents(capabilities, &mut cmd) {
                 Ok(()) if matches!(cmd.kind, Some(c6_proto::session_command::Kind::Input(_))) => {
-                    sessions::check_worker_subagent_input(st, capabilities, &cmd.session_id).await
+                    sessions::check_worker_subagent_input(st, capabilities, &cmd.session_id).await.map_err(command_read_error)
                 }
                 result => result,
             };
@@ -324,6 +475,14 @@ fn internal(e: anyhow::Error) -> Status {
     Status::internal("internal error")
 }
 
+fn attach_error(e: anyhow::Error) -> Status {
+    if sqlite_busy(&e) {
+        warn!("attaching worker: {e:#}");
+        return Status::unavailable("head database busy; retry attach");
+    }
+    internal(e)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,6 +493,107 @@ mod tests {
     struct ForkInput {
         #[prost(bool, tag = "16")]
         human_origin: bool,
+    }
+
+    #[tokio::test]
+    async fn worker_pong_precedes_writer_release_and_busy_batch_retries_on_same_stream() {
+        use c6_proto::{Ping, SessionEvent, SessionEventBatch, UserMessage, session_event};
+        use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
+
+        let (_dir, head, _mock, _work) = crate::work::tests::routing_fixture().await;
+        let st = &head.state;
+        let worker = WorkerId::new();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let csr = rcgen::CertificateParams::default().serialize_request(&key).unwrap().pem().unwrap();
+        let cert = st.pki.issue_worker_cert(&csr, worker).unwrap();
+        st.store
+            .insert_worker(
+                &NewWorker {
+                    id: worker,
+                    name: "stream test",
+                    hostname: "localhost",
+                    os: "",
+                    arch: "",
+                    version: "",
+                    cert_serial: &cert.serial_hex,
+                },
+                "",
+                now_ms(),
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sessions SET worker_id = ? WHERE id = 'session'")
+            .bind(worker.to_string())
+            .execute(&st.store.pool)
+            .await
+            .unwrap();
+        let channel = Endpoint::from_shared(format!("https://{}", head.worker_addrs[0]))
+            .unwrap()
+            .tls_config(
+                ClientTlsConfig::new()
+                    .domain_name("localhost")
+                    .ca_certificate(Certificate::from_pem(st.pki.ca_cert_pem()))
+                    .identity(Identity::from_pem(cert.cert_pem, key.serialize_pem())),
+            )
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let (outbound, rx) = mpsc::channel(8);
+        let send = |msg| outbound.send(WorkerMsg { msg: Some(msg) });
+        send(worker_msg::Msg::Hello(Hello { protocol_version: c6_core::PROTOCOL_VERSION, ..Default::default() })).await.unwrap();
+        let mut inbound =
+            c6_proto::worker_hub_client::WorkerHubClient::new(channel).attach(ReceiverStream::new(rx)).await.unwrap().into_inner();
+        assert!(matches!(inbound.message().await.unwrap().unwrap().msg, Some(head_msg::Msg::Welcome(_))));
+
+        let mut live = st.hub.subscribe("session");
+        // Force a single actual SQLite BUSY result without relying on a race
+        // between the SQLite busy timeout and the writer's release. Other
+        // production-pool operations still use their normal busy timeout.
+        let opts = st.store.pool.connect_options().as_ref().clone().busy_timeout(Duration::ZERO);
+        let probe = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect_with(opts).await.unwrap();
+        let writer = st.store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let busy = probe.begin_with("BEGIN IMMEDIATE").await.unwrap_err();
+        assert_eq!(busy.as_database_error().and_then(|e| e.code()).as_deref(), Some("5"));
+        assert!(INGEST_FAILURES.lock().unwrap().insert(worker, busy).is_none());
+        for seq in 1..=2 {
+            send(worker_msg::Msg::Events(SessionEventBatch {
+                session_id: "session".into(),
+                events: vec![SessionEvent {
+                    seq,
+                    kind: Some(session_event::Kind::User(UserMessage { text: format!("event {seq}"), ..Default::default() })),
+                    ..Default::default()
+                }],
+            }))
+            .await
+            .unwrap();
+        }
+        send(worker_msg::Msg::Ping(Ping { nonce: 42, ..Default::default() })).await.unwrap();
+        let pong = c6_testkit::within("pong while the database writer is held", inbound.message()).await.unwrap().unwrap();
+        assert!(matches!(pong.msg, Some(head_msg::Msg::Pong(Pong { nonce: 42 }))));
+        writer.rollback().await.unwrap();
+
+        for expected in 1..=2 {
+            let ack = c6_testkit::within("ack after the writer is released", inbound.message()).await.unwrap().unwrap();
+            assert!(matches!(ack.msg, Some(head_msg::Msg::Ack(EventAck { seq, .. })) if seq == expected));
+        }
+        assert!(!INGEST_FAILURES.lock().unwrap().contains_key(&worker));
+        // The live feed can also carry queue and other notifications; only
+        // durable publications should appear exactly once, in upload order.
+        let mut published = Vec::new();
+        loop {
+            match live.try_recv() {
+                Ok(c6_api::StreamMsg::Event { event }) => published.push(event.seq),
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(e) => panic!("lost live events: {e}"),
+            }
+        }
+        assert_eq!(published, [1, 2]);
+        assert_eq!(st.store.session_positions(worker, &["session".into()]).await.unwrap(), [("session".into(), 2)]);
+        drop(inbound);
+        drop(outbound);
+        head.shutdown().await.unwrap();
     }
 
     #[tokio::test]

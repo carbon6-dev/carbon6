@@ -4865,7 +4865,15 @@ async fn run_session_turn(
 
     // Credentials are checked up front (a missing sign-in says so at once),
     // then fetched for every call, so a long turn outlives its token.
-    let checked = link.session_credential(session_id, connection_id).await;
+    let checked = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            sink.append(session_event::Kind::TurnStarted(TurnStarted { turn, ..Default::default() })).await?;
+            sink.append(session_event::Kind::TurnEnded(TurnEnded { turn, reason: TurnEndReason::Interrupted as i32 })).await?;
+            return Ok(());
+        }
+        checked = link.model_credential(session_id, connection_id) => checked,
+    };
     let client: Arc<dyn c6_llm::ModelClient> =
         match checked.and_then(|g| Ok(c6_llm::client_for(&g.kind, &g.base_url, &g.bearer, g.headers)?)) {
             Ok(_) => Arc::new(crate::link::LinkedClient::new(link.clone(), session_id, connection_id)),

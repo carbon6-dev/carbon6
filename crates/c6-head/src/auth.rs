@@ -21,6 +21,7 @@ use c6_api as api;
 use c6_core::now_ms;
 use sqlx::Row;
 
+use crate::hub::{retry_sqlite_busy, sqlite_busy};
 use crate::store::Store;
 use crate::webauthn;
 use crate::{HeadState, bad_request};
@@ -139,6 +140,27 @@ fn session_cookie(token: &str, secure: bool, max_age_s: i64) -> String {
     format!("{COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age_s}{}", if secure { "; Secure" } else { "" })
 }
 
+async fn insert_auth_session<'db>(
+    db: impl sqlx::Executor<'db, Database = sqlx::Sqlite>,
+    token: &str,
+    method: &str,
+    ua: Option<&str>,
+    now: i64,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO auth_sessions (token_hash, method, user_agent, created_at, last_seen_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(sha256_hex(token))
+    .bind(method)
+    .bind(ua)
+    .bind(now)
+    .bind(now)
+    .bind(now + SESSION_MS)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
 // --- Store ----------------------------------------------------------------------
 
 impl Store {
@@ -155,23 +177,31 @@ impl Store {
         Ok(token)
     }
 
-    async fn redeem_login_link(&self, token: &str) -> anyhow::Result<bool> {
-        self.redeem(token, "link").await
-    }
-
     /// Uses up a link or code of `kind`. Each kind is only accepted at its
-    /// own endpoint: short codes must not be guessable through the link one.
-    async fn redeem(&self, secret: &str, kind: &str) -> anyhow::Result<bool> {
-        let now = now_ms();
-        let done =
-            sqlx::query("UPDATE login_links SET used_at = ? WHERE token_hash = ? AND kind = ? AND used_at IS NULL AND expires_at > ?")
-                .bind(now)
-                .bind(sha256_hex(secret))
-                .bind(kind)
-                .bind(now)
-                .execute(&self.pool)
-                .await?;
-        Ok(done.rows_affected() == 1)
+    /// own endpoint. Consume it and issue the session together so a failed
+    /// insert never loses a user's only sign-in credential.
+    async fn redeem(&self, secret: &str, kind: &str, ua: Option<&str>) -> anyhow::Result<Option<String>> {
+        let token = new_token();
+        retry_sqlite_busy(|| async {
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let now = now_ms();
+            let done =
+                sqlx::query("UPDATE login_links SET used_at = ? WHERE token_hash = ? AND kind = ? AND used_at IS NULL AND expires_at > ?")
+                    .bind(now)
+                    .bind(sha256_hex(secret))
+                    .bind(kind)
+                    .bind(now)
+                    .execute(&mut *tx)
+                    .await?;
+            if done.rows_affected() == 0 {
+                tx.rollback().await?;
+                return Ok(None);
+            }
+            insert_auth_session(&mut *tx, &token, kind, ua, now).await?;
+            tx.commit().await?;
+            Ok(Some(token.clone()))
+        })
+        .await
     }
 
     /// A new one-time code ("K7QM-2XRD"), valid for 10 minutes.
@@ -197,18 +227,7 @@ impl Store {
 
     async fn create_auth_session(&self, method: &str, user_agent: Option<&str>) -> anyhow::Result<String> {
         let token = new_token();
-        let now = now_ms();
-        sqlx::query(
-            "INSERT INTO auth_sessions (token_hash, method, user_agent, created_at, last_seen_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(sha256_hex(&token))
-        .bind(method)
-        .bind(user_agent)
-        .bind(now)
-        .bind(now)
-        .bind(now + SESSION_MS)
-        .execute(&self.pool)
-        .await?;
+        retry_sqlite_busy(|| insert_auth_session(&self.pool, &token, method, user_agent, now_ms())).await?;
         Ok(token)
     }
 
@@ -223,21 +242,36 @@ impl Store {
         {
             return Ok(true);
         }
-        let row = sqlx::query("SELECT last_seen_at, expires_at FROM auth_sessions WHERE token_hash = ? AND expires_at > ?")
-            .bind(&hash)
-            .bind(now)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row = retry_sqlite_busy(|| async {
+            Ok(sqlx::query("SELECT last_seen_at, expires_at FROM auth_sessions WHERE token_hash = ? AND expires_at > ?")
+                .bind(&hash)
+                .bind(now_ms())
+                .fetch_optional(&self.pool)
+                .await?)
+        })
+        .await?;
         let Some(row) = row else { return Ok(false) };
         let mut expires_at = row.get("expires_at");
         if now - row.get::<i64, _>("last_seen_at") > TOUCH_MS {
-            sqlx::query("UPDATE auth_sessions SET last_seen_at = ?, expires_at = ? WHERE token_hash = ?")
+            let touched = sqlx::query("UPDATE auth_sessions SET last_seen_at = ?, expires_at = ? WHERE token_hash = ? AND expires_at > ?")
                 .bind(now)
                 .bind(now + SESSION_MS)
                 .bind(&hash)
+                .bind(now)
                 .execute(&self.pool)
-                .await?;
-            expires_at = now + SESSION_MS;
+                .await;
+            match touched.map_err(anyhow::Error::from) {
+                Ok(result) if result.rows_affected() > 0 => expires_at = now + SESSION_MS,
+                Ok(_) => return Ok(false),
+                // Authentication came from the authoritative read. A busy
+                // maintenance write must not turn it into an invalid cookie,
+                // and we must not cache a slide that was never persisted.
+                Err(e) if sqlite_busy(&e) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if expires_at <= now_ms() {
+            return Ok(false);
         }
         self.auth_cache.insert(generation, key, CachedAuth::Session { expires_at });
         Ok(true)
@@ -277,15 +311,29 @@ impl Store {
             return Ok(Some(caller));
         }
         let now = now_ms();
-        let Some(row) = sqlx::query("SELECT last_used_at, realm, name FROM api_tokens WHERE token_hash = ?")
-            .bind(&hash)
-            .fetch_optional(&self.pool)
-            .await?
+        let Some(row) = retry_sqlite_busy(|| async {
+            Ok(sqlx::query("SELECT last_used_at, realm, name FROM api_tokens WHERE token_hash = ?")
+                .bind(&hash)
+                .fetch_optional(&self.pool)
+                .await?)
+        })
+        .await?
         else {
             return Ok(None);
         };
         if now - row.get::<Option<i64>, _>("last_used_at").unwrap_or(0) > TOUCH_MS {
-            sqlx::query("UPDATE api_tokens SET last_used_at = ? WHERE token_hash = ?").bind(now).bind(&hash).execute(&self.pool).await?;
+            let touched = sqlx::query("UPDATE api_tokens SET last_used_at = ? WHERE token_hash = ?")
+                .bind(now)
+                .bind(&hash)
+                .execute(&self.pool)
+                .await
+                .map_err(anyhow::Error::from);
+            match touched {
+                Ok(result) if result.rows_affected() == 0 => return Ok(None),
+                Ok(_) => {}
+                Err(e) if sqlite_busy(&e) => {}
+                Err(e) => return Err(e),
+            }
         }
         let caller = crate::realms::Caller { realm: row.get("realm"), api_token_name: Some(row.get("name")), ..Default::default() };
         self.auth_cache.insert(generation, key, CachedAuth::Token(caller.clone()));
@@ -433,10 +481,10 @@ pub async fn require(State(st): State<Arc<HeadState>>, mut req: Request, next: N
         let caller = if path.starts_with("/api/v1/auth/") {
             None
         } else {
-            st.store.check_api_token(&token).await.unwrap_or_else(|e| {
-                tracing::warn!("checking API token: {e:#}");
-                None
-            })
+            match st.store.check_api_token(&token).await {
+                Ok(caller) => caller,
+                Err(e) => return auth_unavailable(e).into_response(),
+            }
         };
         match caller {
             Some(caller) => {
@@ -463,10 +511,10 @@ pub async fn require(State(st): State<Arc<HeadState>>, mut req: Request, next: N
     }
     let place = browser_place(&req);
     let ok = match cookie_token(req.headers()) {
-        Some(t) => st.store.check_auth_session(&t).await.unwrap_or_else(|e| {
-            tracing::warn!("checking session: {e:#}");
-            false
-        }),
+        Some(t) => match st.store.check_auth_session(&t).await {
+            Ok(ok) => ok,
+            Err(e) => return auth_unavailable(e).into_response(),
+        },
         None => false,
     };
     if !st.auth.required {
@@ -547,6 +595,15 @@ pub fn routes() -> Router<Arc<HeadState>> {
 
 type Res<T> = Result<T, crate::api::ApiErr>;
 
+fn auth_unavailable(error: anyhow::Error) -> crate::api::ApiErr {
+    tracing::warn!("authentication database unavailable: {error:#}");
+    crate::api::ApiErr(StatusCode::SERVICE_UNAVAILABLE, "authentication temporarily unavailable; try again".into())
+}
+
+fn auth_write_error(error: anyhow::Error) -> crate::api::ApiErr {
+    if sqlite_busy(&error) { auth_unavailable(error) } else { error.into() }
+}
+
 fn is_tls(req_ext: Option<axum::Extension<Tls>>) -> bool {
     req_ext.is_some()
 }
@@ -554,7 +611,7 @@ fn is_tls(req_ext: Option<axum::Extension<Tls>>) -> bool {
 async fn status(State(st): State<Arc<HeadState>>, tls: Option<axum::Extension<Tls>>, headers: HeaderMap) -> Res<Json<api::AuthStatus>> {
     let here = here(&headers, is_tls(tls));
     let authenticated = match cookie_token(&headers) {
-        Some(t) => st.store.check_auth_session(&t).await?,
+        Some(t) => st.store.check_auth_session(&t).await.map_err(auth_unavailable)?,
         None => false,
     };
     let has_passkeys = match &here.rp_id {
@@ -570,12 +627,13 @@ async fn status(State(st): State<Arc<HeadState>>, tls: Option<axum::Extension<Tl
     }))
 }
 
-/// Starts a session and sets its cookie.
-async fn sign_in(st: &HeadState, method: &str, headers: &HeaderMap, secure: bool) -> Res<Response> {
-    let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).map(|s| s.chars().take(200).collect::<String>());
-    let token = st.store.create_auth_session(method, ua.as_deref()).await?;
+fn user_agent(headers: &HeaderMap) -> Option<String> {
+    headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).map(|s| s.chars().take(200).collect())
+}
+
+fn signed_in(token: &str, method: &str, secure: bool) -> Response {
     tracing::info!(method, "browser signed in");
-    Ok(([(header::SET_COOKIE, session_cookie(&token, secure, SESSION_MS / 1000))], StatusCode::NO_CONTENT).into_response())
+    ([(header::SET_COOKIE, session_cookie(token, secure, SESSION_MS / 1000))], StatusCode::NO_CONTENT).into_response()
 }
 
 async fn redeem_link(
@@ -584,14 +642,15 @@ async fn redeem_link(
     headers: HeaderMap,
     Json(req): Json<api::RedeemLink>,
 ) -> Res<Response> {
-    if !st.store.redeem_login_link(req.token.trim()).await? {
+    let ua = user_agent(&headers);
+    let Some(token) = st.store.redeem(req.token.trim(), "link", ua.as_deref()).await.map_err(auth_write_error)? else {
         return Err(bad_request(format!(
             "this login link is invalid, expired or already used; run `{}` for a new one",
             st.auth.login_link_command
         ))
         .into());
-    }
-    sign_in(&st, "link", &headers, is_tls(tls)).await
+    };
+    Ok(signed_in(&token, "link", is_tls(tls)))
 }
 
 /// The code as typed: case, spaces and dashes don't matter, and the
@@ -619,9 +678,10 @@ async fn redeem_code(
     headers: HeaderMap,
     Json(req): Json<api::RedeemCode>,
 ) -> Res<Response> {
-    if st.store.redeem(&normalize_code(&req.code), "code").await? {
+    let ua = user_agent(&headers);
+    if let Some(token) = st.store.redeem(&normalize_code(&req.code), "code", ua.as_deref()).await.map_err(auth_write_error)? {
         *st.auth.code_failures.lock().unwrap() = 0;
-        return sign_in(&st, "code", &headers, is_tls(tls)).await;
+        return Ok(signed_in(&token, "code", is_tls(tls)));
     }
     let cancel = {
         let mut failures = st.auth.code_failures.lock().unwrap();
@@ -717,7 +777,9 @@ async fn login_finish(
         .execute(&st.store.pool)
         .await
         .map_err(anyhow::Error::from)?;
-    sign_in(&st, "passkey", &headers, secure).await
+    let ua = user_agent(&headers);
+    let token = st.store.create_auth_session("passkey", ua.as_deref()).await.map_err(auth_write_error)?;
+    Ok(signed_in(&token, "passkey", secure))
 }
 
 async fn register_begin(
@@ -857,6 +919,81 @@ mod tests {
     use serde_json::{Value, json};
 
     use crate::webauthn::{self, tests::SoftKey};
+
+    #[tokio::test]
+    async fn busy_bookkeeping_preserves_live_session_and_token_scope() {
+        use super::*;
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("head.db");
+        let writer_store = Store::open(&path).await.unwrap();
+        let mut store = writer_store.clone();
+        // A second connection to the same WAL database sees the real busy
+        // result immediately; the writer gate needs no sleep or timing guess.
+        store.pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::new().filename(path).busy_timeout(Duration::ZERO))
+            .await
+            .unwrap();
+        let session = store.create_auth_session("link", None).await.unwrap();
+        let token = store.create_api_token("receiver", Some("lab")).await.unwrap();
+        let secret = token.token.unwrap();
+        let hash = sha256_hex(&session);
+        let expiry = now_ms() + 86_400_000;
+        sqlx::query("UPDATE auth_sessions SET last_seen_at = 0, expires_at = ? WHERE token_hash = ?")
+            .bind(expiry)
+            .bind(&hash)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let writer = writer_store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let err = store.pool.begin_with("BEGIN IMMEDIATE").await.unwrap_err();
+        assert!(sqlite_busy(&err.into()));
+        assert!(store.check_auth_session(&session).await.unwrap());
+        assert_eq!(store.check_api_token(&secret).await.unwrap().unwrap().realm.as_deref(), Some("lab"));
+        assert!(!store.check_auth_session("bad-cookie").await.unwrap());
+        assert!(store.check_api_token("bad-token").await.unwrap().is_none());
+        assert!(
+            matches!(store.auth_cache.get(&format!("session:{hash}")).1, Some(CachedAuth::Session { expires_at }) if expires_at == expiry)
+        );
+        writer.rollback().await.unwrap();
+
+        store.auth_cache.invalidate();
+        assert!(store.check_auth_session(&session).await.unwrap());
+        assert!(store.check_api_token(&secret).await.unwrap().is_some());
+        let new_expiry: i64 = sqlx::query_scalar("SELECT expires_at FROM auth_sessions WHERE token_hash = ?")
+            .bind(&hash)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        let last_used: Option<i64> = sqlx::query_scalar("SELECT last_used_at FROM api_tokens WHERE token_hash = ?")
+            .bind(sha256_hex(&secret))
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert!(new_expiry > expiry);
+        assert!(last_used.is_some());
+    }
+
+    #[tokio::test]
+    async fn failed_session_insert_does_not_consume_one_time_link() {
+        use super::*;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("head.db")).await.unwrap();
+        let link = store.create_login_link().await.unwrap();
+        sqlx::query("CREATE TRIGGER reject_session BEFORE INSERT ON auth_sessions BEGIN SELECT RAISE(ABORT, 'test'); END")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(store.redeem(&link, "link", None).await.is_err());
+        sqlx::query("DROP TRIGGER reject_session").execute(&store.pool).await.unwrap();
+        let token = store.redeem(&link, "link", None).await.unwrap().unwrap();
+        assert!(store.check_auth_session(&token).await.unwrap());
+        assert!(store.redeem(&link, "link", None).await.unwrap().is_none());
+    }
 
     #[tokio::test]
     async fn brief_auth_cache_hits_keep_scope_and_revocations_are_shared_by_store_clones() {

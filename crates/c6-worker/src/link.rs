@@ -2,7 +2,7 @@
 //! Works whether or not the worker is currently connected.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -15,6 +15,10 @@ const CREDENTIAL_TIMEOUT: Duration = Duration::from_secs(15);
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Refresh credentials this long before they expire.
 const EXPIRY_MARGIN_MS: i64 = 60_000;
+
+fn is_session_model(session_id: &str, connection_id: &str) -> bool {
+    !session_id.is_empty() && !connection_id.starts_with("secret:")
+}
 
 /// Live deltas are batched for this long, so a fast model sends a few
 /// messages per frame instead of one per token.
@@ -43,6 +47,7 @@ pub struct HeadLink {
     local: std::sync::OnceLock<Arc<dyn LocalHead>>,
     outbound: Mutex<Option<mpsc::Sender<WorkerMsg>>>,
     attached: tokio::sync::Notify,
+    stopped: AtomicBool,
     /// Deltas waiting for the next flush; `Some` while a flush is scheduled.
     ephemeral_buf: Arc<Mutex<Option<Vec<EphemeralEvent>>>>,
     waiters: Mutex<HashMap<u64, oneshot::Sender<CredentialGrant>>>,
@@ -64,14 +69,30 @@ impl HeadLink {
     }
 
     pub(crate) fn connected(&self, tx: mpsc::Sender<WorkerMsg>) {
-        *self.outbound.lock().unwrap() = Some(tx);
+        let mut outbound = self.outbound.lock().unwrap();
+        let mut cache = self.cache.lock().unwrap();
+        // Model grants bridge a transient outage, but a new attachment
+        // must go through the head's current authorization again.
+        self.cache_generation.fetch_add(1, Ordering::Relaxed);
+        cache.retain(|(session, id), _| !is_session_model(session, id));
+        self.stopped.store(false, Ordering::Relaxed);
+        *outbound = Some(tx);
         self.attached.notify_waiters();
     }
 
     pub(crate) fn disconnected(&self) {
-        *self.outbound.lock().unwrap() = None;
+        let mut outbound = self.outbound.lock().unwrap();
+        *outbound = None;
         self.waiters.lock().unwrap().clear(); // waiters see a closed channel
         self.calls.lock().unwrap().clear();
+    }
+
+    pub(crate) fn stop_credentials(&self) {
+        let mut cache = self.cache.lock().unwrap();
+        self.cache_generation.fetch_add(1, Ordering::Relaxed);
+        cache.clear();
+        self.stopped.store(true, Ordering::Relaxed);
+        self.attached.notify_waiters();
     }
 
     /// Calls the head: `method` with JSON `params`. What a node may call
@@ -181,6 +202,37 @@ impl HeadLink {
         self.credential_with(session_id, connection_id, false).await
     }
 
+    /// For an accepted model turn with no usable grant, allow a brief
+    /// reconnect to the broker instead of borrowing another session's grant.
+    pub(crate) async fn model_credential(&self, session_id: &str, connection_id: &str) -> anyhow::Result<CredentialGrant> {
+        let result = self.session_credential(session_id, connection_id).await;
+        let Some(failure) = result.as_ref().err().and_then(|e| e.downcast_ref::<CredentialTransport>()) else { return result };
+        if !is_session_model(session_id, connection_id) {
+            return result;
+        }
+        let replacement = async {
+            loop {
+                let attached = self.attached.notified();
+                tokio::pin!(attached);
+                attached.as_mut().enable();
+                if self.stopped.load(Ordering::Relaxed) {
+                    return false;
+                }
+                if self.outbound.lock().unwrap().as_ref().is_some_and(|tx| {
+                    !tx.is_closed() && !failure.0.as_ref().and_then(|old| old.upgrade()).is_some_and(|old| tx.same_channel(&old))
+                }) {
+                    return true;
+                }
+                attached.await;
+            }
+        };
+        if matches!(tokio::time::timeout(CREDENTIAL_TIMEOUT, replacement).await, Ok(true)) {
+            self.session_credential(session_id, connection_id).await
+        } else {
+            result
+        }
+    }
+
     /// Forget grants after a connection changes in the head's process.
     pub fn forget_connection(&self, connection_id: &str) {
         let mut cache = self.cache.lock().unwrap();
@@ -220,16 +272,24 @@ impl HeadLink {
     /// New credentials, after the provider refused the ones it had (HTTP
     /// 401): the head signs in again where it can (ChatGPT).
     pub async fn fresh_credential(&self, session_id: &str, connection_id: &str) -> anyhow::Result<CredentialGrant> {
-        self.cache.lock().unwrap().remove(&(session_id.to_owned(), connection_id.to_owned()));
+        self.forget_session_credential(session_id, connection_id);
         self.credential_with(session_id, connection_id, true).await
+    }
+
+    fn forget_session_credential(&self, session_id: &str, connection_id: &str) {
+        let mut cache = self.cache.lock().unwrap();
+        self.cache_generation.fetch_add(1, Ordering::Relaxed);
+        cache.remove(&(session_id.to_owned(), connection_id.to_owned()));
     }
 
     async fn credential_with(&self, session_id: &str, connection_id: &str, refresh: bool) -> anyhow::Result<CredentialGrant> {
         let now = c6_core::now_ms();
         let key = (session_id.to_owned(), connection_id.to_owned());
-        let (cached, generation) = {
+        let (tx, cached, generation) = {
+            let outbound = self.outbound.lock().unwrap();
             let cache = self.cache.lock().unwrap();
-            (cache.get(&key).cloned(), self.cache_generation.load(Ordering::Relaxed))
+            let cached = if refresh { None } else { cache.get(&key).cloned() };
+            (outbound.clone(), cached, self.cache_generation.load(Ordering::Relaxed))
         };
         if let Some(g) = &cached
             && (g.expires_at_ms == 0 || g.expires_at_ms - EXPIRY_MARGIN_MS > now)
@@ -245,29 +305,71 @@ impl HeadLink {
             self.cache_grant(key, &grant, generation);
             return Ok(grant);
         }
-        let tx = self.outbound.lock().unwrap().clone();
         let Some(tx) = tx else {
             // An expiring-but-valid token is better than nothing offline.
             if let Some(g) = cached.filter(|g| g.expires_at_ms > now) {
                 return Ok(g);
             }
-            bail!("not connected to the head and no cached credentials for this connection");
+            return Err(CredentialTransport(None).into());
         };
         let request_id = self.next_request.fetch_add(1, Ordering::Relaxed);
         let (done, wait) = oneshot::channel();
-        self.waiters.lock().unwrap().insert(request_id, done);
+        {
+            let outbound = self.outbound.lock().unwrap();
+            // Do not register a request after disconnect cleared the waiters.
+            if !outbound.as_ref().is_some_and(|current| current.same_channel(&tx)) {
+                return self.credential_transport_failure(&key, generation, refresh, &tx);
+            }
+            self.waiters.lock().unwrap().insert(request_id, done);
+        }
+        let _cleanup = CredentialWaiter { link: self, id: request_id };
         let req = CredentialRequest { request_id, connection_id: connection_id.to_owned(), refresh, session_id: session_id.to_owned() };
-        tx.send(WorkerMsg { msg: Some(worker_msg::Msg::CredentialRequest(req)) }).await.map_err(|_| anyhow!("head connection closed"))?;
-
-        let grant = tokio::time::timeout(CREDENTIAL_TIMEOUT, wait)
-            .await
-            .map_err(|_| anyhow!("timed out waiting for credentials from the head"))?
-            .map_err(|_| anyhow!("head connection closed while fetching credentials"))?;
+        let grant = match tokio::time::timeout(CREDENTIAL_TIMEOUT, async {
+            tx.send(WorkerMsg { msg: Some(worker_msg::Msg::CredentialRequest(req)) }).await.ok()?;
+            wait.await.ok()
+        })
+        .await
+        {
+            Ok(Some(grant)) => grant,
+            Ok(None) => return self.credential_transport_failure(&key, generation, refresh, &tx),
+            Err(_) if tx.is_closed() => return self.credential_transport_failure(&key, generation, refresh, &tx),
+            Err(_) => bail!("timed out waiting for credentials from the head"),
+        };
+        let outbound = self.outbound.lock().unwrap();
+        if self.stopped.load(Ordering::Relaxed) || outbound.as_ref().is_some_and(|current| !current.same_channel(&tx)) {
+            // A reply queued just before a disconnect does not authorize
+            // a call once a replacement head is attached (or the link stopped).
+            return Err(CredentialTransport(Some(tx.downgrade())).into());
+        }
         if !grant.error.is_empty() {
+            self.forget_session_credential(session_id, connection_id);
             bail!("head refused credentials: {}", grant.error);
+        }
+        if is_session_model(session_id, connection_id) && grant.expires_at_ms != 0 && grant.expires_at_ms <= c6_core::now_ms() {
+            self.forget_session_credential(session_id, connection_id);
+            bail!("head returned expired model credentials");
         }
         self.cache_grant(key, &grant, generation);
         Ok(grant)
+    }
+
+    fn credential_transport_failure(
+        &self,
+        key: &(String, String),
+        generation: u64,
+        refresh: bool,
+        tx: &mpsc::Sender<WorkerMsg>,
+    ) -> anyhow::Result<CredentialGrant> {
+        if !refresh && is_session_model(&key.0, &key.1) {
+            let cache = self.cache.lock().unwrap();
+            if generation == self.cache_generation.load(Ordering::Relaxed)
+                && let Some(grant) = cache.get(key)
+                && grant.expires_at_ms > c6_core::now_ms()
+            {
+                return Ok(grant.clone());
+            }
+        }
+        Err(CredentialTransport(Some(tx.downgrade())).into())
     }
 
     fn cache_grant(&self, key: (String, String), grant: &CredentialGrant, generation: u64) {
@@ -284,6 +386,32 @@ impl HeadLink {
     }
 }
 
+struct CredentialWaiter<'a> {
+    link: &'a HeadLink,
+    id: u64,
+}
+
+impl Drop for CredentialWaiter<'_> {
+    fn drop(&mut self) {
+        self.link.waiters.lock().unwrap().remove(&self.id);
+    }
+}
+
+#[derive(Debug)]
+struct CredentialTransport(Option<mpsc::WeakSender<WorkerMsg>>);
+
+impl std::fmt::Display for CredentialTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "head connection closed while fetching credentials"
+        } else {
+            "not connected to the head and no cached credentials for this connection"
+        })
+    }
+}
+
+impl std::error::Error for CredentialTransport {}
+
 /// A model client that takes its credentials from the head for every call
 /// (cached until they near expiry), so a long turn never runs on an
 /// expired token; when the provider refuses them anyway (HTTP 401), it
@@ -292,8 +420,8 @@ pub struct LinkedClient {
     link: Arc<HeadLink>,
     session_id: String,
     connection_id: String,
-    /// The client for the last bearer token, kept while the token is.
-    current: Mutex<Option<(String, Arc<dyn c6_llm::ModelClient>)>>,
+    /// The client for the last grant's provider configuration.
+    current: Mutex<Option<(CredentialGrant, Arc<dyn c6_llm::ModelClient>)>>,
 }
 
 impl LinkedClient {
@@ -304,13 +432,16 @@ impl LinkedClient {
 
     fn client(&self, g: &CredentialGrant) -> Result<Arc<dyn c6_llm::ModelClient>, c6_llm::LlmError> {
         let mut current = self.current.lock().unwrap();
-        if let Some((bearer, c)) = current.as_ref()
-            && *bearer == g.bearer
+        if let Some((previous, c)) = current.as_ref()
+            && previous.kind == g.kind
+            && previous.base_url == g.base_url
+            && previous.bearer == g.bearer
+            && previous.headers == g.headers
         {
             return Ok(c.clone());
         }
         let c: Arc<dyn c6_llm::ModelClient> = Arc::from(c6_llm::client_for(&g.kind, &g.base_url, &g.bearer, g.headers.clone())?);
-        *current = Some((g.bearer.clone(), c.clone()));
+        *current = Some((g.clone(), c.clone()));
         Ok(c)
     }
 }
@@ -319,12 +450,16 @@ impl LinkedClient {
 impl c6_llm::ModelClient for LinkedClient {
     async fn stream(&self, req: &c6_llm::ModelRequest) -> Result<c6_llm::EventStream, c6_llm::LlmError> {
         let unreachable = |e: anyhow::Error| c6_llm::LlmError::Network(format!("credentials from the head: {e:#}"));
-        let g = self.link.session_credential(&self.session_id, &self.connection_id).await.map_err(unreachable)?;
+        let g = self.link.model_credential(&self.session_id, &self.connection_id).await.map_err(unreachable)?;
         match self.client(&g)?.stream(req).await {
             Err(c6_llm::LlmError::Http { status: 401, body, .. }) => {
                 tracing::warn!(connection = %self.connection_id, "the provider refused the credentials; asking the head for new ones: {body}");
                 let g = self.link.fresh_credential(&self.session_id, &self.connection_id).await.map_err(unreachable)?;
-                self.client(&g)?.stream(req).await
+                let retried = self.client(&g)?.stream(req).await;
+                if matches!(&retried, Err(c6_llm::LlmError::Http { status: 401, .. })) {
+                    self.link.forget_session_credential(&self.session_id, &self.connection_id);
+                }
+                retried
             }
             r => r,
         }
@@ -448,6 +583,128 @@ mod tests {
         assert_eq!(c6_testkit::within("the old credential fetch to finish", pending).await.unwrap().context_window, 16_384);
         assert_eq!(link.credential("c").await.unwrap().context_window, 32_768);
         assert_eq!(head.calls.load(Ordering::Relaxed), 2);
+    }
+
+    fn take_request(rx: &mut mpsc::Receiver<WorkerMsg>) -> CredentialRequest {
+        let Some(worker_msg::Msg::CredentialRequest(req)) = rx.try_recv().unwrap().msg else { panic!("expected credential request") };
+        req
+    }
+
+    fn attach(link: &HeadLink) -> mpsc::Receiver<WorkerMsg> {
+        let (tx, rx) = mpsc::channel(8);
+        link.connected(tx);
+        rx
+    }
+
+    fn seed_grant(link: &HeadLink, expires_at_ms: i64) -> (String, String) {
+        let key = ("root".to_owned(), "c".to_owned());
+        link.cache.lock().unwrap().insert(key.clone(), CredentialGrant { bearer: "old".into(), expires_at_ms, ..Default::default() });
+        key
+    }
+
+    #[tokio::test]
+    async fn model_cache_bridges_disconnect_but_reconnect_requires_authorization() {
+        let link = HeadLink::default();
+        let mut rx = attach(&link);
+        let grant = link.model_credential("root", "c");
+        tokio::pin!(grant);
+        assert!(futures::poll!(&mut grant).is_pending());
+        let req = take_request(&mut rx);
+        assert_eq!((req.session_id.as_str(), req.connection_id.as_str()), ("root", "c"));
+        link.on_grant(CredentialGrant { request_id: req.request_id, bearer: "initial".into(), ..Default::default() });
+        assert_eq!(grant.await.unwrap().bearer, "initial");
+
+        link.disconnected();
+        assert_eq!(link.model_credential("root", "c").await.unwrap().bearer, "initial");
+        assert!(link.session_credential("other", "c").await.is_err());
+        assert!(link.session_credential("root", "other").await.is_err());
+
+        let mut rx = attach(&link);
+        let grant = link.model_credential("root", "c");
+        tokio::pin!(grant);
+        assert!(futures::poll!(&mut grant).is_pending());
+        let req = take_request(&mut rx);
+        link.on_grant(CredentialGrant { request_id: req.request_id, error: "no longer authorized".into(), ..Default::default() });
+        assert_eq!(grant.await.unwrap_err().to_string(), "head refused credentials: no longer authorized");
+        link.disconnected();
+        assert!(link.session_credential("root", "c").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cold_model_grant_waits_for_reattach_and_resends_if_the_stream_drops() {
+        let link = HeadLink::default();
+        let first = link.model_credential("root", "c");
+        tokio::pin!(first);
+        assert!(futures::poll!(&mut first).is_pending());
+        let mut rx = attach(&link);
+        assert!(futures::poll!(&mut first).is_pending());
+        let req = take_request(&mut rx);
+        link.on_grant(CredentialGrant { request_id: req.request_id, bearer: "first".into(), ..Default::default() });
+        assert_eq!(first.await.unwrap().bearer, "first");
+
+        let second = link.model_credential("root", "other");
+        tokio::pin!(second);
+        assert!(futures::poll!(&mut second).is_pending());
+        let old = take_request(&mut rx);
+        link.disconnected();
+        assert!(futures::poll!(&mut second).is_pending());
+        let mut rx = attach(&link);
+        assert!(futures::poll!(&mut second).is_pending());
+        let req = take_request(&mut rx);
+        assert_ne!(old.request_id, req.request_id);
+        assert_eq!((req.session_id.as_str(), req.connection_id.as_str()), ("root", "other"));
+        link.on_grant(CredentialGrant { request_id: old.request_id, bearer: "obsolete".into(), ..Default::default() });
+        assert!(futures::poll!(&mut second).is_pending());
+        link.on_grant(CredentialGrant { request_id: req.request_id, bearer: "replacement".into(), ..Default::default() });
+        assert_eq!(second.await.unwrap().bearer, "replacement");
+    }
+
+    #[tokio::test]
+    async fn model_refresh_transport_failure_uses_only_an_unexpired_grant() {
+        let link = HeadLink::default();
+        let mut rx = attach(&link);
+        let expires_at_ms = c6_core::now_ms() + EXPIRY_MARGIN_MS;
+        let key = seed_grant(&link, expires_at_ms);
+
+        let grant = link.model_credential("root", "c");
+        tokio::pin!(grant);
+        assert!(futures::poll!(&mut grant).is_pending());
+        take_request(&mut rx);
+        link.disconnected();
+        assert_eq!(grant.await.unwrap().expires_at_ms, expires_at_ms);
+        link.cache.lock().unwrap().get_mut(&key).unwrap().expires_at_ms = c6_core::now_ms() - 1;
+        assert!(link.session_credential("root", "c").await.is_err());
+
+        link.cache.lock().unwrap().get_mut(&key).unwrap().expires_at_ms = 0;
+        assert!(link.fresh_credential("root", "c").await.is_err(), "a 401 must never reuse the rejected bearer");
+        assert!(link.session_credential("root", "c").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn refusal_revokes_a_still_valid_model_grant_in_the_cache() {
+        let link = HeadLink::default();
+        let mut rx = attach(&link);
+        seed_grant(&link, c6_core::now_ms() + EXPIRY_MARGIN_MS);
+        let grant = link.model_credential("root", "c");
+        tokio::pin!(grant);
+        assert!(futures::poll!(&mut grant).is_pending());
+        let req = take_request(&mut rx);
+        link.on_grant(CredentialGrant { request_id: req.request_id, error: "denied".into(), ..Default::default() });
+        assert_eq!(grant.await.unwrap_err().to_string(), "head refused credentials: denied");
+        link.disconnected();
+        assert!(link.session_credential("root", "c").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn stopping_credentials_clears_grants_and_releases_model_waiters() {
+        let link = HeadLink::default();
+        seed_grant(&link, 0);
+        let grant = link.model_credential("root", "other");
+        tokio::pin!(grant);
+        assert!(futures::poll!(&mut grant).is_pending());
+        link.stop_credentials();
+        assert!(grant.await.is_err());
+        assert!(link.session_credential("root", "c").await.is_err());
     }
 
     /// A token the provider refuses (401) is traded for a new one from the

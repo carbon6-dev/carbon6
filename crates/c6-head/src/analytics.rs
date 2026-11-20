@@ -8,14 +8,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use c6_api as api;
 use c6_proto::session_event::Kind;
 use chrono::{Duration, Local, TimeZone};
-use prost::Message;
 use sqlx::Row;
-use tracing::{info, warn};
 
 use crate::HeadState;
 use crate::usage::Sessions;
-
-const BACKFILLED: &str = "activity_backfilled";
 
 /// Records an event's timing mark, if it has one (while it is stored).
 pub async fn mark(tx: &mut sqlx::SqliteConnection, session_id: &str, ev: &c6_proto::SessionEvent) -> anyhow::Result<()> {
@@ -53,40 +49,7 @@ pub async fn mark(tx: &mut sqlx::SqliteConnection, session_id: &str, ev: &c6_pro
 
 /// Marks the events stored before the table existed (once).
 pub fn spawn_backfill(st: std::sync::Arc<HeadState>) {
-    tokio::spawn(async move {
-        if let Err(e) = backfill(&st).await {
-            warn!("filling activity from earlier events: {e:#}");
-        }
-    });
-}
-
-async fn backfill(st: &HeadState) -> anyhow::Result<()> {
-    if st.store.setting(BACKFILLED).await?.is_some() {
-        return Ok(());
-    }
-    let (mut after_session, mut after_seq, mut n) = (String::new(), 0i64, 0u64);
-    loop {
-        let rows =
-            sqlx::query("SELECT session_id, seq, data FROM events WHERE (session_id, seq) > (?, ?) ORDER BY session_id, seq LIMIT 2000")
-                .bind(&after_session)
-                .bind(after_seq)
-                .fetch_all(&st.store.pool)
-                .await?;
-        let Some(last) = rows.last() else { break };
-        (after_session, after_seq) = (last.get("session_id"), last.get("seq"));
-        let mut tx = st.store.pool.begin_with("BEGIN IMMEDIATE").await?;
-        for r in &rows {
-            let ev = c6_proto::SessionEvent::decode(r.get::<Vec<u8>, _>("data").as_slice())?;
-            mark(&mut tx, &r.get::<String, _>("session_id"), &ev).await?;
-            n += 1;
-        }
-        tx.commit().await?;
-    }
-    st.store.set_setting(BACKFILLED, "1").await?;
-    if n > 0 {
-        info!(events = n, "activity filled from earlier events");
-    }
-    Ok(())
+    crate::usage::spawn_event_backfill(st, crate::usage::EventBackfill::Activity);
 }
 
 struct Mark {

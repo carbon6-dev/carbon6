@@ -65,7 +65,20 @@ fn checksum(big_endian: bool, data: &[u8], s: &mut (u32, u32)) {
 
 /// Reads the committed frames of the log at `wal` after `from`. A log in
 /// another cycle is read from its start (`restarted`).
+#[cfg(test)]
 pub fn scan(wal: &Path, from: &Cursor) -> anyhow::Result<Scan> {
+    scan_to(wal, from, u64::MAX)
+}
+
+/// Read through an end confirmed by SQLite, never inspecting later frames.
+/// The caller keeps the WAL cycle from restarting during the scan.
+pub fn scan_committed(wal: &Path, from: &Cursor, end: u64) -> anyhow::Result<Scan> {
+    let scan = scan_to(wal, from, end)?;
+    anyhow::ensure!(scan.cursor.frames == end, "{}: WAL ended before committed frame {end}", wal.display());
+    Ok(scan)
+}
+
+fn scan_to(wal: &Path, from: &Cursor, end: u64) -> anyhow::Result<Scan> {
     let mut f = match std::fs::File::open(wal) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -100,7 +113,7 @@ pub fn scan(wal: &Path, from: &Cursor) -> anyhow::Result<Scan> {
     let (mut frames, mut pending) = (Vec::new(), Vec::new());
     let mut cursor = if same { *from } else { Cursor { salt1, salt2, frames: 0, ck1: s.0, ck2: s.1 } };
     let mut n = start;
-    while r.read_exact(&mut buf).is_ok() {
+    while n < end && r.read_exact(&mut buf).is_ok() {
         if (be32(&buf[8..12]), be32(&buf[12..16])) != (salt1, salt2) {
             break;
         }
