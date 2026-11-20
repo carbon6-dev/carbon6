@@ -33,6 +33,7 @@ mod explorer;
 mod extract;
 mod fixtures;
 mod goals;
+mod gradual_sessions;
 mod grants;
 mod hooks;
 mod ide;

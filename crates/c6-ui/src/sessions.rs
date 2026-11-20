@@ -124,8 +124,7 @@ fn home_form(path: &str) -> String {
 }
 
 /// Native title text for where and how a new session runs: "on thalassa ·
-/// ~/projects/carbon6 · opus · high"; `short` (a phone's chip):
-/// "thalassa · carbon6 · opus".
+/// ~/projects/carbon6 · opus · high".
 fn summary(worker: &str, ssh: Option<&str>, folder: &str, model: &str, effort: &str, short: bool) -> String {
     let place = match ssh {
         Some(t) if folder.is_empty() => format!("⇄ {t}"),
@@ -1448,10 +1447,48 @@ pub fn SessionDialog(
     }
 }
 
-/// The new-session form: the prompt first, then one line of where and how
-/// it runs (worker, folder, model, effort), a Worktree chip, Change for the
-/// fields (in place on a desktop, a sheet on a phone), Template ▾ on the
-/// Sessions page, and Send. With a `seed` it starts from those values
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartSettings {
+    Worker,
+    Model,
+    More,
+}
+
+impl StartSettings {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Worker => "Worker",
+            Self::Model => "Model",
+            Self::More => "More",
+        }
+    }
+
+    fn toggle(self, open: &mut Option<Self>) {
+        *open = (*open != Some(self)).then_some(self);
+    }
+}
+
+#[component]
+fn StartSettingsChip(
+    kind: StartSettings,
+    open: RwSignal<Option<StartSettings>>,
+    #[prop(optional, into)] value: Option<Signal<String>>,
+    pop: String,
+) -> impl IntoView {
+    view! {
+        <button type="button" data-pop=pop
+            class="inline-flex min-h-8 min-w-0 max-w-full items-center gap-1 rounded-md border border-zinc-200 px-2 text-xs text-soft hover:bg-zinc-100 pointer-coarse:min-h-11 dark:border-zinc-700 dark:hover:bg-zinc-800"
+            aria-label=move || value.map_or_else(|| kind.label().to_owned(), |v| format!("{}: {}", kind.label(), v.get()))
+            aria-expanded=move || (open.get() == Some(kind)).to_string()
+            on:click=move |_| open.update(|open| kind.toggle(open))>
+            {kind.label()}{value.map(|v| view! { <span class="min-w-0 truncate font-medium" title=move || v.get()>{move || v.get()}</span> })}
+            <span class="shrink-0 text-muted" aria-hidden="true">{icons::chevron_down()}</span>
+        </button>
+    }
+}
+
+/// The new-session form: prompt, worker and model, optional settings under
+/// More, Template ▾ on the Sessions page, and Send. A `seed` starts from those values
 /// instead of the ones remembered in this browser, and remembers none of
 /// its own.
 #[component]
@@ -1485,6 +1522,7 @@ fn SessionForm(
     let live = api::live();
     let (ws, col) = (use_workspace(), use_column());
     let seeded = seed.is_some();
+    let explicit_placement = !work.is_empty() || !todo.is_empty();
     let seed = seed.unwrap_or_default();
     // Radio groups and datalists are per document: each form its own names.
     static FORMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1495,7 +1533,7 @@ fn SessionForm(
     let cwd = RwSignal::new(if seeded && seed.ssh.is_none() { seed.cwd.clone() } else { String::new() });
     let picking = RwSignal::new(false);
     // Or on an SSH host, through the worker: the target and a folder there.
-    let remote = RwSignal::new(if seeded { seed.ssh.is_some() } else { storage_get("c6.where").as_deref() == Some("ssh") });
+    let remote = RwSignal::new(seed.ssh.is_some());
     let ssh = RwSignal::new(seed.ssh.clone().unwrap_or_default());
     let remote_dir = RwSignal::new(if seed.ssh.is_some() { seed.cwd.clone() } else { String::new() });
     // Hosts from the inventory, offered by name.
@@ -1527,8 +1565,7 @@ fn SessionForm(
     let auto = move || connection.get().is_empty();
     let model = RwSignal::new(if seeded_connection.is_some() { seed.model.clone() } else { String::new() });
     let effort = RwSignal::new(if seeded { seed.effort.clone() } else { storage_get("c6.effort").unwrap_or_default() });
-    let worktree =
-        RwSignal::new(if seeded { seed.worktree && seed.ssh.is_none() } else { storage_get("c6.worktree").as_deref() == Some("1") });
+    let worktree = RwSignal::new(seed.worktree && seed.ssh.is_none());
     // A fresh form keeps what you typed until the session starts.
     let saved_draft = !seeded && first_message.is_none();
     let prompt = match first_message {
@@ -1655,7 +1692,7 @@ fn SessionForm(
         if let Some(w) = pick {
             worker.set(w.id.to_string());
         }
-    }); // Remember the last directory per worker (a seed's folder first).
+    }); // Work dialogs can remember a folder per worker; ordinary starts use scratch.
     Effect::new(move |first: Option<()>| {
         let w = worker.get();
         if first.is_none() && seeded {
@@ -1664,6 +1701,10 @@ fn SessionForm(
         // The plan's folder on the plan's worker.
         if let Some(p) = plan.get_untracked().filter(|p| p.worker_id.is_some_and(|id| id.to_string() == w)) {
             cwd.set(p.cwd);
+            return;
+        }
+        if !explicit_placement {
+            cwd.set(String::new());
             return;
         }
         let remembered = storage_get(&format!("c6.cwd.{w}")).unwrap_or_default();
@@ -1809,13 +1850,14 @@ fn SessionForm(
             recent.truncate(10);
             storage_set(&format!("c6.ssh.{}", req.worker_id), &recent.join(","));
         }
-        // A seeded form leaves the main form's defaults alone.
+        // A seeded form leaves the main form's defaults alone. Folder history
+        // helps work dialogs, but scratch starts must not erase that history.
         if !seeded {
-            storage_set("c6.where", if on_ssh { "ssh" } else { "worker" });
-            storage_set("c6.worktree", if worktree.get_untracked() { "1" } else { "0" });
             storage_set("c6.effort", &effort.get_untracked());
             storage_set("c6.worker", &req.worker_id.to_string());
-            storage_set(&format!("c6.cwd.{}", req.worker_id), &req.cwd);
+            if !on_ssh && (!req.cwd.is_empty() || explicit_placement) {
+                storage_set(&format!("c6.cwd.{}", req.worker_id), &req.cwd);
+            }
             storage_set(&format!("c6.labels.{}.{}", req.worker_id, req.cwd), &req.labels.join(", "));
             storage_set("c6.connection", &req.connection_id);
             if !req.connection_id.is_empty() {
@@ -1905,15 +1947,15 @@ fn SessionForm(
         });
     }
 
-    // Where and how it runs, changed only when needed: in place on a
-    // desktop, a sheet on a phone. Esc puts it away.
-    let changing = RwSignal::new(false);
+    // More can be closed without changing the choices used to start.
+    let changing = RwSignal::new(explicit_placement.then_some(StartSettings::More));
     let fields_pop = escapable(
-        move || changing.get(),
+        move || changing.with(Option::is_some),
         move || {
-            changing.try_set(false);
+            changing.try_set(None);
         },
     );
+    let chip_pop = fields_pop.clone();
     let template_at = RwSignal::new(None::<(f64, f64)>);
     // A template that takes no input: its prompt, shown in the box.
     let fixed =
@@ -1930,7 +1972,7 @@ fn SessionForm(
         }
         let m = model.get();
         if m.trim().is_empty() {
-            conns.with_value(|cs| cs.iter().find(|c| c.id == connection.get()).map(|c| c.name.clone())).unwrap_or_default()
+            conns.with_value(|cs| cs.iter().find(|c| c.id == connection.get()).map(|c| c.name.clone())).unwrap_or_else(|| "default".into())
         } else {
             m
         }
@@ -1952,7 +1994,7 @@ fn SessionForm(
     let template_key = |t: &c6_api::RealmTemplate| format!("{}/{}", t.realm, t.template.name);
     let pick_template = move |t: Option<c6_api::RealmTemplate>| {
         template.set(t);
-        changing.set(false);
+        changing.set(None);
         template_at.set(None);
         note.set(None);
     };
@@ -2038,56 +2080,23 @@ fn SessionForm(
             ></textarea>
             <crate::completion::CompletionList completion=completion below=true />
             <div class="flex min-w-0 flex-wrap items-center gap-1.5 px-2 pb-2">
-                {move || fixed().is_none().then(|| view! {
-                    <button type="button" class="flex size-6.5 shrink-0 items-center justify-center rounded-md text-muted hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
-                        title="Attach images or files (or paste / drop them)" aria-label="Attach images or files"
-                        on:click=move |_| { if let Some(i) = picker.get_untracked() { i.click(); } }>
-                        {crate::icons::icon(crate::icons::Icon::Plus, crate::icons::Size::S14)}
-                    </button>
-                })}
-                <input node_ref=picker type="file" multiple class="hidden"
-                    on:change=move |ev| crate::session::add_attachments(ev, attachments, error) />
-                // A desktop's summary line, then its buttons.
                 {move || match template.get() {
                     Some(t) => view! {
-                        <span class="hidden min-w-0 truncate text-xs text-muted md:inline" title=t.template.description.clone()>
+                        <span class="min-w-0 truncate text-xs text-muted" title=t.template.description.clone()>
                             "Template: " <span class="text-soft">{template_label(&t)}</span>
                             {(!t.template.description.is_empty()).then(|| format!(" · {}", t.template.description))}
                         </span>
-                        <button class=format!("{tool} hidden md:inline-flex") title="Don't use the template" aria-label="Don't use the template"
+                        <button class=tool title="Don't use the template" aria-label="Don't use the template"
                             on:click=move |_| pick_template(None)>{icons::x()}</button>
                     }.into_any(),
                     None => view! {
-                        <span class="hidden min-w-0 truncate text-xs text-muted md:inline" title=move || line(false).0>{move || line(false).1}</span>
+                        <StartSettingsChip kind=StartSettings::Worker open=changing value=Signal::derive(worker_label) pop=chip_pop.clone() />
+                        <StartSettingsChip kind=StartSettings::Model open=changing value=Signal::derive(model_label) pop=chip_pop.clone() />
+                        <StartSettingsChip kind=StartSettings::More open=changing pop=chip_pop.clone() />
                     }.into_any(),
                 }}
-                // A phone's one chip, opening every field in a sheet.
-                <button data-pop=fields_pop.clone() aria-haspopup="dialog" aria-expanded=move || changing.get().to_string()
-                    class="inline-flex h-8 min-w-0 items-center gap-1 rounded-md border border-zinc-200 px-2 text-xs text-soft md:hidden dark:border-zinc-700"
-                    title="Where and how it runs" on:click=move |_| changing.update(|c| *c = !*c)>
-                    <span class="min-w-0 truncate">{move || match template.with(|t| t.as_ref().map(template_label)) {
-                        Some(label) => label.into_any(),
-                        None => line(true).1,
-                    }}</span>
-                    <span class="text-muted">{crate::icons::chevron_down()}</span>
-                </button>
-                <label
-                    title="A new git worktree: a c6/… branch and a separate checkout for this session"
-                    class=move || if remote.get() || template.with(Option::is_some) { "hidden".to_owned() } else {
-                        format!("inline-flex min-h-8 shrink-0 cursor-pointer items-center gap-1 rounded-md border px-1.5 text-xs pointer-coarse:min-h-11 {}",
-                            if worktree.get() { "border-sky-300 bg-sky-50 text-sky-800 dark:border-sky-800 dark:bg-sky-950 dark:text-sky-300" } else { "border-zinc-300 text-soft hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800" })
-                    }>
-                    <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || worktree.get()
-                        on:change=move |ev| worktree.set(event_target_checked(&ev)) />
-                    "Worktree"
-                </label>
-                <button data-pop=fields_pop.clone() aria-expanded=move || changing.get().to_string()
-                    class=move || if template.with(Option::is_some) { "hidden".to_owned() } else { format!("{tool} hidden md:inline-flex") }
-                    title="Change where and how it runs" on:click=move |_| changing.update(|c| *c = !*c)>
-                    {move || if changing.get() { "Done" } else { "Change" }}
-                </button>
                 {move || (page && !templates.with(Vec::is_empty)).then(|| view! {
-                    <button class=format!("{tool} hidden md:inline-flex") aria-haspopup="menu" title="Run a template: it sets where and how its sessions run"
+                    <button class=tool aria-haspopup="menu" aria-expanded=move || template_at.with(Option::is_some).to_string() title="Run a template: it sets where and how its sessions run"
                         on:click=move |ev| template_at.set(Some(below(&ev, 320.0)))>
                         "Template" <span class="text-muted">{crate::icons::chevron_down()}</span>
                     </button>
@@ -2127,7 +2136,7 @@ fn SessionForm(
                     <div class=format!("flex flex-wrap items-center gap-x-3 gap-y-1 px-1 text-xs {tone}") data-start-plan="">
                         {(!p.template.is_empty()).then(|| view! { <span>"Template " <span class="font-medium text-soft">{p.template.clone()}</span></span> })}
                         <span data-start-why="">{p.why.clone()}</span>
-                        {move || (worktree.get() && worktree_options.with(Option::is_some)).then(|| view! {
+                        {move || ((explicit_placement || changing.get() == Some(StartSettings::More)) && !remote.get() && worktree.get() && worktree_options.with(Option::is_some)).then(|| view! {
                             <label class="inline-flex items-center gap-1">"New branch"
                                 <input class="w-56 rounded border border-zinc-200 bg-transparent px-1.5 py-0.5 font-mono text-xs dark:border-zinc-700" data-start-branch=""
                                     prop:value=move || branch.get() on:input=move |ev| branch.set(event_target_value(&ev)) />
@@ -2137,22 +2146,13 @@ fn SessionForm(
                                 format!("from {base}{}", if o.fetch { " (fetched)" } else { "" })
                             }))}
                         })}
-                        {p.reuse.then(|| view! { <span class="font-mono">{format!("in its worktree, on {}", p.options.branch)}</span> })}
+                        {move || (p.reuse && (explicit_placement || changing.get() == Some(StartSettings::More))).then(|| view! { <span class="font-mono">{format!("in its worktree, on {}", p.options.branch)}</span> })}
                     </div>
                 }
             })}
-            <div class:hidden=move || !changing.get()>
-                <div class="fixed inset-0 z-40 bg-black/30 md:hidden" on:click=move |_| changing.set(false)></div>
-                <div data-pop=fields_pop
-                    class="phone-sheet fixed inset-x-0 bottom-0 z-50 flex max-h-[85dvh] flex-col rounded-t-xl border-t border-zinc-200 bg-white text-sm shadow-xl md:static md:z-auto md:max-h-none md:rounded-t-none md:rounded-b-xl md:shadow-none dark:border-zinc-800 dark:bg-zinc-900">
-                    <h2 class="shrink-0 border-b border-zinc-200 px-4 py-3 font-medium md:hidden dark:border-zinc-800">"New session: where and how it runs"</h2>
-                    <div class="min-h-0 flex-1 space-y-3 overflow-y-auto px-4 py-4 md:overflow-visible md:px-3 md:py-3">
-                        {move || template.with(Option::is_some).then(|| view! {
-                            <p class="text-xs text-muted">"The template sets where and how its sessions run."</p>
-                        })}
-                        <div class="space-y-3" class:hidden=move || template.with(Option::is_some)>
-                            <div class="grid grid-cols-1 gap-3 @min-[40rem]/view:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]">
-                                <label class="block min-w-0 text-xs text-muted">
+            <div data-pop=fields_pop class="space-y-3 border-t border-zinc-200 px-3 py-3 dark:border-zinc-800" hidden=move || changing.with(Option::is_none)>
+                <div hidden=move || changing.get() != Some(StartSettings::Worker)>
+                                <label class="block max-w-80 text-xs text-muted">
                                     "Worker"
                                     <select class=format!("mt-1 {INPUT}") on:change=move |ev| { chosen_by_hand.set(true); worker.set(event_target_value(&ev)) } prop:value=move || worker.get()>
                                         {move || live.workers.get().into_iter().filter(|w| w.status != WorkerStatus::Revoked && w.role != "memex").map(|w| {
@@ -2161,6 +2161,19 @@ fn SessionForm(
                                         }).collect_view()}
                                     </select>
                                 </label>
+                </div>
+                <div class="min-w-0 text-xs text-muted" hidden=move || changing.get() != Some(StartSettings::Model)>
+                    "Connection and model"
+                    <div class="mt-1 flex flex-wrap items-center gap-2">
+                        <ModelPicker connection model effort auto=has_routes hide_effort=true />
+                    </div>
+                    {move || auto().then(|| view! {
+                        <p class="mt-1">"The connection, model and effort come from the first rule in Settings → Model routing that matches this session's labels."</p>
+                    })}
+                </div>
+                <div hidden=move || changing.get() != Some(StartSettings::More)>
+                    <div class="space-y-3">
+                                <p class="text-xs text-muted" title=move || line(false).0>{move || line(false).1}</p>
                                 <div class="min-w-0 text-xs text-muted">
                                     <div class="flex flex-wrap items-center gap-x-3 gap-y-1">
                                         <label class="flex items-center gap-1"><input type="radio" name=where_name.clone() prop:checked=move || !remote.get() on:change=move |_| remote.set(false) />"Folder on the worker"</label>
@@ -2194,15 +2207,20 @@ fn SessionForm(
                                         })}
                                     </div>
                                 </div>
-                            </div>
-                            <div class="min-w-0 text-xs text-muted">
-                                "Connection and model"
-                                <div class="mt-1 flex flex-wrap items-center gap-2">
-                                    <ModelPicker connection model effort auto=has_routes />
-                                </div>
-                                {move || auto().then(|| view! {
-                                    <p class="mt-1">"The connection, model and effort come from the first rule in Settings → Model routing that matches this session's labels."</p>
-                                })}
+                            <div class="flex flex-wrap items-center gap-3">
+                                <label class="items-center gap-1 text-xs text-soft" class:inline-flex=move || !remote.get() hidden=move || remote.get()
+                                    title="A new git worktree: a c6/… branch and a separate checkout for this session">
+                                    <input type="checkbox" class=crate::components::CHECKBOX prop:checked=move || worktree.get()
+                                        on:change=move |ev| worktree.set(event_target_checked(&ev)) />
+                                    "New git worktree"
+                                </label>
+                                <div hidden=move || !effort_supported()><crate::session::ReasoningEffort effort /></div>
+                                <button type="button" class=tool title="Attach images or files (or paste / drop them)"
+                                    on:click=move |_| { if let Some(i) = picker.get_untracked() { i.click(); } }>
+                                    {icon(Icon::Plus, Size::S14)} "Attach files"
+                                </button>
+                                <input node_ref=picker type="file" multiple class="hidden"
+                                    on:change=move |ev| crate::session::add_attachments(ev, attachments, error) />
                             </div>
                             <div class="grid grid-cols-1 gap-3 @min-[40rem]/view:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
                                 <label class="block min-w-0 text-xs text-muted">
@@ -2236,29 +2254,6 @@ fn SessionForm(
                                 </label>
                             </div>
                         </div>
-                        // A phone has no Template ▾: it's here.
-                        {move || (page && !templates.with(Vec::is_empty)).then(|| view! {
-                            <label class="block min-w-0 text-xs text-muted md:hidden">
-                                "Template"
-                                <select class=format!("mt-1 {INPUT}")
-                                    prop:value=move || template.with(|t| t.as_ref().map(template_key).unwrap_or_default())
-                                    on:change=move |ev| {
-                                        let k = event_target_value(&ev);
-                                        template.set(templates.get_untracked().into_iter().find(|t| template_key(t) == k));
-                                        note.set(None);
-                                    }>
-                                    <option value="">"None: a session as set above"</option>
-                                    {templates.get().into_iter().map(|t| view! { <option value=template_key(&t)>{template_label(&t)}</option> }).collect_view()}
-                                </select>
-                                {move || template.get().filter(|t| !t.template.description.is_empty()).map(|t| view! {
-                                    <span class="mt-0.5 block">{t.template.description}</span>
-                                })}
-                            </label>
-                        })}
-                    </div>
-                    <div class="notice-safe shrink-0 border-t border-zinc-200 px-4 pt-3 md:hidden dark:border-zinc-800">
-                        <button class=format!("{BUTTON} w-full py-2") on:click=move |_| changing.set(false)>"Done"</button>
-                    </div>
                 </div>
             </div>
         </section>
@@ -2279,6 +2274,26 @@ fn SessionForm(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_chips_are_collapsed_by_default_and_open_only_the_selected_settings() {
+        Owner::new().with(|| {
+            let open = RwSignal::new(None);
+            let render = |kind| StartSettingsChip(StartSettingsChipProps { kind, open, value: None, pop: "test".into() }).to_html();
+            for kind in [StartSettings::Worker, StartSettings::Model, StartSettings::More] {
+                let html = render(kind);
+                assert!(html.starts_with("<button") && html.contains("aria-expanded=\"false\""), "{html}");
+                assert!(html.contains(kind.label()), "{html}");
+            }
+            open.update(|open| StartSettings::More.toggle(open));
+            assert!(render(StartSettings::More).contains("aria-expanded=\"true\""));
+            open.update(|open| StartSettings::Model.toggle(open));
+            assert!(render(StartSettings::Model).contains("aria-expanded=\"true\""));
+            assert!(render(StartSettings::More).contains("aria-expanded=\"false\""));
+            open.update(|open| StartSettings::Model.toggle(open));
+            assert_eq!(open.get_untracked(), None);
+        });
+    }
 
     #[test]
     fn seed_takes_where_and_how_a_session_runs() {

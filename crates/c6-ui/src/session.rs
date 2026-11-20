@@ -887,6 +887,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
 
     let usage = feed.usage;
     let choice = ModelChoice::follow(events, Default::default());
+    let model_disclosure = RwSignal::new(None::<ModelDisclosure>);
     let model_label = Memo::new(move |_| {
         let (_, m, e) = choice.current.get();
         model_label(&m, &e)
@@ -1045,6 +1046,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
         usage,
         started,
         model_label,
+        model_disclosure,
         connection: Signal::derive(move || choice.current.with(|(c, _, _)| c.clone())),
         git,
         subagents,
@@ -1304,7 +1306,7 @@ pub fn SessionView(id: String, target: Option<Target>) -> impl IntoView {
                         let start = row.map(|s| (s.subagent_connection_id, s.subagent_model, s.subagent_effort)).unwrap_or_default();
                         let subagents = SubagentChoice::follow(events, start, choice.current);
                         view! {
-                            <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) archived error model=choice files subagents no_claude_code ask recovery=feed.composer />
+                            <Composer id=id_stored.get_value() running=Signal::derive(running) disabled=Signal::derive(move || status.get() == SessionStatus::Failed) archived error model=choice files subagents no_claude_code ask recovery=feed.composer header_model=model_disclosure />
                         }.into_any()
                     }
                 }
@@ -1414,6 +1416,13 @@ pub(crate) struct Started {
     pub(crate) repo: String,
 }
 
+#[derive(Clone, Copy)]
+struct ModelDisclosure {
+    toggle: Callback<()>,
+    open: RwSignal<bool>,
+    pop: StoredValue<String>,
+}
+
 /// What a session pane offers its tile's bar (its panes, what runs in it,
 /// its context ring and its ⋯), and its glance.
 #[derive(Clone, Copy)]
@@ -1434,6 +1443,7 @@ pub struct SessionChrome {
     pub(crate) usage: Memo<UsageStats>,
     pub(crate) started: Memo<Option<Started>>,
     pub(crate) model_label: Memo<String>,
+    model_disclosure: RwSignal<Option<ModelDisclosure>>,
     /// The connection it uses now.
     pub(crate) connection: Signal<String>,
     pub(crate) git: LocalResource<Option<(usize, String)>>,
@@ -1858,6 +1868,83 @@ pub fn SessionControls(chrome: SessionChrome) -> impl IntoView {
 }
 
 pub(crate) const SESSION_SLOT: &str = crate::components::SESSION_BAR_BUTTON;
+
+fn session_place(s: &Session, started: Option<&Started>) -> (String, String, Option<(String, String)>) {
+    let worktree = started.filter(|st| !st.branch.is_empty());
+    // Once Started is mirrored, the head records the worker's resolved cwd.
+    // The worker's scratch directories end in these exact path components.
+    let cwd = started.filter(|st| !st.cwd.is_empty()).map_or(s.cwd.as_str(), |st| st.cwd.as_str());
+    if worktree.is_none()
+        && !s.on_head
+        && s.ssh.is_none()
+        && (cwd.is_empty() || std::path::Path::new(cwd).ends_with(std::path::Path::new("scratch").join(&s.id)))
+    {
+        return ("Scratch workspace".into(), cwd.to_owned(), None);
+    }
+    let folder = if let Some(wt) = worktree.filter(|wt| !wt.repo.is_empty()) {
+        wt.repo.clone()
+    } else if !s.cwd.is_empty() {
+        s.cwd.clone()
+    } else if s.ssh.is_some() {
+        "~".to_owned()
+    } else if cwd.is_empty() {
+        "No folder".to_owned()
+    } else {
+        cwd.to_owned()
+    };
+    let label = folder.trim_end_matches('/').rsplit('/').next().filter(|p| !p.is_empty()).unwrap_or(&folder).to_owned();
+    (label, folder, worktree.map(|st| (st.branch.clone(), st.cwd.clone())))
+}
+
+#[component]
+fn LocationChip(
+    label: &'static str,
+    value: String,
+    title: String,
+    #[prop(optional_no_strip)] model: Option<ModelDisclosure>,
+) -> impl IntoView {
+    const CHIP: &str = "inline-flex min-w-0 max-w-full items-center gap-1 rounded-md border border-zinc-200 px-1.5 py-0.5 text-xs text-soft dark:border-zinc-700";
+    let contents = || view! { <span class="shrink-0 text-muted">{label}</span><span class="min-w-0 truncate">{value}</span> };
+    match model {
+        Some(m) => view! {
+            <button type="button" class=format!("{CHIP} hover:bg-zinc-100 pointer-coarse:min-h-8 dark:hover:bg-zinc-800")
+                title=title aria-expanded=move || m.open.try_get().unwrap_or(false).to_string() data-pop=m.pop.get_value()
+                on:click=move |ev| { ev.stop_propagation(); m.toggle.run(()); }>
+                {contents()}<span class="shrink-0 text-muted" aria-hidden="true">{crate::icons::chevron_down()}</span>
+            </button>
+        }
+        .into_any(),
+        None => view! { <span class=CHIP title=title>{contents()}</span> }.into_any(),
+    }
+}
+
+/// The tile header's place is descriptive until moving a session is supported.
+/// The model already has an editor, so its chip opens that same composer menu.
+#[component]
+pub(crate) fn SessionLocation(chrome: SessionChrome) -> impl IntoView {
+    view! {
+        {move || chrome.detail.get().and_then(Result::ok).map(|d| {
+            let s = d.session;
+            let worker = if s.on_head { "Head".to_owned() } else if d.worker_name.is_empty() { s.worker_id.to_string() } else { d.worker_name };
+            let worker = match &s.ssh { Some(host) => format!("{worker} via SSH: {host}"), None => worker };
+            let (folder, path, worktree) = session_place(&s, chrome.started.get().as_ref());
+            let model_fallback = if s.model.is_empty() { "Default model".to_owned() } else { s.model };
+            view! {
+                <div class="flex min-w-0 shrink-0 flex-wrap items-center gap-1 border-b border-zinc-200 px-2 py-1 dark:border-zinc-800" role="group" aria-label="Session location">
+                    <LocationChip label=if s.on_head { "Runs on" } else { "Worker" } title=worker.clone() value=worker />
+                    <LocationChip label="Folder" value=folder title=path />
+                    {worktree.map(|(branch, path)| view! { <LocationChip label="Worktree" title=format!("{branch}: {path}") value=branch /> })}
+                    {move || {
+                        let current = chrome.model_label.get();
+                        let value = if current.is_empty() { model_fallback.clone() } else { current };
+                        let title = if chrome.model_disclosure.with(Option::is_some) { format!("Change model: {value}") } else { value.clone() };
+                        view! { <LocationChip label="Model" value title model=chrome.model_disclosure.get() /> }
+                    }}
+                </div>
+            }
+        })}
+    }
+}
 
 /// The context ring's one destination: panes, what runs, and the unchanged glance.
 #[component]
@@ -3826,6 +3913,9 @@ pub(crate) fn ModelPicker(
     /// The phone composer sheet gives the labelled model field its own full row.
     #[prop(optional)]
     stacked: bool,
+    /// The new-session form puts effort in its advanced settings.
+    #[prop(optional)]
+    hide_effort: bool,
 ) -> impl IntoView {
     // The new-session sheet and Ask's inline form also scroll on phones.
     // An absolutely positioned offered list can be clipped by those scrollports.
@@ -3867,7 +3957,18 @@ pub(crate) fn ModelPicker(
             <ModelInput connection=connection value=model on_set=move |v| model.set(v)
                 class=if stacked { format!("{SMALL_INPUT} min-w-0 flex-1") } else { SMALL_INPUT.to_owned() } placeholder="model id" inline_list />
         </div>
-        <select class=format!("{SMALL_INPUT} {}", if stacked { "w-full" } else { "" }) class:hidden=move || !supports_effort(&connection.get()) aria-label="Reasoning effort" title="Reasoning effort" on:change=move |ev| effort.set(event_target_value(&ev))>
+        {(!hide_effort).then(|| view! {
+            <div class=if stacked { "w-full" } else { "" } hidden=move || !supports_effort(&connection.get())>
+                <ReasoningEffort effort stacked />
+            </div>
+        })}
+    }
+}
+
+#[component]
+pub(crate) fn ReasoningEffort(effort: RwSignal<String>, #[prop(optional)] stacked: bool) -> impl IntoView {
+    view! {
+        <select class=format!("{SMALL_INPUT} {}", if stacked { "w-full" } else { "" }) aria-label="Reasoning effort" title="Reasoning effort" on:change=move |ev| effort.set(event_target_value(&ev))>
             {EFFORTS.iter().map(|&(value, label)| view! {
                 <option value=value selected=move || effort.get() == value>{label}</option>
             }).collect_view()}
@@ -5921,6 +6022,9 @@ fn Composer(
     /// Offer a model picker; sending with another model switches to it.
     #[prop(optional)]
     model: Option<ModelChoice>,
+    /// Lets the tile header open this composer's existing model selector.
+    #[prop(optional)]
+    header_model: Option<RwSignal<Option<ModelDisclosure>>>,
     /// (worker id, directory): for @-mention completion.
     #[prop(optional, into)]
     files: Option<Signal<Option<(String, String)>>>,
@@ -5991,6 +6095,13 @@ fn Composer(
             picking.try_set(false);
         },
     ));
+    if let Some(header) = header_model.filter(|_| model.is_some()) {
+        let disclosure = ModelDisclosure { toggle: Callback::new(move |()| toggle()), open: picking, pop: picking_pop };
+        Effect::new(move || header.set((!disabled.get()).then_some(disclosure)));
+        on_cleanup(move || {
+            header.try_set(None);
+        });
+    }
     let id = StoredValue::new(id);
     let area = NodeRef::<leptos::html::Textarea>::new();
     let revision = RwSignal::new(0u64);
@@ -8220,6 +8331,46 @@ mod tests {
 
     const W: &str = "00000000-0000-0000-0000-000000000001";
     const HEAD: &str = "00000000-0000-0000-0000-0000000000ff";
+
+    #[test]
+    fn location_labels_distinguish_scratch_remote_home_folder_and_worktree() {
+        let mut s = session(W, false);
+        let scratch = Started { cwd: "/state/scratch/s".into(), branch: String::new(), repo: String::new() };
+        assert_eq!(session_place(&s, None), ("Scratch workspace".into(), String::new(), None));
+        s.cwd.clone_from(&scratch.cwd);
+        assert_eq!(session_place(&s, Some(&scratch)), ("Scratch workspace".into(), scratch.cwd.clone(), None));
+        assert_eq!(session_place(&s, None), ("Scratch workspace".into(), scratch.cwd, None));
+        s.cwd = "/src/not-scratch/s".into();
+        assert_eq!(session_place(&s, None), ("s".into(), s.cwd.clone(), None));
+        s.cwd.clear();
+        s.ssh = Some("host".into());
+        assert_eq!(session_place(&s, None), ("~".into(), "~".into(), None));
+        s.ssh = None;
+        s.cwd = "/src/app".into();
+        assert_eq!(session_place(&s, None), ("app".into(), "/src/app".into(), None));
+        let worktree = Started { cwd: "/state/worktrees/s".into(), branch: "c6/task".into(), repo: s.cwd.clone() };
+        assert_eq!(session_place(&s, Some(&worktree)), ("app".into(), "/src/app".into(), Some((worktree.branch, worktree.cwd))));
+    }
+
+    #[test]
+    fn location_chips_only_offer_an_action_when_there_is_a_model_editor() {
+        Owner::new().with(|| {
+            let worker = view! { <LocationChip label="Worker" value="dev".to_owned() title=String::new() /> }.to_html();
+            assert!(worker.starts_with("<span") && !worker.contains("<button"), "{worker}");
+            let open = RwSignal::new(false);
+            let editor = ModelDisclosure {
+                toggle: Callback::new(move |()| open.update(|open| *open = !*open)),
+                open,
+                pop: StoredValue::new("composer-pop".to_owned()),
+            };
+            let model = view! { <LocationChip label="Model" value="opus".to_owned() title="Change model".to_owned() model=Some(editor) /> }
+                .to_html();
+            assert!(
+                model.starts_with("<button") && model.contains("aria-expanded=\"false\"") && model.contains("data-pop=\"composer-pop\""),
+                "{model}"
+            );
+        });
+    }
 
     #[test]
     fn a_session_the_head_runs_is_never_offline() {

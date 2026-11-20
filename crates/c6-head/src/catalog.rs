@@ -407,7 +407,7 @@ fn build() -> Vec<Op> {
 
         // Sessions.
         op!("sessions.list", "sessions", "GET" "/api/v1/sessions", Read, Input::None, "Sessions (not archived): title, worker, model, status, labels, whether waiting for approval."),
-        op!("sessions.create", "sessions", "POST" "/api/v1/sessions", Write, Input::Body(schema::<api::CreateSession>), "Starts an agent session on a worker, with a first message (prompt), a folder (cwd), model and labels.", choices = &[("worker_id", "workers.list"), ("connection_id", "connections.list")]),
+        op!("sessions.create", "sessions", "POST" "/api/v1/sessions", Write, Input::Body(schema::<api::CreateSession>), "Starts an agent session with a worker and model; omitted cwd uses its own scratch folder. Optionally set a first message, folder, worktree, SSH and labels.", choices = &[("worker_id", "workers.list"), ("connection_id", "connections.list")]),
         op!("sessions.get", "sessions", "GET" "/api/v1/sessions/{id}", Read, Input::None, "A session's details.", choices = &[("id", "sessions.list")]),
         op!("sessions.update", "sessions", "PATCH" "/api/v1/sessions/{id}", Write, Input::Body(schema::<UpdateSession>), "Renames or archives (or unarchives) a session.", choices = &[("id", "sessions.list")]),
         op!("sessions.events", "sessions", "GET" "/api/v1/sessions/{id}/events", Read, Input::Query(schema::<After>), "A session's log: messages, tool calls and results, after event seq `after` (or, with `before`, about `limit` events before it, from the start of a turn).", choices = &[("id", "sessions.list")]),

@@ -11,8 +11,7 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-/// A head, a worker attached to it and a mock model connection (also for
-/// goals.rs).
+/// A head, a worker attached to it and a mock model connection.
 pub(crate) struct Env {
     pub(crate) mock: MockLlm,
     pub(crate) api: String,
@@ -20,7 +19,8 @@ pub(crate) struct Env {
     pub(crate) conn: String,
     pub(crate) wid: uuid::Uuid,
     _head: c6_head::Head,
-    _dirs: Vec<tempfile::TempDir>,
+    _head_dir: tempfile::TempDir,
+    state: tempfile::TempDir,
     pub(crate) stop: CancellationToken,
 }
 
@@ -56,7 +56,11 @@ impl Env {
             .json()
             .await
             .unwrap();
-        Env { mock, api, http, conn: conn.id, wid: worker.identity.meta.worker_id.0, _head: head, _dirs: vec![head_dir, state], stop }
+        Env { mock, api, http, conn: conn.id, wid: worker.identity.meta.worker_id.0, _head: head, _head_dir: head_dir, state, stop }
+    }
+
+    pub(crate) fn worker_state(&self) -> &std::path::Path {
+        self.state.path()
     }
 
     pub(crate) async fn get(&self, path: &str) -> Value {

@@ -1932,6 +1932,8 @@ pub struct CreateSideChat {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreateSession {
     pub worker_id: Uuid,
+    /// Empty or omitted: a per-session scratch workspace on the worker.
+    #[serde(default)]
     pub cwd: String,
     /// Empty: the matching routing rule's, or the first connection.
     #[serde(default)]
@@ -1984,6 +1986,37 @@ pub struct CreateSession {
     /// Or several of its to-dos, started together (docs/batch-starts.md).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub todos: Vec<String>,
+}
+
+#[cfg(test)]
+mod create_session_tests {
+    use super::CreateSession;
+    use serde_json::json;
+
+    #[test]
+    fn worker_and_model_can_start_in_scratch() {
+        let worker = uuid::Uuid::nil();
+        let request: CreateSession = serde_json::from_value(json!({"worker_id": worker, "model": "m"})).unwrap();
+        assert_eq!(request.worker_id, worker);
+        assert_eq!(request.model, "m");
+        assert!(request.cwd.is_empty());
+        assert!(request.connection_id.is_empty(), "routing still chooses the connection");
+        assert!(!request.worktree);
+        assert!(request.ssh.is_none());
+    }
+
+    #[test]
+    fn explicit_placement_is_preserved() {
+        let request: CreateSession = serde_json::from_value(json!({
+            "worker_id": uuid::Uuid::nil(), "cwd": "/work/repo", "worktree": true,
+            "ssh": "dev", "labels": ["project:falcon"]
+        }))
+        .unwrap();
+        assert_eq!(request.cwd, "/work/repo");
+        assert!(request.worktree);
+        assert_eq!(request.ssh.as_deref(), Some("dev"));
+        assert_eq!(request.labels, ["project:falcon"]);
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -3061,6 +3061,9 @@ fn TileView(key: u64, rect: Signal<Rect>) -> AnyView {
                 <button class=format!("{btn} hidden md:@min-[14rem]/tile:flex") title="Close this tile" aria-label="Close this tile" on:click=move |_| ws.close_tile(key)>{crate::icons::x()}</button>
                 <crate::activity::SessionsPicker />
             </div>
+            <For each=chrome key=|c| c.token let:c>
+                <crate::session::SessionLocation chrome=c />
+            </For>
             {move || shown.get().map(|(_, id)| view! { <crate::session::ArchivedSession id /> })}
             <Popover at=palette_at class="w-auto">
                 {move || shown.get().map(|(_, id)| view! { <crate::marks::SessionPalette session=id on_pick=move |()| palette_at.set(None) /> })}
