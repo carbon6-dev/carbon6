@@ -11,7 +11,7 @@ use c6_agent::{EventSink, PendingInput};
 use c6_api::SubagentConnection;
 use c6_llm::{Provider, ToolProfile, model_info};
 use c6_proto::{CreateSession, Delegation, ModelSpec, SessionStarted, SubagentSpawned, TurnEndReason, session_event};
-use c6_tools::{AgentDef, ModelChoice, SendMessage, Skill, SkillTool, Subagents, Task, Tool};
+use c6_tools::{AgentDef, ModelChoice, SendMessage, Skill, SkillTool, Subagents, Task, TaskGroup, Tool};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -238,6 +238,7 @@ impl Subagents for Runner {
         agent: Option<&AgentDef>,
         choice: &ModelChoice,
         background: Option<&str>,
+        group: Option<&TaskGroup>,
         cancel: CancellationToken,
     ) -> Result<String, String> {
         let child_id = uuid::Uuid::now_v7().to_string();
@@ -385,6 +386,8 @@ impl Subagents for Runner {
                 background_task_id: background.unwrap_or_default().to_owned(),
                 model: Some(model_spec.clone()),
                 remote: None,
+                group: group.map_or_else(String::new, |g| g.group.clone()),
+                wake: group.map_or_else(String::new, |g| g.wake.clone()),
             }))
             .await
             .map_err(|e| format!("{e:#}"))?;
@@ -425,6 +428,7 @@ impl Subagents for Runner {
         template: &str,
         on: &str,
         background: Option<&str>,
+        group: Option<&TaskGroup>,
         cancel: CancellationToken,
     ) -> Result<String, String> {
         let p = &self.parent;
@@ -462,6 +466,8 @@ impl Subagents for Runner {
                     target: remote.target,
                     cwd: remote.cwd,
                 }),
+                group: group.map_or_else(String::new, |g| g.group.clone()),
+                wake: group.map_or_else(String::new, |g| g.wake.clone()),
             }))
             .await
             .map_err(|e| format!("{e:#}"))?;
@@ -594,6 +600,9 @@ impl Runner {
         let mut link = spawn.clone();
         link.call_id = call_id.to_owned();
         link.background_task_id = background.to_owned();
+        // SendMessage is a new task, not another member of Task's fan-out.
+        link.group.clear();
+        link.wake.clear();
         self.parent.log.append(session_event::Kind::SubagentSpawned(link)).await.map_err(|e| format!("{e:#}"))?;
         Ok(())
     }

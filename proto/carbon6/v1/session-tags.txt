@@ -365,3 +365,18 @@ carbon6.v1.UserInput 16 string prompt
 carbon6.v1.UserInput 18 bool human_origin
 # Only the worker stamps provenance for appended attachment notes.
 carbon6.v1.UserMessage 17 uint32 generated_attachment_count
+# Durable notice scheduling and explicit refresh on Continue.
+carbon6.v1.CreateSession 37 uint32 notice_quiet_seconds
+carbon6.v1.CreateSession 38 uint32 notice_max_wait_seconds
+carbon6.v1.CreateSession 39 uint32 notice_no_progress_limit
+carbon6.v1.CreateSession 40 uint32 notice_failure_relaunch_limit
+carbon6.v1.CreateSession 41 uint64 notice_tokens_per_hour
+carbon6.v1.NoticeQueued 12 string reason
+carbon6.v1.SubagentSpawned 8 string group
+carbon6.v1.SubagentSpawned 9 string wake
+carbon6.v1.ReleaseNotices 1 NoticeLimits limits
+carbon6.v1.NoticeLimits 1 uint32 notice_quiet_seconds
+carbon6.v1.NoticeLimits 2 uint32 notice_max_wait_seconds
+carbon6.v1.NoticeLimits 3 uint32 notice_no_progress_limit
+carbon6.v1.NoticeLimits 4 uint32 notice_failure_relaunch_limit
+carbon6.v1.NoticeLimits 5 uint64 notice_tokens_per_hour

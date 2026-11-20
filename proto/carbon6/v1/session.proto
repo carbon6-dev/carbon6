@@ -68,7 +68,7 @@ message NoticeQueued {
   string text = 2;
   // The input's command ("task-notification").
   string command = 3;
-  // An idle session starts a turn on it (within the hourly limit); else it
+  // An idle session may start a turn on it automatically; else it
   // waits for the next input.
   bool wake = 4;
   // What the model gets instead of the text (a session message's wrapper).
@@ -77,13 +77,15 @@ message NoticeQueued {
   string from_session_id = 6;
   string from_title = 7;
   uint32 hops = 8;
-  // When the hourly limit next permits this notice's automatic delivery
-  // (Unix milliseconds); zero if it is not held by the limit.
+  // Next eligible automatic delivery time, if known (Unix milliseconds).
   int64 deliver_at_ms = 9;
   // Preview journals used 10 for bool quiet, then 5384d8e2 reused it for
   // TaskNotice. Both encodings must remain unknown fields when replayed.
   reserved 10;
   TaskNotice task_notice = 11;
+  // Display text explaining why this notice is waiting; empty if unspecified.
+  // "paused:" marks a guard that paused automatic delivery.
+  string reason = 12;
 }
 
 // The session's default for its subagents changed (you picked one in the
@@ -110,6 +112,10 @@ message SubagentSpawned {
   // Set for a remote subagent: a session the head started from a template,
   // perhaps on another worker (docs/remote-subagents.md).
   RemoteSubagent remote = 7;
+  // Optional fan-in group, scoped to the parent session.
+  string group = 8;
+  // all (default), count:N, or any. Empty for an ungrouped launch.
+  string wake = 9;
 }
 
 // Where a remote subagent runs.
@@ -584,8 +590,19 @@ message DelegationEnded {
 }
 
 // Deliver the session's held notices now (docs/background.md §5): they
-// start a turn together, whatever the hourly limit.
-message ReleaseNotices {}
+// start a turn together, bypassing the current automatic delivery hold.
+message ReleaseNotices {
+  // The session realm's latest notice settings; absent from older heads.
+  NoticeLimits limits = 1;
+}
+
+message NoticeLimits {
+  uint32 notice_quiet_seconds = 1;
+  uint32 notice_max_wait_seconds = 2;
+  uint32 notice_no_progress_limit = 3;
+  uint32 notice_failure_relaunch_limit = 4;
+  uint64 notice_tokens_per_hour = 5;
+}
 
 // Sets the session's default for its subagents (unset `model`: the
 // session's own model).
@@ -710,10 +727,9 @@ message CreateSession {
   // c6_api::SubagentTemplate), and the line introducing them in Task's
   // description.
   string subagent_templates_json = 30;
-  // From the subagent-limits setting: how many turns notices may start in
-  // an idle session per hour, and how long an idle Claude Code process with
-  // no background tasks stays up. 0: the defaults (20 and 15).
+  // Legacy cap, ignored by workers using the newer notice settings below.
   uint32 auto_turns_per_hour = 31;
+  // How long idle Claude Code with no background tasks stays up. 0: 15 min.
   uint32 claude_code_idle_minutes = 32;
   // carbon6's tools its Claude Code gets over the MCP bridge (Settings →
   // Agents; names in any profile's naming); empty: the defaults (the
@@ -728,6 +744,12 @@ message CreateSession {
   // With `worktree`: how it is made (docs/dev-starts.md §2); unset: a
   // `c6/<id>` branch from HEAD.
   WorktreeSpec worktree_spec = 36;
+  // Automatic notice delivery settings. 0: use the default.
+  uint32 notice_quiet_seconds = 37;
+  uint32 notice_max_wait_seconds = 38;
+  uint32 notice_no_progress_limit = 39;
+  uint32 notice_failure_relaunch_limit = 40;
+  uint64 notice_tokens_per_hour = 41;
 }
 
 // How a new git worktree is made: the branch ({{id}} is the session's

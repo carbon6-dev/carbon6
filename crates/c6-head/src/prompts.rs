@@ -56,6 +56,14 @@ pub const DEFAULTS: &[Prompt] = &[
         default: c6_agent::SUBAGENT_TEMPLATES,
     },
     Prompt {
+        name: "session.subagent_group",
+        description: "Explains grouped background reports in the Task tool's description, including Claude Code's carbon6 Task.",
+        default: "For background tasks whose reports you want to receive together, set the same group on each Task. \
+            Use a fresh name per batch and the same wake policy for every member. Use all (default) to wait for all launched members, \
+            count:N for a positive number of reports, or any to wake when any member reports. Failures do not wait for the group. \
+            Do not poll just to wait for reports.",
+    },
+    Prompt {
         name: "session.resume_after_restart",
         description: "What the agent is told when its worker restarted in the middle of its turn, which then goes on (docs/restarts.md §4).",
         default: c6_agent::RESUME_AFTER_RESTART,

@@ -1,7 +1,6 @@
-//! A Claude Code session's carbon6 subagent runs in the background
-//! (docs/background.md §4): the call returns at once, the turn ends, and
-//! the subagent's report reaches the same Claude Code process as a notice,
-//! which starts a turn. A binary of its own: it sets C6_CLAUDE_BIN.
+//! Claude Code starts a carbon6 Task group over MCP, and its failed member
+//! wakes the same process before its sibling has finished. A binary of its
+//! own: it sets C6_CLAUDE_BIN.
 
 #[path = "support/held_worker.rs"]
 mod held_worker;
@@ -14,7 +13,7 @@ use c6_testkit::{MockLlm, Reply, eventually};
 use c6_worker::enroll;
 use serde_json::{Value, json};
 
-/// A `claude` that stays up. Its first message: it starts carbon6's `Task`
+/// A `claude` that stays up. Its first message: it starts two carbon6 Tasks
 /// in the background over MCP (with curl) and ends its turn. Every message
 /// after that (the notice): it records it and answers.
 fn fake_claude(dir: &Path) -> std::path::PathBuf {
@@ -29,9 +28,12 @@ read -r line
 echo '{"type":"system","subtype":"init"}'
 printf '{"type":"user","isReplay":true,"uuid":"%s","message":{"role":"user","content":"echo"},"parent_tool_use_id":null}\n' "$(uuid_of "$line")"
 post '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fake","version":"0"}}}' > /dev/null
-echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_b1","name":"mcp__carbon6__Task","input":{"description":"look","prompt":"Look around.","connection":"api","run_in_background":true}}],"stop_reason":"tool_use"},"parent_tool_use_id":null}'
-post '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"Task","arguments":{"description":"look","prompt":"Look around.","connection":"api","run_in_background":true}}}' > call.json
+echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_b1","name":"mcp__carbon6__Task","input":{"description":"look","prompt":"Look around.","connection":"api","run_in_background":true,"group":"review"}}],"stop_reason":"tool_use"},"parent_tool_use_id":null}'
+post '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"Task","arguments":{"description":"look","prompt":"Look around.","connection":"api","run_in_background":true,"group":"review"}}}' > call.json
 echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_b1","content":"started"}]},"parent_tool_use_id":null}'
+echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_b2","name":"mcp__carbon6__Task","input":{"description":"failure probe","prompt":"mcp-group-failure-probe","connection":"api","run_in_background":true,"group":"review","wake":"all"}}],"stop_reason":"tool_use"},"parent_tool_use_id":null}'
+post '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"Task","arguments":{"description":"failure probe","prompt":"mcp-group-failure-probe","connection":"api","run_in_background":true,"group":"review","wake":"all"}}}' > failed-call.json
+echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_b2","content":"started"}]},"parent_tool_use_id":null}'
 echo '{"type":"assistant","message":{"content":[{"type":"text","text":"Started it."}],"stop_reason":"end_turn"},"parent_tool_use_id":null}'
 echo '{"type":"result","subtype":"success","is_error":false,"result":"Started it.","usage":{"input_tokens":1,"output_tokens":1}}'
 while read -r line; do
@@ -50,7 +52,7 @@ done
 }
 
 #[tokio::test]
-async fn a_background_carbon6_subagent_reports_to_claude_code() {
+async fn a_failed_grouped_carbon6_subagent_wakes_claude_code_before_its_peer_finishes() {
     if !c6_testkit::have("curl") {
         return;
     }
@@ -81,7 +83,9 @@ async fn a_background_carbon6_subagent_reports_to_claude_code() {
         async |body: Value| -> Value { http.post(format!("{api}/connections")).json(&body).send().await.unwrap().json().await.unwrap() };
     let cc = add(json!({"kind": "claude_code", "name": "cc", "base_url": ""})).await;
     add(json!({"name": "api", "base_url": mock.base_url(), "default_model": "m2"})).await;
-    mock.push(Reply::Text("api says hi".into()));
+    let slow = mock.push_gated_about("Look around.", Reply::Text("api says hi".into()));
+    let failure = mock.push_gated_about("mcp-group-failure-probe", Reply::Broken("partial report".into()));
+    mock.push_about("mcp-group-failure-probe", Reply::Error(400, "permanent provider failure".into()));
 
     let project = tempfile::tempdir().unwrap();
     let s: Value = http
@@ -95,30 +99,64 @@ async fn a_background_carbon6_subagent_reports_to_claude_code() {
         .await
         .unwrap();
     let id = s["id"].as_str().unwrap().to_owned();
-    // Two turns: the one that started it, and the one its report started.
-    let events = eventually("the report's turn to end", async || {
-        let d: SessionDetail = http.get(format!("{api}/sessions/{id}")).send().await.ok()?.json().await.ok()?;
+    let wait_turns = async |turns: usize| {
+        eventually("the requested parent turn to end", async || {
+            let d: SessionDetail = http.get(format!("{api}/sessions/{id}")).send().await.ok()?.json().await.ok()?;
+            let events: Vec<Event> = http.get(format!("{api}/sessions/{id}/events")).send().await.ok()?.json().await.ok()?;
+            let ended = events.iter().filter(|e| matches!(e.kind, EventKind::TurnEnded { .. })).count();
+            (d.session.status == SessionStatus::Idle && ended == turns).then_some(events)
+        })
+        .await
+    };
+    wait_turns(1).await;
+    // Wait for both durable spawn records before failing either member. The
+    // parent is idle now; the failure must bypass an unsatisfied `all` barrier.
+    let events = eventually("both grouped Tasks to spawn", async || {
         let events: Vec<Event> = http.get(format!("{api}/sessions/{id}/events")).send().await.ok()?.json().await.ok()?;
-        let ended = events.iter().filter(|e| matches!(e.kind, EventKind::TurnEnded { .. })).count();
-        (d.session.status == SessionStatus::Idle && ended == 2).then_some(events)
+        (events.iter().filter(|e| matches!(e.kind, EventKind::SubagentSpawned { .. })).count() == 2).then_some(events)
     })
     .await;
 
     let call: Value = serde_json::from_str(&std::fs::read_to_string(project.path().join("call.json")).unwrap()).unwrap();
     let started = call["result"]["content"][0]["text"].as_str().unwrap();
     assert!(started.starts_with("Started the subagent in the background as bg"), "the call returns at once: {call}");
+    let spawn = events.iter().find_map(|e| match &e.kind {
+        EventKind::SubagentSpawned { call_id, group, wake, background_task_id, .. } if call_id == "toolu_b1" => {
+            Some((group.as_str(), wake.as_str(), background_task_id.as_str()))
+        }
+        _ => None,
+    });
+    let (group, wake, task_id) = spawn.expect("MCP Task durably links its group to the call and background task");
+    assert_eq!((group, wake), ("review", "all"));
+    assert!(task_id.starts_with("bg") && started.contains(task_id), "{task_id}: {started}");
+
+    failure.notify_one();
+    let failed_events = wait_turns(2).await;
+    let failed_notice = failed_events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::User { command, text, .. } if command == "task-notification" => Some(text.as_str()),
+            _ => None,
+        })
+        .expect("the failed member starts its own notice turn while its sibling is gated");
+    assert!(failed_notice.contains("group review: 1 of 2 finished, 1 failed"), "{failed_notice}");
+    assert!(failed_notice.contains("failure probe") && !failed_notice.contains("api says hi"), "{failed_notice}");
+
+    slow.notify_one();
+    let events = wait_turns(3).await;
     // The report went to the same process, as a message it took.
     let notices = std::fs::read_to_string(project.path().join("notices.txt")).unwrap();
-    let notice: Value = serde_json::from_str(notices.lines().next().unwrap()).unwrap();
+    assert_eq!(notices.lines().count(), 2, "{notices}");
+    let notice: Value = serde_json::from_str(notices.lines().last().unwrap()).unwrap();
     let text = notice["message"]["content"].as_str().unwrap();
     assert!(notice.get("origin").is_none(), "a notice is not a person's message: {notice}");
     assert!(text.contains("<background-task") && text.contains("api says hi"), "{text}");
     assert_eq!(std::fs::read_to_string(project.path().join("spawns.txt")).unwrap().lines().count(), 1, "one process");
     let woke = events.iter().find_map(|e| match &e.kind {
-        EventKind::User { command, text, .. } if command == "task-notification" => Some(text.clone()),
+        EventKind::User { command, text, .. } if command == "task-notification" && text.contains("api says hi") => Some(text.clone()),
         _ => None,
     });
-    assert!(woke.is_some_and(|t| t.contains("api says hi")), "the notice is the second turn's message");
+    assert!(woke.is_some(), "the successful member is delivered after it finishes");
     worker.stop();
     head.shutdown().await.unwrap();
 }

@@ -3732,6 +3732,7 @@ impl Mapper {
             background_task_id: self.call_tasks.get(call).cloned().unwrap_or_default(),
             model: None,
             remote: None,
+            ..Default::default()
         };
         parent_log.append(session_event::Kind::SubagentSpawned(spawn.clone())).await?;
         let started = SessionStarted {

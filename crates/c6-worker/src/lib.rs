@@ -17,6 +17,7 @@ pub mod journal;
 pub mod link;
 mod mcp_bridge;
 pub mod mentions;
+mod notice_guard;
 pub mod policy;
 pub mod pty;
 pub mod rpc;

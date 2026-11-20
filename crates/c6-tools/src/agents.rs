@@ -18,6 +18,7 @@ pub trait Subagents: Send + Sync {
     /// `background`: the background task it runs as, if it does. `choice`:
     /// the connection, model and effort the call asks for (empty: the
     /// agent's, else the session's default for subagents).
+    /// `group`: how to batch this background task's completion notice.
     #[allow(clippy::too_many_arguments)]
     async fn run(
         &self,
@@ -27,6 +28,7 @@ pub trait Subagents: Send + Sync {
         agent: Option<&AgentDef>,
         choice: &ModelChoice,
         background: Option<&str>,
+        group: Option<&TaskGroup>,
         cancel: CancellationToken,
     ) -> Result<String, String>;
 
@@ -63,9 +65,41 @@ pub trait Subagents: Send + Sync {
         _template: &str,
         _on: &str,
         _background: Option<&str>,
+        _group: Option<&TaskGroup>,
         _cancel: CancellationToken,
     ) -> Result<String, String> {
         Err("templates cannot start subagents here".into())
+    }
+}
+
+/// Fan-in settings for one background Task, in their persisted form.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskGroup {
+    pub group: String,
+    pub wake: String,
+}
+
+impl TaskGroup {
+    fn from_input(input: &Value, background: bool) -> Result<Option<Self>, &'static str> {
+        let (group, wake) = (input.get("group"), input.get("wake"));
+        let Some(group) = group else {
+            return if wake.is_none() { Ok(None) } else { Err("wake requires a group") };
+        };
+        if !background {
+            return Err("group requires run_in_background: true");
+        }
+        let group = group.as_str().map(str::trim).filter(|s| !s.is_empty()).ok_or("group must be a nonempty string")?;
+        let invalid = "wake must be all, any, or count:N with a positive integer N";
+        let wake = match wake.map_or(Some("all"), Value::as_str) {
+            Some(wake @ ("all" | "any")) => wake.to_owned(),
+            Some(wake) => {
+                let n = wake.strip_prefix("count:").filter(|n| n.bytes().all(|b| b.is_ascii_digit())).ok_or(invalid)?;
+                let n = n.parse::<u32>().ok().filter(|&n| n > 0).ok_or(invalid)?;
+                format!("count:{n}")
+            }
+            None => return Err(invalid),
+        };
+        Ok(Some(Self { group: group.to_owned(), wake }))
     }
 }
 
@@ -143,6 +177,7 @@ pub struct Task {
     /// Offer `run_in_background` (not where nothing could deliver its
     /// notice).
     background: bool,
+    group_guidance: String,
     /// The tool that stops a background one, as the model knows it.
     kill_tool: &'static str,
 }
@@ -155,6 +190,7 @@ impl Task {
             connections: Arc::default(),
             templates: Arc::default(),
             background: true,
+            group_guidance: String::new(),
             kill_tool: "kill_shell",
         }
     }
@@ -177,6 +213,11 @@ impl Task {
     /// introduced by `intro`.
     pub fn with_templates(self, intro: &str, templates: Vec<TemplateInfo>) -> Self {
         Self { templates: Arc::new((intro.to_owned(), templates)), ..self }
+    }
+
+    /// Editable guidance for grouped background notices, in Task's description.
+    pub fn with_group_guidance(self, guidance: impl Into<String>) -> Self {
+        Self { group_guidance: guidance.into(), ..self }
     }
 
     /// The same tool, without `run_in_background`.
@@ -210,6 +251,14 @@ impl Tool for Task {
         });
         if self.background {
             properties["run_in_background"] = json!({"type": "boolean", "description": format!("Start it in the background and continue; its report arrives as a notice when it finishes (stop it with {})", self.kill_tool)});
+            properties["group"] =
+                json!({"type": "string", "description": "Optional name shared by background Tasks whose reports should be grouped"});
+            properties["wake"] =
+                json!({"type": "string", "description": "With group: all (default), count:N for a positive report count, or any"});
+            if !self.group_guidance.is_empty() {
+                description.push_str("\n\n");
+                description.push_str(&self.group_guidance);
+            }
         }
         if !self.connections.is_empty() {
             description.push_str(
@@ -267,6 +316,11 @@ impl Tool for Task {
         let Some(prompt) = input["prompt"].as_str().filter(|p| !p.trim().is_empty()) else {
             return ToolOutput::err("prompt is required");
         };
+        let background = self.background && input["run_in_background"].as_bool() == Some(true);
+        let group = match TaskGroup::from_input(&input, background) {
+            Ok(group) => group,
+            Err(e) => return ToolOutput::err(e),
+        };
         let agent = match input["subagent_type"].as_str().filter(|t| !t.is_empty() && *t != "general-purpose") {
             None => None,
             Some(t) => match self.agents.iter().find(|a| a.name == t) {
@@ -285,41 +339,46 @@ impl Tool for Task {
                 );
             }
             let on = input["on"].as_str().unwrap_or_default().trim().to_owned();
-            if self.background && input["run_in_background"].as_bool() == Some(true) {
+            if background {
                 let (id, cancel) = ctx.session.background.start_agent(description, true);
                 let (session, call_id, description, prompt, template, task) =
                     (ctx.session.clone(), ctx.call_id.clone(), description.to_owned(), prompt.to_owned(), template.to_owned(), id.clone());
                 tokio::spawn(async move {
-                    let result = agents.run_template(&call_id, &description, &prompt, &template, &on, Some(&task), cancel).await;
+                    let result =
+                        agents.run_template(&call_id, &description, &prompt, &template, &on, Some(&task), group.as_ref(), cancel).await;
                     session.background.finish_agent(&task, result);
                 });
-                return ToolOutput::ok(format!(
-                    "Started the subagent in the background as {id}. Its report will arrive as a notice when it finishes; continue with other work meanwhile."
-                ));
+                return task_launched(&id);
             }
-            return match agents.run_template(&ctx.call_id, description, prompt, template, &on, None, ctx.cancel.clone()).await {
+            return match agents.run_template(&ctx.call_id, description, prompt, template, &on, None, None, ctx.cancel.clone()).await {
                 Ok(answer) => ToolOutput::limited(answer, false),
                 Err(e) => ToolOutput::err(e),
             };
         }
-        if self.background && input["run_in_background"].as_bool() == Some(true) {
+        if background {
             let (id, cancel) = ctx.session.background.start_agent(description, true);
             let (session, call_id, description, prompt, agent, task) =
                 (ctx.session.clone(), ctx.call_id.clone(), description.to_owned(), prompt.to_owned(), agent.cloned(), id.clone());
             tokio::spawn(async move {
-                let result = agents.run(&call_id, &description, &prompt, agent.as_ref(), &choice, Some(&task), cancel).await;
+                let result =
+                    agents.run(&call_id, &description, &prompt, agent.as_ref(), &choice, Some(&task), group.as_ref(), cancel).await;
                 session.background.finish_agent(&task, result);
             });
-            return ToolOutput::ok(format!(
-                "Started the subagent in the background as {id}. Its report will arrive as a notice when it finishes; continue with other work meanwhile."
-            ));
+            return task_launched(&id);
         }
-        match agents.run(&ctx.call_id, description, prompt, agent, &choice, None, ctx.cancel.clone()).await {
+        match agents.run(&ctx.call_id, description, prompt, agent, &choice, None, None, ctx.cancel.clone()).await {
             Ok(answer) => ToolOutput::limited(answer, false),
             // What it did and how it ended.
             Err(e) => ToolOutput::err(e),
         }
     }
+}
+
+fn task_launched(id: &str) -> ToolOutput {
+    // Keep the existing launch placeholder recognizable during recovery.
+    ToolOutput::ok(format!(
+        "Started the subagent in the background as {id}. Its report will arrive as a notice when it finishes; continue with other work meanwhile."
+    ))
 }
 
 /// Continues one of this session's subagents: a follow-up for one that is
@@ -491,6 +550,28 @@ impl Tool for SkillTool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn task_groups_require_background_and_a_valid_wake_policy() {
+        assert_eq!(TaskGroup::from_input(&json!({}), false), Ok(None));
+        assert_eq!(
+            TaskGroup::from_input(&json!({"group": " reviews "}), true),
+            Ok(Some(TaskGroup { group: "reviews".into(), wake: "all".into() }))
+        );
+        for (input, wake) in [("all", "all"), ("any", "any"), ("count:003", "count:3")] {
+            assert_eq!(TaskGroup::from_input(&json!({"group": "reviews", "wake": input}), true).unwrap().unwrap().wake, wake);
+        }
+        assert!(TaskGroup::from_input(&json!({"group": "reviews"}), false).is_err());
+        for input in [json!({"wake": "any"}), json!({"group": " "}), json!({"group": 12})] {
+            assert!(TaskGroup::from_input(&input, true).is_err(), "{input}");
+        }
+        for wake in ["count:0", "count:-1", "count:", "count:4294967296", "sometimes", ""] {
+            assert!(TaskGroup::from_input(&json!({"group": "reviews", "wake": wake}), true).is_err(), "{wake}");
+        }
+        let tool = Task::generic().with_group_guidance("Realm instructions.");
+        assert!(tool.spec().description.contains("Realm instructions."));
+        assert!(tool.foreground_only().spec().parameters["properties"].get("group").is_none());
+    }
+
     struct EndedBeforeSend;
 
     #[async_trait]
@@ -503,6 +584,7 @@ mod tests {
             _: Option<&AgentDef>,
             _: &ModelChoice,
             _: Option<&str>,
+            _: Option<&TaskGroup>,
             _: CancellationToken,
         ) -> Result<String, String> {
             unreachable!()

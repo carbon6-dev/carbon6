@@ -144,7 +144,7 @@ is a **waking notice to the recorded parent**; it does not depend on the old
 background task still existing. A steer queued after a final model request
 belongs to the next turn, not the turn that is finishing. A child's own
 task-notification turns report back too. Direct messages from you still respect
-your **Wake the parent** choice, and automatic-turn limits still apply.
+your **Wake the parent** choice, and the [notice scheduler](notices.md) still applies.
 
 Local report recovery reads consumed inputs and turn ends from the journal.
 Stable `subagent:local:<child>:<end-seq>` notice IDs deduplicate retries; a child
@@ -181,7 +181,7 @@ A subagent's thread (§9) has a reply box and, after an interrupted, failed or l
 - **When no call is waiting,** your message starts a new delegation that you own. When that turn ends, its report goes to the subagent's parent as a `task-notification` notice:
   - **If the parent is running,** the notice arrives at its next model boundary. It is acting, so it needs to know what changed.
   - **If the parent is idle,** the notice waits and arrives with the parent's next input. It doesn't start a turn by itself.
-  - **With *Wake the parent* ticked,** an idle parent starts a turn on the notice right away. This counts toward the hourly auto-turn limit.
+  - **With *Wake the parent* ticked,** the notice can start a turn in an idle parent. The [notice scheduler](notices.md) merges arrivals and applies progress and spending guards.
 
   The parent never acts on stale information, and nothing runs behind your back unless you ask for it. To only *ask* a subagent something, use a side chat on it (↳ Ask); side chats don't report back.
 - **In a tree,** the rule repeats one level at a time. A report from a woken parent goes to its own parent under the same rule, and `wake` carries up only as far as you ticked it (stored on the `UserMessage`).
@@ -208,7 +208,7 @@ This comes from `history_from_events`. A tool call that was cut off gets its rep
   - Reports and notices go up one level.
   - `SendMessage` goes down one level.
   - You can reach any level from the UI.
-- **Auto-turn chains.** A report bubbling up through idle subagents could set off a chain of turns. That only happens with *Wake* ticked; the per-session hourly auto-turn limit then applies at each level.
+- **Notice chains.** A report bubbling up through idle subagents can set off a chain of turns. Work descended from a direct user turn remains expected, but progress and spending guards still apply at each level. Quiet user reports do not wake an idle parent.
 
 ## 8. Claude Code sessions
 
@@ -302,7 +302,9 @@ As built: all six steps on 2026-10-14.
 
 ## Background tasks: completion and inspection
 
-carbon6-managed shell tasks use the same background manager across the Generic, Claude and Codex tool profiles. Set `run_in_background: true` on Bash / shell. Completion is pushed to the session: a running model receives the notice at its next boundary, and an idle session wakes automatically (subject to the hourly limit in Settings → Agents → Limits, default 20; excess notices wait until the hour allows, or for the next input, and survive a worker restart: [background.md](background.md) §5). The model need not poll output simply to wait. Use `notify: false` for servers and watchers that should not wake it.
+carbon6-managed shell tasks use the same background manager across the Generic, Claude and Codex tool profiles. Set `run_in_background: true` on Bash / shell. Completion is pushed to the session: a running model receives the notice at its next boundary, and an idle session merges completions before waking, subject to progress and spending guards. Held notices survive worker restart. The model need not poll output simply to wait. Use `notify: false` for servers and watchers that should not wake it. See [Notice scheduling](notices.md).
+
+For background `Task` calls, set `group` to a fresh name for each fan-out and `wake` to `all` (the default), `count:N`, or `any`. A group waits for its threshold of completed tasks before waking an idle parent; a failed or lost member bypasses the threshold, but not the guards. The report includes a group summary. The same arguments are available on Claude Code's carbon6 `Task` bridge.
 
 The session's **Tasks** control shows the running count and lifecycle history, including completed, stopped and lost tasks. A compact task badge stays in the tile bar, including on mobile, so it is reachable while the transcript is scrolled. **Inspect** opens command, status, elapsed time and separate stdin/stdout/stderr panes; **Stop** is available while running. Opening the inspector, pressing **Refresh**, or receiving a lifecycle change fetches a snapshot. There is no periodic output polling and inspecting does not wake the model or advance its incremental output cursor.
 

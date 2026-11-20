@@ -402,6 +402,7 @@ async fn create_assistant_with_origin(
         colour: String::new(),
         remote_template: String::new(),
     };
+    let limits = subagent_limits(st, Some(&realm)).await?;
     let spec = CreateSession {
         model: Some(ModelSpec {
             connection_id,
@@ -413,6 +414,11 @@ async fn create_assistant_with_origin(
         }),
         base_prompt: crate::assistant::prompt(st, &req.context, &realm).await,
         labels,
+        notice_quiet_seconds: limits.notice_quiet_seconds,
+        notice_max_wait_seconds: limits.notice_max_wait_seconds,
+        notice_no_progress_limit: limits.notice_no_progress_limit,
+        notice_failure_relaunch_limit: limits.notice_failure_relaunch_limit,
+        notice_tokens_per_hour: limits.notice_tokens_per_hour,
         ..Default::default()
     };
     crate::naming::expect(st, &row.id).await?;
@@ -609,7 +615,12 @@ async fn session_spec(st: &HeadState, row: &SessionRow, worktree: bool, seed: Ve
         max_running_subagents: limits.max_running,
         depth: 0,
         subagent_templates_json: serde_json::to_string(&crate::templates::for_subagents(st, &row.realm, &row.instance).await)?,
-        auto_turns_per_hour: limits.auto_turns_per_hour,
+        auto_turns_per_hour: 0,
+        notice_quiet_seconds: limits.notice_quiet_seconds,
+        notice_max_wait_seconds: limits.notice_max_wait_seconds,
+        notice_no_progress_limit: limits.notice_no_progress_limit,
+        notice_failure_relaunch_limit: limits.notice_failure_relaunch_limit,
+        notice_tokens_per_hour: limits.notice_tokens_per_hour,
         claude_code_idle_minutes: limits.claude_code_idle_minutes,
         claude_code: Some(claude_code_choice(st, &row.realm).await?),
         claude_code_tools: claude_code_tools(st, Some(&row.realm)).await?.tools,
@@ -2255,14 +2266,23 @@ pub async fn task_snapshot(st: &HeadState, session_id: &str, task_id: &str) -> a
     })
 }
 
-/// Delivers a session's held notices now (docs/background.md §5). `false`:
-/// its worker is not connected.
+/// Delivers a session's held notices now and refreshes its notice limits
+/// (docs/background.md §5). `false`: its worker is not connected.
 pub async fn release_notices(st: &HeadState, session_id: &str) -> anyhow::Result<bool> {
     let session = st.store.session(session_id).await?.ok_or_else(|| not_found("no such session"))?;
+    let limits = subagent_limits(st, Some(&session.realm)).await?;
     let cmd = SessionCommand {
         command_id: Uuid::now_v7().to_string(),
         session_id: session_id.to_owned(),
-        kind: Some(session_command::Kind::ReleaseNotices(c6_proto::ReleaseNotices {})),
+        kind: Some(session_command::Kind::ReleaseNotices(c6_proto::ReleaseNotices {
+            limits: Some(c6_proto::NoticeLimits {
+                notice_quiet_seconds: limits.notice_quiet_seconds,
+                notice_max_wait_seconds: limits.notice_max_wait_seconds,
+                notice_no_progress_limit: limits.notice_no_progress_limit,
+                notice_failure_relaunch_limit: limits.notice_failure_relaunch_limit,
+                notice_tokens_per_hour: limits.notice_tokens_per_hour,
+            }),
+        })),
     };
     Ok(st.registry.send_command(session.worker_id.parse()?, cmd))
 }
@@ -3129,10 +3149,20 @@ mod input_compatibility_tests {
             })),
         };
         events.push(notice.clone());
-        assert_eq!(ingest(st, worker, SessionEventBatch { session_id: "session".into(), events }).await.unwrap(), Some(8));
+        let mut update = notice.clone();
+        update.seq = 9;
+        update.ts_ms = 9;
+        let Some(session_event::Kind::NoticeQueued(queued)) = &mut update.kind else { unreachable!() };
+        queued.reason = "paused: spending limit".into();
+        events.push(update.clone());
+        assert_eq!(ingest(st, worker, SessionEventBatch { session_id: "session".into(), events }).await.unwrap(), Some(9));
         let stored = st.store.events_after("session", 0, 10).await.unwrap();
         assert_eq!(stored[0], historical, "replayed history must remain legacy/neutral");
         assert_eq!(stored[7], notice, "user command provenance must not be copied onto a notice");
+        assert_eq!(stored[8], update, "a repeated command ID may update the wait metadata");
+        assert!(
+            matches!(convert::event(&stored[8]).unwrap().kind, api::EventKind::NoticeQueued { reason, .. } if reason == "paused: spending limit")
+        );
         assert!(matches!(convert::event(&stored[0]).unwrap().kind, api::EventKind::User { origin: None, .. }));
         for (event, expected) in stored[1..7].iter().zip([
             api::MessageOrigin::Human,

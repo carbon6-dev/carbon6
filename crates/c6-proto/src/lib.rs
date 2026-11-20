@@ -39,6 +39,7 @@ mod tests {
             let notice = NoticeQueued::decode(bytes).unwrap();
             assert_eq!(notice.command_id, "c");
             assert_eq!(notice.text, "n");
+            assert!(notice.reason.is_empty());
             assert!(notice.task_notice.is_none(), "retired tag 10 falls back to the plain label");
             // SessionEvent seq=14378, ts_ms=1, notice_queued=tag 31.
             let mut event = vec![0x08, 0xaa, 0x70, 0x10, 0x01, 0xfa, 0x01, bytes.len() as u8];
@@ -54,5 +55,37 @@ mod tests {
         let notice = NoticeQueued { task_notice: Some(TaskNotice::default()), ..Default::default() };
         assert_eq!(notice.encode_to_vec(), [0x5a, 0x00]);
         assert_eq!(NoticeQueued::decode(notice.encode_to_vec().as_slice()).unwrap(), notice);
+    }
+
+    #[test]
+    fn notice_queued_writes_reason_at_fresh_tag_12() {
+        let notice = NoticeQueued { reason: "paused".into(), ..Default::default() };
+        let bytes = b"\x62\x06paused";
+        assert_eq!(notice.encode_to_vec(), bytes);
+        assert_eq!(NoticeQueued::decode(bytes.as_slice()).unwrap(), notice);
+    }
+
+    #[test]
+    fn create_session_retains_legacy_notice_tag_with_new_settings_unset() {
+        // auto_turns_per_hour=20, claude_code_idle_minutes=15 (tags 31–32).
+        let bytes = b"\xf8\x01\x14\x80\x02\x0f";
+        let spec = CreateSession::decode(bytes.as_slice()).unwrap();
+        assert_eq!(spec, CreateSession { auto_turns_per_hour: 20, claude_code_idle_minutes: 15, ..Default::default() });
+        assert_eq!(spec.encode_to_vec(), bytes);
+    }
+
+    #[test]
+    fn release_notices_carries_limits_but_accepts_older_empty_commands() {
+        assert_eq!(ReleaseNotices::decode(&[][..]).unwrap().limits, None);
+        let release = ReleaseNotices {
+            limits: Some(NoticeLimits {
+                notice_quiet_seconds: 3,
+                notice_max_wait_seconds: 30,
+                notice_no_progress_limit: 5,
+                notice_failure_relaunch_limit: 3,
+                notice_tokens_per_hour: 10_000_000_000,
+            }),
+        };
+        assert_eq!(ReleaseNotices::decode(release.encode_to_vec().as_slice()).unwrap(), release);
     }
 }

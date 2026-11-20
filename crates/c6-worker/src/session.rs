@@ -277,8 +277,10 @@ pub(crate) enum ActorMsg {
     /// Context for the next input, never a reason to start a turn.
     /// How a remote subagent's turn ended (from the head, as a command).
     RemoteReport(String, Box<c6_proto::DelegationEnded>, tokio::sync::oneshot::Sender<Result<(), String>>),
-    /// Deliver the held notices now, whatever the hourly limit (you asked).
+    /// Deliver all held notices now, bypassing automatic holds (you asked).
     ReleaseNotices,
+    /// Refresh the notice settings when you explicitly continue a session.
+    NoticeLimits(c6_proto::NoticeLimits),
     /// Its turn `.0` was cut short by a worker restart: it goes on
     /// (docs/restarts.md §4).
     Resume(u64),
@@ -288,17 +290,11 @@ pub(crate) enum ActorMsg {
     /// started turns in the last hour, the ids of every notice recorded,
     /// and those no turn took, to deliver again.
     Reloaded {
-        auto_turns_ms: Vec<i64>,
         noticed: Vec<String>,
         pending: Vec<(PendingInput, bool)>,
     },
 }
 
-/// Notices may start this many turns per hour in an idle session unless
-/// the subagent-limits setting says otherwise; beyond that they wait until
-/// the hour allows, or for your next message.
-const AUTO_TURNS_PER_HOUR: usize = c6_api::DEFAULT_AUTO_TURNS_PER_HOUR as usize;
-const HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
 /// Only recently active sessions re-arm held notices at worker startup:
 /// don't scan dormant logs or wake days-old conversations on upgrade.
 const NOTICE_RECOVERY_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
@@ -810,9 +806,12 @@ impl SessionManager {
                 // delivery failure from the head and the parent's queue.
                 ack.await.unwrap_or_else(|_| Err("parent stopped before recording the report".into()))
             }
-            Some(session_command::Kind::ReleaseNotices(_)) => {
+            Some(session_command::Kind::ReleaseNotices(release)) => {
                 // Loading it delivers what it can; then the rest, now.
                 let actor = self.actor(&cmd.session_id).await.map_err(internal)?.ok_or("unknown session on this worker")?;
+                if let Some(limits) = release.limits {
+                    let _ = actor.send(ActorMsg::NoticeLimits(limits));
+                }
                 let _ = actor.send(ActorMsg::ReleaseNotices);
                 Ok(())
             }
@@ -1212,8 +1211,8 @@ impl SessionManager {
         }
         let _ = tx.send(ActorMsg::Reserve(highest));
         // Notices no turn took are delivered again.
-        let (auto_turns_ms, noticed, pending) = notices_of(&events);
-        let _ = tx.send(ActorMsg::Reloaded { auto_turns_ms, noticed, pending });
+        let (_, noticed, pending) = notices_of(&events);
+        let _ = tx.send(ActorMsg::Reloaded { noticed, pending });
         if local_child && !pending_local_reports(session_id, &events).is_empty() {
             let _ = tx.send(ActorMsg::RecoverReport);
         }
@@ -1485,7 +1484,10 @@ impl SessionManager {
             inbox: Arc::new(Mutex::new(Inbox::default())),
             // Files on an SSH target are not checkpointed.
             checkpoints: Arc::new(Checkpoints::new(&self.state_dir, session_id, if remote { &local } else { Path::new(&started_cwd) })),
-            auto_turns: VecDeque::new(),
+            notice_arrivals: HashMap::new(),
+            notice_deadline: None,
+            notice_ready: HashSet::new(),
+            notice_pause: None,
             deferred: Vec::new(),
             unrecorded_notices: Vec::new(),
             pending_task_event: None,
@@ -1523,6 +1525,19 @@ impl SessionManager {
 /// carbon6's own loop, everything before it is a marked transcript at the
 /// start of the conversation, not native history.
 fn conversation_from_log(spec: &mut CreateSession, events: &[SessionEvent]) -> Conversation {
+    // Continue snapshots are durable, so raising a limit also survives reload.
+    if let Some(limits) = events.iter().rev().find_map(|e| match &e.kind {
+        Some(session_event::Kind::Notice(n)) if n.quiet && n.title == crate::notice_guard::CONTINUED_TITLE => {
+            serde_json::from_str::<c6_api::SubagentLimits>(&n.message).ok()
+        }
+        _ => None,
+    }) {
+        spec.notice_quiet_seconds = limits.notice_quiet_seconds;
+        spec.notice_max_wait_seconds = limits.notice_max_wait_seconds;
+        spec.notice_no_progress_limit = limits.notice_no_progress_limit;
+        spec.notice_failure_relaunch_limit = limits.notice_failure_relaunch_limit;
+        spec.notice_tokens_per_hour = limits.notice_tokens_per_hour;
+    }
     let seed = seed_events(spec);
     let seed_len = seed.len();
     let all = [seed, events.to_vec()].concat();
@@ -1879,26 +1894,31 @@ fn notices_of(events: &[SessionEvent]) -> (Vec<i64>, Vec<String>, Vec<(PendingIn
             _ => {}
         }
     }
-    let pending = events
+    let mut seen_pending = HashSet::new();
+    let mut pending: Vec<_> = events
         .iter()
+        .rev()
         .filter_map(|e| match &e.kind {
-            Some(session_event::Kind::NoticeQueued(n)) if !taken.contains(&n.command_id) => Some((
-                PendingInput {
-                    command_id: n.command_id.clone(),
-                    text: n.text.clone(),
-                    command: n.command.clone(),
-                    prompt: n.prompt.clone(),
-                    from_session_id: n.from_session_id.clone(),
-                    from_title: n.from_title.clone(),
-                    hops: n.hops,
-                    task_notice: n.task_notice.clone(),
-                    ..Default::default()
-                },
-                n.wake,
-            )),
+            Some(session_event::Kind::NoticeQueued(n)) if !taken.contains(&n.command_id) && seen_pending.insert(n.command_id.clone()) => {
+                Some((
+                    PendingInput {
+                        command_id: n.command_id.clone(),
+                        text: n.text.clone(),
+                        command: n.command.clone(),
+                        prompt: n.prompt.clone(),
+                        from_session_id: n.from_session_id.clone(),
+                        from_title: n.from_title.clone(),
+                        hops: n.hops,
+                        task_notice: n.task_notice.clone(),
+                        ..Default::default()
+                    },
+                    n.wake,
+                ))
+            }
             _ => None,
         })
         .collect();
+    pending.reverse();
     (auto_turns, noticed.into_iter().collect(), pending)
 }
 
@@ -2462,10 +2482,13 @@ struct Actor {
     tools: Vec<Arc<dyn Tool>>,
     inbox: Arc<Mutex<Inbox>>,
     checkpoints: Arc<Checkpoints>,
-    /// When background-task notices started turns (for the hourly limit).
-    auto_turns: VecDeque<tokio::time::Instant>,
-    /// Notices held for your next message, and whether each would start a
-    /// turn (those held by the hourly limit go once the hour allows).
+    /// Idle merge window. Tokio's clock is injectable in scheduler tests.
+    notice_arrivals: HashMap<String, tokio::time::Instant>,
+    notice_deadline: Option<tokio::time::Instant>,
+    notice_ready: HashSet<String>,
+    notice_pause: Option<String>,
+    /// Notices waiting for a merge/group barrier or explicit input, and
+    /// whether each may start an unattended turn.
     deferred: Vec<(PendingInput, bool)>,
     /// Notices whose first durable queue write failed, never mixed with the
     /// held (already durable) batch until their own marker is recorded.
@@ -2688,12 +2711,11 @@ impl Actor {
         self.withdrawn = withdrawn_sources(&events);
         self.inbox.lock().unwrap().recover(&taken, &self.withdrawn, self.claude.is_some());
         self.deferred.clear();
-        let (auto_turns_ms, noticed, pending) = notices_of(&events);
-        let (now, now_ms) = (tokio::time::Instant::now(), c6_core::now_ms());
-        self.auto_turns = auto_turns_ms
-            .into_iter()
-            .filter_map(|t| now.checked_sub(std::time::Duration::from_millis(now_ms.saturating_sub(t).max(0) as u64)))
-            .collect();
+        let (_, noticed, pending) = notices_of(&events);
+        self.notice_arrivals.clear();
+        self.notice_deadline = None;
+        self.notice_ready.clear();
+        self.notice_pause = None;
         self.noticed = noticed.into_iter().collect();
         // A background completion has no head redelivery. If its event or
         // notice write failed, finish it before taking another callback.
@@ -2896,9 +2918,9 @@ impl Actor {
             // start a turn for them by itself.
             let wake_at =
                 self.claude.as_ref().filter(|_| !rewind_blocked && !adoption_blocked && running.is_none()).and_then(|p| p.wake_due());
-            // Notices the hourly limit held: once the hour allows.
+            // A merge window or a ready fan-in group, never an hourly wake count.
             let waiting_to_wake = !rewind_blocked && !adoption_blocked && running.is_none() && self.deferred.iter().any(|(_, wake)| *wake);
-            let retry_at = (waiting_to_wake && self.link.is_connected()).then(|| self.next_auto_turn());
+            let retry_at = (waiting_to_wake && self.link.is_connected()).then_some(self.notice_deadline).flatten();
             tokio::select! {
                 msg = rx.recv() => match msg {
                     None => return,
@@ -2920,6 +2942,10 @@ impl Actor {
                         }
                     }
                     Some(ActorMsg::Input(mut input, model, choice)) => {
+                        if let Err(e) = self.continue_notices().await {
+                            error!(session = %self.writer.session_id, "continuing notice wakes: {e:#}");
+                            return;
+                        }
                         // Your message: what the agent does from now on is not
                         // a session message's chain.
                         self.session_tools.set_message_hops(0);
@@ -3076,7 +3102,20 @@ impl Actor {
                             error!(session = %self.writer.session_id, "recovering a subagent's report: {e:#}");
                         }
                     }
+                    Some(ActorMsg::NoticeLimits(limits)) => {
+                        self.spec.notice_quiet_seconds = limits.notice_quiet_seconds;
+                        self.spec.notice_max_wait_seconds = limits.notice_max_wait_seconds;
+                        self.spec.notice_no_progress_limit = limits.notice_no_progress_limit;
+                        self.spec.notice_failure_relaunch_limit = limits.notice_failure_relaunch_limit;
+                        self.spec.notice_tokens_per_hour = limits.notice_tokens_per_hour;
+                        // Persist the refresh even if no guard was active.
+                        self.notice_pause = Some(String::new());
+                    }
                     Some(ActorMsg::ReleaseNotices) => {
+                        if let Err(e) = self.continue_notices().await {
+                            error!(session = %self.writer.session_id, "continuing notice wakes: {e:#}");
+                            return;
+                        }
                         let held = std::mem::take(&mut self.deferred);
                         info!(session = %self.writer.session_id, notices = held.len(), "delivering held notices: you asked");
                         let mut inbox = self.inbox.lock().unwrap();
@@ -3084,12 +3123,7 @@ impl Actor {
                             inbox.push(n, None);
                         }
                     }
-                    Some(ActorMsg::Reloaded { auto_turns_ms, noticed, pending }) => {
-                        let (now, now_ms) = (tokio::time::Instant::now(), c6_core::now_ms());
-                        self.auto_turns = auto_turns_ms
-                            .into_iter()
-                            .filter_map(|t| now.checked_sub(std::time::Duration::from_millis(now_ms.saturating_sub(t).max(0) as u64)))
-                            .collect();
+                    Some(ActorMsg::Reloaded { noticed, pending }) => {
                         self.noticed.extend(noticed);
                         for (input, wake) in pending {
                             info!(session = %self.writer.session_id, notice = %input.command_id, "delivering a notice again after a reload");
@@ -3416,13 +3450,16 @@ impl Actor {
                     }
                 }
                 _ = tokio::time::sleep_until(retry_at.unwrap_or_else(tokio::time::Instant::now)), if retry_at.is_some() => {
-                    self.release_held();
+                    if let Err(e) = self.release_held().await {
+                        error!(session = %self.writer.session_id, "delivering merged notices: {e:#}");
+                        return;
+                    }
                 }
                 // A queued input must not require another command to recover
                 // after unrelated metadata publication/removal finishes. This
                 // wake only rechecks ownership; failed Rewinds never arm it.
                 _ = tokio::time::sleep(std::time::Duration::from_millis(250)), if adoption_blocked && !rewind_blocked && running.is_none() => {}
-                _ = self.link.wait_connected(), if waiting_to_wake && retry_at.is_none() => {}
+                _ = self.link.wait_connected(), if waiting_to_wake && !self.link.is_connected() => {}
                 // Idle long enough, with no background tasks: close it.
                 _ = tokio::time::sleep_until(idle_until.unwrap_or_else(tokio::time::Instant::now)), if running.is_none() && idle_until.is_some() => {
                     info!(session = %self.writer.session_id, "closing an idle Claude Code process");
@@ -3436,6 +3473,10 @@ impl Actor {
                         Ok(Some((conv, claude))) => {
                             self.conv = Some(conv);
                             self.claude = claude;
+                            if let Err(e) = self.schedule_notices().await {
+                                error!(session = %self.writer.session_id, "checking unattended progress: {e:#}");
+                                return;
+                            }
                             if std::mem::take(&mut self.stopping) {
                                 self.stopped_until = Some(std::time::Instant::now() + crate::claude_code::STOP_QUIET);
                             }
@@ -3680,14 +3721,6 @@ impl Actor {
         leaving && self.runs_claude_code() && self.claude.as_ref().is_some_and(|p| p.tasks_running())
     }
 
-    /// The most turns notices may start per hour.
-    fn auto_turn_limit(&self) -> usize {
-        match self.spec.auto_turns_per_hour {
-            0 => AUTO_TURNS_PER_HOUR,
-            n => n as usize,
-        }
-    }
-
     /// How long its idle Claude Code process stays up with no tasks.
     fn claude_idle(&self) -> std::time::Duration {
         match self.spec.claude_code_idle_minutes {
@@ -3696,35 +3729,266 @@ impl Actor {
         }
     }
 
-    /// Takes a turn for notices if the hour allows one.
-    fn take_auto_turn(&mut self) -> bool {
-        let now = tokio::time::Instant::now();
-        while self.auto_turns.front().is_some_and(|t| now.duration_since(*t) >= HOUR) {
-            self.auto_turns.pop_front();
+    /// A durable acknowledgement resets the guard after an explicit Continue.
+    async fn continue_notices(&mut self) -> anyhow::Result<()> {
+        if self.notice_pause.take().is_some() {
+            self.writer
+                .append(session_event::Kind::Notice(c6_proto::Notice {
+                    title: crate::notice_guard::CONTINUED_TITLE.into(),
+                    message: serde_json::json!({
+                        "notice_quiet_seconds": self.spec.notice_quiet_seconds,
+                        "notice_max_wait_seconds": self.spec.notice_max_wait_seconds,
+                        "notice_no_progress_limit": self.spec.notice_no_progress_limit,
+                        "notice_failure_relaunch_limit": self.spec.notice_failure_relaunch_limit,
+                        "notice_tokens_per_hour": self.spec.notice_tokens_per_hour,
+                    })
+                    .to_string(),
+                    priority: "low".into(),
+                    quiet: true,
+                }))
+                .await?;
         }
-        if self.auto_turns.len() >= self.auto_turn_limit() {
-            return false;
-        }
-        self.auto_turns.push_back(now);
-        true
+        self.notice_arrivals.clear();
+        self.notice_deadline = None;
+        self.notice_ready.clear();
+        Ok(())
     }
 
-    /// The first slot with fewer than N turns in the preceding hour. A
-    /// manual Deliver now can leave more than N counted turns after load.
-    fn next_auto_turn(&self) -> tokio::time::Instant {
-        let now = tokio::time::Instant::now();
-        self.auto_turns.len().checked_sub(self.auto_turn_limit()).map_or(now, |i| (self.auto_turns[i] + HOUR).max(now))
+    fn queued_notice(input: &PendingInput, wake: bool, reason: String, deliver_at_ms: i64) -> c6_proto::NoticeQueued {
+        c6_proto::NoticeQueued {
+            command_id: input.command_id.clone(),
+            text: input.text.clone(),
+            command: input.command.clone(),
+            wake,
+            prompt: input.prompt.clone(),
+            from_session_id: input.from_session_id.clone(),
+            from_title: input.from_title.clone(),
+            hops: input.hops,
+            task_notice: input.task_notice.clone(),
+            deliver_at_ms,
+            reason,
+        }
     }
 
-    /// The hour allows another automatic turn: the held notices start one
-    /// together.
-    fn release_held(&mut self) {
-        if !self.link.is_connected() || !self.deferred.iter().any(|(_, wake)| *wake) || !self.take_auto_turn() {
-            return;
+    /// Rebuild decisions from durable facts, including group membership and real
+    /// usage. No counter of wakes limits a productive fan-out.
+    async fn schedule_notices(&mut self) -> anyhow::Result<()> {
+        self.notice_deadline = None;
+        self.notice_ready.clear();
+        if self.deferred.is_empty() {
+            return Ok(());
         }
-        for (n, _) in std::mem::take(&mut self.deferred) {
-            self.inbox.lock().unwrap().push(n, None);
+        let raw = self.journal.events_after(&self.writer.session_id, 0, u32::MAX).await?;
+        let pause = crate::notice_guard::evaluate(
+            &raw,
+            c6_core::now_ms(),
+            if self.spec.notice_no_progress_limit == 0 {
+                c6_api::DEFAULT_NOTICE_NO_PROGRESS_LIMIT
+            } else {
+                self.spec.notice_no_progress_limit
+            },
+            if self.spec.notice_failure_relaunch_limit == 0 {
+                c6_api::DEFAULT_NOTICE_FAILURE_RELAUNCH_LIMIT
+            } else {
+                self.spec.notice_failure_relaunch_limit
+            },
+            if self.spec.notice_tokens_per_hour == 0 { c6_api::DEFAULT_NOTICE_TOKENS_PER_HOUR } else { self.spec.notice_tokens_per_hour },
+        );
+        if let Some(reason) = &pause
+            && self.notice_pause.as_ref() != Some(reason)
+        {
+            self.writer
+                .append(session_event::Kind::Notice(c6_proto::Notice {
+                    title: format!("{} paused", self.started.title),
+                    message: format!("{reason}. Continue with Deliver now or your next message; raise the limit in Agents → Limits."),
+                    priority: "normal".into(),
+                    quiet: false,
+                }))
+                .await?;
         }
+        self.notice_pause = pause;
+        let events = c6_agent::effective_events(&raw);
+        let mut groups: HashMap<String, Vec<&c6_proto::SubagentSpawned>> = HashMap::new();
+        let mut children = HashMap::new();
+        let mut finished = HashSet::new();
+        let mut failed = HashSet::new();
+        let mut previous = HashMap::new();
+        let mut group_calls: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut rejected_calls = HashSet::new();
+        for e in &events {
+            match &e.kind {
+                Some(session_event::Kind::Assistant(a)) => {
+                    for block in &a.blocks {
+                        if let Some(c6_proto::content_block::Block::ToolUse(t)) = &block.block
+                            && (c6_tools::Task::is_task(&t.name) || t.name == "mcp__carbon6__Task")
+                            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&t.input_json)
+                            && let Some(group) = v["group"].as_str().filter(|g| !g.is_empty())
+                        {
+                            group_calls.entry(group.to_owned()).or_default().insert(t.id.clone());
+                        }
+                    }
+                }
+                Some(session_event::Kind::ToolResult(t)) if t.is_error => {
+                    rejected_calls.insert(t.call_id.clone());
+                }
+                Some(session_event::Kind::SubagentSpawned(s)) => {
+                    if s.group.is_empty() {
+                        children.remove(&s.child_session_id);
+                    } else {
+                        children.insert(s.child_session_id.clone(), s);
+                    }
+                }
+                Some(session_event::Kind::NoticeQueued(n)) => {
+                    if let Some(t) = &n.task_notice
+                        && !t.session_id.is_empty()
+                    {
+                        finished.insert(t.session_id.clone());
+                        if matches!(t.status.as_str(), "failed" | "lost" | "error") {
+                            failed.insert(t.session_id.clone());
+                        }
+                    }
+                    previous.insert(n.command_id.clone(), n.clone());
+                }
+                _ => {}
+            }
+        }
+        // Tool background completions name the task, while direct child and
+        // remote reports name the session. Both belong to the same fan-in.
+        for n in previous.values() {
+            if let Some(s) = children
+                .values()
+                .find(|s| !s.background_task_id.is_empty() && n.command_id.starts_with(&format!("task:{}:", s.background_task_id)))
+            {
+                finished.insert(s.child_session_id.clone());
+                if n.task_notice.as_ref().is_some_and(|t| matches!(t.status.as_str(), "failed" | "lost" | "error")) {
+                    failed.insert(s.child_session_id.clone());
+                }
+            }
+        }
+        for s in children.values() {
+            groups.entry(s.group.clone()).or_default().push(*s);
+        }
+        let now = tokio::time::Instant::now();
+        let quiet = std::time::Duration::from_secs(u64::from(if self.spec.notice_quiet_seconds == 0 {
+            c6_api::DEFAULT_NOTICE_QUIET_SECONDS
+        } else {
+            self.spec.notice_quiet_seconds
+        }));
+        let max_wait = std::time::Duration::from_secs(u64::from(if self.spec.notice_max_wait_seconds == 0 {
+            c6_api::DEFAULT_NOTICE_MAX_WAIT_SECONDS
+        } else {
+            self.spec.notice_max_wait_seconds
+        }));
+        let member_of = |input: &PendingInput| {
+            input.task_notice.as_ref().and_then(|t| children.get(&t.session_id)).copied().or_else(|| {
+                children
+                    .values()
+                    .copied()
+                    .find(|s| !s.background_task_id.is_empty() && input.command_id.starts_with(&format!("task:{}:", s.background_task_id)))
+            })
+        };
+        // A group barrier or a non-waking watcher is not the first arrival
+        // of an unrelated merge window, however long it has been waiting.
+        let arrivals: Vec<_> = self
+            .deferred
+            .iter()
+            .filter(|(input, wake)| *wake && member_of(input).is_none())
+            .filter_map(|(input, _)| self.notice_arrivals.get(&input.command_id).copied())
+            .collect();
+        let merge_at =
+            (arrivals.iter().max().copied().unwrap_or(now) + quiet).min(arrivals.iter().min().copied().unwrap_or(now) + max_wait);
+        let mut updates = Vec::new();
+        let count = self.deferred.len();
+        let mut represented = HashSet::new();
+        for (input, wake) in &mut self.deferred {
+            let member = member_of(input);
+            // One representative carries each barrier's live count and ETA.
+            // Rewriting every report on every arrival would copy O(N²) report
+            // bytes into the journal during the large fan-outs this supports.
+            let key =
+                if !*wake { input.command_id.clone() } else { member.map_or_else(|| "merge".to_owned(), |s| format!("group:{}", s.group)) };
+            let representative = represented.insert(key);
+            let (ready, immediate, waiting) = if let Some(s) = member {
+                let members = &groups[&s.group];
+                // Task acknowledges background launch before its detached
+                // runner necessarily links the child. Count logged calls too,
+                // so an already acknowledged sibling cannot be missed.
+                let total = group_calls
+                    .get(&s.group)
+                    .map_or(members.len(), |calls| calls.iter().filter(|id| !rejected_calls.contains(*id)).count().max(members.len()));
+                let done = members.iter().filter(|s| finished.contains(&s.child_session_id)).count();
+                let failures = members.iter().filter(|s| failed.contains(&s.child_session_id)).count();
+                let target = match s.wake.as_str() {
+                    "any" => 1,
+                    w if w.starts_with("count:") => w[6..].parse::<usize>().unwrap_or(total),
+                    _ => total,
+                };
+                let failure = input.task_notice.as_ref().is_some_and(|t| matches!(t.status.as_str(), "failed" | "lost" | "error"));
+                let ready = failure || failures > 0 || done >= target;
+                if ready {
+                    let summary = format!("group {}: {done} of {total} finished, {failures} failed", s.group);
+                    let body = if input.text.starts_with(&format!("group {}:", s.group)) {
+                        input.text.split_once("\n\n").map_or(input.text.as_str(), |(_, body)| body)
+                    } else {
+                        &input.text
+                    };
+                    input.text = format!("{summary}\n\n{body}");
+                }
+                (ready, true, format!("waiting for {target} of {total} in group {} ({done} finished)", s.group))
+            } else {
+                let failure = input.task_notice.as_ref().is_some_and(|t| matches!(t.status.as_str(), "failed" | "lost" | "error"));
+                (true, failure, format!("merging {count} reports"))
+            };
+            let deliver = if *wake && ready && self.notice_pause.is_none() {
+                self.notice_ready.insert(input.command_id.clone());
+                let at = if immediate { now } else { merge_at };
+                self.notice_deadline = Some(self.notice_deadline.map_or(at, |old| old.min(at)));
+                if representative { c6_core::now_ms() + at.saturating_duration_since(now).as_millis() as i64 } else { 0 }
+            } else {
+                0
+            };
+            let reason = self.notice_pause.clone().unwrap_or_else(|| {
+                if !*wake {
+                    "waiting for your next message".into()
+                } else if representative {
+                    waiting
+                } else {
+                    member.map_or_else(|| "merging reports".to_owned(), |s| format!("waiting for group {}", s.group))
+                }
+            });
+            let updated = Self::queued_notice(input, *wake, reason, deliver);
+            if previous.get(&input.command_id) != Some(&updated) {
+                updates.push(updated);
+            }
+        }
+        for n in updates {
+            self.writer.append(session_event::Kind::NoticeQueued(n)).await?;
+        }
+        Ok(())
+    }
+
+    async fn release_held(&mut self) -> anyhow::Result<()> {
+        if !self.link.is_connected() || self.notice_pause.is_some() {
+            return Ok(());
+        }
+        let now = tokio::time::Instant::now();
+        if self.notice_deadline.is_none_or(|at| at > now) {
+            return Ok(());
+        }
+        // Only release eligible members: unrelated groups keep their barrier.
+        let mut waiting = Vec::new();
+        for (n, wake) in std::mem::take(&mut self.deferred) {
+            if self.notice_ready.contains(&n.command_id) || !wake {
+                self.notice_arrivals.remove(&n.command_id);
+                self.inbox.lock().unwrap().push(n, None);
+            } else {
+                waiting.push((n, wake));
+            }
+        }
+        self.deferred = waiting;
+        self.notice_deadline = None;
+        self.notice_ready.clear();
+        Ok(())
     }
 
     /// A notice for the agent (docs/background.md §5). It is recorded first
@@ -3737,23 +4001,7 @@ impl Actor {
         if !self.noticed.insert(input.command_id.clone()) {
             return Ok(());
         }
-        let queued = c6_proto::NoticeQueued {
-            command_id: input.command_id.clone(),
-            text: input.text.clone(),
-            command: input.command.clone(),
-            wake,
-            prompt: input.prompt.clone(),
-            from_session_id: input.from_session_id.clone(),
-            from_title: input.from_title.clone(),
-            hops: input.hops,
-            task_notice: input.task_notice.clone(),
-            deliver_at_ms: if wake && !busy && self.inbox.lock().unwrap().queue.is_empty() {
-                let delay = self.next_auto_turn().saturating_duration_since(tokio::time::Instant::now());
-                if delay.is_zero() { 0 } else { c6_core::now_ms() + delay.as_millis() as i64 }
-            } else {
-                0
-            },
-        };
+        let queued = Self::queued_notice(&input, wake, String::new(), 0);
         if let Err(e) = self.writer.append(session_event::Kind::NoticeQueued(queued)).await {
             self.noticed.remove(&input.command_id);
             // The head does not redeliver tool callbacks. Keep this input
@@ -3768,10 +4016,9 @@ impl Actor {
     }
 
     /// Delivers a notice: it joins a running turn at its next step; in an
-    /// idle session it starts a turn if `wake` (within the hourly limit;
-    /// beyond it, once the hour allows), else it waits for the next input.
-    /// `announce`: say so in the log when the limit holds it.
-    async fn deliver_notice(&mut self, input: PendingInput, busy: bool, wake: bool, announce: bool) -> anyhow::Result<()> {
+    /// idle session it joins a merge/group window if `wake`, else it waits
+    /// for the next explicit input. Guards explain every pause to the user.
+    async fn deliver_notice(&mut self, input: PendingInput, busy: bool, wake: bool, _announce: bool) -> anyhow::Result<()> {
         if self.withdrawn_input(&input) {
             return Ok(());
         }
@@ -3780,6 +4027,9 @@ impl Actor {
             self.session_tools.set_message_hops(input.hops);
         }
         if busy || !self.inbox.lock().unwrap().queue.is_empty() {
+            self.notice_arrivals.clear();
+            self.notice_deadline = None;
+            self.notice_ready.clear();
             let mut inbox = self.inbox.lock().unwrap();
             for (held, _) in std::mem::take(&mut self.deferred) {
                 inbox.push(held, None);
@@ -3787,40 +4037,11 @@ impl Actor {
             inbox.push(input, None);
             return Ok(());
         }
-        if !wake {
-            self.deferred.push((input, false));
-            return Ok(());
+        self.notice_arrivals.entry(input.command_id.clone()).or_insert_with(tokio::time::Instant::now);
+        if !self.deferred.iter().any(|(n, _)| n.command_id == input.command_id) {
+            self.deferred.push((input, wake));
         }
-        if !self.link.is_connected() {
-            self.deferred.push((input, true));
-            return Ok(());
-        }
-        if self.take_auto_turn() {
-            let mut inbox = self.inbox.lock().unwrap();
-            for (held, _) in std::mem::take(&mut self.deferred) {
-                inbox.push(held, None);
-            }
-            inbox.push(input, None);
-            return Ok(());
-        }
-        warn!(session = %self.writer.session_id, notice = %input.command_id, "notice held: too many automatic turns this hour");
-        let limit = self.auto_turn_limit();
-        let what = match input.command_id.strip_prefix("task:").and_then(|t| t.split(':').next()) {
-            Some(task) => format!("Background task {task} ended."),
-            None => "A notice for the agent is waiting.".to_owned(),
-        };
-        self.deferred.push((input, true));
-        if !announce {
-            return Ok(());
-        }
-        self.writer
-            .append(session_event::Kind::Error(ErrorEvent {
-                message: format!(
-                    "{what} Notices already started {limit} turns in the last hour, so the agent hears about it once the hour allows, or with your next message."
-                ),
-            }))
-            .await?;
-        Ok(())
+        self.schedule_notices().await
     }
 
     /// Logs a background task's start or end and, for an end the agent
@@ -4425,6 +4646,7 @@ impl Actor {
         let mut all: Vec<Arc<dyn Tool>> = vec![
             Arc::new(
                 c6_tools::Task::with_agents(true, agents)
+                    .with_group_guidance(spec_prompt(&self.spec, "session.subagent_group", ""))
                     .with_connections(connections)
                     .with_templates(&templates_intro(&self.spec), templates)
                     .stopped_with("mcp__carbon6__TaskStop"),
@@ -5227,11 +5449,10 @@ fn builtin_tools(
     let agents = session_agents(spec, labels);
     let connections = task_connections(spec);
     let templates = task_templates(spec);
-    if (!agents.is_empty() || !connections.is_empty() || !templates.is_empty())
-        && let Some(i) = tools.iter().position(|t| c6_tools::Task::is_task(&t.spec().name))
-    {
+    if let Some(i) = tools.iter().position(|t| c6_tools::Task::is_task(&t.spec().name)) {
         tools[i] = Arc::new(
             c6_tools::Task::with_agents(profile == ToolProfile::Claude, agents)
+                .with_group_guidance(spec_prompt(spec, "session.subagent_group", ""))
                 .with_connections(connections)
                 .with_templates(&templates_intro(spec), templates),
         );
@@ -6785,8 +7006,7 @@ mod notice_tests {
         session_event::Kind::TurnStarted(TurnStarted::default())
     }
 
-    /// A reload delivers the notices no turn took, and knows which turns
-    /// notices started (they count toward the hourly limit).
+    /// A reload delivers the notices no turn took and retains notice provenance.
     #[test]
     fn a_log_says_which_notices_are_pending_and_which_turns_they_started() {
         let events = [
@@ -6806,19 +7026,22 @@ mod notice_tests {
         assert_eq!(pending, [("subagent:s", "about subagent:s", false), ("task:bg2:finished", "about task:bg2:finished", true)]);
     }
 
-    /// A log at the default limit, with no open task or turn: the case
-    /// startup recovery used to leave without an actor (and thus a timer).
-    async fn at_limit() -> (tempfile::TempDir, SessionManager, c6_testkit::MockLlm) {
+    const QUIET: std::time::Duration = std::time::Duration::from_secs(3);
+    const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+    const SECOND: std::time::Duration = std::time::Duration::from_secs(1);
+    // Tokio rounds timer deadlines up to the next clock tick.
+    const TICK: std::time::Duration = std::time::Duration::from_millis(1);
+
+    async fn idle_session() -> (tempfile::TempDir, SessionManager, c6_testkit::MockLlm) {
         let dir = tempfile::tempdir().unwrap();
         let mock = c6_testkit::MockLlm::start().await;
         let journal = Arc::new(Journal::open(&dir.path().join("journal.db")).await.unwrap());
         let model =
             ModelSpec { connection_id: "mock".into(), connection_kind: "openai_compat".into(), model: "m".into(), ..Default::default() };
         let spec = CreateSession { model: Some(model.clone()), cwd: dir.path().display().to_string(), ..Default::default() };
-        let now = c6_core::now_ms();
-        let mut events = vec![ev(
+        let events = [ev(
             1,
-            now,
+            c6_core::now_ms(),
             session_event::Kind::Started(SessionStarted {
                 model: Some(model),
                 cwd: spec.cwd.clone(),
@@ -6826,16 +7049,6 @@ mod notice_tests {
                 ..Default::default()
             }),
         )];
-        for i in 0..AUTO_TURNS_PER_HOUR {
-            for kind in [
-                queued(&format!("n{i}"), true),
-                user(&format!("n{i}")),
-                turn(),
-                session_event::Kind::TurnEnded(TurnEnded { turn: i as u64 + 1, reason: TurnEndReason::Completed as i32 }),
-            ] {
-                events.push(ev(events.len() as u64 + 1, now, kind));
-            }
-        }
         journal.import("held", &spec, &events).await.unwrap();
         let manager =
             SessionManager::new(journal, Arc::new(HeadLink::local(Arc::new(Head(mock.base_url())))), dir.path().join("worktrees"));
@@ -6843,7 +7056,7 @@ mod notice_tests {
     }
 
     // External I/O (SQLite and the mock server) must progress without
-    // Tokio automatically jumping to the hourly timer while we await it.
+    // Tokio automatically jumping to a merge deadline while we await it.
     fn pause_clock() -> tokio_util::task::AbortOnDropHandle<()> {
         tokio::time::pause();
         tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async {
@@ -6854,57 +7067,81 @@ mod notice_tests {
     }
 
     async fn logged(manager: &SessionManager, predicate: impl Fn(&[SessionEvent]) -> bool) -> Vec<SessionEvent> {
-        c6_testkit::within("the notice actor to record its work", async {
-            loop {
-                let events = manager.journal.events_after("held", 0, u32::MAX).await.unwrap();
-                if predicate(&events) {
-                    return events;
-                }
-                tokio::task::yield_now().await;
+        // Use real time only as a watchdog: the Tokio clock may be paused.
+        let deadline = std::time::Instant::now() + c6_testkit::wait::deadline();
+        loop {
+            let events = manager.journal.events_after("held", 0, u32::MAX).await.unwrap();
+            if predicate(&events) {
+                return events;
             }
-        })
-        .await
+            assert!(std::time::Instant::now() < deadline, "notice actor did not record its work");
+            tokio::task::yield_now().await;
+        }
     }
 
-    async fn hold(manager: &SessionManager) -> mpsc::UnboundedSender<ActorMsg> {
+    async fn enqueue_reports(manager: &SessionManager, reports: std::ops::Range<usize>, wake: bool) {
         let tx = manager.actor("held").await.unwrap().unwrap();
-        for text in ["report 21", "report 22"] {
+        for number in reports.clone() {
+            let text = format!("report #{number}.");
             tx.send(ActorMsg::ChildReport {
                 command_id: format!("subagent:{text}"),
                 recorded: tokio::sync::oneshot::channel().0,
-                text: text.into(),
-                wake: true,
-                task_notice: Some(crate::subagent::task_report_notice("Review", "child", TurnEndReason::Completed, text)),
+                task_notice: Some(crate::subagent::task_report_notice("Review", "child", TurnEndReason::Completed, &text)),
+                text,
+                wake,
                 inline: None,
             })
             .unwrap();
         }
+        barrier(manager, &format!("queued-{}-{}", reports.start, reports.end)).await;
+    }
+
+    async fn assert_waiting(manager: &SessionManager, mock: &c6_testkit::MockLlm, count: usize) {
+        assert_waiting_after(manager, mock, count, 0).await;
+    }
+
+    async fn assert_waiting_after(manager: &SessionManager, mock: &c6_testkit::MockLlm, count: usize, after: u64) {
+        let events = manager.journal.events_after("held", 0, u32::MAX).await.unwrap();
+        assert_eq!(notices_of(&events).2.len(), count, "each report must remain durably pending while waiting");
+        assert!(
+            !events
+                .iter()
+                .filter(|e| e.seq > after)
+                .any(|e| matches!(&e.kind, Some(session_event::Kind::User(_) | session_event::Kind::TurnStarted(_))))
+        );
+        assert!(mock.requests().is_empty(), "merging or held notices must not start a model request");
+    }
+
+    async fn completed_batch(manager: &SessionManager, mock: &c6_testkit::MockLlm) -> (Vec<SessionEvent>, String) {
+        completed_batch_after(manager, mock, 0).await
+    }
+
+    async fn completed_batch_after(manager: &SessionManager, mock: &c6_testkit::MockLlm, after: u64) -> (Vec<SessionEvent>, String) {
+        // Require delivery to start at the simulated deadline, before resuming
+        // real time for the mock's streaming timers.
+        logged(manager, |events| events.iter().any(|e| e.seq > after && matches!(&e.kind, Some(session_event::Kind::TurnStarted(_)))))
+            .await;
+        tokio::time::resume();
         let events =
-            logged(manager, |events| events.iter().filter(|e| matches!(e.kind, Some(session_event::Kind::Error(_)))).count() == 2).await;
-        let held: Vec<_> = events
+            logged(manager, |events| events.iter().any(|e| e.seq > after && matches!(&e.kind, Some(session_event::Kind::TurnEnded(_)))))
+                .await;
+        let ends: Vec<_> = events
             .iter()
+            .filter(|e| e.seq > after)
             .filter_map(|e| match &e.kind {
-                Some(session_event::Kind::NoticeQueued(n)) if n.text.starts_with("report ") => Some(n),
+                Some(session_event::Kind::TurnEnded(t)) => Some(t.reason),
                 _ => None,
             })
             .collect();
-        assert_eq!(held.len(), 2);
-        assert!(held.iter().all(|n| n.task_notice.as_ref().is_some_and(|m| m.title == "Review" && m.session_id == "child")));
-        assert!(held.iter().all(|n| n.deliver_at_ms > c6_core::now_ms()), "the UI gets the next free slot");
-        tx
+        assert_eq!(ends, [TurnEndReason::Completed as i32], "the batch should complete in one turn");
+        assert!(notices_of(&events).2.is_empty(), "no delivered report may remain pending in the journal");
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1, "one turn takes the whole held batch");
+        (events, requests[0].to_string())
     }
 
-    async fn delivered(manager: &SessionManager, mock: &c6_testkit::MockLlm) {
-        // Only the hourly wait is simulated. The mock streams chunks on
-        // short timers, and the model's I/O must run on a live clock.
-        tokio::time::resume();
-        let events =
-            logged(manager, |events| events.iter().filter(|e| matches!(e.kind, Some(session_event::Kind::TurnEnded(_)))).count() == 21)
-                .await;
-        assert_eq!(mock.requests().len(), 1, "one turn takes the whole held batch");
-        let request = mock.requests()[0].to_string();
-        assert!(request.contains("report 21") && request.contains("report 22"), "{request}");
-        assert!(notices_of(&events).2.is_empty());
+    async fn delivered(manager: &SessionManager, mock: &c6_testkit::MockLlm, count: usize) {
+        let (events, request) = completed_batch(manager, mock).await;
         let delivered: Vec<_> = events
             .iter()
             .filter_map(|e| match &e.kind {
@@ -6912,82 +7149,439 @@ mod notice_tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(delivered.len(), 2);
-        assert!(delivered.iter().all(|u| u.task_notice.as_ref().is_some_and(|m| m.markdown == u.text)));
+        assert_eq!(delivered.len(), count);
+        for number in 1..=count {
+            let text = format!("report #{number}.");
+            assert!(request.contains(&text), "missing {text} in {request}");
+            let matching: Vec<_> = delivered.iter().filter(|u| u.text == text).collect();
+            assert_eq!(matching.len(), 1, "each queued report must be recorded as consumed exactly once");
+            let metadata = matching[0].task_notice.as_ref().expect("the delivered report retains its metadata");
+            assert_eq!(metadata.title, "Review");
+            assert_eq!(metadata.session_id, "child");
+            assert_eq!(metadata.markdown, text);
+        }
+    }
+
+    const GROUP_SIZE: usize = 5;
+
+    fn audit_spawn(number: usize, wake: &str) -> session_event::Kind {
+        session_event::Kind::SubagentSpawned(c6_proto::SubagentSpawned {
+            call_id: format!("call-{number}"),
+            child_session_id: format!("audit-child-{number}"),
+            background_task_id: format!("audit-task-{number}"),
+            description: format!("Audit part {number}"),
+            group: "audit".into(),
+            wake: wake.into(),
+            ..Default::default()
+        })
+    }
+
+    async fn seed_audit_group(manager: &SessionManager, wake: &str) {
+        // Seed launches before starting the actor, just as replay sees them.
+        let now = c6_core::now_ms();
+        for number in 1..=GROUP_SIZE {
+            manager.journal.append("held", &ev(number as u64 + 1, now, audit_spawn(number, wake))).await.unwrap();
+        }
+    }
+
+    async fn enqueue_audit_reports(manager: &SessionManager, reports: std::ops::RangeInclusive<usize>, reason: TurnEndReason) {
+        let tx = manager.actor("held").await.unwrap().unwrap();
+        for number in reports.clone() {
+            let child = format!("audit-child-{number}");
+            let text = format!("audit report #{number}.");
+            tx.send(ActorMsg::ChildReport {
+                command_id: format!("subagent:{child}"),
+                recorded: tokio::sync::oneshot::channel().0,
+                task_notice: Some(crate::subagent::task_report_notice("Audit", &child, reason, &text)),
+                text,
+                wake: true,
+                inline: None,
+            })
+            .unwrap();
+        }
+        barrier(manager, &format!("queued-audit-{}-{}", reports.start(), reports.end())).await;
+    }
+
+    async fn audit_delivered(manager: &SessionManager, mock: &c6_testkit::MockLlm, count: usize, failures: usize) {
+        // A ready group should turn without the ordinary 3s merge delay.
+        tokio::time::advance(TICK).await;
+        let (events, request) = completed_batch(manager, mock).await;
+        assert_audit_batch(&events, &request, count, GROUP_SIZE, failures);
+    }
+
+    fn assert_audit_batch(events: &[SessionEvent], request: &str, count: usize, total: usize, failures: usize) {
+        let summary = format!("group audit: {count} of {total} finished, {failures} failed");
+        assert!(request.contains(&summary), "missing {summary} in {request}");
+        let mut children: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Some(session_event::Kind::User(u)) => u.task_notice.as_ref().map(|n| n.session_id.clone()),
+                _ => None,
+            })
+            .collect();
+        children.sort();
+        assert_eq!(children, (1..=count).map(|n| format!("audit-child-{n}")).collect::<Vec<_>>());
+        for number in 1..=count {
+            assert!(request.contains(&format!("audit report #{number}.")), "missing audit report #{number} in {request}");
+        }
+    }
+
+    async fn audit_threshold(wake: &str, target: usize) {
+        let (_dir, manager, mock) = idle_session().await;
+        seed_audit_group(&manager, wake).await;
+        let _clock = pause_clock();
+        mock.push(c6_testkit::Reply::Text("Saw the audit reports.".into()));
+        if target > 1 {
+            enqueue_audit_reports(&manager, 1..=target - 1, TurnEndReason::Completed).await;
+            assert_waiting(&manager, &mock, target - 1).await;
+            tokio::time::advance(MAX_WAIT + TICK).await;
+            barrier(&manager, "group-still-waiting").await;
+            assert_waiting(&manager, &mock, target - 1).await;
+        }
+        enqueue_audit_reports(&manager, target..=target, TurnEndReason::Completed).await;
+        audit_delivered(&manager, &mock, target, 0).await;
     }
 
     #[tokio::test]
-    async fn the_twenty_first_notice_delivers_itself_when_the_hour_frees_up() {
-        let (_dir, manager, mock) = at_limit().await;
-        let _clock = pause_clock();
-        let _tx = hold(&manager).await;
-        assert!(mock.requests().is_empty(), "the 21st notice is held");
-        tokio::time::advance(HOUR - std::time::Duration::from_secs(1)).await;
-        assert!(mock.requests().is_empty(), "not before a counted turn expires");
-        mock.push(c6_testkit::Reply::Text("Saw the batch.".into()));
-        tokio::time::advance(std::time::Duration::from_secs(1)).await;
-        delivered(&manager, &mock).await;
+    async fn audit_group_all_wakes_once_for_the_fifth_report() {
+        audit_threshold("all", GROUP_SIZE).await;
     }
 
     #[tokio::test]
-    async fn deliver_now_bypasses_the_hourly_timer() {
-        let (_dir, manager, mock) = at_limit().await;
+    async fn audit_group_count_wakes_at_its_configured_threshold() {
+        audit_threshold("count:3", 3).await;
+    }
+
+    #[tokio::test]
+    async fn audit_group_any_wakes_for_the_first_report() {
+        audit_threshold("any", 1).await;
+    }
+
+    #[tokio::test]
+    async fn audit_group_failure_wakes_immediately_with_four_children_unfinished() {
+        let (_dir, manager, mock) = idle_session().await;
+        seed_audit_group(&manager, "all").await;
         let _clock = pause_clock();
-        let tx = hold(&manager).await;
-        mock.push(c6_testkit::Reply::Text("Saw them now.".into()));
+        mock.push(c6_testkit::Reply::Text("Saw the audit failure.".into()));
+        enqueue_audit_reports(&manager, 1..=1, TurnEndReason::Error).await;
+        audit_delivered(&manager, &mock, 1, 1).await;
+    }
+
+    fn task_calls(turn: u64, tasks: &[(&str, &str)], group: Option<&str>) -> session_event::Kind {
+        let blocks = tasks
+            .iter()
+            .map(|&(id, description)| {
+                let mut input = serde_json::json!({ "description": description, "prompt": description, "run_in_background": true });
+                if let Some(group) = group {
+                    input["group"] = group.into();
+                    input["wake"] = "all".into();
+                }
+                c6_proto::ContentBlock {
+                    block: Some(c6_proto::content_block::Block::ToolUse(c6_proto::ToolUse {
+                        id: id.into(),
+                        name: "Task".into(),
+                        input_json: input.to_string(),
+                    })),
+                    ..Default::default()
+                }
+            })
+            .collect();
+        session_event::Kind::Assistant(c6_proto::AssistantMessage { turn, blocks, ..Default::default() })
+    }
+
+    fn task_ack(call: &str) -> session_event::Kind {
+        session_event::Kind::ToolResult(c6_proto::ToolResult {
+            call_id: call.into(),
+            tool: "Task".into(),
+            output: "Started in the background".into(),
+            ..Default::default()
+        })
+    }
+
+    fn started_turn(turn: u64) -> session_event::Kind {
+        session_event::Kind::TurnStarted(TurnStarted { turn, ..Default::default() })
+    }
+
+    fn ended_turn(turn: u64) -> session_event::Kind {
+        session_event::Kind::TurnEnded(TurnEnded { turn, reason: TurnEndReason::Completed as i32 })
+    }
+
+    async fn append_seed(journal: &Journal, after: u64, kinds: impl IntoIterator<Item = session_event::Kind>) -> u64 {
+        let now = c6_core::now_ms();
+        let mut seq = after;
+        for kind in kinds {
+            seq += 1;
+            journal.append("held", &ev(seq, now, kind)).await.unwrap();
+        }
+        seq
+    }
+
+    #[tokio::test]
+    async fn audit_group_waits_for_a_logged_task_call_whose_child_is_not_linked_yet() {
+        let (dir, manager, mock) = idle_session().await;
+        let initial = append_seed(
+            &manager.journal,
+            1,
+            [
+                user("audit-request"),
+                started_turn(1),
+                task_calls(1, &[("call-1", "Audit part 1"), ("call-2", "Audit part 2")], Some("audit")),
+                task_ack("call-1"),
+                task_ack("call-2"),
+                audit_spawn(1, "all"),
+                ended_turn(1),
+            ],
+        )
+        .await;
+
+        let _clock = pause_clock();
+        enqueue_audit_reports(&manager, 1..=1, TurnEndReason::Completed).await;
+        tokio::time::advance(MAX_WAIT + TICK).await;
+        barrier(&manager, "unlinked-sibling-still-pending").await;
+        assert_waiting_after(&manager, &mock, 1, initial).await;
+        let (spec, events) = manager.journal.load_session("held").await.unwrap().unwrap();
+        let reason = events.iter().rev().find_map(|e| match &e.kind {
+            Some(session_event::Kind::NoticeQueued(n)) if n.command_id == "subagent:audit-child-1" => Some(n.reason.as_str()),
+            _ => None,
+        });
+        assert_eq!(reason, Some("waiting for 2 of 2 in group audit (1 finished)"));
+
+        // Replay the same pending report in a separate journal so the live
+        // actor's sequence counter never races a direct test append.
+        let journal = Arc::new(Journal::open(&dir.path().join("replay.db")).await.unwrap());
+        journal.import("held", &spec, &events).await.unwrap();
+        append_seed(&journal, events.last().unwrap().seq, [audit_spawn(2, "all")]).await;
+        let replay = SessionManager::new(journal, manager.link.clone(), dir.path().join("replay/worktrees"));
+        mock.push(c6_testkit::Reply::Text("Saw both audit reports.".into()));
+        enqueue_audit_reports(&replay, 2..=2, TurnEndReason::Completed).await;
+        tokio::time::advance(TICK).await;
+        let (events, request) = completed_batch_after(&replay, &mock, initial).await;
+        assert_audit_batch(&events, &request, 2, 2, 0);
+    }
+
+    #[tokio::test]
+    async fn repeated_failure_notifies_and_holds_until_continue() {
+        use session_event::Kind;
+
+        const DESCRIPTION: &str = "Run the same failing task";
+        const PAUSED: &str = "paused: repeated failure of Run the same failing task";
+        let (_dir, manager, mock) = idle_session().await;
+        let mut history = vec![user("direct-request")];
+        for launch in 0..=4 {
+            if launch != 0 {
+                let command_id = format!("task:retry-{}:failed", launch - 1);
+                let task_notice = Some(c6_proto::TaskNotice {
+                    title: DESCRIPTION.into(),
+                    status: "failed".into(),
+                    markdown: "Same failure.".into(),
+                    ..Default::default()
+                });
+                let text = format!("Failure wrapper from task {}.", launch - 1);
+                history.push(Kind::NoticeQueued(c6_proto::NoticeQueued {
+                    command_id: command_id.clone(),
+                    task_notice: task_notice.clone(),
+                    wake: true,
+                    text: text.clone(),
+                    ..Default::default()
+                }));
+                history.push(Kind::User(c6_proto::UserMessage { command_id, task_notice, text, ..Default::default() }));
+            }
+            let turn = launch + 1;
+            let call = format!("retry-call-{launch}");
+            let task = BackgroundTask {
+                task_id: format!("retry-{launch}"),
+                description: DESCRIPTION.into(),
+                state: "started".into(),
+                ..Default::default()
+            };
+            history.extend([
+                started_turn(turn),
+                task_calls(turn, &[(&call, DESCRIPTION)], None),
+                task_ack(&call),
+                Kind::BackgroundTask(task.clone()),
+                ended_turn(turn),
+                Kind::BackgroundTask(BackgroundTask { state: "failed".into(), exit_code: 1, ..task }),
+            ]);
+        }
+        let initial = append_seed(&manager.journal, 1, history).await;
+        let _clock = pause_clock();
+        enqueue_reports(&manager, 1..2, true).await;
+        tokio::time::advance(MAX_WAIT + TICK).await;
+        barrier(&manager, "still-paused").await;
+        assert_waiting_after(&manager, &mock, 1, initial).await;
+
+        let events = manager.journal.events_after("held", initial, u32::MAX).await.unwrap();
+        let latest = events
+            .iter()
+            .rev()
+            .find_map(|e| match &e.kind {
+                Some(Kind::NoticeQueued(n)) => Some(n),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(latest.reason, PAUSED);
+        assert_eq!(latest.deliver_at_ms, 0, "paused notices have no automatic delivery deadline");
+        assert_eq!(
+            events.iter().filter(|e| matches!(&e.kind, Some(Kind::Notice(n)) if !n.quiet && n.message.starts_with(PAUSED))).count(),
+            1
+        );
+
+        mock.push(c6_testkit::Reply::Text("Continued after the pause.".into()));
+        let tx = manager.actor("held").await.unwrap().unwrap();
+        let limits = c6_proto::NoticeLimits {
+            notice_quiet_seconds: 7,
+            notice_max_wait_seconds: 41,
+            notice_no_progress_limit: 8,
+            notice_failure_relaunch_limit: 6,
+            notice_tokens_per_hour: 7_000_000,
+        };
+        tx.send(ActorMsg::NoticeLimits(limits)).unwrap();
         tx.send(ActorMsg::ReleaseNotices).unwrap();
-        delivered(&manager, &mock).await;
+        let (events, request) = completed_batch_after(&manager, &mock, initial).await;
+        assert!(request.contains("report #1."), "the held report should reach the model after Continue");
+        let marker = events
+            .iter()
+            .find(|e| matches!(&e.kind, Some(Kind::Notice(n)) if n.quiet && n.title == crate::notice_guard::CONTINUED_TITLE))
+            .unwrap();
+        let delivery = events.iter().find(|e| matches!(&e.kind, Some(Kind::User(u)) if u.text == "report #1.")).unwrap();
+        assert!(marker.seq < delivery.seq, "Continue must reset the guard durably before delivering the report");
+        assert_eq!(crate::notice_guard::evaluate(&events, c6_core::now_ms(), 5, 3, 5_000_000), None);
+
+        let (mut spec, events) = manager.journal.load_session("held").await.unwrap().unwrap();
+        assert_ne!(spec.notice_quiet_seconds, limits.notice_quiet_seconds, "the imported spec precedes the refresh");
+        let _ = conversation_from_log(&mut spec, &events);
+        assert_eq!(spec.notice_quiet_seconds, limits.notice_quiet_seconds);
+        assert_eq!(spec.notice_max_wait_seconds, limits.notice_max_wait_seconds);
+        assert_eq!(spec.notice_no_progress_limit, limits.notice_no_progress_limit);
+        assert_eq!(spec.notice_failure_relaunch_limit, limits.notice_failure_relaunch_limit);
+        assert_eq!(spec.notice_tokens_per_hour, limits.notice_tokens_per_hour);
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_twenty_reports_starts_one_turn_after_the_quiet_window() {
+        let (_dir, manager, mock) = idle_session().await;
+        let _clock = pause_clock();
+        mock.push(c6_testkit::Reply::Text("Saw the batch.".into()));
+        enqueue_reports(&manager, 1..21, true).await;
+        assert_waiting(&manager, &mock, 20).await;
+        let events = manager.journal.events_after("held", 0, u32::MAX).await.unwrap();
+        let mut latest = HashMap::new();
+        let mut snapshots = 0;
+        for event in &events {
+            if let Some(session_event::Kind::NoticeQueued(n)) = &event.kind {
+                snapshots += 1;
+                latest.insert(&n.command_id, n);
+            }
+        }
+        assert_eq!(latest.len(), 20);
+        assert!(snapshots <= 4 * latest.len(), "live counts must not rewrite every full report on every arrival: {snapshots}");
+        assert!(latest.values().all(|n| n.reason.starts_with("merging")), "the UI shows why every report is waiting");
+        tokio::time::advance(QUIET - SECOND).await;
+        barrier(&manager, "before-quiet").await;
+        assert_waiting(&manager, &mock, 20).await;
+        tokio::time::advance(SECOND + TICK).await;
+        delivered(&manager, &mock, 20).await;
+    }
+
+    #[tokio::test]
+    async fn a_new_report_restarts_the_quiet_window() {
+        let (_dir, manager, mock) = idle_session().await;
+        let _clock = pause_clock();
+        mock.push(c6_testkit::Reply::Text("Saw both reports.".into()));
+        enqueue_reports(&manager, 1..2, true).await;
+        tokio::time::advance(QUIET - SECOND).await;
+        enqueue_reports(&manager, 2..3, true).await;
+        tokio::time::advance(QUIET - SECOND).await;
+        barrier(&manager, "past-original-deadline").await;
+        assert_waiting(&manager, &mock, 2).await;
+        tokio::time::advance(SECOND + TICK).await;
+        delivered(&manager, &mock, 2).await;
+    }
+
+    #[tokio::test]
+    async fn sustained_arrivals_cannot_push_delivery_past_the_maximum_wait() {
+        let (_dir, manager, mock) = idle_session().await;
+        let _clock = pause_clock();
+        mock.push(c6_testkit::Reply::Text("Saw the full batch.".into()));
+        let interval = QUIET - SECOND;
+        let count = ((MAX_WAIT - SECOND).as_secs() / interval.as_secs()) as usize + 1;
+        for number in 1..=count {
+            if number > 1 {
+                tokio::time::advance(interval).await;
+            }
+            enqueue_reports(&manager, number..number + 1, true).await;
+            assert_waiting(&manager, &mock, number).await;
+        }
+        // The last report arrived at t=28, so quiet alone would wait until t=31.
+        tokio::time::advance(SECOND).await;
+        barrier(&manager, "before-max-wait").await;
+        assert_waiting(&manager, &mock, count).await;
+        tokio::time::advance(SECOND + TICK).await;
+        delivered(&manager, &mock, count).await;
+    }
+
+    #[tokio::test]
+    async fn deliver_now_bypasses_the_merge_window_without_delivering_twice() {
+        let (_dir, manager, mock) = idle_session().await;
+        let _clock = pause_clock();
+        enqueue_reports(&manager, 1..3, true).await;
+        assert_waiting(&manager, &mock, 2).await;
+        mock.push(c6_testkit::Reply::Text("Saw them now.".into()));
+        manager.actor("held").await.unwrap().unwrap().send(ActorMsg::ReleaseNotices).unwrap();
+        delivered(&manager, &mock, 2).await;
         tokio::time::pause();
-        tokio::time::advance(HOUR).await;
+        tokio::time::advance(MAX_WAIT).await;
         barrier(&manager, "after-old-timer").await;
+        let events = manager.journal.events_after("held", 0, u32::MAX).await.unwrap();
+        assert_eq!(events.iter().filter(|e| matches!(&e.kind, Some(session_event::Kind::TurnStarted(_)))).count(), 1);
         assert_eq!(mock.requests().len(), 1, "the old timer doesn't deliver them twice");
     }
 
     #[tokio::test]
     async fn non_waking_notices_still_wait_for_explicit_input() {
-        let (_dir, manager, mock) = at_limit().await;
+        let (_dir, manager, mock) = idle_session().await;
         let _clock = pause_clock();
-        let tx = manager.actor("held").await.unwrap().unwrap();
-        for text in ["report 21", "report 22"] {
-            tx.send(ActorMsg::ChildReport {
-                command_id: format!("subagent:{text}"),
-                recorded: tokio::sync::oneshot::channel().0,
-                text: text.into(),
-                wake: false,
-                task_notice: Some(crate::subagent::task_report_notice("Review", "child", TurnEndReason::Completed, text)),
-                inline: None,
-            })
-            .unwrap();
-        }
-        barrier(&manager, "held-without-wake").await;
-        tokio::time::advance(HOUR).await;
-        barrier(&manager, "hour-free").await;
-        let events = manager.journal.events_after("held", 0, u32::MAX).await.unwrap();
-        assert_eq!(notices_of(&events).2.len(), 2);
-        assert!(mock.requests().is_empty(), "a free slot doesn't grant permission to wake");
+        enqueue_reports(&manager, 1..3, false).await;
+        tokio::time::advance(MAX_WAIT).await;
+        barrier(&manager, "after-merge-windows").await;
+        assert_waiting(&manager, &mock, 2).await;
         mock.push(c6_testkit::Reply::Text("Saw them when asked.".into()));
-        tx.send(ActorMsg::ReleaseNotices).unwrap();
-        delivered(&manager, &mock).await;
+        manager.actor("held").await.unwrap().unwrap().send(ActorMsg::ReleaseNotices).unwrap();
+        delivered(&manager, &mock, 2).await;
+    }
+
+    #[tokio::test]
+    async fn non_waking_notices_join_the_next_waking_batch() {
+        let (_dir, manager, mock) = idle_session().await;
+        let _clock = pause_clock();
+        enqueue_reports(&manager, 1..2, false).await;
+        tokio::time::advance(MAX_WAIT).await;
+        barrier(&manager, "non-waking-does-not-start-a-turn").await;
+        assert_waiting(&manager, &mock, 1).await;
+        mock.push(c6_testkit::Reply::Text("Saw both notices.".into()));
+        enqueue_reports(&manager, 2..3, true).await;
+        tokio::time::advance(QUIET + TICK).await;
+        delivered(&manager, &mock, 2).await;
     }
 
     #[tokio::test]
     async fn recovery_reschedules_pending_notices_without_an_open_task() {
-        let (_dir, manager, mock) = at_limit().await;
+        let (_dir, manager, mock) = idle_session().await;
         seed_held(&manager).await;
         assert!(manager.journal.sessions_with_open_tasks().await.unwrap().is_empty());
         let _clock = pause_clock();
+        mock.push(c6_testkit::Reply::Text("Saw them after restart.".into()));
         manager.recover().await.unwrap();
         assert_eq!(manager.active(), ["held"], "startup, not a new command, restores its actor");
         barrier(&manager, "reloaded").await;
-        assert!(mock.requests().is_empty(), "restart must not reset the limit");
-        mock.push(c6_testkit::Reply::Text("Saw them after restart.".into()));
-        tokio::time::advance(HOUR).await;
-        delivered(&manager, &mock).await;
+        assert_waiting(&manager, &mock, 2).await;
+        tokio::time::advance(QUIET + TICK).await;
+        delivered(&manager, &mock, 2).await;
     }
 
     #[tokio::test]
     async fn recovery_leaves_old_held_notices_for_explicit_input() {
-        let (dir, manager, mock) = at_limit().await;
+        let (dir, manager, mock) = idle_session().await;
         seed_held(&manager).await;
         // The log's events are recent: it is last_activity, not event
         // timestamps, that bounds the SQL scan at startup.
@@ -7001,36 +7595,41 @@ mod notice_tests {
         let _clock = pause_clock();
         manager.recover().await.unwrap();
         assert!(manager.active().is_empty(), "startup must not restore an old session's actor");
-        tokio::time::advance(HOUR).await;
-        let events = manager.journal.events_after("held", 0, u32::MAX).await.unwrap();
-        assert_eq!(notices_of(&events).2.len(), 2, "old held notices remain pending");
-        assert!(mock.requests().is_empty(), "old notices must not cause an upgrade burst");
+        tokio::time::advance(MAX_WAIT).await;
+        assert_waiting(&manager, &mock, 2).await;
 
         // Deliver now still loads the actor and delivers the batch.
         mock.push(c6_testkit::Reply::Text("Saw the old notices when asked.".into()));
         manager.actor("held").await.unwrap().unwrap().send(ActorMsg::ReleaseNotices).unwrap();
-        delivered(&manager, &mock).await;
+        delivered(&manager, &mock, 2).await;
     }
 
     async fn seed_held(manager: &SessionManager) {
         // Seed held notices without starting an actor, exactly as a fresh
         // worker finds them on disk after its predecessor exited.
-        for (i, text) in ["report 21", "report 22"].into_iter().enumerate() {
+        let now = c6_core::now_ms();
+        for number in 1..=2 {
+            let text = format!("report #{number}.");
             let notice = c6_proto::NoticeQueued {
-                command_id: format!("held{i}"),
-                text: text.into(),
+                command_id: format!("held{number}"),
                 wake: true,
                 command: "task-notification".into(),
-                task_notice: Some(crate::subagent::task_report_notice("Review", "child", TurnEndReason::Completed, text)),
+                task_notice: Some(crate::subagent::task_report_notice("Review", "child", TurnEndReason::Completed, &text)),
+                text,
                 ..Default::default()
             };
-            manager.journal.append("held", &ev(82 + i as u64, c6_core::now_ms(), session_event::Kind::NoticeQueued(notice))).await.unwrap();
+            let seq = 2 * number;
+            let first = ev(seq, now, session_event::Kind::NoticeQueued(notice.clone()));
+            let latest =
+                ev(seq + 1, now, session_event::Kind::NoticeQueued(c6_proto::NoticeQueued { reason: "merging reports".into(), ..notice }));
+            manager.journal.append("held", &first).await.unwrap();
+            manager.journal.append("held", &latest).await.unwrap();
         }
     }
 
     async fn barrier(manager: &SessionManager, id: &str) {
-        // A recorded message after Reloaded is a barrier: the actor has
-        // reconstructed its counted turns and armed its timer.
+        // A recorded message after an enqueue or reload confirms that the
+        // actor has handled that message before the test advances the clock.
         let tx = manager.actor("held").await.unwrap().unwrap();
         tx.send(ActorMsg::SetSubagentModel { command_id: id.into(), model: None }).unwrap();
         logged(manager, |events| {
@@ -7041,18 +7640,16 @@ mod notice_tests {
 
     #[tokio::test]
     async fn overdue_notices_wait_for_the_head_after_restart() {
-        let (_dir, mut manager, mock) = at_limit().await;
+        let (_dir, mut manager, mock) = idle_session().await;
         seed_held(&manager).await;
         let head = manager.link.clone();
         manager.link = Arc::new(HeadLink::default());
         let _clock = pause_clock();
         manager.recover().await.unwrap();
         barrier(&manager, "reloaded").await;
-        tokio::time::advance(HOUR).await;
+        tokio::time::advance(MAX_WAIT).await;
         barrier(&manager, "still-offline").await;
-        let events = manager.journal.events_after("held", 0, u32::MAX).await.unwrap();
-        assert_eq!(notices_of(&events).2.len(), 2, "offline delivery must not consume the held batch");
-        assert!(mock.requests().is_empty());
+        assert_waiting(&manager, &mock, 2).await;
 
         mock.push(c6_testkit::Reply::Text("Saw them once connected.".into()));
         let (tx, mut rx) = mpsc::channel::<c6_proto::WorkerMsg>(32);
@@ -7067,7 +7664,7 @@ mod notice_tests {
                 }
             }
         }));
-        delivered(&manager, &mock).await;
+        delivered(&manager, &mock, 2).await;
     }
 }
 

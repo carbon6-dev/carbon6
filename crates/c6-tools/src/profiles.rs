@@ -262,11 +262,18 @@ mod tests {
             _agent: Option<&crate::AgentDef>,
             _choice: &crate::ModelChoice,
             _background: Option<&str>,
+            group: Option<&crate::TaskGroup>,
             cancel: tokio_util::sync::CancellationToken,
         ) -> Result<String, String> {
             if prompt == "wait" {
                 cancel.cancelled().await;
                 return Err("stopped".into());
+            }
+            if prompt == "Grouped work." {
+                let group = group.expect("Task passes the group to the runner");
+                assert_eq!((group.group.as_str(), group.wake.as_str()), ("reviews", "count:2"));
+            } else {
+                assert!(group.is_none());
             }
             Ok("subagent report".into())
         }
@@ -315,6 +322,10 @@ mod tests {
         assert!(!result.is_error && result.content == "continued report", "{result:?}");
         for (name, input) in [
             ("task", json!({"description": "look", "prompt": "Look around.", "run_in_background": true})),
+            (
+                "task",
+                json!({"description": "look", "prompt": "Grouped work.", "run_in_background": true, "group": "reviews", "wake": "count:2"}),
+            ),
             ("send_message", json!({"to": "child1", "message": "More.", "run_in_background": true})),
         ] {
             let result = get(name).call(&ctx, input).await;

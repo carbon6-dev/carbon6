@@ -68,6 +68,8 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
             agent: s.agent.clone(),
             description: s.description.clone(),
             background_task_id: s.background_task_id.clone(),
+            group: s.group.clone(),
+            wake: s.wake.clone(),
             connection_id: s.model.as_ref().map(|m| m.connection_id.clone()).unwrap_or_default(),
             model: s.model.as_ref().map(|m| m.model.clone()).unwrap_or_default(),
             effort: s.model.as_ref().map(|m| m.effort.clone()).unwrap_or_default(),
@@ -209,6 +211,7 @@ pub fn event(ev: &SessionEvent) -> Option<api::Event> {
             command: n.command.clone(),
             from_title: n.from_title.clone(),
             deliver_at_ms: n.deliver_at_ms,
+            reason: n.reason.clone(),
         },
     };
     Some(api::Event { seq: ev.seq, ts: ev.ts_ms, kind })

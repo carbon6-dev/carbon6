@@ -830,6 +830,8 @@ pub(crate) mod tests {
             agent: String::new(),
             description: description.into(),
             background_task_id: String::new(),
+            group: String::new(),
+            wake: String::new(),
             connection_id: String::new(),
             model: String::new(),
             effort: String::new(),

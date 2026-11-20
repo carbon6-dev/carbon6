@@ -3964,7 +3964,11 @@ fn SubagentLimitsSetting() -> impl IntoView {
     let save = move |_| {
         let v = serde_json::to_value(setting.get_untracked()).unwrap_or_default();
         spawn_local(async move {
-            status.set(Some(api::put_setting("subagent-limits", v).await.map(|_| "Saved. New sessions will use it.")));
+            status.set(Some(
+                api::put_setting("subagent-limits", v)
+                    .await
+                    .map(|_| "Saved. New sessions use these settings; Continue applies the notice limits to a paused session."),
+            ));
         });
     };
     let number = |ev: &leptos::ev::Event| event_target_value(ev).trim().parse::<u32>().unwrap_or(0);
@@ -3988,15 +3992,40 @@ fn SubagentLimitsSetting() -> impl IntoView {
                         prop:value=move || setting.with(|s| s.max_running.to_string()) on:input=move |ev| setting.update(|s| s.max_running = number(&ev)) />
                 </label>
             </div>
-            <p class="text-sm text-muted">
-                "A background task's end or a subagent's report wakes an idle session, at most this many times an hour; beyond that it waits until the hour allows, or for your next message. A Claude Code session's process stays up this long when idle with no background tasks."
-            </p>
+            <div>
+                <h3 class="font-medium">"Automatic notice delivery"</h3>
+                <p class="text-sm text-muted">
+                    "An idle session collects notices, like task completions and subagent reports, into one turn. It waits for the quiet period, up to the maximum wait. Automatic delivery pauses when a progress, failure or token limit is reached. You can still deliver the notices yourself."
+                </p>
+            </div>
             <div class="grid gap-2 @lg/settings:grid-cols-2">
                 <label class="space-y-0.5">
-                    <span class="text-xs text-muted">"Turns notices start per hour (1–200)"</span>
-                    <input type="number" min="1" max="200" class=format!("{INPUT} py-1")
-                        prop:value=move || setting.with(|s| s.auto_turns_per_hour.to_string()) on:input=move |ev| setting.update(|s| s.auto_turns_per_hour = number(&ev)) />
+                    <span class="text-xs text-muted">"Quiet period (seconds)"</span>
+                    <input type="number" min="1" class=format!("{INPUT} py-1")
+                        prop:value=move || setting.with(|s| s.notice_quiet_seconds.to_string()) on:input=move |ev| setting.update(|s| s.notice_quiet_seconds = number(&ev)) />
                 </label>
+                <label class="space-y-0.5">
+                    <span class="text-xs text-muted">"Maximum time to collect a batch (seconds)"</span>
+                    <input type="number" min="1" class=format!("{INPUT} py-1")
+                        prop:value=move || setting.with(|s| s.notice_max_wait_seconds.to_string()) on:input=move |ev| setting.update(|s| s.notice_max_wait_seconds = number(&ev)) />
+                </label>
+                <label class="space-y-0.5">
+                    <span class="text-xs text-muted">"Notice turns without progress"</span>
+                    <input type="number" min="1" class=format!("{INPUT} py-1")
+                        prop:value=move || setting.with(|s| s.notice_no_progress_limit.to_string()) on:input=move |ev| setting.update(|s| s.notice_no_progress_limit = number(&ev)) />
+                </label>
+                <label class="space-y-0.5">
+                    <span class="text-xs text-muted">"Relaunches after failures"</span>
+                    <input type="number" min="1" class=format!("{INPUT} py-1")
+                        prop:value=move || setting.with(|s| s.notice_failure_relaunch_limit.to_string()) on:input=move |ev| setting.update(|s| s.notice_failure_relaunch_limit = number(&ev)) />
+                </label>
+                <label class="space-y-0.5">
+                    <span class="text-xs text-muted">"Tokens per hour"</span>
+                    <input type="number" min="1" class=format!("{INPUT} py-1")
+                        prop:value=move || setting.with(|s| s.notice_tokens_per_hour.to_string()) on:input=move |ev| setting.update(|s| s.notice_tokens_per_hour = event_target_value(&ev).trim().parse::<u64>().unwrap_or(0)) />
+                </label>
+            </div>
+            <div class="grid gap-2 @lg/settings:grid-cols-2">
                 <label class="space-y-0.5">
                     <span class="text-xs text-muted">"Claude Code idle minutes (1–1440)"</span>
                     <input type="number" min="1" max="1440" class=format!("{INPUT} py-1")

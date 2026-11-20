@@ -1777,8 +1777,11 @@ async fn put_subagent_limits(State(st): State<Arc<HeadState>>, Json(l): Json<api
     if !(1..=64).contains(&l.max_running) {
         return Err(ApiErr(StatusCode::BAD_REQUEST, "the number running at once is 1 to 64".into()));
     }
-    if !(1..=200).contains(&l.auto_turns_per_hour) {
-        return Err(ApiErr(StatusCode::BAD_REQUEST, "the turns notices may start per hour are 1 to 200".into()));
+    if l.notice_quiet_seconds == 0 || l.notice_max_wait_seconds < l.notice_quiet_seconds {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, "the notice quiet period must be positive and no longer than the maximum wait".into()));
+    }
+    if l.notice_no_progress_limit == 0 || l.notice_failure_relaunch_limit == 0 || l.notice_tokens_per_hour == 0 {
+        return Err(ApiErr(StatusCode::BAD_REQUEST, "the notice progress, relaunch and token limits must be positive".into()));
     }
     if !(1..=1440).contains(&l.claude_code_idle_minutes) {
         return Err(ApiErr(StatusCode::BAD_REQUEST, "an idle Claude Code process stays up 1 to 1440 minutes".into()));

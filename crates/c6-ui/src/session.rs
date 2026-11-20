@@ -3324,11 +3324,18 @@ fn SubagentWaiting(chrome: SessionChrome) -> impl IntoView {
 /// Don't flash the held-notices box while an idle agent takes its input.
 const NOTICE_GRACE_MS: i64 = 3_000;
 
-/// The notices no turn has taken after the grace (docs/background.md §5): from a session
-/// message, or a background task's end or a subagent's report, each held
-/// by the hourly limit or for your next message. Its first line, and who
-/// sent it.
-fn waiting_notices(evs: &[Event], now: i64) -> Vec<(String, String, i64)> {
+#[derive(Clone, Debug, PartialEq)]
+struct WaitingNotice {
+    from: String,
+    line: String,
+    deliver_at_ms: i64,
+    reason: String,
+}
+
+/// Pending notices, retaining first-queue order and grace time but using the
+/// latest metadata. The worker can append an updated wait reason while a
+/// notice is still pending without enqueuing another input.
+fn waiting_notices(evs: &[Event], now: i64) -> Vec<WaitingNotice> {
     let taken: std::collections::HashSet<&str> = evs
         .iter()
         .filter_map(|e| match &e.kind {
@@ -3336,14 +3343,32 @@ fn waiting_notices(evs: &[Event], now: i64) -> Vec<(String, String, i64)> {
             _ => None,
         })
         .collect();
-    evs.iter()
-        .filter_map(|e| match &e.kind {
-            EventKind::NoticeQueued { command_id, text, from_title, deliver_at_ms, .. }
-                if !taken.contains(command_id.as_str()) && now.saturating_sub(e.ts) >= NOTICE_GRACE_MS =>
-            {
-                Some((from_title.clone(), text.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().to_owned(), *deliver_at_ms))
-            }
-            _ => None,
+    let mut indices = std::collections::HashMap::new();
+    let mut pending: Vec<(i64, &EventKind)> = Vec::new();
+    for e in evs {
+        let EventKind::NoticeQueued { command_id, .. } = &e.kind else { continue };
+        if taken.contains(command_id.as_str()) {
+            continue;
+        }
+        let next = pending.len();
+        let index = *indices.entry(command_id.as_str()).or_insert(next);
+        if index == next {
+            pending.push((e.ts, &e.kind));
+        } else {
+            pending[index].1 = &e.kind;
+        }
+    }
+    pending
+        .into_iter()
+        .filter(|(ts, _)| now.saturating_sub(*ts) >= NOTICE_GRACE_MS)
+        .filter_map(|(_, kind)| {
+            let EventKind::NoticeQueued { text, from_title, deliver_at_ms, reason, .. } = kind else { return None };
+            Some(WaitingNotice {
+                from: from_title.clone(),
+                line: text.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().to_owned(),
+                deliver_at_ms: *deliver_at_ms,
+                reason: reason.clone(),
+            })
         })
         .collect()
 }
@@ -3364,19 +3389,40 @@ fn WaitingNotices(events: RwSignal<Vec<Event>>, now: RwSignal<i64>, session_id: 
         let w = waiting.get();
         (!w.is_empty()).then(|| {
             let n = w.len();
-            let delivery = w.iter().filter_map(|(_, _, at)| (*at > 0).then_some(*at)).min();
+            let pause_reason = w.iter().find(|notice| notice.reason.starts_with("paused:")).map(|notice| notice.reason.clone());
+            let paused = pause_reason.is_some();
             view! {
                 <div class="space-y-1 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm dark:border-amber-800 dark:bg-amber-950">
-                    <div class="flex items-center gap-3">
+                    <div class="flex flex-wrap items-center gap-3">
                         <span class="flex-1 text-amber-800 dark:text-amber-300">
                             {if n == 1 { "1 notice waiting for the agent".to_owned() } else { format!("{n} notices waiting for the agent") }}
-                            {delivery.map(|at| format!(" — delivers itself at {}", crate::when::time(at)))}
+                            {move || if paused {
+                                Some(" — automatic delivery paused".into())
+                            } else {
+                                let now = now.get();
+                                waiting.with(|notices| notices.iter().map(|n| n.deliver_at_ms).filter(|at| *at > now).min())
+                                    .map(|at| format!(" — next automatic delivery at {}", crate::when::time(at)))
+                            }}
                         </span>
-                        <button class=BUTTON on:click=deliver title="Start a turn with them now, whatever the hourly limit">"Deliver now"</button>
+                        {paused.then(|| view! {
+                            <Go to=View::Settings { note: None, section: "agents".into() } class=BUTTON_QUIET
+                                title="Change notice limits, then select Continue to apply them here">"Raise limit"</Go>
+                        })}
+                        <button class=BUTTON on:click=deliver title="Start a turn with these notices now">
+                            {if paused { "Continue" } else { "Deliver now" }}
+                        </button>
                     </div>
+                    {pause_reason.map(|reason| view! {
+                        <p class="text-xs text-amber-800 dark:text-amber-300">{reason["paused:".len()..].trim().to_owned()}</p>
+                    })}
                     <ul class="space-y-0.5 text-xs text-zinc-600 dark:text-zinc-400">
-                        {w.into_iter().map(|(from, line, _)| view! {
-                            <li class="truncate">{if from.is_empty() { line } else { format!("From {from}: {line}") }}</li>
+                        {w.into_iter().map(|notice| view! {
+                            <li>
+                                <div class="truncate">{if notice.from.is_empty() { notice.line } else { format!("From {}: {}", notice.from, notice.line) }}</div>
+                                {(!notice.reason.is_empty() && !notice.reason.starts_with("paused:")).then(|| view! {
+                                    <div class="wrap-anywhere text-muted">{notice.reason}</div>
+                                })}
+                            </li>
                         }).collect_view()}
                     </ul>
                     {move || status.get().map(|e| view! { <p class="text-xs text-red-600">{e}</p> })}
@@ -8076,6 +8122,7 @@ mod tests {
             command: String::new(),
             from_title: from.into(),
             deliver_at_ms: 42,
+            reason: String::new(),
         };
         let user = |id: &str| EventKind::User {
             command_id: id.into(),
@@ -8098,13 +8145,16 @@ mod tests {
 
         let mut evs = evs.to_vec();
         evs.push(ev(3, ts, queued("m-2", "Alice")));
-        assert_eq!(waiting_notices(&evs, ts + NOTICE_GRACE_MS + 1), [("Alice".to_owned(), "about m-2".to_owned(), 42)]);
+        assert_eq!(
+            waiting_notices(&evs, ts + NOTICE_GRACE_MS + 1),
+            [WaitingNotice { from: "Alice".into(), line: "about m-2".into(), deliver_at_ms: 42, reason: String::new() }]
+        );
     }
 
     #[test]
     fn notices_show_only_after_their_own_timestamp_grace_including_quota_holds() {
         let ts = 10_000;
-        let mut ev = Event {
+        let ev = Event {
             seq: 1,
             ts,
             kind: EventKind::NoticeQueued {
@@ -8113,9 +8163,10 @@ mod tests {
                 command: String::new(),
                 from_title: "Alice".into(),
                 deliver_at_ms: 0,
+                reason: String::new(),
             },
         };
-        let expected = |at| [("Alice".to_owned(), "Ready".to_owned(), at)];
+        let expected = |at| [WaitingNotice { from: "Alice".into(), line: "Ready".into(), deliver_at_ms: at, reason: String::new() }];
         let evs = std::slice::from_ref(&ev);
         assert!(waiting_notices(evs, ts - 1).is_empty());
         assert!(waiting_notices(evs, ts + 47).is_empty());
@@ -8124,12 +8175,18 @@ mod tests {
         assert_eq!(waiting_notices(evs, ts + NOTICE_GRACE_MS + 60_000), expected(0));
 
         let delivery = ts + 3_600_000;
-        if let EventKind::NoticeQueued { deliver_at_ms, .. } = &mut ev.kind {
+        let mut update = ev.clone();
+        update.seq += 1;
+        update.ts = ts + NOTICE_GRACE_MS;
+        if let EventKind::NoticeQueued { deliver_at_ms, reason, .. } = &mut update.kind {
             *deliver_at_ms = delivery;
+            *reason = "paused: spending limit".into();
         }
-        let evs = std::slice::from_ref(&ev);
-        assert!(waiting_notices(evs, ts + NOTICE_GRACE_MS - 1).is_empty());
-        assert_eq!(waiting_notices(evs, ts + NOTICE_GRACE_MS + 1), expected(delivery));
+        let evs = [ev, update];
+        assert_eq!(
+            waiting_notices(&evs, ts + NOTICE_GRACE_MS),
+            [WaitingNotice { reason: "paused: spending limit".into(), ..expected(delivery)[0].clone() }]
+        );
     }
 
     /// A message to another session reads as one, in every tool profile's

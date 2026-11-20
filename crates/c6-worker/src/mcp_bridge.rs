@@ -293,7 +293,7 @@ mod tests {
         let registration = bridge.register(Entry {
             session_id: "s".into(),
             session: Arc::new(SessionTools::new(dir.path().to_owned())),
-            tools: vec![Arc::new(c6_tools::records::Doc::new(false)), Arc::new(c6_tools::Glob)],
+            tools: vec![Arc::new(c6_tools::records::Doc::new(false)), Arc::new(c6_tools::Glob), Arc::new(c6_tools::Task::claude())],
             cancel: Default::default(),
             journal: Arc::new(Journal::open(&dir.path().join("journal.db")).await.unwrap()),
             matched: Default::default(),
@@ -315,5 +315,10 @@ mod tests {
         assert_eq!(meta("doc"), json!({"anthropic/alwaysLoad": true}));
         let other = tools.iter().find(|t| t["name"] != "doc").unwrap();
         assert_eq!(other["_meta"], Value::Null, "not core: found with tool search");
+        let task = tools.iter().find(|t| t["name"] == "Task").unwrap();
+        for option in ["group", "wake"] {
+            assert_eq!(task["inputSchema"]["properties"][option]["type"], "string");
+        }
+        assert_eq!(task["inputSchema"]["required"], json!(["description", "prompt"]));
     }
 }

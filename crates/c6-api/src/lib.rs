@@ -2054,11 +2054,21 @@ pub struct SubagentLimits {
     /// How many subagents may work at once below one top-level session.
     #[serde(default = "default_running_subagents")]
     pub max_running: u32,
-    /// How many turns notices (a background task's end, a subagent's
-    /// report) may start in an idle session per hour; beyond that they wait
-    /// until the hour allows, or for your next message.
-    #[serde(default = "default_auto_turns_per_hour")]
-    pub auto_turns_per_hour: u32,
+    /// Collect notices until this many seconds have passed without another notice.
+    #[serde(default = "default_notice_quiet_seconds")]
+    pub notice_quiet_seconds: u32,
+    /// Don't defer a batch longer than this while collecting notices.
+    #[serde(default = "default_notice_max_wait_seconds")]
+    pub notice_max_wait_seconds: u32,
+    /// Pause automatic delivery after this many notice turns without progress.
+    #[serde(default = "default_notice_no_progress_limit")]
+    pub notice_no_progress_limit: u32,
+    /// Pause automatic delivery after this many launches following failures.
+    #[serde(default = "default_notice_failure_relaunch_limit")]
+    pub notice_failure_relaunch_limit: u32,
+    /// Hourly token budget for automatically started notice turns.
+    #[serde(default = "default_notice_tokens_per_hour")]
+    pub notice_tokens_per_hour: u64,
     /// How long an idle Claude Code process with no background tasks stays
     /// up, in minutes.
     #[serde(default = "default_claude_code_idle_minutes")]
@@ -2075,7 +2085,11 @@ pub struct SubagentLimits {
 
 pub const DEFAULT_SUBAGENT_DEPTH: u32 = 3;
 pub const DEFAULT_RUNNING_SUBAGENTS: u32 = 16;
-pub const DEFAULT_AUTO_TURNS_PER_HOUR: u32 = 20;
+pub const DEFAULT_NOTICE_QUIET_SECONDS: u32 = 3;
+pub const DEFAULT_NOTICE_MAX_WAIT_SECONDS: u32 = 30;
+pub const DEFAULT_NOTICE_NO_PROGRESS_LIMIT: u32 = 5;
+pub const DEFAULT_NOTICE_FAILURE_RELAUNCH_LIMIT: u32 = 3;
+pub const DEFAULT_NOTICE_TOKENS_PER_HOUR: u64 = 5_000_000;
 pub const DEFAULT_CLAUDE_CODE_IDLE_MINUTES: u32 = 15;
 pub const DEFAULT_MAX_MESSAGE_HOPS: u32 = 4;
 pub const DEFAULT_MESSAGES_PER_HOUR: u32 = 30;
@@ -2088,8 +2102,24 @@ fn default_messages_per_hour() -> u32 {
     DEFAULT_MESSAGES_PER_HOUR
 }
 
-fn default_auto_turns_per_hour() -> u32 {
-    DEFAULT_AUTO_TURNS_PER_HOUR
+fn default_notice_quiet_seconds() -> u32 {
+    DEFAULT_NOTICE_QUIET_SECONDS
+}
+
+fn default_notice_max_wait_seconds() -> u32 {
+    DEFAULT_NOTICE_MAX_WAIT_SECONDS
+}
+
+fn default_notice_no_progress_limit() -> u32 {
+    DEFAULT_NOTICE_NO_PROGRESS_LIMIT
+}
+
+fn default_notice_failure_relaunch_limit() -> u32 {
+    DEFAULT_NOTICE_FAILURE_RELAUNCH_LIMIT
+}
+
+fn default_notice_tokens_per_hour() -> u64 {
+    DEFAULT_NOTICE_TOKENS_PER_HOUR
 }
 
 fn default_claude_code_idle_minutes() -> u32 {
@@ -2109,11 +2139,49 @@ impl Default for SubagentLimits {
         Self {
             max_depth: DEFAULT_SUBAGENT_DEPTH,
             max_running: DEFAULT_RUNNING_SUBAGENTS,
-            auto_turns_per_hour: DEFAULT_AUTO_TURNS_PER_HOUR,
+            notice_quiet_seconds: DEFAULT_NOTICE_QUIET_SECONDS,
+            notice_max_wait_seconds: DEFAULT_NOTICE_MAX_WAIT_SECONDS,
+            notice_no_progress_limit: DEFAULT_NOTICE_NO_PROGRESS_LIMIT,
+            notice_failure_relaunch_limit: DEFAULT_NOTICE_FAILURE_RELAUNCH_LIMIT,
+            notice_tokens_per_hour: DEFAULT_NOTICE_TOKENS_PER_HOUR,
             claude_code_idle_minutes: DEFAULT_CLAUDE_CODE_IDLE_MINUTES,
             max_message_hops: DEFAULT_MAX_MESSAGE_HOPS,
             messages_per_hour: DEFAULT_MESSAGES_PER_HOUR,
         }
+    }
+}
+
+#[cfg(test)]
+mod notice_settings_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_notice_limit_is_ignored_and_new_limits_get_defaults() {
+        let settings: SubagentLimits = serde_json::from_value(serde_json::json!({
+            "auto_turns_per_hour": "even a malformed legacy value is ignored",
+            "max_depth": 4
+        }))
+        .unwrap();
+        assert_eq!(settings, SubagentLimits { max_depth: 4, ..Default::default() });
+        let mut json = serde_json::to_value(settings).unwrap();
+        assert!(json.get("auto_turns_per_hour").is_none());
+        assert_eq!(json["notice_quiet_seconds"], 3);
+        assert_eq!(json["notice_max_wait_seconds"], 30);
+        assert_eq!(json["notice_no_progress_limit"], 5);
+        assert_eq!(json["notice_failure_relaunch_limit"], 3);
+        assert_eq!(json["notice_tokens_per_hour"], 5_000_000);
+        json["notice_tokens_per_hour"] = 10_000_000_000u64.into();
+        assert_eq!(serde_json::from_value::<SubagentLimits>(json).unwrap().notice_tokens_per_hour, 10_000_000_000);
+    }
+
+    #[test]
+    fn notice_reason_is_optional_for_old_events() {
+        let json = serde_json::json!({"type":"notice_queued", "command_id":"notice", "text":"finished"});
+        let mut notice: EventKind = serde_json::from_value(json).unwrap();
+        assert!(serde_json::to_value(&notice).unwrap().get("reason").is_none());
+        let EventKind::NoticeQueued { reason, .. } = &mut notice else { panic!("expected notice") };
+        *reason = "paused".into();
+        assert_eq!(serde_json::to_value(&notice).unwrap()["reason"], "paused");
     }
 }
 
@@ -2498,6 +2566,10 @@ pub enum EventKind {
         /// Set when it runs in the background.
         #[serde(default, skip_serializing_if = "String::is_empty")]
         background_task_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        group: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        wake: String,
         /// The connection, model and effort it runs on (empty for logs
         /// from before subagents could pick them).
         #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -2591,6 +2663,9 @@ pub enum EventKind {
         from_title: String,
         #[serde(default)]
         deliver_at_ms: i64,
+        /// Why this notice is waiting, when known. The `paused:` prefix marks a guard pause.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        reason: String,
     },
 }
 

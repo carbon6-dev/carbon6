@@ -1701,6 +1701,8 @@ impl Tool for Delegate {
             agent: String::new(),
             description: description.clone(),
             background_task_id: String::new(),
+            group: String::new(),
+            wake: String::new(),
             model: Some(c6_proto::ModelSpec {
                 connection_id: child.connection_id.clone(),
                 model: child.model.clone(),
