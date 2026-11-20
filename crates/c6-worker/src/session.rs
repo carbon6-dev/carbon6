@@ -576,7 +576,7 @@ impl SessionManager {
             let undelivered = pending.iter().any(|(id, end, inputs)| {
                 let outcome = last_turn_outcome(&events[..=*end]);
                 let status = crate::subagent::status_of(outcome.reason, &outcome.report);
-                !inputs.iter().any(|u| report_recorded(&parent, &u.delegated_by, &session_id, status))
+                !inputs.iter().any(|u| LocalReportCall::of(u).is_some_and(|call| call.recorded(&parent, &session_id, status)))
                     && !parent.iter().any(|e| {
                         matches!(&e.kind,
                         Some(session_event::Kind::NoticeQueued(n)) if &n.command_id == id)
@@ -1973,6 +1973,10 @@ fn pending_local_reports<'a>(sid: &str, events: &'a [SessionEvent]) -> Vec<(Stri
 /// report. A placeholder saying the child is still running/lost does not
 /// acknowledge a later completed report.
 fn report_recorded(events: &[SessionEvent], call: &str, child: &str, status: &str) -> bool {
+    report_recorded_for(events, call, child, status, None)
+}
+
+fn report_recorded_for(events: &[SessionEvent], call: &str, child: &str, status: &str, task: Option<&str>) -> bool {
     if call.is_empty() || child.is_empty() {
         return false;
     }
@@ -1992,9 +1996,9 @@ fn report_recorded(events: &[SessionEvent], call: &str, child: &str, status: &st
                 _ => kept.push(event),
             }
         }
-        return report_recorded_in(kept.iter().copied(), call, child, status);
+        return report_recorded_in(kept.iter().copied(), call, child, status, task);
     }
-    report_recorded_in(events.iter(), call, child, status)
+    report_recorded_in(events.iter(), call, child, status, task)
 }
 
 fn call_invocation<'a>(kind: Option<&'a session_event::Kind>, call: &str) -> Option<&'a str> {
@@ -2013,8 +2017,41 @@ fn background_report_task(output: &str) -> Option<&str> {
             .strip_prefix("Continuing the subagent in the background as ")?
             .strip_suffix(". Its report will arrive as a notice when it finishes.")?
     };
+    background_task_id(task)
+}
+
+fn background_task_id(task: &str) -> Option<&str> {
     let number = task.strip_prefix("bg")?;
     (!number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())).then_some(task)
+}
+
+fn task_completion(command_id: &str) -> Option<(&str, &str)> {
+    let (task, state) = command_id.strip_prefix("task:")?.rsplit_once(':')?;
+    matches!(state, "finished" | "failed" | "lost" | "stopped_by_user").then_some((task, state))
+}
+
+fn grouped_run_key(s: &c6_proto::SubagentSpawned) -> (&str, &str) {
+    (&s.child_session_id, &s.background_task_id)
+}
+
+fn background_report_owner<'a>(events: impl Iterator<Item = &'a SessionEvent>, call: &str, task: &str) -> Result<Option<&'a str>, ()> {
+    let mut owners = events.filter_map(|e| match &e.kind {
+        Some(session_event::Kind::SubagentSpawned(s)) if s.call_id == call && s.background_task_id == task => {
+            Some(s.child_session_id.as_str())
+        }
+        _ => None,
+    });
+    let owner = owners.next();
+    if owner.is_some_and(|id| id.is_empty() || owners.any(|other| other != id)) { Err(()) } else { Ok(owner) }
+}
+
+fn background_report_recorded<'a>(mut events: impl Iterator<Item = &'a SessionEvent>, task: &str, status: &str) -> bool {
+    let prefix = format!("task:{task}:");
+    events.any(|e| {
+        matches!(&e.kind, Some(session_event::Kind::NoticeQueued(n)) if n.command_id.strip_prefix(&prefix).is_some_and(|state| {
+            matches!(state, "finished" | "failed" | "stopped_by_user") || (state == "lost" && status == "lost")
+        }))
+    })
 }
 
 fn report_recorded_in<'a>(
@@ -2022,7 +2059,13 @@ fn report_recorded_in<'a>(
     call: &str,
     child: &str,
     status: &str,
+    task: Option<&str>,
 ) -> bool {
+    if let Some(task) = task {
+        // The child's input already identifies the exact task. MCP tool
+        // results need not echo our launch placeholder, and may arrive late.
+        return background_report_owner(events.clone(), call, task) == Ok(Some(child)) && background_report_recorded(events, task, status);
+    }
     // Some providers (and the scripted model) reuse ids across turns.
     // Only an explicit link identifies an older invocation. A newer
     // unlinked send_message may have continued this very child: don't let
@@ -2053,28 +2096,18 @@ fn report_recorded_in<'a>(
                     // Background links are appended by a spawned future;
                     // their position does not identify an invocation. Join
                     // the exact task in the placeholder to its durable owner.
-                    let mut owners = events.clone().filter_map(|e| match &e.kind {
-                        Some(session_event::Kind::SubagentSpawned(s)) if s.call_id == call && s.background_task_id == task => {
-                            Some(s.child_session_id.as_str())
-                        }
-                        _ => None,
-                    });
-                    let owner = owners.next();
-                    if owner.is_none() && matches!(invocation, Some("task" | "Task")) {
+                    let owner = background_report_owner(events.clone(), call, task);
+                    if owner == Ok(None) && matches!(invocation, Some("task" | "Task")) {
                         // A new Task cannot be a continuation of the child
                         // we're already tracking, even before its link lands.
                         (latest, has_link, linked_here, result) = (false, false, false, None);
                         continue;
                     }
-                    let Some(owner) = owner.filter(|id| !id.is_empty() && owners.all(|other| other == *id)) else {
+                    let Ok(Some(owner)) = owner else {
                         return false;
                     };
                     if owner == child {
-                        let prefix = format!("task:{task}:");
-                        return events.clone().any(|e| {
-                            matches!(&e.kind, Some(session_event::Kind::NoticeQueued(n)) if n.command_id.starts_with(&prefix)
-                                && (status == "lost" || !n.command_id.ends_with(":lost")))
-                        });
+                        return background_report_recorded(events, task, status);
                     }
                     (latest, has_link, linked_here, result) = (false, false, false, None);
                     continue;
@@ -2108,39 +2141,74 @@ fn report_recorded_in<'a>(
     false
 }
 
+struct LocalReportCall {
+    id: String,
+    task: Option<String>,
+}
+
+impl LocalReportCall {
+    fn of(input: &c6_proto::UserMessage) -> Option<Self> {
+        if input.delegated_by.is_empty() {
+            return None;
+        }
+        // Old and foreground input ids have no task suffix.
+        let task =
+            input.command_id.strip_prefix("delegation:").and_then(|id| id.split_once(':')).and_then(|(_, task)| background_task_id(task));
+        Some(Self { id: input.delegated_by.clone(), task: task.map(str::to_owned) })
+    }
+
+    fn recorded(&self, events: &[SessionEvent], child: &str, status: &str) -> bool {
+        report_recorded_for(events, &self.id, child, status, self.task.as_deref())
+    }
+}
+
 /// The original call may record its result while the fallback is in flight.
 pub(crate) struct InlineChildReport {
     child: String,
     status: &'static str,
-    calls: Vec<String>,
+    calls: Vec<LocalReportCall>,
     after: u64,
 }
 
 impl InlineChildReport {
-    fn check_after(calls: &[String], events: &[SessionEvent], cursor: u64) -> u64 {
+    fn check_after(calls: &[LocalReportCall], events: &[SessionEvent], cursor: u64) -> u64 {
         events
             .iter()
             .find(|e| {
                 calls.iter().any(|call| {
-                    call_invocation(e.kind.as_ref(), call).is_some()
-                        || matches!(&e.kind, Some(session_event::Kind::SubagentSpawned(s)) if s.call_id == *call)
-                        || matches!(&e.kind, Some(session_event::Kind::ToolResult(r)) if r.call_id == *call)
+                    call_invocation(e.kind.as_ref(), &call.id).is_some()
+                        || matches!(&e.kind, Some(session_event::Kind::SubagentSpawned(s)) if s.call_id == call.id)
+                        || matches!(&e.kind, Some(session_event::Kind::ToolResult(r)) if r.call_id == call.id)
                 })
             })
             .map_or(cursor, |e| e.seq.saturating_sub(1))
     }
 
     fn recorded(&self, events: &[SessionEvent]) -> bool {
-        self.calls.iter().any(|call| report_recorded(events, call, &self.child, self.status))
+        self.calls.iter().any(|call| call.recorded(events, &self.child, self.status))
     }
 
-    fn still_running(&self, parent: &Handle, events: &[SessionEvent]) -> bool {
+    fn background_pending(&self, events: &[SessionEvent], retained: impl Fn(&str) -> bool) -> bool {
+        self.calls.iter().any(|call| {
+            let Some(task) = call.task.as_deref() else { return false };
+            // finish_agent sets its exit status before the actor receives
+            // the callback. Even a finished snapshot still owns the report
+            // until the actor handles that callback. After a terminal row,
+            // a missing/mismatched notice can fall back (e.g. after loss).
+            background_report_owner(events.iter(), &call.id, task) == Ok(Some(self.child.as_str())) && retained(task)
+        })
+    }
+
+    fn still_running(&self, parent: &Handle, evidence: &LocalReportParent) -> bool {
         if parent.tx.is_closed() {
             return false;
         }
-        if events.iter().any(|e| {
+        let events = &evidence.events;
+        if self.background_pending(events, |task| {
+            !evidence.finished_tasks.contains(task) && parent.tools.background.snapshot(task).is_some_and(|t| t.kind == "agent")
+        }) || events.iter().any(|e| {
             matches!(&e.kind, Some(session_event::Kind::SubagentSpawned(s))
-                if s.child_session_id == self.child && self.calls.contains(&s.call_id)
+                if s.child_session_id == self.child && self.calls.iter().any(|call| call.task.is_none() && call.id == s.call_id)
                 && !s.background_task_id.is_empty()
                 && parent.tools.background.snapshot(&s.background_task_id).is_some_and(|t| t.running))
         }) {
@@ -2157,7 +2225,7 @@ impl InlineChildReport {
             .take_while(|e| !matches!(e.kind, Some(session_event::Kind::TurnStarted(_) | session_event::Kind::TurnEnded(_))))
             .any(|e| {
                 matches!(&e.kind, Some(session_event::Kind::Assistant(a)) if a.blocks.iter().any(|b| {
-                    matches!(&b.block, Some(c6_proto::content_block::Block::ToolUse(u)) if self.calls.contains(&u.id))
+                    matches!(&b.block, Some(c6_proto::content_block::Block::ToolUse(u)) if self.calls.iter().any(|call| call.task.is_none() && call.id == u.id))
                 }))
             })
     }
@@ -2169,6 +2237,9 @@ struct LocalReportParent {
     after: u64,
     calls: HashSet<String>,
     events: Vec<SessionEvent>,
+    // Unlike receipts, whether the callback ran is a fact about the raw
+    // log. A rewind may remove the notice but cannot make it in flight again.
+    finished_tasks: HashSet<String>,
 }
 
 impl LocalReportParent {
@@ -2207,6 +2278,10 @@ impl LocalReportParent {
                         true
                     }
                     Some(session_event::Kind::ToolResult(r)) => self.calls.contains(&r.call_id),
+                    Some(session_event::Kind::BackgroundTask(t)) if t.kind == "agent" && t.state != "started" => {
+                        self.finished_tasks.insert(std::mem::take(&mut t.task_id));
+                        false
+                    }
                     Some(session_event::Kind::NoticeQueued(n))
                         if n.command_id.starts_with(&notices) || n.command_id.starts_with("task:") =>
                     {
@@ -3077,6 +3152,17 @@ impl Actor {
                                     let _ = recorded.send(());
                                     continue;
                                 }
+                                Ok(events) if inline.background_pending(&events, |task| {
+                                    !self.withdrawn.contains(task)
+                                        && !self.withdrawn.contains(&inline.child)
+                                        && !events.iter().any(|e| matches!(&e.kind, Some(session_event::Kind::BackgroundTask(t))
+                                            if t.task_id == task && t.kind == "agent" && t.state != "started"))
+                                        && self.session_tools.background.snapshot(task).is_some_and(|t| t.kind == "agent")
+                                }) => {
+                                    // Do not acknowledge the fallback until
+                                    // the owning task has actually reported.
+                                    continue;
+                                }
                                 Ok(_) => {}
                                 Err(e) => {
                                     warn!(session = %self.writer.session_id, "checking a subagent's inline result: {e:#}");
@@ -3544,7 +3630,7 @@ impl Actor {
             self.waiting = still;
             let outcome = last_turn_outcome(&events[..=end]);
             let status = crate::subagent::status_of(outcome.reason, &outcome.report);
-            let calls: Vec<_> = inputs.iter().filter(|u| !u.delegated_by.is_empty()).map(|u| u.delegated_by.clone()).collect();
+            let calls: Vec<_> = inputs.iter().filter_map(|u| LocalReportCall::of(u)).collect();
             let after = InlineChildReport::check_after(&calls, parent, self.local_report_parent.after);
             let inline = InlineChildReport { child: sid.clone(), status, calls, after };
             // Sending, rather than testing is_closed, decides ownership. A
@@ -3563,7 +3649,7 @@ impl Actor {
                 }
             }
             if !told {
-                if handed || parent_handle.as_ref().is_some_and(|h| inline.still_running(h, parent)) {
+                if handed || parent_handle.as_ref().is_some_and(|h| inline.still_running(h, &self.local_report_parent)) {
                     continue;
                 }
                 let wake = inputs
@@ -3810,42 +3896,68 @@ impl Actor {
         let events = c6_agent::effective_events(&raw);
         let mut groups: HashMap<String, Vec<&c6_proto::SubagentSpawned>> = HashMap::new();
         let mut children = HashMap::new();
+        let mut grouped_runs = HashMap::new();
+        let mut grouped_tasks = HashMap::new();
+        let mut session_reports = HashMap::new();
         let mut finished = HashSet::new();
         let mut failed = HashSet::new();
         let mut previous = HashMap::new();
         let mut group_calls: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut pending_group_calls = HashMap::new();
+        let mut launched_tasks = HashMap::new();
+        let mut linked_tasks = HashSet::new();
         let mut rejected_calls = HashSet::new();
         for e in &events {
             match &e.kind {
                 Some(session_event::Kind::Assistant(a)) => {
                     for block in &a.blocks {
-                        if let Some(c6_proto::content_block::Block::ToolUse(t)) = &block.block
-                            && (c6_tools::Task::is_task(&t.name) || t.name == "mcp__carbon6__Task")
+                        let Some(c6_proto::content_block::Block::ToolUse(t)) = &block.block else { continue };
+                        pending_group_calls.remove(&t.id);
+                        if (c6_tools::Task::is_task(&t.name) || t.name == "mcp__carbon6__Task")
                             && let Ok(v) = serde_json::from_str::<serde_json::Value>(&t.input_json)
-                            && let Some(group) = v["group"].as_str().filter(|g| !g.is_empty())
+                            && let Some(group) = v["group"].as_str().map(str::trim).filter(|g| !g.is_empty())
                         {
                             group_calls.entry(group.to_owned()).or_default().insert(t.id.clone());
+                            rejected_calls.remove(&t.id);
+                            pending_group_calls.insert(t.id.clone(), (group.to_owned(), v["wake"].as_str().unwrap_or("all").to_owned()));
                         }
                     }
                 }
                 Some(session_event::Kind::ToolResult(t)) if t.is_error => {
                     rejected_calls.insert(t.call_id.clone());
                 }
+                Some(session_event::Kind::ToolResult(t)) => {
+                    if t.output.starts_with("Started the subagent in the background as ")
+                        && let Some(task) = background_report_task(&t.output)
+                        && let Some(group) = pending_group_calls.remove(&t.call_id)
+                    {
+                        launched_tasks.insert(task, group);
+                    }
+                }
                 Some(session_event::Kind::SubagentSpawned(s)) => {
+                    if !s.background_task_id.is_empty() {
+                        linked_tasks.insert(s.background_task_id.as_str());
+                    }
                     if s.group.is_empty() {
                         children.remove(&s.child_session_id);
                     } else {
                         children.insert(s.child_session_id.clone(), s);
+                        // A continuation changes where new session-only reports
+                        // belong, not the membership of a previous launch.
+                        grouped_runs.insert(grouped_run_key(s), s);
+                        if !s.background_task_id.is_empty() {
+                            grouped_tasks.insert(s.background_task_id.as_str(), s);
+                        }
                     }
                 }
                 Some(session_event::Kind::NoticeQueued(n)) => {
-                    if let Some(t) = &n.task_notice
-                        && !t.session_id.is_empty()
+                    // Attribute a session-only report where it first arrived.
+                    // Later scheduling snapshots must not move it to a new run.
+                    if !n.command_id.starts_with("task:")
+                        && !previous.contains_key(&n.command_id)
+                        && let Some(s) = n.task_notice.as_ref().and_then(|t| children.get(&t.session_id))
                     {
-                        finished.insert(t.session_id.clone());
-                        if matches!(t.status.as_str(), "failed" | "lost" | "error") {
-                            failed.insert(t.session_id.clone());
-                        }
+                        session_reports.insert(n.command_id.as_str(), *s);
                     }
                     previous.insert(n.command_id.clone(), n.clone());
                 }
@@ -3854,18 +3966,34 @@ impl Actor {
         }
         // Tool background completions name the task, while direct child and
         // remote reports name the session. Both belong to the same fan-in.
+        let mut orphan_outcomes = HashMap::new();
         for n in previous.values() {
-            if let Some(s) = children
-                .values()
-                .find(|s| !s.background_task_id.is_empty() && n.command_id.starts_with(&format!("task:{}:", s.background_task_id)))
-            {
-                finished.insert(s.child_session_id.clone());
-                if n.task_notice.as_ref().is_some_and(|t| matches!(t.status.as_str(), "failed" | "lost" | "error")) {
-                    failed.insert(s.child_session_id.clone());
+            let failure = n.task_notice.as_ref().is_some_and(|t| matches!(t.status.as_str(), "failed" | "lost" | "error"));
+            if let Some((task, state)) = task_completion(&n.command_id) {
+                let failure = failure || matches!(state, "failed" | "lost");
+                if let Some(s) = grouped_tasks.get(task) {
+                    finished.insert(grouped_run_key(s));
+                    if failure {
+                        failed.insert(grouped_run_key(s));
+                    }
+                } else if !linked_tasks.contains(task) && launched_tasks.contains_key(task) {
+                    // A detached runner can fail before it has a child to link.
+                    *orphan_outcomes.entry(task).or_insert(false) |= failure;
+                }
+            } else if let Some(s) = session_reports.get(n.command_id.as_str()) {
+                finished.insert(grouped_run_key(s));
+                if failure {
+                    failed.insert(grouped_run_key(s));
                 }
             }
         }
-        for s in children.values() {
+        let mut orphan_counts = HashMap::new();
+        for (task, failure) in orphan_outcomes {
+            let (done, failed) = orphan_counts.entry(launched_tasks[task].0.as_str()).or_insert((0, 0));
+            *done += 1;
+            *failed += usize::from(failure);
+        }
+        for s in grouped_runs.values() {
             groups.entry(s.group.clone()).or_default().push(*s);
         }
         let now = tokio::time::Instant::now();
@@ -3880,12 +4008,15 @@ impl Actor {
             self.spec.notice_max_wait_seconds
         }));
         let member_of = |input: &PendingInput| {
-            input.task_notice.as_ref().and_then(|t| children.get(&t.session_id)).copied().or_else(|| {
-                children
-                    .values()
-                    .copied()
-                    .find(|s| !s.background_task_id.is_empty() && input.command_id.starts_with(&format!("task:{}:", s.background_task_id)))
-            })
+            if let Some((task, _)) = task_completion(&input.command_id) {
+                if let Some(s) = grouped_tasks.get(task) {
+                    return Some((s.group.as_str(), s.wake.as_str()));
+                }
+                let (group, wake) = launched_tasks.get(task).filter(|_| !linked_tasks.contains(task))?;
+                Some((group.as_str(), wake.as_str()))
+            } else {
+                session_reports.get(input.command_id.as_str()).map(|s| (s.group.as_str(), s.wake.as_str()))
+            }
         };
         // A group barrier or a non-waking watcher is not the first arrival
         // of an unrelated merge window, however long it has been waiting.
@@ -3905,20 +4036,25 @@ impl Actor {
             // One representative carries each barrier's live count and ETA.
             // Rewriting every report on every arrival would copy O(N²) report
             // bytes into the journal during the large fan-outs this supports.
-            let key =
-                if !*wake { input.command_id.clone() } else { member.map_or_else(|| "merge".to_owned(), |s| format!("group:{}", s.group)) };
+            let key = if !*wake {
+                input.command_id.clone()
+            } else {
+                member.map_or_else(|| "merge".to_owned(), |(group, _)| format!("group:{group}"))
+            };
             let representative = represented.insert(key);
-            let (ready, immediate, waiting) = if let Some(s) = member {
-                let members = &groups[&s.group];
+            let (ready, immediate, waiting) = if let Some((group, wake)) = member {
+                let members = groups.get(group).map_or(&[][..], Vec::as_slice);
+                let (orphan_done, orphan_failed) = orphan_counts.get(group).copied().unwrap_or_default();
                 // Task acknowledges background launch before its detached
                 // runner necessarily links the child. Count logged calls too,
                 // so an already acknowledged sibling cannot be missed.
                 let total = group_calls
-                    .get(&s.group)
-                    .map_or(members.len(), |calls| calls.iter().filter(|id| !rejected_calls.contains(*id)).count().max(members.len()));
-                let done = members.iter().filter(|s| finished.contains(&s.child_session_id)).count();
-                let failures = members.iter().filter(|s| failed.contains(&s.child_session_id)).count();
-                let target = match s.wake.as_str() {
+                    .get(group)
+                    .map_or(0, |calls| calls.iter().filter(|id| !rejected_calls.contains(*id)).count())
+                    .max(members.len() + orphan_done);
+                let done = members.iter().filter(|s| finished.contains(&grouped_run_key(s))).count() + orphan_done;
+                let failures = members.iter().filter(|s| failed.contains(&grouped_run_key(s))).count() + orphan_failed;
+                let target = match wake {
                     "any" => 1,
                     w if w.starts_with("count:") => w[6..].parse::<usize>().unwrap_or(total),
                     _ => total,
@@ -3926,15 +4062,15 @@ impl Actor {
                 let failure = input.task_notice.as_ref().is_some_and(|t| matches!(t.status.as_str(), "failed" | "lost" | "error"));
                 let ready = failure || failures > 0 || done >= target;
                 if ready {
-                    let summary = format!("group {}: {done} of {total} finished, {failures} failed", s.group);
-                    let body = if input.text.starts_with(&format!("group {}:", s.group)) {
+                    let summary = format!("group {group}: {done} of {total} finished, {failures} failed");
+                    let body = if input.text.starts_with(&format!("group {group}:")) {
                         input.text.split_once("\n\n").map_or(input.text.as_str(), |(_, body)| body)
                     } else {
                         &input.text
                     };
                     input.text = format!("{summary}\n\n{body}");
                 }
-                (ready, true, format!("waiting for {target} of {total} in group {} ({done} finished)", s.group))
+                (ready, true, format!("waiting for {target} of {total} in group {group} ({done} finished)"))
             } else {
                 let failure = input.task_notice.as_ref().is_some_and(|t| matches!(t.status.as_str(), "failed" | "lost" | "error"));
                 (true, failure, format!("merging {count} reports"))
@@ -3953,7 +4089,7 @@ impl Actor {
                 } else if representative {
                     waiting
                 } else {
-                    member.map_or_else(|| "merging reports".to_owned(), |s| format!("waiting for group {}", s.group))
+                    member.map_or_else(|| "merging reports".to_owned(), |(group, _)| format!("waiting for group {group}"))
                 }
             });
             let updated = Self::queued_notice(input, *wake, reason, deliver);
@@ -6768,6 +6904,79 @@ mod notice_tests {
     }
 
     #[test]
+    fn failed_background_handoff_waits_for_its_exact_notice_without_a_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = Arc::new(SessionTools::new(dir.path().into()));
+        let (task_tx, mut task_rx) = mpsc::unbounded_channel();
+        tools.background.set_sink(Some(task_tx));
+        let (older_task, _) = tools.background.start_agent("earlier run", true);
+        let (task, _) = tools.background.start_agent("failing run", true);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let handle = Handle { tx, tools: tools.clone(), running: Arc::default(), claude_code: Arc::default(), inbox: Arc::default() };
+        let link = |seq, task: &str| {
+            ev(
+                seq,
+                seq as i64,
+                session_event::Kind::SubagentSpawned(c6_proto::SubagentSpawned {
+                    call_id: "call".into(),
+                    child_session_id: "child".into(),
+                    background_task_id: task.into(),
+                    ..Default::default()
+                }),
+            )
+        };
+        let notice = |seq, task: &str, state: &str| {
+            ev(
+                seq,
+                seq as i64,
+                session_event::Kind::NoticeQueued(c6_proto::NoticeQueued {
+                    command_id: format!("task:{task}:{state}"),
+                    ..Default::default()
+                }),
+            )
+        };
+        let call = LocalReportCall::of(&c6_proto::UserMessage {
+            command_id: format!("delegation:unique:{task}"),
+            delegated_by: "call".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let inline = InlineChildReport { child: "child".into(), calls: vec![call], status: "failed", after: 0 };
+        let mut parent = LocalReportParent {
+            events: vec![link(1, &older_task), notice(2, &older_task, "finished"), link(3, &task)],
+            ..Default::default()
+        };
+        assert!(!inline.recorded(&parent.events), "a reused call id and the same child do not make the old run a receipt");
+
+        tools.background.finish_agent(&task, Err("failed".into()));
+        let _ = task_rx.try_recv().unwrap(); // older start
+        let _ = task_rx.try_recv().unwrap(); // current start
+        let completed = task_rx.try_recv().unwrap(); // do not hand it to the actor yet
+        assert_eq!((completed.id, completed.exit_code), (task.clone(), Some(1)));
+        assert!(!tools.background.snapshot(&task).unwrap().running);
+        assert!(inline.still_running(&handle, &parent), "a finished snapshot still has an undelivered callback");
+        drop(rx);
+        assert!(!inline.still_running(&handle, &parent), "a dead actor cannot deliver its retained callback");
+
+        parent.events.push(notice(4, &task, "lost"));
+        assert!(!inline.recorded(&parent.events), "a loss placeholder did not deliver this failure");
+        parent.events.push(notice(5, &task, "finished")); // nonzero exit, so this is the failure notice
+        assert!(inline.recorded(&parent.events), "link and notice suffice before the CLI result arrives");
+        parent.events.push(ev(
+            6,
+            6,
+            session_event::Kind::ToolResult(c6_proto::ToolResult {
+                call_id: "call".into(),
+                output: "started".into(),
+                ..Default::default()
+            }),
+        ));
+        assert!(inline.recorded(&parent.events), "MCP can log a wrapped result instead of the launch placeholder");
+        parent.events.remove(2);
+        assert!(!inline.recorded(&parent.events), "the notice cannot acknowledge a child without its exact link");
+    }
+
+    #[test]
     fn linked_receipts_survive_call_id_reuse_without_acknowledging_new_calls() {
         let invoke = |seq, name: &str| {
             ev(
@@ -6816,7 +7025,7 @@ mod notice_tests {
         assert!(!recorded(&events, "b"));
         events.push(result(6, "B done\n[subagent session b]"));
         assert!(recorded(&events, "a") && recorded(&events, "b"));
-        assert_eq!(InlineChildReport::check_after(&["call".into()], &events, 6), 0);
+        assert_eq!(InlineChildReport::check_after(&[LocalReportCall { id: "call".into(), task: None }], &events, 6), 0);
 
         events.push(invoke(7, "send_message"));
         assert!(!recorded(&events, "a"), "an unlinked continuation could be a new run of A");
@@ -7357,6 +7566,188 @@ mod notice_tests {
         tokio::time::advance(TICK).await;
         let (events, request) = completed_batch_after(&replay, &mock, initial).await;
         assert_audit_batch(&events, &request, 2, 2, 0);
+    }
+
+    async fn audit_group_releases_on_a_failure_before_the_child_is_linked(tool: &str) {
+        use session_event::Kind;
+        let (_dir, manager, mock) = idle_session().await;
+        let Kind::Assistant(mut calls) = task_calls(1, &[("call-1", "linked"), ("call-2", "orphan")], Some(" audit \t")) else {
+            unreachable!()
+        };
+        for block in &mut calls.blocks {
+            let Some(c6_proto::content_block::Block::ToolUse(use_)) = &mut block.block else { unreachable!() };
+            use_.name = tool.into();
+        }
+        let launch = |call: &str, task: &str| {
+            Kind::ToolResult(c6_proto::ToolResult {
+                call_id: call.into(),
+                tool: tool.into(),
+                output: format!(
+                    "Started the subagent in the background as {task}. Its report will arrive as a notice when it finishes; continue with other work meanwhile."
+                ),
+                ..Default::default()
+            })
+        };
+        let Kind::SubagentSpawned(mut linked) = audit_spawn(1, "all") else { unreachable!() };
+        linked.background_task_id = "bg1".into();
+        let initial = append_seed(
+            &manager.journal,
+            1,
+            [
+                user("audit-request"),
+                started_turn(1),
+                Kind::Assistant(calls),
+                launch("call-1", "bg1"),
+                launch("call-2", "bg2"),
+                Kind::SubagentSpawned(linked),
+                ended_turn(1),
+            ],
+        )
+        .await;
+        let _clock = pause_clock();
+        mock.push(c6_testkit::Reply::Text("Saw both outcomes.".into()));
+        let actor = manager.actor("held").await.unwrap().unwrap();
+        let finish = |task: &str, code, output: &str| {
+            ActorMsg::Task(c6_tools::TaskEvent {
+                id: task.into(),
+                kind: c6_tools::TaskKind::Agent,
+                description: task.into(),
+                state: c6_tools::TaskState::Finished,
+                notify: true,
+                exit_code: Some(code),
+                elapsed: TICK,
+                output: output.into(),
+                pgid: None,
+                native_type: String::new(),
+                foreground: false,
+            })
+        };
+        actor.send(finish("bg1", 0, "linked success")).unwrap();
+        barrier(&manager, "linked-sibling-only").await;
+        tokio::time::advance(MAX_WAIT + TICK).await;
+        barrier(&manager, "linked-sibling-still-held").await;
+        assert_waiting_after(&manager, &mock, 1, initial).await;
+
+        actor.send(finish("bg2", 1, "could not resolve model")).unwrap();
+        barrier(&manager, "orphan-failure-arrived").await;
+        tokio::time::advance(TICK).await;
+        let (events, request) = completed_batch_after(&manager, &mock, initial).await;
+        assert!(request.contains("group audit: 2 of 2 finished, 1 failed"), "{request}");
+        assert!(request.contains("linked success") && request.contains("could not resolve model"), "{request}");
+        let mut delivered: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Some(Kind::User(u)) if u.command == "task-notification" => Some(u.command_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        delivered.sort_unstable();
+        assert_eq!(delivered, ["task:bg1:finished", "task:bg2:finished"]);
+    }
+
+    #[tokio::test]
+    async fn audit_group_counts_an_unlinked_native_task_failure() {
+        audit_group_releases_on_a_failure_before_the_child_is_linked("task").await;
+    }
+
+    #[tokio::test]
+    async fn audit_group_counts_an_unlinked_mcp_task_failure() {
+        audit_group_releases_on_a_failure_before_the_child_is_linked("mcp__carbon6__Task").await;
+    }
+
+    async fn audit_group_keeps_a_completed_member_after_its_continuation(session_only: bool) {
+        use session_event::Kind;
+        let (_dir, manager, mock) = idle_session().await;
+        let Kind::SubagentSpawned(mut a) = audit_spawn(1, "all") else { unreachable!() };
+        a.background_task_id = "bg1".into();
+        let mut continuation = a.clone();
+        continuation.call_id = "continue-a".into();
+        continuation.background_task_id = "bg3".into();
+        continuation.group.clear();
+        continuation.wake.clear();
+        let (old_id, continued_id) =
+            if session_only { ("subagent:original-a", "subagent:continuation-a") } else { ("task:bg1:finished", "task:bg3:finished") };
+        let old = c6_proto::NoticeQueued {
+            command_id: old_id.into(),
+            command: "task-notification".into(),
+            text: "original success".into(),
+            wake: true,
+            task_notice: Some(c6_proto::TaskNotice {
+                session_id: if session_only { a.child_session_id.clone() } else { String::new() },
+                status: "completed".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let continuation_notice = Kind::NoticeQueued(c6_proto::NoticeQueued {
+            command_id: continued_id.into(),
+            command: "task-notification".into(),
+            text: "continuation failed".into(),
+            // Hold for the next input so the final B notice and this report
+            // can be checked together, including their different summaries.
+            wake: false,
+            task_notice: Some(c6_proto::TaskNotice {
+                session_id: a.child_session_id.clone(),
+                status: "failed".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let initial = append_seed(
+            &manager.journal,
+            1,
+            [
+                user("audit-request"),
+                started_turn(1),
+                task_calls(1, &[("call-1", "A"), ("call-2", "B")], Some("audit")),
+                task_ack("call-1"),
+                task_ack("call-2"),
+                Kind::SubagentSpawned(a),
+                audit_spawn(2, "all"),
+                ended_turn(1),
+                Kind::NoticeQueued(old.clone()),
+                user("direct-input"),
+                user(old_id),
+                started_turn(2),
+                Kind::SubagentSpawned(continuation),
+                ended_turn(2),
+                // Replaying a later scheduling snapshot cannot change where the
+                // original session-only report belonged when it first arrived.
+                Kind::NoticeQueued(c6_proto::NoticeQueued { reason: "later snapshot".into(), ..old }),
+                continuation_notice,
+            ],
+        )
+        .await;
+
+        let _clock = pause_clock();
+        mock.push(c6_testkit::Reply::Text("Saw the final audit report.".into()));
+        barrier(&manager, "continuation-notice-held").await;
+        assert_waiting_after(&manager, &mock, 1, initial).await;
+        enqueue_audit_reports(&manager, 2..=2, TurnEndReason::Completed).await;
+        tokio::time::advance(TICK).await;
+        let (events, request) = completed_batch_after(&manager, &mock, initial).await;
+        assert!(request.contains("group audit: 2 of 2 finished, 0 failed"), "{request}");
+        let delivered: Vec<_> = events
+            .iter()
+            .filter(|e| e.seq > initial)
+            .filter_map(|e| match &e.kind {
+                Some(Kind::User(u)) if u.command == "task-notification" => Some(u),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(delivered.len(), 2);
+        assert!(delivered.iter().any(|u| u.command_id == continued_id && u.text == "continuation failed"));
+        assert!(delivered.iter().any(|u| u.command_id == "subagent:audit-child-2" && u.text.starts_with("group audit:")));
+    }
+
+    #[tokio::test]
+    async fn audit_group_preserves_task_id_completion_across_a_continuation() {
+        audit_group_keeps_a_completed_member_after_its_continuation(false).await;
+    }
+
+    #[tokio::test]
+    async fn audit_group_preserves_session_only_completion_across_a_continuation() {
+        audit_group_keeps_a_completed_member_after_its_continuation(true).await;
     }
 
     #[tokio::test]

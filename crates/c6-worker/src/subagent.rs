@@ -402,7 +402,7 @@ impl Subagents for Runner {
             _ => String::new(),
         };
         let input = PendingInput {
-            command_id: format!("delegation:{}", uuid::Uuid::now_v7()),
+            command_id: delegation_command_id(background),
             text: prompt.to_owned(),
             prompt: format!("{instructions}{prompt}\n\n---\n{note}"),
             delegated_by: parent_call_id.to_owned(),
@@ -515,7 +515,7 @@ impl Subagents for Runner {
             Err(e) => return Err(format!("subagent {to} could not be loaded: {e:#}")),
         };
         let input = PendingInput {
-            command_id: format!("delegation:{}", uuid::Uuid::now_v7()),
+            command_id: delegation_command_id(background),
             text: message.to_owned(),
             delegated_by: call_id.to_owned(),
             ..Default::default()
@@ -528,9 +528,9 @@ impl Subagents for Runner {
         }
         let root = p.spec.delegation.as_ref().map_or(p.session_id.as_str(), |d| d.root_session_id.as_str()).to_owned();
         let _working = self.permit(&root)?;
-        if !running {
-            self.link_continuation(&spawn, call_id, background).await?;
-        }
+        // A background invocation has its own waiter even if the child
+        // became busy since the tool checked. Link that waiter before input.
+        self.link_continuation(&spawn, call_id, background).await?;
         self.delegate(child_id, &child, input, cancel).await.map(Some)
     }
 
@@ -690,6 +690,16 @@ impl Runner {
             }
             Err(_) => Err(partial(&p.spec, &digest(journal, child_id, "failed", "").await)),
         }
+    }
+}
+
+/// Preserve the exact background waiter on the child's durable User input.
+/// A reused tool call id cannot identify a particular run of the same child.
+fn delegation_command_id(background: Option<&str>) -> String {
+    let id = uuid::Uuid::now_v7();
+    match background {
+        Some(task) => format!("delegation:{id}:{task}"),
+        None => format!("delegation:{id}"),
     }
 }
 

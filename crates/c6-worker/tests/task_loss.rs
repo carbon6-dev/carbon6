@@ -349,11 +349,21 @@ async fn handed_child_report_falls_back_when_the_parent_cannot_record_its_result
     let parent = journal.events_after(sid, 0, u32::MAX).await.unwrap();
     let fallback = parent
         .iter()
-        .filter(|e| {
-            matches!(&e.kind, Some(Kind::NoticeQueued(n)) if n.command_id.starts_with(&format!("subagent:local:{child}:"))
-            && n.text.contains("The child finished its checks."))
+        .filter_map(|e| match &e.kind {
+            Some(Kind::NoticeQueued(n))
+                if n.command_id.starts_with(&format!("subagent:local:{child}:")) && n.text.contains("The child finished its checks.") =>
+            {
+                Some((&n.command_id, &n.text))
+            }
+            _ => None,
         })
-        .count();
-    assert_eq!(fallback, 1, "{parent:?}");
+        .collect::<std::collections::HashSet<_>>();
+    // ETA/reason updates are snapshots of one durable fallback, not reports
+    // of another child completion.
+    assert_eq!(fallback.len(), 1, "{parent:?}");
+    assert!(
+        parent.iter().filter(|e| matches!(&e.kind, Some(Kind::User(u)) if fallback.iter().any(|(id, _)| **id == u.command_id))).count()
+            <= 1
+    );
     db.close().await;
 }

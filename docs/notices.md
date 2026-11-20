@@ -42,9 +42,13 @@ the session and resets the chain. Group failures bypass batching, not guards.
 Only turns started entirely by notices contribute to a rolling hour's spending.
 The default budget is **5,000,000 tokens** (input plus output, using recorded
 usage; cache accounting follows the existing usage representation). A turn
-started by a direct user input never counts, even if notices join it. Spending
-is evaluated before the next unattended turn, so a single turn may cross the
-budget. Historical usage and notice provenance are reconstructed from the log.
+started by a direct user input never counts, even if notices join it. The guard
+is evaluated before the next carbon6-scheduled wake, so a single turn may
+cross the budget. Claude Code can start a turn on its own task notifications
+before the carbon6 scheduler can intervene. When those notifications are
+recorded as the inputs starting the turn, its usage counts toward the next
+carbon6-scheduled wake and the notifications do not reset the progress chain.
+Historical usage and notice provenance are reconstructed from the log.
 Continue acknowledges earlier spending and authorizes another stretch of
 unattended work. Raise the limit opens Agents → Limits; save there, then Continue
 applies those settings to the paused session and records them for recovery.

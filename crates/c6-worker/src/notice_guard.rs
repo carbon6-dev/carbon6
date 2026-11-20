@@ -70,10 +70,30 @@ fn failed(status: &str) -> bool {
     matches!(status, "failed" | "lost" | "error")
 }
 
+fn report_markdown(markdown: &str, status: &str) -> String {
+    let markdown = markdown.trim();
+    if matches!(status, "completed" | "finished")
+        && let Some((body, footer)) = markdown.rsplit_once("\n\n[subagent session ")
+        && footer.strip_suffix(']').is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+    {
+        return normalized(body);
+    }
+    if failed(status)
+        && let Some((header, body)) = markdown.split_once('\n')
+        && let Some((id, attrs)) = header.strip_prefix("<subagent id=\"").and_then(|s| s.split_once("\" status=\""))
+        && uuid::Uuid::parse_str(id).is_ok()
+        && let Some((stable_attrs, _)) = attrs.strip_suffix("\">").and_then(|s| s.rsplit_once(" elapsed=\""))
+        && body.contains("</subagent>")
+    {
+        return normalized(&format!("<subagent status=\"{stable_attrs}>\n{body}"));
+    }
+    normalized(markdown)
+}
+
 fn report(reports: &mut HashSet<String>, notice: &TaskNotice) {
     // Display markdown omits the delivery wrapper's task ID, sender and
-    // elapsed time; the model-facing User text does not.
-    let markdown = normalized(&notice.markdown);
+    // elapsed time, but background subagent output still wraps its result.
+    let markdown = report_markdown(&notice.markdown, &notice.status);
     if !markdown.is_empty() {
         // Different audit slices can all honestly report "no issues". Their
         // descriptions distinguish completed work without treating fresh task
@@ -133,9 +153,12 @@ pub(crate) fn evaluate(
             }
             Some(Kind::User(u)) if u.blocked.is_empty() => {
                 let queued = notices.get(u.command_id.as_str());
-                // Native CLI reports may also arrive *during* a turn. They
-                // aren't direct input, but don't establish an unattended start.
-                let native_report = active.is_some() && u.command == "task-notification" && u.task_notice.is_some();
+                // The CLI logs its own task notifications without NoticeQueued.
+                // Only a notification before the turn can establish its start.
+                let native_report = u.command == "task-notification"
+                    && !u.human_origin
+                    && u.api_origin.is_none()
+                    && (u.origin_recorded || u.task_notice.is_some());
                 if queued.is_some() || native_report {
                     if active.is_none() {
                         notice_input = true;
@@ -382,6 +405,36 @@ mod tests {
     }
 
     #[test]
+    fn background_subagent_report_wrappers_do_not_hide_no_progress() {
+        for status in ["finished", "failed"] {
+            let mut log = Log::default();
+            log.user("start");
+            log.start();
+            log.background("initial", "Same task", "started", 0);
+            log.end();
+            for i in 0..=5 {
+                let child = format!("01900000-0000-7000-8000-{i:012}");
+                let report = if status == "finished" {
+                    format!("Nothing changed.\n\n[subagent session {child}]")
+                } else {
+                    format!(
+                        "<subagent id=\"{child}\" status=\"failed\" turns=\"1\" tool_calls=\"0\" elapsed=\"{i}s\">\n\
+                         Last message: Nothing changed.\n</subagent>\nCheck its work."
+                    )
+                };
+                log.notice("Same task", status, &report);
+                log.start();
+                log.background(&format!("bg-{i}"), "Same task", "started", 0);
+                log.end();
+                if i < 5 {
+                    assert_eq!(log.reason(5, 10, 100), None);
+                }
+            }
+            assert_eq!(log.reason(5, 10, 100).as_deref(), Some("paused: no progress in 5 wakes"));
+        }
+    }
+
+    #[test]
     fn failed_relaunch_limit_ignores_changing_reports_and_deduplicates_launch_pairs() {
         let mut log = Log::default();
         log.user("start");
@@ -426,6 +479,58 @@ mod tests {
         log.user("direct again");
         assert_eq!(log.reason(5, 3, 10).as_deref(), Some("paused: spending limit (10 tokens this hour)"));
         assert_eq!(evaluate(&log.0, NOW + HOUR_MS, 5, 3, 10), None);
+    }
+
+    #[test]
+    fn native_self_wakes_keep_progress_and_spending_history() {
+        let native_report = |log: &mut Log| {
+            log.push(Kind::User(UserMessage {
+                command_id: format!("task:native-{}", log.0.len()),
+                command: "task-notification".into(),
+                task_notice: Some(TaskNotice {
+                    title: "Job".into(),
+                    status: "completed".into(),
+                    markdown: "Same report".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }));
+        };
+        let mut log = Log::default();
+        native_report(&mut log);
+        log.user("direct");
+        log.start();
+        native_report(&mut log);
+        log.usage(100, 0, 0, 0);
+        log.end();
+        assert_eq!(log.reason(5, 3, 1), None);
+
+        log.notice("Job", "completed", "Same report");
+        log.start();
+        log.usage(1, 0, 0, 0);
+        log.end();
+        for _ in 0..5 {
+            native_report(&mut log);
+            log.start();
+            log.usage(2, 0, 0, 0);
+            log.end();
+        }
+        assert_eq!(log.reason(5, 3, 100).as_deref(), Some("paused: no progress in 5 wakes"));
+        assert_eq!(log.reason(6, 3, 11).as_deref(), Some("paused: spending limit (11 tokens this hour)"));
+
+        log.push(Kind::User(UserMessage {
+            command_id: "task:native-no-metadata".into(),
+            command: "task-notification".into(),
+            text: "A background task ended.".into(),
+            origin_recorded: true,
+            ..Default::default()
+        }));
+        log.start();
+        log.usage(3, 0, 0, 0);
+        log.end();
+        assert_eq!(log.reason(6, 3, 100).as_deref(), Some("paused: no progress in 6 wakes"));
+        log.user("direct again");
+        assert_eq!(log.reason(5, 3, 14).as_deref(), Some("paused: spending limit (14 tokens this hour)"));
     }
 
     #[test]

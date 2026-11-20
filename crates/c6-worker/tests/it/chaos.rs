@@ -243,13 +243,18 @@ async fn journal_failure_keeps_a_notice_whose_queue_marker_could_not_be_written(
     })
     .await;
     let events = env.events(&id).await;
-    assert_eq!(
-        events
-            .iter()
-            .filter(|e| matches!(&e.kind, EventKind::NoticeQueued { command_id, .. } if command_id == "notice-with-no-marker"))
-            .count(),
-        1
-    );
+    // Scheduling may append updated queue snapshots; they must all retain
+    // the same notice and payload, not become independent deliveries.
+    let queued: std::collections::HashSet<_> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::NoticeQueued { command_id, text, .. } if command_id == "notice-with-no-marker" => {
+                Some((command_id.as_str(), text.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(queued, std::collections::HashSet::from([("notice-with-no-marker", "This notice must survive its failed queue write")]));
     assert_eq!(
         events.iter().filter(|e| matches!(&e.kind, EventKind::User { command_id, .. } if command_id == "notice-with-no-marker")).count(),
         1
